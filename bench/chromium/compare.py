@@ -2,10 +2,12 @@
 """Set the VM arm and the host-container arms side by side, per URL and overall.
 
 Reads only records: the campaign's reqbench.jsonl + analysis.json (the VM arm,
-already through its publication gate) and hostcdp.jsonl + run.json (the host
-arms). The VM bytes must match the analysis identity, and every host row must
-name the exact run.json bytes beside it. Prints two tables and the ratios, and
-writes comparison.json.
+already through its publication gate) and hostcdp.jsonl + run.json +
+complete.json (the host arms). A corpus-extra host also requires the parent
+campaign-complete.json. The VM bytes and published cell must match the raw
+metadata, every host row must name the exact run.json bytes beside it, and the
+completion records must commit every consumed artifact. Prints two tables and
+the ratios, and writes comparison.json.
 
 Two quantities are compared, never mixed:
   caller-visible   VM blocking_ms (spawn -> image in hand) against host wall_ms
@@ -27,9 +29,11 @@ import math
 import os
 import random
 import secrets
+import stat
 import statistics
 import sys
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 
@@ -135,6 +139,89 @@ def ensure_output_directory(target):
         raise Refusal(f"output directory {target['directory']} changed during comparison")
 
 
+def validate_output_lock(target, lock_fd):
+    """Prove the held fd is the one permanent regular lock directory entry."""
+    ensure_output_directory(target)
+    lock_name = f"{target['name']}.lock"
+    try:
+        opened = os.fstat(lock_fd)
+        entry = os.stat(
+            lock_name,
+            dir_fd=target["directory_fd"],
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise Refusal(
+            f"cannot validate output lock {target['path']}.lock: {error}"
+        ) from error
+    if not stat.S_ISREG(opened.st_mode) or opened.st_nlink != 1:
+        raise Refusal(
+            f"output lock {target['path']}.lock is not a single-link regular file"
+        )
+    if (
+        not stat.S_ISREG(entry.st_mode)
+        or entry.st_nlink != 1
+        or not os.path.samestat(opened, entry)
+    ):
+        raise Refusal(
+            f"output lock {target['path']}.lock changed directory identity"
+        )
+    ensure_output_directory(target)
+
+
+def open_output_lock(target):
+    """Open, without following links, the permanent lock beside the output."""
+    ensure_output_directory(target)
+    lock_name = f"{target['name']}.lock"
+    flags = (
+        os.O_RDWR
+        | os.O_CREAT
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        lock_fd = os.open(
+            lock_name,
+            flags,
+            0o666,
+            dir_fd=target["directory_fd"],
+        )
+    except OSError as error:
+        raise Refusal(
+            f"cannot open output lock {target['path']}.lock: {error}"
+        ) from error
+    try:
+        validate_output_lock(target, lock_fd)
+    except BaseException:
+        os.close(lock_fd)
+        raise
+    return lock_fd
+
+
+def acquire_output_lock(target, lock_fd, wait_seconds=5.0):
+    """Acquire one permanent lock within a bounded monotonic deadline."""
+    deadline = time.monotonic() + wait_seconds
+    while True:
+        validate_output_lock(target, lock_fd)
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError as error:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refusal(
+                    f"output lock {target['path']}.lock remained held for "
+                    f"{wait_seconds:g}s"
+                ) from error
+            time.sleep(min(0.01, remaining))
+        except OSError as error:
+            raise Refusal(
+                f"cannot acquire output lock {target['path']}.lock: {error}"
+            ) from error
+    validate_output_lock(target, lock_fd)
+
+
 def rename_noreplace(directory_fd, source, destination):
     """Rename one directory entry without overwriting a concurrent creator."""
     try:
@@ -161,9 +248,9 @@ def rename_noreplace(directory_fd, source, destination):
         raise OSError(error_number, os.strerror(error_number), source)
 
 
-def write_json_atomic(path, value, output_target=None):
+def write_json_atomic(path, value, output_target=None, before_publish=None):
     if output_target is not None:
-        return write_json_atomic_at(output_target, value)
+        return write_json_atomic_at(output_target, value, before_publish)
     directory = os.path.dirname(os.path.abspath(path)) or "."
     fd, temporary = tempfile.mkstemp(prefix=".compare-", dir=directory)
     try:
@@ -172,6 +259,8 @@ def write_json_atomic(path, value, output_target=None):
             handle.write("\n")
             handle.flush()
             os.fsync(handle.fileno())
+        if before_publish is not None:
+            before_publish()
         os.replace(temporary, path)
     except BaseException:
         try:
@@ -181,7 +270,7 @@ def write_json_atomic(path, value, output_target=None):
         raise
 
 
-def write_json_atomic_at(target, value):
+def write_json_atomic_at(target, value, before_publish=None):
     ensure_output_directory(target)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     while True:
@@ -211,6 +300,8 @@ def write_json_atomic_at(target, value):
             handle.flush()
             os.fsync(handle.fileno())
             written_stat = os.fstat(handle.fileno())
+        if before_publish is not None:
+            before_publish()
         ensure_output_directory(target)
         try:
             os.link(
@@ -512,7 +603,223 @@ def host_counts(meta, label):
             "convention": convention}
 
 
+def reject_withdrawn(directory):
+    absolute = os.path.realpath(directory)
+    for owner in (absolute, os.path.dirname(absolute)):
+        marker = os.path.join(owner, "WITHDRAWN")
+        try:
+            os.lstat(marker)
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise Refusal(f"cannot inspect withdrawal marker {marker}: {error}") from error
+        raise Refusal(f"host input is WITHDRAWN by {marker}")
+
+
+def completion_identity(record, label):
+    if not isinstance(record, dict) or set(record) != {"size", "sha256"}:
+        raise Refusal(f"{label} must contain exactly size and sha256")
+    size = record.get("size")
+    digest = record.get("sha256")
+    if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+        raise Refusal(f"{label} has invalid size={size!r}")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+    ):
+        raise Refusal(f"{label} has invalid sha256={digest!r}")
+    return {"size": size, "sha256": digest}
+
+
+def validate_host_completion(directory, run_id, artifacts):
+    path = os.path.join(directory, "complete.json")
+    completion_artifact = read_artifact(path)
+    completion = parse_json(completion_artifact["text"], path)
+    if set(completion) != {"schema_version", "run_id", "artifacts"}:
+        raise Refusal(
+            f"{path} must contain exactly schema_version, run_id, and artifacts"
+        )
+    version = completion.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise Refusal(f"{path} has unsupported schema_version={version!r}")
+    if completion.get("run_id") != run_id:
+        raise Refusal(
+            f"{path} run_id={completion.get('run_id')!r} does not match "
+            f"run.json run_id={run_id!r}"
+        )
+    declared = completion.get("artifacts")
+    expected_names = {"run.json", "hostcdp.jsonl"}
+    if not isinstance(declared, dict) or set(declared) != expected_names:
+        raise Refusal(
+            f"{path} artifacts must identify exactly run.json and hostcdp.jsonl"
+        )
+    for name in sorted(expected_names):
+        recorded = completion_identity(
+            declared[name], f"{path} artifacts[{name!r}]"
+        )
+        current = artifacts[name]
+        if (
+            recorded["size"] != current["size"]
+            or recorded["sha256"] != current["sha256"]
+        ):
+            raise Refusal(
+                f"{path} does not bind the current {name}: current "
+                f"size={current['size']} sha256={current['sha256']}, recorded "
+                f"size={recorded['size']} sha256={recorded['sha256']}"
+            )
+    return artifact_identity(completion_artifact)
+
+
+def campaign_arm(path, label):
+    if not isinstance(path, str):
+        raise Refusal(f"{label} has invalid path={path!r}")
+    parts = path.split("/")
+    if len(parts) != 2 or parts[1] != "complete.json":
+        raise Refusal(f"{label} has non-canonical path={path!r}")
+    prefix = "hostcdp-"
+    directory = parts[0]
+    arm = directory[len(prefix):] if directory.startswith(prefix) else ""
+    if (
+        not arm
+        or len(arm) > 63
+        or not arm[0].isascii()
+        or not arm[0].isalnum()
+        or any(
+            not character.isascii()
+            or not (character.isalnum() or character in "-_.")
+            for character in arm[1:]
+        )
+        or path != f"hostcdp-{arm}/complete.json"
+    ):
+        raise Refusal(f"{label} has non-canonical path={path!r}")
+    return arm
+
+
+def validate_campaign_completion(directory, meta, child_completion):
+    meta_path = os.path.join(directory, "run.json")
+    key = "corpus_extra_runtime_bundle_sha256"
+    if key not in meta:
+        raise Refusal(f"{meta_path} has no {key}")
+    runtime_sha256 = meta.get(key)
+    if runtime_sha256 is None:
+        return None
+    runtime_sha256 = sha256_field(meta, key, meta_path)
+
+    host_directory = os.path.realpath(directory)
+    campaign_directory = os.path.dirname(host_directory)
+    child_path = f"{os.path.basename(host_directory)}/complete.json"
+    arm = campaign_arm(child_path, f"host directory {host_directory}")
+    if meta.get("comparison_label") != arm:
+        raise Refusal(
+            f"{meta_path} comparison_label={meta.get('comparison_label')!r} "
+            f"does not match campaign child arm={arm!r}"
+        )
+
+    path = os.path.join(campaign_directory, "campaign-complete.json")
+    artifact = read_artifact(path)
+    completion = parse_json(artifact["text"], path)
+    expected_keys = {
+        "schema_version",
+        "run_id",
+        "runtime_bundle_sha256",
+        "host_completes",
+    }
+    if set(completion) != expected_keys:
+        raise Refusal(
+            f"{path} must contain exactly schema_version, run_id, "
+            "runtime_bundle_sha256, and host_completes"
+        )
+    version = completion.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise Refusal(f"{path} has unsupported schema_version={version!r}")
+    campaign_run_id = completion.get("run_id")
+    if (
+        not isinstance(campaign_run_id, str)
+        or len(campaign_run_id) != 32
+        or any(
+            character not in "0123456789abcdef"
+            for character in campaign_run_id
+        )
+    ):
+        raise Refusal(f"{path} has invalid run_id={campaign_run_id!r}")
+    completion_runtime = sha256_field(
+        completion, "runtime_bundle_sha256", path
+    )
+    if completion_runtime != runtime_sha256:
+        raise Refusal(
+            f"{path} runtime_bundle_sha256={completion_runtime!r} does not "
+            f"match run.json {key}={runtime_sha256!r}"
+        )
+    expected_child_run_id = f"{campaign_run_id}-{arm}"
+    if meta.get("run_id") != expected_child_run_id:
+        raise Refusal(
+            f"{path} run_id={campaign_run_id!r} and child arm={arm!r} "
+            f"require run.json run_id={expected_child_run_id!r}, got "
+            f"{meta.get('run_id')!r}"
+        )
+
+    children = completion.get("host_completes")
+    if not isinstance(children, list) or not children:
+        raise Refusal(f"{path} host_completes must be a nonempty array")
+    paths = []
+    selected = None
+    for ordinal, record in enumerate(children):
+        label = f"{path} host_completes[{ordinal}]"
+        if not isinstance(record, dict) or set(record) != {
+            "path", "size", "sha256"
+        }:
+            raise Refusal(
+                f"{label} must contain exactly path, size, and sha256"
+            )
+        recorded_path = record.get("path")
+        campaign_arm(recorded_path, label)
+        identity = completion_identity(
+            {"size": record.get("size"), "sha256": record.get("sha256")},
+            label,
+        )
+        paths.append(recorded_path)
+        if recorded_path == child_path:
+            selected = identity
+    if paths != sorted(paths):
+        raise Refusal(f"{path} host_completes is not sorted by path")
+    if len(paths) != len(set(paths)):
+        raise Refusal(f"{path} host_completes contains duplicate paths")
+    if selected is None:
+        raise Refusal(f"{path} does not commit selected child {child_path}")
+    if (
+        selected["size"] != child_completion["size"]
+        or selected["sha256"] != child_completion["sha256"]
+    ):
+        raise Refusal(
+            f"{path} does not bind the current {child_path}: current "
+            f"size={child_completion['size']} "
+            f"sha256={child_completion['sha256']}, recorded "
+            f"size={selected['size']} sha256={selected['sha256']}"
+        )
+    return artifact_identity(artifact)
+
+
+def revalidate_artifact_identity(label, expected):
+    """Refuse if one captured artifact no longer names the same exact bytes."""
+    current = artifact_identity(read_artifact(expected["path"]))
+    if current != expected:
+        raise Refusal(
+            f"captured input {label} changed before publication: "
+            f"{expected['path']}"
+        )
+
+
+def revalidate_host_inputs(directory, identities):
+    """Refuse if any captured authorization/input bytes changed."""
+    reject_withdrawn(directory)
+    for name, expected in sorted(identities.items()):
+        revalidate_artifact_identity(f"host {name}", expected)
+    reject_withdrawn(directory)
+
+
 def load_host_dataset(directory, require_driver=False):
+    reject_withdrawn(directory)
     meta_artifact = read_artifact(os.path.join(directory, "run.json"))
     rows_artifact = read_artifact(os.path.join(directory, "hostcdp.jsonl"))
     meta = parse_json(meta_artifact["text"], meta_artifact["path"])
@@ -520,6 +827,17 @@ def load_host_dataset(directory, require_driver=False):
     run_id = meta.get("run_id")
     if not isinstance(run_id, str) or not run_id:
         raise Refusal(f"{meta_artifact['path']} names no host run_id")
+    bound_artifacts = {
+        "run.json": meta_artifact,
+        "hostcdp.jsonl": rows_artifact,
+    }
+    completion_identity_record = validate_host_completion(
+        directory, run_id, bound_artifacts
+    )
+    campaign_completion_identity = validate_campaign_completion(
+        directory, meta, completion_identity_record
+    )
+    reject_withdrawn(directory)
     counts = host_counts(meta, meta_artifact["path"])
     urls = declared_urls(meta, meta_artifact["path"])
     if integer_field(meta, "url_count", meta_artifact["path"], minimum=1) != len(urls):
@@ -561,6 +879,16 @@ def load_host_dataset(directory, require_driver=False):
             )
         if record.get("ok") is not True:
             raise Refusal(f"{label} is not a successful host rep")
+        if record.get("measurement_valid") is not True:
+            raise Refusal(
+                f"{label} has measurement_valid="
+                f"{record.get('measurement_valid')!r}; expected true"
+            )
+        load_status = integer_field(record, "loadavg1_read_status", label)
+        if load_status != 0:
+            raise Refusal(
+                f"{label} has loadavg1_read_status={load_status}; expected 0"
+            )
         expected_url = urls[rep % len(urls)]
         if record.get("url") != expected_url:
             raise Refusal(
@@ -606,7 +934,11 @@ def load_host_dataset(directory, require_driver=False):
     identities = {
         "run_json": artifact_identity(meta_artifact),
         "hostcdp_jsonl": artifact_identity(rows_artifact),
+        "complete_json": completion_identity_record,
     }
+    if campaign_completion_identity is not None:
+        identities["campaign_complete_json"] = campaign_completion_identity
+    revalidate_host_inputs(directory, identities)
     return meta, records, measured_rows, counts, identities
 
 
@@ -619,6 +951,119 @@ def normalize_image_id(value, label):
     if len(normalized) != 64 or any(c not in "0123456789abcdef" for c in normalized):
         raise Refusal(f"{label} has invalid image_id={value!r}")
     return normalized
+
+
+PUBLISHED_CELL_FIELDS = (
+    "cpu",
+    "memory_mib",
+    "backend",
+    "uffd_mode",
+    "snapshot",
+    "image_id",
+    "source_revision",
+    "fcvm_sha256",
+    "runtime_bundle_sha256",
+    "host_kernel_release",
+    "host_machine",
+)
+
+
+def exact_string_field(record, key, label):
+    value = record.get(key)
+    if not isinstance(value, str) or not value or value != value.strip():
+        raise Refusal(f"{label} has invalid {key}={value!r}")
+    return value
+
+
+def lowercase_hex_field(record, key, label, length):
+    value = exact_string_field(record, key, label)
+    if len(value) != length or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise Refusal(f"{label} has invalid {key}={record.get(key)!r}")
+    return value
+
+
+def source_revision_field(record, label):
+    value = exact_string_field(record, "source_revision", label)
+    if len(value) not in (40, 64) or any(
+        character not in "0123456789abcdef" for character in value
+    ):
+        raise Refusal(
+            f"{label} has invalid source_revision="
+            f"{record.get('source_revision')!r}"
+        )
+    return value
+
+
+def snapshot_name_field(record, label):
+    value = exact_string_field(record, "snapshot", label)
+    if (
+        len(value) > 128
+        or value in (".", "..")
+        or any(
+            not character.isascii()
+            or not (character.isalnum() or character in "-_.")
+            for character in value
+        )
+    ):
+        raise Refusal(f"{label} has invalid snapshot={value!r}")
+    return value
+
+
+def validated_published_cell(record, label):
+    if not isinstance(record, dict):
+        raise Refusal(f"{label} cell is not an object")
+    cell = {
+        "cpu": integer_field(record, "cpu", label, minimum=1),
+        "memory_mib": integer_field(record, "memory_mib", label, minimum=1),
+        "backend": exact_string_field(record, "backend", label),
+        "uffd_mode": exact_string_field(record, "uffd_mode", label),
+        "snapshot": snapshot_name_field(record, label),
+        "image_id": "sha256:" + normalize_image_id(
+            record.get("image_id"), label
+        ),
+        "source_revision": source_revision_field(record, label),
+        "fcvm_sha256": lowercase_hex_field(
+            record, "fcvm_sha256", label, 64
+        ),
+        "runtime_bundle_sha256": lowercase_hex_field(
+            record, "runtime_bundle_sha256", label, 64
+        ),
+        "host_kernel_release": exact_string_field(
+            record, "host_kernel_release", label
+        ),
+        "host_machine": exact_string_field(record, "host_machine", label),
+    }
+    if cell["backend"] not in ("file", "uffd"):
+        raise Refusal(f"{label} has invalid backend={cell['backend']!r}")
+    if cell["uffd_mode"] not in ("file", "copy", "minor"):
+        raise Refusal(f"{label} has invalid uffd_mode={cell['uffd_mode']!r}")
+    valid_pair = (
+        cell["backend"] == "file" and cell["uffd_mode"] == "file"
+    ) or (
+        cell["backend"] == "uffd" and cell["uffd_mode"] in ("copy", "minor")
+    )
+    if not valid_pair:
+        raise Refusal(
+            f"{label} has inconsistent backend={cell['backend']!r} and "
+            f"uffd_mode={cell['uffd_mode']!r}"
+        )
+    return cell
+
+
+def bind_analysis_cell(analysis, vm_meta):
+    analysis_cell = validated_published_cell(
+        analysis.get("cell"), "analysis.json"
+    )
+    raw_cell = validated_published_cell(vm_meta, "VM reqbench metadata")
+    for field in PUBLISHED_CELL_FIELDS:
+        if analysis_cell[field] != raw_cell[field]:
+            raise Refusal(
+                f"analysis.json cell {field}={analysis_cell[field]!r} does not "
+                f"match VM reqbench metadata {field}={raw_cell[field]!r}"
+            )
+    return raw_cell
 
 
 def canonical_ip(value, label):
@@ -811,10 +1256,19 @@ def comparison_input_paths(args):
     for ordinal, spec in enumerate(args.host, 1):
         _label, separator, directory = spec.partition("=")
         if separator and directory:
+            campaign_directory = os.path.dirname(os.path.realpath(directory))
             inputs.extend((
                 (f"host {ordinal} run.json", os.path.join(directory, "run.json")),
                 (f"host {ordinal} hostcdp.jsonl",
                  os.path.join(directory, "hostcdp.jsonl")),
+                (f"host {ordinal} complete.json",
+                 os.path.join(directory, "complete.json")),
+                (f"host {ordinal} WITHDRAWN",
+                 os.path.join(directory, "WITHDRAWN")),
+                (f"host {ordinal} campaign-complete.json",
+                 os.path.join(campaign_directory, "campaign-complete.json")),
+                (f"host {ordinal} campaign WITHDRAWN",
+                 os.path.join(campaign_directory, "WITHDRAWN")),
             ))
     return inputs
 
@@ -949,42 +1403,30 @@ def main():
     # The lock file is permanent. Unlinking a flock inode while another caller
     # waits on it creates two lock domains and admits concurrent writers.
     target = open_output_target(a.out)
-    lock_path = f"{a.out}.lock"
     try:
+        lock_fd = open_output_lock(target)
         try:
-            ensure_output_directory(target)
-            lock_fd = os.open(
-                f"{target['name']}.lock",
-                os.O_RDWR | os.O_CREAT | getattr(os, "O_CLOEXEC", 0),
-                0o666,
-                dir_fd=target["directory_fd"],
-            )
             try:
-                output_lock = os.fdopen(lock_fd, "r+")
-            except BaseException:
-                os.close(lock_fd)
-                raise
-        except OSError as error:
-            raise Refusal(f"cannot open output lock {lock_path}: {error}") from error
-        with output_lock:
-            try:
-                fcntl.flock(output_lock.fileno(), fcntl.LOCK_EX)
+                acquire_output_lock(target, lock_fd)
                 ensure_output_directory(target)
                 preflight = reject_output_alias(
                     a.out, comparison_input_paths(a), target
                 )
                 ensure_output_directory(target)
                 clear_stale_output(target, preflight)
+                validate_output_lock(target, lock_fd)
             except OSError as error:
                 raise Refusal(
                     f"cannot clear stale output {a.out}: {error}"
                 ) from error
-            run_comparison(a, target)
+            run_comparison(a, target, lock_fd)
+        finally:
+            os.close(lock_fd)
     finally:
         os.close(target["directory_fd"])
 
 
-def run_comparison(a, output_target=None):
+def run_comparison(a, output_target=None, output_lock_fd=None):
     analysis_artifact = read_artifact(os.path.join(a.vm_run, "analysis.json"))
     analysis = parse_json(analysis_artifact["text"], analysis_artifact["path"])
     if not analysis.get("publishable") or not analysis.get("gate", {}).get("passed"):
@@ -992,6 +1434,7 @@ def run_comparison(a, output_target=None):
             "the VM run did not pass its publication gate; its numbers are not quotable"
         )
     vm_meta, vm_all, vm_input_identity = load_vm(a.vm_run, analysis)
+    published_cell = bind_analysis_cell(analysis, vm_meta)
     vm = [dict(r, total_ms=driver_total(r), load_ms=nav_load(r)) for r in vm_all if r["arm"] == "cdp"]
     noop = [r for r in vm_all if r["arm"] == "noop"]
     if not vm:
@@ -1003,10 +1446,7 @@ def run_comparison(a, output_target=None):
                "reqbench_jsonl": vm_input_identity,
                "hosts": {},
            },
-           "cell": {k: analysis["cell"][k] for k in
-                    ("cpu", "memory_mib", "backend", "uffd_mode", "snapshot", "image_id",
-                     "source_revision", "fcvm_sha256", "runtime_bundle_sha256",
-                     "host_kernel_release", "host_machine")},
+           "cell": published_cell,
            "vm": {"arm": "cdp",
                   "blocking_ms": summarize(vm, "blocking_ms"),
                   "wall_ms": summarize(vm, "wall_ms"),
@@ -1020,6 +1460,7 @@ def run_comparison(a, output_target=None):
 
     seen_host_datasets = {}
     seen_host_run_ids = {}
+    host_rechecks = []
     hostcdp_sha256 = None
     for spec in a.host:
         label, _, d = spec.partition("=")
@@ -1050,6 +1491,7 @@ def run_comparison(a, output_target=None):
             )
         seen_host_datasets[dataset_identity] = label
         seen_host_run_ids[meta["run_id"]] = label
+        host_rechecks.append((d, identities))
         validate_host_compatibility(label, meta, rows, counts, vm_meta, vm)
         current_hostcdp_sha256 = meta["hostcdp_sha256"]
         if hostcdp_sha256 is None:
@@ -1092,7 +1534,24 @@ def run_comparison(a, output_target=None):
             if h["load_event_ms"]["p50"] else None,
         }
 
-    write_json_atomic(a.out, out, output_target)
+    def recheck_inputs_before_publication():
+        revalidate_artifact_identity(
+            "VM analysis_json", out["input_identity"]["analysis_json"]
+        )
+        revalidate_artifact_identity(
+            "VM reqbench_jsonl", out["input_identity"]["reqbench_jsonl"]
+        )
+        for directory, identities in host_rechecks:
+            revalidate_host_inputs(directory, identities)
+        if output_target is not None and output_lock_fd is not None:
+            validate_output_lock(output_target, output_lock_fd)
+
+    write_json_atomic(
+        a.out,
+        out,
+        output_target,
+        before_publish=recheck_inputs_before_publication,
+    )
     print(json.dumps({k: out[k] for k in ("cell", "vm", "vm_noop", "ratios")}, indent=1)[:6000])
     print("\nper-URL wall/blocking p50 (ms)")
     urls = list(out["vm"]["per_url_blocking_p50"])

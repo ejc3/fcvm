@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Recompute a hostcdp summary.json from one complete host run.
 
-The run metadata must account for every record before any summary is written.
+The producer's complete.json must bind the run metadata and every record before
+any summary is written. A corpus-extra run also needs its parent campaign's
+campaign-complete.json to bind the completed child.
 The p50 uses the convention reqanalyze publishes (statistics.median), so the
 host p50 and the VM p50 it is divided by are the same kind of number. The
 records are untouched.
@@ -20,12 +22,20 @@ loadavg1_measured forward. That field is the answer to "was the box busy while
 this was measured", and a summary that dropped it cannot be checked against
 that question again.
 """
-import fcntl
 import os
 import statistics
 import sys
 
-from compare import Refusal, load_host_dataset, write_json_atomic
+from compare import (
+    Refusal,
+    acquire_output_lock,
+    load_host_dataset,
+    open_output_lock,
+    open_output_target,
+    revalidate_host_inputs,
+    validate_output_lock,
+    write_json_atomic,
+)
 
 
 def pct(values, p):
@@ -38,13 +48,20 @@ def pct(values, p):
 
 d = sys.argv[1]
 summary_path = os.path.join(d, "summary.json")
-lock_path = os.path.join(d, ".summary.lock")
 try:
-    lock = open(lock_path, "a+")
-except OSError as error:
-    sys.exit(f"REFUSING: cannot open {lock_path}: {error}")
-with lock:
-    fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+    lock_target = open_output_target(os.path.join(d, ".summary"))
+except Refusal as error:
+    sys.exit(f"REFUSING: {error}")
+lock_fd = None
+try:
+    lock_fd = open_output_lock(lock_target)
+    acquire_output_lock(lock_target, lock_fd)
+except Refusal as error:
+    if lock_fd is not None:
+        os.close(lock_fd)
+    os.close(lock_target["directory_fd"])
+    sys.exit(f"REFUSING: {error}")
+try:
     try:
         os.unlink(summary_path)
     except FileNotFoundError:
@@ -52,7 +69,7 @@ with lock:
     except OSError as error:
         sys.exit(f"REFUSING: cannot remove stale {summary_path}: {error}")
     try:
-        _meta, rows, _transformed, _counts, _identities = load_host_dataset(d)
+        _meta, rows, _transformed, _counts, identities = load_host_dataset(d)
     except Refusal as error:
         sys.exit(f"REFUSING: {error}")
     measured_rows = [r for r in rows if r["warmup"] is False]
@@ -77,5 +94,17 @@ with lock:
         "p50_convention": "statistics.median", "loadavg1_measured": load,
         "per_url": per_url,
     }
-    write_json_atomic(summary_path, out)
+
+    def recheck_inputs_before_publication():
+        revalidate_host_inputs(d, identities)
+        validate_output_lock(lock_target, lock_fd)
+
+    write_json_atomic(
+        summary_path,
+        out,
+        before_publish=recheck_inputs_before_publication,
+    )
     print(d, out["n"], out["p50_ms"], out["p95_ms"], out["mean_ms"])
+finally:
+    os.close(lock_fd)
+    os.close(lock_target["directory_fd"])

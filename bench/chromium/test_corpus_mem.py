@@ -18,6 +18,7 @@ import json
 import os
 import random
 import re
+import runpy
 import select
 import shutil
 import signal
@@ -1538,9 +1539,16 @@ exec {real_date!r} "$@"
         self.assertIn('"$RESULTS/.summary.lock"', producer)
         self.assertIn("os.replace(temporary, output_path)", producer)
         self.assertNotIn('open(sys.argv[3], "w")', producer)
-        self.assertIn('os.path.join(d, ".summary.lock")', resummarizer)
+        self.assertIn(
+            'open_output_target(os.path.join(d, ".summary"))', resummarizer
+        )
+        self.assertIn("open_output_lock(lock_target)", resummarizer)
+        self.assertIn("acquire_output_lock(lock_target, lock_fd)", resummarizer)
         self.assertNotIn(".resummarize.lock", resummarizer)
-        self.assertIn("write_json_atomic(summary_path, out)", resummarizer)
+        self.assertIn("write_json_atomic(", resummarizer)
+        self.assertIn("revalidate_host_inputs(d, identities)", resummarizer)
+        self.assertIn("validate_output_lock(lock_target, lock_fd)", resummarizer)
+        self.assertIn("before_publish=recheck_inputs_before_publication", resummarizer)
 
 
 class CorpusExtraFailClosed(unittest.TestCase):
@@ -3368,8 +3376,14 @@ class Resummarize(unittest.TestCase):
     """
 
     @staticmethod
-    def run_on(rows, meta=None, stale_summary=False):
-        tmp = tempfile.mkdtemp()
+    def run_on(rows, meta=None, stale_summary=False, complete=True,
+               withdrawn=False, campaign_runtime=False):
+        if campaign_runtime:
+            campaign = tempfile.mkdtemp()
+            tmp = os.path.join(campaign, "hostcdp-free")
+            os.mkdir(tmp)
+        else:
+            tmp = tempfile.mkdtemp()
         if meta is None:
             warmup = sum(r.get("warmup") is True for r in rows)
             urls = list(dict.fromkeys(r.get("url") for r in rows))
@@ -3382,7 +3396,17 @@ class Resummarize(unittest.TestCase):
             }
         if meta is not False:
             meta = dict(meta)
-            meta.setdefault("run_id", "resummarize-fixture")
+            meta.setdefault(
+                "run_id",
+                f"{'1' * 32}-free" if campaign_runtime
+                else "resummarize-fixture",
+            )
+            meta.setdefault(
+                "corpus_extra_runtime_bundle_sha256",
+                "9" * 64 if campaign_runtime else None,
+            )
+            if campaign_runtime:
+                meta.setdefault("comparison_label", "free")
             with open(os.path.join(tmp, "run.json"), "w") as handle:
                 json.dump(meta, handle)
             with open(os.path.join(tmp, "run.json"), "rb") as handle:
@@ -3395,6 +3419,23 @@ class Resummarize(unittest.TestCase):
                 if run_json_sha256 is not None:
                     record["run_json_sha256"] = run_json_sha256
                 handle.write(json.dumps(record) + "\n")
+        if meta is not False and complete:
+            artifacts = {}
+            for name in ("run.json", "hostcdp.jsonl"):
+                path = os.path.join(tmp, name)
+                with open(path, "rb") as handle:
+                    raw = handle.read()
+                artifacts[name] = {
+                    "size": len(raw),
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                }
+            with open(os.path.join(tmp, "complete.json"), "w") as handle:
+                json.dump({"schema_version": 1,
+                           "run_id": meta["run_id"],
+                           "artifacts": artifacts}, handle)
+        if withdrawn:
+            with open(os.path.join(tmp, "WITHDRAWN"), "w") as handle:
+                handle.write("fixture was withdrawn\n")
         if stale_summary:
             with open(os.path.join(tmp, "summary.json"), "w") as handle:
                 json.dump({"n": 999, "failures": 0, "passed": True}, handle)
@@ -3405,7 +3446,9 @@ class Resummarize(unittest.TestCase):
     @staticmethod
     def rep(rep, ok=True, warmup=False, wall_ms=100.0, load=0.5):
         return {"rep": rep, "ok": ok, "warmup": warmup, "wall_ms": wall_ms,
-                "loadavg1": load, "url": "https://example.com/", "driver": "{}"}
+                "loadavg1": load, "loadavg1_read_status": 0,
+                "measurement_valid": True,
+                "url": "https://example.com/", "driver": "{}"}
 
     def test_a_clean_run_is_summarised(self):
         rows = [self.rep(0, warmup=True, wall_ms=900.0)] + \
@@ -3510,6 +3553,180 @@ class Resummarize(unittest.TestCase):
         self.assertIn("run.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
 
+    def test_a_run_without_its_completion_commit_is_refused(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows, stale_summary=True, complete=False)
+        self.assertNotEqual(proc.returncode, 0,
+                            "an interrupted producer was resummarized")
+        self.assertIn("complete.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")),
+                         "the refusal left a stale summary quotable")
+
+    def test_a_campaign_run_without_parent_completion_is_refused(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(
+            rows, stale_summary=True, campaign_runtime=True
+        )
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "leftover child completion authorized campaign resummarization",
+        )
+        self.assertIn("campaign-complete.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
+
+    def test_completion_is_rechecked_at_summary_publication(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = os.path.join(tmp, "summary.json")
+        os.unlink(summary)
+        completion = os.path.join(tmp, "complete.json")
+        original = bench_compare.write_json_atomic
+
+        def change_completion_before_publication(*args, **kwargs):
+            with open(completion) as handle:
+                record = json.load(handle)
+            record["run_id"] = "changed-before-publication"
+            with open(completion, "w") as handle:
+                json.dump(record, handle)
+            return original(*args, **kwargs)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(
+                bench_compare, "write_json_atomic",
+                side_effect=change_completion_before_publication), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg="changed completion raced summary publication"):
+                runpy.run_path(
+                    os.path.join(HERE, "resummarize.py"), run_name="__main__"
+                )
+        self.assertFalse(os.path.exists(summary))
+
+    def test_summary_lock_contention_is_bounded(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = os.path.join(tmp, "summary.json")
+        os.unlink(summary)
+        ready = os.path.join(tmp, "summary-lock-holder-ready")
+        holder_source = """
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDWR)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(sys.argv[2], "x"):
+    pass
+sys.stdin.read(1)
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_source,
+             os.path.join(tmp, ".summary.lock"), ready],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 2
+            while not os.path.exists(ready) and time.monotonic() < deadline:
+                if holder.poll() is not None:
+                    self.fail(
+                        "summary lock holder exited early: "
+                        f"{holder.communicate()[1]}"
+                    )
+                time.sleep(0.01)
+            self.assertTrue(os.path.exists(ready), "summary lock holder was not ready")
+            try:
+                blocked = subprocess.run(
+                    [sys.executable, os.path.join(HERE, "resummarize.py"), tmp],
+                    capture_output=True,
+                    text=True,
+                    timeout=7,
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("resummarize blocked indefinitely on its held lock")
+            self.assertNotEqual(blocked.returncode, 0)
+            self.assertIn("lock", blocked.stderr.lower(), blocked.stderr)
+            self.assertIn("held", blocked.stderr.lower(), blocked.stderr)
+            self.assertFalse(os.path.exists(summary))
+        finally:
+            if holder.poll() is None:
+                holder.communicate(input="x", timeout=5)
+
+    def test_summary_lock_refuses_symlinks_and_multiple_links(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        for kind in ("symlink", "hardlink"):
+            with self.subTest(kind=kind):
+                tmp, proc = self.run_on(rows)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                os.unlink(os.path.join(tmp, "summary.json"))
+                lock_path = os.path.join(tmp, ".summary.lock")
+                os.unlink(lock_path)
+                backing = os.path.join(tmp, f"summary-lock-{kind}-backing")
+                backing_bytes = b"not a lock domain\n"
+                with open(backing, "wb") as handle:
+                    handle.write(backing_bytes)
+                if kind == "symlink":
+                    os.symlink(backing, lock_path)
+                else:
+                    os.link(backing, lock_path)
+                refused = subprocess.run(
+                    [sys.executable, os.path.join(HERE, "resummarize.py"), tmp],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                self.assertNotEqual(
+                    refused.returncode, 0,
+                    f"resummarize used a {kind} as its lock domain",
+                )
+                self.assertIn("lock", refused.stderr.lower(), refused.stderr)
+                self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
+                with open(backing, "rb") as handle:
+                    self.assertEqual(handle.read(), backing_bytes)
+
+    def test_summary_lock_entry_is_rechecked_at_publication(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = os.path.join(tmp, "summary.json")
+        os.unlink(summary)
+        lock_path = os.path.join(tmp, ".summary.lock")
+        detached = os.path.join(tmp, ".summary.lock.detached")
+        original = bench_compare.write_json_atomic
+
+        def replace_lock_before_publication(*args, **kwargs):
+            os.rename(lock_path, detached)
+            with open(lock_path, "w"):
+                pass
+            return original(*args, **kwargs)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(
+                bench_compare, "write_json_atomic",
+                side_effect=replace_lock_before_publication), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg="a detached summary lock authorized publication"):
+                runpy.run_path(
+                    os.path.join(HERE, "resummarize.py"), run_name="__main__"
+                )
+        self.assertFalse(os.path.exists(summary))
+
+    def test_a_withdrawn_run_is_refused(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows, stale_summary=True, withdrawn=True)
+        self.assertNotEqual(proc.returncode, 0,
+                            "a withdrawn host run was resummarized")
+        self.assertIn("WITHDRAWN", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")),
+                         "the refusal left a stale summary quotable")
+
 
 class FrozenCopiesAreRecordsNotTests(unittest.TestCase):
     """The sealed harness copies under results/ are provenance, not code CI runs.
@@ -3608,7 +3825,7 @@ class ComparePublicationGate(unittest.TestCase):
             "guest_dns": "10.0.2.2",
             "guest_env": [], "engine": "chromium", "cdp_port": 9222,
             "source_revision": "b" * 40, "harness_sha256": "c" * 64,
-            "fcvm_sha256": "d", "runtime_bundle_sha256": "e" * 64,
+            "fcvm_sha256": "d" * 64, "runtime_bundle_sha256": "e" * 64,
             "host_boot_id": "00000000-0000-4000-8000-000000000001",
             "host_kernel_release": "k", "host_machine": "aarch64"}
 
@@ -3651,6 +3868,10 @@ class ComparePublicationGate(unittest.TestCase):
             "image": cell["image"], "image_id": cell["image_id"],
             "guest_dns": cell["guest_dns"], "guest_env": cell["guest_env"],
             "source_revision": cell["source_revision"],
+            "memory_mib": cell["memory_mib"],
+            "backend": cell["backend"], "uffd_mode": cell["uffd_mode"],
+            "snapshot": cell["snapshot"],
+            "fcvm_sha256": cell["fcvm_sha256"],
             "harness_sha256": cell["harness_sha256"],
             "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
             "host_boot_id": cell["host_boot_id"],
@@ -3687,6 +3908,15 @@ class ComparePublicationGate(unittest.TestCase):
         with open(analysis_path) as handle:
             analysis = json.load(handle)
         analysis["analysis_identity"]["inputs"] = [self.artifact_identity(records)]
+        with open(analysis_path, "w") as handle:
+            json.dump(analysis, handle)
+
+    @staticmethod
+    def rewrite_analysis(run, mutate):
+        analysis_path = os.path.join(run, "analysis.json")
+        with open(analysis_path) as handle:
+            analysis = json.load(handle)
+        mutate(analysis)
         with open(analysis_path, "w") as handle:
             json.dump(analysis, handle)
 
@@ -3740,6 +3970,7 @@ class ComparePublicationGate(unittest.TestCase):
                       "nav": {"load_ms": wall_ms}}
         return {"rep": rep, "ok": ok, "warmup": warmup,
                 "wall_ms": wall_ms, "loadavg1": 0.2,
+                "loadavg1_read_status": 0, "measurement_valid": True,
                 "url": url, "driver": json.dumps(driver)}
 
     def make_host(self, rows, meta_overrides=None):
@@ -3761,6 +3992,7 @@ class ComparePublicationGate(unittest.TestCase):
             "source_revision": self.CELL["source_revision"],
             "harness_sha256": self.CELL["harness_sha256"],
             "runtime_bundle_sha256": self.CELL["runtime_bundle_sha256"],
+            "corpus_extra_runtime_bundle_sha256": None,
             "hostcdp_sha256": "f" * 64,
         }
         if meta_overrides:
@@ -3769,6 +4001,85 @@ class ComparePublicationGate(unittest.TestCase):
             json.dump(meta, handle)
         self.bind_host_rows(tmp, rows)
         return tmp
+
+    @staticmethod
+    def write_host_complete(host):
+        artifacts = {}
+        for name in ("run.json", "hostcdp.jsonl"):
+            path = os.path.join(host, name)
+            with open(path, "rb") as handle:
+                raw = handle.read()
+            artifacts[name] = {
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        with open(os.path.join(host, "run.json")) as handle:
+            run_id = json.load(handle)["run_id"]
+        with open(os.path.join(host, "complete.json"), "w") as handle:
+            json.dump({"schema_version": 1, "run_id": run_id,
+                       "artifacts": artifacts}, handle)
+
+    @staticmethod
+    def rewrite_host_complete(host, mutate):
+        path = os.path.join(host, "complete.json")
+        with open(path) as handle:
+            complete = json.load(handle)
+        mutate(complete)
+        with open(path, "w") as handle:
+            json.dump(complete, handle)
+
+    @staticmethod
+    def write_campaign_complete(campaign, hosts, run_id, runtime_sha256):
+        host_completes = []
+        for host in hosts:
+            complete = os.path.join(host, "complete.json")
+            with open(complete, "rb") as handle:
+                raw = handle.read()
+            host_completes.append({
+                "path": os.path.relpath(complete, campaign),
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            })
+        host_completes.sort(key=lambda record: record["path"])
+        with open(os.path.join(campaign, "campaign-complete.json"), "w") as handle:
+            json.dump({
+                "schema_version": 1,
+                "run_id": run_id,
+                "runtime_bundle_sha256": runtime_sha256,
+                "host_completes": host_completes,
+            }, handle)
+
+    def make_campaign_host(self, rows=None, arm="free"):
+        campaign = tempfile.mkdtemp()
+        campaign_run_id = "1" * 32
+        runtime_sha256 = "9" * 64
+        if rows is None:
+            rows = [self.host_rep(0, True)] + [
+                self.host_rep(i, False, wall_ms=float(100 + i))
+                for i in range(1, 4)
+            ]
+        temporary_host = self.make_host(rows, meta_overrides={
+            "run_id": f"{campaign_run_id}-{arm}",
+            "comparison_label": arm,
+            "corpus_extra_runtime_bundle_sha256": runtime_sha256,
+            "cpu_budget": "unlimited" if arm == "free" else "vm-matched",
+            "cpus": None if arm == "free" else 2,
+        })
+        host = os.path.join(campaign, f"hostcdp-{arm}")
+        shutil.move(temporary_host, host)
+        self.write_campaign_complete(
+            campaign, [host], campaign_run_id, runtime_sha256
+        )
+        return campaign, host
+
+    @staticmethod
+    def rewrite_campaign_complete(campaign, mutate):
+        path = os.path.join(campaign, "campaign-complete.json")
+        with open(path) as handle:
+            complete = json.load(handle)
+        mutate(complete)
+        with open(path, "w") as handle:
+            json.dump(complete, handle)
 
     @staticmethod
     def bind_host_rows(host, rows=None):
@@ -3782,6 +4093,7 @@ class ComparePublicationGate(unittest.TestCase):
                 record = dict(row)
                 record["run_json_sha256"] = run_json_sha256
                 handle.write(json.dumps(record) + "\n")
+        ComparePublicationGate.write_host_complete(host)
 
     def run_compare(self, run_dir, hosts=(), out=None, script=None):
         out = out or os.path.join(run_dir, "comparison.json")
@@ -3795,7 +4107,8 @@ class ComparePublicationGate(unittest.TestCase):
             capture_output=True, text=True, timeout=60), out
 
     def test_output_cannot_name_or_alias_any_input(self):
-        for input_name in ("analysis", "reqbench", "host-run", "host-rows"):
+        for input_name in ("analysis", "reqbench", "host-run", "host-rows",
+                           "host-complete"):
             for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
                 with self.subTest(input=input_name, alias=alias_kind):
                     run, host = self.valid_comparison()
@@ -3804,6 +4117,7 @@ class ComparePublicationGate(unittest.TestCase):
                         "reqbench": os.path.join(run, "reqbench.jsonl"),
                         "host-run": os.path.join(host, "run.json"),
                         "host-rows": os.path.join(host, "hostcdp.jsonl"),
+                        "host-complete": os.path.join(host, "complete.json"),
                     }
                     protected = inputs[input_name]
                     if alias_kind == "direct":
@@ -3833,6 +4147,52 @@ class ComparePublicationGate(unittest.TestCase):
                             handle.read(), before,
                             f"--out destroyed or rewrote {input_name}",
                         )
+                    if alias_kind in ("symlink", "hardlink"):
+                        self.assertTrue(
+                            os.path.lexists(out),
+                            "the refused alias itself was unlinked",
+                        )
+
+    def test_output_cannot_remove_a_withdrawal_marker(self):
+        for location in ("host", "campaign"):
+            for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+                with self.subTest(location=location, alias=alias_kind):
+                    if location == "campaign":
+                        run, campaign, host = self.valid_campaign_comparison()
+                        hosts = [("free", host)]
+                        marker = os.path.join(campaign, "WITHDRAWN")
+                    else:
+                        run, host = self.valid_comparison()
+                        hosts = [("host", host)]
+                        marker = os.path.join(host, "WITHDRAWN")
+                    marker_bytes = b"fixture was withdrawn\n"
+                    with open(marker, "wb") as handle:
+                        handle.write(marker_bytes)
+                    if alias_kind == "direct":
+                        out = marker
+                    elif alias_kind == "realpath":
+                        alias_root = tempfile.mkdtemp()
+                        os.symlink(
+                            os.path.dirname(marker),
+                            os.path.join(alias_root, "marker-owner"),
+                        )
+                        out = os.path.join(alias_root, "marker-owner", "WITHDRAWN")
+                    else:
+                        out = os.path.join(
+                            run, f"withdrawn-{location}-{alias_kind}"
+                        )
+                        if alias_kind == "symlink":
+                            os.symlink(marker, out)
+                        else:
+                            os.link(marker, out)
+                    proc, _ = self.run_compare(run, hosts, out=out)
+                    self.assertNotEqual(
+                        proc.returncode, 0,
+                        f"--out removed the {location} withdrawal marker",
+                    )
+                    self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                    with open(marker, "rb") as handle:
+                        self.assertEqual(handle.read(), marker_bytes)
                     if alias_kind in ("symlink", "hardlink"):
                         self.assertTrue(
                             os.path.lexists(out),
@@ -4021,6 +4381,110 @@ class ComparePublicationGate(unittest.TestCase):
                     "atomic publication replaced the raced input",
                 )
 
+    def test_output_lock_refuses_aliases_and_non_regular_entries(self):
+        for kind in ("symlink", "hardlink", "fifo"):
+            with self.subTest(kind=kind):
+                run, host = self.valid_comparison()
+                out = os.path.join(run, f"comparison-{kind}.json")
+                lock = out + ".lock"
+                if kind == "fifo":
+                    os.mkfifo(lock)
+                else:
+                    backing = os.path.join(run, f"lock-backing-{kind}")
+                    with open(backing, "w"):
+                        pass
+                    if kind == "symlink":
+                        os.symlink(backing, lock)
+                    else:
+                        os.link(backing, lock)
+                proc, _ = self.run_compare(
+                    run, [("host", host)], out=out)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"the comparator used a {kind} as its lock domain",
+                )
+                self.assertIn("REFUSING", proc.stderr, proc.stderr)
+                self.assertIn("lock", proc.stderr.lower(), proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_output_lock_entry_cannot_change_while_the_waiter_acquires_it(self):
+        run, host = self.valid_comparison()
+        out = os.path.join(run, "comparison-lock-race.json")
+        lock = out + ".lock"
+        detached = lock + ".detached"
+        original_flock = bench_compare.fcntl.flock
+        replaced = False
+
+        def replace_lock_after_acquiring(fd, operation):
+            nonlocal replaced
+            result = original_flock(fd, operation)
+            if not replaced:
+                replaced = True
+                os.rename(lock, detached)
+                with open(lock, "w"):
+                    pass
+            return result
+
+        argv = ["compare.py", "--vm-run", run,
+                "--host", f"host={host}", "--out", out]
+        with mock.patch.object(
+                bench_compare.fcntl, "flock",
+                side_effect=replace_lock_after_acquiring), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(bench_compare.Refusal):
+                bench_compare.main()
+        self.assertFalse(os.path.exists(out),
+                         "a detached lock inode still authorized publication")
+
+    def test_output_lock_contention_is_bounded(self):
+        run, host = self.valid_comparison()
+        out = os.path.join(run, "comparison-contended.json")
+        ready = os.path.join(run, "lock-holder-ready")
+        holder_source = """
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CREAT, 0o600)
+fcntl.flock(fd, fcntl.LOCK_EX)
+with open(sys.argv[2], "x"):
+    pass
+sys.stdin.read(1)
+"""
+        holder = subprocess.Popen(
+            [sys.executable, "-c", holder_source, out + ".lock", ready],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            deadline = time.monotonic() + 2
+            while not os.path.exists(ready) and time.monotonic() < deadline:
+                if holder.poll() is not None:
+                    self.fail(
+                        "lock holder exited before acquiring the lock: "
+                        f"{holder.communicate()[1]}"
+                    )
+                time.sleep(0.01)
+            self.assertTrue(os.path.exists(ready), "lock holder was not ready")
+            argv = [sys.executable, os.path.join(HERE, "compare.py"),
+                    "--vm-run", run, "--host", f"host={host}",
+                    "--out", out]
+            try:
+                proc = subprocess.run(
+                    argv, capture_output=True, text=True, timeout=7
+                )
+            except subprocess.TimeoutExpired:
+                self.fail("comparator blocked indefinitely on a held output lock")
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertIn("lock", proc.stderr.lower(), proc.stderr)
+            self.assertIn("held", proc.stderr.lower(), proc.stderr)
+            self.assertFalse(os.path.exists(out))
+        finally:
+            if holder.poll() is None:
+                holder.communicate(input="x", timeout=5)
+
     def test_a_run_that_failed_its_gate_is_refused(self):
         run = self.make_run(passed=False, vm_rows=[self.vm_rep(700.0)])
         proc, out = self.run_compare(run)
@@ -4071,6 +4535,111 @@ class ComparePublicationGate(unittest.TestCase):
             rec = json.load(handle)
         self.assertEqual(rec["vm"]["blocking_ms"]["p50"], 700.0)
         self.assertEqual(rec["vm"]["blocking_ms"]["n"], 3)
+
+    def test_every_published_cell_field_is_bound_to_raw_vm_metadata(self):
+        mismatches = {
+            "cpu": 3,
+            "memory_mib": 2048,
+            "backend": "file",
+            "uffd_mode": "copy",
+            "snapshot": "another-snapshot",
+            "image_id": "sha256:" + "f" * 64,
+            "source_revision": "0" * 40,
+            "fcvm_sha256": "1" * 64,
+            "runtime_bundle_sha256": "2" * 64,
+            "host_kernel_release": "another-kernel",
+            "host_machine": "x86_64",
+        }
+        for field, value in mismatches.items():
+            with self.subTest(field=field):
+                run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+                self.rewrite_analysis(
+                    run, lambda analysis, field=field, value=value:
+                    analysis["cell"].update({field: value}))
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"analysis.json relabelled the raw VM {field}",
+                )
+                self.assertIn(field, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_published_cell_fields_are_validated_not_only_compared(self):
+        invalid = {
+            "cpu": True,
+            "memory_mib": "1024",
+            "backend": "unknown",
+            "uffd_mode": "unknown",
+            "snapshot": " padded ",
+            "image_id": "sha256:short",
+            "source_revision": "z" * 40,
+            "fcvm_sha256": "z" * 64,
+            "runtime_bundle_sha256": "z" * 64,
+            "host_kernel_release": "",
+            "host_machine": 7,
+        }
+        for field, value in invalid.items():
+            with self.subTest(field=field):
+                run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+                self.rewrite_vm_records(
+                    run, lambda rows, field=field, value=value:
+                    rows[0].update({field: value}))
+                self.rewrite_analysis(
+                    run, lambda analysis, field=field, value=value:
+                    analysis["cell"].update({field: value}))
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"an invalid but equal {field} was published",
+                )
+                self.assertIn(field, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_snapshot_cell_uses_the_fcvm_snapshot_name_shape(self):
+        for value in (".", "..", "slash/name", "snowman-\N{SNOWMAN}", "x" * 129):
+            with self.subTest(value=value):
+                run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+                self.rewrite_vm_records(
+                    run, lambda rows, value=value:
+                    rows[0].update(snapshot=value))
+                self.rewrite_analysis(
+                    run, lambda analysis, value=value:
+                    analysis["cell"].update(snapshot=value))
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"invalid snapshot name {value!r} was published",
+                )
+                self.assertIn("snapshot", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_image_id_prefix_spelling_is_equivalent_and_output_is_canonical(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        self.rewrite_analysis(
+            run, lambda analysis:
+            analysis["cell"].update({"image_id": "a" * 64}))
+        proc, out = self.run_compare(run)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            comparison = json.load(handle)
+        self.assertEqual(comparison["cell"]["image_id"], self.IMAGE_ID)
+
+    def test_source_revision_accepts_sha1_and_sha256_git_object_formats(self):
+        for length in (40, 64):
+            with self.subTest(length=length):
+                cell = dict(self.CELL, source_revision="b" * length)
+                run = self.make_run(
+                    vm_rows=[self.vm_rep(700.0)], cell=cell)
+                proc, out = self.run_compare(run)
+                self.assertEqual(
+                    proc.returncode, 0,
+                    f"a supported {length}-hex Git object ID was refused: "
+                    f"{proc.stderr}",
+                )
+                with open(out) as handle:
+                    comparison = json.load(handle)
+                self.assertEqual(
+                    comparison["cell"]["source_revision"], "b" * length)
 
     def test_a_vm_record_that_does_not_say_it_succeeded_is_refused(self):
         rows = [self.vm_rep(v) for v in (600.0, 700.0, 800.0)]
@@ -4302,6 +4871,14 @@ class ComparePublicationGate(unittest.TestCase):
         host = self.make_host(host_rows, meta_overrides=meta_overrides)
         return run, host
 
+    def valid_campaign_comparison(self):
+        run = self.make_run(
+            vm_rows=[self.vm_rep(value) for value in (600.0, 700.0, 800.0)],
+            warmup=1,
+        )
+        campaign, host = self.make_campaign_host()
+        return run, campaign, host
+
     def test_a_complete_compatible_host_is_compared(self):
         run, host = self.valid_comparison()
         proc, out = self.run_compare(run, [("host", host)])
@@ -4319,6 +4896,383 @@ class ComparePublicationGate(unittest.TestCase):
             identities["hosts"]["host"]["hostcdp_jsonl"]["sha256"],
             self.artifact_identity(os.path.join(host, "hostcdp.jsonl"))["sha256"],
         )
+        self.assertEqual(
+            identities["hosts"]["host"]["complete_json"]["sha256"],
+            self.artifact_identity(os.path.join(host, "complete.json"))["sha256"],
+        )
+
+    def test_a_completed_campaign_host_is_bound_into_the_comparison(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        proc, out = self.run_compare(run, [("free", host)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            comparison = json.load(handle)
+        self.assertEqual(
+            comparison["input_identity"]["hosts"]["free"]
+                      ["campaign_complete_json"]["sha256"],
+            self.artifact_identity(
+                os.path.join(campaign, "campaign-complete.json")
+            )["sha256"],
+        )
+
+    def test_one_campaign_completion_binds_both_host_arms(self):
+        run = self.make_run(
+            vm_rows=[self.vm_rep(value) for value in (600.0, 700.0, 800.0)],
+            warmup=1,
+        )
+        campaign = tempfile.mkdtemp()
+        campaign_run_id = "1" * 32
+        runtime_sha256 = "9" * 64
+        rows = [self.host_rep(0, True)] + [
+            self.host_rep(i, False, wall_ms=float(100 + i))
+            for i in range(1, 4)
+        ]
+        hosts = []
+        for arm, cpu_budget, cpus in (
+            ("free", "unlimited", None),
+            ("cpu2", "vm-matched", 2),
+        ):
+            temporary = self.make_host(rows, meta_overrides={
+                "run_id": f"{campaign_run_id}-{arm}",
+                "comparison_label": arm,
+                "corpus_extra_runtime_bundle_sha256": runtime_sha256,
+                "cpu_budget": cpu_budget,
+                "cpus": cpus,
+            })
+            host = os.path.join(campaign, f"hostcdp-{arm}")
+            shutil.move(temporary, host)
+            hosts.append((arm, host))
+        self.write_campaign_complete(
+            campaign,
+            [host for _arm, host in hosts],
+            campaign_run_id,
+            runtime_sha256,
+        )
+        proc, out = self.run_compare(run, hosts)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            comparison = json.load(handle)
+        self.assertEqual(set(comparison["hosts"]), {"free", "cpu2"})
+        marker_hashes = {
+            comparison["input_identity"]["hosts"][arm]
+                      ["campaign_complete_json"]["sha256"]
+            for arm, _host in hosts
+        }
+        self.assertEqual(len(marker_hashes), 1)
+
+    def test_campaign_host_requires_the_parent_completion_commit(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        os.unlink(os.path.join(campaign, "campaign-complete.json"))
+        self.assertTrue(os.path.exists(os.path.join(host, "complete.json")))
+        proc, out = self.run_compare(run, [("free", host)])
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "leftover successful child records authorized an incomplete campaign",
+        )
+        self.assertIn("campaign-complete.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_corpus_extra_runtime_binding_is_explicit(self):
+        invalid = {
+            "missing": None,
+            "empty": "",
+            "uppercase": "A" * 64,
+            "short": "a" * 63,
+            "boolean": True,
+        }
+        for label, value in invalid.items():
+            with self.subTest(label=label):
+                run, host = self.valid_comparison()
+                with open(os.path.join(host, "run.json")) as handle:
+                    meta = json.load(handle)
+                if label == "missing":
+                    meta.pop("corpus_extra_runtime_bundle_sha256")
+                else:
+                    meta["corpus_extra_runtime_bundle_sha256"] = value
+                with open(os.path.join(host, "run.json"), "w") as handle:
+                    json.dump(meta, handle)
+                self.bind_host_rows(host)
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"invalid corpus-extra runtime binding {label} was accepted",
+                )
+                self.assertIn(
+                    "corpus_extra_runtime_bundle_sha256",
+                    proc.stderr,
+                    proc.stderr,
+                )
+                self.assertFalse(os.path.exists(out))
+
+    def test_campaign_completion_binds_parent_run_runtime_and_child(self):
+        def append_unsorted(complete):
+            complete["host_completes"].insert(0, {
+                "path": "hostcdp-zulu/complete.json",
+                "size": 0,
+                "sha256": "0" * 64,
+            })
+
+        mutations = {
+            "schema version": lambda complete:
+                complete.update(schema_version=2),
+            "boolean schema version": lambda complete:
+                complete.update(schema_version=True),
+            "float schema version": lambda complete:
+                complete.update(schema_version=1.0),
+            "parent run": lambda complete:
+                complete.update(run_id="2" * 32),
+            "unsafe parent run": lambda complete:
+                complete.update(run_id="not-a-campaign-run"),
+            "runtime bundle": lambda complete:
+                complete.update(runtime_bundle_sha256="8" * 64),
+            "missing selected child": lambda complete:
+                complete.update(host_completes=[]),
+            "duplicate selected child": lambda complete:
+                complete["host_completes"].append(
+                    dict(complete["host_completes"][0])),
+            "unsorted children": append_unsorted,
+            "child size": lambda complete:
+                complete["host_completes"][0].update(
+                    size=complete["host_completes"][0]["size"] + 1),
+            "boolean child size": lambda complete:
+                complete["host_completes"][0].update(size=True),
+            "child digest": lambda complete:
+                complete["host_completes"][0].update(sha256="0" * 64),
+            "uppercase child digest": lambda complete:
+                complete["host_completes"][0].update(sha256="A" * 64),
+            "unsafe child path": lambda complete:
+                complete["host_completes"][0].update(
+                    path="hostcdp-free/../complete.json"),
+            "absolute child path": lambda complete:
+                complete["host_completes"][0].update(
+                    path="/hostcdp-free/complete.json"),
+            "unexpected top-level field": lambda complete:
+                complete.update(extra=True),
+            "unexpected child field": lambda complete:
+                complete["host_completes"][0].update(extra=True),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run, campaign, host = self.valid_campaign_comparison()
+                self.rewrite_campaign_complete(campaign, mutate)
+                proc, out = self.run_compare(run, [("free", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"campaign-complete with invalid {label} authorized output",
+                )
+                self.assertIn("campaign-complete.json", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_campaign_run_id_is_derived_from_the_bound_child_arm(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        with open(os.path.join(host, "run.json")) as handle:
+            meta = json.load(handle)
+        meta["run_id"] = "unrelated-child-run"
+        with open(os.path.join(host, "run.json"), "w") as handle:
+            json.dump(meta, handle)
+        self.bind_host_rows(host)
+        self.write_campaign_complete(
+            campaign, [host], "1" * 32, "9" * 64
+        )
+        proc, out = self.run_compare(run, [("free", host)])
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "campaign completion did not bind the child run_id to its arm",
+        )
+        self.assertIn("run_id", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_campaign_completion_is_a_protected_input(self):
+        for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+            with self.subTest(alias=alias_kind):
+                run, campaign, host = self.valid_campaign_comparison()
+                marker = os.path.join(campaign, "campaign-complete.json")
+                if alias_kind == "direct":
+                    out = marker
+                elif alias_kind == "realpath":
+                    alias_root = tempfile.mkdtemp()
+                    os.symlink(campaign, os.path.join(alias_root, "campaign"))
+                    out = os.path.join(
+                        alias_root, "campaign", "campaign-complete.json"
+                    )
+                else:
+                    out = os.path.join(run, f"campaign-{alias_kind}.json")
+                    if alias_kind == "symlink":
+                        os.symlink(marker, out)
+                    else:
+                        os.link(marker, out)
+                with open(marker, "rb") as handle:
+                    before = handle.read()
+                proc, _out = self.run_compare(
+                    run, [("free", host)], out=out
+                )
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"--out used a {alias_kind} alias of campaign completion",
+                )
+                self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                with open(marker, "rb") as handle:
+                    self.assertEqual(handle.read(), before)
+
+    def test_campaign_authorization_is_rechecked_at_publication(self):
+        actions = {
+            "campaign completion changed": lambda campaign, host:
+                self.rewrite_campaign_complete(
+                    campaign,
+                    lambda complete: complete.update(runtime_bundle_sha256="8" * 64),
+                ),
+            "child completion changed": lambda _campaign, host:
+                self.rewrite_host_complete(
+                    host, lambda complete: complete.update(run_id="changed")
+                ),
+            "campaign withdrawn": lambda campaign, _host:
+                open(os.path.join(campaign, "WITHDRAWN"), "w").close(),
+        }
+        for label, action in actions.items():
+            with self.subTest(label=label):
+                run, campaign, host = self.valid_campaign_comparison()
+                out = os.path.join(run, "comparison.json")
+                original = bench_compare.write_json_atomic
+
+                def change_input_before_publication(*args, **kwargs):
+                    action(campaign, host)
+                    return original(*args, **kwargs)
+
+                argv = ["compare.py", "--vm-run", run,
+                        "--host", f"free={host}", "--out", out]
+                with mock.patch.object(
+                        bench_compare, "write_json_atomic",
+                        side_effect=change_input_before_publication), \
+                        mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(
+                            bench_compare.Refusal,
+                            msg=f"{label} raced comparison publication"):
+                        bench_compare.main()
+                self.assertFalse(os.path.exists(out))
+
+    def test_vm_inputs_are_rechecked_at_publication(self):
+        for filename in ("analysis.json", "reqbench.jsonl"):
+            with self.subTest(filename=filename):
+                run, host = self.valid_comparison()
+                out = os.path.join(run, "comparison.json")
+                changed = os.path.join(run, filename)
+                original = bench_compare.write_json_atomic
+
+                def change_vm_input_before_publication(*args, **kwargs):
+                    with open(changed, "a") as handle:
+                        handle.write(" ")
+                    return original(*args, **kwargs)
+
+                argv = ["compare.py", "--vm-run", run,
+                        "--host", f"host={host}", "--out", out]
+                with mock.patch.object(
+                        bench_compare, "write_json_atomic",
+                        side_effect=change_vm_input_before_publication), \
+                        mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(
+                            bench_compare.Refusal,
+                            msg=f"changed {filename} raced publication"):
+                        bench_compare.main()
+                self.assertFalse(os.path.exists(out))
+
+    def test_host_completion_commit_is_required(self):
+        run, host = self.valid_comparison()
+        os.unlink(os.path.join(host, "complete.json"))
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "an interrupted host producer was compared")
+        self.assertIn("complete.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_completion_commit_binds_run_rows_and_run_id(self):
+        mutations = {
+            "schema_version": lambda complete:
+                complete.update(schema_version=2),
+            "boolean schema_version": lambda complete:
+                complete.update(schema_version=True),
+            "float schema_version": lambda complete:
+                complete.update(schema_version=1.0),
+            "run_id": lambda complete:
+                complete.update(run_id="another-run"),
+            "run.json size": lambda complete:
+                complete["artifacts"]["run.json"].update(
+                    size=complete["artifacts"]["run.json"]["size"] + 1),
+            "run.json sha256": lambda complete:
+                complete["artifacts"]["run.json"].update(sha256="0" * 64),
+            "hostcdp.jsonl size": lambda complete:
+                complete["artifacts"]["hostcdp.jsonl"].update(
+                    size=complete["artifacts"]["hostcdp.jsonl"]["size"] + 1),
+            "hostcdp.jsonl sha256": lambda complete:
+                complete["artifacts"]["hostcdp.jsonl"].update(sha256="0" * 64),
+            "missing artifact": lambda complete:
+                complete["artifacts"].pop("hostcdp.jsonl"),
+            "unexpected key": lambda complete:
+                complete.update(extra=True),
+            "boolean size": lambda complete:
+                complete["artifacts"]["run.json"].update(size=True),
+            "uppercase digest": lambda complete:
+                complete["artifacts"]["run.json"].update(sha256="A" * 64),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run, host = self.valid_comparison()
+                self.rewrite_host_complete(host, mutate)
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"complete.json with invalid {label} authorized comparison",
+                )
+                self.assertIn("complete.json", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_withdrawn_host_input_or_campaign_is_refused(self):
+        for location in ("host", "campaign", "campaign-via-symlink"):
+            with self.subTest(location=location):
+                run, original_host = self.valid_comparison()
+                if location == "host":
+                    host = original_host
+                    marker = os.path.join(host, "WITHDRAWN")
+                else:
+                    campaign = tempfile.mkdtemp()
+                    physical_host = os.path.join(campaign, "host")
+                    shutil.move(original_host, physical_host)
+                    marker = os.path.join(campaign, "WITHDRAWN")
+                    if location == "campaign-via-symlink":
+                        alias_root = tempfile.mkdtemp()
+                        host = os.path.join(alias_root, "host-alias")
+                        os.symlink(physical_host, host)
+                    else:
+                        host = physical_host
+                with open(marker, "w") as handle:
+                    handle.write("fixture was withdrawn\n")
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"a WITHDRAWN marker in the {location} was ignored",
+                )
+                self.assertIn("WITHDRAWN", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_every_host_row_requires_a_successful_load_capture(self):
+        mutations = {
+            "measurement_valid": lambda row: row.update(measurement_valid=False),
+            "loadavg1_read_status": lambda row:
+                row.update(loadavg1_read_status=1),
+        }
+        for field, mutate in mutations.items():
+            with self.subTest(field=field):
+                run, host = self.valid_comparison()
+                with open(os.path.join(host, "hostcdp.jsonl")) as handle:
+                    rows = [json.loads(line) for line in handle]
+                mutate(rows[0])
+                self.bind_host_rows(host, rows)
+                proc, out = self.run_compare(run, [("host", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"a row with invalid {field} entered the comparison",
+                )
+                self.assertIn(field, proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
 
     def test_host_environment_and_producer_must_match_the_vm_arm(self):
         mutations = {
@@ -4427,7 +5381,8 @@ class ComparePublicationGate(unittest.TestCase):
         proc, out = self.run_compare(run, [("host", host)])
         self.assertNotEqual(proc.returncode, 0,
                             "rows from another run were attributed to this run.json")
-        self.assertIn("run.json", proc.stderr, proc.stderr)
+        self.assertIn("complete.json", proc.stderr, proc.stderr)
+        self.assertIn("hostcdp.jsonl", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(out))
 
     def test_host_measured_count_must_match_the_vm_arm(self):
