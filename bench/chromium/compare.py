@@ -112,6 +112,7 @@ def load_vm_publication(run_dir):
         _cell, sources = campaign_summary.load_cell(run_dir)
     except campaign_summary.RunError as error:
         raise Refusal(f"VM publication contract: {error}") from error
+    reject_vm_withdrawn(run_dir)
 
     artifacts = []
     for source in sources:
@@ -335,9 +336,9 @@ def write_json_atomic_at(target, value, before_publish=None):
             handle.flush()
             os.fsync(handle.fileno())
             written_stat = os.fstat(handle.fileno())
+        ensure_output_directory(target)
         if before_publish is not None:
             before_publish()
-        ensure_output_directory(target)
         try:
             os.link(
                 temporary,
@@ -649,6 +650,20 @@ def reject_withdrawn(directory):
         except OSError as error:
             raise Refusal(f"cannot inspect withdrawal marker {marker}: {error}") from error
         raise Refusal(f"host input is WITHDRAWN by {marker}")
+
+
+def reject_vm_withdrawn(run_dir):
+    marker = os.path.join(run_dir, campaign_summary.WITHDRAWN_MARKER)
+    try:
+        os.lstat(marker)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise Refusal(
+            f"cannot inspect VM withdrawal marker {marker}: {error}"
+        ) from error
+    reason = campaign_summary.withdrawal_reason(marker)
+    raise Refusal(f"VM input is WITHDRAWN by {marker}: {reason}")
 
 
 def completion_identity(record, label):
@@ -1286,6 +1301,7 @@ def comparison_input_paths(args):
     inputs = [
         ("VM analysis.json", os.path.join(args.vm_run, "analysis.json")),
         ("VM reqbench.jsonl", os.path.join(args.vm_run, "reqbench.jsonl")),
+        ("VM WITHDRAWN", os.path.join(args.vm_run, "WITHDRAWN")),
         ("VM dns-evidence.json", os.path.join(args.vm_run, "dns-evidence.json")),
         ("VM dns-owner.log", os.path.join(args.vm_run, "dns-owner.log")),
         ("VM verify-dns-pre.json",
@@ -1460,6 +1476,7 @@ def main():
                 preflight = reject_output_alias(
                     a.out, comparison_input_paths(a), target
                 )
+                reject_vm_withdrawn(a.vm_run)
                 ensure_output_directory(target)
                 clear_stale_output(target, preflight)
                 validate_output_lock(target, lock_fd)
@@ -1593,6 +1610,7 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
             revalidate_host_inputs(directory, identities)
         if output_target is not None and output_lock_fd is not None:
             validate_output_lock(output_target, output_lock_fd)
+        reject_vm_withdrawn(a.vm_run)
 
     write_json_atomic(
         a.out,

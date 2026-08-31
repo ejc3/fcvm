@@ -38,6 +38,7 @@ sys.path.insert(0, HERE)
 
 import corpus_mem  # noqa: E402
 import compare as bench_compare  # noqa: E402
+import campaign_summary as bench_campaign_summary  # noqa: E402
 import phase_supervisor  # noqa: E402
 import report as bench_report  # noqa: E402
 
@@ -4360,10 +4361,14 @@ class ComparePublicationGate(unittest.TestCase):
                         )
 
     def test_output_cannot_remove_a_withdrawal_marker(self):
-        for location in ("host", "campaign"):
+        for location in ("vm", "host", "campaign"):
             for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
                 with self.subTest(location=location, alias=alias_kind):
-                    if location == "campaign":
+                    if location == "vm":
+                        run, host = self.valid_comparison()
+                        hosts = [("host", host)]
+                        marker = os.path.join(run, "WITHDRAWN")
+                    elif location == "campaign":
                         run, campaign, host = self.valid_campaign_comparison()
                         hosts = [("free", host)]
                         marker = os.path.join(campaign, "WITHDRAWN")
@@ -4404,6 +4409,43 @@ class ComparePublicationGate(unittest.TestCase):
                             os.path.lexists(out),
                             "the refused alias itself was unlinked",
                         )
+
+    def test_output_cannot_name_an_absent_vm_withdrawal_marker(self):
+        run, host = self.valid_comparison()
+        marker = os.path.join(run, "WITHDRAWN")
+        self.assertFalse(os.path.lexists(marker))
+        proc, _ = self.run_compare(
+            run, [("host", host)], out=marker
+        )
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "--out published comparison bytes at the VM withdrawal marker",
+        )
+        self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+        self.assertFalse(
+            os.path.lexists(marker),
+            "the refused comparison created a withdrawal marker",
+        )
+
+    def test_vm_withdrawal_is_refused_before_stale_output_cleanup(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        marker = os.path.join(run, "WITHDRAWN")
+        marker_bytes = b"fixture was withdrawn\n"
+        with open(marker, "wb") as handle:
+            handle.write(marker_bytes)
+        out = os.path.join(run, "comparison.json")
+        argv = ["compare.py", "--vm-run", run, "--out", out]
+        with mock.patch.object(
+                bench_compare, "clear_stale_output",
+                side_effect=AssertionError(
+                    "withdrawal was checked after stale-output cleanup"
+                )), mock.patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal, "WITHDRAWN|withdrawn"):
+                bench_compare.main()
+        with open(marker, "rb") as handle:
+            self.assertEqual(handle.read(), marker_bytes)
+        self.assertFalse(os.path.exists(out))
 
     def test_output_cannot_alias_the_running_comparator(self):
         for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
@@ -5462,6 +5504,58 @@ sys.stdin.read(1)
                             msg=f"changed {filename} raced publication"):
                         bench_compare.main()
                 self.assertFalse(os.path.exists(out))
+
+    def test_vm_withdrawal_is_rechecked_after_contract_loading(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        marker = os.path.join(run, "WITHDRAWN")
+        marker_bytes = b"withdrawn after contract loading\n"
+        out = os.path.join(run, "comparison.json")
+        original = bench_campaign_summary.load_cell
+
+        def withdraw_after_load(*args, **kwargs):
+            result = original(*args, **kwargs)
+            with open(marker, "wb") as handle:
+                handle.write(marker_bytes)
+            return result
+
+        argv = ["compare.py", "--vm-run", run, "--out", out]
+        with mock.patch.object(
+                bench_campaign_summary, "load_cell",
+                side_effect=withdraw_after_load), mock.patch.object(
+                bench_compare, "load_vm",
+                side_effect=AssertionError(
+                    "comparison continued after the VM was withdrawn"
+                )), mock.patch.object(sys, "argv", argv):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal, "WITHDRAWN|withdrawn"):
+                bench_compare.main()
+        with open(marker, "rb") as handle:
+            self.assertEqual(handle.read(), marker_bytes)
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_withdrawal_is_rechecked_immediately_before_publication(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        marker = os.path.join(run, "WITHDRAWN")
+        marker_bytes = b"withdrawn before publication\n"
+        out = os.path.join(run, "comparison.json")
+        original = bench_compare.write_json_atomic
+
+        def withdraw_before_publication(*args, **kwargs):
+            with open(marker, "wb") as handle:
+                handle.write(marker_bytes)
+            return original(*args, **kwargs)
+
+        argv = ["compare.py", "--vm-run", run, "--out", out]
+        with mock.patch.object(
+                bench_compare, "write_json_atomic",
+                side_effect=withdraw_before_publication), mock.patch.object(
+                sys, "argv", argv):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal, "WITHDRAWN|withdrawn"):
+                bench_compare.main()
+        with open(marker, "rb") as handle:
+            self.assertEqual(handle.read(), marker_bytes)
+        self.assertFalse(os.path.exists(out))
 
     def test_host_completion_commit_is_required(self):
         run, host = self.valid_comparison()
