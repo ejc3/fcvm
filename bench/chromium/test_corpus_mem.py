@@ -1477,7 +1477,12 @@ exec {real_date!r} "$@"
             started = os.path.join(tmp, "driver-started")
             release = os.path.join(tmp, "release-driver")
             env, _removed, _state = self.environment(
-                tmp, DRIVER_STARTED_FILE=started, DRIVER_WAIT_FILE=release)
+                tmp,
+                DRIVER_STARTED_FILE=started,
+                DRIVER_WAIT_FILE=release,
+                CORPUS_EXTRA_RUNTIME_MANIFEST="",
+                CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="",
+            )
             producer = subprocess.Popen(
                 ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE, text=True,
