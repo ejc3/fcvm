@@ -724,6 +724,10 @@ case "$cmd" in
     printf '%s\n' "${{PODMAN_CONTAINER_OWNER_TOKEN-$owner}}" >"$PODMAN_TEST_STATE.owner"
     printf '%s\n' "$launch_image" >"$PODMAN_TEST_STATE.launch-image"
     printf '%s\n' "${{PODMAN_CONTAINER_IMAGE_ID-{self.IMAGE_ID}}}" >"$PODMAN_TEST_STATE.image"
+    if [ "${{PODMAN_MODE:-ok}}" = committed-wait ]; then
+      : >"$PODMAN_CREATE_COMMITTED_FILE"
+      while [ ! -e "$PODMAN_CREATE_RETURN_FILE" ]; do sleep 0.01; done
+    fi
     [ "${{PODMAN_MODE:-ok}}" != partial ] || exit 124
     [ "${{PODMAN_MODE:-ok}}" != late-partial ] || exit 124
     [ "${{PODMAN_MODE:-ok}}" != inspect-error ] || exit 124
@@ -883,6 +887,8 @@ exec {real_date!r} "$@"
         escaped_release = os.path.join(tmp, "escaped-release")
         late_commit = os.path.join(tmp, "late-commit")
         late_ack = os.path.join(tmp, "late-ack")
+        create_committed = os.path.join(tmp, "create-committed")
+        create_return = os.path.join(tmp, "create-return")
 
         env = dict(
             os.environ,
@@ -917,6 +923,8 @@ exec {real_date!r} "$@"
             PODMAN_ESCAPED_RELEASE_FILE=escaped_release,
             PODMAN_LATE_COMMIT_FILE=late_commit,
             PODMAN_LATE_ACK_FILE=late_ack,
+            PODMAN_CREATE_COMMITTED_FILE=create_committed,
+            PODMAN_CREATE_RETURN_FILE=create_return,
             COMPARISON_LABEL="free",
             CPU_BUDGET="unlimited",
             SOURCE_REVISION=revision,
@@ -989,6 +997,43 @@ exec {real_date!r} "$@"
             with open(state + ".owner") as handle:
                 token = handle.read().strip()
             self.assertRegex(token, r"^[0-9a-f]{32}$")
+
+    def test_term_after_create_commit_reconciles_the_owned_container(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, removed, state = self.environment(tmp, mode="committed-wait")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(env["PODMAN_CREATE_COMMITTED_FILE"]):
+                    if producer.poll() is not None:
+                        stdout, stderr = producer.communicate()
+                        self.fail(
+                            f"hostcdp exited before create committed: "
+                            f"{producer.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("fake podman create did not commit")
+                    time.sleep(0.01)
+
+                producer.send_signal(signal.SIGTERM)
+                with open(env["PODMAN_CREATE_RETURN_FILE"], "w"):
+                    pass
+                stdout, stderr = producer.communicate(timeout=10)
+
+                self.assertEqual(producer.returncode, 143, stdout + stderr)
+                self.assertEqual(
+                    self.removed_ids(removed), [self.CONTAINER_ID],
+                    "TERM after create committed leaked the owned container",
+                )
+                self.assertFalse(os.path.exists(state + ".name"))
+            finally:
+                with open(env["PODMAN_CREATE_RETURN_FILE"], "w"):
+                    pass
+                if producer.poll() is None:
+                    producer.kill()
+                    producer.communicate(timeout=5)
 
     def test_failed_inspect_cannot_claim_absence_when_container_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1156,8 +1201,17 @@ exec {real_date!r} "$@"
         self.assertIn('--term-grace "$PODMAN_CREATE_KILL_AFTER_SECS"', prefix)
         self.assertIn('--kill-grace "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS"', prefix)
         self.assertIn('--pass-fd "$CREATE_OP_LOCK_FD"', prefix)
-        quiesce = source.index(
-            'flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS"', create)
+        quiesce_match = re.search(
+            r'^quiesce_create_operation\(\) \{\n.*?^\}',
+            source, re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(quiesce_match)
+        quiesce_function = quiesce_match.group(0)
+        self.assertIn(
+            'flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS"',
+            quiesce_function,
+        )
+        quiesce = source.index("if quiesce_create_operation", create)
         outcome = source.index('if [ "$podman_create_rc" -eq 0 ]', create)
         self.assertLess(quiesce, outcome)
         ownership = source.index('inspect_owned_container "$CONTAINER_ID"', outcome)

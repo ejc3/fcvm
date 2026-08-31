@@ -534,19 +534,51 @@ remove_owned_container() {
     CONTAINER_REMOVED=true
 }
 
+quiesce_create_operation() {
+    [ "$CREATE_OP_STARTED" = true ] || return 0
+    [ "$CREATE_OP_QUIESCENT" != true ] || return 0
+    if [ -n "$CREATE_OP_LOCK_FD" ]; then
+        if ! exec {CREATE_OP_LOCK_FD}>&-; then
+            log "FAILED: cannot close container create-operation lease"
+            return 1
+        fi
+        CREATE_OP_LOCK_FD=
+    fi
+    if ! exec {CREATE_OP_LOCK_FD}>"$CREATE_OP_LOCK_PATH"; then
+        log "FAILED: cannot reopen container create-operation lock"
+        CREATE_OP_LOCK_FD=
+        return 2
+    fi
+    if ! flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS" \
+            "$CREATE_OP_LOCK_FD"; then
+        log "FAILED: container create operation did not quiesce within ${PODMAN_CREATE_QUIESCE_TIMEOUT_SECS}s"
+        exec {CREATE_OP_LOCK_FD}>&-
+        CREATE_OP_LOCK_FD=
+        return 124
+    fi
+    CREATE_OP_QUIESCENT=true
+}
+
 cleanup() {
     original_rc=$?
     trap - EXIT
     final_rc=$original_rc
+    if [ "$CREATE_OP_STARTED" = true ] && [ "$CREATE_OP_QUIESCENT" != true ]; then
+        if quiesce_create_operation; then
+            :
+        else
+            quiesce_rc=$?
+            log "FAILED: container create operation did not reach quiescence; refusing an absence claim"
+            [ "$final_rc" -ne 0 ] || final_rc=$quiesce_rc
+        fi
+    fi
     if [ -n "$CREATE_OUTPUT_PATH" ] \
             && ! rm -f -- "$CREATE_OUTPUT_PATH"; then
         log "FAILED: could not remove container create output $CREATE_OUTPUT_PATH"
         [ "$final_rc" -ne 0 ] || final_rc=1
     fi
-    if [ "$CREATE_OP_STARTED" = true ] && [ "$CREATE_OP_QUIESCENT" != true ]; then
-        log "FAILED: container create operation did not reach quiescence; refusing an absence claim"
-        [ "$final_rc" -ne 0 ] || final_rc=1
-    elif [ "$CREATE_OP_STARTED" = true ] \
+    if [ "$CREATE_OP_STARTED" = true ] \
+            && [ "$CREATE_OP_QUIESCENT" = true ] \
             && [ "$CREATE_OUTCOME_CHECKED" != true ] \
             && [ "$CONTAINER_OWNERSHIP_VERIFIED" != true ]; then
         if adopt_completed_create; then
@@ -646,19 +678,14 @@ if python3 "$HERE/phase_supervisor.py" \
 else
     podman_create_rc=$?
 fi
-exec {CREATE_OP_LOCK_FD}>&-
-CREATE_OP_LOCK_FD=
 # The subreaper is the create-completion proof. The exclusive lease is a
 # second boundary shared with the outer campaign sweep.
-exec {CREATE_OP_LOCK_FD}>"$CREATE_OP_LOCK_PATH" \
-    || { log "REFUSING: cannot reopen container create-operation lock"; exit 2; }
-if ! flock -x -w "$PODMAN_CREATE_QUIESCE_TIMEOUT_SECS" "$CREATE_OP_LOCK_FD"; then
-    log "REFUSING: container create operation did not quiesce within ${PODMAN_CREATE_QUIESCE_TIMEOUT_SECS}s"
-    exec {CREATE_OP_LOCK_FD}>&-
-    CREATE_OP_LOCK_FD=
-    exit 124
+if quiesce_create_operation; then
+    :
+else
+    quiesce_rc=$?
+    exit "$quiesce_rc"
 fi
-CREATE_OP_QUIESCENT=true
 podman_create_output=$(<"$CREATE_OUTPUT_PATH")
 rm -f -- "$CREATE_OUTPUT_PATH" \
     || { log "REFUSING: cannot remove container create output"; exit 2; }
