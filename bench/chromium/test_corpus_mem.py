@@ -3130,6 +3130,66 @@ os.fsync = _fsync
         self.assertIsNone(external_signal)
         self.assertEqual(sent, [([identity], os.getpid(), signal.SIGTERM)])
 
+    def test_post_leader_drain_error_still_reaps_adopted_descendant(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child_file = os.path.join(tmp, "child")
+            leader = (
+                "import subprocess,sys; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                f"open({child_file!r}, 'w').write(str(child.pid))"
+            )
+            real_scan = phase_supervisor.direct_live_children
+            scan_calls = 0
+
+            def fail_once(parent_pid, proc_root="/proc"):
+                nonlocal scan_calls
+                scan_calls += 1
+                if scan_calls == 1:
+                    raise RuntimeError("injected descendant scan failure")
+                return real_scan(parent_pid, proc_root)
+
+            child = None
+            try:
+                with mock.patch.object(
+                        phase_supervisor, "direct_live_children",
+                        side_effect=fail_once):
+                    with self.assertRaisesRegex(
+                            RuntimeError, "injected descendant scan failure"):
+                        phase_supervisor.supervise(
+                            [sys.executable, "-c", leader], os.getppid(),
+                            term_grace=0.05, kill_grace=1.0,
+                        )
+                with open(child_file) as handle:
+                    child = int(handle.read())
+                self.assertIn(
+                    proc_state(child), (None, "Z"),
+                    "a post-leader drain error left an adopted descendant alive",
+                )
+                self.assertGreaterEqual(
+                    scan_calls, 2,
+                    "the original drain error skipped emergency descendant cleanup",
+                )
+            finally:
+                if child is None and os.path.isfile(child_file):
+                    with open(child_file) as handle:
+                        child = int(handle.read())
+                if child is not None and proc_state(child) not in (None, "Z"):
+                    pidfd = os.pidfd_open(child)
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        poller = select.poll()
+                        poller.register(pidfd, select.POLLIN)
+                        poller.poll(5000)
+                    finally:
+                        os.close(pidfd)
+                if child is not None:
+                    try:
+                        os.waitpid(child, 0)
+                    except ChildProcessError:
+                        pass
+
     def test_phase_supervisor_escalates_when_phase_leader_ignores_term(self):
         driver = (
             "import os,sys; "

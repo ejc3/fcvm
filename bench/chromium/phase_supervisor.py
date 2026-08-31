@@ -334,32 +334,34 @@ def wait_child_exit_wnowait(child, wake_read, timeout):
             drain(wake_read)
 
 
-def emergency_cleanup(child, wake_read, term_grace, kill_grace):
+def emergency_cleanup(child, wake_read, term_grace, kill_grace,
+                      leader_reaped=False):
     """Best-effort bounded cleanup after the supervisor itself faults."""
-    info = os.waitid(
-        os.P_PID, child.pid,
-        os.WEXITED | os.WNOWAIT | os.WNOHANG,
-    )
-    if info is None:
-        try:
-            os.killpg(child.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        info = wait_child_exit_wnowait(child, wake_read, term_grace)
-    if info is None:
-        try:
-            os.killpg(child.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        info = wait_child_exit_wnowait(child, wake_read, kill_grace)
-    if info is None:
-        identity = read_process_stat(child.pid)
-        detail = format_identities([identity]) if identity else str(child.pid)
-        raise RuntimeError(
-            f"emergency cleanup leader survived SIGKILL: {detail}")
+    if not leader_reaped:
+        info = os.waitid(
+            os.P_PID, child.pid,
+            os.WEXITED | os.WNOWAIT | os.WNOHANG,
+        )
+        if info is None:
+            try:
+                os.killpg(child.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            info = wait_child_exit_wnowait(child, wake_read, term_grace)
+        if info is None:
+            try:
+                os.killpg(child.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            info = wait_child_exit_wnowait(child, wake_read, kill_grace)
+        if info is None:
+            identity = read_process_stat(child.pid)
+            detail = format_identities([identity]) if identity else str(child.pid)
+            raise RuntimeError(
+                f"emergency cleanup leader survived SIGKILL: {detail}")
 
-    _pid, wait_status = os.waitpid(child.pid, 0)
-    child.returncode = os.waitstatus_to_exitcode(wait_status)
+        _pid, wait_status = os.waitpid(child.pid, 0)
+        child.returncode = os.waitstatus_to_exitcode(wait_status)
 
     emergency_selector = selectors.DefaultSelector()
     try:
@@ -389,6 +391,8 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
         previous_handlers[signum] = signal.signal(signum, remember)
     previous_handlers[signal.SIGCHLD] = signal.signal(signal.SIGCHLD, lambda *_: None)
     child = None
+    leader_reaped = False
+    descendants_drained = False
     pidfd = None
     selector = None
     control_fd = None
@@ -410,11 +414,13 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
         selector.unregister(pidfd)
         result = status_code(leader_info)
         _pid, wait_status = os.waitpid(child.pid, 0)
+        leader_reaped = True
         child.returncode = os.waitstatus_to_exitcode(wait_status)
         parent_pid = os.getpid()
         escaped, external_signal = drain_adopted_children(
             selector, wake_read, pending, external_signal, parent_pid,
             term_grace, kill_grace, control_fd)
+        descendants_drained = True
 
         reap_available()
         if (external_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
@@ -426,10 +432,10 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             return 1
         return result
     finally:
-        if child is not None and child.returncode is None:
+        if child is not None and not descendants_drained:
             try:
                 emergency_cleanup(
-                    child, wake_read, term_grace, kill_grace)
+                    child, wake_read, term_grace, kill_grace, leader_reaped)
             except BaseException as cleanup_error:
                 print(
                     f"FAILED: phase supervisor emergency cleanup: {cleanup_error}",
