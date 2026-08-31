@@ -887,6 +887,7 @@ case "$cmd" in
         printf "%s\n" "$BASHPID" >"$PODMAN_ESCAPED_STARTED_FILE"
         while [ ! -e "$PODMAN_ESCAPED_RELEASE_FILE" ]; do sleep 0.01; done
       ' >/dev/null 2>&1 &
+      while [ ! -e "$PODMAN_ESCAPED_STARTED_FILE" ]; do sleep 0.01; done
       exit 124
     fi
     if [ "${{PODMAN_MODE:-ok}}" = late-partial ]; then
@@ -1375,6 +1376,31 @@ exec {real_date!r} "$@"
                 tmp, mode="escaped-create",
                 PODMAN_CREATE_KILL_AFTER_SECS="1",
                 PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+            with open(os.path.join(tmp, "bin", "podman")) as handle:
+                podman = handle.read()
+            fixture_start = podman.index(
+                'if [ "${PODMAN_MODE:-ok}" = escaped-create ]; then')
+            fixture_end = podman.index(
+                'if [ "${PODMAN_MODE:-ok}" = late-partial ]; then',
+                fixture_start)
+            fixture = podman[fixture_start:fixture_end]
+            descendant_started = (
+                'while [ ! -e "$PODMAN_ESCAPED_STARTED_FILE" ]; '
+                'do sleep 0.01; done'
+            )
+            self.assertIn(
+                descendant_started, fixture,
+                "the escaped-create parent can exit before its child is observable",
+            )
+            self.assertLess(
+                fixture.index("' >/dev/null 2>&1 &"),
+                fixture.index(descendant_started),
+                "the escaped-create parent waits before launching its child",
+            )
+            self.assertLess(
+                fixture.index(descendant_started), fixture.index("exit 124"),
+                "the escaped-create synchronization follows the parent exit",
+            )
             try:
                 started = time.monotonic()
                 proc = self.run_host(env)
