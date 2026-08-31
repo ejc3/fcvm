@@ -5,8 +5,9 @@ The producer's complete.json must bind the run metadata and every record before
 any summary is written. A corpus-extra run also needs its parent campaign's
 campaign-complete.json to bind the completed child.
 The p50 uses the convention reqanalyze publishes (statistics.median), so the
-host p50 and the VM p50 it is divided by are the same kind of number. The
-records are untouched.
+host and VM descriptive tables use the same kind of number. The records are
+untouched. compare.py does not publish an effect ratio from separately timed
+host and VM runs.
 
 hostcdp.sh can write "failures": 0 because it exits 4 on the first failed rep,
 so a summary it reaches is a run that had none. This script has no such
@@ -113,6 +114,7 @@ try:
         out,
         output_target=summary_target,
         before_publish=recheck_inputs_before_publication,
+        after_publish=recheck_inputs_before_publication,
     )
     print(d, out["n"], out["p50_ms"], out["p95_ms"], out["mean_ms"])
 finally:

@@ -551,18 +551,23 @@ wait_for_container_create_operations() {
 }
 
 mark_campaign_withdrawn() {
-    local reason="$1" marker
-    rm -f -- "$RESULTS/campaign-complete.json" || return 1
-    marker=$(mktemp "$RESULTS/.WITHDRAWN.XXXXXX") || return 1
-    if printf '%s\n' \
-            "WITHDRAWN: $reason; no result in this directory is publishable." \
-            > "$marker" \
-            && mv -f -- "$marker" "$RESULTS/WITHDRAWN"; then
-        rm -f -- "$RESULTS/summary.json"
-        return $?
-    fi
-    rm -f -- "$marker"
-    return 1
+    local reason="$1"
+    (
+        local marker withdrawal_lock_fd
+        exec {withdrawal_lock_fd}<"$RESULTS" || exit 1
+        flock -x "$withdrawal_lock_fd" || exit 1
+        rm -f -- "$RESULTS/campaign-complete.json" || exit 1
+        marker=$(mktemp "$RESULTS/.WITHDRAWN.XXXXXX") || exit 1
+        if printf '%s\n' \
+                "WITHDRAWN: $reason; no result in this directory is publishable." \
+                > "$marker" \
+                && mv -f -- "$marker" "$RESULTS/WITHDRAWN"; then
+            rm -f -- "$RESULTS/summary.json"
+            exit $?
+        fi
+        rm -f -- "$marker"
+        exit 1
+    )
 }
 
 publish_campaign_completion() {
@@ -894,10 +899,11 @@ done
 [ -z "$missing" ] || { printf 'BLOCKED: the corpus does not serve every URL:%s\n' "$missing" >&2; exit 3; }
 say "corpus complete: all $checked URLs replay locally"
 
-# Two host arms. "free" is the naive host container: the whole box is available
-# to it, which is what a container on this machine actually gets. "cpu2" caps it
-# at the VM clone's vCPU count, so the CPU budget is not a second variable in the
-# comparison. Both run the same schedule against the same replay.
+# Two descriptive host arms. "free" gives the container the whole box; "cpu2"
+# caps it at the VM clone's vCPU count. They repeat the VM workload but run in
+# separate time blocks, so compare.py records their medians without publishing
+# VM/host effect ratios. Such ratios need one joint request-level schedule, a
+# drift-control probe, and uncertainty.
 HOSTCDP_ARMS="${HOSTCDP_ARMS:-free,cpu2}"
 if [[ ",$PHASES," == *",hostcdp,"* ]]; then
     for arm in $(printf '%s' "$HOSTCDP_ARMS" | tr ',' ' '); do

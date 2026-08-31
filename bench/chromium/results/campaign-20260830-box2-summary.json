@@ -39,6 +39,10 @@
     {
       "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/diag/summary.json",
       "sha256": "5122d51d7f3ef1009092f6f8e05a3b4c4f857222164230542c0caa54621e4cc0"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/reqbench.jsonl",
+      "sha256": "fbf87fc4f368b3edac75b4df1c3804cb13dcfd94d0a73a537736d59f09b4dfc9"
     }
   ],
   "cells": [
@@ -65,6 +69,37 @@
       "stall_gate_passed": true,
       "dns_verdict": "clean",
       "load_max_1min": 2.87,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/dns-owner.log",
+          "samples": 40,
+          "min": 0.59,
+          "median": 1.935,
+          "max": 2.87,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/reqbench.jsonl",
+          "samples": 404,
+          "min": 1.48,
+          "median": 2.03,
+          "max": 2.94,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.48,
+              "median": 2.03,
+              "max": 2.94
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.48,
+              "median": 2.03,
+              "max": 2.94
+            }
+          }
+        }
+      },
       "headline": {
         "cdp": {
           "blocking_ms": 712.5603174999924,

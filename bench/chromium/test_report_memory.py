@@ -173,6 +173,37 @@ class ProcessPss(unittest.TestCase):
                 report.cgroup_bytes(tmp)
 
 
+class LegacyFirecrackerPss(unittest.TestCase):
+    """A disappearing legacy process is an incomplete sample, not a traceback."""
+
+    def test_process_exit_during_legacy_pss_sum_is_a_bounded_refusal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(os.path.join(tmp, "vm.json"), "w") as handle:
+                json.dump({"name": "owned-one", "vm_id": "vm-one"}, handle)
+            args = SimpleNamespace(
+                cgroup_root=None,
+                cgroup_prefix=None,
+                state_dir=tmp,
+                name_prefix="owned-",
+                podman_prefix=None,
+                extra=None,
+            )
+            stderr = io.StringIO()
+            with mock.patch.object(report, "read_meminfo", return_value={}), \
+                 mock.patch.object(
+                     report, "firecracker_pids_for_vm_ids",
+                     return_value={"vm-one": 4001}), \
+                 mock.patch.object(
+                     report, "pss_kb_of_pid",
+                     side_effect=report.CgroupReadError("process exited")), \
+                 contextlib.redirect_stderr(stderr):
+                with self.assertRaises(SystemExit) as caught:
+                    report.cmd_sample(args)
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn("REFUSING:", stderr.getvalue())
+            self.assertIn("process exited", stderr.getvalue())
+
+
 class PodmanCgroupIdentity(unittest.TestCase):
     """A container sample belongs only to the cgroup podman identifies.
 

@@ -403,7 +403,12 @@ def cmd_sample(args):
         fps = firecracker_pids_for_vm_ids([v for v in vm_ids if v])
         rec.setdefault("clones", len(vm_ids))
         rec["fc_procs"] = len(fps)
-        rec["fc_only_pss_kb"] = sum(pss_kb_of_pid(p) for p in fps.values())
+        try:
+            rec["fc_only_pss_kb"] = sum(
+                pss_kb_of_pid(p) for p in fps.values()
+            )
+        except CgroupReadError as exc:
+            refuse_sample(f"legacy firecracker PSS basis incomplete: {exc}")
 
     # --- host-native container pool: the SAME two bases ----------------------
     if args.podman_prefix:

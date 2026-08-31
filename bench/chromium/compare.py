@@ -6,8 +6,9 @@ already through its publication gate) and hostcdp.jsonl + run.json +
 complete.json (the host arms). A corpus-extra host also requires the parent
 campaign-complete.json. The VM bytes and published cell must match the raw
 metadata, every host row must name the exact run.json bytes beside it, and the
-completion records must commit every consumed artifact. Prints two tables and
-the ratios, and writes comparison.json.
+completion records must commit every consumed artifact. Prints two descriptive
+tables and writes comparison.json. Host and VM records produced by the current
+harness run in separate time blocks, so they do not publish effect ratios.
 
 Two quantities are compared, never mixed:
   caller-visible   VM blocking_ms (spawn -> image in hand) against host wall_ms
@@ -656,8 +657,8 @@ def bind_analysis_input(analysis, current):
 
 def pct(v, p):
     """p50 is statistics.median, the convention reqanalyze uses for every
-    published median (median_ci), so a ratio taken here is between two numbers
-    computed the same way. Other percentiles are nearest-rank."""
+    published median (median_ci), so the descriptive host and VM tables use
+    the same convention. Other percentiles are nearest-rank."""
     v = sorted(v)
     if not v:
         return None
@@ -1671,6 +1672,18 @@ def comparison_input_paths(args):
     return inputs
 
 
+def comparison_run_directories(args):
+    """Directories whose withdrawal state this comparison consumes."""
+    directories = [args.vm_run]
+    for spec in args.host:
+        _label, separator, directory = spec.partition("=")
+        if not separator or not directory:
+            continue
+        directories.append(directory)
+        directories.append(os.path.dirname(os.path.realpath(directory)))
+    return directories
+
+
 def path_stat(path, label, fail_on_error, directory_fd=None):
     try:
         return os.stat(path, dir_fd=directory_fd)
@@ -1798,31 +1811,37 @@ def main():
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
-    # The lock file is permanent. Unlinking a flock inode while another caller
-    # waits on it creates two lock domains and admits concurrent writers.
-    target = open_output_target(a.out)
-    try:
-        lock_fd = open_output_lock(target)
+    with campaign_summary.shared_run_directory_locks(
+            comparison_run_directories(a)) as lock_errors:
+        if lock_errors:
+            raise Refusal("; ".join(lock_errors))
+
+        # The lock file is permanent. Unlinking a flock inode while another
+        # caller waits on it creates two lock domains and admits concurrent
+        # writers.
+        target = open_output_target(a.out)
         try:
+            lock_fd = open_output_lock(target)
             try:
-                acquire_output_lock(target, lock_fd)
-                ensure_output_directory(target)
-                preflight = reject_output_alias(
-                    a.out, comparison_input_paths(a), target
-                )
-                reject_vm_withdrawn(a.vm_run)
-                ensure_output_directory(target)
-                clear_stale_output(target, preflight)
-                validate_output_lock(target, lock_fd)
-            except OSError as error:
-                raise Refusal(
-                    f"cannot clear stale output {a.out}: {error}"
-                ) from error
-            run_comparison(a, target, lock_fd)
+                try:
+                    acquire_output_lock(target, lock_fd)
+                    ensure_output_directory(target)
+                    preflight = reject_output_alias(
+                        a.out, comparison_input_paths(a), target
+                    )
+                    reject_vm_withdrawn(a.vm_run)
+                    ensure_output_directory(target)
+                    clear_stale_output(target, preflight)
+                    validate_output_lock(target, lock_fd)
+                except OSError as error:
+                    raise Refusal(
+                        f"cannot clear stale output {a.out}: {error}"
+                    ) from error
+                run_comparison(a, target, lock_fd)
+            finally:
+                os.close(lock_fd)
         finally:
-            os.close(lock_fd)
-    finally:
-        os.close(target["directory_fd"])
+            os.close(target["directory_fd"])
 
 
 def run_comparison(a, output_target=None, output_lock_fd=None):
@@ -1919,16 +1938,13 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
             "load_event_ms": summarize(rows, "load_ms"),
             "per_url_wall_p50": per_url(rows, "wall_ms"),
             "per_url_load_p50": per_url(rows, "load_ms")}
-        h = out["hosts"][label]
         out["ratios"][label] = {
-            "vm_blocking_over_host_wall": round(out["vm"]["blocking_ms"]["p50"] / h["wall_ms"]["p50"], 2)
-            if h["wall_ms"]["p50"] else None,
-            "vm_driver_total_over_host_driver_total": round(
-                out["vm"]["driver_total_ms"]["p50"] / h["driver_total_ms"]["p50"], 2)
-            if h["driver_total_ms"]["p50"] else None,
-            "vm_load_event_over_host_load_event": round(
-                out["vm"]["load_event_ms"]["p50"] / h["load_event_ms"]["p50"], 2)
-            if h["load_event_ms"]["p50"] else None,
+            "publishable": False,
+            "reason": (
+                "the host and VM samples have no joint request-level schedule "
+                "or drift-control probe, and no uncertainty interval for an "
+                "effect ratio"
+            ),
         }
 
     def recheck_inputs_before_publication():

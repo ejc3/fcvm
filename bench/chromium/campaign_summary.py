@@ -3,7 +3,9 @@
 
     campaign_summary.py --out PATH <run_dir>...
 
-Each run directory holds reqanalyze's analysis.json (required; its stall_gate
+Each run directory holds reqanalyze's analysis.json and the reqbench.jsonl it
+names in analysis_identity.inputs (both required; the size and sha256 must
+match before any request load is consumed). analysis.json's stall_gate
 must have been armed with --stall-max-ms and must have evaluated at least one
 record, since an unarmed gate reports passed=true having evaluated nothing),
 dns-evidence.json (required when the cell's guest_dns names a baked resolver,
@@ -36,7 +38,9 @@ before building anything. The index names every file it was generated from
 with its sha256, and carries one cell per run: engine, cpu, memory_mib,
 guest_dns, guest_env, the seal identity, publishable, stall_gate_passed,
 dns_verdict, load_max_1min (the maximum 1-min load the campaign's sampler saw
-during the measured run, when the evidence records it), the headline median
+during the measured run, when the evidence records it), load_evidence with
+descriptive statistics from the continuous owner sampler and every measured
+request (overall and per arm), the headline median
 blocking_ms per arm with its CI, and for the diag its verdict, violation
 count and slowest load event per URL.
 
@@ -62,14 +66,17 @@ so the hash names the bytes that were parsed.
 """
 
 import argparse
+import fcntl
 import hashlib
 import ipaddress
 import json
 import math
 import os
 import re
+import statistics
 import sys
 import tempfile
+from contextlib import contextmanager
 from urllib.parse import urlsplit
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
@@ -182,7 +189,7 @@ def write_json_atomic(path, value):
     fd, temp_path = tempfile.mkstemp(prefix=".campaign-summary.", dir=directory)
     try:
         with os.fdopen(fd, "w") as handle:
-            json.dump(value, handle, indent=2, sort_keys=False)
+            json.dump(value, handle, indent=2, sort_keys=False, allow_nan=False)
             handle.write("\n")
         os.replace(temp_path, path)
     except BaseException:
@@ -251,12 +258,23 @@ def check_owner_log(run_dir, evidence, owner_bytes):
                     f"{run_dir}: dns-owner.log line {number} carries a load1 that is "
                     f"not a number: {line!r}"
                 )
-            loads.append(float(match["load"]))
+            load = float(match["load"])
+            if not math.isfinite(load):
+                raise RunError(
+                    f"{run_dir}: dns-owner.log line {number} carries a load1 that is "
+                    f"not finite: {line!r}"
+                )
+            loads.append(load)
     load_samples = evidence.get("load_samples", 0)
     load_max = evidence.get("load_max_1min")
     if isinstance(load_samples, bool) or not isinstance(load_samples, int):
         raise RunError(f"{run_dir}: dns-evidence.json records load_samples={load_samples!r}")
-    if isinstance(load_max, bool) or not (load_max is None or isinstance(load_max, (int, float))):
+    if (
+        isinstance(load_max, bool)
+        or not (load_max is None or isinstance(load_max, (int, float)))
+        or (load_max is not None and not math.isfinite(load_max))
+        or (load_max is not None and load_max < 0)
+    ):
         raise RunError(f"{run_dir}: dns-evidence.json records load_max_1min={load_max!r}")
     found_max = max(loads) if loads else None
     if len(loads) != load_samples or found_max != load_max:
@@ -265,6 +283,134 @@ def check_owner_log(run_dir, evidence, owner_bytes):
             f"{found_max} but dns-evidence.json records load_samples={load_samples}, "
             f"load_max_1min={load_max}"
         )
+    return loads
+
+
+def load_distribution(values):
+    """The exact descriptive statistics published for one load series."""
+    return {
+        "samples": len(values),
+        "min": min(values),
+        "median": statistics.median(values),
+        "max": max(values),
+    }
+
+
+def bind_analysis_input(run_dir, analysis, size, digest):
+    """Hold reqbench.jsonl to the bytes reqanalyze's verdict consumed."""
+    identity = analysis.get("analysis_identity")
+    inputs = identity.get("inputs") if isinstance(identity, dict) else None
+    if not isinstance(inputs, list) or len(inputs) != 1:
+        raise RunError(
+            f"{run_dir}: analysis.json analysis_identity.inputs must identify "
+            "exactly the reqbench.jsonl used for this cell"
+        )
+    recorded = inputs[0]
+    if not isinstance(recorded, dict):
+        raise RunError(
+            f"{run_dir}: analysis.json analysis_identity.inputs[0] is not an object"
+        )
+    recorded_digest = recorded.get("sha256")
+    recorded_size = recorded.get("size")
+    if (
+        not isinstance(recorded_digest, str)
+        or len(recorded_digest) != 64
+        or any(character not in "0123456789abcdefABCDEF" for character in recorded_digest)
+        or isinstance(recorded_size, bool)
+        or not isinstance(recorded_size, int)
+        or recorded_size < 0
+    ):
+        raise RunError(
+            f"{run_dir}: analysis.json analysis_identity.inputs[0] has no "
+            "valid size and sha256"
+        )
+    if recorded_size != size or recorded_digest.lower() != digest:
+        raise RunError(
+            f"{run_dir}: reqbench.jsonl does not match analysis_identity.inputs "
+            f"(current size={size} sha256={digest}, recorded size={recorded_size} "
+            f"sha256={recorded_digest})"
+        )
+
+
+def request_load_evidence(run_dir, analysis, arms, sources):
+    """Derive per-request load from the exact reqanalyze input bytes."""
+    path = os.path.join(run_dir, "reqbench.jsonl")
+    if not os.path.isfile(path):
+        raise RunError(f"{run_dir}: reqbench.jsonl is missing")
+    data, digest = sources.read_hashed(path)
+    # The binding precedes parsing, so no value from bytes outside the
+    # publication verdict can enter the generated cell.
+    bind_analysis_input(run_dir, analysis, len(data), digest)
+
+    rows = []
+    for line_number, line in enumerate(data.splitlines(), 1):
+        if not line.strip():
+            raise RunError(f"{path}:{line_number} is blank")
+        row = parse_json(line, f"{path}:{line_number}")
+        if not isinstance(row, dict):
+            raise RunError(f"{path}:{line_number} is not a JSON object")
+        rows.append(row)
+    if not rows or rows[0].get("kind") != "meta":
+        raise RunError(f"{path}: first record is not reqbench metadata")
+    if any(row.get("kind") == "meta" for row in rows[1:]):
+        raise RunError(f"{path}: carries more than one metadata record")
+    run_id = analysis.get("run_id")
+    if rows[0].get("run_id") != run_id:
+        raise RunError(
+            f"{path}: metadata run_id={rows[0].get('run_id')!r}, not the "
+            f"analysis.json run_id={run_id!r}"
+        )
+
+    by_arm = {arm: [] for arm in arms}
+    for line_number, row in enumerate(rows[1:], 2):
+        warmup = row.get("warmup")
+        if warmup is True:
+            continue
+        if warmup is not False:
+            raise RunError(
+                f"{path}:{line_number} has warmup={warmup!r}, not a boolean"
+            )
+        arm = row.get("arm")
+        if arm not in by_arm:
+            raise RunError(
+                f"{path}:{line_number} names arm={arm!r}, not one of "
+                f"{list(by_arm)!r} in analysis.json"
+            )
+        if row.get("run_id") != run_id:
+            raise RunError(
+                f"{path}:{line_number} run_id={row.get('run_id')!r}, not the "
+                f"analysis.json run_id={run_id!r}"
+            )
+        load = row.get("loadavg1")
+        if (
+            isinstance(load, bool)
+            or not isinstance(load, (int, float))
+            or not math.isfinite(load)
+            or load < 0
+        ):
+            raise RunError(
+                f"{path}:{line_number} has invalid loadavg1={load!r}; every "
+                "measured request must carry one finite non-negative sample"
+            )
+        by_arm[arm].append(load)
+
+    for arm, loads in by_arm.items():
+        blocking = arms[arm].get("blocking_ms") if isinstance(arms[arm], dict) else None
+        expected = blocking.get("n") if isinstance(blocking, dict) else None
+        if not positive_int(expected) or len(loads) != expected:
+            raise RunError(
+                f"{run_dir}: reqbench.jsonl carries {len(loads)} measured load "
+                f"samples for arm {arm}, but analysis.json blocking_ms.n is {expected!r}"
+            )
+
+    all_loads = [load for loads in by_arm.values() for load in loads]
+    return {
+        "artifact": path,
+        **load_distribution(all_loads),
+        "per_arm": {
+            arm: load_distribution(loads) for arm, loads in by_arm.items()
+        },
+    }
 
 
 def resolv_conf_resolvers(text):
@@ -627,7 +773,25 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
             f"{run_dir}: dns-evidence.json records {evidence['samples']} samples but "
             f"dns-owner.log holds {owner_lines} lines"
         )
-    check_owner_log(run_dir, evidence, owner_bytes)
+    owner_loads = check_owner_log(run_dir, evidence, owner_bytes)
+    owner_load_evidence = None
+    if owner_loads:
+        interval = evidence.get("sample_interval_s")
+        if (
+            isinstance(interval, bool)
+            or not isinstance(interval, (int, float))
+            or not math.isfinite(interval)
+            or interval <= 0
+        ):
+            raise RunError(
+                f"{run_dir}: dns-evidence.json records sample_interval_s="
+                f"{interval!r}; continuous load samples need a positive interval"
+            )
+        owner_load_evidence = {
+            "artifact": owner_log,
+            **load_distribution(owner_loads),
+            "interval_seconds": interval,
+        }
     # The replay server's exit status, recorded by the campaign once the
     # server was gone: 0 is the shutdown sequence completing with both logs
     # closed; 1 is a log line it could not write after the response was
@@ -708,7 +872,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
         stage_hosts,
         answers,
     )
-    return answers
+    return answers, owner_load_evidence
 
 
 def recorded_addresses(run_dir, measured_urls, guest_env, answers):
@@ -955,6 +1119,12 @@ def load_cell(run_dir):
     analysis = sources.read_json(analysis_path)
     if not isinstance(analysis, dict):
         raise RunError(f"{analysis_path}: not a JSON object")
+    run_id = analysis.get("run_id")
+    if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+        raise RunError(
+            f"{run_dir}: analysis.json records invalid run_id={run_id!r}; "
+            "reqbench runs use 32 lowercase hexadecimal characters"
+        )
 
     if analysis.get("withdrawn", False) is not False:
         raise RunError(
@@ -1045,12 +1215,13 @@ def load_cell(run_dir):
     dns_verdict = None
     load_max_1min = None
     answers = set()
+    owner_load_evidence = None
     evidence_path = os.path.join(run_dir, "dns-evidence.json")
     if os.path.isfile(evidence_path):
         evidence = sources.read_json(evidence_path)
-        answers = check_evidence(
+        answers, owner_load_evidence = check_evidence(
             run_dir, evidence, sources, cell["guest_dns"], measured,
-            analysis.get("run_id"),
+            run_id,
         )
         dns_verdict = evidence["verdict"]
         # Reported, not gated: the run driver refused a busy box at the
@@ -1110,10 +1281,11 @@ def load_cell(run_dir):
             "blocking_ms_ci": [blocking.get("lo"), blocking.get("hi")],
             "n": blocking.get("n"),
         }
+    request_loads = request_load_evidence(run_dir, analysis, arms, sources)
 
     return {
         "run_dir": run_dir,
-        "run_id": analysis.get("run_id"),
+        "run_id": run_id,
         "engine": cell["engine"],
         "cpu": cell["cpu"],
         "memory_mib": cell["memory_mib"],
@@ -1126,6 +1298,10 @@ def load_cell(run_dir):
         "stall_gate_passed": True,
         "dns_verdict": dns_verdict,
         "load_max_1min": load_max_1min,
+        "load_evidence": {
+            "continuous_owner_log": owner_load_evidence,
+            "measured_requests": request_loads,
+        },
         "headline": headline,
         "diag": diag,
     }, sources.entries
@@ -1145,6 +1321,77 @@ def run_identity(run_dir):
         return keys
     keys.append(("dir", (stat.st_dev, stat.st_ino)))
     return keys
+
+
+def paths_alias(left, right):
+    """Whether two paths name, or would name, the same filesystem object."""
+    if os.path.realpath(left) == os.path.realpath(right):
+        return True
+    try:
+        return os.path.samefile(left, right)
+    except OSError:
+        return False
+
+
+def withdrawal_errors(run_dirs):
+    """Re-read every run's withdrawal marker at a publication boundary."""
+    errors = []
+    for run_dir in run_dirs:
+        marker = os.path.join(run_dir, WITHDRAWN_MARKER)
+        if os.path.lexists(marker):
+            errors.append(f"{run_dir}: withdrawn: {withdrawal_reason(marker)}")
+    return errors
+
+
+@contextmanager
+def shared_run_directory_locks(run_dirs):
+    """Hold the reader side of the WITHDRAWN publication protocol.
+
+    A withdrawal writer takes an exclusive flock on the run directory before
+    publishing WITHDRAWN. Holding shared locks from the first input read until
+    the publication decision returns gives the two operations one ordering:
+    either the marker exists before validation, or it is published after this
+    index and invalidates it. The inode key avoids opening a second lock
+    description for a directory supplied through an alias.
+
+    Lock acquisition failures are returned as publication errors. The caller
+    still runs ordinary validation so a missing or malformed run retains its
+    more specific refusal too.
+    """
+    descriptors = []
+    identities = set()
+    errors = []
+    try:
+        for run_dir in run_dirs:
+            try:
+                descriptor = os.open(
+                    run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+                )
+            except OSError as error:
+                errors.append(f"{run_dir}: cannot open run directory lock: {error}")
+                continue
+            try:
+                stat = os.fstat(descriptor)
+            except OSError as error:
+                os.close(descriptor)
+                errors.append(f"{run_dir}: cannot identify run directory: {error}")
+                continue
+            identity = (stat.st_dev, stat.st_ino)
+            if identity in identities:
+                os.close(descriptor)
+                continue
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_SH)
+            except OSError as error:
+                os.close(descriptor)
+                errors.append(f"{run_dir}: cannot lock run directory: {error}")
+                continue
+            identities.add(identity)
+            descriptors.append(descriptor)
+        yield errors
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
 
 
 def build_index(run_dirs):
@@ -1180,6 +1427,50 @@ def build_index(run_dirs):
     return {"generated_from": generated_from, "cells": cells}, errors
 
 
+def publish_index(args, run_dirs, lock_errors):
+    """Validate and publish while shared run-directory locks remain held."""
+    index, errors = build_index(run_dirs)
+    errors = list(lock_errors) + errors
+    out_realpath = os.path.realpath(args.out)
+    aliases_input = False
+    for entry in index["generated_from"]:
+        if os.path.realpath(entry["path"]) == out_realpath:
+            errors.append(f"--out {args.out} aliases input {entry['path']}")
+            aliases_input = True
+    withdrawal_markers = [
+        os.path.join(run_dir, WITHDRAWN_MARKER) for run_dir in run_dirs
+    ]
+    aliases_withdrawal = any(
+        paths_alias(args.out, marker) for marker in withdrawal_markers
+    )
+    if aliases_withdrawal:
+        errors.append(f"--out {args.out} aliases a run's {WITHDRAWN_MARKER} marker")
+    errors.extend(withdrawal_errors(run_dirs))
+    if errors:
+        print("REFUSED: no index written", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        # An index already at --out describes cells this refusal did not
+        # accept; it must not outlive the refusal. Never when --out is one
+        # of the inputs, which are only ever read.
+        if not aliases_input and not aliases_withdrawal and os.path.lexists(args.out):
+            os.unlink(args.out)
+            print(f"  removed stale index {args.out}", file=sys.stderr)
+        return 5
+    write_json_atomic(args.out, index)
+    errors = withdrawal_errors(run_dirs)
+    if errors:
+        print("REFUSED: no index written", file=sys.stderr)
+        for error in errors:
+            print(f"  - {error}", file=sys.stderr)
+        if not aliases_withdrawal and os.path.lexists(args.out):
+            os.unlink(args.out)
+            print(f"  removed stale index {args.out}", file=sys.stderr)
+        return 5
+    print(f"wrote {args.out}: {len(index['cells'])} cell(s)")
+    return 0
+
+
 def main_with(argv=None):
     parser = argparse.ArgumentParser(
         description="Index the publishable cells of one campaign into one JSON file.",
@@ -1189,27 +1480,8 @@ def main_with(argv=None):
     args = parser.parse_args(argv)
 
     run_dirs = [os.path.normpath(run_dir) for run_dir in args.run_dir]
-    index, errors = build_index(run_dirs)
-    out_realpath = os.path.realpath(args.out)
-    aliases_input = False
-    for entry in index["generated_from"]:
-        if os.path.realpath(entry["path"]) == out_realpath:
-            errors.append(f"--out {args.out} aliases input {entry['path']}")
-            aliases_input = True
-    if errors:
-        print("REFUSED: no index written", file=sys.stderr)
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
-        # An index already at --out describes cells this refusal did not
-        # accept; it must not outlive the refusal. Never when --out is one
-        # of the inputs, which are only ever read.
-        if not aliases_input and os.path.lexists(args.out):
-            os.unlink(args.out)
-            print(f"  removed stale index {args.out}", file=sys.stderr)
-        return 5
-    write_json_atomic(args.out, index)
-    print(f"wrote {args.out}: {len(index['cells'])} cell(s)")
-    return 0
+    with shared_run_directory_locks(run_dirs) as lock_errors:
+        return publish_index(args, run_dirs, lock_errors)
 
 
 if __name__ == "__main__":

@@ -83,10 +83,11 @@ WARMUP=28` hands both arms the same schedule instead of leaving the host with
 174 measured rows and a partial final cycle. `run.json` carries `total_reps`
 beside `reps` and `warmup`; a record without `total_reps` predates this and its
 `reps` is a total. `summary.json` names its own `p50_convention`
-(`statistics.median`, what `reqanalyze` publishes), so a reader can tell whether
-a ratio against a VM p50 is between two numbers of the same kind, and every
-jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
-the measured reps as `loadavg1_measured`. `run.json` also carries the producer's
+(`statistics.median`, what `reqanalyze` publishes), so the host and VM
+descriptive tables use the same convention. Separately timed runs do not
+publish an effect ratio. Every jsonl row carries `loadavg1` the way
+`reqbench.py` stamps it, summarised over the measured reps as
+`loadavg1_measured`. `run.json` also carries the producer's
 `run_id`, and every jsonl row carries the SHA-256 of the exact `run.json` bytes;
 comparison and resummarization refuse rows that are missing that binding or
 name different metadata. `CPU_BUDGET=` records whether the arm is `unlimited`
@@ -192,7 +193,14 @@ in the repo-root AGENTS.md quickstart.
 To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
 directory whose first line is the reason; `campaign_summary.py` refuses the run
 and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
-true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
+true` the same way. A marker writer must first open the results directory and
+take an exclusive `flock` on that directory descriptor, then remove completion
+records and atomically rename the marker while holding the lock.
+`campaign_summary.py` and `compare.py` hold shared locks on every run directory
+whose authorization they consume, across validation and publication. This
+makes a withdrawal order before the publication (which refuses it) or after it
+(which invalidates it), with no unchecked interval between the last marker read
+and publication. The marker is tracked (`!results/**/WITHDRAWN` in
 `bench/chromium/.gitignore`) and is never removed, because a withdrawn run
 stays unquotable (REVIEW.md).
 

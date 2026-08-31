@@ -15,7 +15,9 @@ Run: python3 -m unittest test_corpus_mem -v
 
 import errno
 import hashlib
+import io
 import json
+import math
 import os
 import random
 import re
@@ -23,6 +25,7 @@ import runpy
 import select
 import shutil
 import signal
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -139,6 +142,187 @@ class MemoryCellSchedule(unittest.TestCase):
                       "main can bypass the interleaved schedule the test exercises")
         self.assertIn("for side_name, n, rep, url_indices in schedule:", main)
         self.assertRegex(main, r"run_cell\(\s*sides\[side_name\], args, n, rep, url_indices, out\)")
+
+
+class MemoryFitPublication(unittest.TestCase):
+    """Published memory fits carry uncertainty and agree across bases."""
+
+    @staticmethod
+    def cell(side, n, rep, cgroup, pss, available_delta):
+        pre_available = 1_000_000.0
+        steady = {
+            "clones" if side == "fcvm-clone" else "pool_containers": n,
+            "clone_procs" if side == "fcvm-clone" else "pool_procs": n * 4,
+            "clone_cgroup_kb" if side == "fcvm-clone" else "pool_cgroup_kb":
+                cgroup * 1024,
+            "clone_pss_kb" if side == "fcvm-clone" else "pool_pss_kb":
+                pss * 1024,
+            "mem_available_kb": pre_available - available_delta * 1024,
+        }
+        if side == "fcvm-clone":
+            steady.update(
+                serve_cgroup_kb=64 * 1024,
+                serve_pss_kb=48 * 1024,
+            )
+        return {
+            "side": side,
+            "n": n,
+            "rep": rep,
+            "pre": {"mem_available_kb": pre_available},
+            "steady": [dict(steady), dict(steady), dict(steady)],
+            "post": {},
+        }
+
+    def cells(self, slopes=(100.0, 90.0, 110.0), intercepts=(40.0, 30.0, 50.0)):
+        cells = []
+        for side in ("fcvm-clone", "host-container"):
+            for n in (1, 2, 4, 8):
+                for rep, jitter in enumerate((-8.0, -3.0, 0.0, 4.0, 9.0), 1):
+                    cells.append(self.cell(
+                        side, n, rep,
+                        intercepts[0] + slopes[0] * n + jitter * (1.0 + n / 4),
+                        intercepts[1] + slopes[1] * n + jitter * (0.8 + n / 5),
+                        intercepts[2] + slopes[2] * n + jitter * (1.2 + n / 6),
+                    ))
+        return cells
+
+    def test_memory_fit_quotes_bootstrap_intervals_and_rounds_to_them(self):
+        fits = corpus_mem.summarize_memory_fits(
+            self.cells(), seed=9182, bootstrap_resamples=1000
+        )
+        record = fits["fcvm-clone"]["cgroup_mib"]
+        uncertainty = record["uncertainty"]
+        self.assertEqual(uncertainty["method"], "repetition-block bootstrap")
+        self.assertEqual(uncertainty["confidence"], 0.95)
+        self.assertEqual(uncertainty["resamples"], 1000)
+        self.assertEqual(fits["fcvm-clone"]["n_range"], [1, 8])
+        self.assertEqual(fits["fcvm-clone"]["repetition_blocks"], 5)
+        for estimate_key, interval_key, rounding_key in (
+                ("marginal_mib_per_instance",
+                 "marginal_mib_per_instance_ci95", "marginal"),
+                ("fixed_mib", "fixed_mib_ci95", "fixed")):
+            estimate = record[estimate_key]
+            low, high = record[interval_key]
+            self.assertLess(low, high)
+            self.assertLessEqual(low, estimate)
+            self.assertLessEqual(estimate, high)
+            step = uncertainty["rounding_mib"][rounding_key]
+            for value in (low, estimate, high):
+                self.assertAlmostEqual(value / step, round(value / step), places=7)
+
+    def test_twofold_cross_basis_gap_blocks_memory_completion(self):
+        cases = {
+            "marginal": self.cells(
+                slopes=(40.0, 100.0, 88.0),
+                intercepts=(100.0, 0.0, 20.0),
+            ),
+            "observed totals": self.cells(
+                slopes=(100.0, 100.0, 100.0),
+                intercepts=(0.0, 50.0, 1_000.0),
+            ),
+        }
+        for label, cells in cases.items():
+            with self.subTest(label=label):
+                with self.assertRaises(RuntimeError) as caught:
+                    corpus_mem.summarize_memory_fits(
+                        cells, seed=9182, bootstrap_resamples=200
+                    )
+                self.assertIn("cross-basis", str(caught.exception))
+                self.assertIn("2x", str(caught.exception))
+
+    def test_fewer_than_five_repetition_blocks_cannot_publish_a_ci(self):
+        cells = [cell for cell in self.cells() if cell["rep"] <= 2]
+        with self.assertRaises(RuntimeError) as caught:
+            corpus_mem.summarize_memory_fits(
+                cells, seed=9182, bootstrap_resamples=200
+            )
+        self.assertIn("five repetition blocks", str(caught.exception))
+
+    def test_compatible_bases_record_the_reconciliation(self):
+        fits = corpus_mem.summarize_memory_fits(
+            self.cells(), seed=9182, bootstrap_resamples=200
+        )
+        for side in ("fcvm-clone", "host-container"):
+            reconciliation = fits[side]["cross_basis_reconciliation"]
+            self.assertEqual(reconciliation["status"], "accepted")
+            self.assertLess(reconciliation["maximum_pairwise_ratio"], 2.0)
+            self.assertEqual(reconciliation["refusal_ratio"], 2.0)
+
+    def test_memory_fit_reports_density_at_each_measured_n(self):
+        cells = self.cells()
+        fits = corpus_mem.summarize_memory_fits(
+            cells, seed=9182, bootstrap_resamples=200
+        )
+        n = 4
+        totals = []
+        for cell in cells:
+            if cell["side"] != "fcvm-clone" or cell["n"] != n:
+                continue
+            values = corpus_mem.cell_values(cell)
+            totals.append(values["cgroup_mib"] + values["serve_cgroup_mib"])
+        density = [n * 1024.0 / total for total in totals]
+        memory_record = fits["fcvm-clone"]["per_n"][n]["cgroup_mib"]
+        self.assertEqual(
+            memory_record["scope"],
+            "arrangement total including shared snapshot serve",
+        )
+        self.assertIs(memory_record["includes_shared_serve"], True)
+        self.assertEqual(
+            fits["fcvm-clone"]["cgroup_mib"]["scope"],
+            "clone-incremental fit; shared snapshot serve reported separately",
+        )
+        self.assertIn("shared_serve_fixed_cost", fits["fcvm-clone"])
+        per_instance = [total / n for total in totals]
+        memory_median = statistics.median(per_instance)
+        memory_spread = max(
+            memory_median - min(per_instance),
+            max(per_instance) - memory_median,
+        )
+        memory_step = 10.0 ** math.floor(math.log10(memory_spread))
+        self.assertEqual(
+            memory_record["statistic"], "descriptive repetition-block median"
+        )
+        self.assertEqual(memory_record["rounding"], memory_step)
+        memory_low, memory_high = memory_record["observed_range"]
+        self.assertLessEqual(memory_low, min(per_instance))
+        self.assertGreaterEqual(memory_high, max(per_instance))
+        for value in (memory_low, memory_record["median"], memory_high):
+            self.assertAlmostEqual(
+                value / memory_step, round(value / memory_step), places=7
+            )
+
+        record = memory_record["requests_per_gib"]
+        self.assertEqual(record["scope"], memory_record["scope"])
+        self.assertIs(record["includes_shared_serve"], True)
+        self.assertEqual(record["statistic"], "descriptive repetition-block median")
+        raw_median = statistics.median(density)
+        spread = max(raw_median - min(density), max(density) - raw_median)
+        expected_step = 10.0 ** math.floor(math.log10(spread))
+        self.assertEqual(record["rounding"], expected_step)
+        low, high = record["observed_range"]
+        self.assertLessEqual(low, min(density))
+        self.assertGreaterEqual(high, max(density))
+        for value in (low, record["median"], high):
+            self.assertAlmostEqual(
+                value / expected_step, round(value / expected_step), places=7
+            )
+
+    def test_completion_consumes_reconciled_uncertain_fits(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        main = source[source.index("def main_with_resources(resources):") :]
+        summarize = main.find(
+            'summary["fits"] = summarize_memory_fits(cells, args.seed)'
+        )
+        complete = main.find("publish_completion(args.results, args.run_id)")
+        self.assertGreaterEqual(
+            summarize, 0,
+            "the production summary bypasses the uncertainty and basis gate",
+        )
+        self.assertGreater(
+            complete, summarize,
+            "completion is published before the uncertainty and basis gate",
+        )
 
 
 class SnapshotGenerationLease(unittest.TestCase):
@@ -547,6 +731,28 @@ class RunScopedContainerCleanup(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 side.bring_up(1, "fcvm1r1", [0])
         self.assertIn("mem-" + "a" * 32 + "-fcvm1r1-0", side.owned)
+
+    def test_memory_clones_enable_fcvm_debug_logs(self):
+        proc = mock.Mock()
+        proc.poll.return_value = None
+        args = SimpleNamespace(
+            results="/tmp", fcvm="fcvm", state_dir="/state", cdp_port=9222,
+            urls=["https://example.com/"], tag="tag",
+        )
+        cg = mock.Mock()
+        cg.leaf.return_value = "/cgroup/leaf"
+        side = corpus_mem.FcvmSide(args, cg, "a" * 32)
+        environments = []
+
+        def spawn(_cg_path, _argv, _log_path, env=None):
+            environments.append(env)
+            return proc
+
+        with mock.patch.object(corpus_mem, "spawn_in_cgroup", side_effect=spawn), \
+             mock.patch.object(corpus_mem, "find_clone_state", return_value=None):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "fcvm1r1", [0])
+        self.assertEqual(environments[0]["RUST_LOG"], "fcvm=debug")
 
     def test_unreadable_state_directory_cannot_prove_a_clone_is_gone(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1783,8 +1989,8 @@ class ZeroBasis(unittest.TestCase):
     zero. report.py's single-node cgroup.procs read produced exactly this on
     the container side: pool_containers = N from `podman ps`, pool_procs = 0 and
     pool_pss_kb = 0 from an empty process set. cell_values reads those with
-    `.get(key, 0)`, so a zero becomes a real number in summary.json and in the
-    least-squares fit, and the run's own instance-count check passes.
+    with `.get(key, 0)`, so a zero used to become a real number in summary.json
+    and in the least-squares fit while the run's own instance-count check passed.
     """
 
     def test_a_complete_container_sample_is_accepted(self):
@@ -1820,6 +2026,88 @@ class ZeroBasis(unittest.TestCase):
             missing = os.path.join(tmp, "disappeared")
             with self.assertRaises(bench_report.CgroupReadError):
                 bench_report.measure_cgroup_set(missing, "serve-")
+
+    def test_a_serve_sample_with_no_process_basis_is_refused(self):
+        args = SimpleNamespace(state_dir="/state")
+        side = corpus_mem.FcvmSide(args, SimpleNamespace(base="/cgroup"), "run")
+        clone = {
+            "clones": 1,
+            "clone_procs": 4,
+            "clone_cgroup_kb": 4096,
+            "clone_pss_kb": 2048,
+        }
+        invalid_serve_samples = (
+            {},
+            {"clone_procs": 0, "clone_cgroup_kb": 1024, "clone_pss_kb": 0},
+        )
+        for serve in invalid_serve_samples:
+            with self.subTest(serve=serve), mock.patch.object(
+                    corpus_mem, "sample", side_effect=(clone, serve)):
+                with self.assertRaises(SystemExit) as caught:
+                    side.sample({}, "fcvm1r1")
+                self.assertNotIn(caught.exception.code, (0, None))
+
+    def test_nonmonotonic_steady_samples_use_per_basis_medians(self):
+        cell = {
+            "side": "fcvm-clone",
+            "n": 1,
+            "rep": 1,
+            "pre": {"mem_available_kb": 1_000 * 1024},
+            "steady": [
+                {"clones": 1, "clone_cgroup_kb": 100 * 1024,
+                 "clone_pss_kb": 300 * 1024,
+                 "mem_available_kb": 850 * 1024},
+                {"clones": 1, "clone_cgroup_kb": 300 * 1024,
+                 "clone_pss_kb": 100 * 1024,
+                 "mem_available_kb": 900 * 1024},
+                {"clones": 1, "clone_cgroup_kb": 200 * 1024,
+                 "clone_pss_kb": 200 * 1024,
+                 "mem_available_kb": 800 * 1024},
+            ],
+        }
+        values = corpus_mem.cell_values(cell)
+        self.assertEqual(values["cgroup_mib"], 200.0)
+        self.assertEqual(values["pss_mib"], 200.0)
+        self.assertEqual(values["mem_available_delta_mib"], 150.0)
+
+    def test_every_steady_sample_is_validated_before_the_median(self):
+        good = {
+            "pool_containers": 1, "pool_procs": 4,
+            "pool_cgroup_kb": 200 * 1024, "pool_pss_kb": 180 * 1024,
+            "mem_available_kb": 800 * 1024,
+        }
+        missing_pss = dict(good, pool_procs=0, pool_pss_kb=0)
+
+        class Side:
+            name = "host-container"
+
+            def __init__(self):
+                self.samples = iter((
+                    {"mem_available_kb": 1_000 * 1024},
+                    missing_pss,
+                    good,
+                    good,
+                    {"mem_available_kb": 1_000 * 1024},
+                ))
+
+            def sample(self, _common, _cell_tag):
+                return next(self.samples)
+
+            def bring_up(self, _n, _cell_tag, _url_indices):
+                return [{"url": "https://example.com/"}]
+
+            def tear_down(self, _live):
+                pass
+
+        args = SimpleNamespace(
+            run_id="a" * 32, tag="tag", image="image", uffd_mode="minor",
+            uffd_prefetch="on", settle=0,
+        )
+        with mock.patch.object(corpus_mem, "quiesce"), \
+             mock.patch.object(corpus_mem.time, "sleep"):
+            with self.assertRaises(SystemExit) as caught:
+                corpus_mem.run_cell(Side(), args, 1, 1, [0], io.StringIO())
+        self.assertNotIn(caught.exception.code, (0, None))
 
 
 class BoundedAttempt(unittest.TestCase):
@@ -1998,7 +2286,7 @@ class ArgumentValidation(unittest.TestCase):
     @staticmethod
     def args(**overrides):
         args = SimpleNamespace(
-            urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=2,
+            urls=["https://example.com/"], ns=[1, 2, 4, 8], reps=5,
             settle=5.0, quiet_limit=1.0,
             quiet_wait=300.0, run_id="a" * 32,
             container_owner_token="b" * 32,
@@ -2033,6 +2321,9 @@ class ArgumentValidation(unittest.TestCase):
         self.assert_refused(urls=["one", "two", "three"], reps=2)
         corpus_mem.validate_args(
             self.args(urls=["one", "two", "three"], reps=6))
+
+    def test_reps_must_supply_five_uncertainty_blocks(self):
+        self.assert_refused(reps=4)
 
     def test_unpaired_cpu_measurement_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2164,6 +2455,112 @@ class CampaignIntegrityRegression(unittest.TestCase):
             ).encode()
             + b"\n"
         )
+
+    def test_withdrawal_writers_lock_before_invalidating_or_marking_a_run(self):
+        """Every producer of WITHDRAWN must take the exclusive side of the
+        run-directory lock before it removes completion records or publishes
+        the marker. campaign_summary.py and compare.py hold the shared side
+        while reading and committing, so source order is the deterministic race
+        invariant.
+
+        RED BEFORE THE FIX: neither writer opened or locked its result
+        directory, and both removed publication state before any lock.
+        """
+        for path, function, first_invalidated in (
+            (EXTRA, "mark_campaign_withdrawn", "campaign-complete.json"),
+            (HOSTCDP, "withdraw_failed_run", "complete.json"),
+        ):
+            with self.subTest(path=os.path.basename(path)):
+                with open(path) as handle:
+                    body = self.shell_function(handle.read(), function)
+                opened = body.index('exec {withdrawal_lock_fd}<"$RESULTS"')
+                locked = body.index('flock -x "$withdrawal_lock_fd"')
+                invalidated = body.index(first_invalidated)
+                marker = body.index('"$RESULTS/WITHDRAWN"')
+                self.assertLess(opened, locked)
+                self.assertLess(locked, invalidated)
+                self.assertLess(invalidated, marker)
+
+    def test_withdrawal_writers_hold_the_exclusive_lock_through_publication(self):
+        """Pause each real writer after it invalidates completion but before
+        its atomic marker publication. A nonblocking shared reader must still
+        be excluded at that point, proving the directory FD remains open and
+        locked for the whole state transition.
+
+        RED IN THE CODE-ONLY REVERT PROOF: both shared readers acquired the
+        directory while the writer was paused inside marker publication.
+        """
+        for path, function, tool, real_tool, invalidated in (
+            (EXTRA, "mark_campaign_withdrawn", "mv", shutil.which("mv"),
+             "campaign-complete.json"),
+            (HOSTCDP, "withdraw_failed_run", "python3", sys.executable,
+             "complete.json"),
+        ):
+            with self.subTest(path=os.path.basename(path)), \
+                 tempfile.TemporaryDirectory() as tmp:
+                with open(path) as handle:
+                    body = self.shell_function(handle.read(), function)
+                tools = os.path.join(tmp, "tools")
+                os.mkdir(tools)
+                reached = os.path.join(tmp, "writer-reached")
+                release = os.path.join(tmp, "writer-release")
+                wrapper = os.path.join(tools, tool)
+                with open(wrapper, "w") as handle:
+                    handle.write(
+                        "#!/bin/sh\n"
+                        ': > "$WRITER_REACHED"\n'
+                        'while [ ! -e "$WRITER_RELEASE" ]; do sleep 0.01; done\n'
+                        'exec "$REAL_WITHDRAWAL_TOOL" "$@"\n'
+                    )
+                os.chmod(wrapper, 0o755)
+                for name in ("campaign-complete.json", "complete.json",
+                             "summary.json"):
+                    with open(os.path.join(tmp, name), "w") as handle:
+                        handle.write("{}\n")
+                script = (
+                    "set -u\n"
+                    f"RESULTS={tmp!r}\n"
+                    "log() { :; }\n"
+                    + body + "\n"
+                    + f"{function} 'deterministic lock test'\n"
+                )
+                env = dict(
+                    os.environ,
+                    PATH=tools + os.pathsep + os.environ["PATH"],
+                    WRITER_REACHED=reached,
+                    WRITER_RELEASE=release,
+                    REAL_WITHDRAWAL_TOOL=real_tool,
+                )
+                writer = subprocess.Popen(
+                    ["bash", "-c", script], env=env,
+                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                )
+                try:
+                    deadline = time.monotonic() + 10
+                    while not os.path.exists(reached) and time.monotonic() < deadline:
+                        if writer.poll() is not None:
+                            break
+                        time.sleep(0.01)
+                    self.assertTrue(
+                        os.path.exists(reached),
+                        f"writer exited before marker publication: {writer.poll()}",
+                    )
+                    self.assertFalse(os.path.exists(os.path.join(tmp, invalidated)))
+                    reader = subprocess.run(
+                        ["flock", "-n", "-s", tmp, "true"],
+                        capture_output=True, text=True, timeout=10,
+                    )
+                    self.assertEqual(
+                        reader.returncode, 1,
+                        "a shared publication reader crossed an in-progress withdrawal",
+                    )
+                finally:
+                    with open(release, "w"):
+                        pass
+                    stdout, stderr = writer.communicate(timeout=10)
+                self.assertEqual(writer.returncode, 0, stdout + stderr)
+                self.assertTrue(os.path.isfile(os.path.join(tmp, "WITHDRAWN")))
+                self.assertFalse(os.path.exists(os.path.join(tmp, "summary.json")))
 
     def test_podman_run_must_return_one_full_lowercase_container_id(self):
         args = SimpleNamespace(
@@ -3924,9 +4321,8 @@ class Resummarize(unittest.TestCase):
     """A recomputed host summary must describe one complete successful run.
 
     resummarize.py exists to restate a hostcdp run's p50 under the median
-    convention reqanalyze publishes, so the ratio compare.py takes against the
-    VM arm is between two numbers computed the same way. It overwrites the
-    summary.json hostcdp.sh wrote.
+    convention reqanalyze publishes, so its descriptive host table is directly
+    comparable to the VM table. It overwrites the summary.json hostcdp.sh wrote.
 
     hostcdp.sh can write "failures": 0 because it exits 4 on the first failed
     rep, so a summary it reaches is a run with none. resummarize.py has no such
@@ -4159,6 +4555,43 @@ class Resummarize(unittest.TestCase):
             with self.assertRaises(
                     bench_compare.Refusal,
                     msg="changed completion raced summary publication"):
+                runpy.run_path(
+                    os.path.join(HERE, "resummarize.py"), run_name="__main__"
+                )
+        self.assertFalse(os.path.exists(summary))
+
+    def test_completion_is_rechecked_after_summary_publication(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = os.path.join(tmp, "summary.json")
+        os.unlink(summary)
+        completion = os.path.join(tmp, "complete.json")
+        original = bench_compare.write_json_atomic
+
+        def change_completion_after_publication(*args, **kwargs):
+            caller_after_publish = kwargs.get("after_publish")
+
+            def after_publish():
+                with open(completion) as handle:
+                    record = json.load(handle)
+                record["run_id"] = "changed-after-publication"
+                with open(completion, "w") as handle:
+                    json.dump(record, handle)
+                if caller_after_publish is not None:
+                    caller_after_publish()
+
+            kwargs["after_publish"] = after_publish
+            return original(*args, **kwargs)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(
+                bench_compare, "write_json_atomic",
+                side_effect=change_completion_after_publication), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg="changed completion survived summary publication"):
                 runpy.run_path(
                     os.path.join(HERE, "resummarize.py"), run_name="__main__"
                 )
@@ -4476,13 +4909,28 @@ class ArchivedCorpusExtraDisposition(unittest.TestCase):
         self.assertEqual(switches, 1,
                          "the invalidating blocked-side order changed; re-audit the archive")
 
+    def test_withdrawn_memory_analysis_publishes_no_derived_figures(self):
+        root = os.path.join(
+            self.RESULTS, "corpusextra-memory-20260830-181830"
+        )
+        with open(os.path.join(root, "memory-cpu-analysis.md")) as handle:
+            analysis = handle.read()
+        self.assertIn("withdrawn", analysis.lower())
+        for published_claim in (
+                "## Memory, per instance", "## CPU time", "2.93x",
+                "recompute_memory_cpu.py"):
+            self.assertNotIn(
+                published_claim,
+                analysis,
+                f"withdrawn analysis still publishes {published_claim!r}",
+            )
 
 class ComparePublicationGate(unittest.TestCase):
-    """compare.py divides a VM p50 by a host p50 and writes comparison.json.
+    """compare.py writes descriptive host and VM tables to comparison.json.
 
     The comparison must bind the raw VM bytes to the analysis that passed its
     publication gate, and must prove that every scheduled VM and host input is
-    complete and compatible before it computes a ratio.
+    complete and compatible. Separately timed runs publish no effect ratio.
     """
 
     # Most comparator fixtures exercise record and host binding, not the corpus
@@ -4516,7 +4964,7 @@ class ComparePublicationGate(unittest.TestCase):
         cell = dict(cell or self.CELL)
         measured = [dict(row) for row in vm_rows]
         template = dict(measured[0]) if measured else self.vm_rep(1.0)
-        run_id = "r1"
+        run_id = "1" * 32
         urls = list(cell.get("urls") or [cell["url"]])
 
         scheduled = []
@@ -4567,7 +5015,7 @@ class ComparePublicationGate(unittest.TestCase):
                 "passed": passed,
                 "reasons": [] if passed else ["fixture publication failure"],
             },
-            "run_id": "r1",
+            "run_id": run_id,
             "cell": cell,
             "arms": {
                 "cdp": {
@@ -4638,17 +5086,26 @@ class ComparePublicationGate(unittest.TestCase):
                             "record_id": f"{meta['run_id']}:noop:{rep}:0",
                             "url": meta["urls"][rep % len(meta["urls"])],
                             "ok": True, "blocking_ms": 40.0,
-                            "wall_ms": 200.0,
+                            "wall_ms": 200.0, "loadavg1": 0.5,
                         })
             rows[:] = [meta, *schedule]
 
         self.rewrite_vm_records(run, add_noop)
+        self.rewrite_analysis(
+            run,
+            lambda analysis: analysis["arms"].update(noop={
+                "blocking_ms": {
+                    "median": 40.0, "lo": 40.0, "hi": 40.0, "n": 2,
+                },
+            }),
+        )
         return run
 
     @staticmethod
     def vm_rep(blocking_ms, ok=True, include_ok=True):
         rec = {"arm": "cdp", "warmup": False, "blocking_ms": blocking_ms,
-               "wall_ms": blocking_ms, "url": ComparePublicationGate.URL,
+               "wall_ms": blocking_ms, "loadavg1": 0.5,
+               "url": ComparePublicationGate.URL,
                "render": {"ok": True, "url": ComparePublicationGate.URL,
                           "stages": {"total_ms": blocking_ms},
                           "nav": {"load_ms": blocking_ms}}}
@@ -5580,6 +6037,10 @@ sys.stdin.read(1)
     def test_vm_schedule_cannot_have_a_missing_rep(self):
         run = self.make_run(vm_rows=[self.vm_rep(v) for v in (600.0, 700.0, 800.0)])
         self.rewrite_vm_records(run, lambda rows: rows.pop(2))
+        self.rewrite_analysis(
+            run,
+            lambda analysis: analysis["arms"]["cdp"]["blocking_ms"].update(n=2),
+        )
         proc, out = self.run_compare(run)
         self.assertNotEqual(proc.returncode, 0,
                             "a gap in the VM schedule silently reduced n")
@@ -5610,6 +6071,10 @@ sys.stdin.read(1)
             warmup=1,
         )
         self.rewrite_vm_records(run, lambda rows: rows[-1].update(warmup=True))
+        self.rewrite_analysis(
+            run,
+            lambda analysis: analysis["arms"]["cdp"]["blocking_ms"].update(n=2),
+        )
         proc, out = self.run_compare(run)
         self.assertNotEqual(proc.returncode, 0,
                             "a measured VM rep relabelled as warmup silently reduced n")
@@ -5793,6 +6258,19 @@ sys.stdin.read(1)
             identities["hosts"]["host"]["complete_json"]["sha256"],
             self.artifact_identity(os.path.join(host, "complete.json"))["sha256"],
         )
+
+    def test_separate_host_and_vm_runs_publish_no_effect_ratios(self):
+        run, host = self.valid_comparison()
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            comparison = json.load(handle)
+        ratio = comparison["ratios"]["host"]
+        self.assertEqual(set(ratio), {"publishable", "reason"})
+        self.assertIs(ratio["publishable"], False)
+        self.assertIn("joint request-level schedule", ratio["reason"])
+        self.assertIn("drift-control", ratio["reason"])
+        self.assertIn("uncertainty", ratio["reason"])
 
     def test_a_completed_campaign_host_is_bound_into_the_comparison(self):
         run, campaign, host = self.valid_campaign_comparison()
@@ -6694,6 +7172,66 @@ sys.stdin.read(1)
                             msg=f"{label} raced comparison publication"):
                         bench_compare.main()
                 self.assertFalse(os.path.exists(out))
+
+    def test_withdrawal_writers_cannot_cross_the_final_comparison_check(self):
+        """The VM run, host run and campaign parent stay shared-locked until
+        comparison publication returns. Otherwise an exclusive writer can add
+        WITHDRAWN after the post-publication callback has already accepted the
+        inputs, leaving the just-written comparison visible.
+
+        RED BEFORE THE FIX: each exclusive writer acquired its directory and
+        left WITHDRAWN beside a successful comparison.
+        """
+        for location in ("vm", "host", "campaign"):
+            with self.subTest(location=location):
+                run, campaign, host = self.valid_campaign_comparison()
+                directory = {
+                    "vm": run,
+                    "host": host,
+                    "campaign": campaign,
+                }[location]
+                marker = os.path.join(directory, "WITHDRAWN")
+                out = os.path.join(run, "comparison.json")
+                original = bench_compare.write_json_atomic
+                writer_status = []
+
+                def publish_then_try_writer(*args, **kwargs):
+                    result = original(*args, **kwargs)
+                    writer = subprocess.run(
+                        [
+                            "flock", "-n", "-x", directory,
+                            "sh", "-c", 'printf "%s\\n" late > "$1"',
+                            "sh", marker,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    writer_status.append(writer.returncode)
+                    return result
+
+                argv = [
+                    "compare.py", "--vm-run", run,
+                    "--host", f"free={host}", "--out", out,
+                ]
+                with mock.patch.object(
+                        bench_compare, "write_json_atomic",
+                        side_effect=publish_then_try_writer), \
+                     mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(sys, "stdout", new=io.StringIO()):
+                    bench_compare.main()
+
+                self.assertEqual(writer_status, [1])
+                self.assertTrue(os.path.isfile(out))
+                self.assertFalse(os.path.lexists(marker))
+                released = subprocess.run(
+                    ["flock", "-n", "-x", directory, "true"],
+                    capture_output=True, text=True, timeout=10,
+                )
+                self.assertEqual(
+                    released.returncode, 0,
+                    f"comparison leaked its {location} directory lock",
+                )
 
     def test_vm_inputs_are_rechecked_at_publication(self):
         for filename in ("analysis.json", "reqbench.jsonl"):

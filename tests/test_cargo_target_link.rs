@@ -4292,6 +4292,8 @@ fn touches_raw_target(command: &str) -> bool {
 fn makefile_leases_every_raw_target_access() {
     let makefile = std::fs::read_to_string(repo_root().join("Makefile")).expect("read Makefile");
     let (recipes, leased) = makefile_recipes(&makefile);
+    let corpus_extra = std::fs::read_to_string(repo_root().join("bench/chromium/corpus_extra.sh"))
+        .expect("read corpus_extra.sh");
 
     // Positive control: the parser must find recipe lines that are known to be
     // there, or its emptiness proves nothing.
@@ -4319,6 +4321,15 @@ fn makefile_leases_every_raw_target_access() {
         unleased.is_empty(),
         "these recipe lines reach through target/ without holding the generation lease, so a \
          concurrent make can repoint the link underneath them: {unleased:#?}"
+    );
+    assert!(
+        corpus_extra.contains("$REPO/target/release/fcvm"),
+        "corpus_extra.sh no longer reads the built fcvm through target/; re-audit its lease"
+    );
+    assert!(
+        leased.contains("bench-chromium-corpus-extra"),
+        "bench-chromium-corpus-extra invokes a script that reads target/release/fcvm, so the \
+         complete recipe must hold the target-generation lease"
     );
 
     assert!(

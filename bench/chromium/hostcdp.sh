@@ -479,9 +479,19 @@ done
 
 withdraw_failed_run() {
     local reason=$1
-    rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json" \
-        || log "FAILED: could not remove derived authorization from refused run"
-    if ! python3 - "$RESULTS/WITHDRAWN" "$reason" <<'PY'
+    (
+        local withdrawal_lock_fd
+        if ! exec {withdrawal_lock_fd}<"$RESULTS"; then
+            log "FAILED: could not open withdrawal lock for refused run"
+            exit 1
+        fi
+        if ! flock -x "$withdrawal_lock_fd"; then
+            log "FAILED: could not lock refused run for withdrawal"
+            exit 1
+        fi
+        rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json" \
+            || log "FAILED: could not remove derived authorization from refused run"
+        if ! python3 - "$RESULTS/WITHDRAWN" "$reason" <<'PY'
 import os
 import sys
 import tempfile
@@ -507,9 +517,11 @@ except BaseException:
         pass
     raise
 PY
-    then
-        log "FAILED: could not mark refused run WITHDRAWN"
-    fi
+        then
+            log "FAILED: could not mark refused run WITHDRAWN"
+            exit 1
+        fi
+    )
 }
 
 remove_owned_container() {
@@ -942,9 +954,9 @@ measured_rows = [r for r in rows if not r["warmup"]]
 
 def pct(values, p):
     """p50 is statistics.median, which is what reqanalyze uses for every median
-    it publishes, so a ratio taken between this number and a VM arm's median is
-    between two numbers computed the same way. Other percentiles are
-    nearest-rank."""
+    it publishes, so the descriptive host and VM tables use the same
+    convention. Separately timed runs do not publish an effect ratio. Other
+    percentiles are nearest-rank."""
     values = sorted(values)
     n = len(values)
     if p == 50:

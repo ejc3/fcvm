@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -268,9 +269,11 @@ def write_run(
     guest_env=(),
     engine="chromium",
     stall_max_ms=15000,
-    stall_evaluated=404,
+    stall_evaluated=202,
     samples=12,
     load_max_1min=0.42,
+    owner_loads=None,
+    request_loads=None,
     evidence_overrides=None,
     verify_overrides=None,
     verify_stage_overrides=None,
@@ -321,6 +324,23 @@ def write_run(
             cell[field] = value
     if diag is DIAG_DEFAULT:
         diag = diag_summary(engine=engine) if guest_dns is not None else None
+    if request_loads is None:
+        request_loads = {
+            "cdp": [0.42] * 202,
+            "noop": [0.42] * 202,
+        }
+    paths = {"reqbench": os.path.join(run_dir, "reqbench.jsonl")}
+    with open(paths["reqbench"], "w") as handle:
+        handle.write(json.dumps({"kind": "meta", "run_id": "0" * 32}) + "\n")
+        for arm, loads in request_loads.items():
+            for rep, load in enumerate(loads):
+                handle.write(json.dumps({
+                    "arm": arm,
+                    "rep": rep,
+                    "warmup": False,
+                    "loadavg1": load,
+                    "run_id": "0" * 32,
+                }) + "\n")
     analysis = {
         "publishable": publishable,
         "gate": {"passed": publishable, "reasons": [] if publishable else ["x"]},
@@ -329,11 +349,20 @@ def write_run(
         "cell": cell,
         "arms": {
             "cdp": {
-                "blocking_ms": {"median": 647.2, "lo": 567.6, "hi": 702.9, "n": 202},
-                "wall_ms": {"median": 700.0, "lo": 600.0, "hi": 800.0, "n": 202},
+                "blocking_ms": {
+                    "median": 647.2, "lo": 567.6, "hi": 702.9,
+                    "n": len(request_loads["cdp"]),
+                },
+                "wall_ms": {
+                    "median": 700.0, "lo": 600.0, "hi": 800.0,
+                    "n": len(request_loads["cdp"]),
+                },
             },
             "noop": {
-                "blocking_ms": {"median": 41.1, "lo": 40.0, "hi": 42.5, "n": 202},
+                "blocking_ms": {
+                    "median": 41.1, "lo": 40.0, "hi": 42.5,
+                    "n": len(request_loads["noop"]),
+                },
             },
         },
         "stall_gate": {
@@ -342,9 +371,18 @@ def write_run(
             "evaluated": stall_evaluated,
             "violations": [],
         },
+        "analysis_identity": {
+            "schema_version": 6,
+            "inputs": [{
+                "path": paths["reqbench"],
+                "realpath": os.path.realpath(paths["reqbench"]),
+                "size": os.path.getsize(paths["reqbench"]),
+                "sha256": sha256_file(paths["reqbench"]),
+            }],
+        },
     }
     analysis.update(analysis_overrides or {})
-    paths = {"analysis": os.path.join(run_dir, "analysis.json")}
+    paths["analysis"] = os.path.join(run_dir, "analysis.json")
     with open(paths["analysis"], "w") as handle:
         json.dump(analysis, handle)
     if withdrawn is not None:
@@ -372,12 +410,19 @@ def write_run(
             paths[name] = log_path
             hashes[name] = sha256_file(log_path)
         owner_log = os.path.join(run_dir, "dns-owner.log")
-        load_column = "" if load_max_1min is None else f" load1={load_max_1min}"
+        if owner_loads is None:
+            owner_loads = [load_max_1min] * samples
+        else:
+            owner_loads = list(owner_loads)
+            samples = len(owner_loads)
+            load_max_1min = max(owner_loads) if owner_loads else None
         with open(owner_log, "w") as handle:
-            handle.write(
-                f"2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive{load_column}\n"
-                * samples
-            )
+            for load in owner_loads:
+                load_column = "" if load is None else f" load1={load}"
+                handle.write(
+                    "2026-08-28T00:00:00Z owner_pid=4242 "
+                    f"dnsmasq=inactive{load_column}\n"
+                )
         paths["owner_log"] = owner_log
         evidence = {
             "run_id": analysis["run_id"],
@@ -628,6 +673,167 @@ class CampaignSummary(unittest.TestCase):
             with open(out) as handle:
                 index = json.load(handle)
         self.assertIsNone(index["cells"][0]["load_max_1min"])
+
+    def test_load_evidence_is_derived_from_the_hashed_run_inputs(self):
+        """The campaign index used to carry only the owner sampler's maximum.
+        A publishable performance cell needs the continuous sampler's
+        distribution and the load recorded on every measured request, all
+        derived by the generator from inputs named in generated_from.
+
+        RED BEFORE THE FIX: KeyError: 'load_evidence'.
+        """
+        owner_loads = [0.25, 0.75, 1.5, 2.0]
+        request_loads = {
+            "cdp": [0.5, 1.5, 1.0],
+            "noop": [2.0, 1.0, 3.0],
+        }
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(
+                run_dir,
+                owner_loads=owner_loads,
+                request_loads=request_loads,
+                stall_evaluated=3,
+            )
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+            reqbench_sha256 = sha256_file(paths["reqbench"])
+
+        self.assertEqual(index["cells"][0]["load_evidence"], {
+            "continuous_owner_log": {
+                "artifact": paths["owner_log"],
+                "samples": len(owner_loads),
+                "interval_seconds": 10,
+                "min": min(owner_loads),
+                "median": statistics.median(owner_loads),
+                "max": max(owner_loads),
+            },
+            "measured_requests": {
+                "artifact": paths["reqbench"],
+                "samples": 6,
+                "min": 0.5,
+                "median": 1.25,
+                "max": 3.0,
+                "per_arm": {
+                    "cdp": {
+                        "samples": 3,
+                        "min": 0.5,
+                        "median": 1.0,
+                        "max": 1.5,
+                    },
+                    "noop": {
+                        "samples": 3,
+                        "min": 1.0,
+                        "median": 2.0,
+                        "max": 3.0,
+                    },
+                },
+            },
+        })
+        reqbench_source = next(
+            entry for entry in index["generated_from"]
+            if entry["path"] == paths["reqbench"]
+        )
+        self.assertEqual(reqbench_source["sha256"], reqbench_sha256)
+
+    def test_analysis_must_name_the_reqbench_bytes_used_for_load_evidence(self):
+        """Changing reqbench.jsonl after reqanalyze's publication verdict must
+        not let campaign_summary derive load evidence from bytes the verdict
+        did not cover.
+
+        RED BEFORE THE FIX: the changed input indexed successfully.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["reqbench"]) as handle:
+                before = handle.read()
+            after = before.replace('"loadavg1": 0.42', '"loadavg1": 0.43', 1)
+            self.assertNotEqual(after, before)
+            self.assertEqual(len(after), len(before))
+            with open(paths["reqbench"], "w") as handle:
+                handle.write(after)
+
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("analysis_identity.inputs", text)
+
+    def test_every_measured_request_must_carry_a_load_sample(self):
+        """A missing request load must refuse the cell, not silently reduce
+        the sample count used for its load distribution.
+
+        RED BEFORE THE FIX: the partial load series indexed successfully.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            paths = write_run(run_dir)
+            with open(paths["reqbench"]) as handle:
+                rows = [json.loads(line) for line in handle]
+            rows[1].pop("loadavg1")
+            with open(paths["reqbench"], "w") as handle:
+                for row in rows:
+                    handle.write(json.dumps(row) + "\n")
+            with open(paths["analysis"]) as handle:
+                analysis = json.load(handle)
+            identity = analysis["analysis_identity"]["inputs"][0]
+            identity["size"] = os.path.getsize(paths["reqbench"])
+            identity["sha256"] = sha256_file(paths["reqbench"])
+            with open(paths["analysis"], "w") as handle:
+                json.dump(analysis, handle)
+
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out))
+            self.assertIn("loadavg1", text)
+
+    def test_request_loads_match_the_analyzed_run_and_counts(self):
+        """Identity proves which bytes reqanalyze read. The generator must
+        still interpret those bytes as the same run, arms and measured
+        population as the analysis beside them.
+
+        RED IN THE CODE-ONLY REVERT PROOF: every malformed population indexed.
+        """
+        def remove_every_run_id(rows, analysis):
+            analysis.pop("run_id")
+            for row in rows:
+                row.pop("run_id", None)
+
+        cases = {
+            "missing run identity everywhere": remove_every_run_id,
+            "metadata run": lambda rows, analysis: rows[0].update(run_id="other"),
+            "request run": lambda rows, analysis: rows[1].update(run_id="other"),
+            "second metadata": lambda rows, analysis: rows[1].update(kind="meta"),
+            "unknown arm": lambda rows, analysis: rows[1].update(arm="other"),
+            "arm count": lambda rows, analysis: rows.pop(1),
+        }
+        for label, mutate in cases.items():
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                paths = write_run(run_dir, dns_verdict=None, guest_dns=None)
+                with open(paths["reqbench"]) as handle:
+                    rows = [json.loads(line) for line in handle]
+                with open(paths["analysis"]) as handle:
+                    analysis = json.load(handle)
+                mutate(rows, analysis)
+                with open(paths["reqbench"], "w") as handle:
+                    for row in rows:
+                        handle.write(json.dumps(row) + "\n")
+                identity = analysis["analysis_identity"]["inputs"][0]
+                identity["size"] = os.path.getsize(paths["reqbench"])
+                identity["sha256"] = sha256_file(paths["reqbench"])
+                with open(paths["analysis"], "w") as handle:
+                    json.dump(analysis, handle)
+
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{label}: {text}")
+                self.assertFalse(os.path.exists(out), label)
 
     def test_an_armed_gate_that_evaluated_nothing_refuses(self):
         """max_ms alone is not proof the gate looked at anything.
@@ -1668,6 +1874,37 @@ class CampaignSummary(unittest.TestCase):
             _paths, text = self._refused(d, evidence_overrides={"serve_pid": None})
             self.assertIn("serve_pid", text)
 
+    def test_a_non_finite_owner_load_is_refused(self):
+        """A decimal with enough digits overflows float() to infinity. It is
+        not a load observation and must not enter a published distribution.
+
+        RED BEFORE THE FIX: check_owner_log returned [inf].
+        """
+        evidence = {
+            "serve_pid": 4242,
+            "load_samples": 1,
+            "load_max_1min": float("inf"),
+        }
+        owner = (
+            "2026-08-28T00:00:00Z owner_pid=4242 dnsmasq=inactive load1="
+            + "9" * 400 + "\n"
+        ).encode()
+        with self.assertRaises(campaign_summary.RunError) as caught:
+            campaign_summary.check_owner_log("run", evidence, owner)
+        self.assertIn("finite", str(caught.exception))
+
+    def test_index_publication_refuses_nonstandard_numbers(self):
+        """A non-finite value reaching the last boundary must not be emitted
+        as Python's non-standard Infinity or NaN JSON tokens.
+
+        RED BEFORE THE FIX: write_json_atomic wrote {"value": Infinity}.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "index.json")
+            with self.assertRaises(ValueError):
+                campaign_summary.write_json_atomic(out, {"value": float("inf")})
+            self.assertFalse(os.path.exists(out))
+
     def test_the_hash_names_the_bytes_that_were_parsed(self):
         """Parsing a file and hashing it later are two reads; an atomic
         replacement in between produced a cell from one generation and a
@@ -1795,6 +2032,154 @@ class CampaignSummary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _paths, text = self._refused(d, analysis_overrides={"withdrawn": True})
             self.assertIn("withdrawn", text)
+
+    def test_withdrawal_appearing_at_publication_boundary_refuses(self):
+        """A run can be withdrawn after load_cell's first marker check. The
+        index must recheck on both sides of atomic publication and leave the
+        marker, never a quotable index, behind.
+
+        RED BEFORE THE FIX: both races returned 0 and left the index in place.
+        """
+        for stage in ("before write", "after write"):
+            with self.subTest(stage), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir)
+                marker = os.path.join(run_dir, "WITHDRAWN")
+                out = os.path.join(d, "campaign-x-summary.json")
+
+                if stage == "before write":
+                    original = campaign_summary.build_index
+
+                    def build_then_withdraw(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        with open(marker, "w") as handle:
+                            handle.write("withdrawn at publication boundary\n")
+                        return result
+
+                    patch = unittest.mock.patch.object(
+                        campaign_summary, "build_index",
+                        side_effect=build_then_withdraw,
+                    )
+                else:
+                    original = campaign_summary.write_json_atomic
+
+                    def write_then_withdraw(*args, **kwargs):
+                        result = original(*args, **kwargs)
+                        with open(marker, "w") as handle:
+                            handle.write("withdrawn at publication boundary\n")
+                        return result
+
+                    patch = unittest.mock.patch.object(
+                        campaign_summary, "write_json_atomic",
+                        side_effect=write_then_withdraw,
+                    )
+
+                with patch:
+                    rc, text = self._summarize(out, [run_dir])
+                self.assertNotEqual(rc, 0, f"{stage}: {text}")
+                self.assertFalse(os.path.exists(out), stage)
+                self.assertTrue(os.path.isfile(marker), stage)
+
+    def test_withdrawal_writer_cannot_cross_the_final_publication_check(self):
+        """The final marker recheck and successful publication return must be
+        one critical section with withdrawal writers. Otherwise a writer can
+        create WITHDRAWN after the recheck has read no marker but before the
+        summary reports success, leaving both a quotable index and a marker.
+
+        RED BEFORE THE FIX: the nonblocking exclusive writer acquired the run
+        directory, main_with returned 0, and both files remained visible.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            marker = os.path.join(run_dir, "WITHDRAWN")
+            out = os.path.join(d, "campaign-x-summary.json")
+            original = campaign_summary.withdrawal_errors
+            calls = 0
+            writer_status = []
+
+            def check_then_try_writer(run_dirs):
+                nonlocal calls
+                calls += 1
+                errors = original(run_dirs)
+                if calls == 2:
+                    writer = subprocess.run(
+                        [
+                            "flock", "-n", "-x", run_dir,
+                            "sh", "-c", 'printf "%s\\n" late > "$1"',
+                            "sh", marker,
+                        ],
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    writer_status.append(writer.returncode)
+                return errors
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "withdrawal_errors",
+                    side_effect=check_then_try_writer):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertEqual(rc, 0, text)
+            self.assertEqual(writer_status, [1])
+            self.assertTrue(os.path.isfile(out))
+            self.assertFalse(os.path.lexists(marker))
+            released = subprocess.run(
+                ["flock", "-n", "-x", run_dir, "true"],
+                capture_output=True, text=True, timeout=10,
+            )
+            self.assertEqual(
+                released.returncode, 0,
+                "the publication reader leaked its directory lock",
+            )
+
+    def test_output_cannot_name_or_alias_a_withdrawal_marker(self):
+        """WITHDRAWN is protected even before it exists. Refusal cleanup must
+        not unlink it through its own path, a symlink or a hardlink.
+
+        RED BEFORE THE FIX: direct and hardlink cleanup removed their target;
+        absent direct and symlink targets were replaced by an index.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, withdrawn="keep this marker")
+            marker = os.path.join(run_dir, "WITHDRAWN")
+            before = campaign_summary.read_bytes(marker)
+            rc, text = self._summarize(marker, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertEqual(campaign_summary.read_bytes(marker), before)
+
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            marker = os.path.join(run_dir, "WITHDRAWN")
+            rc, text = self._summarize(marker, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(marker))
+
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            marker = os.path.join(run_dir, "WITHDRAWN")
+            alias = os.path.join(d, "withdrawal-symlink")
+            os.symlink(marker, alias)
+            rc, text = self._summarize(alias, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertTrue(os.path.islink(alias))
+            self.assertFalse(os.path.lexists(marker))
+
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, withdrawn="keep this marker")
+            marker = os.path.join(run_dir, "WITHDRAWN")
+            alias = os.path.join(d, "withdrawal-hardlink")
+            os.link(marker, alias)
+            before = campaign_summary.read_bytes(marker)
+            rc, text = self._summarize(alias, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertEqual(campaign_summary.read_bytes(marker), before)
+            self.assertEqual(campaign_summary.read_bytes(alias), before)
 
     def test_one_run_listed_under_two_names_refuses(self):
         """`seen` held the argument strings, so `results/run` and a symlink

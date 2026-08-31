@@ -2666,7 +2666,7 @@ class AnalyzerAvailability(unittest.TestCase):
         arms = ["exec", "cdp", "cdp-fast", "noop"]
         warmup = 2
         seed = 1
-        run_id = "fixture-" + os.path.basename(path).replace(".", "-")
+        run_id = hashlib.sha256(os.path.basename(path).encode()).hexdigest()[:32]
         meta = {
             "kind": "meta", "run_id": run_id, "seed": seed, "backend": backend,
             "uffd_mode": "file" if backend == "file" else "copy",
@@ -9772,6 +9772,12 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["dns_verdict"], "clean")
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
         self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertIsNone(cell["load_evidence"]["continuous_owner_log"])
+        self.assertEqual(cell["load_evidence"]["measured_requests"]["samples"], 800)
+        self.assertEqual(
+            cell["load_evidence"]["measured_requests"]["per_arm"]["cdp"]["samples"],
+            200,
+        )
         self.assertEqual(cell["diag"], {
             "diag_passed": True, "violations_count": 0,
             "max_load_ms": {url: 812.5 for url in self.CORPUS},
@@ -9782,6 +9788,6 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                "replay-queries.log", "summary.json",
+                "replay-queries.log", "summary.json", "reqbench.jsonl",
             },
         )

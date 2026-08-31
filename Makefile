@@ -1017,6 +1017,7 @@ require-clean-tree:
 		exit 2; \
 	fi
 
+bench-chromium-corpus-extra: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-corpus-extra: require-clean-tree build setup-default
 	@bash bench/chromium/corpus_extra.sh
 

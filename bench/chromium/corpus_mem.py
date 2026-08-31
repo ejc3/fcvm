@@ -318,6 +318,8 @@ def validate_args(args):
         die("--ns contains duplicate cell sizes")
     if not isinstance(args.reps, int) or isinstance(args.reps, bool) or args.reps <= 0:
         die("--reps must be a positive integer")
+    if args.reps < 5:
+        die("--reps must supply at least five repetition blocks for uncertainty")
     if args.reps % len(args.urls) != 0:
         die("--reps must be a whole number of corpus cycles so every N sees "
             "the same balanced page workload")
@@ -699,7 +701,7 @@ class FcvmSide:
             log_path = os.path.join(self.args.results, "logs", f"{name}.log")
             argv = [self.args.fcvm, "snapshot", "run", "--pid", str(self.serve_pid),
                     "--name", name, "--no-dirty-tracking", "--no-swap"]
-            env = dict(os.environ, RUST_LOG="fcvm=info")
+            env = dict(os.environ, RUST_LOG="fcvm=debug")
             proc = spawn_in_cgroup(cgp, argv, log_path, env)
             clone = {"i": i, "leaf": leaf, "name": name,
                      "proc": proc, "log": log_path}
@@ -781,17 +783,22 @@ class FcvmSide:
     def sample(self, extra, cell_tag):
         """The clones, plus the UFFD serve process measured on the same bases.
 
-        The serve is SHARED by every clone, so it is never summed into the
-        per-instance total; it is recorded beside it as the fixed cost of the
-        arrangement, on the same two bases, and the fit's intercept is where a
-        reader can see it again from the other direction."""
+        The serve is shared by every clone. Clone-incremental fits keep it
+        separate and report it as a fixed cost; concrete-N arrangement density
+        adds it once to the clone totals."""
         rec = sample(extra, cgroup_root=self.cg.base, cgroup_prefix=f"req-{cell_tag}-",
                      state_dir=self.args.state_dir,
                      name_prefix=f"mem-{self.run_id}-{cell_tag}-")
         serve = sample({"_": 0}, cgroup_root=self.cg.base, cgroup_prefix="serve-")
-        rec["serve_cgroup_kb"] = serve.get("clone_cgroup_kb", 0)
-        rec["serve_pss_kb"] = serve.get("clone_pss_kb", 0)
-        rec["serve_procs"] = serve.get("clone_procs", 0)
+        missing = empty_bases(serve, self.name)
+        if missing:
+            die(
+                "serve sample returned zero for "
+                f"{', '.join(missing)}; the shared serve cost was not measured"
+            )
+        rec["serve_cgroup_kb"] = serve["clone_cgroup_kb"]
+        rec["serve_pss_kb"] = serve["clone_pss_kb"]
+        rec["serve_procs"] = serve["clone_procs"]
         return rec
 
 
@@ -1181,6 +1188,332 @@ def slope_intercept(xs, ys):
     return slope, my - slope * mx
 
 
+MEMORY_BASES = ("cgroup_mib", "pss_mib", "mem_available_delta_mib")
+MEMORY_BOOTSTRAP_RESAMPLES = 5000
+MEMORY_BASIS_REFUSAL_RATIO = 2.0
+
+
+def percentile(sorted_values, probability):
+    """Linearly interpolated percentile over an already sorted population."""
+    if not sorted_values:
+        raise RuntimeError("cannot compute uncertainty from no bootstrap fits")
+    position = (len(sorted_values) - 1) * probability
+    lower = math.floor(position)
+    upper = math.ceil(position)
+    if lower == upper:
+        return sorted_values[lower]
+    fraction = position - lower
+    return (sorted_values[lower] * (1.0 - fraction)
+            + sorted_values[upper] * fraction)
+
+
+def uncertainty_rounding(estimate, lower, upper):
+    """Round an estimate and interval no finer than their observed uncertainty."""
+    uncertainty = max(abs(estimate - lower), abs(upper - estimate))
+    step = 0.1 if uncertainty <= 0 else 10.0 ** math.floor(math.log10(uncertainty))
+    digits = max(0, -int(math.floor(math.log10(step))))
+
+    def clean(value):
+        rounded = round(value, digits)
+        return 0.0 if rounded == 0 else rounded
+
+    rounded_estimate = clean(round(estimate / step) * step)
+    rounded_lower = clean(math.floor(lower / step) * step)
+    rounded_upper = clean(math.ceil(upper / step) * step)
+    return rounded_estimate, [rounded_lower, rounded_upper], clean(step)
+
+
+def descriptive_median(values, statistic, count_key):
+    """A median and observed range rounded no finer than their spread."""
+    if not values or any(not math.isfinite(value) or value <= 0 for value in values):
+        raise RuntimeError(f"{statistic} contains no usable positive observations")
+    median = statistics.median(values)
+    median, observed_range, step = uncertainty_rounding(
+        median, min(values), max(values)
+    )
+    return {
+        "statistic": statistic,
+        "median": median,
+        "observed_range": observed_range,
+        "rounding": step,
+        count_key: len(values),
+    }
+
+
+def bootstrap_fit(rows, seed, resamples):
+    """Fit totals against N and bootstrap whole repetition blocks."""
+    if not isinstance(resamples, int) or isinstance(resamples, bool) or resamples <= 0:
+        raise RuntimeError("bootstrap resamples must be a positive integer")
+    by_rep = {}
+    for rep, n, value in rows:
+        by_rep.setdefault(rep, []).append((n, value))
+    repetitions = sorted(by_rep)
+    if len(repetitions) < 5:
+        raise RuntimeError(
+            "memory fits need at least five repetition blocks to publish uncertainty"
+        )
+    expected_ns = {n for n, _value in by_rep[repetitions[0]]}
+    if len(expected_ns) < 2:
+        raise RuntimeError("memory fits need at least two distinct N values")
+    for rep in repetitions:
+        found_ns = {n for n, _value in by_rep[rep]}
+        if found_ns != expected_ns or len(by_rep[rep]) != len(expected_ns):
+            raise RuntimeError(
+                f"memory repetition {rep} covers N={sorted(found_ns)}, not "
+                f"the complete grid N={sorted(expected_ns)}"
+            )
+
+    xs = [n for _rep, n, _value in rows]
+    ys = [value for _rep, _n, value in rows]
+    slope, intercept = slope_intercept(xs, ys)
+    if slope is None or intercept is None:
+        raise RuntimeError("memory fit is undefined on the recorded N grid")
+
+    rng = random.Random(seed)
+    bootstrap_slopes = []
+    bootstrap_intercepts = []
+    for _ in range(resamples):
+        sampled = [rng.choice(repetitions) for _rep in repetitions]
+        sample_rows = [row for rep in sampled for row in by_rep[rep]]
+        sample_xs = [n for n, _value in sample_rows]
+        sample_ys = [value for _n, value in sample_rows]
+        sampled_slope, sampled_intercept = slope_intercept(sample_xs, sample_ys)
+        if sampled_slope is None or sampled_intercept is None:
+            raise RuntimeError("bootstrap produced an undefined memory fit")
+        bootstrap_slopes.append(sampled_slope)
+        bootstrap_intercepts.append(sampled_intercept)
+
+    bootstrap_slopes.sort()
+    bootstrap_intercepts.sort()
+    slope_interval = [
+        percentile(bootstrap_slopes, 0.025),
+        percentile(bootstrap_slopes, 0.975),
+    ]
+    intercept_interval = [
+        percentile(bootstrap_intercepts, 0.025),
+        percentile(bootstrap_intercepts, 0.975),
+    ]
+    # Including the observed fit makes the quoted interval conservative when
+    # a skewed percentile bootstrap falls wholly to one side of the estimate.
+    slope_interval = [min(slope_interval[0], slope), max(slope_interval[1], slope)]
+    intercept_interval = [
+        min(intercept_interval[0], intercept),
+        max(intercept_interval[1], intercept),
+    ]
+    return slope, intercept, slope_interval, intercept_interval
+
+
+def fit_seed(seed, side, basis):
+    material = f"{seed}:{side}:{basis}".encode()
+    return int.from_bytes(hashlib.sha256(material).digest()[:8], "big")
+
+
+def summarize_memory_fits(cells, seed, bootstrap_resamples=MEMORY_BOOTSTRAP_RESAMPLES):
+    """Fit every memory basis, quote uncertainty, and refuse divergent bases."""
+    fits = {}
+    for side in sorted({c["side"] for c in cells}):
+        side_cells = [c for c in cells if c["side"] == side]
+        rows = [(c["rep"], c["n"], cell_values(c)) for c in side_cells]
+        fit = {
+            "n_range": [min(c["n"] for c in side_cells),
+                        max(c["n"] for c in side_cells)],
+            "repetition_blocks": len({c["rep"] for c in side_cells}),
+        }
+        raw_slopes = {}
+        for basis in MEMORY_BASES:
+            basis_rows = [(rep, n, values[basis]) for rep, n, values in rows]
+            bootstrap_seed = fit_seed(seed, side, basis)
+            slope, intercept, slope_interval, intercept_interval = bootstrap_fit(
+                basis_rows, bootstrap_seed, bootstrap_resamples
+            )
+            raw_slopes[basis] = slope
+            marginal, marginal_ci, marginal_step = uncertainty_rounding(
+                slope, *slope_interval
+            )
+            fixed, fixed_ci, fixed_step = uncertainty_rounding(
+                intercept, *intercept_interval
+            )
+            fit[basis] = {
+                "marginal_mib_per_instance": marginal,
+                "marginal_mib_per_instance_ci95": marginal_ci,
+                "fixed_mib": fixed,
+                "fixed_mib_ci95": fixed_ci,
+                "scope": (
+                    "clone-incremental fit; shared snapshot serve reported separately"
+                    if side == "fcvm-clone"
+                    and basis in {"cgroup_mib", "pss_mib"}
+                    else "incremental from a pre-cell baseline with the shared "
+                         "snapshot serve already running"
+                    if side == "fcvm-clone"
+                    else "container arrangement total"
+                    if basis in {"cgroup_mib", "pss_mib"}
+                    else "incremental from the pre-cell host baseline"
+                ),
+                "uncertainty": {
+                    "method": "repetition-block bootstrap",
+                    "confidence": 0.95,
+                    "resamples": bootstrap_resamples,
+                    "seed": bootstrap_seed,
+                    "unit": "one repetition containing one cell at every N",
+                    "rounding_mib": {
+                        "marginal": marginal_step,
+                        "fixed": fixed_step,
+                    },
+                },
+                "points": sorted(
+                    (n, round(values[basis], 1)) for _rep, n, values in rows
+                ),
+            }
+
+        if any(not math.isfinite(value) or value <= 0 for value in raw_slopes.values()):
+            detail = ", ".join(
+                f"{basis}={value:.3f}" for basis, value in raw_slopes.items()
+            )
+            raise RuntimeError(
+                f"{side} cross-basis marginal fit is nonpositive or non-finite: {detail}"
+            )
+        marginal_ratio = max(raw_slopes.values()) / min(raw_slopes.values())
+        if marginal_ratio >= MEMORY_BASIS_REFUSAL_RATIO:
+            detail = ", ".join(
+                f"{basis}={value:.1f} MiB/instance"
+                for basis, value in raw_slopes.items()
+            )
+            raise RuntimeError(
+                f"{side} cross-basis marginal fits differ by {marginal_ratio:.2f}x; "
+                f"a {MEMORY_BASIS_REFUSAL_RATIO:g}x gap blocks completion "
+                f"({detail})"
+            )
+        observed = {}
+        maximum_observed_ratio = 1.0
+        for n in sorted({n for _rep, n, _values in rows}):
+            at = [values for _rep, m, values in rows if m == n]
+            estimates = {
+                basis: statistics.median(value[basis] for value in at)
+                for basis in MEMORY_BASES
+            }
+            if any(not math.isfinite(value) or value <= 0
+                   for value in estimates.values()):
+                detail = ", ".join(
+                    f"{basis}={value:.3f}" for basis, value in estimates.items()
+                )
+                raise RuntimeError(
+                    f"{side} cross-basis observed N={n} estimate is nonpositive "
+                    f"or non-finite: {detail}"
+                )
+            ratio = max(estimates.values()) / min(estimates.values())
+            if ratio >= MEMORY_BASIS_REFUSAL_RATIO:
+                detail = ", ".join(
+                    f"{basis}={value:.1f} MiB" for basis, value in estimates.items()
+                )
+                raise RuntimeError(
+                    f"{side} cross-basis observed N={n} estimates differ by "
+                    f"{ratio:.2f}x; a {MEMORY_BASIS_REFUSAL_RATIO:g}x gap "
+                    f"blocks completion ({detail})"
+                )
+            maximum_observed_ratio = max(maximum_observed_ratio, ratio)
+            observed[str(n)] = {
+                "maximum_pairwise_ratio": ratio,
+            }
+        fit["cross_basis_reconciliation"] = {
+            "status": "accepted",
+            "scope": (
+                "clone-incremental cell costs; shared snapshot serve excluded"
+                if side == "fcvm-clone"
+                else "container arrangement cell costs"
+            ),
+            "observed_per_n": observed,
+            "fit_marginal_maximum_pairwise_ratio": marginal_ratio,
+            "maximum_pairwise_ratio": max(
+                maximum_observed_ratio, marginal_ratio
+            ),
+            "refusal_ratio": MEMORY_BASIS_REFUSAL_RATIO,
+        }
+
+        if side == "fcvm-clone":
+            fixed_cost = {}
+            for basis, extra in (
+                    ("cgroup_mib", "serve_cgroup_mib"),
+                    ("pss_mib", "serve_pss_mib")):
+                if any(extra not in values for _rep, _n, values in rows):
+                    raise RuntimeError(
+                        f"{side} has no {extra} observations for its shared fixed cost"
+                    )
+                fixed_cost[basis] = descriptive_median(
+                    [values[extra] for _rep, _n, values in rows],
+                    "descriptive shared-serve sample median",
+                    "samples",
+                )
+            fit["shared_serve_fixed_cost"] = fixed_cost
+
+        # Per instance AT EACH N, with the observed spread across repetitions.
+        # A single average across the whole N grid would mix N=1, where the
+        # fixed cost is charged entirely to one instance, with N=8, where it is
+        # spread over eight, and read as neither.
+        fit["per_n"] = {}
+        for n in sorted({n for _rep, n, _values in rows}):
+            at = [values for _rep, m, values in rows if m == n]
+            cell = {"reps": len(at)}
+            for basis in MEMORY_BASES:
+                totals = [value[basis] for value in at]
+                includes_shared_serve = False
+                if side == "fcvm-clone" and basis in {"cgroup_mib", "pss_mib"}:
+                    serve_key = (
+                        "serve_cgroup_mib" if basis == "cgroup_mib"
+                        else "serve_pss_mib"
+                    )
+                    if any(serve_key not in value for value in at):
+                        raise RuntimeError(
+                            f"{side} {basis} N={n} has no shared serve fixed cost"
+                        )
+                    totals = [
+                        value[basis] + value[serve_key] for value in at
+                    ]
+                    includes_shared_serve = True
+                if any(not math.isfinite(value) or value <= 0 for value in totals):
+                    raise RuntimeError(
+                        f"{side} {basis} N={n} contains a nonpositive or "
+                        "non-finite total, so concrete-N density is undefined"
+                    )
+                values = [value / n for value in totals]
+                requests_per_gib = [n * 1024.0 / value for value in totals]
+                memory_record = descriptive_median(
+                    values,
+                    "descriptive repetition-block median",
+                    "repetition_blocks",
+                )
+                memory_record["scope"] = (
+                    "arrangement total including shared snapshot serve"
+                    if includes_shared_serve
+                    else "incremental after shared snapshot serve baseline"
+                    if side == "fcvm-clone"
+                    else "container arrangement total"
+                    if basis in {"cgroup_mib", "pss_mib"}
+                    else "incremental from the pre-cell host baseline"
+                )
+                memory_record["includes_shared_serve"] = includes_shared_serve
+                density_record = descriptive_median(
+                    requests_per_gib,
+                    "descriptive repetition-block median",
+                    "repetition_blocks",
+                )
+                density_record["scope"] = memory_record["scope"]
+                density_record["includes_shared_serve"] = includes_shared_serve
+                memory_record["requests_per_gib"] = density_record
+                cell[basis] = memory_record
+            for extra in ("serve_pss_mib", "serve_cgroup_mib",
+                          "refuted_fc_only_pss_mib"):
+                values = [value[extra] for value in at if extra in value]
+                if values:
+                    cell[extra + "_total"] = descriptive_median(
+                        values,
+                        "descriptive repetition-block median",
+                        "repetition_blocks",
+                    )
+            fit["per_n"][n] = cell
+        fits[side] = fit
+    return fits
+
+
 def build_cell_schedule(sides, ns, reps, seed, url_count):
     """Pair sides while every instance at every N sees the same page history."""
     rng = random.Random(seed)
@@ -1209,8 +1542,9 @@ def empty_bases(s, side):
     pool_pss_kb were 0, and cell_values reads both with `.get(key, 0)`, so the
     zero reached summary.json and the least-squares fit as a number.
 
-    A missing key is treated as a zero because `.get(key, 0)` downstream cannot
-    tell them apart either.
+    A missing key is treated as a zero by this validation because it is no more
+    usable than an explicit zero. cell_values runs only after every steady
+    sample passes this check.
     """
     keys = (("clone_procs", "clone_cgroup_kb", "clone_pss_kb")
             if side == "fcvm-clone" else
@@ -1238,23 +1572,28 @@ def run_cell(side, args, n, rep, url_indices, out):
                                mem_available_pre_kb=pre["mem_available_kb"]), cell_tag)
         out.write(json.dumps(rec) + "\n"); out.flush()
         steady.append(rec)
+        counted = rec.get(
+            "clones" if side.name == "fcvm-clone" else "pool_containers"
+        )
+        if counted != n:
+            die(
+                f"{side.name} n={n} rep={rep} sample={k}: {counted} instance(s) "
+                f"were accounted, not {n}; the per-instance figure from this "
+                "cell would be wrong"
+            )
+        empty = empty_bases(rec, side.name)
+        if empty:
+            die(
+                f"{side.name} n={n} rep={rep} sample={k}: "
+                f"{', '.join(empty)} came back zero with {counted} instance(s) "
+                "accounted; a zero basis is a sample that could not see the "
+                "process set, not a measurement of one"
+            )
         time.sleep(1)
     log(f"{side.name} n={n} rep={rep}: "
         + " ".join(f"{k}={steady[1].get(k)}" for k in
                    ("clones", "clone_cgroup_kb", "clone_pss_kb", "pool_containers",
                     "pool_cgroup_kb", "pool_pss_kb") if k in steady[1]))
-    # Fail closed on a cell that lost an instance. Per-instance memory divides
-    # by the n that was ASKED for, so a cell measured with fewer live instances
-    # than that would silently report a smaller number per instance.
-    counted = steady[1].get("clones" if side.name == "fcvm-clone" else "pool_containers")
-    if counted != n:
-        die(f"{side.name} n={n} rep={rep}: {counted} instance(s) were accounted, not {n}; "
-            "the per-instance figure from this cell would be wrong")
-    empty = empty_bases(steady[1], side.name)
-    if empty:
-        die(f"{side.name} n={n} rep={rep}: {', '.join(empty)} came back zero with "
-            f"{counted} instance(s) accounted; a zero basis is a sample that could "
-            "not see the process set, not a measurement of one")
     side.tear_down(live)
     quiesce()
     post = side.sample(dict(common, phase="post"), cell_tag)
@@ -1264,24 +1603,34 @@ def run_cell(side, args, n, rep, url_indices, out):
 
 
 def cell_values(cell):
-    """The middle steady sample, on each basis, as MiB totals."""
-    s = cell["steady"][1]
+    """Per-basis medians across the cell's validated steady samples."""
+    steady = cell["steady"]
     if cell["side"] == "fcvm-clone":
-        counted = s.get("clones", 0)
-        cg = s.get("clone_cgroup_kb", 0) / 1024
-        pss = s.get("clone_pss_kb", 0) / 1024
+        count_key = "clones"
+        cgroup_key = "clone_cgroup_kb"
+        pss_key = "clone_pss_kb"
     else:
-        counted = s.get("pool_containers", 0)
-        cg = s.get("pool_cgroup_kb", 0) / 1024
-        pss = s.get("pool_pss_kb", 0) / 1024
-    avail_delta = (cell["pre"]["mem_available_kb"] - s["mem_available_kb"]) / 1024
+        count_key = "pool_containers"
+        cgroup_key = "pool_cgroup_kb"
+        pss_key = "pool_pss_kb"
+    counted = statistics.median(s[count_key] for s in steady)
+    cg = statistics.median(s[cgroup_key] for s in steady) / 1024
+    pss = statistics.median(s[pss_key] for s in steady) / 1024
+    available = statistics.median(s["mem_available_kb"] for s in steady)
+    avail_delta = (cell["pre"]["mem_available_kb"] - available) / 1024
     out = {"instances_counted": counted, "cgroup_mib": cg, "pss_mib": pss,
            "mem_available_delta_mib": avail_delta}
-    if "fc_only_pss_kb" in s:
-        out["refuted_fc_only_pss_mib"] = s["fc_only_pss_kb"] / 1024
-    if "serve_pss_kb" in s:
-        out["serve_pss_mib"] = s["serve_pss_kb"] / 1024
-        out["serve_cgroup_mib"] = s.get("serve_cgroup_kb", 0) / 1024
+    if all("fc_only_pss_kb" in s for s in steady):
+        out["refuted_fc_only_pss_mib"] = statistics.median(
+            s["fc_only_pss_kb"] for s in steady
+        ) / 1024
+    if all("serve_pss_kb" in s and "serve_cgroup_kb" in s for s in steady):
+        out["serve_pss_mib"] = statistics.median(
+            s["serve_pss_kb"] for s in steady
+        ) / 1024
+        out["serve_cgroup_mib"] = statistics.median(
+            s["serve_cgroup_kb"] for s in steady
+        ) / 1024
     return out
 
 
@@ -1444,37 +1793,10 @@ def main_with_resources(resources):
                                  "pss_mib_per_instance": round(v["pss_mib"] / c["n"], 1),
                                  "mem_available_delta_mib_per_instance": round(
                                      v["mem_available_delta_mib"] / c["n"], 1)})
-    summary["fits"] = {}
-    for side in sorted({c["side"] for c in cells}):
-        rows = [(c["n"], cell_values(c)) for c in cells if c["side"] == side]
-        fit = {}
-        for basis in ("cgroup_mib", "pss_mib", "mem_available_delta_mib"):
-            xs = [n for n, _ in rows]
-            ys = [v[basis] for _, v in rows]
-            slope, intercept = slope_intercept(xs, ys)
-            fit[basis] = {"marginal_mib_per_instance": None if slope is None else round(slope, 1),
-                          "fixed_mib": None if intercept is None else round(intercept, 1),
-                          "points": sorted(zip(xs, [round(y, 1) for y in ys]))}
-        # Per instance AT EACH N, with the observed spread across repetitions.
-        # A single average across the whole N grid would mix N=1, where the
-        # fixed cost is charged entirely to one instance, with N=8, where it is
-        # spread over eight, and read as neither.
-        fit["per_n"] = {}
-        for n in sorted({n for n, _ in rows}):
-            at = [v for m, v in rows if m == n]
-            cell = {"reps": len(at)}
-            for basis in ("cgroup_mib", "pss_mib", "mem_available_delta_mib"):
-                vals = [v[basis] / n for v in at]
-                cell[basis] = {"mean": round(statistics.mean(vals), 1),
-                               "min": round(min(vals), 1), "max": round(max(vals), 1)}
-            for extra in ("serve_pss_mib", "serve_cgroup_mib", "refuted_fc_only_pss_mib"):
-                vals = [v[extra] for v in at if extra in v]
-                if vals:
-                    cell[extra + "_total"] = {"mean": round(statistics.mean(vals), 1),
-                                              "min": round(min(vals), 1),
-                                              "max": round(max(vals), 1)}
-            fit["per_n"][n] = cell
-        summary["fits"][side] = fit
+    try:
+        summary["fits"] = summarize_memory_fits(cells, args.seed)
+    except RuntimeError as exc:
+        die(f"memory results are not publishable: {exc}")
     with open(os.path.join(args.results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
     try:
