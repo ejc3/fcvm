@@ -480,7 +480,7 @@ done
 withdraw_failed_run() {
     local reason=$1
     (
-        local withdrawal_lock_fd
+        local withdrawal_lock_fd invalidation_failed=false
         if ! exec {withdrawal_lock_fd}<"$RESULTS"; then
             log "FAILED: could not open withdrawal lock for refused run"
             exit 1
@@ -489,8 +489,10 @@ withdraw_failed_run() {
             log "FAILED: could not lock refused run for withdrawal"
             exit 1
         fi
-        rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json" \
-            || log "FAILED: could not remove derived authorization from refused run"
+        if ! rm -f -- "$RESULTS/complete.json" "$RESULTS/summary.json"; then
+            log "FAILED: could not remove derived authorization from refused run"
+            invalidation_failed=true
+        fi
         if ! python3 - "$RESULTS/WITHDRAWN" "$reason" <<'PY'
 import os
 import sys
@@ -521,6 +523,7 @@ PY
             log "FAILED: could not mark refused run WITHDRAWN"
             exit 1
         fi
+        [ "$invalidation_failed" = false ] || exit 1
     )
 }
 
@@ -614,7 +617,10 @@ cleanup() {
         CREATE_OP_LOCK_FD=
     fi
     if [ "$final_rc" -ne 0 ]; then
-        withdraw_failed_run "hostcdp exited $final_rc; raw completion is not authorized"
+        if ! withdraw_failed_run \
+                "hostcdp exited $final_rc; raw completion is not authorized"; then
+            log "FAILED: withdrawal of refused run was incomplete"
+        fi
     fi
     exit "$final_rc"
 }

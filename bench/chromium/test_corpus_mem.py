@@ -2481,6 +2481,86 @@ class CampaignIntegrityRegression(unittest.TestCase):
                 self.assertLess(locked, invalidated)
                 self.assertLess(invalidated, marker)
 
+    def test_failed_host_withdrawal_invalidation_is_marked_and_returns_failure(self):
+        """A failed invalidation still withdraws the run and returns failure.
+
+        WITHDRAWN is the fail-closed signal when an authorization file cannot
+        be removed. The writer must publish that signal under its lock, but it
+        cannot report a successful state transition after incomplete cleanup.
+
+        RED BEFORE THE FIX: withdraw_failed_run left complete.json beside the
+        marker and returned success after logging the failed removal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(HOSTCDP) as handle:
+                body = self.shell_function(handle.read(), "withdraw_failed_run")
+            os.mkdir(os.path.join(tmp, "complete.json"))
+            with open(os.path.join(tmp, "summary.json"), "w") as handle:
+                handle.write("{}\n")
+            script = (
+                "set -u\n"
+                f"RESULTS={tmp!r}\n"
+                "log() { printf '%s\\n' \"$*\" >&2; }\n"
+                + body + "\n"
+                + "withdraw_failed_run 'deterministic rm failure'\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("could not remove derived authorization", proc.stderr)
+            self.assertTrue(os.path.isdir(os.path.join(tmp, "complete.json")))
+            self.assertFalse(os.path.lexists(os.path.join(tmp, "summary.json")))
+            with open(os.path.join(tmp, "WITHDRAWN")) as handle:
+                self.assertEqual(handle.read(), "deterministic rm failure\n")
+
+    def test_cleanup_preserves_primary_status_when_withdrawal_reports_failure(self):
+        """A secondary withdrawal error cannot replace the primary failure.
+
+        The EXIT trap deliberately carries final_rc through cleanup. Its call
+        to a fallible withdrawal writer must be in a conditional so errexit
+        reaches the explicit final exit instead of replacing that status.
+
+        RED BEFORE THE FIX: an original exit 7 became exit 1 when withdrawal
+        returned failure after publishing its marker.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            with open(HOSTCDP) as handle:
+                source = handle.read()
+            withdrawal = self.shell_function(source, "withdraw_failed_run")
+            cleanup = self.shell_function(source, "cleanup")
+            os.mkdir(os.path.join(tmp, "complete.json"))
+            with open(os.path.join(tmp, "summary.json"), "w") as handle:
+                handle.write("{}\n")
+            script = (
+                "set -eu\n"
+                f"RESULTS={tmp!r}\n"
+                "CREATE_OP_STARTED=false\n"
+                "CREATE_OP_QUIESCENT=false\n"
+                "CREATE_OUTPUT_PATH=\n"
+                "CREATE_OUTCOME_CHECKED=false\n"
+                "CONTAINER_OWNERSHIP_VERIFIED=false\n"
+                "CREATE_OP_LOCK_FD=\n"
+                "log() { printf '%s\\n' \"$*\" >&2; }\n"
+                + withdrawal + "\n"
+                + cleanup + "\n"
+                + "trap cleanup EXIT\n"
+                + "exit 7\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, timeout=30,
+            )
+
+            self.assertEqual(proc.returncode, 7, proc.stdout + proc.stderr)
+            with open(os.path.join(tmp, "WITHDRAWN")) as handle:
+                self.assertEqual(
+                    handle.read(),
+                    "hostcdp exited 7; raw completion is not authorized\n",
+                )
+
     def test_withdrawal_writers_hold_the_exclusive_lock_through_publication(self):
         """Pause each real writer after it invalidates completion but before
         its atomic marker publication. A nonblocking shared reader must still
