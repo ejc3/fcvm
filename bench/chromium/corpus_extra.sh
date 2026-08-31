@@ -481,7 +481,7 @@ require_corpus_serve_clean() {
 
 cleanup_owned_containers() {
     local listed rc=0 exists_rc id name identity actual_id owner extra
-    listed=$(timeout 30 podman ps -a --no-trunc --format '{{.ID}} {{.Names}}') \
+    listed=$(timeout --kill-after=5s 30s podman ps -a --no-trunc --format '{{.ID}} {{.Names}}') \
         || { echo "FAILED: cannot enumerate containers owned by run $RUN_ID" >&2; return 1; }
     while read -r id name extra; do
         [ -n "$id" ] || continue
@@ -497,7 +497,7 @@ cleanup_owned_containers() {
         fi
         case "$name" in
             cbmem-"$RUN_ID"-*|hostcdp-"$RUN_ID"-*)
-                identity=$(timeout 30 podman inspect --format \
+                identity=$(timeout --kill-after=5s 30s podman inspect --format \
                     '{{.Id}} {{ index .Config.Labels "io.fcvm.bench.owner" }}' "$id") \
                     || { echo "FAILED: cannot inspect possible owned container $name ($id)" >&2; rc=1; continue; }
                 read -r actual_id owner extra <<<"$identity"
@@ -507,9 +507,9 @@ cleanup_owned_containers() {
                     continue
                 fi
                 [ "$owner" = "$CONTAINER_OWNER_TOKEN" ] || continue
-                timeout 30 podman rm -f -- "$actual_id" >/dev/null 2>&1 \
+                timeout --kill-after=5s 30s podman rm -f -- "$actual_id" >/dev/null 2>&1 \
                     || { echo "FAILED: could not remove owned container $name ($actual_id)" >&2; rc=1; }
-                if timeout 30 podman container exists "$actual_id" >/dev/null 2>&1; then
+                if timeout --kill-after=5s 30s podman container exists "$actual_id" >/dev/null 2>&1; then
                     echo "FAILED: owned container $name ($actual_id) survived podman rm" >&2
                     rc=1
                 else
@@ -857,6 +857,7 @@ grep -q "loaded [1-9]" "$LOGDIR/corpus_serve.log" || {
 
 answer=""
 code=""
+replay_ready=false
 for attempt in $(seq 1 100); do
     readiness_nonce="$RUN_ID-$attempt"
     readiness_qname="ready-$readiness_nonce.blog.cloudflare.com"
@@ -867,6 +868,7 @@ for attempt in $(seq 1 100); do
         "https://blog.cloudflare.com$readiness_path" 2>/dev/null || true)
     if [ "$answer" = "10.0.2.2" ] && [ "$code" = "200" ] \
             && replay_probe_logged "$readiness_qname" "$readiness_path"; then
+        replay_ready=true
         break
     fi
     [ ! -f "$RESULTS/corpus-serve.status" ] || {
@@ -880,6 +882,10 @@ done
     || { echo "BLOCKED: wildcard DNS answered '$answer', expected 10.0.2.2" >&2; exit 3; }
 [ "$code" = "200" ] \
     || { echo "BLOCKED: HTTPS replay returned '$code' for blog.cloudflare.com" >&2; exit 3; }
+[ "$replay_ready" = true ] || {
+    echo "BLOCKED: replay readiness never satisfied DNS, HTTPS, and log evidence" >&2
+    exit 3
+}
 
 # Every corpus member must replay before anything is measured: a partial corpus
 # measures error pages as renders, which look like fast, plausible numbers.

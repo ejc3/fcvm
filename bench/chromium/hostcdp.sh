@@ -149,7 +149,7 @@ canonicalize_image_id() {
 
 resolve_image_id() {
     local reference=$1 raw resolved
-    raw=$(timeout 30 podman image inspect --format '{{.Id}}' "$reference") \
+    raw=$(timeout --kill-after=5s 30s podman image inspect --format '{{.Id}}' "$reference") \
         || { log "REFUSING: cannot resolve image identity for $reference"; return 2; }
     resolved=$(canonicalize_image_id "$raw") \
         || { log "REFUSING: image $reference resolved to an invalid identity"; return 2; }
@@ -158,7 +158,7 @@ resolve_image_id() {
 
 verify_container_image() {
     local reference=$1 raw actual
-    raw=$(timeout 30 podman inspect --type container --format '{{.Image}}' "$reference") \
+    raw=$(timeout --kill-after=5s 30s podman inspect --type container --format '{{.Image}}' "$reference") \
         || { log "REFUSING: cannot inspect image identity for container $reference"; return 2; }
     actual=$(canonicalize_image_id "$raw") \
         || { log "REFUSING: container $reference reports an invalid image identity"; return 2; }
@@ -321,7 +321,7 @@ CREATE_OP_LOCK_PATH="$CONTAINER_CREATE_OPS_DIR/hostcdp-$RUNID-$CONTAINER_OWNER_T
 readonly CONTAINER_CREATE_OPS_DIR CREATE_OP_LOCK_PATH
 
 container_owns_cdp() {
-    timeout 30 podman exec "$CONTAINER_ID" python3 -c '
+    timeout --kill-after=5s 30s podman exec "$CONTAINER_ID" python3 -c '
 import os
 import sys
 
@@ -374,13 +374,13 @@ record_owned_container_id() {
 
 inspect_owned_container() {
     local reference=$1 line inspect_status exists_status inspected_id inspected_token extra
-    if line=$(timeout 30 podman inspect --type container \
+    if line=$(timeout --kill-after=5s 30s podman inspect --type container \
             --format '{{.Id}}|{{index .Config.Labels "io.fcvm.bench.owner"}}' \
             "$reference" 2>/dev/null); then
         :
     else
         inspect_status=$?
-        if timeout 30 podman container exists "$reference" >/dev/null 2>&1; then
+        if timeout --kill-after=5s 30s podman container exists "$reference" >/dev/null 2>&1; then
             log "REFUSING: container $reference exists but its identity could not be inspected (inspect status=$inspect_status)"
             return 3
         else
@@ -532,11 +532,11 @@ remove_owned_container() {
     [ -n "$CONTAINER_ID" ] || return 0
     [ "$CONTAINER_OWNERSHIP_VERIFIED" = true ] || return 0
     [ "$CONTAINER_REMOVED" != true ] || return 0
-    if ! timeout 30 podman rm -f -- "$CONTAINER_ID" >/dev/null 2>&1; then
+    if ! timeout --kill-after=5s 30s podman rm -f -- "$CONTAINER_ID" >/dev/null 2>&1; then
         log "FAILED: could not remove owned container $CONTAINER_ID"
         return 1
     fi
-    if timeout 30 podman container exists "$CONTAINER_ID" >/dev/null 2>&1; then
+    if timeout --kill-after=5s 30s podman container exists "$CONTAINER_ID" >/dev/null 2>&1; then
         log "FAILED: owned container $CONTAINER_ID survived podman rm"
         return 1
     else
@@ -740,11 +740,11 @@ fi
 # Ready = the same two conditions the VM golden gates on: warm marker file AND
 # a live CDP round trip that finds a page target (cdp_health inside the image).
 t0=$SECONDS
-until timeout 30 podman exec "$CONTAINER_ID" test -f /run/bench-ready 2>/dev/null \
+until timeout --kill-after=5s 30s podman exec "$CONTAINER_ID" test -f /run/bench-ready 2>/dev/null \
         && container_owns_cdp; do
     [ $((SECONDS - t0)) -lt 120 ] || {
         log "container never became ready with an owned CDP listener"
-        timeout 30 podman logs --tail 20 "$CONTAINER_ID" >&2 || true
+        timeout --kill-after=5s 30s podman logs --tail 20 "$CONTAINER_ID" >&2 || true
         exit 1
     }
     sleep 0.5

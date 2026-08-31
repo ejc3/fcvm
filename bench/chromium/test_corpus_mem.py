@@ -1952,6 +1952,42 @@ class CorpusExtraFailClosed(unittest.TestCase):
             )
             self.assertEqual(probe(stale_qname, stale_path).returncode, 0)
 
+    def test_replay_retry_exhaustion_requires_log_evidence(self):
+        """The last DNS and HTTPS response cannot bypass the log check.
+
+        RED BEFORE THE FIX: the final retry returned the expected DNS answer
+        and HTTPS status while replay_probe_logged failed, but the two scalar
+        checks after the loop still accepted startup.
+        """
+        source = self.source()
+        launch = source[
+            source.index('answer=""'):
+            source.index('# Every corpus member')
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "set -euo pipefail\n"
+                f"RESULTS={tmp!r}\n"
+                f"LOGDIR={tmp!r}\n"
+                "RUN_ID=readiness-test\n"
+                "seq() { printf '100\\n'; }\n"
+                "dig() { printf '10.0.2.2\\n'; }\n"
+                "curl() { printf '200'; }\n"
+                "sleep() { :; }\n"
+                "replay_probe_logged() { return 1; }\n"
+                + launch
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script],
+                capture_output=True, text=True, timeout=10,
+            )
+
+        self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertIn(
+            "replay readiness never satisfied DNS, HTTPS, and log evidence",
+            proc.stderr,
+        )
+
     def test_replay_nonzero_exit_prevents_success(self):
         source = self.source()
         final_records = source.rfind('say "records:')
@@ -2481,6 +2517,29 @@ class CampaignIntegrityRegression(unittest.TestCase):
             ).encode()
             + b"\n"
         )
+
+    def test_podman_timeouts_escalate_to_kill(self):
+        """Every bounded Podman command escalates from TERM to KILL.
+
+        RED BEFORE THE FIX: thirteen Podman calls used `timeout 30`, which can
+        wait forever after sending TERM to a command that does not exit.
+        """
+        for path in (EXTRA, HOSTCDP):
+            with self.subTest(path=os.path.basename(path)):
+                with open(path) as handle:
+                    source = handle.read().replace("\\\n", " ")
+                commands = [
+                    line.strip()
+                    for line in source.splitlines()
+                    if re.search(r'(?<![-\w])timeout\b.*\bpodman\b', line)
+                ]
+
+                self.assertTrue(commands, "no bounded Podman commands found")
+                for command in commands:
+                    self.assertIn(
+                        "--kill-after=", command,
+                        f"Podman timeout has no KILL escalation: {command}",
+                    )
 
     def test_withdrawal_writers_lock_before_invalidating_or_marking_a_run(self):
         """Every producer of WITHDRAWN must take the exclusive side of the
