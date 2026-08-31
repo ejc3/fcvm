@@ -4447,41 +4447,46 @@ class ComparePublicationGate(unittest.TestCase):
             self.assertEqual(handle.read(), marker_bytes)
         self.assertFalse(os.path.exists(out))
 
-    def test_output_cannot_alias_the_running_comparator(self):
-        for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
-            with self.subTest(alias=alias_kind):
-                run, host = self.valid_comparison()
-                with tempfile.TemporaryDirectory() as tmp:
-                    copied = os.path.join(tmp, "compare.py")
-                    shutil.copyfile(os.path.join(HERE, "compare.py"), copied)
-                    shutil.copyfile(
-                        os.path.join(HERE, "campaign_summary.py"),
-                        os.path.join(tmp, "campaign_summary.py"),
-                    )
-                    if alias_kind == "direct":
-                        out = copied
-                    elif alias_kind == "realpath":
-                        os.mkdir(os.path.join(tmp, "unused"))
-                        out = os.path.join(tmp, "unused", "..", "compare.py")
-                    else:
-                        out = os.path.join(tmp, f"output-{alias_kind}")
-                        if alias_kind == "symlink":
-                            os.symlink(copied, out)
+    def test_output_cannot_alias_running_comparison_source(self):
+        for source_name in ("compare.py", "campaign_summary.py"):
+            for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+                with self.subTest(source=source_name, alias=alias_kind):
+                    run, host = self.valid_comparison()
+                    with tempfile.TemporaryDirectory() as tmp:
+                        comparator = os.path.join(tmp, "compare.py")
+                        validator = os.path.join(tmp, "campaign_summary.py")
+                        shutil.copyfile(os.path.join(HERE, "compare.py"), comparator)
+                        shutil.copyfile(
+                            os.path.join(HERE, "campaign_summary.py"), validator
+                        )
+                        protected = os.path.join(tmp, source_name)
+                        if alias_kind == "direct":
+                            out = protected
+                        elif alias_kind == "realpath":
+                            os.mkdir(os.path.join(tmp, "unused"))
+                            out = os.path.join(tmp, "unused", "..", source_name)
                         else:
-                            os.link(copied, out)
-                    with open(copied, "rb") as handle:
-                        before = handle.read()
-                    proc, _ = self.run_compare(run, [("host", host)],
-                                               out=out, script=copied)
-                    self.assertNotEqual(
-                        proc.returncode, 0,
-                        f"the comparator accepted its {alias_kind} source alias",
-                    )
-                    self.assertIn("alias", proc.stderr.lower(), proc.stderr)
-                    with open(copied, "rb") as handle:
-                        self.assertEqual(handle.read(), before)
-                    if alias_kind in ("symlink", "hardlink"):
-                        self.assertTrue(os.path.lexists(out))
+                            out = os.path.join(
+                                tmp, f"output-{source_name}-{alias_kind}"
+                            )
+                            if alias_kind == "symlink":
+                                os.symlink(protected, out)
+                            else:
+                                os.link(protected, out)
+                        with open(protected, "rb") as handle:
+                            before = handle.read()
+                        proc, _ = self.run_compare(
+                            run, [("host", host)], out=out, script=comparator
+                        )
+                        self.assertNotEqual(
+                            proc.returncode, 0,
+                            f"--out accepted a {alias_kind} alias of {source_name}",
+                        )
+                        self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                        with open(protected, "rb") as handle:
+                            self.assertEqual(handle.read(), before)
+                        if alias_kind in ("symlink", "hardlink"):
+                            self.assertTrue(os.path.lexists(out))
 
     def test_output_parent_cannot_be_swapped_onto_an_input_after_preflight(self):
         run = self.make_run(vm_rows=[self.vm_rep(700.0)])

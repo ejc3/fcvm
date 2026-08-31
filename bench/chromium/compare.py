@@ -1316,6 +1316,7 @@ def comparison_input_paths(args):
         ("VM diag/summary.json",
          os.path.join(args.vm_run, "diag", "summary.json")),
         ("running comparator source", __file__),
+        ("running publication validator source", campaign_summary.__file__),
     ]
     for ordinal, spec in enumerate(args.host, 1):
         _label, separator, directory = spec.partition("=")
