@@ -3785,10 +3785,24 @@ class CampaignIntegrityRegression(unittest.TestCase):
                            source.index("def main_with_resources(resources):")]
         lifecycle = bootstrap.find("status = run_memory_lifecycle(")
         publish = bootstrap.find("publish_completion(results, run_id)")
+        self.assertGreaterEqual(
+            lifecycle, 0, "memory lifecycle call is absent")
         self.assertGreater(
             publish, lifecycle,
             "memory completion precedes the worker and finalizer completion",
         )
+
+    def test_memory_completion_order_rejects_an_absent_lifecycle_call(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read().replace(
+                "status = run_memory_lifecycle(",
+                "status = missing_memory_lifecycle(",
+                1,
+            )
+        with mock.patch("builtins.open", mock.mock_open(read_data=source)):
+            with self.assertRaisesRegex(
+                    AssertionError, "memory lifecycle call is absent"):
+                self.test_memory_completion_is_published_after_final_summary()
 
     def test_memory_completion_does_not_retain_samples_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
