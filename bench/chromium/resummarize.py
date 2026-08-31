@@ -49,9 +49,15 @@ def pct(values, p):
 d = sys.argv[1]
 summary_path = os.path.join(d, "summary.json")
 try:
-    lock_target = open_output_target(os.path.join(d, ".summary"))
+    summary_target = open_output_target(summary_path)
 except Refusal as error:
     sys.exit(f"REFUSING: {error}")
+lock_target = dict(summary_target)
+lock_target.update({
+    "path": os.path.join(d, ".summary"),
+    "absolute": os.path.join(summary_target["directory"], ".summary"),
+    "name": ".summary",
+})
 lock_fd = None
 try:
     lock_fd = open_output_lock(lock_target)
@@ -59,11 +65,14 @@ try:
 except Refusal as error:
     if lock_fd is not None:
         os.close(lock_fd)
-    os.close(lock_target["directory_fd"])
+    os.close(summary_target["directory_fd"])
     sys.exit(f"REFUSING: {error}")
 try:
     try:
-        os.unlink(summary_path)
+        os.unlink(
+            summary_target["name"],
+            dir_fd=summary_target["directory_fd"],
+        )
     except FileNotFoundError:
         pass
     except OSError as error:
@@ -102,9 +111,10 @@ try:
     write_json_atomic(
         summary_path,
         out,
+        output_target=summary_target,
         before_publish=recheck_inputs_before_publication,
     )
     print(d, out["n"], out["p50_ms"], out["p95_ms"], out["mean_ms"])
 finally:
     os.close(lock_fd)
-    os.close(lock_target["directory_fd"])
+    os.close(summary_target["directory_fd"])

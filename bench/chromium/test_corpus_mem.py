@@ -1608,13 +1608,14 @@ exec {real_date!r} "$@"
         self.assertIn('"$RESULTS/.summary.lock"', producer)
         self.assertIn("os.replace(temporary, output_path)", producer)
         self.assertNotIn('open(sys.argv[3], "w")', producer)
-        self.assertIn(
-            'open_output_target(os.path.join(d, ".summary"))', resummarizer
-        )
+        self.assertIn("summary_target = open_output_target(summary_path)", resummarizer)
+        self.assertIn("lock_target = dict(summary_target)", resummarizer)
+        self.assertIn('"name": ".summary"', resummarizer)
         self.assertIn("open_output_lock(lock_target)", resummarizer)
         self.assertIn("acquire_output_lock(lock_target, lock_fd)", resummarizer)
         self.assertNotIn(".resummarize.lock", resummarizer)
         self.assertIn("write_json_atomic(", resummarizer)
+        self.assertIn("output_target=summary_target", resummarizer)
         self.assertIn("revalidate_host_inputs(d, identities)", resummarizer)
         self.assertIn("validate_output_lock(lock_target, lock_fd)", resummarizer)
         self.assertIn("before_publish=recheck_inputs_before_publication", resummarizer)
@@ -3781,6 +3782,114 @@ class Resummarize(unittest.TestCase):
                     os.path.join(HERE, "resummarize.py"), run_name="__main__"
                 )
         self.assertFalse(os.path.exists(summary))
+
+    def test_stale_summary_removal_uses_the_pinned_directory(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        summary = os.path.join(tmp, "summary.json")
+        stale = b'{"stale": true}\n'
+        with open(summary, "wb") as handle:
+            handle.write(stale)
+
+        detached = f"{tmp}.detached"
+        replacement = f"{tmp}.replacement"
+        os.mkdir(replacement)
+        replacement_summary = os.path.join(replacement, "summary.json")
+        sentinel = b'{"replacement": true}\n'
+        with open(replacement_summary, "wb") as handle:
+            handle.write(sentinel)
+
+        real_unlink = os.unlink
+        swapped = False
+
+        def swap_before_unlink(path, *args, **kwargs):
+            nonlocal swapped
+            if not swapped and os.path.basename(path) == "summary.json":
+                os.rename(tmp, detached)
+                os.rename(replacement, tmp)
+                swapped = True
+            return real_unlink(path, *args, **kwargs)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(os, "unlink", side_effect=swap_before_unlink), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    SystemExit,
+                    msg="directory replacement escaped a bounded refusal"):
+                runpy.run_path(
+                    os.path.join(HERE, "resummarize.py"), run_name="__main__"
+                )
+        self.assertTrue(swapped, "the directory replacement was not injected")
+        with open(os.path.join(tmp, "summary.json"), "rb") as handle:
+            self.assertEqual(
+                handle.read(), sentinel,
+                "stale-summary cleanup removed an entry from the replacement directory",
+            )
+        self.assertFalse(
+            os.path.exists(os.path.join(detached, "summary.json")),
+            "stale-summary cleanup did not remove the entry from the pinned directory",
+        )
+
+    def test_summary_publication_uses_the_pinned_directory(self):
+        rows = [self.rep(0, warmup=True), self.rep(1)]
+        tmp, proc = self.run_on(rows)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        os.unlink(os.path.join(tmp, "summary.json"))
+
+        detached = f"{tmp}.detached"
+        replacement = f"{tmp}.replacement"
+        os.mkdir(replacement)
+        replacement_summary = os.path.join(replacement, "summary.json")
+        sentinel = b'{"replacement": true}\n'
+        with open(replacement_summary, "wb") as handle:
+            handle.write(sentinel)
+
+        real_link = os.link
+        real_replace = os.replace
+        swapped = False
+
+        def swap_directories():
+            nonlocal swapped
+            if swapped:
+                return
+            os.rename(tmp, detached)
+            os.rename(replacement, tmp)
+            swapped = True
+
+        def link_after_swap(source, destination, *args, **kwargs):
+            swap_directories()
+            return real_link(source, destination, *args, **kwargs)
+
+        def replace_after_swap(source, destination, *args, **kwargs):
+            swap_directories()
+            # The path-based writer's temporary moved with the detached
+            # directory. A replacement directory can contain the same entry
+            # name by the time rename(2) resolves both pathnames.
+            with open(source, "wb") as handle:
+                handle.write(b'{"substituted": true}\n')
+            return real_replace(source, destination, *args, **kwargs)
+
+        argv = ["resummarize.py", tmp]
+        with mock.patch.object(os, "link", side_effect=link_after_swap), \
+                mock.patch.object(os, "replace", side_effect=replace_after_swap), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg="a replaced results directory authorized summary publication"):
+                runpy.run_path(
+                    os.path.join(HERE, "resummarize.py"), run_name="__main__"
+                )
+        self.assertTrue(swapped, "the directory replacement was not injected")
+        with open(os.path.join(tmp, "summary.json"), "rb") as handle:
+            self.assertEqual(
+                handle.read(), sentinel,
+                "summary publication replaced an entry outside the pinned directory",
+            )
+        self.assertFalse(
+            os.path.exists(os.path.join(detached, "summary.json")),
+            "a refused publication left a summary in the detached directory",
+        )
 
     def test_summary_lock_contention_is_bounded(self):
         rows = [self.rep(0, warmup=True), self.rep(1)]
