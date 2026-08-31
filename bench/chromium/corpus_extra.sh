@@ -566,57 +566,163 @@ mark_campaign_withdrawn() {
 }
 
 publish_campaign_completion() {
-    local arm
+    local arm memory_complete=""
     local host_completes=()
     if [[ ",$PHASES," == *",hostcdp,"* ]]; then
         for arm in $(printf '%s' "$HOSTCDP_ARMS" | tr ',' ' '); do
             host_completes+=("$RESULTS/hostcdp-$arm/complete.json")
         done
     fi
+    if [[ ",$PHASES," == *",memory,"* ]]; then
+        memory_complete="$RESULTS/memory/complete.json"
+    fi
     python3 - "$RESULTS/campaign-complete.json" "$RESULTS" "$RUN_ID" \
-            "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" "${host_completes[@]}" <<'PY'
+            "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256" "$PHASES" \
+            "$memory_complete" "${host_completes[@]}" <<'PY'
 import hashlib
 import json
 import os
+import re
 import stat
 import sys
 import tempfile
 
-output_path, results, run_id, runtime_bundle_sha256, *complete_paths = sys.argv[1:]
-records = []
+output_path, results, run_id, runtime_bundle_sha256, phases_raw, memory_path, \
+    *host_paths = sys.argv[1:]
+phases = phases_raw.split(",")
+if (not phases or any(phase not in {"hostcdp", "memory"} for phase in phases)
+        or len(phases) != len(set(phases))):
+    sys.exit(f"FAILED: invalid campaign phases {phases_raw!r}")
+if ("hostcdp" in phases) != bool(host_paths):
+    sys.exit("FAILED: hostcdp phase and host completion set disagree")
+if ("memory" in phases) != bool(memory_path):
+    sys.exit("FAILED: memory phase and memory completion disagree")
+
 seen = set()
-for path in complete_paths:
+sources = []
+
+def completion_record(path, kind, expected_relative=None, capture=False):
     relative = os.path.relpath(path, results)
     if (relative.startswith("../") or relative == ".." or os.path.isabs(relative)
             or relative in seen):
-        sys.exit(f"FAILED: invalid or duplicate host completion path {relative!r}")
+        sys.exit(f"FAILED: invalid or duplicate {kind} completion path {relative!r}")
+    if expected_relative is not None and relative != expected_relative:
+        sys.exit(
+            f"FAILED: {kind} completion path {relative!r} is not "
+            f"{expected_relative!r}"
+        )
     seen.add(relative)
     try:
         fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
     except OSError as exc:
-        sys.exit(f"FAILED: cannot open host completion {relative}: {exc}")
+        sys.exit(f"FAILED: cannot open {kind} completion {relative}: {exc}")
     try:
-        metadata = os.fstat(fd)
-        if not stat.S_ISREG(metadata.st_mode):
-            sys.exit(f"FAILED: host completion {relative} is not a regular file")
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            sys.exit(f"FAILED: {kind} completion {relative} is not a regular file")
         digest = hashlib.sha256()
+        chunks = [] if capture else None
         size = 0
         while True:
             chunk = os.read(fd, 1024 * 1024)
             if not chunk:
                 break
+            if chunks is not None:
+                chunks.append(chunk)
             digest.update(chunk)
             size += len(chunk)
+        after = os.fstat(fd)
     finally:
         os.close(fd)
-    records.append({"path": relative, "size": size,
-                    "sha256": digest.hexdigest()})
+    before_identity = (
+        before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns,
+    )
+    after_identity = (
+        after.st_dev, after.st_ino, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns,
+    )
+    if before_identity != after_identity or size != after.st_size:
+        sys.exit(f"FAILED: {kind} completion {relative} changed while read")
+    record = {"path": relative, "size": size, "sha256": digest.hexdigest()}
+    payload = b"".join(chunks) if chunks is not None else None
+    return record, payload
+
+host_records = [
+    completion_record(path, "host")[0] for path in host_paths
+]
+memory_record = None
+if memory_path:
+    memory_record, memory_payload = completion_record(
+        memory_path, "memory", "memory/complete.json", capture=True
+    )
+    try:
+        memory_completion = json.loads(memory_payload)
+    except (TypeError, ValueError) as exc:
+        sys.exit(f"FAILED: memory completion is not JSON: {exc}")
+    if not isinstance(memory_completion, dict) or set(memory_completion) != {
+        "schema_version", "run_id", "artifacts"
+    }:
+        sys.exit(
+            "FAILED: memory completion must contain exactly schema_version, "
+            "run_id, and artifacts"
+        )
+    version = memory_completion.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        sys.exit(
+            f"FAILED: memory completion has unsupported schema_version={version!r}"
+        )
+    if memory_completion.get("run_id") != run_id:
+        sys.exit(
+            f"FAILED: memory completion run_id={memory_completion.get('run_id')!r} "
+            f"does not match campaign run_id={run_id!r}"
+        )
+    memory_artifacts = memory_completion.get("artifacts")
+    expected_paths = ["run.json", "samples.jsonl", "summary.json"]
+    if not isinstance(memory_artifacts, list) or len(memory_artifacts) != 3:
+        sys.exit("FAILED: memory completion artifacts must contain three entries")
+    artifact_paths = []
+    for ordinal, artifact in enumerate(memory_artifacts):
+        if not isinstance(artifact, dict) or set(artifact) != {
+            "path", "size", "sha256"
+        }:
+            sys.exit(
+                f"FAILED: memory completion artifacts[{ordinal}] must contain "
+                "exactly path, size, and sha256"
+            )
+        artifact_paths.append(artifact.get("path"))
+        size = artifact.get("size")
+        digest = artifact.get("sha256")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            sys.exit(
+                f"FAILED: memory completion artifacts[{ordinal}] has "
+                f"invalid size={size!r}"
+            )
+        if not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            sys.exit(
+                f"FAILED: memory completion artifacts[{ordinal}] has "
+                f"invalid sha256={digest!r}"
+            )
+    if artifact_paths != expected_paths:
+        sys.exit(
+            f"FAILED: memory completion artifacts have paths={artifact_paths!r}; "
+            f"expected {expected_paths!r}"
+        )
+if not host_records and memory_record is None:
+    sys.exit("FAILED: campaign completion would authorize zero phase completions")
+
+host_records.sort(key=lambda item: item["path"])
+sources.extend((record["path"], record) for record in host_records)
+if memory_record is not None:
+    sources.append((memory_record["path"], memory_record))
 
 record = {
-    "schema_version": 1,
+    "schema_version": 2,
     "run_id": run_id,
     "runtime_bundle_sha256": runtime_bundle_sha256,
-    "host_completes": sorted(records, key=lambda item: item["path"]),
+    "phases": phases,
+    "host_completes": host_records,
+    "memory_complete": memory_record,
 }
 directory = os.path.dirname(output_path)
 fd, temporary = tempfile.mkstemp(prefix=".campaign-complete.", dir=directory)
@@ -626,6 +732,17 @@ try:
         target.write("\n")
         target.flush()
         os.fsync(target.fileno())
+    for relative, expected in sources:
+        seen.remove(relative)
+        current, _payload = completion_record(
+            os.path.join(results, relative),
+            "memory" if relative == "memory/complete.json" else "host",
+            relative,
+        )
+        if current != expected:
+            sys.exit(
+                f"FAILED: completion {relative} changed before campaign publication"
+            )
     os.replace(temporary, output_path)
     directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
     try:

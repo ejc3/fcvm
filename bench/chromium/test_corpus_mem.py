@@ -2140,6 +2140,31 @@ class CampaignIntegrityRegression(unittest.TestCase):
             raise AssertionError(f"{name} is missing")
         return match.group(0)
 
+    @staticmethod
+    def memory_completion_record(run_id):
+        return {
+            "schema_version": 1,
+            "run_id": run_id,
+            "artifacts": [
+                {"path": name, "size": ordinal,
+                 "sha256": str(ordinal) * 64}
+                for ordinal, name in enumerate(
+                    ("run.json", "samples.jsonl", "summary.json"), 1
+                )
+            ],
+        }
+
+    @classmethod
+    def memory_completion_bytes(cls, run_id):
+        return (
+            json.dumps(
+                cls.memory_completion_record(run_id),
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+            + b"\n"
+        )
+
     def test_podman_run_must_return_one_full_lowercase_container_id(self):
         args = SimpleNamespace(
             image="image", urls=["https://example.com/"],
@@ -2619,6 +2644,122 @@ class CampaignIntegrityRegression(unittest.TestCase):
             self.assertNotEqual(proc.returncode, 0)
             self.assertTrue(os.path.isfile(os.path.join(tmp, "WITHDRAWN")))
 
+    def test_memory_completion_binds_exact_final_artifacts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "a" * 32
+            payloads = {
+                "run.json": json.dumps({"run_id": run_id}).encode() + b"\n",
+                "samples.jsonl": b'{"sample":1}\n{"sample":2}\n',
+                "summary.json": json.dumps(
+                    {"run_id": run_id, "result": 3}
+                ).encode() + b"\n",
+            }
+            for name, payload in payloads.items():
+                with open(os.path.join(tmp, name), "wb") as handle:
+                    handle.write(payload)
+
+            corpus_mem.publish_completion(tmp, run_id)
+
+            with open(os.path.join(tmp, "complete.json")) as handle:
+                completion = json.load(handle)
+            self.assertEqual(set(completion), {
+                "schema_version", "run_id", "artifacts",
+            })
+            self.assertEqual(completion["schema_version"], 1)
+            self.assertEqual(completion["run_id"], run_id)
+            self.assertEqual(completion["artifacts"], [
+                {
+                    "path": name,
+                    "size": len(payloads[name]),
+                    "sha256": hashlib.sha256(payloads[name]).hexdigest(),
+                }
+                for name in sorted(payloads)
+            ])
+            self.assertFalse(any(
+                name.startswith(".complete.") for name in os.listdir(tmp)
+            ))
+
+    def test_memory_completion_is_published_after_final_summary(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        main = source[source.index("def main_with_resources(resources):") :]
+        summary = main.find(
+            'with open(os.path.join(args.results, "summary.json"), "w")'
+        )
+        publish = main.find("publish_completion(args.results, args.run_id)")
+        self.assertGreaterEqual(summary, 0, "memory has no final summary writer")
+        self.assertGreater(
+            publish, summary,
+            "memory completion is not published after the final summary closes",
+        )
+
+    def test_memory_completion_does_not_retain_samples_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "a" * 32
+            payloads = {
+                "run.json": json.dumps({"run_id": run_id}).encode(),
+                "samples.jsonl": b'{"sample":1}\n',
+                "summary.json": json.dumps({"run_id": run_id}).encode(),
+            }
+            for name, payload in payloads.items():
+                with open(os.path.join(tmp, name), "wb") as handle:
+                    handle.write(payload)
+            original = corpus_mem.read_memory_artifact
+            captures = {}
+
+            def record_capture(directory_fd, name, *args, **kwargs):
+                captures[name] = kwargs.get("capture", False)
+                return original(directory_fd, name, *args, **kwargs)
+
+            with mock.patch.object(
+                    corpus_mem, "read_memory_artifact",
+                    side_effect=record_capture):
+                corpus_mem.publish_completion(tmp, run_id)
+            self.assertEqual(captures, {
+                "run.json": True,
+                "samples.jsonl": False,
+                "summary.json": True,
+            })
+
+    def test_memory_completion_rechecks_artifacts_before_publication(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_id = "a" * 32
+            paths = {
+                "run.json": json.dumps({"run_id": run_id}).encode(),
+                "samples.jsonl": b'{"sample":1}\n',
+                "summary.json": json.dumps({"run_id": run_id}).encode(),
+            }
+            for name, payload in paths.items():
+                with open(os.path.join(tmp, name), "wb") as handle:
+                    handle.write(payload)
+            samples = os.path.join(tmp, "samples.jsonl")
+            real_fsync = os.fsync
+            changed = False
+
+            def change_after_completion_flush(fd):
+                nonlocal changed
+                try:
+                    target = os.path.basename(os.readlink(f"/proc/self/fd/{fd}"))
+                except OSError:
+                    target = ""
+                if not changed and target.startswith(".complete."):
+                    with open(samples, "ab") as handle:
+                        handle.write(b'{"sample":2}\n')
+                    changed = True
+                return real_fsync(fd)
+
+            with mock.patch.object(
+                    os, "fsync", side_effect=change_after_completion_flush):
+                with self.assertRaises(
+                        RuntimeError,
+                        msg="changed samples were committed by complete.json"):
+                    corpus_mem.publish_completion(tmp, run_id)
+            self.assertTrue(changed, "the artifact mutation was not injected")
+            self.assertFalse(os.path.exists(os.path.join(tmp, "complete.json")))
+            self.assertFalse(any(
+                name.startswith(".complete.") for name in os.listdir(tmp)
+            ))
+
     def test_campaign_completion_binds_every_requested_host_arm(self):
         with open(EXTRA) as handle:
             source = handle.read()
@@ -2639,6 +2780,11 @@ class CampaignIntegrityRegression(unittest.TestCase):
                     "size": len(payload),
                     "sha256": hashlib.sha256(payload).hexdigest(),
                 })
+            memory_directory = os.path.join(tmp, "memory")
+            os.mkdir(memory_directory)
+            memory_payload = self.memory_completion_bytes("a" * 32)
+            with open(os.path.join(memory_directory, "complete.json"), "wb") as handle:
+                handle.write(memory_payload)
             script = (
                 "set -euo pipefail\n"
                 f"RESULTS={tmp!r}\nRUN_ID={'a' * 32!r}\n"
@@ -2650,17 +2796,178 @@ class CampaignIntegrityRegression(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
             with open(os.path.join(tmp, "campaign-complete.json")) as handle:
                 completion = json.load(handle)
+            self.assertEqual(completion["schema_version"], 2)
             self.assertEqual(set(completion), {
                 "schema_version", "run_id", "runtime_bundle_sha256",
-                "host_completes",
+                "phases", "host_completes", "memory_complete",
             })
-            self.assertEqual(completion["schema_version"], 1)
             self.assertEqual(completion["run_id"], "a" * 32)
             self.assertEqual(completion["runtime_bundle_sha256"], "b" * 64)
+            self.assertEqual(completion["phases"], ["hostcdp", "memory"])
             self.assertEqual(completion["host_completes"],
                              sorted(expected, key=lambda item: item["path"]))
+            self.assertEqual(completion["memory_complete"], {
+                "path": "memory/complete.json",
+                "size": len(memory_payload),
+                "sha256": hashlib.sha256(memory_payload).hexdigest(),
+            })
             self.assertFalse(any(name.startswith(".campaign-complete.")
                                  for name in os.listdir(tmp)))
+
+    def test_memory_only_campaign_requires_and_binds_memory_completion(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        start = source.index("publish_campaign_completion() {")
+        end = source.index("\ncleanup() {", start)
+        publisher = source[start:end]
+
+        with tempfile.TemporaryDirectory() as missing:
+            script = (
+                "set -euo pipefail\n"
+                f"RESULTS={missing!r}\nRUN_ID={'a' * 32!r}\n"
+                f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256={'b' * 64!r}\n"
+                "PHASES=memory\nHOSTCDP_ARMS=free,cpu2\n"
+                + publisher + "\npublish_campaign_completion\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertNotEqual(
+                proc.returncode, 0,
+                "memory-only campaign authorized zero completion artifacts",
+            )
+            self.assertFalse(os.path.exists(
+                os.path.join(missing, "campaign-complete.json")
+            ))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            memory = os.path.join(tmp, "memory")
+            os.mkdir(memory)
+            payload = self.memory_completion_bytes("a" * 32)
+            with open(os.path.join(memory, "complete.json"), "wb") as handle:
+                handle.write(payload)
+            script = (
+                "set -euo pipefail\n"
+                f"RESULTS={tmp!r}\nRUN_ID={'a' * 32!r}\n"
+                f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256={'b' * 64!r}\n"
+                "PHASES=memory\nHOSTCDP_ARMS=free,cpu2\n"
+                + publisher + "\npublish_campaign_completion\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True, timeout=30
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            with open(os.path.join(tmp, "campaign-complete.json")) as handle:
+                completion = json.load(handle)
+            self.assertEqual(completion["schema_version"], 2)
+            self.assertEqual(completion["phases"], ["memory"])
+            self.assertEqual(completion["host_completes"], [])
+            self.assertEqual(completion["memory_complete"], {
+                "path": "memory/complete.json",
+                "size": len(payload),
+                "sha256": hashlib.sha256(payload).hexdigest(),
+            })
+
+    def test_campaign_rejects_invalid_memory_completion(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        start = source.index("publish_campaign_completion() {")
+        end = source.index("\ncleanup() {", start)
+        publisher = source[start:end]
+        mutations = {
+            "old schema": lambda record: record.update(schema_version=0),
+            "boolean schema": lambda record: record.update(schema_version=True),
+            "wrong run": lambda record: record.update(run_id="c" * 32),
+            "missing artifact": lambda record: record["artifacts"].pop(),
+            "unsorted artifacts": lambda record: record["artifacts"].reverse(),
+            "unexpected field": lambda record: record.update(extra=True),
+            "invalid size": lambda record:
+                record["artifacts"][0].update(size=True),
+            "invalid digest": lambda record:
+                record["artifacts"][0].update(sha256="A" * 64),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                memory = os.path.join(tmp, "memory")
+                os.mkdir(memory)
+                record = self.memory_completion_record("a" * 32)
+                mutate(record)
+                with open(os.path.join(memory, "complete.json"), "w") as handle:
+                    json.dump(record, handle)
+                script = (
+                    "set -euo pipefail\n"
+                    f"RESULTS={tmp!r}\nRUN_ID={'a' * 32!r}\n"
+                    f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256={'b' * 64!r}\n"
+                    "PHASES=memory\nHOSTCDP_ARMS=free,cpu2\n"
+                    + publisher + "\npublish_campaign_completion\n"
+                )
+                proc = subprocess.run(
+                    ["bash", "-c", script], capture_output=True,
+                    text=True, timeout=30,
+                )
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"campaign accepted memory completion with {label}",
+                )
+                self.assertFalse(os.path.exists(
+                    os.path.join(tmp, "campaign-complete.json")
+                ))
+
+    def test_campaign_rechecks_memory_completion_before_publication(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        start = source.index("publish_campaign_completion() {")
+        end = source.index("\ncleanup() {", start)
+        publisher = source[start:end]
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as hook_dir:
+            memory = os.path.join(tmp, "memory")
+            os.mkdir(memory)
+            completion_path = os.path.join(memory, "complete.json")
+            with open(completion_path, "wb") as handle:
+                handle.write(self.memory_completion_bytes("a" * 32))
+            hook = f'''\
+import os
+
+_real_fsync = os.fsync
+_changed = False
+
+def _fsync(fd):
+    global _changed
+    try:
+        target = os.path.basename(os.readlink(f"/proc/self/fd/{{fd}}"))
+    except OSError:
+        target = ""
+    if not _changed and target.startswith(".campaign-complete."):
+        with open({completion_path!r}, "ab") as handle:
+            handle.write(b"changed after load\\n")
+        _changed = True
+    return _real_fsync(fd)
+
+os.fsync = _fsync
+'''
+            with open(os.path.join(hook_dir, "sitecustomize.py"), "w") as handle:
+                handle.write(hook)
+            script = (
+                "set -euo pipefail\n"
+                f"RESULTS={tmp!r}\nRUN_ID={'a' * 32!r}\n"
+                f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256={'b' * 64!r}\n"
+                "PHASES=memory\nHOSTCDP_ARMS=free,cpu2\n"
+                + publisher + "\npublish_campaign_completion\n"
+            )
+            env = os.environ.copy()
+            env["PYTHONPATH"] = hook_dir
+            proc = subprocess.run(
+                ["bash", "-c", script], env=env,
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertNotEqual(
+                proc.returncode, 0,
+                "changed memory completion was published into campaign completion",
+            )
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "campaign-complete.json")
+            ))
 
     def test_only_successful_cleanup_publishes_campaign_completion(self):
         with open(EXTRA) as handle:
@@ -4345,7 +4652,8 @@ class ComparePublicationGate(unittest.TestCase):
             json.dump(complete, handle)
 
     @staticmethod
-    def write_campaign_complete(campaign, hosts, run_id, runtime_sha256):
+    def write_campaign_complete(campaign, hosts, run_id, runtime_sha256,
+                                memory=None, phases=None):
         host_completes = []
         for host in hosts:
             complete = os.path.join(host, "complete.json")
@@ -4357,12 +4665,25 @@ class ComparePublicationGate(unittest.TestCase):
                 "sha256": hashlib.sha256(raw).hexdigest(),
             })
         host_completes.sort(key=lambda record: record["path"])
+        memory_complete = None
+        if memory is not None:
+            with open(memory, "rb") as handle:
+                raw = handle.read()
+            memory_complete = {
+                "path": os.path.relpath(memory, campaign),
+                "size": len(raw),
+                "sha256": hashlib.sha256(raw).hexdigest(),
+            }
+        if phases is None:
+            phases = ["hostcdp"] + (["memory"] if memory is not None else [])
         with open(os.path.join(campaign, "campaign-complete.json"), "w") as handle:
             json.dump({
-                "schema_version": 1,
+                "schema_version": 2,
                 "run_id": run_id,
                 "runtime_bundle_sha256": runtime_sha256,
+                "phases": phases,
                 "host_completes": host_completes,
+                "memory_complete": memory_complete,
             }, handle)
 
     def make_campaign_host(self, rows=None, arm="free"):
@@ -5323,6 +5644,19 @@ sys.stdin.read(1)
         campaign, host = self.make_campaign_host()
         return run, campaign, host
 
+    def valid_campaign_memory_comparison(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        run_id = "1" * 32
+        memory_directory = os.path.join(campaign, "memory")
+        os.mkdir(memory_directory)
+        memory = os.path.join(memory_directory, "complete.json")
+        with open(memory, "wb") as handle:
+            handle.write(CampaignIntegrityRegression.memory_completion_bytes(run_id))
+        self.write_campaign_complete(
+            campaign, [host], run_id, "9" * 64, memory=memory
+        )
+        return run, campaign, host, memory
+
     def test_a_complete_compatible_host_is_compared(self):
         run, host = self.valid_comparison()
         proc, out = self.run_compare(run, [("host", host)])
@@ -5358,6 +5692,58 @@ sys.stdin.read(1)
                 os.path.join(campaign, "campaign-complete.json")
             )["sha256"],
         )
+
+    def test_campaign_memory_completion_is_bound_and_revalidated(self):
+        run, _campaign, host, memory = self.valid_campaign_memory_comparison()
+
+        proc, out = self.run_compare(run, [("free", host)])
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        with open(out) as handle:
+            comparison = json.load(handle)
+        self.assertEqual(
+            comparison["input_identity"]["hosts"]["free"]
+                      ["memory_complete_json"]["sha256"],
+            self.artifact_identity(memory)["sha256"],
+        )
+
+        os.unlink(out)
+        with open(memory, "ab") as handle:
+            handle.write(b"changed after campaign completion\n")
+        proc, out = self.run_compare(run, [("free", host)])
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "campaign completion authorized changed memory completion bytes",
+        )
+        self.assertIn("memory/complete.json", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_campaign_completion_validates_memory_binding(self):
+        mutations = {
+            "missing record": lambda complete:
+                complete.update(memory_complete=None),
+            "undeclared phase": lambda complete:
+                complete.update(phases=["hostcdp"]),
+            "unsafe path": lambda complete:
+                complete["memory_complete"].update(path="memory/../complete.json"),
+            "boolean size": lambda complete:
+                complete["memory_complete"].update(size=True),
+            "invalid digest": lambda complete:
+                complete["memory_complete"].update(sha256="A" * 64),
+            "unexpected field": lambda complete:
+                complete["memory_complete"].update(extra=True),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run, campaign, host, _memory = \
+                    self.valid_campaign_memory_comparison()
+                self.rewrite_campaign_complete(campaign, mutate)
+                proc, out = self.run_compare(run, [("free", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"campaign accepted memory binding with {label}",
+                )
+                self.assertIn("campaign-complete.json", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
 
     def test_one_campaign_completion_binds_both_host_arms(self):
         run = self.make_run(
@@ -5458,17 +5844,27 @@ sys.stdin.read(1)
 
         mutations = {
             "schema version": lambda complete:
-                complete.update(schema_version=2),
+                complete.update(schema_version=3),
+            "old schema version": lambda complete:
+                complete.update(schema_version=1),
             "boolean schema version": lambda complete:
                 complete.update(schema_version=True),
             "float schema version": lambda complete:
-                complete.update(schema_version=1.0),
+                complete.update(schema_version=2.0),
             "parent run": lambda complete:
                 complete.update(run_id="2" * 32),
             "unsafe parent run": lambda complete:
                 complete.update(run_id="not-a-campaign-run"),
             "runtime bundle": lambda complete:
                 complete.update(runtime_bundle_sha256="8" * 64),
+            "missing phase": lambda complete:
+                complete.update(phases=[]),
+            "unknown phase": lambda complete:
+                complete.update(phases=["hostcdp", "unknown"]),
+            "duplicate phase": lambda complete:
+                complete.update(phases=["hostcdp", "hostcdp"]),
+            "host child without hostcdp phase": lambda complete:
+                complete.update(phases=["memory"], memory_complete=None),
             "missing selected child": lambda complete:
                 complete.update(host_completes=[]),
             "duplicate selected child": lambda complete:

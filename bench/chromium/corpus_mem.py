@@ -33,9 +33,11 @@ import math
 import os
 import random
 import re
+import secrets
 import shutil
 import signal
 import socket
+import stat
 import statistics
 import subprocess
 import sys
@@ -131,6 +133,178 @@ def sha256_file(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+MEMORY_COMPLETION_ARTIFACTS = ("run.json", "samples.jsonl", "summary.json")
+
+
+def read_memory_artifact(directory_fd, name, *, capture=False):
+    """Read one final memory artifact without following or changing its entry."""
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(name, flags, dir_fd=directory_fd)
+    except OSError as exc:
+        raise RuntimeError(f"cannot open final memory artifact {name}: {exc}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RuntimeError(f"final memory artifact {name} is not a regular file")
+        digest = hashlib.sha256()
+        chunks = [] if capture else None
+        size = 0
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            if chunks is not None:
+                chunks.append(chunk)
+            digest.update(chunk)
+            size += len(chunk)
+        after = os.fstat(fd)
+    finally:
+        os.close(fd)
+    identity_before = (
+        before.st_dev, before.st_ino, before.st_size,
+        before.st_mtime_ns, before.st_ctime_ns,
+    )
+    identity_after = (
+        after.st_dev, after.st_ino, after.st_size,
+        after.st_mtime_ns, after.st_ctime_ns,
+    )
+    if identity_before != identity_after or size != after.st_size:
+        raise RuntimeError(f"final memory artifact {name} changed while being read")
+    return (
+        {"path": name, "size": size, "sha256": digest.hexdigest()},
+        b"".join(chunks) if chunks is not None else None,
+    )
+
+
+def publish_completion(results, run_id):
+    """Atomically commit the three closed files that define a memory run."""
+    directory_flags = (
+        os.O_RDONLY
+        | getattr(os, "O_DIRECTORY", 0)
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        directory_fd = os.open(results, directory_flags)
+    except OSError as exc:
+        raise RuntimeError(
+            f"cannot open memory result directory {results}: {exc}"
+        ) from exc
+    directory_stat = os.fstat(directory_fd)
+    temporary = f".complete.{os.getpid()}.{secrets.token_hex(8)}"
+    target = "complete.json"
+    temporary_exists = False
+    linked = False
+    written_stat = None
+
+    def ensure_directory():
+        try:
+            current = os.stat(results)
+        except OSError as exc:
+            raise RuntimeError(
+                f"memory result directory {results} cannot be rechecked: {exc}"
+            ) from exc
+        if not os.path.samestat(current, directory_stat):
+            raise RuntimeError(
+                f"memory result directory {results} changed before completion"
+            )
+
+    def read_all():
+        rows = []
+        raw = {}
+        for name in MEMORY_COMPLETION_ARTIFACTS:
+            capture = name in {"run.json", "summary.json"}
+            identity, payload = read_memory_artifact(
+                directory_fd, name, capture=capture
+            )
+            rows.append(identity)
+            if capture:
+                raw[name] = payload
+        return rows, raw
+
+    try:
+        ensure_directory()
+        artifacts, raw = read_all()
+        for name in ("run.json", "summary.json"):
+            try:
+                record = json.loads(raw[name])
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(f"final memory artifact {name} is not JSON") from exc
+            if not isinstance(record, dict) or record.get("run_id") != run_id:
+                raise RuntimeError(
+                    f"final memory artifact {name} does not name run_id {run_id}"
+                )
+        record = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "artifacts": artifacts,
+        }
+        flags = (
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+        )
+        fd = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        temporary_exists = True
+        try:
+            handle = os.fdopen(fd, "w")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
+            json.dump(record, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+            written_stat = os.fstat(handle.fileno())
+
+        ensure_directory()
+        current_artifacts, _raw = read_all()
+        if current_artifacts != artifacts:
+            raise RuntimeError("final memory artifacts changed before completion")
+        try:
+            os.link(
+                temporary,
+                target,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileExistsError as exc:
+            raise RuntimeError(
+                f"memory completion {os.path.join(results, target)} already exists"
+            ) from exc
+        linked = True
+        os.unlink(temporary, dir_fd=directory_fd)
+        temporary_exists = False
+        published = os.stat(target, dir_fd=directory_fd, follow_symlinks=False)
+        if not os.path.samestat(published, written_stat):
+            raise RuntimeError("memory completion changed during publication")
+        ensure_directory()
+        os.fsync(directory_fd)
+    except BaseException:
+        if linked:
+            try:
+                published = os.stat(
+                    target, dir_fd=directory_fd, follow_symlinks=False
+                )
+                if written_stat is not None and os.path.samestat(
+                        published, written_stat):
+                    os.unlink(target, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        if temporary_exists:
+            try:
+                os.unlink(temporary, dir_fd=directory_fd)
+            except FileNotFoundError:
+                pass
+        try:
+            os.fsync(directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(directory_fd)
 
 
 def validate_args(args):
@@ -1303,6 +1477,10 @@ def main_with_resources(resources):
         summary["fits"][side] = fit
     with open(os.path.join(args.results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
+    try:
+        publish_completion(args.results, args.run_id)
+    except RuntimeError as exc:
+        die(str(exc))
     print(json.dumps(summary["fits"], indent=1))
     log(f"records in {args.results}")
 

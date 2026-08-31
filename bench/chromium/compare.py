@@ -753,7 +753,7 @@ def validate_campaign_completion(directory, meta, child_completion):
         raise Refusal(f"{meta_path} has no {key}")
     runtime_sha256 = meta.get(key)
     if runtime_sha256 is None:
-        return None
+        return None, None
     runtime_sha256 = sha256_field(meta, key, meta_path)
 
     host_directory = os.path.realpath(directory)
@@ -773,15 +773,18 @@ def validate_campaign_completion(directory, meta, child_completion):
         "schema_version",
         "run_id",
         "runtime_bundle_sha256",
+        "phases",
         "host_completes",
+        "memory_complete",
     }
     if set(completion) != expected_keys:
         raise Refusal(
             f"{path} must contain exactly schema_version, run_id, "
-            "runtime_bundle_sha256, and host_completes"
+            "runtime_bundle_sha256, phases, host_completes, and "
+            "memory_complete; older records do not bind memory completion"
         )
     version = completion.get("schema_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
         raise Refusal(f"{path} has unsupported schema_version={version!r}")
     campaign_run_id = completion.get("run_id")
     if (
@@ -808,6 +811,17 @@ def validate_campaign_completion(directory, meta, child_completion):
             f"require run.json run_id={expected_child_run_id!r}, got "
             f"{meta.get('run_id')!r}"
         )
+
+    phases = completion.get("phases")
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(phase not in {"hostcdp", "memory"} for phase in phases)
+        or len(phases) != len(set(phases))
+    ):
+        raise Refusal(f"{path} has invalid phases={phases!r}")
+    if "hostcdp" not in phases:
+        raise Refusal(f"{path} does not declare the hostcdp phase")
 
     children = completion.get("host_completes")
     if not isinstance(children, list) or not children:
@@ -847,7 +861,48 @@ def validate_campaign_completion(directory, meta, child_completion):
             f"sha256={child_completion['sha256']}, recorded "
             f"size={selected['size']} sha256={selected['sha256']}"
         )
-    return artifact_identity(artifact)
+
+    memory_record = completion.get("memory_complete")
+    memory_identity = None
+    if "memory" in phases:
+        label = f"{path} memory_complete"
+        if not isinstance(memory_record, dict) or set(memory_record) != {
+            "path", "size", "sha256"
+        }:
+            raise Refusal(
+                f"{label} must contain exactly path, size, and sha256"
+            )
+        if memory_record.get("path") != "memory/complete.json":
+            raise Refusal(
+                f"{label} has invalid path={memory_record.get('path')!r}"
+            )
+        expected_memory = completion_identity(
+            {
+                "size": memory_record.get("size"),
+                "sha256": memory_record.get("sha256"),
+            },
+            label,
+        )
+        memory_artifact = read_artifact(
+            os.path.join(campaign_directory, "memory", "complete.json")
+        )
+        memory_identity = artifact_identity(memory_artifact)
+        if (
+            expected_memory["size"] != memory_identity["size"]
+            or expected_memory["sha256"] != memory_identity["sha256"]
+        ):
+            raise Refusal(
+                f"{path} does not bind the current memory/complete.json: current "
+                f"size={memory_identity['size']} "
+                f"sha256={memory_identity['sha256']}, recorded "
+                f"size={expected_memory['size']} "
+                f"sha256={expected_memory['sha256']}"
+            )
+    elif memory_record is not None:
+        raise Refusal(
+            f"{path} binds memory_complete without declaring the memory phase"
+        )
+    return artifact_identity(artifact), memory_identity
 
 
 def revalidate_artifact_identity(label, expected):
@@ -884,9 +939,10 @@ def load_host_dataset(directory, require_driver=False):
     completion_identity_record = validate_host_completion(
         directory, run_id, bound_artifacts
     )
-    campaign_completion_identity = validate_campaign_completion(
-        directory, meta, completion_identity_record
-    )
+    (
+        campaign_completion_identity,
+        memory_completion_identity,
+    ) = validate_campaign_completion(directory, meta, completion_identity_record)
     reject_withdrawn(directory)
     counts = host_counts(meta, meta_artifact["path"])
     urls = declared_urls(meta, meta_artifact["path"])
@@ -988,6 +1044,8 @@ def load_host_dataset(directory, require_driver=False):
     }
     if campaign_completion_identity is not None:
         identities["campaign_complete_json"] = campaign_completion_identity
+    if memory_completion_identity is not None:
+        identities["memory_complete_json"] = memory_completion_identity
     revalidate_host_inputs(directory, identities)
     return meta, records, measured_rows, counts, identities
 
@@ -1332,6 +1390,8 @@ def comparison_input_paths(args):
                  os.path.join(directory, "WITHDRAWN")),
                 (f"host {ordinal} campaign-complete.json",
                  os.path.join(campaign_directory, "campaign-complete.json")),
+                (f"host {ordinal} memory complete.json",
+                 os.path.join(campaign_directory, "memory", "complete.json")),
                 (f"host {ordinal} campaign WITHDRAWN",
                  os.path.join(campaign_directory, "WITHDRAWN")),
             ))
