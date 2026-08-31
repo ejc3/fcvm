@@ -1226,14 +1226,41 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         """
         from unittest import mock
 
-        p = spawn_pdeathsig_parent(["sleep", "300"])
-        wait_for_child(p.pid)
-        kids = reqbench.children_of(p.pid)
-        self.assertEqual(len(kids), 1, "parent never forked its child")
+        with child_subreaper():
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            kids = []
+            statuses = {}
+            try:
+                wait_for_child(p.pid)
+                kids = reqbench.children_of(p.pid)
+                self.assertEqual(len(kids), 1, "parent never forked its child")
 
-        boom = RuntimeError("host CPU delta is smaller than enclosed harness CPU delta")
-        with mock.patch.object(reqbench, "bounded_cpu_residual", side_effect=boom):
-            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+                boom = RuntimeError(
+                    "host CPU delta is smaller than enclosed harness CPU delta")
+                with mock.patch.object(
+                        reqbench, "bounded_cpu_residual", side_effect=boom):
+                    out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+                self.assertEqual(
+                    p.wait(timeout=5), -signal.SIGKILL,
+                    "fast teardown did not SIGKILL its direct owner",
+                )
+                for pid in kids:
+                    note = f"fast teardown left pdeathsig child {pid} running"
+                    statuses[pid] = reap_orphan(pid, note)
+            finally:
+                if p.poll() is None:
+                    kill_tree(p)
+                for pid in kids:
+                    if pid in statuses:
+                        continue
+                    fields = reqbench.proc_stat_fields(pid)
+                    if fields is not None and fields[0] not in ("Z", "X", "x"):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    statuses[pid] = reap_orphan(
+                        pid, f"cleanup could not reap pdeathsig child {pid}")
 
         self.assertTrue(out["all_gone"], "the process set must still be reaped")
         self.assertNotIn("disk_reap_skipped", out,
@@ -1247,8 +1274,10 @@ class TeardownFastCpuAccounting(unittest.TestCase):
             self.assertNotIn(absent, out,
                              f"{absent} must be ABSENT, not zeroed, when unmeasurable")
         for pid in kids:
-            self.assertFalse(reqbench.proc_stat_fields(pid),
-                             f"child {pid} survived a teardown that reported success")
+            assert_sigkilled(
+                self, pid, statuses[pid],
+                f"child {pid} survived a teardown that reported success",
+            )
 
     def test_the_probe_reports_this_host_tracks_its_own_processes(self):
         """The probe must say yes HERE, or it would excuse every real violation.

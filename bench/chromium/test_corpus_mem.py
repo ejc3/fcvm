@@ -2773,6 +2773,39 @@ class CampaignIntegrityRegression(unittest.TestCase):
         self.assertEqual(result, 124)
         self.assertLess(elapsed, 5)
 
+    def test_phase_supervisor_restores_callers_process_controls(self):
+        original_subreaper = phase_supervisor.get_process_control(
+            phase_supervisor.PR_GET_CHILD_SUBREAPER)
+        original_pdeathsig = phase_supervisor.get_process_control(
+            phase_supervisor.PR_GET_PDEATHSIG)
+        try:
+            phase_supervisor.set_process_control(
+                phase_supervisor.PR_SET_CHILD_SUBREAPER, 0)
+            phase_supervisor.set_process_control(
+                phase_supervisor.PR_SET_PDEATHSIG, 0)
+            result = phase_supervisor.supervise(
+                [sys.executable, "-c", "pass"], os.getppid(),
+                term_grace=0.05, kill_grace=1.0,
+            )
+            self.assertEqual(result, 0)
+            self.assertEqual(
+                phase_supervisor.get_process_control(
+                    phase_supervisor.PR_GET_CHILD_SUBREAPER),
+                0,
+                "supervise left its caller adopting unrelated descendants",
+            )
+            self.assertEqual(
+                phase_supervisor.get_process_control(
+                    phase_supervisor.PR_GET_PDEATHSIG),
+                0,
+                "supervise left its caller armed against its own parent",
+            )
+        finally:
+            phase_supervisor.set_process_control(
+                phase_supervisor.PR_SET_CHILD_SUBREAPER, original_subreaper)
+            phase_supervisor.set_process_control(
+                phase_supervisor.PR_SET_PDEATHSIG, original_pdeathsig)
+
     def test_phase_supervisor_control_is_open_before_the_phase_launches(self):
         with open(PHASE_SUPERVISOR) as handle:
             source = handle.read()
@@ -4520,7 +4553,8 @@ class ProvenanceNamesBytes(unittest.TestCase):
         for name in ("corpus_extra.sh", "corpus_mem.py", "hostcdp.sh",
                      "cdpdrive.py", "render.py", "corpus_serve.py", "report.py",
                      "reqbench.py", "reqbench.sh", "reqanalyze.py", "wddrive.py",
-                     "owned_process.py", "corpus_campaign.sh", "fcvm"):
+                     "owned_process.py", "phase_supervisor.py",
+                     "corpus_campaign.sh", "fcvm"):
             if bench_has_files:
                 with open(os.path.join(bench, name), "w") as handle:
                     handle.write(name)

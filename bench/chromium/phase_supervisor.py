@@ -16,16 +16,31 @@ import time
 
 
 PR_SET_CHILD_SUBREAPER = 36
+PR_GET_CHILD_SUBREAPER = 37
 PR_SET_PDEATHSIG = 1
+PR_GET_PDEATHSIG = 2
 GRACE_SECONDS = 5.0
 KILL_REAP_SECONDS = 30.0
 
 
-def become_subreaper():
+def get_process_control(option):
     libc = ctypes.CDLL(None, use_errno=True)
-    if libc.prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
+    value = ctypes.c_int()
+    if libc.prctl(option, ctypes.byref(value), 0, 0, 0) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
+    return value.value
+
+
+def set_process_control(option, value):
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(option, value, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def become_subreaper():
+    set_process_control(PR_SET_CHILD_SUBREAPER, 1)
 
 
 def arm_parent_death(expected_parent):
@@ -334,13 +349,11 @@ def emergency_cleanup(child, wake_read, term_grace, kill_grace):
     reap_available()
 
 
-def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
-              pass_fds=(), command_timeout=None, control_path=None,
-              return_command_status_on_signal=False):
+def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
+                     command_timeout=None, control_path=None,
+                     return_command_status_on_signal=False):
     term_grace = GRACE_SECONDS if term_grace is None else term_grace
     kill_grace = KILL_REAP_SECONDS if kill_grace is None else kill_grace
-    arm_parent_death(expected_parent)
-    become_subreaper()
     wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
     pending = []
 
@@ -411,6 +424,29 @@ def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
             signal.signal(signum, handler)
         os.close(wake_read)
         os.close(wake_write)
+
+
+def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
+              pass_fds=(), command_timeout=None, control_path=None,
+              return_command_status_on_signal=False):
+    previous_subreaper = get_process_control(PR_GET_CHILD_SUBREAPER)
+    previous_pdeathsig = get_process_control(PR_GET_PDEATHSIG)
+    try:
+        arm_parent_death(expected_parent)
+        become_subreaper()
+        return _supervise_armed(
+            argv, term_grace, kill_grace, pass_fds, command_timeout,
+            control_path, return_command_status_on_signal,
+        )
+    finally:
+        # _supervise_armed drains and reaps the complete adopted process set
+        # before returning. Restore process-wide controls only after that
+        # lifecycle boundary, and restore both even if one prctl fails.
+        try:
+            set_process_control(
+                PR_SET_CHILD_SUBREAPER, previous_subreaper)
+        finally:
+            set_process_control(PR_SET_PDEATHSIG, previous_pdeathsig)
 
 
 def main(argv=None):
