@@ -646,6 +646,42 @@ class RunScopedContainerCleanup(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = os.path.join(tmp, "bin")
             os.mkdir(bindir)
+            cgroup_root = os.path.join(tmp, "cgroup")
+            os.mkdir(cgroup_root)
+            cgroup_lock = os.path.join(tmp, "cgroup-lock")
+            sudo = os.path.join(bindir, "sudo")
+            with open(sudo, "w") as handle:
+                handle.write(
+                    "#!/usr/bin/env python3\n"
+                    "import os, sys\n"
+                    "args = sys.argv[1:]\n"
+                    "if args[:1] != ['-n']:\n"
+                    " raise SystemExit(64)\n"
+                    "args = args[1:]\n"
+                    "root = os.environ['FAKE_CGROUP_ROOT']\n"
+                    "lock = os.environ['FAKE_CGROUP_LOCK']\n"
+                    "if args[0] == 'install':\n"
+                    " target = args[-1]\n"
+                    " if target != lock:\n"
+                    "  raise SystemExit(96)\n"
+                    " os.makedirs(target, exist_ok=True)\n"
+                    "elif args[0] == 'mkdir':\n"
+                    " target = args[-1]\n"
+                    " if os.path.dirname(target) != root:\n"
+                    "  raise SystemExit(96)\n"
+                    " os.mkdir(target)\n"
+                    "elif args[0] == 'sh':\n"
+                    " raise SystemExit(0)\n"
+                    "else:\n"
+                    " try:\n"
+                    "  internal = args.index('--internal-remove-memory-cgroup')\n"
+                    " except ValueError:\n"
+                    "  raise SystemExit(96)\n"
+                    " if args[internal + 1] != root:\n"
+                    "  raise SystemExit(96)\n"
+                    " os.execv(args[0], args)\n"
+                )
+            os.chmod(sudo, 0o755)
             podman = os.path.join(bindir, "podman")
             state_path = os.path.join(tmp, "container.json")
             ready_path = os.path.join(tmp, "worker.ready")
@@ -738,6 +774,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 "import sys\n"
                 f"sys.path.insert(0, {HERE!r})\n"
                 "import corpus_mem\n"
+                f"corpus_mem.MEMORY_CGROUP_ROOT = {cgroup_root!r}\n"
+                f"corpus_mem.MEMORY_CGROUP_LOCK_DIR = {cgroup_lock!r}\n"
                 "raise SystemExit(corpus_mem.run_memory_lifecycle(\n"
                 f" [sys.executable, '-c', {worker_code!r}],\n"
                 f" {run_id!r}, {token!r}, {lock_dir!r}, {lifecycle_dir!r},\n"
@@ -748,6 +786,8 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 PATH=bindir + os.pathsep + os.environ["PATH"],
                 FAKE_CONTAINER_STATE=state_path,
                 FAKE_ABSENCE_PROOF=absence_path,
+                FAKE_CGROUP_ROOT=cgroup_root,
+                FAKE_CGROUP_LOCK=cgroup_lock,
             )
             wrapper = subprocess.Popen(
                 [sys.executable, "-c", wrapper_code], env=env,
