@@ -45,12 +45,15 @@ import tempfile
 import time
 import uuid
 
+import host_resource_finalizer
 from reqbench import snapshot_generation, valid_snapshot_name
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
 CDPDRIVE = os.path.join(HERE, "cdpdrive.py")
 PHASE_SUPERVISOR = os.path.join(HERE, "phase_supervisor.py")
+MEMORY_CGROUP_ROOT = "/sys/fs/cgroup"
+MEMORY_CGROUP_LOCK_DIR = "/run/lock/fcvm-memory-cgroups.lock"
 
 
 def log(msg):
@@ -470,18 +473,12 @@ def port_open(host, port, timeout=0.5):
 # --------------------------------------------------------------------------
 # sampling (report.py, unmodified, is the only thing that reads memory)
 # --------------------------------------------------------------------------
-def sample(extra: dict, cgroup_root=None, cgroup_prefix=None, podman_prefix=None,
-           state_dir=None, name_prefix=None):
+def sample(extra: dict, cgroup_root=None, cgroup_prefix=None, podman_prefix=None):
     cmd = [sys.executable, REPORT, "sample"]
     if cgroup_root:
         cmd += ["--cgroup-root", cgroup_root, "--cgroup-prefix", cgroup_prefix]
     if podman_prefix:
         cmd += ["--podman-prefix", podman_prefix]
-    if state_dir:
-        # The REFUTED basis, recorded on purpose: PSS over the firecracker
-        # processes alone. It is never the headline; it sits in the record so a
-        # reader can see how far off the old accounting was from the same run.
-        cmd += ["--state-dir", state_dir, "--name-prefix", name_prefix]
     cmd += ["--extra", ", ".join(f'"{k}": {json.dumps(v)}' for k, v in extra.items())]
     r = sh(cmd)
     if r.returncode != 0:
@@ -525,14 +522,27 @@ class CgroupSet:
     def __init__(self, base):
         self.base = base
         self.created = False
+        self.finalized_externally = False
 
     def setup(self):
-        if os.path.exists(self.base):
-            die(f"cgroup {self.base} already exists; this run does not own it")
-        made = sh_bounded(["sudo", "-n", "mkdir", self.base], 30)
-        if made.returncode != 0:
-            die(f"cannot create {self.base}; per-instance cgroup accounting is the measurement")
-        self.created = True
+        if os.environ.get("FCVM_MEMORY_CGROUP_FD"):
+            try:
+                descriptor = host_resource_finalizer.verify_pinned_memory_cgroup(
+                    self.base)
+            except host_resource_finalizer.FinalizerError as exc:
+                die(str(exc))
+            self.base = f"/proc/{os.getpid()}/fd/{descriptor}"
+            self.created = True
+            self.finalized_externally = True
+        elif os.environ.get("FCVM_MEMORY_CGROUP_ROOT"):
+            die("memory cgroup finalizer did not pass its pinned descriptor")
+        else:
+            if os.path.exists(self.base):
+                die(f"cgroup {self.base} already exists; this run does not own it")
+            made = sh_bounded(["sudo", "-n", "mkdir", self.base], 30)
+            if made.returncode != 0:
+                die(f"cannot create {self.base}; per-instance cgroup accounting is the measurement")
+            self.created = True
         r = sh_bounded(
             ["sudo", "-n", "sh", "-c",
              f"echo '+memory' > {self.base}/cgroup.subtree_control"], 30)
@@ -558,6 +568,8 @@ class CgroupSet:
 
     def rm_all(self):
         if not self.created:
+            return
+        if self.finalized_externally:
             return
         try:
             names = sorted(os.listdir(self.base)) if os.path.isdir(self.base) else []
@@ -787,9 +799,8 @@ class FcvmSide:
         The serve is shared by every clone. Clone-incremental fits keep it
         separate and report it as a fixed cost; concrete-N arrangement density
         adds it once to the clone totals."""
-        rec = sample(extra, cgroup_root=self.cg.base, cgroup_prefix=f"req-{cell_tag}-",
-                     state_dir=self.args.state_dir,
-                     name_prefix=f"mem-{self.run_id}-{cell_tag}-")
+        rec = sample(extra, cgroup_root=self.cg.base,
+                     cgroup_prefix=f"req-{cell_tag}-")
         serve = sample({"_": 0}, cgroup_root=self.cg.base, cgroup_prefix="serve-")
         missing = empty_bases(serve, self.name)
         if missing:
@@ -838,6 +849,45 @@ MEMORY_FINALIZER_TIMEOUT = 180.0
 MEMORY_ROLE_ENV = "FCVM_MEMORY_LIFECYCLE_ROLE"
 
 
+def memory_argument_parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--results", required=True)
+    parser.add_argument("--tag", required=True,
+                        help="golden snapshot the clones restore from")
+    parser.add_argument("--image", default="localhost/chromium-bench-req")
+    parser.add_argument(
+        "--image-id", default="",
+        help="exact preflight image identity; the logical tag remains in provenance")
+    parser.add_argument("--urls", required=True, help="comma-separated corpus")
+    parser.add_argument("--ns", default="1,2,4,8")
+    parser.add_argument("--reps", type=int, default=14)
+    parser.add_argument(
+        "--seed", type=int, default=20260830,
+        help="recorded seed for the interleaved memory-cell schedule")
+    parser.add_argument(
+        "--fcvm",
+        default=os.path.join(
+            os.path.dirname(os.path.dirname(HERE)), "target/release/fcvm"))
+    parser.add_argument("--data-root", default="/mnt/fcvm-btrfs")
+    parser.add_argument("--cdp-port", type=int, default=9222)
+    parser.add_argument("--container-create-ops-dir", default="")
+    parser.add_argument("--uffd-mode", default="minor")
+    parser.add_argument("--uffd-prefetch", default="on")
+    parser.add_argument("--settle", type=float, default=5.0)
+    parser.add_argument("--quiet-limit", type=float, default=1.0)
+    parser.add_argument("--quiet-wait", type=float, default=300.0)
+    parser.add_argument(
+        "--run-id", default="",
+        help="owner ID shared with the outer cleanup; defaults to a UUID")
+    parser.add_argument(
+        "--container-owner-token", default="",
+        help="32-hex token proving which containers this invocation created")
+    parser.add_argument("--source-revision", required=True)
+    parser.add_argument("--runtime-bundle-sha256", required=True)
+    parser.add_argument("--corpus-extra-runtime-bundle-sha256", required=True)
+    return parser
+
+
 def read_lifecycle_completion(path, token):
     try:
         with open(path) as handle:
@@ -868,10 +918,12 @@ def run_memory_lifecycle(command, run_id, owner_token, lock_dir, lifecycle_dir,
     if child_environment:
         environment.update(child_environment)
     environment.update({
-        "FCVM_FINALIZER_MODE": "container-set",
+        "FCVM_FINALIZER_MODE": "memory-set",
         "FCVM_CONTAINER_RUN_ID": run_id,
         "FCVM_CONTAINER_OWNER_TOKEN": owner_token,
         "FCVM_CONTAINER_CREATE_LOCK_DIR": lock_dir,
+        "FCVM_MEMORY_CGROUP_ROOT": MEMORY_CGROUP_ROOT,
+        "FCVM_MEMORY_CGROUP_LOCK_DIR": MEMORY_CGROUP_LOCK_DIR,
     })
     supervisor = subprocess.Popen(
         [
@@ -883,6 +935,8 @@ def run_memory_lifecycle(command, run_id, owner_token, lock_dir, lifecycle_dir,
             "--finalizer-timeout", str(MEMORY_FINALIZER_TIMEOUT),
             "--completion-path", completion_path,
             "--completion-token", completion_token,
+            "--memory-cgroup-base",
+            os.path.join(MEMORY_CGROUP_ROOT, f"cbmem-{run_id}.slice"),
             "--", *command,
         ],
         stdin=subprocess.DEVNULL,
@@ -1758,6 +1812,9 @@ def main():
     """Arm run-level cleanup before starting the measured worker."""
     help_only = any(argument in ("-h", "--help") for argument in sys.argv[1:])
     if os.environ.get(MEMORY_ROLE_ENV) != "worker" and not help_only:
+        # Parsing cannot create a container. Reject malformed invocations before
+        # arming a finalizer for a worker that will never start.
+        memory_argument_parser().parse_args(sys.argv[1:])
         try:
             return bootstrap_memory_lifecycle(sys.argv[1:])
         except RuntimeError as exc:
@@ -1767,34 +1824,7 @@ def main():
 
 
 def main_with_resources(resources):
-    p = argparse.ArgumentParser()
-    p.add_argument("--results", required=True)
-    p.add_argument("--tag", required=True, help="golden snapshot the clones restore from")
-    p.add_argument("--image", default="localhost/chromium-bench-req")
-    p.add_argument("--image-id", default="",
-                   help="exact preflight image identity; the logical tag remains in provenance")
-    p.add_argument("--urls", required=True, help="comma-separated corpus")
-    p.add_argument("--ns", default="1,2,4,8")
-    p.add_argument("--reps", type=int, default=14)
-    p.add_argument("--seed", type=int, default=20260830,
-                   help="recorded seed for the interleaved memory-cell schedule")
-    p.add_argument("--fcvm", default=os.path.join(os.path.dirname(os.path.dirname(HERE)), "target/release/fcvm"))
-    p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
-    p.add_argument("--cdp-port", type=int, default=9222)
-    p.add_argument("--container-create-ops-dir", default="")
-    p.add_argument("--uffd-mode", default="minor")
-    p.add_argument("--uffd-prefetch", default="on")
-    p.add_argument("--settle", type=float, default=5.0)
-    p.add_argument("--quiet-limit", type=float, default=1.0)
-    p.add_argument("--quiet-wait", type=float, default=300.0)
-    p.add_argument("--run-id", default="",
-                   help="owner ID shared with the outer cleanup; defaults to a UUID")
-    p.add_argument("--container-owner-token", default="",
-                   help="32-hex token proving which containers this invocation created")
-    p.add_argument("--source-revision", required=True)
-    p.add_argument("--runtime-bundle-sha256", required=True)
-    p.add_argument("--corpus-extra-runtime-bundle-sha256", required=True)
-    args = p.parse_args()
+    args = memory_argument_parser().parse_args()
 
     args.urls = parse_csv(args.urls, "--urls")
     try:
@@ -1889,7 +1919,8 @@ def main_with_resources(resources):
     with open(os.path.join(args.results, "run.json"), "x") as f:
         json.dump(meta, f, indent=1)
 
-    cg = CgroupSet(f"/sys/fs/cgroup/cbmem-{args.run_id}.slice")
+    cg = CgroupSet(
+        os.path.join(MEMORY_CGROUP_ROOT, f"cbmem-{args.run_id}.slice"))
     cells = []
     out = open(os.path.join(args.results, "samples.jsonl"), "x")
     fcvm_side = None

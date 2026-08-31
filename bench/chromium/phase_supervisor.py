@@ -426,7 +426,7 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
                      return_command_status_on_signal=False, finalizer=None,
                      finalizer_timeout=FINALIZER_TIMEOUT_SECONDS,
                      completion_path=None, completion_token=None,
-                     drain_certificate=None):
+                     drain_certificate=None, memory_cgroup_base=None):
     term_grace = GRACE_SECONDS if term_grace is None else term_grace
     kill_grace = KILL_REAP_SECONDS if kill_grace is None else kill_grace
     wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
@@ -451,6 +451,11 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
     completion_armed = False
     phase_drained = False
     finalizer_drained = finalizer is None
+    memory_cgroup_fd = None
+    memory_cgroup_claim_fd = None
+    previous_memory_cgroup_fd = os.environ.get("FCVM_MEMORY_CGROUP_FD")
+    previous_memory_cgroup_claim_fd = os.environ.get(
+        "FCVM_MEMORY_CGROUP_CLAIM_FD")
     try:
         if control_path is not None:
             control_fd = open_control_path(control_path)
@@ -458,8 +463,18 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             publish_completion_state(
                 completion_path, completion_token, "armed")
             completion_armed = True
+        child_pass_fds = tuple(pass_fds)
+        if memory_cgroup_base is not None:
+            import host_resource_finalizer
+            (memory_cgroup_fd,
+             memory_cgroup_claim_fd) = host_resource_finalizer.claim_memory_cgroup(
+                 memory_cgroup_base)
+            os.environ["FCVM_MEMORY_CGROUP_FD"] = str(memory_cgroup_fd)
+            os.environ["FCVM_MEMORY_CGROUP_CLAIM_FD"] = str(
+                memory_cgroup_claim_fd)
+            child_pass_fds += (memory_cgroup_fd, memory_cgroup_claim_fd)
         child = subprocess.Popen(argv, start_new_session=True,
-                                 pass_fds=tuple(pass_fds))
+                                 pass_fds=child_pass_fds)
         pidfd = os.pidfd_open(child.pid)
         selector = selectors.DefaultSelector()
         selector.register(wake_read, selectors.EVENT_READ, "signal")
@@ -521,6 +536,8 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
                     finalizer,
                     term_grace=term_grace,
                     kill_grace=kill_grace,
+                    pass_fds=(memory_cgroup_fd, memory_cgroup_claim_fd)
+                    if memory_cgroup_fd is not None else (),
                     command_timeout=finalizer_timeout,
                     return_command_status_on_signal=True,
                     drain_certificate=finalizer_drain_certificate,
@@ -544,6 +561,18 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
             signal.signal(signum, handler)
         os.close(wake_read)
         os.close(wake_write)
+        if memory_cgroup_fd is not None:
+            os.close(memory_cgroup_fd)
+            os.close(memory_cgroup_claim_fd)
+            if previous_memory_cgroup_fd is None:
+                os.environ.pop("FCVM_MEMORY_CGROUP_FD", None)
+            else:
+                os.environ["FCVM_MEMORY_CGROUP_FD"] = previous_memory_cgroup_fd
+            if previous_memory_cgroup_claim_fd is None:
+                os.environ.pop("FCVM_MEMORY_CGROUP_CLAIM_FD", None)
+            else:
+                os.environ["FCVM_MEMORY_CGROUP_CLAIM_FD"] = (
+                    previous_memory_cgroup_claim_fd)
         if (completion_armed and phase_drained and finalizer_drained
                 and finalizer_error is None):
             publish_completion_state(
@@ -558,7 +587,8 @@ def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
               pass_fds=(), command_timeout=None, control_path=None,
               return_command_status_on_signal=False, finalizer=None,
               finalizer_timeout=FINALIZER_TIMEOUT_SECONDS,
-              completion_path=None, completion_token=None):
+              completion_path=None, completion_token=None,
+              memory_cgroup_base=None):
     previous_subreaper = get_process_control(PR_GET_CHILD_SUBREAPER)
     previous_pdeathsig = get_process_control(PR_GET_PDEATHSIG)
     try:
@@ -568,6 +598,7 @@ def supervise(argv, expected_parent, term_grace=None, kill_grace=None,
             argv, term_grace, kill_grace, pass_fds, command_timeout,
             control_path, return_command_status_on_signal, finalizer,
             finalizer_timeout, completion_path, completion_token,
+            memory_cgroup_base=memory_cgroup_base,
         )
     finally:
         # _supervise_armed drains and reaps the complete adopted process set
@@ -598,6 +629,7 @@ def main(argv=None):
     )
     parser.add_argument("--completion-path")
     parser.add_argument("--completion-token")
+    parser.add_argument("--memory-cgroup-base")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args(argv)
     command = args.command[1:] if args.command[:1] == ["--"] else args.command
@@ -631,7 +663,7 @@ def main(argv=None):
             args.return_command_status_on_signal,
             [args.finalizer] if args.finalizer else None,
             args.finalizer_timeout, args.completion_path,
-            args.completion_token)
+            args.completion_token, args.memory_cgroup_base)
     except (OSError, RuntimeError) as exc:
         print(f"FAILED: phase supervisor: {exc}", file=sys.stderr)
         return 125

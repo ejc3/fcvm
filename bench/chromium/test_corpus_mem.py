@@ -810,6 +810,107 @@ class RunScopedContainerCleanup(unittest.TestCase):
             'if [[ ",$PHASES," == *",memory,"* ]]'):]
         self.assertIn("ACTIVE_PHASE_FINALIZER=memory-containers", memory_call)
 
+    def test_memory_cgroup_finalizer_survives_worker_sigkill(self):
+        """The detached finalizer removes the run's owned cgroup tree."""
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.mkdir(bindir)
+            podman = os.path.join(bindir, "podman")
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    "[ \"$1\" = ps ] && exit 0\n"
+                    "exit 64\n"
+                )
+            os.chmod(podman, 0o755)
+            sudo = os.path.join(bindir, "sudo")
+            with open(sudo, "w") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    "[ \"$1\" = -n ] || exit 64\n"
+                    "shift\n"
+                    "if [ \"$1\" = install ]; then\n"
+                    " for argument in \"$@\"; do target=$argument; done\n"
+                    " mkdir -p -- \"$target\"\n"
+                    " exit\n"
+                    "fi\n"
+                    "[ \"$1\" = sh ] && exit 0\n"
+                    "exec \"$@\"\n"
+                )
+            os.chmod(sudo, 0o755)
+
+            cgroup_root = os.path.join(tmp, "cgroup")
+            os.mkdir(cgroup_root)
+            lifecycle_dir = os.path.join(tmp, "lifecycle")
+            os.mkdir(lifecycle_dir)
+            lock_dir = os.path.join(tmp, "create-ops")
+            os.mkdir(lock_dir)
+            ready_path = os.path.join(tmp, "worker.ready")
+            run_id = "b" * 32
+            token = "a" * 32
+            base = os.path.join(cgroup_root, f"cbmem-{run_id}.slice")
+            leaf = os.path.join(base, "req-fcvm1r1-0")
+            worker_code = (
+                "import os,signal\n"
+                f"import sys; sys.path.insert(0, {HERE!r})\n"
+                "import corpus_mem\n"
+                f"cg=corpus_mem.CgroupSet({base!r})\n"
+                "cg.setup()\n"
+                "os.mkdir(os.path.join(cg.base, 'req-fcvm1r1-0'))\n"
+                f"with open({ready_path!r}, 'w') as target:\n"
+                " target.write(str(os.getpid()))\n"
+                "signal.pause()\n"
+            )
+            wrapper_code = (
+                "import sys\n"
+                f"sys.path.insert(0, {HERE!r})\n"
+                "import corpus_mem\n"
+                f"corpus_mem.MEMORY_CGROUP_ROOT = {cgroup_root!r}\n"
+                f"corpus_mem.MEMORY_CGROUP_LOCK_DIR = {os.path.join(tmp, 'cgroup-lock')!r}\n"
+                "raise SystemExit(corpus_mem.run_memory_lifecycle(\n"
+                f" [sys.executable, '-c', {worker_code!r}],\n"
+                f" {run_id!r}, {token!r}, {lock_dir!r}, {lifecycle_dir!r},\n"
+                " term_grace=0.05, kill_grace=2.0))\n"
+            )
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+            )
+            wrapper = subprocess.Popen(
+                [sys.executable, "-c", wrapper_code], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.isfile(ready_path):
+                    if wrapper.poll() is not None:
+                        stdout, stderr = wrapper.communicate()
+                        self.fail(
+                            f"memory worker exited before readiness: "
+                            f"{wrapper.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("memory worker never created its cgroup")
+                    time.sleep(0.01)
+                with open(ready_path) as handle:
+                    worker_pid = int(handle.read())
+                os.kill(worker_pid, signal.SIGKILL)
+                stdout, stderr = wrapper.communicate(timeout=10)
+                self.assertFalse(
+                    os.path.exists(leaf),
+                    f"SIGKILL left the memory cgroup leaf behind: {stdout}{stderr}",
+                )
+                self.assertFalse(
+                    os.path.exists(base),
+                    f"SIGKILL left the memory cgroup base behind: {stdout}{stderr}",
+                )
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.wait(timeout=5)
+                for pipe in (wrapper.stdout, wrapper.stderr):
+                    if pipe is not None:
+                        pipe.close()
+
     def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
         with open(EXTRA) as handle:
             source = handle.read()
@@ -2346,6 +2447,262 @@ exec {real_date!r} "$@"
 class HostResourceFinalizer(unittest.TestCase):
     """Host-resource cleanup is bounded, exact, and fail-closed."""
 
+    @staticmethod
+    def memory_cgroup_environment(root, lock_path, claim_dir, run_id, token):
+        return {
+            "FCVM_MEMORY_CGROUP_ROOT": root,
+            "FCVM_MEMORY_CGROUP_LOCK_DIR": lock_path,
+            "FCVM_CONTAINER_CREATE_LOCK_DIR": claim_dir,
+            "FCVM_CONTAINER_RUN_ID": run_id,
+            "FCVM_CONTAINER_OWNER_TOKEN": token,
+        }
+
+    @staticmethod
+    def local_cgroup_command(argv, *_args, **_kwargs):
+        command = tuple(argv)
+        if command[1:3] == ("-n", "install"):
+            os.makedirs(command[-1], exist_ok=True)
+            return host_resource_finalizer.CommandResult(0, b"", b"")
+        if command[1:3] == ("-n", "mkdir"):
+            os.mkdir(command[-1])
+            return host_resource_finalizer.CommandResult(0, b"", b"")
+        if command[1:3] == ("-n", "rmdir"):
+            os.rmdir(command[-1])
+            return host_resource_finalizer.CommandResult(0, b"", b"")
+        if (command[:2] == ("sudo", "-n")
+                and "--internal-remove-memory-cgroup" in command):
+            index = command.index("--internal-remove-memory-cgroup")
+            try:
+                host_resource_finalizer.remove_memory_cgroup_exact(
+                    command[index + 1], command[index + 2],
+                    int(command[index + 3]), int(command[index + 4]),
+                    command[index + 5], command[index + 6])
+            except host_resource_finalizer.FinalizerError as exc:
+                return host_resource_finalizer.CommandResult(
+                    1, b"", str(exc).encode())
+            return host_resource_finalizer.CommandResult(0, b"", b"")
+        raise AssertionError(f"unexpected cgroup command: {command}")
+
+    def test_memory_cgroup_setup_refuses_a_preexisting_unclaimed_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cgroup")
+            lock_path = os.path.join(tmp, "global-lock")
+            claim_dir = os.path.join(tmp, "claims")
+            os.mkdir(root)
+            os.mkdir(claim_dir)
+            run_id = "a" * 32
+            token = "b" * 32
+            base = os.path.join(root, f"cbmem-{run_id}.slice")
+            os.mkdir(base)
+            sentinel = os.path.join(base, "foreign")
+            with open(sentinel, "w") as handle:
+                handle.write("foreign\n")
+            env = self.memory_cgroup_environment(
+                root, lock_path, claim_dir, run_id, token)
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                    host_resource_finalizer, "run_bounded",
+                    side_effect=self.local_cgroup_command):
+                with self.assertRaisesRegex(
+                        host_resource_finalizer.FinalizerError,
+                        "does not own"):
+                    host_resource_finalizer.claim_memory_cgroup(base)
+            self.assertTrue(os.path.isfile(sentinel))
+            self.assertEqual(os.listdir(claim_dir), [])
+
+    def test_memory_cgroup_finalizer_preserves_a_replacement_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cgroup")
+            lock_path = os.path.join(tmp, "global-lock")
+            claim_dir = os.path.join(tmp, "claims")
+            os.mkdir(root)
+            os.mkdir(claim_dir)
+            run_id = "a" * 32
+            token = "b" * 32
+            base = os.path.join(root, f"cbmem-{run_id}.slice")
+            env = self.memory_cgroup_environment(
+                root, lock_path, claim_dir, run_id, token)
+            descriptor = None
+            claim_descriptor = None
+            try:
+                with mock.patch.dict(os.environ, env), mock.patch.object(
+                        host_resource_finalizer, "run_bounded",
+                        side_effect=self.local_cgroup_command):
+                    (descriptor,
+                     claim_descriptor) = host_resource_finalizer.claim_memory_cgroup(base)
+                    os.environ["FCVM_MEMORY_CGROUP_FD"] = str(descriptor)
+                    os.environ["FCVM_MEMORY_CGROUP_CLAIM_FD"] = str(
+                        claim_descriptor)
+                    os.rmdir(base)
+                    os.mkdir(base)
+                    sentinel = os.path.join(base, "foreign")
+                    with open(sentinel, "w") as handle:
+                        handle.write("foreign\n")
+                    with self.assertRaisesRegex(
+                            host_resource_finalizer.FinalizerError,
+                            "different inode"):
+                        host_resource_finalizer.finalize_memory_cgroup()
+            finally:
+                if descriptor is not None:
+                    os.close(descriptor)
+                if claim_descriptor is not None:
+                    os.close(claim_descriptor)
+            self.assertTrue(os.path.isfile(sentinel))
+
+    def test_exact_cgroup_removal_preserves_a_pre_remove_replacement(self):
+        with tempfile.TemporaryDirectory() as root:
+            run_id = "a" * 32
+            token = "b" * 32
+            base_name = f"cbmem-{run_id}.slice"
+            base = os.path.join(root, base_name)
+            holding = os.path.join(root, "holding")
+            os.mkdir(base)
+            owned = os.stat(base)
+
+            def replace_before_remove():
+                os.rename(base, holding)
+                os.mkdir(base)
+
+            with self.assertRaisesRegex(
+                    host_resource_finalizer.FinalizerError,
+                    "changed before final removal"):
+                host_resource_finalizer.remove_memory_cgroup_exact(
+                    root, base_name, owned.st_dev, owned.st_ino,
+                    run_id, token, before_remove=replace_before_remove)
+            self.assertTrue(os.path.isdir(base), "foreign replacement was deleted")
+            self.assertTrue(os.path.isdir(holding), "owned inode was deleted")
+
+    def test_memory_cgroup_finalizer_refuses_a_renamed_owned_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cgroup")
+            lock_path = os.path.join(tmp, "global-lock")
+            claim_dir = os.path.join(tmp, "claims")
+            os.mkdir(root)
+            os.mkdir(claim_dir)
+            run_id = "a" * 32
+            token = "b" * 32
+            base = os.path.join(root, f"cbmem-{run_id}.slice")
+            holding = os.path.join(root, "holding")
+            env = self.memory_cgroup_environment(
+                root, lock_path, claim_dir, run_id, token)
+            descriptors = None
+            try:
+                with mock.patch.dict(os.environ, env), mock.patch.object(
+                        host_resource_finalizer, "run_bounded",
+                        side_effect=self.local_cgroup_command):
+                    descriptors = host_resource_finalizer.claim_memory_cgroup(base)
+                    os.environ["FCVM_MEMORY_CGROUP_FD"] = str(descriptors[0])
+                    os.environ["FCVM_MEMORY_CGROUP_CLAIM_FD"] = str(
+                        descriptors[1])
+                    os.rename(base, holding)
+                    with self.assertRaisesRegex(
+                            host_resource_finalizer.FinalizerError,
+                            "renamed"):
+                        host_resource_finalizer.finalize_memory_cgroup()
+            finally:
+                if descriptors is not None:
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+            self.assertTrue(os.path.isdir(holding))
+
+    def test_memory_cgroup_cleanup_uses_the_pinned_claim_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cgroup")
+            lock_path = os.path.join(tmp, "global-lock")
+            claim_dir = os.path.join(tmp, "claims")
+            old_claim_dir = os.path.join(tmp, "claims-held")
+            os.mkdir(root)
+            os.mkdir(claim_dir)
+            run_id = "a" * 32
+            token = "b" * 32
+            base = os.path.join(root, f"cbmem-{run_id}.slice")
+            env = self.memory_cgroup_environment(
+                root, lock_path, claim_dir, run_id, token)
+            descriptors = None
+            try:
+                with mock.patch.dict(os.environ, env), mock.patch.object(
+                        host_resource_finalizer, "run_bounded",
+                        side_effect=self.local_cgroup_command):
+                    descriptors = host_resource_finalizer.claim_memory_cgroup(base)
+                    os.environ["FCVM_MEMORY_CGROUP_FD"] = str(descriptors[0])
+                    os.environ["FCVM_MEMORY_CGROUP_CLAIM_FD"] = str(
+                        descriptors[1])
+                    os.rename(claim_dir, old_claim_dir)
+                    os.mkdir(claim_dir)
+                    host_resource_finalizer.finalize_memory_cgroup()
+            finally:
+                if descriptors is not None:
+                    for descriptor in descriptors:
+                        os.close(descriptor)
+            self.assertFalse(os.path.exists(base))
+            self.assertEqual(os.listdir(old_claim_dir), [])
+
+    def test_failed_cgroup_pin_rolls_back_the_created_inode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = os.path.join(tmp, "cgroup")
+            lock_path = os.path.join(tmp, "global-lock")
+            claim_dir = os.path.join(tmp, "claims")
+            os.mkdir(root)
+            os.mkdir(claim_dir)
+            run_id = "a" * 32
+            token = "b" * 32
+            base_name = f"cbmem-{run_id}.slice"
+            base = os.path.join(root, base_name)
+            env = self.memory_cgroup_environment(
+                root, lock_path, claim_dir, run_id, token)
+            real_open = os.open
+            injected = False
+
+            def fail_created_cgroup_open(path, flags, *args, **kwargs):
+                nonlocal injected
+                if (not injected and path == base_name
+                        and flags & os.O_DIRECTORY):
+                    injected = True
+                    raise OSError(errno.EMFILE, "injected descriptor exhaustion")
+                return real_open(path, flags, *args, **kwargs)
+
+            with mock.patch.dict(os.environ, env), mock.patch.object(
+                    host_resource_finalizer, "run_bounded",
+                    side_effect=self.local_cgroup_command), mock.patch.object(
+                        host_resource_finalizer.os, "open",
+                        side_effect=fail_created_cgroup_open):
+                with self.assertRaisesRegex(
+                        host_resource_finalizer.FinalizerError,
+                        "cannot pin created"):
+                    host_resource_finalizer.claim_memory_cgroup(base)
+            self.assertFalse(os.path.exists(base))
+            self.assertEqual(os.listdir(claim_dir), [])
+
+    def test_worker_uses_its_pinned_cgroup_descriptor_path(self):
+        cg = corpus_mem.CgroupSet("/sys/fs/cgroup/cbmem-owned.slice")
+        with mock.patch.dict(os.environ, {"FCVM_MEMORY_CGROUP_FD": "41"}), \
+             mock.patch.object(
+                 host_resource_finalizer, "verify_pinned_memory_cgroup",
+                 return_value=41), \
+             mock.patch.object(corpus_mem, "sh_bounded", return_value=Completed()):
+            cg.setup()
+        self.assertEqual(cg.base, f"/proc/{os.getpid()}/fd/41")
+
+    def test_container_failure_does_not_skip_memory_cgroup_finalization(self):
+        calls = []
+
+        def container_failure():
+            calls.append("container")
+            raise host_resource_finalizer.FinalizerError("container failed")
+
+        def cgroup_cleanup():
+            calls.append("cgroup")
+
+        with mock.patch.object(
+                host_resource_finalizer, "finalize_container_set",
+                side_effect=container_failure), mock.patch.object(
+                    host_resource_finalizer, "finalize_memory_cgroup",
+                    side_effect=cgroup_cleanup):
+            with self.assertRaisesRegex(
+                    host_resource_finalizer.FinalizerError,
+                    "container failed"):
+                host_resource_finalizer.finalize_memory_resource_set()
+        self.assertEqual(calls, ["container", "cgroup"])
+
     def test_dnsmasq_finalizer_restores_and_verifies_the_prior_active_state(self):
         with tempfile.TemporaryDirectory() as tmp:
             bindir = os.path.join(tmp, "bin")
@@ -2781,6 +3138,47 @@ class ZeroBasis(unittest.TestCase):
                     side.sample({}, "fcvm1r1")
                 self.assertNotIn(caught.exception.code, (0, None))
 
+    def test_memory_sample_never_enables_legacy_proc_cmdline_scan(self):
+        args = SimpleNamespace(state_dir="/state")
+        side = corpus_mem.FcvmSide(
+            args, SimpleNamespace(base="/cgroup"), "a" * 32)
+        clone = {
+            "clones": 1,
+            "clone_procs": 4,
+            "clone_cgroup_kb": 4096,
+            "clone_pss_kb": 2048,
+        }
+        serve = {
+            "clones": 1,
+            "clone_procs": 2,
+            "clone_cgroup_kb": 1024,
+            "clone_pss_kb": 512,
+        }
+        calls = []
+
+        def capture(_extra, **kwargs):
+            calls.append(kwargs)
+            return clone if len(calls) == 1 else serve
+
+        with mock.patch.object(corpus_mem, "sample", side_effect=capture):
+            side.sample({}, "fcvm1r1")
+        for kwargs in calls:
+            self.assertNotIn("state_dir", kwargs)
+            self.assertNotIn("name_prefix", kwargs)
+
+        with open(os.path.join(HERE, "report.py")) as handle:
+            report_source = handle.read()
+        self.assertNotIn("/proc/{pid}/cmdline", report_source)
+        self.assertNotIn("def firecracker_pids_for_vm_ids", report_source)
+        with open(os.path.join(HERE, "bench.sh")) as handle:
+            bench_source = handle.read()
+        sample_once = bench_source[
+            bench_source.index("sample_once()"):
+            bench_source.index("wait_clones_gone()")
+        ]
+        self.assertNotIn("--state-dir", sample_once)
+        self.assertNotIn("--name-prefix", sample_once)
+
     def test_nonmonotonic_steady_samples_use_per_basis_medians(self):
         cell = {
             "side": "fcvm-clone",
@@ -3072,6 +3470,48 @@ class ArgumentValidation(unittest.TestCase):
             )
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn("unrecognized arguments: --cputime-reps 1", proc.stderr)
+
+    def test_invalid_arguments_never_arm_the_memory_lifecycle(self):
+        argv = [
+            CORPUS_MEM,
+            "--results", "/tmp/result",
+            "--tag", "tag",
+            "--urls", "https://example.com/",
+            "--source-revision", "a" * 40,
+            "--runtime-bundle-sha256", "b" * 64,
+            "--corpus-extra-runtime-bundle-sha256", "c" * 64,
+            "--removed-option", "value",
+        ]
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(
+                 corpus_mem, "bootstrap_memory_lifecycle") as lifecycle, \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            os.environ.pop(corpus_mem.MEMORY_ROLE_ENV, None)
+            with self.assertRaises(SystemExit) as caught:
+                corpus_mem.main()
+        self.assertEqual(caught.exception.code, 2)
+        lifecycle.assert_not_called()
+
+    def test_valid_arguments_arm_the_memory_lifecycle_after_parsing(self):
+        argv = [
+            CORPUS_MEM,
+            "--results", "/tmp/result",
+            "--tag", "tag",
+            "--urls", "https://example.com/",
+            "--source-revision", "a" * 40,
+            "--runtime-bundle-sha256", "b" * 64,
+            "--corpus-extra-runtime-bundle-sha256", "c" * 64,
+        ]
+        with mock.patch.dict(os.environ, {}, clear=False), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(
+                 corpus_mem, "bootstrap_memory_lifecycle",
+                 return_value=17) as lifecycle:
+            os.environ.pop(corpus_mem.MEMORY_ROLE_ENV, None)
+            status = corpus_mem.main()
+        self.assertEqual(status, 17)
+        lifecycle.assert_called_once_with(argv[1:])
 
     def test_invalid_container_owner_token_is_refused(self):
         for value in ("", "short", "A" * 32, "a/b", "has space", "a" * 100):

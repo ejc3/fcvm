@@ -305,28 +305,18 @@ def measure_cgroup_set(root, prefix):
     return n, tot_cg, tot_pss, tot_procs, stat_sums
 
 
-def firecracker_pids_for_vm_ids(vm_ids):
-    """Map vm_id -> firecracker pid by the --api-sock path in the cmdline."""
-    out = {}
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmd = f.read().decode(errors="replace")
-        except OSError:
-            continue
-        if "firecracker" not in cmd:
-            continue
-        for vid in vm_ids:
-            if f"/{vid}/" in cmd:
-                out[vid] = int(pid)
-    return out
-
-
 def refuse_sample(message):
     print(f"REFUSING: {message}", file=sys.stderr)
     raise SystemExit(2)
+
+
+def sustained_clone_count(sample):
+    """Read current cgroup samples while retaining archived sample support."""
+    return sample.get("clones", sample.get("fc_procs", 0))
+
+
+def sustained_clone_pss_kb(sample):
+    return sample.get("clone_pss_kb", sample.get("pss_kb", 0))
 
 
 def podman_container_cgroup(name):
@@ -388,27 +378,6 @@ def cmd_sample(args):
         rec["clone_anon_kb"] = st["anon"] // 1024
         rec["clone_file_kb"] = st["file"] // 1024
         rec["basis"] = "cgroup+pss over full per-clone process set"
-
-    # legacy firecracker-only PSS, kept ONLY as the refuted comparator so the
-    # report can show how large the basis error was. Never the headline number.
-    if args.state_dir and args.name_prefix:
-        vm_ids = []
-        for f in glob.glob(os.path.join(args.state_dir, "*.json")):
-            try:
-                st_json = json.load(open(f))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (st_json.get("name") or "").startswith(args.name_prefix):
-                vm_ids.append(st_json.get("vm_id"))
-        fps = firecracker_pids_for_vm_ids([v for v in vm_ids if v])
-        rec.setdefault("clones", len(vm_ids))
-        rec["fc_procs"] = len(fps)
-        try:
-            rec["fc_only_pss_kb"] = sum(
-                pss_kb_of_pid(p) for p in fps.values()
-            )
-        except CgroupReadError as exc:
-            refuse_sample(f"legacy firecracker PSS basis incomplete: {exc}")
 
     # --- host-native container pool: the SAME two bases ----------------------
     if args.podman_prefix:
@@ -787,16 +756,16 @@ def cmd_finalize(args):
     # ---- sustained memory curve
     w("## Sustained-rate memory density\n")
     w("Sampled every 2s during each 60s window: MemAvailable delta vs quiescent, "
-      "sum of firecracker PSS (`/proc/<pid>/smaps_rollup`) over live clones, page cache. "
+      "PSS over each live clone's complete cgroup process set, page cache. "
       "Marginal MiB/request = least-squares slope of PSS vs concurrent clones across the "
       "cell's samples; req/GB = 1024/slope.\n")
     rows = []
     cell_slopes = {}
     for cell in ("uffd-4k", "file-4k", "uffd-huge", "file-huge"):
         cell_samples = [s for s in samples if s.get("cell") == cell and s.get("phase") == "load"
-                        and s.get("fc_procs", 0) > 0]
-        xs = [s["fc_procs"] for s in cell_samples]
-        ys = [s["pss_kb"] / 1024 for s in cell_samples]
+                        and sustained_clone_count(s) > 0]
+        xs = [sustained_clone_count(s) for s in cell_samples]
+        ys = [sustained_clone_pss_kb(s) / 1024 for s in cell_samples]
         fit = linfit(xs, ys)
         if fit:
             cell_slopes[cell] = fit[0]
@@ -807,8 +776,8 @@ def cmd_finalize(args):
                      and s.get("phase") == "quiescent"]
             if not load:
                 continue
-            clones = [s.get("fc_procs", 0) for s in load]
-            pss = [s.get("pss_kb", 0) / 1024 for s in load]
+            clones = [sustained_clone_count(s) for s in load]
+            pss = [sustained_clone_pss_kb(s) / 1024 for s in load]
             qa = statistics.mean([s["mem_available_kb"] for s in quies]) if quies else None
             dmem = (qa - min(s["mem_available_kb"] for s in load)) / 1024 if qa else None
             pool_pages = avail["hugepages"].get("pool_pages", 0)
@@ -841,8 +810,8 @@ def cmd_finalize(args):
             eff_slope, basis = slope, "PSS"
             if cell.endswith("-huge") and pool_pages:
                 hs = [s for s in samples if s.get("cell") == cell and s.get("phase") == "load"
-                      and s.get("fc_procs", 0) > 0]
-                fit = linfit([s["fc_procs"] for s in hs],
+                      and sustained_clone_count(s) > 0]
+                fit = linfit([sustained_clone_count(s) for s in hs],
                              [(pool_pages - s.get("hugepages_free", pool_pages)) * 2 for s in hs])
                 if fit:
                     eff_slope, basis = fit[0], f"hugepage pool draw (PSS slope {slope:.1f})"
@@ -916,8 +885,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sample")
-    s.add_argument("--state-dir")
-    s.add_argument("--name-prefix")
     s.add_argument("--podman-prefix")
     s.add_argument("--cgroup-root", help="directory holding one leaf cgroup per clone")
     s.add_argument("--cgroup-prefix", default="req-", help="leaf cgroup name prefix")

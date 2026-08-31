@@ -7,6 +7,7 @@ import errno
 import fcntl
 import os
 import re
+import secrets
 import signal
 import stat
 import subprocess
@@ -30,6 +31,7 @@ DNSMASQ_RETRY_SECONDS = 1.0
 CONTAINER_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
 CONTAINER_ID_RE = re.compile(r"[0-9a-f]{64}")
 OWNER_TOKEN_RE = re.compile(r"[0-9a-f]{32}")
+MEMORY_CGROUP_CHILD_RE = re.compile(r"(?:serve|req)-[A-Za-z0-9_.-]+")
 
 
 class FinalizerError(RuntimeError):
@@ -107,6 +109,428 @@ def required_environment(name: str) -> str:
     if not value:
         raise FinalizerError(f"{name} must not be empty")
     return value
+
+
+def safe_absolute_path(name: str) -> str:
+    value = required_environment(name)
+    if ("\n" in value or "\r" in value or not os.path.isabs(value)
+            or os.path.normpath(value) != value):
+        raise FinalizerError(f"{name} must be one normalized absolute path")
+    return value
+
+
+def memory_cgroup_names(run_id: str, owner_token: str) -> tuple[str, str, str]:
+    if OWNER_TOKEN_RE.fullmatch(run_id) is None:
+        raise FinalizerError(
+            "FCVM_CONTAINER_RUN_ID must be exactly 32 lowercase hex characters")
+    if OWNER_TOKEN_RE.fullmatch(owner_token) is None:
+        raise FinalizerError(
+            "FCVM_CONTAINER_OWNER_TOKEN must be exactly 32 lowercase hex characters")
+    base_name = f"cbmem-{run_id}.slice"
+    stem = f".cbmem-cgroup-{run_id}-{owner_token}"
+    return base_name, stem + ".owned", stem + ".identity"
+
+
+def open_directory(path: str, description: str) -> int:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise FinalizerError(f"cannot open {description}: {exc}") from exc
+    identity = os.fstat(descriptor)
+    if not stat.S_ISDIR(identity.st_mode):
+        os.close(descriptor)
+        raise FinalizerError(f"{description} is not a directory")
+    return descriptor
+
+
+def stat_entry(directory_fd: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FinalizerError(f"cannot inspect {name}: {exc}") from exc
+
+
+def write_all(descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            raise FinalizerError("short write while publishing cgroup ownership")
+        offset += written
+
+
+def publish_identity(directory_fd: int, name: str, payload: bytes) -> None:
+    temporary = f"{name}.tmp-{os.getpid()}-{secrets.token_hex(8)}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    descriptor = None
+    try:
+        descriptor = os.open(temporary, flags, 0o600, dir_fd=directory_fd)
+        write_all(descriptor, payload)
+        os.fsync(descriptor)
+        os.close(descriptor)
+        descriptor = None
+        os.replace(
+            temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
+        os.fsync(directory_fd)
+    except OSError as exc:
+        raise FinalizerError(f"cannot publish cgroup ownership: {exc}") from exc
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except FileNotFoundError:
+            pass
+
+
+def read_identity(directory_fd: int, name: str) -> tuple[int, int] | str | None:
+    flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory_fd)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise FinalizerError(f"cannot open cgroup identity: {exc}") from exc
+    try:
+        identity = os.fstat(descriptor)
+        if not stat.S_ISREG(identity.st_mode):
+            raise FinalizerError("cgroup identity is not a regular file")
+        payload = os.read(descriptor, 128)
+        if os.read(descriptor, 1):
+            raise FinalizerError("cgroup identity is too long")
+    finally:
+        os.close(descriptor)
+    if payload == b"absent\n":
+        return "absent"
+    match = re.fullmatch(rb"inode ([0-9]+) ([0-9]+)\n", payload)
+    if match is None:
+        raise FinalizerError("cgroup identity has invalid contents")
+    return int(match.group(1)), int(match.group(2))
+
+
+class MemoryCgroupLock:
+    def __init__(self, path: str):
+        self.path = path
+        self.descriptor: int | None = None
+
+    def __enter__(self):
+        self.descriptor = open_directory(self.path, "memory cgroup lock")
+        deadline = time.monotonic() + CREATE_LOCK_WAIT_SECONDS
+        while True:
+            try:
+                fcntl.flock(
+                    self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN, errno.EINTR):
+                    os.close(self.descriptor)
+                    self.descriptor = None
+                    raise FinalizerError(
+                        f"cannot lock memory cgroup creation: {exc}") from exc
+                if time.monotonic() >= deadline:
+                    os.close(self.descriptor)
+                    self.descriptor = None
+                    raise FinalizerError(
+                        "memory cgroup creation lock stayed busy") from exc
+                time.sleep(0.05)
+        return self
+
+    def __exit__(self, _exc_type, _exc, _traceback):
+        if self.descriptor is not None:
+            os.close(self.descriptor)
+            self.descriptor = None
+
+
+def memory_cgroup_environment() -> tuple[str, str, str, str, str, str, str]:
+    root = safe_absolute_path("FCVM_MEMORY_CGROUP_ROOT")
+    lock_path = safe_absolute_path("FCVM_MEMORY_CGROUP_LOCK_DIR")
+    claim_dir = safe_absolute_path("FCVM_CONTAINER_CREATE_LOCK_DIR")
+    run_id = required_environment("FCVM_CONTAINER_RUN_ID")
+    owner_token = required_environment("FCVM_CONTAINER_OWNER_TOKEN")
+    base_name, marker_name, identity_name = memory_cgroup_names(
+        run_id, owner_token)
+    return (root, lock_path, claim_dir, base_name, marker_name,
+            identity_name, os.path.join(root, base_name))
+
+
+def ensure_memory_cgroup_lock(path: str) -> None:
+    result = run_bounded((
+        "sudo", "-n", "install", "-d", "-o", "root", "-g", "root",
+        "-m", "0755", "--", path,
+    ))
+    if result.returncode != 0:
+        raise FinalizerError(
+            f"cannot create memory cgroup lock (status={result.returncode})")
+    descriptor = open_directory(path, "memory cgroup lock")
+    os.close(descriptor)
+
+
+def remove_memory_cgroup_exact(
+        root: str, base_name: str, expected_dev: int, expected_ino: int,
+        run_id: str, owner_token: str, before_remove=None) -> None:
+    """Validate and remove one exact cgroup in one privileged process.
+
+    The caller holds the host-wide memory-cgroup lock, so every fcvm creator
+    and finalizer is excluded for the whole operation. The retained descriptor
+    prevents reuse of the expected inode while this helper runs.
+    """
+    expected_base, _marker, _identity = memory_cgroup_names(
+        run_id, owner_token)
+    if base_name != expected_base:
+        raise FinalizerError("memory cgroup removal name is not run-derived")
+    if (not os.path.isabs(root) or os.path.normpath(root) != root
+            or "\n" in root or "\r" in root):
+        raise FinalizerError("memory cgroup removal root is not absolute")
+    expected = (expected_dev, expected_ino)
+    root_fd = open_directory(root, "memory cgroup root")
+    try:
+        current = stat_entry(root_fd, base_name)
+        if current is None or (current.st_dev, current.st_ino) != expected:
+            raise FinalizerError(
+                "same-name memory cgroup is not the pinned inode; preserving it")
+        try:
+            owned_fd = os.open(
+                base_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except OSError as exc:
+            raise FinalizerError(
+                f"cannot open pinned memory cgroup for removal: {exc}") from exc
+        try:
+            owned = os.fstat(owned_fd)
+            if (owned.st_dev, owned.st_ino) != expected:
+                raise FinalizerError("memory cgroup identity changed before removal")
+            children = []
+            for child in sorted(os.listdir(owned_fd)):
+                child_identity = stat_entry(owned_fd, child)
+                if child_identity is None or not stat.S_ISDIR(child_identity.st_mode):
+                    continue
+                if MEMORY_CGROUP_CHILD_RE.fullmatch(child) is None:
+                    raise FinalizerError(
+                        f"claimed memory cgroup has unexpected child {child!r}")
+                children.append(child)
+            for child in children:
+                try:
+                    os.rmdir(child, dir_fd=owned_fd)
+                except OSError as exc:
+                    raise FinalizerError(
+                        f"cannot remove memory cgroup child {child}: {exc}") from exc
+        finally:
+            os.close(owned_fd)
+        if before_remove is not None:
+            before_remove()
+        current = stat_entry(root_fd, base_name)
+        if current is None or (current.st_dev, current.st_ino) != expected:
+            raise FinalizerError(
+                "memory cgroup changed before final removal; preserving it")
+        try:
+            os.rmdir(base_name, dir_fd=root_fd)
+        except OSError as exc:
+            raise FinalizerError(f"cannot remove memory cgroup: {exc}") from exc
+        if stat_entry(root_fd, base_name) is not None:
+            raise FinalizerError("memory cgroup survived removal")
+    finally:
+        os.close(root_fd)
+
+
+def exact_cgroup_remove_command(
+        root: str, base_name: str, expected: tuple[int, int],
+        run_id: str, owner_token: str) -> tuple[str, ...]:
+    return (
+        "sudo", "-n", sys.executable, os.path.abspath(__file__),
+        "--internal-remove-memory-cgroup", root, base_name,
+        str(expected[0]), str(expected[1]), run_id, owner_token,
+    )
+
+
+def clear_memory_cgroup_claim(
+        claim_fd: int, marker_name: str, identity_name: str) -> None:
+    publish_identity(claim_fd, identity_name, b"absent\n")
+    os.unlink(marker_name, dir_fd=claim_fd)
+    os.fsync(claim_fd)
+    os.unlink(identity_name, dir_fd=claim_fd)
+    os.fsync(claim_fd)
+
+
+def claim_memory_cgroup(base: str) -> tuple[int, int]:
+    """Claim and create one exact cgroup while its detached finalizer is armed."""
+    (root, lock_path, claim_dir, base_name, marker_name,
+     identity_name, expected_base) = memory_cgroup_environment()
+    if os.path.abspath(base) != expected_base:
+        raise FinalizerError(
+            f"memory cgroup must be the run-derived path {expected_base}")
+    ensure_memory_cgroup_lock(lock_path)
+    with MemoryCgroupLock(lock_path), ExitStack() as stack:
+        root_fd = open_directory(root, "memory cgroup root")
+        stack.callback(os.close, root_fd)
+        claim_fd = open_directory(claim_dir, "memory cgroup claim directory")
+        stack.callback(os.close, claim_fd)
+        if stat_entry(claim_fd, marker_name) is not None:
+            raise FinalizerError("memory cgroup ownership marker already exists")
+        if stat_entry(claim_fd, identity_name) is not None:
+            raise FinalizerError("memory cgroup identity already exists")
+        if stat_entry(root_fd, base_name) is not None:
+            raise FinalizerError(
+                f"cgroup {expected_base} already exists; this run does not own it")
+
+        marker_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC
+        marker_flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            marker_fd = os.open(
+                marker_name, marker_flags, 0o600, dir_fd=claim_fd)
+        except OSError as exc:
+            raise FinalizerError(f"cannot publish cgroup ownership intent: {exc}") from exc
+        os.close(marker_fd)
+        os.fsync(claim_fd)
+
+        created = run_bounded(("sudo", "-n", "mkdir", "--", expected_base))
+        current = stat_entry(root_fd, base_name)
+        if current is None:
+            clear_memory_cgroup_claim(
+                claim_fd, marker_name, identity_name)
+            raise FinalizerError(
+                f"cannot create memory cgroup (status={created.returncode})")
+        if not stat.S_ISDIR(current.st_mode):
+            raise FinalizerError("created memory cgroup is not a directory")
+        try:
+            owned_fd = os.open(
+                base_name,
+                os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=root_fd,
+            )
+        except OSError as exc:
+            rollback = run_bounded(exact_cgroup_remove_command(
+                root, base_name, (current.st_dev, current.st_ino),
+                required_environment("FCVM_CONTAINER_RUN_ID"),
+                required_environment("FCVM_CONTAINER_OWNER_TOKEN")))
+            if rollback.returncode == 0 and stat_entry(root_fd, base_name) is None:
+                clear_memory_cgroup_claim(
+                    claim_fd, marker_name, identity_name)
+                raise FinalizerError(
+                    f"cannot pin created memory cgroup: {exc}") from exc
+            raise FinalizerError(
+                f"cannot pin or roll back created memory cgroup: {exc}; "
+                f"rollback status={rollback.returncode}") from exc
+        pinned = os.fstat(owned_fd)
+        if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+            os.close(owned_fd)
+            raise FinalizerError("memory cgroup changed before it could be pinned")
+        try:
+            publish_identity(
+                claim_fd, identity_name,
+                f"inode {current.st_dev} {current.st_ino}\n".encode("ascii"))
+            retained_claim_fd = os.dup(claim_fd)
+        except BaseException:
+            rollback = run_bounded(exact_cgroup_remove_command(
+                root, base_name, (pinned.st_dev, pinned.st_ino),
+                required_environment("FCVM_CONTAINER_RUN_ID"),
+                required_environment("FCVM_CONTAINER_OWNER_TOKEN")))
+            os.close(owned_fd)
+            if rollback.returncode == 0 and stat_entry(root_fd, base_name) is None:
+                clear_memory_cgroup_claim(
+                    claim_fd, marker_name, identity_name)
+            raise
+        return owned_fd, retained_claim_fd
+
+
+def required_descriptor(name: str, description: str) -> tuple[int, os.stat_result]:
+    raw_descriptor = required_environment(name)
+    if re.fullmatch(r"[0-9]+", raw_descriptor) is None:
+        raise FinalizerError(f"{name} must be one decimal descriptor")
+    descriptor = int(raw_descriptor)
+    try:
+        identity = os.fstat(descriptor)
+    except OSError as exc:
+        raise FinalizerError(f"cannot inspect {description}: {exc}") from exc
+    if not stat.S_ISDIR(identity.st_mode):
+        raise FinalizerError(f"{description} descriptor is not a directory")
+    return descriptor, identity
+
+
+def pinned_memory_cgroup(base: str) -> tuple[int, os.stat_result]:
+    (_root, _lock_path, _claim_dir, _base_name, _marker_name,
+     _identity_name, expected_base) = memory_cgroup_environment()
+    if os.path.abspath(base) != expected_base:
+        raise FinalizerError(
+            f"memory cgroup must be the run-derived path {expected_base}")
+    return required_descriptor(
+        "FCVM_MEMORY_CGROUP_FD", "pinned memory cgroup")
+
+
+def pinned_memory_claim_directory() -> int:
+    descriptor, _identity = required_descriptor(
+        "FCVM_MEMORY_CGROUP_CLAIM_FD", "pinned memory cgroup claim directory")
+    return descriptor
+
+
+def verify_pinned_memory_cgroup(base: str) -> int:
+    descriptor, pinned = pinned_memory_cgroup(base)
+    (root, _lock_path, _claim_dir, base_name, marker_name,
+     _identity_name, _expected_base) = memory_cgroup_environment()
+    root_fd = open_directory(root, "memory cgroup root")
+    try:
+        current = stat_entry(root_fd, base_name)
+    finally:
+        os.close(root_fd)
+    if current is None:
+        raise FinalizerError("pinned memory cgroup is absent")
+    if (current.st_dev, current.st_ino) != (pinned.st_dev, pinned.st_ino):
+        raise FinalizerError("pinned memory cgroup has been replaced")
+    claim_fd = pinned_memory_claim_directory()
+    marker = stat_entry(claim_fd, marker_name)
+    if marker is None or not stat.S_ISREG(marker.st_mode):
+        raise FinalizerError("pinned memory cgroup has no ownership marker")
+    return descriptor
+
+
+def finalize_memory_cgroup() -> None:
+    """Remove only the cgroup inode claimed by this exact run and owner token."""
+    (root, lock_path, _claim_dir, base_name, marker_name,
+     identity_name, base_path) = memory_cgroup_environment()
+    claim_fd = pinned_memory_claim_directory()
+    marker = stat_entry(claim_fd, marker_name)
+    if marker is None or not stat.S_ISREG(marker.st_mode):
+        raise FinalizerError("pinned cgroup ownership marker is absent or invalid")
+
+    with MemoryCgroupLock(lock_path), ExitStack() as stack:
+        root_fd = open_directory(root, "memory cgroup root")
+        stack.callback(os.close, root_fd)
+        marker = stat_entry(claim_fd, marker_name)
+        if marker is None or not stat.S_ISREG(marker.st_mode):
+            raise FinalizerError("pinned cgroup ownership marker changed")
+
+        _pinned_fd, pinned = pinned_memory_cgroup(base_path)
+
+        recorded = read_identity(claim_fd, identity_name)
+        current = stat_entry(root_fd, base_name)
+        expected = (pinned.st_dev, pinned.st_ino)
+        if recorded != expected:
+            raise FinalizerError(
+                "pinned memory cgroup does not match its ownership record")
+        if current is None:
+            raise FinalizerError(
+                "owned memory cgroup was renamed; refusing to lose its pinned inode")
+        if (current.st_dev, current.st_ino) != expected:
+            raise FinalizerError(
+                "same-name memory cgroup has a different inode; preserving it")
+        run_id = required_environment("FCVM_CONTAINER_RUN_ID")
+        owner_token = required_environment("FCVM_CONTAINER_OWNER_TOKEN")
+        removed = run_bounded(exact_cgroup_remove_command(
+            root, base_name, expected, run_id, owner_token))
+        if removed.returncode != 0:
+            raise FinalizerError(
+                f"exact memory cgroup removal failed (status={removed.returncode})")
+        if stat_entry(root_fd, base_name) is not None:
+            raise FinalizerError("memory cgroup name survived exact removal")
+        clear_memory_cgroup_claim(claim_fd, marker_name, identity_name)
 
 
 def finalize_dnsmasq() -> None:
@@ -439,9 +863,34 @@ def finalize_container_set() -> None:
             return
 
 
+def finalize_memory_resource_set() -> None:
+    """Run independent container and cgroup teardown before reporting errors."""
+    errors = []
+    for finalizer in (finalize_container_set, finalize_memory_cgroup):
+        try:
+            finalizer()
+        except FinalizerError as exc:
+            errors.append(str(exc))
+    if errors:
+        raise FinalizerError("; ".join(errors))
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     try:
+        if len(argv) == 8 and argv[1] == "--internal-remove-memory-cgroup":
+            try:
+                expected_dev = int(argv[4])
+                expected_ino = int(argv[5])
+            except ValueError as exc:
+                raise FinalizerError(
+                    "memory cgroup identity must contain decimal integers") from exc
+            if expected_dev < 0 or expected_ino <= 0:
+                raise FinalizerError("memory cgroup identity is out of range")
+            remove_memory_cgroup_exact(
+                argv[2], argv[3], expected_dev, expected_ino,
+                argv[6], argv[7])
+            return 0
         if len(argv) != 1:
             raise FinalizerError("host resource finalizer accepts no arguments")
         mode = required_environment("FCVM_FINALIZER_MODE")
@@ -451,9 +900,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             finalize_container()
         elif mode == "container-set":
             finalize_container_set()
+        elif mode == "memory-set":
+            finalize_memory_resource_set()
         else:
             raise FinalizerError(
-                "FCVM_FINALIZER_MODE must be dnsmasq, container, or container-set")
+                "FCVM_FINALIZER_MODE must be dnsmasq, container, "
+                "container-set, or memory-set")
         return 0
     except FinalizerError as exc:
         print(f"FAILED: host resource finalizer: {exc}", file=sys.stderr)

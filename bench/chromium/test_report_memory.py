@@ -26,6 +26,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import report  # noqa: E402
+import analyze  # noqa: E402
 
 
 def write_cgroup(path, pids=()):
@@ -173,35 +174,54 @@ class ProcessPss(unittest.TestCase):
                 report.cgroup_bytes(tmp)
 
 
-class LegacyFirecrackerPss(unittest.TestCase):
-    """A disappearing legacy process is an incomplete sample, not a traceback."""
+class SustainedSampleSchema(unittest.TestCase):
+    """Current cgroup samples and archived process samples remain readable."""
 
-    def test_process_exit_during_legacy_pss_sum_is_a_bounded_refusal(self):
+    def test_current_cgroup_sample_supplies_clone_count_and_pss(self):
+        sample = {"clones": 4, "clone_pss_kb": 8192}
+        self.assertEqual(report.sustained_clone_count(sample), 4)
+        self.assertEqual(report.sustained_clone_pss_kb(sample), 8192)
+
+    def test_archived_process_sample_supplies_clone_count_and_pss(self):
+        sample = {"fc_procs": 3, "pss_kb": 6144}
+        self.assertEqual(report.sustained_clone_count(sample), 3)
+        self.assertEqual(report.sustained_clone_pss_kb(sample), 6144)
+
+
+class RemovedLegacyDensityBasis(unittest.TestCase):
+    @staticmethod
+    def analyse(include_legacy):
         with tempfile.TemporaryDirectory() as tmp:
-            with open(os.path.join(tmp, "vm.json"), "w") as handle:
-                json.dump({"name": "owned-one", "vm_id": "vm-one"}, handle)
-            args = SimpleNamespace(
-                cgroup_root=None,
-                cgroup_prefix=None,
-                state_dir=tmp,
-                name_prefix="owned-",
-                podman_prefix=None,
-                extra=None,
-            )
-            stderr = io.StringIO()
-            with mock.patch.object(report, "read_meminfo", return_value={}), \
-                 mock.patch.object(
-                     report, "firecracker_pids_for_vm_ids",
-                     return_value={"vm-one": 4001}), \
-                 mock.patch.object(
-                     report, "pss_kb_of_pid",
-                     side_effect=report.CgroupReadError("process exited")), \
-                 contextlib.redirect_stderr(stderr):
-                with self.assertRaises(SystemExit) as caught:
-                    report.cmd_sample(args)
-            self.assertEqual(caught.exception.code, 2)
-            self.assertIn("REFUSING:", stderr.getvalue())
-            self.assertIn("process exited", stderr.getvalue())
+            sample_dir = os.path.join(tmp, "samples")
+            os.mkdir(sample_dir)
+            path = os.path.join(sample_dir, "density.jsonl")
+            with open(path, "w") as handle:
+                for n in (1, 2, 4):
+                    handle.write(json.dumps({
+                        "cell": "uffd-4k", "rep": 1, "n": n,
+                        "phase": "pre", "mem_available_kb": 1_000_000,
+                    }) + "\n")
+                    steady = {
+                        "cell": "uffd-4k", "rep": 1, "n": n,
+                        "phase": "steady", "clones": n,
+                        "clone_cgroup_kb": n * 1000,
+                        "clone_pss_kb": n * 800,
+                        "mem_available_kb": 1_000_000 - n * 1200,
+                    }
+                    if include_legacy:
+                        steady["fc_only_pss_kb"] = n * 700
+                    handle.write(json.dumps(steady) + "\n")
+            result = {}
+            analyze.analyse_density(tmp, result)
+            return result["density"]["uffd-4k"]["fits"]
+
+    def test_current_samples_do_not_fabricate_a_zero_legacy_fit(self):
+        self.assertNotIn(
+            "fc_only_pss_REFUTED_BASIS", self.analyse(include_legacy=False))
+
+    def test_archived_samples_retain_the_recorded_legacy_fit(self):
+        self.assertIn(
+            "fc_only_pss_REFUTED_BASIS", self.analyse(include_legacy=True))
 
 
 class PodmanCgroupIdentity(unittest.TestCase):
@@ -218,8 +238,6 @@ class PodmanCgroupIdentity(unittest.TestCase):
         return SimpleNamespace(
             cgroup_root=None,
             cgroup_prefix=None,
-            state_dir=None,
-            name_prefix=None,
             podman_prefix="owned-",
             extra=None,
         )
