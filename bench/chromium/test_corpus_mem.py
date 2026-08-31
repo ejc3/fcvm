@@ -18,10 +18,13 @@ import json
 import os
 import random
 import re
+import select
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from contextlib import ExitStack
@@ -33,6 +36,7 @@ sys.path.insert(0, HERE)
 
 import corpus_mem  # noqa: E402
 import compare as bench_compare  # noqa: E402
+import phase_supervisor  # noqa: E402
 import report as bench_report  # noqa: E402
 
 EXTRA = os.path.join(HERE, "corpus_extra.sh")
@@ -40,6 +44,8 @@ CORPUS_MEM = os.path.join(HERE, "corpus_mem.py")
 CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
 HOSTCDP = os.path.join(HERE, "hostcdp.sh")
 OWNED_PROCESS = os.path.join(HERE, "owned_process.py")
+PHASE_SUPERVISOR = os.path.join(HERE, "phase_supervisor.py")
+MAKEFILE = os.path.join(os.path.dirname(os.path.dirname(HERE)), "Makefile")
 
 
 class Completed:
@@ -73,17 +79,19 @@ class MemoryCellSchedule(unittest.TestCase):
     def test_memory_cells_are_interleaved_by_recorded_seed(self):
         sides = ["fcvm", "container"]
         schedule = corpus_mem.build_cell_schedule(
-            sides, [1, 2, 4, 8], 2, seed=9182, url_count=14)
+            sides, [1, 2, 4, 8], 14, seed=9182, url_count=14)
         self.assertEqual(schedule,
                          corpus_mem.build_cell_schedule(
-                             sides, [1, 2, 4, 8], 2, seed=9182, url_count=14))
+                             sides, [1, 2, 4, 8], 14, seed=9182, url_count=14))
         expected = sorted((side, n, rep)
                           for n in (1, 2, 4, 8)
-                          for rep in (1, 2)
+                          for rep in range(1, 15)
                           for side in sides)
         self.assertEqual(sorted((side, n, rep) for side, n, rep, _urls in schedule),
                          expected)
         covered = set()
+        url_by_rep = {}
+        per_n_urls = {n: [] for n in (1, 2, 4, 8)}
         for offset in range(0, len(schedule), len(sides)):
             pair = schedule[offset:offset + len(sides)]
             self.assertEqual({side for side, _n, _rep, _urls in pair}, set(sides))
@@ -91,9 +99,25 @@ class MemoryCellSchedule(unittest.TestCase):
                              f"matched sides were separated in {pair}")
             self.assertEqual(pair[0][3], pair[1][3],
                              f"matched sides rendered different pages in {pair}")
-            covered.update(pair[0][3])
+            n, rep = pair[0][1:3]
+            url_indices = pair[0][3]
+            self.assertEqual(len(url_indices), n)
+            self.assertEqual(len(set(url_indices)), 1,
+                             f"N={n} gave its instances different page histories")
+            if rep in url_by_rep:
+                self.assertEqual(
+                    url_indices[0], url_by_rep[rep],
+                    f"N={n} changed the normalized page workload for repetition {rep}",
+                )
+            else:
+                url_by_rep[rep] = url_indices[0]
+            per_n_urls[n].append(url_indices[0])
+            covered.update(url_indices)
         self.assertEqual(covered, set(range(14)),
                          "the default N/repetition grid omits corpus members")
+        for n, urls in per_n_urls.items():
+            self.assertEqual(sorted(urls), list(range(14)),
+                             f"N={n} did not see one balanced corpus cycle per side")
 
         with open(os.path.join(HERE, "corpus_mem.py")) as handle:
             source = handle.read()
@@ -163,13 +187,15 @@ class RunScopedContainerCleanup(unittest.TestCase):
         token = "c" * 32
         side = corpus_mem.ContainerSide(
             SimpleNamespace(container_owner_token=token), "a" * 32)
-        owned = {"name": side.prefix("host1r1") + "0", "container_id": "ours"}
+        container_id = "e" * 64
+        owned = {"name": side.prefix("host1r1") + "0",
+                 "container_id": container_id}
         calls = []
 
         def shell(cmd, *_args, **_kwargs):
             calls.append(cmd)
             if cmd[:3] == ["podman", "inspect", "--format"]:
-                return Completed(0, f"ours {token}\n", "")
+                return Completed(0, f"{container_id} {token}\n", "")
             if cmd[:3] == ["podman", "container", "exists"]:
                 return Completed(1, "", "")
             return Completed()
@@ -215,6 +241,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
             f"cbmem-{peer}-host1r1-0",
             f"hostcdp-{peer}-free",
         )
+        ids = tuple(str(i) * 64 for i in range(4))
         with tempfile.TemporaryDirectory() as tmp:
             removed = os.path.join(tmp, "removed")
             podman = os.path.join(tmp, "podman")
@@ -223,11 +250,13 @@ class RunScopedContainerCleanup(unittest.TestCase):
                     "#!/bin/sh\n"
                     "last=\nfor arg do last=$arg; done\n"
                     "case $1 in\n"
-                    f"  ps) printf '%s\\n' {' '.join(repr(f'id{i} {name}') for i, name in enumerate(names))} ;;\n"
+                    f"  ps) printf '%s\\n' {' '.join(repr(f'{ids[i]} {name}') for i, name in enumerate(names))} ;;\n"
                     "  inspect) case \"$last\" in\n"
-                    f"    id0) echo 'id0 {token}' ;; id1) echo 'id1 {token}' ;;\n"
+                    f"    {ids[0]}) echo '{ids[0]} {token}' ;;\n"
+                    f"    {ids[1]}) echo '{ids[1]} {token}' ;;\n"
                     f"    *) echo \"$last {peer_token}\" ;; esac ;;\n"
                     "  rm) printf '%s\\n' \"$last\" >>\"$REMOVED\" ;;\n"
+                    "  container) exit 1 ;;\n"
                     "  *) exit 64 ;;\n"
                     "esac\n")
             os.chmod(podman, 0o755)
@@ -242,7 +271,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             with open(removed) as handle:
                 actual = set(handle.read().splitlines())
-        self.assertEqual(actual, {"id0", "id1"},
+        self.assertEqual(actual, set(ids[:2]),
                          "cleanup crossed the run ownership boundary")
         self.assertIn('--run-id "$RUN_ID"', source,
                       "the child and outer cleanup do not share an owner ID")
@@ -253,9 +282,10 @@ class RunScopedContainerCleanup(unittest.TestCase):
         self.assertLess(match.group(1).find("stop_active_phase"),
                         match.group(1).find("cleanup_owned_containers"),
                         "the child must stop before its owned containers are enumerated")
-        self.assertIn('setsid "$@"', source,
-                      "killing only the phase parent can leave its VMM children running")
-        self.assertIn('kill -TERM -- "-$pid"', source)
+        self.assertIn("phase_supervisor.py", source,
+                      "the phase process group has no stable supervisor")
+        self.assertNotIn('setsid "$@"', source)
+        self.assertNotIn('kill -TERM -- "-$pid"', source)
 
     def test_reused_root_pid_is_never_signalled(self):
         import importlib.util
@@ -282,9 +312,12 @@ class RunScopedContainerCleanup(unittest.TestCase):
                              re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(function)
         body = function.group(0)
-        self.assertIn('owned_process.py" signal', body)
-        self.assertIn('SERVE_PID=""', body)
-        self.assertIn('SERVE_START_TIME=""', body)
+        self.assertIn('printf T >&"$control_fd"', body)
+        self.assertIn('wait "$pid"', body)
+        self.assertNotIn("owned_process.py", body)
+        self.assertIn('SERVE_JOB_PID=""', body)
+        self.assertIn('SERVE_CONTROL_FD=""', body)
+        self.assertIn('SERVE_CONTROL_PATH=""', body)
 
     def test_a_phase_leader_cannot_leave_an_untracked_descendant(self):
         with open(EXTRA) as handle:
@@ -301,7 +334,9 @@ class RunScopedContainerCleanup(unittest.TestCase):
             script = (
                 "set -uo pipefail\n"
                 "say() { :; }\n"
-                "ACTIVE_PHASE_PID=\n"
+                + f"BENCH={HERE!r}\n"
+                "ACTIVE_PHASE_PID=\nACTIVE_PHASE_SIGNAL=\n"
+                "ACTIVE_PHASE_CONTROL_FD=\nACTIVE_PHASE_CONTROL_PATH=\n"
                 + "\n".join(functions) + "\n"
                 + "set +e\n"
                 + f"CHILD_PID={child_pid!r} run_logged {log_path!r} "
@@ -327,15 +362,16 @@ class RunScopedContainerCleanup(unittest.TestCase):
                                container_owner_token="a" * 32)
         side = corpus_mem.ContainerSide(args, "b" * 32)
         removed = []
+        name = side.prefix("host1r1") + "0"
 
         def bounded(cmd, _timeout):
-            if cmd[:3] == ["podman", "run", "-d"]:
+            if cmd[:2] == ["podman", "create"]:
                 return Completed(125, "", "name is already in use")
             if cmd[:3] == ["podman", "rm", "-f"]:
                 removed.append(cmd[-1])
                 return Completed()
             if cmd[:3] == ["podman", "inspect", "--format"]:
-                return Completed(0, "peer-id peer-owner\n", "")
+                return Completed(0, f"{'d' * 64} peer-owner\n", "")
             if cmd[:3] == ["podman", "container", "exists"]:
                 return Completed(0, "", "")
             if cmd[:3] == ["podman", "ps", "-a"]:
@@ -345,9 +381,12 @@ class RunScopedContainerCleanup(unittest.TestCase):
         with mock.patch.object(corpus_mem, "sh_bounded", bounded):
             with self.assertRaises(SystemExit):
                 side.bring_up(1, "host1r1", [0])
-            side.stop_all()
+            with self.assertRaises(RuntimeError):
+                side.stop_all()
         self.assertEqual(removed, [],
                          "cleanup deleted a same-name container this run did not create")
+        self.assertIn(name, side.owned,
+                      "failed ownership proof discarded the cleanup obligation")
 
     def test_partial_creation_is_cleaned_by_owner_label_and_exact_id(self):
         token = "a" * 32
@@ -358,7 +397,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
         name = side.prefix("host1r1") + "0"
 
         def bounded(cmd, _timeout):
-            if cmd[:3] == ["podman", "run", "-d"]:
+            if cmd[:2] == ["podman", "create"]:
                 return Completed(124, "", "timed out after create")
             if cmd[:3] == ["podman", "inspect", "--format"]:
                 return Completed(0, f"{'c' * 64} {token}\n", "")
@@ -441,7 +480,9 @@ class RunScopedContainerCleanup(unittest.TestCase):
 
         def shell(cmd, *_args, **_kwargs):
             calls.append(cmd)
-            return Completed(0, "container-id\n", "")
+            if cmd[:3] == ["podman", "inspect", "--format"]:
+                return Completed(0, "c" * 64 + " " + "c" * 32 + "\n", "")
+            return Completed(0, "c" * 64 + "\n", "")
 
         with mock.patch.object(corpus_mem, "sh", shell), \
              mock.patch.object(corpus_mem, "sh_bounded", shell):
@@ -1554,10 +1595,52 @@ class CorpusExtraFailClosed(unittest.TestCase):
 
     def test_replay_readiness_is_bound_to_this_server(self):
         source = self.source()
-        launch = source[source.index('SERVE_PIDFILE='):source.index('# Every corpus member')]
-        self.assertIn('sudo kill -0 "$SERVE_PID"', launch)
-        self.assertIn('[ "$answer" = "10.0.2.2" ]', launch)
-        self.assertIn('[ "$code" = "200" ]', launch)
+        helper = re.search(
+            r'^replay_probe_logged\(\) \{\n.*?^\}', source,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(helper, "startup responses are not bound to this server's logs")
+        launch = source[
+            source.index('SERVE_CONTROL_PATH='):
+            source.index('# Every corpus member')
+        ]
+        self.assertIn('replay_probe_logged "$readiness_qname" "$readiness_path"',
+                      launch)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            dns_log = os.path.join(tmp, "corpus-dns.log")
+            access_log = os.path.join(tmp, "corpus-access.log")
+            stale_qname = "ready-stale.blog.cloudflare.com"
+            stale_path = "/?fcvm-ready=stale"
+            with open(dns_log, "w") as handle:
+                handle.write(json.dumps({
+                    "qname": stale_qname, "qtype": 1, "answer": "10.0.2.2",
+                }) + "\n")
+            with open(access_log, "w") as handle:
+                handle.write(json.dumps({
+                    "host": "blog.cloudflare.com", "path": stale_path,
+                    "status": 200,
+                }) + "\n")
+
+            def probe(qname, path):
+                script = (
+                    "set -euo pipefail\n"
+                    f"RESULTS={tmp!r}\n"
+                    + helper.group(0) + "\n"
+                    + f"replay_probe_logged {qname!r} {path!r}\n"
+                )
+                return subprocess.run(
+                    ["bash", "-c", script], capture_output=True, text=True,
+                    timeout=10,
+                )
+
+            self.assertNotEqual(
+                probe("ready-current.blog.cloudflare.com",
+                      "/?fcvm-ready=current").returncode,
+                0,
+                "a stale response from this run was accepted for a later probe",
+            )
+            self.assertEqual(probe(stale_qname, stale_path).returncode, 0)
 
     def test_replay_nonzero_exit_prevents_success(self):
         source = self.source()
@@ -1778,6 +1861,9 @@ class SnapshotIdentity(unittest.TestCase):
             "guest_dns": "10.0.2.2",
             "dns_server": "10.0.2.2",
             "guest_env": [],
+            "creator_fcvm_sha256": "b" * 64,
+            "creator_runtime_bundle_sha256": "c" * 64,
+            "source_revision": "d" * 40,
         }
         record.update(overrides)
         return record
@@ -1785,20 +1871,47 @@ class SnapshotIdentity(unittest.TestCase):
     def test_matching_snapshot_identity_is_accepted(self):
         corpus_mem.validate_snapshot_for_benchmark(
             self.generation(), "localhost/chromium-bench-req",
-            "sha256:" + "a" * 64, "10.0.2.2")
+            "sha256:" + "a" * 64, "10.0.2.2", "b" * 64,
+            "c" * 64, "d" * 40)
 
     def test_snapshot_of_another_image_is_refused(self):
         with self.assertRaises(SystemExit):
             corpus_mem.validate_snapshot_for_benchmark(
                 self.generation(), "localhost/chromium-bench-req",
-                "sha256:" + "b" * 64, "10.0.2.2")
+                "sha256:" + "b" * 64, "10.0.2.2", "b" * 64,
+                "c" * 64, "d" * 40)
 
     def test_snapshot_without_the_replay_resolver_is_refused(self):
         with self.assertRaises(SystemExit):
             corpus_mem.validate_snapshot_for_benchmark(
                 self.generation(guest_dns=None, dns_server="127.0.0.53"),
                 "localhost/chromium-bench-req", "sha256:" + "a" * 64,
-                "10.0.2.2")
+                "10.0.2.2", "b" * 64, "c" * 64, "d" * 40)
+
+    def test_snapshot_creator_must_match_every_staged_runtime_identity(self):
+        expected = ("b" * 64, "c" * 64, "d" * 40)
+        fields = (
+            ("creator_fcvm_sha256", "e" * 64),
+            ("creator_runtime_bundle_sha256", "f" * 64),
+            ("source_revision", "1" * 40),
+        )
+        for field, wrong in fields:
+            with self.subTest(field=field):
+                with self.assertRaises(SystemExit):
+                    corpus_mem.validate_snapshot_for_benchmark(
+                        self.generation(**{field: wrong}),
+                        "localhost/chromium-bench-req", "sha256:" + "a" * 64,
+                        "10.0.2.2", *expected)
+
+    def test_fcvm_digest_is_computed_before_snapshot_validation(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        main = source[source.index("def main_with_resources(resources") :]
+        digest = main.find("fcvm_sha256 = sha256_file(args.fcvm)")
+        validate = main.find("validate_snapshot_for_benchmark(")
+        self.assertGreaterEqual(digest, 0, "the current fcvm bytes are never identified")
+        self.assertGreater(validate, digest,
+                           "snapshot provenance is accepted before current fcvm is identified")
 
 
 class ArgumentValidation(unittest.TestCase):
@@ -1837,6 +1950,11 @@ class ArgumentValidation(unittest.TestCase):
 
     def test_valid_arguments_are_accepted(self):
         corpus_mem.validate_args(self.args())
+
+    def test_reps_must_cover_whole_corpus_cycles(self):
+        self.assert_refused(urls=["one", "two", "three"], reps=2)
+        corpus_mem.validate_args(
+            self.args(urls=["one", "two", "three"], reps=6))
 
     def test_unpaired_cpu_measurement_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1891,6 +2009,1293 @@ class CanonicalImageIdentity(unittest.TestCase):
             with self.subTest(value=value):
                 with self.assertRaises(SystemExit):
                     corpus_mem.canonical_image_id(value)
+
+    def test_outer_preflight_canonicalizes_bare_and_prefixed_image_ids(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        match = re.search(
+            r'^canonical_runtime_image_id\(\) \{\n.*?^\}', source,
+            re.MULTILINE | re.DOTALL,
+        )
+        self.assertIsNotNone(match, "the outer image identity has no canonicalizer")
+        digest = "a" * 64
+        script = (match.group(0) + "\n"
+                  + f"canonical_runtime_image_id {digest!r}\n"
+                  + f"canonical_runtime_image_id {'sha256:' + digest!r}\n"
+                  + "canonical_runtime_image_id malformed\n")
+        proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, timeout=30)
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertEqual(proc.stdout.splitlines(),
+                         ["sha256:" + digest, "sha256:" + digest])
+
+    def test_campaign_preserves_logical_tag_and_passes_exact_image_id(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        self.assertIn("podman image inspect", source)
+        host_start = source.index('run_logged "$LOGDIR/hostcdp-$arm.log"')
+        host_end = source.index('RESULTS="$RESULTS/hostcdp-$arm"', host_start)
+        host = source[host_start:host_end]
+        self.assertIn('IMAGE="$IMAGE"', host)
+        self.assertIn('IMAGE_ID="$RUNTIME_IMAGE"', host)
+        memory = source[source.index('run_logged "$LOGDIR/memory.log"'):]
+        self.assertIn('--image "$IMAGE" --image-id "$RUNTIME_IMAGE"', memory)
+
+    def test_memory_preflight_uses_image_namespace_and_launches_exact_id(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        self.assertIn(
+            '["podman", "image", "inspect", "--format", "{{.Id}}", args.image]',
+            source,
+        )
+        self.assertIn('getattr(self.args, "image_id", self.args.image)', source)
+
+
+class CampaignIntegrityRegression(unittest.TestCase):
+    """The campaign cannot publish after an ambiguous create or failed phase."""
+
+    @staticmethod
+    def shell_function(source, name):
+        match = re.search(rf'^{name}\(\) \{{\n.*?^\}}', source,
+                          re.MULTILINE | re.DOTALL)
+        if match is None:
+            raise AssertionError(f"{name} is missing")
+        return match.group(0)
+
+    def test_podman_run_must_return_one_full_lowercase_container_id(self):
+        args = SimpleNamespace(
+            image="image", urls=["https://example.com/"],
+            container_owner_token="a" * 32,
+            container_create_ops_dir=None,
+        )
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        with mock.patch.object(corpus_mem, "sh_bounded",
+                               return_value=Completed(0, "short-id\n", "")), \
+             mock.patch.object(corpus_mem, "sh", return_value=Completed()):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "host1r1", [0])
+        self.assertIn(side.prefix("host1r1") + "0", side.owned,
+                      "an ambiguous create lost its cleanup ownership")
+
+    def test_malformed_success_keeps_create_lease_until_reconciliation(self):
+        args = SimpleNamespace(
+            image="image", urls=["https://example.com/"],
+            container_owner_token="a" * 32,
+            container_create_ops_dir="unused",
+        )
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        name = side.prefix("host1r1") + "0"
+
+        class Operation:
+            released = False
+
+            def finish(self, _timeout):
+                return Completed(0, "short-id\n", "")
+
+            def acquire_reconciliation(self, _timeout):
+                pass
+
+            def release(self):
+                self.released = True
+
+        operation = Operation()
+        with mock.patch.object(
+                corpus_mem, "start_container_create",
+                return_value=(operation, Completed(0, "short-id\n", ""))):
+            with self.assertRaises(SystemExit):
+                side.bring_up(1, "host1r1", [0])
+        self.assertIs(side.create_operations.get(name), operation)
+        self.assertFalse(operation.released,
+                         "malformed output released the unknown create outcome")
+
+        with mock.patch.object(corpus_mem, "inspected_container_identity",
+                               return_value=None):
+            side.stop_all()
+        self.assertTrue(operation.released)
+        self.assertNotIn(name, side.owned)
+
+    def test_hung_create_is_killed_reaped_and_holds_lease_until_reconciled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            operation = corpus_mem.ContainerCreateOperation(
+                [sys.executable, "-c",
+                 "import os,signal,time; "
+                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                 "print(os.getpid(), flush=True); time.sleep(60)"],
+                tmp, "hung-create", 0.05, 2.0, 0.2,
+            )
+            child_pid = int(operation.process.stdout.readline())
+            lock_path = os.path.join(tmp, "hung-create.lock")
+            result = None
+            reaped = False
+            still_locked = False
+            try:
+                result = operation.finish(0.01)
+                reaped = operation.process.poll() is not None
+                probe = subprocess.run(
+                    ["flock", "-x", "-n", lock_path, "true"],
+                    capture_output=True, text=True, timeout=10)
+                still_locked = probe.returncode != 0
+            finally:
+                if operation.process.poll() is None:
+                    operation.process.kill()
+                    operation.process.communicate(timeout=10)
+                if getattr(operation, "lock_fd", None) is not None:
+                    os.close(operation.lock_fd)
+                    operation.lock_fd = None
+            self.assertIsNotNone(result)
+            self.assertEqual(result.returncode, 124)
+            self.assertTrue(reaped)
+            self.assertFalse(os.path.exists(f"/proc/{child_pid}"))
+            self.assertTrue(still_locked,
+                            "the create lease was released before reconciliation")
+            probe = subprocess.run(
+                ["flock", "-x", "-n", lock_path, "true"],
+                capture_output=True, text=True, timeout=10)
+            self.assertEqual(probe.returncode, 0, probe.stderr)
+
+    def test_late_create_commit_precedes_exclusive_reconciliation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "committed")
+            lock_path = os.path.join(tmp, "late-create.lock")
+            operation = corpus_mem.ContainerCreateOperation(
+                [sys.executable, "-c", "print('leader-done', flush=True)"],
+                tmp, "late-create",
+            )
+            result = operation.finish(10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            holder = subprocess.Popen(
+                [sys.executable, "-c",
+                 "import fcntl,os,sys; "
+                 "fd=os.open(sys.argv[1], os.O_RDWR); "
+                 "fcntl.flock(fd, fcntl.LOCK_SH); "
+                 "print('locked', flush=True); sys.stdin.buffer.read(1); "
+                 "open(sys.argv[2], 'w').write('committed\\n'); os.close(fd)",
+                 lock_path, marker],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            self.assertEqual(holder.stdout.readline().strip(), "locked")
+            reconciliation_started = threading.Event()
+            writer_error = []
+
+            def allow_commit():
+                if not reconciliation_started.wait(10):
+                    writer_error.append("exclusive reconciliation never started")
+                    return
+                try:
+                    holder.stdin.write("1")
+                    holder.stdin.flush()
+                    holder.stdin.close()
+                except (OSError, ValueError) as exc:
+                    writer_error.append(str(exc))
+
+            writer = threading.Thread(target=allow_commit)
+            writer.start()
+            shared_fd = operation.lock_fd
+            real_close = os.close
+
+            def observed_close(fd):
+                result = real_close(fd)
+                if fd == shared_fd:
+                    reconciliation_started.set()
+                return result
+
+            try:
+                with mock.patch.object(corpus_mem.os, "close", observed_close):
+                    operation.acquire_reconciliation(10)
+                writer.join(timeout=10)
+                self.assertFalse(writer.is_alive())
+                self.assertEqual(writer_error, [])
+                holder.wait(timeout=10)
+                holder_error = holder.stderr.read()
+                holder.stdout.close()
+                holder.stderr.close()
+                self.assertEqual(holder.returncode, 0, holder_error)
+                self.assertTrue(os.path.isfile(marker),
+                                "absence could be inspected before the late commit")
+            finally:
+                reconciliation_started.set()
+                writer.join(timeout=10)
+                if holder.poll() is None:
+                    holder.kill()
+                    holder.communicate(timeout=5)
+                if holder.stdout is not None and not holder.stdout.closed:
+                    holder.stdout.close()
+                if holder.stderr is not None and not holder.stderr.closed:
+                    holder.stderr.close()
+                if getattr(operation, "lock_fd", None) is not None:
+                    os.close(operation.lock_fd)
+                    operation.lock_fd = None
+                if getattr(operation, "reconcile_fd", None) is not None:
+                    os.close(operation.reconcile_fd)
+                    operation.reconcile_fd = None
+
+    def test_create_supervisor_drains_fd_closing_escaped_committer(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = os.path.join(tmp, "late-commit")
+            child_pid_path = os.path.join(tmp, "late-child")
+            child = (
+                "import os,signal,time; "
+                "[os.close(fd) for fd in range(3,256) "
+                "if os.path.exists(f'/proc/self/fd/{fd}')]; "
+                f"signal.signal(signal.SIGTERM, lambda *_: "
+                f"(open({marker!r}, 'w').write('committed\\n'), "
+                "raise_exit())[1]); "
+                "time.sleep(60)"
+            )
+            child = child.replace(
+                "import os,signal,time; ",
+                "import os,signal,time; raise_exit=lambda: "
+                "(_ for _ in ()).throw(SystemExit(0)); ",
+            )
+            leader = (
+                "import subprocess,sys; "
+                "proc=subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
+                "start_new_session=True, stdin=subprocess.DEVNULL, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                f"open({child_pid_path!r}, 'w').write(str(proc.pid)); "
+                "print('leader-finished', flush=True)"
+            )
+            operation = corpus_mem.ContainerCreateOperation(
+                [sys.executable, "-c", leader, child], tmp, "fd-closing-create")
+            result = operation.finish(10)
+            with open(child_pid_path) as handle:
+                child_pid = int(handle.read())
+            try:
+                self.assertEqual(
+                    result.returncode, 1,
+                    "an escaped create committer was not part of operation completion",
+                )
+                self.assertTrue(os.path.isfile(marker))
+                operation.acquire_reconciliation(10)
+            finally:
+                try:
+                    pidfd = os.pidfd_open(child_pid)
+                except ProcessLookupError:
+                    pidfd = None
+                if pidfd is not None:
+                    try:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    finally:
+                        os.close(pidfd)
+                if getattr(operation, "lock_fd", None) is not None:
+                    os.close(operation.lock_fd)
+                    operation.lock_fd = None
+                if getattr(operation, "reconcile_fd", None) is not None:
+                    os.close(operation.reconcile_fd)
+                    operation.reconcile_fd = None
+
+    def test_container_inspection_runs_under_exclusive_create_lease(self):
+        token = "a" * 32
+        args = SimpleNamespace(container_owner_token=token)
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        name = side.prefix("host1r1") + "0"
+        state = {"exclusive": False, "released": False}
+
+        class Operation:
+            def finish(self, _timeout):
+                return Completed(125, "", "create failed")
+
+            def acquire_reconciliation(self, _timeout):
+                state["exclusive"] = True
+
+            def release(self):
+                state["released"] = True
+
+        side.owned.add(name)
+        side.create_operations[name] = Operation()
+
+        def inspect(_name):
+            self.assertTrue(state["exclusive"])
+            return None
+
+        with mock.patch.object(corpus_mem, "inspected_container_identity", inspect):
+            side.stop_all()
+        self.assertTrue(state["released"])
+        self.assertNotIn(name, side.owned)
+
+    def test_memory_uses_supervised_create_then_starts_only_the_owned_exact_id(self):
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        bring_up = source[source.index("    def bring_up(self, n, cell_tag, url_indices):",
+                                       source.index("class ContainerSide")):
+                          source.index("    def tear_down(self, live):",
+                                       source.index("class ContainerSide"))]
+        create = bring_up.find('["podman", "create"')
+        reconcile = bring_up.find("inspected_container_identity(name)")
+        start = bring_up.find('["podman", "start", "--", container_id]')
+        self.assertGreaterEqual(create, 0, "memory still uses podman run -d")
+        self.assertGreater(reconcile, create)
+        self.assertGreater(start, reconcile,
+                           "an unowned/unverified ID can be started")
+
+    def test_finish_exception_cannot_lose_the_create_operation(self):
+        args = SimpleNamespace(
+            image="image", urls=["https://example.com/"],
+            container_owner_token="a" * 32,
+            container_create_ops_dir="unused",
+        )
+        side = corpus_mem.ContainerSide(args, "b" * 32)
+        name = side.prefix("host1r1") + "0"
+
+        class Operation:
+            calls = 0
+            acquired = False
+            released = False
+
+            def finish(self, _timeout):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("injected reap failure")
+                return Completed(125, "", "injected create failure")
+
+            def acquire_reconciliation(self, _timeout):
+                self.acquired = True
+
+            def release(self):
+                self.released = True
+
+        operation = Operation()
+        with mock.patch.object(corpus_mem, "ContainerCreateOperation",
+                               return_value=operation):
+            with self.assertRaisesRegex(RuntimeError, "injected reap failure"):
+                side.bring_up(1, "host1r1", [0])
+        self.assertIs(side.create_operations.get(name), operation,
+                      "finish failed before cleanup retained the operation")
+        with mock.patch.object(corpus_mem, "inspected_container_identity",
+                               return_value=None):
+            side.stop_all()
+        self.assertTrue(operation.acquired)
+        self.assertTrue(operation.released)
+        self.assertNotIn(name, side.owned)
+
+    def test_matching_owner_with_a_different_exact_id_fails_cleanup(self):
+        token = "a" * 32
+        expected = "b" * 64
+        actual = "c" * 64
+        args = SimpleNamespace(container_owner_token=token,
+                               container_create_ops_dir=None)
+        side = corpus_mem.ContainerSide(args, "d" * 32)
+        name = side.prefix("host1r1") + "0"
+        side.owned.add(name)
+        side.owned_ids[name] = expected
+        with mock.patch.object(corpus_mem, "inspected_container_identity",
+                               return_value=(actual, token)):
+            with self.assertRaises(RuntimeError):
+                side.stop_all()
+        self.assertIn(name, side.owned,
+                      "an ID mismatch discarded the only cleanup ownership record")
+
+    def test_timed_out_create_is_quiesced_before_absence_can_clear_ownership(self):
+        token = "a" * 32
+        container_id = "b" * 64
+        args = SimpleNamespace(container_owner_token=token,
+                               container_create_ops_dir=None)
+        side = corpus_mem.ContainerSide(args, "c" * 32)
+        name = side.prefix("host1r1") + "0"
+        side.owned.add(name)
+        state = {"complete": False}
+
+        class LateCreate:
+            def finish(self, _timeout):
+                state["complete"] = True
+                return Completed(0, container_id + "\n", "")
+
+            def acquire_reconciliation(self, _timeout):
+                self.exclusive = True
+
+            def release(self):
+                self.released = True
+
+        side.create_operations[name] = LateCreate()
+
+        def identity(_name):
+            return (container_id, token) if state["complete"] else None
+
+        removed = []
+
+        def bounded(cmd, _timeout):
+            if cmd[:3] == ["podman", "rm", "-f"]:
+                removed.append(cmd[-1])
+                return Completed()
+            if cmd[:3] == ["podman", "container", "exists"]:
+                return Completed(1, "", "")
+            return Completed()
+
+        with mock.patch.object(corpus_mem, "inspected_container_identity", identity), \
+             mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            side.stop_all()
+        self.assertTrue(state["complete"], "cleanup observed absence before create completed")
+        self.assertEqual(removed, [container_id])
+        self.assertNotIn(name, side.owned)
+
+    def test_outer_cleanup_waits_for_create_locks_after_phase_quiescence(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        cleanup = self.shell_function(source, "cleanup")
+        wait = self.shell_function(source, "wait_for_container_create_operations")
+        self.assertLess(cleanup.find("stop_active_phase"),
+                        cleanup.find("wait_for_container_create_operations"))
+        self.assertLess(cleanup.find("wait_for_container_create_operations"),
+                        cleanup.find("cleanup_owned_containers"))
+        self.assertIn("flock -x", wait)
+        self.assertNotIn("sleep", wait)
+        self.assertIn('CONTAINER_CREATE_OPS_DIR="$RESULTS/container-create-ops"', source)
+        self.assertIn('CONTAINER_CREATE_OPS_DIR="$CONTAINER_CREATE_OPS_DIR"', source)
+        self.assertIn('--container-create-ops-dir "$CONTAINER_CREATE_OPS_DIR"', source)
+
+    def test_outer_cleanup_refuses_rm_success_when_exact_id_survives(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        cleanup_owned = self.shell_function(source, "cleanup_owned_containers")
+        run_id = "a" * 32
+        token = "b" * 32
+        container_id = "c" * 64
+        name = f"cbmem-{run_id}-host1r1-0"
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = os.path.join(tmp, "calls")
+            podman = os.path.join(tmp, "podman")
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/bin/sh\n"
+                    "printf '%s\\n' \"$*\" >>\"$CALLS\"\n"
+                    "case \"$1 $2\" in\n"
+                    f"  'ps -a') echo '{container_id} {name}' ;;\n"
+                    f"  'inspect --format') echo '{container_id} {token}' ;;\n"
+                    "  'rm -f') exit 0 ;;\n"
+                    "  'container exists') exit 0 ;;\n"
+                    "  *) exit 64 ;;\n"
+                    "esac\n"
+                )
+            os.chmod(podman, 0o755)
+            script = (
+                "set -uo pipefail\n"
+                f"RUN_ID={run_id!r}\nCONTAINER_OWNER_TOKEN={token!r}\n"
+                + cleanup_owned + "\ncleanup_owned_containers\n"
+            )
+            env = dict(os.environ, PATH=tmp + os.pathsep + os.environ["PATH"],
+                       CALLS=calls)
+            proc = subprocess.run(["bash", "-c", script], env=env,
+                                  capture_output=True, text=True, timeout=30)
+            self.assertNotEqual(proc.returncode, 0,
+                                "rm exit 0 was mistaken for proof of absence")
+            with open(calls) as handle:
+                invocations = handle.read()
+            self.assertIn(f"container exists {container_id}", invocations)
+
+    def test_failed_phase_atomically_withdraws_and_unpublishes_summary(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        marker = self.shell_function(source, "mark_campaign_withdrawn")
+        cleanup = self.shell_function(source, "cleanup")
+        with tempfile.TemporaryDirectory() as tmp:
+            summary = os.path.join(tmp, "summary.json")
+            with open(summary, "w") as handle:
+                handle.write("{}\n")
+            script = (
+                "set +e\n"
+                f"RESULTS={tmp!r}\nDNSMASQ_WAS_ACTIVE=no\n"
+                "stop_active_phase() { return 0; }\n"
+                "verify_runtime_bundle() { return 0; }\n"
+                "wait_for_container_create_operations() { return 0; }\n"
+                "cleanup_owned_containers() { return 0; }\n"
+                "stop_corpus_serve() { return 0; }\n"
+                "require_corpus_serve_clean() { return 0; }\n"
+                + marker + "\n" + cleanup + "\n"
+                + "false\ncleanup\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=30)
+            self.assertNotEqual(proc.returncode, 0)
+            with open(os.path.join(tmp, "WITHDRAWN")) as handle:
+                self.assertIn("phase exited", handle.readline())
+            self.assertFalse(os.path.exists(summary),
+                             "an earlier summary remained publishable after failure")
+            self.assertEqual(
+                [name for name in os.listdir(tmp) if name.startswith(".WITHDRAWN.")],
+                [], "the atomic withdrawal left a temporary marker",
+            )
+
+    def test_cleanup_failure_withdraws_a_nominally_successful_phase(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        marker = self.shell_function(source, "mark_campaign_withdrawn")
+        cleanup = self.shell_function(source, "cleanup")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "set +e\n"
+                f"RESULTS={tmp!r}\nDNSMASQ_WAS_ACTIVE=no\n"
+                "stop_active_phase() { return 0; }\n"
+                "verify_runtime_bundle() { return 0; }\n"
+                "wait_for_container_create_operations() { return 0; }\n"
+                "cleanup_owned_containers() { return 1; }\n"
+                "stop_corpus_serve() { return 0; }\n"
+                "require_corpus_serve_clean() { return 0; }\n"
+                + marker + "\n" + cleanup + "\ncleanup\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=30)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "WITHDRAWN")))
+
+    def test_campaign_completion_binds_every_requested_host_arm(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        start = source.index("publish_campaign_completion() {")
+        end = source.index("\ncleanup() {", start)
+        publisher = source[start:end]
+        with tempfile.TemporaryDirectory() as tmp:
+            expected = []
+            for arm, payload in (("free", b"free-complete\n"),
+                                 ("cpu2", b"cpu2-complete\n")):
+                directory = os.path.join(tmp, f"hostcdp-{arm}")
+                os.mkdir(directory)
+                path = os.path.join(directory, "complete.json")
+                with open(path, "wb") as handle:
+                    handle.write(payload)
+                expected.append({
+                    "path": f"hostcdp-{arm}/complete.json",
+                    "size": len(payload),
+                    "sha256": hashlib.sha256(payload).hexdigest(),
+                })
+            script = (
+                "set -euo pipefail\n"
+                f"RESULTS={tmp!r}\nRUN_ID={'a' * 32!r}\n"
+                f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256={'b' * 64!r}\n"
+                "PHASES=hostcdp,memory\nHOSTCDP_ARMS=free,cpu2\n"
+                + publisher + "\npublish_campaign_completion\n"
+            )
+            subprocess.run(["bash", "-c", script], check=True,
+                           capture_output=True, text=True, timeout=30)
+            with open(os.path.join(tmp, "campaign-complete.json")) as handle:
+                completion = json.load(handle)
+            self.assertEqual(set(completion), {
+                "schema_version", "run_id", "runtime_bundle_sha256",
+                "host_completes",
+            })
+            self.assertEqual(completion["schema_version"], 1)
+            self.assertEqual(completion["run_id"], "a" * 32)
+            self.assertEqual(completion["runtime_bundle_sha256"], "b" * 64)
+            self.assertEqual(completion["host_completes"],
+                             sorted(expected, key=lambda item: item["path"]))
+            self.assertFalse(any(name.startswith(".campaign-complete.")
+                                 for name in os.listdir(tmp)))
+
+    def test_only_successful_cleanup_publishes_campaign_completion(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        cleanup = self.shell_function(source, "cleanup")
+
+        def run(cleanup_result, withdrawal_result):
+            with tempfile.TemporaryDirectory() as tmp:
+                script = (
+                    "set +e\n"
+                    f"RESULTS={tmp!r}\nDNSMASQ_WAS_ACTIVE=no\n"
+                    "stop_active_phase() { return 0; }\n"
+                    "verify_runtime_bundle() { return 0; }\n"
+                    "wait_for_container_create_operations() { return 0; }\n"
+                    f"cleanup_owned_containers() {{ return {cleanup_result}; }}\n"
+                    "stop_corpus_serve() { return 0; }\n"
+                    "require_corpus_serve_clean() { return 0; }\n"
+                    f"mark_campaign_withdrawn() {{ return {withdrawal_result}; }}\n"
+                    "publish_campaign_completion() { : > \"$RESULTS/campaign-complete.json\"; }\n"
+                    + cleanup + "\ncleanup\n"
+                )
+                proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                      text=True, timeout=30)
+                return proc.returncode, os.path.exists(
+                    os.path.join(tmp, "campaign-complete.json"))
+
+        self.assertEqual(run(0, 0), (0, True))
+        self.assertEqual(
+            run(1, 1), (1, False),
+            "failed cleanup became publishable when WITHDRAWN could not be written",
+        )
+
+    def test_late_completion_failure_removes_the_visible_commit(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        marker = self.shell_function(source, "mark_campaign_withdrawn")
+        cleanup = self.shell_function(source, "cleanup")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "set +e\n"
+                f"RESULTS={tmp!r}\nDNSMASQ_WAS_ACTIVE=no\n"
+                "stop_active_phase() { return 0; }\n"
+                "verify_runtime_bundle() { return 0; }\n"
+                "wait_for_container_create_operations() { return 0; }\n"
+                "cleanup_owned_containers() { return 0; }\n"
+                "stop_corpus_serve() { return 0; }\n"
+                "require_corpus_serve_clean() { return 0; }\n"
+                "publish_campaign_completion() {\n"
+                "  printf '{\"schema_version\":1}\n' >"
+                "\"$RESULTS/campaign-complete.json\"\n"
+                "  return 1\n"
+                "}\n"
+                + marker + "\n" + cleanup + "\ncleanup\n"
+            )
+            proc = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, timeout=30)
+            self.assertNotEqual(proc.returncode, 0)
+            self.assertFalse(os.path.exists(
+                os.path.join(tmp, "campaign-complete.json")),
+                "a failed late publication left an authorizing record",
+            )
+            self.assertTrue(os.path.isfile(os.path.join(tmp, "WITHDRAWN")))
+
+    def test_phase_supervisor_reaps_a_descendant_after_its_leader_exits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child_file = os.path.join(tmp, "child")
+            proc = subprocess.run(
+                [sys.executable, PHASE_SUPERVISOR,
+                 "--expected-parent", str(os.getpid()), "--", "sh", "-c",
+                 f"sleep 60 & echo $! > {child_file!r}"],
+                capture_output=True, text=True, timeout=20,
+            )
+            self.assertEqual(
+                proc.returncode, 1,
+                "internal descendant cleanup was misreported as an operator signal",
+            )
+            with open(child_file) as handle:
+                child = int(handle.read())
+            self.assertFalse(os.path.exists(f"/proc/{child}"),
+                             "the supervised phase left a descendant alive")
+
+    def test_phase_supervisor_drains_a_descendant_that_escaped_the_leader_group(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            child_file = os.path.join(tmp, "escaped-child")
+            leader = (
+                "import os,subprocess,sys; "
+                "child=subprocess.Popen([sys.executable, '-c', "
+                "'import time; time.sleep(60)'], start_new_session=True, "
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
+                f"open({child_file!r}, 'w').write(str(child.pid))"
+            )
+            proc = subprocess.run(
+                [sys.executable, PHASE_SUPERVISOR,
+                 "--expected-parent", str(os.getpid()), "--",
+                 sys.executable, "-c", leader],
+                capture_output=True, text=True, timeout=20,
+            )
+            with open(child_file) as handle:
+                child = int(handle.read())
+
+            def state(pid):
+                try:
+                    with open(f"/proc/{pid}/stat") as handle:
+                        raw = handle.read()
+                except FileNotFoundError:
+                    return None
+                return raw[raw.rfind(")") + 2:].split()[0]
+
+            try:
+                self.assertEqual(
+                    proc.returncode, 1,
+                    "an escaped descendant was omitted from phase integrity",
+                )
+                self.assertIn(state(child), (None, "Z"),
+                              "the escaped descendant survived supervision")
+            finally:
+                if state(child) not in (None, "Z"):
+                    pidfd = os.pidfd_open(child)
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        poller = select.poll()
+                        poller.register(pidfd, select.POLLIN)
+                        poller.poll(5000)
+                    finally:
+                        os.close(pidfd)
+
+    def test_phase_supervisor_escalates_when_phase_leader_ignores_term(self):
+        driver = (
+            "import os,sys; "
+            f"sys.path.insert(0, {HERE!r}); "
+            "import phase_supervisor as supervisor; "
+            "supervisor.GRACE_SECONDS=0.05; "
+            "raise SystemExit(supervisor.supervise([sys.executable, '-c', "
+            "'import os,signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print(os.getpid(), flush=True); time.sleep(60)'], os.getppid()))"
+        )
+        supervisor = subprocess.Popen(
+            [sys.executable, "-c", driver], stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True,
+        )
+        leader_pid = int(supervisor.stdout.readline())
+        timed_out = False
+        returncode = None
+        try:
+            supervisor.send_signal(signal.SIGTERM)
+            try:
+                supervisor.communicate(timeout=5)
+                returncode = supervisor.returncode
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        finally:
+            try:
+                pidfd = os.pidfd_open(leader_pid)
+            except ProcessLookupError:
+                pidfd = None
+            killed_supervisor = supervisor.poll() is None
+            if killed_supervisor:
+                supervisor.kill()
+            if pidfd is not None:
+                try:
+                    try:
+                        signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    poller = select.poll()
+                    poller.register(pidfd, select.POLLIN)
+                    poller.poll(5000)
+                finally:
+                    os.close(pidfd)
+            if killed_supervisor:
+                supervisor.communicate(timeout=5)
+        self.assertFalse(timed_out, "TERM left the phase supervisor waiting forever")
+        self.assertEqual(returncode, 128 + signal.SIGTERM)
+
+    def test_phase_supervisor_owns_the_normal_command_deadline(self):
+        command = [
+            sys.executable, "-c",
+            "import signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)",
+        ]
+        started = time.monotonic()
+        result = phase_supervisor.supervise(
+            command, os.getppid(), term_grace=0.05, kill_grace=1.0,
+            command_timeout=0.05,
+        )
+        elapsed = time.monotonic() - started
+        self.assertEqual(result, 124)
+        self.assertLess(elapsed, 5)
+
+    def test_phase_supervisor_control_is_open_before_the_phase_launches(self):
+        with open(PHASE_SUPERVISOR) as handle:
+            source = handle.read()
+        with tempfile.TemporaryDirectory() as tmp:
+            control = os.path.join(tmp, "control")
+            phase_pid_path = os.path.join(tmp, "phase.pid")
+            os.mkfifo(control)
+            control_fd = os.open(control, os.O_RDWR | os.O_NONBLOCK)
+            command = (
+                "import os,signal,time; "
+                "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
+                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                "signal.signal(signal.SIGTERM, stop); time.sleep(60)"
+            )
+            proc = subprocess.Popen(
+                [sys.executable, PHASE_SUPERVISOR,
+                 "--expected-parent", str(os.getpid()),
+                 "--control-path", control,
+                 "--return-command-status-on-signal", "--",
+                 sys.executable, "-c", command],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            phase_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.isfile(phase_pid_path):
+                    if proc.poll() is not None:
+                        stdout, stderr = proc.communicate()
+                        self.fail(
+                            f"supervisor exited before phase readiness: "
+                            f"{proc.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("controlled phase did not start")
+                    time.sleep(0.01)
+                with open(phase_pid_path) as handle:
+                    phase_pid = int(handle.read())
+                os.write(control_fd, b"T")
+                stdout, stderr = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, stdout + stderr)
+                self.assertFalse(os.path.exists(f"/proc/{phase_pid}"))
+                opened = source.index("open_control_path(control_path)")
+                launched = source.index("subprocess.Popen(argv")
+                self.assertLess(opened, launched)
+            finally:
+                os.close(control_fd)
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.communicate(timeout=5)
+                if phase_pid is not None and os.path.exists(f"/proc/{phase_pid}"):
+                    try:
+                        pidfd = os.pidfd_open(phase_pid)
+                    except ProcessLookupError:
+                        pidfd = None
+                    if pidfd is not None:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            poller = select.poll()
+                            poller.register(pidfd, select.POLLIN)
+                            poller.poll(5000)
+                        finally:
+                            os.close(pidfd)
+
+    def test_phase_supervisor_bounds_post_kill_waits(self):
+        signal_key = SimpleNamespace(data="signal")
+
+        class Selector:
+            def __init__(self, events):
+                self.events = iter(events)
+                self.timeouts = []
+
+            def select(self, timeout=None):
+                self.timeouts.append(timeout)
+                return next(self.events)
+
+        identity = {"pid": 4242, "state": "D", "ppid": os.getpid(),
+                    "pgid": 4242, "starttime": 99}
+        leader_selector = Selector(([(signal_key, 1)], [], []))
+        with mock.patch.object(phase_supervisor, "drain"), \
+             mock.patch.object(phase_supervisor.os, "killpg"), \
+             mock.patch.object(phase_supervisor, "read_process_stat",
+                               return_value=identity):
+            with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
+                phase_supervisor.wait_for_phase_leader(
+                    leader_selector, SimpleNamespace(pid=4242),
+                    [signal.SIGTERM], -1, 0.01, 0.02,
+                )
+        self.assertEqual(len(leader_selector.timeouts), 3)
+        self.assertIsNone(leader_selector.timeouts[0])
+        self.assertGreater(leader_selector.timeouts[1], 0)
+        self.assertGreater(leader_selector.timeouts[2], 0)
+
+        descendant_selector = Selector(([], []))
+        sent = []
+        with mock.patch.object(
+                phase_supervisor, "direct_live_children",
+                return_value=[identity]), \
+             mock.patch.object(
+                 phase_supervisor, "signal_direct_children",
+                 side_effect=lambda children, parent, signum: sent.append(signum)):
+            with self.assertRaisesRegex(RuntimeError, "survived SIGKILL"):
+                phase_supervisor.drain_adopted_children(
+                    descendant_selector, -1, [], None, os.getpid(),
+                    0.01, 0.02,
+                )
+        self.assertEqual(sent, [signal.SIGTERM, signal.SIGKILL])
+        self.assertEqual(len(descendant_selector.timeouts), 2)
+        self.assertGreater(descendant_selector.timeouts[0], 0)
+        self.assertGreater(descendant_selector.timeouts[1], 0)
+
+    def test_internal_supervisor_failure_cannot_leak_the_spawned_phase(self):
+        real_popen = subprocess.Popen
+        real_selector = phase_supervisor.selectors.DefaultSelector
+        spawned = {}
+
+        def capture_spawn(argv, **kwargs):
+            kwargs["stdout"] = subprocess.PIPE
+            kwargs["stderr"] = subprocess.PIPE
+            kwargs["text"] = True
+            proc = real_popen(argv, **kwargs)
+            spawned["process"] = proc
+            spawned["pid"] = int(proc.stdout.readline())
+            return proc
+
+        class BrokenSelector:
+            def __init__(self):
+                self.selector = real_selector()
+                self.registrations = 0
+
+            def register(self, *args, **kwargs):
+                self.registrations += 1
+                if self.registrations == 2:
+                    raise RuntimeError("injected selector failure")
+                return self.selector.register(*args, **kwargs)
+
+            def close(self):
+                self.selector.close()
+
+        selectors_to_return = iter((BrokenSelector(), real_selector()))
+        command = [
+            sys.executable, "-c",
+            "import os,signal,time; "
+            "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+            "print(os.getpid(), flush=True); time.sleep(60)",
+        ]
+        try:
+            with mock.patch.object(phase_supervisor.subprocess, "Popen",
+                                   side_effect=capture_spawn), \
+                 mock.patch.object(
+                     phase_supervisor.selectors, "DefaultSelector",
+                     side_effect=lambda: next(selectors_to_return)), \
+                 mock.patch.object(phase_supervisor, "GRACE_SECONDS", 0.05), \
+                 mock.patch.object(phase_supervisor, "KILL_REAP_SECONDS", 1.0):
+                with self.assertRaisesRegex(RuntimeError,
+                                            "injected selector failure"):
+                    phase_supervisor.supervise(command, os.getppid())
+            self.assertIsNotNone(spawned["process"].returncode,
+                                 "internal failure left the phase unreaped")
+            self.assertFalse(os.path.exists(f"/proc/{spawned['pid']}"),
+                             "internal failure left the phase running")
+        finally:
+            proc = spawned.get("process")
+            if proc is not None and proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=5)
+            elif proc is not None:
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+
+    def test_phase_supervisor_dies_with_parent_and_drains_its_phase(self):
+        with open(PHASE_SUPERVISOR) as handle:
+            supervisor_source = handle.read()
+        armed = supervisor_source.index("arm_parent_death(expected_parent)")
+        launched = supervisor_source.index("subprocess.Popen(argv")
+        self.assertLess(armed, launched,
+                        "the phase can launch before its parent-death guard is armed")
+        with tempfile.TemporaryDirectory() as tmp:
+            phase_pid_path = os.path.join(tmp, "phase.pid")
+            parent_code = (
+                "import os,signal,subprocess,sys\n"
+                "phase = [sys.executable, '-c', "
+                + repr("import os,signal,time; "
+                       f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                       "signal.signal(signal.SIGTERM, lambda *_: raise_exit()); "
+                       "time.sleep(60)")
+                + "]\n"
+                "supervisor = subprocess.Popen([sys.executable, "
+                + repr(PHASE_SUPERVISOR)
+                + ", '--expected-parent', str(os.getpid()), '--'] + phase)\n"
+                "print(supervisor.pid, flush=True)\n"
+                "signal.pause()\n"
+            )
+            # The phase's SIGTERM handler calls this name. SystemExit is used
+            # instead of ignoring the signal so the parent-death path finishes
+            # without waiting for its escalation deadline.
+            parent_code = parent_code.replace(
+                "import os,signal,time; ",
+                "import os,signal,time; raise_exit=lambda: (_ for _ in ()).throw(SystemExit(143)); ",
+            )
+            parent = subprocess.Popen(
+                [sys.executable, "-c", parent_code], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            supervisor_pid = int(parent.stdout.readline())
+            deadline = time.monotonic() + 10
+            while not (os.path.isfile(phase_pid_path)
+                       and os.path.getsize(phase_pid_path) > 0):
+                if time.monotonic() >= deadline:
+                    self.fail("supervised phase never started")
+                time.sleep(0.01)
+            with open(phase_pid_path) as handle:
+                phase_pid = int(handle.read())
+            os.kill(parent.pid, signal.SIGKILL)
+            parent.communicate(timeout=20)
+
+            def state(pid):
+                try:
+                    with open(f"/proc/{pid}/stat") as handle:
+                        raw = handle.read()
+                except FileNotFoundError:
+                    return None
+                return raw[raw.rfind(")") + 2:].split()[0]
+
+            self.assertIn(state(supervisor_pid), (None, "Z"))
+            self.assertIn(state(phase_pid), (None, "Z"),
+                          "parent death left the measured phase alive")
+
+    def test_outer_stops_only_through_the_preopened_supervisor_control(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        stop = self.shell_function(source, "stop_active_phase")
+        run = self.shell_function(source, "run_logged")
+        self.assertIn("phase_supervisor.py", run)
+        self.assertIn("mkfifo", run)
+        self.assertIn('--control-path "$ACTIVE_PHASE_CONTROL_PATH"', run)
+        self.assertIn('printf T >&"$control_fd"', stop)
+        self.assertNotIn("owned_process.py", run + stop)
+        self.assertNotRegex(stop, r'\bkill\b')
+        self.assertNotIn("kill -0", stop)
+
+    def test_failed_phase_identity_capture_cannot_leave_the_phase_running(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        run = self.shell_function(source, "run_logged")
+        stop = self.shell_function(source, "stop_active_phase")
+        with tempfile.TemporaryDirectory() as tmp:
+            bench = os.path.join(tmp, "bench")
+            os.mkdir(bench)
+            fake_supervisor = os.path.join(bench, "phase_supervisor.py")
+            with open(fake_supervisor, "w") as handle:
+                handle.write(
+                    "import os,sys,time\n"
+                    "args=sys.argv[1:]\n"
+                    "control=None\n"
+                    "if '--control-path' in args:\n"
+                    "    control=args[args.index('--control-path')+1]\n"
+                    "with open(os.environ['FAKE_PHASE_PID'], 'w') as out:\n"
+                    "    out.write(str(os.getpid()))\n"
+                    "os.close(1); os.close(2)\n"
+                    "if control is None:\n"
+                    "    time.sleep(60)\n"
+                    "fd=os.open(control, os.O_RDONLY)\n"
+                    "try:\n"
+                    "    command=os.read(fd, 1)\n"
+                    "finally:\n"
+                    "    os.close(fd)\n"
+                    "raise SystemExit(143 if command == b'T' else 125)\n"
+                )
+            fake_identity = os.path.join(bench, "owned_process.py")
+            with open(fake_identity, "w") as handle:
+                handle.write("raise SystemExit(3)\n")
+            phase_pid_path = os.path.join(tmp, "phase.pid")
+            script = (
+                "set -uo pipefail\n"
+                f"BENCH={bench!r}\nLOGDIR={tmp!r}\n"
+                "ACTIVE_PHASE_PID=\nACTIVE_PHASE_START_TIME=\n"
+                "ACTIVE_PHASE_SIGNAL=\nACTIVE_PHASE_CONTROL_FD=\n"
+                "ACTIVE_PHASE_CONTROL_PATH=\n"
+                "say() { :; }\n"
+                + run + "\n" + stop + "\n"
+                "set +e\nrun_logged \"$LOGDIR/phase.log\" ignored\n"
+                "exit $?\n"
+            )
+            proc = subprocess.Popen(
+                ["bash", "-c", script],
+                env=dict(os.environ, FAKE_PHASE_PID=phase_pid_path),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            phase_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.isfile(phase_pid_path):
+                    if proc.poll() is not None:
+                        stdout, stderr = proc.communicate()
+                        self.fail(
+                            f"phase launcher exited before readiness: "
+                            f"{proc.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("fake phase supervisor did not start")
+                    time.sleep(0.01)
+                with open(phase_pid_path) as handle:
+                    phase_pid = int(handle.read())
+                proc.send_signal(signal.SIGTERM)
+                proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 143)
+                self.assertFalse(
+                    os.path.exists(f"/proc/{phase_pid}"),
+                    "identity capture failed and the still-running phase escaped",
+                )
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.communicate(timeout=5)
+                if phase_pid is not None and os.path.exists(f"/proc/{phase_pid}"):
+                    try:
+                        pidfd = os.pidfd_open(phase_pid)
+                    except ProcessLookupError:
+                        pidfd = None
+                    if pidfd is not None:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            poller = select.poll()
+                            poller.register(pidfd, select.POLLIN)
+                            poller.poll(5000)
+                        finally:
+                            os.close(pidfd)
+
+    def test_outer_sigkill_closes_control_and_drains_the_phase(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        run = self.shell_function(source, "run_logged")
+        stop = self.shell_function(source, "stop_active_phase")
+        with tempfile.TemporaryDirectory() as tmp:
+            phase_pid_path = os.path.join(tmp, "phase.pid")
+            phase_code = (
+                "import os,signal,time; "
+                "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
+                "signal.signal(signal.SIGTERM, stop); "
+                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                "time.sleep(60)"
+            )
+            script = (
+                "set -uo pipefail\n"
+                f"BENCH={HERE!r}\nLOGDIR={tmp!r}\n"
+                "ACTIVE_PHASE_PID=\nACTIVE_PHASE_SIGNAL=\n"
+                "ACTIVE_PHASE_CONTROL_FD=\nACTIVE_PHASE_CONTROL_PATH=\n"
+                "say() { :; }\n"
+                + run + "\n" + stop + "\n"
+                "run_logged \"$LOGDIR/phase.log\" python3 -c \"$PHASE_CODE\"\n"
+            )
+            proc = subprocess.Popen(
+                ["bash", "-c", script],
+                env=dict(os.environ, PHASE_CODE=phase_code),
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                start_new_session=True,
+            )
+            phase_pid = None
+            pidfd = None
+            drained = False
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.isfile(phase_pid_path):
+                    if proc.poll() is not None:
+                        stdout, stderr = proc.communicate()
+                        self.fail(
+                            f"phase launcher exited before readiness: "
+                            f"{proc.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("supervised phase did not start")
+                    time.sleep(0.01)
+                with open(phase_pid_path) as handle:
+                    phase_pid = int(handle.read())
+                pidfd = os.pidfd_open(phase_pid)
+                os.kill(proc.pid, signal.SIGKILL)
+                proc.communicate(timeout=5)
+                poller = select.poll()
+                poller.register(pidfd, select.POLLIN)
+                drained = bool(poller.poll(3000))
+            finally:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                    proc.communicate(timeout=5)
+                if pidfd is not None:
+                    if not drained:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                        poller = select.poll()
+                        poller.register(pidfd, select.POLLIN)
+                        poller.poll(5000)
+                    os.close(pidfd)
+            self.assertTrue(
+                drained,
+                "the async phase job inherited its own control writer and "
+                "survived the campaign shell",
+            )
+
+    def test_run_logged_captures_parent_before_async_bash_expansion(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        run = self.shell_function(source, "run_logged")
+        stop = self.shell_function(source, "stop_active_phase")
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "set -uo pipefail\n"
+                f"BENCH={HERE!r}\nLOGDIR={tmp!r}\n"
+                "ACTIVE_PHASE_PID=\nACTIVE_PHASE_SIGNAL=\n"
+                "ACTIVE_PHASE_CONTROL_FD=\nACTIVE_PHASE_CONTROL_PATH=\n"
+                "say() { :; }\n"
+                + run + "\n" + stop + "\n"
+                "run_logged \"$LOGDIR/phase.log\" true\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                timeout=10,
+            )
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertNotIn("expected parent is already gone", proc.stdout + proc.stderr)
+
+    def test_server_startup_identity_failure_retains_a_cleanup_handle(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        stop = self.shell_function(source, "stop_corpus_serve")
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = os.path.join(tmp, "fake_server.py")
+            with open(fake, "w") as handle:
+                handle.write(
+                    "import os,sys,time\n"
+                    "control,pid_path,status_path,ready=sys.argv[1:]\n"
+                    "with open(pid_path, 'w') as out:\n"
+                    "    out.write(str(os.getpid()))\n"
+                    "with open(ready, 'w') as out:\n"
+                    "    out.write('ready\\n')\n"
+                    "fd=os.open(control, os.O_RDONLY)\n"
+                    "try:\n"
+                    "    command=os.read(fd, 1)\n"
+                    "finally:\n"
+                    "    os.close(fd)\n"
+                    "if command != b'T':\n"
+                    "    time.sleep(60)\n"
+                    "with open(status_path + '.tmp', 'w') as out:\n"
+                    "    out.write('0\\n')\n"
+                    "os.replace(status_path + '.tmp', status_path)\n"
+                )
+            control = os.path.join(tmp, "server.control")
+            ready = os.path.join(tmp, "server.ready")
+            pid_path = os.path.join(tmp, "server.pid")
+            status_path = os.path.join(tmp, "corpus-serve.status")
+            script = (
+                "set -uo pipefail\n"
+                f"RESULTS={tmp!r}\nBENCH={HERE!r}\n"
+                f"SERVE_CONTROL_PATH={control!r}\n"
+                "mkfifo -- \"$SERVE_CONTROL_PATH\"\n"
+                f"mkfifo -- {ready!r}\n"
+                "exec {SERVE_CONTROL_FD}<>\"$SERVE_CONTROL_PATH\"\n"
+                f"python3 {fake!r} \"$SERVE_CONTROL_PATH\" "
+                f"{pid_path!r} {status_path!r} {ready!r} >/dev/null 2>&1 &\n"
+                "SERVE_JOB_PID=$!\nSERVE_PID=\nSERVE_START_TIME=\n"
+                f"IFS= read -r _ < {ready!r}\n"
+                "say() { :; }\n"
+                + stop + "\n"
+                "stop_corpus_serve\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                timeout=10,
+            )
+            self.assertTrue(os.path.isfile(pid_path), proc.stderr)
+            with open(pid_path) as handle:
+                server_pid = int(handle.read())
+            try:
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertFalse(
+                    os.path.exists(f"/proc/{server_pid}"),
+                    "a failed server pidfile/identity capture lost the live server",
+                )
+                with open(status_path) as handle:
+                    self.assertEqual(handle.read().strip(), "0")
+            finally:
+                if os.path.exists(f"/proc/{server_pid}"):
+                    try:
+                        pidfd = os.pidfd_open(server_pid)
+                    except ProcessLookupError:
+                        pidfd = None
+                    if pidfd is not None:
+                        try:
+                            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                            poller = select.poll()
+                            poller.register(pidfd, select.POLLIN)
+                            poller.poll(5000)
+                        finally:
+                            os.close(pidfd)
+
+    def test_dead_container_resolver_option_is_removed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            proc = subprocess.run(
+                [sys.executable, CORPUS_MEM,
+                 "--results", os.path.join(tmp, "result"), "--tag", "tag",
+                 "--urls", "https://example.com/",
+                 "--source-revision", "a" * 40,
+                 "--runtime-bundle-sha256", "b" * 64,
+                 "--corpus-extra-runtime-bundle-sha256", "c" * 64,
+                 "--container-resolve-to", "127.0.0.9"],
+                capture_output=True, text=True, timeout=30,
+            )
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("unrecognized arguments: --container-resolve-to", proc.stderr)
+
+    def test_make_entry_enforces_clean_build_and_setup_prerequisites(self):
+        with open(MAKEFILE) as handle:
+            source = handle.read()
+        match = re.search(
+            r'^bench-chromium-corpus-extra:\s*([^\n]*)\n((?:\t[^\n]*\n)+)',
+            source, re.MULTILINE,
+        )
+        self.assertIsNotNone(match, "corpus-extra has no Make entry point")
+        dependencies = set(match.group(1).split())
+        self.assertTrue({"require-clean-tree", "build", "setup-default"}
+                        <= dependencies)
+        self.assertIn("bench/chromium/corpus_extra.sh", match.group(2))
 
 
 class ExactHostListener(unittest.TestCase):
@@ -3162,7 +4567,7 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "corpus_extra.sh", "corpus_mem.py", "hostcdp.sh", "cdpdrive.py",
         "render.py", "corpus_serve.py", "report.py", "reqbench.py",
         "reqbench.sh", "reqanalyze.py", "wddrive.py", "owned_process.py",
-        "corpus_campaign.sh",
+        "phase_supervisor.py", "corpus_campaign.sh",
     )
     REQBENCH_SOURCES = (
         "fcvm", "fc-agent", "reqbench.sh", "reqbench.py", "reqanalyze.py",

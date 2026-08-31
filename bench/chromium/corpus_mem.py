@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -46,6 +47,7 @@ from reqbench import snapshot_generation, valid_snapshot_name
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPORT = os.path.join(HERE, "report.py")
 CDPDRIVE = os.path.join(HERE, "cdpdrive.py")
+PHASE_SUPERVISOR = os.path.join(HERE, "phase_supervisor.py")
 
 
 def log(msg):
@@ -116,6 +118,21 @@ def canonical_image_id(raw):
     return "sha256:" + digest
 
 
+def exact_container_id(raw):
+    """Return one full podman container ID, never a prefix or display token."""
+    if not re.fullmatch(r"[0-9a-f]{64}", raw or ""):
+        raise RuntimeError(f"podman returned invalid exact container ID {raw!r}")
+    return raw
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def validate_args(args):
     """Refuse an empty or ambiguous measurement grid before creating output."""
     if not args.urls or any(not isinstance(url, str) or not url for url in args.urls):
@@ -127,6 +144,9 @@ def validate_args(args):
         die("--ns contains duplicate cell sizes")
     if not isinstance(args.reps, int) or isinstance(args.reps, bool) or args.reps <= 0:
         die("--reps must be a positive integer")
+    if args.reps % len(args.urls) != 0:
+        die("--reps must be a whole number of corpus cycles so every N sees "
+            "the same balanced page workload")
     timings = (args.settle, args.quiet_limit, args.quiet_wait)
     if any(not isinstance(value, (int, float)) or isinstance(value, bool)
            or not math.isfinite(value) or value < 0 for value in timings):
@@ -160,7 +180,9 @@ def claim_results_dir(path):
         die(f"cannot create the owned log directory under {path}: {exc}")
 
 
-def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns):
+def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns,
+                                    fcvm_sha256, runtime_bundle_sha256,
+                                    source_revision):
     """Bind the snapshot tag to the image bytes and replay resolver in use."""
     if generation.get("image") != image:
         die(f"snapshot image {generation.get('image')!r} does not match {image!r}")
@@ -175,6 +197,15 @@ def validate_snapshot_for_benchmark(generation, image, image_id, expected_dns):
     if generation.get("guest_env") != []:
         die(f"snapshot has unexpected baked container environment: "
             f"{generation.get('guest_env')!r}")
+    expected_creator = {
+        "creator_fcvm_sha256": fcvm_sha256,
+        "creator_runtime_bundle_sha256": runtime_bundle_sha256,
+        "source_revision": source_revision,
+    }
+    for field, expected in expected_creator.items():
+        if generation.get(field) != expected:
+            die(f"snapshot {field} {generation.get(field)!r} does not match "
+                f"current staged runtime {expected!r}")
 
 
 def snapshot_generation_under_lease(resources, data_root, tag):
@@ -617,6 +648,140 @@ class FcvmSide:
 CONTAINER_NET = "slirp4netns:allow_host_loopback=true"
 CONTAINER_RESOLVE_TO = "10.0.2.2"
 CONTAINER_OWNER_LABEL = "io.fcvm.bench.owner"
+CREATE_OPERATION_TIMEOUT = 120
+CREATE_QUIESCE_TIMEOUT = 180
+CREATE_TERM_TIMEOUT = 5.0
+CREATE_KILL_TIMEOUT = 30.0
+
+
+class ContainerCreateOperation:
+    """A podman create whose shared lock survives a caller-side timeout."""
+
+    def __init__(self, command, lock_dir, operation_name,
+                 supervisor_term_grace=CREATE_TERM_TIMEOUT,
+                 supervisor_kill_reap=CREATE_KILL_TIMEOUT,
+                 command_timeout=CREATE_OPERATION_TIMEOUT):
+        if not os.path.isdir(lock_dir):
+            raise RuntimeError(
+                f"container create lease directory does not exist: {lock_dir}")
+        lock_path = os.path.join(lock_dir, operation_name + ".lock")
+        self.lock_path = lock_path
+        try:
+            self.lock_fd = os.open(
+                lock_path, os.O_RDWR | os.O_CREAT | os.O_EXCL, 0o600)
+        except OSError as exc:
+            raise RuntimeError(f"cannot claim container create lease {lock_path}: {exc}") from exc
+        try:
+            fcntl.flock(self.lock_fd, fcntl.LOCK_SH)
+            supervised_command = [
+                sys.executable, PHASE_SUPERVISOR,
+                "--expected-parent", str(os.getpid()),
+                "--timeout", str(command_timeout),
+                "--term-grace", str(supervisor_term_grace),
+                "--kill-grace", str(supervisor_kill_reap),
+                "--pass-fd", str(self.lock_fd), "--", *command,
+            ]
+            self.process = subprocess.Popen(
+                supervised_command,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, pass_fds=(self.lock_fd,), start_new_session=True)
+        except BaseException:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+            raise
+        self.command = command
+        self.supervisor_shutdown_timeout = (
+            supervisor_term_grace + supervisor_kill_reap + 5.0)
+        self.complete = None
+        self.reconcile_fd = None
+
+    def finish(self, timeout):
+        if self.complete is not None:
+            return self.complete
+        try:
+            stdout, stderr = self.process.communicate(
+                timeout=timeout + self.supervisor_shutdown_timeout)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            try:
+                stdout, stderr = self.process.communicate(
+                    timeout=self.supervisor_shutdown_timeout)
+            except subprocess.TimeoutExpired:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    stdout, stderr = self.process.communicate(
+                        timeout=CREATE_KILL_TIMEOUT)
+                except subprocess.TimeoutExpired as exc:
+                    raise RuntimeError(
+                        f"cannot kill and reap container create operation "
+                        f"{self.process.pid}") from exc
+        self.complete = subprocess.CompletedProcess(
+            self.command, self.process.returncode, stdout, stderr)
+        return self.complete
+
+    def acquire_reconciliation(self, timeout):
+        """Wait for every inherited shared holder, then retain an exclusive lock."""
+        if self.reconcile_fd is not None:
+            return
+        if self.process.poll() is None:
+            raise RuntimeError(
+                f"container create operation {self.process.pid} is still running")
+        if self.lock_fd is not None:
+            os.close(self.lock_fd)
+            self.lock_fd = None
+        reconcile_fd = os.open(self.lock_path, os.O_RDWR | os.O_CLOEXEC)
+        helper = subprocess.Popen(
+            [sys.executable, "-c",
+             "import fcntl,os,sys; "
+             "fcntl.flock(int(sys.argv[1]), fcntl.LOCK_EX); "
+             "os.write(1, b'acquired')",
+             str(reconcile_fd)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(reconcile_fd,), start_new_session=True,
+        )
+        try:
+            stdout, stderr = helper.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            try:
+                os.killpg(helper.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            helper.communicate(timeout=CREATE_KILL_TIMEOUT)
+            os.close(reconcile_fd)
+            raise RuntimeError(
+                f"container create operation {self.process.pid} left inherited "
+                f"lease holders after {timeout}s") from exc
+        if helper.returncode != 0 or stdout != b"acquired":
+            os.close(reconcile_fd)
+            detail = stderr.decode(errors="replace").strip()
+            raise RuntimeError(
+                f"cannot acquire exclusive create reconciliation lease: {detail}")
+        self.reconcile_fd = reconcile_fd
+
+    def release(self):
+        """Release the create lease only after name/owner reconciliation."""
+        if self.process.poll() is None:
+            raise RuntimeError(
+                f"container create operation {self.process.pid} is still running")
+        if self.reconcile_fd is None:
+            raise RuntimeError("container create lease was not reconciled")
+        os.close(self.reconcile_fd)
+        self.reconcile_fd = None
+
+
+def start_container_create(command, lock_dir, operation_name, timeout):
+    """Start a create and retain its completion identity after a timeout."""
+    if lock_dir is None:
+        return None, sh_bounded(command, timeout)
+    operation = ContainerCreateOperation(
+        command, lock_dir, operation_name, command_timeout=timeout)
+    return operation, None
 
 
 def inspected_container_identity(name):
@@ -638,7 +803,7 @@ def inspected_container_identity(name):
             f"podman returned no exact ID and owner label for {name}: "
             f"{inspected.stdout.strip()!r}"
         )
-    return fields[0], fields[1]
+    return exact_container_id(fields[0]), fields[1]
 
 
 def remove_owned_container(name, owner_token, expected_id=None):
@@ -647,9 +812,12 @@ def remove_owned_container(name, owner_token, expected_id=None):
     if identity is None:
         return
     container_id, actual_owner = identity
-    if actual_owner != owner_token or (expected_id and container_id != expected_id):
-        log(f"leaving unowned same-name container {name} ({container_id}) untouched")
-        return
+    if actual_owner != owner_token:
+        raise RuntimeError(
+            f"same-name container {name} ({container_id}) is not owned by this run")
+    if expected_id is not None and container_id != exact_container_id(expected_id):
+        raise RuntimeError(
+            f"owned container {name} changed identity from {expected_id} to {container_id}")
     removed = sh_bounded(["podman", "rm", "-f", "--", container_id], 30)
     if removed.returncode != 0:
         raise RuntimeError(
@@ -674,6 +842,7 @@ class ContainerSide:
         self.run_id = run_id
         self.owned = set()
         self.owned_ids = {}
+        self.create_operations = {}
 
     def prefix(self, cell_tag):
         return f"cbmem-{self.run_id}-{cell_tag}-"
@@ -683,17 +852,51 @@ class ContainerSide:
         for i in range(n):
             name = f"{self.prefix(cell_tag)}{i}"
             self.owned.add(name)
-            r = sh_bounded(["podman", "run", "-d", "--name", name,
-                            "--label", f"{CONTAINER_OWNER_LABEL}={self.args.container_owner_token}",
-                            "--network", CONTAINER_NET,
-                            "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
-                            self.args.image], 120)
+            command = ["podman", "create", "--name", name,
+                       "--label", f"{CONTAINER_OWNER_LABEL}={self.args.container_owner_token}",
+                       "--network", CONTAINER_NET,
+                       "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",
+                       getattr(self.args, "image_id", self.args.image)]
+            operation, r = start_container_create(
+                command, getattr(self.args, "container_create_ops_dir", None),
+                name, CREATE_OPERATION_TIMEOUT)
+            if operation is not None:
+                self.create_operations[name] = operation
+                if r is None:
+                    r = operation.finish(CREATE_OPERATION_TIMEOUT)
+            if r is None:
+                die(f"podman create {name} did not complete within "
+                    f"{CREATE_OPERATION_TIMEOUT}s")
             if r.returncode != 0:
-                die(f"podman run {name} failed: {r.stderr.strip()}")
-            container_id = r.stdout.strip()
-            if not container_id or any(character.isspace() for character in container_id):
-                die(f"podman run {name} returned no exact container ID")
+                die(f"podman create {name} failed: {r.stderr.strip()}")
+            try:
+                if operation is not None:
+                    operation.acquire_reconciliation(CREATE_QUIESCE_TIMEOUT)
+                container_id = exact_container_id(r.stdout.strip())
+                identity = inspected_container_identity(name)
+                if identity is None:
+                    raise RuntimeError(
+                        f"podman create returned {container_id}, but {name} is absent")
+                actual_id, owner = identity
+                if owner != self.args.container_owner_token:
+                    raise RuntimeError(
+                        f"created container {name} ({actual_id}) has owner {owner!r}")
+                if actual_id != container_id:
+                    raise RuntimeError(
+                        f"created container {name} changed identity from "
+                        f"{container_id} to {actual_id}")
+            except RuntimeError as exc:
+                die(str(exc))
+            if operation is not None:
+                operation.release()
+                self.create_operations.pop(name, None)
             self.owned_ids[name] = container_id
+            started = sh_bounded(
+                ["podman", "start", "--", container_id],
+                CREATE_OPERATION_TIMEOUT)
+            if started.returncode != 0:
+                die(f"podman start {name} ({container_id}) failed: "
+                    f"{started.stderr.strip()}")
             live.append({"i": i, "name": name, "container_id": container_id})
         for c in live:
             deadline = time.monotonic() + 180
@@ -725,9 +928,28 @@ class ContainerSide:
         for c in live:
             name = c["name"]
             try:
+                operation = self.create_operations.get(name)
+                if operation is not None:
+                    result = operation.finish(CREATE_QUIESCE_TIMEOUT)
+                    operation.acquire_reconciliation(CREATE_QUIESCE_TIMEOUT)
+                    if result.returncode == 0:
+                        try:
+                            output_id = exact_container_id(result.stdout.strip())
+                        except RuntimeError:
+                            output_id = None
+                        if output_id is not None:
+                            recorded_id = self.owned_ids.get(name)
+                            if recorded_id is not None and recorded_id != output_id:
+                                raise RuntimeError(
+                                    f"container create for {name} returned "
+                                    f"{output_id}, expected {recorded_id}")
+                            self.owned_ids[name] = output_id
                 remove_owned_container(
                     name, self.args.container_owner_token,
                     c.get("container_id", self.owned_ids.get(name)))
+                if operation is not None:
+                    operation.release()
+                    self.create_operations.pop(name, None)
             except RuntimeError as exc:
                 errors.append(exc)
                 continue
@@ -786,15 +1008,16 @@ def slope_intercept(xs, ys):
 
 
 def build_cell_schedule(sides, ns, reps, seed, url_count):
-    """Pair both sides and rotate the corpus across the complete cell grid."""
+    """Pair sides while every instance at every N sees the same page history."""
     rng = random.Random(seed)
+    url_cycle = list(range(url_count))
+    rng.shuffle(url_cycle)
     pairs = [(n, rep) for n in ns for rep in range(1, reps + 1)]
     rng.shuffle(pairs)
-    cursor = rng.randrange(url_count)
     schedule = []
     for n, rep in pairs:
-        url_indices = tuple((cursor + i) % url_count for i in range(n))
-        cursor = (cursor + n) % url_count
+        url_index = url_cycle[(rep - 1) % url_count]
+        url_indices = (url_index,) * n
         pair_sides = list(sides)
         rng.shuffle(pair_sides)
         schedule.extend((side, n, rep, url_indices) for side in pair_sides)
@@ -899,15 +1122,17 @@ def main_with_resources(resources):
     p.add_argument("--results", required=True)
     p.add_argument("--tag", required=True, help="golden snapshot the clones restore from")
     p.add_argument("--image", default="localhost/chromium-bench-req")
+    p.add_argument("--image-id", default="",
+                   help="exact preflight image identity; the logical tag remains in provenance")
     p.add_argument("--urls", required=True, help="comma-separated corpus")
     p.add_argument("--ns", default="1,2,4,8")
-    p.add_argument("--reps", type=int, default=2)
+    p.add_argument("--reps", type=int, default=14)
     p.add_argument("--seed", type=int, default=20260830,
                    help="recorded seed for the interleaved memory-cell schedule")
     p.add_argument("--fcvm", default=os.path.join(os.path.dirname(os.path.dirname(HERE)), "target/release/fcvm"))
     p.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     p.add_argument("--cdp-port", type=int, default=9222)
-    p.add_argument("--container-resolve-to", default="127.0.0.1")
+    p.add_argument("--container-create-ops-dir", default="")
     p.add_argument("--uffd-mode", default="minor")
     p.add_argument("--uffd-prefetch", default="on")
     p.add_argument("--settle", type=float, default=5.0)
@@ -930,6 +1155,10 @@ def main_with_resources(resources):
     args.state_dir = os.path.join(args.data_root, "state")
     args.run_id = args.run_id or uuid.uuid4().hex
     args.container_owner_token = args.container_owner_token or uuid.uuid4().hex
+    args.container_create_ops_dir = (
+        args.container_create_ops_dir
+        or os.path.join(args.results, "container-create-ops")
+    )
     validate_args(args)
     install_signal_cleanup()
 
@@ -939,19 +1168,30 @@ def main_with_resources(resources):
     if not os.access(args.fcvm, os.X_OK):
         die(f"no fcvm binary at {args.fcvm}")
     try:
+        fcvm_sha256 = sha256_file(args.fcvm)
+    except OSError as exc:
+        die(f"cannot identify current fcvm bytes at {args.fcvm}: {exc}")
+    try:
         generation = snapshot_generation_under_lease(
             resources, args.data_root, args.tag)
     except RuntimeError as exc:
         die(str(exc))
     inspected = sh_bounded(
-        ["podman", "inspect", "--format", "{{.Id}}", args.image], 30)
+        ["podman", "image", "inspect", "--format", "{{.Id}}", args.image], 30)
     raw_image_id = inspected.stdout.strip()
     if inspected.returncode != 0:
         die(f"cannot identify current image {args.image}: "
             f"{inspected.stderr.strip() or raw_image_id!r}")
     image_id = canonical_image_id(raw_image_id)
+    if args.image_id:
+        supplied_image_id = canonical_image_id(args.image_id)
+        if supplied_image_id != image_id:
+            die(f"current image {args.image} resolved to {image_id}, not staged "
+                f"identity {supplied_image_id}")
+    args.image_id = image_id
     validate_snapshot_for_benchmark(
-        generation, args.image, image_id, CONTAINER_RESOLVE_TO)
+        generation, args.image, image_id, CONTAINER_RESOLVE_TO,
+        fcvm_sha256, args.runtime_bundle_sha256, args.source_revision)
     if sh(["sudo", "-n", "true"]).returncode != 0:
         die("passwordless sudo is required to create the per-instance cgroups")
     stray = stray_vmm_processes()
@@ -971,7 +1211,7 @@ def main_with_resources(resources):
             "snapshot": args.tag, "image": args.image,
             "image_id": image_id,
             "snapshot_generation": generation,
-            "fcvm_sha256": sh(["sha256sum", args.fcvm]).stdout.split()[0] if os.path.exists(args.fcvm) else None,
+            "fcvm_sha256": fcvm_sha256,
             "report_py_sha256": sh(["sha256sum", REPORT]).stdout.split()[0],
             "cdpdrive_sha256": sh(["sha256sum", CDPDRIVE]).stdout.split()[0],
             "urls": args.urls, "ns": args.ns, "reps": args.reps,
@@ -987,6 +1227,11 @@ def main_with_resources(resources):
                      "podman's own. MemAvailable delta from a quiesced pre-sample is recorded "
                      "beside them as an attribution-free check."}
     claim_results_dir(args.results)
+    try:
+        os.makedirs(args.container_create_ops_dir, exist_ok=True)
+    except OSError as exc:
+        die(f"cannot create container operation lease directory "
+            f"{args.container_create_ops_dir}: {exc}")
     with open(os.path.join(args.results, "run.json"), "x") as f:
         json.dump(meta, f, indent=1)
 
