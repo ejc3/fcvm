@@ -2182,14 +2182,61 @@ exec {real_date!r} "$@"
                 )
 
     def test_post_rename_publication_failure_withdraws_completion(self):
+        """A reader cannot cross publication while its rollback is possible.
+
+        RED BEFORE THE FIX: publish_complete held only .summary.lock, so the
+        nonblocking shared run-directory lock succeeded after complete.json
+        appeared and before the injected rollback withdrew the run.
+        """
         with tempfile.TemporaryDirectory() as tmp:
+            pause = os.path.join(tmp, "publication-pause")
             env, _removed, _state = self.environment(
-                tmp, HOSTCDP_COMPLETE_FAIL_AFTER_RENAME="1")
-            proc = self.run_host(env)
-            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                tmp,
+                HOSTCDP_COMPLETE_FAIL_AFTER_RENAME="1",
+                HOSTCDP_COMPLETE_PAUSE_AFTER_RENAME=pause,
+            )
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while (not os.path.exists(pause + ".ready")
+                       and time.monotonic() < deadline):
+                    if producer.poll() is not None:
+                        break
+                    time.sleep(0.01)
+                self.assertTrue(
+                    os.path.exists(pause + ".ready"),
+                    f"publisher exited before the test pause: {producer.poll()}",
+                )
+                directory_fd = os.open(
+                    env["RESULTS"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+                )
+                try:
+                    with self.assertRaises(
+                            BlockingIOError,
+                            msg="a reader crossed a publication that rolled back"):
+                        fcntl.flock(
+                            directory_fd, fcntl.LOCK_SH | fcntl.LOCK_NB,
+                        )
+                finally:
+                    os.close(directory_fd)
+            finally:
+                with open(pause + ".release", "w"):
+                    pass
+                stdout, stderr = producer.communicate(timeout=20)
+            self.assertNotEqual(producer.returncode, 0, stdout + stderr)
             self.assertTrue(os.path.exists(os.path.join(env["RESULTS"], "WITHDRAWN")))
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "complete.json")))
             self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
+            directory_fd = os.open(
+                env["RESULTS"], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC,
+            )
+            try:
+                fcntl.flock(directory_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            finally:
+                os.close(directory_fd)
 
     def test_success_retires_cleanup_before_publication(self):
         """Published success has no fallible container proof after the worker."""
@@ -3717,6 +3764,39 @@ class CampaignIntegrityRegression(unittest.TestCase):
                 self.assertLess(opened, locked)
                 self.assertLess(locked, invalidated)
                 self.assertLess(invalidated, marker)
+
+    def test_bootstrap_writers_lock_run_directory_before_summary_state(self):
+        """Bootstrap publication and withdrawal use the reader protocol.
+
+        compare.py holds a shared run-directory lock across validation and
+        publication. Both bootstrap writers must take the exclusive side
+        before entering Python, where they take .summary.lock and mutate the
+        authorization files.
+
+        RED BEFORE THE FIX: neither bootstrap writer took the directory lock;
+        both entered the summary-state transition with only .summary.lock.
+        """
+        with open(HOSTCDP) as handle:
+            source = handle.read()
+        for function, lock_fd in (
+            ("publish_complete", "publication_lock_fd"),
+            ("withdraw_guarded_run", "withdrawal_lock_fd"),
+        ):
+            with self.subTest(function=function):
+                body = self.shell_function(source, function)
+                opened_text = f'exec {{{lock_fd}}}<"$RESULTS"'
+                locked_text = f'flock -x "${lock_fd}"'
+                self.assertIn(opened_text, body)
+                self.assertIn(locked_text, body)
+                opened = body.index(opened_text)
+                locked = body.index(locked_text)
+                python = body.index("python3 -")
+                summary_lock = body.index(
+                    "fcntl.flock(lock_fd, fcntl.LOCK_EX)", python,
+                )
+                self.assertLess(opened, locked)
+                self.assertLess(locked, python)
+                self.assertLess(python, summary_lock)
 
     def test_failed_host_withdrawal_invalidation_is_marked_and_returns_failure(self):
         """A failed invalidation still withdraws the run and returns failure.

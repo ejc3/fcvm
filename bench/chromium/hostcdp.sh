@@ -112,7 +112,17 @@ log() { printf '%s %s\n' "$(date +%H:%M:%S)" "$*" >&2; }
 # finalizer has returned, so neither artifact can authorize a run whose outer
 # lifecycle later fails.
 publish_complete() {
-    python3 - "$RESULTS/complete.json" "$RUNID" \
+    (
+        local publication_lock_fd
+        if ! exec {publication_lock_fd}<"$RESULTS"; then
+            log "FAILED: could not open run directory for publication"
+            exit 1
+        fi
+        if ! flock -x "$publication_lock_fd"; then
+            log "FAILED: could not lock run directory for publication"
+            exit 1
+        fi
+        python3 - "$RESULTS/complete.json" "$RUNID" \
             "$RESULTS/run.json" "$RESULTS/hostcdp.jsonl" \
             "$RESULTS/.summary.pending" "$RESULTS/summary.json" \
             "$RESULTS/.summary.lock" "$RESULTS/WITHDRAWN" <<'PY'
@@ -123,6 +133,7 @@ import os
 import stat
 import sys
 import tempfile
+import time
 
 (output_path, run_id, run_path, rows_path, pending_summary_path,
  summary_path, lock_path, withdrawn_path) = sys.argv[1:]
@@ -188,6 +199,19 @@ try:
         os.fsync(target.fileno())
     os.replace(temporary, output_path)
     temporary = None
+    pause_path = os.environ.get("HOSTCDP_COMPLETE_PAUSE_AFTER_RENAME")
+    if pause_path:
+        ready_path = pause_path + ".ready"
+        release_path = pause_path + ".release"
+        with open(ready_path, "x") as target:
+            target.write("ready\n")
+            target.flush()
+            os.fsync(target.fileno())
+        deadline = time.monotonic() + 10.0
+        while not os.path.exists(release_path):
+            if time.monotonic() >= deadline:
+                raise TimeoutError("post-rename test pause was not released")
+            time.sleep(0.01)
     if os.environ.get("HOSTCDP_COMPLETE_FAIL_AFTER_RENAME") == "1":
         raise OSError("injected failure after completion rename")
     directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
@@ -228,12 +252,23 @@ except BaseException as error:
 finally:
     os.close(lock_fd)
 PY
+    )
 }
 
 withdraw_guarded_run() {
     local reason=$1
     [ -d "$RESULTS" ] || return 0
-    python3 - "$RESULTS" "$reason" <<'PY'
+    (
+        local withdrawal_lock_fd
+        if ! exec {withdrawal_lock_fd}<"$RESULTS"; then
+            log "FAILED: could not open run directory for withdrawal"
+            exit 1
+        fi
+        if ! flock -x "$withdrawal_lock_fd"; then
+            log "FAILED: could not lock run directory for withdrawal"
+            exit 1
+        fi
+        python3 - "$RESULTS" "$reason" <<'PY'
 import fcntl
 import os
 import stat
@@ -276,6 +311,7 @@ try:
 finally:
     os.close(lock_fd)
 PY
+    )
 }
 
 if [ "$HOSTCDP_PROCESS_ROLE" = bootstrap ]; then
