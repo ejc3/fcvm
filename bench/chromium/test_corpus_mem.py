@@ -2337,13 +2337,18 @@ class CampaignIntegrityRegression(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             marker = os.path.join(tmp, "late-commit")
             child_pid_path = os.path.join(tmp, "late-child")
+            child_ready_path = os.path.join(tmp, "late-child-ready")
             child = (
                 "import os,signal,time; "
                 "[os.close(fd) for fd in range(3,256) "
                 "if os.path.exists(f'/proc/self/fd/{fd}')]; "
+                "time.sleep(0.25); "
                 f"signal.signal(signal.SIGTERM, lambda *_: "
                 f"(open({marker!r}, 'w').write('committed\\n'), "
                 "raise_exit())[1]); "
+                f"ready_fd=os.open({child_ready_path!r}, "
+                "os.O_WRONLY|os.O_CREAT|os.O_EXCL, 0o600); "
+                "os.write(ready_fd, b'ready\\n'); os.close(ready_fd); "
                 "time.sleep(60)"
             )
             child = child.replace(
@@ -2352,12 +2357,21 @@ class CampaignIntegrityRegression(unittest.TestCase):
                 "(_ for _ in ()).throw(SystemExit(0)); ",
             )
             leader = (
-                "import subprocess,sys; "
+                "import os,subprocess,sys,time\n"
                 "proc=subprocess.Popen([sys.executable, '-c', sys.argv[1]], "
                 "start_new_session=True, stdin=subprocess.DEVNULL, "
-                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL); "
-                f"open({child_pid_path!r}, 'w').write(str(proc.pid)); "
-                "print('leader-finished', flush=True)"
+                "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+                f"with open({child_pid_path!r}, 'w') as handle:\n"
+                "    handle.write(str(proc.pid))\n"
+                f"ready={child_ready_path!r}\n"
+                "deadline=time.monotonic()+5\n"
+                "while not os.path.isfile(ready):\n"
+                "    if proc.poll() is not None:\n"
+                "        raise SystemExit('escaped child exited before readiness')\n"
+                "    if time.monotonic() >= deadline:\n"
+                "        raise SystemExit('escaped child never became ready')\n"
+                "    time.sleep(0.001)\n"
+                "print('leader-finished', flush=True)\n"
             )
             operation = corpus_mem.ContainerCreateOperation(
                 [sys.executable, "-c", leader, child], tmp, "fd-closing-create")
