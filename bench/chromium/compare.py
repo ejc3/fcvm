@@ -32,7 +32,6 @@ import secrets
 import stat
 import statistics
 import sys
-import tempfile
 import time
 from urllib.parse import urlsplit
 
@@ -76,6 +75,39 @@ def read_artifact(path):
     }
 
 
+def stable_file_state(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+
+
+def published_content_state(value):
+    return (
+        value.st_dev,
+        value.st_ino,
+        stat.S_IFMT(value.st_mode),
+        value.st_size,
+        value.st_mtime_ns,
+    )
+
+
+def sha256_fd(fd):
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(fd, 1024 * 1024, offset)
+        if not chunk:
+            return offset, digest.hexdigest()
+        digest.update(chunk)
+        offset += len(chunk)
+
+
 def read_artifact_nofollow(path):
     """Read one stable regular file without following its final component."""
     flags = (
@@ -89,47 +121,49 @@ def read_artifact_nofollow(path):
     except OSError as error:
         raise Refusal(f"cannot read {path} without following links: {error}") from error
     try:
-        before = os.fstat(fd)
-        if not stat.S_ISREG(before.st_mode):
-            raise Refusal(f"{path} is not a regular file")
-        chunks = []
-        while True:
-            chunk = os.read(fd, 1024 * 1024)
-            if not chunk:
-                break
-            chunks.append(chunk)
-        after = os.fstat(fd)
-    except OSError as error:
-        raise Refusal(f"cannot read {path}: {error}") from error
+        try:
+            before = os.fstat(fd)
+            if not stat.S_ISREG(before.st_mode):
+                raise Refusal(f"{path} is not a regular file")
+            chunks = []
+            while True:
+                chunk = os.read(fd, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            after = os.fstat(fd)
+        except OSError as error:
+            raise Refusal(f"cannot read {path}: {error}") from error
+        if stable_file_state(before) != stable_file_state(after):
+            raise Refusal(f"{path} changed while it was being read")
+        raw = b"".join(chunks)
+        if len(raw) != after.st_size:
+            raise Refusal(f"{path} changed while it was being read")
+        try:
+            current = os.stat(path, follow_symlinks=False)
+        except OSError as error:
+            raise Refusal(
+                f"{path} changed while it was being read: {error}"
+            ) from error
+        if stable_file_state(after) != stable_file_state(current):
+            raise Refusal(f"{path} changed while it was being read")
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise Refusal(f"{path} is not UTF-8: {error}") from error
+        return {
+            "path": path,
+            "realpath": os.path.realpath(path),
+            "device": before.st_dev,
+            "inode": before.st_ino,
+            "size": len(raw),
+            "mtime_ns": before.st_mtime_ns,
+            "ctime_ns": before.st_ctime_ns,
+            "sha256": hashlib.sha256(raw).hexdigest(),
+            "text": text,
+        }
     finally:
         os.close(fd)
-    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
-    if any(getattr(before, field) != getattr(after, field) for field in fields):
-        raise Refusal(f"{path} changed while it was being read")
-    raw = b"".join(chunks)
-    if len(raw) != after.st_size:
-        raise Refusal(f"{path} changed while it was being read")
-    try:
-        current = os.stat(path, follow_symlinks=False)
-    except OSError as error:
-        raise Refusal(f"{path} changed while it was being read: {error}") from error
-    if not os.path.samestat(after, current):
-        raise Refusal(f"{path} changed while it was being read")
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise Refusal(f"{path} is not UTF-8: {error}") from error
-    return {
-        "path": path,
-        "realpath": os.path.realpath(path),
-        "device": before.st_dev,
-        "inode": before.st_ino,
-        "size": len(raw),
-        "mtime_ns": before.st_mtime_ns,
-        "ctime_ns": before.st_ctime_ns,
-        "sha256": hashlib.sha256(raw).hexdigest(),
-        "text": text,
-    }
 
 
 def reject_duplicate_keys(pairs):
@@ -346,41 +380,91 @@ def write_json_atomic(path, value, output_target=None, before_publish=None,
         return write_json_atomic_at(
             output_target, value, before_publish, after_publish
         )
-    directory = os.path.dirname(os.path.abspath(path)) or "."
-    fd, temporary = tempfile.mkstemp(prefix=".compare-", dir=directory)
-    published = False
-    written_stat = None
+    target = open_output_target(path)
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(value, handle, indent=1, allow_nan=False)
-            handle.write("\n")
-            handle.flush()
-            os.fsync(handle.fileno())
-            written_stat = os.fstat(handle.fileno())
-        if before_publish is not None:
-            before_publish()
-        os.replace(temporary, path)
-        published = True
-        if after_publish is not None:
-            after_publish()
-    except BaseException:
-        if published:
-            try:
-                current = os.stat(path, follow_symlinks=False)
-                if os.path.samestat(current, written_stat):
-                    os.unlink(path)
-            except FileNotFoundError:
-                pass
+        return write_json_atomic_at(
+            target,
+            value,
+            before_publish,
+            after_publish,
+            replace_existing=True,
+        )
+    finally:
+        os.close(target["directory_fd"])
+
+
+def rollback_published_output(target, written_stat):
+    """Remove only this writer's output; restore any raced replacement."""
+    while True:
+        quarantine = f".compare-rollback-{os.getpid()}-{secrets.token_hex(8)}"
         try:
-            os.unlink(temporary)
+            rename_noreplace(
+                target["directory_fd"], target["name"], quarantine
+            )
+            break
         except FileNotFoundError:
-            pass
-        raise
+            return
+        except FileExistsError:
+            continue
+    try:
+        moved = os.stat(
+            quarantine,
+            dir_fd=target["directory_fd"],
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        restore_quarantined_output(target, quarantine)
+        raise Refusal(
+            f"cannot inspect failed output {target['path']}: {error}"
+        ) from error
+    if os.path.samestat(moved, written_stat):
+        try:
+            os.unlink(quarantine, dir_fd=target["directory_fd"])
+        except OSError as error:
+            preserved = os.path.join(target["directory"], quarantine)
+            raise Refusal(
+                f"cannot remove failed output {target['path']}; its bytes remain "
+                f"at {preserved}: {error}"
+            ) from error
+        return
+    restore_quarantined_output(target, quarantine)
 
 
-def write_json_atomic_at(target, value, before_publish=None, after_publish=None):
+def validate_published_output(target, fd, written_stat, expected_size,
+                              expected_sha256, baseline=None):
+    try:
+        before = os.fstat(fd)
+        size, digest = sha256_fd(fd)
+        after = os.fstat(fd)
+        current = os.stat(
+            target["name"],
+            dir_fd=target["directory_fd"],
+            follow_symlinks=False,
+        )
+    except OSError as error:
+        raise Refusal(
+            f"cannot validate output {target['path']}: {error}"
+        ) from error
+    if (
+        stable_file_state(before) != stable_file_state(after)
+        or size != expected_size
+        or digest != expected_sha256
+        or published_content_state(after)
+        != published_content_state(written_stat)
+        or (
+            baseline is not None
+            and stable_file_state(after) != stable_file_state(baseline)
+        )
+        or stable_file_state(current) != stable_file_state(after)
+    ):
+        raise Refusal(f"output {target['path']} changed during publication")
+    return after
+
+
+def write_json_atomic_at(target, value, before_publish=None, after_publish=None,
+                         replace_existing=False):
     ensure_output_directory(target)
-    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     while True:
         temporary = f".compare-{os.getpid()}-{secrets.token_hex(8)}"
         try:
@@ -394,77 +478,88 @@ def write_json_atomic_at(target, value, before_publish=None, after_publish=None)
             raise Refusal(
                 f"cannot create temporary output in {target['directory']}: {error}"
             ) from error
-    linked = False
+    published = False
     temporary_exists = True
     try:
-        try:
-            handle = os.fdopen(fd, "w")
-        except BaseException:
-            os.close(fd)
-            raise
-        with handle:
-            json.dump(value, handle, indent=1, allow_nan=False)
-            handle.write("\n")
+        payload = (json.dumps(value, indent=1, allow_nan=False) + "\n").encode(
+            "ascii"
+        )
+        expected_sha256 = hashlib.sha256(payload).hexdigest()
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
             handle.flush()
             os.fsync(handle.fileno())
             written_stat = os.fstat(handle.fileno())
         ensure_output_directory(target)
         if before_publish is not None:
             before_publish()
-        try:
-            os.link(
+        if replace_existing:
+            os.replace(
                 temporary,
                 target["name"],
                 src_dir_fd=target["directory_fd"],
                 dst_dir_fd=target["directory_fd"],
-                follow_symlinks=False,
             )
-        except FileExistsError as error:
-            raise Refusal(
-                f"output {target['path']} appeared during comparison; refusing "
-                "to replace it"
-            ) from error
-        linked = True
-        os.unlink(temporary, dir_fd=target["directory_fd"])
-        temporary_exists = False
-        current = os.stat(
-            target["name"],
-            dir_fd=target["directory_fd"],
-            follow_symlinks=False,
-        )
-        if not os.path.samestat(current, written_stat):
-            raise Refusal(f"output {target['path']} changed during publication")
-        ensure_output_directory(target)
-        # A successful publication linearizes at this post-link validation.
-        # Failure rolls back only the inode linked by this writer.
-        if after_publish is not None:
-            after_publish()
-        current = os.stat(
-            target["name"],
-            dir_fd=target["directory_fd"],
-            follow_symlinks=False,
-        )
-        if not os.path.samestat(current, written_stat):
-            raise Refusal(f"output {target['path']} changed during publication")
-        ensure_output_directory(target)
-    except BaseException:
-        if linked:
+            published = True
+            temporary_exists = False
+        else:
             try:
-                current = os.stat(
+                os.link(
+                    temporary,
                     target["name"],
-                    dir_fd=target["directory_fd"],
+                    src_dir_fd=target["directory_fd"],
+                    dst_dir_fd=target["directory_fd"],
                     follow_symlinks=False,
                 )
-                if os.path.samestat(current, written_stat):
-                    os.unlink(target["name"], dir_fd=target["directory_fd"])
-            except FileNotFoundError:
-                pass
+            except FileExistsError as error:
+                raise Refusal(
+                    f"output {target['path']} appeared during comparison; "
+                    "refusing to replace it"
+                ) from error
+            published = True
+            os.unlink(temporary, dir_fd=target["directory_fd"])
+            temporary_exists = False
+        published_stat = validate_published_output(
+            target,
+            fd,
+            written_stat,
+            len(payload),
+            expected_sha256,
+        )
+        ensure_output_directory(target)
+        # A successful publication linearizes at this post-link validation.
+        # Failure rolls back only the inode pinned by this writer.
+        if after_publish is not None:
+            after_publish()
+        validate_published_output(
+            target,
+            fd,
+            written_stat,
+            len(payload),
+            expected_sha256,
+            published_stat,
+        )
+        ensure_output_directory(target)
+    except BaseException as publication_error:
+        cleanup_error = None
+        if published:
+            try:
+                rollback_published_output(target, written_stat)
+            except BaseException as error:
+                cleanup_error = error
         if temporary_exists:
             try:
                 os.unlink(temporary, dir_fd=target["directory_fd"])
             except FileNotFoundError:
                 pass
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if cleanup_error is not None:
+            raise cleanup_error from publication_error
         raise
+    finally:
+        os.close(fd)
 
 
 def integer_field(record, key, label, minimum=0):

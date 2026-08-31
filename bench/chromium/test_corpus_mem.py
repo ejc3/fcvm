@@ -5975,6 +5975,125 @@ sys.stdin.read(1)
     def test_memory_revalidation_refuses_unlink_after_final_fd_stat(self):
         self.assert_memory_revalidation_refuses_post_fstat_race("unlink")
 
+    def require_immediate_inode_reuse(self, directory):
+        """Skip ABA regressions only when this filesystem will not reuse an inode."""
+        probe = os.path.join(directory, "inode-reuse-probe")
+        try:
+            for attempt in range(32):
+                with open(probe, "xb") as handle:
+                    handle.write(f"old-{attempt}".encode())
+                before = os.stat(probe)
+                os.unlink(probe)
+                with open(probe, "xb") as handle:
+                    handle.write(f"new-{attempt}".encode())
+                after = os.stat(probe)
+                os.unlink(probe)
+                if os.path.samestat(before, after):
+                    return
+        finally:
+            try:
+                os.unlink(probe)
+            except FileNotFoundError:
+                pass
+        self.skipTest("filesystem did not reuse an immediately freed inode")
+
+    def test_memory_reader_pins_inode_through_path_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.require_immediate_inode_reuse(tmp)
+            path = os.path.join(tmp, "summary.json")
+            old = b'{"run_id":"' + b"a" * 32 + b'","value":1}\n'
+            new = b'{"run_id":"' + b"b" * 32 + b'","value":2}\n'
+            self.assertEqual(len(old), len(new))
+            with open(path, "wb") as handle:
+                handle.write(old)
+            original = os.stat(path)
+            real_stat = os.stat
+            raced = False
+            replacement = None
+
+            def replace_at_path_validation(candidate, *args, **kwargs):
+                nonlocal raced, replacement
+                if (
+                    not raced
+                    and os.fspath(candidate) == path
+                    and kwargs.get("follow_symlinks") is False
+                    and kwargs.get("dir_fd") is None
+                ):
+                    raced = True
+                    os.unlink(path)
+                    with open(path, "xb") as handle:
+                        handle.write(new)
+                    replacement = real_stat(path, follow_symlinks=False)
+                return real_stat(candidate, *args, **kwargs)
+
+            with mock.patch.object(
+                    bench_compare.os, "stat",
+                    side_effect=replace_at_path_validation):
+                with self.assertRaises(
+                        bench_compare.Refusal,
+                        msg="an after-close same-inode replacement was accepted"):
+                    artifact = bench_compare.read_artifact_nofollow(path)
+                    self.fail(
+                        "reader returned old bytes after the pathname was replaced: "
+                        f"original_inode={original.st_ino} "
+                        f"replacement_inode={replacement.st_ino} "
+                        f"returned_old={artifact['text'].encode() == old}"
+                    )
+            self.assertTrue(raced)
+            self.assertFalse(
+                os.path.samestat(original, replacement),
+                "the live reader fd did not keep its inode out of reuse",
+            )
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), new)
+
+    def test_memory_reader_refuses_same_inode_mutation_at_path_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "summary.json")
+            old = b'{"run_id":"' + b"a" * 32 + b'","value":1}\n'
+            new = b'{"run_id":"' + b"b" * 32 + b'","value":2}\n'
+            self.assertEqual(len(old), len(new))
+            with open(path, "wb") as handle:
+                handle.write(old)
+            real_stat = os.stat
+            before = real_stat(path)
+            raced = False
+            changed = None
+
+            def mutate_at_path_validation(candidate, *args, **kwargs):
+                nonlocal raced, changed
+                if (
+                    not raced
+                    and os.fspath(candidate) == path
+                    and kwargs.get("follow_symlinks") is False
+                    and kwargs.get("dir_fd") is None
+                ):
+                    raced = True
+                    with open(path, "r+b") as handle:
+                        handle.write(new)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        path,
+                        ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000),
+                    )
+                    changed = real_stat(path, follow_symlinks=False)
+                return real_stat(candidate, *args, **kwargs)
+
+            with mock.patch.object(
+                    bench_compare.os, "stat",
+                    side_effect=mutate_at_path_validation):
+                with self.assertRaises(
+                        bench_compare.Refusal,
+                        msg="same-inode bytes changed after final fstat were accepted"):
+                    bench_compare.read_artifact_nofollow(path)
+            self.assertTrue(raced)
+            self.assertTrue(os.path.samestat(before, changed))
+            self.assertEqual(changed.st_size, before.st_size)
+            self.assertNotEqual(changed.st_mtime_ns, before.st_mtime_ns)
+            with open(path, "rb") as handle:
+                self.assertEqual(handle.read(), new)
+
     def assert_memory_publication_rolls_back_path_race(self, action):
         run, campaign, host, _memory = self.valid_campaign_memory_comparison()
         changed = os.path.join(campaign, "memory", "summary.json")
@@ -6034,6 +6153,223 @@ sys.stdin.read(1)
                 os.close(target["directory_fd"])
             with open(out, "rb") as handle:
                 self.assertEqual(handle.read(), b"attacker output\n")
+
+    def test_publication_inode_pin_refuses_unlink_recreate_aba(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.require_immediate_inode_reuse(tmp)
+            out = os.path.join(tmp, "comparison.json")
+            attacker_bytes = b"attacker output\n"
+            target = bench_compare.open_output_target(out)
+            real_unlink = os.unlink
+            raced = False
+            published = None
+            replacement = None
+
+            def replace_after_temporary_unlink(candidate, *args, **kwargs):
+                nonlocal raced, published, replacement
+                result = real_unlink(candidate, *args, **kwargs)
+                if (
+                    not raced
+                    and kwargs.get("dir_fd") == target["directory_fd"]
+                    and candidate != target["name"]
+                    and os.path.exists(out)
+                ):
+                    raced = True
+                    published = os.stat(out, follow_symlinks=False)
+                    real_unlink(target["name"], dir_fd=target["directory_fd"])
+                    with open(out, "xb") as handle:
+                        handle.write(attacker_bytes)
+                    replacement = os.stat(out, follow_symlinks=False)
+                return result
+
+            try:
+                with mock.patch.object(
+                        bench_compare.os, "unlink",
+                        side_effect=replace_after_temporary_unlink):
+                    with self.assertRaises(
+                            bench_compare.Refusal,
+                            msg="publication accepted a same-inode replacement"):
+                        bench_compare.write_json_atomic(
+                            out, {"result": "ours"}, target
+                        )
+            finally:
+                os.close(target["directory_fd"])
+            self.assertTrue(raced)
+            self.assertIsNotNone(published)
+            self.assertIsNotNone(replacement)
+            self.assertFalse(
+                os.path.samestat(published, replacement),
+                "the live writer fd did not keep its inode out of reuse",
+            )
+            self.assertTrue(os.path.exists(out))
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), attacker_bytes)
+
+    def test_publication_refuses_restored_mtime_mutation_before_first_check(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "comparison.json")
+            target = bench_compare.open_output_target(out)
+            real_unlink = os.unlink
+            raced = False
+
+            def mutate_after_temporary_unlink(candidate, *args, **kwargs):
+                nonlocal raced
+                result = real_unlink(candidate, *args, **kwargs)
+                if (
+                    not raced
+                    and kwargs.get("dir_fd") == target["directory_fd"]
+                    and candidate != target["name"]
+                    and os.path.exists(out)
+                ):
+                    raced = True
+                    before = os.stat(out, follow_symlinks=False)
+                    with open(out, "r+b") as handle:
+                        raw = handle.read()
+                        changed = raw.replace(b"ours", b"evil", 1)
+                        self.assertNotEqual(changed, raw)
+                        self.assertEqual(len(changed), len(raw))
+                        handle.seek(0)
+                        handle.write(changed)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        out,
+                        ns=(before.st_atime_ns, before.st_mtime_ns),
+                    )
+                return result
+
+            try:
+                with mock.patch.object(
+                        bench_compare.os, "unlink",
+                        side_effect=mutate_after_temporary_unlink):
+                    with self.assertRaises(
+                            bench_compare.Refusal,
+                            msg="publication adopted mutated bytes as its baseline"):
+                        bench_compare.write_json_atomic(
+                            out, {"result": "ours"}, target
+                        )
+            finally:
+                os.close(target["directory_fd"])
+            self.assertTrue(raced)
+            self.assertFalse(os.path.exists(out))
+
+    def test_publication_rollback_preserves_unlink_recreate_aba(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.require_immediate_inode_reuse(tmp)
+            out = os.path.join(tmp, "comparison.json")
+            attacker_bytes = b"attacker output\n"
+            target = bench_compare.open_output_target(out)
+            published = None
+            replacement = None
+
+            def replace_output_then_refuse():
+                nonlocal published, replacement
+                published = os.stat(out, follow_symlinks=False)
+                os.unlink(out)
+                with open(out, "xb") as handle:
+                    handle.write(attacker_bytes)
+                replacement = os.stat(out, follow_symlinks=False)
+                raise bench_compare.Refusal("input changed after publication")
+
+            try:
+                with self.assertRaises(bench_compare.Refusal):
+                    bench_compare.write_json_atomic(
+                        out, {"result": "ours"}, target,
+                        after_publish=replace_output_then_refuse,
+                    )
+            finally:
+                os.close(target["directory_fd"])
+            self.assertIsNotNone(published)
+            self.assertIsNotNone(replacement)
+            self.assertFalse(
+                os.path.samestat(published, replacement),
+                "the live rollback pin did not keep its inode out of reuse",
+            )
+            self.assertTrue(
+                os.path.exists(out),
+                "rollback deleted the replacement after inode reuse",
+            )
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), attacker_bytes)
+
+    def assert_publication_rollback_preserves_post_check_replacement(
+            self, explicit_target):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "comparison.json")
+            attacker = os.path.join(tmp, "attacker.json")
+            attacker_bytes = b"attacker output\n"
+            with open(attacker, "wb") as handle:
+                handle.write(attacker_bytes)
+            target = (
+                bench_compare.open_output_target(out)
+                if explicit_target else None
+            )
+            target_name = os.path.basename(out)
+            target_directory_fd = (
+                target["directory_fd"] if target is not None else None
+            )
+            real_stat = bench_compare.os.stat
+            real_rename_noreplace = bench_compare.rename_noreplace
+            armed = False
+            raced = False
+
+            def install_replacement():
+                nonlocal raced
+                raced = True
+                os.replace(attacker, out)
+
+            def replace_after_rollback_stat(candidate, *args, **kwargs):
+                result = real_stat(candidate, *args, **kwargs)
+                candidate_name = os.fspath(candidate)
+                is_output = (
+                    candidate_name == out
+                    or (
+                        candidate_name == target_name
+                        and kwargs.get("dir_fd") == target_directory_fd
+                    )
+                )
+                if armed and not raced and is_output:
+                    install_replacement()
+                return result
+
+            def replace_before_atomic_rollback(
+                    directory_fd, source, destination):
+                if armed and not raced and source == target_name:
+                    install_replacement()
+                return real_rename_noreplace(
+                    directory_fd, source, destination
+                )
+
+            def refuse_after_publication():
+                nonlocal armed
+                armed = True
+                raise bench_compare.Refusal("input changed after publication")
+
+            try:
+                with mock.patch.object(
+                        bench_compare.os, "stat",
+                        side_effect=replace_after_rollback_stat), \
+                     mock.patch.object(
+                         bench_compare, "rename_noreplace",
+                         side_effect=replace_before_atomic_rollback):
+                    with self.assertRaises(bench_compare.Refusal):
+                        bench_compare.write_json_atomic(
+                            out, {"result": "ours"}, target,
+                            after_publish=refuse_after_publication,
+                        )
+            finally:
+                if target is not None:
+                    os.close(target["directory_fd"])
+            self.assertTrue(raced)
+            self.assertTrue(os.path.exists(out))
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), attacker_bytes)
+
+    def test_publication_rollback_preserves_post_check_replacement(self):
+        self.assert_publication_rollback_preserves_post_check_replacement(True)
+
+    def test_implicit_publication_rollback_preserves_post_check_replacement(self):
+        self.assert_publication_rollback_preserves_post_check_replacement(False)
 
     def test_campaign_memory_artifacts_are_protected_inputs(self):
         for name in ("complete.json", "run.json", "samples.jsonl", "summary.json"):
