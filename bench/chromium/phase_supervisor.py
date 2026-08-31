@@ -135,6 +135,21 @@ def reap_available():
             return
 
 
+def direct_children_remain():
+    """Reap exited direct children and report whether a live child remains."""
+    while True:
+        try:
+            info = os.waitid(
+                os.P_ALL, 0,
+                os.WEXITED | os.WNOHANG | os.WNOWAIT,
+            )
+        except ChildProcessError:
+            return False
+        if info is None:
+            return True
+        os.waitpid(info.si_pid, 0)
+
+
 def drain(fd):
     while True:
         try:
@@ -260,18 +275,25 @@ def drain_adopted_children(selector, wake_read, pending, external_signal,
                            parent_pid, term_grace, kill_grace,
                            control_fd=None):
     """Drain every adopted phase descendant without a PID-reuse signal race."""
-    survivors = direct_live_children(parent_pid)
-    escaped = bool(survivors)
-    if escaped:
-        print(
-            "FAILED: phase leader exited with live descendants "
-            + format_identities(survivors),
-            file=sys.stderr,
-            flush=True,
-        )
-    deadline = time.monotonic() + term_grace if survivors else None
+    escaped = False
+    deadline = None
     killed = False
-    while survivors:
+    while direct_children_remain():
+        survivors = direct_live_children(parent_pid)
+        if not survivors:
+            # A child can be reparented to this subreaper while procfs is being
+            # enumerated. The kernel child set, not one procfs scan, proves
+            # that every descendant has gone.
+            continue
+        if not escaped:
+            escaped = True
+            print(
+                "FAILED: phase leader exited with live descendants "
+                + format_identities(survivors),
+                file=sys.stderr,
+                flush=True,
+            )
+            deadline = time.monotonic() + term_grace
         signum = (signal.SIGKILL if killed else
                   (external_signal or signal.SIGTERM))
         signal_direct_children(survivors, parent_pid, signum)
@@ -290,7 +312,6 @@ def drain_adopted_children(selector, wake_read, pending, external_signal,
             termination = pending_termination(pending)
             if termination is not None and external_signal is None:
                 external_signal = termination
-        survivors = direct_live_children(parent_pid)
     return escaped, external_signal
 
 
@@ -337,6 +358,9 @@ def emergency_cleanup(child, wake_read, term_grace, kill_grace):
         raise RuntimeError(
             f"emergency cleanup leader survived SIGKILL: {detail}")
 
+    _pid, wait_status = os.waitpid(child.pid, 0)
+    child.returncode = os.waitstatus_to_exitcode(wait_status)
+
     emergency_selector = selectors.DefaultSelector()
     try:
         emergency_selector.register(wake_read, selectors.EVENT_READ, "signal")
@@ -345,8 +369,6 @@ def emergency_cleanup(child, wake_read, term_grace, kill_grace):
             term_grace, kill_grace)
     finally:
         emergency_selector.close()
-    _pid, wait_status = os.waitpid(child.pid, 0)
-    child.returncode = os.waitstatus_to_exitcode(wait_status)
     reap_available()
 
 
@@ -387,13 +409,13 @@ def _supervise_armed(argv, term_grace=None, kill_grace=None, pass_fds=(),
 
         selector.unregister(pidfd)
         result = status_code(leader_info)
+        _pid, wait_status = os.waitpid(child.pid, 0)
+        child.returncode = os.waitstatus_to_exitcode(wait_status)
         parent_pid = os.getpid()
         escaped, external_signal = drain_adopted_children(
             selector, wake_read, pending, external_signal, parent_pid,
             term_grace, kill_grace, control_fd)
 
-        _pid, wait_status = os.waitpid(child.pid, 0)
-        child.returncode = os.waitstatus_to_exitcode(wait_status)
         reap_available()
         if (external_signal in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP)
                 and not return_command_status_on_signal):

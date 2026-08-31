@@ -2723,6 +2723,50 @@ class CampaignIntegrityRegression(unittest.TestCase):
                     finally:
                         os.close(pidfd)
 
+    def test_phase_supervisor_rechecks_after_adoption_moves_during_proc_scan(self):
+        identity = {
+            "pid": 4242,
+            "state": "S",
+            "ppid": os.getpid(),
+            "pgid": 4242,
+            "starttime": 99,
+        }
+
+        class Selector:
+            @staticmethod
+            def select(_timeout=None):
+                return []
+
+        scans = iter(([], [identity]))
+        child_set = iter((None, None, ChildProcessError()))
+        sent = []
+
+        def waitid(*_args):
+            result = next(child_set)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+        with mock.patch.object(
+                phase_supervisor, "direct_live_children",
+                side_effect=lambda _parent: next(scans)), \
+             mock.patch.object(phase_supervisor.os, "waitid",
+                               side_effect=waitid), \
+             mock.patch.object(
+                 phase_supervisor, "signal_direct_children",
+                 side_effect=lambda children, parent, signum:
+                 sent.append((children, parent, signum))):
+            escaped, external_signal = phase_supervisor.drain_adopted_children(
+                Selector(), -1, [], None, os.getpid(), 0.01, 0.02,
+            )
+
+        self.assertTrue(
+            escaped,
+            "a child adopted during the procfs scan escaped supervision",
+        )
+        self.assertIsNone(external_signal)
+        self.assertEqual(sent, [([identity], os.getpid(), signal.SIGTERM)])
+
     def test_phase_supervisor_escalates_when_phase_leader_ignores_term(self):
         driver = (
             "import os,sys; "
@@ -2916,6 +2960,8 @@ class CampaignIntegrityRegression(unittest.TestCase):
         with mock.patch.object(
                 phase_supervisor, "direct_live_children",
                 return_value=[identity]), \
+             mock.patch.object(phase_supervisor, "direct_children_remain",
+                               return_value=True), \
              mock.patch.object(
                  phase_supervisor, "signal_direct_children",
                  side_effect=lambda children, parent, signum: sent.append(signum)):
