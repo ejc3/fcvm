@@ -66,6 +66,7 @@ so the hash names the bytes that were parsed.
 """
 
 import argparse
+import ctypes
 import fcntl
 import hashlib
 import ipaddress
@@ -73,6 +74,7 @@ import json
 import math
 import os
 import re
+import secrets
 import statistics
 import sys
 import tempfile
@@ -124,6 +126,15 @@ REPLAY_LOGS = {
     "corpus_access_log_sha256": "corpus-access.log",
     "replay_queries_log_sha256": "replay-queries.log",
 }
+RUN_INPUT_RELATIVE_PATHS = (
+    "analysis.json",
+    "reqbench.jsonl",
+    "dns-evidence.json",
+    "dns-owner.log",
+    *(f"verify-dns-{stage}.json" for stage in VERIFY_STAGES),
+    *REPLAY_LOGS.values(),
+    os.path.join("diag", "summary.json"),
+)
 
 
 class RunError(Exception):
@@ -159,42 +170,267 @@ def parse_json(data, path):
         raise RunError(f"{path}: cannot parse: {error}")
 
 
+class SourceEntries(list):
+    """Public source records paired with the exact paths used to read them."""
+
+    def __init__(self):
+        super().__init__()
+        self.attempted_paths = []
+
+
 class Sources:
     """The files one cell was read from, each read once and hashed from those bytes."""
 
-    def __init__(self):
-        self.entries = []
+    def __init__(self, run_dir=None):
+        self.entries = SourceEntries()
+        self.access_dir = os.fspath(run_dir) if run_dir is not None else None
+        self.display_dir = str(run_dir) if run_dir is not None else None
+        self._attempted_paths = set()
+
+    def display_path(self, path):
+        """Translate an fd-pinned input path back to the caller's pathname."""
+        path = os.fspath(path)
+        if (
+            self.access_dir is not None
+            and self.access_dir != self.display_dir
+            and (
+                path == self.access_dir
+                or path.startswith(self.access_dir + os.sep)
+            )
+        ):
+            return self.display_dir + path[len(self.access_dir):]
+        return path
+
+    def protect(self, path):
+        """Record a possible input before validation can stop or its read can fail."""
+        display_path = self.display_path(path)
+        access_path = os.fspath(path)
+        pair = (display_path, access_path)
+        if pair not in self._attempted_paths:
+            self._attempted_paths.add(pair)
+            self.entries.attempted_paths.append(pair)
+        return display_path
 
     def read_json(self, path):
+        display_path = self.protect(path)
         try:
             data = read_bytes(path)
         except OSError as error:
-            raise RunError(f"{path}: cannot read: {error}")
-        self.entries.append({"path": path, "sha256": hashlib.sha256(data).hexdigest()})
-        return parse_json(data, path)
+            raise RunError(f"{display_path}: cannot read: {error}")
+        self.entries.append({
+            "path": display_path,
+            "sha256": hashlib.sha256(data).hexdigest(),
+        })
+        return parse_json(data, display_path)
 
     def read_hashed(self, path):
         """Record a file the index does not parse; returns its sha256."""
+        display_path = self.protect(path)
         try:
             data = read_bytes(path)
         except OSError as error:
-            raise RunError(f"{path}: cannot read: {error}")
+            raise RunError(f"{display_path}: cannot read: {error}")
         digest = hashlib.sha256(data).hexdigest()
-        self.entries.append({"path": path, "sha256": digest})
+        self.entries.append({"path": display_path, "sha256": digest})
         return data, digest
 
 
+class PublishedOutput:
+    """The still-open inode and exact bytes installed by one atomic write."""
+
+    def __init__(self, descriptor, identity, size, digest):
+        self.descriptor = descriptor
+        self.identity = identity
+        self.size = size
+        self.digest = digest
+
+    def close(self):
+        os.close(self.descriptor)
+
+
 def write_json_atomic(path, value):
+    payload = (
+        json.dumps(value, indent=2, sort_keys=False, allow_nan=False) + "\n"
+    ).encode("utf-8")
     directory = os.path.dirname(os.path.abspath(path))
     fd, temp_path = tempfile.mkstemp(prefix=".campaign-summary.", dir=directory)
+    temporary_exists = True
     try:
-        with os.fdopen(fd, "w") as handle:
-            json.dump(value, handle, indent=2, sort_keys=False, allow_nan=False)
-            handle.write("\n")
+        with os.fdopen(fd, "wb", closefd=False) as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
         os.replace(temp_path, path)
+        temporary_exists = False
+        return PublishedOutput(
+            fd,
+            os.fstat(fd),
+            len(payload),
+            hashlib.sha256(payload).hexdigest(),
+        )
     except BaseException:
-        os.unlink(temp_path)
+        os.close(fd)
+        if temporary_exists:
+            os.unlink(temp_path)
         raise
+
+
+class PinnedOutput:
+    """Keep publication and cleanup in the directory selected at entry."""
+
+    def __init__(self, path):
+        self.path = os.fspath(path)
+        absolute = os.path.abspath(self.path)
+        self.directory = os.path.dirname(absolute)
+        self.name = os.path.basename(absolute)
+        self.descriptor = os.open(
+            self.directory,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY,
+        )
+        self.directory_identity = os.fstat(self.descriptor)
+        self.access_path = f"/proc/self/fd/{self.descriptor}/{self.name}"
+        self.initial_identity = self.identity()
+
+    def identity(self):
+        try:
+            info = os.stat(
+                self.name, dir_fd=self.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        return info
+
+    @staticmethod
+    def same_state(left, right):
+        fields = (
+            "st_dev", "st_ino", "st_mode", "st_size",
+            "st_mtime_ns",
+        )
+        return left is not None and right is not None and all(
+            getattr(left, field) == getattr(right, field) for field in fields)
+
+    @staticmethod
+    def same_publication_state(left, right):
+        return (
+            PinnedOutput.same_state(left, right)
+            and left.st_ctime_ns == right.st_ctime_ns
+        )
+
+    def validation_error(self, publication=None):
+        try:
+            current_directory = os.stat(self.directory)
+        except OSError as error:
+            return f"output directory {self.directory} cannot be rechecked: {error}"
+        if not os.path.samestat(current_directory, self.directory_identity):
+            return f"output directory {self.directory} changed during publication"
+        if publication is not None:
+            try:
+                before = os.fstat(publication.descriptor)
+                os.lseek(publication.descriptor, 0, os.SEEK_SET)
+                digest = hashlib.sha256()
+                size = 0
+                while True:
+                    chunk = os.read(publication.descriptor, 1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+                    size += len(chunk)
+                after = os.fstat(publication.descriptor)
+                current = self.identity()
+            except OSError as error:
+                return f"output {self.path} cannot be rechecked: {error}"
+            if (
+                not self.same_publication_state(before, publication.identity)
+                or not self.same_publication_state(after, publication.identity)
+                or not self.same_publication_state(current, publication.identity)
+                or size != publication.size
+                or digest.hexdigest() != publication.digest
+            ):
+                return f"output {self.path} changed during publication"
+        return None
+
+    def restore_quarantine(self, quarantine):
+        try:
+            rename_noreplace(self.descriptor, quarantine, self.name)
+        except OSError as error:
+            preserved = os.path.join(self.directory, quarantine)
+            raise RuntimeError(
+                f"cannot restore raced output {self.path}; its bytes remain at "
+                f"{preserved}: {error}"
+            ) from error
+
+    def unlink_if_unchanged(self, expected_identity, protected_identities=()):
+        """Atomically quarantine, inspect, then remove only the expected inode."""
+        if (expected_identity is None
+                or not self.same_state(self.identity(), expected_identity)):
+            return False
+        while True:
+            quarantine = (
+                f".campaign-summary-cleanup-{os.getpid()}-"
+                f"{secrets.token_hex(8)}"
+            )
+            try:
+                rename_noreplace(self.descriptor, self.name, quarantine)
+                break
+            except FileNotFoundError:
+                return False
+            except FileExistsError:
+                continue
+        try:
+            quarantined = os.stat(
+                quarantine,
+                dir_fd=self.descriptor,
+                follow_symlinks=False,
+            )
+        except OSError:
+            self.restore_quarantine(quarantine)
+            raise
+        protected = any(
+            os.path.samestat(quarantined, identity)
+            for identity in protected_identities
+        )
+        if not self.same_state(quarantined, expected_identity) or protected:
+            self.restore_quarantine(quarantine)
+            return False
+        try:
+            os.unlink(quarantine, dir_fd=self.descriptor)
+        except OSError:
+            self.restore_quarantine(quarantine)
+            raise
+        return True
+
+    def close(self):
+        os.close(self.descriptor)
+
+
+@contextmanager
+def pinned_output(path):
+    output = PinnedOutput(path)
+    try:
+        yield output
+    finally:
+        output.close()
+
+
+def rename_noreplace(directory_fd, source, destination):
+    """Rename one entry without overwriting a concurrent creator."""
+    try:
+        renameat2 = ctypes.CDLL(None, use_errno=True).renameat2
+    except AttributeError as error:
+        raise RuntimeError(
+            "renameat2 is required for race-free output cleanup") from error
+    renameat2.argtypes = (
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    )
+    renameat2.restype = ctypes.c_int
+    if renameat2(
+            directory_fd, os.fsencode(source),
+            directory_fd, os.fsencode(destination), 1) != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number), source)
 
 
 def positive_int(value):
@@ -335,6 +571,7 @@ def bind_analysis_input(run_dir, analysis, size, digest):
 def request_load_evidence(run_dir, analysis, arms, sources):
     """Derive per-request load from the exact reqanalyze input bytes."""
     path = os.path.join(run_dir, "reqbench.jsonl")
+    display_path = sources.display_path(path)
     if not os.path.isfile(path):
         raise RunError(f"{run_dir}: reqbench.jsonl is missing")
     data, digest = sources.read_hashed(path)
@@ -345,19 +582,19 @@ def request_load_evidence(run_dir, analysis, arms, sources):
     rows = []
     for line_number, line in enumerate(data.splitlines(), 1):
         if not line.strip():
-            raise RunError(f"{path}:{line_number} is blank")
-        row = parse_json(line, f"{path}:{line_number}")
+            raise RunError(f"{display_path}:{line_number} is blank")
+        row = parse_json(line, f"{display_path}:{line_number}")
         if not isinstance(row, dict):
-            raise RunError(f"{path}:{line_number} is not a JSON object")
+            raise RunError(f"{display_path}:{line_number} is not a JSON object")
         rows.append(row)
     if not rows or rows[0].get("kind") != "meta":
-        raise RunError(f"{path}: first record is not reqbench metadata")
+        raise RunError(f"{display_path}: first record is not reqbench metadata")
     if any(row.get("kind") == "meta" for row in rows[1:]):
-        raise RunError(f"{path}: carries more than one metadata record")
+        raise RunError(f"{display_path}: carries more than one metadata record")
     run_id = analysis.get("run_id")
     if rows[0].get("run_id") != run_id:
         raise RunError(
-            f"{path}: metadata run_id={rows[0].get('run_id')!r}, not the "
+            f"{display_path}: metadata run_id={rows[0].get('run_id')!r}, not the "
             f"analysis.json run_id={run_id!r}"
         )
 
@@ -368,17 +605,17 @@ def request_load_evidence(run_dir, analysis, arms, sources):
             continue
         if warmup is not False:
             raise RunError(
-                f"{path}:{line_number} has warmup={warmup!r}, not a boolean"
+                f"{display_path}:{line_number} has warmup={warmup!r}, not a boolean"
             )
         arm = row.get("arm")
         if arm not in by_arm:
             raise RunError(
-                f"{path}:{line_number} names arm={arm!r}, not one of "
+                f"{display_path}:{line_number} names arm={arm!r}, not one of "
                 f"{list(by_arm)!r} in analysis.json"
             )
         if row.get("run_id") != run_id:
             raise RunError(
-                f"{path}:{line_number} run_id={row.get('run_id')!r}, not the "
+                f"{display_path}:{line_number} run_id={row.get('run_id')!r}, not the "
                 f"analysis.json run_id={run_id!r}"
             )
         load = row.get("loadavg1")
@@ -389,7 +626,7 @@ def request_load_evidence(run_dir, analysis, arms, sources):
             or load < 0
         ):
             raise RunError(
-                f"{path}:{line_number} has invalid loadavg1={load!r}; every "
+                f"{display_path}:{line_number} has invalid loadavg1={load!r}; every "
                 "measured request must carry one finite non-negative sample"
             )
         by_arm[arm].append(load)
@@ -405,7 +642,7 @@ def request_load_evidence(run_dir, analysis, arms, sources):
 
     all_loads = [load for loads in by_arm.values() for load in loads]
     return {
-        "artifact": path,
+        "artifact": display_path,
         **load_distribution(all_loads),
         "per_arm": {
             arm: load_distribution(loads) for arm, loads in by_arm.items()
@@ -788,7 +1025,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
                 f"{interval!r}; continuous load samples need a positive interval"
             )
         owner_load_evidence = {
-            "artifact": owner_log,
+            "artifact": sources.display_path(owner_log),
             **load_distribution(owner_loads),
             "interval_seconds": interval,
         }
@@ -842,7 +1079,7 @@ def check_evidence(run_dir, evidence, sources, guest_dns, measured_urls, run_id)
                 f"{run_dir}: {name} sha256 {digest} does not match the {want} "
                 "dns-evidence.json recorded at the verdict"
             )
-        verify = parse_json(data, path)
+        verify = parse_json(data, sources.display_path(path))
         resolver = check_verify_bracket(
             run_dir, name, verify, resolver, set(measured_urls), measured_hosts
         )
@@ -1107,9 +1344,10 @@ def check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms):
             )
 
 
-def load_cell(run_dir):
+def load_cell(run_dir, sources=None):
     """Read one run directory into an index cell. Returns (cell, source entries)."""
-    sources = Sources()
+    if sources is None:
+        sources = Sources(run_dir)
     marker = os.path.join(run_dir, WITHDRAWN_MARKER)
     if os.path.lexists(marker):
         raise RunError(f"{run_dir}: withdrawn: {withdrawal_reason(marker)}")
@@ -1118,7 +1356,7 @@ def load_cell(run_dir):
         raise RunError(f"{run_dir}: analysis.json is missing")
     analysis = sources.read_json(analysis_path)
     if not isinstance(analysis, dict):
-        raise RunError(f"{analysis_path}: not a JSON object")
+        raise RunError(f"{sources.display_path(analysis_path)}: not a JSON object")
     run_id = analysis.get("run_id")
     if not isinstance(run_id, str) or re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
         raise RunError(
@@ -1284,7 +1522,7 @@ def load_cell(run_dir):
     request_loads = request_load_evidence(run_dir, analysis, arms, sources)
 
     return {
-        "run_dir": run_dir,
+        "run_dir": str(run_dir),
         "run_id": run_id,
         "engine": cell["engine"],
         "cpu": cell["cpu"],
@@ -1333,6 +1571,23 @@ def paths_alias(left, right):
         return False
 
 
+def existing_path_identities(paths):
+    """Snapshot entry and target inodes that cleanup must never remove."""
+    identities = []
+    seen = set()
+    for path in paths:
+        for follow_symlinks in (False, True):
+            try:
+                identity = os.stat(path, follow_symlinks=follow_symlinks)
+            except OSError:
+                continue
+            key = (identity.st_dev, identity.st_ino)
+            if key not in seen:
+                seen.add(key)
+                identities.append(identity)
+    return identities
+
+
 def withdrawal_errors(run_dirs):
     """Re-read every run's withdrawal marker at a publication boundary."""
     errors = []
@@ -1340,6 +1595,59 @@ def withdrawal_errors(run_dirs):
         marker = os.path.join(run_dir, WITHDRAWN_MARKER)
         if os.path.lexists(marker):
             errors.append(f"{run_dir}: withdrawn: {withdrawal_reason(marker)}")
+    return errors
+
+
+class LockedRunDirectory:
+    """One caller pathname read through the directory descriptor we locked."""
+
+    def __init__(self, path, descriptor, identity):
+        self.path = path
+        self.access_path = f"/proc/self/fd/{descriptor}"
+        self.identity = identity
+
+    def __fspath__(self):
+        return self.access_path
+
+    def __str__(self):
+        return self.path
+
+    def __repr__(self):
+        return repr(self.path)
+
+    def __eq__(self, other):
+        return str(self) == str(other)
+
+    def __hash__(self):
+        return hash(str(self))
+
+
+class RunDirectoryLockErrors(list):
+    """Lock failures plus the fd-pinned paths acquired successfully."""
+
+    def __init__(self):
+        super().__init__()
+        self.run_dirs = []
+
+
+def locked_run_directory_errors(run_dirs):
+    """Refuse when a caller pathname no longer names its locked inode."""
+    errors = []
+    for run_dir in run_dirs:
+        if not isinstance(run_dir, LockedRunDirectory):
+            continue
+        try:
+            current = os.stat(run_dir.path)
+        except OSError as error:
+            errors.append(
+                f"{run_dir}: changed after its directory lock was acquired: {error}"
+            )
+            continue
+        identity = (current.st_dev, current.st_ino)
+        if identity != run_dir.identity:
+            errors.append(
+                f"{run_dir}: changed after its directory lock was acquired"
+            )
     return errors
 
 
@@ -1359,8 +1667,8 @@ def shared_run_directory_locks(run_dirs):
     more specific refusal too.
     """
     descriptors = []
-    identities = set()
-    errors = []
+    identities = {}
+    errors = RunDirectoryLockErrors()
     try:
         for run_dir in run_dirs:
             try:
@@ -1369,25 +1677,34 @@ def shared_run_directory_locks(run_dirs):
                 )
             except OSError as error:
                 errors.append(f"{run_dir}: cannot open run directory lock: {error}")
+                errors.run_dirs.append(run_dir)
                 continue
             try:
                 stat = os.fstat(descriptor)
             except OSError as error:
                 os.close(descriptor)
                 errors.append(f"{run_dir}: cannot identify run directory: {error}")
+                errors.run_dirs.append(run_dir)
                 continue
             identity = (stat.st_dev, stat.st_ino)
             if identity in identities:
                 os.close(descriptor)
+                errors.run_dirs.append(
+                    LockedRunDirectory(run_dir, identities[identity], identity)
+                )
                 continue
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_SH)
             except OSError as error:
                 os.close(descriptor)
                 errors.append(f"{run_dir}: cannot lock run directory: {error}")
+                errors.run_dirs.append(run_dir)
                 continue
-            identities.add(identity)
+            identities[identity] = descriptor
             descriptors.append(descriptor)
+            errors.run_dirs.append(
+                LockedRunDirectory(run_dir, descriptor, identity)
+            )
         yield errors
     finally:
         for descriptor in reversed(descriptors):
@@ -1398,6 +1715,7 @@ def build_index(run_dirs):
     """Every cell or a list of refusals; never a partial index."""
     cells = []
     generated_from = []
+    source_attempted_paths = []
     errors = []
     seen = {}
     for run_dir in run_dirs:
@@ -1417,35 +1735,57 @@ def build_index(run_dirs):
             continue
         for key in keys:
             seen[key] = run_dir
+        sources = Sources(run_dir)
+        for relative_path in RUN_INPUT_RELATIVE_PATHS:
+            sources.protect(os.path.join(run_dir, relative_path))
         try:
-            cell, sources = load_cell(run_dir)
+            cell, _ = load_cell(run_dir, sources)
         except RunError as error:
             errors.append(str(error))
-            continue
-        cells.append(cell)
-        generated_from.extend(sources)
-    return {"generated_from": generated_from, "cells": cells}, errors
+        else:
+            cells.append(cell)
+        generated_from.extend(sources.entries)
+        source_attempted_paths.extend(sources.entries.attempted_paths)
+    return ({"generated_from": generated_from, "cells": cells}, errors,
+            source_attempted_paths)
 
 
-def publish_index(args, run_dirs, lock_errors):
+def publish_index(args, run_dirs, lock_errors, output):
     """Validate and publish while shared run-directory locks remain held."""
-    index, errors = build_index(run_dirs)
+    validation_dirs = getattr(lock_errors, "run_dirs", run_dirs)
+    index, errors, source_attempted_paths = build_index(validation_dirs)
     errors = list(lock_errors) + errors
-    out_realpath = os.path.realpath(args.out)
     aliases_input = False
-    for entry in index["generated_from"]:
-        if os.path.realpath(entry["path"]) == out_realpath:
-            errors.append(f"--out {args.out} aliases input {entry['path']}")
+    protected_paths = set()
+    for display_path, pinned_path in source_attempted_paths:
+        protected_paths.update((display_path, pinned_path))
+        if any(
+                paths_alias(output_path, protected_path)
+                for output_path in (args.out, output.access_path)
+                for protected_path in (display_path, pinned_path)):
+            errors.append(f"--out {args.out} aliases input {display_path}")
             aliases_input = True
-    withdrawal_markers = [
+    withdrawal_markers = {
         os.path.join(run_dir, WITHDRAWN_MARKER) for run_dir in run_dirs
-    ]
+    }
+    withdrawal_markers.update(
+        os.path.join(os.fspath(run_dir), WITHDRAWN_MARKER)
+        for run_dir in validation_dirs
+    )
+    protected_paths.update(withdrawal_markers)
+    protected_identities = existing_path_identities(protected_paths)
     aliases_withdrawal = any(
-        paths_alias(args.out, marker) for marker in withdrawal_markers
+        paths_alias(output_path, marker)
+        for output_path in (args.out, output.access_path)
+        for marker in withdrawal_markers
     )
     if aliases_withdrawal:
         errors.append(f"--out {args.out} aliases a run's {WITHDRAWN_MARKER} marker")
-    errors.extend(withdrawal_errors(run_dirs))
+    errors.extend(withdrawal_errors(validation_dirs))
+    errors.extend(locked_run_directory_errors(validation_dirs))
+    output_error = output.validation_error()
+    if output_error is not None:
+        errors.append(output_error)
     if errors:
         print("REFUSED: no index written", file=sys.stderr)
         for error in errors:
@@ -1453,22 +1793,38 @@ def publish_index(args, run_dirs, lock_errors):
         # An index already at --out describes cells this refusal did not
         # accept; it must not outlive the refusal. Never when --out is one
         # of the inputs, which are only ever read.
-        if not aliases_input and not aliases_withdrawal and os.path.lexists(args.out):
-            os.unlink(args.out)
+        if (not aliases_input and not aliases_withdrawal
+                and output.unlink_if_unchanged(
+                    output.initial_identity, protected_identities)):
             print(f"  removed stale index {args.out}", file=sys.stderr)
         return 5
-    write_json_atomic(args.out, index)
-    errors = withdrawal_errors(run_dirs)
-    if errors:
-        print("REFUSED: no index written", file=sys.stderr)
-        for error in errors:
-            print(f"  - {error}", file=sys.stderr)
-        if not aliases_withdrawal and os.path.lexists(args.out):
-            os.unlink(args.out)
-            print(f"  removed stale index {args.out}", file=sys.stderr)
-        return 5
-    print(f"wrote {args.out}: {len(index['cells'])} cell(s)")
-    return 0
+    publication = write_json_atomic(output.access_path, index)
+    try:
+        output_error = output.validation_error(publication)
+        if output_error is not None:
+            print("REFUSED: no index written", file=sys.stderr)
+            print(f"  - {output_error}", file=sys.stderr)
+            if output.unlink_if_unchanged(
+                    publication.identity, protected_identities):
+                print(f"  removed stale index {args.out}", file=sys.stderr)
+            return 5
+        errors = withdrawal_errors(validation_dirs)
+        output_error = output.validation_error(publication)
+        if output_error is not None:
+            errors.append(output_error)
+        errors.extend(locked_run_directory_errors(validation_dirs))
+        if errors:
+            print("REFUSED: no index written", file=sys.stderr)
+            for error in errors:
+                print(f"  - {error}", file=sys.stderr)
+            if output.unlink_if_unchanged(
+                    publication.identity, protected_identities):
+                print(f"  removed stale index {args.out}", file=sys.stderr)
+            return 5
+        print(f"wrote {args.out}: {len(index['cells'])} cell(s)")
+        return 0
+    finally:
+        publication.close()
 
 
 def main_with(argv=None):
@@ -1481,7 +1837,8 @@ def main_with(argv=None):
 
     run_dirs = [os.path.normpath(run_dir) for run_dir in args.run_dir]
     with shared_run_directory_locks(run_dirs) as lock_errors:
-        return publish_index(args, run_dirs, lock_errors)
+        with pinned_output(args.out) as output:
+            return publish_index(args, run_dirs, lock_errors, output)
 
 
 if __name__ == "__main__":

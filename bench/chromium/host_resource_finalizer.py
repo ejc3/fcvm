@@ -12,6 +12,7 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass
 from typing import Sequence
 
@@ -142,8 +143,9 @@ def finalize_dnsmasq() -> None:
 class ExistingCreateLock:
     """Hold an existing create-operation lease, without creating a new file."""
 
-    def __init__(self, path: str):
+    def __init__(self, path: str, directory_fd: int | None = None):
         self.path = path
+        self.directory_fd = directory_fd
         self.fd: int | None = None
         self.acquired = False
         self.retired = False
@@ -151,7 +153,7 @@ class ExistingCreateLock:
     def __enter__(self):
         flags = os.O_RDONLY | os.O_CLOEXEC | getattr(os, "O_NOFOLLOW", 0)
         try:
-            self.fd = os.open(self.path, flags)
+            self.fd = os.open(self.path, flags, dir_fd=self.directory_fd)
         except FileNotFoundError:
             return self
         except OSError as exc:
@@ -183,7 +185,8 @@ class ExistingCreateLock:
                     time.sleep(0.05)
 
             try:
-                path_identity = os.stat(self.path, follow_symlinks=False)
+                path_identity = os.stat(
+                    self.path, dir_fd=self.directory_fd, follow_symlinks=False)
             except OSError as exc:
                 raise FinalizerError(
                     "container create-operation lock changed while it was acquired"
@@ -226,7 +229,7 @@ def prove_container_absent(reference: str) -> bool:
     )
 
 
-def inspect_owned_container(name: str, owner_token: str) -> str | None:
+def inspect_container_identity(name: str) -> tuple[str, str] | None:
     result = run_bounded((
         "podman", "inspect", "--type", "container", "--format",
         '{{.Id}}|{{index .Config.Labels "io.fcvm.bench.owner"}}', name,
@@ -247,7 +250,14 @@ def inspect_owned_container(name: str, owner_token: str) -> str | None:
     match = re.fullmatch(r"([0-9a-f]{64})\|([0-9a-f]{32})\n?", identity)
     if match is None:
         raise FinalizerError("container inspection returned an invalid identity")
-    container_id, actual_owner = match.groups()
+    return match.groups()
+
+
+def inspect_owned_container(name: str, owner_token: str) -> str | None:
+    identity = inspect_container_identity(name)
+    if identity is None:
+        return None
+    container_id, actual_owner = identity
     if actual_owner != owner_token:
         raise FinalizerError("same-name container has a different owner label")
     return container_id
@@ -288,6 +298,147 @@ def finalize_container() -> None:
             raise FinalizerError("owned container survived podman rm")
 
 
+def classify_memory_containers(
+        run_id: str, owner_token: str
+) -> tuple[list[tuple[str, str]], list[tuple[str, str]]]:
+    """Classify exact run-prefix rows without letting collisions block cleanup."""
+    result = run_bounded((
+        "podman", "ps", "-a", "--no-trunc", "--format", "{{.ID}}|{{.Names}}",
+    ))
+    if result.returncode != 0:
+        raise FinalizerError(
+            f"cannot enumerate memory containers (status={result.returncode})")
+    try:
+        listing = result.stdout.decode("ascii")
+    except UnicodeDecodeError as exc:
+        raise FinalizerError("container listing is not ASCII") from exc
+
+    prefix = f"cbmem-{run_id}-"
+    owned = []
+    foreign = []
+    seen_ids = set()
+    seen_names = set()
+    for line in listing.splitlines():
+        if not line:
+            continue
+        fields = line.split("|")
+        if len(fields) != 2:
+            raise FinalizerError("container listing returned an invalid row")
+        container_id, name = fields
+        if not name.startswith(prefix):
+            continue
+        if (CONTAINER_ID_RE.fullmatch(container_id) is None
+                or CONTAINER_NAME_RE.fullmatch(name) is None):
+            raise FinalizerError("memory container listing has an invalid identity")
+        if container_id in seen_ids or name in seen_names:
+            raise FinalizerError("memory container listing has a duplicate identity")
+        identity = inspect_container_identity(container_id)
+        if identity is None:
+            continue
+        inspected_id, actual_owner = identity
+        if inspected_id != container_id:
+            raise FinalizerError("memory container changed exact identity")
+        seen_ids.add(container_id)
+        seen_names.add(name)
+        target = owned if actual_owner == owner_token else foreign
+        target.append((container_id, name))
+    return owned, foreign
+
+
+def hold_memory_create_leases(lock_dir: str, run_id: str, stack: ExitStack) -> None:
+    """Hold every run create lease and prove the stable, quiescent set."""
+    try:
+        directory_fd = os.open(
+            lock_dir,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise FinalizerError(
+            f"cannot open container create-operation directory: {exc}") from exc
+    stack.callback(os.close, directory_fd)
+    identity = os.fstat(directory_fd)
+    prefix = f"cbmem-{run_id}-"
+
+    def matching_entries() -> set[str]:
+        try:
+            entries = os.listdir(directory_fd)
+        except OSError as exc:
+            raise FinalizerError(
+                f"cannot enumerate container create-operation leases: {exc}") from exc
+        matches = {entry for entry in entries
+                   if entry.startswith(prefix) and entry.endswith(".lock")}
+        if any(CONTAINER_NAME_RE.fullmatch(entry[:-5]) is None for entry in matches):
+            raise FinalizerError("container create-operation lease has an invalid name")
+        return matches
+
+    before = matching_entries()
+    for entry in sorted(before):
+        lease = stack.enter_context(
+            ExistingCreateLock(entry, directory_fd))
+        if not lease.acquired:
+            raise FinalizerError("container create-operation lease disappeared")
+    try:
+        current = os.stat(lock_dir, follow_symlinks=False)
+    except OSError as exc:
+        raise FinalizerError(
+            "container create-operation directory changed while locked") from exc
+    if ((identity.st_dev, identity.st_ino)
+            != (current.st_dev, current.st_ino)):
+        raise FinalizerError("container create-operation directory changed identity")
+    if matching_entries() != before:
+        raise FinalizerError("container create-operation lease set changed while locked")
+
+
+def finalize_container_set() -> None:
+    """Remove every exact, owner-labelled memory container for one run."""
+    run_id = required_environment("FCVM_CONTAINER_RUN_ID")
+    owner_token = required_environment("FCVM_CONTAINER_OWNER_TOKEN")
+    lock_dir = required_environment("FCVM_CONTAINER_CREATE_LOCK_DIR")
+    if OWNER_TOKEN_RE.fullmatch(run_id) is None:
+        raise FinalizerError(
+            "FCVM_CONTAINER_RUN_ID must be exactly 32 lowercase hex characters")
+    if OWNER_TOKEN_RE.fullmatch(owner_token) is None:
+        raise FinalizerError(
+            "FCVM_CONTAINER_OWNER_TOKEN must be exactly 32 lowercase hex characters")
+    if "\n" in lock_dir or "\r" in lock_dir:
+        raise FinalizerError(
+            "FCVM_CONTAINER_CREATE_LOCK_DIR must be one filesystem path")
+
+    with ExitStack() as create_leases:
+        hold_memory_create_leases(lock_dir, run_id, create_leases)
+        rows, foreign = classify_memory_containers(run_id, owner_token)
+        if not rows:
+            if foreign:
+                raise FinalizerError(
+                    "memory container prefix has a different owner label")
+            return
+        identifiers = tuple(container_id for container_id, _name in rows)
+        removed = run_bounded(("podman", "rm", "-f", "--", *identifiers))
+        survivor_ids = [
+            container_id for container_id in identifiers
+            if not prove_container_absent(container_id)
+        ]
+        replacements, later_foreign = classify_memory_containers(
+            run_id, owner_token)
+        if survivor_ids or replacements:
+            survivor_ids.extend(
+                container_id for container_id, _name in replacements
+                if container_id not in survivor_ids)
+            raise FinalizerError(
+                "owned memory containers survived podman rm: "
+                + ",".join(survivor_ids))
+        if foreign or later_foreign:
+            raise FinalizerError(
+                "memory container prefix has a different owner label")
+        if removed.returncode != 0:
+            # Podman may report a concurrent already-absent ID as failure. The
+            # second exact enumeration above is the authoritative absence proof.
+            return
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     try:
@@ -298,8 +449,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             finalize_dnsmasq()
         elif mode == "container":
             finalize_container()
+        elif mode == "container-set":
+            finalize_container_set()
         else:
-            raise FinalizerError("FCVM_FINALIZER_MODE must be dnsmasq or container")
+            raise FinalizerError(
+                "FCVM_FINALIZER_MODE must be dnsmasq, container, or container-set")
         return 0
     except FinalizerError as exc:
         print(f"FAILED: host resource finalizer: {exc}", file=sys.stderr)

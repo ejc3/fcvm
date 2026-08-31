@@ -319,14 +319,18 @@ class MemoryFitPublication(unittest.TestCase):
         summarize = main.find(
             'summary["fits"] = summarize_memory_fits(cells, args.seed)'
         )
-        complete = main.find("publish_completion(args.results, args.run_id)")
         self.assertGreaterEqual(
             summarize, 0,
             "the production summary bypasses the uncertainty and basis gate",
         )
+        bootstrap = source[source.index("def bootstrap_memory_lifecycle"):
+                           source.index("def main_with_resources(resources):")]
+        lifecycle = bootstrap.find("status = run_memory_lifecycle(")
+        complete = bootstrap.find("publish_completion(results, run_id)")
+        self.assertGreaterEqual(lifecycle, 0)
         self.assertGreater(
-            complete, summarize,
-            "completion is published before the uncertainty and basis gate",
+            complete, lifecycle,
+            "completion is published before the worker and its finalizer finish",
         )
 
 
@@ -614,6 +618,180 @@ class RunScopedContainerCleanup(unittest.TestCase):
             side.stop_all()
         self.assertEqual(removed, ["c" * 64])
         self.assertNotIn(name, side.owned)
+
+    def test_memory_container_finalizer_survives_worker_sigkill(self):
+        """A started Podman container has a cleanup owner outside the worker.
+
+        RED BEFORE THE FIX: killing corpus_mem.py after bring_up returned left
+        the detached container alive because only the killed worker remembered
+        its exact ID and owner token.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            bindir = os.path.join(tmp, "bin")
+            os.mkdir(bindir)
+            podman = os.path.join(bindir, "podman")
+            state_path = os.path.join(tmp, "container.json")
+            ready_path = os.path.join(tmp, "worker.ready")
+            absence_path = os.path.join(tmp, "absence.proved")
+            lock_dir = os.path.join(tmp, "create-ops")
+            os.mkdir(lock_dir)
+            lifecycle_dir = os.path.join(tmp, "lifecycle")
+            os.mkdir(lifecycle_dir)
+            container_id = "c" * 64
+            token = "a" * 32
+            run_id = "b" * 32
+            name = f"cbmem-{run_id}-host1r1-0"
+            with open(podman, "w") as handle:
+                handle.write(
+                    "#!/usr/bin/env python3\n"
+                    "import json, os, sys, tempfile\n"
+                    "args = sys.argv[1:]\n"
+                    "state_path = os.environ['FAKE_CONTAINER_STATE']\n"
+                    "absence_path = os.environ['FAKE_ABSENCE_PROOF']\n"
+                    f"container_id = {container_id!r}\n"
+                    "def read_state():\n"
+                    "    try:\n"
+                    "        with open(state_path) as source:\n"
+                    "            return json.load(source)\n"
+                    "    except FileNotFoundError:\n"
+                    "        return None\n"
+                    "command = args[0]\n"
+                    "if command == 'ps':\n"
+                    "    state = read_state()\n"
+                    "    if state is not None:\n"
+                    "        print(state['id'] + '|' + state['name'])\n"
+                    "    else:\n"
+                    "        with open(absence_path, 'w') as target:\n"
+                    "            target.write('absent\\n')\n"
+                    "elif command == 'create':\n"
+                    "    name = args[args.index('--name') + 1]\n"
+                    "    label = args[args.index('--label') + 1]\n"
+                    "    token = label.split('=', 1)[1]\n"
+                    "    fd, temporary = tempfile.mkstemp(dir=os.path.dirname(state_path))\n"
+                    "    with os.fdopen(fd, 'w') as target:\n"
+                    "        json.dump({'id': container_id, 'name': name, 'token': token}, target)\n"
+                    "    os.replace(temporary, state_path)\n"
+                    "    print(container_id)\n"
+                    "elif command == 'inspect':\n"
+                    "    state = read_state()\n"
+                    "    if state is None or args[-1] not in (state['id'], state['name']):\n"
+                    "        raise SystemExit(125)\n"
+                    "    separator = '|' if '|' in ' '.join(args) else ' '\n"
+                    "    print(state['id'] + separator + state['token'])\n"
+                    "elif command == 'start':\n"
+                    "    state = read_state()\n"
+                    "    raise SystemExit(0 if state and args[-1] == state['id'] else 125)\n"
+                    "elif command == 'exec':\n"
+                    "    raise SystemExit(0)\n"
+                    "elif command == 'logs':\n"
+                    "    raise SystemExit(0)\n"
+                    "elif command == 'rm':\n"
+                    "    state = read_state()\n"
+                    "    if state is None or args[-1] not in (state['id'], state['name']):\n"
+                    "        raise SystemExit(125)\n"
+                    "    os.unlink(state_path)\n"
+                    "elif command == 'container' and args[1] == 'exists':\n"
+                    "    state = read_state()\n"
+                    "    if state is not None and args[-1] in (state['id'], state['name']):\n"
+                    "        raise SystemExit(0)\n"
+                    "    with open(absence_path, 'w') as target:\n"
+                    "        target.write('absent\\n')\n"
+                    "    raise SystemExit(1)\n"
+                    "else:\n"
+                    "    raise SystemExit(64)\n"
+                )
+            os.chmod(podman, 0o755)
+            worker_code = (
+                "import os,signal,sys\n"
+                f"sys.path.insert(0, {HERE!r})\n"
+                "import corpus_mem\n"
+                "from types import SimpleNamespace\n"
+                "args=SimpleNamespace(\n"
+                " image='image', image_id='image',\n"
+                " urls=['https://example.com/'],\n"
+                f" container_owner_token={token!r},\n"
+                f" container_create_ops_dir={lock_dir!r})\n"
+                f"side=corpus_mem.ContainerSide(args, {run_id!r})\n"
+                "side.bring_up(1, 'host1r1', [0])\n"
+                f"with open({ready_path!r}, 'w') as target:\n"
+                " target.write(str(os.getpid()))\n"
+                "signal.pause()\n"
+            )
+            wrapper_code = (
+                "import sys\n"
+                f"sys.path.insert(0, {HERE!r})\n"
+                "import corpus_mem\n"
+                "raise SystemExit(corpus_mem.run_memory_lifecycle(\n"
+                f" [sys.executable, '-c', {worker_code!r}],\n"
+                f" {run_id!r}, {token!r}, {lock_dir!r}, {lifecycle_dir!r},\n"
+                " term_grace=0.05, kill_grace=2.0))\n"
+            )
+            env = dict(
+                os.environ,
+                PATH=bindir + os.pathsep + os.environ["PATH"],
+                FAKE_CONTAINER_STATE=state_path,
+                FAKE_ABSENCE_PROOF=absence_path,
+            )
+            wrapper = subprocess.Popen(
+                [sys.executable, "-c", wrapper_code], env=env,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.isfile(ready_path):
+                    if wrapper.poll() is not None:
+                        stdout, stderr = wrapper.communicate()
+                        self.fail(
+                            f"memory worker exited before readiness: "
+                            f"{wrapper.returncode}: {stdout}{stderr}")
+                    if time.monotonic() >= deadline:
+                        self.fail("memory worker never started its container")
+                    time.sleep(0.01)
+                self.assertTrue(os.path.isfile(state_path))
+
+                with open(ready_path) as handle:
+                    worker_pid = int(handle.read())
+                os.kill(worker_pid, signal.SIGKILL)
+                deadline = time.monotonic() + 10
+                while (not os.path.isfile(absence_path)
+                       and time.monotonic() < deadline):
+                    time.sleep(0.01)
+                self.assertTrue(
+                    os.path.isfile(absence_path),
+                    "SIGKILL left the memory container without a live finalizer",
+                )
+                self.assertFalse(os.path.exists(state_path))
+                wrapper.wait(timeout=5)
+            finally:
+                if wrapper.poll() is None:
+                    wrapper.kill()
+                    wrapper.wait(timeout=5)
+                if os.path.isfile(state_path):
+                    subprocess.run(
+                        [podman, "rm", "-f", "--", container_id],
+                        env=env, capture_output=True, text=True, timeout=5,
+                    )
+                for pipe in (wrapper.stdout, wrapper.stderr):
+                    if pipe is not None:
+                        pipe.close()
+
+        with open(CORPUS_MEM) as handle:
+            memory_source = handle.read()
+        bootstrap = memory_source.index("def bootstrap_memory_lifecycle")
+        worker = memory_source.index("def main_with_resources")
+        self.assertLess(bootstrap, worker)
+        self.assertIn("run_memory_lifecycle(", memory_source[bootstrap:worker])
+        with open(EXTRA) as handle:
+            outer_source = handle.read()
+        match = re.search(r'^run_logged\(\) \{\n.*?^\}', outer_source,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match)
+        run_logged = match.group(0)
+        self.assertIn('--finalizer "$BENCH/host_resource_finalizer.py"', run_logged)
+        self.assertIn("FCVM_FINALIZER_MODE=container-set", run_logged)
+        memory_call = outer_source[outer_source.index(
+            'if [[ ",$PHASES," == *",memory,"* ]]'):]
+        self.assertIn("ACTIVE_PHASE_FINALIZER=memory-containers", memory_call)
 
     def test_shared_replay_ports_are_locked_before_dnsmasq_is_touched(self):
         with open(EXTRA) as handle:
@@ -2136,6 +2314,62 @@ class HostResourceFinalizer(unittest.TestCase):
                 "retired cleanup performed a fallible post-publication Podman proof",
             )
 
+    def test_container_set_removes_owned_ids_before_reporting_foreign_collision(self):
+        run_id = "a" * 32
+        owner_token = "b" * 32
+        foreign_token = "c" * 32
+        owned_id = "d" * 64
+        foreign_id = "e" * 64
+        containers = {
+            owned_id: (f"cbmem-{run_id}-host1r1-0", owner_token),
+            foreign_id: (f"cbmem-{run_id}-host1r1-1", foreign_token),
+        }
+        removals = []
+
+        def podman(argv, *_args, **_kwargs):
+            command = tuple(argv)
+            if command[1:3] == ("ps", "-a"):
+                listing = "".join(
+                    f"{container_id}|{name}\n"
+                    for container_id, (name, _token) in containers.items()
+                )
+                return host_resource_finalizer.CommandResult(
+                    0, listing.encode(), b"")
+            if command[1] == "inspect":
+                container_id = command[-1]
+                if container_id not in containers:
+                    return host_resource_finalizer.CommandResult(125, b"", b"missing")
+                _name, token = containers[container_id]
+                return host_resource_finalizer.CommandResult(
+                    0, f"{container_id}|{token}\n".encode(), b"")
+            if command[1:3] == ("rm", "-f"):
+                identifiers = command[command.index("--") + 1:]
+                removals.append(identifiers)
+                for container_id in identifiers:
+                    containers.pop(container_id, None)
+                return host_resource_finalizer.CommandResult(0, b"", b"")
+            if command[1:3] == ("container", "exists"):
+                return host_resource_finalizer.CommandResult(
+                    0 if command[-1] in containers else 1, b"", b"")
+            self.fail(f"unexpected Podman command: {command}")
+
+        with tempfile.TemporaryDirectory() as lock_dir, \
+             mock.patch.dict(os.environ, {
+                 "FCVM_CONTAINER_RUN_ID": run_id,
+                 "FCVM_CONTAINER_OWNER_TOKEN": owner_token,
+                 "FCVM_CONTAINER_CREATE_LOCK_DIR": lock_dir,
+             }), \
+             mock.patch.object(
+                 host_resource_finalizer, "run_bounded", side_effect=podman):
+            with self.assertRaisesRegex(
+                    host_resource_finalizer.FinalizerError,
+                    "different owner"):
+                host_resource_finalizer.finalize_container_set()
+
+        self.assertEqual(removals, [(owned_id,)])
+        self.assertNotIn(owned_id, containers)
+        self.assertIn(foreign_id, containers)
+
 
 class CorpusExtraFailClosed(unittest.TestCase):
     """The shell driver cannot publish after a preflight or replay failure."""
@@ -3546,11 +3780,14 @@ class CampaignIntegrityRegression(unittest.TestCase):
         summary = main.find(
             'with open(os.path.join(args.results, "summary.json"), "w")'
         )
-        publish = main.find("publish_completion(args.results, args.run_id)")
         self.assertGreaterEqual(summary, 0, "memory has no final summary writer")
+        bootstrap = source[source.index("def bootstrap_memory_lifecycle"):
+                           source.index("def main_with_resources(resources):")]
+        lifecycle = bootstrap.find("status = run_memory_lifecycle(")
+        publish = bootstrap.find("publish_completion(results, run_id)")
         self.assertGreater(
-            publish, summary,
-            "memory completion is not published after the final summary closes",
+            publish, lifecycle,
+            "memory completion precedes the worker and finalizer completion",
         )
 
     def test_memory_completion_does_not_retain_samples_payload(self):

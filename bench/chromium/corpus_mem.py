@@ -41,6 +41,7 @@ import stat
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -833,6 +834,125 @@ CREATE_OPERATION_TIMEOUT = 120
 CREATE_QUIESCE_TIMEOUT = 180
 CREATE_TERM_TIMEOUT = 5.0
 CREATE_KILL_TIMEOUT = 30.0
+MEMORY_FINALIZER_TIMEOUT = 180.0
+MEMORY_ROLE_ENV = "FCVM_MEMORY_LIFECYCLE_ROLE"
+
+
+def read_lifecycle_completion(path, token):
+    try:
+        with open(path) as handle:
+            payload = handle.read()
+    except FileNotFoundError:
+        return None
+    expected = {
+        f"armed {token}\n": "armed",
+        f"complete {token}\n": "complete",
+    }
+    if payload not in expected:
+        raise RuntimeError(
+            f"memory lifecycle published invalid completion state {payload!r}")
+    return expected[payload]
+
+
+def run_memory_lifecycle(command, run_id, owner_token, lock_dir, lifecycle_dir,
+                         *, term_grace=CREATE_TERM_TIMEOUT,
+                         kill_grace=CREATE_KILL_TIMEOUT,
+                         child_environment=None,
+                         finalizer_path=None):
+    """Supervise one whole memory run with a mandatory set finalizer."""
+    finalizer_path = finalizer_path or os.path.join(
+        HERE, "host_resource_finalizer.py")
+    completion_path = os.path.join(lifecycle_dir, "completion")
+    completion_token = secrets.token_hex(16)
+    environment = dict(os.environ)
+    if child_environment:
+        environment.update(child_environment)
+    environment.update({
+        "FCVM_FINALIZER_MODE": "container-set",
+        "FCVM_CONTAINER_RUN_ID": run_id,
+        "FCVM_CONTAINER_OWNER_TOKEN": owner_token,
+        "FCVM_CONTAINER_CREATE_LOCK_DIR": lock_dir,
+    })
+    supervisor = subprocess.Popen(
+        [
+            sys.executable, PHASE_SUPERVISOR,
+            "--detach", "--expected-parent", str(os.getpid()),
+            "--term-grace", str(term_grace),
+            "--kill-grace", str(kill_grace),
+            "--finalizer", finalizer_path,
+            "--finalizer-timeout", str(MEMORY_FINALIZER_TIMEOUT),
+            "--completion-path", completion_path,
+            "--completion-token", completion_token,
+            "--", *command,
+        ],
+        stdin=subprocess.DEVNULL,
+        env=environment,
+        start_new_session=True,
+    )
+    status = supervisor.wait()
+    state = read_lifecycle_completion(completion_path, completion_token)
+    if state != "complete":
+        raise RuntimeError(
+            f"memory lifecycle exited {status} without finalizer completion")
+    return status
+
+
+def memory_lifecycle_arguments(argv):
+    """Resolve cleanup identity before the lifecycle worker can mutate Podman."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--results", required=True)
+    parser.add_argument("--run-id", default="")
+    parser.add_argument("--container-owner-token", default="")
+    parser.add_argument("--container-create-ops-dir", default="")
+    known, _unknown = parser.parse_known_args(argv)
+    results = os.path.abspath(known.results)
+    run_id = known.run_id or uuid.uuid4().hex
+    owner_token = known.container_owner_token or uuid.uuid4().hex
+    lock_dir = os.path.abspath(
+        known.container_create_ops_dir
+        or os.path.join(results, "container-create-ops"))
+    if re.fullmatch(r"[0-9a-f]{32}", run_id) is None:
+        raise RuntimeError("--run-id must be a 32-character lowercase hexadecimal ID")
+    if re.fullmatch(r"[0-9a-f]{32}", owner_token) is None:
+        raise RuntimeError(
+            "--container-owner-token must be a 32-character lowercase hexadecimal token")
+    return results, run_id, owner_token, lock_dir
+
+
+def bootstrap_memory_lifecycle(argv):
+    """Arm cleanup, run the measurement worker, then authorize completion."""
+    results, run_id, owner_token, lock_dir = memory_lifecycle_arguments(argv)
+    parent = os.path.dirname(results)
+    os.makedirs(parent, exist_ok=True)
+    lifecycle_dir = tempfile.mkdtemp(
+        prefix=f".cbmem-lifecycle-{run_id}.", dir=parent)
+    lifecycle_finished = False
+    try:
+        status = run_memory_lifecycle(
+            [sys.executable, os.path.abspath(__file__), *argv],
+            run_id, owner_token, lock_dir, lifecycle_dir,
+            child_environment={
+                MEMORY_ROLE_ENV: "worker",
+                "FCVM_MEMORY_RUN_ID": run_id,
+                "FCVM_MEMORY_CONTAINER_OWNER_TOKEN": owner_token,
+                "FCVM_MEMORY_CONTAINER_CREATE_LOCK_DIR": lock_dir,
+            },
+        )
+        lifecycle_finished = True
+        if status == 0:
+            publish_completion(results, run_id)
+        return status
+    finally:
+        if lifecycle_finished:
+            for name in ("completion",):
+                try:
+                    os.unlink(os.path.join(lifecycle_dir, name))
+                except FileNotFoundError:
+                    pass
+            try:
+                os.rmdir(lifecycle_dir)
+            except OSError:
+                pass
 
 
 class ContainerCreateOperation:
@@ -1635,7 +1755,13 @@ def cell_values(cell):
 
 
 def main():
-    """Run one measurement while releasing every whole-run lease on exit."""
+    """Arm run-level cleanup before starting the measured worker."""
+    help_only = any(argument in ("-h", "--help") for argument in sys.argv[1:])
+    if os.environ.get(MEMORY_ROLE_ENV) != "worker" and not help_only:
+        try:
+            return bootstrap_memory_lifecycle(sys.argv[1:])
+        except RuntimeError as exc:
+            die(str(exc))
     with ExitStack() as resources:
         return main_with_resources(resources)
 
@@ -1676,10 +1802,15 @@ def main_with_resources(resources):
     except ValueError as exc:
         die(f"--ns must be comma-separated integers: {exc}")
     args.state_dir = os.path.join(args.data_root, "state")
-    args.run_id = args.run_id or uuid.uuid4().hex
-    args.container_owner_token = args.container_owner_token or uuid.uuid4().hex
+    args.run_id = (
+        args.run_id or os.environ.get("FCVM_MEMORY_RUN_ID") or uuid.uuid4().hex)
+    args.container_owner_token = (
+        args.container_owner_token
+        or os.environ.get("FCVM_MEMORY_CONTAINER_OWNER_TOKEN")
+        or uuid.uuid4().hex)
     args.container_create_ops_dir = (
         args.container_create_ops_dir
+        or os.environ.get("FCVM_MEMORY_CONTAINER_CREATE_LOCK_DIR")
         or os.path.join(args.results, "container-create-ops")
     )
     validate_args(args)
@@ -1799,13 +1930,9 @@ def main_with_resources(resources):
         die(f"memory results are not publishable: {exc}")
     with open(os.path.join(args.results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
-    try:
-        publish_completion(args.results, args.run_id)
-    except RuntimeError as exc:
-        die(str(exc))
     print(json.dumps(summary["fits"], indent=1))
     log(f"records in {args.results}")
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

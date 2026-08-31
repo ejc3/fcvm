@@ -365,7 +365,8 @@ ACTIVE_PHASE_CONTROL_FD=""
 ACTIVE_PHASE_CONTROL_PATH=""
 
 run_logged() {
-    local log_path="$1" rc
+    local log_path="$1" rc phase_finalizer="${ACTIVE_PHASE_FINALIZER:-}"
+    local finalizer_args=()
     shift
     if [ -n "$ACTIVE_PHASE_PID" ] || [ -n "$ACTIVE_PHASE_CONTROL_FD" ]; then
         echo "FAILED: another measurement phase is still owned" >&2
@@ -384,6 +385,23 @@ run_logged() {
     trap 'ACTIVE_PHASE_SIGNAL=130' INT
     trap 'ACTIVE_PHASE_SIGNAL=143' TERM
     (
+        case "$phase_finalizer" in
+            "") ;;
+            memory-containers)
+                export FCVM_FINALIZER_MODE=container-set
+                export FCVM_CONTAINER_RUN_ID="$RUN_ID"
+                export FCVM_CONTAINER_OWNER_TOKEN="$CONTAINER_OWNER_TOKEN"
+                export FCVM_CONTAINER_CREATE_LOCK_DIR="$CONTAINER_CREATE_OPS_DIR"
+                finalizer_args=(
+                    --finalizer "$BENCH/host_resource_finalizer.py"
+                    --finalizer-timeout 180
+                )
+                ;;
+            *)
+                echo "FAILED: unknown phase finalizer $phase_finalizer" >&2
+                exit 2
+                ;;
+        esac
         # The supervisor detaches before it starts the phase and its tee. The
         # campaign shell is the only control writer, so process-group death
         # becomes FIFO EOF without killing the cleanup owner.
@@ -392,7 +410,8 @@ run_logged() {
         set +e
         python3 "$BENCH/phase_supervisor.py" --detach \
             --expected-parent "$phase_parent" \
-            --control-path "$ACTIVE_PHASE_CONTROL_PATH" -- \
+            --control-path "$ACTIVE_PHASE_CONTROL_PATH" \
+            "${finalizer_args[@]}" -- \
             bash -c '
                 log_path=$1
                 shift
@@ -977,6 +996,7 @@ fi
 
 if [[ ",$PHASES," == *",memory,"* ]]; then
     say "matched-basis memory: N in $MEM_NS, $MEM_REPS reps, interleaved seed $MEM_SEED"
+    ACTIVE_PHASE_FINALIZER=memory-containers \
     run_logged "$LOGDIR/memory.log" python3 "$BENCH/corpus_mem.py" \
         --results "$RESULTS/memory" --tag "$TAG" \
         --image "$IMAGE" --image-id "$RUNTIME_IMAGE" \

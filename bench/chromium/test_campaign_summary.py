@@ -2134,6 +2134,557 @@ class CampaignSummary(unittest.TestCase):
                 "the publication reader leaked its directory lock",
             )
 
+    def test_run_directory_replacement_cannot_escape_the_locked_inode(self):
+        """Validation must consume the directory inode whose shared lock it
+        holds. A rename and replacement after open otherwise moves the lock to
+        an inode the pathname-based reads never inspect, and the replacement
+        can be published without sharing a lock domain with its withdrawal
+        writer.
+
+        RED BEFORE THE FIX: main_with returned 0 and wrote an index from the
+        replacement directory while its shared flock remained on the renamed
+        original directory.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            displaced = os.path.join(d, "run-before-replacement")
+            write_run(run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            real_flock = campaign_summary.fcntl.flock
+            replaced = False
+
+            def lock_then_replace(descriptor, operation):
+                nonlocal replaced
+                result = real_flock(descriptor, operation)
+                if operation == campaign_summary.fcntl.LOCK_SH and not replaced:
+                    replaced = True
+                    os.rename(run_dir, displaced)
+                    write_run(run_dir)
+                return result
+
+            with unittest.mock.patch.object(
+                    campaign_summary.fcntl, "flock",
+                    side_effect=lock_then_replace):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(out), text)
+            self.assertIn("changed after its directory lock was acquired", text)
+
+    def test_replacement_refusal_never_unlinks_a_pinned_input(self):
+        """A moved locked directory remains read-only during refusal cleanup.
+
+        RED BEFORE THE FIX: generated_from and withdrawal-alias checks used the
+        caller pathname after it named the replacement. Refusal cleanup then
+        unlinked the original run's analysis or permanent WITHDRAWN marker
+        through its new pathname.
+        """
+        for target_name in ("analysis.json", "WITHDRAWN"):
+            with self.subTest(target_name=target_name), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                displaced = os.path.join(d, "run-before-replacement")
+                write_run(run_dir)
+                if target_name == "WITHDRAWN":
+                    with open(os.path.join(run_dir, target_name), "w") as handle:
+                        handle.write("permanent withdrawal\n")
+                out = os.path.join(displaced, target_name)
+                real_flock = campaign_summary.fcntl.flock
+                replaced = False
+
+                def lock_then_replace(descriptor, operation):
+                    nonlocal replaced
+                    result = real_flock(descriptor, operation)
+                    if operation == campaign_summary.fcntl.LOCK_SH and not replaced:
+                        replaced = True
+                        os.rename(run_dir, displaced)
+                        write_run(run_dir)
+                    return result
+
+                with unittest.mock.patch.object(
+                        campaign_summary.fcntl, "flock",
+                        side_effect=lock_then_replace):
+                    rc, text = self._summarize(out, [run_dir])
+
+                self.assertNotEqual(rc, 0, text)
+                self.assertTrue(
+                    os.path.isfile(out),
+                    f"refusal cleanup deleted pinned {target_name}: {text}",
+                )
+
+    def test_final_boundary_checks_locked_path_identity_after_withdrawal(self):
+        """The last path check closes a replacement-inode withdrawal gap.
+
+        RED BEFORE THE FIX: the final boundary checked pathname identity and
+        then read WITHDRAWN through the locked FD. A writer could replace the
+        directory in between, exclusively lock the replacement, and publish
+        its marker while the index remained authorized.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            displaced = os.path.join(d, "run-before-replacement")
+            write_run(run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            real_withdrawal_errors = campaign_summary.withdrawal_errors
+            calls = 0
+            writer_locked = False
+
+            def replace_at_final_withdrawal(run_dirs):
+                nonlocal calls, writer_locked
+                calls += 1
+                if calls == 2:
+                    os.rename(run_dir, displaced)
+                    write_run(run_dir)
+                    descriptor = os.open(
+                        run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                    try:
+                        campaign_summary.fcntl.flock(
+                            descriptor,
+                            campaign_summary.fcntl.LOCK_EX
+                            | campaign_summary.fcntl.LOCK_NB,
+                        )
+                        writer_locked = True
+                        with open(os.path.join(run_dir, "WITHDRAWN"), "w") as handle:
+                            handle.write("replacement withdrawn\n")
+                    finally:
+                        os.close(descriptor)
+                return real_withdrawal_errors(run_dirs)
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "withdrawal_errors",
+                    side_effect=replace_at_final_withdrawal):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertTrue(writer_locked, text)
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(out), text)
+            self.assertTrue(os.path.isfile(os.path.join(run_dir, "WITHDRAWN")))
+
+    def test_final_run_identity_check_follows_output_validation(self):
+        """The final run-path check is the last state read before success.
+
+        RED BEFORE THE FIX: final output validation ran after the run identity
+        check. Replacing the run while that output check ran let a writer lock
+        the replacement, publish WITHDRAWN, and still receive a successful
+        index for the displaced source.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            displaced = os.path.join(d, "run-before-replacement")
+            write_run(run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            real_validation_error = campaign_summary.PinnedOutput.validation_error
+            calls = 0
+            writer_locked = False
+
+            def replace_during_final_output_validation(output, expected=None):
+                nonlocal calls, writer_locked
+                calls += 1
+                if calls == 3:
+                    os.rename(run_dir, displaced)
+                    write_run(run_dir)
+                    descriptor = os.open(
+                        run_dir, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+                    try:
+                        campaign_summary.fcntl.flock(
+                            descriptor,
+                            campaign_summary.fcntl.LOCK_EX
+                            | campaign_summary.fcntl.LOCK_NB,
+                        )
+                        writer_locked = True
+                        with open(os.path.join(run_dir, "WITHDRAWN"), "w") as handle:
+                            handle.write("replacement withdrawn\n")
+                    finally:
+                        os.close(descriptor)
+                return real_validation_error(output, expected)
+
+            with unittest.mock.patch.object(
+                    campaign_summary.PinnedOutput, "validation_error",
+                    autospec=True,
+                    side_effect=replace_during_final_output_validation):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertEqual(calls, 3, text)
+            self.assertTrue(writer_locked, text)
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(out), text)
+            self.assertTrue(os.path.isfile(os.path.join(run_dir, "WITHDRAWN")))
+
+    def test_nested_run_aliases_use_the_most_specific_locked_directory(self):
+        """A child run's source must map through the child's locked FD.
+
+        RED BEFORE THE FIX: locked_access_path selected the first matching
+        caller prefix. With parent before child, it resolved the replaced
+        child through the parent FD and refusal cleanup deleted the actual
+        fd-pinned child input at its displaced pathname.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            outer = os.path.join(d, "run")
+            child = os.path.join(outer, "child")
+            displaced = os.path.join(d, "child-before-replacement")
+            write_run(outer)
+            write_run(child)
+            out = os.path.join(displaced, "analysis.json")
+            real_flock = campaign_summary.fcntl.flock
+            lock_count = 0
+
+            def lock_then_replace_child(descriptor, operation):
+                nonlocal lock_count
+                result = real_flock(descriptor, operation)
+                if operation == campaign_summary.fcntl.LOCK_SH:
+                    lock_count += 1
+                    if lock_count == 2:
+                        os.rename(child, displaced)
+                        write_run(child)
+                return result
+
+            with unittest.mock.patch.object(
+                    campaign_summary.fcntl, "flock",
+                    side_effect=lock_then_replace_child):
+                rc, text = self._summarize(out, [outer, child])
+
+            self.assertNotEqual(rc, 0, text)
+            self.assertTrue(
+                os.path.isfile(out),
+                f"refusal cleanup deleted the pinned nested input: {text}",
+            )
+
+    def test_refusal_preserves_inputs_read_before_validation_failed(self):
+        """A source read before a later refusal remains protected as input.
+
+        RED BEFORE THE FIX: load_cell discarded its SourceEntries when it
+        raised after reading analysis.json. With --out naming that input,
+        refusal cleanup treated the source as stale output and unlinked it.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            out = os.path.join(run_dir, "analysis.json")
+            with open(out) as handle:
+                analysis = json.load(handle)
+            analysis["publishable"] = False
+            analysis["gate"] = {"passed": False, "reasons": ["deliberate refusal"]}
+            with open(out, "w") as handle:
+                json.dump(analysis, handle)
+
+            rc, text = self._summarize(out, [run_dir])
+
+            self.assertNotEqual(rc, 0, text)
+            self.assertTrue(
+                os.path.isfile(out),
+                f"refusal cleanup deleted analysis.json after reading it: {text}",
+            )
+
+    def test_refusal_preserves_existing_input_when_its_read_fails(self):
+        """An attempted input is protected before its bytes can be read.
+
+        RED BEFORE THE FIX: Sources registered paths only after read_bytes
+        succeeded. When analysis.json or reqbench.jsonl returned EACCES and
+        --out named that file, refusal cleanup unlinked the unreadable input.
+        """
+        for target_name in ("analysis.json", "reqbench.jsonl"):
+            with self.subTest(target_name=target_name), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir)
+                out = os.path.join(run_dir, target_name)
+                real_read_bytes = campaign_summary.read_bytes
+
+                def fail_target_read(path):
+                    if os.path.basename(os.fspath(path)) == target_name:
+                        raise PermissionError("deliberate unreadable input")
+                    return real_read_bytes(path)
+
+                with unittest.mock.patch.object(
+                        campaign_summary, "read_bytes",
+                        side_effect=fail_target_read):
+                    rc, text = self._summarize(out, [run_dir])
+
+                self.assertNotEqual(rc, 0, text)
+                self.assertTrue(
+                    os.path.isfile(out),
+                    f"refusal cleanup deleted unreadable {target_name}: {text}",
+                )
+
+    def test_early_refusal_preserves_every_known_run_input(self):
+        """A withdrawal cannot make later inputs eligible for stale cleanup.
+
+        RED BEFORE THE FIX: WITHDRAWN stopped validation before Sources
+        registered any ordinary input. Pointing --out at each existing input
+        then deleted that file even though campaign_summary is read-only over
+        run directories.
+        """
+        input_names = (
+            "analysis.json",
+            "reqbench.jsonl",
+            "dns-evidence.json",
+            "dns-owner.log",
+            "verify-dns-pre.json",
+            "verify-dns-before-run.json",
+            "verify-dns-after-run.json",
+            "corpus-dns.log",
+            "corpus-access.log",
+            "replay-queries.log",
+            os.path.join("diag", "summary.json"),
+        )
+        for input_name in input_names:
+            with self.subTest(input_name=input_name), \
+                    tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, withdrawn="deliberate refusal")
+                out = os.path.join(run_dir, input_name)
+                self.assertTrue(os.path.isfile(out), input_name)
+
+                rc, text = self._summarize(out, [run_dir])
+
+                self.assertNotEqual(rc, 0, text)
+                self.assertTrue(
+                    os.path.isfile(out),
+                    f"early refusal deleted run input {input_name}: {text}",
+                )
+
+    def test_late_refusal_cleans_the_pinned_output_not_a_moved_input(self):
+        """Post-publication cleanup stays attached to the output directory.
+
+        RED BEFORE THE FIX: after the index write, moving its parent aside and
+        moving the locked run into the old pathname made args.out name the
+        run's analysis.json. The final identity refusal then unlinked that
+        input while leaving the rejected index in the moved output directory.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            replacement_run = run_dir
+            out_dir = os.path.join(d, "out")
+            moved_out = os.path.join(d, "out-before-swap")
+            os.mkdir(out_dir)
+            write_run(run_dir)
+            out = os.path.join(out_dir, "analysis.json")
+            real_withdrawal_errors = campaign_summary.withdrawal_errors
+            calls = 0
+
+            def swap_names_at_final_boundary(run_dirs):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    os.rename(out_dir, moved_out)
+                    os.rename(run_dir, out_dir)
+                    write_run(replacement_run)
+                return real_withdrawal_errors(run_dirs)
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "withdrawal_errors",
+                    side_effect=swap_names_at_final_boundary):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertNotEqual(rc, 0, text)
+            self.assertTrue(
+                os.path.isfile(os.path.join(out_dir, "analysis.json")),
+                f"late cleanup deleted the moved locked input: {text}",
+            )
+            self.assertFalse(
+                os.path.lexists(os.path.join(moved_out, "analysis.json")),
+                f"late cleanup left the refused index published: {text}",
+            )
+
+    def test_cleanup_quarantines_before_deciding_which_inode_to_unlink(self):
+        """A raced input replacement is moved aside and restored, not deleted.
+
+        RED BEFORE THE FIX: unlink_if_unchanged compared the stale output's
+        inode, then unlinked by name. Moving analysis.json into that name
+        between the comparison and unlink made cleanup delete the input.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            out_dir = os.path.join(d, "out")
+            os.mkdir(out_dir)
+            write_run(run_dir, publishable=False)
+            analysis_path = os.path.join(run_dir, "analysis.json")
+            with open(analysis_path, "rb") as handle:
+                analysis_bytes = handle.read()
+            out = os.path.join(out_dir, "campaign.json")
+            moved_stale = os.path.join(out_dir, "stale-before-race.json")
+            with open(out, "w") as handle:
+                handle.write("stale index\n")
+            real_identity = campaign_summary.PinnedOutput.identity
+            identity_calls = 0
+            swapped = False
+
+            def identity_then_swap(output):
+                nonlocal identity_calls, swapped
+                result = real_identity(output)
+                identity_calls += 1
+                if identity_calls == 2:
+                    os.rename(out, moved_stale)
+                    os.rename(analysis_path, out)
+                    swapped = True
+                return result
+
+            with unittest.mock.patch.object(
+                    campaign_summary.PinnedOutput, "identity",
+                    autospec=True, side_effect=identity_then_swap):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertTrue(swapped, text)
+            self.assertNotEqual(rc, 0, text)
+            self.assertTrue(os.path.isfile(out), text)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), analysis_bytes)
+            self.assertTrue(os.path.isfile(moved_stale), text)
+
+    def test_publication_rejects_a_replacement_after_the_atomic_write(self):
+        """The installed inode must be the writer's temp inode.
+
+        RED BEFORE THE FIX: publish_index sampled output.identity only after
+        write_json_atomic returned. A replacement in that interval was
+        mistaken for the written index and published successfully.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            out = os.path.join(d, "campaign.json")
+            real_write = campaign_summary.write_json_atomic
+            replacement = b"not the campaign index\n"
+
+            def write_then_replace(path, value):
+                identity = real_write(path, value)
+                temporary = os.fspath(path) + ".raced"
+                with open(temporary, "wb") as handle:
+                    handle.write(replacement)
+                os.replace(temporary, path)
+                return identity
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "write_json_atomic",
+                    side_effect=write_then_replace):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertNotEqual(rc, 0, text)
+            with open(out, "rb") as handle:
+                self.assertEqual(handle.read(), replacement)
+
+    def test_publication_rejects_same_inode_content_corruption(self):
+        """Final validation hashes the inode installed by the writer.
+
+        RED BEFORE THE FIX: a writer could overwrite the output in place with
+        equal-length bytes and restore mtime. The dev/inode/mode/size/mtime
+        tuple still matched, so campaign_summary returned success over bytes
+        that were not its index.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            out = os.path.join(d, "campaign.json")
+            real_withdrawal_errors = campaign_summary.withdrawal_errors
+            calls = 0
+            corrupted = False
+
+            def corrupt_at_final_boundary(run_dirs):
+                nonlocal calls, corrupted
+                calls += 1
+                if calls == 2:
+                    identity = os.stat(out)
+                    with open(out, "r+b") as handle:
+                        handle.write(b"X" * identity.st_size)
+                        handle.flush()
+                        os.fsync(handle.fileno())
+                    os.utime(
+                        out,
+                        ns=(identity.st_atime_ns, identity.st_mtime_ns),
+                    )
+                    corrupted = True
+                return real_withdrawal_errors(run_dirs)
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "withdrawal_errors",
+                    side_effect=corrupt_at_final_boundary):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertTrue(corrupted, text)
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(out), text)
+
+    def test_publication_detects_mutation_after_the_post_hash_fstat(self):
+        """The directory-entry check closes the final content-read window.
+
+        RED BEFORE THE FIX: validation hashed the writer FD and sampled it a
+        second time, then compared the pathname with a state tuple that omitted
+        ctime. Equal-length bytes written after that second fstat, with mtime
+        restored, were accepted even though the pathname now held corruption.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "campaign.json")
+            with campaign_summary.pinned_output(out) as output:
+                publication = campaign_summary.write_json_atomic(
+                    output.access_path, {"value": "original"})
+                try:
+                    real_fstat = campaign_summary.os.fstat
+                    publication_fstats = 0
+                    mutated = False
+
+                    def mutate_after_post_hash_fstat(descriptor):
+                        nonlocal publication_fstats, mutated
+                        identity = real_fstat(descriptor)
+                        if descriptor == publication.descriptor:
+                            publication_fstats += 1
+                            if publication_fstats == 2:
+                                with open(output.access_path, "r+b") as handle:
+                                    handle.write(b"X" * publication.size)
+                                    handle.flush()
+                                    os.fsync(handle.fileno())
+                                os.utime(
+                                    output.access_path,
+                                    ns=(identity.st_atime_ns, identity.st_mtime_ns),
+                                )
+                                mutated = True
+                        return identity
+
+                    with unittest.mock.patch.object(
+                            campaign_summary.os, "fstat",
+                            side_effect=mutate_after_post_hash_fstat):
+                        error = output.validation_error(publication)
+                finally:
+                    publication.close()
+
+            self.assertTrue(mutated)
+            self.assertIsNotNone(error)
+            self.assertIn("changed during publication", error)
+
+    def test_publication_refuses_when_the_output_directory_path_changes(self):
+        """Success requires the caller pathname to reach the pinned directory.
+
+        RED BEFORE THE FIX: after PinnedOutput opened out/, validation moved
+        it to out-moved/ and created a replacement out/. Publication wrote
+        through the old directory FD, returned success, and left --out absent.
+        """
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir)
+            out_dir = os.path.join(d, "out")
+            moved_out = os.path.join(d, "out-moved")
+            os.mkdir(out_dir)
+            out = os.path.join(out_dir, "campaign.json")
+            real_build_index = campaign_summary.build_index
+            moved = False
+
+            def move_output_directory(run_dirs):
+                nonlocal moved
+                result = real_build_index(run_dirs)
+                os.rename(out_dir, moved_out)
+                os.mkdir(out_dir)
+                moved = True
+                return result
+
+            with unittest.mock.patch.object(
+                    campaign_summary, "build_index",
+                    side_effect=move_output_directory):
+                rc, text = self._summarize(out, [run_dir])
+
+            self.assertTrue(moved, text)
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.lexists(out), text)
+            self.assertFalse(
+                os.path.lexists(os.path.join(moved_out, "campaign.json")), text)
+
     def test_output_cannot_name_or_alias_a_withdrawal_marker(self):
         """WITHDRAWN is protected even before it exists. Refusal cleanup must
         not unlink it through its own path, a symlink or a hardlink.
