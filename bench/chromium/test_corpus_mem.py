@@ -13,6 +13,7 @@ None of them raises on its own. Each one produces a run that looks finished.
 Run: python3 -m unittest test_corpus_mem -v
 """
 
+import errno
 import hashlib
 import json
 import os
@@ -46,6 +47,14 @@ CAMPAIGN = os.path.join(HERE, "corpus_campaign.sh")
 HOSTCDP = os.path.join(HERE, "hostcdp.sh")
 OWNED_PROCESS = os.path.join(HERE, "owned_process.py")
 PHASE_SUPERVISOR = os.path.join(HERE, "phase_supervisor.py")
+
+
+def proc_state(pid):
+    """Return one procfs process state, or None once that process is gone."""
+    identity = phase_supervisor.read_process_stat(pid)
+    return None if identity is None else identity["state"]
+
+
 MAKEFILE = os.path.join(os.path.dirname(os.path.dirname(HERE)), "Makefile")
 
 
@@ -2696,23 +2705,15 @@ class CampaignIntegrityRegression(unittest.TestCase):
             with open(child_file) as handle:
                 child = int(handle.read())
 
-            def state(pid):
-                try:
-                    with open(f"/proc/{pid}/stat") as handle:
-                        raw = handle.read()
-                except FileNotFoundError:
-                    return None
-                return raw[raw.rfind(")") + 2:].split()[0]
-
             try:
                 self.assertEqual(
                     proc.returncode, 1,
                     "an escaped descendant was omitted from phase integrity",
                 )
-                self.assertIn(state(child), (None, "Z"),
+                self.assertIn(proc_state(child), (None, "Z"),
                               "the escaped descendant survived supervision")
             finally:
-                if state(child) not in (None, "Z"):
+                if proc_state(child) not in (None, "Z"):
                     pidfd = os.pidfd_open(child)
                     try:
                         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
@@ -3035,17 +3036,46 @@ class CampaignIntegrityRegression(unittest.TestCase):
             os.kill(parent.pid, signal.SIGKILL)
             parent.communicate(timeout=20)
 
-            def state(pid):
-                try:
-                    with open(f"/proc/{pid}/stat") as handle:
-                        raw = handle.read()
-                except FileNotFoundError:
-                    return None
-                return raw[raw.rfind(")") + 2:].split()[0]
-
-            self.assertIn(state(supervisor_pid), (None, "Z"))
-            self.assertIn(state(phase_pid), (None, "Z"),
+            self.assertIn(proc_state(supervisor_pid), (None, "Z"))
+            self.assertIn(proc_state(phase_pid), (None, "Z"),
                           "parent death left the measured phase alive")
+
+    def test_proc_state_readers_treat_disappearance_during_read_as_gone(self):
+        class VanishedProcStat:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                raise ProcessLookupError(errno.ESRCH, "process exited")
+
+        readers = (proc_state, phase_supervisor.read_process_stat)
+        for reader in readers:
+            with self.subTest(reader=reader.__module__ + "." + reader.__name__), \
+                    mock.patch("builtins.open", return_value=VanishedProcStat()):
+                self.assertIsNone(
+                    reader(4242),
+                    "a process exiting after open was reported as an error",
+                )
+
+    def test_process_stat_read_error_other_than_disappearance_blocks(self):
+        class UnreadableProcStat:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def read():
+                raise OSError(errno.EIO, "procfs read failed")
+
+        with mock.patch("builtins.open", return_value=UnreadableProcStat()):
+            with self.assertRaisesRegex(RuntimeError, "procfs read failed"):
+                phase_supervisor.read_process_stat(4242)
 
     def test_outer_stops_only_through_the_preopened_supervisor_control(self):
         with open(EXTRA) as handle:

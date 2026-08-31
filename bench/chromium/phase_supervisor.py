@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import errno
 import os
 import select
 import selectors
@@ -60,9 +61,9 @@ def read_process_stat(pid, proc_root="/proc"):
     try:
         with open(path) as handle:
             raw = handle.read()
-    except FileNotFoundError:
-        return None
     except OSError as exc:
+        if exc.errno in (errno.ENOENT, errno.ESRCH):
+            return None
         raise RuntimeError(f"cannot read {path}: {exc}") from exc
     close = raw.rfind(")")
     fields = raw[close + 2:].split() if close >= 0 else []
