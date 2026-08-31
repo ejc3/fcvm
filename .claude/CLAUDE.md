@@ -1430,6 +1430,69 @@ git push origin feature-b --force
 
 **One PR per concern:** Unrelated changes get separate PRs.
 
+### THREE BROAD REVIEW PASSES, NOT AN OPEN-ENDED REVIEW LOOP
+
+A review campaign has at most three broad passes:
+
+1. **Architecture pass, before implementation.** Write the invariants, ownership
+   boundaries, failure states, publication boundary, and test plan. For process or file
+   lifecycle work, draw the complete create/use/cleanup sequence. Review this model before
+   patching individual call sites.
+2. **Candidate pass, on one frozen tree.** Finish focused tests, freeze one commit, and run
+   all independent reviewers in parallel against that exact commit. Wait for every reviewer,
+   then deduplicate their findings into one report and fix the batch together. Reviewers must
+   return one complete report, not drip findings while the tree moves.
+3. **Closure pass, on the integrated exact head.** Run the full relevant suite, freeze the
+   resulting commit, and review that exact head in parallel. Wait for every reviewer and fix
+   the consolidated batch. Every accepted defect claim needs the required test observed red
+   without the fix. A process, architecture, or configuration contract can be pinned by a
+   fixture or source-level assertion when no runtime test fits. Naming, documentation, and
+   style findings that are not defect claims use `NOT-A-DEFECT` and verification of the
+   corrected text. Never substitute prose evidence for a red test on an accepted defect.
+   Review the repair deltas, then run the full relevant suite and CI on the repaired exact
+   head and verify exact-head coverage. Targeted checks supplement that validation; they do
+   not start another broad campaign.
+
+Never send reviewers a moving worktree, add new broad reviewers halfway through a pass, or
+run the full suite after each individual finding. Batch findings, make one repair, and run the
+suite once per candidate.
+
+**The second instance of one defect class is an architecture finding.** Stop fixing sites one
+at a time. Extract a shared primitive or invariant, build a test matrix over every caller, and
+then resume the current pass.
+
+If the closure pass finds a new systemic defect class, stop and report that the architecture
+model was incomplete. Re-plan the abstraction once instead of silently starting broad review
+passes four, five, and six. This does not waive a concrete defect: fix it and prove it red,
+using a fixture or source-level assertion for a non-runtime contract. Keep the follow-up
+review targeted to that repair and the final exact head.
+
+When a user-controlled remote is authorized, push each signed, focused-green frozen
+checkpoint before beginning the next pass. A remote checkpoint is recovery and visibility;
+it is not merge authorization and its old checks do not cover later local commits.
+
+**Land the smallest correct PR, then continue on the next stacked PR.** The architecture
+pass must partition the work into a sequence of independently useful, mergeable contracts.
+Once one PR satisfies its stated contract, focused and full tests, CI, and exact-head review,
+report it ready. Merge it only when the user has separately authorized that merge. Push or
+checkpoint authority is not merge authority. Do not hold a ready PR open to add adjacent
+features, speculative hardening, or cleanup that can be expressed safely in a follow-up.
+
+Every review finding must be classified before work starts:
+
+- **Blocks this PR:** the diff causes it, makes it worse, violates the PR's stated contract,
+  makes its tests/evidence invalid, or would make the merged state unsafe.
+- **Stacked follow-up:** it is pre-existing or adjacent work that the PR does not rely on and
+  can remain safely after this PR merges. File it or put it in the next stacked branch, with
+  its dependency stated.
+
+Review scope is the PR's contract and delta, not an invitation to redesign the whole system.
+Never use “follow-up” to waive a known defect in changed code, but never keep a correct PR
+hostage to unrelated improvements either. A review thread classified as a follow-up still
+needs the gate's existing disposition vocabulary. Reply with `DISAGREE: this PR does not
+cause or worsen the reported behavior; tracked in #N` and resolve it only when the diff and
+tests substantiate that statement. If they do not, the finding blocks this PR.
+
 ### Claude Review Workflow
 
 PRs trigger an automated Claude review via GitHub Actions. After pushing:
