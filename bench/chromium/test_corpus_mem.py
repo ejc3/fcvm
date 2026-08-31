@@ -64,6 +64,19 @@ def proc_state(pid):
     return None if identity is None else identity["state"]
 
 
+def communicate_test_process_group(process, timeout):
+    try:
+        return process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        if process.poll() is None:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        process.communicate(timeout=5)
+        raise
+
+
 MAKEFILE = os.path.join(os.path.dirname(os.path.dirname(HERE)), "Makefile")
 
 
@@ -1033,6 +1046,7 @@ case "$cmd" in
     shift
     target="${{@: -1}}"
     [ "$target" = "${{IMAGE:-localhost/chromium-bench-req}}" ] || exit 65
+    sleep "${{PODMAN_PRE_CREATE_DELAY_SECS:-0}}"
     printf '%s\n' "${{PODMAN_TAG_IMAGE_ID-{self.IMAGE_ID}}}"
     ;;
   container)
@@ -1066,7 +1080,7 @@ case "$cmd" in
     done
     [ "${{PODMAN_MODE:-ok}}" != collision ] || exit 125
     if [ "${{PODMAN_MODE:-ok}}" = hung-create ]; then
-      : >"$PODMAN_CREATE_STARTED_FILE"
+      printf '%s\n' "$BASHPID" >"$PODMAN_CREATE_STARTED_FILE"
       trap '' TERM
       while :; do sleep 10; done
     fi
@@ -1647,13 +1661,27 @@ exec {real_date!r} "$@"
             env, removed, state = self.environment(
                 tmp, mode="hung-create", PODMAN_CREATE_TIMEOUT_SECS="1",
                 PODMAN_CREATE_KILL_AFTER_SECS="1",
-                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1",
+                PODMAN_PRE_CREATE_DELAY_SECS="5")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True,
+            )
+            deadline = time.monotonic() + 10
+            while not os.path.exists(env["PODMAN_CREATE_STARTED_FILE"]):
+                if producer.poll() is not None:
+                    stdout, stderr = producer.communicate()
+                    self.fail("hostcdp exited before create started: " + stdout + stderr)
+                if time.monotonic() >= deadline:
+                    producer.kill()
+                    stdout, stderr = producer.communicate(timeout=5)
+                    self.fail("podman create did not start: " + stdout + stderr)
+                time.sleep(0.01)
             started = time.monotonic()
-            proc = self.run_host(env)
+            stdout, stderr = communicate_test_process_group(producer, 10)
             elapsed = time.monotonic() - started
-            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotEqual(producer.returncode, 0, stdout + stderr)
             self.assertLess(elapsed, 5, f"create deadline took {elapsed:.3f}s")
-            self.assertTrue(os.path.exists(env["PODMAN_CREATE_STARTED_FILE"]))
             self.assertFalse(os.path.exists(state + ".name"))
             self.assertEqual(self.removed_ids(removed), [])
             locks = os.listdir(env["CONTAINER_CREATE_OPS_DIR"])
@@ -1663,6 +1691,54 @@ exec {real_date!r} "$@"
                 subprocess.run(["flock", "-n", lock, "true"]).returncode, 0,
                 "the killed create operation still holds its shared lock",
             )
+
+    def test_hung_create_timeout_cleanup_reaps_the_process_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            env, _removed, _state = self.environment(
+                tmp, mode="hung-create", PODMAN_CREATE_TIMEOUT_SECS="30",
+                PODMAN_CREATE_KILL_AFTER_SECS="1",
+                PODMAN_CREATE_QUIESCE_TIMEOUT_SECS="1")
+            producer = subprocess.Popen(
+                ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True, start_new_session=True,
+            )
+            create_pid = None
+            try:
+                deadline = time.monotonic() + 10
+                while not os.path.exists(env["PODMAN_CREATE_STARTED_FILE"]):
+                    if producer.poll() is not None:
+                        stdout, stderr = producer.communicate()
+                        self.fail(
+                            "hostcdp exited before create started: " + stdout + stderr)
+                    if time.monotonic() >= deadline:
+                        self.fail("podman create did not start")
+                    time.sleep(0.01)
+                with open(env["PODMAN_CREATE_STARTED_FILE"]) as handle:
+                    create_pid = int(handle.read().strip())
+
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    communicate_test_process_group(producer, 0.05)
+                self.assertIsNotNone(
+                    producer.poll(), "timed-out test left hostcdp running")
+                deadline = time.monotonic() + 5
+                while proc_state(create_pid) not in (None, "Z"):
+                    if time.monotonic() >= deadline:
+                        self.fail("timed-out test left podman create running")
+                    time.sleep(0.01)
+            finally:
+                if producer.poll() is None:
+                    os.killpg(producer.pid, signal.SIGKILL)
+                    producer.communicate(timeout=5)
+                if create_pid is not None and proc_state(create_pid) not in (None, "Z"):
+                    try:
+                        os.kill(create_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    deadline = time.monotonic() + 5
+                    while proc_state(create_pid) not in (None, "Z"):
+                        if time.monotonic() >= deadline:
+                            self.fail("emergency cleanup could not reap podman create")
+                        time.sleep(0.01)
 
     def test_escaped_lock_holder_is_reaped_before_absence_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -8984,6 +9060,361 @@ sys.stdin.read(1)
                     released.returncode, 0,
                     f"comparison leaked its {location} directory lock",
                 )
+
+    def test_comparison_reads_and_publishes_against_locked_run_directories(self):
+        """A pathname replacement cannot escape a run directory's lock."""
+        for location in ("vm", "host", "campaign"):
+            with self.subTest(location=location):
+                run, campaign, host = self.valid_campaign_comparison()
+                directory = {
+                    "vm": run,
+                    "host": host,
+                    "campaign": campaign,
+                }[location]
+                displaced = directory + "-before-replacement"
+                out = os.path.join(os.path.dirname(run), f"{location}-comparison.json")
+                original = bench_compare.reject_output_alias
+                replaced = False
+
+                def replace_after_locks(*args, **kwargs):
+                    nonlocal replaced
+                    if not replaced:
+                        os.rename(directory, displaced)
+                        shutil.copytree(displaced, directory)
+                        replaced = True
+                    return original(*args, **kwargs)
+
+                argv = [
+                    "compare.py", "--vm-run", run,
+                    "--host", f"free={host}", "--out", out,
+                ]
+                with mock.patch.object(
+                        bench_compare, "reject_output_alias",
+                        side_effect=replace_after_locks), \
+                     mock.patch.object(sys, "argv", argv), \
+                     mock.patch.object(sys, "stdout", new=io.StringIO()):
+                    with self.assertRaisesRegex(
+                            bench_compare.Refusal,
+                            "changed after its directory lock was acquired|locked host"):
+                        bench_compare.main()
+
+                self.assertTrue(replaced)
+                self.assertFalse(os.path.lexists(out))
+
+    def test_comparison_publishes_stable_display_input_paths(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        out = os.path.join(os.path.dirname(run), "display-path-comparison.json")
+
+        proc, _ = self.run_compare(run, [("free", host)], out=out)
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        with open(out) as handle:
+            identities = json.load(handle)["input_identity"]
+        self.assertNotIn("/proc/self/fd/", json.dumps(identities))
+        self.assertEqual(
+            identities["analysis_json"]["path"],
+            os.path.join(run, "analysis.json"),
+        )
+        self.assertEqual(
+            identities["analysis_json"]["realpath"],
+            os.path.realpath(os.path.join(run, "analysis.json")),
+        )
+        self.assertEqual(
+            identities["hosts"]["free"]["run_json"]["path"],
+            os.path.join(host, "run.json"),
+        )
+        self.assertEqual(
+            identities["hosts"]["free"]["campaign_complete_json"]["path"],
+            os.path.join(campaign, "campaign-complete.json"),
+        )
+
+    def test_replacement_input_alias_is_preserved_before_identity_refusal(self):
+        for location in ("vm", "host", "campaign"):
+            with self.subTest(location=location):
+                run, campaign, host = self.valid_campaign_comparison()
+                directory, relative = {
+                    "vm": (run, "analysis.json"),
+                    "host": (host, "run.json"),
+                    "campaign": (campaign, "campaign-complete.json"),
+                }[location]
+                out = os.path.join(directory, relative)
+                with open(out, "rb") as handle:
+                    expected = handle.read()
+                displaced = directory + "-before-output-open"
+                original = bench_compare.open_output_target
+                replaced = False
+
+                def replace_before_output_open(path):
+                    nonlocal replaced
+                    if not replaced:
+                        os.rename(directory, displaced)
+                        shutil.copytree(displaced, directory)
+                        replaced = True
+                    return original(path)
+
+                argv = [
+                    "compare.py", "--vm-run", run,
+                    "--host", f"free={host}", "--out", out,
+                ]
+                with mock.patch.object(
+                        bench_compare, "open_output_target",
+                        side_effect=replace_before_output_open), \
+                     mock.patch.object(sys, "argv", argv):
+                    with self.assertRaises(bench_compare.Refusal):
+                        bench_compare.main()
+
+                self.assertTrue(replaced)
+                with open(out, "rb") as handle:
+                    self.assertEqual(
+                        handle.read(), expected,
+                        "alias preflight deleted a replacement input",
+                    )
+
+    def test_run_identity_is_checked_after_final_output_validation(self):
+        run, host = self.valid_comparison()
+        displaced = run + "-after-output-validation"
+        out = os.path.join(os.path.dirname(run), "late-run-replacement.json")
+        original = bench_compare.validate_published_output
+        calls = 0
+
+        def validate_then_replace(*args, **kwargs):
+            nonlocal calls
+            result = original(*args, **kwargs)
+            calls += 1
+            if calls == 2:
+                os.rename(run, displaced)
+                shutil.copytree(displaced, run)
+            return result
+
+        argv = [
+            "compare.py", "--vm-run", run,
+            "--host", f"host={host}", "--out", out,
+        ]
+        with mock.patch.object(
+                bench_compare, "validate_published_output",
+                side_effect=validate_then_replace), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(sys, "stdout", new=io.StringIO()):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal,
+                    "changed after its directory lock was acquired"):
+                bench_compare.main()
+
+        self.assertEqual(calls, 2)
+        self.assertFalse(os.path.lexists(out))
+
+    def test_final_validation_binds_the_labeled_campaign_child_inode(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        caller = os.path.join(run, "selected-host")
+        os.symlink(host, caller)
+        holding = os.path.join(campaign, "holding")
+        decoy = os.path.join(campaign, "decoy")
+        shutil.copytree(host, decoy)
+        out = os.path.join(os.path.dirname(run), "late-host-shuffle.json")
+        original = bench_compare.validate_published_output
+        calls = 0
+
+        def validate_then_shuffle(*args, **kwargs):
+            nonlocal calls
+            result = original(*args, **kwargs)
+            calls += 1
+            if calls == 2:
+                os.rename(host, holding)
+                os.rename(decoy, host)
+                os.unlink(caller)
+                os.symlink(holding, caller)
+            return result
+
+        argv = [
+            "compare.py", "--vm-run", run,
+            "--host", f"free={caller}", "--out", out,
+        ]
+        with mock.patch.object(
+                bench_compare, "validate_published_output",
+                side_effect=validate_then_shuffle), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(sys, "stdout", new=io.StringIO()):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal,
+                    "campaign child hostcdp-free"):
+                bench_compare.main()
+
+        self.assertEqual(calls, 2)
+        self.assertFalse(os.path.lexists(out))
+
+    def test_pinned_host_withdrawal_check_does_not_dereference_to_a_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            host = os.path.join(tmp, "host")
+            moved = os.path.join(tmp, "moved")
+            os.mkdir(host)
+            with open(os.path.join(host, "WITHDRAWN"), "w") as handle:
+                handle.write("withdrawn\n")
+            descriptor = os.open(host, os.O_RDONLY | os.O_DIRECTORY)
+            identity = os.fstat(descriptor)
+            pinned = bench_campaign_summary.LockedRunDirectory(
+                host, descriptor, (identity.st_dev, identity.st_ino))
+            original = bench_compare.os.path.realpath
+            raced = False
+
+            def move_after_dereference(path):
+                nonlocal raced
+                result = original(path)
+                if os.fspath(path) == os.fspath(pinned):
+                    os.rename(host, moved)
+                    os.mkdir(host)
+                    raced = True
+                return result
+
+            try:
+                with mock.patch.object(
+                        bench_compare.os.path, "realpath",
+                        side_effect=move_after_dereference):
+                    with self.assertRaisesRegex(
+                            bench_compare.Refusal, "WITHDRAWN"):
+                        bench_compare.reject_withdrawn(pinned, tmp)
+            finally:
+                os.close(descriptor)
+            self.assertFalse(
+                raced,
+                "withdrawal check converted the pinned directory to a pathname",
+            )
+
+    def test_locked_host_parent_must_be_its_locked_campaign(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            campaign_a = os.path.join(tmp, "campaign-a")
+            campaign_b = os.path.join(tmp, "campaign-b")
+            host_a = os.path.join(campaign_a, "host")
+            host_b = os.path.join(campaign_b, "host")
+            vm = os.path.join(tmp, "vm")
+            for directory in (campaign_a, campaign_b, host_a, host_b, vm):
+                os.makedirs(directory, exist_ok=True)
+            link = os.path.join(tmp, "selected-host")
+            os.symlink(host_a, link)
+            os.unlink(link)
+            os.symlink(host_b, link)
+            paths = (vm, host_b, campaign_a)
+            descriptors = [
+                os.open(path, os.O_RDONLY | os.O_DIRECTORY) for path in paths
+            ]
+            locked = []
+            try:
+                for path, descriptor in zip(paths, descriptors):
+                    info = os.fstat(descriptor)
+                    locked.append(bench_campaign_summary.LockedRunDirectory(
+                        path, descriptor, (info.st_dev, info.st_ino)))
+                args = SimpleNamespace(
+                    vm_run=vm, host=[f"free={link}"], out="unused")
+                with self.assertRaisesRegex(
+                        bench_compare.Refusal, "locked campaign directory"):
+                    bench_compare.bind_locked_comparison_directories(args, locked)
+            finally:
+                for descriptor in descriptors:
+                    os.close(descriptor)
+
+    def test_load_host_dataset_keeps_campaign_withdrawal_checks_pinned(self):
+        _run, campaign, host = self.valid_campaign_comparison()
+        descriptors = [
+            os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            for path in (host, campaign)
+        ]
+        pinned = []
+        for path, descriptor in zip((host, campaign), descriptors):
+            info = os.fstat(descriptor)
+            pinned.append(bench_campaign_summary.LockedRunDirectory(
+                path, descriptor, (info.st_dev, info.st_ino)))
+        original = bench_compare.reject_withdrawn
+
+        def require_campaign_pin(directory, campaign_directory=None):
+            if os.fspath(directory).startswith("/proc/self/fd/"):
+                self.assertIsNotNone(
+                    campaign_directory,
+                    "pinned host withdrawal check lost its campaign fd",
+                )
+            return original(directory, campaign_directory)
+
+        try:
+            with mock.patch.object(
+                    bench_compare, "reject_withdrawn",
+                    side_effect=require_campaign_pin):
+                bench_compare.load_host_dataset(
+                    pinned[0], require_driver=True,
+                    campaign_directory=pinned[1],
+                )
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_locked_campaign_arm_cannot_be_spoofed_by_realpath_aba(self):
+        _run, campaign, host = self.valid_campaign_comparison()
+        run_json = os.path.join(host, "run.json")
+        with open(run_json) as handle:
+            meta = json.load(handle)
+        meta["comparison_label"] = "cpu2"
+        meta["run_id"] = "1" * 32 + "-cpu2"
+        with open(run_json, "w") as handle:
+            json.dump(meta, handle)
+        self.bind_host_rows(host)
+        complete_path = os.path.join(campaign, "campaign-complete.json")
+        with open(complete_path) as handle:
+            complete = json.load(handle)
+        child_complete = os.path.join(host, "complete.json")
+        with open(child_complete, "rb") as handle:
+            child_bytes = handle.read()
+        complete["host_completes"][0].update(
+            path="hostcdp-cpu2/complete.json",
+            size=len(child_bytes),
+            sha256=hashlib.sha256(child_bytes).hexdigest(),
+        )
+        with open(complete_path, "w") as handle:
+            json.dump(complete, handle)
+
+        descriptors = [
+            os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+            for path in (host, campaign)
+        ]
+        pinned = []
+        for path, descriptor in zip((host, campaign), descriptors):
+            info = os.fstat(descriptor)
+            pinned.append(bench_campaign_summary.LockedRunDirectory(
+                path, descriptor, (info.st_dev, info.st_ino)))
+        original = bench_compare.os.path.realpath
+
+        def spoof_arm(path):
+            if path == host:
+                return os.path.join(campaign, "hostcdp-cpu2")
+            return original(path)
+
+        try:
+            with mock.patch.object(
+                    bench_compare.os.path, "realpath", side_effect=spoof_arm):
+                with self.assertRaisesRegex(
+                        bench_compare.Refusal, "locked host|hostcdp-cpu2"):
+                    bench_compare.load_host_dataset(
+                        pinned[0], require_driver=True,
+                        campaign_directory=pinned[1],
+                    )
+        finally:
+            for descriptor in descriptors:
+                os.close(descriptor)
+
+    def test_display_identity_keeps_the_read_time_canonical_realpath(self):
+        identity = {
+            "path": "/proc/self/fd/10/run.json",
+            "realpath": "/stable/campaign/hostcdp-free/run.json",
+            "size": 1,
+            "sha256": "a" * 64,
+        }
+        with mock.patch.object(
+                bench_compare.os.path, "realpath",
+                return_value="/spoof/campaign/hostcdp-cpu2/run.json"):
+            displayed = bench_compare.display_artifact_identity(
+                identity,
+                [("/proc/self/fd/10", "/caller/hostcdp-free")],
+            )
+        self.assertEqual(
+            displayed["realpath"],
+            "/stable/campaign/hostcdp-free/run.json",
+        )
 
     def test_vm_inputs_are_rechecked_at_publication(self):
         for filename in ("analysis.json", "reqbench.jsonl"):

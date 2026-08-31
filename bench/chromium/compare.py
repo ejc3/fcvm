@@ -47,6 +47,34 @@ def artifact_identity(artifact):
     return {key: value for key, value in artifact.items() if key != "text"}
 
 
+def display_artifact_identity(identity, directory_mappings):
+    """Publish caller paths while retaining pinned paths only for revalidation."""
+    displayed = dict(identity)
+    path = os.fspath(identity["path"])
+    path_absolute = os.path.abspath(path)
+    for access_directory, display_directory in directory_mappings:
+        access_absolute = os.path.abspath(os.fspath(access_directory))
+        try:
+            relative = os.path.relpath(path_absolute, access_absolute)
+        except ValueError:
+            continue
+        if relative == os.pardir or relative.startswith(os.pardir + os.sep):
+            continue
+        display_path = os.path.normpath(
+            os.path.join(str(display_directory), relative)
+        )
+        displayed["path"] = display_path
+        return displayed
+    return displayed
+
+
+def display_artifact_identities(identities, directory_mappings):
+    return {
+        name: display_artifact_identity(identity, directory_mappings)
+        for name, identity in identities.items()
+    }
+
+
 def read_artifact(path):
     """Read one stable byte view and name the exact bytes returned."""
     try:
@@ -207,7 +235,19 @@ def load_vm_publication(run_dir):
 
     artifacts = []
     for source in sources:
-        artifact = read_artifact(source["path"])
+        source_path = source["path"]
+        display_directory = os.path.abspath(str(run_dir))
+        access_directory = os.path.abspath(os.fspath(run_dir))
+        source_absolute = os.path.abspath(source_path)
+        if (
+            display_directory != access_directory
+            and (
+                source_absolute == display_directory
+                or source_absolute.startswith(display_directory + os.sep)
+            )
+        ):
+            source_path = access_directory + source_absolute[len(display_directory):]
+        artifact = read_artifact(source_path)
         if artifact["sha256"] != source["sha256"]:
             raise Refusal(
                 f"VM publication input {source['path']} changed while its "
@@ -376,10 +416,11 @@ def rename_noreplace(directory_fd, source, destination):
 
 
 def write_json_atomic(path, value, output_target=None, before_publish=None,
-                      after_publish=None):
+                      after_publish=None, final_validate=None):
     if output_target is not None:
         return write_json_atomic_at(
-            output_target, value, before_publish, after_publish
+            output_target, value, before_publish, after_publish,
+            final_validate=final_validate,
         )
     target = open_output_target(path)
     try:
@@ -388,6 +429,7 @@ def write_json_atomic(path, value, output_target=None, before_publish=None,
             value,
             before_publish,
             after_publish,
+            final_validate,
             replace_existing=True,
         )
     finally:
@@ -463,7 +505,7 @@ def validate_published_output(target, fd, written_stat, expected_size,
 
 
 def write_json_atomic_at(target, value, before_publish=None, after_publish=None,
-                         replace_existing=False):
+                         final_validate=None, replace_existing=False):
     ensure_output_directory(target)
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | getattr(os, "O_CLOEXEC", 0)
     while True:
@@ -541,6 +583,8 @@ def write_json_atomic_at(target, value, before_publish=None, after_publish=None,
             published_stat,
         )
         ensure_output_directory(target)
+        if final_validate is not None:
+            final_validate()
     except BaseException as publication_error:
         cleanup_error = None
         if published:
@@ -819,17 +863,27 @@ def host_counts(meta, label):
             "convention": convention}
 
 
-def reject_withdrawn(directory):
-    absolute = os.path.realpath(directory)
-    for owner in (absolute, os.path.dirname(absolute)):
+def reject_withdrawn(directory, campaign_directory=None):
+    if campaign_directory is None:
+        access = os.path.realpath(directory)
+        owners = [(access, access), (os.path.dirname(access), os.path.dirname(access))]
+    else:
+        owners = [
+            (os.fspath(directory), str(directory)),
+            (os.fspath(campaign_directory), str(campaign_directory)),
+        ]
+    for owner, display_owner in owners:
         marker = os.path.join(owner, "WITHDRAWN")
+        display_marker = os.path.join(display_owner, "WITHDRAWN")
         try:
             os.lstat(marker)
         except FileNotFoundError:
             continue
         except OSError as error:
-            raise Refusal(f"cannot inspect withdrawal marker {marker}: {error}") from error
-        raise Refusal(f"host input is WITHDRAWN by {marker}")
+            raise Refusal(
+                f"cannot inspect withdrawal marker {display_marker}: {error}"
+            ) from error
+        raise Refusal(f"host input is WITHDRAWN by {display_marker}")
 
 
 def reject_vm_withdrawn(run_dir):
@@ -1012,7 +1066,8 @@ def validate_memory_completion(campaign_directory, campaign_run_id):
     return identities
 
 
-def validate_campaign_completion(directory, meta, child_completion):
+def validate_campaign_completion(
+        directory, meta, child_completion, campaign_directory=None):
     meta_path = os.path.join(directory, "run.json")
     key = "corpus_extra_runtime_bundle_sha256"
     if key not in meta:
@@ -1022,10 +1077,29 @@ def validate_campaign_completion(directory, meta, child_completion):
         return None, {}
     runtime_sha256 = sha256_field(meta, key, meta_path)
 
-    host_directory = os.path.realpath(directory)
-    campaign_directory = os.path.dirname(host_directory)
-    child_path = f"{os.path.basename(host_directory)}/complete.json"
-    arm = campaign_arm(child_path, f"host directory {host_directory}")
+    if campaign_directory is not None:
+        campaign_directory = os.fspath(campaign_directory)
+        child_path = f"hostcdp-{meta.get('comparison_label')}/complete.json"
+        arm = campaign_arm(child_path, f"host directory {directory}")
+        expected_host = os.path.join(
+            campaign_directory, os.path.dirname(child_path))
+        try:
+            expected_identity = os.stat(expected_host)
+            locked_identity = os.stat(os.fspath(directory))
+        except OSError as error:
+            raise Refusal(
+                f"cannot bind locked host {directory} to {child_path}: {error}"
+            ) from error
+        if not os.path.samestat(expected_identity, locked_identity):
+            raise Refusal(
+                f"locked host {directory} is not campaign child {child_path}"
+            )
+        host_directory = str(directory)
+    else:
+        host_directory = os.path.realpath(directory)
+        campaign_directory = os.path.dirname(host_directory)
+        child_path = f"{os.path.basename(host_directory)}/complete.json"
+        arm = campaign_arm(child_path, f"host directory {host_directory}")
     if meta.get("comparison_label") != arm:
         raise Refusal(
             f"{meta_path} comparison_label={meta.get('comparison_label')!r} "
@@ -1182,18 +1256,19 @@ def revalidate_artifact_identity(label, expected, nofollow=False):
         )
 
 
-def revalidate_host_inputs(directory, identities):
+def revalidate_host_inputs(directory, identities, campaign_directory=None):
     """Refuse if any captured authorization/input bytes changed."""
-    reject_withdrawn(directory)
+    reject_withdrawn(directory, campaign_directory)
     for name, expected in sorted(identities.items()):
         revalidate_artifact_identity(
             f"host {name}", expected, nofollow=name in MEMORY_IDENTITY_KEYS
         )
-    reject_withdrawn(directory)
+    reject_withdrawn(directory, campaign_directory)
 
 
-def load_host_dataset(directory, require_driver=False):
-    reject_withdrawn(directory)
+def load_host_dataset(
+        directory, require_driver=False, campaign_directory=None):
+    reject_withdrawn(directory, campaign_directory)
     meta_artifact = read_artifact(os.path.join(directory, "run.json"))
     rows_artifact = read_artifact(os.path.join(directory, "hostcdp.jsonl"))
     meta = parse_json(meta_artifact["text"], meta_artifact["path"])
@@ -1211,8 +1286,9 @@ def load_host_dataset(directory, require_driver=False):
     (
         campaign_completion_identity,
         memory_identities,
-    ) = validate_campaign_completion(directory, meta, completion_identity_record)
-    reject_withdrawn(directory)
+    ) = validate_campaign_completion(
+        directory, meta, completion_identity_record, campaign_directory)
+    reject_withdrawn(directory, campaign_directory)
     counts = host_counts(meta, meta_artifact["path"])
     urls = declared_urls(meta, meta_artifact["path"])
     if integer_field(meta, "url_count", meta_artifact["path"], minimum=1) != len(urls):
@@ -1314,7 +1390,7 @@ def load_host_dataset(directory, require_driver=False):
     if campaign_completion_identity is not None:
         identities["campaign_complete_json"] = campaign_completion_identity
     identities.update(memory_identities)
-    revalidate_host_inputs(directory, identities)
+    revalidate_host_inputs(directory, identities, campaign_directory)
     return meta, records, measured_rows, counts, identities
 
 
@@ -1623,31 +1699,37 @@ def per_url(rows, key):
     return {u: {"n": len(v), "p50": round(pct(v, 50), 1)} for u, v in out.items()}
 
 
-def comparison_input_paths(args):
+def comparison_input_paths(args, locked=None):
+    vm_run = locked["vm_run"] if locked is not None else args.vm_run
     inputs = [
-        ("VM analysis.json", os.path.join(args.vm_run, "analysis.json")),
-        ("VM reqbench.jsonl", os.path.join(args.vm_run, "reqbench.jsonl")),
-        ("VM WITHDRAWN", os.path.join(args.vm_run, "WITHDRAWN")),
-        ("VM dns-evidence.json", os.path.join(args.vm_run, "dns-evidence.json")),
-        ("VM dns-owner.log", os.path.join(args.vm_run, "dns-owner.log")),
+        ("VM analysis.json", os.path.join(vm_run, "analysis.json")),
+        ("VM reqbench.jsonl", os.path.join(vm_run, "reqbench.jsonl")),
+        ("VM WITHDRAWN", os.path.join(vm_run, "WITHDRAWN")),
+        ("VM dns-evidence.json", os.path.join(vm_run, "dns-evidence.json")),
+        ("VM dns-owner.log", os.path.join(vm_run, "dns-owner.log")),
         ("VM verify-dns-pre.json",
-         os.path.join(args.vm_run, "verify-dns-pre.json")),
+         os.path.join(vm_run, "verify-dns-pre.json")),
         ("VM verify-dns-before-run.json",
-         os.path.join(args.vm_run, "verify-dns-before-run.json")),
+         os.path.join(vm_run, "verify-dns-before-run.json")),
         ("VM verify-dns-after-run.json",
-         os.path.join(args.vm_run, "verify-dns-after-run.json")),
-        ("VM corpus-dns.log", os.path.join(args.vm_run, "corpus-dns.log")),
-        ("VM corpus-access.log", os.path.join(args.vm_run, "corpus-access.log")),
-        ("VM replay-queries.log", os.path.join(args.vm_run, "replay-queries.log")),
+         os.path.join(vm_run, "verify-dns-after-run.json")),
+        ("VM corpus-dns.log", os.path.join(vm_run, "corpus-dns.log")),
+        ("VM corpus-access.log", os.path.join(vm_run, "corpus-access.log")),
+        ("VM replay-queries.log", os.path.join(vm_run, "replay-queries.log")),
         ("VM diag/summary.json",
-         os.path.join(args.vm_run, "diag", "summary.json")),
+         os.path.join(vm_run, "diag", "summary.json")),
         ("running comparator source", __file__),
         ("running publication validator source", campaign_summary.__file__),
     ]
+    locked_hosts = iter(locked["hosts"]) if locked is not None else None
     for ordinal, spec in enumerate(args.host, 1):
         _label, separator, directory = spec.partition("=")
         if separator and directory:
-            campaign_directory = os.path.dirname(os.path.realpath(directory))
+            if locked_hosts is not None:
+                _bound_label, _display, directory, campaign_directory = next(
+                    locked_hosts)
+            else:
+                campaign_directory = os.path.dirname(os.path.realpath(directory))
             inputs.extend((
                 (f"host {ordinal} run.json", os.path.join(directory, "run.json")),
                 (f"host {ordinal} hostcdp.jsonl",
@@ -1669,6 +1751,8 @@ def comparison_input_paths(args):
                 (f"host {ordinal} campaign WITHDRAWN",
                  os.path.join(campaign_directory, "WITHDRAWN")),
             ))
+    if locked is not None:
+        return comparison_input_paths(args) + inputs
     return inputs
 
 
@@ -1682,6 +1766,60 @@ def comparison_run_directories(args):
         directories.append(directory)
         directories.append(os.path.dirname(os.path.realpath(directory)))
     return directories
+
+
+def bind_locked_comparison_directories(args, locked_directories):
+    """Pair each caller path with the descriptor-backed directory it locked."""
+    locked = iter(locked_directories)
+    try:
+        vm_run = next(locked)
+    except StopIteration as error:
+        raise Refusal("VM run directory was not locked") from error
+    hosts = []
+    for spec in args.host:
+        label, separator, directory = spec.partition("=")
+        if not separator or not directory:
+            continue
+        try:
+            host_run = next(locked)
+            campaign_run = next(locked)
+        except StopIteration as error:
+            raise Refusal("host run directories were not locked") from error
+        validate_locked_host_campaign(host_run, campaign_run)
+        hosts.append((label, directory, host_run, campaign_run))
+    try:
+        next(locked)
+    except StopIteration:
+        return {"vm_run": vm_run, "hosts": hosts,
+                "all": list(locked_directories), "campaign_labels": set()}
+    raise Refusal("unexpected locked comparison directory")
+
+
+def validate_locked_host_campaign(host_run, campaign_run, label=None):
+    """Require the locked host directory to belong to the locked campaign."""
+    try:
+        parent = os.stat(os.path.join(os.fspath(host_run), os.pardir))
+    except OSError as error:
+        raise Refusal(
+            f"cannot identify locked campaign directory for {host_run}: {error}"
+        ) from error
+    if (parent.st_dev, parent.st_ino) != campaign_run.identity:
+        raise Refusal(
+            f"host run {host_run} does not belong to its locked campaign directory"
+        )
+    if label is not None:
+        try:
+            labeled = os.stat(os.path.join(
+                os.fspath(campaign_run), f"hostcdp-{label}"))
+            host_identity = os.stat(os.fspath(host_run))
+        except OSError as error:
+            raise Refusal(
+                f"cannot bind campaign child hostcdp-{label}: {error}"
+            ) from error
+        if not os.path.samestat(labeled, host_identity):
+            raise Refusal(
+                f"campaign child hostcdp-{label} is not the locked host inode"
+            )
 
 
 def path_stat(path, label, fail_on_error, directory_fd=None):
@@ -1815,6 +1953,7 @@ def main():
             comparison_run_directories(a)) as lock_errors:
         if lock_errors:
             raise Refusal("; ".join(lock_errors))
+        locked = bind_locked_comparison_directories(a, lock_errors.run_dirs)
 
         # The lock file is permanent. Unlinking a flock inode while another
         # caller waits on it creates two lock domains and admits concurrent
@@ -1827,9 +1966,9 @@ def main():
                     acquire_output_lock(target, lock_fd)
                     ensure_output_directory(target)
                     preflight = reject_output_alias(
-                        a.out, comparison_input_paths(a), target
+                        a.out, comparison_input_paths(a, locked), target
                     )
-                    reject_vm_withdrawn(a.vm_run)
+                    reject_vm_withdrawn(locked["vm_run"])
                     ensure_output_directory(target)
                     clear_stale_output(target, preflight)
                     validate_output_lock(target, lock_fd)
@@ -1837,18 +1976,21 @@ def main():
                     raise Refusal(
                         f"cannot clear stale output {a.out}: {error}"
                     ) from error
-                run_comparison(a, target, lock_fd)
+                run_comparison(a, target, lock_fd, locked)
             finally:
                 os.close(lock_fd)
         finally:
             os.close(target["directory_fd"])
 
 
-def run_comparison(a, output_target=None, output_lock_fd=None):
+def run_comparison(
+        a, output_target=None, output_lock_fd=None, locked=None):
+    vm_run = locked["vm_run"] if locked is not None else a.vm_run
     analysis, analysis_artifact, publication_inputs = load_vm_publication(
-        a.vm_run
+        vm_run
     )
-    vm_meta, vm_all, vm_input_identity = load_vm(a.vm_run, analysis)
+    vm_meta, vm_all, vm_input_identity = load_vm(vm_run, analysis)
+    vm_mappings = [(vm_run, a.vm_run)] if locked is not None else []
     published_cell = bind_analysis_cell(analysis, vm_meta)
     vm = [dict(r, total_ms=driver_total(r), load_ms=nav_load(r)) for r in vm_all if r["arm"] == "cdp"]
     noop = [r for r in vm_all if r["arm"] == "noop"]
@@ -1857,9 +1999,14 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
 
     out = {"vm_run": os.path.abspath(a.vm_run), "run_id": analysis.get("run_id"),
            "input_identity": {
-               "analysis_json": artifact_identity(analysis_artifact),
-               "vm_publication": publication_inputs,
-               "reqbench_jsonl": vm_input_identity,
+               "analysis_json": display_artifact_identity(
+                   artifact_identity(analysis_artifact), vm_mappings),
+               "vm_publication": [
+                   display_artifact_identity(identity, vm_mappings)
+                   for identity in publication_inputs
+               ],
+               "reqbench_jsonl": display_artifact_identity(
+                   vm_input_identity, vm_mappings),
                "hosts": {},
            },
            "cell": published_cell,
@@ -1878,15 +2025,27 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
     seen_host_run_ids = {}
     host_rechecks = []
     hostcdp_sha256 = None
+    locked_hosts = iter(locked["hosts"]) if locked is not None else None
     for spec in a.host:
         label, _, d = spec.partition("=")
         if not label or not d:
             raise Refusal(f"invalid --host {spec!r}; expected LABEL=DIR")
         if label in out["hosts"]:
             raise Refusal(f"duplicate --host label {label!r}")
+        campaign_directory = None
+        if locked_hosts is not None:
+            bound_label, display_directory, d, campaign_directory = next(
+                locked_hosts)
+            if bound_label != label:
+                raise Refusal("locked host directory order changed")
+        else:
+            display_directory = d
         meta, _records, rows, counts, identities = load_host_dataset(
-            d, require_driver=True
+            d, require_driver=True, campaign_directory=campaign_directory
         )
+        if (locked is not None
+                and meta.get("corpus_extra_runtime_bundle_sha256") is not None):
+            locked["campaign_labels"].add(label)
         dataset_identity = (
             identities["run_json"]["size"],
             identities["run_json"]["sha256"],
@@ -1907,7 +2066,7 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
             )
         seen_host_datasets[dataset_identity] = label
         seen_host_run_ids[meta["run_id"]] = label
-        host_rechecks.append((d, identities))
+        host_rechecks.append((d, campaign_directory, identities))
         validate_host_compatibility(label, meta, rows, counts, vm_meta, vm)
         current_hostcdp_sha256 = meta["hostcdp_sha256"]
         if hostcdp_sha256 is None:
@@ -1917,9 +2076,15 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
                 f"host {label} hostcdp_sha256={current_hostcdp_sha256!r} does "
                 f"not match the comparison producer {hostcdp_sha256!r}"
             )
-        out["input_identity"]["hosts"][label] = identities
+        host_mappings = (
+            [(d, display_directory),
+             (campaign_directory, str(campaign_directory))]
+            if locked is not None else []
+        )
+        out["input_identity"]["hosts"][label] = display_artifact_identities(
+            identities, host_mappings)
         out["hosts"][label] = {
-            "dir": os.path.abspath(d), "run_id": meta["run_id"],
+            "dir": os.path.abspath(display_directory), "run_id": meta["run_id"],
             "comparison_label": meta["comparison_label"],
             "cpu_budget": meta["cpu_budget"], "cpus": meta.get("cpus"),
             "host_boot_id": meta["host_boot_id"],
@@ -1948,19 +2113,31 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
         }
 
     def recheck_inputs_before_publication():
-        for ordinal, identity in enumerate(
-                out["input_identity"]["vm_publication"], 1):
+        for ordinal, identity in enumerate(publication_inputs, 1):
             revalidate_artifact_identity(
                 f"VM publication input {ordinal}", identity
             )
         revalidate_artifact_identity(
-            "VM reqbench_jsonl", out["input_identity"]["reqbench_jsonl"]
+            "VM reqbench_jsonl", vm_input_identity
         )
-        for directory, identities in host_rechecks:
-            revalidate_host_inputs(directory, identities)
+        for directory, campaign_directory, identities in host_rechecks:
+            revalidate_host_inputs(directory, identities, campaign_directory)
         if output_target is not None and output_lock_fd is not None:
             validate_output_lock(output_target, output_lock_fd)
-        reject_vm_withdrawn(a.vm_run)
+        reject_vm_withdrawn(vm_run)
+
+    def recheck_caller_paths_after_output_validation():
+        if locked is not None:
+            for label, _display, host_run, campaign_run in locked["hosts"]:
+                validate_locked_host_campaign(
+                    host_run,
+                    campaign_run,
+                    label if label in locked["campaign_labels"] else None,
+                )
+            path_errors = campaign_summary.locked_run_directory_errors(
+                locked["all"])
+            if path_errors:
+                raise Refusal("; ".join(path_errors))
 
     write_json_atomic(
         a.out,
@@ -1968,6 +2145,7 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
         output_target,
         before_publish=recheck_inputs_before_publication,
         after_publish=recheck_inputs_before_publication,
+        final_validate=recheck_caller_paths_after_output_validation,
     )
     print(json.dumps({k: out[k] for k in ("cell", "vm", "vm_noop", "ratios")}, indent=1)[:6000])
     print("\nper-URL wall/blocking p50 (ms)")
