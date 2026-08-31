@@ -64,16 +64,20 @@ def proc_state(pid):
     return None if identity is None else identity["state"]
 
 
+def kill_and_reap_test_process_group(process):
+    """Kill the session rooted at process and drain its captured pipes."""
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    return process.communicate(timeout=5)
+
+
 def communicate_test_process_group(process, timeout):
     try:
         return process.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
-        if process.poll() is None:
-            try:
-                os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
-        process.communicate(timeout=5)
+        kill_and_reap_test_process_group(process)
         raise
 
 
@@ -1673,8 +1677,7 @@ exec {real_date!r} "$@"
                     stdout, stderr = producer.communicate()
                     self.fail("hostcdp exited before create started: " + stdout + stderr)
                 if time.monotonic() >= deadline:
-                    producer.kill()
-                    stdout, stderr = producer.communicate(timeout=5)
+                    stdout, stderr = kill_and_reap_test_process_group(producer)
                     self.fail("podman create did not start: " + stdout + stderr)
                 time.sleep(0.01)
             started = time.monotonic()
@@ -1739,6 +1742,81 @@ exec {real_date!r} "$@"
                         if time.monotonic() >= deadline:
                             self.fail("emergency cleanup could not reap podman create")
                         time.sleep(0.01)
+
+    def test_hung_create_start_deadline_uses_process_group_cleanup(self):
+        """The pre-create timeout must not leave a pipe-holding child alive."""
+        with open(__file__) as handle:
+            source = handle.read()
+        start = source.index(
+            "    def test_hung_create_is_terminated_and_reaped_within_the_bound"
+        )
+        end = source.index("\n    def test_", start + 1)
+        method = source[start:end]
+        self.assertNotIn(
+            "producer.kill()",
+            method,
+            "the create-start deadline kills only the shell leader",
+        )
+        self.assertIn(
+            "kill_and_reap_test_process_group(producer)",
+            method,
+            "the create-start deadline does not reap the producer's process group",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            child_file = os.path.join(tmp, "child-pid")
+            producer = subprocess.Popen(
+                [
+                    "bash", "-c",
+                    "trap '' TERM\n"
+                    "sleep 300 &\n"
+                    "child=$!\n"
+                    "printf '%s\\n' \"$child\" > \"$1\"\n"
+                    "wait \"$child\"\n",
+                    "bash", child_file,
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                start_new_session=True,
+            )
+            child_pid = None
+            try:
+                deadline = time.monotonic() + 5
+                while not os.path.exists(child_file):
+                    if producer.poll() is not None:
+                        stdout, stderr = producer.communicate()
+                        self.fail(
+                            "cleanup fixture exited before starting its child: "
+                            + stdout + stderr
+                        )
+                    if time.monotonic() >= deadline:
+                        self.fail("cleanup fixture did not record its child")
+                    time.sleep(0.01)
+                with open(child_file) as handle:
+                    child_pid = int(handle.read().strip())
+
+                kill_and_reap_test_process_group(producer)
+                self.assertIsNotNone(
+                    producer.poll(), "group cleanup left its session leader alive"
+                )
+                deadline = time.monotonic() + 5
+                while proc_state(child_pid) not in (None, "Z"):
+                    if time.monotonic() >= deadline:
+                        self.fail("group cleanup left its pipe-holding child alive")
+                    time.sleep(0.01)
+            finally:
+                try:
+                    os.killpg(producer.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                if producer.poll() is None:
+                    producer.communicate(timeout=5)
+                if child_pid is not None and proc_state(child_pid) not in (None, "Z"):
+                    try:
+                        os.kill(child_pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     def test_escaped_lock_holder_is_reaped_before_absence_reconciliation(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -9203,10 +9281,8 @@ sys.stdin.read(1)
         self.assertEqual(calls, 2)
         self.assertFalse(os.path.lexists(out))
 
-    def test_final_validation_binds_the_labeled_campaign_child_inode(self):
+    def test_final_validation_refuses_labeled_campaign_child_replacement(self):
         run, campaign, host = self.valid_campaign_comparison()
-        caller = os.path.join(run, "selected-host")
-        os.symlink(host, caller)
         holding = os.path.join(campaign, "holding")
         decoy = os.path.join(campaign, "decoy")
         shutil.copytree(host, decoy)
@@ -9221,13 +9297,11 @@ sys.stdin.read(1)
             if calls == 2:
                 os.rename(host, holding)
                 os.rename(decoy, host)
-                os.unlink(caller)
-                os.symlink(holding, caller)
             return result
 
         argv = [
             "compare.py", "--vm-run", run,
-            "--host", f"free={caller}", "--out", out,
+            "--host", f"free={host}", "--out", out,
         ]
         with mock.patch.object(
                 bench_compare, "validate_published_output",
@@ -9236,10 +9310,86 @@ sys.stdin.read(1)
              mock.patch.object(sys, "stdout", new=io.StringIO()):
             with self.assertRaisesRegex(
                     bench_compare.Refusal,
+                    "changed after its directory lock was acquired|"
                     "campaign child hostcdp-free"):
                 bench_compare.main()
 
         self.assertEqual(calls, 2)
+        self.assertFalse(os.path.lexists(out))
+
+    def test_campaign_alias_cannot_mask_a_labeled_child_replacement(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        caller = os.path.join(run, "selected-host")
+        os.symlink(host, caller)
+        holding = os.path.join(campaign, "holding")
+        decoy = os.path.join(campaign, "decoy")
+        shutil.copytree(host, decoy)
+        out = os.path.join(os.path.dirname(run), "intercheck-host-shuffle.json")
+        original = bench_compare.campaign_summary.locked_run_directory_errors
+        raced = False
+
+        def shuffle_then_check(run_dirs):
+            nonlocal raced
+            os.rename(host, holding)
+            os.rename(decoy, host)
+            os.unlink(caller)
+            os.symlink(holding, caller)
+            raced = True
+            return original(run_dirs)
+
+        argv = [
+            "compare.py", "--vm-run", run,
+            "--host", f"free={caller}", "--out", out,
+        ]
+        with mock.patch.object(
+                bench_compare.campaign_summary,
+                "locked_run_directory_errors",
+                side_effect=shuffle_then_check), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(sys, "stdout", new=io.StringIO()):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal,
+                    "canonical campaign child|campaign child hostcdp-free"):
+                bench_compare.main()
+
+        self.assertFalse(raced, "a campaign alias reached the publication boundary")
+        self.assertFalse(os.path.lexists(out))
+
+    def test_canonical_campaign_child_is_checked_after_pinned_relations(self):
+        run, campaign, host = self.valid_campaign_comparison()
+        moved = campaign + "-before-final-canonical-check"
+        out = os.path.join(os.path.dirname(run), "late-campaign-replacement.json")
+        original = bench_compare.validate_locked_host_campaign
+        parent_checks = 0
+        raced = False
+
+        def replace_campaign_on_final_parent(
+                host_run, campaign_run, label=None):
+            nonlocal parent_checks, raced
+            if label is None:
+                parent_checks += 1
+                if parent_checks == 2:
+                    os.rename(campaign, moved)
+                    shutil.copytree(moved, campaign)
+                    raced = True
+            return original(host_run, campaign_run, label)
+
+        argv = [
+            "compare.py", "--vm-run", run,
+            "--host", f"free={host}", "--out", out,
+        ]
+        with mock.patch.object(
+                bench_compare,
+                "validate_locked_host_campaign",
+                side_effect=replace_campaign_on_final_parent), \
+             mock.patch.object(sys, "argv", argv), \
+             mock.patch.object(sys, "stdout", new=io.StringIO()):
+            with self.assertRaisesRegex(
+                    bench_compare.Refusal,
+                    "canonical campaign child|changed after its directory lock"):
+                bench_compare.main()
+
+        self.assertTrue(raced, "the late campaign replacement was not exercised")
         self.assertFalse(os.path.lexists(out))
 
     def test_pinned_host_withdrawal_check_does_not_dereference_to_a_path(self):

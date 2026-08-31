@@ -1822,6 +1822,35 @@ def validate_locked_host_campaign(host_run, campaign_run, label=None):
             )
 
 
+def require_canonical_campaign_host(display_directory, campaign_run, label):
+    """Completed campaign inputs must use their one authoritative child name."""
+    expected = os.path.join(str(campaign_run), f"hostcdp-{label}")
+    if os.path.abspath(display_directory) != os.path.abspath(expected):
+        raise Refusal(
+            f"--host {label} must name canonical campaign child {expected}; "
+            f"got {display_directory}"
+        )
+    return expected
+
+
+def validate_canonical_campaign_host(
+        display_directory, host_run, campaign_run, label):
+    """Bind the public campaign/hostcdp-label path in one final lookup."""
+    expected = require_canonical_campaign_host(
+        display_directory, campaign_run, label
+    )
+    try:
+        current = os.stat(expected, follow_symlinks=False)
+    except OSError as error:
+        raise Refusal(
+            f"cannot inspect canonical campaign child {expected}: {error}"
+        ) from error
+    if (current.st_dev, current.st_ino) != host_run.identity:
+        raise Refusal(
+            f"canonical campaign child {expected} is not the locked host inode"
+        )
+
+
 def path_stat(path, label, fail_on_error, directory_fd=None):
     try:
         return os.stat(path, dir_fd=directory_fd)
@@ -2045,6 +2074,9 @@ def run_comparison(
         )
         if (locked is not None
                 and meta.get("corpus_extra_runtime_bundle_sha256") is not None):
+            require_canonical_campaign_host(
+                display_directory, campaign_directory, label
+            )
             locked["campaign_labels"].add(label)
         dataset_identity = (
             identities["run_json"]["size"],
@@ -2128,16 +2160,25 @@ def run_comparison(
 
     def recheck_caller_paths_after_output_validation():
         if locked is not None:
-            for label, _display, host_run, campaign_run in locked["hosts"]:
-                validate_locked_host_campaign(
-                    host_run,
-                    campaign_run,
-                    label if label in locked["campaign_labels"] else None,
-                )
             path_errors = campaign_summary.locked_run_directory_errors(
                 locked["all"])
             if path_errors:
                 raise Refusal("; ".join(path_errors))
+            # Completed campaign hosts have one authoritative namespace: the
+            # labeled child inside the locked campaign inode. Caller aliases
+            # are rejected before publication. Check parent relationships
+            # first, then resolve each full canonical path as the final input
+            # observation so a parent or child replacement cannot split it.
+            for label, _display, host_run, campaign_run in locked["hosts"]:
+                validate_locked_host_campaign(
+                    host_run,
+                    campaign_run,
+                )
+            for label, display, host_run, campaign_run in locked["hosts"]:
+                if label in locked["campaign_labels"]:
+                    validate_canonical_campaign_host(
+                        display, host_run, campaign_run, label
+                    )
 
     write_json_atomic(
         a.out,
