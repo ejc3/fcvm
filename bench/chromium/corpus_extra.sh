@@ -412,6 +412,9 @@ run_logged() {
     fi
     trap 'exit 130' INT
     trap 'exit 143' TERM
+    if [ -n "$ACTIVE_PHASE_SIGNAL" ]; then
+        rc="$ACTIVE_PHASE_SIGNAL"
+    fi
     return "$rc"
 }
 

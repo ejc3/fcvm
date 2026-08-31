@@ -3190,6 +3190,48 @@ class CampaignIntegrityRegression(unittest.TestCase):
         self.assertNotRegex(stop, r'\bkill\b')
         self.assertNotIn("kill -0", stop)
 
+    def test_run_logged_preserves_a_signal_during_finished_phase_cleanup(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        run = self.shell_function(source, "run_logged")
+        stop = self.shell_function(source, "stop_active_phase")
+        boundary = (
+            "    else\n"
+            "        exec {ACTIVE_PHASE_CONTROL_FD}>&-\n"
+        )
+        self.assertEqual(run.count(boundary), 1)
+        run = run.replace(
+            boundary,
+            "    else\n"
+            "        kill -TERM \"$BASHPID\"\n"
+            "        exec {ACTIVE_PHASE_CONTROL_FD}>&-\n",
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                "set -uo pipefail\n"
+                f"BENCH={HERE!r}\nLOGDIR={tmp!r}\n"
+                "ACTIVE_PHASE_PID=\nACTIVE_PHASE_SIGNAL=\n"
+                "ACTIVE_PHASE_CONTROL_FD=\nACTIVE_PHASE_CONTROL_PATH=\n"
+                "say() { :; }\n"
+                + run + "\n" + stop + "\n"
+                "set +e\n"
+                "run_logged \"$LOGDIR/phase.log\" true\n"
+                "rc=$?\n"
+                "printf 'remembered=%s\\n' \"$ACTIVE_PHASE_SIGNAL\"\n"
+                "exit \"$rc\"\n"
+            )
+            proc = subprocess.run(
+                ["bash", "-c", script], capture_output=True, text=True,
+                timeout=10,
+            )
+
+        self.assertEqual(
+            proc.returncode, 143,
+            "a signal received after the phase wait was reported as success: "
+            + proc.stdout + proc.stderr,
+        )
+
     def test_failed_phase_identity_capture_cannot_leave_the_phase_running(self):
         with open(EXTRA) as handle:
             source = handle.read()
