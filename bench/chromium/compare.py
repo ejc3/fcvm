@@ -36,6 +36,8 @@ import tempfile
 import time
 from urllib.parse import urlsplit
 
+import campaign_summary
+
 
 class Refusal(ValueError):
     """The inputs cannot support the comparison they were asked to make."""
@@ -102,6 +104,39 @@ def parse_jsonl(text, label):
     if not rows:
         raise Refusal(f"{label} has no records")
     return rows
+
+
+def load_vm_publication(run_dir):
+    """Validate one VM run and bind the exact bytes used by that verdict."""
+    try:
+        _cell, sources = campaign_summary.load_cell(run_dir)
+    except campaign_summary.RunError as error:
+        raise Refusal(f"VM publication contract: {error}") from error
+
+    artifacts = []
+    for source in sources:
+        artifact = read_artifact(source["path"])
+        if artifact["sha256"] != source["sha256"]:
+            raise Refusal(
+                f"VM publication input {source['path']} changed while its "
+                "publication contract was being validated"
+            )
+        artifacts.append(artifact)
+
+    analysis_path = os.path.abspath(os.path.join(run_dir, "analysis.json"))
+    analysis_artifacts = [
+        artifact for artifact in artifacts
+        if os.path.abspath(artifact["path"]) == analysis_path
+    ]
+    if len(analysis_artifacts) != 1:
+        raise Refusal(
+            "VM publication contract did not consume exactly one analysis.json"
+        )
+    analysis_artifact = analysis_artifacts[0]
+    analysis = parse_json(analysis_artifact["text"], analysis_artifact["path"])
+    return analysis, analysis_artifact, [
+        artifact_identity(artifact) for artifact in artifacts
+    ]
 
 
 def open_output_target(path):
@@ -1251,6 +1286,19 @@ def comparison_input_paths(args):
     inputs = [
         ("VM analysis.json", os.path.join(args.vm_run, "analysis.json")),
         ("VM reqbench.jsonl", os.path.join(args.vm_run, "reqbench.jsonl")),
+        ("VM dns-evidence.json", os.path.join(args.vm_run, "dns-evidence.json")),
+        ("VM dns-owner.log", os.path.join(args.vm_run, "dns-owner.log")),
+        ("VM verify-dns-pre.json",
+         os.path.join(args.vm_run, "verify-dns-pre.json")),
+        ("VM verify-dns-before-run.json",
+         os.path.join(args.vm_run, "verify-dns-before-run.json")),
+        ("VM verify-dns-after-run.json",
+         os.path.join(args.vm_run, "verify-dns-after-run.json")),
+        ("VM corpus-dns.log", os.path.join(args.vm_run, "corpus-dns.log")),
+        ("VM corpus-access.log", os.path.join(args.vm_run, "corpus-access.log")),
+        ("VM replay-queries.log", os.path.join(args.vm_run, "replay-queries.log")),
+        ("VM diag/summary.json",
+         os.path.join(args.vm_run, "diag", "summary.json")),
         ("running comparator source", __file__),
     ]
     for ordinal, spec in enumerate(args.host, 1):
@@ -1427,12 +1475,9 @@ def main():
 
 
 def run_comparison(a, output_target=None, output_lock_fd=None):
-    analysis_artifact = read_artifact(os.path.join(a.vm_run, "analysis.json"))
-    analysis = parse_json(analysis_artifact["text"], analysis_artifact["path"])
-    if not analysis.get("publishable") or not analysis.get("gate", {}).get("passed"):
-        raise Refusal(
-            "the VM run did not pass its publication gate; its numbers are not quotable"
-        )
+    analysis, analysis_artifact, publication_inputs = load_vm_publication(
+        a.vm_run
+    )
     vm_meta, vm_all, vm_input_identity = load_vm(a.vm_run, analysis)
     published_cell = bind_analysis_cell(analysis, vm_meta)
     vm = [dict(r, total_ms=driver_total(r), load_ms=nav_load(r)) for r in vm_all if r["arm"] == "cdp"]
@@ -1443,6 +1488,7 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
     out = {"vm_run": os.path.abspath(a.vm_run), "run_id": analysis.get("run_id"),
            "input_identity": {
                "analysis_json": artifact_identity(analysis_artifact),
+               "vm_publication": publication_inputs,
                "reqbench_jsonl": vm_input_identity,
                "hosts": {},
            },
@@ -1535,9 +1581,11 @@ def run_comparison(a, output_target=None, output_lock_fd=None):
         }
 
     def recheck_inputs_before_publication():
-        revalidate_artifact_identity(
-            "VM analysis_json", out["input_identity"]["analysis_json"]
-        )
+        for ordinal, identity in enumerate(
+                out["input_identity"]["vm_publication"], 1):
+            revalidate_artifact_identity(
+                f"VM publication input {ordinal}", identity
+            )
         revalidate_artifact_identity(
             "VM reqbench_jsonl", out["input_identity"]["reqbench_jsonl"]
         )

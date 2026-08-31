@@ -3994,15 +3994,21 @@ class ComparePublicationGate(unittest.TestCase):
     complete and compatible before it computes a ratio.
     """
 
-    URL = "https://example.com/"
+    # Most comparator fixtures exercise record and host binding, not the corpus
+    # resolver. Keep those fixtures outside the resolver publication contract;
+    # the resolver-specific cases below opt into a hostname and its evidence.
+    URL = "https://192.0.2.1/"
+    HOSTNAME_URL = "https://example.com/"
     IMAGE_ID = "sha256:" + "a" * 64
     CELL = {"cpu": 2, "memory_mib": 1024, "backend": "uffd", "uffd_mode": "minor",
             "snapshot": "cb-req-corpus", "image": "localhost/chromium-bench-req",
             "image_id": IMAGE_ID, "url": URL, "urls": [URL],
-            "guest_dns": "10.0.2.2",
+            "guest_dns": None,
             "guest_env": [], "engine": "chromium", "cdp_port": 9222,
             "source_revision": "b" * 40, "harness_sha256": "c" * 64,
             "fcvm_sha256": "d" * 64, "runtime_bundle_sha256": "e" * 64,
+            "snapshot_generation_id": "33333333-3333-4333-8333-333333333333",
+            "snapshot_config_sha256": "5" * 64,
             "host_boot_id": "00000000-0000-4000-8000-000000000001",
             "host_kernel_release": "k", "host_machine": "aarch64"}
 
@@ -4051,6 +4057,8 @@ class ComparePublicationGate(unittest.TestCase):
             "fcvm_sha256": cell["fcvm_sha256"],
             "harness_sha256": cell["harness_sha256"],
             "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
+            "snapshot_generation_id": cell["snapshot_generation_id"],
+            "snapshot_config_sha256": cell["snapshot_config_sha256"],
             "host_boot_id": cell["host_boot_id"],
             "host_kernel_release": cell["host_kernel_release"],
             "host_machine": cell["host_machine"],
@@ -4062,8 +4070,29 @@ class ComparePublicationGate(unittest.TestCase):
             handle.write(json.dumps(meta) + "\n")
             for row in scheduled:
                 handle.write(json.dumps(row) + "\n")
-        analysis = {"publishable": publishable, "gate": {"passed": passed},
-                    "run_id": "r1", "cell": cell}
+        analysis = {
+            "publishable": publishable,
+            "gate": {
+                "passed": passed,
+                "reasons": [] if passed else ["fixture publication failure"],
+            },
+            "run_id": "r1",
+            "cell": cell,
+            "arms": {
+                "cdp": {
+                    "blocking_ms": {
+                        "median": 700.0, "lo": 600.0, "hi": 800.0,
+                        "n": max(1, len(measured)),
+                    },
+                },
+            },
+            "stall_gate": {
+                "max_ms": 15000,
+                "passed": True,
+                "evaluated": max(1, len(measured)),
+                "violations": [],
+            },
+        }
         if include_identity:
             analysis["analysis_identity"] = {
                 "schema_version": 6,
@@ -4383,6 +4412,10 @@ class ComparePublicationGate(unittest.TestCase):
                 with tempfile.TemporaryDirectory() as tmp:
                     copied = os.path.join(tmp, "compare.py")
                     shutil.copyfile(os.path.join(HERE, "compare.py"), copied)
+                    shutil.copyfile(
+                        os.path.join(HERE, "campaign_summary.py"),
+                        os.path.join(tmp, "campaign_summary.py"),
+                    )
                     if alias_kind == "direct":
                         out = copied
                     elif alias_kind == "realpath":
@@ -4667,6 +4700,84 @@ sys.stdin.read(1)
         proc, out = self.run_compare(run)
         self.assertNotEqual(proc.returncode, 0,
                             "a run that did not pass its publication gate was quoted")
+        self.assertFalse(os.path.exists(out))
+
+    def test_vm_gate_requires_boolean_agreement_and_no_reasons(self):
+        mutations = {
+            "truthy publishable": lambda analysis:
+                analysis.update(publishable=1),
+            "truthy passed": lambda analysis:
+                analysis["gate"].update(passed=1),
+            "passed with reasons": lambda analysis:
+                analysis["gate"].update(reasons=["recorded defect"]),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+                self.rewrite_analysis(run, mutate)
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"VM analysis with {label} authorized a comparison",
+                )
+                self.assertIn("analysis.json", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_vm_stall_gate_must_be_armed_and_evaluate_records(self):
+        mutations = {
+            "unarmed": lambda analysis:
+                analysis["stall_gate"].update(max_ms=None, evaluated=0),
+            "empty": lambda analysis:
+                analysis["stall_gate"].update(evaluated=0),
+            "failed": lambda analysis:
+                analysis["stall_gate"].update(
+                    passed=False, violations=[{"record_id": "r1:cdp:0:0"}]
+                ),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+                self.rewrite_analysis(run, mutate)
+                proc, out = self.run_compare(run)
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"VM analysis with {label} stall gate authorized output",
+                )
+                self.assertIn("stall_gate", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_analysis_level_withdrawal_is_refused(self):
+        run = self.make_run(vm_rows=[self.vm_rep(700.0)])
+        self.rewrite_analysis(
+            run, lambda analysis: analysis.update(withdrawn=True)
+        )
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "analysis.json withdrew the VM run but compare published it",
+        )
+        self.assertIn("withdrawn", proc.stderr.lower(), proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_resolver_vm_requires_campaign_dns_and_diag_evidence(self):
+        cell = dict(
+            self.CELL,
+            url=self.HOSTNAME_URL,
+            urls=[self.HOSTNAME_URL],
+            guest_dns="10.0.2.2",
+        )
+        resolver_rep = self.vm_rep(700.0)
+        resolver_rep["render"]["url"] = self.HOSTNAME_URL
+        run = self.make_run(
+            vm_rows=[resolver_rep],
+            cell=cell,
+        )
+        proc, out = self.run_compare(run)
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "a resolver VM with no campaign evidence was compared",
+        )
+        self.assertIn("dns-evidence.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(out))
 
     def test_a_refusal_removes_an_earlier_comparison(self):
@@ -5607,21 +5718,46 @@ sys.stdin.read(1)
         self.assertIn("image_id", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def resolver_compatibility_inputs(self, host_resolver):
+        cell = dict(
+            self.CELL,
+            url=self.HOSTNAME_URL,
+            urls=[self.HOSTNAME_URL],
+            guest_dns="10.0.2.2",
+        )
+        vm_rep = self.vm_rep(700.0)
+        vm_rep["render"]["url"] = self.HOSTNAME_URL
+        run = self.make_run(vm_rows=[vm_rep], cell=cell)
+        with open(os.path.join(run, "analysis.json")) as handle:
+            analysis = json.load(handle)
+        vm_meta, vm_rows, _identity = bench_compare.load_vm(run, analysis)
+
+        host = self.make_host(
+            [self.host_rep(0, False, url=self.HOSTNAME_URL)],
+            meta_overrides={"resolve_all_to": host_resolver},
+        )
+        host_meta, _records, host_rows, counts, _identities = (
+            bench_compare.load_host_dataset(host, require_driver=True)
+        )
+        return vm_meta, vm_rows, host_meta, host_rows, counts
+
     def test_host_resolver_identity_must_match_the_vm_arm(self):
-        run, host = self.valid_comparison(
-            meta_overrides={"resolve_all_to": "203.0.113.9"})
-        proc, out = self.run_compare(run, [("host", host)])
-        self.assertNotEqual(proc.returncode, 0,
-                            "a live/other resolver host run was compared to the replay VM run")
-        self.assertIn("resolver", proc.stderr, proc.stderr)
-        self.assertFalse(os.path.exists(out))
+        vm_meta, vm_rows, host_meta, host_rows, counts = (
+            self.resolver_compatibility_inputs("203.0.113.9")
+        )
+        with self.assertRaisesRegex(bench_compare.Refusal, "resolver"):
+            bench_compare.validate_host_compatibility(
+                "host", host_meta, host_rows, counts, vm_meta, vm_rows
+            )
 
     def test_host_resolver_identity_must_be_present_for_a_hostname_corpus(self):
-        run, host = self.valid_comparison(meta_overrides={"resolve_all_to": None})
-        proc, out = self.run_compare(run, [("host", host)])
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("resolver", proc.stderr, proc.stderr)
-        self.assertFalse(os.path.exists(out))
+        vm_meta, vm_rows, host_meta, host_rows, counts = (
+            self.resolver_compatibility_inputs(None)
+        )
+        with self.assertRaisesRegex(bench_compare.Refusal, "resolver"):
+            bench_compare.validate_host_compatibility(
+                "host", host_meta, host_rows, counts, vm_meta, vm_rows
+            )
 
     def test_a_legacy_total_count_is_interpreted_unambiguously(self):
         """Before total_reps existed, run.json's reps field meant total.
