@@ -4779,6 +4779,38 @@ class ComparePublicationGate(unittest.TestCase):
             json.dump(complete, handle)
 
     @staticmethod
+    def rewrite_memory_complete(campaign, host, mutate):
+        memory = os.path.join(campaign, "memory", "complete.json")
+        with open(memory) as handle:
+            complete = json.load(handle)
+        mutate(complete)
+        with open(memory, "w") as handle:
+            json.dump(complete, handle)
+        ComparePublicationGate.write_campaign_complete(
+            campaign, [host], "1" * 32, "9" * 64, memory=memory
+        )
+
+    @staticmethod
+    def rewrite_memory_artifact(campaign, host, name, payload):
+        memory_directory = os.path.join(campaign, "memory")
+        path = os.path.join(memory_directory, name)
+        with open(path, "wb") as handle:
+            handle.write(payload)
+        complete_path = os.path.join(memory_directory, "complete.json")
+        with open(complete_path) as handle:
+            complete = json.load(handle)
+        record = next(
+            artifact for artifact in complete["artifacts"]
+            if artifact["path"] == name
+        )
+        record.update(size=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+        with open(complete_path, "w") as handle:
+            json.dump(complete, handle)
+        ComparePublicationGate.write_campaign_complete(
+            campaign, [host], "1" * 32, "9" * 64, memory=complete_path
+        )
+
+    @staticmethod
     def bind_host_rows(host, rows=None):
         if rows is None:
             with open(os.path.join(host, "hostcdp.jsonl")) as handle:
@@ -5709,9 +5741,18 @@ sys.stdin.read(1)
         run_id = "1" * 32
         memory_directory = os.path.join(campaign, "memory")
         os.mkdir(memory_directory)
+        payloads = {
+            "run.json": json.dumps({"run_id": run_id}).encode() + b"\n",
+            "samples.jsonl": b'{"sample":1}\n',
+            "summary.json": json.dumps(
+                {"run_id": run_id, "result": 3}
+            ).encode() + b"\n",
+        }
+        for name, payload in payloads.items():
+            with open(os.path.join(memory_directory, name), "wb") as handle:
+                handle.write(payload)
         memory = os.path.join(memory_directory, "complete.json")
-        with open(memory, "wb") as handle:
-            handle.write(CampaignIntegrityRegression.memory_completion_bytes(run_id))
+        corpus_mem.publish_completion(memory_directory, run_id)
         self.write_campaign_complete(
             campaign, [host], run_id, "9" * 64, memory=memory
         )
@@ -5765,6 +5806,17 @@ sys.stdin.read(1)
                       ["memory_complete_json"]["sha256"],
             self.artifact_identity(memory)["sha256"],
         )
+        for name, filename, identity_key in (
+            ("run", "run.json", "memory_run_json"),
+            ("samples", "samples.jsonl", "memory_samples_jsonl"),
+            ("summary", "summary.json", "memory_summary_json"),
+        ):
+            path = os.path.join(os.path.dirname(memory), filename)
+            self.assertEqual(
+                comparison["input_identity"]["hosts"]["free"]
+                          [identity_key]["sha256"],
+                self.artifact_identity(path)["sha256"],
+            )
 
         os.unlink(out)
         with open(memory, "ab") as handle:
@@ -5776,6 +5828,146 @@ sys.stdin.read(1)
         )
         self.assertIn("memory/complete.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(out))
+
+    def test_campaign_memory_completion_validates_its_nested_contract(self):
+        mutations = {
+            "schema version": lambda complete:
+                complete.update(schema_version=2),
+            "boolean schema version": lambda complete:
+                complete.update(schema_version=True),
+            "wrong run": lambda complete:
+                complete.update(run_id="2" * 32),
+            "missing artifact": lambda complete:
+                complete["artifacts"].pop(),
+            "unsafe path": lambda complete:
+                complete["artifacts"][0].update(path="../run.json"),
+            "boolean size": lambda complete:
+                complete["artifacts"][0].update(size=True),
+            "invalid digest": lambda complete:
+                complete["artifacts"][0].update(sha256="A" * 64),
+            "unexpected field": lambda complete:
+                complete.update(extra=True),
+            "unexpected artifact field": lambda complete:
+                complete["artifacts"][0].update(extra=True),
+        }
+        for label, mutate in mutations.items():
+            with self.subTest(label=label):
+                run, campaign, host, _memory = \
+                    self.valid_campaign_memory_comparison()
+                self.rewrite_memory_complete(campaign, host, mutate)
+                proc, out = self.run_compare(run, [("free", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"campaign accepted nested memory completion with {label}",
+                )
+                self.assertIn("memory/complete.json", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+        for name, payload in (
+            ("run.json", b"[]\n"),
+            ("summary.json", b"[]\n"),
+            ("run.json", json.dumps({"run_id": "2" * 32}).encode() + b"\n"),
+            ("summary.json", json.dumps({"run_id": "2" * 32}).encode() + b"\n"),
+        ):
+            with self.subTest(artifact=name, payload=payload):
+                run, campaign, host, _memory = \
+                    self.valid_campaign_memory_comparison()
+                self.rewrite_memory_artifact(
+                    campaign, host, name, payload
+                )
+                proc, out = self.run_compare(run, [("free", host)])
+                self.assertNotEqual(
+                    proc.returncode, 0,
+                    f"campaign accepted invalid memory document {name}",
+                )
+                self.assertIn(name, proc.stderr, proc.stderr)
+                self.assertIn("REFUSING", proc.stderr, proc.stderr)
+                self.assertNotIn("Traceback", proc.stderr, proc.stderr)
+                self.assertFalse(os.path.exists(out))
+
+    def test_campaign_memory_artifacts_must_exist_and_match_completion(self):
+        for name in ("run.json", "samples.jsonl", "summary.json"):
+            for change in ("missing", "changed", "symlink"):
+                with self.subTest(artifact=name, change=change):
+                    run, campaign, host, _memory = \
+                        self.valid_campaign_memory_comparison()
+                    path = os.path.join(campaign, "memory", name)
+                    if change == "missing":
+                        os.unlink(path)
+                    elif change == "changed":
+                        with open(path, "ab") as handle:
+                            handle.write(b"changed after completion\n")
+                    else:
+                        backing = path + ".backing"
+                        os.rename(path, backing)
+                        os.symlink(backing, path)
+                    proc, out = self.run_compare(run, [("free", host)])
+                    self.assertNotEqual(
+                        proc.returncode, 0,
+                        f"campaign accepted {change} memory artifact {name}",
+                    )
+                    self.assertIn(name, proc.stderr, proc.stderr)
+                    self.assertFalse(os.path.exists(out))
+
+    def test_campaign_memory_artifacts_are_rechecked_at_publication(self):
+        run, campaign, host, _memory = self.valid_campaign_memory_comparison()
+        changed = os.path.join(campaign, "memory", "summary.json")
+        out = os.path.join(run, "comparison.json")
+        original = bench_compare.write_json_atomic
+
+        def change_memory_before_publication(*args, **kwargs):
+            with open(changed, "ab") as handle:
+                handle.write(b"changed before publication\n")
+            return original(*args, **kwargs)
+
+        argv = ["compare.py", "--vm-run", run,
+                "--host", f"free={host}", "--out", out]
+        with mock.patch.object(
+                bench_compare, "write_json_atomic",
+                side_effect=change_memory_before_publication), \
+                mock.patch.object(sys, "argv", argv):
+            with self.assertRaises(
+                    bench_compare.Refusal,
+                    msg="changed memory artifact raced comparison publication"):
+                bench_compare.main()
+        self.assertFalse(os.path.exists(out))
+
+    def test_campaign_memory_artifacts_are_protected_inputs(self):
+        for name in ("complete.json", "run.json", "samples.jsonl", "summary.json"):
+            for alias_kind in ("direct", "realpath", "symlink", "hardlink"):
+                with self.subTest(artifact=name, alias=alias_kind):
+                    run, campaign, host, _memory = \
+                        self.valid_campaign_memory_comparison()
+                    protected = os.path.join(campaign, "memory", name)
+                    if alias_kind == "direct":
+                        out = protected
+                    elif alias_kind == "realpath":
+                        alias_root = tempfile.mkdtemp()
+                        self.addCleanup(shutil.rmtree, alias_root, ignore_errors=True)
+                        os.symlink(campaign, os.path.join(alias_root, "campaign"))
+                        out = os.path.join(alias_root, "campaign", "memory", name)
+                    else:
+                        out = os.path.join(
+                            run, f"memory-{name}-{alias_kind}.json"
+                        )
+                        if alias_kind == "symlink":
+                            os.symlink(protected, out)
+                        else:
+                            os.link(protected, out)
+                    with open(protected, "rb") as handle:
+                        before = handle.read()
+                    proc, _out = self.run_compare(
+                        run, [("free", host)], out=out
+                    )
+                    self.assertNotEqual(
+                        proc.returncode, 0,
+                        f"--out used a {alias_kind} alias of memory {name}",
+                    )
+                    self.assertIn("alias", proc.stderr.lower(), proc.stderr)
+                    with open(protected, "rb") as handle:
+                        self.assertEqual(handle.read(), before)
+                    if alias_kind in ("symlink", "hardlink"):
+                        self.assertTrue(os.path.lexists(out))
 
     def test_campaign_completion_validates_memory_binding(self):
         mutations = {

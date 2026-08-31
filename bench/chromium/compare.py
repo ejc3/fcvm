@@ -76,6 +76,56 @@ def read_artifact(path):
     }
 
 
+def read_artifact_nofollow(path):
+    """Read one stable regular file without following its final component."""
+    flags = (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+        | getattr(os, "O_NONBLOCK", 0)
+    )
+    try:
+        fd = os.open(path, flags)
+    except OSError as error:
+        raise Refusal(f"cannot read {path} without following links: {error}") from error
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise Refusal(f"{path} is not a regular file")
+        chunks = []
+        while True:
+            chunk = os.read(fd, 1024 * 1024)
+            if not chunk:
+                break
+            chunks.append(chunk)
+        after = os.fstat(fd)
+    except OSError as error:
+        raise Refusal(f"cannot read {path}: {error}") from error
+    finally:
+        os.close(fd)
+    fields = ("st_dev", "st_ino", "st_size", "st_mtime_ns", "st_ctime_ns")
+    if any(getattr(before, field) != getattr(after, field) for field in fields):
+        raise Refusal(f"{path} changed while it was being read")
+    raw = b"".join(chunks)
+    if len(raw) != after.st_size:
+        raise Refusal(f"{path} changed while it was being read")
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise Refusal(f"{path} is not UTF-8: {error}") from error
+    return {
+        "path": path,
+        "realpath": os.path.realpath(path),
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "size": len(raw),
+        "mtime_ns": before.st_mtime_ns,
+        "ctime_ns": before.st_ctime_ns,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "text": text,
+    }
+
+
 def reject_duplicate_keys(pairs):
     value = {}
     for key, item in pairs:
@@ -746,6 +796,92 @@ def campaign_arm(path, label):
     return arm
 
 
+MEMORY_COMPLETION_ARTIFACTS = (
+    ("run.json", "memory_run_json"),
+    ("samples.jsonl", "memory_samples_jsonl"),
+    ("summary.json", "memory_summary_json"),
+)
+MEMORY_IDENTITY_KEYS = {
+    "memory_complete_json",
+    *(identity_key for _name, identity_key in MEMORY_COMPLETION_ARTIFACTS),
+}
+
+
+def validate_memory_completion(campaign_directory, campaign_run_id):
+    memory_directory = os.path.join(campaign_directory, "memory")
+    completion_path = os.path.join(memory_directory, "complete.json")
+    completion_artifact = read_artifact_nofollow(completion_path)
+    completion = parse_json(completion_artifact["text"], completion_path)
+    if set(completion) != {"schema_version", "run_id", "artifacts"}:
+        raise Refusal(
+            f"{completion_path} must contain exactly schema_version, run_id, "
+            "and artifacts"
+        )
+    version = completion.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 1:
+        raise Refusal(
+            f"{completion_path} has unsupported schema_version={version!r}"
+        )
+    if completion.get("run_id") != campaign_run_id:
+        raise Refusal(
+            f"{completion_path} run_id={completion.get('run_id')!r} does not "
+            f"match campaign run_id={campaign_run_id!r}"
+        )
+    declared = completion.get("artifacts")
+    if not isinstance(declared, list) or len(declared) != len(
+            MEMORY_COMPLETION_ARTIFACTS):
+        raise Refusal(
+            f"{completion_path} artifacts must identify exactly run.json, "
+            "samples.jsonl, and summary.json"
+        )
+
+    identities = {
+        "memory_complete_json": artifact_identity(completion_artifact),
+    }
+    for ordinal, ((expected_path, identity_key), record) in enumerate(
+            zip(MEMORY_COMPLETION_ARTIFACTS, declared)):
+        label = f"{completion_path} artifacts[{ordinal}]"
+        if not isinstance(record, dict) or set(record) != {
+            "path", "size", "sha256"
+        }:
+            raise Refusal(
+                f"{label} must contain exactly path, size, and sha256"
+            )
+        if record.get("path") != expected_path:
+            raise Refusal(
+                f"{label} has path={record.get('path')!r}; expected "
+                f"{expected_path!r}"
+            )
+        recorded = completion_identity(
+            {"size": record.get("size"), "sha256": record.get("sha256")},
+            label,
+        )
+        current = read_artifact_nofollow(
+            os.path.join(memory_directory, expected_path)
+        )
+        if (
+            recorded["size"] != current["size"]
+            or recorded["sha256"] != current["sha256"]
+        ):
+            raise Refusal(
+                f"{completion_path} does not bind the current {expected_path}: "
+                f"current size={current['size']} sha256={current['sha256']}, "
+                f"recorded size={recorded['size']} "
+                f"sha256={recorded['sha256']}"
+            )
+        if expected_path in {"run.json", "summary.json"}:
+            document = parse_json(current["text"], current["path"])
+            if not isinstance(document, dict):
+                raise Refusal(f"{current['path']} is not a JSON object")
+            if document.get("run_id") != campaign_run_id:
+                raise Refusal(
+                    f"{current['path']} run_id={document.get('run_id')!r} does "
+                    f"not match campaign run_id={campaign_run_id!r}"
+                )
+        identities[identity_key] = artifact_identity(current)
+    return identities
+
+
 def validate_campaign_completion(directory, meta, child_completion):
     meta_path = os.path.join(directory, "run.json")
     key = "corpus_extra_runtime_bundle_sha256"
@@ -753,7 +889,7 @@ def validate_campaign_completion(directory, meta, child_completion):
         raise Refusal(f"{meta_path} has no {key}")
     runtime_sha256 = meta.get(key)
     if runtime_sha256 is None:
-        return None, None
+        return None, {}
     runtime_sha256 = sha256_field(meta, key, meta_path)
 
     host_directory = os.path.realpath(directory)
@@ -863,7 +999,7 @@ def validate_campaign_completion(directory, meta, child_completion):
         )
 
     memory_record = completion.get("memory_complete")
-    memory_identity = None
+    memory_identities = {}
     if "memory" in phases:
         label = f"{path} memory_complete"
         if not isinstance(memory_record, dict) or set(memory_record) != {
@@ -883,10 +1019,10 @@ def validate_campaign_completion(directory, meta, child_completion):
             },
             label,
         )
-        memory_artifact = read_artifact(
-            os.path.join(campaign_directory, "memory", "complete.json")
+        memory_identities = validate_memory_completion(
+            campaign_directory, campaign_run_id
         )
-        memory_identity = artifact_identity(memory_artifact)
+        memory_identity = memory_identities["memory_complete_json"]
         if (
             expected_memory["size"] != memory_identity["size"]
             or expected_memory["sha256"] != memory_identity["sha256"]
@@ -902,12 +1038,13 @@ def validate_campaign_completion(directory, meta, child_completion):
         raise Refusal(
             f"{path} binds memory_complete without declaring the memory phase"
         )
-    return artifact_identity(artifact), memory_identity
+    return artifact_identity(artifact), memory_identities
 
 
-def revalidate_artifact_identity(label, expected):
+def revalidate_artifact_identity(label, expected, nofollow=False):
     """Refuse if one captured artifact no longer names the same exact bytes."""
-    current = artifact_identity(read_artifact(expected["path"]))
+    reader = read_artifact_nofollow if nofollow else read_artifact
+    current = artifact_identity(reader(expected["path"]))
     if current != expected:
         raise Refusal(
             f"captured input {label} changed before publication: "
@@ -919,7 +1056,9 @@ def revalidate_host_inputs(directory, identities):
     """Refuse if any captured authorization/input bytes changed."""
     reject_withdrawn(directory)
     for name, expected in sorted(identities.items()):
-        revalidate_artifact_identity(f"host {name}", expected)
+        revalidate_artifact_identity(
+            f"host {name}", expected, nofollow=name in MEMORY_IDENTITY_KEYS
+        )
     reject_withdrawn(directory)
 
 
@@ -941,7 +1080,7 @@ def load_host_dataset(directory, require_driver=False):
     )
     (
         campaign_completion_identity,
-        memory_completion_identity,
+        memory_identities,
     ) = validate_campaign_completion(directory, meta, completion_identity_record)
     reject_withdrawn(directory)
     counts = host_counts(meta, meta_artifact["path"])
@@ -1044,8 +1183,7 @@ def load_host_dataset(directory, require_driver=False):
     }
     if campaign_completion_identity is not None:
         identities["campaign_complete_json"] = campaign_completion_identity
-    if memory_completion_identity is not None:
-        identities["memory_complete_json"] = memory_completion_identity
+    identities.update(memory_identities)
     revalidate_host_inputs(directory, identities)
     return meta, records, measured_rows, counts, identities
 
@@ -1392,6 +1530,12 @@ def comparison_input_paths(args):
                  os.path.join(campaign_directory, "campaign-complete.json")),
                 (f"host {ordinal} memory complete.json",
                  os.path.join(campaign_directory, "memory", "complete.json")),
+                (f"host {ordinal} memory run.json",
+                 os.path.join(campaign_directory, "memory", "run.json")),
+                (f"host {ordinal} memory samples.jsonl",
+                 os.path.join(campaign_directory, "memory", "samples.jsonl")),
+                (f"host {ordinal} memory summary.json",
+                 os.path.join(campaign_directory, "memory", "summary.json")),
                 (f"host {ordinal} campaign WITHDRAWN",
                  os.path.join(campaign_directory, "WITHDRAWN")),
             ))
