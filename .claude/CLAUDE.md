@@ -1433,7 +1433,9 @@ git push origin feature-b --force
 ### THREE BROAD REVIEW PASSES, NOT AN OPEN-ENDED REVIEW LOOP
 
 Three broad passes are a ceiling, not a checklist. Set the minimum bar before
-work starts from the impact of a bad merge:
+work starts from the downstream impact of a bad merge, not from where the code
+runs. A CI, release, or review gate that can approve or ship bad code is high
+risk when it fails open.
 
 - **High risk:** production runtime, security or isolation, persistent data,
   migrations, recovery, or public compatibility. Use the architecture,
@@ -1441,8 +1443,9 @@ work starts from the impact of a bad merge:
 - **Normal risk:** user-visible behavior with a bounded, reversible failure.
   Require focused regression coverage, the relevant suite, self-review of the
   complete delta, required CI, and exact-head review coverage.
-- **Low risk:** benchmarks, test harnesses, internal developer tooling, and
-  documentation that production does not execute. The normal minimum is one
+- **Low risk:** benchmarks, non-gating test harnesses, internal developer tools,
+  and documentation whose failure cannot approve or ship production code. The
+  normal minimum is one
   focused regression for each accepted defect class, one run of the relevant
   suite, self-review of the complete delta, required CI, and one exact-head
   automated review result. Do not add broad review passes, soak tests, fuzzing,
