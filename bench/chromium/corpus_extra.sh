@@ -147,12 +147,15 @@ CORPUS_EXTRA_LOCK="/run/lock/fcvm-corpus-extra.lock"
 stage_runtime_bundle() {
     local stage source reqbench_manifest_temp manifest_temp
     local reqbench_digest bundle_digest bundle_dest
+    local post_revision post_git_dirty
     local sources=(
         corpus_extra.sh corpus_mem.py hostcdp.sh cdpdrive.py render.py
         corpus_serve.py report.py reqbench.py reqbench.sh reqanalyze.py wddrive.py
         owned_process.py phase_supervisor.py host_resource_finalizer.py
         serve_guardian.py corpus_campaign.sh
     )
+    [ "${SOURCE_REVISION+x}" = x ] && [ "${SOURCE_GIT_DIRTY+x}" = x ] \
+        || { echo "BLOCKED: runtime staging requires a complete source identity" >&2; return 2; }
     mkdir -- "$RESULTS/runtime"
     stage=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
     for source in "${sources[@]}"; do
@@ -164,6 +167,206 @@ stage_runtime_bundle() {
     cp --reflink=auto --preserve=mode,timestamps \
         "$REPO/target/release/fc-agent" "$stage/fc-agent"
     cp -a --reflink=auto "$SOURCE_BENCH/corpus-live" "$stage/corpus-live"
+
+    post_revision=$(git -C "$REPO" rev-parse HEAD) \
+        || { echo "BLOCKED: cannot read source revision after runtime staging" >&2; return 2; }
+    post_git_dirty=$(git -C "$REPO" status --porcelain --untracked-files=no | tr '\n' ';') \
+        || { echo "BLOCKED: cannot read source status after runtime staging" >&2; return 2; }
+    [ "$post_revision" = "$SOURCE_REVISION" ] \
+        || { echo "BLOCKED: source revision changed during runtime staging" >&2; return 2; }
+    [ "$post_git_dirty" = "$SOURCE_GIT_DIRTY" ] \
+        || { echo "BLOCKED: source status changed during runtime staging" >&2; return 2; }
+
+    if ! python3 - "$REPO" "$SOURCE_REVISION" "$stage" \
+            "$SOURCE_GIT_DIRTY" "${sources[@]}" <<'PY'
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+
+def blocked(message):
+    print(f"BLOCKED: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+repo, revision, stage, git_dirty, *sources = sys.argv[1:]
+prefix = b"bench/chromium/"
+source_paths = {prefix + os.fsencode(source) for source in sources}
+tree_paths = [os.fsdecode(path) for path in sorted(source_paths)]
+tree_paths.append("bench/chromium/corpus-live")
+clean = not git_dirty
+
+try:
+    if clean:
+        object_format = subprocess.run(
+            ["git", "-C", repo, "rev-parse", "--show-object-format"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        ).stdout.strip()
+        if object_format not in ("sha1", "sha256"):
+            blocked(f"unsupported Git object format {object_format!r}")
+        listing = subprocess.run(
+            ["git", "-C", repo, "ls-tree", "-r", "-z", revision, "--", *tree_paths],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+    else:
+        listing = subprocess.run(
+            ["git", "-C", repo, "ls-files", "--cached", "-z", "--", *tree_paths],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ).stdout
+except (OSError, subprocess.CalledProcessError) as error:
+    blocked(f"cannot read tracked runtime sources from {revision}: {error}")
+
+records = {}
+if clean:
+    for record in listing.split(b"\0"):
+        if not record:
+            continue
+        try:
+            metadata, repo_path = record.split(b"\t", 1)
+            git_mode, kind, expected_oid = metadata.split()
+        except ValueError:
+            blocked(f"malformed Git tree record {record!r}")
+        if repo_path in records:
+            blocked(f"duplicate Git tree path {os.fsdecode(repo_path)!r}")
+        records[repo_path] = (git_mode, kind, expected_oid)
+else:
+    paths = [path for path in listing.split(b"\0") if path]
+    if len(paths) != len(set(paths)):
+        blocked("Git index returned a duplicate runtime path")
+    records = {path: None for path in paths}
+
+for repo_path in records:
+    if repo_path not in source_paths and not repo_path.startswith(prefix + b"corpus-live/"):
+        blocked(f"unexpected tracked runtime path {os.fsdecode(repo_path)!r}")
+
+missing_sources = source_paths - records.keys()
+if missing_sources:
+    blocked(
+        "runtime sources are absent from the recorded source state: "
+        + ", ".join(sorted(os.fsdecode(path) for path in missing_sources))
+    )
+
+stage_bytes = os.fsencode(stage)
+corpus_prefix = prefix + b"corpus-live"
+corpus_root = os.path.join(stage_bytes, b"corpus-live")
+try:
+    corpus_stat = os.lstat(corpus_root)
+except OSError as error:
+    blocked(f"cannot stat staged corpus root: {error}")
+if not stat.S_ISDIR(corpus_stat.st_mode):
+    blocked("staged corpus root is not a real directory")
+
+for repo_path, record in records.items():
+    is_corpus_entry = repo_path.startswith(corpus_prefix + b"/")
+    if not clean and is_corpus_entry:
+        # Dirty tracked deletions are valid.  Existing corpus entries are
+        # checked against the index and for real regular-file type below.
+        continue
+
+    relative = repo_path[len(prefix):]
+    staged_path = os.path.join(stage_bytes, relative)
+    try:
+        staged_stat = os.lstat(staged_path)
+    except OSError as error:
+        blocked(f"cannot stat staged source {os.fsdecode(relative)!r}: {error}")
+    if not stat.S_ISREG(staged_stat.st_mode):
+        blocked(f"staged source {os.fsdecode(relative)!r} is not a regular file")
+
+    if clean:
+        git_mode, kind, expected_oid = record
+        if kind != b"blob":
+            blocked(f"tracked runtime path {os.fsdecode(repo_path)!r} is not a blob")
+        if git_mode == b"120000":
+            blocked(
+                f"tracked runtime path {os.fsdecode(repo_path)!r} is a symlink, "
+                "which MANIFEST.sha256 cannot seal"
+            )
+        if git_mode in (b"100644", b"100755"):
+            expected_executable = git_mode == b"100755"
+            actual_executable = bool(staged_stat.st_mode & stat.S_IXUSR)
+            if actual_executable != expected_executable:
+                blocked(
+                    f"staged source {os.fsdecode(relative)!r} has owner executable="
+                    f"{actual_executable}, expected {expected_executable}"
+                )
+        else:
+            blocked(
+                f"tracked runtime path {os.fsdecode(repo_path)!r} has unsupported mode "
+                f"{git_mode.decode('ascii', 'backslashreplace')}"
+            )
+
+        digest = hashlib.new(object_format)
+        digest.update(b"blob " + str(staged_stat.st_size).encode("ascii") + b"\0")
+        byte_count = 0
+        try:
+            with open(staged_path, "rb") as handle:
+                while True:
+                    chunk = handle.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    byte_count += len(chunk)
+                    digest.update(chunk)
+        except OSError as error:
+            blocked(f"cannot read staged source {os.fsdecode(relative)!r}: {error}")
+        if byte_count != staged_stat.st_size:
+            blocked(f"staged source {os.fsdecode(relative)!r} changed while hashing")
+        if digest.hexdigest().encode("ascii") != expected_oid:
+            blocked(f"staged source {os.fsdecode(relative)!r} differs from {revision}")
+
+expected_files = set(
+    path for path in records if path.startswith(corpus_prefix + b"/")
+)
+expected_directories = {corpus_prefix}
+for path in expected_files:
+    parent = os.path.dirname(path)
+    while parent.startswith(corpus_prefix):
+        expected_directories.add(parent)
+        if parent == corpus_prefix:
+            break
+        parent = os.path.dirname(parent)
+
+pending = [corpus_root]
+while pending:
+    directory = pending.pop()
+    try:
+        entries = list(os.scandir(directory))
+    except OSError as error:
+        blocked(f"cannot enumerate staged corpus {os.fsdecode(directory)!r}: {error}")
+    for entry in entries:
+        relative = os.path.relpath(entry.path, stage_bytes)
+        repo_path = prefix + relative
+        if entry.is_dir(follow_symlinks=False):
+            if repo_path not in expected_directories:
+                blocked(
+                    f"staged corpus has untracked directory "
+                    f"{os.fsdecode(relative)!r}"
+                )
+            pending.append(entry.path)
+        elif entry.is_file(follow_symlinks=False):
+            if repo_path not in expected_files:
+                blocked(
+                    f"staged corpus has untracked file {os.fsdecode(relative)!r}"
+                )
+        else:
+            blocked(
+                f"staged corpus entry {os.fsdecode(relative)!r} is not a real "
+                "directory or regular file"
+            )
+PY
+    then
+        echo "BLOCKED: staged runtime sources do not match $SOURCE_REVISION" >&2
+        return 2
+    fi
+
     chmod 0555 "$stage/fcvm" "$stage/fc-agent"
     reqbench_manifest_temp=$(mktemp "$RESULTS/runtime/.reqbench-manifest.XXXXXX")
     (
@@ -177,14 +380,22 @@ stage_runtime_bundle() {
     manifest_temp=$(mktemp "$RESULTS/runtime/.manifest.XXXXXX")
     (
         cd "$stage"
-        find . -type f ! -name MANIFEST.sha256 -print0 \
+        find . -type f -print0 \
             | sort -z \
             | xargs -0 sha256sum
     ) > "$manifest_temp"
     mv --no-target-directory "$manifest_temp" "$stage/MANIFEST.sha256"
+    # Runtime modes are a staging policy, not a property inherited from the
+    # caller's checkout.  Canonical modes keep one content identity from
+    # naming behaviorally different bundles and avoid fragmenting the cache
+    # over group/other permission differences Git does not record.
+    find "$stage" -type d -exec chmod 0555 {} +
+    find "$stage" -mindepth 2 -type f -exec chmod 0444 {} +
+    find "$stage" -maxdepth 1 -type f -exec chmod 0555 {} +
+    chmod 0444 \
+        "$stage/MANIFEST.sha256" "$stage/REQBENCH_MANIFEST.sha256"
     bundle_digest=$(sha256sum "$stage/MANIFEST.sha256" | cut -d' ' -f1)
     bundle_dest="$RESULTS/runtime/$bundle_digest"
-    chmod -R a-w "$stage"
     mv --no-target-directory "$stage" "$bundle_dest"
     REQBENCH_BUNDLE_SHA256="$reqbench_digest"
     BUNDLE_SHA256="$bundle_digest"
@@ -197,6 +408,79 @@ verify_runtime_bundle() {
         echo "FAILED: the executing harness is not its recorded runtime bundle" >&2
         return 1
     }
+    if ! python3 - "$BENCH" <<'PY'
+import os
+import stat
+import sys
+
+
+root = os.fsencode(sys.argv[1])
+stack = [(root, b".")]
+while stack:
+    path, relative = stack.pop()
+    try:
+        current = os.lstat(path)
+    except OSError as error:
+        print(
+            f"FAILED: cannot inspect runtime mode for "
+            f"{os.fsdecode(relative)!r}: {error}",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    mode = stat.S_IMODE(current.st_mode)
+    if stat.S_ISDIR(current.st_mode):
+        expected = 0o555
+        if mode != expected:
+            print(
+                f"FAILED: runtime directory {os.fsdecode(relative)!r} has "
+                f"mode {mode:04o}, expected {expected:04o}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        try:
+            entries = list(os.scandir(path))
+        except OSError as error:
+            print(
+                f"FAILED: cannot enumerate runtime directory "
+                f"{os.fsdecode(relative)!r}: {error}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+        for entry in entries:
+            child_relative = (
+                b"./" + entry.name if relative == b"."
+                else relative + b"/" + entry.name
+            )
+            stack.append((entry.path, child_relative))
+    elif stat.S_ISREG(current.st_mode):
+        top_level = relative.count(b"/") == 1
+        expected = (
+            0o444
+            if relative in {
+                b"./MANIFEST.sha256",
+                b"./REQBENCH_MANIFEST.sha256",
+            } or not top_level
+            else 0o555
+        )
+        if mode != expected:
+            print(
+                f"FAILED: runtime file {os.fsdecode(relative)!r} has mode "
+                f"{mode:04o}, expected {expected:04o}",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    else:
+        print(
+            f"FAILED: runtime entry {os.fsdecode(relative)!r} is not a real "
+            "directory or regular file",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+PY
+    then
+        echo "FAILED: runtime bundle modes changed" >&2
+        return 1
+    fi
     manifest_digest=$(sha256sum "$BENCH/MANIFEST.sha256" | cut -d' ' -f1) || return 1
     [ "$manifest_digest" = "${CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256:-}" ] || {
         echo "FAILED: runtime bundle manifest identity changed" >&2

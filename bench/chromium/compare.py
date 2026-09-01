@@ -989,33 +989,62 @@ MEMORY_IDENTITY_KEYS = {
     "memory_complete_json",
     *(identity_key for _name, identity_key in MEMORY_COMPLETION_ARTIFACTS),
 }
+CAMPAIGN_COMPLETION_KEYS = {
+    "schema_version",
+    "run_id",
+    "runtime_bundle_sha256",
+    "phases",
+    "host_completes",
+    "memory_complete",
+}
 
 
-def validate_memory_completion(campaign_directory, campaign_run_id):
-    memory_directory = os.path.join(campaign_directory, "memory")
-    completion_path = os.path.join(memory_directory, "complete.json")
+def reject_memory_withdrawn(memory_directory):
+    marker = os.path.join(os.fspath(memory_directory), "WITHDRAWN")
+    display_marker = os.path.join(str(memory_directory), "WITHDRAWN")
+    try:
+        os.lstat(marker)
+    except FileNotFoundError:
+        return
+    except OSError as error:
+        raise Refusal(
+            f"cannot inspect memory withdrawal marker {display_marker}: {error}"
+        ) from error
+    raise Refusal(f"memory input is WITHDRAWN by {display_marker}")
+
+
+def validate_memory_completion(memory_directory, campaign_run_id):
+    reject_memory_withdrawn(memory_directory)
+    completion_path = os.path.join(
+        os.fspath(memory_directory), "complete.json"
+    )
+    completion_display_path = os.path.join(
+        str(memory_directory), "complete.json"
+    )
     completion_artifact = read_artifact_nofollow(completion_path)
-    completion = parse_json(completion_artifact["text"], completion_path)
+    completion = parse_json(
+        completion_artifact["text"], completion_display_path
+    )
     if set(completion) != {"schema_version", "run_id", "artifacts"}:
         raise Refusal(
-            f"{completion_path} must contain exactly schema_version, run_id, "
+            f"{completion_display_path} must contain exactly schema_version, run_id, "
             "and artifacts"
         )
     version = completion.get("schema_version")
     if isinstance(version, bool) or not isinstance(version, int) or version != 1:
         raise Refusal(
-            f"{completion_path} has unsupported schema_version={version!r}"
+            f"{completion_display_path} has unsupported schema_version={version!r}"
         )
     if completion.get("run_id") != campaign_run_id:
         raise Refusal(
-            f"{completion_path} run_id={completion.get('run_id')!r} does not "
+            f"{completion_display_path} run_id={completion.get('run_id')!r} does not "
             f"match campaign run_id={campaign_run_id!r}"
         )
     declared = completion.get("artifacts")
     if not isinstance(declared, list) or len(declared) != len(
             MEMORY_COMPLETION_ARTIFACTS):
         raise Refusal(
-            f"{completion_path} artifacts must identify exactly run.json, "
+            f"{completion_display_path} artifacts must identify exactly run.json, "
             "samples.jsonl, and summary.json"
         )
 
@@ -1024,7 +1053,7 @@ def validate_memory_completion(campaign_directory, campaign_run_id):
     }
     for ordinal, ((expected_path, identity_key), record) in enumerate(
             zip(MEMORY_COMPLETION_ARTIFACTS, declared)):
-        label = f"{completion_path} artifacts[{ordinal}]"
+        label = f"{completion_display_path} artifacts[{ordinal}]"
         if not isinstance(record, dict) or set(record) != {
             "path", "size", "sha256"
         }:
@@ -1040,34 +1069,67 @@ def validate_memory_completion(campaign_directory, campaign_run_id):
             {"size": record.get("size"), "sha256": record.get("sha256")},
             label,
         )
-        current = read_artifact_nofollow(
-            os.path.join(memory_directory, expected_path)
+        current_path = os.path.join(
+            os.fspath(memory_directory), expected_path
         )
+        current_display_path = os.path.join(
+            str(memory_directory), expected_path
+        )
+        current = read_artifact_nofollow(current_path)
         if (
             recorded["size"] != current["size"]
             or recorded["sha256"] != current["sha256"]
         ):
             raise Refusal(
-                f"{completion_path} does not bind the current {expected_path}: "
+                f"{completion_display_path} does not bind the current "
+                f"{expected_path}: "
                 f"current size={current['size']} sha256={current['sha256']}, "
                 f"recorded size={recorded['size']} "
                 f"sha256={recorded['sha256']}"
             )
         if expected_path in {"run.json", "summary.json"}:
-            document = parse_json(current["text"], current["path"])
+            document = parse_json(current["text"], current_display_path)
             if not isinstance(document, dict):
-                raise Refusal(f"{current['path']} is not a JSON object")
+                raise Refusal(f"{current_display_path} is not a JSON object")
             if document.get("run_id") != campaign_run_id:
                 raise Refusal(
-                    f"{current['path']} run_id={document.get('run_id')!r} does "
+                    f"{current_display_path} "
+                    f"run_id={document.get('run_id')!r} does "
                     f"not match campaign run_id={campaign_run_id!r}"
                 )
         identities[identity_key] = artifact_identity(current)
+    reject_memory_withdrawn(memory_directory)
     return identities
 
 
+def campaign_completion_phases(completion, path):
+    """Validate the fields needed before optional child locks are acquired."""
+    if not isinstance(completion, dict) or set(completion) != \
+            CAMPAIGN_COMPLETION_KEYS:
+        raise Refusal(
+            f"{path} must contain exactly schema_version, run_id, "
+            "runtime_bundle_sha256, phases, host_completes, and "
+            "memory_complete; older records do not bind memory completion"
+        )
+    version = completion.get("schema_version")
+    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
+        raise Refusal(f"{path} has unsupported schema_version={version!r}")
+    phases = completion.get("phases")
+    if (
+        not isinstance(phases, list)
+        or not phases
+        or any(phase not in {"hostcdp", "memory"} for phase in phases)
+        or len(phases) != len(set(phases))
+    ):
+        raise Refusal(f"{path} has invalid phases={phases!r}")
+    if "hostcdp" not in phases:
+        raise Refusal(f"{path} does not declare the hostcdp phase")
+    return phases
+
+
 def validate_campaign_completion(
-        directory, meta, child_completion, campaign_directory=None):
+        directory, meta, child_completion, campaign_directory=None,
+        memory_directory=None):
     meta_path = os.path.join(directory, "run.json")
     key = "corpus_extra_runtime_bundle_sha256"
     if key not in meta:
@@ -1109,23 +1171,7 @@ def validate_campaign_completion(
     path = os.path.join(campaign_directory, "campaign-complete.json")
     artifact = read_artifact(path)
     completion = parse_json(artifact["text"], path)
-    expected_keys = {
-        "schema_version",
-        "run_id",
-        "runtime_bundle_sha256",
-        "phases",
-        "host_completes",
-        "memory_complete",
-    }
-    if set(completion) != expected_keys:
-        raise Refusal(
-            f"{path} must contain exactly schema_version, run_id, "
-            "runtime_bundle_sha256, phases, host_completes, and "
-            "memory_complete; older records do not bind memory completion"
-        )
-    version = completion.get("schema_version")
-    if isinstance(version, bool) or not isinstance(version, int) or version != 2:
-        raise Refusal(f"{path} has unsupported schema_version={version!r}")
+    phases = campaign_completion_phases(completion, path)
     campaign_run_id = completion.get("run_id")
     if (
         not isinstance(campaign_run_id, str)
@@ -1151,17 +1197,6 @@ def validate_campaign_completion(
             f"require run.json run_id={expected_child_run_id!r}, got "
             f"{meta.get('run_id')!r}"
         )
-
-    phases = completion.get("phases")
-    if (
-        not isinstance(phases, list)
-        or not phases
-        or any(phase not in {"hostcdp", "memory"} for phase in phases)
-        or len(phases) != len(set(phases))
-    ):
-        raise Refusal(f"{path} has invalid phases={phases!r}")
-    if "hostcdp" not in phases:
-        raise Refusal(f"{path} does not declare the hostcdp phase")
 
     children = completion.get("host_completes")
     if not isinstance(children, list) or not children:
@@ -1205,6 +1240,10 @@ def validate_campaign_completion(
     memory_record = completion.get("memory_complete")
     memory_identities = {}
     if "memory" in phases:
+        if memory_directory is None:
+            raise Refusal(
+                f"{path} declares memory but its memory directory was not locked"
+            )
         label = f"{path} memory_complete"
         if not isinstance(memory_record, dict) or set(memory_record) != {
             "path", "size", "sha256"
@@ -1224,8 +1263,7 @@ def validate_campaign_completion(
             label,
         )
         memory_identities = validate_memory_completion(
-            campaign_directory, campaign_run_id
-        )
+            memory_directory, campaign_run_id)
         memory_identity = memory_identities["memory_complete_json"]
         if (
             expected_memory["size"] != memory_identity["size"]
@@ -1256,18 +1294,28 @@ def revalidate_artifact_identity(label, expected, nofollow=False):
         )
 
 
-def revalidate_host_inputs(directory, identities, campaign_directory=None):
+def revalidate_host_inputs(
+        directory, identities, campaign_directory=None,
+        memory_directory=None):
     """Refuse if any captured authorization/input bytes changed."""
     reject_withdrawn(directory, campaign_directory)
+    consumes_memory = bool(MEMORY_IDENTITY_KEYS.intersection(identities))
+    if consumes_memory:
+        if memory_directory is None:
+            raise Refusal("captured memory input directory was not locked")
+        reject_memory_withdrawn(memory_directory)
     for name, expected in sorted(identities.items()):
         revalidate_artifact_identity(
             f"host {name}", expected, nofollow=name in MEMORY_IDENTITY_KEYS
         )
+    if consumes_memory:
+        reject_memory_withdrawn(memory_directory)
     reject_withdrawn(directory, campaign_directory)
 
 
 def load_host_dataset(
-        directory, require_driver=False, campaign_directory=None):
+        directory, require_driver=False, campaign_directory=None,
+        memory_directory=None):
     reject_withdrawn(directory, campaign_directory)
     meta_artifact = read_artifact(os.path.join(directory, "run.json"))
     rows_artifact = read_artifact(os.path.join(directory, "hostcdp.jsonl"))
@@ -1287,7 +1335,10 @@ def load_host_dataset(
         campaign_completion_identity,
         memory_identities,
     ) = validate_campaign_completion(
-        directory, meta, completion_identity_record, campaign_directory)
+        directory, meta, completion_identity_record, campaign_directory,
+        memory_directory)
+    if memory_identities:
+        reject_memory_withdrawn(memory_directory)
     reject_withdrawn(directory, campaign_directory)
     counts = host_counts(meta, meta_artifact["path"])
     urls = declared_urls(meta, meta_artifact["path"])
@@ -1390,7 +1441,9 @@ def load_host_dataset(
     if campaign_completion_identity is not None:
         identities["campaign_complete_json"] = campaign_completion_identity
     identities.update(memory_identities)
-    revalidate_host_inputs(directory, identities, campaign_directory)
+    revalidate_host_inputs(
+        directory, identities, campaign_directory, memory_directory
+    )
     return meta, records, measured_rows, counts, identities
 
 
@@ -1726,10 +1779,18 @@ def comparison_input_paths(args, locked=None):
         _label, separator, directory = spec.partition("=")
         if separator and directory:
             if locked_hosts is not None:
-                _bound_label, _display, directory, campaign_directory = next(
-                    locked_hosts)
+                (
+                    _bound_label,
+                    _display,
+                    directory,
+                    campaign_directory,
+                    memory_directory,
+                ) = next(locked_hosts)
             else:
                 campaign_directory = os.path.dirname(os.path.realpath(directory))
+                memory_directory = os.path.join(campaign_directory, "memory")
+            if memory_directory is None:
+                memory_directory = os.path.join(campaign_directory, "memory")
             inputs.extend((
                 (f"host {ordinal} run.json", os.path.join(directory, "run.json")),
                 (f"host {ordinal} hostcdp.jsonl",
@@ -1741,13 +1802,15 @@ def comparison_input_paths(args, locked=None):
                 (f"host {ordinal} campaign-complete.json",
                  os.path.join(campaign_directory, "campaign-complete.json")),
                 (f"host {ordinal} memory complete.json",
-                 os.path.join(campaign_directory, "memory", "complete.json")),
+                 os.path.join(memory_directory, "complete.json")),
                 (f"host {ordinal} memory run.json",
-                 os.path.join(campaign_directory, "memory", "run.json")),
+                 os.path.join(memory_directory, "run.json")),
                 (f"host {ordinal} memory samples.jsonl",
-                 os.path.join(campaign_directory, "memory", "samples.jsonl")),
+                 os.path.join(memory_directory, "samples.jsonl")),
                 (f"host {ordinal} memory summary.json",
-                 os.path.join(campaign_directory, "memory", "summary.json")),
+                 os.path.join(memory_directory, "summary.json")),
+                (f"host {ordinal} memory WITHDRAWN",
+                 os.path.join(memory_directory, "WITHDRAWN")),
                 (f"host {ordinal} campaign WITHDRAWN",
                  os.path.join(campaign_directory, "WITHDRAWN")),
             ))
@@ -1793,6 +1856,106 @@ def bind_locked_comparison_directories(args, locked_directories):
         return {"vm_run": vm_run, "hosts": hosts,
                 "all": list(locked_directories), "campaign_labels": set()}
     raise Refusal("unexpected locked comparison directory")
+
+
+def comparison_memory_directories(locked):
+    """Declared campaign memory children, reached through locked parents."""
+    directories = []
+    seen_campaigns = set()
+    for _label, _display, host_run, campaign_run in locked["hosts"]:
+        if campaign_run.identity in seen_campaigns:
+            continue
+        try:
+            meta_path = os.path.join(os.fspath(host_run), "run.json")
+            meta_artifact = read_artifact(meta_path)
+            meta = parse_json(meta_artifact["text"], meta_path)
+        except Refusal:
+            # Ordinary dataset validation retains the specific refusal.  If
+            # the bytes become a campaign input later, validation refuses a
+            # declared memory phase because no memory lock was acquired.
+            continue
+        runtime_sha256 = (
+            meta.get("corpus_extra_runtime_bundle_sha256")
+            if isinstance(meta, dict) else None
+        )
+        if (
+            not isinstance(runtime_sha256, str)
+            or len(runtime_sha256) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in runtime_sha256
+            )
+        ):
+            continue
+        seen_campaigns.add(campaign_run.identity)
+        completion_access = os.path.join(
+            os.fspath(campaign_run), "campaign-complete.json"
+        )
+        completion_display = os.path.join(
+            str(campaign_run), "campaign-complete.json"
+        )
+        artifact = read_artifact(completion_access)
+        completion = parse_json(artifact["text"], completion_display)
+        if "memory" not in campaign_completion_phases(
+                completion, completion_display):
+            continue
+        access = os.path.join(os.fspath(campaign_run), "memory")
+        display = os.path.join(str(campaign_run), "memory")
+        directories.append((campaign_run, display, access))
+    return directories
+
+
+def validate_locked_campaign_memory(campaign_run, memory_run):
+    """Require the memory lock to name the locked campaign's real child."""
+    try:
+        parent = os.stat(os.path.join(os.fspath(memory_run), os.pardir))
+        canonical = os.stat(
+            os.path.join(os.fspath(campaign_run), "memory"),
+            follow_symlinks=False,
+        )
+        memory_identity = os.stat(os.fspath(memory_run))
+    except OSError as error:
+        raise Refusal(
+            f"cannot bind locked memory directory to {campaign_run}: {error}"
+        ) from error
+    if (parent.st_dev, parent.st_ino) != campaign_run.identity:
+        raise Refusal(
+            f"memory run {memory_run} does not belong to its locked campaign "
+            "directory"
+        )
+    if not os.path.samestat(canonical, memory_identity):
+        raise Refusal(
+            f"campaign memory child is not the locked memory directory for "
+            f"{campaign_run}"
+        )
+
+
+def bind_locked_memory_directories(locked, specs, locked_directories):
+    """Attach each optional locked memory child to its campaign hosts."""
+    if len(specs) != len(locked_directories):
+        raise Refusal("campaign memory directories were not locked")
+    by_campaign = {}
+    memory_runs = []
+    for (campaign_run, display, _access), memory_run in zip(
+            specs, locked_directories):
+        if not isinstance(memory_run, campaign_summary.LockedRunDirectory):
+            raise Refusal(f"campaign memory directory {display} was not locked")
+        validate_locked_campaign_memory(campaign_run, memory_run)
+        memory_run.path = display
+        by_campaign[campaign_run.identity] = memory_run
+        memory_runs.append(memory_run)
+    locked["hosts"] = [
+        (
+            label,
+            display,
+            host_run,
+            campaign_run,
+            by_campaign.get(campaign_run.identity),
+        )
+        for label, display, host_run, campaign_run in locked["hosts"]
+    ]
+    locked["memory_runs"] = memory_runs
+    locked["all"].extend(memory_runs)
 
 
 def validate_locked_host_campaign(host_run, campaign_run, label=None):
@@ -1971,6 +2134,35 @@ def clear_stale_output(target, preflight):
         raise Refusal(f"cannot clear stale output {target['path']}: {error}") from error
 
 
+def publish_locked_comparison(a, locked):
+    # The lock file is permanent. Unlinking a flock inode while another
+    # caller waits on it creates two lock domains and admits concurrent
+    # writers.
+    target = open_output_target(a.out)
+    try:
+        lock_fd = open_output_lock(target)
+        try:
+            try:
+                acquire_output_lock(target, lock_fd)
+                ensure_output_directory(target)
+                preflight = reject_output_alias(
+                    a.out, comparison_input_paths(a, locked), target
+                )
+                reject_vm_withdrawn(locked["vm_run"])
+                ensure_output_directory(target)
+                clear_stale_output(target, preflight)
+                validate_output_lock(target, lock_fd)
+            except OSError as error:
+                raise Refusal(
+                    f"cannot clear stale output {a.out}: {error}"
+                ) from error
+            run_comparison(a, target, lock_fd, locked)
+        finally:
+            os.close(lock_fd)
+    finally:
+        os.close(target["directory_fd"])
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--vm-run", required=True)
@@ -1983,33 +2175,16 @@ def main():
         if lock_errors:
             raise Refusal("; ".join(lock_errors))
         locked = bind_locked_comparison_directories(a, lock_errors.run_dirs)
-
-        # The lock file is permanent. Unlinking a flock inode while another
-        # caller waits on it creates two lock domains and admits concurrent
-        # writers.
-        target = open_output_target(a.out)
-        try:
-            lock_fd = open_output_lock(target)
-            try:
-                try:
-                    acquire_output_lock(target, lock_fd)
-                    ensure_output_directory(target)
-                    preflight = reject_output_alias(
-                        a.out, comparison_input_paths(a, locked), target
-                    )
-                    reject_vm_withdrawn(locked["vm_run"])
-                    ensure_output_directory(target)
-                    clear_stale_output(target, preflight)
-                    validate_output_lock(target, lock_fd)
-                except OSError as error:
-                    raise Refusal(
-                        f"cannot clear stale output {a.out}: {error}"
-                    ) from error
-                run_comparison(a, target, lock_fd, locked)
-            finally:
-                os.close(lock_fd)
-        finally:
-            os.close(target["directory_fd"])
+        memory_specs = comparison_memory_directories(locked)
+        with campaign_summary.shared_run_directory_locks(
+                [access for _campaign, _display, access in memory_specs]
+                ) as memory_lock_errors:
+            if memory_lock_errors:
+                raise Refusal("; ".join(memory_lock_errors))
+            bind_locked_memory_directories(
+                locked, memory_specs, memory_lock_errors.run_dirs
+            )
+            publish_locked_comparison(a, locked)
 
 
 def run_comparison(
@@ -2062,15 +2237,22 @@ def run_comparison(
         if label in out["hosts"]:
             raise Refusal(f"duplicate --host label {label!r}")
         campaign_directory = None
+        memory_directory = None
         if locked_hosts is not None:
-            bound_label, display_directory, d, campaign_directory = next(
-                locked_hosts)
+            (
+                bound_label,
+                display_directory,
+                d,
+                campaign_directory,
+                memory_directory,
+            ) = next(locked_hosts)
             if bound_label != label:
                 raise Refusal("locked host directory order changed")
         else:
             display_directory = d
         meta, _records, rows, counts, identities = load_host_dataset(
-            d, require_driver=True, campaign_directory=campaign_directory
+            d, require_driver=True, campaign_directory=campaign_directory,
+            memory_directory=memory_directory,
         )
         if (locked is not None
                 and meta.get("corpus_extra_runtime_bundle_sha256") is not None):
@@ -2098,7 +2280,9 @@ def run_comparison(
             )
         seen_host_datasets[dataset_identity] = label
         seen_host_run_ids[meta["run_id"]] = label
-        host_rechecks.append((d, campaign_directory, identities))
+        host_rechecks.append(
+            (d, campaign_directory, memory_directory, identities)
+        )
         validate_host_compatibility(label, meta, rows, counts, vm_meta, vm)
         current_hostcdp_sha256 = meta["hostcdp_sha256"]
         if hostcdp_sha256 is None:
@@ -2108,11 +2292,16 @@ def run_comparison(
                 f"host {label} hostcdp_sha256={current_hostcdp_sha256!r} does "
                 f"not match the comparison producer {hostcdp_sha256!r}"
             )
-        host_mappings = (
-            [(d, display_directory),
-             (campaign_directory, str(campaign_directory))]
-            if locked is not None else []
-        )
+        host_mappings = []
+        if locked is not None:
+            host_mappings = [
+                (d, display_directory),
+                (campaign_directory, str(campaign_directory)),
+            ]
+            if memory_directory is not None:
+                host_mappings.append(
+                    (memory_directory, str(memory_directory))
+                )
         out["input_identity"]["hosts"][label] = display_artifact_identities(
             identities, host_mappings)
         out["hosts"][label] = {
@@ -2152,8 +2341,15 @@ def run_comparison(
         revalidate_artifact_identity(
             "VM reqbench_jsonl", vm_input_identity
         )
-        for directory, campaign_directory, identities in host_rechecks:
-            revalidate_host_inputs(directory, identities, campaign_directory)
+        for (
+                directory,
+                campaign_directory,
+                memory_directory,
+                identities,
+        ) in host_rechecks:
+            revalidate_host_inputs(
+                directory, identities, campaign_directory, memory_directory
+            )
         if output_target is not None and output_lock_fd is not None:
             validate_output_lock(output_target, output_lock_fd)
         reject_vm_withdrawn(vm_run)
@@ -2169,12 +2365,28 @@ def run_comparison(
             # are rejected before publication. Check parent relationships
             # first, then resolve each full canonical path as the final input
             # observation so a parent or child replacement cannot split it.
-            for label, _display, host_run, campaign_run in locked["hosts"]:
+            for (
+                    label,
+                    _display,
+                    host_run,
+                    campaign_run,
+                    memory_run,
+            ) in locked["hosts"]:
                 validate_locked_host_campaign(
                     host_run,
                     campaign_run,
                 )
-            for label, display, host_run, campaign_run in locked["hosts"]:
+                if memory_run is not None:
+                    validate_locked_campaign_memory(
+                        campaign_run, memory_run
+                    )
+            for (
+                    label,
+                    display,
+                    host_run,
+                    campaign_run,
+                    _memory_run,
+            ) in locked["hosts"]:
                 if label in locked["campaign_labels"]:
                     validate_canonical_campaign_host(
                         display, host_run, campaign_run, label

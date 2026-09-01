@@ -8839,6 +8839,46 @@ sys.stdin.read(1)
         self.assertIn("memory/complete.json", proc.stderr, proc.stderr)
         self.assertFalse(os.path.exists(out))
 
+    def test_withdrawn_campaign_memory_is_refused(self):
+        """A memory completion cannot authorize a withdrawn memory run.
+
+        RED BEFORE THE FIX: compare checked WITHDRAWN in the host and campaign
+        directories but ignored the marker beside memory/complete.json.
+        """
+        run, campaign, host, _memory = self.valid_campaign_memory_comparison()
+        marker = os.path.join(campaign, "memory", "WITHDRAWN")
+        with open(marker, "w") as handle:
+            handle.write("memory cleanup failed\n")
+
+        proc, out = self.run_compare(run, [("free", host)])
+
+        self.assertNotEqual(
+            proc.returncode, 0,
+            "a withdrawn memory run authorized comparison output",
+        )
+        self.assertIn("WITHDRAWN", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
+
+    def test_host_only_campaign_ignores_unconsumed_memory_entry(self):
+        """A host-only campaign must not lock an unrelated memory path.
+
+        RED BEFORE THE FIX: optional memory-lock discovery treated every
+        existing campaign/memory entry as an input before reading the campaign
+        phase declaration.  A regular-file sentinel then refused an otherwise
+        valid host-only comparison.
+        """
+        run, campaign, host = self.valid_campaign_comparison()
+        sentinel = os.path.join(campaign, "memory")
+        with open(sentinel, "w") as handle:
+            handle.write("not a campaign input\n")
+
+        proc, out = self.run_compare(run, [("free", host)])
+
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        self.assertTrue(os.path.isfile(out))
+        with open(sentinel) as handle:
+            self.assertEqual(handle.read(), "not a campaign input\n")
+
     def test_campaign_memory_completion_validates_its_nested_contract(self):
         mutations = {
             "schema version": lambda complete:
@@ -9700,13 +9740,18 @@ sys.stdin.read(1)
         RED BEFORE THE FIX: each exclusive writer acquired its directory and
         left WITHDRAWN beside a successful comparison.
         """
-        for location in ("vm", "host", "campaign"):
+        for location in ("vm", "host", "campaign", "memory"):
             with self.subTest(location=location):
-                run, campaign, host = self.valid_campaign_comparison()
+                if location == "memory":
+                    run, campaign, host, _memory = \
+                        self.valid_campaign_memory_comparison()
+                else:
+                    run, campaign, host = self.valid_campaign_comparison()
                 directory = {
                     "vm": run,
                     "host": host,
                     "campaign": campaign,
+                    "memory": os.path.join(campaign, "memory"),
                 }[location]
                 marker = os.path.join(directory, "WITHDRAWN")
                 out = os.path.join(run, "comparison.json")
@@ -9753,13 +9798,18 @@ sys.stdin.read(1)
 
     def test_comparison_reads_and_publishes_against_locked_run_directories(self):
         """A pathname replacement cannot escape a run directory's lock."""
-        for location in ("vm", "host", "campaign"):
+        for location in ("vm", "host", "campaign", "memory"):
             with self.subTest(location=location):
-                run, campaign, host = self.valid_campaign_comparison()
+                if location == "memory":
+                    run, campaign, host, _memory = \
+                        self.valid_campaign_memory_comparison()
+                else:
+                    run, campaign, host = self.valid_campaign_comparison()
                 directory = {
                     "vm": run,
                     "host": host,
                     "campaign": campaign,
+                    "memory": os.path.join(campaign, "memory"),
                 }[location]
                 displaced = directory + "-before-replacement"
                 out = os.path.join(os.path.dirname(run), f"{location}-comparison.json")
@@ -9785,7 +9835,8 @@ sys.stdin.read(1)
                      mock.patch.object(sys, "stdout", new=io.StringIO()):
                     with self.assertRaisesRegex(
                             bench_compare.Refusal,
-                            "changed after its directory lock was acquired|locked host"):
+                            "changed after its directory lock was acquired|"
+                            "locked host|locked memory"):
                         bench_compare.main()
 
                 self.assertTrue(replaced)
@@ -10670,40 +10721,502 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "cdpdrive.py", "render.py", "wddrive.py",
     )
 
-    def test_staged_bundle_is_independent_of_later_repository_edits(self):
+    def stage_function(self):
         with open(EXTRA) as handle:
             source = handle.read()
         match = re.search(r'^stage_runtime_bundle\(\) \{\n.*?^\}', source,
                           re.MULTILINE | re.DOTALL)
         self.assertIsNotNone(match, "corpus-extra has no runtime staging function")
-        with tempfile.TemporaryDirectory() as tmp:
-            bench = os.path.join(tmp, "source")
-            repo = os.path.join(tmp, "repo")
-            results = os.path.join(tmp, "results")
-            os.makedirs(bench)
-            os.makedirs(results)
-            os.makedirs(os.path.join(repo, "target", "release"))
-            corpus = os.path.join(bench, "corpus-live")
-            os.makedirs(corpus)
-            with open(os.path.join(corpus, "page.html"), "w") as handle:
-                handle.write("original corpus\n")
-            for name in self.SOURCES:
-                with open(os.path.join(bench, name), "w") as handle:
-                    handle.write(f"original {name}\n")
-            fcvm = os.path.join(repo, "target", "release", "fcvm")
-            with open(fcvm, "w") as handle:
-                handle.write("original fcvm\n")
-            fc_agent = os.path.join(repo, "target", "release", "fc-agent")
-            with open(fc_agent, "w") as handle:
-                handle.write("original fc-agent\n")
-            script = (
-                "set -euo pipefail\n"
-                f"SOURCE_BENCH={bench!r}\nREPO={repo!r}\nRESULTS={results!r}\n"
-                + match.group(0) + "\n"
-                + "stage_runtime_bundle\nprintf '%s\\n%s\\n' \"$BUNDLE_DIR\" \"$REQBENCH_BUNDLE_SHA256\"\n"
+        return match.group(0)
+
+    def verify_function(self):
+        with open(EXTRA) as handle:
+            source = handle.read()
+        match = re.search(r'^verify_runtime_bundle\(\) \{\n.*?^\}', source,
+                          re.MULTILINE | re.DOTALL)
+        self.assertIsNotNone(match, "corpus-extra has no runtime verifier")
+        return match.group(0)
+
+    def make_stage_fixture(self, tmp):
+        repo = os.path.join(tmp, "repo")
+        bench = os.path.join(repo, "bench", "chromium")
+        results = os.path.join(tmp, "results")
+        os.makedirs(bench)
+        os.makedirs(results)
+        os.makedirs(os.path.join(repo, "target", "release"))
+        corpus = os.path.join(bench, "corpus-live")
+        os.makedirs(corpus)
+        with open(os.path.join(corpus, "page.html"), "w") as handle:
+            handle.write("original corpus\n")
+        for name in self.SOURCES:
+            with open(os.path.join(bench, name), "w") as handle:
+                handle.write(f"original {name}\n")
+        for name in ("fcvm", "fc-agent"):
+            with open(os.path.join(repo, "target", "release", name), "w") as handle:
+                handle.write(f"original {name}\n")
+        subprocess.check_call(["git", "init", "-q", repo])
+        subprocess.check_call(
+            ["git", "-C", repo, "config", "user.email", "test@example.com"]
+        )
+        subprocess.check_call(
+            ["git", "-C", repo, "config", "user.name", "Test"]
+        )
+        subprocess.check_call(["git", "-C", repo, "add", "bench/chromium"])
+        subprocess.check_call(
+            ["git", "-C", repo, "commit", "-q", "-m", "fixture"]
+        )
+        return repo, bench, results
+
+    def run_stage_fixture(
+            self, repo, bench, results, source_identity=True, preamble=""):
+        identity = "unset SOURCE_REVISION SOURCE_GIT_DIRTY\n"
+        if source_identity:
+            identity = (
+                "SOURCE_REVISION=$(git -C \"$REPO\" rev-parse HEAD)\n"
+                "SOURCE_GIT_DIRTY=$(git -C \"$REPO\" status --porcelain "
+                "--untracked-files=no | tr '\\n' ';')\n"
             )
-            proc = subprocess.run(["bash", "-c", script], capture_output=True,
-                                  text=True, timeout=60)
+        script = (
+            "set -euo pipefail\n"
+            + preamble
+            + f"SOURCE_BENCH={bench!r}\nREPO={repo!r}\nRESULTS={results!r}\n"
+            + identity
+            + self.stage_function() + "\n"
+            + "stage_runtime_bundle\nprintf '%s\\n%s\\n' "
+            '"$BUNDLE_DIR" "$REQBENCH_BUNDLE_SHA256"\n'
+        )
+        return subprocess.run(
+            ["bash", "-c", script], capture_output=True, text=True, timeout=60
+        )
+
+    def test_stage_runtime_bundle_requires_source_identity_before_copy(self):
+        """The provenance check is mandatory for every staged bundle.
+
+        RED BEFORE THE FIX: the staging primitive accepted both source identity
+        variables unset and copied a complete bundle without verifying it.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+
+            proc = self.run_stage_fixture(
+                repo, bench, results, source_identity=False
+            )
+
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                "runtime staging succeeded without a source identity",
+            )
+            self.assertFalse(
+                os.path.lexists(os.path.join(results, "runtime")),
+                "staging copied bytes before rejecting missing provenance",
+            )
+
+    def test_clean_bundle_accepts_git_equivalent_regular_file_modes(self):
+        """Git's regular-file mode records only the owner executable bit.
+
+        RED BEFORE THE FIX: the verifier interpreted 100644 as exact mode 0644
+        and rejected a clean checkout whose non-executable file was mode 0640.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            os.chmod(os.path.join(bench, "corpus_mem.py"), 0o640)
+            status = subprocess.check_output(
+                ["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+                text=True,
+            )
+            self.assertEqual(status, "", "fixture mode is not Git-equivalent")
+
+            proc = self.run_stage_fixture(repo, bench, results)
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
+    def test_clean_bundle_rejects_git_executable_mismatch(self):
+        """A clean bundle must preserve Git's owner-executable bit."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            source = os.path.join(bench, "corpus_mem.py")
+            subprocess.check_call(
+                ["git", "-C", repo, "config", "core.fileMode", "false"]
+            )
+            os.chmod(source, 0o755)
+            status = subprocess.check_output(
+                ["git", "-C", repo, "status", "--porcelain",
+                 "--untracked-files=no"],
+                text=True,
+            )
+            self.assertEqual(status, "", "fixture mode is visible to Git status")
+
+            proc = self.run_stage_fixture(repo, bench, results)
+
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                "clean staging ignored Git's owner-executable bit",
+            )
+
+    def test_bundle_identity_normalizes_and_verifies_executable_modes(self):
+        """One bundle identity names one canonical executable-mode topology.
+
+        RED BEFORE THE FIX: clean 0644 and dirty 0755 copies of the same
+        corpus_mem.py bytes produced the same bundle digest, and the runtime
+        verifier accepted both different topologies because it checked bytes.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, clean_results = self.make_stage_fixture(tmp)
+            clean = self.run_stage_fixture(repo, bench, clean_results)
+            self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)
+            clean_bundle = clean.stdout.strip().splitlines()[-2]
+
+            os.chmod(os.path.join(bench, "corpus_mem.py"), 0o755)
+            dirty_results = os.path.join(tmp, "dirty-results")
+            os.makedirs(dirty_results)
+            dirty = self.run_stage_fixture(repo, bench, dirty_results)
+            self.assertEqual(dirty.returncode, 0, dirty.stdout + dirty.stderr)
+            dirty_bundle = dirty.stdout.strip().splitlines()[-2]
+
+            self.assertEqual(
+                os.path.basename(clean_bundle),
+                os.path.basename(dirty_bundle),
+                "source modes should not fragment a canonical runtime bundle",
+            )
+            clean_mode = os.stat(
+                os.path.join(clean_bundle, "corpus_mem.py")
+            ).st_mode & 0o777
+            dirty_mode = os.stat(
+                os.path.join(dirty_bundle, "corpus_mem.py")
+            ).st_mode & 0o777
+            self.assertEqual(
+                clean_mode,
+                dirty_mode,
+                "one bundle identity named different executable modes",
+            )
+
+            verify_script = (
+                "set -euo pipefail\n"
+                f"HERE={dirty_bundle!r}\n"
+                "BENCH=$HERE\n"
+                "CORPUS_EXTRA_RUNTIME_BUNDLE=$HERE\n"
+                f"CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256="
+                f"{os.path.basename(dirty_bundle)!r}\n"
+                + self.verify_function() + "\n"
+                + "verify_runtime_bundle\n"
+            )
+            verified = subprocess.run(
+                ["bash", "-c", verify_script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertEqual(
+                verified.returncode, 0, verified.stdout + verified.stderr
+            )
+
+            os.chmod(os.path.join(dirty_bundle, "corpus_mem.py"), 0o444)
+            changed = subprocess.run(
+                ["bash", "-c", verify_script],
+                capture_output=True,
+                text=True,
+                timeout=60,
+            )
+            self.assertNotEqual(
+                changed.returncode,
+                0,
+                "runtime verification accepted a changed executable mode",
+            )
+
+    def test_dirty_bundle_requires_every_runtime_source_in_the_index(self):
+        """Dirty bytes may vary, but every copied script must remain tracked."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            subprocess.check_call(
+                ["git", "-C", repo, "rm", "--cached", "bench/chromium/render.py"],
+                stdout=subprocess.DEVNULL,
+            )
+            self.assertTrue(
+                os.path.isfile(os.path.join(bench, "render.py")),
+                "fixture removed the worktree source",
+            )
+
+            proc = self.run_stage_fixture(repo, bench, results)
+
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                "dirty staging copied a required script absent from the index",
+            )
+
+    def test_runtime_staging_rechecks_source_identity_after_copy(self):
+        """Both the recorded revision and tracked status stay fixed while copying."""
+        for change in ("revision", "status"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                repo, bench, results = self.make_stage_fixture(tmp)
+                stub = os.path.join(tmp, "bin")
+                marker = os.path.join(tmp, "identity-raced")
+                os.makedirs(stub)
+                wrapper = os.path.join(stub, "cp")
+                with open(wrapper, "w") as handle:
+                    handle.write(
+                        "#!/usr/bin/env bash\n"
+                        "set -euo pipefail\n"
+                        "args=(\"$@\")\n"
+                        "source_path=${args[${#args[@]}-2]}\n"
+                        "\"$REAL_CP\" \"$@\"\n"
+                        "if [[ $source_path == */corpus_mem.py "
+                        "&& ! -e $HOOK_MARKER ]]; then\n"
+                        "  if [[ $HOOK_CHANGE == revision ]]; then\n"
+                        "    git -C \"$HOOK_REPO\" commit --allow-empty -q "
+                        "-m identity-race\n"
+                        "  else\n"
+                        "    printf '%s\\n' 'identity raced bytes' >> \"$source_path\"\n"
+                        "  fi\n"
+                        "  : > \"$HOOK_MARKER\"\n"
+                        "fi\n"
+                    )
+                os.chmod(wrapper, 0o755)
+
+                proc = self.run_stage_fixture(
+                    repo,
+                    bench,
+                    results,
+                    preamble=(
+                        f"export PATH={stub!r}:$PATH\n"
+                        f"export REAL_CP={shutil.which('cp')!r}\n"
+                        f"export HOOK_MARKER={marker!r}\n"
+                        f"export HOOK_CHANGE={change!r}\n"
+                        f"export HOOK_REPO={repo!r}\n"
+                    ),
+                )
+
+                self.assertTrue(os.path.isfile(marker), proc.stdout + proc.stderr)
+                self.assertNotEqual(
+                    proc.returncode,
+                    0,
+                    f"staging ignored a post-copy source {change} change",
+                )
+
+    def test_bundle_rejects_untracked_corpus_entries(self):
+        """The source identity must account for every copied corpus entry.
+
+        RED BEFORE THE FIX: tracked-only status stayed clean while cp -a copied
+        an untracked file or symlink that the revision verifier never enumerated.
+        Dirty tracked bytes must not make unrelated untracked entries eligible.
+        """
+        for state in ("clean", "dirty"):
+            for kind in ("file", "symlink"):
+                with self.subTest(state=state, kind=kind), \
+                        tempfile.TemporaryDirectory() as tmp:
+                    repo, bench, results = self.make_stage_fixture(tmp)
+                    if state == "dirty":
+                        with open(os.path.join(bench, "corpus_mem.py"), "a") as handle:
+                            handle.write("dirty tracked source\n")
+                    extra = os.path.join(
+                        bench, "corpus-live", f"untracked-{kind}"
+                    )
+                    if kind == "file":
+                        with open(extra, "w") as handle:
+                            handle.write("untracked corpus bytes\n")
+                    else:
+                        os.symlink("page.html", extra)
+                    status = subprocess.check_output(
+                        ["git", "-C", repo, "status", "--porcelain",
+                         "--untracked-files=no"],
+                        text=True,
+                    )
+                    if state == "clean":
+                        self.assertEqual(
+                            status, "", "tracked-only status saw the extra"
+                        )
+                    else:
+                        self.assertNotEqual(status, "", "fixture is not dirty")
+
+                    proc = self.run_stage_fixture(repo, bench, results)
+
+                    self.assertNotEqual(
+                        proc.returncode,
+                        0,
+                        f"{state} staging accepted an untracked corpus {kind}",
+                    )
+
+    def test_bundle_rejects_corpus_symlinks_the_manifest_cannot_seal(self):
+        """Every staged entry must be verifiable by MANIFEST.sha256.
+
+        RED BEFORE THE FIX: a tracked symlink passed the revision check but
+        find -type f omitted it from MANIFEST.sha256.  A dirty run skipped the
+        revision check and admitted an untracked symlink the same way.
+        """
+        for state in ("clean-tracked", "dirty-untracked"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                repo, bench, results = self.make_stage_fixture(tmp)
+                link = os.path.join(bench, "corpus-live", "linked-page")
+                os.symlink("page.html", link)
+                if state == "clean-tracked":
+                    subprocess.check_call(
+                        ["git", "-C", repo, "add", "bench/chromium/corpus-live"]
+                    )
+                    subprocess.check_call(
+                        ["git", "-C", repo, "commit", "-q", "-m", "link fixture"]
+                    )
+                else:
+                    with open(os.path.join(bench, "corpus_mem.py"), "a") as handle:
+                        handle.write("dirty tracked source\n")
+
+                proc = self.run_stage_fixture(repo, bench, results)
+
+                self.assertNotEqual(
+                    proc.returncode,
+                    0,
+                    f"{state} corpus symlink escaped the runtime manifest",
+                )
+
+    def test_bundle_rejects_symlinked_corpus_root(self):
+        """The corpus root itself must be sealed as a real directory.
+
+        RED BEFORE THE FIX: cp -a preserved a dirty corpus-live symlink,
+        Python followed it while validating the tracked children, and find
+        omitted the entire external tree from MANIFEST.sha256.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            corpus = os.path.join(bench, "corpus-live")
+            external = os.path.join(tmp, "external-corpus")
+            os.rename(corpus, external)
+            os.symlink(external, corpus)
+
+            proc = self.run_stage_fixture(repo, bench, results)
+
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                "a symlinked corpus root escaped the runtime manifest",
+            )
+
+    def test_dirty_bundle_accepts_indexed_corpus_changes(self):
+        """Dirty source topology is sealed by the runtime manifest.
+
+        RED BEFORE THE FIX: the revision verifier required the committed file
+        set even when SOURCE_GIT_DIRTY said the run intentionally used dirty
+        tracked sources, rejecting modifications, indexed additions, and
+        tracked deletions even though the bundle manifest seals their bytes.
+        """
+        for change in ("modification", "indexed-addition", "deletion"):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
+                repo, bench, results = self.make_stage_fixture(tmp)
+                corpus = os.path.join(bench, "corpus-live")
+                added = os.path.join(corpus, "added.html")
+                page = os.path.join(corpus, "page.html")
+                if change == "modification":
+                    with open(page, "a") as handle:
+                        handle.write("dirty tracked corpus bytes\n")
+                elif change == "indexed-addition":
+                    with open(added, "w") as handle:
+                        handle.write("regular dirty addition\n")
+                    subprocess.check_call(
+                        ["git", "-C", repo, "add", "bench/chromium/corpus-live"]
+                    )
+                else:
+                    os.unlink(page)
+
+                proc = self.run_stage_fixture(repo, bench, results)
+
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                bundle = proc.stdout.strip().splitlines()[-2]
+                with open(os.path.join(bundle, "MANIFEST.sha256")) as handle:
+                    manifest = handle.read()
+                if change == "indexed-addition":
+                    self.assertIn("./corpus-live/added.html", manifest)
+                elif change == "modification":
+                    self.assertIn("./corpus-live/page.html", manifest)
+                else:
+                    self.assertNotIn("./corpus-live/page.html", manifest)
+
+    def test_nested_manifest_named_file_is_sealed(self):
+        """Only the root output manifest may be absent from its own listing.
+
+        RED BEFORE THE FIX: find excluded every file named MANIFEST.sha256, so
+        a committed corpus-live/MANIFEST.sha256 shipped outside the root seal.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            nested = os.path.join(bench, "corpus-live", "MANIFEST.sha256")
+            with open(nested, "w") as handle:
+                handle.write("nested corpus bytes\n")
+            subprocess.check_call(
+                ["git", "-C", repo, "add", "bench/chromium/corpus-live"]
+            )
+            subprocess.check_call(
+                ["git", "-C", repo, "commit", "-q", "-m", "nested manifest"]
+            )
+
+            proc = self.run_stage_fixture(repo, bench, results)
+
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            bundle = proc.stdout.strip().splitlines()[-2]
+            with open(os.path.join(bundle, "MANIFEST.sha256")) as handle:
+                manifest = handle.read()
+            self.assertIn("./corpus-live/MANIFEST.sha256", manifest)
+
+    def test_stage_runtime_bundle_rejects_transient_tracked_source_edit(self):
+        """A clean revision must name the exact tracked bytes staged.
+
+        RED BEFORE THE FIX: a cp wrapper changed corpus_mem.py only while it
+        was copied, then restored the checkout before staging returned.  The
+        bundle contained the raced bytes while provenance still said the
+        recorded revision was clean.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            stub = os.path.join(tmp, "bin")
+            marker = os.path.join(tmp, "copy-raced")
+            os.makedirs(stub)
+
+            wrapper = os.path.join(stub, "cp")
+            with open(wrapper, "w") as handle:
+                handle.write(
+                    "#!/usr/bin/env bash\n"
+                    "set -euo pipefail\n"
+                    "args=(\"$@\")\n"
+                    "source_path=${args[${#args[@]}-2]}\n"
+                    "if [[ $source_path == */corpus_mem.py && ! -e $HOOK_MARKER ]]; then\n"
+                    "  backup=$(mktemp)\n"
+                    "  \"$REAL_CP\" -p -- \"$source_path\" \"$backup\"\n"
+                    "  printf '%s\\n' 'transient raced bytes' > \"$source_path\"\n"
+                    "  \"$REAL_CP\" \"$@\"\n"
+                    "  \"$REAL_CP\" -p -- \"$backup\" \"$source_path\"\n"
+                    "  rm -- \"$backup\"\n"
+                    "  : > \"$HOOK_MARKER\"\n"
+                    "else\n"
+                    "  exec \"$REAL_CP\" \"$@\"\n"
+                    "fi\n"
+                )
+            os.chmod(wrapper, 0o755)
+            proc = self.run_stage_fixture(
+                repo,
+                bench,
+                results,
+                preamble=(
+                    f"export PATH={stub!r}:$PATH\n"
+                    f"export REAL_CP={shutil.which('cp')!r}\n"
+                    f"export HOOK_MARKER={marker!r}\n"
+                ),
+            )
+            self.assertTrue(os.path.isfile(marker), proc.stdout + proc.stderr)
+            status = subprocess.check_output(
+                ["git", "-C", repo, "status", "--porcelain", "--untracked-files=no"],
+                text=True,
+            )
+            self.assertEqual(status, "", "the copy hook did not restore the checkout")
+            self.assertNotEqual(
+                proc.returncode,
+                0,
+                "staging accepted transient tracked bytes while recording a clean "
+                f"revision\n{proc.stdout}{proc.stderr}",
+            )
+
+    def test_staged_bundle_is_independent_of_later_repository_edits(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, bench, results = self.make_stage_fixture(tmp)
+            proc = self.run_stage_fixture(repo, bench, results)
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             bundle, reqbench_digest = proc.stdout.strip().splitlines()[-2:]
             with open(os.path.join(bench, "corpus_mem.py"), "w") as handle:
