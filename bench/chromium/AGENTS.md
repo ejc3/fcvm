@@ -273,9 +273,10 @@ easy to get wrong:
    pool comparator summed an entire cgroup — it excluded the `fcvm` process, the
    `unshare` holder, `pasta`, and the page cache holding memory.bin. On a matched
    whole-machine basis the difference vanished and both *lost* to the pool.
-   Report at least two independent bases (per-clone cgroup/PSS **and** whole-machine
-   `MemAvailable` delta from a quiescent baseline) and **reconcile them**. A 2x gap
-   between bases is a finding, not a rounding error.
+   Report cgroup memory and PSS over the same process set and **reconcile them**.
+   A 2x gap between bases is a finding, not a rounding error. Host-global
+   `MemAvailable` may remain in raw diagnostics, but it is not a publishable
+   memory basis because unrelated processes can change it.
 
 2. **Interleave, never block.** Modes/configs must be shuffled request-by-request
    from a recorded seed, all serves running concurrently. The retracted egress

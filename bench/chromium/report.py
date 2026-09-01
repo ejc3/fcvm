@@ -181,7 +181,8 @@ def pss_kb_of_pid(pid):
 # cgroup. Everything below measures both sides through the SAME two bases:
 #   cgroup  memory.current of the cgroup that contains the entire process set
 #   pss     PSS summed over exactly that cgroup's process set
-# plus a machine-level MemAvailable delta recorded by the caller.
+# Raw samples also carry host-global MemAvailable as a diagnostic. The matched
+# corpus fit does not publish it as a memory basis.
 
 
 class CgroupReadError(RuntimeError):

@@ -239,7 +239,7 @@ class MemoryFitPublication(unittest.TestCase):
             ),
             "observed totals": self.cells(
                 slopes=(100.0, 100.0, 100.0),
-                intercepts=(0.0, 50.0, 1_000.0),
+                intercepts=(0.0, 250.0, 1_000.0),
             ),
         }
         for label, cells in cases.items():
@@ -268,6 +268,25 @@ class MemoryFitPublication(unittest.TestCase):
             self.assertEqual(reconciliation["status"], "accepted")
             self.assertLess(reconciliation["maximum_pairwise_ratio"], 2.0)
             self.assertEqual(reconciliation["refusal_ratio"], 2.0)
+
+    def test_host_global_memavailable_is_not_a_publishable_memory_basis(self):
+        """Unowned host processes cannot change a reported memory cost."""
+        fits = corpus_mem.summarize_memory_fits(
+            self.cells(
+                slopes=(100.0, 90.0, 1.0),
+                intercepts=(40.0, 30.0, 1.0),
+            ),
+            seed=9182,
+            bootstrap_resamples=200,
+        )
+        for side in ("fcvm-clone", "host-container"):
+            self.assertNotIn("mem_available_delta_mib", fits[side])
+        self.assertNotIn(
+            "mem_available_delta_mib", corpus_mem.cell_values(self.cells()[0])
+        )
+        with open(CORPUS_MEM) as handle:
+            source = handle.read()
+        self.assertNotIn('"mem_available_delta_mib_per_instance"', source)
 
     def test_memory_fit_reports_density_at_each_measured_n(self):
         cells = self.cells()
@@ -3234,7 +3253,7 @@ class ZeroBasis(unittest.TestCase):
         values = corpus_mem.cell_values(cell)
         self.assertEqual(values["cgroup_mib"], 200.0)
         self.assertEqual(values["pss_mib"], 200.0)
-        self.assertEqual(values["mem_available_delta_mib"], 150.0)
+        self.assertNotIn("mem_available_delta_mib", values)
 
     def test_every_steady_sample_is_validated_before_the_median(self):
         good = {

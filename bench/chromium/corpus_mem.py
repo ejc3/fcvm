@@ -13,9 +13,9 @@ the container side measured a whole cgroup):
            cgroup.
   pss      PSS summed over exactly that cgroup's process set.
 
-A third, attribution-free basis is recorded beside them: MemAvailable measured
-on a quiesced box before the instances exist and again while they are held, so a
-reader can check the attributed numbers against a machine-level delta.
+Raw samples retain host-global MemAvailable for diagnostics. It is not a
+published memory basis because an unrelated process can change it without
+appearing in this run's cgroup or PSS process set.
 
 Every instance renders one corpus page before it is sampled, so what is measured
 is an instance that has done the work, not one that has merely booted.  The
@@ -1362,7 +1362,7 @@ def slope_intercept(xs, ys):
     return slope, my - slope * mx
 
 
-MEMORY_BASES = ("cgroup_mib", "pss_mib", "mem_available_delta_mib")
+MEMORY_BASES = ("cgroup_mib", "pss_mib")
 MEMORY_BOOTSTRAP_RESAMPLES = 5000
 MEMORY_BASIS_REFUSAL_RATIO = 2.0
 
@@ -1790,10 +1790,7 @@ def cell_values(cell):
     counted = statistics.median(s[count_key] for s in steady)
     cg = statistics.median(s[cgroup_key] for s in steady) / 1024
     pss = statistics.median(s[pss_key] for s in steady) / 1024
-    available = statistics.median(s["mem_available_kb"] for s in steady)
-    avail_delta = (cell["pre"]["mem_available_kb"] - available) / 1024
-    out = {"instances_counted": counted, "cgroup_mib": cg, "pss_mib": pss,
-           "mem_available_delta_mib": avail_delta}
+    out = {"instances_counted": counted, "cgroup_mib": cg, "pss_mib": pss}
     if all("fc_only_pss_kb" in s for s in steady):
         out["refuted_fc_only_pss_mib"] = statistics.median(
             s["fc_only_pss_kb"] for s in steady
@@ -1908,8 +1905,8 @@ def main_with_resources(resources):
             "basis": "cgroup memory.current and PSS summed over EXACTLY that cgroup's "
                      "process set, on both sides: an fcvm clone's leaf cgroup holds fcvm, "
                      "firecracker, the namespace holder and pasta; a container's cgroup is "
-                     "podman's own. MemAvailable delta from a quiesced pre-sample is recorded "
-                     "beside them as an attribution-free check."}
+                     "podman's own. Raw samples retain host-global MemAvailable only as a "
+                     "diagnostic; summary.json does not publish it as a memory basis."}
     claim_results_dir(args.results)
     try:
         os.makedirs(args.container_create_ops_dir, exist_ok=True)
@@ -1952,9 +1949,8 @@ def main_with_resources(resources):
         v = cell_values(c)
         summary["cells"].append({"side": c["side"], "n": c["n"], "rep": c["rep"], **v,
                                  "cgroup_mib_per_instance": round(v["cgroup_mib"] / c["n"], 1),
-                                 "pss_mib_per_instance": round(v["pss_mib"] / c["n"], 1),
-                                 "mem_available_delta_mib_per_instance": round(
-                                     v["mem_available_delta_mib"] / c["n"], 1)})
+                                 "pss_mib_per_instance": round(
+                                     v["pss_mib"] / c["n"], 1)})
     try:
         summary["fits"] = summarize_memory_fits(cells, args.seed)
     except RuntimeError as exc:
