@@ -254,7 +254,7 @@ class HostCdpSummaryProvenance(unittest.TestCase):
 
     A host p50 is only divisible into a VM p50 if both are statistics.median,
     and a reader of summary.json alone cannot check that unless the record says
-    so; the previous corpus run needed a post-hoc resummarize to add it.
+    so; old summaries that omitted the convention cannot support a ratio.
     Contention is the other half: reqbench.py stamps loadavg1 on every record
     and reqanalyze reports min/median/max "during run", while this control
     recorded only the load at start, which cannot show contention that arrived

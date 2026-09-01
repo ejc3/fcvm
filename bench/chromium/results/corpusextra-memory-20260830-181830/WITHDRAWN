@@ -1,1 +1,0 @@
-The memory and CPU comparisons are withdrawn because side order was blocked, workloads varied with N, and the run lacks snapshot and schedule identity.

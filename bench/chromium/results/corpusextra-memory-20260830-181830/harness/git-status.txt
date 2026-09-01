@@ -1,2 +1,0 @@
- M bench/chromium/hostcdp.sh
- M bench/chromium/report.py
