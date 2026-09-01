@@ -1432,6 +1432,29 @@ git push origin feature-b --force
 
 ### THREE BROAD REVIEW PASSES, NOT AN OPEN-ENDED REVIEW LOOP
 
+Three broad passes are a ceiling, not a checklist. Every PR has the same minimum
+bar: focused regression coverage for each accepted defect class, one run of the
+relevant suite, self-review of the complete delta, required CI, and exact-head
+review coverage.
+
+Set any additional review from the downstream impact and demonstrated failure
+mechanisms, not from where the code runs. Production runtime, security,
+isolation, persistent data, migrations, recovery, public compatibility, and any
+CI, release, or review gate that can fail open may need the architecture,
+candidate, and closure passes below.
+
+For benchmarks, non-gating test harnesses, internal developer tools, and
+documentation whose failure cannot approve or ship production code, the minimum
+bar is normally sufficient. Do not add broad review passes, soak tests, fuzzing,
+platform matrices, or historical research unless the user asks for them or the
+demonstrated failure mechanism needs them.
+
+Write the PR's contract, downstream impact, and minimum evidence in the PR
+description.
+A race in benchmark output can invalidate the benchmark and must be fixed, but
+it does not turn benchmark tooling into a production safety system. Once the
+stated evidence is green, stop.
+
 A review campaign has at most three broad passes:
 
 1. **Architecture pass, before implementation.** Write the invariants, ownership
@@ -1467,6 +1490,11 @@ passes four, five, and six. This does not waive a concrete defect: fix it and pr
 using a fixture or source-level assertion for a non-runtime contract. Keep the follow-up
 review targeted to that repair and the final exact head.
 
+There is one closure repair batch. If another blocking finding appears after that batch,
+reduce or split the PR to its last proven contract before adding more machinery. If the
+contract cannot be preserved by reduction, report the blocker and ask the user whether to
+continue. Do not silently begin another repair and review cycle.
+
 When a user-controlled remote is authorized, push each signed, focused-green frozen
 checkpoint before beginning the next pass. A remote checkpoint is recovery and visibility;
 it is not merge authorization and its old checks do not cover later local commits.
@@ -1492,6 +1520,20 @@ hostage to unrelated improvements either. A review thread classified as a follow
 needs the gate's existing disposition vocabulary. Reply with `DISAGREE: this PR does not
 cause or worsen the reported behavior; tracked in #N` and resolve it only when the diff and
 tests substantiate that statement. If they do not, the finding blocks this PR.
+
+### REMOVE GOLD PLATING BEFORE CLOSURE
+
+Every changed file, abstraction, test, and evidence artifact must do at least one of these:
+
+- implement the PR's stated contract;
+- close an accepted blocking finding caused or worsened by the PR;
+- provide evidence that is not already supplied by a cheaper test or summary.
+
+Remove or split everything else. Prefer deleting optional behavior or reverting to the last
+proven implementation over expanding a low-risk PR to defend it. Use one deterministic test
+per defect class, not several tests of the same invariant. Do not generalize a one-caller fix
+without a second required caller. Do not commit raw benchmark output when a small summary and
+the command that produced it carry the required evidence.
 
 ### Claude Review Workflow
 
