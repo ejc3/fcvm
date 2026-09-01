@@ -1432,27 +1432,25 @@ git push origin feature-b --force
 
 ### THREE BROAD REVIEW PASSES, NOT AN OPEN-ENDED REVIEW LOOP
 
-Three broad passes are a ceiling, not a checklist. Set the minimum bar before
-work starts from the downstream impact of a bad merge, not from where the code
-runs. A CI, release, or review gate that can approve or ship bad code is high
-risk when it fails open.
+Three broad passes are a ceiling, not a checklist. Every PR has the same minimum
+bar: focused regression coverage for each accepted defect class, one run of the
+relevant suite, self-review of the complete delta, required CI, and exact-head
+review coverage.
 
-- **High risk:** production runtime, security or isolation, persistent data,
-  migrations, recovery, or public compatibility. Use the architecture,
-  candidate, and closure passes when they apply.
-- **Normal risk:** user-visible behavior with a bounded, reversible failure.
-  Require focused regression coverage, the relevant suite, self-review of the
-  complete delta, required CI, and exact-head review coverage.
-- **Low risk:** benchmarks, non-gating test harnesses, internal developer tools,
-  and documentation whose failure cannot approve or ship production code. The
-  normal minimum is one
-  focused regression for each accepted defect class, one run of the relevant
-  suite, self-review of the complete delta, required CI, and one exact-head
-  automated review result. Do not add broad review passes, soak tests, fuzzing,
-  platform matrices, or historical research unless the user asks for them or
-  the demonstrated failure mechanism needs them.
+Set any additional review from the downstream impact and demonstrated failure
+mechanisms, not from where the code runs. Production runtime, security,
+isolation, persistent data, migrations, recovery, public compatibility, and any
+CI, release, or review gate that can fail open may need the architecture,
+candidate, and closure passes below.
 
-Write the PR's contract, risk class, and minimum evidence in the PR description.
+For benchmarks, non-gating test harnesses, internal developer tools, and
+documentation whose failure cannot approve or ship production code, the minimum
+bar is normally sufficient. Do not add broad review passes, soak tests, fuzzing,
+platform matrices, or historical research unless the user asks for them or the
+demonstrated failure mechanism needs them.
+
+Write the PR's contract, downstream impact, and minimum evidence in the PR
+description.
 A race in benchmark output can invalidate the benchmark and must be fixed, but
 it does not turn benchmark tooling into a production safety system. Once the
 stated evidence is green, stop.
