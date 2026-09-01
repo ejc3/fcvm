@@ -989,6 +989,8 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
     """
 
     def test_a_surviving_child_blocks_the_reap_and_raises(self):
+        from unittest import mock
+
         with tempfile.TemporaryDirectory() as d:
             state_dir = os.path.join(d, "state")
             disks = os.path.join(d, "vm-disks", "vm-22222222222222222222222222222222")
@@ -997,6 +999,13 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
             marker = os.path.join(disks, "rootfs.raw")
             with open(marker, "w") as f:
                 f.write("golden reflink")
+            # Publishing state through an external `cat` adds a transient direct
+            # child. Hold that child across the initial capture, then let it exit
+            # before the timeout capture so the fixture regression is deterministic.
+            slow_cat = os.path.join(d, "cat")
+            with open(slow_cat, "w") as f:
+                f.write("#!/bin/bash\n/bin/cat \"$@\"\nsleep 0.2\n")
+            os.chmod(slow_cat, 0o755)
             stub = os.path.join(d, "fcvm-stub")
             with open(stub, "w") as f:
                 f.write(
@@ -1004,9 +1013,10 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                     "sleep 300 &\n"     # UNARMED child: survives parent SIGKILL
                     "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
                     "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
-                    f"cat > {state_dir}/vm-22222222222222222222222222222222.json <<EOF\n"
-                    '{"vm_id": "vm-22222222222222222222222222222222", "name": "rb-test-run-0-exec", "pid": $$, "pid_start_time": $start, "lifecycle_ready": true}\n'
-                    "EOF\n"
+                    "printf '{\"vm_id\": \"vm-22222222222222222222222222222222\", "
+                    "\"name\": \"rb-test-run-0-exec\", \"pid\": %s, "
+                    "\"pid_start_time\": %s, \"lifecycle_ready\": true}\\n' "
+                    f'"$$" "$start" > {state_dir}/vm-22222222222222222222222222222222.json\n'
                     f": > {state_dir}/vm-22222222222222222222222222222222.json.lock\n"
                     "wait\n"
                 )
@@ -1017,12 +1027,16 @@ class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
                 timeout=0.6, teardown_timeout=0.4,
                 state_dir=state_dir, data_root=d, run_id="test-run",
             )
-            try:
-                returned = reqbench.run_exec_request(args, 0)
-            except reqbench.SurvivedTeardown as error:
-                cm = error
-            else:
-                self.fail(f"live-child exec teardown returned instead of aborting: {returned}")
+            with mock.patch.dict(
+                os.environ,
+                {"PATH": d + os.pathsep + os.environ["PATH"]},
+            ):
+                try:
+                    returned = reqbench.run_exec_request(args, 0)
+                except reqbench.SurvivedTeardown as error:
+                    cm = error
+                else:
+                    self.fail(f"live-child exec teardown returned instead of aborting: {returned}")
             rec = cm.record
             try:
                 self.assertTrue(rec.get("survivors"), f"no survivor list in {rec}")
@@ -1212,14 +1226,41 @@ class TeardownFastCpuAccounting(unittest.TestCase):
         """
         from unittest import mock
 
-        p = spawn_pdeathsig_parent(["sleep", "300"])
-        wait_for_child(p.pid)
-        kids = reqbench.children_of(p.pid)
-        self.assertEqual(len(kids), 1, "parent never forked its child")
+        with child_subreaper():
+            p = spawn_pdeathsig_parent(["sleep", "300"])
+            kids = []
+            statuses = {}
+            try:
+                wait_for_child(p.pid)
+                kids = reqbench.children_of(p.pid)
+                self.assertEqual(len(kids), 1, "parent never forked its child")
 
-        boom = RuntimeError("host CPU delta is smaller than enclosed harness CPU delta")
-        with mock.patch.object(reqbench, "bounded_cpu_residual", side_effect=boom):
-            out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+                boom = RuntimeError(
+                    "host CPU delta is smaller than enclosed harness CPU delta")
+                with mock.patch.object(
+                        reqbench, "bounded_cpu_residual", side_effect=boom):
+                    out = reqbench.teardown_fast(p.pid, "", "", "", 5.0)
+                self.assertEqual(
+                    p.wait(timeout=5), -signal.SIGKILL,
+                    "fast teardown did not SIGKILL its direct owner",
+                )
+                for pid in kids:
+                    note = f"fast teardown left pdeathsig child {pid} running"
+                    statuses[pid] = reap_orphan(pid, note)
+            finally:
+                if p.poll() is None:
+                    kill_tree(p)
+                for pid in kids:
+                    if pid in statuses:
+                        continue
+                    fields = reqbench.proc_stat_fields(pid)
+                    if fields is not None and fields[0] not in ("Z", "X", "x"):
+                        try:
+                            os.kill(pid, signal.SIGKILL)
+                        except ProcessLookupError:
+                            pass
+                    statuses[pid] = reap_orphan(
+                        pid, f"cleanup could not reap pdeathsig child {pid}")
 
         self.assertTrue(out["all_gone"], "the process set must still be reaped")
         self.assertNotIn("disk_reap_skipped", out,
@@ -1233,8 +1274,10 @@ class TeardownFastCpuAccounting(unittest.TestCase):
             self.assertNotIn(absent, out,
                              f"{absent} must be ABSENT, not zeroed, when unmeasurable")
         for pid in kids:
-            self.assertFalse(reqbench.proc_stat_fields(pid),
-                             f"child {pid} survived a teardown that reported success")
+            assert_sigkilled(
+                self, pid, statuses[pid],
+                f"child {pid} survived a teardown that reported success",
+            )
 
     def test_the_probe_reports_this_host_tracks_its_own_processes(self):
         """The probe must say yes HERE, or it would excuse every real violation.
@@ -2623,7 +2666,7 @@ class AnalyzerAvailability(unittest.TestCase):
         arms = ["exec", "cdp", "cdp-fast", "noop"]
         warmup = 2
         seed = 1
-        run_id = "fixture-" + os.path.basename(path).replace(".", "-")
+        run_id = hashlib.sha256(os.path.basename(path).encode()).hexdigest()[:32]
         meta = {
             "kind": "meta", "run_id": run_id, "seed": seed, "backend": backend,
             "uffd_mode": "file" if backend == "file" else "copy",
@@ -5993,6 +6036,27 @@ class HostCdpQuietGate(unittest.TestCase):
 
     SH = os.path.join(HERE, "hostcdp.sh")
 
+    @staticmethod
+    def producer_contract_env(directory):
+        runtime = os.path.join(directory, "runtime")
+        os.makedirs(runtime)
+        payload = os.path.join(runtime, "payload")
+        with open(payload, "w") as handle:
+            handle.write("sealed\n")
+        payload_digest = hashlib.sha256(b"sealed\n").hexdigest()
+        manifest = os.path.join(runtime, "REQBENCH_MANIFEST.sha256")
+        with open(manifest, "w") as handle:
+            handle.write(f"{payload_digest}  payload\n")
+        with open(manifest, "rb") as handle:
+            runtime_identity = hashlib.sha256(handle.read()).hexdigest()
+        return {
+            "COMPARISON_LABEL": "quiet-gate",
+            "CPU_BUDGET": "unlimited",
+            "CONTAINER_OWNER_TOKEN": "1" * 32,
+            "REQBENCH_RUNTIME_MANIFEST": manifest,
+            "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
+        }
+
     def test_the_gate_reads_a_leading_zero_window_as_decimal(self):
         # Same octal trap as reqbench's guard_quiet (CodeRabbit on #865):
         # "08" must be an eight-second window, not a bash arithmetic error.
@@ -6004,7 +6068,12 @@ class HostCdpQuietGate(unittest.TestCase):
                 f.write("9.99 0 0 1/1 1\n")
             stubs = {
                 "pgrep": "#!/bin/bash\necho 0\nexit 1\n",
-                "podman": "#!/bin/bash\nexit 7\n",
+                "podman": ("#!/bin/bash\n"
+                           "if [ \"${1:-}\" = image ]; then "
+                           f"echo sha256:{'a' * 64}; exit 0; fi\n"
+                           "if [ \"${1:-}\" = container ] "
+                           "&& [ \"${2:-}\" = exists ]; then exit 1; fi\n"
+                           "exit 7\n"),
             }
             for name, body in stubs.items():
                 path = os.path.join(binx, name)
@@ -6019,6 +6088,11 @@ class HostCdpQuietGate(unittest.TestCase):
                 ALLOW_BUSY="0",
                 RESULTS=os.path.join(d, "results"),
             )
+            env.pop("CPUS", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+            env.pop("SOURCE_REVISION", None)
+            env.update(self.producer_contract_env(d))
             helper = subprocess.Popen(
                 ["bash", "-c",
                  f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
@@ -6048,7 +6122,12 @@ class HostCdpQuietGate(unittest.TestCase):
                 # Failing the container start right after the gate keeps the
                 # test to the gate itself; exit 7 is distinguishable from the
                 # gate's refusal exit 3.
-                "podman": "#!/bin/bash\nexit 7\n",
+                "podman": ("#!/bin/bash\n"
+                           "if [ \"${1:-}\" = image ]; then "
+                           f"echo sha256:{'a' * 64}; exit 0; fi\n"
+                           "if [ \"${1:-}\" = container ] "
+                           "&& [ \"${2:-}\" = exists ]; then exit 1; fi\n"
+                           "exit 7\n"),
             }
             for name, body in stubs.items():
                 path = os.path.join(binx, name)
@@ -6063,6 +6142,11 @@ class HostCdpQuietGate(unittest.TestCase):
                 ALLOW_BUSY="0",
                 RESULTS=os.path.join(d, "results"),
             )
+            env.pop("CPUS", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+            env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+            env.pop("SOURCE_REVISION", None)
+            env.update(self.producer_contract_env(d))
             helper = subprocess.Popen(
                 ["bash", "-c",
                  f'sleep 2; printf "0.10 0 0 1/1 1\\n" > {loadavg}'],
@@ -6112,6 +6196,11 @@ class HostCdpQuietGate(unittest.TestCase):
                     ALLOW_BUSY="0",
                     RESULTS=os.path.join(d, "results"),
                 )
+                env.pop("CPUS", None)
+                env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+                env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+                env.pop("SOURCE_REVISION", None)
+                env.update(self.producer_contract_env(d))
                 result = subprocess.run(
                     ["bash", self.SH], env=env,
                     capture_output=True, text=True, timeout=60,
@@ -7464,6 +7553,18 @@ class MakefileBenchGraph(unittest.TestCase):
         fp = self.prereqs("bench-chromium-fault")
         self.assertIn("build", fp)
         self.assertIn("setup-default", fp)
+
+    def test_hostcdp_entrypoint_supplies_standalone_comparison_semantics(self):
+        """The Make entry point must satisfy hostcdp.sh's explicit producer
+        contract while preserving command-line overrides.
+
+        A bare `bash hostcdp.sh` reaches the producer with no comparison label
+        or CPU-budget meaning and is refused before it can measure anything.
+        """
+        recipe = "\n".join(self.recipes.get("bench-chromium-hostcdp", []))
+        self.assertIn("${COMPARISON_LABEL-standalone}", recipe)
+        self.assertIn("${CPU_BUDGET-unlimited}", recipe)
+        self.assertIn("bash bench/chromium/hostcdp.sh", recipe)
 
     def test_phase_indirection_is_gone(self):
         # NO LEGACY: the PHASE?=run single target could not express
@@ -9671,6 +9772,12 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["dns_verdict"], "clean")
         self.assertEqual(cell["headline"]["cdp"]["blocking_ms"], 384.0)
         self.assertEqual(cell["headline"]["cdp"]["n"], 200)
+        self.assertIsNone(cell["load_evidence"]["continuous_owner_log"])
+        self.assertEqual(cell["load_evidence"]["measured_requests"]["samples"], 800)
+        self.assertEqual(
+            cell["load_evidence"]["measured_requests"]["per_arm"]["cdp"]["samples"],
+            200,
+        )
         self.assertEqual(cell["diag"], {
             "diag_passed": True, "violations_count": 0,
             "max_load_ms": {url: 812.5 for url in self.CORPUS},
@@ -9681,7 +9788,6 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
                 "analysis.json", "dns-evidence.json", "verify-dns-pre.json",
                 "verify-dns-before-run.json", "verify-dns-after-run.json",
                 "dns-owner.log", "corpus-dns.log", "corpus-access.log",
-                "replay-queries.log", "summary.json",
+                "replay-queries.log", "summary.json", "reqbench.jsonl",
             },
         )
-

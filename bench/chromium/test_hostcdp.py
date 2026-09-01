@@ -18,6 +18,7 @@ quoted on each test.
 Run: python3 -m unittest test_hostcdp -v
 """
 
+import hashlib
 import json
 import os
 import subprocess
@@ -27,12 +28,29 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH = os.path.join(HERE, "hostcdp.sh")
+CONTAINER_ID = "c" * 64
+CONTAINER_OWNER_TOKEN = "1" * 32
 
 
 def write_exec(path, body):
     with open(path, "w") as handle:
         handle.write(body)
     os.chmod(path, 0o755)
+
+
+def staged_runtime(directory):
+    runtime = os.path.join(directory, "runtime")
+    os.makedirs(runtime)
+    payload = os.path.join(runtime, "payload")
+    with open(payload, "w") as handle:
+        handle.write("sealed\n")
+    payload_digest = hashlib.sha256(b"sealed\n").hexdigest()
+    manifest = os.path.join(runtime, "REQBENCH_MANIFEST.sha256")
+    with open(manifest, "w") as handle:
+        handle.write(f"{payload_digest}  payload\n")
+    with open(manifest, "rb") as handle:
+        identity = hashlib.sha256(handle.read()).hexdigest()
+    return manifest, identity
 
 
 class HostCdpResolverRule(unittest.TestCase):
@@ -42,10 +60,23 @@ class HostCdpResolverRule(unittest.TestCase):
         binx = os.path.join(d, "bin")
         os.makedirs(binx)
         run_argv = os.path.join(d, "podman-run-argv")
+        present = os.path.join(d, "podman-container-present")
         write_exec(os.path.join(binx, "podman"), f'''#!/bin/bash
 case "$1" in
-  run) printf '%s\\0' "$@" > {run_argv}; echo 0123456789ab ;;
-  inspect) echo sha256:{"c" * 64} ;;
+  image) echo sha256:{"a" * 64} ;;
+  create) printf '%s\\0' "$@" > {run_argv}; : > {present}; echo {CONTAINER_ID} ;;
+  start) ;;
+  inspect)
+    case "$*" in
+      *'.Image'*) echo sha256:{"a" * 64} ;;
+      *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
+    esac
+    ;;
+  container)
+    [ "${{2:-}}" = exists ] && [ -e {present} ] && exit 0
+    exit 1
+    ;;
+  rm) rm -f -- {present} ;;
 esac
 exit 0
 ''')
@@ -57,6 +88,11 @@ exec {sys.executable} "$@"
 ''')
         env = dict(os.environ)
         env.pop("BENCH_RESOLVE_ALL_TO", None)
+        env.pop("CPUS", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
+        env.pop("CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256", None)
+        env.pop("SOURCE_REVISION", None)
+        manifest, runtime_identity = staged_runtime(d)
         env.update(
             PATH=binx + os.pathsep + env["PATH"],
             RESULTS=os.path.join(d, "results"),
@@ -64,6 +100,11 @@ exec {sys.executable} "$@"
             REPS="1",
             WARMUP="0",
             IMAGE="localhost/chromium-bench-req",
+            COMPARISON_LABEL="resolver-rule",
+            CPU_BUDGET="unlimited",
+            CONTAINER_OWNER_TOKEN=CONTAINER_OWNER_TOKEN,
+            REQBENCH_RUNTIME_MANIFEST=manifest,
+            REQBENCH_RUNTIME_BUNDLE_SHA256=runtime_identity,
         )
         if resolve_all_to is not None:
             env["BENCH_RESOLVE_ALL_TO"] = resolve_all_to
@@ -85,10 +126,10 @@ exec {sys.executable} "$@"
         found in [('run', '-d'), ...]`; the container ran without the rule."""
         result, argv, record = self._run("10.0.2.2")
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        self.assertIsNotNone(argv, "podman run was never invoked")
+        self.assertIsNotNone(argv, "podman create was never invoked")
         pairs = list(zip(argv, argv[1:]))
         self.assertIn(("-e", "BENCH_RESOLVE_ALL_TO=10.0.2.2"), pairs, pairs)
-        self.assertLess(argv.index("-e"), argv.index("localhost/chromium-bench-req"),
+        self.assertLess(argv.index("-e"), argv.index("sha256:" + "a" * 64),
                         "the -e landed after the image, where podman reads it as "
                         "the container command")
         self.assertIsNotNone(record, "run.json was not written")
@@ -99,7 +140,7 @@ exec {sys.executable} "$@"
         the record could not say which resolver rule the control ran under."""
         result, argv, record = self._run(None)
         self.assertEqual(result.returncode, 0, result.stderr[-2000:])
-        self.assertIsNotNone(argv, "podman run was never invoked")
+        self.assertIsNotNone(argv, "podman create was never invoked")
         self.assertEqual(
             [a for a in argv if "BENCH_RESOLVE_ALL_TO" in a], [],
             f"the knob was forwarded while unset: {argv}")

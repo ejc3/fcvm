@@ -347,7 +347,10 @@ def analyse_density(results, out):
                     continue
                 cg = statistics.median([s.get("clone_cgroup_kb", 0) for s in steady]) / 1024.0
                 pss = statistics.median([s.get("clone_pss_kb", 0) for s in steady]) / 1024.0
-                fco = statistics.median([s.get("fc_only_pss_kb", 0) for s in steady]) / 1024.0
+                fco = None
+                if all("fc_only_pss_kb" in s for s in steady):
+                    fco = statistics.median(
+                        [s["fc_only_pss_kb"] for s in steady]) / 1024.0
                 avail_pre = statistics.median([s["mem_available_kb"] for s in pre])
                 avail_st = statistics.median([s["mem_available_kb"] for s in steady])
                 rows.append((N, cg, pss, (avail_pre - avail_st) / 1024.0, fco))
@@ -356,7 +359,10 @@ def analyse_density(results, out):
             continue
         entry = {"n_range": [min(r[0] for r in rows), max(r[0] for r in rows)],
                  "n_points": len(rows), "rows": rows, "fits": {}}
-        for idx, basis in ((1, "cgroup"), (2, "pss"), (3, "memavailable_delta"), (4, "fc_only_pss_REFUTED_BASIS")):
+        bases = [(1, "cgroup"), (2, "pss"), (3, "memavailable_delta")]
+        if all(row[4] is not None for row in rows):
+            bases.append((4, "fc_only_pss_REFUTED_BASIS"))
+        for idx, basis in bases:
             X = [[1.0, float(r[0])] for r in rows]
             y = [r[idx] for r in rows]
             fit = ols(X, y)

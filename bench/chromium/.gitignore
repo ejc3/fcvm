@@ -11,6 +11,9 @@
 results/**
 !results/**/
 !results/**/analysis.json
+# analysis_identity.inputs names these exact bytes. A published analysis without
+# its reqbench input can be read but cannot be recomputed or checked by compare.py.
+!results/**/reqbench.jsonl
 !results/**/run.json
 !results/**/hostcdp.jsonl
 !results/**/summary.json

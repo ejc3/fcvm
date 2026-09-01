@@ -770,7 +770,7 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=` |
 | `bench-webkit-request-diag` | none (sealed bundle) | the diag knobs above; `ENGINE=webkit`, default `TAG=cb-req-webkit` |
 | `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
-| `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM; `BENCH_RESOLVE_ALL_TO=` |
+| `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM; `COMPARISON_LABEL=` (default `standalone`), `CPU_BUDGET=` (default `unlimited`), `CPUS=` (requires `CPU_BUDGET=vm-matched`), `BENCH_RESOLVE_ALL_TO=` |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
 
 - **verify/diag/run must never gain a `build` dependency.** reqbench.sh seals

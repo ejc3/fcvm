@@ -64,6 +64,10 @@ entries change what the snapshot does, so such a golden needs its own `TAG=`.
 The host control takes the same variable directly:
 `make bench-chromium-hostcdp BENCH_RESOLVE_ALL_TO=10.0.2.2`, recorded as
 `resolve_all_to` in its `run.json` (null when unset).
+The Make entry point supplies `COMPARISON_LABEL=standalone` and
+`CPU_BUDGET=unlimited` when those variables are unset. A finite control must
+name both parts explicitly, for example
+`make bench-chromium-hostcdp COMPARISON_LABEL=cpu2 CPU_BUDGET=vm-matched CPUS=2`.
 
 `URL=` on the host control names one url or a comma-separated list, and a list
 is cycled the way `reqbench.url_for_rep` cycles the VM arm's: `urls[rep %
@@ -79,13 +83,22 @@ WARMUP=28` hands both arms the same schedule instead of leaving the host with
 174 measured rows and a partial final cycle. `run.json` carries `total_reps`
 beside `reps` and `warmup`; a record without `total_reps` predates this and its
 `reps` is a total. `summary.json` names its own `p50_convention`
-(`statistics.median`, what `reqanalyze` publishes), so a reader can tell whether
-a ratio against a VM p50 is between two numbers of the same kind, and every
-jsonl row carries `loadavg1` the way `reqbench.py` stamps it, summarised over
-the measured reps as `loadavg1_measured`. `CPUS=` bounds the container's CPU budget
-(`podman run --cpus`) and is recorded as `cpus` in `run.json`, null when unset,
-which means the whole machine: a host baseline on every core compared against a
-2-vCPU VM arm is two variables, not one.
+(`statistics.median`, what `reqanalyze` publishes), so the host and VM
+descriptive tables use the same convention. Separately timed runs do not
+publish an effect ratio. Every jsonl row carries `loadavg1` the way
+`reqbench.py` stamps it, summarised over the measured reps as
+`loadavg1_measured`. `run.json` also carries the producer's
+`run_id`, and every jsonl row carries the SHA-256 of the exact `run.json` bytes;
+comparison and resummarization refuse rows that are missing that binding or
+name different metadata. `CPU_BUDGET=` records whether the arm is `unlimited`
+or `vm-matched`. `CPUS=` carries a positive finite limit for the latter to
+`podman run --cpus` and is recorded as a JSON number in `run.json`; an unlimited
+arm requires CPUS to be unset and records null. A host baseline on every core
+compared against a 2-vCPU VM arm is two variables, not one.
+
+`RESULTS=` is an ownership claim, not a resume directory. `hostcdp.sh` creates
+its final component atomically and refuses an existing directory before writing
+anything, so a failed rerun cannot leave old `summary.json` beside new records.
 
 `bench-chromium-request-diag` (and its `bench-webkit-request-diag` twin)
 answers what holds a page's load event inside a restored clone, on the
@@ -180,7 +193,14 @@ in the repo-root AGENTS.md quickstart.
 To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
 directory whose first line is the reason; `campaign_summary.py` refuses the run
 and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
-true` the same way. The marker is tracked (`!results/**/WITHDRAWN` in
+true` the same way. A marker writer must first open the results directory and
+take an exclusive `flock` on that directory descriptor, then remove completion
+records and atomically rename the marker while holding the lock.
+`campaign_summary.py` and `compare.py` hold shared locks on every run directory
+whose authorization they consume, across validation and publication. This
+makes a withdrawal order before the publication (which refuses it) or after it
+(which invalidates it), with no unchecked interval between the last marker read
+and publication. The marker is tracked (`!results/**/WITHDRAWN` in
 `bench/chromium/.gitignore`) and is never removed, because a withdrawn run
 stays unquotable (REVIEW.md).
 
@@ -253,9 +273,10 @@ easy to get wrong:
    pool comparator summed an entire cgroup — it excluded the `fcvm` process, the
    `unshare` holder, `pasta`, and the page cache holding memory.bin. On a matched
    whole-machine basis the difference vanished and both *lost* to the pool.
-   Report at least two independent bases (per-clone cgroup/PSS **and** whole-machine
-   `MemAvailable` delta from a quiescent baseline) and **reconcile them**. A 2x gap
-   between bases is a finding, not a rounding error.
+   Report cgroup memory and PSS over the same process set and **reconcile them**.
+   A 2x gap between bases is a finding, not a rounding error. Host-global
+   `MemAvailable` may remain in raw diagnostics, but it is not a publishable
+   memory basis because unrelated processes can change it.
 
 2. **Interleave, never block.** Modes/configs must be shuffled request-by-request
    from a recorded seed, all serves running concurrently. The retracted egress

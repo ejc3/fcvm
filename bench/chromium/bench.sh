@@ -924,7 +924,7 @@ phase3() {
 # both estimable, instead of quoting an asymptotic slope alone.
 sample_once() {  # $1 outfile  $2 extra-json
     python3 "$SCRIPT_DIR/report.py" sample --cgroup-root "$CG_BASE" --cgroup-prefix req- \
-        --state-dir "$STATE_DIR" --name-prefix "cb-$RUNID" --extra "$2" >> "$1" 2>/dev/null || true
+        --extra "$2" >> "$1" 2>/dev/null || true
 }
 
 wait_clones_gone() {  # $1 timeout

@@ -17,9 +17,12 @@ import json
 import os
 import re
 import statistics
+import subprocess
 import sys
 import textwrap
 import time
+
+CGROUP_ROOT = "/sys/fs/cgroup"
 
 # The date the six quoted Cloudflare rows were last checked against their source.
 # The prose below and test_report_kitesurf.py both read this constant, so the
@@ -161,14 +164,15 @@ def read_meminfo():
 
 
 def pss_kb_of_pid(pid):
+    path = f"/proc/{pid}/smaps_rollup"
     try:
-        with open(f"/proc/{pid}/smaps_rollup") as f:
+        with open(path) as f:
             for line in f:
                 if line.startswith("Pss:"):
                     return int(line.split()[1])
-    except (OSError, ValueError):
-        return 0
-    return 0
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    raise CgroupReadError(f"cannot read {path}: no Pss field")
 
 
 # --- matched-basis memory accounting -------------------------------------
@@ -177,38 +181,104 @@ def pss_kb_of_pid(pid):
 # cgroup. Everything below measures both sides through the SAME two bases:
 #   cgroup  memory.current of the cgroup that contains the entire process set
 #   pss     PSS summed over exactly that cgroup's process set
-# plus a machine-level MemAvailable delta recorded by the caller.
+# Raw samples also carry host-global MemAvailable as a diagnostic. The matched
+# corpus fit does not publish it as a memory basis.
+
+
+class CgroupReadError(RuntimeError):
+    """A cgroup basis could not be read completely."""
+
 
 def cgroup_bytes(cg_path):
-    """memory.current of one cgroup (bytes), or None if unreadable."""
+    """memory.current of one cgroup (bytes), or refuse an incomplete basis."""
+    path = os.path.join(cg_path, "memory.current")
     try:
-        with open(os.path.join(cg_path, "memory.current")) as f:
+        with open(path) as f:
             return int(f.read().strip())
-    except (OSError, ValueError):
-        return None
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
 
 
 def cgroup_procs(cg_path):
-    try:
-        with open(os.path.join(cg_path, "cgroup.procs")) as f:
-            return [int(x) for x in f.read().split()]
-    except (OSError, ValueError):
+    """Every pid in this cgroup SUBTREE, which is the process set
+    memory.current is charged over.
+
+    Not just the named node. Rootless podman nests a container's processes one
+    level below the cgroup `podman inspect` reports, so a single-node read
+    returned [] for every container while memory.current still counted them,
+    and pool_pss_kb came back 0 with pool_containers = N. The instance-count
+    check upstream cannot catch that: pool_containers is counted from
+    `podman ps`, not from this function. measure_cgroup_set drops a leaf with no
+    procs, so on the fcvm side the same miss lowers `clones` and the cell is
+    refused -- the failure was one-sided, in fcvm's favour.
+
+    Every node must be readable and parseable. Skipping one produces a subtotal
+    that is indistinguishable from the complete process set memory.current is
+    charged over.
+    """
+    if not os.path.isdir(cg_path):
         return []
+
+    def walk_error(exc):
+        raise CgroupReadError(f"cannot walk cgroup subtree {cg_path}: {exc}") from exc
+
+    pids = []
+    for root, _dirs, files in os.walk(cg_path, onerror=walk_error):
+        if "cgroup.procs" not in files:
+            raise CgroupReadError(f"cgroup node has no cgroup.procs: {root}")
+        path = os.path.join(root, "cgroup.procs")
+        try:
+            with open(path) as f:
+                node = [int(x) for x in f.read().split()]
+        except (OSError, ValueError) as exc:
+            raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+        pids.extend(node)
+    if len(pids) != len(set(pids)):
+        raise CgroupReadError(
+            f"process moved within cgroup subtree {cg_path} while it was read")
+    return pids
 
 
 def cgroup_stat(cg_path):
+    """Read one complete memory.stat record."""
+    path = os.path.join(cg_path, "memory.stat")
     out = {}
     try:
-        with open(os.path.join(cg_path, "memory.stat")) as f:
+        with open(path) as f:
             for line in f:
                 k, _, v = line.partition(" ")
-                try:
-                    out[k] = int(v)
-                except ValueError:
-                    pass
-    except OSError:
-        pass
+                if not k or not v:
+                    raise ValueError(f"malformed line {line!r}")
+                out[k] = int(v)
+    except (OSError, ValueError) as exc:
+        raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    missing = sorted({"anon", "file", "kernel", "sock"} - out.keys())
+    if missing:
+        raise CgroupReadError(f"{path} has no {', '.join(missing)} field(s)")
     return out
+
+
+def measure_complete_cgroup(cg_path, with_stat=True):
+    """Read both bases over one process set that stayed unchanged."""
+    if not os.path.isdir(cg_path):
+        raise CgroupReadError(f"cgroup disappeared before it was sampled: {cg_path}")
+    before = cgroup_procs(cg_path)
+    if not before:
+        after = cgroup_procs(cg_path)
+        if after:
+            raise CgroupReadError(
+                f"process set changed in {cg_path} while it was sampled: [] -> {after}")
+        raise CgroupReadError(
+            f"owned cgroup {cg_path} has no processes; zero is not a complete sample")
+    current = cgroup_bytes(cg_path)
+    pss = sum(pss_kb_of_pid(pid) for pid in before)
+    stat = cgroup_stat(cg_path) if with_stat else {}
+    after = cgroup_procs(cg_path)
+    if sorted(before) != sorted(after):
+        raise CgroupReadError(
+            f"process set changed in {cg_path} while it was sampled: "
+            f"{sorted(before)} -> {sorted(after)}")
+    return before, current, pss, stat
 
 
 def measure_cgroup_set(root, prefix):
@@ -218,46 +288,70 @@ def measure_cgroup_set(root, prefix):
     stat_sums = {"anon": 0, "file": 0, "kernel": 0, "sock": 0}
     try:
         entries = sorted(os.listdir(root))
-    except OSError:
-        return 0, 0, 0, 0, stat_sums
+    except OSError as exc:
+        raise CgroupReadError(f"cannot enumerate cgroup root {root}: {exc}") from exc
     for name in entries:
         if not name.startswith(prefix):
             continue
         path = os.path.join(root, name)
         if not os.path.isdir(path):
             continue
-        procs = cgroup_procs(path)
-        if not procs:
-            continue  # leaf with no live process contributes nothing
-        cb = cgroup_bytes(path)
+        procs, cb, pss, st = measure_complete_cgroup(path)
         n += 1
         tot_procs += len(procs)
-        if cb is not None:
-            tot_cg += cb
-        tot_pss += sum(pss_kb_of_pid(p) for p in procs)
-        st = cgroup_stat(path)
+        tot_cg += cb
+        tot_pss += pss
         for k in stat_sums:
             stat_sums[k] += st.get(k, 0)
     return n, tot_cg, tot_pss, tot_procs, stat_sums
 
 
-def firecracker_pids_for_vm_ids(vm_ids):
-    """Map vm_id -> firecracker pid by the --api-sock path in the cmdline."""
-    out = {}
-    for pid in os.listdir("/proc"):
-        if not pid.isdigit():
-            continue
-        try:
-            with open(f"/proc/{pid}/cmdline", "rb") as f:
-                cmd = f.read().decode(errors="replace")
-        except OSError:
-            continue
-        if "firecracker" not in cmd:
-            continue
-        for vid in vm_ids:
-            if f"/{vid}/" in cmd:
-                out[vid] = int(pid)
-    return out
+def refuse_sample(message):
+    print(f"REFUSING: {message}", file=sys.stderr)
+    raise SystemExit(2)
+
+
+def sustained_clone_count(sample):
+    """Read current cgroup samples while retaining archived sample support."""
+    return sample.get("clones", sample.get("fc_procs", 0))
+
+
+def sustained_clone_pss_kb(sample):
+    return sample.get("clone_pss_kb", sample.get("pss_kb", 0))
+
+
+def podman_container_cgroup(name):
+    """Return one container's existing non-root cgroup or refuse the sample."""
+    try:
+        result = subprocess.run(
+            ["podman", "inspect", "--format", "{{.State.CgroupPath}}", name],
+            capture_output=True, text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        refuse_sample(f"podman inspect failed for {name}: {exc}")
+    if result.returncode != 0:
+        refuse_sample(
+            f"podman inspect failed for {name} with status {result.returncode}: "
+            f"{result.stderr.strip()}")
+
+    relative = result.stdout.strip()
+    if not relative.startswith("/") or relative == "/":
+        refuse_sample(
+            f"podman reports no container cgroup for {name} (got {relative!r}); "
+            "the root cgroup is the whole machine")
+
+    root = os.path.realpath(CGROUP_ROOT)
+    path = os.path.realpath(os.path.join(root, relative.lstrip("/")))
+    try:
+        inside_root = os.path.commonpath((root, path)) == root
+    except ValueError:
+        inside_root = False
+    if path == root or not inside_root:
+        refuse_sample(f"podman cgroup for {name} escapes {root}: {relative!r}")
+    if not os.path.isdir(path):
+        refuse_sample(
+            f"podman cgroup for {name} does not exist at {path}; "
+            "nothing can be attributed to it")
+    return path
 
 
 def cmd_sample(args):
@@ -273,7 +367,11 @@ def cmd_sample(args):
 
     # --- fcvm clones: EVERY process of each clone, via its own cgroup --------
     if args.cgroup_root and args.cgroup_prefix:
-        n, cg, pss, nproc, st = measure_cgroup_set(args.cgroup_root, args.cgroup_prefix)
+        try:
+            n, cg, pss, nproc, st = measure_cgroup_set(
+                args.cgroup_root, args.cgroup_prefix)
+        except CgroupReadError as exc:
+            refuse_sample(str(exc))
         rec["clones"] = n
         rec["clone_procs"] = nproc
         rec["clone_cgroup_kb"] = cg // 1024
@@ -282,47 +380,30 @@ def cmd_sample(args):
         rec["clone_file_kb"] = st["file"] // 1024
         rec["basis"] = "cgroup+pss over full per-clone process set"
 
-    # legacy firecracker-only PSS, kept ONLY as the refuted comparator so the
-    # report can show how large the basis error was. Never the headline number.
-    if args.state_dir and args.name_prefix:
-        vm_ids = []
-        for f in glob.glob(os.path.join(args.state_dir, "*.json")):
-            try:
-                st_json = json.load(open(f))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (st_json.get("name") or "").startswith(args.name_prefix):
-                vm_ids.append(st_json.get("vm_id"))
-        fps = firecracker_pids_for_vm_ids([v for v in vm_ids if v])
-        rec.setdefault("clones", len(vm_ids))
-        rec["fc_procs"] = len(fps)
-        rec["fc_only_pss_kb"] = sum(pss_kb_of_pid(p) for p in fps.values())
-
     # --- host-native container pool: the SAME two bases ----------------------
     if args.podman_prefix:
-        import subprocess
         try:
-            names = subprocess.run(
+            result = subprocess.run(
                 ["podman", "ps", "--format", "{{.Names}}"],
-                capture_output=True, text=True, timeout=20).stdout.split()
-        except Exception:
-            names = []
+                capture_output=True, text=True, timeout=20)
+        except (OSError, subprocess.SubprocessError) as exc:
+            refuse_sample(f"podman ps failed while identifying the container pool: {exc}")
+        if result.returncode != 0:
+            refuse_sample(
+                f"podman ps failed with status {result.returncode}: {result.stderr.strip()}")
+        names = result.stdout.split()
         names = [n for n in names if n.startswith(args.podman_prefix)]
         tot_pss = tot_cg = tot_procs = 0
         for n in names:
+            path = podman_container_cgroup(n)
             try:
-                cg = subprocess.run(
-                    ["podman", "inspect", "--format", "{{.State.CgroupPath}}", n],
-                    capture_output=True, text=True, timeout=20).stdout.strip()
-            except Exception:
-                continue
-            path = "/sys/fs/cgroup" + cg
-            procs = cgroup_procs(path)
+                procs, cb, pss, _st = measure_complete_cgroup(
+                    path, with_stat=False)
+            except CgroupReadError as exc:
+                refuse_sample(f"container {n}: {exc}")
             tot_procs += len(procs)
-            tot_pss += sum(pss_kb_of_pid(p) for p in procs)
-            cb = cgroup_bytes(path)
-            if cb is not None:
-                tot_cg += cb
+            tot_pss += pss
+            tot_cg += cb
         rec["pool_containers"] = len(names)
         rec["pool_procs"] = tot_procs
         rec["pool_pss_kb"] = tot_pss
@@ -676,16 +757,16 @@ def cmd_finalize(args):
     # ---- sustained memory curve
     w("## Sustained-rate memory density\n")
     w("Sampled every 2s during each 60s window: MemAvailable delta vs quiescent, "
-      "sum of firecracker PSS (`/proc/<pid>/smaps_rollup`) over live clones, page cache. "
+      "PSS over each live clone's complete cgroup process set, page cache. "
       "Marginal MiB/request = least-squares slope of PSS vs concurrent clones across the "
       "cell's samples; req/GB = 1024/slope.\n")
     rows = []
     cell_slopes = {}
     for cell in ("uffd-4k", "file-4k", "uffd-huge", "file-huge"):
         cell_samples = [s for s in samples if s.get("cell") == cell and s.get("phase") == "load"
-                        and s.get("fc_procs", 0) > 0]
-        xs = [s["fc_procs"] for s in cell_samples]
-        ys = [s["pss_kb"] / 1024 for s in cell_samples]
+                        and sustained_clone_count(s) > 0]
+        xs = [sustained_clone_count(s) for s in cell_samples]
+        ys = [sustained_clone_pss_kb(s) / 1024 for s in cell_samples]
         fit = linfit(xs, ys)
         if fit:
             cell_slopes[cell] = fit[0]
@@ -696,8 +777,8 @@ def cmd_finalize(args):
                      and s.get("phase") == "quiescent"]
             if not load:
                 continue
-            clones = [s.get("fc_procs", 0) for s in load]
-            pss = [s.get("pss_kb", 0) / 1024 for s in load]
+            clones = [sustained_clone_count(s) for s in load]
+            pss = [sustained_clone_pss_kb(s) / 1024 for s in load]
             qa = statistics.mean([s["mem_available_kb"] for s in quies]) if quies else None
             dmem = (qa - min(s["mem_available_kb"] for s in load)) / 1024 if qa else None
             pool_pages = avail["hugepages"].get("pool_pages", 0)
@@ -730,8 +811,8 @@ def cmd_finalize(args):
             eff_slope, basis = slope, "PSS"
             if cell.endswith("-huge") and pool_pages:
                 hs = [s for s in samples if s.get("cell") == cell and s.get("phase") == "load"
-                      and s.get("fc_procs", 0) > 0]
-                fit = linfit([s["fc_procs"] for s in hs],
+                      and sustained_clone_count(s) > 0]
+                fit = linfit([sustained_clone_count(s) for s in hs],
                              [(pool_pages - s.get("hugepages_free", pool_pages)) * 2 for s in hs])
                 if fit:
                     eff_slope, basis = fit[0], f"hugepage pool draw (PSS slope {slope:.1f})"
@@ -805,8 +886,6 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("sample")
-    s.add_argument("--state-dir")
-    s.add_argument("--name-prefix")
     s.add_argument("--podman-prefix")
     s.add_argument("--cgroup-root", help="directory holding one leaf cgroup per clone")
     s.add_argument("--cgroup-prefix", default="req-", help="leaf cgroup name prefix")

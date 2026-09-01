@@ -1,0 +1,143 @@
+{
+  "generated_from": [
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/analysis.json",
+      "sha256": "85031fe2fc4655aa08e41830ae57987f517c0aa165354d71c8cdb0248de830c0"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/dns-evidence.json",
+      "sha256": "b490d4dc741b11b261f109159432ece3bce944d17c2b93021794f1000c62d56c"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/dns-owner.log",
+      "sha256": "e575f41c4191117501b9258dbfce5f16d0ff5ed9b5884b22b5a4feda8ec5c612"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-pre.json",
+      "sha256": "c769476621d97e795e00ab5d379e88e516bfdd4817cd1337dc585b5e8eaddcc3"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-before-run.json",
+      "sha256": "f965102e59903a6db53dfc3357fa42e28e965a8c6f6d3b79dc85fe0cfac7eb52"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/verify-dns-after-run.json",
+      "sha256": "91f769a80087b79b703e54c8de094a4851b709419f4a3c44e7be34ac43057c01"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/corpus-dns.log",
+      "sha256": "c54276e60c329e4b9f50840b90f698b9198ac0b7e188fbfc201c20399289c7f8"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/corpus-access.log",
+      "sha256": "b205f24f5fa3508e818c3db46d79280d35dd92d7e32a07b5654ada278d41c201"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/replay-queries.log",
+      "sha256": "ef74d7ac1c09ccbcf7d94a2869b4c8dfdfa7e6e4fc857e5eb5b047a366f7f9b0"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/diag/summary.json",
+      "sha256": "5122d51d7f3ef1009092f6f8e05a3b4c4f857222164230542c0caa54621e4cc0"
+    },
+    {
+      "path": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/reqbench.jsonl",
+      "sha256": "fbf87fc4f368b3edac75b4df1c3804cb13dcfd94d0a73a537736d59f09b4dfc9"
+    }
+  ],
+  "cells": [
+    {
+      "run_dir": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus",
+      "run_id": "b6c7c20926674e76aa8bdc8e329dd6aa",
+      "engine": "chromium",
+      "cpu": 2,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "81ab7a2f0ebb8d4ddb599c1d3edecb6c37d0ce4c66bbb609dc2d82af7009e859",
+        "fcvm_sha256": "e18eae60578c5046c62b376fc34c5e193d1207088a30f5a2666068c5772c7e3c",
+        "harness_sha256": "3f0fff066567212a1ef0b822d60469d0b85ed28adea5a19db39b246652de7573",
+        "source_revision": "55756858d46347f00bac3f66f1f5cacf3411bbb8",
+        "image_id": "sha256:334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+        "snapshot_generation_id": "4e924d4b-5036-4d01-bf6a-b0dc7e93ab6d",
+        "snapshot_config_sha256": "b13e58385c3203541785a141ec8fcb3c4bfaf48040608434f60449e8315e0901"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 2.87,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/dns-owner.log",
+          "samples": 40,
+          "min": 0.59,
+          "median": 1.935,
+          "max": 2.87,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "/home/ubuntu/src/fcvm/bench/chromium/results/reqbench-20260830-171007-corpus/reqbench.jsonl",
+          "samples": 404,
+          "min": 1.48,
+          "median": 2.03,
+          "max": 2.94,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.48,
+              "median": 2.03,
+              "max": 2.94
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.48,
+              "median": 2.03,
+              "max": 2.94
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 712.5603174999924,
+          "blocking_ms_ci": [
+            610.4840620000687,
+            808.4824570000819
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 44.82384150003327,
+          "blocking_ms_ci": [
+            44.595801000014035,
+            45.16023049995965
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 593.2121349999306,
+          "https://developer.mozilla.org/en-US/": 515.5662860000803,
+          "https://developers.cloudflare.com/": 613.5050869999077,
+          "https://en.wikipedia.org/": 469.8439829999188,
+          "https://example.com/": 102.68079000002217,
+          "https://news.ycombinator.com/": 208.15585700006523,
+          "https://todomvc.com/examples/angular/dist/browser/": 334.3037810000169,
+          "https://todomvc.com/examples/javascript-es6/dist/": 248.36752000010165,
+          "https://todomvc.com/examples/preact/dist/": 239.95183700003508,
+          "https://todomvc.com/examples/react/dist/index.html": 263.17074700000376,
+          "https://todomvc.com/examples/vue/dist/": 259.8993629999313,
+          "https://www.elmundo.es/": 3679.8611429999255,
+          "https://www.rtp.pt/noticias/": 2648.604731999967,
+          "https://www.theguardian.com/international": 1293.2883470000434
+        }
+      }
+    }
+  ]
+}
