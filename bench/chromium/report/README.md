@@ -288,9 +288,11 @@ The two verified 2 vCPU cells agree: this ladder's 770.3 [596.2, 807.8] and
 the 2026-08-30 run's 712.6 [610.5, 808.5], each median inside the other's
 interval, measured on different goldens, fcvm binaries and host boots
 (`cell.host_boot_id` 291f8bad and 21ffa582). Both ran on kernel
-6.17.0-1019-aws on aarch64 and no record names the machine, so whether that
-is one box rebooted or two is not established. That agreement is the
-cross-check that the two runs measure the same thing.
+6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` names its machine
+(box parallel-box-2, instance i-0b8def825d4e9bcc2) and the 2026-08-30 run has
+no `hostinfo.json`, so whether that is one box rebooted or two is not
+established. That agreement is the cross-check that the two runs measure the
+same thing.
 
 The direction argument that stood here, derived from the six URLs whose
 screenshots are byte-identical between each withdrawn rung and the 2026-08-30
