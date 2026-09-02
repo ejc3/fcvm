@@ -1103,3 +1103,163 @@ fn a_bot_notice_that_no_review_ran_is_neither_a_finding_nor_coverage() {
     assert!(out.contains("carry no disposition"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A region removed before classification is a region the classifier never read.
+///
+/// Finding 44 parsed the notice PAYLOAD against shapes, because accepting every line that
+/// starts with ">" let `> P1: this drops the last row` ride inside a notice and need no
+/// disposition. That closed one site. Three more regions were removed from the body before
+/// any shape ran: the CodeRabbit tips block (stripped from the summary-notice residue), the
+/// folded "About Codex in GitHub" block (stripped by both Codex paths), and HTML comments.
+/// A finding placed in either of the first two vanished the same way, and the About-block
+/// one was worse than an exemption: the comment stayed a Codex verdict, so it still bound
+/// no-findings coverage to the head.
+///
+/// The invariant is that a body is exempt only when the classifier accounted for every byte
+/// of it. Each removal now names a declared region whose content must match that region's
+/// line shapes; a region holding anything else makes the whole body claimable. HTML
+/// comments are declared unrendered, so nothing inside one is a claim anyone can read.
+/// scripts/gate-discard-sites.sh enumerates every discarding call in VERDICT_JQ and blocks
+/// on one that is neither the accounting primitive nor a listed normalization, so the next
+/// stripping step fails a test unless it declares a region.
+///
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 45") carries the full
+/// matrix, including the review-summary table and the unlisted-tips-line case; these run in
+/// CI.
+#[test]
+fn a_region_stripped_before_classification_is_validated_or_the_body_stays_claimable() {
+    require_jq();
+    // The tips block as CodeRabbit posts it, under a rate-limit notice (#874, #901).
+    const CR_SUMMARY_NOTICE: &str = r#""<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 53 minutes.**\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n\n<!-- tips_start -->\n\n---\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=901)! It's free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->""#;
+    // Codex's legacy no-findings verdict with its folded About block (#867 and earlier).
+    const CODEX_VERDICT: &str = r#""Codex Review: Didn't find any major issues. Bravo.\n\n**Reviewed commit:** `deadbeef`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n</details>""#;
+    const COVERED: &str = r#"[{"author":{"login":"reviewer"},"state":"APPROVED","submittedAt":"2026-01-02T00:40:00Z","body":"","commit":{"oid":"deadbeef"}}]"#;
+    let comment = |login: &str, body: &str| {
+        format!(
+            r#"{{"author":{{"login":"{login}","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}"#
+        )
+    };
+    let payload = |reviews: &str, comments: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":{reviews}}},"comments":{{"nodes":[{comments}]}},"recheck":{{"comments":{{"nodes":[{comments}]}}}}}}}}}}}}"#
+        )
+    };
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-region-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    // A finding inside the tips block. The residue check ran after the block was removed,
+    // so the whole comment passed as a notice and the claim was never answered.
+    let tips_finding = CR_SUMMARY_NOTICE.replace(
+        r"\n<sub>Comment",
+        r"\nP1: this drops the last row\n\n<sub>Comment",
+    );
+    assert_ne!(
+        tips_finding, CR_SUMMARY_NOTICE,
+        "the fixture edit must apply"
+    );
+    let (out, code) = run(
+        "tips-finding.json",
+        payload(COVERED, &comment("coderabbitai", &tips_finding)),
+    );
+    assert_eq!(
+        code, 1,
+        "a finding inside the tips block is a finding: the block is removed before the \
+         notice shapes run, so nothing evaluated it.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+
+    // A finding APPENDED to a line that is itself a listed shape. This is what the anchors
+    // in each shape list are for: unanchored, the shape matches the head of the line and
+    // the rest of it rides along, which is round 1 of this class with a different marker.
+    let tips_trailing = CR_SUMMARY_NOTICE.replace(
+        r"available commands.</sub>",
+        r"available commands.</sub> P1: this drops the last row",
+    );
+    assert_ne!(
+        tips_trailing, CR_SUMMARY_NOTICE,
+        "the fixture edit must apply"
+    );
+    let (out, code) = run(
+        "tips-trailing.json",
+        payload(COVERED, &comment("coderabbitai", &tips_trailing)),
+    );
+    assert_eq!(
+        code, 1,
+        "a shape must match the WHOLE line: a finding appended to a listed tips line is \
+         still a finding.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+
+    // A finding inside the About Codex block. This one also bound coverage to the head.
+    let about_finding = CODEX_VERDICT.replace(
+        r"\nIf Codex has suggestions",
+        r"\nP1: this drops the last row\n\nIf Codex has suggestions",
+    );
+    assert_ne!(about_finding, CODEX_VERDICT, "the fixture edit must apply");
+    let (out, code) = run(
+        "about-finding.json",
+        payload("[]", &comment("chatgpt-codex-connector", &about_finding)),
+    );
+    assert_eq!(
+        code, 1,
+        "a finding inside the About Codex block is a finding, and a comment carrying one \
+         is not a no-findings verdict of the head.\n{out}"
+    );
+    assert!(
+        !out.contains("HEAD COVERED"),
+        "coverage was granted by a comment whose About block was never read.\n{out}"
+    );
+
+    // The negative cases the exemption exists for: the same bodies with the regions as the
+    // bots post them stay exempt, and the verdict still covers the head.
+    let (out, code) = run(
+        "tips-clean.json",
+        payload(COVERED, &comment("coderabbitai", CR_SUMMARY_NOTICE)),
+    );
+    assert_eq!(
+        code, 0,
+        "a rate-limit notice with the tips block CodeRabbit actually posts says no review \
+         ran; it claims nothing and needs no disposition.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+    let (out, code) = run(
+        "about-clean.json",
+        payload("[]", &comment("chatgpt-codex-connector", CODEX_VERDICT)),
+    );
+    assert_eq!(
+        code, 0,
+        "Codex's no-findings verdict with the About block it actually posts still covers \
+         the head.\n{out}"
+    );
+    assert!(out.contains("HEAD COVERED"), "{out}");
+
+    // The structural pin: a stripping step added later must declare a region.
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/gate-discard-sites.sh"))
+        .output()
+        .expect("gate-discard-sites.sh must be runnable");
+    assert!(
+        out.status.success(),
+        "every call in VERDICT_JQ that discards content must be the accounting primitive \
+         or a listed normalization.\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

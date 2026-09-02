@@ -676,12 +676,78 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #     disposition. The range
 #     that notice quotes is not coverage (walkthrough_sha never read it). Once the comment
 #     holds a walkthrough or a recent-review block it is a walkthrough, judged as one.
+#
+# ACCOUNTING. A body is exempt from dispositions only if the classifier read every byte of
+# it. Content removed before classification is content nobody evaluated, so a finding in a
+# removed region is exempt and never answered. That is one defect class and it landed three
+# times: the notice payload (any line starting with ">"), the CodeRabbit tips block, and
+# the folded About Codex block, the last of which also bound no-findings COVERAGE to the
+# head. Every removal now goes through strip_accounted, which deletes a region declared in
+# accounted_regions only after every non-blank line inside it matches one of that region's
+# shapes, and returns null otherwise, which makes the whole body claimable. The regions:
+#
+#   cr_tips       <!-- tips_start --> .. <!-- tips_end -->        rendered, shape-checked
+#   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
+#   html_comment  <!-- .. -->                                     not rendered, no shapes
+#
+# html_comment carries no shapes because GitHub renders none of it: nothing inside one is a
+# claim a reader can see or answer. Both shape lists were read off what the bots posted on
+# ejc3/fcvm #789 through #901 (13 About blocks, 17 tips blocks) and match all of it with
+# nothing left over. Every shape is anchored, because an unanchored one matches the head of
+# a line and lets the rest ride along. An unlisted line costs one disposition; accepting
+# one costs a finding nobody has to answer.
+#
+# scripts/gate-discard-sites.sh enumerates every discarding call in VERDICT_JQ and blocks
+# on any that is neither this primitive nor a listed normalization, so the next stripping
+# step fails a test unless it declares a region. Both harnesses run it.
 VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
+def cr_tips_res:
+  [ "^---$"
+  , "^</?details>$"
+  , "^<summary>❤️ Share</summary>$"
+  , "^- \\[(X|Mastodon|Reddit|LinkedIn)\\]\\(https://[^)]*\\)$"
+  , "^Thanks for using \\[CodeRabbit\\]\\(https://coderabbit\\.ai\\?utm_source=oss&utm_medium=github&utm_campaign=[^)]+\\)! It.s free for OSS, and your support helps us grow\\. If you like it, consider giving us a shout-out\\.$"
+  , "^<sub>Comment `@coderabbitai help` to get the list of available commands\\.</sub>$"
+  ];
+def codex_about_res:
+  [ "^<br/>$"
+  , "^\\[Your team has set up Codex to review pull requests in this repo\\]\\(https://chatgpt\\.com/codex/cloud/settings/general\\)\\. Reviews are triggered when you$"
+  , "^- Open a pull request for review$"
+  , "^- Mark a draft as ready$"
+  , "^- Comment \"@codex review\"( or \"@codex security review\")?\\.$"
+  , "^If Codex has suggestions, it will comment; otherwise it will react with 👍\\.$"
+  , "^Codex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings\\.$"
+  , "^Codex can also answer questions or update the PR\\. Try commenting \"@codex address that feedback\"\\.$"
+  ];
+def accounted_regions:
+  [ { name: "cr_tips", rendered: true, lines: cr_tips_res,
+      re: "<!-- tips_start -->(?<inner>(.|\n)*?)<!-- tips_end -->" }
+  , { name: "codex_about", rendered: true, lines: codex_about_res,
+      re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
+  , { name: "html_comment", rendered: false, lines: null,
+      re: "<!--(.|\n)*?-->" }
+  ];
+def strip_accounted($names):
+  if ($names | any(. as $n | ([accounted_regions[] | .name] | index($n)) == null)) then null
+  else reduce accounted_regions[] as $r (.;
+    if . == null then null
+    elif ($r.name | IN($names[]) | not) then .
+    elif ($r.rendered | not) then gsub($r.re; "")
+    elif (($r.lines // []) | length) == 0 then null
+    elif ([match($r.re; "g")] | all(.[];
+            [.captures[] | select(.name == "inner") | .string] as $c
+            | ($c | length) == 1
+              and (($c[0] // "") | split("\n")
+                   | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))
+                   | all(.[]; . as $line | any($r.lines[]; . as $re | $line | test($re))))))
+      then gsub($r.re; "")
+    else null end)
+  end;
 def verdict_lines:
-  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
-    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
-    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
-    | map(select(length > 0 and . != cr_note)));
+  ((. // "") | strip_accounted(["codex_about", "html_comment"])) as $s
+  | if $s == null then null
+    else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+             | map(select(length > 0 and . != cr_note))) end;
 def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
@@ -698,10 +764,10 @@ def summary_cells:
   | (if (.[0] // "") == "" then .[1:] else . end)
   | (if (.[-1] // "") == "" then .[:-1] else . end);
 def summary_lines:
-  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
-    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
-    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
-    | map(select(length > 0)));
+  ((. // "") | strip_accounted(["codex_about", "html_comment"])) as $s
+  | if $s == null then null
+    else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+             | map(select(length > 0))) end;
 def is_codex_summary:
   (((. // "") | sub("^[[:space:]]+"; "")) | startswith(codex_summary_marker))
   and (summary_lines as $l
@@ -753,7 +819,6 @@ def is_cr_reply_notice:
     or (($l | length) == 2 and $l[0] == "### Rate Limit Exceeded" and ($l[1] | test(cr_chat_limit_re)));
 def cr_notice_start_re: "^<!-- This is an auto-generated comment: (?<k>rate limited|skip review|review paused) by coderabbit\\.ai -->$";
 def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paused)$";
-def cr_tips_re: "<!-- tips_start -->(.|\n)*?<!-- tips_end -->";
 # The notice payload, one accepted shape per line, with the parts that vary between
 # postings generalized: counts, durations, shas, run and org ids, backticked names, and the
 # handle the rate-limit line addresses. An apostrophe is written "." so this list can live
@@ -818,8 +883,8 @@ def is_cr_summary_notice:
                 | ($q | length) == 2
                   and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)))
                        | cr_notice_payload_ok)
-                  and (($p[0] + $q[1]) | gsub(cr_tips_re; "") | gsub("<!--(.|\n)*?-->"; "")
-                       | test("[^[:space:]]") | not)));
+                  and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "html_comment"])) as $rest
+                       | $rest != null and ($rest | test("[^[:space:]]") | not))));
 def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like

@@ -1320,7 +1320,7 @@ CR_CHAT=$(jq -n '"<!-- This is an auto-generated reply by CodeRabbit -->\n### Ra
 CR_TIPS=$'<!-- tips_start -->\n\n---\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=874)! It\'s free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary>❤️ Share</summary>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21&url=https%3A//coderabbit.ai)\n\n</details>\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->'
 # CodeRabbit's summary comment before any review has run: the summarize marker, one notice
 # of kind $1 holding the blockquote $2, the tips block, and $3 (default nothing) after it.
-cr_summary_notice() { jq -n --arg k "$1" --arg n "$2" --arg x "${3:-}" --arg tips "$CR_TIPS" '"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: \($k) by coderabbit.ai -->\n\n\($n)\n\n<!-- end of auto-generated comment: \($k) by coderabbit.ai -->\n\n\($tips)" + (if $x == "" then "" else "\n\n" + $x end)'; }
+cr_summary_notice() { jq -n --arg k "$1" --arg n "$2" --arg x "${3:-}" --arg tips "${4:-$CR_TIPS}" '"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: \($k) by coderabbit.ai -->\n\n\($n)\n\n<!-- end of auto-generated comment: \($k) by coderabbit.ai -->\n\n\($tips)" + (if $x == "" then "" else "\n\n" + $x end)'; }
 # The #874 notice quotes the range a review WOULD have covered, ending at the head.
 LIMIT_NOTICE=$'> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 53 minutes.**\n> \n> <details>\n> <summary>View limit details</summary>\n> \n> **Limit details:** You’ve used the included review currently available.\n> \n> [Learn how review limits work](https://docs.coderabbit.ai/management/plans#rate-limits).\n> \n> **Review configuration:**\n> \n> <details>\n> <summary>📥 Commits</summary>\n> \n> Reviewing files that changed from the base of the PR and between '"$BASE40"$' and '"$HEAD40"$'.\n> \n> </details>\n> \n> </details>'
 SKIP_NOTICE=$'> [!IMPORTANT]\n> ## Review skipped\n> \n> Auto reviews are disabled on base/target branches other than the default branch.\n> \n> Please check the settings in the CodeRabbit UI or the `.coderabbit.yaml` file in this repository. To trigger a single review, invoke the `@coderabbitai review` command.\n> \n> <details>\n> <summary>⚙️ Run configuration</summary>\n> \n> **Configuration used**: defaults\n> \n> **Run ID**: `29692184-5f4e-43c5-8f4f-ccb92b0cf21e`\n> \n> </details>\n> \n> Use the checkbox below for a quick retry:\n> - [ ] <!-- {"checkboxId": "e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> 🔍 Trigger review'
@@ -1459,6 +1459,92 @@ run_case "a summary notice of a kind this gate does not list is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice failure $'> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "a summary notice beside a walkthrough is a walkthrough, still claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_LIMITED" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+
+
+echo "== finding 45: a region removed before classification is a region nobody read =="
+# Round 1 of this class (finding 44) was the notice payload: every line starting with ">"
+# was accepted, so "> P1: this drops the last row" rode inside a notice and needed no
+# disposition. The payload is now parsed against shapes. That fixed one SITE, not the
+# class: three more regions were REMOVED from the body before the shapes ever ran, and
+# content removed before classification is content the classifier did not read.
+#
+#   region                                    removed by                    rendered
+#   <!-- tips_start --> .. <!-- tips_end -->  is_cr_summary_notice residue  yes
+#   <details> <summary>ℹ️ About Codex ..      verdict_lines, summary_lines  yes
+#   <!-- .. -->                               verdict_lines, summary_lines,
+#                                             is_cr_summary_notice residue  no
+#
+# Both rendered regions were live holes, verified red before the fix: a finding inside the
+# tips block made a CodeRabbit summary notice exempt from dispositions, and a finding
+# inside the About Codex block made a Codex verdict exempt AND still bound coverage to the
+# head. The invariant now: a body is exempt only if the classifier accounted for every
+# byte of it, so each removal names a declared region whose content must match that
+# region's line shapes, and a region holding anything else makes the whole body claimable.
+# HTML comments are declared unrendered: GitHub shows none of it, so nothing inside one is
+# a claim anybody can read or answer. Shapes were read off the 13 About blocks and 17 tips
+# blocks the two bots posted on ejc3/fcvm #789 through #901.
+CR_TIPS_FINDING=${CR_TIPS/'<sub>Comment'/'P1: this drops the last row'$'\n\n''<sub>Comment'}
+[ "$CR_TIPS_FINDING" != "$CR_TIPS" ] || { echo "  FAIL  tips fixture edit did not apply"; fail=$((fail+1)); }
+CR_TIPS_UNLISTED=${CR_TIPS/'<sub>Comment'/'<sub>A tips line this gate has never seen.</sub>'$'\n\n''<sub>Comment'}
+[ "$CR_TIPS_UNLISTED" != "$CR_TIPS" ] || { echo "  FAIL  tips fixture edit did not apply"; fail=$((fail+1)); }
+run_case "a summary notice with a finding in its tips block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' "$CR_TIPS_FINDING")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice whose tips block holds an unlisted line is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' "$CR_TIPS_UNLISTED")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+# A finding APPENDED to a line that is itself a listed shape. This is what the anchors in
+# each shape list are for: without them the shape matches the head of the line and the rest
+# rides along, which is round 1 of this class with a different marker.
+CR_TIPS_TRAILING=${CR_TIPS/'available commands.</sub>'/'available commands.</sub> P1: this drops the last row'}
+[ "$CR_TIPS_TRAILING" != "$CR_TIPS" ] || { echo "  FAIL  tips fixture edit did not apply"; fail=$((fail+1)); }
+run_case "a summary notice whose tips line carries a finding after it is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' "$CR_TIPS_TRAILING")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice with a finding in its tips block covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' "$CR_TIPS_FINDING")" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD"
+# The About Codex block, in both comments Codex folds one into: the legacy verdict, which
+# names the commit it covers, and the review-summary table, whose rows do.
+CODEX_VERDICT=$(codex_body ' Bravo.' deadbeef)
+CODEX_VERDICT_FINDING=${CODEX_VERDICT/'If Codex has suggestions'/'P1: this drops the last row\n\nIf Codex has suggestions'}
+[ "$CODEX_VERDICT_FINDING" != "$CODEX_VERDICT" ] || { echo "  FAIL  About-block fixture edit did not apply"; fail=$((fail+1)); }
+CODEX_SUM=$(codex_summary "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)")
+CODEX_SUM_FINDING=${CODEX_SUM/'Codex reacts with'/'P1: this drops the last row\n\nCodex reacts with'}
+[ "$CODEX_SUM_FINDING" != "$CODEX_SUM" ] || { echo "  FAIL  About-block fixture edit did not apply"; fail=$((fail+1)); }
+CODEX_VERDICT_TRAILING=${CODEX_VERDICT/'- Mark a draft as ready'/'- Mark a draft as ready. P1: this drops the last row'}
+[ "$CODEX_VERDICT_TRAILING" != "$CODEX_VERDICT" ] || { echo "  FAIL  About-block fixture edit did not apply"; fail=$((fail+1)); }
+run_case "a codex verdict whose About line carries a finding after it is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_VERDICT_TRAILING")")" 1 "carry no disposition"
+run_case "a codex verdict with a finding in its About block is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_VERDICT_FINDING")")" 1 "carry no disposition"
+run_case "a codex verdict with a finding in its About block covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_VERDICT_FINDING")")" 1 "UNREVIEWED HEAD"
+run_case "a codex review summary with a finding in its About block is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$CODEX_SUM_FINDING" 2026-01-02T01:00:05Z)")" 1 "carry no disposition"
+run_case "a codex review summary with a finding in its About block covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$CODEX_SUM_FINDING" 2026-01-02T01:00:05Z)")" 1 "UNREVIEWED HEAD"
+# The negative cases the exemption exists for, green before and after: the same bodies with
+# the regions as the bots actually post them stay exempt, and the verdict still covers.
+run_case "the same summary notice with the real tips block still needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE")" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "the same summary notice with the real tips block still covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE")" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD"
+run_case "the same codex verdict with the real About block still covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_VERDICT")")" 0 "HEAD COVERED"
+run_case "the same codex review summary with the real About block still covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$CODEX_SUM" 2026-01-02T01:00:05Z)")" 0 "HEAD COVERED"
+run_case "a codex quota notice is still exempt and still covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "UNREVIEWED HEAD"
+run_case "a coderabbit rate-limit reply is still exempt and still covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_LIMITED")")" 1 "UNREVIEWED HEAD"
+# Structural pin. Fixing sites one at a time is what produced rounds 1, 2 and 3, so the
+# NEXT removal must fail a test unless it declares a region. gate-discard-sites.sh reads
+# VERDICT_JQ, enumerates every call that discards content, and blocks on any that is
+# neither the accounting primitive nor one of the listed normalizations. It enumerates
+# rather than naming, so a step added under any name is caught.
+if out=$(bash "$(dirname "$GATE")/gate-discard-sites.sh" 2>&1); then
+  echo "  PASS  every discard in VERDICT_JQ is a declared region or a listed normalization"; pass=$((pass+1))
+else
+  echo "  FAIL  every discard in VERDICT_JQ is a declared region or a listed normalization"
+  sed 's/^/          /' <<<"$out" | head -8; fail=$((fail+1))
+fi
 
 
 echo
