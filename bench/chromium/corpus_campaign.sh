@@ -479,8 +479,12 @@ write_dns_evidence() {
     # busy box at the start, and the record is what says how busy it got.
     # Prints the final verdict; a verdict that could not be written is
     # unclean and the function returns 1.
-    local verdict="$1" reason="${2:-}" log="$RESULTS/dns-owner.log"
-    local out="$RESULTS/dns-evidence.json"
+    # owner_log and verify_files are names inside $RESULTS, not paths. The
+    # run directory is committed and read from other checkouts, where a path
+    # of this box names nothing; campaign_summary resolves each name beside
+    # the record, and verify_file_sha256 is keyed by the same names.
+    local verdict="$1" reason="${2:-}" owner_log="dns-owner.log"
+    local log="$RESULTS/$owner_log" out="$RESULTS/dns-evidence.json"
     local samples=0 first_mismatch="" before=false after=false after_state f
     local sampler_alive=false load_stats load_samples=0 load_max=null
     # The run this bundle is evidence for. Every file in it (the brackets,
@@ -537,7 +541,7 @@ write_dns_evidence() {
     # unclean.
     local verify_sha='{}' sha
     for f in pre before-run after-run; do
-        if [ -f "$RESULTS/verify-dns-$f.json" ]; then files+=("$RESULTS/verify-dns-$f.json"); fi
+        if [ -f "$RESULTS/verify-dns-$f.json" ]; then files+=("verify-dns-$f.json"); fi
         if ! jq -e '.passed == true' "$RESULTS/verify-dns-$f.json" >/dev/null 2>&1; then
             verdict=unclean; reason="${reason:-the $f verify bracket is missing or did not pass}"
         fi
@@ -580,7 +584,7 @@ write_dns_evidence() {
         --arg after_state "$after_state" --argjson sampler_alive "$sampler_alive" \
         --argjson samples "$samples" --argjson interval "$DNS_SAMPLE_INTERVAL" \
         --argjson load_max "$load_max" --argjson load_samples "$load_samples" \
-        --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$log" \
+        --arg first "$first_mismatch" --arg reason "$reason" --arg owner_log "$owner_log" \
         --arg dns_sha "$(sha256_or_empty "$RESULTS/corpus-dns.log")" \
         --arg replay_queries_sha "$(sha256_or_empty "$RESULTS/replay-queries.log")" \
         --arg access_sha "$(sha256_or_empty "$RESULTS/corpus-access.log")" \

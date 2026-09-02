@@ -1590,12 +1590,47 @@ wait_sampler_gone() {
             self.assertGreaterEqual(evidence["samples"], 3)
             self.assertIsNone(evidence["first_mismatch"])
             self.assertEqual(evidence["verify_files"],
-                             [os.path.join(results, f"verify-dns-{s}.json")
-                              for s in self.BRACKETS])
+                             [f"verify-dns-{s}.json" for s in self.BRACKETS])
             for key, name in (("corpus_dns_log_sha256", "corpus-dns.log"),
                               ("corpus_access_log_sha256", "corpus-access.log")):
                 self.assertEqual(evidence[key],
                                  hashlib.sha256((name + "\n").encode()).hexdigest())
+
+    def test_the_evidence_names_its_files_relative_to_the_run_directory(self):
+        """owner_log and verify_files are names inside the run directory
+        (dns-owner.log, verify-dns-<stage>.json), the names verify_file_sha256
+        is keyed by. The record outlives the box that wrote it: the run
+        directory is committed under results/ and read from other checkouts,
+        where an absolute path of the producing box names nothing. The cells
+        sealed before this change carry such paths and are never rewritten
+        (each campaign index cites dns-evidence.json by sha256), so the
+        consumer keeps resolving by basename; test_dns_evidence_paths.py
+        holds campaign_summary to both forms.
+
+        RED BEFORE THE FIX: `/tmp/.../results/dns-owner.log does not resolve
+        inside the relocated run directory`; owner_log and every verify_files
+        entry named the results directory of the box that wrote them.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            evidence, _ = self._sample(env, results)
+            self.assertEqual(evidence["verdict"], "clean", evidence)
+            cited = [evidence["owner_log"], *evidence["verify_files"]]
+            # A reader that has only the run directory, wherever it is now.
+            moved = os.path.join(tmp, "elsewhere", "reqbench-20260902-000000-corpus")
+            os.makedirs(os.path.dirname(moved))
+            os.rename(results, moved)
+            for name in cited:
+                self.assertTrue(
+                    os.path.isfile(os.path.join(moved, name)),
+                    f"{name} does not resolve inside the relocated run directory")
+            self.assertEqual(evidence["owner_log"], "dns-owner.log")
+            self.assertEqual(evidence["verify_files"],
+                             [f"verify-dns-{s}.json" for s in self.BRACKETS])
+            self.assertEqual(set(evidence["verify_files"]),
+                             set(evidence["verify_file_sha256"]))
+            self.assertNotIn(results, json.dumps(evidence),
+                             "a clean record names the directory of the box that wrote it")
 
     def test_the_evidence_pins_each_bracket_by_hash(self):
         """The bracket files are the only record that a restored clone
