@@ -434,6 +434,44 @@ fn fixture_shape_problem(name: &str, text: &str) -> Option<String> {
             ));
         }
     }
+    // A review's own inline comments, which is how the gate tells a submitted review from
+    // the empty container GitHub mints for a reply to a comment thread. A fixture without
+    // them makes every empty review on the head decline coverage for the wrong reason.
+    for (i, review) in pr["reviews"]["nodes"]
+        .as_array()
+        .expect("checked above")
+        .iter()
+        .enumerate()
+    {
+        let at = format!("reviews.nodes[{i}]");
+        for (path, value) in [("state", &review["state"]), ("body", &review["body"])] {
+            if !value.is_string() {
+                return Some(format!(
+                    "fixture {name}: {at}.{path} is not a string. {hint}"
+                ));
+            }
+        }
+        if !review["comments"]["totalCount"].is_number() {
+            return Some(format!(
+                "fixture {name}: {at}.comments.totalCount is not a number, so a truncated \
+                 connection cannot be told from a complete one. {hint}"
+            ));
+        }
+        let Some(comments) = review["comments"]["nodes"].as_array() else {
+            return Some(format!(
+                "fixture {name}: {at}.comments.nodes is not an array. {hint}"
+            ));
+        };
+        for (j, comment) in comments.iter().enumerate() {
+            if comment.get("replyTo").is_none() {
+                return Some(format!(
+                    "fixture {name}: {at}.comments.nodes[{j}] has no `replyTo` key, and it \
+                     is the field that separates a finding this review placed from a reply \
+                     to someone else's. {hint}"
+                ));
+            }
+        }
+    }
     for (i, thread) in pr["reviewThreads"]["nodes"]
         .as_array()
         .expect("checked above")
@@ -1261,5 +1299,117 @@ fn a_region_stripped_before_classification_is_validated_or_the_body_stays_claima
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An EMPTY review object is not a review.
+///
+/// #897 merged at 14:28:38Z on head 27b1b943 with its last two commits reviewed by nobody.
+/// CodeRabbit reviewed the previous head 34f66d47, posted two findings, and was refused
+/// under Fair Usage on every request after that. The author fixed both, pushed, replied in
+/// both threads and resolved them. GitHub mints an empty COMMENTED review object as the
+/// container for each reply to an inline thread, and both landed on the new head:
+///
+/// ```text
+/// [coderabbitai[bot]] COMMENTED body_len=0  14:16:37Z  commit=27b1b943
+/// [coderabbitai[bot]] COMMENTED body_len=0  14:16:41Z  commit=27b1b943
+/// ```
+///
+/// The coverage predicate counted any review object on the head from a non-author, so those
+/// two containers certified a commit nobody had read and the gate reported CLEAR. Same
+/// failure class the gate already carries two scars from: "the reviewer never ran" must not
+/// be indistinguishable from "the reviewer approved".
+///
+/// A review object is coverage only when it carries something that could only exist because
+/// a review ran: a non-empty body, a state of APPROVED or CHANGES_REQUESTED (a reply
+/// container is always COMMENTED), or an inline comment of its own that is not a reply.
+/// The last is not decoration, and the second half of this test pins it: a human who
+/// reviews with inline comments and no summary submits exactly that shape, and refusing it
+/// would leave such a head permanently uncoverable once its threads were answered.
+///
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 46") carries the full
+/// matrix, including the truncated and unparsable review objects; these run in CI.
+#[test]
+fn an_empty_review_object_is_not_head_coverage() {
+    require_jq();
+    // The two threads CodeRabbit raised on the old head, answered and resolved.
+    const THREADS: &str = r#"[
+      {"id":"PRRT_1","isResolved":true,"isOutdated":false,"comments":{"nodes":[
+        {"author":{"login":"coderabbitai"},"path":"scripts/x.sh","line":10,"originalLine":10,
+         "body":"P1: this drops the last row"},
+        {"author":{"login":"me"},"path":"scripts/x.sh","line":10,"originalLine":10,
+         "body":"RED-VERIFIED: tests/row.rs"}]}},
+      {"id":"PRRT_2","isResolved":true,"isOutdated":false,"comments":{"nodes":[
+        {"author":{"login":"coderabbitai"},"path":"scripts/x.sh","line":20,"originalLine":20,
+         "body":"P2: the count is off by one"},
+        {"author":{"login":"me"},"path":"scripts/x.sh","line":20,"originalLine":20,
+         "body":"NOT-A-DEFECT: reworded the message only"}]}}]"#;
+    // The real review of the OLD head, the author's disposition, and the two empty
+    // containers GitHub minted for the bot's two thread replies on the new head.
+    const PR897_REVIEWS: &str = r#"[
+      {"author":{"login":"coderabbitai"},"state":"COMMENTED","submittedAt":"2026-01-02T00:10:00Z",
+       "commit":{"oid":"0ldc0mm1t"},"body":"**Actionable comments posted: 2**",
+       "comments":{"totalCount":2,"nodes":[{"replyTo":null},{"replyTo":null}]}},
+      {"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z",
+       "commit":{"oid":"deadbeef"},"body":"RED-VERIFIED: tests/row.rs, both findings answered",
+       "comments":{"totalCount":0,"nodes":[]}},
+      {"author":{"login":"coderabbitai"},"state":"COMMENTED","submittedAt":"2026-01-02T00:50:00Z",
+       "commit":{"oid":"deadbeef"},"body":"",
+       "comments":{"totalCount":1,"nodes":[{"replyTo":{"id":"PRRC_a"}}]}},
+      {"author":{"login":"coderabbitai"},"state":"COMMENTED","submittedAt":"2026-01-02T00:50:04Z",
+       "commit":{"oid":"deadbeef"},"body":"",
+       "comments":{"totalCount":1,"nodes":[{"replyTo":{"id":"PRRC_b"}}]}}]"#;
+    // The shape an over-tight rule would refuse: inline findings, no summary body.
+    const INLINE_ONLY: &str = r#"[
+      {"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T00:40:00Z",
+       "commit":{"oid":"deadbeef"},"body":"",
+       "comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]"#;
+
+    let payload = |threads: &str, reviews: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":{threads}}},"reviews":{{"nodes":{reviews}}},"comments":{{"nodes":[]}},"recheck":{{"comments":{{"nodes":[]}}}}}}}}}}}}"#
+        )
+    };
+
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-empty-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    let (out, code) = run("pr897.json", payload(THREADS, PR897_REVIEWS));
+    assert_eq!(
+        code, 1,
+        "every finding on this PR is answered and resolved, and the only review objects on \
+         the head are the empty containers GitHub minted for two thread replies. Nobody \
+         reviewed the head. Exit 0 here is the #897 merge.\n{out}"
+    );
+    assert!(
+        out.contains("UNREVIEWED HEAD"),
+        "the gate must name the uncovered head rather than blocking for some other \
+         reason.\n{out}"
+    );
+
+    let (out, code) = run("inline-only.json", payload("[]", INLINE_ONLY));
+    assert_eq!(
+        code, 0,
+        "a review that placed an inline finding of its own is a review, whatever its \
+         summary body says. Refusing it would leave a head permanently uncoverable once \
+         its threads were answered, and a gate that cries wolf gets switched off.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
 }

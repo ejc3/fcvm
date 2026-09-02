@@ -273,7 +273,8 @@ fetch_payload() {
             commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt commit { oid } }
+              nodes { author { login } state body submittedAt commit { oid }
+                    comments(first: $REVIEWS_PAGE_SIZE) { totalCount nodes { replyTo { id } } } }
             } } } }" 2>/dev/null) || return 1
     require_page "$rresp" data.repository.pullRequest.reviews "the reviews" "$pr" || return 2
     reviews=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
@@ -375,7 +376,8 @@ fetch_payload() {
           pullRequest(number: $pr) {
             reviews(first: $REVIEWS_PAGE_SIZE$rv2after) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt commit { oid } }
+              nodes { author { login } state body submittedAt commit { oid }
+                    comments(first: $REVIEWS_PAGE_SIZE) { totalCount nodes { replyTo { id } } } }
             } } } }" 2>/dev/null) || return 1
     require_page "$rv2resp" data.repository.pullRequest.reviews "the second read of the reviews" "$pr" || return 2
     rv2=$(jq -s '.[0] + (.[1].data.repository.pullRequest.reviews.nodes // [])' \
@@ -1153,9 +1155,78 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # author's own `gh pr review --comment` disposition — posted after the push, as the
   # workflow requires — marked the commit reviewed. The check certified precisely the
   # race it was built to catch.
-  reviewed=$(jq -r --arg h "$headoid" --arg me "$prauthor" \
-             '[ .[] | select((.commit.oid // "") == $h) | select(.author.login != $me) ] | length' \
+  #
+  # And a review OBJECT on the head is not the same thing as a review of it. GitHub mints
+  # an empty COMMENTED review as the CONTAINER for every reply to an inline thread, bound
+  # to whatever the head is at the time. #897 merged on head 27b1b943 with its last two
+  # commits reviewed by nobody: CodeRabbit reviewed the previous head 34f66d47, posted two
+  # findings, was refused under Fair Usage on every request after that, and the two
+  # containers minted when it replied in the answered threads
+  #     [coderabbitai] COMMENTED body_len=0 14:16:37Z commit=27b1b943
+  #     [coderabbitai] COMMENTED body_len=0 14:16:41Z commit=27b1b943
+  # counted as coverage. The gate said CLEAR and the merge went through 12 minutes later.
+  # #901 merged the same way 40 minutes after that, on head e35ff1a2. This is the same
+  # fail-open as the missing `jq` and the rate-limited CodeRabbit check: "the reviewer never
+  # ran" reading as "the reviewer approved".
+  #
+  # So an object counts only when it carries something that could ONLY exist because a
+  # review ran. Three things can, and a reply container has none of them:
+  #   - a non-empty BODY. The reviewer wrote a summary. A container's body is "".
+  #   - a state of APPROVED or CHANGES_REQUESTED. GitHub mints those only from the review
+  #     form; a reply container is always COMMENTED. DISMISSED is a review withdrawn and
+  #     PENDING one never submitted, so neither covers on its own.
+  #   - an inline comment of its own that is not a reply, which is a finding this review
+  #     placed. No review on ejc3/fcvm has that shape today: every bot review here writes a
+  #     summary body (checked across #844, #853, #867, #872, #874, #887, #893, #897, #901).
+  #     It is admitted because POST /pulls/N/reviews takes `event: COMMENT` with `comments`
+  #     and no `body`, so a reviewer who only comments inline submits it, and refusing that
+  #     would leave the head uncoverable once its threads were answered. A gate that cries
+  #     wolf on a real review gets switched off, and then it catches nothing.
+  # Emptiness is judged on the object, not on who wrote it. Authorship has decided nothing
+  # in this gate since the claimable rule was rewritten, and a human's reply container is
+  # as empty as a bot's: #897 carried two of each.
+  covering_jq='def covers:
+      (((.body // "") | type) == "string" and ((.body // "") | test("[^[:space:]]")))
+      or (((.state // "") | type) == "string" and ((.state // "") | IN("APPROVED", "CHANGES_REQUESTED")))
+      or (any(.comments.nodes[]?; has("replyTo") and .replyTo == null));'
+  headreviews=$(jq -c --arg h "$headoid" --arg me "$prauthor" \
+             '[ .[] | select((.commit.oid // "") == $h) | select(.author.login != $me) ]' \
              <<<"$reviews") || {
+    echo "verdict: BLOCKED — could not evaluate head-commit review coverage." >&2; exit 2; }
+  # A review object this gate cannot read is not one it may wave through as coverage, and
+  # not one it may silently drop either. `state` is what separates a submitted verdict from
+  # a reply container, so a non-string one is unreadable and blocks.
+  if ! jq -e 'all(((.state // null) | type) == "string")' >/dev/null 2>&1 <<<"$headreviews"; then
+    echo "verdict: BLOCKED — a review object on the head has no readable state, so this" >&2
+    echo "gate cannot tell a submitted review from the empty container GitHub mints for a" >&2
+    echo "reply to a comment thread. Re-run, or re-capture the fixture." >&2
+    exit 2
+  fi
+  if ! jq -e 'all((has("comments") | not)
+                  or (((.comments | type) == "object") and ((.comments.nodes | type) == "array")))' \
+       >/dev/null 2>&1 <<<"$headreviews"; then
+    echo "verdict: BLOCKED — a review object on the head has an unreadable comments" >&2
+    echo "connection, so this gate cannot tell whether that review placed a finding." >&2
+    exit 2
+  fi
+  # A comments connection that does not account for every comment it reports cannot answer
+  # "did this review place a finding of its own": the one non-reply may be the comment that
+  # was not fetched. Only asked of an object that is not already coverage by body or state.
+  # An ABSENT connection is a different thing and declines rather than blocking: it is the
+  # shape of every fixture captured before this gate read review comments, and no evidence
+  # is not evidence of a review.
+  truncated=$(jq -r "$covering_jq"'[ .[] | select(covers | not) | select(has("comments"))
+    | select((((.comments.totalCount | type) == "number")
+              and (.comments.totalCount == (.comments.nodes | length))) | not) ] | length' \
+    <<<"$headreviews") || {
+    echo "verdict: BLOCKED — could not evaluate the head reviews' comment connections." >&2; exit 2; }
+  if [ "${truncated:-0}" -gt 0 ]; then
+    echo "verdict: BLOCKED — $truncated review object(s) on the head report more inline" >&2
+    echo "comments than were fetched, so this gate cannot tell whether they placed a" >&2
+    echo "finding or only replied to one. Re-run, or re-capture the fixture." >&2
+    exit 2
+  fi
+  reviewed=$(jq -r "$covering_jq"'[ .[] | select(covers) ] | length' <<<"$headreviews") || {
     echo "verdict: BLOCKED — could not evaluate head-commit review coverage." >&2; exit 2; }
   # A no-findings result leaves no review object (see VERDICT_JQ), so it carries no commit
   # of its own. It counts for THIS head only when the bot itself names the head. A result
@@ -1264,7 +1335,7 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
     echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
   elif [ "${reviewed:-0}" -eq 0 ]; then
     echo
-    echo "  UNREVIEWED HEAD  ${headoid:0:9} — no review object on this commit from anyone but the author, and no no-findings verdict bound to it"
+    echo "  UNREVIEWED HEAD  ${headoid:0:9} — no review of this commit from anyone but the author (an empty review object is a reply container, not a review), and no no-findings verdict bound to it"
     echo
     echo "verdict: BLOCKED — the head commit has not been reviewed."
     echo "Every finding raised so far is answered, but the code being merged is not the code"
