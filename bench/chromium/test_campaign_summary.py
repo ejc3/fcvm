@@ -633,9 +633,12 @@ class CampaignSummary(unittest.TestCase):
             self.assertIn("analysis.json", text)
 
     def test_absent_dns_evidence_is_recorded_as_null(self):
+        """A fixture run measures an IP-literal URL on the guest loopback and
+        needs no resolver; its cell records guest_dns null and no evidence."""
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
-            write_run(run_dir, dns_verdict=None, guest_dns=None)
+            write_run(run_dir, dns_verdict=None, guest_dns=None,
+                      cell_overrides={"url": "http://127.0.0.1:8000/medium.html"})
             out = os.path.join(d, "campaign-x-summary.json")
             rc, text = self._summarize(out, [run_dir])
             self.assertEqual(rc, 0, text)
@@ -1346,10 +1349,14 @@ class CampaignSummary(unittest.TestCase):
             self.assertIs(cell["diag"]["diag_passed"], True)
 
     def test_a_fixture_run_keeps_its_previous_shape(self):
-        """No resolver, no diag: the medium.html runs index as before."""
+        """No resolver, no diag: the medium.html runs index as before. The
+        fixture URL is an IP literal on the guest loopback, which is what
+        makes a run with no recorded resolver a fixture run and not an
+        ambient-DNS corpus run."""
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
-            write_run(run_dir, dns_verdict=None, guest_dns=None, diag=None)
+            write_run(run_dir, dns_verdict=None, guest_dns=None, diag=None,
+                      cell_overrides={"url": "http://127.0.0.1:8000/medium.html"})
             out = os.path.join(d, "campaign-x-summary.json")
             rc, text = self._summarize(out, [run_dir])
             self.assertEqual(rc, 0, text)
@@ -1357,6 +1364,78 @@ class CampaignSummary(unittest.TestCase):
                 cell = json.load(handle)["cells"][0]
         self.assertIsNone(cell["diag"])
         self.assertIsNone(cell["dns_verdict"])
+
+    def test_hostname_urls_with_no_recorded_resolver_are_not_indexed(self):
+        """A run whose measured URLs name hosts, whose cell records no
+        resolver (guest_dns null, no BENCH_RESOLVE_ALL_TO) and which carries
+        no dns-evidence.json resolved its corpus through whatever answered
+        port 53, and the record does not say what that was. Every
+        results/reqbench-20260816-*-corpus record has exactly that shape:
+        pasta redirected the guest's port 53 to the host's own resolver
+        (fixed in fcvm 90733b854e), and the index took them with
+        dns_verdict null. reqanalyze already refuses the shape at analysis
+        time (AnalyzerResolverGate); the index has to refuse it too, or a
+        legacy or hand-edited analysis.json brings the numbers back. A
+        fixture run on an IP-literal URL, a baked resolver with clean
+        evidence and a resolver-rule golden keep indexing.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        corpus = "https://example.com/,https://news.ycombinator.com/"
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(
+                d, dns_verdict=None, guest_dns=None, diag=None,
+                cell_overrides={"url": corpus})
+            self.assertIn("resolver", text)
+            self.assertIn("ambient DNS", text)
+        accepted = (
+            ("a fixture url on the host loopback",
+             dict(dns_verdict=None, guest_dns=None, diag=None,
+                  cell_overrides={"url": "http://127.0.0.1:8000/medium.html"})),
+            ("a baked resolver with clean evidence", {}),
+            ("a resolver rule naming the replay",
+             dict(dns_verdict=None, guest_dns=None,
+                  guest_env=["BENCH_RESOLVE_ALL_TO=10.0.2.2"],
+                  diag=diag_summary())),
+        )
+        for label, kwargs in accepted:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                run_dir = os.path.join(d, "run")
+                write_run(run_dir, **kwargs)
+                out = os.path.join(d, "campaign-x-summary.json")
+                rc, text = self._summarize(out, [run_dir])
+                self.assertEqual(rc, 0, f"{label}: {text}")
+
+    def test_a_resolver_rule_is_not_a_webkit_runs_resolver(self):
+        """Only entry.sh reads BENCH_RESOLVE_ALL_TO and only Chromium takes
+        the flag it builds (reqanalyze._resolver_rule_address refuses the
+        rule under any other engine). A WebKit cell with guest_dns null and
+        the rule in guest_env resolved its hostnames through whatever
+        resolv.conf named, and its diag carries no address trace to say
+        otherwise, so the rule records no resolver for that run and the
+        index refuses it like any hostname run with none. The same cell on
+        Chromium indexes.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        webkit_diag = diag_summary(engine="webkit")
+        webkit_diag["limits"].update(expect_ips=None)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(
+                d, engine="webkit", dns_verdict=None, guest_dns=None,
+                guest_env=rule, diag=webkit_diag)
+            self.assertIn("webkit", text)
+            self.assertIn("resolver", text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns=None, guest_env=rule,
+                      diag=diag_summary())
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
 
     def _refused(self, d, **run_kwargs):
         run_dir = os.path.join(d, "run")
@@ -2032,6 +2111,25 @@ class CampaignSummary(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _paths, text = self._refused(d, analysis_overrides={"withdrawn": True})
             self.assertIn("withdrawn", text)
+
+    def test_load_cell_refuses_a_marked_directory_itself(self):
+        """The marker is read at load_cell, again at the publication boundary
+        (withdrawal_errors) and again by compare.py. The two tests around
+        this one drive the CLI, so a load_cell that ignored the marker still
+        passed them: the later checks caught it. This pins the primary site.
+
+        RED BEFORE THE FIX (load_cell's marker check replaced by `if False:`):
+        AssertionError: RunError not raised
+        """
+        reason = "DNS contaminated: pasta redirected port 53"
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, withdrawn=reason + "\nsecond line")
+            with self.assertRaises(campaign_summary.RunError) as caught:
+                campaign_summary.load_cell(run_dir)
+            self.assertIn("withdrawn", str(caught.exception))
+            self.assertIn(reason, str(caught.exception))
+            self.assertNotIn("second line", str(caught.exception))
 
     def test_withdrawal_appearing_at_publication_boundary_refuses(self):
         """A run can be withdrawn after load_cell's first marker check. The

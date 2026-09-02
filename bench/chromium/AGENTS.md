@@ -193,7 +193,10 @@ in the repo-root AGENTS.md quickstart.
 To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
 directory whose first line is the reason; `campaign_summary.py` refuses the run
 and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
-true` the same way. A marker writer must first open the results directory and
+true` the same way. Independently of any marker it refuses a run that measured
+hostname URLs and records no resolver (`guest_dns` null, no
+`BENCH_RESOLVE_ALL_TO`, no `dns-evidence.json`): that is the shape of every
+2026-08-16 corpus record, whose guests resolved through ambient DNS. A marker writer must first open the results directory and
 take an exclusive `flock` on that directory descriptor, then remove completion
 records and atomically rename the marker while holding the lock.
 `campaign_summary.py` and `compare.py` hold shared locks on every run directory
@@ -265,7 +268,7 @@ easy to get wrong:
   themselves, so it survives a re-analysis; a hash of `analysis.json` would
   not.
 
-## Six methodology defects — do not reintroduce
+## Seven methodology defects — do not reintroduce
 
 1. **Matched accounting basis.** Sum memory over the SAME process set for every
    configuration you compare. The retracted claim ("fcvm 129 MiB/req beats a warm
@@ -307,6 +310,17 @@ easy to get wrong:
 6. **Quote uncertainty; round to it.** "129.0 MiB" on data carrying ±20–70 MiB is a
    false claim dressed as precision.
 
+7. **Record the resolver.** A run that measures hostname URLs must carry which
+   resolver answered: `guest_dns` with `dns-evidence.json` beside the record, or a
+   `BENCH_RESOLVE_ALL_TO` rule in `guest_env`. A `--dns` flag on the golden proves
+   nothing by itself: until fcvm `90733b854e` pasta claimed the guest's port 53 and
+   redirected it to the host's own resolver, so `--dns 10.0.2.2` was baked into every
+   corpus golden while the guest resolved on the live internet. The whole 2026-08-16
+   corpus series was withdrawn for this (REVIEW.md, "The 2026-08-16 corpus series");
+   `scripts/probe-pasta-dns-gateway.sh` reproduces the redirect with the pinned pasta
+   binary and no VM. `campaign_summary.load_cell` and `reqanalyze._validate_resolver`
+   refuse the shape.
+
 ## Environment traps (each cost real time)
 
 - **`/mnt/fcvm-btrfs` is ephemeral instance-store.** A stop/start wipes it: rootfs,
@@ -314,6 +328,11 @@ easy to get wrong:
   `make setup-fcvm` (~5 min; it boots a VM to build the 10 GB Layer-2 rootfs and
   waits for `FCVM_SETUP_COMPLETE` on the serial console). Golden snapshots must be
   rebuilt after. Verified 2026-08-08 after a nightly restart.
+- **pasta owned the guest's port 53 before fcvm `90733b854e`.** With `--dns` naming
+  the gateway, pasta still redirected port 53 to the host resolver, so a replay DNS
+  server on 10.0.2.2 was never asked. Check that the fcvm source_revision contains
+  that commit, and read `dns-evidence.json`, before trusting any hostname
+  measurement (defect 7).
 - **This box is shared with other agents.** Before measuring: check `uptime` and
   `pgrep -c firecracker`. Contention silently inflates every number. If load is
   non-trivial, say so in the report or re-run — do not quietly publish.
@@ -808,6 +827,17 @@ this list now points at it rather than contradicting it.
   "The CDP-path A/B"). `exec 565 ms`, `cdp 384 ms`, `cdp-fast 372 ms`,
   `PART 1 −180.5 ms`, `reclaim CPU 0.00 ms`, the `+610.4 ms` machine cost and the
   `pasta 704 ms` straggler are all withdrawn; do not quote any of them.
+- every figure from the 2026-08-16 corpus series: **WITHDRAWN IN FULL**
+  (REVIEW.md, "The 2026-08-16 corpus series"). The `695.7 ms` headline, the
+  `982.9 / 695.7 / 647.2 ms` vCPU ladder with its steps and noise floor, the
+  probed `966.2 / 685.5 / 660.5 ms` trio and the probe-overhead comparison, the
+  elmundo `31,046 ms` stall with its 114 ms, the CX `615.1 ms`, and "TCP connect
+  is 0.1 ms" as a network exclusion (`stages.tcp_ms` is the harness's loopback
+  connect to the CDP port, never the page's network) are all withdrawn; do not
+  quote any of them. Every run predates fcvm
+  `90733b854e`, so its guest resolved the corpus on the live internet. The
+  current corpus record is 712.6 ms at 2 vCPU from
+  `results/reqbench-20260830-171007-corpus`; no 4 or 8 vCPU cell is verified.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 

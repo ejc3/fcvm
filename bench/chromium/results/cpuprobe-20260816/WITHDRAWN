@@ -1,0 +1,4 @@
+Derived from withdrawn runs: the three curated files name source_run results/reqbench-20260816-152156-corpus (2 vCPU), -145649-corpus (4) and -154831-corpus (8), all withdrawn for DNS contamination (pasta redirected the guest's port 53 to the host resolver, fixed in fcvm 90733b854e), so the per-render peak-core samples and the cdp_blocking_p50_ms values (966.2, 685.5, 660.5 ms) were taken while renders waited on live DNS and are not quotable.
+See the WITHDRAWN marker in each source run directory for the per-run evidence.
+The probe's method (20 ms schedstat sampling of the vCPU threads) is unaffected; a probed campaign on a source_revision containing 90733b854e would replace these.
+ledger: bench/chromium/REVIEW.md, row for the 2026-08-16 corpus series.

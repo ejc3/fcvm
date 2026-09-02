@@ -57,9 +57,14 @@ What this rule costs the current document, so nobody rediscovers it:
   host container. Same treatment.
 - "Three network modes, priced" is fixture-based AND has no surviving record.
 
-That leaves the corpus mix (695.7 ms [560.9, 747.1], n=202, 14 URLs cycled
-uniformly, 4 guest vCPUs) as the publishable headline: the one figure with both
-a shipped record and a real workload behind it.
+That leaves the corpus mix as the publishable headline: 712.6 ms [610.5, 808.5],
+n=202, 14 URLs cycled uniformly, 2 guest vCPUs, from
+`results/reqbench-20260830-171007-corpus` (DNS-verified: `dns-evidence.json`
+verdict clean, first_mismatch null, diag violations none). It is the one figure
+with a shipped record, a real workload and a verified resolver behind it. The
+695.7 ms at 4 vCPU that stood here came from
+`results/reqbench-20260816-123529-corpus`, which is withdrawn (see "Corpus
+latency by guest vCPU count" below); no 4 or 8 vCPU cell is verified.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
@@ -138,67 +143,124 @@ fixed in the same pass:
   2026-08-16 reproduction section brings it back to 15; the count above is
   current.)
 
+The 2026-08-16 corpus series was withdrawn on 2026-09-02 for live-DNS
+contamination (the section below has the evidence). The headline moved from
+695.7 ms at 4 vCPU to the DNS-verified 712.6 ms at 2 vCPU, the vCPU ladder,
+its steps and its noise floor were withdrawn, the CPU-demand section lost its
+latency captions, the elmundo note now names its cause, and the "TCP connect is
+0.1 ms" network exclusion was withdrawn because the stage it quoted never
+measured the page's network. `test_reqbench.DocLint` now fails if a doc cites
+a withdrawn corpus record without saying so, or quotes a corpus figure that is
+not a median, lo or hi of a DNS-verified record.
+
 ## Corpus latency by guest vCPU count
 
-The curve below is the clean trio: three gated runs on one fcvm binary
-(`aa5340ac`), same host, same 14 URLs, same knobs. The campaign's ten gated
-2026-08-16 runs as a whole span four binaries (`3976d0ba`, `f1fb5376`,
-`3f85bd26`, `aa5340ac`; the summary's `_note` records which run used which),
-which is why the trio was re-run on one binary before drawing a curve:
+The 2026-08-16 ladder is withdrawn. Every run in that series (the ten gated
+campaign runs `results/reqbench-20260816-*-corpus`, the 2 vCPU rerun
+`results/reqbench-20260816-134130-corpus`, the three cpuprobe source runs, and
+the earlier `results/reqbench-20260814-042319-uffd`) has a source_revision that
+does not contain fcvm `90733b854e`. Before that commit pasta claimed the guest's
+port 53 and redirected it to the host's own resolver, so the guest resolved the
+corpus hostnames on the live internet instead of at the replay server;
+`scripts/probe-pasta-dns-gateway.sh` reproduces the redirect with the pinned
+pasta binary and no VM. Each directory carries a `WITHDRAWN` marker with the
+per-run evidence; `campaign_summary.py` refuses a marked run, and refuses the
+shape itself (hostname URLs with no recorded resolver) whether or not a marker
+is present. The raw records survive in
+`/home/ubuntu/src/fcvm-main/bench/chromium/results/`, the worktree the runs
+executed in, byte-identical to the sha256 each analysis.json records under
+`analysis_identity.inputs`, so the series can be re-analyzed without re-running.
+Re-analysis does not rehabilitate it: the current reqanalyze exits 5 on every
+record because the meta assigns no complete cell and the record names no
+resolver; on the 2026-08-16 runs the 15 s stall gate also fails, on 16 to 22
+elmundo load events per run, while the 2026-08-14 run has none over 15 s and
+passes it.
 
-| guest vCPUs | cdp p50 | CI | Page.enable |
+What the records show, read from the same reqbench.jsonl files the figures
+came from:
+
+- `render.nav.dns_ms` (Chrome Navigation Timing) is nonzero in 8 of 460 render
+  records of the withdrawn 4 vCPU run, seven of them between 149 and 158 ms.
+  The verified run has 2 nonzero of 230, at 4.6 and 4.9 ms.
+- `render.nav.ttfb_ms`: the verified run's maximum (15.0 ms) is below the
+  withdrawn 2 vCPU run's median (16.2 ms); the withdrawn runs' maxima are
+  1.0 to 7.4 s against a replay server on the host loopback.
+- The corpus is frozen (`corpus-live/`, one commit), yet news.ycombinator.com
+  produced 11 distinct screenshot hashes across 15 renders in each of the
+  withdrawn 2 and 4 vCPU runs, against 1 across 15 in the verified run.
+- www.elmundo.es: 30,912 ms median at 2 vCPU and 31,046 at 4 (cdp arm, n=14
+  each), unmoved by a vCPU doubling; 3,842 ms in the verified run.
+- Controls at matched 2 vCPU (withdrawn `reqbench-20260816-121054-corpus`
+  against the verified run): noop 41.0 vs 44.8 ms (the verified run is slower),
+  resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot 82.8 vs
+  80.3, navigate 598.4 vs 409.1. The two runs were measured on different
+  hosts: the withdrawn series on this box (`cell.host_kernel_release`
+  7.0.14-fcvm-cd6cd2b4b52e, boot 80bfe10d), the verified run on a
+  6.17.0-1019-aws host (boot 291f8bad), each on its own golden and fcvm
+  binary. So neither the navigate change nor the 3.8 ms noop shift is
+  attributed to the DNS fix. The withdrawn 982.9 is 37.9% above the
+  verified 712.6 across that host change; how much of the gap is DNS is
+  not measured.
+
+The one DNS-verified cell:
+
+| guest vCPUs | cdp p50 | CI | record |
 |---|---|---|---|
-| 2 | 982.9 ms | [776.3, 1046.4] | 6.8 ms |
-| **4** | **695.7 ms** | [560.9, 747.1] | 3.9 ms |
-| 8 | 647.2 ms | [567.6, 702.9] | 3.6 ms |
+| 2 | 712.6 ms | [610.5, 808.5] | `results/reqbench-20260830-171007-corpus/analysis.json` |
+| 4 | not measured on the fixed tree | | |
+| 8 | not measured on the fixed tree | | |
 
-The guest is CPU-starved rather than slow: `Page.enable` is one CDP round trip
-and it costs 6.8 ms on 2 vCPUs against 3.9 on 4, so it was waiting for a
-runnable core, not for the network -- TCP connect is 0.1 ms throughout.
+What survives of the withdrawn ladder is a direction, not a magnitude. On the
+six URLs whose screenshots are byte-identical between each withdrawn rung and
+the verified run (example.com and the five TodoMVC variants), the withdrawn
+series' cdp medians were 680.9, 498.7 and 494.9 ms at 2, 4 and 8 vCPU. Those
+six pages were still fetched over the live network in every withdrawn rung
+(example.com main-document ttfb 46.6 / 51.0 / 48.3 ms at 2 / 4 / 8 vCPU
+against 0.6 ms in the verified run; the five TodoMVC pages' medians 5.7 to
+7.5 / 3.7 to 4.0 / 3.8 to 4.1 ms against 0.5 to 1.0),
+so the direction survives only because that network term does not move with
+the vCPU count. The verified run's median on the same six URLs is 547.5 ms
+at 2 vCPU: 133 ms below the withdrawn 2 vCPU rung and 49 ms above the
+withdrawn 4 vCPU rung, so 4 vCPU is faster than 2 and the size of the knee
+is unmeasured. Nothing more is claimed until the ladder is re-run on a
+source_revision that contains `90733b854e`. Do not fill the 4 and 8 rows
+with a prediction.
 
-What the curve supports. vCPU count is baked into the golden, so the three
-points are three goldens, and this file's rule is that absolutes are per-golden.
-The spread is measured, not assumed: the 2 vCPU configuration was measured three
-times at 916.9, 951.2 and 982.9 ms — the first two on one golden and one binary
-(`cb-req-corpus`, `3976d0ba`), the third on a second golden with `aa5340ac` —
-so golden-to-golden plus binary-to-binary plus run-to-run variation together
-amount to at least 66 ms here. The 2->4 step (287 ms) is four
-times that and holds; the 4->8 step (48 ms) is smaller than it and does NOT.
-Eight vCPUs is not shown to be faster than four, only not slower.
+Two things about the withdrawn table, so nobody restores it from memory:
 
-One more gated record exists that no figure uses:
-`results/reqbench-20260816-134130-corpus` is a 2 vCPU rerun (927.8 ms median,
-202 measured) taken between the mixed-binary sweep and the clean trio; the
-clean trio superseded it, and it stays committed because the tracking rule
-keeps every gated record.
- Each point is
-one gated run: 202 samples, one experimental unit, so the harness's intervals
-are within-run and carry no run-to-run variance. Five independent bursts per
-configuration with burst-level intervals is what would give these medians real
-error bars, and that campaign has not been run.
+- Its 2 vCPU rung, 982.9 ms, was the MAXIMUM of the five withdrawn uffd/minor
+  2 vCPU cells in the series (916.9 to 982.9 ms, mean 949.0), which by itself
+  inflated the 2->4 step from 253 ms to 287 ms; the eight withdrawn 2 vCPU
+  cells across uffd/minor, uffd/copy and file backends and four fcvm binaries
+  span 878.5 to 982.9 ms (mean 938.2).
+- Its "the guest is CPU-starved rather than slow" argument rested on
+  `Page.enable` costing 6.8 ms on 2 vCPUs against 3.9 on 4 while "TCP connect
+  is 0.1 ms throughout". That 0.1 ms is `stages.tcp_ms`, which cdpdrive.py
+  defines as its own TCP connect to the WebSocket endpoint: the harness on the
+  host reaching the guest's forwarded CDP port on 127.0.0.2:9222 over loopback.
+  It is not the page's connection to any origin and cannot rule network
+  effects in or out. The page-side timings in the same records
+  (`render.nav.dns_ms`, `render.nav.ttfb_ms`, above) show the renders waiting
+  on live DNS. The conclusion is withdrawn. A CPU-starvation reading has to be
+  re-derived from a verified ladder with `render.nav` quoted beside
+  `Page.enable`; until then the section makes no claim about why 2 vCPU is
+  slower than 4.
 
-**elmundo is waiting, not rendering, and the cause is unresolved.** Its
-31,046 ms median is 99% `navigate_load_event_ms`. TTFB is 4.4 ms, the screenshot
-takes 85 ms as on every other page, and the screenshot takes just two forms
-across all 14 renders -- 108,917 bytes ten times and 108,923 four times, two
-distinct SHA-256s -- with which one you get uncorrelated with render time (the
-108,923 variant appears at both the fastest render, 4,390 ms, and the slowest,
-35,070). The page is visually complete almost immediately and the browser then
-waits; waiting longer does not change what is drawn. No healthy mode -- quickest 4.0 s,
-slowest 34.7 s.
+**elmundo was waiting on live DNS.** The 31,046 ms median this file called an
+unresolved guest-specific stall, and the "untested: DNS through the wildcard
+override" hedge under it, were the defect above: elmundo's third-party request
+chains, which the replay leaves unanswered, went out to the live internet and
+waited for real timeouts. The DNS-verified run measures elmundo at 3,842 ms
+median [3,714, 3,879], n=14, on 2 vCPUs, one screenshot form across all 14
+renders. The 114 ms it used to add to the mix median and the 581.8 ms
+elmundo-excluded figure are withdrawn with the run that produced them. The
+remaining 1.5 s over the 2.36 s host-container load (2026-08-17 probe,
+unretained) is not decomposed.
 
-It is NOT the unanswered ad chains, which is what this report used to say. Same
-corpus, same Chromium, host container with `--host-resolver-rules="MAP *
-127.0.0.1"`: load event at 2.36 s, with 8 requests failed and 10 still in flight
-AT the load event -- they do not hold it. Not vCPU count either: `--cpus=2`
-gives 2.82 s.
-
-A page that loads in 2.4 s on the host takes 31 s in a 4-vCPU guest and neither
-obvious explanation accounts for it. Untested and guest-specific: DNS through
-the wildcard override rather than a resolver rule, the network path to the
-replay server, and Chromium being restored from a snapshot rather than freshly
-launched. Open measurement defect, not a page-weight finding. Adds 114 ms to the
-mix median (581.8 ms without it); stays because the corpus is Kitesurf's list.
-
-Records: `results/reqbench-20260816-*-corpus/analysis.json`,
-`results/campaign-20260816-summary.json`. Procedure: `../corpus_campaign.sh`.
+Records: `results/reqbench-20260830-171007-corpus/analysis.json`,
+`results/campaign-20260830-box2-summary.json`. Withdrawn, kept in the tree
+with their markers: `results/reqbench-20260816-*-corpus/WITHDRAWN`,
+`results/reqbench-20260814-042319-uffd/WITHDRAWN`,
+`results/cpuprobe-20260816/WITHDRAWN`; `results/campaign-20260816-summary.json`
+is a hand-written index of those cells, not a record, and is not cited.
+Ledger: `../REVIEW.md`. Procedure: `../corpus_campaign.sh`.
