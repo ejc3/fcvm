@@ -271,11 +271,11 @@ and 5 at 2, 4 and 8 vCPU, and pooled over the four verified runs the median
 Subtracting the sleeps leaves 3.1, 3.2 and 4.5 ms of non-sleep time per rung,
 so the stage is almost entirely waiting. The 51.5 ms is one extra poll: at
 8 vCPU the endpoint was not ready at the attempt that served the 4 vCPU rung.
-The whole
-distribution shifts, not just the median, so this is not a boundary crossing:
-mean attempts are 3.58, 3.97 and 4.95. By how much the 8 vCPU guest was later
-is not measured. The stage resolves nothing finer than its own 50 ms quantum,
-and it spans host and guest with no field separating the wait from the request.
+The whole distribution shifts, not just the median, so this is not a boundary
+crossing: mean attempts are 3.58, 3.97 and 4.95. By how much the 8 vCPU guest
+was later is not measured. The stage resolves nothing finer than its own 50 ms
+quantum, and it spans host and guest with no field separating the wait from the
+request.
 
 The box was not equally quiet at every rung. `load_max_1min` is 2.62 at
 2 vCPU, 18.3 at 4 and 16.97 at 8, against 2.87 in the 2026-08-30 run, and the
