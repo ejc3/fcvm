@@ -259,6 +259,14 @@ navigate and screenshot both keep falling from 4 to 8. What rises is `resolve`,
 by 51.5 ms, which cdpdrive.py measures on the host as its own name lookup for
 the forwarded CDP endpoint, outside the guest.
 
+The box was not equally quiet at every rung. `load_max_1min` is 2.62 at
+2 vCPU, 18.3 at 4 and 16.97 at 8, against 2.87 in the 2026-08-30 run, and the
+per-request samples in the campaign index have medians 2.14, 4.41 and 4.19. The
+quiet-box gate is checked at run start, and the noop arm, which restores, boots
+and tears down without rendering, is the drift canary the analyzer rejects a
+run on: it reads 44.9, 45.1 and 45.8 ms across the three rungs, so the extra
+load did not move the lifecycle baseline.
+
 The two verified 2 vCPU cells agree: this ladder's 770.3 [596.2, 807.8] and
 the 2026-08-30 run's 712.6 [610.5, 808.5], each median inside the other's
 interval, measured on different goldens, fcvm binaries and hosts. That
