@@ -1547,6 +1547,140 @@ else
 fi
 
 
+echo "== finding 46: a comment is removed unread only where GitHub actually hides it =="
+# Round 4 of the same class. Finding 45 gave the two RENDERED regions shape lists and left
+# the third, html_comment, stripped with no check at all, on the premise that "GitHub
+# renders none of it". That premise is false. CommonMark's HTML-block start condition 2
+# admits at most three spaces of indentation; at four columns the same bytes are an indented
+# code block and every reader sees them. Confirmed against GitHub's own renderer
+# (POST /markdown, mode gfm): `<!-- P1 -->` returns nothing at 0-3 spaces and comes back as
+# a <pre><code> block at 4 spaces, after a tab, and inside a fenced block.
+#
+# So a finding a reader could see was removed before classification, which made the comment
+# a no-findings verdict: exempt from dispositions AND binding coverage to the head. The
+# region is now removed by strip_hidden_comments, which takes out a complete single-line
+# comment only on a line that is not indented four columns and not inside a fence, measured
+# after any blockquote markers. Anything else stays in the body and the body is claimable.
+# Codex's no-findings verdict with $1 appended: the two lines it must reduce to, plus the
+# bytes under test. The apostrophe is written \u0027 so this can live in a single-quoted
+# shell string, as codex_body above does.
+codex_plus() { jq -n --arg x "$1" '"Codex Review: Didn\u0027t find any major issues.\n\n**Reviewed commit:** `deadbeef`\n\n\($x)"'; }
+SPACE_FINDING='    <!-- P1: the restore path drops the last row -->'
+TAB_FINDING=$'\t<!-- P1: the restore path drops the last row -->'
+SPAN_FINDING=$'    <!-- P1: the restore path drops the last row\n    and the compaction pass never reruns\n    -->'
+FENCE_FINDING=$'```\n<!-- P1: the restore path drops the last row -->\n```'
+QUOTED_FINDING='>     <!-- P1: the restore path drops the last row -->'
+# The four-space case, in both of the things a verdict decides.
+run_case "a verdict with a four-space indented finding is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$SPACE_FINDING")")")" \
+  1 "carry no disposition"
+run_case "a verdict with a four-space indented finding covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$SPACE_FINDING")")")" \
+  1 "UNREVIEWED HEAD"
+# A tab is four columns, so a tab-indented comment renders the same way and a space-only
+# indentation test cannot see it.
+run_case "a verdict with a tab-indented finding is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$TAB_FINDING")")")" \
+  1 "carry no disposition"
+run_case "a verdict with a tab-indented finding covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$TAB_FINDING")")")" \
+  1 "UNREVIEWED HEAD"
+# An indented comment SPANNING lines shows every line of itself in the code block, so the
+# more text it carries the more a reader sees and the more the old region removed.
+run_case "a verdict with an indented finding spanning lines is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$SPAN_FINDING")")")" \
+  1 "carry no disposition"
+# The same bytes in the two other comments the exemption covers: Codex's review-summary
+# table, whose rows bind coverage, and a CodeRabbit summary notice, whose residue check
+# runs after the region is removed.
+run_case "a codex review summary with an indented finding is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_plus "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)" "$SPACE_FINDING")" 2026-01-02T01:00:05Z)")" \
+  1 "carry no disposition"
+run_case "a codex review summary with an indented finding covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T00:20:00Z "$(codex_summary_plus "$(sum_row Completed 2026-01-02T01:00:00.123456Z deadbee)" "$SPACE_FINDING")" 2026-01-02T01:00:05Z)")" \
+  1 "UNREVIEWED HEAD"
+run_case "a summary notice with an indented finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" "$SPACE_FINDING")" 2026-01-02T01:00:00Z)")" \
+  1 "carry no disposition"
+# A fenced block renders its content literally the same way. This pair was already green:
+# the fence markers themselves survive the removal and no shape list accepts a line of
+# backticks, so the shape lists caught it rather than the region rule. strip_hidden_comments
+# tracks fences so that protection stops depending on that coincidence; the scanner
+# assertion below is what goes red if the fence handling is dropped.
+run_case "a verdict with a fenced finding is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$FENCE_FINDING")")")" \
+  1 "carry no disposition"
+run_case "a verdict with a fenced finding covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$FENCE_FINDING")")")" \
+  1 "UNREVIEWED HEAD"
+# Indentation is measured inside the blockquote, not from the start of the line: GitHub
+# renders `>     <!-- .. -->` as a code block inside the quote.
+run_case "a verdict with a finding indented inside a blockquote is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$QUOTED_FINDING")")")" \
+  1 "carry no disposition"
+# The negative cases the exemption exists for. Every HTML comment the two bots posted on
+# ejc3/fcvm #789 through #901 (1602 of them) sits at column 0 on one line or inline on a
+# column-0 line, and all of it must stay exempt: an over-tight rule blocks on ordinary bot
+# traffic, which is how a gate gets switched off.
+run_case "a verdict carrying a column-0 hidden marker still covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus '<!-- an ordinary hidden marker -->')")")" \
+  0 "HEAD COVERED"
+run_case "a verdict whose reviewed-commit line carries an inline marker still covers" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(jq -n '"Codex Review: Didn\u0027t find any major issues.\n\n**Reviewed commit:** `deadbeef` <!-- run 4c1f -->"')")")" \
+  0 "HEAD COVERED"
+run_case "the real codex verdict with its About block still covers the head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body ' Bravo.' deadbeef)")")" \
+  0 "HEAD COVERED"
+run_case "the real summary notice still needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE")" 2026-01-02T01:00:00Z)")" \
+  0 "CLEAR"
+# The skip notice carries CodeRabbit's inline checkbox marker inside its blockquote, which
+# is the live inline case; it must stay a notice.
+run_case "the real skip notice with its inline checkbox marker still needs no disposition" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'skip review' "$SKIP_NOTICE")" 2026-01-02T01:00:00Z)")" \
+  0 "CLEAR"
+
+# The other two regions were checked for the same premise. Their DELIMITERS can be moved
+# into a code context the same way, but that hides nothing: what a rendered region removes
+# still has to match that region's line shapes, and a finding matches none of them. All four
+# were green before this change too, which is the answer to "is this the same class twice":
+# it is not, because those regions are justified by their shapes rather than by invisibility.
+run_case "a finding inside an indented About Codex block is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus $'    <details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n    <br/>\n    P1: this drops the last row\n    </details>')")")" \
+  1 "carry no disposition"
+run_case "a finding inside a fenced About Codex block is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus $'```\n<details> <summary>\u2139\ufe0f About Codex in GitHub</summary>\n<br/>\nP1: this drops the last row\n</details>\n```')")")" \
+  1 "carry no disposition"
+run_case "a finding inside an indented tips block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' $'    <!-- tips_start -->\n    ---\n    P1: this drops the last row\n    <!-- tips_end -->')" 2026-01-02T01:00:00Z)")" \
+  1 "carry no disposition"
+run_case "a finding inside a fenced tips block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" '' $'```\n<!-- tips_start -->\n---\nP1: this drops the last row\n<!-- tips_end -->\n```')" 2026-01-02T01:00:00Z)")" \
+  1 "carry no disposition"
+
+# The scanner, exercised directly from the gate's own VERDICT_JQ. The end-to-end cases above
+# cannot go red for the fence and blockquote rules, because today the leftover fence markers
+# and quote markers are themselves unlisted lines. This asserts the rule instead of the
+# coincidence, so dropping either one fails here.
+jqprog=$(awk '{f = f $0 "\n"}
+  END { k = index(f, "VERDICT_JQ=\047"); if (k == 0) exit 1
+        r = substr(f, k + length("VERDICT_JQ=\047")); e = index(r, "\047"); if (e == 0) exit 1
+        printf "%s", substr(r, 1, e - 1) }' "$GATE")
+scan_case() {
+  local name=$1 body=$2 want=$3 got
+  got=$(printf '%s' "$body" | jq -Rrs "$jqprog"' strip_hidden_comments' 2>&1)
+  if [ "$got" = "$want" ]; then echo "  PASS  $name"; pass=$((pass+1))
+  else echo "  FAIL  $name"; printf '          want %q\n          got  %q\n' "$want" "$got"; fail=$((fail+1)); fi
+}
+scan_case "a column-0 comment is removed"         '<!-- m -->'              ''
+scan_case "a fenced comment is kept"             $'```\n<!-- P1 -->\n```'    $'```\n<!-- P1 -->\n```'
+scan_case "a four-space comment is kept"         '    <!-- P1 -->'          '    <!-- P1 -->'
+scan_case "a tab-indented comment is kept"       $'\t<!-- P1 -->'           $'\t<!-- P1 -->'
+scan_case "a blockquote-indented comment is kept" '>     <!-- P1 -->'       '>     <!-- P1 -->'
+scan_case "a comment spanning lines is kept"     $'<!-- P1\nmore\n-->'      $'<!-- P1\nmore\n-->'
+scan_case "an inline comment is removed"         '- [ ] <!-- {"checkboxId":"a"} --> Trigger review' '- [ ]  Trigger review'
+scan_case "a quoted column-0 comment is removed" '> <!-- m -->'             '> '
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

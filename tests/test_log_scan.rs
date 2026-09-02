@@ -1263,3 +1263,221 @@ fn a_region_stripped_before_classification_is_validated_or_the_body_stays_claima
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A comment is removed unread only where GitHub actually hides it.
+///
+/// Round 4 of the same class as `a_region_stripped_before_classification_is_validated_...`.
+/// That round gave the two rendered regions shape lists and left the third, `html_comment`,
+/// stripped with no check at all, on the premise that GitHub renders nothing inside
+/// `<!-- .. -->`. The premise is false. CommonMark's HTML-block start condition 2 admits at
+/// most three spaces of indentation, so at four columns the same bytes are an indented code
+/// block and every reader sees them. Confirmed against GitHub's own renderer (POST
+/// /markdown, mode gfm): `<!-- P1 -->` returns nothing at 0-3 spaces and comes back as a
+/// `<pre><code>` block at 4 spaces, after a tab, and inside a fenced block.
+///
+/// So a finding a reader could see was removed before classification, which left the
+/// comment a no-findings verdict: exempt from dispositions AND binding coverage to the
+/// head. `strip_hidden_comments` now removes a complete single-line comment only on a line
+/// that is not indented four columns and not inside a fenced block, measured after any
+/// blockquote markers; everything else stays in the body and the body is claimable.
+///
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 46") carries the full
+/// matrix; these run in CI.
+#[test]
+fn a_comment_is_removed_unread_only_where_github_hides_it() {
+    require_jq();
+    const HEAD: &str =
+        r"Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `deadbeef`";
+    // Codex's no-findings verdict with `extra` appended, as a JSON string literal.
+    let verdict = |extra: &str| format!(r#""{HEAD}\n\n{extra}""#);
+    // The CodeRabbit rate-limit notice with `extra` appended after its tips block.
+    let notice = |extra: &str| {
+        format!(
+            r#""<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 53 minutes.**\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->\n\n<!-- tips_start -->\n\n---\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->{extra}""#
+        )
+    };
+    const COVERED: &str = r#"[{"author":{"login":"reviewer"},"state":"APPROVED","submittedAt":"2026-01-02T00:40:00Z","body":"","commit":{"oid":"deadbeef"}}]"#;
+    let comment = |login: &str, body: &str| {
+        format!(
+            r#"{{"author":{{"login":"{login}","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}"#
+        )
+    };
+    let payload = |reviews: &str, comments: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":{reviews}}},"comments":{{"nodes":[{comments}]}},"recheck":{{"comments":{{"nodes":[{comments}]}}}}}}}}}}}}"#
+        )
+    };
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-hidden-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    // Four columns of indentation. The gate reported CLEAR on exactly this body, with no
+    // review object anywhere on the PR.
+    let (out, code) = run(
+        "indent-verdict.json",
+        payload(
+            "[]",
+            &comment(
+                "chatgpt-codex-connector",
+                &verdict(r"    <!-- P1: the restore path drops the last row -->"),
+            ),
+        ),
+    );
+    assert_eq!(
+        code, 1,
+        "an indented comment is an indented code block: GitHub shows it, so the finding \
+         inside it is a finding and the comment is not a no-findings verdict.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+    assert!(
+        !out.contains("HEAD COVERED"),
+        "coverage was bound by a comment carrying a finding every reader can see.\n{out}"
+    );
+
+    // A tab is four columns, so a rule written in spaces alone cannot see this one.
+    let (out, code) = run(
+        "tab-verdict.json",
+        payload(
+            "[]",
+            &comment(
+                "chatgpt-codex-connector",
+                &verdict("\\t<!-- P1: the restore path drops the last row -->"),
+            ),
+        ),
+    );
+    assert_eq!(code, 1, "a tab indents four columns.\n{out}");
+    assert!(out.contains("carry no disposition"), "{out}");
+    assert!(!out.contains("HEAD COVERED"), "{out}");
+
+    // The same bytes appended to a real rate-limit notice, whose residue check runs after
+    // the region is removed.
+    let (out, code) = run(
+        "indent-notice.json",
+        payload(
+            COVERED,
+            &comment(
+                "coderabbitai",
+                &notice(r"\n\n    <!-- P1: the restore path drops the last row -->"),
+            ),
+        ),
+    );
+    assert_eq!(
+        code, 1,
+        "a notice is exempt because it claims nothing; one carrying a visible finding \
+         claims something.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+
+    // The negative cases the exemption exists for. Every HTML comment the two bots posted
+    // on ejc3/fcvm #789 through #901 sits at column 0 on one line or inline on a column-0
+    // line; an over-tight rule blocks on ordinary bot traffic.
+    let (out, code) = run(
+        "marker-verdict.json",
+        payload(
+            "[]",
+            &comment(
+                "chatgpt-codex-connector",
+                &verdict("<!-- an ordinary hidden marker -->"),
+            ),
+        ),
+    );
+    assert_eq!(
+        code, 0,
+        "a marker at column 0 is hidden and must stay exempt.\n{out}"
+    );
+    assert!(out.contains("HEAD COVERED"), "{out}");
+    let (out, code) = run(
+        "notice-clean.json",
+        payload(COVERED, &comment("coderabbitai", &notice(""))),
+    );
+    assert_eq!(
+        code, 0,
+        "the rate-limit notice CodeRabbit actually posts still needs no disposition.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    // The scanner, exercised directly from the gate's own VERDICT_JQ. The end-to-end cases
+    // above cannot go red for the fence and blockquote rules: today the leftover fence and
+    // quote markers are themselves unlisted lines, so the shape lists catch those bodies
+    // rather than the region rule. This asserts the rule instead of the coincidence.
+    let gate = std::fs::read_to_string(repo_root().join("scripts/check-review-threads.sh"))
+        .expect("the gate must be readable");
+    let jq_prog = gate
+        .split_once("VERDICT_JQ='")
+        .and_then(|(_, rest)| rest.split_once('\''))
+        .map(|(prog, _)| prog.to_string())
+        .expect("VERDICT_JQ must be a single-quoted assignment in the gate");
+    let strip = |body: &str| -> String {
+        let out = Command::new("jq")
+            .args(["-Rrs", &format!("{jq_prog} strip_hidden_comments")])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .and_then(|mut c| {
+                use std::io::Write;
+                c.stdin.as_mut().unwrap().write_all(body.as_bytes())?;
+                c.wait_with_output()
+            })
+            .expect("jq must be runnable");
+        assert!(
+            out.status.success(),
+            "strip_hidden_comments must exist and run: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // jq -Rrs adds no trailing newline of its own beyond the input's.
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    for (name, body, want) in [
+        ("a column-0 comment is removed", "<!-- m -->", ""),
+        (
+            "an inline comment is removed",
+            r#"- [ ] <!-- {"checkboxId":"a"} --> Trigger review"#,
+            "- [ ]  Trigger review",
+        ),
+        ("a quoted column-0 comment is removed", "> <!-- m -->", "> "),
+        (
+            "a four-column comment is kept",
+            "    <!-- P1 -->",
+            "    <!-- P1 -->",
+        ),
+        (
+            "a tab-indented comment is kept",
+            "\t<!-- P1 -->",
+            "\t<!-- P1 -->",
+        ),
+        (
+            "a fenced comment is kept",
+            "```\n<!-- P1 -->\n```",
+            "```\n<!-- P1 -->\n```",
+        ),
+        (
+            "a blockquote-indented comment is kept",
+            ">     <!-- P1 -->",
+            ">     <!-- P1 -->",
+        ),
+        (
+            "a comment spanning lines is kept",
+            "<!-- P1\nmore\n-->",
+            "<!-- P1\nmore\n-->",
+        ),
+    ] {
+        assert_eq!(strip(body).trim_end_matches('\n'), want, "{name}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
