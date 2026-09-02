@@ -808,6 +808,16 @@ this list now points at it rather than contradicting it.
   "The CDP-path A/B"). `exec 565 ms`, `cdp 384 ms`, `cdp-fast 372 ms`,
   `PART 1 −180.5 ms`, `reclaim CPU 0.00 ms`, the `+610.4 ms` machine cost and the
   `pasta 704 ms` straggler are all withdrawn; do not quote any of them.
+- every figure from the 2026-08-16 corpus series: **WITHDRAWN IN FULL**
+  (REVIEW.md, "The 2026-08-16 corpus series"). The `695.7 ms` headline, the
+  `982.9 / 695.7 / 647.2 ms` vCPU ladder with its steps and noise floor, the
+  probed `966.2 / 685.5 / 660.5 ms` trio and the probe-overhead comparison, the
+  elmundo `31,046 ms` stall with its 114 ms, the CX `615.1 ms`, and "TCP connect
+  is 0.1 ms" as a network exclusion (`stages.tcp_ms` is the harness's loopback
+  connect to the CDP port, never the page's network). Every run predates fcvm
+  `90733b854e`, so its guest resolved the corpus on the live internet. The
+  current corpus record is 712.6 ms at 2 vCPU from
+  `results/reqbench-20260830-171007-corpus`; no 4 or 8 vCPU cell is verified.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 

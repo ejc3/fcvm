@@ -12,6 +12,66 @@ records why.
 | `20260807-full` | 2026-08-07 | comparative numbers **retracted** on methodology (six defects) |
 | `results/20260808-corrected` | 2026-08-08 | six defects corrected; numbers below are the current record |
 | `reqbench` CDP A/B | 2026-08-08 | **WITHDRAWN IN FULL** — see "The CDP-path A/B" below. Harness defects invalidate every figure it produced. |
+| `results/reqbench-20260816-*-corpus` (14 runs), `results/reqbench-20260814-042319-uffd`, `results/cpuprobe-20260816` | 2026-08-14 to 2026-08-16 | **WITHDRAWN IN FULL** on 2026-09-02, live-DNS contamination; see "The 2026-08-16 corpus series" below. Each directory carries a `WITHDRAWN` marker with its evidence and stays in the tree. `results/campaign-20260816-summary.json` is a hand-written index of these cells, not a record. |
+| `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU is the current corpus headline. No 4 or 8 vCPU cell is verified. |
+
+---
+
+## The 2026-08-16 corpus series: WITHDRAWN, do not quote
+
+Every corpus run recorded before fcvm `90733b854e` (2026-08-29, "network: stop
+pasta claiming the guest's port 53 when --dns names the gateway") resolved its
+hostnames on the live internet. pasta claimed the guest's port 53 and redirected
+it to the host's own resolver, so the `--dns 10.0.2.2` baked into the corpus
+golden never reached the replay server; `scripts/probe-pasta-dns-gateway.sh`
+reproduces the redirect with the pinned pasta binary and no VM (with `-D none`
+the query reaches 10.0.2.2, without it port 53 lands on the host resolver).
+`git merge-base --is-ancestor 90733b854e <source_revision>` fails for every
+run in the series (e4e4df8d, efee2208, 45b64a4f, f167c726, a7275a4e, 8f0a01e8,
+and 50d343f8 for the 2026-08-14 CX run) and succeeds for the 2026-08-30
+record's 55756858.
+
+The raw records are intact in `/home/ubuntu/src/fcvm-main/bench/chromium/results/`,
+the worktree the runs executed in: each directory's `reqbench.jsonl` hashes to
+the sha256 its committed `analysis.json` records under
+`analysis_identity.inputs`, so the series can be re-analyzed without
+re-running. Re-analysis does not rehabilitate it (the current reqanalyze exits 5
+on the 4 vCPU record: the meta assigns no complete cell and the stall gate
+fails on 19 elmundo load events over 15 s), and `campaign_summary.py` refuses
+both a marked run and the shape itself: hostname URLs with no recorded
+resolver (`guest_dns` null, no `BENCH_RESOLVE_ALL_TO`, no `dns-evidence.json`).
+The marker is `WITHDRAWN` in each directory; it is never removed, and the
+directory is kept so the marker and its evidence stay readable.
+
+Evidence, from the runs' own `reqbench.jsonl` (paths under fcvm-main):
+
+- `render.nav.dns_ms` nonzero in 8 of 460 render records of
+  `reqbench-20260816-123529-corpus` (4 vCPU), seven between 149 and 158 ms;
+  26 of 460 in `-121054-corpus` (2 vCPU), max 141.5 ms; 52 of 460 in
+  `reqbench-20260814-042319-uffd`, max 186.2 ms. The verified run: 2 of 230,
+  at 4.6 and 4.9 ms.
+- `render.nav.ttfb_ms` maxima 1.0 to 7.4 s across the series (the replay
+  server sits on the host loopback); 15.0 ms in the verified run, below the
+  withdrawn 2 vCPU run's median of 16.2 ms.
+- news.ycombinator.com rendered 11 distinct screenshot hashes in 15 renders in
+  each of the 2 and 4 vCPU runs over a frozen corpus; 1 in the verified run.
+- www.elmundo.es cdp median 30,912 ms at 2 vCPU and 31,046 at 4 (n=14 each),
+  unmoved by a vCPU doubling; 3,842 ms [3,714, 3,879] in the verified run.
+- Controls at matched 2 vCPU (`-121054-corpus` vs the verified run): noop 41.0
+  vs 44.8 ms, resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot
+  82.8 vs 80.3; only navigate moves, 598.4 -> 409.1 ms. The contamination made
+  fcvm look worse, not better: 712.6 is 27.5% below the withdrawn 982.9.
+
+| withdrawn figure | why it cannot stand |
+|---|---|
+| corpus mix p50 **695.7 ms [560.9, 747.1]** at 4 vCPU (`results/reqbench-20260816-123529-corpus/analysis.json`), the report's headline and its Kitesurf comparison cell | Rendered under live DNS: `dns_ms` hits at 149-158 ms, `ttfb_ms` p99 279 ms and max 3.6 s, elmundo at 31 s. Replaced by 712.6 ms [610.5, 808.5] at 2 vCPU from `results/reqbench-20260830-171007-corpus/analysis.json`. No DNS-verified 4 vCPU cell exists; do not substitute a prediction. |
+| the vCPU ladder **982.9 / 695.7 / 647.2 ms** at 2/4/8, its steps (287 ms, 48 ms), its 66 ms noise floor (916.9, 951.2, 982.9) and "4 vCPU is the operating point" | All ten runs contaminated. 982.9 was also the maximum of eight same-config 2 vCPU cells (878.5-982.9, mean 938.2), inflating the 2->4 step from 242 to 287 ms. What survives is a direction only: on the six URLs whose screenshots are byte-identical between each rung and the verified run (example.com and the five TodoMVC pages), the withdrawn medians were 680.9 / 498.7 / 494.9 ms, so the knee is between 2 and 4 vCPU. |
+| the probed trio **966.2 / 685.5 / 660.5 ms** and its per-render peak-core captions (`results/cpuprobe-20260816/*.json`), the "probe overhead −1.5%" comparison (685.5 vs 695.7), and the 1630 -> 1885 -> 2340 core-ms totals | Source runs `-152156`, `-145649`, `-154831` are contaminated; the samples were taken while renders waited on live DNS, and a difference between two live-network runs says nothing about the probe. The censoring shape at 2 and 4 vCPU is kept as a lead, not a measurement. |
+| "the guest is CPU-starved, not slow: `Page.enable` 6.8 vs 3.9 ms, TCP connect is 0.1 ms throughout" | `stages.tcp_ms` is cdpdrive.py's own TCP connect to the WebSocket endpoint, the harness reaching the guest's forwarded CDP port on 127.0.0.2:9222 over loopback (`cdpdrive.py` line 16). It is not the page's connection to any origin and cannot exclude network effects. The page-side timings in the same records (`render.nav`) show live DNS. Conclusion withdrawn; a CPU-starvation reading needs a verified ladder with `render.nav` quoted beside `Page.enable`. |
+| elmundo **31,046 ms** "unresolved, guest-specific stall", its 114 ms contribution to the mix and the 581.8 ms elmundo-excluded figure | The cause was the untested item on that list: DNS. Third-party chains the replay leaves unanswered went to the live internet and waited for real timeouts. Verified value 3,842 ms at 2 vCPU. |
+| CX, **615.1 ms** at 2 vCPU (`results/reqbench-20260814-042319-uffd/analysis.json`), the report's original corpus run | Same class: source_revision 50d343f8 predates the fix, `dns_ms` nonzero in 52 of 460 records, no resolver evidence. |
+
+The guard is `test_reqbench.DocLint`: `test_every_corpus_record_cited_by_the_report_is_dns_verified_or_withdrawn` (a cited corpus record loads clean through `campaign_summary.load_cell` or is cited as withdrawn; every committed corpus record is one or the other; a cited campaign index is `campaign_summary` output whose hashes match the committed bytes) and `test_every_corpus_figure_in_the_ladder_is_a_verified_headline` (every figure in a vCPU or cdp-headline table equals a median, lo or hi of a verified record at its printed precision).
 
 ---
 
