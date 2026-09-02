@@ -122,7 +122,7 @@ a { color: inherit; }
 <p class="dek">fcvm runs each browser-render request in its own Firecracker microVM: restored from a snapshot of an already-running Chromium, driven over the Chrome DevTools Protocol, destroyed after one page. This report measures what that costs, on one Graviton3 server. Each number cites the run that produced it.</p>
 
 <div class="verdict">
-  <div><span class="num">549.4 ms</span><span class="lbl">p50 · Cloudflare&#8217;s 14-URL corpus, byte-replayed · 4 vCPU · gated · DNS-verified. The same ladder reads 770.3 ms at 2 vCPU, and a second verified 2 vCPU run reads 712.6</span></div>
+  <div><span class="num">549.4 ms</span><span class="lbl">p50 · Cloudflare&#8217;s 14-URL corpus, byte-replayed · 4 vCPU · gated · DNS-verified. The same ladder reads 770.3 ms at 2 vCPU; a second verified 2 vCPU run reads 712.6 ms</span></div>
   <div><span class="num">0</span><span class="lbl">failed requests in any gated run cited here: the four DNS-verified corpus runs at 202 measured each, the NM trio at 200</span></div>
 </div>
 <p class="src"><strong>The 348.7&nbsp;ms direct-CDP figure is not a headline.</strong> It is a <code>medium.html</code> micro-benchmark, kept below as optimisation evidence; published numbers come from the corpus mix only.</p>
