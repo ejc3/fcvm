@@ -268,9 +268,10 @@ loopback path as `tcp_ms` and Chromium inside the guest answers it.
 So the stage advances in 50 ms steps. `render.resolve_attempts` has median 4, 4
 and 5 at 2, 4 and 8 vCPU, and pooled over the four verified runs the median
 `resolve_ms` is 104.1 ms at 3 attempts, 153.6 at 4, 204.6 at 5 and 254.4 at 6.
-Subtracting the sleeps leaves 3.1, 3.2 and 4.5 ms of HTTP time per rung, so the
-stage is almost entirely waiting. The 51.5 ms is one extra poll: at 8 vCPU the
-endpoint was not ready at the attempt that served the 4 vCPU rung. The whole
+Subtracting the sleeps leaves 3.1, 3.2 and 4.5 ms of non-sleep time per rung,
+so the stage is almost entirely waiting. The 51.5 ms is one extra poll: at
+8 vCPU the endpoint was not ready at the attempt that served the 4 vCPU rung.
+The whole
 distribution shifts, not just the median, so this is not a boundary crossing:
 mean attempts are 3.58, 3.97 and 4.95. By how much the 8 vCPU guest was later
 is not measured. The stage resolves nothing finer than its own 50 ms quantum,
