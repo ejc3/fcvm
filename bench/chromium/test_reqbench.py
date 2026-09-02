@@ -6411,6 +6411,356 @@ class DocLint(unittest.TestCase):
                         f"(fcvm treats a missing healthcheck as a PASS, so the golden "
                         f"snapshot would fire on a cold browser).\n{snippet}")
 
+    # Corpus provenance. The report is hand-authored, so nothing between a
+    # results directory and a figure in the text checks that the directory
+    # can still be quoted. These two lints do: every corpus record a doc
+    # cites is DNS-verified or cited as withdrawn, and every corpus figure
+    # in a ladder or mix table is a value from a verified record.
+
+    CORPUS_DOCS = (
+        "README.md", "AGENTS.md", "REVIEW.md",
+        "report/README.md", "report/shared-nothing-renders.html",
+    )
+    RESULTS_CITE = re.compile(r"results/([A-Za-z0-9][A-Za-z0-9_.*\-]*)(…?)")
+
+    def _results(self):
+        return os.path.join(HERE, "results")
+
+    def _committed_results(self):
+        """Basenames of the committed results entries, and the committed
+        files under each, from git ls-files (a directory on disk but not
+        in git is not a record)."""
+        out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
+                             capture_output=True, text=True, check=True).stdout
+        files = {}
+        for path in out.split():
+            parts = path.split("/")
+            if len(parts) < 2:
+                continue
+            files.setdefault(parts[1], set()).add("/".join(parts[2:]))
+        self.assertTrue(files, "git ls-files found nothing under results/")
+        return files
+
+    def _doc_units(self, name):
+        """The citing units of a doc: HTML is one paragraph or row per line;
+        Markdown paragraphs span lines, so they are split on blank lines."""
+        text = self._read(name)
+        if name.endswith(".html"):
+            return text.splitlines()
+        return re.split(r"\n\s*\n", text)
+
+    def _cell_urls(self, run):
+        path = os.path.join(self._results(), run, "analysis.json")
+        if not os.path.isfile(path):
+            return None
+        with open(path) as f:
+            cell = json.load(f).get("cell") or {}
+        return [u.strip() for u in str(cell.get("url") or "").split(",") if u.strip()]
+
+    def _needs_resolver(self, run):
+        urls = self._cell_urls(run)
+        return bool(urls) and any(
+            reqanalyze.url_needs_resolver(u) is not False for u in urls)
+
+    def _is_withdrawn(self, run):
+        return os.path.lexists(
+            os.path.join(self._results(), run, campaign_summary.WITHDRAWN_MARKER))
+
+    def _verified_cell(self, run):
+        """load_cell's cell for a committed run, or the RunError text."""
+        try:
+            cell, _sources = campaign_summary.load_cell(
+                os.path.join(self._results(), run))
+        except campaign_summary.RunError as error:
+            return None, str(error)
+        return cell, None
+
+    def _resolve_cite(self, token, ellipsis, names):
+        if "*" in token:
+            import fnmatch
+            return sorted(n for n in names if fnmatch.fnmatch(n, token))
+        if token in names:
+            return [token]
+        if ellipsis or not re.search(r"\.\w+$", token):
+            return sorted(n for n in names if n.startswith(token))
+        return []
+
+    def test_every_corpus_record_cited_by_the_report_is_dns_verified_or_withdrawn(self):
+        """RED BEFORE THE FIX: report/README.md, REVIEW.md and the HTML cited
+        results/reqbench-20260816-*-corpus, results/cpuprobe-20260816 and
+        results/campaign-20260816-summary.json as the record behind the
+        695.7 ms headline and the 2/4/8 vCPU ladder. Every one of those
+        runs measured the 14-hostname corpus with guest_dns null and no
+        dns-evidence.json: pasta redirected the guest's port 53 to the
+        host's own resolver (fixed in fcvm 90733b854e, which none of their
+        source_revisions contain), so the corpus resolved on the live
+        internet. campaign-20260816-summary.json is hand-written (no
+        generated_from) and says publishable: true for all of them.
+
+        The rule: a corpus record (a cell whose URL needs a resolver) a
+        doc cites must load through campaign_summary.load_cell with
+        dns_verdict clean, or carry a WITHDRAWN marker and be cited on a
+        line that says so; the same holds for every committed corpus
+        record whether or not a doc cites it; a cited campaign index must
+        be campaign_summary output whose cells are all clean and whose
+        generated_from hashes match the committed bytes; and a cpuprobe
+        curated record whose source_run is withdrawn is withdrawn too.
+        """
+        self.maxDiff = None
+        files = self._committed_results()
+        names = set(files)
+        bad = []
+        seen = {"withdrawn": 0, "verified": 0, "cited": {}}
+
+        for name in self.CORPUS_DOCS:
+            for unit in self._doc_units(name):
+                for token, ellipsis in self.RESULTS_CITE.findall(unit):
+                    if token.startswith("campaign-") and token.endswith(".json"):
+                        bad.extend(self._check_cited_index(name, token, unit, files))
+                        continue
+                    for run in self._resolve_cite(token.rstrip("/"), ellipsis, names):
+                        seen["cited"][name] = seen["cited"].get(name, 0) + 1
+                        bad.extend(self._check_cited_run(name, run, unit, seen))
+
+        for run in sorted(names):
+            bad.extend(self._check_committed_run(run, seen))
+
+        self.assertEqual(bad, [], "\n".join(bad))
+        for name in ("report/README.md", "report/shared-nothing-renders.html"):
+            self.assertTrue(seen["cited"].get(name),
+                            f"{name}: the lint matched no results/ citation; it is vacuous")
+        self.assertTrue(seen["withdrawn"], "no withdrawn corpus record was examined")
+        self.assertTrue(seen["verified"], "no DNS-verified corpus record was examined")
+
+    def _check_cited_run(self, name, run, unit, seen):
+        if self._is_withdrawn(run):
+            seen["withdrawn"] += 1
+            if "withdrawn" not in unit.lower():
+                return [f"{name}: cites withdrawn results/{run} without saying so: "
+                        f"{unit.strip()[:160]!r}"]
+            return []
+        if not self._needs_resolver(run):
+            return []
+        cell, error = self._verified_cell(run)
+        if cell is None:
+            return [f"{name}: cites corpus record results/{run}, which campaign_summary "
+                    f"refuses: {error}"]
+        if cell["dns_verdict"] != "clean":
+            return [f"{name}: cites corpus record results/{run} with dns_verdict "
+                    f"{cell['dns_verdict']!r}, not clean"]
+        seen["verified"] += 1
+        return []
+
+    def _check_committed_run(self, run, seen):
+        results = self._results()
+        curated = sorted(
+            p for p in os.listdir(os.path.join(results, run))
+            if re.fullmatch(r"cpuprobe-.*-curated\.json", p)
+        ) if os.path.isdir(os.path.join(results, run)) else []
+        if curated:
+            for entry in curated:
+                with open(os.path.join(results, run, entry)) as f:
+                    source = os.path.basename(str(json.load(f).get("source_run") or ""))
+                if source in os.listdir(results) and self._is_withdrawn(source) \
+                        and not self._is_withdrawn(run):
+                    return [f"results/{run}/{entry}: source_run results/{source} is "
+                            f"withdrawn but results/{run} carries no WITHDRAWN marker"]
+            return []
+        if not self._needs_resolver(run):
+            return []
+        if self._is_withdrawn(run):
+            seen["withdrawn"] += 1
+            return []
+        cell, error = self._verified_cell(run)
+        if cell is None:
+            return [f"results/{run}: corpus record that is neither withdrawn nor "
+                    f"loadable: {error}"]
+        if cell["dns_verdict"] != "clean":
+            return [f"results/{run}: corpus record with dns_verdict "
+                    f"{cell['dns_verdict']!r} and no WITHDRAWN marker"]
+        seen["verified"] += 1
+        return []
+
+    def _check_cited_index(self, name, token, unit, files):
+        path = os.path.join(self._results(), token)
+        if not os.path.isfile(path):
+            return []
+        with open(path) as f:
+            index = json.load(f)
+        generated = index.get("generated_from") if isinstance(index, dict) else None
+        cells = index.get("cells") if isinstance(index, dict) else None
+        if not isinstance(generated, list) or not isinstance(cells, list):
+            if "withdrawn" in unit.lower():
+                return []
+            return [f"{name}: cites results/{token}, which campaign_summary did not "
+                    f"generate (no generated_from/cells), as a record: "
+                    f"{unit.strip()[:160]!r}"]
+        bad = []
+        for cell in cells:
+            run = os.path.basename(str(cell.get("run_dir") or ""))
+            if run not in files or self._is_withdrawn(run):
+                bad.append(f"{name}: results/{token} cell names results/{run}, "
+                           "which is missing or withdrawn")
+            if cell.get("dns_verdict") != "clean":
+                bad.append(f"{name}: results/{token} cell for results/{run} has "
+                           f"dns_verdict {cell.get('dns_verdict')!r}")
+        for entry in generated:
+            parts = str(entry.get("path") or "").split("/")
+            anchors = [i for i, part in enumerate(parts) if part in files]
+            run = parts[anchors[-1]] if anchors else ""
+            rel = "/".join(parts[anchors[-1] + 1:]) if anchors else ""
+            committed = os.path.join(self._results(), run, rel)
+            if run not in files or rel not in files[run]:
+                bad.append(f"{name}: results/{token} generated_from names "
+                           f"results/{run}/{rel}, not committed")
+                continue
+            with open(committed, "rb") as f:
+                digest = hashlib.sha256(f.read()).hexdigest()
+            if digest != entry.get("sha256"):
+                bad.append(f"{name}: results/{token} generated_from sha256 for "
+                           f"results/{run}/{rel} does not match the committed file")
+        return bad
+
+    # Tables that name a vCPU ladder or a cdp headline column carry corpus
+    # figures; every number in them must come from a verified record.
+
+    def _verified_values(self):
+        """Every median/lo/hi in every committed analysis.json that
+        campaign_summary accepts with dns_verdict clean."""
+        values = set()
+        runs = []
+        for run in sorted(self._committed_results()):
+            if not run.startswith("reqbench-") or self._is_withdrawn(run):
+                continue
+            cell, _error = self._verified_cell(run)
+            if cell is None or cell["dns_verdict"] != "clean":
+                continue
+            runs.append(run)
+            with open(os.path.join(self._results(), run, "analysis.json")) as f:
+                analysis = json.load(f)
+
+            def walk(node):
+                if isinstance(node, dict):
+                    for key in ("median", "lo", "hi"):
+                        v = node.get(key)
+                        if isinstance(v, (int, float)) and not isinstance(v, bool):
+                            values.add(float(v))
+                    for v in node.values():
+                        walk(v)
+                elif isinstance(node, list):
+                    for v in node:
+                        walk(v)
+            walk(analysis.get("arms"))
+            walk(analysis.get("per_url"))
+        return values, runs
+
+    NUMBER = re.compile(r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)(?![\w-])")
+    RANGE = re.compile(
+        r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)\s*[–—-]\s*(\d[\d,]*(?:\.\d+)?)\s*(ms|s)\b")
+    UNIT = re.compile(r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)\s*(ms|s)\b")
+
+    def _figures_in(self, cell_text):
+        """(value, unit_ms_multiplier, printed decimals) for every figure in
+        a table cell: ranges and unit-bearing numbers first, then bare
+        numbers of three or more digits or with a decimal point."""
+        import html as html_mod
+
+        text = html_mod.unescape(re.sub(r"<[^>]+>", "", cell_text))
+        text = text.replace(" ", " ")
+        found = []
+
+        def take(raw, unit):
+            value = float(raw.replace(",", ""))
+            decimals = len(raw.split(".")[1]) if "." in raw else 0
+            found.append((raw, value, 1000.0 if unit == "s" else 1.0, decimals))
+
+        def scrub(match):
+            return " " * len(match.group(0))
+
+        for m in self.RANGE.finditer(text):
+            take(m.group(1), m.group(3))
+            take(m.group(2), m.group(3))
+        text = self.RANGE.sub(scrub, text)
+        for m in self.UNIT.finditer(text):
+            take(m.group(1), m.group(2))
+        text = self.UNIT.sub(scrub, text)
+        for m in self.NUMBER.finditer(text):
+            raw = m.group(1)
+            if "." in raw or float(raw.replace(",", "")) >= 100:
+                take(raw, "ms")
+        return found
+
+    def _figure_tables(self, name):
+        """(header, [cells...]) for every table in a doc whose header names
+        a ladder or headline column, plus the verdict card's numbers."""
+        text = self._read(name)
+        tables = []
+        if name.endswith(".html"):
+            for body in re.findall(r"<table>(.*?)</table>", text, re.S):
+                rows = [re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", r, re.S)
+                        for r in re.findall(r"<tr>(.*?)</tr>", body, re.S)]
+                if rows:
+                    tables.append((" | ".join(rows[0]), rows[1:]))
+            card = re.search(r'<div class="verdict">(.*?)</div>\s*\n', text, re.S)
+            if card:
+                nums = re.findall(r'<span class="num">(.*?)</span>', card.group(1))
+                tables.append(("verdict card", [["verdict"] + nums]))
+        else:
+            block = []
+            for line in text.splitlines() + [""]:
+                if line.strip().startswith("|"):
+                    block.append(line)
+                    continue
+                if block:
+                    from test_report_kitesurf import table_rows
+                    rows = table_rows("\n".join(block))
+                    if rows:
+                        tables.append((" | ".join(rows[0]), rows[1:]))
+                    block = []
+        return [(h, rows) for h, rows in tables if self._is_figure_table(h, rows)]
+
+    def _is_figure_table(self, header, rows):
+        """A corpus table names a vCPU ladder or a cdp median in its header,
+        or a cdp p50 column over rows keyed by vCPU count. The fixture
+        ladder ("direct CDP p50" over run ids) is optimisation evidence
+        under this document's own publication rule and is not one."""
+        head = header.lower()
+        if head == "verdict card" or "vcpu" in head or "cdp median" in head:
+            return True
+        return "cdp p50" in head and any("vcpu" in row[0].lower() for row in rows if row)
+
+    def test_every_corpus_figure_in_the_ladder_is_a_verified_headline(self):
+        """RED BEFORE THE FIX: report/README.md's ladder quoted 982.9, 695.7
+        and 647.2 ms and the HTML's verdict card 695.7 ms, all medians of
+        withdrawn runs (see the lint above). A grep for one literal would
+        pass on 696 or 0.696 s and say nothing about the replacement, so
+        the allowed set is built from the records at test time: every
+        median, lo and hi in every committed analysis.json that
+        campaign_summary.load_cell accepts with dns_verdict clean. Each
+        figure in a vCPU or cdp-headline table must equal one of them at
+        its printed precision (a value in seconds is compared times 1000).
+        """
+        self.maxDiff = None
+        values, runs = self._verified_values()
+        self.assertTrue(values, "no DNS-verified record to draw figures from")
+        bad = []
+        checked = {}
+        for name in ("report/README.md", "report/shared-nothing-renders.html"):
+            tables = self._figure_tables(name)
+            self.assertTrue(tables, f"{name}: no ladder or headline table; the lint is vacuous")
+            for header, rows in tables:
+                for row in rows:
+                    for cell in row[1:]:
+                        for raw, value, scale, decimals in self._figures_in(cell):
+                            checked[name] = checked.get(name, 0) + 1
+                            if not any(abs(round(v / scale, decimals) - value) < 1e-9
+                                       for v in values):
+                                bad.append(f"{name}: table {header[:40]!r} quotes "
+                                           f"{raw!r}, which is no median, lo or hi of "
+                                           f"a verified record ({', '.join(runs)})")
+            self.assertTrue(checked.get(name), f"{name}: no figure was checked")
+        self.assertEqual(bad, [], "\n".join(bad))
+
 
 def probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode="canned"):
     """An fcvm stub that is BOTH a clone and an exec client.
