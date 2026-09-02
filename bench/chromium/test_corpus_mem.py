@@ -6364,9 +6364,10 @@ os.fsync = _fsync
         RED BEFORE THE FIX: the terminal checks named only Z, so the X
         (EXIT_DEAD) window that wait_task_zombie() holds open between storing
         EXIT_DEAD and calling release_task() read an already-exited process as
-        still running. Observed once in 200 local runs of
-        test_phase_supervisor_finalizes_after_parent_sigkill, and in CI on
-        5028c718 as "AssertionError: 'X' not found in (None, 'Z')".
+        still running. CI hit that window on 5028c718 in
+        test_phase_supervisor_finalizes_after_parent_sigkill:
+        "AssertionError: 'X' not found in (None, 'Z')"
+        (actions/runs/33618696866/job/100210498405).
         """
         for state in ("Z", "X"):
             with self.subTest(state=state), self._reported_state(state):
