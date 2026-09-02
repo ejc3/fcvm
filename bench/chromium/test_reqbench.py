@@ -7038,12 +7038,21 @@ class DocLint(unittest.TestCase):
         DNS-verified record) N must equal (subject - reference) / reference
         for "above" and (reference - subject) / reference for "below", at
         N's printed precision.
+
+        The two pools are drawn differently because the records differ.
+        A verified record carries per_url, so its pool is every median,
+        lo and hi under arms AND per_url (_record_values): 216 values
+        here, against the 3 render-arm blocking_ms figures a per-run-only
+        pool would give, and a percentage stated between two per-URL
+        figures passed unchecked while the pool was that narrow. No
+        withdrawn record carries per_url, so the withdrawn pool stays the
+        per-run render-arm triples _blocking_values can actually build.
         """
         self.maxDiff = None
         _headline, withdrawn, _runs = self._withdrawn_values()
         verified = set()
         for run in self._verified_runs():
-            verified |= self._blocking_values(run)[1]
+            verified |= self._record_values(run)
         corpus = withdrawn | verified
         self.assertTrue(withdrawn and verified, "no corpus record to draw figures from")
 
