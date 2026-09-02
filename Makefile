@@ -1021,7 +1021,12 @@ bench-chromium-corpus-extra: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-corpus-extra: require-clean-tree build setup-default
 	@bash bench/chromium/corpus_extra.sh
 
-bench-chromium-corpus: private SHELL := $(TARGET_LEASE_SHELL)
+# Not leased as a whole: the orchestrator runs `make -C` once per phase, and
+# each sub-make's cargo-target-link prerequisite takes the target generation's
+# lease exclusively. A recipe line holding that lease shared for the whole
+# campaign leaves the sub-make waiting on its own ancestor forever (observed
+# 2026-09-02: `flock -x` parked in locks_lock_inode_wait with the box idle).
+# The one direct target/ read below takes the lease for that command alone.
 bench-chromium-corpus: require-clean-tree build setup-default
 	@mkdir -p "$(dir $(CORPUS_RUN_DIR))"
 	@# Reserve, do not reuse: plain mkdir FAILS on collision. `mkdir -p` would
@@ -1035,7 +1040,7 @@ bench-chromium-corpus: require-clean-tree build setup-default
 	@cp bench/chromium/corpus_campaign.sh "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
 	@chmod 0555 "$(CORPUS_RUN_DIR)/orchestrator/corpus_campaign.sh"
 	@cd "$(CORPUS_RUN_DIR)/orchestrator" && sha256sum corpus_campaign.sh > MANIFEST.sha256
-	@sha256sum "$(CURDIR)/target/release/fcvm" >> "$(CORPUS_RUN_DIR)/orchestrator/MANIFEST.sha256"
+	@$(TARGET_LEASE_SHELL) sha256sum "$(CURDIR)/target/release/fcvm" >> "$(CORPUS_RUN_DIR)/orchestrator/MANIFEST.sha256"
 	@git -C "$(CURDIR)" rev-parse HEAD > "$(CORPUS_RUN_DIR)/orchestrator/SOURCE_REVISION"
 	@# Pin the revision behind a ref of its own. Every record cites
 	@# source_revision, and reqbench REFUSES a golden whose revision differs from

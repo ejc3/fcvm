@@ -7314,6 +7314,24 @@ class HarnessIdentity(unittest.TestCase):
         self.assertEqual(set(reqbench.HARNESS_SOURCES), staged - {"reqanalyze.py"})
 
 
+# `make` invoked as a command in a repository script, ignoring comment lines:
+# a flag or a target may follow it, or the command may end there (a bare
+# `make` runs the default target, which reaches cargo-target-link the same
+# way). Prose about make in comments does not count. Used by MakefileBenchGraph to refuse a leased
+# recipe whose script would reach cargo-target-link through a sub-make.
+MAKE_CALL = re.compile(
+    r"(?:^|[\s;&|(`])(make(?:\s+(?:-[A-Za-z]|[A-Za-z_][\w./-]*))?)(?=\s|$|[;&|)`])", re.M
+)
+
+
+def script_runs_make(text):
+    """The matched `make ...` invocation in `text`, or None."""
+    code = "\n".join(src_line for src_line in text.splitlines()
+                     if not src_line.lstrip().startswith("#"))
+    m = MAKE_CALL.search(code)
+    return m.group(1) if m else None
+
+
 class MakefileBenchGraph(unittest.TestCase):
     """The Chromium bench make targets must encode their real dependencies.
 
@@ -7341,6 +7359,10 @@ class MakefileBenchGraph(unittest.TestCase):
         cls.rules = {}
         cls.recipes = {}
         cls.phony = set()
+        # Target-specific SHELL assignments, printed as
+        # "<target>: SHELL := <path>" (`private` is not echoed). The rule
+        # parser below skips every line carrying "=", so they are read here.
+        cls.target_shell = {}
         cur = None
         for line in out.stdout.splitlines():
             if line.startswith("\t") and cur:
@@ -7348,6 +7370,10 @@ class MakefileBenchGraph(unittest.TestCase):
                 continue
             if line.startswith(".PHONY:"):
                 cls.phony.update(line.partition(":")[2].split())
+                continue
+            shell = re.match(r"^([^\s:#]+):\s+SHELL\s*:?=\s*(.+?)\s*$", line)
+            if shell:
+                cls.target_shell[shell.group(1)] = shell.group(2)
                 continue
             if line.startswith("#"):
                 # -p interleaves "# recipe to execute (from ...)" comments
@@ -7384,6 +7410,74 @@ class MakefileBenchGraph(unittest.TestCase):
                       f"the database below it is partial and every other "
                       f"assertion in this class is vacuous. stderr: "
                       f"{self.make_stderr}")
+
+    def test_make_call_detector_classifies_known_cases(self):
+        """The detector behind the leased-recipe rule must see every way a
+        script hands control to make, and none of the ways it merely talks
+        about it. RED BEFORE THE FIX: a bare `make` ending a line (`cd sub &&
+        make`, or `make` alone) was missed, because the pattern demanded
+        whitespace and an argument after the word.
+        """
+        runs = {
+            'make -C "$REPO" bench-chromium-request-golden': "make -C",
+            "cd bench && make": "make",
+            "make\n": "make",
+            "  make; echo done": "make",
+            "(make)": "make",
+            "make build 2>&1 | tee log": "make build",
+        }
+        for text, expect in runs.items():
+            self.assertEqual(script_runs_make(text), expect, text)
+        for text in (
+            "# so make - not the operator - walks the graph",
+            "echo makes the host resolve",
+            "cmake --build .",
+            "gmake all",
+        ):
+            self.assertIsNone(script_runs_make(text), text)
+
+    def test_leased_recipes_never_run_a_script_that_runs_make(self):
+        """A recipe under TARGET_LEASE_SHELL holds the target generation's
+        shared lease for each of its lines, and every child inherits it.
+        cargo-target-link.sh, the prerequisite of every build-shaped target,
+        takes that generation exclusively before it publishes, so a leased
+        recipe whose script runs `make` reaches the link script through the
+        sub-make and waits on its own ancestor forever.
+
+        Observed 2026-09-02 on parallel-box 2: `make bench-chromium-corpus`
+        -> corpus_campaign.sh -> `make -C $REPO bench-chromium-request-golden`
+        -> cargo-target-link.sh, `flock -x` parked in locks_lock_inode_wait
+        with the box at load 0.00, until killed.
+
+        RED BEFORE THE FIX: bench-chromium-corpus ran under the lease shell and
+        its recipe stages bench/chromium/corpus_campaign.sh, which runs
+        `make -C` once per phase.
+        """
+        wrapper = "scripts/cargo-target-run.sh"
+        leased = sorted(t for t, sh in self.target_shell.items() if sh.endswith(wrapper))
+        self.assertTrue(leased, "no target names the lease wrapper as its SHELL; "
+                        "the target-specific SHELL parser found nothing")
+        # Repository scripts a recipe line names, whatever it does with them
+        # (the corpus recipe copies its orchestrator before running the copy).
+        script_ref = re.compile(r"(?:bench/chromium|scripts)/[A-Za-z0-9_.-]+\.(?:sh|py)")
+        offenders = []
+        for target in leased:
+            for line in self.recipes.get(target, []):
+                for rel in sorted(set(script_ref.findall(line))):
+                    path = os.path.join(self.REPO, rel)
+                    if not os.path.isfile(path):
+                        continue
+                    with open(path, encoding="utf-8") as f:
+                        call = script_runs_make(f.read())
+                    if call:
+                        offenders.append(f"{target}: {rel} runs `{call}`")
+        self.assertEqual(
+            offenders, [],
+            "a recipe that runs under the target lease must not run a script that "
+            "invokes make: the sub-make's cargo-target-link prerequisite waits on the "
+            "lease this recipe already holds, forever. Lease the recipe's own target/ "
+            "reads one command at a time (`$(TARGET_LEASE_SHELL) <cmd>`) instead: "
+            + "; ".join(offenders))
 
     def test_golden_depends_on_binary_and_assets(self):
         p = self.prereqs("bench-chromium-request-golden")

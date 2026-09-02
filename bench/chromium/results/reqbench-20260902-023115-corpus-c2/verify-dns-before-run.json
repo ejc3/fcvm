@@ -1,0 +1,122 @@
+{
+  "dns_server": "10.0.2.2",
+  "resolv_conf_vm": "nameserver 10.0.2.2",
+  "resolv_conf_container": "nameserver 10.0.2.2",
+  "hosts": {
+    "example.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "news.ycombinator.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "developers.cloudflare.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "blog.cloudflare.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "en.wikipedia.org": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "developer.mozilla.org": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "www.elmundo.es": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "www.rtp.pt": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "www.theguardian.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    },
+    "todomvc.com": {
+      "answer": "10.0.2.2",
+      "ok": true
+    }
+  },
+  "urls": {
+    "https://example.com/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://news.ycombinator.com/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://developers.cloudflare.com/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://blog.cloudflare.com/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://en.wikipedia.org/": {
+      "status": 301,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://developer.mozilla.org/en-US/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://www.elmundo.es/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://www.rtp.pt/noticias/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://www.theguardian.com/international": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+      "status": 200,
+      "ok": true,
+      "proxy_env_ignored": []
+    }
+  },
+  "proxies_disabled": true,
+  "timestamp": "2026-09-02T02:36:24Z",
+  "passed": true
+}

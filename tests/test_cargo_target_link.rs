@@ -190,6 +190,105 @@ fn wait_for_path(path: &Path) {
     }
 }
 
+/// A recipe line under `scripts/cargo-target-run.sh` (`TARGET_LEASE_SHELL` in the Makefile)
+/// holds the published generation's shared lease for its whole life, and every child
+/// inherits the descriptor. `scripts/cargo-target-link.sh` takes that same generation
+/// exclusively before it publishes, so a link run from inside such a line waits on its own
+/// ancestor. Observed 2026-09-02 on parallel-box 2: `make bench-chromium-corpus` ->
+/// corpus_campaign.sh -> `make -C $REPO bench-chromium-request-golden` ->
+/// cargo-target-link.sh, `flock -x` parked in locks_lock_inode_wait with the box at load
+/// 0.00, until killed.
+///
+/// The wrapper names the lease it hands down (`FCVM_TARGET_LEASE_HELD`) and the link script
+/// refuses at once instead of waiting. RED BEFORE THE FIX: the link never exits and this
+/// test kills the process group at the deadline.
+#[test]
+fn cargo_target_link_refuses_inside_a_leased_recipe_line() {
+    use std::os::unix::process::CommandExt;
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let btrfs = tempfile::tempdir().expect("tempdir");
+    let (ok, out) = run_link(work.path(), btrfs.path());
+    assert!(ok, "cargo-target-link.sh failed:\n{out}");
+    assert_target_usable(work.path(), "before the leased line");
+    let published = std::fs::read_link(work.path().join("target")).expect("target link");
+
+    // The wrapper's `-c <line>` form is how make invokes a SHELL; the line runs
+    // the link script the way a nested `make` prerequisite would.
+    let line = format!(
+        "exec bash {}",
+        shell_quote(&repo_root().join("scripts/cargo-target-link.sh"))
+    );
+    let mut child = ChildGuard(Some(
+        Command::new(repo_root().join("scripts/cargo-target-run.sh"))
+            .args(["-c", &line])
+            .env("BTRFS_ROOT", btrfs.path())
+            .env_remove("CARGO_TARGET_DIR")
+            .env_remove("CARGO_TARGET_LINK_LOCKED")
+            .env_remove("FCVM_TARGET_LEASE_HELD")
+            .current_dir(work.path())
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .expect("spawn scripts/cargo-target-run.sh -c"),
+    ));
+    let pgid = child.child_mut().id() as libc::pid_t;
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+        if child
+            .child_mut()
+            .try_wait()
+            .expect("poll leased line")
+            .is_some()
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            // The whole group: the wrapper exec'd into the link script, which
+            // re-exec'd under `flock <checkout>` and forked the blocked `flock -x`.
+            // SAFETY: plain libc call on a pgid this test created with process_group(0).
+            unsafe {
+                libc::kill(-pgid, libc::SIGKILL);
+            }
+            panic!(
+                "cargo-target-link.sh ran inside a leased recipe line and never returned: it \
+                 is waiting for the exclusive generation lease its own ancestor holds shared \
+                 (published generation {published:?}). The link script must refuse instead."
+            );
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().expect("collect leased line");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !output.status.success(),
+        "the link script published target/ from inside a leased recipe line; a recipe that \
+         runs make under the lease would have hung here before the guard:\n{text}"
+    );
+    assert!(
+        text.contains("FCVM_TARGET_LEASE_HELD"),
+        "the refusal must name the inherited lease marker so the recipe author knows what to \
+         change:\n{text}"
+    );
+    // Refusing must leave the published link alone.
+    assert_eq!(
+        std::fs::read_link(work.path().join("target")).expect("target link"),
+        published,
+        "the refused link run replaced target/"
+    );
+    assert_target_usable(work.path(), "after the refused leased line");
+}
+
+fn shell_quote(path: &Path) -> String {
+    format!("'{}'", path.display().to_string().replace('\'', "'\\''"))
+}
+
 /// Fresh checkout: the link gets created, per-worktree.
 #[test]
 fn cargo_target_link_creates_a_per_worktree_link() {
@@ -4264,6 +4363,20 @@ fn makefile_recipes(makefile: &str) -> (Vec<(String, String)>, HashSet<String>) 
 ///
 /// `CARGO_TARGET_DIR=target` names no path component, and `cargo-target-run.sh`
 /// is a script name, so only a `target/` preceded by a separator counts.
+/// A recipe line that runs one command through the lease wrapper itself
+/// (`$(TARGET_LEASE_SHELL) <cmd>`): the wrapper holds the generation lease for
+/// that command, so the line is leased without the target being. This is the
+/// form for a target whose recipe cannot run under the wrapper as a whole
+/// because it runs `make` (through a script), whose own cargo-target-link
+/// prerequisite would then wait forever on the lease the recipe holds.
+fn leased_per_command(command: &str) -> bool {
+    let body = command
+        .trim_start()
+        .trim_start_matches(['@', '-', '+'])
+        .trim_start();
+    body.starts_with("$(TARGET_LEASE_SHELL) ")
+}
+
 fn touches_raw_target(command: &str) -> bool {
     let body = command
         .trim_start()
@@ -4311,10 +4424,19 @@ fn makefile_leases_every_raw_target_access() {
             && !touches_raw_target("\t@\"$(MAKEFILE_DIR)scripts/cargo-target-run.sh\" cargo build"),
         "the raw-target detector does not classify the known cases correctly"
     );
+    assert!(
+        leased_per_command(
+            "\t@$(TARGET_LEASE_SHELL) sha256sum \"$(CURDIR)/target/release/fcvm\" >> m"
+        ) && !leased_per_command("\t@sha256sum \"$(CURDIR)/target/release/fcvm\" >> m")
+            && !leased_per_command("\t@echo $(TARGET_LEASE_SHELL) sha256sum target/release/fcvm"),
+        "the per-command lease detector does not classify the known cases correctly"
+    );
 
     let unleased: Vec<String> = recipes
         .iter()
-        .filter(|(target, command)| touches_raw_target(command) && !leased.contains(target))
+        .filter(|(target, command)| {
+            touches_raw_target(command) && !leased.contains(target) && !leased_per_command(command)
+        })
         .map(|(target, command)| format!("{target}: {}", command.lines().next().unwrap_or("")))
         .collect();
     assert!(
@@ -4330,6 +4452,27 @@ fn makefile_leases_every_raw_target_access() {
         leased.contains("bench-chromium-corpus-extra"),
         "bench-chromium-corpus-extra invokes a script that reads target/release/fcvm, so the \
          complete recipe must hold the target-generation lease"
+    );
+    // The corpus campaign is the other way round: its orchestrator runs `make -C`
+    // once per phase, and a sub-make's cargo-target-link prerequisite takes the
+    // generation exclusively, so a recipe holding it shared deadlocks against its
+    // own child (observed 2026-09-02, `flock -x` in locks_lock_inode_wait on an
+    // idle box). Its one direct target/ read is leased per command instead, and
+    // the binary the orchestrator reads is sealed by reqbench.sh into a runtime
+    // bundle that every later phase checks by hash.
+    assert!(
+        !leased.contains("bench-chromium-corpus"),
+        "bench-chromium-corpus runs under the lease wrapper as a whole; its orchestrator runs \
+         make, whose cargo-target-link prerequisite then waits forever on this recipe's lease"
+    );
+    assert!(
+        recipes.iter().any(|(target, command)| {
+            target == "bench-chromium-corpus"
+                && touches_raw_target(command)
+                && leased_per_command(command)
+        }),
+        "the bench-chromium-corpus recipe no longer leases its target/release/fcvm read per \
+         command; re-audit how MANIFEST.sha256 gets the fcvm hash"
     );
 
     assert!(
