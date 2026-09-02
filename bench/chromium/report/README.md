@@ -258,12 +258,12 @@ The 4-to-8 difference is not in the render. Stage medians, cdp arm:
 | 8 vCPU | 204.6 | 3.1 | 3.8 | 267.2 | 64.1 | 580.2 ms |
 
 navigate and screenshot both keep falling from 4 to 8. What rises is `resolve`,
-by 51.5 ms, and that stage is a poll, not a lookup. `resolve_target` GETs
-`http://{cdp_host}/json/list` until the answer carries a page target, sleeping
-`RESOLVE_RETRY_S = 0.05` between attempts (`cdpdrive.py:107,184`). `cdp_host`
-is `127.0.0.2:9222` in every record, an IP literal, so nothing is name-resolved;
-the GET crosses the same forwarded loopback path as `tcp_ms` and Chromium
-inside the guest answers it.
+by 51.5 ms, and that stage is a poll, not a lookup. cdpdrive.py's
+`resolve_target` GETs `http://{cdp_host}/json/list` until the answer carries a
+page target, sleeping `RESOLVE_RETRY_S = 0.05` between attempts
+(`cdpdrive.py:107,184`). `cdp_host` is `127.0.0.2:9222` in every record, an IP
+literal, so nothing is name-resolved; the GET crosses the same forwarded
+loopback path as `tcp_ms` and Chromium inside the guest answers it.
 
 So the stage advances in 50 ms steps. `render.resolve_attempts` has median 4, 4
 and 5 at 2, 4 and 8 vCPU, and pooled over the four verified runs the median
@@ -316,8 +316,7 @@ Two things about the withdrawn table, so nobody restores it from memory:
   not re-derive it. `Page.enable` there runs 2.5 ms at 2 vCPU, 2.8 at 4 and 3.8
   at 8, slower as cores are added, and the two verified 2 vCPU runs differ by
   more (2.5 against 4.3 ms, a 1.9 ms gap) than the ladder spans from 2 to 8
-  (1.4 ms). The
-  section makes no claim about why 2 vCPU is slower than 4.
+  (1.4 ms). The section makes no claim about why 2 vCPU is slower than 4.
 
 **elmundo was waiting on live DNS.** The 31,046 ms median this file called an
 unresolved guest-specific stall, and the "untested: DNS through the wildcard
