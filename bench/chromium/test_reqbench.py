@@ -6526,13 +6526,7 @@ class DocLint(unittest.TestCase):
 
         for name in self.CORPUS_DOCS:
             for unit in self._doc_units(name):
-                for token, ellipsis in self.RESULTS_CITE.findall(unit):
-                    if token.startswith("campaign-") and token.endswith(".json"):
-                        bad.extend(self._check_cited_index(name, token, unit, files))
-                        continue
-                    for run in self._resolve_cite(token.rstrip("/"), ellipsis, names):
-                        seen["cited"][name] = seen["cited"].get(name, 0) + 1
-                        bad.extend(self._check_cited_run(name, run, unit, seen))
+                bad.extend(self._citation_findings(name, unit, files, seen))
 
         for run in sorted(names):
             bad.extend(self._check_committed_run(run, seen))
@@ -6543,6 +6537,57 @@ class DocLint(unittest.TestCase):
                             f"{name}: the lint matched no results/ citation; it is vacuous")
         self.assertTrue(seen["withdrawn"], "no withdrawn corpus record was examined")
         self.assertTrue(seen["verified"], "no DNS-verified corpus record was examined")
+
+    def _citation_findings(self, name, unit, files, seen):
+        """Findings for every results/ citation in one doc unit. A token
+        that resolves to no committed record is itself a finding: it names
+        a record nobody can open, and skipping it left the doc green on
+        the strength of its other citations."""
+        names = set(files)
+        bad = []
+        for token, ellipsis in self.RESULTS_CITE.findall(unit):
+            if token.startswith("campaign-") and token.endswith(".json"):
+                bad.extend(self._check_cited_index(name, token, unit, files))
+                continue
+            runs = self._resolve_cite(token.rstrip("/"), ellipsis, names)
+            if not runs:
+                bad.append(f"{name}: cites results/{token}{ellipsis}, which resolves "
+                           f"to no committed record: {unit.strip()[:160]!r}")
+                continue
+            for run in runs:
+                seen["cited"][name] = seen["cited"].get(name, 0) + 1
+                bad.extend(self._check_cited_run(name, run, unit, seen))
+        return bad
+
+    def test_a_citation_that_resolves_to_no_committed_record_is_a_finding(self):
+        """RED BEFORE THE FIX: a results/ token that matched no committed
+        entry produced no finding (_resolve_cite returned [] and the loop
+        over it ran zero times; _check_cited_index returned [] for a
+        missing file), so a misspelled or deleted citation left the doc
+        green on the strength of its other citations, and the vacuity
+        guard, which only counts citations that resolved, never noticed.
+        Observed on that tree: AssertionError: 0 != 1 : 'see
+        results/reqbench-20260899-000000-corpus/analysis.json' produced
+        no finding (and the same for a glob, a prefix with an ellipsis
+        and a campaign index).
+
+        The rule: a citation that resolves to no committed record is a
+        finding, whether it is a run id, a prefix, a glob or a campaign
+        index; a citation of a committed record is unchanged.
+        """
+        files = self._committed_results()
+        seen = {"withdrawn": 0, "verified": 0, "cited": {}}
+        for unit in ("see results/reqbench-20260899-000000-corpus/analysis.json",
+                     "the results/reqbench-20260899-* runs",
+                     "results/reqbench-20260899… (three runs)",
+                     "indexed in results/campaign-20260899-summary.json"):
+            with self.subTest(unit=unit):
+                bad = self._citation_findings("report/README.md", unit, files, seen)
+                self.assertEqual(len(bad), 1, f"{unit!r} produced {bad or 'no finding'}")
+                self.assertIn("no committed record", bad[0])
+        control = "results/reqbench-20260830-171007-corpus/analysis.json (verified)"
+        self.assertEqual(self._citation_findings("report/README.md", control, files, seen), [])
+        self.assertEqual(seen["verified"], 1, "the control citation was not checked")
 
     def _check_cited_run(self, name, run, unit, seen):
         if self._is_withdrawn(run):
@@ -6596,7 +6641,8 @@ class DocLint(unittest.TestCase):
     def _check_cited_index(self, name, token, unit, files):
         path = os.path.join(self._results(), token)
         if not os.path.isfile(path):
-            return []
+            return [f"{name}: cites results/{token}, which resolves to no committed "
+                    f"record: {unit.strip()[:160]!r}"]
         with open(path) as f:
             index = json.load(f)
         generated = index.get("generated_from") if isinstance(index, dict) else None
