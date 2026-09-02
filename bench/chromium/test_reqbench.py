@@ -17,6 +17,7 @@ import fcntl
 import hashlib
 import io
 import json
+import math
 import os
 import random
 import re
@@ -6731,12 +6732,15 @@ class DocLint(unittest.TestCase):
             everything |= e
         return headline, everything, runs
 
-    SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z`(\[*_<])")
+    SENTENCE = re.compile(r"(?<=[.!?])\s+")
 
     def _doc_sentences(self, name):
         """Sentences of a doc's units: each HTML line or Markdown paragraph
-        split at a sentence end followed by whitespace and a capital,
-        backtick, bracket or tag. A table (a Markdown block of | rows, an
+        split at sentence-ending punctuation followed by whitespace,
+        whatever follows (a split only before a capital, backtick, bracket
+        or tag left "695.7 ms at 4 vCPU. 2026-08-16 is the withdrawn
+        series." as one sentence, and the word in the second half excused
+        the figure in the first). A table (a Markdown block of | rows, an
         HTML <tr> line) stays whole: its header is what says withdrawn."""
         for unit in self._doc_units(name):
             if unit.lstrip().startswith(("|", "<tr")):
@@ -6937,7 +6941,12 @@ class DocLint(unittest.TestCase):
         self.assertTrue(verified, "no DNS-verified record to exclude figures from")
 
         def quoted(values, value, scale, decimals):
-            return any(abs(round(v / scale, decimals) - value) < 1e-9 for v in values)
+            # At integer precision a doc may have truncated as well as
+            # rounded: "695 ms" and "696 ms" both quote 695.65.
+            return any(
+                abs(round(v / scale, decimals) - value) < 1e-9
+                or (decimals == 0 and math.floor(v / scale) == value)
+                for v in values)
 
         bad = []
         checked = {}
