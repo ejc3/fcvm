@@ -25,7 +25,7 @@
     "sha256": "217f8d9dd3f33ab67a00305f797090bccd25c31c84ecf18deea7bc9aa30219e8"
   },
   "source_revision": "1e9e9b70937ccc6317046ea22ba41ef0acc454d0",
-  "source_ref": "bench-run/20260902-031115-1e9e9b7093 LOCAL-ONLY",
+  "source_ref": "bench-run/20260902-031115-1e9e9b7093",
   "orchestrator_manifest": "2f2f183aba8e8d042c8ad7b7d8d88cb05ddd98bbb32b5f4dff8b4e8716d89b52  corpus_campaign.sh;ff49264ab72de43c459d407c06cb141f7643fbb28807874ae559c1c533ebba5b  /mnt/work/src/fcvm/target/release/fcvm",
   "store": "btrfs loopback on /mnt/work/fcvm-btrfs.img (ext4, EBS gp3)",
   "assets": {
@@ -33,5 +33,6 @@
     "rootfs": "layer2-8d7e1c725608.raw",
     "initrd": "fc-agent-4a3697b980ba.initrd,fc-agent-4a3697b980ba.lock,fc-agent-934f9450308d.initrd,fc-agent-934f9450308d.lock"
   },
-  "loadavg_at_capture": "1.60 4.38 8.19 1/2411 1156409"
+  "loadavg_at_capture": "1.60 4.38 8.19 1/2411 1156409",
+  "source_ref_note": "pushed to origin as refs/heads/bench-run/20260902-031115-1e9e9b7093 on 2026-09-02 from the dev box; the Makefile on the run box wrote LOCAL-ONLY at record time because that box had no push credentials"
 }
