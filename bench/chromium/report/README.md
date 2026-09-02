@@ -157,11 +157,11 @@ measured the page's network. `test_reqbench.DocLint` now fails if a doc cites
 a withdrawn corpus record without saying so, or quotes a corpus figure that is
 not a median, lo or hi of a DNS-verified record.
 
-The DNS-verified 2/4/8 vCPU ladder was measured on 2026-09-02 and landed after
-that withdrawal was written, so this file still carried "not measured on the
-fixed tree" for 4 and 8 vCPU. Those rows are now the measurement, and the
-headline moved again, from the 2 vCPU 712.6 ms to the 4 vCPU 549.4 ms. Both
-cells are verified and both are quoted.
+The headline is now the 4 vCPU 549.4 ms of the DNS-verified 2/4/8 vCPU ladder
+measured on 2026-09-02, not the 2 vCPU 712.6 ms that replaced the withdrawn
+figure first. Both cells are verified and both are quoted. This file previously
+said 4 and 8 vCPU were "not measured on the fixed tree"; the ladder measures
+them, and the rows that called the knee unmeasured are corrected.
 
 ## Corpus latency by guest vCPU count
 
