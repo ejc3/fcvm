@@ -13,7 +13,8 @@ records why.
 | `results/20260808-corrected` | 2026-08-08 | six defects corrected; numbers below are the current record |
 | `reqbench` CDP A/B | 2026-08-08 | **WITHDRAWN IN FULL** — see "The CDP-path A/B" below. Harness defects invalidate every figure it produced. |
 | `results/reqbench-20260816-*-corpus` (14 runs), `results/reqbench-20260814-042319-uffd`, `results/cpuprobe-20260816` | 2026-08-14 to 2026-08-16 | **WITHDRAWN IN FULL** on 2026-09-02, live-DNS contamination; see "The 2026-08-16 corpus series" below. Each directory carries a `WITHDRAWN` marker with its evidence and stays in the tree. `results/campaign-20260816-summary.json` is a hand-written index of these cells, not a record. |
-| `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU is the current corpus headline. No 4 or 8 vCPU cell is verified. |
+| `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU. Still verified; the headline moved to the 4 vCPU rung of the ladder below. |
+| `results/reqbench-20260902-023115-corpus-c2`, `results/reqbench-20260902-025115-corpus-c4`, `results/reqbench-20260902-031115-corpus-c8` | 2026-09-02 | DNS-verified 2/4/8 vCPU ladder, one golden per rung on one runtime bundle (each `dns-evidence.json` verdict clean, first_mismatch null, diag violations none); cdp p50 770.3 [596.2, 807.8], 549.4 [467.9, 632.4] and 580.2 [520.8, 645.9] ms, n=202 each. 549.4 at 4 vCPU is the current corpus headline: the knee is between 2 and 4, and 4 does not separate from 8. Indexed by `results/campaign-20260902-box2-ladder-summary.json`. |
 
 ---
 

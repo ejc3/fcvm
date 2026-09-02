@@ -836,8 +836,12 @@ this list now points at it rather than contradicting it.
   connect to the CDP port, never the page's network) are all withdrawn; do not
   quote any of them. Every run predates fcvm
   `90733b854e`, so its guest resolved the corpus on the live internet. The
-  current corpus record is 712.6 ms at 2 vCPU from
-  `results/reqbench-20260830-171007-corpus`; no 4 or 8 vCPU cell is verified.
+  current corpus headline is 549.4 ms at 4 vCPU from
+  `results/reqbench-20260902-025115-corpus-c4`, the middle rung of the
+  DNS-verified 2/4/8 vCPU ladder measured 2026-09-02
+  (`results/campaign-20260902-box2-ladder-summary.json`);
+  `results/reqbench-20260830-171007-corpus` at 712.6 ms on 2 vCPU is also
+  verified and is quoted beside it.
 
 `REVIEW.md` is the ledger of what holds and what doesn't. **Update it every run.**
 
