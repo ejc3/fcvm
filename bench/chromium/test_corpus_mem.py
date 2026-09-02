@@ -13,6 +13,7 @@ None of them raises on its own. Each one produces a run that looks finished.
 Run: python3 -m unittest test_corpus_mem -v
 """
 
+import ast
 import errno
 import fcntl
 import hashlib
@@ -30,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import textwrap
 import time
 import unittest
 from contextlib import ExitStack
@@ -57,16 +59,27 @@ HOST_RESOURCE_FINALIZER = os.path.join(HERE, "host_resource_finalizer.py")
 SERVE_GUARDIAN = os.path.join(HERE, "serve_guardian.py")
 
 
-def await_phase_pid(path, timeout, fail, message, proc=None, early=None):
-    """Return the pid PATH holds, once it holds a COMPLETE one.
+def complete_record(path):
+    """Return PATH's content once it is COMPLETE, or None until then.
 
-    Readiness is a parsed pid, not a created file. Every writer here does
-    `open(path, "w").write(...)`, and open(2) creates and truncates the
-    file before the write lands, so a reader that waits on
-    os.path.isfile can open it empty (int("") raises ValueError) or read
-    a truncated pid and go on to pidfd_open a process nobody started.
-    The terminating newline is the completeness marker: a reader that
-    requires it cannot observe a half-written pid.
+    Existence is not completeness. Every writer here publishes with
+    `open(path, "w")` or a shell `>` redirect, and both create and
+    truncate the file before the record lands, so a reader gated on
+    os.path.exists can read an empty file (int("") raises ValueError) or
+    a prefix, and a caller that reads a prefixed pid goes on to signal a
+    process nobody started. The terminating newline is the completeness
+    marker: a reader that requires it cannot observe a partial record.
+    """
+    try:
+        with open(path) as handle:
+            text = handle.read()
+    except FileNotFoundError:
+        return None
+    return text if text.endswith("\n") else None
+
+
+def await_complete_record(path, timeout, fail, message, proc=None, early=None):
+    """Return PATH's record once it lands, waiting for completeness.
 
     fail is the caller's TestCase.fail. proc, when given, is the launcher
     whose early exit is reported with the early message instead of a
@@ -74,19 +87,156 @@ def await_phase_pid(path, timeout, fail, message, proc=None, early=None):
     """
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            with open(path) as handle:
-                text = handle.read()
-        except FileNotFoundError:
-            text = ""
-        if text.endswith("\n"):
-            return int(text.strip())
+        text = complete_record(path)
+        if text is not None:
+            return text
         if proc is not None and proc.poll() is not None:
             stdout, stderr = proc.communicate()
             fail(f"{early}: {proc.returncode}: {stdout}{stderr}")
         if time.monotonic() >= deadline:
             fail(message)
         time.sleep(0.01)
+
+
+def await_phase_pid(path, timeout, fail, message, proc=None, early=None):
+    """Return the pid PATH holds, once it holds a COMPLETE one.
+
+    Readiness is a parsed pid, not a created file; see complete_record
+    for the window this closes.
+    """
+    return int(await_complete_record(
+        path, timeout, fail, message, proc, early).strip())
+
+
+EXISTENCE_PREDICATES = ("isfile", "exists", "getsize", "lexists")
+
+
+def _unparse(node):
+    try:
+        return ast.unparse(node)
+    except Exception:  # pragma: no cover - every node here unparses
+        return None
+
+
+def _existence_tests(node):
+    """The path expressions NODE tests for mere existence."""
+    found = []
+    for inner in ast.walk(node):
+        if (isinstance(inner, ast.Call)
+                and isinstance(inner.func, ast.Attribute)
+                and inner.func.attr in EXISTENCE_PREDICATES
+                and inner.args
+                and (_unparse(inner.func.value) or "").split(".")[-1] == "path"):
+            path = _unparse(inner.args[0])
+            if path is not None:
+                found.append((path, inner.lineno))
+    return found
+
+
+def _loop_gates(loop):
+    """The existence tests that CONTROL a loop, not the ones inside it.
+
+    A test in the while condition gates the loop. So does one in an if
+    that breaks out of it, which is how a deadline loop spells the same
+    wait. An existence test that only decorates a failure message (an if
+    with no break, reading a log to quote it) gates nothing.
+    """
+    gates = list(_existence_tests(loop.test))
+    for inner in ast.walk(loop):
+        if isinstance(inner, ast.If) and any(
+                isinstance(node, ast.Break) for node in ast.walk(inner)):
+            gates += _existence_tests(inner.test)
+    return gates
+
+
+def _is_polling(loop):
+    return (bool(_existence_tests(loop.test))
+            or any(isinstance(node, ast.Call)
+                   and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "sleep"
+                   for node in ast.walk(loop)))
+
+
+def _content_reads(scope, excluded):
+    """Where SCOPE reads a path's CONTENT, ignoring nested definitions."""
+    skip = {id(node) for tree in excluded for node in ast.walk(tree)}
+    reads = {}
+    for node in ast.walk(scope):
+        if id(node) in skip or not isinstance(node, ast.Call):
+            continue
+        function = node.func
+        if isinstance(function, ast.Name) and function.id == "open" and node.args:
+            mode = ""
+            if len(node.args) > 1 and isinstance(node.args[1], ast.Constant):
+                mode = str(node.args[1].value)
+            for keyword in node.keywords:
+                if keyword.arg == "mode" and isinstance(keyword.value, ast.Constant):
+                    mode = str(keyword.value.value)
+            if any(letter in mode for letter in "wax"):
+                continue
+            path = _unparse(node.args[0])
+        elif (isinstance(function, ast.Attribute)
+              and function.attr in ("read_text", "read_bytes")):
+            path = _unparse(function.value)
+        else:
+            continue
+        if path is not None:
+            reads.setdefault(path, []).append(node.lineno)
+    return reads
+
+
+def readiness_violations(source, filename="<source>"):
+    """Every path a loop waits into EXISTENCE and then reads for CONTENT.
+
+    The defect is a shape, not a variable name, so both halves are found
+    structurally: a new site is reported whatever it calls its path, and
+    a local wait helper is followed into the callers that pass a path to
+    it. A path that is only waited on is a marker and is fine; a path
+    that is only read is settled and is fine. Holding both is the bug,
+    and the two lawful repairs are to stop reading it or to read it
+    through await_complete_record, which waits for the record rather
+    than for the file.
+    """
+    tree = ast.parse(source, filename)
+    violations = []
+    for scope in ast.walk(tree):
+        if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        nested = [node for node in ast.walk(scope)
+                  if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and node is not scope]
+        waiters = {}
+        for inner in nested:
+            parameters = [argument.arg for argument in inner.args.args]
+            for loop in ast.walk(inner):
+                if not (isinstance(loop, ast.While) and _is_polling(loop)):
+                    continue
+                for path, _ in _loop_gates(loop):
+                    if path in parameters:
+                        waiters[inner.name] = parameters.index(path)
+        waited = {}
+        for loop in ast.walk(scope):
+            if isinstance(loop, ast.While) and _is_polling(loop):
+                for path, line in _loop_gates(loop):
+                    waited.setdefault(path, []).append(line)
+        for node in ast.walk(scope):
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id in waiters):
+                index = waiters[node.func.id]
+                if len(node.args) > index:
+                    path = _unparse(node.args[index])
+                    if path is not None:
+                        waited.setdefault(path, []).append(node.lineno)
+        reads = _content_reads(scope, nested)
+        for path, waits in sorted(waited.items()):
+            after = sorted(line for line in reads.get(path, [])
+                           if line > min(waits))
+            if after:
+                violations.append(
+                    f"{filename}:{min(waits)} {scope.name} waits for "
+                    f"{path} to exist, then reads it at "
+                    f"{', '.join(str(line) for line in after)}")
+    return violations
 
 
 def proc_state(pid):
@@ -817,7 +967,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 f"side=corpus_mem.ContainerSide(args, {run_id!r})\n"
                 "side.bring_up(1, 'host1r1', [0])\n"
                 f"with open({ready_path!r}, 'w') as target:\n"
-                " target.write(str(os.getpid()))\n"
+                " target.write(f'{os.getpid()}\\n')\n"
                 "signal.pause()\n"
             )
             wrapper_code = (
@@ -844,20 +994,12 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                deadline = time.monotonic() + 10
-                while not os.path.isfile(ready_path):
-                    if wrapper.poll() is not None:
-                        stdout, stderr = wrapper.communicate()
-                        self.fail(
-                            f"memory worker exited before readiness: "
-                            f"{wrapper.returncode}: {stdout}{stderr}")
-                    if time.monotonic() >= deadline:
-                        self.fail("memory worker never started its container")
-                    time.sleep(0.01)
+                worker_pid = await_phase_pid(
+                    ready_path, 10, self.fail,
+                    "memory worker never started its container",
+                    proc=wrapper, early="memory worker exited before readiness")
                 self.assertTrue(os.path.isfile(state_path))
 
-                with open(ready_path) as handle:
-                    worker_pid = int(handle.read())
                 os.kill(worker_pid, signal.SIGKILL)
                 deadline = time.monotonic() + 10
                 while (not os.path.isfile(absence_path)
@@ -948,7 +1090,7 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 "cg.setup()\n"
                 "os.mkdir(os.path.join(cg.base, 'req-fcvm1r1-0'))\n"
                 f"with open({ready_path!r}, 'w') as target:\n"
-                " target.write(str(os.getpid()))\n"
+                " target.write(f'{os.getpid()}\\n')\n"
                 "signal.pause()\n"
             )
             wrapper_code = (
@@ -971,18 +1113,10 @@ class RunScopedContainerCleanup(unittest.TestCase):
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
             )
             try:
-                deadline = time.monotonic() + 10
-                while not os.path.isfile(ready_path):
-                    if wrapper.poll() is not None:
-                        stdout, stderr = wrapper.communicate()
-                        self.fail(
-                            f"memory worker exited before readiness: "
-                            f"{wrapper.returncode}: {stdout}{stderr}")
-                    if time.monotonic() >= deadline:
-                        self.fail("memory worker never created its cgroup")
-                    time.sleep(0.01)
-                with open(ready_path) as handle:
-                    worker_pid = int(handle.read())
+                worker_pid = await_phase_pid(
+                    ready_path, 10, self.fail,
+                    "memory worker never created its cgroup",
+                    proc=wrapper, early="memory worker exited before readiness")
                 os.kill(worker_pid, signal.SIGKILL)
                 stdout, stderr = wrapper.communicate(timeout=10)
                 self.assertFalse(
@@ -1808,11 +1942,12 @@ exec {real_date!r} "$@"
             try:
                 deadline = time.monotonic() + 10
                 while time.monotonic() < deadline:
-                    if (os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"])
-                            and os.path.exists(env["PODMAN_ESCAPED_STARTED_FILE"])):
-                        with open(env["PODMAN_ESCAPED_STARTED_FILE"]) as handle:
-                            escaped_pid = int(handle.read().strip())
-                        break
+                    if os.path.exists(env["PODMAN_PRIOR_ABSENCE_FILE"]):
+                        record = complete_record(
+                            env["PODMAN_ESCAPED_STARTED_FILE"])
+                        if record is not None:
+                            escaped_pid = int(record.strip())
+                            break
                     if producer.poll() is not None:
                         break
                     time.sleep(0.01)
@@ -1898,17 +2033,10 @@ exec {real_date!r} "$@"
             )
             create_pid = None
             try:
-                deadline = time.monotonic() + 10
-                while not os.path.exists(env["PODMAN_CREATE_STARTED_FILE"]):
-                    if producer.poll() is not None:
-                        stdout, stderr = producer.communicate()
-                        self.fail(
-                            "hostcdp exited before create started: " + stdout + stderr)
-                    if time.monotonic() >= deadline:
-                        self.fail("podman create did not start")
-                    time.sleep(0.01)
-                with open(env["PODMAN_CREATE_STARTED_FILE"]) as handle:
-                    create_pid = int(handle.read().strip())
+                create_pid = await_phase_pid(
+                    env["PODMAN_CREATE_STARTED_FILE"], 10, self.fail,
+                    "podman create did not start", proc=producer,
+                    early="hostcdp exited before create started")
 
                 with self.assertRaises(subprocess.TimeoutExpired):
                     communicate_test_process_group(producer, 0.05)
@@ -1973,19 +2101,10 @@ exec {real_date!r} "$@"
             )
             child_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not os.path.exists(child_file):
-                    if producer.poll() is not None:
-                        stdout, stderr = producer.communicate()
-                        self.fail(
-                            "cleanup fixture exited before starting its child: "
-                            + stdout + stderr
-                        )
-                    if time.monotonic() >= deadline:
-                        self.fail("cleanup fixture did not record its child")
-                    time.sleep(0.01)
-                with open(child_file) as handle:
-                    child_pid = int(handle.read().strip())
+                child_pid = await_phase_pid(
+                    child_file, 5, self.fail,
+                    "cleanup fixture did not record its child", proc=producer,
+                    early="cleanup fixture exited before starting its child")
 
                 kill_and_reap_test_process_group(producer)
                 self.assertIsNotNone(
@@ -2047,9 +2166,9 @@ exec {real_date!r} "$@"
                 self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
                 self.assertLess(elapsed, 5, f"escaped create drain took {elapsed:.3f}s")
                 self.assertIn("live descendants", proc.stderr)
-                self.assertTrue(os.path.exists(env["PODMAN_ESCAPED_STARTED_FILE"]))
-                with open(env["PODMAN_ESCAPED_STARTED_FILE"]) as handle:
-                    escaped_pid = int(handle.read().strip())
+                escaped_pid = await_phase_pid(
+                    env["PODMAN_ESCAPED_STARTED_FILE"], 5, self.fail,
+                    "the escaped create descendant recorded no pid")
                 self.assertFalse(os.path.exists(f"/proc/{escaped_pid}"),
                                  "create descendant survived reconciliation")
                 self.assertTrue(os.path.exists(env["PODMAN_INSPECT_CALLED_FILE"]))
@@ -5397,8 +5516,9 @@ os.fsync = _fsync
                     if time.monotonic() >= deadline:
                         self.fail("finalized phase never became ready")
                     time.sleep(0.01)
-                with open(phase_pid_path) as handle:
-                    phase_pid = int(handle.read())
+                phase_pid = await_phase_pid(
+                    phase_pid_path, 10, self.fail,
+                    "finalized phase never recorded its pid")
 
                 os.kill(parent.pid, signal.SIGKILL)
                 parent.communicate(timeout=20)
@@ -5771,20 +5891,38 @@ os.fsync = _fsync
                         self.fail(f"timed out waiting for {description}")
                     time.sleep(0.01)
 
+            def read_when_ready(path, description, timeout=10,
+                                campaign_must_live=True):
+                """Return PATH's complete record.
+
+                Existence is the signal for a marker, not for a record;
+                see complete_record for the window wait_for leaves open
+                to a caller that goes on to read.
+                """
+                def fail_with_log(message):
+                    log = ""
+                    if os.path.exists(log_path):
+                        with open(log_path) as handle:
+                            log = handle.read()
+                    self.fail(message + log)
+
+                return await_complete_record(
+                    path, timeout, fail_with_log,
+                    f"timed out waiting for {description}",
+                    proc=campaign if campaign_must_live else None,
+                    early=f"campaign exited before {description}")
+
             try:
-                wait_for(guardian_pid_path, "the guardian pid")
-                with open(guardian_pid_path) as handle:
-                    guardian_pid = int(handle.read())
+                guardian_pid = int(
+                    read_when_ready(guardian_pid_path, "the guardian pid"))
                 wait_for(guardian_ready, "the guardian to detach")
                 detached_ready = True
                 guardian_pidfd = os.pidfd_open(guardian_pid)
-                wait_for(supervisor_pgid_path, "the root supervisor process group")
-                wait_for(serve_pid_path, "the replay phase pid")
                 wait_for(serve_ready, "the replay server to stop dnsmasq")
-                with open(serve_pid_path) as handle:
-                    serve_pid = int(handle.read())
-                with open(supervisor_pgid_path) as handle:
-                    supervisor_pgid = int(handle.read())
+                serve_pid = int(
+                    read_when_ready(serve_pid_path, "the replay phase pid"))
+                supervisor_pgid = int(read_when_ready(
+                    supervisor_pgid_path, "the root supervisor process group"))
                 self.assertEqual(os.getpgid(guardian_pid), guardian_pid)
                 self.assertEqual(supervisor_pgid, guardian_pid)
                 self.assertEqual(os.getpgid(serve_pid), serve_pid)
@@ -5811,7 +5949,7 @@ os.fsync = _fsync
                 )
                 with open(restore_release, "w"):
                     pass
-                wait_for(
+                status = read_when_ready(
                     status_path,
                     "the replay guardian status",
                     campaign_must_live=False,
@@ -5824,8 +5962,7 @@ os.fsync = _fsync
                 )
                 with open(state_path) as handle:
                     self.assertEqual(handle.read(), "active\n")
-                with open(status_path) as handle:
-                    self.assertEqual(handle.read(), "143\n")
+                self.assertEqual(status, "143\n")
                 with open(completion_path) as handle:
                     self.assertEqual(
                         handle.read(), f"complete {completion_token}\n")
@@ -5948,7 +6085,7 @@ os.fsync = _fsync
                     "#!/usr/bin/env python3\n"
                     "import os, subprocess, sys\n"
                     "with open(os.environ['SUDO_PID_PATH'], 'w') as out:\n"
-                    "    out.write(str(os.getpid()))\n"
+                    "    out.write(f'{os.getpid()}\\n')\n"
                     "phase = (\"systemctl stop dnsmasq && \"\n"
                     "         \": >\\\"$SERVE_READY\\\" && exec sleep 60\")\n"
                     "command = [sys.executable, os.environ['PHASE_SUPERVISOR'],\n"
@@ -5961,7 +6098,7 @@ os.fsync = _fsync
                     "           'bash', '-c', phase]\n"
                     "supervisor = subprocess.Popen(command)\n"
                     "with open(os.environ['SUPERVISOR_PID_PATH'], 'w') as out:\n"
-                    "    out.write(str(supervisor.pid))\n"
+                    "    out.write(f'{supervisor.pid}\\n')\n"
                     "raise SystemExit(supervisor.wait())\n"
                 )
             os.chmod(sudo_parent, 0o755)
@@ -6037,18 +6174,34 @@ os.fsync = _fsync
                         self.fail(f"timed out waiting for {description}")
                     time.sleep(0.01)
 
+            def read_when_ready(path, description, timeout=10):
+                """Return PATH's complete record.
+
+                Existence is the signal for a marker, not for a record;
+                see complete_record for the window wait_for leaves open
+                to a caller that goes on to read.
+                """
+                def fail_with_log(message):
+                    log = ""
+                    if os.path.exists(log_path):
+                        with open(log_path) as handle:
+                            log = handle.read()
+                    self.fail(message + log)
+
+                return await_complete_record(
+                    path, timeout, fail_with_log,
+                    f"timed out waiting for {description}", proc=campaign,
+                    early=f"campaign exited before {description}")
+
             try:
-                wait_for(guardian_pid_path, "the guardian pid")
                 wait_for(guardian_ready, "the guardian readiness record")
-                wait_for(sudo_pid_path, "the sudo parent pid")
-                wait_for(supervisor_pid_path, "the root supervisor pid")
                 wait_for(serve_ready, "the DNS stop")
-                with open(guardian_pid_path) as handle:
-                    guardian_pid = int(handle.read())
-                with open(sudo_pid_path) as handle:
-                    sudo_pid = int(handle.read())
-                with open(supervisor_pid_path) as handle:
-                    supervisor_pid = int(handle.read())
+                guardian_pid = int(
+                    read_when_ready(guardian_pid_path, "the guardian pid"))
+                sudo_pid = int(
+                    read_when_ready(sudo_pid_path, "the sudo parent pid"))
+                supervisor_pid = int(read_when_ready(
+                    supervisor_pid_path, "the root supervisor pid"))
                 with open(state_path) as handle:
                     self.assertEqual(handle.read(), "inactive\n")
                 with open(completion_path) as handle:
@@ -6259,14 +6412,25 @@ os.fsync = _fsync
                         self.fail(f"timed out waiting for {description}")
                     time.sleep(0.01)
 
+            def read_when_ready(path, description):
+                """Return PATH's complete record.
+
+                Existence is the signal for a marker, not for a record;
+                see complete_record for the window wait_for leaves open
+                to a caller that goes on to read.
+                """
+                return await_complete_record(
+                    path, 10, self.fail,
+                    f"timed out waiting for {description}",
+                    proc=launcher_process,
+                    early=f"launcher exited before {description}")
+
             try:
-                wait_for(guardian_pid_path, "the guardian pid")
                 wait_for(ready_path, "guardian readiness")
-                wait_for(child_pid_path, "the long-lived child")
-                with open(guardian_pid_path) as handle:
-                    guardian_pid = int(handle.read())
-                with open(child_pid_path) as handle:
-                    child_pid = int(handle.read())
+                guardian_pid = int(
+                    read_when_ready(guardian_pid_path, "the guardian pid"))
+                child_pid = int(
+                    read_when_ready(child_pid_path, "the long-lived child"))
 
                 os.kill(guardian_pid, signal.SIGTERM)
                 time.sleep(0.1)
@@ -10546,8 +10710,14 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         )
 
 
-class PhasePidReadiness(unittest.TestCase):
-    """A phase is ready when its pid file HOLDS a pid, not when it exists."""
+class RecordReadiness(unittest.TestCase):
+    """A record is ready when it HOLDS its content, not when it exists.
+
+    Not phase pids only: the same shape reached worker.ready, the
+    started-files, and the guardian, child, sudo, supervisor and status
+    records, so the matrix at the end of this class is over the shape
+    rather than over any one name.
+    """
 
     def test_a_created_pid_file_is_not_a_ready_phase(self):
         """RED BEFORE THE FIX: three readiness loops waited for the
@@ -10614,24 +10784,98 @@ class PhasePidReadiness(unittest.TestCase):
                 await_phase_pid(path, 0.2, self.fail, "supervised phase did not start")
             self.assertIn("supervised phase did not start", str(caught.exception))
 
-    def test_no_phase_pid_reader_takes_existence_for_readiness(self):
-        """The matrix over every caller: the defect was one predicate
-        copied to four readers, and one of them had already been repaired
-        in place (an `os.path.getsize(...) > 0` guard) without the other
-        three being touched. No reader may wait on the pid file's
-        existence or size; they all go through await_phase_pid.
+    def test_the_readiness_scan_reports_a_wait_then_read(self):
+        """The pin's detector, proved able to fire.
 
-        The needles are built from pieces so this assertion does not
-        match itself."""
-        source = open(os.path.join(HERE, "test_corpus_mem.py")).read()
-        target = "phase_pid" + "_path"
-        for call in ("isfile", "getsize", "exists"):
-            needle = f"os.path.{call}({target})"
-            self.assertEqual(source.count(needle), 0,
-                             f"{needle} takes existence for readiness")
-        needle = "phase_pid = await" + "_phase_pid("
-        self.assertEqual(source.count(needle), 4,
-                         "every phase-pid reader goes through the helper")
+        A scan that cannot report anything would pass the matrix below
+        for the same reason a missing jq once printed CLEAR: it never
+        evaluated. This is the shape it must catch, written out.
+        """
+        source = textwrap.dedent("""
+            def probe():
+                while not os.path.isfile(record):
+                    time.sleep(0.01)
+                with open(record) as handle:
+                    return int(handle.read())
+        """)
+        found = readiness_violations(source, "synthetic")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn("record", found[0])
+
+    def test_the_readiness_scan_follows_a_local_wait_helper(self):
+        """The wait and the read need not sit in one function: three
+        tests here spell the wait as a nested helper taking the path."""
+        source = textwrap.dedent("""
+            def probe():
+                def wait_for(path, description):
+                    while not os.path.exists(path):
+                        time.sleep(0.01)
+                wait_for(record, "the record")
+                with open(record) as handle:
+                    return int(handle.read())
+        """)
+        self.assertEqual(len(readiness_violations(source, "synthetic")), 1)
+
+    def test_the_readiness_scan_passes_a_marker_that_is_never_read(self):
+        """Existence is the whole signal for a marker file, so waiting
+        on one is not the defect. A scan that flagged this would be
+        turned off within a week."""
+        source = textwrap.dedent("""
+            def probe():
+                while not os.path.exists(marker):
+                    time.sleep(0.01)
+                return "started"
+        """)
+        self.assertEqual(readiness_violations(source, "synthetic"), [])
+
+    def test_the_readiness_scan_passes_a_read_through_the_primitive(self):
+        """The lawful repair, and the one the sites below take."""
+        source = textwrap.dedent("""
+            def probe():
+                return await_phase_pid(record, 5, fail, "never started")
+        """)
+        self.assertEqual(readiness_violations(source, "synthetic"), [])
+
+    def test_the_readiness_scan_passes_a_log_quoted_in_a_failure(self):
+        """An existence test inside a wait that gates nothing, reading a
+        log to quote it, is not a readiness wait. Two waiters here do
+        exactly that, and a scan that counted them would be reporting on
+        the diagnostic rather than on the race."""
+        source = textwrap.dedent("""
+            def probe():
+                while not os.path.exists(marker):
+                    if os.path.exists(log):
+                        with open(log) as handle:
+                            quoted = handle.read()
+                    time.sleep(0.01)
+        """)
+        self.assertEqual(readiness_violations(source, "synthetic"), [])
+
+    def test_no_bench_reader_takes_existence_for_readiness(self):
+        """The matrix over every caller, enumerated rather than counted.
+
+        The defect was one predicate copied to readers that share no
+        name: phase.pid, worker.ready, guardian.pid, child.pid,
+        serve.pid, and two started-files reached through an environment
+        lookup. A pin keyed on the token `phase_pid_path`, or on a count
+        of the readers holding it, says nothing about the next one, and
+        the previous pass shipped with fourteen sites uncovered for
+        exactly that reason.
+
+        This walks every bench/chromium module structurally, so a new
+        site is reported whatever it calls its path.
+        """
+        offenders = []
+        for name in sorted(os.listdir(HERE)):
+            if not name.endswith(".py"):
+                continue
+            path = os.path.join(HERE, name)
+            with open(path) as handle:
+                offenders += readiness_violations(handle.read(), name)
+        self.assertEqual(
+            offenders, [],
+            "existence is not readiness; read the record through "
+            "await_complete_record:\n" + "\n".join(offenders))
 
 
 if __name__ == "__main__":
