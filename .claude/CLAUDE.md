@@ -251,10 +251,19 @@ Earlier versions also guessed which findings were defects from a `panic|crash|le
 That failed BOTH ways: "this drops the final game from the schedule" matched nothing and closed
 on an assertion, while a *wrong* defect claim could never be closed at all. Do not guess; answer.
 
-The gate has its own tests, each written against the unfixed script and observed failing first:
-`scripts/test-check-review-threads.sh`, plus `scripts/probe-review-gate-pagination.sh` for the
-live oversized-thread path that fixtures cannot reach. CI state cannot tell you whether a
-finding was answered.
+The gate has its own tests, each written against the unfixed script and observed failing first.
+There are two harnesses and only one of them runs in CI, so run both before pushing a gate
+change:
+
+```bash
+bash scripts/test-check-review-threads.sh                 # shell fixtures, not run by CI
+make test-unit FILTER="-E 'binary(test_log_scan)'"        # tests/test_log_scan.rs, run by CI
+```
+
+`make test-unit FILTER=log_scan` runs 0 tests and exits 4: FILTER is passed to nextest as-is
+and no test NAME contains that substring, so the plain form selects nothing while looking like
+a pass. `scripts/probe-review-gate-pagination.sh` covers the live oversized-thread path that
+fixtures cannot reach. CI state cannot tell you whether a finding was answered.
 
 ### "LOAD RELATED" IS NOT A DIAGNOSIS. NEITHER IS "FLAKY", "TIMING", OR "CONTENTION"
 

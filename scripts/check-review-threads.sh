@@ -679,23 +679,49 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #
 # ACCOUNTING. A body is exempt from dispositions only if the classifier read every byte of
 # it. Content removed before classification is content nobody evaluated, so a finding in a
-# removed region is exempt and never answered. That is one defect class and it landed three
-# times: the notice payload (any line starting with ">"), the CodeRabbit tips block, and
-# the folded About Codex block, the last of which also bound no-findings COVERAGE to the
-# head. Every removal now goes through strip_accounted, which deletes a region declared in
-# accounted_regions only after every non-blank line inside it matches one of that region's
-# shapes, and returns null otherwise, which makes the whole body claimable. The regions:
+# removed region is exempt and never answered. That is one defect class and it landed four
+# times: the notice payload (any line starting with ">"), the CodeRabbit tips block, the
+# folded About Codex block, and an HTML comment a reader can see. The third and fourth also
+# bound no-findings COVERAGE to the head. Every removal now goes through strip_accounted,
+# and a region is removed only under the justification it declares: a RENDERED region is
+# removed after every non-blank line inside it matches one of that region's shapes, and the
+# one UNRENDERED region is removed only where GitHub is known to hide it. A rendered region
+# that fails its shapes returns null, which makes the whole body claimable; an unrendered
+# one that cannot be shown hidden stays in the body, where it is an unlisted line and the
+# body is claimable the same way. The regions:
 #
 #   cr_tips       <!-- tips_start --> .. <!-- tips_end -->        rendered, shape-checked
 #   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
-#   html_comment  <!-- .. -->                                     not rendered, no shapes
+#   html_comment  <!-- .. -->                                     removed only where
+#                                                                 CommonMark hides it
 #
-# html_comment carries no shapes because GitHub renders none of it: nothing inside one is a
-# claim a reader can see or answer. Both shape lists were read off what the bots posted on
-# ejc3/fcvm #789 through #901 (13 About blocks, 17 tips blocks) and match all of it with
-# nothing left over. Every shape is anchored, because an unanchored one matches the head of
-# a line and lets the rest ride along. An unlisted line costs one disposition; accepting
-# one costs a finding nobody has to answer.
+# Both shape lists were read off what the bots posted on ejc3/fcvm #789 through #901 (13
+# About blocks, 17 tips blocks) and match all of it with nothing left over. Every shape is
+# anchored, because an unanchored one matches the head of a line and lets the rest ride
+# along. An unlisted line costs one disposition; accepting one costs a finding nobody has
+# to answer.
+#
+# html_comment carries no shapes because it is justified by INVISIBILITY instead, and that
+# justification is checked per occurrence by strip_hidden_comments. "GitHub renders none of
+# it" is false as a blanket premise: CommonMark's HTML-block start condition 2 admits at
+# most three spaces of indentation, so at four columns the same bytes are an indented code
+# block and every reader sees them. Verified against GitHub's own renderer (POST /markdown,
+# mode gfm): `<!-- P1 -->` at 0-3 spaces renders as nothing, at 4 spaces or after a tab it
+# comes back as a <pre><code> block, and inside a fenced block it comes back the same way.
+# A body carrying a visible finding there was exempt from dispositions AND bound
+# no-findings coverage to the head.
+#
+# strip_hidden_comments walks the body one line at a time and removes a comment only where
+# GitHub is known to hide it. It removes a COMPLETE single-line `<!-- .. -->`, at line start
+# or inline, on a line that is not indented four columns (tabs count as four) and is not
+# inside a fenced code block, measuring both after any blockquote markers so a `>`-quoted
+# line is judged by its own content. Everything else stays in the body, where it is an
+# unlisted line and the body is claimable. Two things it therefore declines to remove that
+# GitHub does hide, both fail-closed and both costing one disposition: a comment spanning
+# lines, and a comment indented four columns under an open paragraph. Neither has occurred
+# in the 1602 HTML comments the two bots posted on ejc3/fcvm #789 through #901, every one
+# of which sits at column 0 on one line (1350) or inline on a column-0 line (252). Judged
+# over those 350 comment bodies, the narrowed region changes no verdict.
 #
 # scripts/gate-discard-sites.sh enumerates every discarding call in VERDICT_JQ and blocks
 # on any that is neither this primitive nor a listed normalization, so the next stripping
@@ -724,15 +750,43 @@ def accounted_regions:
       re: "<!-- tips_start -->(?<inner>(.|\n)*?)<!-- tips_end -->" }
   , { name: "codex_about", rendered: true, lines: codex_about_res,
       re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
-  , { name: "html_comment", rendered: false, lines: null,
-      re: "<!--(.|\n)*?-->" }
+  , { name: "html_comment", rendered: false, lines: null, re: null }
   ];
+# One complete comment on one line. Spanning lines is deliberately not matched: GitHub
+# hides such a comment, this leaves it in the body, and the body is claimable.
+def hidden_comment_re: "<!--[^\n]*?-->";
+# A line is judged by its own content, so the blockquote markers in front of it are not
+# part of its indentation and do not hide a fence opened inside the quote.
+def quote_prefix_re: "^(?: {0,3}> ?)+";
+def fence_mark: [ match("^ {0,3}(?<f>`{3,}|~{3,})") | .captures[] | select(.name == "f") | .string ] | first;
+# CommonMark closes a fence with at least as many of the SAME character and nothing else on
+# the line, so a closer that does not match leaves the block open and its content in place.
+def fence_close_re: "^ {0,3}(?:`{3,}|~{3,})[ \t]*$";
+def lead_cols: (([ match("^[ \t]*") | .string ] | first) // "") | gsub("\t"; "    ") | length;
+def strip_hidden_comments:
+  ((. // "") | split("\n"))
+  | reduce .[] as $raw ({fence: null, out: []};
+      . as $st
+      | ($raw | sub(quote_prefix_re; "")) as $c
+      | if $st.fence != null then
+          ($c | fence_mark) as $f
+          | { fence: (if ($f != null) and ($f[0:1] == ($st.fence | .[0:1]))
+                         and (($f | length) >= ($st.fence | length)) and ($c | test(fence_close_re))
+                      then null else $st.fence end),
+              out: ($st.out + [$raw]) }
+        elif ($c | lead_cols) >= 4 then { fence: null, out: ($st.out + [$raw]) }
+        else ($c | fence_mark) as $f
+          | if $f != null then { fence: $f, out: ($st.out + [$raw]) }
+            else { fence: null, out: ($st.out + [($raw | gsub(hidden_comment_re; ""))]) }
+            end
+        end)
+  | .out | join("\n");
 def strip_accounted($names):
   if ($names | any(. as $n | ([accounted_regions[] | .name] | index($n)) == null)) then null
   else reduce accounted_regions[] as $r (.;
     if . == null then null
     elif ($r.name | IN($names[]) | not) then .
-    elif ($r.rendered | not) then gsub($r.re; "")
+    elif ($r.rendered | not) then strip_hidden_comments
     elif (($r.lines // []) | length) == 0 then null
     elif ([match($r.re; "g")] | all(.[];
             [.captures[] | select(.name == "inner") | .string] as $c
