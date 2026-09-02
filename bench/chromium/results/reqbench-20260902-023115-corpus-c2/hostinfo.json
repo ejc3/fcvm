@@ -1,0 +1,37 @@
+{
+  "captured_at": "2026-09-02T02:43:03Z",
+  "box": "parallel-box-2",
+  "instance_id": "i-0b8def825d4e9bcc2",
+  "instance_type": "c8g.metal-48xl",
+  "availability_zone": "us-west-2d",
+  "uname": "Linux ip-172-31-62-119 6.17.0-1019-aws #19~24.04.1-Ubuntu SMP Tue Jun 23 18:34:05 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux",
+  "kernel_release": "6.17.0-1019-aws",
+  "machine": "aarch64",
+  "cpu_model": "Neoverse-V2",
+  "nproc": 192,
+  "mem_total_kb": 395389732,
+  "os": "Ubuntu 24.04.4 LTS",
+  "fcvm": {
+    "path": "/home/ubuntu/src/fcvm/target/release/fcvm",
+    "sha256": "ff49264ab72de43c459d407c06cb141f7643fbb28807874ae559c1c533ebba5b"
+  },
+  "fc_agent_sha256": "66db2fe9cff744b9aca1043dcf5f4a287124f2880dfdca28ed0c2bf2ebbe6c37",
+  "firecracker": {
+    "path": "/mnt/fcvm-btrfs/firecracker/firecracker-default-9eba8aaaad59.bin",
+    "sha256": "895235f43d5822f05657bc722ac0b57207609b1e237410af6ed8955aa2d494c7"
+  },
+  "pasta": {
+    "path": "/mnt/fcvm-btrfs/pasta/pasta-39927af1b41b.bin",
+    "sha256": "217f8d9dd3f33ab67a00305f797090bccd25c31c84ecf18deea7bc9aa30219e8"
+  },
+  "source_revision": "1e9e9b70937ccc6317046ea22ba41ef0acc454d0",
+  "source_ref": "bench-run/20260902-023115-1e9e9b7093 LOCAL-ONLY",
+  "orchestrator_manifest": "2f2f183aba8e8d042c8ad7b7d8d88cb05ddd98bbb32b5f4dff8b4e8716d89b52  corpus_campaign.sh;ff49264ab72de43c459d407c06cb141f7643fbb28807874ae559c1c533ebba5b  /mnt/work/src/fcvm/target/release/fcvm",
+  "store": "btrfs loopback on /mnt/work/fcvm-btrfs.img (ext4, EBS gp3)",
+  "assets": {
+    "kernels": "vmlinux-default-6.18.44-aarch64-aabb4e064783.bin,vmlinux-default-6.18.44-aarch64-aabb4e064783.bin.lock",
+    "rootfs": "layer2-8d7e1c725608.raw",
+    "initrd": "fc-agent-4a3697b980ba.initrd,fc-agent-4a3697b980ba.lock,fc-agent-934f9450308d.initrd,fc-agent-934f9450308d.lock"
+  },
+  "loadavg_at_capture": "1.42 2.88 7.11 1/2272 459683"
+}
