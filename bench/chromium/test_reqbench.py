@@ -6801,36 +6801,44 @@ class DocLint(unittest.TestCase):
 
     def _figures_in(self, cell_text, with_unit_flag=False):
         """(raw, value, unit_ms_multiplier, printed decimals) for every
-        figure in a table cell: ranges and unit-bearing numbers first, then
-        bare numbers of three or more digits or with a decimal point.
-        with_unit_flag appends whether the figure carried a unit (ms/s)."""
+        figure in a table cell, IN PRINTED ORDER.
+
+        Ranges and unit-bearing numbers are matched first so the bare
+        number pattern cannot claim their digits, and each consumed
+        match is scrubbed to spaces of its own length, which keeps every
+        offset comparable across the three passes. The results are then
+        sorted by offset, because a caller asking for the figure nearest
+        a phrase means the nearest printed one, not the one an earlier
+        pattern happened to match first. with_unit_flag appends whether
+        the figure carried a unit (ms/s)."""
         import html as html_mod
 
         text = html_mod.unescape(re.sub(r"<[^>]+>", " ", cell_text))
         text = text.replace(" ", " ")
         found = []
 
-        def take(raw, unit, unit_bearing=True):
+        def take(start, raw, unit, unit_bearing=True):
             value = float(raw.replace(",", ""))
             decimals = len(raw.split(".")[1]) if "." in raw else 0
             entry = (raw, value, 1000.0 if unit == "s" else 1.0, decimals)
-            found.append(entry + (unit_bearing,) if with_unit_flag else entry)
+            found.append(
+                (start, entry + (unit_bearing,) if with_unit_flag else entry))
 
         def scrub(match):
             return " " * len(match.group(0))
 
         for m in self.RANGE.finditer(text):
-            take(m.group(1), m.group(3))
-            take(m.group(2), m.group(3))
+            take(m.start(1), m.group(1), m.group(3))
+            take(m.start(2), m.group(2), m.group(3))
         text = self.RANGE.sub(scrub, text)
         for m in self.UNIT.finditer(text):
-            take(m.group(1), m.group(2))
+            take(m.start(1), m.group(1), m.group(2))
         text = self.UNIT.sub(scrub, text)
         for m in self.NUMBER.finditer(text):
             raw = m.group(1)
             if "." in raw or float(raw.replace(",", "")) >= 100:
-                take(raw, "ms", unit_bearing=False)
-        return found
+                take(m.start(1), raw, "ms", unit_bearing=False)
+        return [entry for _start, entry in sorted(found, key=lambda f: f[0])]
 
     def _figure_tables(self, name):
         """(header, [cells...]) for every table in a doc whose header names
@@ -7021,6 +7029,22 @@ class DocLint(unittest.TestCase):
         self.assertEqual(bad, [], "\n".join(bad))
 
     PERCENT = re.compile(r"(\d+(?:\.\d+)?)%\s+(above|below)\b")
+
+    def test_figures_come_back_in_the_order_they_are_printed(self):
+        """RED BEFORE THE FIX: _figures_in matched ranges, then
+        unit-bearing numbers, then bare ones, and returned them in that
+        matching order rather than in printed order.
+
+        test_a_percentage_between_two_corpus_figures_is_the_arithmetic
+        reads the nearest figure before the phrase as before[-1] and the
+        nearest after it as after[0], so a sentence that prints a bare
+        decimal before a unit-bearing one handed it the FURTHER figure
+        and it validated the wrong pair: a true statement reported as
+        wrong arithmetic, or a wrong one passed.
+        """
+        figures = self._figures_in("the 483.2 total against the 527.9 ms blocking")
+        self.assertEqual([raw for raw, _value, _scale, _decimals in figures],
+                         ["483.2", "527.9"])
 
     def test_a_percentage_between_two_corpus_figures_is_the_arithmetic(self):
         """RED BEFORE THE FIX: report/README.md, REVIEW.md and the HTML said
