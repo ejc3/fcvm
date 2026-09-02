@@ -193,7 +193,9 @@ came from:
 
 - `render.nav.dns_ms` (Chrome Navigation Timing) is nonzero in 8 of 460 render
   records of the withdrawn 4 vCPU run, seven of them between 149 and 158 ms.
-  The verified run has 2 nonzero of 230, at 4.6 and 4.9 ms.
+  The verified 2026-08-30 run has 2 nonzero of 230, at 4.6 and 4.9 ms, and the
+  three ladder runs have none of 230 each, with `render.nav.ttfb_ms` maxima of
+  15.1, 2.5 and 2.2 ms at 2, 4 and 8 vCPU.
 - `render.nav.ttfb_ms`: the verified run's maximum (15.0 ms) is below the
   withdrawn 2 vCPU run's median (16.2 ms); the withdrawn runs' maxima are
   1.0 to 7.4 s against a replay server on the host loopback.
