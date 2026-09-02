@@ -312,7 +312,8 @@ Two things about the withdrawn table, so nobody restores it from memory:
   on live DNS. The conclusion is withdrawn, and the verified ladder above does
   not re-derive it. `Page.enable` there runs 2.5 ms at 2 vCPU, 2.8 at 4 and 3.8
   at 8, slower as cores are added, and the two verified 2 vCPU runs differ by
-  more (2.5 against 4.3 ms) than the ladder spans from 2 to 8 (1.3 ms). The
+  more (2.5 against 4.3 ms, a 1.9 ms gap) than the ladder spans from 2 to 8
+  (1.4 ms). The
   section makes no claim about why 2 vCPU is slower than 4.
 
 **elmundo was waiting on live DNS.** The 31,046 ms median this file called an
