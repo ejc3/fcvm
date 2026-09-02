@@ -57,6 +57,38 @@ HOST_RESOURCE_FINALIZER = os.path.join(HERE, "host_resource_finalizer.py")
 SERVE_GUARDIAN = os.path.join(HERE, "serve_guardian.py")
 
 
+def await_phase_pid(path, timeout, fail, message, proc=None, early=None):
+    """Return the pid PATH holds, once it holds a COMPLETE one.
+
+    Readiness is a parsed pid, not a created file. Every writer here does
+    `open(path, "w").write(...)`, and open(2) creates and truncates the
+    file before the write lands, so a reader that waits on
+    os.path.isfile can open it empty (int("") raises ValueError) or read
+    a truncated pid and go on to pidfd_open a process nobody started.
+    The terminating newline is the completeness marker: a reader that
+    requires it cannot observe a half-written pid.
+
+    fail is the caller's TestCase.fail. proc, when given, is the launcher
+    whose early exit is reported with the early message instead of a
+    timeout.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            with open(path) as handle:
+                text = handle.read()
+        except FileNotFoundError:
+            text = ""
+        if text.endswith("\n"):
+            return int(text.strip())
+        if proc is not None and proc.poll() is not None:
+            stdout, stderr = proc.communicate()
+            fail(f"{early}: {proc.returncode}: {stdout}{stderr}")
+        if time.monotonic() >= deadline:
+            fail(message)
+        time.sleep(0.01)
+
+
 def proc_state(pid):
     """Return one procfs process state, or None once that process is gone."""
     identity = phase_supervisor.read_process_stat(pid)
@@ -5110,7 +5142,7 @@ os.fsync = _fsync
             command = (
                 "import os,signal,time; "
                 "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
-                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                f"open({phase_pid_path!r}, 'w').write(f'{{os.getpid()}}\\n'); "
                 "signal.signal(signal.SIGTERM, stop); time.sleep(60)"
             )
             proc = subprocess.Popen(
@@ -5123,18 +5155,9 @@ os.fsync = _fsync
             )
             phase_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not os.path.isfile(phase_pid_path):
-                    if proc.poll() is not None:
-                        stdout, stderr = proc.communicate()
-                        self.fail(
-                            f"supervisor exited before phase readiness: "
-                            f"{proc.returncode}: {stdout}{stderr}")
-                    if time.monotonic() >= deadline:
-                        self.fail("controlled phase did not start")
-                    time.sleep(0.01)
-                with open(phase_pid_path) as handle:
-                    phase_pid = int(handle.read())
+                phase_pid = await_phase_pid(
+                    phase_pid_path, 5, self.fail, "controlled phase did not start",
+                    proc=proc, early="supervisor exited before phase readiness")
                 os.write(control_fd, b"T")
                 stdout, stderr = proc.communicate(timeout=10)
                 self.assertEqual(proc.returncode, 0, stdout + stderr)
@@ -5284,7 +5307,7 @@ os.fsync = _fsync
                 "import os,signal,subprocess,sys\n"
                 "phase = [sys.executable, '-c', "
                 + repr("import os,signal,time; "
-                       f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                       f"open({phase_pid_path!r}, 'w').write(f'{{os.getpid()}}\\n'); "
                        "signal.signal(signal.SIGTERM, lambda *_: raise_exit()); "
                        "time.sleep(60)")
                 + "]\n"
@@ -5306,14 +5329,8 @@ os.fsync = _fsync
                 stderr=subprocess.PIPE, text=True,
             )
             supervisor_pid = int(parent.stdout.readline())
-            deadline = time.monotonic() + 10
-            while not (os.path.isfile(phase_pid_path)
-                       and os.path.getsize(phase_pid_path) > 0):
-                if time.monotonic() >= deadline:
-                    self.fail("supervised phase never started")
-                time.sleep(0.01)
-            with open(phase_pid_path) as handle:
-                phase_pid = int(handle.read())
+            phase_pid = await_phase_pid(
+                phase_pid_path, 10, self.fail, "supervised phase never started")
             os.kill(parent.pid, signal.SIGKILL)
             parent.communicate(timeout=20)
 
@@ -5345,7 +5362,7 @@ os.fsync = _fsync
                 "import os,signal,time; "
                 "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
                 "signal.signal(signal.SIGTERM, stop); "
-                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                f"open({phase_pid_path!r}, 'w').write(f'{{os.getpid()}}\\n'); "
                 f"open({state_path!r}, 'w').write('inactive\\n'); "
                 f"open({ready_path!r}, 'w').write('ready\\n'); "
                 "time.sleep(60)"
@@ -6433,7 +6450,7 @@ os.fsync = _fsync
                     "if '--control-path' in args:\n"
                     "    control=args[args.index('--control-path')+1]\n"
                     "with open(os.environ['FAKE_PHASE_PID'], 'w') as out:\n"
-                    "    out.write(str(os.getpid()))\n"
+                    "    out.write(f'{os.getpid()}\\n')\n"
                     "os.close(1); os.close(2)\n"
                     "if control is None:\n"
                     "    time.sleep(60)\n"
@@ -6467,18 +6484,10 @@ os.fsync = _fsync
             )
             phase_pid = None
             try:
-                deadline = time.monotonic() + 5
-                while not os.path.isfile(phase_pid_path):
-                    if proc.poll() is not None:
-                        stdout, stderr = proc.communicate()
-                        self.fail(
-                            f"phase launcher exited before readiness: "
-                            f"{proc.returncode}: {stdout}{stderr}")
-                    if time.monotonic() >= deadline:
-                        self.fail("fake phase supervisor did not start")
-                    time.sleep(0.01)
-                with open(phase_pid_path) as handle:
-                    phase_pid = int(handle.read())
+                phase_pid = await_phase_pid(
+                    phase_pid_path, 5, self.fail,
+                    "fake phase supervisor did not start",
+                    proc=proc, early="phase launcher exited before readiness")
                 proc.send_signal(signal.SIGTERM)
                 proc.communicate(timeout=10)
                 self.assertEqual(proc.returncode, 143)
@@ -6521,7 +6530,7 @@ os.fsync = _fsync
                 "import os,signal,time; "
                 "stop=lambda *_: (_ for _ in ()).throw(SystemExit(0)); "
                 "signal.signal(signal.SIGTERM, stop); "
-                f"open({phase_pid_path!r}, 'w').write(str(os.getpid())); "
+                f"open({phase_pid_path!r}, 'w').write(f'{{os.getpid()}}\\n'); "
                 "time.sleep(60)"
             )
             script = (
@@ -6543,18 +6552,9 @@ os.fsync = _fsync
             pidfd = None
             drained = False
             try:
-                deadline = time.monotonic() + 5
-                while not os.path.isfile(phase_pid_path):
-                    if proc.poll() is not None:
-                        stdout, stderr = proc.communicate()
-                        self.fail(
-                            f"phase launcher exited before readiness: "
-                            f"{proc.returncode}: {stdout}{stderr}")
-                    if time.monotonic() >= deadline:
-                        self.fail("supervised phase did not start")
-                    time.sleep(0.01)
-                with open(phase_pid_path) as handle:
-                    phase_pid = int(handle.read())
+                phase_pid = await_phase_pid(
+                    phase_pid_path, 5, self.fail, "supervised phase did not start",
+                    proc=proc, early="phase launcher exited before readiness")
                 pidfd = os.pidfd_open(phase_pid)
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.communicate(timeout=5)
@@ -10544,6 +10544,94 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
             '--corpus-extra-runtime-bundle-sha256 "$CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256"',
             source,
         )
+
+
+class PhasePidReadiness(unittest.TestCase):
+    """A phase is ready when its pid file HOLDS a pid, not when it exists."""
+
+    def test_a_created_pid_file_is_not_a_ready_phase(self):
+        """RED BEFORE THE FIX: three readiness loops waited for the
+        pid file merely to EXIST, and then did int(handle.read()).
+        Every writer does open(path, "w"), which creates and truncates
+        the file before the pid lands, so the reader could open it empty.
+        Observed in a full `make test-chromium` run as
+
+            ValueError: invalid literal for int() with base 10: ''
+
+        from test_outer_sigkill_closes_control_and_drains_the_phase,
+        which passes in isolation: the window is only wide enough to lose
+        under a loaded suite. A truncated pid is the same window's worse
+        outcome, since the caller goes on to pidfd_open whatever prefix
+        it read.
+
+        await_phase_pid requires the writers' terminating newline, so
+        neither an empty file nor a prefix can be mistaken for a pid.
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "phase.pid")
+            open(path, "w").close()  # what open(path, "w") leaves behind
+            self.assertTrue(os.path.isfile(path), "the old predicate was satisfied")
+
+            def finish():
+                time.sleep(0.2)
+                with open(path, "w") as handle:
+                    handle.write("31337\n")
+
+            writer = threading.Thread(target=finish)
+            writer.start()
+            try:
+                pid = await_phase_pid(path, 5, self.fail, "never started")
+            finally:
+                writer.join()
+            self.assertEqual(pid, 31337)
+
+    def test_a_truncated_pid_is_not_a_pid(self):
+        """A prefix of the pid parses, and signalling it would reach a
+        process the test never started."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "phase.pid")
+            with open(path, "w") as handle:
+                handle.write("313")  # the write the reader must not observe
+
+            def finish():
+                time.sleep(0.2)
+                with open(path, "w") as handle:
+                    handle.write("313370\n")
+
+            writer = threading.Thread(target=finish)
+            writer.start()
+            try:
+                pid = await_phase_pid(path, 5, self.fail, "never started")
+            finally:
+                writer.join()
+            self.assertEqual(pid, 313370)
+
+    def test_a_pid_that_never_lands_is_a_timeout_not_a_parse_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "phase.pid")
+            open(path, "w").close()
+            with self.assertRaises(AssertionError) as caught:
+                await_phase_pid(path, 0.2, self.fail, "supervised phase did not start")
+            self.assertIn("supervised phase did not start", str(caught.exception))
+
+    def test_no_phase_pid_reader_takes_existence_for_readiness(self):
+        """The matrix over every caller: the defect was one predicate
+        copied to four readers, and one of them had already been repaired
+        in place (an `os.path.getsize(...) > 0` guard) without the other
+        three being touched. No reader may wait on the pid file's
+        existence or size; they all go through await_phase_pid.
+
+        The needles are built from pieces so this assertion does not
+        match itself."""
+        source = open(os.path.join(HERE, "test_corpus_mem.py")).read()
+        target = "phase_pid" + "_path"
+        for call in ("isfile", "getsize", "exists"):
+            needle = f"os.path.{call}({target})"
+            self.assertEqual(source.count(needle), 0,
+                             f"{needle} takes existence for readiness")
+        needle = "phase_pid = await" + "_phase_pid("
+        self.assertEqual(source.count(needle), 4,
+                         "every phase-pid reader goes through the helper")
 
 
 if __name__ == "__main__":
