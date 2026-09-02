@@ -57,14 +57,18 @@ What this rule costs the current document, so nobody rediscovers it:
   host container. Same treatment.
 - "Three network modes, priced" is fixture-based AND has no surviving record.
 
-That leaves the corpus mix as the publishable headline: 712.6 ms [610.5, 808.5],
-n=202, 14 URLs cycled uniformly, 2 guest vCPUs, from
-`results/reqbench-20260830-171007-corpus` (DNS-verified: `dns-evidence.json`
-verdict clean, first_mismatch null, diag violations none). It is the one figure
-with a shipped record, a real workload and a verified resolver behind it. The
-695.7 ms at 4 vCPU that stood here came from
-`results/reqbench-20260816-123529-corpus`, which is withdrawn (see "Corpus
-latency by guest vCPU count" below); no 4 or 8 vCPU cell is verified.
+That leaves the corpus mix as the publishable headline: 549.4 ms [467.9, 632.4],
+n=202, 14 URLs cycled uniformly, 4 guest vCPUs, from
+`results/reqbench-20260902-025115-corpus-c4` (DNS-verified: `dns-evidence.json`
+verdict clean, first_mismatch null, diag violations none). Four corpus cells now
+have a shipped record, a real workload and a verified resolver: the 2026-09-02
+ladder at 2, 4 and 8 vCPU, and `results/reqbench-20260830-171007-corpus` at
+712.6 ms [610.5, 808.5] on 2 vCPU. The headline is the 4 vCPU cell because the
+ladder puts the knee between 2 and 4 (see "Corpus latency by guest vCPU count"
+below), so 4 is the operating point; the 2 vCPU figures are quoted beside it
+wherever it appears, because most of the rest of this report is 2 vCPU work.
+The 695.7 ms at 4 vCPU that stood here before came from
+`results/reqbench-20260816-123529-corpus`, which is withdrawn.
 
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
@@ -142,6 +146,12 @@ fixed in the same pass:
   `favicon` argument, and the section count said 15 against an actual 14. (The
   2026-08-16 reproduction section brings it back to 15; the count above is
   current.)
+
+A DNS-verified 2/4/8 vCPU ladder was measured on 2026-09-02 and is cited in
+"Corpus latency by guest vCPU count" below. The headline moved with it, from
+the 2 vCPU 712.6 ms to the 4 vCPU 549.4 ms; both cells are verified and both
+are quoted. The two "not measured on the fixed tree" rows are gone, replaced
+by the measurement.
 
 The 2026-08-16 corpus series was withdrawn on 2026-09-02 for live-DNS
 contamination (the section below has the evidence). The headline moved from
