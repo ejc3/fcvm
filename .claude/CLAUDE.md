@@ -224,6 +224,18 @@ Three rules the gate enforces, each of them a hole it once had:
   answers nothing, it has simply stopped being a question. Treating every non-empty body as a
   finding blocked PRs that had none at all, `@codex review` included, which is the command
   the docs tell you to post.
+- **A reviewer saying it did not run is not a claim either.** Out of quota, Codex's bot
+  posts "You have reached your Codex usage limits for code reviews" as a top-level comment;
+  CodeRabbit answers a trigger it cannot serve with "Review rate limited." under an "Action
+  not completed" fold, and until a review has run its summary comment holds only a "Review
+  limit reached" or "Review skipped" notice. Both bots are listed reviewers, so none of that
+  was a notification bot's comment, and the gate counted each one as a finding: on
+  2026-09-02 #898 carried three Codex quota notices reported UNANSWERED, aws #46 one more,
+  and the author posted a `NOT-A-DEFECT:` review to answer text that claimed nothing. A
+  listed bot's comment whose whole body is one of those notices, matched line for line, now
+  needs no disposition and covers no head. The same words with anything added, or from any
+  other account, stay claimable, and a summary comment that has grown a walkthrough is a
+  walkthrough.
 - **The head commit must have been reviewed.** Answering every finding proves nothing if
   nobody reviewed the code you are merging. This gate shipped with five open findings that
   way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it

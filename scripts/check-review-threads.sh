@@ -573,8 +573,9 @@ fi
 #     can wear it; an empty or absent author matches nothing, because on a payload that
 #     names no author "" == "" would exempt every unattributed body on it.
 #   - TOP-LEVEL COMMENTS have no state, so everything counts unless it is on a short,
-#     documented ignore list: bot logins that only ever post notifications, and the
-#     literal trigger phrases this skill tells you to post. An unknown bot counts, and so
+#     documented ignore list: bot logins that only ever post notifications, the literal
+#     trigger phrases this skill tells you to post, and a listed reviewer's notice that it
+#     did NOT review (the shapes above VERDICT_JQ). An unknown bot counts, and so
 #     does the AUTHOR: a comment is where a self-reported defect lands, and a review is
 #     where an answer does. That asymmetry is the whole rule.
 #
@@ -641,12 +642,112 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # the comment, which is the right direction; extend the list when Codex says something
 # new. Only the About Codex block is stripped, and only under that exact summary text:
 # a details block with any other summary is where a bot folds its findings.
+# NOTICES: a listed reviewer saying that its review did NOT run. Neither a finding nor
+# coverage. Both bots post one, and because both are in VERDICT_BOTS none of it fell under
+# the notification-bot exemption below: every notice was a PR-level claim needing a
+# disposition dated after it. On 2026-09-02 #898 carried three Codex quota notices and the
+# gate reported all three UNANSWERED (aws #46 one more); the author cleared them with a
+# NOT-A-DEFECT review answering text that claimed nothing. A gate that blocks on ordinary
+# bot traffic gets switched off, which is the failure the withdrawn last-word rule had.
+#
+# A notice is matched as the WHOLE body, line for line, against the shapes the bots have
+# posted here, and belongs to the bot that posts it (see CODERABBIT_LOGIN): the same words
+# with anything added, or from any other account, are a comment like any other and stay
+# claimable. The shapes, with where each was observed:
+#   - Codex, a plain top-level comment: "You have reached your Codex usage limits for code
+#     reviews. You can see your limits in the [Codex usage dashboard](...)." alone (#898 at
+#     05:16Z, #842) or followed by "To continue using code reviews, add credits to your
+#     account and enable them for code reviews in your [settings](...)." (#898 at 05:20Z
+#     and 06:04Z, aws #46, aws #27).
+#   - CodeRabbit's reply to a command it did not carry out: one of "Review rate limited.",
+#     "Already reviewed.", "Already reviewed the last commit. Use `@coderabbitai full
+#     review` to rerun a review of the entire changeset.", "No files to review." or "Pull
+#     request is closed." folded under "⚠️ Action not completed", with or without the
+#     incremental-review note (#847, #864, #846, #869, #853); or "Review rate limited." over
+#     a rule and the Fair Usage Limits paragraph naming a wait (#844, #887, aws #17).
+#   - CodeRabbit's chat reply "### Rate Limit Exceeded" naming the user and a wait (#893).
+#   - CodeRabbit's summary comment before any review has run: the summarize marker, ONE
+#     notice between its "rate limited", "skip review" or "review paused" markers, its
+#     payload blockquoted under a "Review limit reached", "Review skipped" or "Reviews
+#     paused" heading, the tips block, and nothing else (#874, #843, #789, #832). The
+#     payload is parsed line by line against the shapes CodeRabbit posts
+#     (cr_notice_payload_res), not skimmed for a leading ">": accepting any quoted line
+#     made "> P1: this drops the last row" part of the notice, and a notice needs no
+#     disposition. The range
+#     that notice quotes is not coverage (walkthrough_sha never read it). Once the comment
+#     holds a walkthrough or a recent-review block it is a walkthrough, judged as one.
+#
+# ACCOUNTING. A body is exempt from dispositions only if the classifier read every byte of
+# it. Content removed before classification is content nobody evaluated, so a finding in a
+# removed region is exempt and never answered. That is one defect class and it landed three
+# times: the notice payload (any line starting with ">"), the CodeRabbit tips block, and
+# the folded About Codex block, the last of which also bound no-findings COVERAGE to the
+# head. Every removal now goes through strip_accounted, which deletes a region declared in
+# accounted_regions only after every non-blank line inside it matches one of that region's
+# shapes, and returns null otherwise, which makes the whole body claimable. The regions:
+#
+#   cr_tips       <!-- tips_start --> .. <!-- tips_end -->        rendered, shape-checked
+#   codex_about   <details> <summary>ℹ️ About Codex ..</details>  rendered, shape-checked
+#   html_comment  <!-- .. -->                                     not rendered, no shapes
+#
+# html_comment carries no shapes because GitHub renders none of it: nothing inside one is a
+# claim a reader can see or answer. Both shape lists were read off what the bots posted on
+# ejc3/fcvm #789 through #901 (13 About blocks, 17 tips blocks) and match all of it with
+# nothing left over. Every shape is anchored, because an unanchored one matches the head of
+# a line and lets the rest ride along. An unlisted line costs one disposition; accepting
+# one costs a finding nobody has to answer.
+#
+# scripts/gate-discard-sites.sh enumerates every discarding call in VERDICT_JQ and blocks
+# on any that is neither this primitive nor a listed normalization, so the next stripping
+# step fails a test unless it declares a region. Both harnesses run it.
 VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
+def cr_tips_res:
+  [ "^---$"
+  , "^</?details>$"
+  , "^<summary>❤️ Share</summary>$"
+  , "^- \\[(X|Mastodon|Reddit|LinkedIn)\\]\\(https://[^)]*\\)$"
+  , "^Thanks for using \\[CodeRabbit\\]\\(https://coderabbit\\.ai\\?utm_source=oss&utm_medium=github&utm_campaign=[^)]+\\)! It.s free for OSS, and your support helps us grow\\. If you like it, consider giving us a shout-out\\.$"
+  , "^<sub>Comment `@coderabbitai help` to get the list of available commands\\.</sub>$"
+  ];
+def codex_about_res:
+  [ "^<br/>$"
+  , "^\\[Your team has set up Codex to review pull requests in this repo\\]\\(https://chatgpt\\.com/codex/cloud/settings/general\\)\\. Reviews are triggered when you$"
+  , "^- Open a pull request for review$"
+  , "^- Mark a draft as ready$"
+  , "^- Comment \"@codex review\"( or \"@codex security review\")?\\.$"
+  , "^If Codex has suggestions, it will comment; otherwise it will react with 👍\\.$"
+  , "^Codex reacts with 👀 while any review is running, comments if it has suggestions, and reacts with 👍 once all reviews finish with no findings\\.$"
+  , "^Codex can also answer questions or update the PR\\. Try commenting \"@codex address that feedback\"\\.$"
+  ];
+def accounted_regions:
+  [ { name: "cr_tips", rendered: true, lines: cr_tips_res,
+      re: "<!-- tips_start -->(?<inner>(.|\n)*?)<!-- tips_end -->" }
+  , { name: "codex_about", rendered: true, lines: codex_about_res,
+      re: "<details> <summary>ℹ️ About Codex in GitHub</summary>(?<inner>(.|\n)*?)</details>" }
+  , { name: "html_comment", rendered: false, lines: null,
+      re: "<!--(.|\n)*?-->" }
+  ];
+def strip_accounted($names):
+  if ($names | any(. as $n | ([accounted_regions[] | .name] | index($n)) == null)) then null
+  else reduce accounted_regions[] as $r (.;
+    if . == null then null
+    elif ($r.name | IN($names[]) | not) then .
+    elif ($r.rendered | not) then gsub($r.re; "")
+    elif (($r.lines // []) | length) == 0 then null
+    elif ([match($r.re; "g")] | all(.[];
+            [.captures[] | select(.name == "inner") | .string] as $c
+            | ($c | length) == 1
+              and (($c[0] // "") | split("\n")
+                   | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))
+                   | all(.[]; . as $line | any($r.lines[]; . as $re | $line | test($re))))))
+      then gsub($r.re; "")
+    else null end)
+  end;
 def verdict_lines:
-  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
-    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
-    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
-    | map(select(length > 0 and . != cr_note)));
+  ((. // "") | strip_accounted(["codex_about", "html_comment"])) as $s
+  | if $s == null then null
+    else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+             | map(select(length > 0 and . != cr_note))) end;
 def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
@@ -663,10 +764,10 @@ def summary_cells:
   | (if (.[0] // "") == "" then .[1:] else . end)
   | (if (.[-1] // "") == "" then .[:-1] else . end);
 def summary_lines:
-  ((. // "") | gsub("<!--(.|\n)*?-->"; "")
-    | gsub("<details> <summary>ℹ️ About Codex in GitHub</summary>(.|\n)*?</details>"; "")
-    | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
-    | map(select(length > 0)));
+  ((. // "") | strip_accounted(["codex_about", "html_comment"])) as $s
+  | if $s == null then null
+    else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
+             | map(select(length > 0))) end;
 def is_codex_summary:
   (((. // "") | sub("^[[:space:]]+"; "")) | startswith(codex_summary_marker))
   and (summary_lines as $l
@@ -700,7 +801,91 @@ def walkthrough_sha:
      | select(test("(?m)^>[[:space:]]*##") | not)
      | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
      | select(test("No actionable comments were generated in the recent review"))
-     | capture(cr_range_re) | .sha ] | first) // "";'
+     | capture(cr_range_re) | .sha ] | first) // "";
+def codex_limit_line1: "You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).";
+def codex_limit_line2: "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).";
+def is_codex_limit_notice:
+  verdict_lines as $l | ($l == [codex_limit_line1]) or ($l == [codex_limit_line1, codex_limit_line2]);
+def cr_not_done_re: "^(Review rate limited\\.|Already reviewed\\.|Already reviewed the last commit\\. Use `@coderabbitai full review` to rerun a review of the entire changeset\\.|No files to review\\.|Pull request is closed\\.)$";
+def cr_fair_usage_re: "^Your included review limit is currently reached under our \\[Fair Usage Limits Policy\\]\\(https://docs\\.coderabbit\\.ai/management/plans#fair-usage-limits-policy\\)\\. This review may still proceed through usage-based billing if eligible\\. Your next included review will be available in [0-9]+ (minutes?|seconds?|hours?)\\.$";
+def cr_chat_limit_re: "^`@[A-Za-z0-9-]+` have exceeded the limit for the number of chat messages per hour\\. Please wait \\*\\*[0-9]+ (minutes?|seconds?|hours?)( and [0-9]+ (minutes?|seconds?))?\\*\\* before sending another message\\.$";
+def is_cr_reply_notice:
+  verdict_lines as $l
+  | (($l | length) == 4 and $l[0] == "<details>" and $l[1] == "<summary>⚠️ Action not completed</summary>"
+     and ($l[2] | test(cr_not_done_re)) and $l[3] == "</details>")
+    or (($l | length) == 6 and $l[0] == "<details>" and $l[1] == "<summary>⚠️ Action not completed</summary>"
+        and $l[2] == "Review rate limited." and $l[3] == "---" and ($l[4] | test(cr_fair_usage_re))
+        and $l[5] == "</details>")
+    or (($l | length) == 2 and $l[0] == "### Rate Limit Exceeded" and ($l[1] | test(cr_chat_limit_re)));
+def cr_notice_start_re: "^<!-- This is an auto-generated comment: (?<k>rate limited|skip review|review paused) by coderabbit\\.ai -->$";
+def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paused)$";
+# The notice payload, one accepted shape per line, with the parts that vary between
+# postings generalized: counts, durations, shas, run and org ids, backticked names, and the
+# handle the rate-limit line addresses. An apostrophe is written "." so this list can live
+# inside VERDICT_JQ. Every shape was read off a notice CodeRabbit posted in ejc3/fcvm or
+# ejc3/aws; the 46 such bodies fetched on 2026-09-02 are matched by this list with nothing
+# left over. A line outside it makes the comment claimable, which is what it was before the
+# exemption existed: the cost of an unlisted shape is one disposition, and the cost of
+# accepting one is a finding nobody has to answer.
+def cr_notice_payload_res:
+  [ "^$"
+  , "^</?details>$"
+  , "^<summary>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing \\([0-9]+\\)|⛔ Files ignored due to path filters \\([0-9]+\\)|How can I continue\\?|How do review limits work\\?|Review details|View limit details)</summary>$"
+  , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
+  , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> 🔍 Trigger review$"
+  , "^\\*\\*(Configuration used|Review profile|Plan)\\*\\*: [A-Za-z0-9 +]+$"
+  , "^\\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
+  , "^\\*\\*Review configuration:\\*\\*$"
+  , "^\\*\\*Next review available in:\\*\\* \\*\\*[0-9]+ (minutes?|seconds?|hours?)\\*\\*$"
+  , "^\\*\\*Next included review available in [0-9]+ (minutes?|seconds?|hours?)\\.\\*\\*$"
+  , "^\\*\\*Limit details:\\*\\* You.ve used (all [0-9]+ included review|the included review) currently available( under your plan)?\\.$"
+  , "^Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and [0-9a-f]{40}\\.$"
+  , "^You can disable this status message by setting the `reviews\\.review_status` to `false` in the CodeRabbit configuration file\\.$"
+  , "^Please check the settings in the CodeRabbit UI or the `\\.coderabbit\\.yaml` file in this repository\\. To trigger a single review, invoke the `@coderabbitai review` command\\.$"
+  , "^Use the checkbox below for a quick retry:$"
+  , "^`@[A-Za-z0-9-]+`, you.ve reached your PR review limit, so we couldn.t start this review\\.$"
+  , "^After more reviews become available, a review can be triggered using the `@coderabbitai review` command as a PR comment\\. Alternatively, push new commits to this PR\\.$"
+  , "^To avoid repeated limits, reduce automatic review volume by pausing incremental auto-reviews earlier, using label-based review opt-in, excluding WIP or generated PR titles, or requesting reviews manually when the PR is ready\\. If your team needs uninterrupted high-volume reviews, an organization admin can enable usage-based reviews\\.$"
+  , "^CodeRabbit enforces per-developer PR review limits for each organization\\. Most developers receive the normal plan review availability\\.$"
+  , "^For paid Pro and Pro\\+ PR reviews, CodeRabbit uses adaptive limits for sustained high-volume activity\\. When a developer.s recent PR review activity reaches the 95th percentile or higher among CodeRabbit users, additional reviews become available more gradually as earlier reviews age out of the rolling window\\.$"
+  , "^Please refer \\[docs\\]\\(https://docs\\.coderabbit\\.ai/management/plans#rate-limits\\) for additional details\\.$"
+  , "^You.ve used all free OSS reviews for now\\. Wait for the free limit to reset to keep reviewing this public repository\\.$"
+  , "^Auto reviews are disabled on base/target branches other than the default branch\\.$"
+  , "^Draft detected\\.$"
+  , "^Enable \\*\\*\\[usage-based reviews\\]\\(https://app\\.coderabbit\\.ai/settings/billing\\?tab=usage&orgId=[0-9a-f-]+\\)\\*\\* in Billing to review now\\. Otherwise, wait until the next included review is available\\.$"
+  , "^You.re only billed for reviews past your plan.s rate limits \\(\\$[0-9]+\\.[0-9]+/file\\)\\.$"
+  , "^\\[Learn how review limits work\\]\\(https://docs\\.coderabbit\\.ai/management/plans#rate-limits\\)\\.$"
+  , "^Too many files!$"
+  , "^This PR contains [0-9]+ files, which is [0-9]+ over the limit of [0-9]+\\.$"
+  , "^To get a review, reduce the PR to [0-9]+ files or fewer by splitting it into smaller PRs or changing its base branch\\.$"
+  , "^Upgrade to a paid plan to raise the limit\\.$"
+  , "^Usage-priced reviews support at most [0-9]+ files\\.$"
+  , "^\\[Check out review usage here\\]\\(https://app\\.coderabbit\\.ai/dashboard/review-capacity\\?orgId=[0-9a-f-]+\\)\\.$"
+  ];
+# The blockquote between the notice markers: an alert marker, one of the listed headings,
+# then payload. Accepting any line that merely starts with ">" made "> P1: this drops the
+# last row" part of a notice, and a notice needs no disposition.
+def cr_notice_payload_ok:
+  . as $n
+  | ($n | length) >= 2 and all($n[]; startswith(">"))
+    and (($n | map(sub("^>[[:space:]]*"; ""))) as $t
+         | ($t[0] | test("^\\[!(WARNING|IMPORTANT|NOTE)\\]$"))
+           and ($t[1] | test(cr_notice_heading_re))
+           and all($t[2:][]; . as $line | any(cr_notice_payload_res[]; . as $re | $line | test($re))));
+def is_cr_summary_notice:
+  (. // "") as $b
+  | [$b | scan(cr_marker_re)] as $m
+  | ($m | length) == 2 and $m[0] == cr_summarize_marker
+    and (($m[1] | capture(cr_notice_start_re) // null) != null)
+    and (($b | split($m[1])) as $p
+         | ($p | length) == 2
+           and (($p[1] | split("<!-- end of auto-generated comment: \($m[1] | capture(cr_notice_start_re).k) by coderabbit.ai -->")) as $q
+                | ($q | length) == 2
+                  and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)))
+                       | cr_notice_payload_ok)
+                  and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "html_comment"])) as $rest
+                       | $rest != null and ($rest | test("[^[:space:]]") | not))));
+def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
 # any other, never coverage. Entries are logins; their mention handles (@codex,
@@ -710,6 +895,10 @@ VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector,coderabbitai}
 # CodeRabbit comment carrying the marker a Codex verdict: exempt from dispositions, with its
 # table read as head coverage.
 CODEX_LOGIN=${CODEX_LOGIN:-chatgpt-codex-connector}
+# Each notice belongs to its bot the same way: the quota notice is Codex's, the rate-limit,
+# not-completed and summary notices are CodeRabbit's. From any other account they are
+# ordinary comments.
+CODERABBIT_LOGIN=${CODERABBIT_LOGIN:-coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 
@@ -793,7 +982,7 @@ fi
 # The coverage check below asks only whether some row names the head and postdates its
 # arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
-   --arg codex "$CODEX_LOGIN" --arg me "$prauthor" \
+   --arg codex "$CODEX_LOGIN" --arg cr "$CODERABBIT_LOGIN" --arg me "$prauthor" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
@@ -803,16 +992,19 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
       | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
       | ($listed and ($c.body | is_verdict)) as $v
       | ($listed and (($c.author.login // "") == $codex) and ($c.body | is_codex_summary)) as $sum
+      | ($listed and ((($c.author.login // "") == $codex and ($c.body | is_codex_limit_notice))
+                      or (($c.author.login // "") == $cr and ($c.body | is_cr_notice)))) as $notice
       | {author, state: "COMMENT", body, at: .updatedAt,
-         verdict: ($v or $sum),
-         reviewed_rows: ((if $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
+         verdict: ($v or $sum), notice: $notice,
+         reviewed_rows: ((if $notice then []
+                          elif $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
                           elif $sum then ($c.body | summary_rows)
                           elif $listed then [{sha: ($c.body | walkthrough_sha), at: (.updatedAt // "")}]
                           else [] end)
                          | map(select((.sha // "") != "" and (.at // "") != ""))),
          claimable: ((.author.login | IN($skip[]) | not)
                      and ((.body // "") | test($trig; "i") | not)
-                     and (($v or $sum) | not))}))' \
+                     and (($v or $sum or $notice) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
