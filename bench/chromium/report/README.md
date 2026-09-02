@@ -155,7 +155,9 @@ not a median, lo or hi of a DNS-verified record.
 
 ## Corpus latency by guest vCPU count
 
-The 2026-08-16 ladder is withdrawn. Every run in that series (the ten gated
+A DNS-verified 2/4/8 vCPU ladder exists, measured 2026-09-02; it is below,
+under "The verified ladder". The 2026-08-16 ladder that used to stand here is
+withdrawn and stays withdrawn. Every run in that series (the ten gated
 campaign runs `results/reqbench-20260816-*-corpus`, the 2 vCPU rerun
 `results/reqbench-20260816-134130-corpus`, the three cpuprobe source runs, and
 the earlier `results/reqbench-20260814-042319-uffd`) has a source_revision that
@@ -202,29 +204,60 @@ came from:
   verified 712.6 across that host change; how much of the gap is DNS is
   not measured.
 
-The one DNS-verified cell:
+### The verified ladder
 
-| guest vCPUs | cdp p50 | CI | record |
-|---|---|---|---|
-| 2 | 712.6 ms | [610.5, 808.5] | `results/reqbench-20260830-171007-corpus/analysis.json` |
-| 4 | not measured on the fixed tree | | |
-| 8 | not measured on the fixed tree | | |
+The ladder was re-run on a source_revision that contains `90733b854e`
+(`1e9e9b70937c`): three rungs measured back to back in one session, one runtime
+bundle (`b1194fed78b8`), one golden per rung because the guest vCPU count is
+baked into the snapshot. Every rung passed its gates: 202 measured non-warmup
+cdp requests at zero failures, `dns-evidence.json` verdict clean with
+first_mismatch null, diag violations none, teardown failures none.
 
-What survives of the withdrawn ladder is a direction, not a magnitude. On the
-six URLs whose screenshots are byte-identical between each withdrawn rung and
-the verified run (example.com and the five TodoMVC variants), the withdrawn
-series' cdp medians were 680.9, 498.7 and 494.9 ms at 2, 4 and 8 vCPU. Those
-six pages were still fetched over the live network in every withdrawn rung
-(example.com main-document ttfb 46.6 / 51.0 / 48.3 ms at 2 / 4 / 8 vCPU
-against 0.6 ms in the verified run; the five TodoMVC pages' medians 5.7 to
-7.5 / 3.7 to 4.0 / 3.8 to 4.1 ms against 0.5 to 1.0),
-so the direction survives only because that network term does not move with
-the vCPU count. The verified run's median on the same six URLs is 547.5 ms
-at 2 vCPU: 133 ms below the withdrawn 2 vCPU rung and 49 ms above the
-withdrawn 4 vCPU rung, so 4 vCPU is faster than 2 and the size of the knee
-is unmeasured. Nothing more is claimed until the ladder is re-run on a
-source_revision that contains `90733b854e`. Do not fill the 4 and 8 rows
-with a prediction.
+| guest vCPUs | cdp p50 | CI | noop | record |
+|---|---|---|---|---|
+| 2 | 770.3 ms | [596.2, 807.8] | 44.9 ms | `results/reqbench-20260902-023115-corpus-c2/analysis.json` |
+| 4 | 549.4 ms | [467.9, 632.4] | 45.1 ms | `results/reqbench-20260902-025115-corpus-c4/analysis.json` |
+| 8 | 580.2 ms | [520.8, 645.9] | 45.8 ms | `results/reqbench-20260902-031115-corpus-c8/analysis.json` |
+
+Index: `results/campaign-20260902-box2-ladder-summary.json`, which carries the
+per-cell seals, DNS verdicts and load evidence.
+
+2 to 4 vCPU is a step of 220.9 ms: 549.4 is 28.7% below 770.3, and all 14 URLs
+are faster at 4 than at 2. 4 to 8 does not separate. Each rung's median sits
+inside the other's interval, and 8 vCPU is slower than 4 on 11 of the 14 URLs,
+faster only on the three heaviest (elmundo 2,907.2 against 2,945.2, rtp.pt
+1,945.8 against 2,195.0, theguardian 894.9 against 913.7). So the knee is
+between 2 and 4, and 4 vCPU is the operating point.
+
+Two limits on that reading. The intervals are within-run: 202 requests of one
+run, not run-to-run variance. The 2 and 4 intervals overlap between 596.2 and
+632.4, so the step is read from the medians and the per-URL sweep, not from
+disjoint intervals; neither median falls inside the other's interval, which is
+what separates that pair from 4 against 8. And the ladder prices latency only:
+twice the vCPUs per render halves how many renders a fixed core budget holds
+concurrently, and no run here measures that.
+
+The 4-to-8 difference is not in the render. Stage medians, cdp arm:
+
+| rung | resolve | upgrade | Page.enable | navigate | screenshot | cdp p50 |
+|---|---|---|---|---|---|---|
+| 2 vCPU | 152.9 | 6.1 | 2.5 | 414.1 | 81.4 | 770.3 ms |
+| 4 vCPU | 153.1 | 2.6 | 2.8 | 301.0 | 67.1 | 549.4 ms |
+| 8 vCPU | 204.6 | 3.1 | 3.8 | 267.2 | 64.1 | 580.2 ms |
+
+navigate and screenshot both keep falling from 4 to 8. What rises is `resolve`,
+by 51.5 ms, which cdpdrive.py measures on the host as its own name lookup for
+the forwarded CDP endpoint, outside the guest.
+
+The two verified 2 vCPU cells agree: this ladder's 770.3 [596.2, 807.8] and
+the 2026-08-30 run's 712.6 [610.5, 808.5], each median inside the other's
+interval, measured on different goldens, fcvm binaries and hosts. That
+agreement is the cross-check that the two runs measure the same thing.
+
+The direction argument that stood here, derived from the six URLs whose
+screenshots are byte-identical between each withdrawn rung and the 2026-08-30
+run, is superseded by the ladder above and removed. No figure from the
+withdrawn series is used to size the step.
 
 Two things about the withdrawn table, so nobody restores it from memory:
 
@@ -257,7 +290,11 @@ elmundo-excluded figure are withdrawn with the run that produced them. The
 remaining 1.5 s over the 2.36 s host-container load (2026-08-17 probe,
 unretained) is not decomposed.
 
-Records: `results/reqbench-20260830-171007-corpus/analysis.json`,
+Records: `results/reqbench-20260902-023115-corpus-c2/analysis.json`,
+`results/reqbench-20260902-025115-corpus-c4/analysis.json`,
+`results/reqbench-20260902-031115-corpus-c8/analysis.json`,
+`results/campaign-20260902-box2-ladder-summary.json`,
+`results/reqbench-20260830-171007-corpus/analysis.json`,
 `results/campaign-20260830-box2-summary.json`. Withdrawn, kept in the tree
 with their markers: `results/reqbench-20260816-*-corpus/WITHDRAWN`,
 `results/reqbench-20260814-042319-uffd/WITHDRAWN`,
