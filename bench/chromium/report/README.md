@@ -197,10 +197,10 @@ came from:
   hosts: the withdrawn series on this box (`cell.host_kernel_release`
   7.0.14-fcvm-cd6cd2b4b52e, boot 80bfe10d), the verified run on a
   6.17.0-1019-aws host (boot 291f8bad), each on its own golden and fcvm
-  binary. So the navigate change is not attributed to the DNS fix, and the
-  3.8 ms noop shift is as likely the host as anything else. The withdrawn
-  982.9 is 37.9% above the verified 712.6 across that host change; how much
-  of the gap is DNS is not measured.
+  binary. So neither the navigate change nor the 3.8 ms noop shift is
+  attributed to the DNS fix. The withdrawn 982.9 is 37.9% above the
+  verified 712.6 across that host change; how much of the gap is DNS is
+  not measured.
 
 The one DNS-verified cell:
 
@@ -216,7 +216,8 @@ the verified run (example.com and the five TodoMVC variants), the withdrawn
 series' cdp medians were 680.9, 498.7 and 494.9 ms at 2, 4 and 8 vCPU. Those
 six pages were still fetched over the live network in every withdrawn rung
 (example.com main-document ttfb 46.6 / 51.0 / 48.3 ms at 2 / 4 / 8 vCPU
-against 0.6 ms in the verified run; the TodoMVC pages 4 to 7 ms against 0.8),
+against 0.6 ms in the verified run; the five TodoMVC pages' medians 5.7 to
+7.5 / 3.7 to 4.0 / 3.8 to 4.1 ms against 0.5 to 1.0),
 so the direction survives only because that network term does not move with
 the vCPU count. The verified run's median on the same six URLs is 547.5 ms
 at 2 vCPU: 133 ms below the withdrawn 2 vCPU rung and 49 ms above the
