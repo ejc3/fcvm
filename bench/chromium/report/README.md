@@ -147,12 +147,6 @@ fixed in the same pass:
   2026-08-16 reproduction section brings it back to 15; the count above is
   current.)
 
-A DNS-verified 2/4/8 vCPU ladder was measured on 2026-09-02 and is cited in
-"Corpus latency by guest vCPU count" below. The headline moved with it, from
-the 2 vCPU 712.6 ms to the 4 vCPU 549.4 ms; both cells are verified and both
-are quoted. The two "not measured on the fixed tree" rows are gone, replaced
-by the measurement.
-
 The 2026-08-16 corpus series was withdrawn on 2026-09-02 for live-DNS
 contamination (the section below has the evidence). The headline moved from
 695.7 ms at 4 vCPU to the DNS-verified 712.6 ms at 2 vCPU, the vCPU ladder,
@@ -162,6 +156,12 @@ latency captions, the elmundo note now names its cause, and the "TCP connect is
 measured the page's network. `test_reqbench.DocLint` now fails if a doc cites
 a withdrawn corpus record without saying so, or quotes a corpus figure that is
 not a median, lo or hi of a DNS-verified record.
+
+The DNS-verified 2/4/8 vCPU ladder was measured on 2026-09-02 and landed after
+that withdrawal was written, so this file still carried "not measured on the
+fixed tree" for 4 and 8 vCPU. Those rows are now the measurement, and the
+headline moved again, from the 2 vCPU 712.6 ms to the 4 vCPU 549.4 ms. Both
+cells are verified and both are quoted.
 
 ## Corpus latency by guest vCPU count
 
