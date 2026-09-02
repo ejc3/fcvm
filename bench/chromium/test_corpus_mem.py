@@ -7253,6 +7253,12 @@ class ComparePublicationGate(unittest.TestCase):
                         shutil.copyfile(
                             os.path.join(HERE, "campaign_summary.py"), validator
                         )
+                        # campaign_summary imports reqanalyze (url_needs_resolver),
+                        # so the staged copy needs it beside it to start at all.
+                        shutil.copyfile(
+                            os.path.join(HERE, "reqanalyze.py"),
+                            os.path.join(tmp, "reqanalyze.py"),
+                        )
                         protected = os.path.join(tmp, source_name)
                         if alias_kind == "direct":
                             out = protected
