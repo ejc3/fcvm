@@ -57,8 +57,9 @@ named WITHDRAWN in its directory whose first line is the reason, or by
 refusal quotes the reason.
 
 The index is written only when every run is sealed, publishable and not
-withdrawn, every stall gate passed, every DNS verdict is clean and every diag
-passed. Otherwise nothing is written, an index already at --out is removed,
+withdrawn, every stall gate passed, every DNS verdict is clean, every diag
+passed, and every run that measured hostname URLs records the resolver that
+answered them (guest_dns with its evidence, or a BENCH_RESOLVE_ALL_TO rule). Otherwise nothing is written, an index already at --out is removed,
 and the exit status is 5, the same code reqanalyze uses for a refused run: an
 index that quietly carried an unpublishable cell would be quoted by someone
 who only opened the index. Inputs are only ever read, and each is read once
@@ -80,6 +81,8 @@ import sys
 import tempfile
 from contextlib import contextmanager
 from urllib.parse import urlsplit
+
+import reqanalyze
 
 VERIFY_STAGES = ("pre", "before-run", "after-run")
 # One :53 owner sample, as corpus_campaign.sh's dns_owner_sample prints it.
@@ -1504,6 +1507,31 @@ def load_cell(run_dir, sources=None):
             f"{run_dir}: {shaped} but there is no "
             "diag/summary.json; a corpus run without its diag is not indexed"
         )
+
+    # A measured URL whose host is a name was answered by some resolver. The
+    # record names one in two places: guest_dns (baked into resolv.conf, held
+    # by the dns-evidence brackets) or a BENCH_RESOLVE_ALL_TO rule in
+    # guest_env. A run with neither resolved its corpus through whatever
+    # owned port 53, and the record cannot say what that was. Every
+    # results/reqbench-20260816-*-corpus record has this shape: pasta
+    # redirected the guest's port 53 to the host's own resolver (fixed in
+    # fcvm 90733b854e), and the index took them with dns_verdict null.
+    # reqanalyze refuses the shape at analysis time (_validate_resolver); a
+    # legacy or hand-edited analysis.json is refused here for the same reason.
+    if (
+        dns_verdict is None
+        and cell["guest_dns"] is None
+        and not any(entry.partition("=")[0] == "BENCH_RESOLVE_ALL_TO" for entry in guest_env)
+    ):
+        unresolved = [
+            url for url in measured if reqanalyze.url_needs_resolver(url) is not False
+        ]
+        if unresolved:
+            raise RunError(
+                f"{run_dir}: measured hostname URL(s) {unresolved[:3]} with no "
+                "recorded resolver (guest_dns null, no BENCH_RESOLVE_ALL_TO, no "
+                "dns-evidence.json); the corpus resolved through ambient DNS"
+            )
 
     arms = analysis.get("arms")
     if not isinstance(arms, dict) or not arms:

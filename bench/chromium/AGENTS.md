@@ -193,7 +193,10 @@ in the repo-root AGENTS.md quickstart.
 To withdraw a run after the fact, add a file named `WITHDRAWN` to its results
 directory whose first line is the reason; `campaign_summary.py` refuses the run
 and quotes that line, and refuses an `analysis.json` carrying `"withdrawn":
-true` the same way. A marker writer must first open the results directory and
+true` the same way. Independently of any marker it refuses a run that measured
+hostname URLs and records no resolver (`guest_dns` null, no
+`BENCH_RESOLVE_ALL_TO`, no `dns-evidence.json`): that is the shape of every
+2026-08-16 corpus record, whose guests resolved through ambient DNS. A marker writer must first open the results directory and
 take an exclusive `flock` on that directory descriptor, then remove completion
 records and atomically rename the marker while holding the lock.
 `campaign_summary.py` and `compare.py` hold shared locks on every run directory
