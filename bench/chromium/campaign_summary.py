@@ -1518,6 +1518,9 @@ def load_cell(run_dir, sources=None):
     # fcvm 90733b854e), and the index took them with dns_verdict null.
     # reqanalyze refuses the shape at analysis time (_validate_resolver); a
     # legacy or hand-edited analysis.json is refused here for the same reason.
+    # This is defense in depth for a record that carries an engine but no
+    # resolver: every committed 2026-08-16 record is already refused by the
+    # engine check above, so on those this rule never fires.
     if (
         dns_verdict is None
         and cell["guest_dns"] is None

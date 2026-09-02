@@ -1,4 +1,5 @@
 {
+  "withdrawn": "WITHDRAWN IN FULL on 2026-09-02: every cell indexes a DNS-contaminated run (pasta redirected the guest port 53 to the host resolver before fcvm 90733b854e), and this file was hand-written, not campaign_summary output; see bench/chromium/REVIEW.md, \"The 2026-08-16 corpus series\". publishable: true below is stale.",
   "_note": "reqbench.sh seals fcvm, fc-agent and its five harness sources into runtime_bundle_sha256 and REFUSES a golden recorded under a different bundle hash, so no single run can mix binaries. Comparisons ACROSS runs still can: the first vCPU sweep (*-mixedbinary) used fcvm 3f85bd26 while the 2 vCPU cells used 3976d0ba, so the clean-* trio re-ran all three points on one binary (aa5340ac). The curve is unchanged in shape.",
   "sealed-2026-08-14-2vcpu-minor": {
     "record": "archived: bench-evidence-archive reqbench-20260814-042319-uffd",

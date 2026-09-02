@@ -6497,6 +6497,17 @@ class DocLint(unittest.TestCase):
         internet. campaign-20260816-summary.json is hand-written (no
         generated_from) and says publishable: true for all of them.
 
+        Observed on that tree (origin/main docs, results and
+        campaign_summary.py, no WITHDRAWN markers, these tests):
+        AssertionError: Lists differ: ['report/README.md: cites corpus
+        record results/reqbench-20260816-080703-corpus, which
+        campaign_summary refuses: .../analysis.json cell has no engine;
+        re-run reqanalyze', ...] != []  (35 findings: 15 in report/README.md,
+        20 in the HTML). With the markers in place and the docs unmodified
+        the same test reports 'cites withdrawn results/... without saying
+        so' and 'cites results/campaign-20260816-summary.json, which
+        campaign_summary did not generate' instead.
+
         The rule: a corpus record (a cell whose URL needs a resolver) a
         doc cites must load through campaign_summary.load_cell with
         dns_verdict clean, or carry a WITHDRAWN marker and be cited on a
@@ -6624,10 +6635,9 @@ class DocLint(unittest.TestCase):
     # Tables that name a vCPU ladder or a cdp headline column carry corpus
     # figures; every number in them must come from a verified record.
 
-    def _verified_values(self):
-        """Every median/lo/hi in every committed analysis.json that
-        campaign_summary accepts with dns_verdict clean."""
-        values = set()
+    def _verified_runs(self):
+        """Every committed reqbench run that campaign_summary accepts with
+        dns_verdict clean."""
         runs = []
         for run in sorted(self._committed_results()):
             if not run.startswith("reqbench-") or self._is_withdrawn(run):
@@ -6636,43 +6646,121 @@ class DocLint(unittest.TestCase):
             if cell is None or cell["dns_verdict"] != "clean":
                 continue
             runs.append(run)
-            with open(os.path.join(self._results(), run, "analysis.json")) as f:
-                analysis = json.load(f)
+        return runs
 
-            def walk(node):
-                if isinstance(node, dict):
-                    for key in ("median", "lo", "hi"):
-                        v = node.get(key)
-                        if isinstance(v, (int, float)) and not isinstance(v, bool):
-                            values.add(float(v))
-                    for v in node.values():
-                        walk(v)
-                elif isinstance(node, list):
-                    for v in node:
-                        walk(v)
-            walk(analysis.get("arms"))
-            walk(analysis.get("per_url"))
+    def _verified_values(self):
+        """Every median/lo/hi in every committed analysis.json that
+        campaign_summary accepts with dns_verdict clean."""
+        values = set()
+        runs = self._verified_runs()
+        for run in runs:
+            values |= self._record_values(run)
         return values, runs
+
+    def _record_values(self, run):
+        """Every median, lo and hi under arms and per_url of a committed
+        run's analysis.json."""
+        values = set()
+        with open(os.path.join(self._results(), run, "analysis.json")) as f:
+            analysis = json.load(f)
+
+        def walk(node):
+            if isinstance(node, dict):
+                for key in ("median", "lo", "hi"):
+                    v = node.get(key)
+                    if isinstance(v, (int, float)) and not isinstance(v, bool):
+                        values.add(float(v))
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, list):
+                for v in node:
+                    walk(v)
+        walk(analysis.get("arms"))
+        walk(analysis.get("per_url"))
+        return values
+
+    def _blocking_values(self, run):
+        """(headline, everything) for one committed run: blocking_ms
+        medians, lo and hi of its render arms (cdp, cdp-fast, exec; not
+        noop, whose ~41 ms is the same in every run by design). `headline`
+        is the cdp arm's own triple plus every per-URL cdp median;
+        `everything` adds the other render arms and every per-URL lo/hi."""
+        headline = set()
+        everything = set()
+        path = os.path.join(self._results(), run, "analysis.json")
+        if not os.path.isfile(path):
+            return headline, everything
+        with open(path) as f:
+            analysis = json.load(f)
+        arms = analysis.get("arms") or {}
+        groups = [(arm == "cdp", None, group)
+                  for arm, group in arms.items() if arm != "noop"]
+        for per_url in (analysis.get("per_url") or {}).values():
+            groups.extend((False, arm == "cdp", v) for arm, v in per_url.items()
+                          if arm != "noop" and isinstance(v, dict))
+        for is_headline, is_url_cdp, group in groups:
+            blocking = group.get("blocking_ms") if isinstance(group, dict) else None
+            if not isinstance(blocking, dict):
+                continue
+            for key in ("median", "lo", "hi"):
+                v = blocking.get(key)
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    everything.add(float(v))
+                    if is_headline or (is_url_cdp and key == "median"):
+                        headline.add(float(v))
+        return headline, everything
+
+    def _withdrawn_values(self):
+        """(headline, everything, runs) over every committed reqbench run
+        whose directory carries a WITHDRAWN marker."""
+        headline = set()
+        everything = set()
+        runs = []
+        for run in sorted(self._committed_results()):
+            if not run.startswith("reqbench-") or not self._is_withdrawn(run):
+                continue
+            if not os.path.isfile(os.path.join(self._results(), run, "analysis.json")):
+                continue
+            runs.append(run)
+            h, e = self._blocking_values(run)
+            headline |= h
+            everything |= e
+        return headline, everything, runs
+
+    SENTENCE = re.compile(r"(?<=[.!?])\s+(?=[A-Z`(\[*_<])")
+
+    def _doc_sentences(self, name):
+        """Sentences of a doc's units: each HTML line or Markdown paragraph
+        split at a sentence end followed by whitespace and a capital,
+        backtick, bracket or tag. A table (a Markdown block of | rows, an
+        HTML <tr> line) stays whole: its header is what says withdrawn."""
+        for unit in self._doc_units(name):
+            if unit.lstrip().startswith(("|", "<tr")):
+                yield unit
+            else:
+                yield from self.SENTENCE.split(unit)
 
     NUMBER = re.compile(r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)(?![\w-])")
     RANGE = re.compile(
         r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)\s*[–—-]\s*(\d[\d,]*(?:\.\d+)?)\s*(ms|s)\b")
     UNIT = re.compile(r"(?<![\w.=-])(\d[\d,]*(?:\.\d+)?)\s*(ms|s)\b")
 
-    def _figures_in(self, cell_text):
-        """(value, unit_ms_multiplier, printed decimals) for every figure in
-        a table cell: ranges and unit-bearing numbers first, then bare
-        numbers of three or more digits or with a decimal point."""
+    def _figures_in(self, cell_text, with_unit_flag=False):
+        """(raw, value, unit_ms_multiplier, printed decimals) for every
+        figure in a table cell: ranges and unit-bearing numbers first, then
+        bare numbers of three or more digits or with a decimal point.
+        with_unit_flag appends whether the figure carried a unit (ms/s)."""
         import html as html_mod
 
-        text = html_mod.unescape(re.sub(r"<[^>]+>", "", cell_text))
+        text = html_mod.unescape(re.sub(r"<[^>]+>", " ", cell_text))
         text = text.replace(" ", " ")
         found = []
 
-        def take(raw, unit):
+        def take(raw, unit, unit_bearing=True):
             value = float(raw.replace(",", ""))
             decimals = len(raw.split(".")[1]) if "." in raw else 0
-            found.append((raw, value, 1000.0 if unit == "s" else 1.0, decimals))
+            entry = (raw, value, 1000.0 if unit == "s" else 1.0, decimals)
+            found.append(entry + (unit_bearing,) if with_unit_flag else entry)
 
         def scrub(match):
             return " " * len(match.group(0))
@@ -6687,7 +6775,7 @@ class DocLint(unittest.TestCase):
         for m in self.NUMBER.finditer(text):
             raw = m.group(1)
             if "." in raw or float(raw.replace(",", "")) >= 100:
-                take(raw, "ms")
+                take(raw, "ms", unit_bearing=False)
         return found
 
     def _figure_tables(self, name):
@@ -6739,6 +6827,12 @@ class DocLint(unittest.TestCase):
         campaign_summary.load_cell accepts with dns_verdict clean. Each
         figure in a vCPU or cdp-headline table must equal one of them at
         its printed precision (a value in seconds is compared times 1000).
+
+        Observed on that tree: AssertionError: Lists differ:
+        ["report/README.md: table 'guest vCPUs | cdp p50 | CI |
+        Page.enable' quotes '776.3', which is no median, lo or hi of a
+        verified record (reqbench-20260830-171007-corpus)", ...] != []
+        (61 findings: 11 in report/README.md, 50 in the HTML).
         """
         self.maxDiff = None
         values, runs = self._verified_values()
@@ -6758,6 +6852,108 @@ class DocLint(unittest.TestCase):
                                 bad.append(f"{name}: table {header[:40]!r} quotes "
                                            f"{raw!r}, which is no median, lo or hi of "
                                            f"a verified record ({', '.join(runs)})")
+            self.assertTrue(checked.get(name), f"{name}: no figure was checked")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+    def test_a_hand_written_campaign_index_says_it_is_withdrawn(self):
+        """results/campaign-20260816-summary.json is hand-written (no
+        generated_from, no cells) and every cell in it still says
+        publishable: true over a withdrawn median. The marker convention
+        cannot apply to a file, and the citation lint only guards the docs
+        that name it. A reader who opens the file sees a valid-looking
+        index.
+
+        RED BEFORE THE FIX: AssertionError: 'withdrawn' not found in
+        ['_note', '2vcpu-copy', ...] : results/campaign-20260816-summary.json
+        is hand-written (no generated_from) and carries no top-level
+        "withdrawn" key
+
+        The rule: a campaign-*-summary.json under results/ that
+        campaign_summary did not generate carries a top-level "withdrawn"
+        string naming the reason and the ledger.
+        """
+        files = self._committed_results()
+        indexes = sorted(n for n in files if re.fullmatch(r"campaign-.*-summary\.json", n))
+        self.assertTrue(indexes, "no campaign index is committed; the lint is vacuous")
+        hand_written = 0
+        for name in indexes:
+            with open(os.path.join(self._results(), name)) as f:
+                index = json.load(f)
+            self.assertIsInstance(index, dict, name)
+            if isinstance(index.get("generated_from"), list) and isinstance(index.get("cells"), list):
+                continue
+            hand_written += 1
+            self.assertIn("withdrawn", index,
+                          f"results/{name} is hand-written (no generated_from) and carries "
+                          f"no top-level \"withdrawn\" key")
+            self.assertIsInstance(index["withdrawn"], str, name)
+            self.assertIn("REVIEW.md", index["withdrawn"], f"results/{name}: withdrawn key names no ledger")
+        self.assertTrue(hand_written, "no hand-written campaign index was examined")
+
+    def test_no_doc_quotes_a_withdrawn_corpus_figure_as_current(self):
+        """The figure lint above walks tables whose header names a vCPU
+        ladder or a cdp median. A withdrawn figure restored anywhere else
+        passed it: report/README.md's headline sentence rewritten to
+        "695.7 ms [560.9, 747.1]" and the HTML's Kitesurf row rewritten to
+        "695.7 ms ... 4 vCPU" both kept DocLint green (that table's header
+        is "dimension | kitesurf | their chromium | fcvm | basis").
+
+        RED BEFORE THE FIX, with those two mutations applied:
+        report/README.md: quotes '695.7', a withdrawn corpus figure (...),
+        in a unit that does not say withdrawn: 'That leaves the corpus mix
+        as the publishable headline: 695.7 ms [560.9, 747.1],'
+        report/README.md: quotes '560.9', ...
+        report/README.md: quotes '747.1', ...
+        report/shared-nothing-renders.html: quotes '695.7', ... '<tr><td>Wall
+        · screenshot op</td>...'
+
+        The rule: a doc unit (an HTML line, a Markdown paragraph) that
+        does not contain the word "withdrawn" may not quote a withdrawn
+        blocking_ms figure at its printed precision. A figure printed with
+        a decimal is checked, in every corpus doc, against every withdrawn
+        render-arm blocking_ms median, lo and hi (cdp, cdp-fast, exec; per
+        run and per URL). A figure printed as an integer with a unit (ms
+        or s) is checked in the two report docs only, against the withdrawn
+        cdp-arm triples and per-URL cdp medians: at integer precision the
+        withdrawn values collide with unrelated figures elsewhere (730 ms
+        from the 2026-08-07 campaign in README.md, the 631 -> 706 ms drift
+        probe in AGENTS.md), and an integer without a unit is a count as
+        often as a latency. A value that is also a median, lo or hi of a
+        DNS-verified
+        record is not withdrawn.
+        """
+        self.maxDiff = None
+        headline, everything, withdrawn_runs = self._withdrawn_values()
+        self.assertTrue(headline, "no withdrawn record to draw figures from")
+        verified = set()
+        for run in self._verified_runs():
+            verified |= self._blocking_values(run)[1]
+        self.assertTrue(verified, "no DNS-verified record to exclude figures from")
+
+        def quoted(values, value, scale, decimals):
+            return any(abs(round(v / scale, decimals) - value) < 1e-9 for v in values)
+
+        bad = []
+        checked = {}
+        for name in self.CORPUS_DOCS:
+            for unit in self._doc_sentences(name):
+                if "withdrawn" in unit.lower():
+                    continue
+                for raw, value, scale, decimals, unit_bearing in self._figures_in(
+                        unit, with_unit_flag=True):
+                    if decimals:
+                        pool = everything
+                    elif unit_bearing and name.startswith("report/"):
+                        pool = headline
+                    else:
+                        continue
+                    checked[name] = checked.get(name, 0) + 1
+                    if quoted(pool, value, scale, decimals) \
+                            and not quoted(verified, value, scale, decimals):
+                        bad.append(f"{name}: quotes {raw!r}, a withdrawn corpus figure "
+                                   f"({', '.join(withdrawn_runs)}), in a unit that does "
+                                   f"not say withdrawn: {unit.strip()[:120]!r}")
+        for name in ("report/README.md", "report/shared-nothing-renders.html"):
             self.assertTrue(checked.get(name), f"{name}: no figure was checked")
         self.assertEqual(bad, [], "\n".join(bad))
 

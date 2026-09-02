@@ -2082,6 +2082,25 @@ class CampaignSummary(unittest.TestCase):
             _paths, text = self._refused(d, analysis_overrides={"withdrawn": True})
             self.assertIn("withdrawn", text)
 
+    def test_load_cell_refuses_a_marked_directory_itself(self):
+        """The marker is read at load_cell, again at the publication boundary
+        (withdrawal_errors) and again by compare.py. The two tests around
+        this one drive the CLI, so a load_cell that ignored the marker still
+        passed them: the later checks caught it. This pins the primary site.
+
+        RED BEFORE THE FIX (load_cell's marker check replaced by `if False:`):
+        AssertionError: RunError not raised
+        """
+        reason = "DNS contaminated: pasta redirected port 53"
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, withdrawn=reason + "\nsecond line")
+            with self.assertRaises(campaign_summary.RunError) as caught:
+                campaign_summary.load_cell(run_dir)
+            self.assertIn("withdrawn", str(caught.exception))
+            self.assertIn(reason, str(caught.exception))
+            self.assertNotIn("second line", str(caught.exception))
+
     def test_withdrawal_appearing_at_publication_boundary_refuses(self):
         """A run can be withdrawn after load_cell's first marker check. The
         index must recheck on both sides of atomic publication and leave the
