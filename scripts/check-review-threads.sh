@@ -667,9 +667,13 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #     a rule and the Fair Usage Limits paragraph naming a wait (#844, #887, aws #17).
 #   - CodeRabbit's chat reply "### Rate Limit Exceeded" naming the user and a wait (#893).
 #   - CodeRabbit's summary comment before any review has run: the summarize marker, ONE
-#     notice between its "rate limited", "skip review" or "review paused" markers, every
-#     line of it blockquoted under a "Review limit reached", "Review skipped" or "Reviews
-#     paused" heading, the tips block, and nothing else (#874, #843, #789, #832). The range
+#     notice between its "rate limited", "skip review" or "review paused" markers, its
+#     payload blockquoted under a "Review limit reached", "Review skipped" or "Reviews
+#     paused" heading, the tips block, and nothing else (#874, #843, #789, #832). The
+#     payload is parsed line by line against the shapes CodeRabbit posts
+#     (cr_notice_payload_res), not skimmed for a leading ">": accepting any quoted line
+#     made "> P1: this drops the last row" part of the notice, and a notice needs no
+#     disposition. The range
 #     that notice quotes is not coverage (walkthrough_sha never read it). Once the comment
 #     holds a walkthrough or a recent-review block it is a walkthrough, judged as one.
 VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
@@ -748,8 +752,61 @@ def is_cr_reply_notice:
         and $l[5] == "</details>")
     or (($l | length) == 2 and $l[0] == "### Rate Limit Exceeded" and ($l[1] | test(cr_chat_limit_re)));
 def cr_notice_start_re: "^<!-- This is an auto-generated comment: (?<k>rate limited|skip review|review paused) by coderabbit\\.ai -->$";
-def cr_notice_heading_re: "^> ## (Review limit reached|Review skipped|Reviews paused)$";
+def cr_notice_heading_re: "^## (Review limit reached|Review skipped|Reviews paused)$";
 def cr_tips_re: "<!-- tips_start -->(.|\n)*?<!-- tips_end -->";
+# The notice payload, one accepted shape per line, with the parts that vary between
+# postings generalized: counts, durations, shas, run and org ids, backticked names, and the
+# handle the rate-limit line addresses. An apostrophe is written "." so this list can live
+# inside VERDICT_JQ. Every shape was read off a notice CodeRabbit posted in ejc3/fcvm or
+# ejc3/aws; the 46 such bodies fetched on 2026-09-02 are matched by this list with nothing
+# left over. A line outside it makes the comment claimable, which is what it was before the
+# exemption existed: the cost of an unlisted shape is one disposition, and the cost of
+# accepting one is a finding nobody has to answer.
+def cr_notice_payload_res:
+  [ "^$"
+  , "^</?details>$"
+  , "^<summary>(⚙️ Run configuration|📥 Commits|📒 Files selected for processing \\([0-9]+\\)|⛔ Files ignored due to path filters \\([0-9]+\\)|How can I continue\\?|How do review limits work\\?|Review details|View limit details)</summary>$"
+  , "^\\* `[^`]+`( is excluded by `[^`]+`)?$"
+  , "^- \\[ \\] <!-- \\{\"checkboxId\": ?\"[0-9a-f-]+\"\\} --> 🔍 Trigger review$"
+  , "^\\*\\*(Configuration used|Review profile|Plan)\\*\\*: [A-Za-z0-9 +]+$"
+  , "^\\*\\*Run ID\\*\\*: `[0-9a-f-]+`$"
+  , "^\\*\\*Review configuration:\\*\\*$"
+  , "^\\*\\*Next review available in:\\*\\* \\*\\*[0-9]+ (minutes?|seconds?|hours?)\\*\\*$"
+  , "^\\*\\*Next included review available in [0-9]+ (minutes?|seconds?|hours?)\\.\\*\\*$"
+  , "^\\*\\*Limit details:\\*\\* You.ve used (all [0-9]+ included review|the included review) currently available( under your plan)?\\.$"
+  , "^Reviewing files that changed from the base of the PR and between [0-9a-f]{40} and [0-9a-f]{40}\\.$"
+  , "^You can disable this status message by setting the `reviews\\.review_status` to `false` in the CodeRabbit configuration file\\.$"
+  , "^Please check the settings in the CodeRabbit UI or the `\\.coderabbit\\.yaml` file in this repository\\. To trigger a single review, invoke the `@coderabbitai review` command\\.$"
+  , "^Use the checkbox below for a quick retry:$"
+  , "^`@[A-Za-z0-9-]+`, you.ve reached your PR review limit, so we couldn.t start this review\\.$"
+  , "^After more reviews become available, a review can be triggered using the `@coderabbitai review` command as a PR comment\\. Alternatively, push new commits to this PR\\.$"
+  , "^To avoid repeated limits, reduce automatic review volume by pausing incremental auto-reviews earlier, using label-based review opt-in, excluding WIP or generated PR titles, or requesting reviews manually when the PR is ready\\. If your team needs uninterrupted high-volume reviews, an organization admin can enable usage-based reviews\\.$"
+  , "^CodeRabbit enforces per-developer PR review limits for each organization\\. Most developers receive the normal plan review availability\\.$"
+  , "^For paid Pro and Pro\\+ PR reviews, CodeRabbit uses adaptive limits for sustained high-volume activity\\. When a developer.s recent PR review activity reaches the 95th percentile or higher among CodeRabbit users, additional reviews become available more gradually as earlier reviews age out of the rolling window\\.$"
+  , "^Please refer \\[docs\\]\\(https://docs\\.coderabbit\\.ai/management/plans#rate-limits\\) for additional details\\.$"
+  , "^You.ve used all free OSS reviews for now\\. Wait for the free limit to reset to keep reviewing this public repository\\.$"
+  , "^Auto reviews are disabled on base/target branches other than the default branch\\.$"
+  , "^Draft detected\\.$"
+  , "^Enable \\*\\*\\[usage-based reviews\\]\\(https://app\\.coderabbit\\.ai/settings/billing\\?tab=usage&orgId=[0-9a-f-]+\\)\\*\\* in Billing to review now\\. Otherwise, wait until the next included review is available\\.$"
+  , "^You.re only billed for reviews past your plan.s rate limits \\(\\$[0-9]+\\.[0-9]+/file\\)\\.$"
+  , "^\\[Learn how review limits work\\]\\(https://docs\\.coderabbit\\.ai/management/plans#rate-limits\\)\\.$"
+  , "^Too many files!$"
+  , "^This PR contains [0-9]+ files, which is [0-9]+ over the limit of [0-9]+\\.$"
+  , "^To get a review, reduce the PR to [0-9]+ files or fewer by splitting it into smaller PRs or changing its base branch\\.$"
+  , "^Upgrade to a paid plan to raise the limit\\.$"
+  , "^Usage-priced reviews support at most [0-9]+ files\\.$"
+  , "^\\[Check out review usage here\\]\\(https://app\\.coderabbit\\.ai/dashboard/review-capacity\\?orgId=[0-9a-f-]+\\)\\.$"
+  ];
+# The blockquote between the notice markers: an alert marker, one of the listed headings,
+# then payload. Accepting any line that merely starts with ">" made "> P1: this drops the
+# last row" part of a notice, and a notice needs no disposition.
+def cr_notice_payload_ok:
+  . as $n
+  | ($n | length) >= 2 and all($n[]; startswith(">"))
+    and (($n | map(sub("^>[[:space:]]*"; ""))) as $t
+         | ($t[0] | test("^\\[!(WARNING|IMPORTANT|NOTE)\\]$"))
+           and ($t[1] | test(cr_notice_heading_re))
+           and all($t[2:][]; . as $line | any(cr_notice_payload_res[]; . as $re | $line | test($re))));
 def is_cr_summary_notice:
   (. // "") as $b
   | [$b | scan(cr_marker_re)] as $m
@@ -759,10 +816,8 @@ def is_cr_summary_notice:
          | ($p | length) == 2
            and (($p[1] | split("<!-- end of auto-generated comment: \($m[1] | capture(cr_notice_start_re).k) by coderabbit.ai -->")) as $q
                 | ($q | length) == 2
-                  and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $n
-                       | ($n | length) >= 2 and all($n[]; startswith(">"))
-                         and ($n[0] | test("^> \\[!(WARNING|IMPORTANT|NOTE)\\]$"))
-                         and ($n[1] | test(cr_notice_heading_re)))
+                  and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0)))
+                       | cr_notice_payload_ok)
                   and (($p[0] + $q[1]) | gsub(cr_tips_re; "") | gsub("<!--(.|\n)*?-->"; "")
                        | test("[^[:space:]]") | not)));
 def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;'

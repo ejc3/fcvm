@@ -1372,6 +1372,89 @@ run_case "a summary notice with text after the tips is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" 'P1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "a summary notice with an unquoted line inside it is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE"$'\n\nP1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+# The payload between a notice's markers is parsed, not skimmed for a leading ">". This
+# body is CodeRabbit's current rate-limit copy in full (aws #17): the prose paragraphs, the
+# nested Review details block, the run configuration and the file list. Every line of it is
+# a shape the gate lists, so it is still a notice.
+LIMIT_NOTICE_ADAPTIVE=$(cat <<'CRNOTICE'
+> [!WARNING]
+> ## Review limit reached
+> 
+> `@ejc3`, you've reached your PR review limit, so we couldn't start this review.
+> 
+> **Next review available in:** **54 minutes**
+> 
+> You've used all free OSS reviews for now. Wait for the free limit to reset to keep reviewing this public repository.
+> 
+> <details>
+> <summary>How can I continue?</summary>
+> 
+> After more reviews become available, a review can be triggered using the `@coderabbitai review` command as a PR comment. Alternatively, push new commits to this PR.
+> 
+> To avoid repeated limits, reduce automatic review volume by pausing incremental auto-reviews earlier, using label-based review opt-in, excluding WIP or generated PR titles, or requesting reviews manually when the PR is ready. If your team needs uninterrupted high-volume reviews, an organization admin can enable usage-based reviews.
+> 
+> </details>
+> 
+> 
+> <details>
+> <summary>How do review limits work?</summary>
+> 
+> CodeRabbit enforces per-developer PR review limits for each organization. Most developers receive the normal plan review availability.
+> 
+> For paid Pro and Pro+ PR reviews, CodeRabbit uses adaptive limits for sustained high-volume activity. When a developer's recent PR review activity reaches the 95th percentile or higher among CodeRabbit users, additional reviews become available more gradually as earlier reviews age out of the rolling window.
+> 
+> Please refer [docs](https://docs.coderabbit.ai/management/plans#rate-limits) for additional details.
+> 
+> </details>
+> 
+> <details>
+> <summary>Review details</summary>
+> 
+> <details>
+> <summary>⚙️ Run configuration</summary>
+> 
+> **Configuration used**: defaults
+> 
+> **Review profile**: CHILL
+> 
+> **Plan**: Pro Plus
+> 
+> **Run ID**: `d307059f-0ec1-452c-b65f-d1401be25dd9`
+> 
+> </details>
+> 
+> <details>
+> <summary>📥 Commits</summary>
+> 
+> Reviewing files that changed from the base of the PR and between b7de97dc7f93551685f6933646dc75dac7cff83b and 2f6be9ef3599cff99406a5fe176bdbdfae6863b0.
+> 
+> </details>
+> 
+> <details>
+> <summary>📒 Files selected for processing (5)</summary>
+> 
+> * `.github/workflows/drift.yml`
+> * `.terraform.lock.hcl`
+> * `README.md`
+> * `cloudflare.tf`
+> * `main.tf`
+> 
+> </details>
+> 
+> </details>
+CRNOTICE
+)
+run_case "today's rate-limit copy, prose and file list and all, needs no disposition (aws #17)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE_ADAPTIVE")" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+# A finding quoted INSIDE the notice is the same hole as one appended after the tips: the
+# body is exempted from dispositions and the claim is never answered. Both positions, and
+# both notice kinds, must stay claimable.
+run_case "a summary notice with a quoted finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE"$'\n> \n> P1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice with a quoted finding inside its details block is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "${LIMIT_NOTICE_ADAPTIVE/'> <summary>How can I continue?</summary>'/'> <summary>How can I continue?</summary>'$'\n> \n> P1: this drops the last row'}")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a skipped notice with a quoted finding is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'skip review' "$SKIP_NOTICE"$'\n> \n> P1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "a summary notice of a kind this gate does not list is claimable" \
   "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice failure $'> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
 run_case "a summary notice beside a walkthrough is a walkthrough, still claimable" \

@@ -923,9 +923,11 @@ fn review_gate_orders_timestamps_as_instants_not_as_strings() {
 ///
 /// A notice is matched as a whole body, line for line, and belongs to the bot that posts
 /// it: the same words with a finding appended stay claimable, and a notice still covers no
-/// head. The shell harness (scripts/test-check-review-threads.sh, "finding 44") carries the
-/// full matrix, including CodeRabbit's summary comment holding only a notice; these three
-/// run in CI.
+/// head. CodeRabbit's summary comment carries its notice as a blockquote, so the payload
+/// between the notice markers is parsed against the line shapes CodeRabbit posts; a quoted
+/// line that is not one of them (`> P1: this drops the last row`) makes the comment
+/// claimable again. The shell harness (scripts/test-check-review-threads.sh, "finding 44")
+/// carries the full matrix; these four run in CI.
 #[test]
 fn a_bot_notice_that_no_review_ran_is_neither_a_finding_nor_coverage() {
     require_jq();
@@ -1053,6 +1055,50 @@ fn a_bot_notice_that_no_review_ran_is_neither_a_finding_nor_coverage() {
         code, 1,
         "the quota notice followed by a finding is a finding; only the exact notice body \
          is exempt.\n{out}"
+    );
+    assert!(out.contains("carry no disposition"), "{out}");
+
+    // CodeRabbit's summary comment before any review has run holds the notice as a
+    // blockquote (#874). Accepting every line that merely starts with ">" exempted the
+    // whole comment from dispositions, so a finding quoted among the notice's own lines
+    // was never answered. The payload is parsed instead.
+    const CR_SUMMARY_NOTICE: &str = r#""<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n\n> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 53 minutes.**\n> \n> <details>\n> <summary>View limit details</summary>\n> \n> **Limit details:** You\u2019ve used the included review currently available.\n> \n> </details>\n\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->""#;
+    let (out, code) = run(
+        "summary-notice.json",
+        payload(
+            COVERED,
+            &comment(
+                "coderabbitai",
+                "Bot",
+                "2026-01-02T01:00:00Z",
+                CR_SUMMARY_NOTICE,
+            ),
+        ),
+    );
+    assert_eq!(
+        code, 0,
+        "a summary comment holding nothing but a rate-limit notice says no review ran; \
+         it claims nothing and needs no disposition.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    let smuggled = CR_SUMMARY_NOTICE.replace(
+        r"> </details>\n\n<!-- end of",
+        r"> </details>\n> \n> P1: this drops the last row\n\n<!-- end of",
+    );
+    assert_ne!(smuggled, CR_SUMMARY_NOTICE, "the fixture edit must apply");
+    let (out, code) = run(
+        "summary-notice-plus-finding.json",
+        payload(
+            COVERED,
+            &comment("coderabbitai", "Bot", "2026-01-02T01:00:00Z", &smuggled),
+        ),
+    );
+    assert_eq!(
+        code, 1,
+        "a finding quoted inside the notice is still a finding; exempting every line that \
+         starts with a quote marker removes it from the disposition check and reports \
+         CLEAR.\n{out}"
     );
     assert!(out.contains("carry no disposition"), "{out}");
     let _ = std::fs::remove_dir_all(&dir);
