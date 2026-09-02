@@ -6683,8 +6683,16 @@ class DocLint(unittest.TestCase):
         """(headline, everything) for one committed run: blocking_ms
         medians, lo and hi of its render arms (cdp, cdp-fast, exec; not
         noop, whose ~41 ms is the same in every run by design). `headline`
-        is the cdp arm's own triple plus every per-URL cdp median;
-        `everything` adds the other render arms and every per-URL lo/hi."""
+        is the cdp arm's triple; `everything` adds the other render arms.
+
+        Per-run only. No committed withdrawn record carries per_url (the
+        reqanalyze that wrote results/reqbench-20260816-*-corpus and
+        -20260814-042319-uffd had no per-URL summary, and the raw records
+        live outside the tree), so the withdrawn per-URL medians the docs
+        quote (www.elmundo.es 30,912 and 31,046 ms, from those raw
+        records) are not in any set this lint can build and are not
+        guarded by it. A per_url branch here would read nothing on every
+        commit."""
         headline = set()
         everything = set()
         path = os.path.join(self._results(), run, "analysis.json")
@@ -6692,13 +6700,9 @@ class DocLint(unittest.TestCase):
             return headline, everything
         with open(path) as f:
             analysis = json.load(f)
-        arms = analysis.get("arms") or {}
-        groups = [(arm == "cdp", None, group)
-                  for arm, group in arms.items() if arm != "noop"]
-        for per_url in (analysis.get("per_url") or {}).values():
-            groups.extend((False, arm == "cdp", v) for arm, v in per_url.items()
-                          if arm != "noop" and isinstance(v, dict))
-        for is_headline, is_url_cdp, group in groups:
+        for arm, group in (analysis.get("arms") or {}).items():
+            if arm == "noop":
+                continue
             blocking = group.get("blocking_ms") if isinstance(group, dict) else None
             if not isinstance(blocking, dict):
                 continue
@@ -6706,7 +6710,7 @@ class DocLint(unittest.TestCase):
                 v = blocking.get(key)
                 if isinstance(v, (int, float)) and not isinstance(v, bool):
                     everything.add(float(v))
-                    if is_headline or (is_url_cdp and key == "median"):
+                    if arm == "cdp":
                         headline.add(float(v))
         return headline, everything
 
@@ -6911,23 +6915,25 @@ class DocLint(unittest.TestCase):
         does not contain the word "withdrawn" may not quote a withdrawn
         blocking_ms figure at its printed precision. A figure printed with
         a decimal is checked, in every corpus doc, against every withdrawn
-        render-arm blocking_ms median, lo and hi (cdp, cdp-fast, exec; per
-        run and per URL). A figure printed as an integer with a unit (ms
-        or s) is checked in the two report docs only, against the withdrawn
-        cdp-arm triples and per-URL cdp medians: at integer precision the
-        withdrawn values collide with unrelated figures elsewhere (730 ms
-        from the 2026-08-07 campaign in README.md, the 631 -> 706 ms drift
-        probe in AGENTS.md), and an integer without a unit is a count as
-        often as a latency. A value that is also a median, lo or hi of a
-        DNS-verified
-        record is not withdrawn.
+        render-arm blocking_ms median, lo and hi (cdp, cdp-fast, exec), per
+        run. A figure printed as an integer with a unit (ms or s) is
+        checked in the two report docs only, in ms only, against the
+        withdrawn cdp-arm triples: at integer precision the withdrawn
+        values collide with unrelated figures elsewhere (730 ms from the
+        2026-08-07 campaign in README.md, the 631 -> 706 ms drift probe in
+        AGENTS.md), an integer without a unit is a count as often as a
+        latency, and an integer in seconds ("1 s") names half the set at
+        once. A value that is also a median, lo or hi anywhere in a
+        DNS-verified record (its arms or its per_url) is not withdrawn.
+        Per-URL medians of the withdrawn runs are not guarded: see
+        _blocking_values.
         """
         self.maxDiff = None
         headline, everything, withdrawn_runs = self._withdrawn_values()
         self.assertTrue(headline, "no withdrawn record to draw figures from")
         verified = set()
         for run in self._verified_runs():
-            verified |= self._blocking_values(run)[1]
+            verified |= self._record_values(run)
         self.assertTrue(verified, "no DNS-verified record to exclude figures from")
 
         def quoted(values, value, scale, decimals):
@@ -6943,7 +6949,9 @@ class DocLint(unittest.TestCase):
                         unit, with_unit_flag=True):
                     if decimals:
                         pool = everything
-                    elif unit_bearing and name.startswith("report/"):
+                    elif unit_bearing and scale == 1.0 and name.startswith("report/"):
+                        # An integer in seconds identifies nothing: "0 s"
+                        # and "1 s" between them cover every corpus value.
                         pool = headline
                     else:
                         continue
