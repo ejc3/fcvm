@@ -133,18 +133,33 @@ def _existence_tests(node):
     return found
 
 
+def _leaves_the_loop(node):
+    """Whether NODE can end the loop it sits in.
+
+    break and return both do. A nested definition does not: its return
+    ends the call, not the loop around the def.
+    """
+    for inner in ast.iter_child_nodes(node):
+        if isinstance(inner, (ast.FunctionDef, ast.AsyncFunctionDef,
+                              ast.ClassDef, ast.While, ast.For)):
+            continue
+        if isinstance(inner, (ast.Break, ast.Return)) or _leaves_the_loop(inner):
+            return True
+    return False
+
+
 def _loop_gates(loop):
     """The existence tests that CONTROL a loop, not the ones inside it.
 
     A test in the while condition gates the loop. So does one in an if
-    that breaks out of it, which is how a deadline loop spells the same
+    that leaves the loop, which is how a deadline loop spells the same
     wait. An existence test that only decorates a failure message (an if
-    with no break, reading a log to quote it) gates nothing.
+    that reads a log to quote it and then carries on round) gates
+    nothing.
     """
     gates = list(_existence_tests(loop.test))
     for inner in ast.walk(loop):
-        if isinstance(inner, ast.If) and any(
-                isinstance(node, ast.Break) for node in ast.walk(inner)):
+        if isinstance(inner, ast.If) and _leaves_the_loop(inner):
             gates += _existence_tests(inner.test)
     return gates
 
@@ -10813,6 +10828,20 @@ class RecordReadiness(unittest.TestCase):
                 wait_for(record, "the record")
                 with open(record) as handle:
                     return int(handle.read())
+        """)
+        self.assertEqual(len(readiness_violations(source, "synthetic")), 1)
+
+    def test_the_readiness_scan_reports_a_gate_that_returns(self):
+        """A deadline loop ends at its gate with break or with return.
+        Only break was recognised, so the return shape would have been a
+        site the matrix could not see."""
+        source = textwrap.dedent("""
+            def probe():
+                while time.monotonic() < deadline:
+                    if os.path.exists(record):
+                        with open(record) as handle:
+                            return int(handle.read())
+                    time.sleep(0.01)
         """)
         self.assertEqual(len(readiness_violations(source, "synthetic")), 1)
 
