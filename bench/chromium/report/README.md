@@ -199,7 +199,7 @@ came from:
   6.17.0-1019-aws host (boot 291f8bad), each on its own golden and fcvm
   binary. So the navigate change is not attributed to the DNS fix, and the
   3.8 ms noop shift is as likely the host as anything else. The withdrawn
-  982.9 is 27.5% above the verified 712.6 across that host change; how much
+  982.9 is 37.9% above the verified 712.6 across that host change; how much
   of the gap is DNS is not measured.
 
 The one DNS-verified cell:

@@ -6957,6 +6957,65 @@ class DocLint(unittest.TestCase):
             self.assertTrue(checked.get(name), f"{name}: no figure was checked")
         self.assertEqual(bad, [], "\n".join(bad))
 
+    PERCENT = re.compile(r"(\d+(?:\.\d+)?)%\s+(above|below)\b")
+
+    def test_a_percentage_between_two_corpus_figures_is_the_arithmetic(self):
+        """RED BEFORE THE FIX: report/README.md, REVIEW.md and the HTML said
+        "the withdrawn 982.9 is 27.5% above the verified 712.6".
+        (982.9 - 712.6) / 712.6 is 37.9%; 27.5% is (982.9 - 712.6) / 982.9,
+        the other direction (712.6 is 27.5% below 982.9). Observed on that
+        tree: AssertionError: Lists differ: ["report/README.md: '27.5%
+        above' with subject 982.9 and reference 712.6 computes to 37.9%:
+        ...", ...] != [] (3 findings).
+
+        The rule: in a sentence that says "N% above" or "N% below", the
+        nearest figure before the phrase is the subject and the nearest
+        figure after it is the reference, and when both are corpus
+        blocking_ms figures (a median, lo or hi of a withdrawn or a
+        DNS-verified record) N must equal (subject - reference) / reference
+        for "above" and (reference - subject) / reference for "below", at
+        N's printed precision.
+        """
+        self.maxDiff = None
+        _headline, withdrawn, _runs = self._withdrawn_values()
+        verified = set()
+        for run in self._verified_runs():
+            verified |= self._blocking_values(run)[1]
+        corpus = withdrawn | verified
+        self.assertTrue(withdrawn and verified, "no corpus record to draw figures from")
+
+        def is_corpus(value, decimals):
+            return decimals > 0 and any(
+                abs(round(v, decimals) - value) < 1e-9 for v in corpus)
+
+        bad = []
+        checked = 0
+        for name in self.CORPUS_DOCS:
+            for sentence in self._doc_sentences(name):
+                for m in self.PERCENT.finditer(sentence):
+                    before = self._figures_in(sentence[:m.start()])
+                    after = self._figures_in(sentence[m.end():])
+                    if not before or not after:
+                        continue
+                    _raw_s, subject, _scale_s, dec_s = before[-1]
+                    _raw_r, reference, _scale_r, dec_r = after[0]
+                    if not (is_corpus(subject, dec_s) and is_corpus(reference, dec_r)):
+                        continue
+                    checked += 1
+                    printed = float(m.group(1))
+                    decimals = len(m.group(1).split(".")[1]) if "." in m.group(1) else 0
+                    if m.group(2) == "above":
+                        actual = (subject - reference) / reference * 100
+                    else:
+                        actual = (reference - subject) / reference * 100
+                    if abs(round(actual, decimals) - printed) > 1e-9:
+                        bad.append(f"{name}: {m.group(0)!r} with subject {subject} and "
+                                   f"reference {reference} computes to "
+                                   f"{actual:.{max(decimals, 1)}f}%: "
+                                   f"{sentence.strip()[:120]!r}")
+        self.assertTrue(checked, "no percentage between corpus figures was checked")
+        self.assertEqual(bad, [], "\n".join(bad))
+
 
 def probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode="canned"):
     """An fcvm stub that is BOTH a clone and an exec client.
