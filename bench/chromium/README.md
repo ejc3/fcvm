@@ -174,7 +174,7 @@ change. Never publish numbers whose review verdicts were refuted; see
 ## Current status
 
 The **2026-08-08 corrected run** is the current record: `results/20260808-corrected/`
-(`summary.md`, `charts/*.svg`, `corrected.json`). It fixes all six methodology defects that
+(`summary.md`, `charts/*.svg`, `corrected.json`). It fixes the six methodology defects (AGENTS.md defects 1 to 6) that
 sank the first run — matched per-clone cgroup accounting plus an independent whole-machine
 `MemAvailable` basis, one seeded interleaved schedule with two control arms, the burst as the
 experimental unit with bootstrap CIs, `RUST_LOG=fcvm=debug` stage attribution, slopes reported

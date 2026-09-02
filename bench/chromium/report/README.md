@@ -170,8 +170,11 @@ is present. The raw records survive in
 `/home/ubuntu/src/fcvm-main/bench/chromium/results/`, the worktree the runs
 executed in, byte-identical to the sha256 each analysis.json records under
 `analysis_identity.inputs`, so the series can be re-analyzed without re-running.
-Re-analysis does not rehabilitate it: the current reqanalyze exits 5 on these
-records and the stall gate fails on elmundo.
+Re-analysis does not rehabilitate it: the current reqanalyze exits 5 on every
+record because the meta assigns no complete cell and the record names no
+resolver; on the 2026-08-16 runs the 15 s stall gate also fails, on 16 to 22
+elmundo load events per run, while the 2026-08-14 run has none over 15 s and
+passes it.
 
 What the records show, read from the same reqbench.jsonl files the figures
 came from:
@@ -190,8 +193,14 @@ came from:
 - Controls at matched 2 vCPU (withdrawn `reqbench-20260816-121054-corpus`
   against the verified run): noop 41.0 vs 44.8 ms (the verified run is slower),
   resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot 82.8 vs
-  80.3. Only navigate moves: 598.4 -> 409.1 ms. The contamination made fcvm
-  look worse, not better: 712.6 is 27.5% below the withdrawn 982.9.
+  80.3, navigate 598.4 vs 409.1. The two runs were measured on different
+  hosts: the withdrawn series on this box (`cell.host_kernel_release`
+  7.0.14-fcvm-cd6cd2b4b52e, boot 80bfe10d), the verified run on a
+  6.17.0-1019-aws host (boot 291f8bad), each on its own golden and fcvm
+  binary. So the navigate change is not attributed to the DNS fix, and the
+  3.8 ms noop shift is as likely the host as anything else. The withdrawn
+  982.9 is 27.5% above the verified 712.6 across that host change; how much
+  of the gap is DNS is not measured.
 
 The one DNS-verified cell:
 
@@ -201,19 +210,28 @@ The one DNS-verified cell:
 | 4 | not measured on the fixed tree | | |
 | 8 | not measured on the fixed tree | | |
 
-What survives of the ladder is a direction, not a magnitude. On the six URLs
-whose screenshots are byte-identical between each withdrawn rung and the
-verified run (example.com and the five TodoMVC variants, the pages with no
-third-party request chains), the withdrawn series' cdp medians were 680.9,
-498.7 and 494.9 ms at 2, 4 and 8 vCPU, so the knee is between 2 and 4 vCPU.
-Nothing more is claimed until the ladder is re-run on a source_revision that
-contains `90733b854e`. Do not fill the 4 and 8 rows with a prediction.
+What survives of the withdrawn ladder is a direction, not a magnitude. On the
+six URLs whose screenshots are byte-identical between each withdrawn rung and
+the verified run (example.com and the five TodoMVC variants), the withdrawn
+series' cdp medians were 680.9, 498.7 and 494.9 ms at 2, 4 and 8 vCPU. Those
+six pages were still fetched over the live network in every withdrawn rung
+(example.com main-document ttfb 46.6 / 51.0 / 48.3 ms at 2 / 4 / 8 vCPU
+against 0.6 ms in the verified run; the TodoMVC pages 4 to 7 ms against 0.8),
+so the direction survives only because that network term does not move with
+the vCPU count. The verified run's median on the same six URLs is 547.5 ms
+at 2 vCPU: 133 ms below the withdrawn 2 vCPU rung and 49 ms above the
+withdrawn 4 vCPU rung, so 4 vCPU is faster than 2 and the size of the knee
+is unmeasured. Nothing more is claimed until the ladder is re-run on a
+source_revision that contains `90733b854e`. Do not fill the 4 and 8 rows
+with a prediction.
 
 Two things about the withdrawn table, so nobody restores it from memory:
 
-- Its 2 vCPU rung, 982.9 ms, was the MAXIMUM of eight same-configuration
-  2 vCPU cells in the series (878.5 to 982.9 ms, mean 938.2), which by itself
-  inflated the 2->4 step from 242 ms to 287 ms.
+- Its 2 vCPU rung, 982.9 ms, was the MAXIMUM of the five withdrawn uffd/minor
+  2 vCPU cells in the series (916.9 to 982.9 ms, mean 949.0), which by itself
+  inflated the 2->4 step from 253 ms to 287 ms; the eight withdrawn 2 vCPU
+  cells across uffd/minor, uffd/copy and file backends and four fcvm binaries
+  span 878.5 to 982.9 ms (mean 938.2).
 - Its "the guest is CPU-starved rather than slow" argument rested on
   `Page.enable` costing 6.8 ms on 2 vCPUs against 3.9 on 4 while "TCP connect
   is 0.1 ms throughout". That 0.1 ms is `stages.tcp_ms`, which cdpdrive.py

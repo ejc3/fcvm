@@ -41,7 +41,12 @@ fails on 19 elmundo load events over 15 s), and `campaign_summary.py` refuses
 both a marked run and the shape itself: hostname URLs with no recorded
 resolver (`guest_dns` null, no `BENCH_RESOLVE_ALL_TO`, no `dns-evidence.json`).
 The marker is `WITHDRAWN` in each directory; it is never removed, and the
-directory is kept so the marker and its evidence stay readable.
+directory is kept so the marker and its evidence stay readable. Three further
+2026-08-16 attempts exist only in that worktree and were never committed, so
+they carry no marker: `reqbench-20260816-120712-corpus` and `-144601-corpus`
+(aborted, no reqbench.jsonl) and `-144802-corpus` (a partial run at
+source_revision b67e28b9 with the same signature: example.com ttfb 47.2 ms,
+`dns_ms` up to 144 ms). Do not quote them from the worktree.
 
 Evidence, from the runs' own `reqbench.jsonl` (paths under fcvm-main):
 
@@ -59,13 +64,17 @@ Evidence, from the runs' own `reqbench.jsonl` (paths under fcvm-main):
   unmoved by a vCPU doubling; 3,842 ms [3,714, 3,879] in the verified run.
 - Controls at matched 2 vCPU (`-121054-corpus` vs the verified run): noop 41.0
   vs 44.8 ms, resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot
-  82.8 vs 80.3; only navigate moves, 598.4 -> 409.1 ms. The contamination made
-  fcvm look worse, not better: 712.6 is 27.5% below the withdrawn 982.9.
+  82.8 vs 80.3, navigate 598.4 vs 409.1. The two runs were measured on
+  different hosts (`cell.host_kernel_release` 7.0.14-fcvm-cd6cd2b4b52e, boot
+  80bfe10d, for the withdrawn series; 6.17.0-1019-aws, boot 291f8bad, for the
+  verified run), on their own goldens and binaries, so no stage difference is
+  attributed to the DNS fix. The withdrawn 982.9 is 27.5% above the verified
+  712.6 across that host change; how much of the gap is DNS is not measured.
 
 | withdrawn figure | why it cannot stand |
 |---|---|
 | corpus mix p50 **695.7 ms [560.9, 747.1]** at 4 vCPU (`results/reqbench-20260816-123529-corpus/analysis.json`), the report's headline and its Kitesurf comparison cell | Rendered under live DNS: `dns_ms` hits at 149-158 ms, `ttfb_ms` p99 279 ms and max 3.6 s, elmundo at 31 s. Replaced by 712.6 ms [610.5, 808.5] at 2 vCPU from `results/reqbench-20260830-171007-corpus/analysis.json`. No DNS-verified 4 vCPU cell exists; do not substitute a prediction. |
-| the vCPU ladder **982.9 / 695.7 / 647.2 ms** at 2/4/8, its steps (287 ms, 48 ms), its 66 ms noise floor (916.9, 951.2, 982.9) and "4 vCPU is the operating point" | All ten runs contaminated. 982.9 was also the maximum of eight same-config 2 vCPU cells (878.5-982.9, mean 938.2), inflating the 2->4 step from 242 to 287 ms. What survives is a direction only: on the six URLs whose screenshots are byte-identical between each rung and the verified run (example.com and the five TodoMVC pages), the withdrawn medians were 680.9 / 498.7 / 494.9 ms, so the knee is between 2 and 4 vCPU. |
+| the vCPU ladder **982.9 / 695.7 / 647.2 ms** at 2/4/8, its steps (287 ms, 48 ms), its 66 ms noise floor (916.9, 951.2, 982.9) and "4 vCPU is the operating point" | All ten runs contaminated. 982.9 was also the maximum of the five uffd/minor 2 vCPU cells (916.9-982.9, mean 949.0), inflating the 2->4 step from 253 to 287 ms; the eight 2 vCPU cells across uffd/minor, uffd/copy and file backends and four fcvm binaries span 878.5-982.9 (mean 938.2). What survives is a direction only: on the six URLs whose screenshots are byte-identical between each rung and the verified run (example.com and the five TodoMVC pages), the withdrawn medians were 680.9 / 498.7 / 494.9 ms, still fetched live (example.com ttfb 46.6 / 51.0 / 48.3 ms against 0.6 verified), against 547.5 ms for the verified run on the same six URLs at 2 vCPU: 4 vCPU is faster than 2, and the size of the knee is unmeasured. |
 | the probed trio **966.2 / 685.5 / 660.5 ms** and its per-render peak-core captions (`results/cpuprobe-20260816/*.json`), the "probe overhead −1.5%" comparison (685.5 vs 695.7), and the 1630 -> 1885 -> 2340 core-ms totals | Source runs `-152156`, `-145649`, `-154831` are contaminated; the samples were taken while renders waited on live DNS, and a difference between two live-network runs says nothing about the probe. The censoring shape at 2 and 4 vCPU is kept as a lead, not a measurement. |
 | "the guest is CPU-starved, not slow: `Page.enable` 6.8 vs 3.9 ms, TCP connect is 0.1 ms throughout" | `stages.tcp_ms` is cdpdrive.py's own TCP connect to the WebSocket endpoint, the harness reaching the guest's forwarded CDP port on 127.0.0.2:9222 over loopback (`cdpdrive.py` line 16). It is not the page's connection to any origin and cannot exclude network effects. The page-side timings in the same records (`render.nav`) show live DNS. Conclusion withdrawn; a CPU-starvation reading needs a verified ladder with `render.nav` quoted beside `Page.enable`. |
 | elmundo **31,046 ms** "unresolved, guest-specific stall", its 114 ms contribution to the mix and the 581.8 ms elmundo-excluded figure | The cause was the untested item on that list: DNS. Third-party chains the replay leaves unanswered went to the live internet and waited for real timeouts. Verified value 3,842 ms at 2 vCPU. |
