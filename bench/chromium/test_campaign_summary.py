@@ -1407,6 +1407,36 @@ class CampaignSummary(unittest.TestCase):
                 rc, text = self._summarize(out, [run_dir])
                 self.assertEqual(rc, 0, f"{label}: {text}")
 
+    def test_a_resolver_rule_is_not_a_webkit_runs_resolver(self):
+        """Only entry.sh reads BENCH_RESOLVE_ALL_TO and only Chromium takes
+        the flag it builds (reqanalyze._resolver_rule_address refuses the
+        rule under any other engine). A WebKit cell with guest_dns null and
+        the rule in guest_env resolved its hostnames through whatever
+        resolv.conf named, and its diag carries no address trace to say
+        otherwise, so the rule records no resolver for that run and the
+        index refuses it like any hostname run with none. The same cell on
+        Chromium indexes.
+
+        RED BEFORE THE FIX: AssertionError: 0 == 0 : wrote
+        .../campaign-x-summary.json: 1 cell(s)
+        """
+        rule = ["BENCH_RESOLVE_ALL_TO=10.0.2.2"]
+        webkit_diag = diag_summary(engine="webkit")
+        webkit_diag["limits"].update(expect_ips=None)
+        with tempfile.TemporaryDirectory() as d:
+            _paths, text = self._refused(
+                d, engine="webkit", dns_verdict=None, guest_dns=None,
+                guest_env=rule, diag=webkit_diag)
+            self.assertIn("webkit", text)
+            self.assertIn("resolver", text)
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "run")
+            write_run(run_dir, dns_verdict=None, guest_dns=None, guest_env=rule,
+                      diag=diag_summary())
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertEqual(rc, 0, text)
+
     def _refused(self, d, **run_kwargs):
         run_dir = os.path.join(d, "run")
         paths = write_run(run_dir, **run_kwargs)

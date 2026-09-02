@@ -1521,18 +1521,26 @@ def load_cell(run_dir, sources=None):
     # This is defense in depth for a record that carries an engine but no
     # resolver: every committed 2026-08-16 record is already refused by the
     # engine check above, so on those this rule never fires.
-    if (
-        dns_verdict is None
-        and cell["guest_dns"] is None
-        and not any(entry.partition("=")[0] == "BENCH_RESOLVE_ALL_TO" for entry in guest_env)
-    ):
+    #
+    # Only entry.sh reads BENCH_RESOLVE_ALL_TO and only Chromium takes the
+    # flag it builds (reqanalyze._resolver_rule_address refuses the rule
+    # under any other engine), so a rule in a WebKit cell's guest_env names
+    # nothing about what answered that run's hostnames.
+    rule = any(entry.partition("=")[0] == "BENCH_RESOLVE_ALL_TO" for entry in guest_env)
+    rule_recorded = rule and cell["engine"] == "chromium"
+    if dns_verdict is None and cell["guest_dns"] is None and not rule_recorded:
         unresolved = [
             url for url in measured if reqanalyze.url_needs_resolver(url) is not False
         ]
         if unresolved:
+            rule_note = (
+                f"a BENCH_RESOLVE_ALL_TO rule under engine {cell['engine']!r}, "
+                "which never reads it"
+                if rule else "no BENCH_RESOLVE_ALL_TO"
+            )
             raise RunError(
                 f"{run_dir}: measured hostname URL(s) {unresolved[:3]} with no "
-                "recorded resolver (guest_dns null, no BENCH_RESOLVE_ALL_TO, no "
+                f"recorded resolver (guest_dns null, {rule_note}, no "
                 "dns-evidence.json); the corpus resolved through ambient DNS"
             )
 
