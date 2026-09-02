@@ -7314,6 +7314,24 @@ class HarnessIdentity(unittest.TestCase):
         self.assertEqual(set(reqbench.HARNESS_SOURCES), staged - {"reqanalyze.py"})
 
 
+# `make` invoked as a command in a repository script, ignoring comment lines:
+# a flag or a target may follow it, or the command may end there (a bare
+# `make` runs the default target, which reaches cargo-target-link the same
+# way). Prose about make in comments does not count. Used by MakefileBenchGraph to refuse a leased
+# recipe whose script would reach cargo-target-link through a sub-make.
+MAKE_CALL = re.compile(
+    r"(?:^|[\s;&|(`])(make(?:\s+(?:-[A-Za-z]|[A-Za-z_][\w./-]*))?)(?=\s|$|[;&|)`])", re.M
+)
+
+
+def script_runs_make(text):
+    """The matched `make ...` invocation in `text`, or None."""
+    code = "\n".join(src_line for src_line in text.splitlines()
+                     if not src_line.lstrip().startswith("#"))
+    m = MAKE_CALL.search(code)
+    return m.group(1) if m else None
+
+
 class MakefileBenchGraph(unittest.TestCase):
     """The Chromium bench make targets must encode their real dependencies.
 
@@ -7393,6 +7411,31 @@ class MakefileBenchGraph(unittest.TestCase):
                       f"assertion in this class is vacuous. stderr: "
                       f"{self.make_stderr}")
 
+    def test_make_call_detector_classifies_known_cases(self):
+        """The detector behind the leased-recipe rule must see every way a
+        script hands control to make, and none of the ways it merely talks
+        about it. RED BEFORE THE FIX: a bare `make` ending a line (`cd sub &&
+        make`, or `make` alone) was missed, because the pattern demanded
+        whitespace and an argument after the word.
+        """
+        runs = {
+            'make -C "$REPO" bench-chromium-request-golden': "make -C",
+            "cd bench && make": "make",
+            "make\n": "make",
+            "  make; echo done": "make",
+            "(make)": "make",
+            "make build 2>&1 | tee log": "make build",
+        }
+        for text, expect in runs.items():
+            self.assertEqual(script_runs_make(text), expect, text)
+        for text in (
+            "# so make - not the operator - walks the graph",
+            "echo makes the host resolve",
+            "cmake --build .",
+            "gmake all",
+        ):
+            self.assertIsNone(script_runs_make(text), text)
+
     def test_leased_recipes_never_run_a_script_that_runs_make(self):
         """A recipe under TARGET_LEASE_SHELL holds the target generation's
         shared lease for each of its lines, and every child inherits it.
@@ -7417,9 +7460,6 @@ class MakefileBenchGraph(unittest.TestCase):
         # Repository scripts a recipe line names, whatever it does with them
         # (the corpus recipe copies its orchestrator before running the copy).
         script_ref = re.compile(r"(?:bench/chromium|scripts)/[A-Za-z0-9_.-]+\.(?:sh|py)")
-        # `make` invoked as a command in non-comment text: a flag or a target
-        # follows it. Prose about make in comments does not count.
-        make_call = re.compile(r"(?:^|[\s;&|(`])make\s+(?:-[A-Za-z]|[A-Za-z_][\w./-]*)(?=\s|$)")
         offenders = []
         for target in leased:
             for line in self.recipes.get(target, []):
@@ -7428,11 +7468,9 @@ class MakefileBenchGraph(unittest.TestCase):
                     if not os.path.isfile(path):
                         continue
                     with open(path, encoding="utf-8") as f:
-                        code = "\n".join(l for l in f.read().splitlines()
-                                         if not l.lstrip().startswith("#"))
-                    m = make_call.search(code)
-                    if m:
-                        offenders.append(f"{target}: {rel} runs `{m.group(0).strip()}`")
+                        call = script_runs_make(f.read())
+                    if call:
+                        offenders.append(f"{target}: {rel} runs `{call}`")
         self.assertEqual(
             offenders, [],
             "a recipe that runs under the target lease must not run a script that "
