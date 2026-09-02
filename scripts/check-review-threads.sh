@@ -573,8 +573,9 @@ fi
 #     can wear it; an empty or absent author matches nothing, because on a payload that
 #     names no author "" == "" would exempt every unattributed body on it.
 #   - TOP-LEVEL COMMENTS have no state, so everything counts unless it is on a short,
-#     documented ignore list: bot logins that only ever post notifications, and the
-#     literal trigger phrases this skill tells you to post. An unknown bot counts, and so
+#     documented ignore list: bot logins that only ever post notifications, the literal
+#     trigger phrases this skill tells you to post, and a listed reviewer's notice that it
+#     did NOT review (the shapes above VERDICT_JQ). An unknown bot counts, and so
 #     does the AUTHOR: a comment is where a self-reported defect lands, and a review is
 #     where an answer does. That asymmetry is the whole rule.
 #
@@ -641,6 +642,36 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # the comment, which is the right direction; extend the list when Codex says something
 # new. Only the About Codex block is stripped, and only under that exact summary text:
 # a details block with any other summary is where a bot folds its findings.
+# NOTICES: a listed reviewer saying that its review did NOT run. Neither a finding nor
+# coverage. Both bots post one, and because both are in VERDICT_BOTS none of it fell under
+# the notification-bot exemption below: every notice was a PR-level claim needing a
+# disposition dated after it. On 2026-09-02 #898 carried three Codex quota notices and the
+# gate reported all three UNANSWERED (aws #46 one more); the author cleared them with a
+# NOT-A-DEFECT review answering text that claimed nothing. A gate that blocks on ordinary
+# bot traffic gets switched off, which is the failure the withdrawn last-word rule had.
+#
+# A notice is matched as the WHOLE body, line for line, against the shapes the bots have
+# posted here, and belongs to the bot that posts it (see CODERABBIT_LOGIN): the same words
+# with anything added, or from any other account, are a comment like any other and stay
+# claimable. The shapes, with where each was observed:
+#   - Codex, a plain top-level comment: "You have reached your Codex usage limits for code
+#     reviews. You can see your limits in the [Codex usage dashboard](...)." alone (#898 at
+#     05:16Z, #842) or followed by "To continue using code reviews, add credits to your
+#     account and enable them for code reviews in your [settings](...)." (#898 at 05:20Z
+#     and 06:04Z, aws #46, aws #27).
+#   - CodeRabbit's reply to a command it did not carry out: one of "Review rate limited.",
+#     "Already reviewed.", "Already reviewed the last commit. Use `@coderabbitai full
+#     review` to rerun a review of the entire changeset.", "No files to review." or "Pull
+#     request is closed." folded under "⚠️ Action not completed", with or without the
+#     incremental-review note (#847, #864, #846, #869, #853); or "Review rate limited." over
+#     a rule and the Fair Usage Limits paragraph naming a wait (#844, #887, aws #17).
+#   - CodeRabbit's chat reply "### Rate Limit Exceeded" naming the user and a wait (#893).
+#   - CodeRabbit's summary comment before any review has run: the summarize marker, ONE
+#     notice between its "rate limited", "skip review" or "review paused" markers, every
+#     line of it blockquoted under a "Review limit reached", "Review skipped" or "Reviews
+#     paused" heading, the tips block, and nothing else (#874, #843, #789, #832). The range
+#     that notice quotes is not coverage (walkthrough_sha never read it). Once the comment
+#     holds a walkthrough or a recent-review block it is a walkthrough, judged as one.
 VERDICT_JQ='def cr_note: "> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.";
 def verdict_lines:
   ((. // "") | gsub("<!--(.|\n)*?-->"; "")
@@ -700,7 +731,41 @@ def walkthrough_sha:
      | select(test("(?m)^>[[:space:]]*##") | not)
      | capture("<!-- recent_review_start -->(?<r>(.|\n)*?)<!-- recent_review_end -->") | .r
      | select(test("No actionable comments were generated in the recent review"))
-     | capture(cr_range_re) | .sha ] | first) // "";'
+     | capture(cr_range_re) | .sha ] | first) // "";
+def codex_limit_line1: "You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).";
+def codex_limit_line2: "To continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review).";
+def is_codex_limit_notice:
+  verdict_lines as $l | ($l == [codex_limit_line1]) or ($l == [codex_limit_line1, codex_limit_line2]);
+def cr_not_done_re: "^(Review rate limited\\.|Already reviewed\\.|Already reviewed the last commit\\. Use `@coderabbitai full review` to rerun a review of the entire changeset\\.|No files to review\\.|Pull request is closed\\.)$";
+def cr_fair_usage_re: "^Your included review limit is currently reached under our \\[Fair Usage Limits Policy\\]\\(https://docs\\.coderabbit\\.ai/management/plans#fair-usage-limits-policy\\)\\. This review may still proceed through usage-based billing if eligible\\. Your next included review will be available in [0-9]+ (minutes?|seconds?|hours?)\\.$";
+def cr_chat_limit_re: "^`@[A-Za-z0-9-]+` have exceeded the limit for the number of chat messages per hour\\. Please wait \\*\\*[0-9]+ (minutes?|seconds?|hours?)( and [0-9]+ (minutes?|seconds?))?\\*\\* before sending another message\\.$";
+def is_cr_reply_notice:
+  verdict_lines as $l
+  | (($l | length) == 4 and $l[0] == "<details>" and $l[1] == "<summary>⚠️ Action not completed</summary>"
+     and ($l[2] | test(cr_not_done_re)) and $l[3] == "</details>")
+    or (($l | length) == 6 and $l[0] == "<details>" and $l[1] == "<summary>⚠️ Action not completed</summary>"
+        and $l[2] == "Review rate limited." and $l[3] == "---" and ($l[4] | test(cr_fair_usage_re))
+        and $l[5] == "</details>")
+    or (($l | length) == 2 and $l[0] == "### Rate Limit Exceeded" and ($l[1] | test(cr_chat_limit_re)));
+def cr_notice_start_re: "^<!-- This is an auto-generated comment: (?<k>rate limited|skip review|review paused) by coderabbit\\.ai -->$";
+def cr_notice_heading_re: "^> ## (Review limit reached|Review skipped|Reviews paused)$";
+def cr_tips_re: "<!-- tips_start -->(.|\n)*?<!-- tips_end -->";
+def is_cr_summary_notice:
+  (. // "") as $b
+  | [$b | scan(cr_marker_re)] as $m
+  | ($m | length) == 2 and $m[0] == cr_summarize_marker
+    and (($m[1] | capture(cr_notice_start_re) // null) != null)
+    and (($b | split($m[1])) as $p
+         | ($p | length) == 2
+           and (($p[1] | split("<!-- end of auto-generated comment: \($m[1] | capture(cr_notice_start_re).k) by coderabbit.ai -->")) as $q
+                | ($q | length) == 2
+                  and (($q[0] | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0))) as $n
+                       | ($n | length) >= 2 and all($n[]; startswith(">"))
+                         and ($n[0] | test("^> \\[!(WARNING|IMPORTANT|NOTE)\\]$"))
+                         and ($n[1] | test(cr_notice_heading_re)))
+                  and (($p[0] + $q[1]) | gsub(cr_tips_re; "") | gsub("<!--(.|\n)*?-->"; "")
+                       | test("[^[:space:]]") | not)));
+def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
 # any other, never coverage. Entries are logins; their mention handles (@codex,
@@ -710,6 +775,10 @@ VERDICT_BOTS=${VERDICT_BOTS:-chatgpt-codex-connector,coderabbitai}
 # CodeRabbit comment carrying the marker a Codex verdict: exempt from dispositions, with its
 # table read as head coverage.
 CODEX_LOGIN=${CODEX_LOGIN:-chatgpt-codex-connector}
+# Each notice belongs to its bot the same way: the quota notice is Codex's, the rate-limit,
+# not-completed and summary notices are CodeRabbit's. From any other account they are
+# ordinary comments.
+CODERABBIT_LOGIN=${CODERABBIT_LOGIN:-coderabbitai}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 
@@ -793,7 +862,7 @@ fi
 # The coverage check below asks only whether some row names the head and postdates its
 # arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
-   --arg codex "$CODEX_LOGIN" --arg me "$prauthor" \
+   --arg codex "$CODEX_LOGIN" --arg cr "$CODERABBIT_LOGIN" --arg me "$prauthor" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
   | (.[0] | map({author, state, body, at: .submittedAt,
@@ -803,16 +872,19 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
       | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
       | ($listed and ($c.body | is_verdict)) as $v
       | ($listed and (($c.author.login // "") == $codex) and ($c.body | is_codex_summary)) as $sum
+      | ($listed and ((($c.author.login // "") == $codex and ($c.body | is_codex_limit_notice))
+                      or (($c.author.login // "") == $cr and ($c.body | is_cr_notice)))) as $notice
       | {author, state: "COMMENT", body, at: .updatedAt,
-         verdict: ($v or $sum),
-         reviewed_rows: ((if $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
+         verdict: ($v or $sum), notice: $notice,
+         reviewed_rows: ((if $notice then []
+                          elif $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
                           elif $sum then ($c.body | summary_rows)
                           elif $listed then [{sha: ($c.body | walkthrough_sha), at: (.updatedAt // "")}]
                           else [] end)
                          | map(select((.sha // "") != "" and (.at // "") != ""))),
          claimable: ((.author.login | IN($skip[]) | not)
                      and ((.body // "") | test($trig; "i") | not)
-                     and (($v or $sum) | not))}))' \
+                     and (($v or $sum or $notice) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 

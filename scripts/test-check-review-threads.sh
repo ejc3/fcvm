@@ -1283,6 +1283,101 @@ COMMENTS_PAGE_SIZE=2 GATE_TEST_THREADS=pagednocursor GATE_TEST_COMMENTS=nocommen
 # above ends that way, so a rule written as "endCursor must be a string" would fail here.
 page_case "a last page with hasNextPage false and a null cursor still reaches a verdict" 1 "carry no disposition"
 
+echo "== finding 44: a bot saying its review did not run is not a finding =="
+# Each listed reviewer posts a notice when it cannot review. Codex out of quota posts a
+# plain top-level comment, "You have reached your Codex usage limits for code reviews",
+# either that one line or the line plus an "add credits" line. CodeRabbit answers a trigger
+# it cannot serve with "Review rate limited." (or "Already reviewed.", "No files to
+# review.", "Pull request is closed.") folded under "Action not completed", answers a chat
+# it cannot serve with "Rate Limit Exceeded", and before any review has run its summary
+# comment holds nothing but a "Review limit reached" or "Review skipped" notice. Both bots
+# are in VERDICT_BOTS, so none of that fell under the notification-bot exemption, and every
+# such comment was a PR-level claim needing a disposition dated after it. On 2026-09-02
+# #898 carried three Codex quota notices and the gate reported all three UNANSWERED (aws
+# #46 one more); the author cleared them with a NOT-A-DEFECT review answering text that
+# claimed nothing. That is the block-on-ordinary-traffic shape the withdrawn last-word rule
+# had. A notice is now matched as a whole body, line for line, against the shapes the bots
+# post here, and belongs to the bot that posts it. It needs no disposition and covers no
+# head. Bodies copied from #898, aws #46, #847, #844, #846, #893, #874 and #789.
+CODEX_LIMIT1=$(jq -n '"You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage)."')
+CODEX_LIMIT2=$(jq -n '"You have reached your Codex usage limits for code reviews. You can see your limits in the [Codex usage dashboard](https://chatgpt.com/codex/cloud/settings/usage).\nTo continue using code reviews, add credits to your account and enable them for code reviews in your [settings](https://chatgpt.com/codex/cloud/settings/code-review)."')
+# CodeRabbit's reply to a command it did not carry out, folding $1 under "Action not completed".
+cr_not_done() { jq -n --arg t "$1" '"<!-- This is an auto-generated reply by CodeRabbit -->\n<!-- CodeRabbit review command invocation: 03686aea-15d0-48ab-a4bd-bf524726db31 -->\n<details>\n<summary>⚠️ Action not completed</summary>\n\n\($t)\n\n</details>"'; }
+CR_INCREMENTAL_NOTE='> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.'
+CR_LIMITED=$(cr_not_done "Review rate limited.
+
+$CR_INCREMENTAL_NOTE")
+CR_FAIR=$(cr_not_done "Review rate limited.
+
+---
+
+Your included review limit is currently reached under our [Fair Usage Limits Policy](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy). This review may still proceed through usage-based billing if eligible. Your next included review will be available in 7 minutes.")
+CR_ALREADY=$(cr_not_done "Already reviewed.
+
+$CR_INCREMENTAL_NOTE")
+CR_CHAT=$(jq -n '"<!-- This is an auto-generated reply by CodeRabbit -->\n### Rate Limit Exceeded\n\n`@ejc3` have exceeded the limit for the number of chat messages per hour. Please wait **3 minutes and 10 seconds** before sending another message."')
+# The tips block CodeRabbit appends to its summary comment, whatever else the comment holds.
+CR_TIPS=$'<!-- tips_start -->\n\n---\n\nThanks for using [CodeRabbit](https://coderabbit.ai?utm_source=oss&utm_medium=github&utm_campaign=ejc3/fcvm&utm_content=874)! It\'s free for OSS, and your support helps us grow. If you like it, consider giving us a shout-out.\n\n<details>\n<summary>❤️ Share</summary>\n\n- [X](https://twitter.com/intent/tweet?text=I%20just%20used%20%40coderabbitai%20for%20my%20code%20review%2C%20and%20it%27s%20fantastic%21&url=https%3A//coderabbit.ai)\n\n</details>\n\n\n<sub>Comment `@coderabbitai help` to get the list of available commands.</sub>\n\n<!-- tips_end -->'
+# CodeRabbit's summary comment before any review has run: the summarize marker, one notice
+# of kind $1 holding the blockquote $2, the tips block, and $3 (default nothing) after it.
+cr_summary_notice() { jq -n --arg k "$1" --arg n "$2" --arg x "${3:-}" --arg tips "$CR_TIPS" '"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: \($k) by coderabbit.ai -->\n\n\($n)\n\n<!-- end of auto-generated comment: \($k) by coderabbit.ai -->\n\n\($tips)" + (if $x == "" then "" else "\n\n" + $x end)'; }
+# The #874 notice quotes the range a review WOULD have covered, ending at the head.
+LIMIT_NOTICE=$'> [!WARNING]\n> ## Review limit reached\n> \n> **Next included review available in 53 minutes.**\n> \n> <details>\n> <summary>View limit details</summary>\n> \n> **Limit details:** You’ve used the included review currently available.\n> \n> [Learn how review limits work](https://docs.coderabbit.ai/management/plans#rate-limits).\n> \n> **Review configuration:**\n> \n> <details>\n> <summary>📥 Commits</summary>\n> \n> Reviewing files that changed from the base of the PR and between '"$BASE40"$' and '"$HEAD40"$'.\n> \n> </details>\n> \n> </details>'
+SKIP_NOTICE=$'> [!IMPORTANT]\n> ## Review skipped\n> \n> Auto reviews are disabled on base/target branches other than the default branch.\n> \n> Please check the settings in the CodeRabbit UI or the `.coderabbit.yaml` file in this repository. To trigger a single review, invoke the `@coderabbitai review` command.\n> \n> <details>\n> <summary>⚙️ Run configuration</summary>\n> \n> **Configuration used**: defaults\n> \n> **Run ID**: `29692184-5f4e-43c5-8f4f-ccb92b0cf21e`\n> \n> </details>\n> \n> Use the checkbox below for a quick retry:\n> - [ ] <!-- {"checkboxId": "e9bb8d72-00e8-4f67-9cb2-caf3b22574fe"} --> 🔍 Trigger review'
+run_case "a codex usage-limit comment needs no disposition (#898)" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 0 "CLEAR"
+run_case "the one-line codex usage-limit comment needs no disposition (#898, 05:16Z)" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT1")")" 0 "CLEAR"
+run_case "a coderabbit rate-limited reply needs no disposition (#847)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_LIMITED")")" 0 "CLEAR"
+run_case "a rate-limited reply naming the fair-usage wait needs no disposition (#844)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_FAIR")")" 0 "CLEAR"
+run_case "an already-reviewed reply needs no disposition (#846)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_ALREADY")")" 0 "CLEAR"
+run_case "a chat rate-limit reply needs no disposition (#893)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_CHAT")")" 0 "CLEAR"
+run_case "a summary comment holding only a rate-limit notice needs no disposition (#874)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE")" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+run_case "a summary comment holding only a skipped notice needs no disposition (#789)" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'skip review' "$SKIP_NOTICE")" 2026-01-02T01:00:00Z)")" 0 "CLEAR"
+# The #898 shape: quota notices around a finding that was answered, on a covered head. The
+# last notice is dated after the disposition, so under the old rule nothing answered it.
+run_case "quota notices beside an answered finding on a covered head clear" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2"),$(cmt reviewer User 2026-01-02T01:10:00Z '"P1: this drops the last row"'),$(cmt coderabbitai Bot 2026-01-02T01:15:00Z "$CR_LIMITED"),$(cmt me User 2026-01-02T01:20:00Z '"RED-VERIFIED: tests/row.rs"'),$(cmt "$CODEX" Bot 2026-01-02T01:30:00Z "$CODEX_LIMIT1")")" \
+  0 "CLEAR"
+# Guards, green before and after. A notice covers no head: an unreviewed head under a quota
+# notice stays unreviewed, and the range a summary notice quotes binds nothing.
+run_case "a codex usage-limit comment covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "UNREVIEWED HEAD"
+run_case "a coderabbit rate-limited reply covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CR_LIMITED")")" 1 "UNREVIEWED HEAD"
+run_case "a summary notice quoting the head's range covers no head" \
+  "$(wrap7 "[$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE")" 2026-01-02T01:00:00Z)]")" 1 "UNREVIEWED HEAD"
+# The match is the whole body, and a notice belongs to the bot that posts it.
+run_case "the codex notice with a finding appended is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(jq -n --argjson b "$CODEX_LIMIT2" '$b + "\n\nP1: this drops the last row"')")")" 1 "carry no disposition"
+run_case "a human posting the codex notice is claimable" \
+  "$(wrap9 "$(cmt helpful-human User 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "carry no disposition"
+run_case "coderabbit posting the codex notice is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "carry no disposition"
+run_case "codex posting the coderabbit reply notice is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$CR_LIMITED")")" 1 "carry no disposition"
+run_case "a finding folded under Action not completed is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_not_done 'P1: this drops the last row')")")" 1 "carry no disposition"
+run_case "a rate-limited reply with a finding appended is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-02T01:00:00Z "$(cr_not_done "Review rate limited.
+
+P1: this drops the last row")")")" 1 "carry no disposition"
+run_case "a summary notice with text after the tips is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE" 'P1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice with an unquoted line inside it is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice 'rate limited' "$LIMIT_NOTICE"$'\n\nP1: this drops the last row')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice of a kind this gate does not list is claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_summary_notice failure $'> [!CAUTION]\n> ## Review failed\n> \n> The pull request is closed.')" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+run_case "a summary notice beside a walkthrough is a walkthrough, still claimable" \
+  "$(wrap9 "$(cmt coderabbitai Bot 2026-01-01T00:00:00Z "$(cr_walk "$NOTICE_LIMITED" clean "$BASE40" "$HEAD40")" 2026-01-02T01:00:00Z)")" 1 "carry no disposition"
+
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
