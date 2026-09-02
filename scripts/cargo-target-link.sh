@@ -72,6 +72,24 @@ if ! command -v flock >/dev/null 2>&1; then
 	exit 2
 fi
 
+# Refuse inside a leased recipe line whose lease is on THIS checkout's
+# published generation. cargo-target-run.sh exports FCVM_TARGET_LEASE_HELD
+# (the device:inode of the generation it leases shared) before it execs the
+# command, and every descendant inherits both the marker and the descriptor.
+# This script takes the published generation's lease exclusively before it
+# replaces target/, which no such descendant can be granted: the shared lease
+# is held by its own ancestor until the recipe line ends, and the recipe line
+# is waiting on this script. Waiting here is a hang, not a queue (observed
+# 2026-09-02, `flock -x` in locks_lock_inode_wait with the box idle), so the
+# answer is immediate and names the cause. A lease on another checkout's
+# generation is no obstacle: the test runner reaches its tests through the
+# wrapper, and those tests publish target/ in scratch checkouts of their own.
+if [ -n "${FCVM_TARGET_LEASE_HELD:-}" ] &&
+	[ "$(stat -Lc '%d:%i' -- target 2>/dev/null || true)" = "$FCVM_TARGET_LEASE_HELD" ]; then
+	echo "ERROR: cargo-target-link.sh was reached from inside a leased recipe line, and the lease (FCVM_TARGET_LEASE_HELD=$FCVM_TARGET_LEASE_HELD) is on the generation target/ publishes here: the exclusive lease this script needs is held shared by its own ancestor, so it would wait forever. A recipe that runs make, or a script that does, must not run under TARGET_LEASE_SHELL; lease its own target/ reads one command at a time (\$(TARGET_LEASE_SHELL) <cmd>) instead." >&2
+	exit 1
+fi
+
 # Re-exec under an exclusive lock on the checkout directory. No lock FILE: a
 # directory fd is lockable, needs no cleanup, and cannot itself become the stale
 # artifact we are trying to avoid.

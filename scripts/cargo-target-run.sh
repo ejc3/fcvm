@@ -77,6 +77,17 @@ while :; do
 	esac
 done
 
+# Name the lease this process hands down. Every child inherits the descriptor,
+# and cargo-target-link.sh needs the same generation exclusively before it
+# publishes, so a child that reaches it (a recipe whose script runs `make`, and
+# that sub-make's cargo-target-link prerequisite) would wait on its own
+# ancestor forever. Observed 2026-09-02: `make bench-chromium-corpus` ->
+# corpus_campaign.sh -> `make -C $REPO bench-chromium-request-golden` ->
+# cargo-target-link.sh, `flock -x` parked in locks_lock_inode_wait with the box
+# idle, until killed. The marker lets the link script refuse at once instead.
+FCVM_TARGET_LEASE_HELD="$(stat -Lc '%d:%i' -- "/proc/$$/fd/$lease_fd")"
+export FCVM_TARGET_LEASE_HELD
+
 # The target descriptor intentionally survives exec, holding the shared lease
 # for the complete Cargo process lifetime (including every rustc/linker child).
 exec "$@"
