@@ -309,10 +309,11 @@ Two things about the withdrawn table, so nobody restores it from memory:
   It is not the page's connection to any origin and cannot rule network
   effects in or out. The page-side timings in the same records
   (`render.nav.dns_ms`, `render.nav.ttfb_ms`, above) show the renders waiting
-  on live DNS. The conclusion is withdrawn. A CPU-starvation reading has to be
-  re-derived from a verified ladder with `render.nav` quoted beside
-  `Page.enable`; until then the section makes no claim about why 2 vCPU is
-  slower than 4.
+  on live DNS. The conclusion is withdrawn, and the verified ladder above does
+  not re-derive it. `Page.enable` there runs 2.5 ms at 2 vCPU, 2.8 at 4 and 3.8
+  at 8, slower as cores are added, and the two verified 2 vCPU runs differ by
+  more (2.5 against 4.3 ms) than the ladder spans from 2 to 8 (1.3 ms). The
+  section makes no claim about why 2 vCPU is slower than 4.
 
 **elmundo was waiting on live DNS.** The 31,046 ms median this file called an
 unresolved guest-specific stall, and the "untested: DNS through the wildcard
