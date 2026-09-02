@@ -201,10 +201,6 @@ The one DNS-verified cell:
 | 4 | not measured on the fixed tree | | |
 | 8 | not measured on the fixed tree | | |
 
-The guest is CPU-starved rather than slow: `Page.enable` is one CDP round trip
-and it costs 6.8 ms on 2 vCPUs against 3.9 on 4, so it was waiting for a
-runnable core, not for the network -- TCP connect is 0.1 ms throughout.
-
 What survives of the ladder is a direction, not a magnitude. On the six URLs
 whose screenshots are byte-identical between each withdrawn rung and the
 verified run (example.com and the five TodoMVC variants, the pages with no
@@ -218,6 +214,19 @@ Two things about the withdrawn table, so nobody restores it from memory:
 - Its 2 vCPU rung, 982.9 ms, was the MAXIMUM of eight same-configuration
   2 vCPU cells in the series (878.5 to 982.9 ms, mean 938.2), which by itself
   inflated the 2->4 step from 242 ms to 287 ms.
+- Its "the guest is CPU-starved rather than slow" argument rested on
+  `Page.enable` costing 6.8 ms on 2 vCPUs against 3.9 on 4 while "TCP connect
+  is 0.1 ms throughout". That 0.1 ms is `stages.tcp_ms`, which cdpdrive.py
+  defines as its own TCP connect to the WebSocket endpoint: the harness on the
+  host reaching the guest's forwarded CDP port on 127.0.0.2:9222 over loopback.
+  It is not the page's connection to any origin and cannot rule network
+  effects in or out. The page-side timings in the same records
+  (`render.nav.dns_ms`, `render.nav.ttfb_ms`, above) show the renders waiting
+  on live DNS. The conclusion is withdrawn. A CPU-starvation reading has to be
+  re-derived from a verified ladder with `render.nav` quoted beside
+  `Page.enable`; until then the section makes no claim about why 2 vCPU is
+  slower than 4.
+
 **elmundo was waiting on live DNS.** The 31,046 ms median this file called an
 unresolved guest-specific stall, and the "untested: DNS through the wildcard
 override" hedge under it, were the defect above: elmundo's third-party request
