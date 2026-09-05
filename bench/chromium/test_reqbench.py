@@ -7112,6 +7112,235 @@ class DocLint(unittest.TestCase):
         self.assertTrue(checked, "no percentage between corpus figures was checked")
         self.assertEqual(bad, [], "\n".join(bad))
 
+    # ---- Four review findings on #903 ----
+    #
+    # The comparison against Cloudflare's published table is the report's
+    # headline, so what our operation IS, and what an interval can be used
+    # for, get the same gate as a figure. Each lint below was written against
+    # the tree that carried the defect and observed failing on it.
+
+    REPORT_DOCS = ("report/README.md", "report/shared-nothing-renders.html")
+
+    # Cloudflare's two wall-time rows, blog.cloudflare.com/kitesurf, pinned
+    # cell for cell by test_report_kitesurf.PUBLISHED.
+    KITESURF_WALL = ("1,148", "1148", "637")
+
+    INTERVAL = re.compile(r"\[\s*\d[\d,]*(?:\.\d+)?\s*(?:,|-|–|—)\s*\d[\d,]*(?:\.\d+)?\s*\]")
+    ENDPOINT_VERDICT = re.compile(
+        r"(?i)whole interval below|interval included|interval containing|"
+        r"interval contains|straddles")
+
+    def _plain(self, text):
+        """A doc unit as prose: tags dropped, entities and nbsp resolved, runs
+        of whitespace collapsed. Markdown wraps at 79 columns, so a phrase this
+        file looks for ("inside the other's interval") is routinely split by a
+        newline; without the collapse the README half of every lint below is
+        silently vacuous."""
+        import html as html_mod
+        flat = html_mod.unescape(re.sub(r"<[^>]+>", " ", text)).replace(" ", " ")
+        return re.sub(r"\s+", " ", flat)
+
+    def _ok_cdp_renders(self):
+        """(run, render) for every ok cdp record of every DNS-verified run."""
+        out = []
+        for run in self._verified_runs():
+            path = os.path.join(self._results(), run, "reqbench.jsonl")
+            if not os.path.isfile(path):
+                continue
+            with open(path) as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    record = json.loads(line)
+                    if record.get("arm") == "cdp" and record.get("ok"):
+                        out.append((run, record.get("render", {})))
+        return out
+
+    def test_the_measured_operation_is_the_screenshot_operation_the_records_hold(self):
+        """RED BEFORE THE FIX: the report defined one request as "render one
+        page (screenshot + DOM text)" (shared-nothing-renders.html:170) and
+        told the reader "our single render captures screenshot AND DOM text in
+        one op; no separate HTML op exists to measure" (:278), with the two
+        HTML-extraction rows' fcvm cells reading "included in the same single
+        op as the screenshot" and "same single-op value".
+
+        No record holds a DOM extraction. Across the DNS-verified corpus runs
+        every ok cdp render carries image_sha256 and stages.screenshot_ms, and
+        none carries html_bytes, html_sha256 or stages.extract_ms; cdpdrive.py's
+        html branch is reachable only through an `op` attribute no caller sets.
+
+        Cloudflare publishes "Wall time: screenshot" and "Wall time: HTML
+        extraction" as separate rows. So the row label was right and the prose
+        was wrong: what we measured is their screenshot operation, and the
+        HTML-extraction operation is unmeasured on our side. A claim that we do
+        both in one op turns a like-for-like row into a combined operation set
+        against a single-operation number.
+
+        Observed on that tree: AssertionError: Lists differ:
+        ["report/shared-nothing-renders.html: credits the measured render with
+        a DOM/HTML extraction no record holds ('screenshot + DOM text'): ...",
+        ...] != [] (4 findings).
+        """
+        self.maxDiff = None
+        renders = self._ok_cdp_renders()
+        self.assertTrue(renders, "no DNS-verified cdp render record; the lint is vacuous")
+        for run, render in renders:
+            stages = render.get("stages", {})
+            self.assertIn("screenshot_ms", stages, run)
+            self.assertIn("image_sha256", render, run)
+            for absent in ("html_bytes", "html_sha256"):
+                self.assertNotIn(absent, render, f"{run}: a record holds {absent}")
+            self.assertNotIn("extract_ms", stages, f"{run}: a record holds extract_ms")
+
+        combined = (
+            r"screenshot\s*(?:\+|AND|and)\s*DOM",
+            r"single[- ]op\b",
+            r"\bin one op\b",
+            r"no separate HTML op",
+            r"same single op\b",
+        )
+        bad = []
+        for name in self.REPORT_DOCS:
+            text = self._plain(self._read(name))
+            for pattern in combined:
+                for m in re.finditer(pattern, text):
+                    bad.append(f"{name}: credits the measured render with a DOM/HTML "
+                               f"extraction no record holds ({m.group(0)!r})")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+        # And the rows for the operation we do not run say so where the reader
+        # looks for our number, not only in a footnote.
+        rows = [line for line in self._read("report/shared-nothing-renders.html").splitlines()
+                if line.lstrip().startswith("<tr") and "HTML extraction" in line]
+        self.assertEqual(len(rows), 3, "the comparator lost its HTML-extraction rows")
+        for row in rows:
+            self.assertIn("not measured", self._plain(row),
+                          f"an HTML-extraction row does not say the operation is "
+                          f"unmeasured on our side: {self._plain(row).strip()[:160]!r}")
+
+    def test_no_comparison_with_a_published_median_quotes_a_within_run_interval(self):
+        """RED BEFORE THE FIX: three sentences derived a verdict against
+        Cloudflare from our interval endpoints. shared-nothing-renders.html:287
+        read "faster than their warm pool as well (549.4 ms [467.9-632.4]
+        against 637, whole interval below it; 712.6 [610.5-808.5] at 2 vCPU,
+        which straddles it)"; :292 "below their 637 ms warm-pool column at
+        4 vCPU (549.4 ms [467.9-632.4]); at 2 vCPU it is above 637 with the
+        interval containing it"; :372 "below their 637 ms warm-pool column,
+        interval included". :192 quoted "712.6 ms mix median [610.5-808.5] ...
+        against their published 1,148 ms isolated render and 637 ms Chromium
+        warm pool".
+
+        The report states its own intervals are within-run: 202 requests of one
+        run, no run-to-run variance. Kitesurf's 637 ms is a median of five runs.
+        An interval that does not carry run-to-run variance cannot establish
+        that a median is below another run's median, so no endpoint may be put
+        against a published value. The comparison that survives is two medians
+        measured under different conditions, and it has to be stated as that.
+
+        The rule: in the two report docs, a sentence quoting one of
+        Cloudflare's published wall-time values may quote neither a bracketed
+        interval nor an endpoint verdict.
+
+        Observed on that tree: AssertionError: Lists differ:
+        ["report/shared-nothing-renders.html: quotes Cloudflare's 637 beside a
+        within-run interval ...", ...] != [] (4 findings).
+        """
+        self.maxDiff = None
+        bad = []
+        checked = 0
+        for name in self.REPORT_DOCS:
+            for sentence in self._doc_sentences(name):
+                text = self._plain(sentence)
+                if not any(v in text for v in self.KITESURF_WALL):
+                    continue
+                checked += 1
+                interval = self.INTERVAL.search(text)
+                verdict = self.ENDPOINT_VERDICT.search(text)
+                if interval or verdict:
+                    bad.append(
+                        f"{name}: quotes Cloudflare's published wall time beside a "
+                        f"within-run interval ({(interval or verdict).group(0)!r}), "
+                        f"which carries no run-to-run variance: {text.strip()[:160]!r}")
+        self.assertTrue(checked, "no sentence quoting a published wall time was checked")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+    def test_no_run_to_run_agreement_rests_on_interval_containment(self):
+        """RED BEFORE THE FIX: report/README.md said "The two verified 2 vCPU
+        cells agree: this ladder's 770.3 [596.2, 807.8] and the 2026-08-30
+        run's 712.6 [610.5, 808.5], each median inside the other's interval,
+        measured on different goldens, fcvm binaries and host boots" and closed
+        "That agreement is the cross-check that the two runs measure the same
+        thing." shared-nothing-renders.html:165 carried the same sentence.
+
+        Both documents state two paragraphs earlier that the intervals are
+        within-run. Two within-run intervals overlapping says nothing about
+        whether two runs, on different goldens, binaries and host boots, measure
+        the same thing; the two medians differ by 57.7 ms and no interval here
+        prices that.
+
+        The rule: no unit of the report docs may claim agreement, or call a
+        comparison a cross-check, in the same breath as interval containment.
+        Both figures must still appear, so the pair is stated rather than
+        dropped.
+
+        Observed on that tree: AssertionError: Lists differ:
+        ["report/README.md: claims run-to-run agreement ('agree') from interval
+        containment ("each median inside the other's interval") ...", ...] != []
+        (2 findings).
+        """
+        self.maxDiff = None
+        agreement = re.compile(r"(?i)\bagree(?:s|d|ment)?\b|\bcross-check\b|"
+                               r"measure the same thing")
+        containment = re.compile(
+            r"(?i)inside the other['’]s interval|within the other['’]s interval|"
+            r"interval contain(?:s|ing)?|intervals? overlap")
+        bad = []
+        for name in self.REPORT_DOCS:
+            text = self._plain(self._read(name))
+            for figure in ("770.3", "712.6"):
+                self.assertIn(figure, text,
+                              f"{name}: no longer names the {figure} ms 2 vCPU cell")
+            for unit in self._doc_units(name):
+                plain = self._plain(unit)
+                claim = agreement.search(plain)
+                rests_on = containment.search(plain)
+                if claim and rests_on:
+                    bad.append(f"{name}: claims run-to-run agreement ({claim.group(0)!r}) "
+                               f"from interval containment ({rests_on.group(0)!r}): "
+                               f"{plain.strip()[:160]!r}")
+        self.assertEqual(bad, [], "\n".join(bad))
+
+    def test_the_zero_failure_claim_is_scoped_to_cells_that_passed_the_gate(self):
+        """RED BEFORE THE FIX: shared-nothing-renders.html:372 said "Zero
+        failures in every gated run" and :360 "every gated run passed 202/200",
+        while :357 records a bridged attempt the zero-failure gate refused at
+        one failure in 205. A run the gate refused is a gated run, so the claim
+        contradicts the provenance paragraph fifteen lines above it. What is
+        true is the scoped statement: every published cell passed.
+
+        Observed on that tree: AssertionError: Lists differ:
+        ["report/shared-nothing-renders.html: 'Zero failures in every gated
+        run' is contradicted by the refusal this document records", ...] != []
+        (2 findings).
+        """
+        self.maxDiff = None
+        html = self._plain(self._read("report/shared-nothing-renders.html"))
+        self.assertRegex(
+            html, r"(?i)refused by the zero-failure gate",
+            "the report no longer records the refused attempt; the lint is vacuous")
+        claim = re.compile(r"(?i)\b(?:zero failures? in every|every gated run passed)\b[^,.;]*")
+        bad = []
+        checked = 0
+        for name in self.REPORT_DOCS:
+            for m in claim.finditer(self._plain(self._read(name))):
+                checked += 1
+                if "published cell" not in m.group(0).lower():
+                    bad.append(f"{name}: {m.group(0)!r} is contradicted by the refusal "
+                               f"this document records; scope it to published cells")
+        self.assertTrue(checked, "no zero-failure claim was checked")
+        self.assertEqual(bad, [], "\n".join(bad))
+
 
 def probe_stub_source(clone_pid_file, exec_log, sleep_pid_file, exec_mode="canned"):
     """An fcvm stub that is BOTH a clone and an exec client.
