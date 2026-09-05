@@ -260,6 +260,33 @@ def proc_state(pid):
     return None if identity is None else identity["state"]
 
 
+# Teardown walks a process through Z (EXIT_ZOMBIE) and then X (EXIT_DEAD)
+# before its procfs entry disappears. wait_task_zombie() stores EXIT_DEAD, then
+# does rusage accounting and a copy to user space, and only then calls
+# release_task() to unhash the pid (kernel/exit.c), so /proc/<pid>/stat reads
+# "X" for a process that has already exited. A terminal check naming only Z
+# reads that window as a running process.
+TERMINAL_PROCESS_STATES = (None, "Z", "X")
+
+
+def process_is_gone(pid):
+    """True once pid no longer runs: absent, reaped (Z), or released (X)."""
+    return proc_state(pid) in TERMINAL_PROCESS_STATES
+
+
+def wait_process_gone(test, pid, what, timeout=10):
+    """Poll pid to a terminal state, failing test while it is still running."""
+    deadline = time.monotonic() + timeout
+    while True:
+        state = proc_state(pid)
+        if state in TERMINAL_PROCESS_STATES:
+            return state
+        if time.monotonic() >= deadline:
+            test.fail(
+                f"{what} is still running in state {state!r} after {timeout}s")
+        time.sleep(0.01)
+
+
 def kill_and_reap_test_process_group(process):
     """Kill the session rooted at process and drain its captured pipes."""
     try:
@@ -2058,7 +2085,7 @@ exec {real_date!r} "$@"
                 self.assertIsNotNone(
                     producer.poll(), "timed-out test left hostcdp running")
                 deadline = time.monotonic() + 5
-                while proc_state(create_pid) not in (None, "Z"):
+                while not process_is_gone(create_pid):
                     if time.monotonic() >= deadline:
                         self.fail("timed-out test left podman create running")
                     time.sleep(0.01)
@@ -2066,13 +2093,13 @@ exec {real_date!r} "$@"
                 if producer.poll() is None:
                     os.killpg(producer.pid, signal.SIGKILL)
                     producer.communicate(timeout=5)
-                if create_pid is not None and proc_state(create_pid) not in (None, "Z"):
+                if create_pid is not None and not process_is_gone(create_pid):
                     try:
                         os.kill(create_pid, signal.SIGKILL)
                     except ProcessLookupError:
                         pass
                     deadline = time.monotonic() + 5
-                    while proc_state(create_pid) not in (None, "Z"):
+                    while not process_is_gone(create_pid):
                         if time.monotonic() >= deadline:
                             self.fail("emergency cleanup could not reap podman create")
                         time.sleep(0.01)
@@ -2126,7 +2153,7 @@ exec {real_date!r} "$@"
                     producer.poll(), "group cleanup left its session leader alive"
                 )
                 deadline = time.monotonic() + 5
-                while proc_state(child_pid) not in (None, "Z"):
+                while not process_is_gone(child_pid):
                     if time.monotonic() >= deadline:
                         self.fail("group cleanup left its pipe-holding child alive")
                     time.sleep(0.01)
@@ -2137,7 +2164,7 @@ exec {real_date!r} "$@"
                     pass
                 if producer.poll() is None:
                     producer.communicate(timeout=5)
-                if child_pid is not None and proc_state(child_pid) not in (None, "Z"):
+                if child_pid is not None and not process_is_gone(child_pid):
                     try:
                         os.kill(child_pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -5030,10 +5057,10 @@ os.fsync = _fsync
                     proc.returncode, 1,
                     "an escaped descendant was omitted from phase integrity",
                 )
-                self.assertIn(proc_state(child), (None, "Z"),
-                              "the escaped descendant survived supervision")
+                wait_process_gone(self, child,
+                                  "the escaped descendant after supervision")
             finally:
-                if proc_state(child) not in (None, "Z"):
+                if not process_is_gone(child):
                     pidfd = os.pidfd_open(child)
                     try:
                         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
@@ -5120,9 +5147,9 @@ os.fsync = _fsync
                         )
                 with open(child_file) as handle:
                     child = int(handle.read())
-                self.assertIn(
-                    proc_state(child), (None, "Z"),
-                    "a post-leader drain error left an adopted descendant alive",
+                wait_process_gone(
+                    self, child,
+                    "the adopted descendant after a post-leader drain error",
                 )
                 self.assertGreaterEqual(
                     scan_calls, 2,
@@ -5132,7 +5159,7 @@ os.fsync = _fsync
                 if child is None and os.path.isfile(child_file):
                     with open(child_file) as handle:
                         child = int(handle.read())
-                if child is not None and proc_state(child) not in (None, "Z"):
+                if child is not None and not process_is_gone(child):
                     pidfd = os.pidfd_open(child)
                     try:
                         signal.pidfd_send_signal(pidfd, signal.SIGKILL)
@@ -5468,9 +5495,9 @@ os.fsync = _fsync
             os.kill(parent.pid, signal.SIGKILL)
             parent.communicate(timeout=20)
 
-            self.assertIn(proc_state(supervisor_pid), (None, "Z"))
-            self.assertIn(proc_state(phase_pid), (None, "Z"),
-                          "parent death left the measured phase alive")
+            wait_process_gone(self, supervisor_pid, "the phase supervisor")
+            wait_process_gone(self, phase_pid,
+                              "the measured phase after parent death")
 
     def test_phase_supervisor_finalizes_after_parent_sigkill(self):
         """A registered finalizer runs after the phase has been reaped.
@@ -5540,8 +5567,8 @@ os.fsync = _fsync
 
                 with open(state_path) as handle:
                     self.assertEqual(handle.read(), "active\n")
-                self.assertIn(proc_state(supervisor_pid), (None, "Z"))
-                self.assertIn(proc_state(phase_pid), (None, "Z"))
+                wait_process_gone(self, supervisor_pid, "the phase supervisor")
+                wait_process_gone(self, phase_pid, "the finalized phase")
             finally:
                 if parent.poll() is None:
                     parent.kill()
@@ -5635,7 +5662,7 @@ os.fsync = _fsync
                 )
                 with open(state_path) as handle:
                     self.assertEqual(handle.read(), "active\n")
-                self.assertIn(proc_state(finalizer_pid), (None, "Z"))
+                wait_process_gone(self, finalizer_pid, "the finalizer")
             finally:
                 try:
                     os.write(release_fd, b"R")
@@ -5646,9 +5673,9 @@ os.fsync = _fsync
                     parent.kill()
                     parent.wait(timeout=5)
                 if (finalizer_pidfd is not None
-                        and proc_state(finalizer_pid) not in (None, "Z")):
+                        and not process_is_gone(finalizer_pid)):
                     signal.pidfd_send_signal(finalizer_pidfd, signal.SIGKILL)
-                if proc_state(supervisor_pid) not in (None, "Z"):
+                if not process_is_gone(supervisor_pid):
                     signal.pidfd_send_signal(supervisor_pidfd, signal.SIGKILL)
                 if finalizer_pidfd is not None:
                     os.close(finalizer_pidfd)
@@ -5739,11 +5766,11 @@ os.fsync = _fsync
                 while time.monotonic() < deadline:
                     with open(state_path) as handle:
                         state = handle.read()
-                    if state == "active\n" and proc_state(supervisor_pid) in (None, "Z"):
+                    if state == "active\n" and process_is_gone(supervisor_pid):
                         break
                     time.sleep(0.01)
                 self.assertEqual(state, "active\n")
-                self.assertIn(proc_state(supervisor_pid), (None, "Z"))
+                wait_process_gone(self, supervisor_pid, "the phase supervisor")
                 with open(calls_path) as handle:
                     self.assertEqual(
                         handle.read().splitlines(),
@@ -5996,7 +6023,7 @@ os.fsync = _fsync
                     os.killpg(campaign.pid, signal.SIGKILL)
                     campaign.communicate(timeout=5)
                 if (detached_ready and guardian_pid is not None
-                        and proc_state(guardian_pid) not in (None, "Z")):
+                        and not process_is_gone(guardian_pid)):
                     try:
                         os.killpg(guardian_pid, signal.SIGKILL)
                     except ProcessLookupError:
@@ -6226,8 +6253,8 @@ os.fsync = _fsync
                 os.kill(sudo_pid, signal.SIGKILL)
                 wait_for(restore_started, "the blocked DNS finalizer")
                 self.assertIsNone(campaign.poll())
-                self.assertNotIn(proc_state(guardian_pid), (None, "Z"))
-                self.assertNotIn(proc_state(supervisor_pid), (None, "Z"))
+                self.assertFalse(process_is_gone(guardian_pid))
+                self.assertFalse(process_is_gone(supervisor_pid))
                 self.assertNotEqual(
                     subprocess.run(
                         ["flock", "-n", lock_path, "true"],
@@ -6275,7 +6302,7 @@ os.fsync = _fsync
                     os.killpg(campaign.pid, signal.SIGKILL)
                     campaign.communicate(timeout=5)
                 for pid in (guardian_pid, supervisor_pid, sudo_pid):
-                    if pid is not None and proc_state(pid) not in (None, "Z"):
+                    if pid is not None and not process_is_gone(pid):
                         try:
                             os.kill(pid, signal.SIGKILL)
                         except ProcessLookupError:
@@ -6449,11 +6476,11 @@ os.fsync = _fsync
 
                 os.kill(guardian_pid, signal.SIGTERM)
                 time.sleep(0.1)
-                self.assertNotIn(
-                    proc_state(guardian_pid), (None, "Z"),
+                self.assertFalse(
+                    process_is_gone(guardian_pid),
                     "TERM killed the guardian before its child finished",
                 )
-                self.assertNotIn(proc_state(child_pid), (None, "Z"))
+                self.assertFalse(process_is_gone(child_pid))
                 self.assertFalse(os.path.exists(status_path))
                 self.assertNotEqual(
                     subprocess.run(
@@ -6474,7 +6501,7 @@ os.fsync = _fsync
                 with open(child_release, "w"):
                     pass
                 for pid in (child_pid, guardian_pid):
-                    if pid is not None and proc_state(pid) not in (None, "Z"):
+                    if pid is not None and not process_is_gone(pid):
                         try:
                             os.kill(pid, signal.SIGKILL)
                         except ProcessLookupError:
@@ -6519,6 +6546,85 @@ os.fsync = _fsync
         self.assertIn('--lease-fd 9 --control-fd "$SERVE_CONTROL_FD"', source)
         self.assertIn('--completion-path "$SERVE_COMPLETION_PATH"', source)
         self.assertIn('--completion-token "$SERVE_COMPLETION_TOKEN"', source)
+
+    @staticmethod
+    def _reported_state(state):
+        return mock.patch.object(
+            phase_supervisor, "read_process_stat",
+            return_value={"pid": 4242, "state": state, "ppid": 1,
+                          "pgid": 4242, "starttime": 0})
+
+    def test_terminal_process_checks_accept_the_whole_release_window(self):
+        """A process that has exited reads as gone in every teardown state.
+
+        RED BEFORE THE FIX: the terminal checks named only Z, so the X
+        (EXIT_DEAD) window that wait_task_zombie() holds open between storing
+        EXIT_DEAD and calling release_task() read an already-exited process as
+        still running. CI hit that window on 5028c718 in
+        test_phase_supervisor_finalizes_after_parent_sigkill:
+        "AssertionError: 'X' not found in (None, 'Z')"
+        (actions/runs/33618696866/job/100210498405).
+        """
+        for state in ("Z", "X"):
+            with self.subTest(state=state), self._reported_state(state):
+                self.assertTrue(
+                    process_is_gone(4242),
+                    f"an exited process in state {state} read as running")
+                self.assertEqual(
+                    wait_process_gone(self, 4242, "the probe", timeout=0),
+                    state)
+        with mock.patch.object(phase_supervisor, "read_process_stat",
+                               return_value=None):
+            self.assertTrue(process_is_gone(4242))
+            self.assertIsNone(wait_process_gone(self, 4242, "the probe",
+                                                timeout=0))
+
+    def test_terminal_process_checks_still_fail_on_a_running_process(self):
+        """Every live kernel state must keep failing the terminal check.
+
+        Widening the accepted set to cover the release window must not turn the
+        check into one that cannot fire: a supervisor still scheduled, sleeping,
+        in uninterruptible I/O, or stopped is a defect these tests exist to
+        catch.
+        """
+        for state in ("R", "S", "D", "T", "t", "I", "P"):
+            with self.subTest(state=state), self._reported_state(state):
+                self.assertFalse(
+                    process_is_gone(4242),
+                    f"a process running in state {state} read as gone")
+                with self.assertRaises(self.failureException):
+                    wait_process_gone(self, 4242, "the probe", timeout=0.05)
+
+    def test_terminal_process_checks_still_fail_on_a_live_process(self):
+        """The same check, against a real process rather than a reported state.
+
+        Mocked states prove the predicate; this proves the call sites, which
+        read /proc. A sleeping child and a SIGSTOPped one are the states a
+        supervisor that failed to exit actually sits in.
+        """
+        child = subprocess.Popen([sys.executable, "-c", "import time;"
+                                  " time.sleep(120)"])
+        try:
+            for signum, expected in ((None, "S"), (signal.SIGSTOP, "T")):
+                if signum is not None:
+                    os.kill(child.pid, signum)
+                deadline = time.monotonic() + 5
+                while proc_state(child.pid) != expected:
+                    if time.monotonic() >= deadline:
+                        self.fail(f"child never reached state {expected}")
+                    time.sleep(0.01)
+                with self.subTest(state=expected):
+                    self.assertFalse(
+                        process_is_gone(child.pid),
+                        f"a live child in state {expected} read as gone")
+                    with self.assertRaises(self.failureException):
+                        wait_process_gone(self, child.pid, "the live child",
+                                          timeout=0.2)
+        finally:
+            os.kill(child.pid, signal.SIGCONT)
+            child.kill()
+            child.wait(timeout=5)
+        wait_process_gone(self, child.pid, "the reaped child", timeout=5)
 
     def test_proc_state_readers_treat_disappearance_during_read_as_gone(self):
         class VanishedProcStat:
