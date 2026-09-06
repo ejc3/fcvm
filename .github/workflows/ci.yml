@@ -249,7 +249,7 @@ jobs:
         run: make test-ci-infrastructure
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -296,7 +296,7 @@ jobs:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Get dependency SHAs
         id: deps
         run: |
@@ -329,7 +329,7 @@ jobs:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@1.120.0
       - name: Get dependency SHAs
         id: deps
         run: |
