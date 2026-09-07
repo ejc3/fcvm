@@ -3,16 +3,20 @@
 `shared-nothing-renders.html` is the source for the published benchmark report:
 https://claude.ai/code/artifact/bc59e62a-a8b3-49f1-b759-878061c94a2e
 
-## Why this exists
+The HTML is the maintained report source. `../REVIEW.md` records withdrawals
+and the status of historical evidence.
 
-The report lived ONLY as an artifact URL. `git ls-files bench/` returned 919
-files, including the entire harness, and no source for the document that quotes
-it. The only other copy was a tool-result cache in a session scratchpad. That is
-the same exposure that already cost the measurements: the probe-set directories
-the report cites by name were destroyed with an instance-store wipe on
-2026-08-15 and do not exist on any filesystem, worktree, or scratchpad.
+## Closeout status (2026-09-07)
 
-`bench/chromium/AGENTS.md` already required a source of record. This is it.
+- The source retains the verified 549.4 ms corpus headline and 2/4/8 vCPU ladder.
+- Unsupported network, memory, CPU-demand and WebKit conclusions are removed.
+- Fixture measurements remain explicitly labelled optimisation evidence.
+- Useful August 30 records are retained under `evidence/20260830/`, with their
+  limitations and reproduction inputs. They are not publication-qualified results.
+- **External publication is pending.** This session has no Artifact publisher.
+  The public URL returns a loader, not a report body that can be checked against
+  this file. Republish to the existing URL with an authorized publisher, then
+  verify the headline and removal of the historical comparison tables there.
 
 ## Publishing
 
@@ -46,16 +50,9 @@ exactly what makes it a good MICRO-BENCHMARK for optimisation work, where the
 question is whether a configuration change moved a number. It is not a workload
 anyone runs, so it must not carry a published figure.
 
-What this rule costs the current document, so nobody rediscovers it:
-
-- The verdict box's second headline, `348.7 ms direct-CDP p50`, is a fixture
-  number. Not publishable as a headline.
-- The whole "Fixture latency ladder, direct CDP" section is fixture-based:
-  RB, AB, PF, HM, HK, NC, FG. Keep it as optimisation evidence, clearly marked,
-  or cut it.
-- "Where the isolation premium lives" decomposes a fixture render against the
-  host container. Same treatment.
-- "Three network modes, priced" is fixture-based AND has no surviving record.
+The 348.7 ms direct-CDP figure and the fixture latency/decomposition tables
+remain optimisation evidence only. They do not appear as corpus headlines or
+support CPU, memory or network-mode comparisons against Cloudflare.
 
 That leaves the corpus mix as the publishable headline: 549.4 ms [467.9, 632.4],
 n=202, 14 URLs cycled uniformly, 4 guest vCPUs, from
@@ -73,95 +70,29 @@ The 695.7 ms at 4 vCPU that stood here before came from
 Regeneration follows the same rule: anything intended for publication is a
 corpus run, not a fixture run.
 
-## Known corrections outstanding
+## Corrections closed in the source
 
-Recorded here so an editor does not have to rediscover them. None are stylistic;
-each is a claim the evidence no longer supports:
+The network-mode, concurrency/memory, memory-frontier, ablation and WebKit
+sections depended on probe directories that no longer exist. Their quantitative
+tables and conclusions are removed, including repeated claims in the Kitesurf
+table, provenance and bottom line. The earlier instantaneous CPU-demand series
+is withdrawn for live-DNS contamination; it no longer supplies a demand chart or
+host/guest queueing attribution. The historical fixture VMM CPU counter is not
+presented as whole-system corpus CPU, and the separately measured fixture stage
+differences are not treated as a causal virtualization/memory decomposition.
 
-1. Six sections quote records that no longer exist: "Three network modes,
-   priced", "Concurrency and memory amortization", "The memory frontier",
-   "Ablating the floor", "A second engine: WebKit", and the Kitesurf memory/CPU
-   rows. The three network-mode run ids it cites (f0023333, b87bb625, 62962574)
-   appear nowhere, and every surviving analysis.json (23 at audit time; the 14
-   curated ones are committed under results/) records network_mode "rootless",
-   so no non-rootless record exists to re-derive.
-2. Provenance says the probe sets are "kept alongside the run index". They are
-   not kept. That sentence is false as published.
-3. "Open measurements" still lists network-mode A/B/C as open while a full
-   section prices it. Do NOT resolve that by deleting the clause: it is the last
-   in-document hedge on the section with zero retrievable evidence. Demote the
-   section instead.
-4. The five headline runs are not mutually seal-comparable: five bundles, five
-   revisions, three snapshot tags. Only the -huge pair shares a seal, so any
-   cross-run subtraction crosses a seal boundary and should say so.
+Provenance states which records are missing. The zero-failure statement covers
+only published cells and retains the historical refused bridged attempt. The
+fixture table already identifies different goldens and runtime seals; only
+same-golden A/B pairs support configuration deltas. The 2026-08-16 corpus
+withdrawal and verified replacement ladder are documented below.
 
-## Corrections applied
-
-Kept as a record of what was wrong, because a corrections file that only ever
-grows is a file nobody acts on.
-
-The 34.7 MiB/clone huge-minor cell was filed here as a correction to
-`shared-nothing-renders.html`, which never published it. It lives in
-`bench/chromium/README.md` and `bench/chromium/REVIEW.md` — the second being the
-file `bench/chromium/README.md` tells readers to "read before quoting anything
-from this directory". Filing it against the wrong document left the overclaim
-standing in the two files a reader is pointed at. Both are now corrected in
-place: 34.7 counts only non-hugetlb memory, since cgroup2 on this host mounts
-without `memory_hugetlb_accounting` and carries no hugetlb controller (verified:
-`mount | grep cgroup2` shows `rw,nosuid,nodev,noexec,relatime,nsdelegate,memory_recursiveprot`),
-and the pool was pre-allocated before the sample, so MemAvailable cannot move
-for those pages either. On the pool-consumption basis, hugepage-minor is
-553-611 MiB per concurrent clone against 133-146 at 4K — it loses on memory and
-buys render latency.
-
-Eleven further defects were found by an adversarial review of this branch and
-fixed in the same pass:
-
-- "Neither mode's render or memory regresses with concurrency at 1 GiB" was
-  refuted by the table directly above it: density render goes 476, 461, 448,
-  then 767 ms at N=32. Now stated as the regression it is.
-- The Bottom line called hugepage per-clone memory "unmeasured and the next
-  experiment" while two sections measure and publish it.
-- "124-298 MiB per concurrent clone at 4 K pages": 298 appears nowhere in the
-  document; the tables give 133-146 at 1 GiB and 108-203 across both guest sizes.
-- WebKit's clean N=1 marginal (147) was compared against Chromium's 124, an
-  ablation floor probe. The matched clean cell is 146, so the engines are at
-  parity.
-- Upstream PR #5696 was cited for two different fixes. It is the dump_dirty PR
-  (verified against the firecracker repo); the vsock muxer change was never
-  filed upstream at all, and now says so.
-- "Plus five commits ... Ranked by relevance:" listed four bullets. The branch is
-  six commits ahead, five non-merge; the serial-interrupt bullet covers two of
-  them (fix plus regression test).
-- "On 4K pages copy is 14% faster than minor" inverted the base: 532.5 vs 607.9
-  makes minor 14% slower and copy 12% faster. Restated to match the body.
-- "Across all 370 LD clones" cannot be reconciled with the rung list (nine rungs,
-  199 clones per fill mode) and the record is gone, so the unverifiable total is
-  no longer asserted.
-- Kitesurf's Chromium column was called "their isolated Chromium" in one place
-  and a warm pool in three others; the headline 1.8x ratio depends on which.
-- "0 failures anywhere" is scoped to the runs in that table; a bridged attempt
-  was refused by the zero-failure gate.
-- The run-id legend omitted NM, and the publish incantation omitted the required
-  `favicon` argument, and the section count said 15 against an actual 14. (The
-  2026-08-16 reproduction section brings it back to 15; the count above is
-  current.)
-
-The 2026-08-16 corpus series was withdrawn on 2026-09-02 for live-DNS
-contamination (the section below has the evidence). The headline moved from
-695.7 ms at 4 vCPU to the DNS-verified 712.6 ms at 2 vCPU, the vCPU ladder,
-its steps and its noise floor were withdrawn, the CPU-demand section lost its
-latency captions, the elmundo note now names its cause, and the "TCP connect is
-0.1 ms" network exclusion was withdrawn because the stage it quoted never
-measured the page's network. `test_reqbench.DocLint` now fails if a doc cites
-a withdrawn corpus record without saying so, or quotes a corpus figure that is
-not a median, lo or hi of a DNS-verified record.
-
-The headline is now the 4 vCPU 549.4 ms of the DNS-verified 2/4/8 vCPU ladder
-measured on 2026-09-02, not the 2 vCPU 712.6 ms that replaced the withdrawn
-figure first. Both cells are verified and both are quoted. This file previously
-said 4 and 8 vCPU were "not measured on the fixed tree"; the ladder measures
-them, and the rows that called the knee unmeasured are corrected.
+The August 30 host-browser and memory experiments do not replace the missing
+probe sets. Their retained metadata, summaries and reduction inputs are listed
+in [evidence/20260830/README.md](evidence/20260830/README.md). Blocked arms,
+changing URL mixes, unreconciled memory bases and missing provenance prevent
+publication comparisons from those records. No new campaign is needed for the
+current latency report; those measurements are follow-up research.
 
 ## Corpus latency by guest vCPU count
 
@@ -332,8 +263,7 @@ waited for real timeouts. The DNS-verified run measures elmundo at 3,842 ms
 median [3,714, 3,879], n=14, on 2 vCPUs, one screenshot form across all 14
 renders. The 114 ms it used to add to the mix median and the 581.8 ms
 elmundo-excluded figure are withdrawn with the run that produced them. The
-remaining 1.5 s over the 2.36 s host-container load (2026-08-17 probe,
-unretained) is not decomposed.
+unretained host-container probe supplies no current comparison.
 
 Records: `results/reqbench-20260902-023115-corpus-c2/analysis.json`,
 `results/reqbench-20260902-025115-corpus-c4/analysis.json`,
