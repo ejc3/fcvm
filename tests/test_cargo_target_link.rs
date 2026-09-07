@@ -3618,6 +3618,31 @@ fn cargo_target_link_preserves_fallback_path_aliases() {
     );
 }
 
+#[test]
+fn cargo_target_link_keeps_external_generation_paths() {
+    for absolute in [false, true] {
+        let root = tempfile::tempdir().expect("scratch root");
+        let checkout = root.path().join("checkout");
+        let relative = Path::new("../external/.cargo-target-local.generation-shared/output");
+        let cache = checkout.join(relative);
+        std::fs::create_dir(&checkout).expect("checkout");
+        std::fs::create_dir_all(&cache).expect("external cache");
+        std::fs::write(cache.join("artifact"), b"cached").expect("cached artifact");
+        let destination = if absolute {
+            cache.clone()
+        } else {
+            relative.to_path_buf()
+        };
+        let target = checkout.join("target");
+        std::os::unix::fs::symlink(&destination, &target).expect("external cache link");
+
+        let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+        assert!(ok, "external generation path was rejected:\n{out}");
+        assert_eq!(std::fs::read_link(&target).unwrap(), destination);
+        assert_eq!(std::fs::read(target.join("artifact")).unwrap(), b"cached");
+    }
+}
+
 /// A fallback identifies one checkout-local generation, not a path through it.
 /// Reject malformed links before mkdir or cleanup can alter either directory.
 #[test]

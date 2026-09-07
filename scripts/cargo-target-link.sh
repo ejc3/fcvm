@@ -112,19 +112,28 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # payload is reachable only while target/ names it.
 LOCAL_TARGET_PREFIX="$p/.cargo-target-local"
 
-# Classify aliases consistently without following generation symlinks. Reject
-# paths through a reserved generation component before normalization can erase
-# that traversal and cleanup can remove a directory target/ still needs.
+# Classify aliases without following symlinks. Only a generation directly under
+# this checkout belongs to cleanup; the same basename in an external cache does
+# not. Check before normalizing away traversal through an owned generation.
 target_link_destination() {
 	local destination
 	destination="$(readlink target)" || return 1
-	case "/$destination" in
-		*/.cargo-target-local.generation-*/*)
-			echo "ERROR: invalid fallback target $destination; expected one generation basename" >&2
-			return 1
-			;;
-	esac
-	realpath -m -s -- "$destination"
+	/usr/bin/python3 -c '
+import posixpath
+import sys
+
+checkout, destination = sys.argv[1:3]
+parts = destination.split("/")
+parent = "/" if destination.startswith("/") else checkout
+for index, part in enumerate(parts):
+    if (parent == checkout and part.startswith(".cargo-target-local.generation-")
+            and index + 1 < len(parts)):
+        print(f"ERROR: invalid fallback target {destination}; expected one generation basename",
+              file=sys.stderr)
+        raise SystemExit(1)
+    parent = posixpath.normpath(posixpath.join(parent, part))
+print(parent)
+' "$p" "$destination"
 }
 
 # Validate before any filesystem mutation, including when btrfs is available.
