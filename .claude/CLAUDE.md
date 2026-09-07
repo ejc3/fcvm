@@ -1941,7 +1941,8 @@ Cargo.lock pins the Git revision of `fuse-backend-rs` for normal builds and CI.
 Host builds do not need a sibling checkout. Container recipes retain the
 `FUSE_BACKEND_RS` and `FUSER` source mounts, so those directories must exist;
 an explicit backend override replaces that mount's source directory.
-To compile uncommitted changes in a local checkout, opt in explicitly:
+The local override is Make-only. To compile uncommitted changes in a local
+checkout, opt in explicitly:
 ```bash
 make build FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs
 make container-test FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs
@@ -1956,6 +1957,9 @@ the Git dependency again; review its lockfile diff before committing.
 `make lint` audits the default Git dependency graph and rejects a local override:
 the pinned cargo-deny version cannot receive the local Cargo patch configuration.
 Use `make clippy` to lint local dependency development without that audit.
+The standalone `scripts/run_fuse_pipe_tests.sh` uses the default Git dependency
+and rejects a local override. For local FUSE tests, use
+`make test-root FILTER='-p fuse-pipe' FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs`.
 
 ### Container KVM Access (Rootless Podman)
 

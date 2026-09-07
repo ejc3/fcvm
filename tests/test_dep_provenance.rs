@@ -737,6 +737,49 @@ fn dependency_auditing_rejects_a_local_override_before_running_tools() {
     assert!(!String::from_utf8_lossy(&out.stdout).contains("UNEXPECTED-TOOL-SETUP"));
 }
 
+#[test]
+fn standalone_fuse_sweep_rejects_a_local_override_before_setup() {
+    let scratch = tempfile::tempdir().unwrap();
+    let bin = scratch.path().join("bin");
+    let probe = scratch.path().join("setup-ran");
+    let logs = scratch.path().join("logs");
+    fs::create_dir(&bin).unwrap();
+    write_executable(
+        &bin.join("make"),
+        "#!/bin/bash\nprintf 'setup ran\\n' > \"$FCVM_SWEEP_PROBE\"\nexit 97\n",
+    );
+    chown_tree(scratch.path());
+    let mut command = Command::new(repo_root().join("scripts/run_fuse_pipe_tests.sh"));
+    command
+        .env("FUSE_BACKEND_RS_OVERRIDE", scratch.path().join("local"))
+        .env("LOG_DIR", &logs)
+        .env("FCVM_SWEEP_PROBE", &probe)
+        .env(
+            "PATH",
+            format!("{}:{}", bin.display(), std::env::var("PATH").unwrap()),
+        );
+    drop_priv(&mut command);
+    let out = command.output().unwrap();
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{stderr}");
+    assert!(
+        stderr.contains("FUSE_BACKEND_RS_OVERRIDE is Make-only"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("make test-root FILTER='-p fuse-pipe'"),
+        "{stderr}"
+    );
+    assert!(
+        !probe.exists(),
+        "the script reached setup before rejecting the override"
+    );
+    assert!(
+        !logs.exists(),
+        "the rejected invocation created a log directory"
+    );
+}
+
 /// Execute the real `build-host-tools` recipe with a stub cargo wrapper and
 /// prove the mid-build guard behaviorally: a sibling checkout mutated while
 /// "cargo" runs must fail the build with the provenance error, and an

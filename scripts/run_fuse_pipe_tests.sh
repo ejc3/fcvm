@@ -14,6 +14,11 @@
 #   STRESS_WORKERS - overrides stress worker count
 set -euo pipefail
 
+if [[ -n "${FUSE_BACKEND_RS_OVERRIDE:-}" ]]; then
+    echo "ERROR: FUSE_BACKEND_RS_OVERRIDE is Make-only. Run make test-root FILTER='-p fuse-pipe' with the same override." >&2
+    exit 2
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${ROOT}"
 make cargo-target-link
