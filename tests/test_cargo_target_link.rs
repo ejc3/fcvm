@@ -2445,6 +2445,8 @@ fn fuse_pipe_privileged_cargo_preserves_target_protocol_environment() {
     path.push(":");
     path.push(inherited_path);
     let output = Command::new(repo_root().join("scripts/run_fuse_pipe_tests.sh"))
+        // This fixture exercises the standalone script's default Git dependency mode.
+        .env_remove("FUSE_BACKEND_RS_OVERRIDE")
         .env("PATH", path)
         .env("FCVM_TEST_LOG", &observed)
         .env("LOG_DIR", &log_dir)

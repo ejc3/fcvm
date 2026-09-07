@@ -1,7 +1,8 @@
 name: Checkout Dependencies
 description: Checkout fuser and fuse-backend-rs dependencies
 
-# UPDATE BRANCHES HERE - this is the single source of truth
+# These checkouts supply container mounts and local dependency development.
+# Normal builds use the Git revisions pinned in fcvm's Cargo.lock.
 # fuser: https://github.com/ejc3/fuser
 # fuse-backend-rs: https://github.com/ejc3/fuse-backend-rs
 

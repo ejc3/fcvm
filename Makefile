@@ -23,7 +23,7 @@ CARGO_BIN ?= cargo
 # exclusively before pruning idle artifacts, so age-check -> delete cannot race
 # a build.  `override` prevents `make CARGO=cargo ...` from silently bypassing
 # the safety protocol; CARGO_BIN remains available for toolchain selection.
-override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN)
+override CARGO = "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" $(CARGO_BIN) $(CARGO_LOCAL_CONFIG)
 
 # Custom dependencies bin directory
 CUSTOM_DEPS_BIN := /mnt/fcvm-btrfs/deps/bin
@@ -41,6 +41,7 @@ show-notes:
 
 # Paths (can be overridden via environment)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
+FUSE_BACKEND_RS_OVERRIDE ?=
 FUSER ?= /home/ubuntu/fuser
 
 # Container settings
@@ -148,12 +149,23 @@ endif
 BTRFS_ROOT ?= /mnt/fcvm-btrfs
 export BTRFS_ROOT
 MAKEFILE_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
+# A Make-only patch leaves the checked-in manifests resolvable by Dependabot.
+# Use one absolute path for Cargo, provenance, and the container bind mount.
+FUSE_BACKEND_RS_OVERRIDE_PATH := $(if $(strip $(FUSE_BACKEND_RS_OVERRIDE)),$(shell realpath -m -- "$(FUSE_BACKEND_RS_OVERRIDE)"))
+CARGO_LOCAL_CONFIG = $(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),--config 'patch."https://github.com/ejc3/fuse-backend-rs.git".fuse-backend-rs.path="$(FUSE_BACKEND_RS_OVERRIDE_PATH)"')
+# cargo-deny 0.18.9 cannot consume Cargo's CLI patch configuration.
+ifneq ($(FUSE_BACKEND_RS_OVERRIDE_PATH),)
+ifneq ($(filter lint,$(MAKECMDGOALS)),)
+$(error lint audits the locked Git graph; unset FUSE_BACKEND_RS_OVERRIDE and run make dependency-metadata first, or use make clippy for local code)
+endif
+endif
 
 # Base test command
 # `target` is a symlink into BTRFS_ROOT, created by the cargo-target-link target
 # (a prerequisite of every build/test target).
 export CARGO_TARGET_DIR := target
-NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) --release
+# Cargo does not forward global --config to external subcommands.
+NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # Extra flags forwarded to every criterion bench recipe (see bench-quick).
 #
@@ -217,7 +229,8 @@ CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
 	--security-opt label=disable --group-add keep-groups \
 	-v .:/workspace/fcvm \
 	$(TARGET_MOUNT) \
-	-v $(FUSE_BACKEND_RS):/workspace/fuse-backend-rs -v $(FUSER):/workspace/fuser \
+	-v "$(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),$(FUSE_BACKEND_RS_OVERRIDE_PATH),$(FUSE_BACKEND_RS)):/workspace/fuse-backend-rs" -v $(FUSER):/workspace/fuser \
+	$(if $(FUSE_BACKEND_RS_OVERRIDE_PATH),-e FUSE_BACKEND_RS_OVERRIDE=/workspace/fuse-backend-rs) \
 	--device /dev/fuse -v /dev/kvm:/dev/kvm -v /dev/userfaultfd:/dev/userfaultfd \
 	--ulimit nofile=65536:65536 --ulimit nproc=-1:-1 \
 	-v /mnt/fcvm-btrfs:/mnt/fcvm-btrfs \
@@ -457,36 +470,25 @@ clean-test-data: build
 	mkdir -p /tmp/fcvm-test-logs
 	@echo "==> Cleaned test data (preserved cached assets)"
 
-# Record which FUSE dependency code this build compiles against. Two
-# dependencies, two mechanisms:
-#   fuse-backend-rs is a sibling path dependency (fuse-pipe/Cargo.toml points
-#   at ../../fuse-backend-rs), so the compiled code is whatever that directory
-#   holds, not what any lockfile pins. Reported as git describe of the
-#   checkout, or MISSING when there is no checkout. When the tree is dirty
-#   the line appends +<first 12 hex of sha256 over `git diff HEAD`>, because
-#   every possible local edit against one commit otherwise prints the same
-#   -dirty value. Untracked files are excluded from the digest: describe
-#   --dirty does not flag them, and an untracked file cannot reach the build
-#   unless a tracked file references it, which dirties the tree.
-#   fuser is a git dependency (fuse-pipe/Cargo.toml declares the URL,
-#   Cargo.lock pins the revision). Cargo compiles the locked revision from
-#   its git cache, never the sibling /workspace/fuser mount, so the line
-#   reports the lock's resolved source, which carries the exact commit
-#   after '#'.
+# Record Cargo.lock's resolved FUSE Git sources, not unused sibling checkouts.
+# An explicit fuse-backend-rs override reports the selected checkout instead:
+# git describe plus a tracked-diff digest distinguishes local dirty states.
 # Issue #807: two local fuse-backend-rs checkouts drifted 19 commits apart
 # and no build log recorded which one a given binary used. Pinned by
 # tests/test_dep_provenance.rs.
 .PHONY: dep-provenance
 dep-provenance:
-	@dir="$(MAKEFILE_DIR)../fuse-backend-rs"; \
-	if desc=$$(git -C "$$dir" describe --always --dirty 2>/dev/null); then \
-		case "$$desc" in \
-			*-dirty) desc="$$desc+$$(git -C "$$dir" diff --no-ext-diff HEAD | sha256sum | cut -c1-12)" ;; \
-		esac; \
+	@if [ -n "$(FUSE_BACKEND_RS_OVERRIDE_PATH)" ]; then \
+		dir="$(FUSE_BACKEND_RS_OVERRIDE_PATH)"; \
+		if desc=$$(git -C "$$dir" describe --always --dirty 2>/dev/null); then \
+			case "$$desc" in \
+				*-dirty) desc="$$desc+$$(git -C "$$dir" diff --no-ext-diff HEAD | sha256sum | cut -c1-12)" ;; \
+			esac; \
+		else desc=MISSING; fi; \
 	else \
-		desc=MISSING; \
+		desc=$$(awk -F'"' '/^name = "fuse-backend-rs"$$/ {f=1; next} f && /^\[\[package\]\]/ {exit} f && /^source = / {print $$2; exit}' "$(MAKEFILE_DIR)Cargo.lock" 2>/dev/null); \
 	fi; \
-	echo "fuse-backend-rs: $$desc"
+	echo "fuse-backend-rs: $${desc:-MISSING}"
 	@src=$$(awk -F'"' '/^name = "fuser"$$/ {f=1; next} f && /^\[\[package\]\]/ {exit} f && /^source = / {print $$2; exit}' "$(MAKEFILE_DIR)Cargo.lock" 2>/dev/null); \
 	echo "fuser: $${src:-MISSING}"
 
@@ -630,12 +632,17 @@ test-fc-mock: show-notes check-disk build build-fc-mock setup-fcvm _test-fc-mock
 FC_MOCK_CONTAINER_FILTER := package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)
 container-test-fc-mock: check-disk container-build setup-btrfs
 	@echo "==> Running fc-mock tests in container (unit tests only)..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) bash -c '\
-		make build build-fc-mock && \
-		FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
-		RUST_LOG="$(TEST_LOG)" \
-		$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E "$(FC_MOCK_CONTAINER_FILTER)" $(FILTER) || \
-		{ echo "TEST FAILED (fc-mock container mode)"; exit 1; }'
+	$(CONTAINER_RUN) $(CONTAINER_TAG) bash -c 'make build build-fc-mock && exec make _test-container-fc-mock "$$@"' -- \
+		FILTER='$(FILTER)' STREAM='$(STREAM)' LIST='$(LIST)' TEST_LOG='$(TEST_LOG)' \
+		FC_MOCK_CONTAINER_FILTER='$(FC_MOCK_CONTAINER_FILTER)'
+
+# Construct Cargo arguments after the dependency override is remapped inside.
+.PHONY: _test-container-fc-mock
+_test-container-fc-mock: cargo-target-link
+	FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
+	RUST_LOG="$(TEST_LOG)" \
+	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E "$(FC_MOCK_CONTAINER_FILTER)" $(FILTER) || \
+	{ echo "TEST FAILED (fc-mock container mode)"; exit 1; }
 
 container-test-unit: check-disk container-build
 	@echo "==> Running unit tests in container..."
@@ -1378,13 +1385,21 @@ setup-lint-tools: cargo-target-link
 
 lint: setup-lint-tools
 	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint --check
-	$(CARGO) clippy --all-targets -- -D warnings
+	$(MAKE) clippy
 	$(CARGO) audit
 	$(CARGO) deny check
+
+.PHONY: clippy
+clippy: cargo-target-link
+	$(CARGO) clippy $(CARGO_LOCAL_CONFIG) --all-targets -- -D warnings
 
 update-dependency: cargo-target-link
 	@test -n "$(PACKAGE)" || (echo "ERROR: PACKAGE required"; exit 1)
 	$(CARGO) update -p "$(PACKAGE)" $(if $(VERSION),--precise "$(VERSION)")
+
+.PHONY: dependency-metadata
+dependency-metadata: cargo-target-link
+	@$(CARGO) metadata --format-version 1 $(METADATA_FLAGS)
 
 # CI merge train - pooled CI for a batch of independent low-risk PRs.
 # One full CI matrix validates the whole batch instead of one per PR.
