@@ -224,6 +224,29 @@
           "https://www.elmundo.es/": 4663.620985999842,
           "https://www.rtp.pt/noticias/": 2853.7569860000076,
           "https://www.theguardian.com/international": 1296.8793689997256
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 47,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 10
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
         }
       }
     },
@@ -317,6 +340,29 @@
           "https://www.elmundo.es/": 2750.362707000022,
           "https://www.rtp.pt/noticias/": 2401.5811819999726,
           "https://www.theguardian.com/international": 741.9693390002067
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 4
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
         }
       }
     },
@@ -410,6 +456,29 @@
           "https://www.elmundo.es/": 2582.250804999603,
           "https://www.rtp.pt/noticias/": 2272.7131779993215,
           "https://www.theguardian.com/international": 682.5176779993853
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 47,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 7
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
         }
       }
     }

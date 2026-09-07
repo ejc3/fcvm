@@ -523,6 +523,7 @@ class CampaignSummary(unittest.TestCase):
         self.assertEqual(cell["diag"], {
             "diag_passed": True, "violations_count": 0,
             "max_load_ms": {"https://example.com/": 812.5},
+            "errors": {"https://example.com/": {}},
         })
 
     def test_an_unclean_dns_verdict_refuses_and_writes_nothing(self):
@@ -884,16 +885,23 @@ class CampaignSummary(unittest.TestCase):
             self.assertIn("dns-evidence.json", text)
 
     def test_diag_fields_flow_into_the_cell(self):
-        """The cell carries the diag's verdict, its violation count and the
-        slowest load event per URL, and the index names the summary among
-        the files it was generated from.
+        """The cell carries the diag verdict, loads and request error counts.
 
         Watched red 2026-08-28 at 55d6fb7d: the cell's diag was the whole
         summary object (`AssertionError: {'engine': 'chromium', ...} != {'diag_passed': True, ...}`).
+
+        #900: a passing diag with request errors must retain their counts,
+        including pages with no errors, without calling them violations.
+        Watched red with errors absent from the index, then green, then red
+        again after removing only the production change.
         """
         urls = ("https://example.com/", "https://news.ycombinator.com/")
         summary = diag_summary(urls=urls)
         summary["urls"]["https://news.ycombinator.com/"]["max_load_ms"] = 2210.0
+        summary["urls"]["https://news.ycombinator.com/"]["errors"] = {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 4,
+        }
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
             paths = write_run(run_dir, diag=summary)
@@ -908,6 +916,13 @@ class CampaignSummary(unittest.TestCase):
             "violations_count": 0,
             "max_load_ms": {"https://example.com/": 812.5,
                             "https://news.ycombinator.com/": 2210.0},
+            "errors": {
+                "https://example.com/": {},
+                "https://news.ycombinator.com/": {
+                    "net::ERR_ABORTED": 45,
+                    "net::ERR_CONNECTION_RESET": 4,
+                },
+            },
         })
         self.assertIn(paths["diag"], {entry["path"] for entry in index["generated_from"]})
 

@@ -42,7 +42,8 @@ during the measured run, when the evidence records it), load_evidence with
 descriptive statistics from the continuous owner sampler and every measured
 request (overall and per arm), the headline median
 blocking_ms per arm with its CI, and for the diag its verdict, violation
-count and slowest load event per URL.
+count, slowest load event and browser request error counts per URL. Request
+errors are reported separately from the limits that determine the verdict.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
@@ -1162,7 +1163,7 @@ DIAG_IDENTITY = (
 
 
 def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
-    """The diag's verdict, violation count and slowest load per URL; RunError otherwise.
+    """The diag's verdict, violations, loads and request errors; RunError otherwise.
 
     addresses is the set recorded_addresses derived for the cell, and
     stall_max_ms the run's armed stall gate: the two things the diag's
@@ -1264,7 +1265,12 @@ def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
             f"{len(violations)} violation(s) {kinds}; a run whose diag failed is not indexed"
         )
     check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms)
-    return {"diag_passed": True, "violations_count": 0, "max_load_ms": max_load}
+    return {
+        "diag_passed": True,
+        "violations_count": 0,
+        "max_load_ms": max_load,
+        "errors": {url: data.get("errors") for url, data in urls.items()},
+    }
 
 
 def check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms):
