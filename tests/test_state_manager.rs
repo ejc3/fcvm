@@ -431,6 +431,93 @@ async fn test_load_state_by_pid_cleans_stale_on_retry() {
 }
 
 #[tokio::test]
+async fn test_stale_sweep_skips_locked_writer_and_rechecks_identity() {
+    use nix::fcntl::{Flock, FlockArg};
+
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    let state_path = temp_dir.path().join("vm-sweep.json");
+    let temp_path = state_path.with_extension("json.tmp");
+    let lock_path = state_path.with_extension("json.lock");
+    manager
+        .save_state(&make_vm_state("vm-sweep", "sweep", u32::MAX))
+        .await
+        .unwrap();
+
+    // Stop a writer between its temporary write and publication. The sweep
+    // must return without waiting for this lock or unlinking either payload.
+    let lock = Flock::lock(
+        std::fs::File::open(&lock_path).unwrap(),
+        FlockArg::LockExclusive,
+    )
+    .unwrap();
+    std::fs::copy(&state_path, &temp_path).unwrap();
+    assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
+    assert!(state_path.exists(), "sweep deleted a locked writer's state");
+    assert!(temp_path.exists(), "sweep deleted a locked writer's temp");
+    assert!(lock_path.exists(), "sweep unlinked a held lock");
+
+    // The skipped writer publishes a live identity. The next sweep must read
+    // that identity afresh, not act on the stale record from its prior scan.
+    let live = make_vm_state("vm-sweep", "sweep", std::process::id());
+    std::fs::write(&temp_path, serde_json::to_vec(&live).unwrap()).unwrap();
+    std::fs::rename(&temp_path, &state_path).unwrap();
+    drop(lock);
+    assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
+    assert_eq!(manager.load_state("vm-sweep").await.unwrap().pid, live.pid);
+}
+
+#[tokio::test]
+async fn test_stale_sweep_reaps_orphan_temps_but_preserves_live_or_unknown_state() {
+    use nix::fcntl::{Flock, FlockArg};
+
+    let temp_dir = TempDir::new().unwrap();
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    for case in ["absent", "dead", "reused", "live", "unknown", "locked"] {
+        let path = temp_dir.path().join(format!("{case}.json"));
+        std::fs::write(path.with_extension("json.tmp"), b"interrupted write").unwrap();
+        if matches!(case, "dead" | "reused" | "live") {
+            let pid = if case == "dead" {
+                u32::MAX
+            } else {
+                std::process::id()
+            };
+            let mut state = make_vm_state(case, case, pid);
+            if case == "reused" {
+                state.pid_start_time = Some(u64::MAX);
+            }
+            std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        } else if case == "unknown" {
+            std::fs::write(&path, b"unreadable state").unwrap();
+        }
+    }
+    let locked_path = temp_dir.path().join("locked.json.lock");
+    let lock = Flock::lock(
+        std::fs::File::create(&locked_path).unwrap(),
+        FlockArg::LockExclusive,
+    )
+    .unwrap();
+    assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
+    for case in ["absent", "dead", "reused"] {
+        assert!(
+            !temp_dir.path().join(format!("{case}.json.tmp")).exists(),
+            "sweep left {case} temp behind"
+        );
+        assert!(!temp_dir.path().join(format!("{case}.json")).exists());
+        assert!(!temp_dir.path().join(format!("{case}.json.lock")).exists());
+    }
+    for case in ["live", "unknown", "locked"] {
+        assert!(
+            temp_dir.path().join(format!("{case}.json.tmp")).exists(),
+            "sweep removed {case} temp"
+        );
+    }
+    drop(lock);
+    assert!(manager.load_state_by_pid(u32::MAX - 1).await.is_err());
+    assert!(!temp_dir.path().join("locked.json.tmp").exists());
+}
+
+#[tokio::test]
 async fn test_update_state_preserves_concurrent_updates() {
     let temp_dir = TempDir::new().unwrap();
     // Two manager instances over the same directory simulate two processes

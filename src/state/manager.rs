@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use nix::fcntl::{Flock, FlockArg};
 use std::path::{Path, PathBuf};
 use tokio::fs;
 
@@ -18,6 +19,47 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     // Force permissions regardless of umask (only effective if we own the file or are root)
     let _ = file.set_permissions(std::fs::Permissions::from_mode(0o666));
     Ok(file)
+}
+
+fn lock_state_file(path: &Path, arg: FlockArg) -> Result<Flock<std::fs::File>> {
+    lock_opened_state_file(path, open_lock_file(path)?, arg)
+}
+
+fn lock_opened_state_file(
+    path: &Path,
+    mut file: std::fs::File,
+    arg: FlockArg,
+) -> Result<Flock<std::fs::File>> {
+    use std::os::unix::fs::MetadataExt;
+
+    loop {
+        let guard = Flock::lock(file, arg)
+            .map_err(|(_, error)| error)
+            .context("acquiring state lock")?;
+        let held = guard
+            .metadata()
+            .context("reading held state lock identity")?;
+        let current = match std::fs::metadata(path) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("reading state lock path identity"),
+        };
+        if current.is_some_and(|current| current.dev() == held.dev() && current.ino() == held.ino())
+        {
+            return Ok(guard);
+        }
+        // Cleanup can unlink a lock after this waiter opened it. No payload
+        // may be touched until we hold the inode now published at the path.
+        drop(guard);
+        file = open_lock_file(path)?;
+    }
+}
+
+fn remove_if_exists(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 use crate::utils::process_start_time;
@@ -98,18 +140,13 @@ impl StateManager {
         let temp_file = self.state_dir.join(format!("{}.json.tmp", state.vm_id));
         let lock_file = self.state_dir.join(format!("{}.json.lock", state.vm_id));
 
-        // Create/open lock file for exclusive locking
-        let lock_fd = open_lock_file(&lock_file).context("opening lock file")?;
-
         // Acquire exclusive lock (blocks if another process has lock).
         // NOTE: Flock::lock() is technically blocking I/O in an async context, but
         // the lock is held for microseconds with near-zero contention (only this
         // process writes its own state file). Using spawn_blocking would add more
         // overhead than the lock itself. If contention becomes an issue, switch to
         // FlockArg::LockExclusiveNonblock with retry + tokio::task::yield_now().
-        use nix::fcntl::{Flock, FlockArg};
-        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-            .map_err(|(_, err)| err)
+        let flock = lock_state_file(&lock_file, FlockArg::LockExclusive)
             .context("acquiring exclusive lock on state file")?;
 
         // Now we have exclusive access, perform the write
@@ -195,10 +232,7 @@ impl StateManager {
 
         // Acquire the per-VM lock so deletion is serialized against in-flight
         // locked writes (save_state / update_state / update_health_status).
-        let lock_fd = open_lock_file(&lock_file).context("opening lock file for state delete")?;
-        use nix::fcntl::{Flock, FlockArg};
-        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-            .map_err(|(_, err)| err)
+        let flock = lock_state_file(&lock_file, FlockArg::LockExclusive)
             .context("acquiring exclusive lock for state delete")?;
 
         let result = async {
@@ -221,8 +255,10 @@ impl StateManager {
                 Err(e) => return Err(e).context("deleting VM state"),
             }
 
-            // Clean up temp file while still holding the lock (ignore errors - may not exist)
-            let _ = fs::remove_file(&temp_file).await;
+            remove_if_exists(&temp_file).context("deleting temporary VM state")?;
+            // Retire the lock while still holding it, after the last payload
+            // operation. Waiters must validate their inode before proceeding.
+            remove_if_exists(&lock_file).context("deleting VM state lock")?;
 
             Ok(())
         }
@@ -232,14 +268,6 @@ impl StateManager {
             .unlock()
             .map_err(|(_, err)| err)
             .context("releasing lock after state delete")?;
-
-        // Remove the lock file only after the state file is gone. A writer that
-        // creates a fresh lock file after this point finds no state file and
-        // does nothing (update_state treats a missing file as a no-op), so
-        // there is no window where two lock-file inodes guard live state.
-        if result.is_ok() {
-            let _ = fs::remove_file(&lock_file).await;
-        }
 
         result
     }
@@ -269,55 +297,72 @@ impl StateManager {
         let mut examined = 0;
         let mut removed = 0;
 
+        let mut seen = std::collections::HashSet::new();
         for entry in entries.flatten() {
-            let path = entry.path();
-
-            // Only process .json files
-            if path.extension().map(|e| e == "json").unwrap_or(false) {
-                // Read the state file to get the PID
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) {
-                        if let Some(pid) = state.get("pid").and_then(|p| p.as_u64()) {
-                            // Check if process exists
-                            let proc_path = format!("/proc/{}", pid);
-                            let proc_exists = std::path::Path::new(&proc_path).exists();
-
-                            // Even if /proc/<pid> exists, the PID may have been
-                            // reused by an unrelated process. Compare the recorded
-                            // process start time (if any) with the current one.
-                            let recorded_start_time =
-                                state.get("pid_start_time").and_then(|t| t.as_u64());
-                            let identity_matches = match recorded_start_time {
-                                Some(recorded) => process_start_time(pid as u32) == Some(recorded),
-                                None => true,
-                            };
-
-                            examined += 1;
-                            tracing::trace!(
-                                pid = pid,
-                                path = %path.display(),
-                                proc_exists = proc_exists,
-                                identity_matches = identity_matches,
-                                "cleanup_stale_state: examined state file"
-                            );
-
-                            if !proc_exists || !identity_matches {
-                                // Process doesn't exist (or PID was reused by an
-                                // unrelated process) - remove stale state
-                                tracing::warn!(
-                                    pid = pid,
-                                    path = %path.display(),
-                                    proc_exists = proc_exists,
-                                    "cleanup_stale_state: removing state file for dead or replaced process"
-                                );
-                                let _ = std::fs::remove_file(&path);
-                                // Also remove lock file if exists
-                                let lock_path = path.with_extension("json.lock");
-                                let _ = std::fs::remove_file(&lock_path);
-                                removed += 1;
-                            }
-                        }
+            let mut path = entry.path();
+            if path.extension().is_some_and(|extension| extension == "tmp") {
+                path = path.with_extension("");
+            }
+            if path.extension().is_none_or(|extension| extension != "json")
+                || !seen.insert(path.clone())
+            {
+                continue;
+            }
+            let lock_path = path.with_extension("json.lock");
+            let _guard = match lock_state_file(&lock_path, FlockArg::LockExclusiveNonblock) {
+                Ok(guard) => guard,
+                Err(error) => {
+                    if error.downcast_ref::<nix::errno::Errno>()
+                        != Some(&nix::errno::Errno::EWOULDBLOCK)
+                    {
+                        tracing::warn!(path = %path.display(), %error, "cleanup_stale_state: lock failed");
                     }
+                    continue;
+                }
+            };
+
+            // Read identity only after acquiring the writer's lock. A missing
+            // sibling makes a temp orphaned; an unreadable sibling proves nothing.
+            let stale = match std::fs::read_to_string(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(_) => continue,
+                Ok(content) => {
+                    let Ok(state) = serde_json::from_str::<serde_json::Value>(&content) else {
+                        continue;
+                    };
+                    let Some(pid) = state
+                        .get("pid")
+                        .and_then(|p| p.as_u64())
+                        .and_then(|p| u32::try_from(p).ok())
+                    else {
+                        continue;
+                    };
+                    let Ok(exists) = Path::new(&format!("/proc/{pid}")).try_exists() else {
+                        continue;
+                    };
+                    let replaced = state
+                        .get("pid_start_time")
+                        .and_then(|t| t.as_u64())
+                        .zip(process_start_time(pid))
+                        .is_some_and(|(recorded, current)| recorded != current);
+                    !exists || replaced
+                }
+            };
+            examined += 1;
+            if !stale {
+                continue;
+            }
+
+            let temp_path = path.with_extension("json.tmp");
+            // Keep the guard through the final unlink. If removing either
+            // payload fails, retain the lock and retry on a later sweep.
+            let result = [&path, &temp_path, &lock_path]
+                .into_iter()
+                .try_for_each(|path| remove_if_exists(path));
+            match result {
+                Ok(()) => removed += 1,
+                Err(error) => {
+                    tracing::warn!(path = %path.display(), %error, "cleanup_stale_state: removal failed")
                 }
             }
         }
@@ -524,13 +569,8 @@ impl StateManager {
             return Ok(None);
         }
 
-        // Create/open lock file for exclusive locking
-        let lock_fd = open_lock_file(&lock_file).context("opening lock file for state update")?;
-
         // Acquire exclusive lock (blocks if another process has lock)
-        use nix::fcntl::{Flock, FlockArg};
-        let flock = Flock::lock(lock_fd, FlockArg::LockExclusive)
-            .map_err(|(_, err)| err)
+        let flock = lock_state_file(&lock_file, FlockArg::LockExclusive)
             .context("acquiring exclusive lock for state update")?;
 
         // CRITICAL: Hold lock across entire read-modify-write
@@ -541,6 +581,10 @@ impl StateManager {
             let state_json = match fs::read_to_string(&state_file).await {
                 Ok(json) => json,
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // We may have reopened the lock after a deleter retired
+                    // its inode. Retire this no-op lock under the same guard.
+                    remove_if_exists(&temp_file).context("deleting orphan temporary state")?;
+                    remove_if_exists(&lock_file).context("deleting unused state lock")?;
                     tracing::debug!(
                         vm_id = vm_id,
                         path = %state_file.display(),
@@ -725,4 +769,36 @@ impl StateManager {
     }
 }
 
-// StateManager tests moved to tests/test_state_integration.rs for better integration testing
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_lock_waiter_rejects_unlinked_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vm.json.lock");
+        let holder = lock_state_file(&path, FlockArg::LockExclusive).unwrap();
+        // A waiter has opened A but has not acquired its lock when cleanup
+        // unlinks it. A new writer then opens and locks B at the same path.
+        let waiter = open_lock_file(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let replacement = lock_state_file(&path, FlockArg::LockExclusive).unwrap();
+        drop(holder);
+        let result = lock_opened_state_file(&path, waiter, FlockArg::LockExclusiveNonblock);
+        assert!(
+            result.is_err(),
+            "waiter acquired retired inode A while B was held"
+        );
+        assert_eq!(
+            result.unwrap_err().downcast_ref::<nix::errno::Errno>(),
+            Some(&nix::errno::Errno::EWOULDBLOCK)
+        );
+        drop(replacement);
+        let current = lock_state_file(&path, FlockArg::LockExclusiveNonblock).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(
+            current.metadata().unwrap().ino(),
+            std::fs::metadata(path).unwrap().ino()
+        );
+    }
+}
