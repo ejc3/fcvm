@@ -1639,6 +1639,13 @@ TAB_FINDING=$'\t<!-- P1: the restore path drops the last row -->'
 SPAN_FINDING=$'    <!-- P1: the restore path drops the last row\n    and the compaction pass never reruns\n    -->'
 FENCE_FINDING=$'```\n<!-- P1: the restore path drops the last row -->\n```'
 QUOTED_FINDING='>     <!-- P1: the restore path drops the last row -->'
+INLINE_CODE_VERDICT=$(jq -n '"Codex Review: Didn\u0027t find any major issues.\n\n**Reviewed commit:** `deadbeef<!-- P1: drops last row -->`"')
+run_case "a finding inside the reviewed-commit code span is claimable" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$INLINE_CODE_VERDICT")")" \
+  1 "carry no disposition"
+run_case "a finding inside the reviewed-commit code span covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$INLINE_CODE_VERDICT")")" \
+  1 "UNREVIEWED HEAD"
 # The four-space case, in both of the things a verdict decides.
 run_case "a verdict with a four-space indented finding is claimable" \
   "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_plus "$SPACE_FINDING")")")" \
@@ -1749,6 +1756,7 @@ scan_case "a blockquote-indented comment is kept" '>     <!-- P1 -->'       '>  
 scan_case "a comment spanning lines is kept"     $'<!-- P1\nmore\n-->'      $'<!-- P1\nmore\n-->'
 scan_case "an inline comment is removed"         '- [ ] <!-- {"checkboxId":"a"} --> Trigger review' '- [ ]  Trigger review'
 scan_case "a quoted column-0 comment is removed" '> <!-- m -->'             '> '
+scan_case "a comment inside a multiline code span is kept" $'`code\n<!-- P1 -->\ncode`' $'`code\n<!-- P1 -->\ncode`'
 
 echo
 echo "passed=$pass failed=$fail"

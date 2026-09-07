@@ -1476,6 +1476,22 @@ fn a_comment_is_removed_unread_only_where_github_hides_it() {
         (combined, out.status.code().unwrap_or(-1))
     };
 
+    // HTML comment bytes inside the commit's code span are visible. Removing them would
+    // turn this finding into a clean verdict naming the head.
+    let (out, code) = run(
+        "inline-code-verdict.json",
+        payload(
+            "[]",
+            &comment(
+                "chatgpt-codex-connector",
+                r#""Codex Review: Didn't find any major issues.\n\n**Reviewed commit:** `deadbeef<!-- P1: drops last row -->`""#,
+            ),
+        ),
+    );
+    assert_eq!(code, 1, "a code-span finding must remain claimable.\n{out}");
+    assert!(out.contains("carry no disposition"), "{out}");
+    assert!(!out.contains("HEAD COVERED"), "{out}");
+
     // Four columns of indentation. The gate reported CLEAR on exactly this body, with no
     // review object anywhere on the PR.
     let (out, code) = run(
@@ -1625,6 +1641,11 @@ fn a_comment_is_removed_unread_only_where_github_hides_it() {
             "a comment spanning lines is kept",
             "<!-- P1\nmore\n-->",
             "<!-- P1\nmore\n-->",
+        ),
+        (
+            "a comment inside a multiline code span is kept",
+            "`code\n<!-- P1 -->\ncode`",
+            "`code\n<!-- P1 -->\ncode`",
         ),
     ] {
         assert_eq!(strip(body).trim_end_matches('\n'), want, "{name}");

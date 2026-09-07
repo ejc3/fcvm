@@ -717,13 +717,13 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # GitHub is known to hide it. It removes a COMPLETE single-line `<!-- .. -->`, at line start
 # or inline, on a line that is not indented four columns (tabs count as four) and is not
 # inside a fenced code block, measuring both after any blockquote markers so a `>`-quoted
-# line is judged by its own content. Everything else stays in the body, where it is an
-# unlisted line and the body is claimable. Two things it therefore declines to remove that
-# GitHub does hide, both fail-closed and both costing one disposition: a comment spanning
+# line is judged by its own content. A comment followed by a backtick could be inside a
+# code span, so that line stays unchanged. Unpaired backtick runs on a non-fence line
+# could open a multiline code span, so that whole body stays unchanged.
+# It also leaves two shapes GitHub does hide, both costing one disposition: a comment spanning
 # lines, and a comment indented four columns under an open paragraph. Neither has occurred
 # in the 1602 HTML comments the two bots posted on ejc3/fcvm #789 through #901, every one
-# of which sits at column 0 on one line (1350) or inline on a column-0 line (252). Judged
-# over those 350 comment bodies, the narrowed region changes no verdict.
+# of which sits at column 0 on one line (1350) or inline on a column-0 line (252).
 #
 # scripts/gate-discard-sites.sh enumerates every discarding call in VERDICT_JQ and blocks
 # on any that is neither this primitive nor a listed normalization, so the next stripping
@@ -766,7 +766,14 @@ def fence_mark: [ match("^ {0,3}(?<f>`{3,}|~{3,})") | .captures[] | select(.name
 def fence_close_re: "^ {0,3}(?:`{3,}|~{3,})[ \t]*$";
 def lead_cols: (([ match("^[ \t]*") | .string ] | first) // "") | gsub("\t"; "    ") | length;
 def strip_hidden_comments:
-  ((. // "") | split("\n"))
+  (. // "") as $body
+  | ($body | split("\n")) as $lines
+  # Do not infer inline-code boundaries across lines. An unpaired delimiter length
+  # makes the body ambiguous; preserving it costs a disposition rather than a finding.
+  | if any($lines[]; sub(quote_prefix_re; "")
+           | (fence_mark == null)
+             and ([scan("`+")] | group_by(length) | any(length % 2 != 0))) then $body
+    else $lines
   | reduce .[] as $raw ({fence: null, out: []};
       . as $st
       | ($raw | sub(quote_prefix_re; "")) as $c
@@ -779,10 +786,11 @@ def strip_hidden_comments:
         elif ($c | lead_cols) >= 4 then { fence: null, out: ($st.out + [$raw]) }
         else ($c | fence_mark) as $f
           | if $f != null then { fence: $f, out: ($st.out + [$raw]) }
+            elif ($c | test("<!--.*`")) then { fence: null, out: ($st.out + [$raw]) }
             else { fence: null, out: ($st.out + [($raw | gsub(hidden_comment_re; ""))]) }
             end
         end)
-  | .out | join("\n");
+  | .out | join("\n") end;
 def strip_accounted($names):
   if ($names | any(. as $n | ([accounted_regions[] | .name] | index($n)) == null)) then null
   else reduce accounted_regions[] as $r (.;
