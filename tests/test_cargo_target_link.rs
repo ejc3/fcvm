@@ -3573,6 +3573,53 @@ fn cargo_target_link_fallback_survives_a_remapped_checkout() {
     );
 }
 
+/// A fallback identifies one checkout-local generation, not a path through it.
+/// Reject malformed links before mkdir or cleanup can alter either directory.
+#[test]
+fn cargo_target_link_rejects_fallback_path_traversal_before_mutation() {
+    for absolute in [false, true] {
+        for outside_exists in [false, true] {
+            let root = tempfile::tempdir().expect("scratch root");
+            let checkout = root.path().join("checkout");
+            let generation = checkout.join(".cargo-target-local.generation-existing");
+            std::fs::create_dir_all(&generation).expect("generation directory");
+            std::fs::write(generation.join("artifact"), b"cached").expect("cached artifact");
+            let outside = root.path().join("outside");
+            if outside_exists {
+                std::fs::create_dir(&outside).expect("outside directory");
+                std::fs::write(outside.join("sentinel"), b"untouched").expect("outside sentinel");
+            }
+            let relative = Path::new(".cargo-target-local.generation-existing/../../outside");
+            let destination = if absolute {
+                checkout.join(relative)
+            } else {
+                relative.to_path_buf()
+            };
+            let target = checkout.join("target");
+            std::os::unix::fs::symlink(&destination, &target).expect("malformed fallback link");
+
+            let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+            assert!(!ok, "accepted malformed fallback (absolute={absolute}, outside_exists={outside_exists}):\n{out}");
+            assert_eq!(std::fs::read_link(&target).unwrap(), destination);
+            assert_eq!(
+                std::fs::read(generation.join("artifact")).unwrap(),
+                b"cached"
+            );
+            assert_eq!(
+                outside.exists(),
+                outside_exists,
+                "created outside directory"
+            );
+            if outside_exists {
+                assert_eq!(
+                    std::fs::read(outside.join("sentinel")).unwrap(),
+                    b"untouched"
+                );
+            }
+        }
+    }
+}
+
 /// A real target/ the script did not create is retained, volume or no volume.
 /// Its dentry may carry a mount that exists only in another mount namespace,
 /// and renaming or removing it could move or detach that mount; only the

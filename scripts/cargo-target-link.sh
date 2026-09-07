@@ -112,6 +112,19 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # payload is reachable only while target/ names it.
 LOCAL_TARGET_PREFIX="$p/.cargo-target-local"
 
+# A fallback names one direct child. Traversing through that child would let
+# cleanup remove an intermediate directory that target/ still needs to resolve.
+if [ -L target ]; then
+	linked="$(readlink target)"
+	[[ $linked = /* ]] || linked="$p/$linked"
+	case "$linked" in
+		"$LOCAL_TARGET_PREFIX".generation-*/*)
+			echo "ERROR: invalid fallback target $linked; expected one generation basename" >&2
+			exit 1
+			;;
+	esac
+fi
+
 # The fallback payload target/ publishes right now, on stdout. Non-zero when
 # target/ publishes something else.
 published_fallback() {
