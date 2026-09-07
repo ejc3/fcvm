@@ -1245,6 +1245,15 @@ def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise RunError(f"{run_dir}: diag/summary.json max_load_ms for {url} is {value!r}")
         max_load[url] = value
+        counts = data.get("errors")
+        if not isinstance(counts, dict) or any(
+            not isinstance(error, str) or type(count) is not int or count < 0
+            for error, count in counts.items()
+        ):
+            raise RunError(
+                f"{run_dir}: diag/summary.json errors for {url} must map "
+                "error texts to nonnegative integer counts"
+            )
     # A diag over other pages says nothing about the pages this run measured,
     # and a cell that names no url gives the comparison nothing to hold the
     # diag to.

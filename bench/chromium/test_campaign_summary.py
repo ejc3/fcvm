@@ -926,6 +926,45 @@ class CampaignSummary(unittest.TestCase):
         })
         self.assertIn(paths["diag"], {entry["path"] for entry in index["generated_from"]})
 
+    def test_diag_error_counts_require_nonnegative_integers(self):
+        """Missing or malformed request counts cannot be published as evidence.
+
+        Watched all seven invalid shapes publish successfully before the
+        validator and again after reverting only the validator.
+        """
+        cases = (
+            ("missing", None, False),
+            ("null", None, False),
+            ("list", [], False),
+            ("negative", {"net::ERR_ABORTED": -1}, False),
+            ("boolean", {"net::ERR_ABORTED": True}, False),
+            ("float", {"net::ERR_ABORTED": 1.0}, False),
+            ("string", {"net::ERR_ABORTED": "1"}, False),
+            ("empty", {}, True),
+            ("zero", {"net::ERR_ABORTED": 0}, True),
+        )
+        url = "https://example.com/"
+        for label, errors, valid in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                summary = diag_summary()
+                if label == "missing":
+                    del summary["urls"][url]["errors"]
+                else:
+                    summary["urls"][url]["errors"] = errors
+                if valid:
+                    run_dir = os.path.join(d, "run")
+                    write_run(run_dir, diag=summary)
+                    out = os.path.join(d, "campaign-x-summary.json")
+                    rc, text = self._summarize(out, [run_dir])
+                    self.assertEqual(rc, 0, text)
+                    with open(out) as handle:
+                        self.assertEqual(json.load(handle)["cells"][0]["diag"]["errors"],
+                                         {url: errors})
+                else:
+                    _, text = self._refused(d, diag=summary)
+                    self.assertIn("errors", text)
+                    self.assertIn(url, text)
+
     def test_a_corpus_cell_without_its_diag_is_refused(self):
         """A run whose guest resolved through the baked resolver had the
         diag run before it; a run directory without the summary is a run
