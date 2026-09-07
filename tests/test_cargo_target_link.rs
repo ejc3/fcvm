@@ -687,6 +687,15 @@ fn makefile_delegates_to_the_script() {
          behaviour every other test in this file verifies is not what `make` runs. Commands \
          found: {recipe:?}"
     );
+    for target in ["container-shell:", "container-setup-fcvm:"] {
+        assert!(
+            mk.lines().any(|line| line.starts_with(target)
+                && line
+                    .split_whitespace()
+                    .any(|word| word == "cargo-target-link")),
+            "{target} must initialize the host target before leasing it"
+        );
+    }
 }
 
 /// The disk preflight selects per-worktree children, never the parent
@@ -4804,6 +4813,164 @@ fn open_fifo(path: &Path) -> std::fs::File {
         .write(true)
         .open(path)
         .unwrap_or_else(|error| panic!("open {path:?}: {error}"))
+}
+
+/// The container cache mount hides the host generation inode. The launch
+/// command must pass its host lease into that namespace even when the CLI
+/// closes every copy of the descriptor it holds itself.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn container_recipe_pins_host_generation_across_mount_namespace() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let checkout = scratch.path().join("checkout");
+    let btrfs = scratch.path().join("btrfs");
+    let cache = scratch.path().join("cache");
+    let tools = scratch.path().join("tools");
+    for directory in [&checkout, &cache, &tools] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    let generation = stage_outage_fallback(&checkout, &btrfs);
+    let before = std::fs::read_link(checkout.join("target")).unwrap();
+    std::fs::write(cache.join("artifact"), b"cache").unwrap();
+    let ready_path = scratch.path().join("ready");
+    let ready = open_fifo(&ready_path);
+    write_script(
+        &tools.join("podman"),
+        r#"#!/usr/bin/python3
+import os
+import subprocess
+import sys
+
+if sys.argv[1] == "login":
+    raise SystemExit(1)
+preserved = (3,) if "--preserve-fds=1" in sys.argv else ()
+os.closerange(4 if preserved else 3, 1048576)
+os.environ.pop("FCVM_TARGET_LEASE_HELD", None)
+child = subprocess.Popen([
+    "unshare", "--mount", "--propagation", "private", "/bin/bash", "-c",
+    '''set -euo pipefail
+mount --bind -- "$CACHE" target
+mounted=$(readlink -f target)
+trap 'umount -- "$mounted"' EXIT
+"$LINK_SCRIPT"
+"$LEASE_SCRIPT" /bin/bash -c 'printf R >"$READY"; IFS= read -r _; test "$(cat target/artifact)" = cache; exit 23'
+'''], pass_fds=preserved)
+if preserved:
+    os.close(3)
+raise SystemExit(child.wait())
+"#,
+    );
+    hand_tree_to_make_child(scratch.path());
+    let path = std::env::join_paths(
+        std::iter::once(tools.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let makefile = repo_root().join("Makefile");
+    let printed = scratch_make(
+        &checkout,
+        &btrfs,
+        &[
+            "--no-print-directory",
+            "-f",
+            makefile.to_str().unwrap(),
+            "-n",
+            "-o",
+            "container-build",
+            "-o",
+            "cargo-target-link",
+            "container-shell",
+        ],
+    )
+    .env("PATH", &path)
+    .output()
+    .unwrap();
+    assert!(
+        printed.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let printed = String::from_utf8(printed.stdout).unwrap();
+    let command = printed
+        .lines()
+        .find(|line| line.contains("podman run "))
+        .expect("container run command");
+    std::fs::create_dir(&btrfs).expect("container-build creates btrfs root");
+    let log_path = scratch.path().join("container.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut container = ChildGuard(Some(
+        Command::new("/bin/bash")
+            .args(["-c", command])
+            .current_dir(&checkout)
+            .env("PATH", &path)
+            .env("BTRFS_ROOT", &btrfs)
+            .env("CARGO_TARGET_DIR", "target")
+            .env("CACHE", &cache)
+            .env("READY", &ready_path)
+            .env(
+                "LINK_SCRIPT",
+                repo_root().join("scripts/cargo-target-link.sh"),
+            )
+            .env(
+                "LEASE_SCRIPT",
+                repo_root().join("scripts/cargo-target-run.sh"),
+            )
+            .env_remove("CARGO_TARGET_LINK_LOCKED")
+            .stdin(Stdio::piped())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    ));
+    assert_eq!(
+        read_marker_with_timeout(ready, "container cache lease"),
+        b'R'
+    );
+    let host_leased = !lease_is_available(&generation, "-x");
+    let cache_leased = !lease_is_available(&cache, "-x");
+    let republish = Command::new("timeout")
+        .arg("2")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", &btrfs)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    let held_link = std::fs::read_link(checkout.join("target")).unwrap();
+    container
+        .child_mut()
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    let status = container.wait().unwrap();
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        host_leased && cache_leased,
+        "host and container must lease their separate inodes:\n{log}"
+    );
+    assert_eq!(
+        republish.status.code(),
+        Some(124),
+        "host setup replaced a live container target: {}{}",
+        String::from_utf8_lossy(&republish.stdout),
+        String::from_utf8_lossy(&republish.stderr)
+    );
+    assert_eq!(held_link, before, "host setup republished the live target");
+    assert_eq!(
+        status.code(),
+        Some(23),
+        "container exit status was lost:\n{log}"
+    );
+    assert!(
+        lease_is_available(&generation, "-x"),
+        "host lease outlived container"
+    );
+    let (ok, out) = run_link(&checkout, &btrfs);
+    assert!(ok, "host could not republish after container exit:\n{out}");
+    assert_eq!(std::fs::read(cache.join("artifact")).unwrap(), b"cache");
 }
 
 /// `build` produces `fc-agent` through the link, copies it back through the

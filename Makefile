@@ -209,7 +209,11 @@ TEST_LOG_DIR := /tmp/fcvm-test-logs
 # Container run command (base)
 # Note: Use -v instead of --device for /dev/kvm to preserve group permissions in rootless mode
 # See: https://github.com/containers/podman/issues/16701
-CONTAINER_RUN_BASE := podman run --rm --privileged \
+# The cache mount presents a different inode inside the container. Pass the
+# host generation's lease through FD 3 so it also survives the Podman CLI.
+CONTAINER_RUN_BASE := "$(MAKEFILE_DIR)scripts/cargo-target-run.sh" \
+	/bin/bash -ec 'exec 3<target; flock -s 3; exec "$$@"' -- \
+	podman run --preserve-fds=1 --rm --privileged \
 	--security-opt label=disable --group-add keep-groups \
 	-v .:/workspace/fcvm \
 	$(TARGET_MOUNT) \
@@ -659,7 +663,7 @@ container-build:
 	|| podman build -t $(CONTAINER_TAG) -f Containerfile --build-arg ARCH=$(CONTAINER_ARCH) \
 		--layers --cache-from $(CONTAINER_CACHE_REPO) .
 
-container-shell: container-build
+container-shell: cargo-target-link container-build
 	$(CONTAINER_RUN) -it $(CONTAINER_TAG) bash
 
 container-clean:
@@ -778,7 +782,7 @@ install-host-kernel: build setup-btrfs
 	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # Run setup inside container (for CI - container has Firecracker)
-container-setup-fcvm: container-build setup-btrfs
+container-setup-fcvm: cargo-target-link container-build setup-btrfs
 	@echo "==> Running fcvm setup in container..."
 	@# Fix ownership for rootless podman: container UID 0 maps to host user,
 	@# so /mnt/fcvm-btrfs/firecracker must be writable by current user (not root)
