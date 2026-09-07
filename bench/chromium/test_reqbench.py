@@ -7311,6 +7311,17 @@ class DocLint(unittest.TestCase):
                                f"{plain.strip()[:160]!r}")
         self.assertEqual(bad, [], "\n".join(bad))
 
+    def test_report_does_not_attribute_causes_to_unretained_operator_logs(self):
+        """Operator/session logs were not retained, so they cannot support
+        the report's causal counts or explain rejected measurement windows.
+        """
+        html = self._plain(self._read("report/shared-nothing-renders.html"))
+        self.assertEqual(
+            re.findall(r"(?i)\b(?:operator|session) logs\b[^.]*\battribut\w*\b[^.]*", html),
+            [],
+            "The report attributes causes to unretained operator/session logs",
+        )
+
     def test_the_zero_failure_claim_is_scoped_to_cells_that_passed_the_gate(self):
         """RED BEFORE THE FIX: shared-nothing-renders.html:372 said "Zero
         failures in every gated run" and :360 "every gated run passed 202/200",
