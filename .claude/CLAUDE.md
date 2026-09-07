@@ -656,8 +656,8 @@ sudo sysctl -w vm.unprivileged_userfaultfd=1
 #    check-disk moves it there), recreate the target first: mkdir -p /mnt/fcvm-btrfs/cargo
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
 
-# 6. Sources on the DURABLE disk, sibling layout is required (fuse-pipe uses
-#    a ../fuse-backend-rs path dependency)
+# 6. Sources on the DURABLE disk. Cargo.lock pins the FUSE forks; sibling
+#    checkouts are for local dependency development and container mounts.
 mkdir -p ~/src && cd ~/src
 git clone https://github.com/ejc3/fcvm.git
 git clone https://github.com/ejc3/fuse-backend-rs.git
@@ -1937,12 +1937,25 @@ that leaked. If teardown matters, it must survive SIGKILL.
 
 **Symlinks for sudo access**: The Containerfile creates symlinks in `/usr/local/bin/` so that `sudo cargo` works (sudo uses secure_path which includes `/usr/local/bin`). This matches how the host is configured.
 
-The `fuse-pipe/Cargo.toml` uses a local path dependency:
-```toml
-fuse-backend-rs = { path = "../../fuse-backend-rs", ... }
+Cargo.lock pins the Git revision of `fuse-backend-rs` for normal builds and CI.
+Host builds do not need a sibling checkout. Container recipes retain the
+`FUSE_BACKEND_RS` and `FUSER` source mounts, so those directories must exist;
+an explicit backend override replaces that mount's source directory.
+To compile uncommitted changes in a local checkout, opt in explicitly:
+```bash
+make build FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs
+make container-test FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs
+make clippy FUSE_BACKEND_RS_OVERRIDE=../fuse-backend-rs
 ```
 
-This ensures changes to fuse-backend-rs are immediately available without git commits.
+The override uses a Cargo path patch, including local manifest dependency changes.
+Container targets mount that checkout and rewrite the path for the inner build.
+An override changes Cargo.lock to the local source; do not commit that local-only
+lockfile change. After removing the override, `make dependency-metadata` resolves
+the Git dependency again; review its lockfile diff before committing.
+`make lint` audits the default Git dependency graph and rejects a local override:
+the pinned cargo-deny version cannot receive the local Cargo patch configuration.
+Use `make clippy` to lint local dependency development without that audit.
 
 ### Container KVM Access (Rootless Podman)
 

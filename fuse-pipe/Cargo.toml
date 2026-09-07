@@ -35,8 +35,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-log = "0.2"  # Bridge log crate to tracing
 
 # fuse-backend-rs for passthrough filesystem (Cloud Hypervisor's production-grade FUSE backend)
-# Using local path for development - synced to EC2 via `make sync`
-fuse-backend-rs = { path = "../../fuse-backend-rs", default-features = false, features = ["fusedev"] }
+# Cargo.lock pins the fork; Make's FUSE_BACKEND_RS_OVERRIDE opts into local development.
+fuse-backend-rs = { git = "https://github.com/ejc3/fuse-backend-rs.git", branch = "master", default-features = false, features = ["fusedev"] }
 
 # FUSE client (fork with clone_fd for true parallel readers + remap_file_range)
 # Based on upstream PR #636 (clone_fd for parallel processing) + remap_file_range

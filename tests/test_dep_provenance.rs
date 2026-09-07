@@ -1,11 +1,10 @@
 //! The build recipes must record which FUSE dependency code they compiled
 //! against, and that record must stay honest.
 //!
-//! Two dependencies, two mechanisms:
+//! Both FUSE forks use their Cargo.lock Git revision by default.
 //!
-//! * `fuse-backend-rs` is a sibling path dependency (`fuse-pipe/Cargo.toml`:
-//!   `path = "../../fuse-backend-rs"`), so the compiled code is whatever that
-//!   directory holds, not what any lockfile pins. Its provenance line is
+//! * An explicit `FUSE_BACKEND_RS_OVERRIDE` compiles the selected local
+//!   checkout, including uncommitted changes. Its provenance line is
 //!   `git describe --always --dirty` of the checkout, `MISSING` when there is
 //!   no checkout, and when the tree is dirty a `+<12 hex>` digest of
 //!   `git diff HEAD`, because every possible local edit against one commit
@@ -243,7 +242,8 @@ fn run_make(fcvm_dir: &Path, target: &str) -> std::process::Output {
         // A -j inherited from the make that started the test suite would
         // interleave other goals' output into the lines under assertion.
         .env_remove("MAKEFLAGS")
-        .env_remove("MFLAGS");
+        .env_remove("MFLAGS")
+        .env_remove("FUSE_BACKEND_RS_OVERRIDE");
     drop_priv(&mut cmd);
     // The test process may have written into the scratch since the last
     // chown; hand the whole tree back to the identity the children run as.
@@ -303,7 +303,14 @@ fn dep_provenance_reports_describe_lock_source_and_missing() {
     let dep_dir = scratch.join("fuse-backend-rs");
     fs::create_dir_all(&fcvm_dir).unwrap();
     fs::create_dir_all(&dep_dir).unwrap();
-    fs::write(fcvm_dir.join("Makefile"), repo_makefile()).unwrap();
+    fs::write(
+        fcvm_dir.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := ../fuse-backend-rs\n{}",
+            repo_makefile()
+        ),
+    )
+    .unwrap();
     fs::write(dep_dir.join("lib.rs"), "// scratch\n").unwrap();
     chown_tree(&scratch);
 
@@ -418,6 +425,246 @@ fn write_executable(path: &Path, body: &str) {
     fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
 }
 
+/// Exercise the Makefile's Cargo command with a local Git remote, without
+/// network access or a sibling checkout. The dependency declaration comes
+/// from fuse-pipe's real manifest; only its remote URL changes for the fixture.
+#[test]
+fn fuse_backend_dependency_resolves_without_a_sibling_checkout() {
+    let scratch = tempfile::tempdir().unwrap();
+    let remote = scratch.path().join("remote");
+    let checkout = scratch.path().join("fcvm");
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(checkout.join("scripts")).unwrap();
+    fs::create_dir_all(checkout.join("target")).unwrap();
+    fs::write(
+        remote.join("Cargo.toml"),
+        "[package]\nname = \"fuse-backend-rs\"\nversion = \"0.14.0\"\nedition = \"2021\"\n\
+         [lib]\npath = \"lib.rs\"\n[features]\nfusedev = []\n",
+    )
+    .unwrap();
+    fs::write(remote.join("lib.rs"), "pub fn value() -> u32 { 1 }\n").unwrap();
+    chown_tree(scratch.path());
+    git(&remote, &["init", "-q", "--initial-branch=master"]);
+    git(&remote, &["add", "."]);
+    git(&remote, &["commit", "-q", "-m", "fixture"]);
+
+    let url = format!("file://{}", remote.display());
+    let manifest = fs::read_to_string(repo_root().join("fuse-pipe/Cargo.toml")).unwrap();
+    let dependency = manifest
+        .lines()
+        .find(|line| line.starts_with("fuse-backend-rs = "))
+        .unwrap()
+        .replace("https://github.com/ejc3/fuse-backend-rs.git", &url);
+    fs::write(
+        checkout.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"fcvm\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [[bin]]\nname = \"fcvm\"\npath = \"main.rs\"\n[dependencies]\n{dependency}\n"
+        ),
+    )
+    .unwrap();
+    fs::write(
+        checkout.join("main.rs"),
+        "fn main() { println!(\"VALUE={}\", fuse_backend_rs::value()); }\n",
+    )
+    .unwrap();
+    fs::write(
+        checkout.join("Makefile"),
+        format!(
+            "{}\nfixture-run:\n\t@$(CARGO) run --quiet\n\
+             fixture-nextest:\n\t@$(NEXTEST)\n\
+             fixture-clippy:\n\t{}\n",
+            repo_makefile().replace("https://github.com/ejc3/fuse-backend-rs.git", &url),
+            rule(&repo_makefile(), "clippy")
+                .or_else(|| rule(&repo_makefile(), "lint"))
+                .unwrap()
+                .1
+                .into_iter()
+                .find(|line| line.contains("$(CARGO) clippy"))
+                .unwrap()
+        ),
+    )
+    .unwrap();
+    for name in ["cargo-target-run.sh", "cargo-target-lib.sh"] {
+        fs::copy(
+            repo_root().join("scripts").join(name),
+            checkout.join("scripts").join(name),
+        )
+        .unwrap();
+    }
+
+    let run = |expected: u32| {
+        let out = run_make(&checkout, "fixture-run");
+        assert!(
+            out.status.success(),
+            "Make Cargo dependency resolution failed:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains(&format!("VALUE={expected}")));
+    };
+    run(1);
+    assert!(line_for(&run_dep_provenance(&checkout), "fuse-backend-rs").starts_with("git+file://"));
+    let locked = fs::read_to_string(checkout.join("Cargo.lock")).unwrap();
+    run(1);
+    assert_eq!(
+        fs::read_to_string(checkout.join("Cargo.lock")).unwrap(),
+        locked
+    );
+
+    // An opt-in override compiles uncommitted source and manifest changes.
+    let local = scratch.path().join("local");
+    git(
+        scratch.path(),
+        &[
+            "clone",
+            "-q",
+            remote.to_str().unwrap(),
+            local.to_str().unwrap(),
+        ],
+    );
+    let makefile = fs::read_to_string(checkout.join("Makefile")).unwrap();
+    fs::write(
+        checkout.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := {}\n{makefile}",
+            local.display()
+        ),
+    )
+    .unwrap();
+    fs::write(local.join("lib.rs"), "pub fn value() -> u32 { 2 }\n").unwrap();
+    run(2);
+    assert!(line_for(&run_dep_provenance(&checkout), "fuse-backend-rs").contains("-dirty+"));
+
+    fs::create_dir(local.join("helper")).unwrap();
+    fs::write(
+        local.join("helper/Cargo.toml"),
+        "[package]\nname = \"fixture-helper\"\nversion = \"0.1.0\"\nedition = \"2021\"\n[lib]\npath = \"lib.rs\"\n",
+    )
+    .unwrap();
+    fs::write(local.join("helper/lib.rs"), "pub fn value() -> u32 { 3 }\n").unwrap();
+    let manifest = fs::read_to_string(local.join("Cargo.toml")).unwrap();
+    fs::write(
+        local.join("Cargo.toml"),
+        format!("{manifest}\n[dependencies]\nfixture-helper = {{ path = \"helper\" }}\n"),
+    )
+    .unwrap();
+    fs::write(
+        local.join("lib.rs"),
+        "pub fn value() -> u32 { fixture_helper::value() }\n",
+    )
+    .unwrap();
+    run(3);
+
+    // External Cargo subcommands do not inherit Cargo's global --config.
+    // Require a symbol that exists only in the uncommitted local override.
+    fs::write(
+        local.join("lib.rs"),
+        "pub fn local_only() -> u32 { fixture_helper::value() }\n",
+    )
+    .unwrap();
+    fs::write(
+        checkout.join("main.rs"),
+        "fn main() { println!(\"{}\", fuse_backend_rs::local_only()); }\n\
+         #[test] fn selected_override() { assert_eq!(fuse_backend_rs::local_only(), 3); }\n",
+    )
+    .unwrap();
+    for target in ["fixture-nextest", "fixture-clippy"] {
+        let out = run_make(&checkout, target);
+        assert!(
+            out.status.success(),
+            "{target} must compile the local override:\n{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
+fn container_dependency_override_mounts_and_rewrites_the_selected_path() {
+    let scratch = tempfile::tempdir().unwrap();
+    let checkout = scratch.path().join("fcvm");
+    let local = scratch.path().join("selected-backend");
+    fs::create_dir_all(checkout.join("scripts")).unwrap();
+    fs::create_dir_all(&local).unwrap();
+    // The fake launcher only records the actual expanded container command.
+    write_executable(
+        &checkout.join("scripts/cargo-target-run.sh"),
+        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
+    );
+    fs::write(
+        checkout.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := {}\n{}\nfixture-container:\n\t@$(CONTAINER_RUN_BASE) /bin/true\n",
+            local.display(),
+            repo_makefile()
+        ),
+    )
+    .unwrap();
+    let out = run_make(&checkout, "fixture-container");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == format!("{}:/workspace/fuse-backend-rs", local.display())),
+        "the selected override must be mounted: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line == "FUSE_BACKEND_RS_OVERRIDE=/workspace/fuse-backend-rs"),
+        "the inner Make must receive the container-visible override: {stdout}"
+    );
+}
+
+#[test]
+fn fuse_backend_provenance_reports_the_locked_source_without_an_override() {
+    let scratch = tempfile::tempdir().unwrap();
+    let checkout = scratch.path().join("fcvm");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(checkout.join("Makefile"), repo_makefile()).unwrap();
+    let source = "git+https://github.com/ejc3/fuse-backend-rs.git?branch=master#cafef00d";
+    fs::write(
+        checkout.join("Cargo.lock"),
+        format!("version = 4\n[[package]]\nname = \"fuse-backend-rs\"\nversion = \"0.13.1\"\nsource = \"{source}\"\n"),
+    )
+    .unwrap();
+    assert_eq!(
+        line_for(&run_dep_provenance(&checkout), "fuse-backend-rs"),
+        source
+    );
+}
+
+#[test]
+fn dependency_auditing_rejects_a_local_override_before_running_tools() {
+    let scratch = tempfile::tempdir().unwrap();
+    let checkout = scratch.path().join("fcvm");
+    fs::create_dir(&checkout).unwrap();
+    fs::write(
+        checkout.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := ../local\n{}\n\
+             setup-lint-tools:\n\t@echo UNEXPECTED-TOOL-SETUP; exit 1\n",
+            repo_makefile()
+        ),
+    )
+    .unwrap();
+    let out = run_make(&checkout, "lint");
+    assert!(!out.status.success());
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("use make clippy for local code"),
+        "lint must reject an override before auditing a different graph:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("UNEXPECTED-TOOL-SETUP"));
+}
+
 /// Execute the real `build-host-tools` recipe with a stub cargo wrapper and
 /// prove the mid-build guard behaviorally: a sibling checkout mutated while
 /// "cargo" runs must fail the build with the provenance error, and an
@@ -448,7 +695,14 @@ fn mid_build_dependency_change_fails_the_build() {
     let dep_dir = scratch.join("fuse-backend-rs");
     fs::create_dir_all(fcvm_dir.join("scripts")).unwrap();
     fs::create_dir_all(&dep_dir).unwrap();
-    fs::write(fcvm_dir.join("Makefile"), repo_makefile()).unwrap();
+    fs::write(
+        fcvm_dir.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := ../fuse-backend-rs\n{}",
+            repo_makefile()
+        ),
+    )
+    .unwrap();
     // The cargo-target-link prerequisite manages btrfs target routing, which
     // a scratch tree has no business touching.
     write_executable(
