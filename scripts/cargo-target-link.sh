@@ -27,7 +27,7 @@
 #    self-heals for exactly this reason; target/ did not.
 #
 # 3. A FALLBACK MUST BE REVERSIBLE, AND MUST NOT SURVIVE ITS OUTAGE. A real
-#    target/ the script did not create is retained for good (its dentry may
+#    target/ or explicit container cache mount is retained (its dentry may
 #    carry a mount visible only in another mount namespace), so a fallback
 #    shaped as a real target/ would keep every later build on the root
 #    filesystem after the volume returned. The fallback is a symlink to a
@@ -112,12 +112,41 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # payload is reachable only while target/ names it.
 LOCAL_TARGET_PREFIX="$p/.cargo-target-local"
 
+# Classify aliases without following symlinks. Only a generation directly under
+# this checkout belongs to cleanup; the same basename in an external cache does
+# not. Check before normalizing away traversal through an owned generation.
+target_link_destination() {
+	local destination
+	destination="$(readlink target)" || return 1
+	/usr/bin/python3 -c '
+import posixpath
+import sys
+
+checkout, destination = sys.argv[1:3]
+parts = destination.split("/")
+parent = "/" if destination.startswith("/") else checkout
+for index, part in enumerate(parts):
+    if (parent == checkout and part.startswith(".cargo-target-local.generation-")
+            and index + 1 < len(parts)):
+        print(f"ERROR: invalid fallback target {destination}; expected one generation basename",
+              file=sys.stderr)
+        raise SystemExit(1)
+    parent = posixpath.normpath(posixpath.join(parent, part))
+print(parent)
+' "$p" "$destination"
+}
+
+# Validate before any filesystem mutation, including when btrfs is available.
+if [ -L target ]; then
+	target_link_destination >/dev/null || exit 1
+fi
+
 # The fallback payload target/ publishes right now, on stdout. Non-zero when
 # target/ publishes something else.
 published_fallback() {
 	[ -L target ] || return 1
 	local linked
-	linked="$(readlink target)"
+	linked="$(target_link_destination)" || exit 1
 	case "$linked" in
 		"$LOCAL_TARGET_PREFIX".generation-*) printf '%s' "$linked" ;;
 		*) return 1 ;;
@@ -418,7 +447,9 @@ require_writable_local_target() {
 				ls -ld -- "$p" >&2 2>/dev/null || true
 				exit 1
 			fi
-			publish_target_link "$payload"
+			# The checkout is mounted at /workspace/fcvm inside containers.
+			# A host-absolute fallback is dangling in that mount namespace.
+			publish_target_link "$(basename -- "$payload")"
 			echo "==> Symlinked target/ → $payload (local fallback)" >&2
 		fi
 	fi
@@ -454,7 +485,7 @@ it is removed by hand" >&2
 drop_managed_link() {
 	[ -L target ] || return 0
 	local linked
-	linked="$(readlink target)"
+	linked="$(target_link_destination)" || exit 1
 	case "$linked" in
 		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET_PREFIX".generation-*) ;;
 		*) return 0 ;;
@@ -636,11 +667,27 @@ finally:
 
 mkdir -p -- "$(dirname "$WT_TARGET")"
 
+# Podman can mount its cache through the fallback symlink. Retain that mount
+# just like a real target/ directory, even when btrfs has become writable.
+mounted_target=0
+if [ -L target ] && [ -d target ]; then
+	mount_rc=0
+	mountpoint -q -- target || mount_rc=$?
+	case "$mount_rc" in
+		0) mounted_target=1 ;;
+		32) ;;
+		*)
+			echo "ERROR: cannot determine whether target/ is mounted (mountpoint rc=$mount_rc); refusing to replace it" >&2
+			exit 1
+			;;
+	esac
+fi
+
 # A pre-protocol real target cannot be replaced safely: another mount
 # namespace may have a mount on that exact dentry. Keep it local and unmanaged;
 # the disk guard will fail its hard floor and quarantine the runner rather than
 # corrupt a hidden mount. Fresh checkouts always take the managed-symlink path.
-if [ -e target ] && ! [ -L target ]; then
+if [ -e target ] && { [ ! -L target ] || ((mounted_target)); }; then
 	if [ ! -d target ]; then
 		echo "ERROR: target exists but is not a usable directory:" >&2
 		ls -ld target >&2
@@ -657,7 +704,7 @@ fi
 
 candidate="$WT_TARGET"
 if [ -L target ]; then
-	linked="$(readlink target)"
+	linked="$(target_link_destination)" || exit 1
 	# target/ is replaced only under an exclusive lease on the generation it
 	# publishes: a cargo wrapper past the checkout→target lock handoff holds
 	# only that lease, shared, and the flock below blocks until it is done. A

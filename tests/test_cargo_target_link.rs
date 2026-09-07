@@ -687,6 +687,15 @@ fn makefile_delegates_to_the_script() {
          behaviour every other test in this file verifies is not what `make` runs. Commands \
          found: {recipe:?}"
     );
+    for target in ["container-shell:", "container-setup-fcvm:"] {
+        assert!(
+            mk.lines().any(|line| line.starts_with(target)
+                && line
+                    .split_whitespace()
+                    .any(|word| word == "cargo-target-link")),
+            "{target} must initialize the host target before leasing it"
+        );
+    }
 }
 
 /// The disk preflight selects per-worktree children, never the parent
@@ -3348,6 +3357,7 @@ fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> 
             std::fs::symlink_metadata(&target).map(|m| m.file_type())
         )
     });
+    let link = checkout.join(link);
     assert!(
         !link.starts_with(btrfs_root),
         "{ctx}: target/ -> {link:?} points into the btrfs root {btrfs_root:?}"
@@ -3539,6 +3549,158 @@ fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
     );
 }
 
+/// The hosted benchmark mounts the checkout at /workspace/fcvm before mounting
+/// its Cargo cache over target/. The fallback must resolve in that new view
+/// before the container starts. Moving a scratch checkout removes its old
+/// pathname and exercises the same resolution without a container or privileges.
+#[test]
+fn cargo_target_link_fallback_survives_a_remapped_checkout() {
+    let root = tempfile::tempdir().expect("scratch root");
+    let host = root.path().join("host-checkout");
+    let container = root.path().join("container-checkout");
+    let absent_volume = root.path().join("absent-volume");
+    std::fs::create_dir(&host).expect("host checkout");
+    let (ok, out) = run_link(&host, &absent_volume);
+    assert!(ok, "host target setup failed:\n{out}");
+    std::fs::write(host.join("target/artifact"), b"cached").expect("cached artifact");
+
+    std::fs::rename(&host, &container).expect("remap checkout");
+    assert_target_usable(&container, "remapped checkout before container startup");
+    let before = std::fs::symlink_metadata(container.join("target")).unwrap();
+    let (ok, out) = run_link(&container, &absent_volume);
+    assert!(ok, "container target setup failed:\n{out}");
+    let after = std::fs::symlink_metadata(container.join("target")).unwrap();
+    assert_eq!(
+        before.ino(),
+        after.ino(),
+        "setup replaced the published link"
+    );
+    assert_eq!(
+        std::fs::read(container.join("target/artifact")).expect("read cached artifact"),
+        b"cached",
+        "container target setup discarded the published payload"
+    );
+}
+
+#[test]
+fn cargo_target_link_preserves_fallback_path_aliases() {
+    for prefix in ["", "./", "././", ".//./"] {
+        for absolute in [false, true] {
+            let root = tempfile::tempdir().expect("scratch root");
+            let checkout = root.path().join("checkout");
+            let generation = checkout.join(".cargo-target-local.generation-existing");
+            std::fs::create_dir_all(&generation).expect("generation directory");
+            std::fs::write(generation.join("artifact"), b"cached").expect("cached artifact");
+            let relative = format!("{prefix}.cargo-target-local.generation-existing");
+            let destination = if absolute {
+                checkout.join(&relative)
+            } else {
+                PathBuf::from(relative)
+            };
+            std::os::unix::fs::symlink(&destination, checkout.join("target"))
+                .expect("fallback alias");
+
+            let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+            assert!(ok, "fallback alias {destination:?} failed:\n{out}");
+            assert_eq!(
+                std::fs::read(checkout.join("target/artifact"))
+                    .ok()
+                    .as_deref(),
+                Some(b"cached".as_slice()),
+                "fallback alias {destination:?} lost its cache:\n{out}"
+            );
+        }
+    }
+    // Parent components remain valid for an ordinary external cache link.
+    let root = tempfile::tempdir().expect("scratch root");
+    let checkout = root.path().join("checkout");
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&checkout).expect("checkout");
+    std::fs::create_dir(&outside).expect("outside cache");
+    std::fs::write(outside.join("artifact"), b"cached").expect("cached artifact");
+    std::os::unix::fs::symlink("../outside", checkout.join("target")).expect("external cache link");
+    let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+    assert!(ok, "external cache link failed:\n{out}");
+    assert_eq!(
+        std::fs::read(checkout.join("target/artifact")).unwrap(),
+        b"cached"
+    );
+}
+
+#[test]
+fn cargo_target_link_keeps_external_generation_paths() {
+    for absolute in [false, true] {
+        let root = tempfile::tempdir().expect("scratch root");
+        let checkout = root.path().join("checkout");
+        let relative = Path::new("../external/.cargo-target-local.generation-shared/output");
+        let cache = checkout.join(relative);
+        std::fs::create_dir(&checkout).expect("checkout");
+        std::fs::create_dir_all(&cache).expect("external cache");
+        std::fs::write(cache.join("artifact"), b"cached").expect("cached artifact");
+        let destination = if absolute {
+            cache.clone()
+        } else {
+            relative.to_path_buf()
+        };
+        let target = checkout.join("target");
+        std::os::unix::fs::symlink(&destination, &target).expect("external cache link");
+
+        let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+        assert!(ok, "external generation path was rejected:\n{out}");
+        assert_eq!(std::fs::read_link(&target).unwrap(), destination);
+        assert_eq!(std::fs::read(target.join("artifact")).unwrap(), b"cached");
+    }
+}
+
+/// A fallback identifies one checkout-local generation, not a path through it.
+/// Reject malformed links before mkdir or cleanup can alter either directory.
+#[test]
+fn cargo_target_link_rejects_fallback_path_traversal_before_mutation() {
+    for (absolute, prefix) in [(false, ""), (true, ""), (false, "././"), (true, ".//./")] {
+        for outside_exists in [false, true] {
+            let root = tempfile::tempdir().expect("scratch root");
+            let checkout = root.path().join("checkout");
+            let generation = checkout.join(".cargo-target-local.generation-existing");
+            std::fs::create_dir_all(&generation).expect("generation directory");
+            std::fs::write(generation.join("artifact"), b"cached").expect("cached artifact");
+            let outside = root.path().join("outside");
+            if outside_exists {
+                std::fs::create_dir(&outside).expect("outside directory");
+                std::fs::write(outside.join("sentinel"), b"untouched").expect("outside sentinel");
+            }
+            let relative = PathBuf::from(format!(
+                "{prefix}.cargo-target-local.generation-existing/../../outside"
+            ));
+            let destination = if absolute {
+                checkout.join(&relative)
+            } else {
+                relative
+            };
+            let target = checkout.join("target");
+            std::os::unix::fs::symlink(&destination, &target).expect("malformed fallback link");
+
+            let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+            assert!(!ok, "accepted malformed fallback (absolute={absolute}, outside_exists={outside_exists}):\n{out}");
+            assert_eq!(std::fs::read_link(&target).unwrap(), destination);
+            assert_eq!(
+                std::fs::read(generation.join("artifact")).unwrap(),
+                b"cached"
+            );
+            assert_eq!(
+                outside.exists(),
+                outside_exists,
+                "created outside directory"
+            );
+            if outside_exists {
+                assert_eq!(
+                    std::fs::read(outside.join("sentinel")).unwrap(),
+                    b"untouched"
+                );
+            }
+        }
+    }
+}
+
 /// A real target/ the script did not create is retained, volume or no volume.
 /// Its dentry may carry a mount that exists only in another mount namespace,
 /// and renaming or removing it could move or detach that mount; only the
@@ -3606,7 +3768,9 @@ fn cargo_target_link_rotate_refuses_the_local_fallback_while_the_volume_is_down(
         "--rotate reported a clean it cannot perform on the fallback link:\n{out}"
     );
     assert_eq!(
-        std::fs::read_link(&target).expect("readlink"),
+        checkout
+            .path()
+            .join(std::fs::read_link(&target).expect("readlink")),
         payload,
         "a refused rotation must leave the fallback link in place"
     );
@@ -3735,6 +3899,52 @@ fn stage_outage_fallback(checkout: &Path, absent_volume: &Path) -> PathBuf {
     let (ok, out) = run_link(checkout, absent_volume);
     assert!(ok, "the outage run failed:\n{out}");
     assert_local_fallback_link(checkout, absent_volume, "volume down")
+}
+
+/// Podman mounts the Cargo cache through the fallback symlink before build
+/// setup runs again, now with a usable btrfs root. The mounted cache must stay
+/// published, including when target/ itself is still a symlink.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_keeps_a_mounted_fallback_after_btrfs_recovery() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let payload = stage_outage_fallback(checkout.path(), &btrfs);
+    let target = checkout.path().join("target");
+    let before = std::fs::read_link(&target).expect("fallback link");
+    let cache = tempfile::tempdir().expect("container cache");
+    std::fs::write(cache.path().join("artifact"), b"container cache").expect("cached artifact");
+    let status = Command::new("mount")
+        .arg("--bind")
+        .arg(cache.path())
+        .arg(&target)
+        .status()
+        .expect("mount container cache through target");
+    assert!(status.success(), "bind mount failed: {status:?}");
+    let mount = BindMountGuard(payload);
+    for volume_available in [false, true] {
+        if volume_available {
+            std::fs::create_dir(&btrfs).expect("container-build creates btrfs root");
+        }
+        let (ok, out) = run_link(checkout.path(), &btrfs);
+        assert!(ok, "setup failed with a mounted fallback:\n{out}");
+        let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+        assert!(
+            !ok && out.contains("refusing unsafe clean"),
+            "rotated a mounted cache:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            before,
+            "setup replaced the mounted fallback"
+        );
+        assert_eq!(
+            std::fs::read(target.join("artifact")).unwrap(),
+            b"container cache"
+        );
+    }
+    mount.unmount();
 }
 
 /// Reclaiming an unpublished payload must not cross a mount boundary.
@@ -4603,6 +4813,164 @@ fn open_fifo(path: &Path) -> std::fs::File {
         .write(true)
         .open(path)
         .unwrap_or_else(|error| panic!("open {path:?}: {error}"))
+}
+
+/// The container cache mount hides the host generation inode. The launch
+/// command must pass its host lease into that namespace even when the CLI
+/// closes every copy of the descriptor it holds itself.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn container_recipe_pins_host_generation_across_mount_namespace() {
+    let scratch = tempfile::tempdir().expect("scratch root");
+    std::fs::set_permissions(scratch.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let checkout = scratch.path().join("checkout");
+    let btrfs = scratch.path().join("btrfs");
+    let cache = scratch.path().join("cache");
+    let tools = scratch.path().join("tools");
+    for directory in [&checkout, &cache, &tools] {
+        std::fs::create_dir(directory).unwrap();
+    }
+    let generation = stage_outage_fallback(&checkout, &btrfs);
+    let before = std::fs::read_link(checkout.join("target")).unwrap();
+    std::fs::write(cache.join("artifact"), b"cache").unwrap();
+    let ready_path = scratch.path().join("ready");
+    let ready = open_fifo(&ready_path);
+    write_script(
+        &tools.join("podman"),
+        r#"#!/usr/bin/python3
+import os
+import subprocess
+import sys
+
+if sys.argv[1] == "login":
+    raise SystemExit(1)
+preserved = (3,) if "--preserve-fds=1" in sys.argv else ()
+os.closerange(4 if preserved else 3, 1048576)
+os.environ.pop("FCVM_TARGET_LEASE_HELD", None)
+child = subprocess.Popen([
+    "unshare", "--mount", "--propagation", "private", "/bin/bash", "-c",
+    '''set -euo pipefail
+mount --bind -- "$CACHE" target
+mounted=$(readlink -f target)
+trap 'umount -- "$mounted"' EXIT
+"$LINK_SCRIPT"
+"$LEASE_SCRIPT" /bin/bash -c 'printf R >"$READY"; IFS= read -r _; test "$(cat target/artifact)" = cache; exit 23'
+'''], pass_fds=preserved)
+if preserved:
+    os.close(3)
+raise SystemExit(child.wait())
+"#,
+    );
+    hand_tree_to_make_child(scratch.path());
+    let path = std::env::join_paths(
+        std::iter::once(tools.clone())
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let makefile = repo_root().join("Makefile");
+    let printed = scratch_make(
+        &checkout,
+        &btrfs,
+        &[
+            "--no-print-directory",
+            "-f",
+            makefile.to_str().unwrap(),
+            "-n",
+            "-o",
+            "container-build",
+            "-o",
+            "cargo-target-link",
+            "container-shell",
+        ],
+    )
+    .env("PATH", &path)
+    .output()
+    .unwrap();
+    assert!(
+        printed.status.success(),
+        "dry run failed: {}",
+        String::from_utf8_lossy(&printed.stderr)
+    );
+    let printed = String::from_utf8(printed.stdout).unwrap();
+    let command = printed
+        .lines()
+        .find(|line| line.contains("podman run "))
+        .expect("container run command");
+    std::fs::create_dir(&btrfs).expect("container-build creates btrfs root");
+    let log_path = scratch.path().join("container.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut container = ChildGuard(Some(
+        Command::new("/bin/bash")
+            .args(["-c", command])
+            .current_dir(&checkout)
+            .env("PATH", &path)
+            .env("BTRFS_ROOT", &btrfs)
+            .env("CARGO_TARGET_DIR", "target")
+            .env("CACHE", &cache)
+            .env("READY", &ready_path)
+            .env(
+                "LINK_SCRIPT",
+                repo_root().join("scripts/cargo-target-link.sh"),
+            )
+            .env(
+                "LEASE_SCRIPT",
+                repo_root().join("scripts/cargo-target-run.sh"),
+            )
+            .env_remove("CARGO_TARGET_LINK_LOCKED")
+            .stdin(Stdio::piped())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    ));
+    assert_eq!(
+        read_marker_with_timeout(ready, "container cache lease"),
+        b'R'
+    );
+    let host_leased = !lease_is_available(&generation, "-x");
+    let cache_leased = !lease_is_available(&cache, "-x");
+    let republish = Command::new("timeout")
+        .arg("2")
+        .arg(repo_root().join("scripts/cargo-target-link.sh"))
+        .env("BTRFS_ROOT", &btrfs)
+        .env_remove("CARGO_TARGET_LINK_LOCKED")
+        .current_dir(&checkout)
+        .output()
+        .unwrap();
+    let held_link = std::fs::read_link(checkout.join("target")).unwrap();
+    container
+        .child_mut()
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"release\n")
+        .unwrap();
+    let status = container.wait().unwrap();
+    let log = std::fs::read_to_string(log_path).unwrap();
+    assert!(
+        host_leased && cache_leased,
+        "host and container must lease their separate inodes:\n{log}"
+    );
+    assert_eq!(
+        republish.status.code(),
+        Some(124),
+        "host setup replaced a live container target: {}{}",
+        String::from_utf8_lossy(&republish.stdout),
+        String::from_utf8_lossy(&republish.stderr)
+    );
+    assert_eq!(held_link, before, "host setup republished the live target");
+    assert_eq!(
+        status.code(),
+        Some(23),
+        "container exit status was lost:\n{log}"
+    );
+    assert!(
+        lease_is_available(&generation, "-x"),
+        "host lease outlived container"
+    );
+    let (ok, out) = run_link(&checkout, &btrfs);
+    assert!(ok, "host could not republish after container exit:\n{out}");
+    assert_eq!(std::fs::read(cache.join("artifact")).unwrap(), b"cache");
 }
 
 /// `build` produces `fc-agent` through the link, copies it back through the
