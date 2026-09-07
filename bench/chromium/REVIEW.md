@@ -18,6 +18,30 @@ records why.
 
 ---
 
+## Report closeout, 2026-09-07
+
+The report now publishes the verified corpus latency result without quantitative
+claims from the missing network-mode, concurrency/memory, memory-frontier,
+ablation, CoW census or WebKit probes. Their tables and repeated conclusions are
+removed. The withdrawn CPU-demand series supplies no chart or queueing
+attribution. The Kitesurf table leaves fcvm CPU and memory unestablished rather
+than substituting fixture VMM CPU or unsupported clone-memory figures.
+
+Useful August 30 exploratory records are retained under
+`report/evidence/20260830/`, including raw reduction inputs and the incomplete
+first memory attempt's failure log. They remain unqualified for publication:
+blocked arms, a changing URL mix and unreconciled memory accounting prevent a
+controlled comparison. See that directory's README for provenance and the
+read-only recomputation command.
+
+The report source and checklist are reconciled. External publication is still
+pending because this session has no Artifact publisher and the public wrapper
+does not expose a report body to compare. Follow-up benchmark campaigns are not
+required to publish the scoped latency result.
+
+The historical sections below retain their original experiment context. The
+unretained hugepage pool-consumption numbers are no longer current evidence.
+
 ## The 2026-08-16 corpus series: WITHDRAWN, do not quote
 
 Every corpus run recorded before fcvm `90733b854e` (2026-08-29, "network: stop

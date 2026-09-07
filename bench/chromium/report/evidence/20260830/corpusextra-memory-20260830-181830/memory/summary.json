@@ -1,0 +1,906 @@
+{
+ "run_id": "e9617763926d442e8a2889b2ee32de6c",
+ "meta": {
+  "run_id": "e9617763926d442e8a2889b2ee32de6c",
+  "started": 1788114311.911765,
+  "loadavg1_at_start": 0.97,
+  "host_kernel": "6.17.0-1019-aws",
+  "machine": "aarch64",
+  "snapshot": "cb-req-corpus",
+  "image": "localhost/chromium-bench-req",
+  "image_id": "334fc21f7c8c82c172a2981d9f5df98df73c3c667c4b96b1e4cdd62f001fb576",
+  "fcvm_sha256": "e18eae60578c5046c62b376fc34c5e193d1207088a30f5a2666068c5772c7e3c",
+  "report_py_sha256": "69961a1cbd6153bb9c0ef8825af709934b7191dab38b3230da2bdfdd0e7efce8",
+  "cdpdrive_sha256": "8ba1299d6120c8beaa5f298497ccca42f58c9396cd90566d39f62ad8a0cd423c",
+  "urls": [
+   "https://example.com/",
+   "https://news.ycombinator.com/",
+   "https://developers.cloudflare.com/",
+   "https://blog.cloudflare.com/",
+   "https://en.wikipedia.org/",
+   "https://developer.mozilla.org/en-US/",
+   "https://www.elmundo.es/",
+   "https://www.rtp.pt/noticias/",
+   "https://www.theguardian.com/international",
+   "https://todomvc.com/examples/javascript-es6/dist/",
+   "https://todomvc.com/examples/react/dist/index.html",
+   "https://todomvc.com/examples/vue/dist/",
+   "https://todomvc.com/examples/angular/dist/browser/",
+   "https://todomvc.com/examples/preact/dist/"
+  ],
+  "ns": [
+   1,
+   2,
+   4,
+   8
+  ],
+  "reps": 3,
+  "uffd_mode": "minor",
+  "uffd_prefetch": "on",
+  "basis": "cgroup memory.current and PSS summed over EXACTLY that cgroup's process set, on both sides: an fcvm clone's leaf cgroup holds fcvm, firecracker, the namespace holder and pasta; a container's cgroup is podman's own. MemAvailable delta from a quiesced pre-sample is recorded beside them as an attribution-free check."
+ },
+ "cells": [
+  {
+   "side": "fcvm-clone",
+   "n": 1,
+   "rep": 1,
+   "instances_counted": 1,
+   "cgroup_mib": 238.04296875,
+   "pss_mib": 566.55078125,
+   "mem_available_delta_mib": 98.41015625,
+   "refuted_fc_only_pss_mib": 555.865234375,
+   "serve_pss_mib": 8.8359375,
+   "serve_cgroup_mib": 968.2578125,
+   "cgroup_mib_per_instance": 238.0,
+   "pss_mib_per_instance": 566.6,
+   "mem_available_delta_mib_per_instance": 98.4
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 1,
+   "rep": 2,
+   "instances_counted": 1,
+   "cgroup_mib": 231.5234375,
+   "pss_mib": 579.1416015625,
+   "mem_available_delta_mib": 167.8828125,
+   "refuted_fc_only_pss_mib": 568.427734375,
+   "serve_pss_mib": 9.60546875,
+   "serve_cgroup_mib": 950.12890625,
+   "cgroup_mib_per_instance": 231.5,
+   "pss_mib_per_instance": 579.1,
+   "mem_available_delta_mib_per_instance": 167.9
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 1,
+   "rep": 3,
+   "instances_counted": 1,
+   "cgroup_mib": 225.5078125,
+   "pss_mib": 584.236328125,
+   "mem_available_delta_mib": 130.12890625,
+   "refuted_fc_only_pss_mib": 573.513671875,
+   "serve_pss_mib": 9.609375,
+   "serve_cgroup_mib": 949.76171875,
+   "cgroup_mib_per_instance": 225.5,
+   "pss_mib_per_instance": 584.2,
+   "mem_available_delta_mib_per_instance": 130.1
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 2,
+   "rep": 1,
+   "instances_counted": 2,
+   "cgroup_mib": 459.5,
+   "pss_mib": 715.2119140625,
+   "mem_available_delta_mib": 324.109375,
+   "refuted_fc_only_pss_mib": 698.2724609375,
+   "serve_pss_mib": 9.169921875,
+   "serve_cgroup_mib": 952.55859375,
+   "cgroup_mib_per_instance": 229.8,
+   "pss_mib_per_instance": 357.6,
+   "mem_available_delta_mib_per_instance": 162.1
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 2,
+   "rep": 2,
+   "instances_counted": 2,
+   "cgroup_mib": 465.25,
+   "pss_mib": 716.609375,
+   "mem_available_delta_mib": 331.71484375,
+   "refuted_fc_only_pss_mib": 699.71875,
+   "serve_pss_mib": 9.197265625,
+   "serve_cgroup_mib": 953.1953125,
+   "cgroup_mib_per_instance": 232.6,
+   "pss_mib_per_instance": 358.3,
+   "mem_available_delta_mib_per_instance": 165.9
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 2,
+   "rep": 3,
+   "instances_counted": 2,
+   "cgroup_mib": 470.48828125,
+   "pss_mib": 731.697265625,
+   "mem_available_delta_mib": 293.98828125,
+   "refuted_fc_only_pss_mib": 714.76953125,
+   "serve_pss_mib": 9.236328125,
+   "serve_cgroup_mib": 953.47265625,
+   "cgroup_mib_per_instance": 235.2,
+   "pss_mib_per_instance": 365.8,
+   "mem_available_delta_mib_per_instance": 147.0
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 4,
+   "rep": 1,
+   "instances_counted": 4,
+   "cgroup_mib": 1088.546875,
+   "pss_mib": 1102.8955078125,
+   "mem_available_delta_mib": 761.38671875,
+   "refuted_fc_only_pss_mib": 1074.908203125,
+   "serve_pss_mib": 9.20703125,
+   "serve_cgroup_mib": 958.03125,
+   "cgroup_mib_per_instance": 272.1,
+   "pss_mib_per_instance": 275.7,
+   "mem_available_delta_mib_per_instance": 190.3
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 4,
+   "rep": 2,
+   "instances_counted": 4,
+   "cgroup_mib": 1068.44921875,
+   "pss_mib": 1121.181640625,
+   "mem_available_delta_mib": 709.02734375,
+   "refuted_fc_only_pss_mib": 1093.123046875,
+   "serve_pss_mib": 9.8515625,
+   "serve_cgroup_mib": 958.1171875,
+   "cgroup_mib_per_instance": 267.1,
+   "pss_mib_per_instance": 280.3,
+   "mem_available_delta_mib_per_instance": 177.3
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 4,
+   "rep": 3,
+   "instances_counted": 4,
+   "cgroup_mib": 1108.6875,
+   "pss_mib": 1145.48046875,
+   "mem_available_delta_mib": 768.00390625,
+   "refuted_fc_only_pss_mib": 1117.474609375,
+   "serve_pss_mib": 10.4765625,
+   "serve_cgroup_mib": 959.80078125,
+   "cgroup_mib_per_instance": 277.2,
+   "pss_mib_per_instance": 286.4,
+   "mem_available_delta_mib_per_instance": 192.0
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 8,
+   "rep": 1,
+   "instances_counted": 8,
+   "cgroup_mib": 3190.4375,
+   "pss_mib": 2572.3154296875,
+   "mem_available_delta_mib": 2400.75,
+   "refuted_fc_only_pss_mib": 2523.1240234375,
+   "serve_pss_mib": 11.2158203125,
+   "serve_cgroup_mib": 968.3046875,
+   "cgroup_mib_per_instance": 398.8,
+   "pss_mib_per_instance": 321.5,
+   "mem_available_delta_mib_per_instance": 300.1
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 8,
+   "rep": 2,
+   "instances_counted": 8,
+   "cgroup_mib": 3172.2109375,
+   "pss_mib": 2621.26171875,
+   "mem_available_delta_mib": 2273.27734375,
+   "refuted_fc_only_pss_mib": 2572.0263671875,
+   "serve_pss_mib": 13.0478515625,
+   "serve_cgroup_mib": 969.41796875,
+   "cgroup_mib_per_instance": 396.5,
+   "pss_mib_per_instance": 327.7,
+   "mem_available_delta_mib_per_instance": 284.2
+  },
+  {
+   "side": "fcvm-clone",
+   "n": 8,
+   "rep": 3,
+   "instances_counted": 8,
+   "cgroup_mib": 3226.53125,
+   "pss_mib": 2633.1279296875,
+   "mem_available_delta_mib": 2336.1953125,
+   "refuted_fc_only_pss_mib": 2583.9052734375,
+   "serve_pss_mib": 13.9541015625,
+   "serve_cgroup_mib": 970.4765625,
+   "cgroup_mib_per_instance": 403.3,
+   "pss_mib_per_instance": 329.1,
+   "mem_available_delta_mib_per_instance": 292.0
+  },
+  {
+   "side": "host-container",
+   "n": 1,
+   "rep": 1,
+   "instances_counted": 1,
+   "cgroup_mib": 317.20703125,
+   "pss_mib": 528.1591796875,
+   "mem_available_delta_mib": 275.796875,
+   "cgroup_mib_per_instance": 317.2,
+   "pss_mib_per_instance": 528.2,
+   "mem_available_delta_mib_per_instance": 275.8
+  },
+  {
+   "side": "host-container",
+   "n": 1,
+   "rep": 2,
+   "instances_counted": 1,
+   "cgroup_mib": 315.58203125,
+   "pss_mib": 526.583984375,
+   "mem_available_delta_mib": 296.84765625,
+   "cgroup_mib_per_instance": 315.6,
+   "pss_mib_per_instance": 526.6,
+   "mem_available_delta_mib_per_instance": 296.8
+  },
+  {
+   "side": "host-container",
+   "n": 1,
+   "rep": 3,
+   "instances_counted": 1,
+   "cgroup_mib": 314.53515625,
+   "pss_mib": 525.0791015625,
+   "mem_available_delta_mib": 396.609375,
+   "cgroup_mib_per_instance": 314.5,
+   "pss_mib_per_instance": 525.1,
+   "mem_available_delta_mib_per_instance": 396.6
+  },
+  {
+   "side": "host-container",
+   "n": 2,
+   "rep": 1,
+   "instances_counted": 2,
+   "cgroup_mib": 626.43359375,
+   "pss_mib": 816.9169921875,
+   "mem_available_delta_mib": 730.515625,
+   "cgroup_mib_per_instance": 313.2,
+   "pss_mib_per_instance": 408.5,
+   "mem_available_delta_mib_per_instance": 365.3
+  },
+  {
+   "side": "host-container",
+   "n": 2,
+   "rep": 2,
+   "instances_counted": 2,
+   "cgroup_mib": 620.59375,
+   "pss_mib": 814.51953125,
+   "mem_available_delta_mib": 557.85546875,
+   "cgroup_mib_per_instance": 310.3,
+   "pss_mib_per_instance": 407.3,
+   "mem_available_delta_mib_per_instance": 278.9
+  },
+  {
+   "side": "host-container",
+   "n": 2,
+   "rep": 3,
+   "instances_counted": 2,
+   "cgroup_mib": 625.4375,
+   "pss_mib": 815.1494140625,
+   "mem_available_delta_mib": 671.015625,
+   "cgroup_mib_per_instance": 312.7,
+   "pss_mib_per_instance": 407.6,
+   "mem_available_delta_mib_per_instance": 335.5
+  },
+  {
+   "side": "host-container",
+   "n": 4,
+   "rep": 1,
+   "instances_counted": 4,
+   "cgroup_mib": 1303.375,
+   "pss_mib": 1450.3671875,
+   "mem_available_delta_mib": 1381.27734375,
+   "cgroup_mib_per_instance": 325.8,
+   "pss_mib_per_instance": 362.6,
+   "mem_available_delta_mib_per_instance": 345.3
+  },
+  {
+   "side": "host-container",
+   "n": 4,
+   "rep": 2,
+   "instances_counted": 4,
+   "cgroup_mib": 1302.83203125,
+   "pss_mib": 1451.0029296875,
+   "mem_available_delta_mib": 1377.91796875,
+   "cgroup_mib_per_instance": 325.7,
+   "pss_mib_per_instance": 362.8,
+   "mem_available_delta_mib_per_instance": 344.5
+  },
+  {
+   "side": "host-container",
+   "n": 4,
+   "rep": 3,
+   "instances_counted": 4,
+   "cgroup_mib": 1303.203125,
+   "pss_mib": 1451.30078125,
+   "mem_available_delta_mib": 1379.98046875,
+   "cgroup_mib_per_instance": 325.8,
+   "pss_mib_per_instance": 362.8,
+   "mem_available_delta_mib_per_instance": 345.0
+  },
+  {
+   "side": "host-container",
+   "n": 8,
+   "rep": 1,
+   "instances_counted": 8,
+   "cgroup_mib": 3049.3359375,
+   "pss_mib": 3105.26953125,
+   "mem_available_delta_mib": 3103.16796875,
+   "cgroup_mib_per_instance": 381.2,
+   "pss_mib_per_instance": 388.2,
+   "mem_available_delta_mib_per_instance": 387.9
+  },
+  {
+   "side": "host-container",
+   "n": 8,
+   "rep": 2,
+   "instances_counted": 8,
+   "cgroup_mib": 3103.59765625,
+   "pss_mib": 3156.4990234375,
+   "mem_available_delta_mib": 3269.76953125,
+   "cgroup_mib_per_instance": 387.9,
+   "pss_mib_per_instance": 394.6,
+   "mem_available_delta_mib_per_instance": 408.7
+  },
+  {
+   "side": "host-container",
+   "n": 8,
+   "rep": 3,
+   "instances_counted": 8,
+   "cgroup_mib": 3050.05859375,
+   "pss_mib": 3102.8623046875,
+   "mem_available_delta_mib": 3221.73046875,
+   "cgroup_mib_per_instance": 381.3,
+   "pss_mib_per_instance": 387.9,
+   "mem_available_delta_mib_per_instance": 402.7
+  }
+ ],
+ "fits": {
+  "fcvm-clone": {
+   "cgroup_mib": {
+    "marginal_mib_per_instance": 431.5,
+    "fixed_mib": -372.7,
+    "points": [
+     [
+      1,
+      225.5
+     ],
+     [
+      1,
+      231.5
+     ],
+     [
+      1,
+      238.0
+     ],
+     [
+      2,
+      459.5
+     ],
+     [
+      2,
+      465.2
+     ],
+     [
+      2,
+      470.5
+     ],
+     [
+      4,
+      1068.4
+     ],
+     [
+      4,
+      1088.5
+     ],
+     [
+      4,
+      1108.7
+     ],
+     [
+      8,
+      3172.2
+     ],
+     [
+      8,
+      3190.4
+     ],
+     [
+      8,
+      3226.5
+     ]
+    ]
+   },
+   "pss_mib": {
+    "marginal_mib_per_instance": 296.4,
+    "fixed_mib": 146.1,
+    "points": [
+     [
+      1,
+      566.6
+     ],
+     [
+      1,
+      579.1
+     ],
+     [
+      1,
+      584.2
+     ],
+     [
+      2,
+      715.2
+     ],
+     [
+      2,
+      716.6
+     ],
+     [
+      2,
+      731.7
+     ],
+     [
+      4,
+      1102.9
+     ],
+     [
+      4,
+      1121.2
+     ],
+     [
+      4,
+      1145.5
+     ],
+     [
+      8,
+      2572.3
+     ],
+     [
+      8,
+      2621.3
+     ],
+     [
+      8,
+      2633.1
+     ]
+    ]
+   },
+   "mem_available_delta_mib": {
+    "marginal_mib_per_instance": 320.0,
+    "fixed_mib": -317.1,
+    "points": [
+     [
+      1,
+      98.4
+     ],
+     [
+      1,
+      130.1
+     ],
+     [
+      1,
+      167.9
+     ],
+     [
+      2,
+      294.0
+     ],
+     [
+      2,
+      324.1
+     ],
+     [
+      2,
+      331.7
+     ],
+     [
+      4,
+      709.0
+     ],
+     [
+      4,
+      761.4
+     ],
+     [
+      4,
+      768.0
+     ],
+     [
+      8,
+      2273.3
+     ],
+     [
+      8,
+      2336.2
+     ],
+     [
+      8,
+      2400.8
+     ]
+    ]
+   },
+   "per_n": {
+    "1": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 231.7,
+      "min": 225.5,
+      "max": 238.0
+     },
+     "pss_mib": {
+      "mean": 576.6,
+      "min": 566.6,
+      "max": 584.2
+     },
+     "mem_available_delta_mib": {
+      "mean": 132.1,
+      "min": 98.4,
+      "max": 167.9
+     },
+     "serve_pss_mib_total": {
+      "mean": 9.4,
+      "min": 8.8,
+      "max": 9.6
+     },
+     "serve_cgroup_mib_total": {
+      "mean": 956.0,
+      "min": 949.8,
+      "max": 968.3
+     },
+     "refuted_fc_only_pss_mib_total": {
+      "mean": 565.9,
+      "min": 555.9,
+      "max": 573.5
+     }
+    },
+    "2": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 232.5,
+      "min": 229.8,
+      "max": 235.2
+     },
+     "pss_mib": {
+      "mean": 360.6,
+      "min": 357.6,
+      "max": 365.8
+     },
+     "mem_available_delta_mib": {
+      "mean": 158.3,
+      "min": 147.0,
+      "max": 165.9
+     },
+     "serve_pss_mib_total": {
+      "mean": 9.2,
+      "min": 9.2,
+      "max": 9.2
+     },
+     "serve_cgroup_mib_total": {
+      "mean": 953.1,
+      "min": 952.6,
+      "max": 953.5
+     },
+     "refuted_fc_only_pss_mib_total": {
+      "mean": 704.3,
+      "min": 698.3,
+      "max": 714.8
+     }
+    },
+    "4": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 272.1,
+      "min": 267.1,
+      "max": 277.2
+     },
+     "pss_mib": {
+      "mean": 280.8,
+      "min": 275.7,
+      "max": 286.4
+     },
+     "mem_available_delta_mib": {
+      "mean": 186.5,
+      "min": 177.3,
+      "max": 192.0
+     },
+     "serve_pss_mib_total": {
+      "mean": 9.8,
+      "min": 9.2,
+      "max": 10.5
+     },
+     "serve_cgroup_mib_total": {
+      "mean": 958.6,
+      "min": 958.0,
+      "max": 959.8
+     },
+     "refuted_fc_only_pss_mib_total": {
+      "mean": 1095.2,
+      "min": 1074.9,
+      "max": 1117.5
+     }
+    },
+    "8": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 399.5,
+      "min": 396.5,
+      "max": 403.3
+     },
+     "pss_mib": {
+      "mean": 326.1,
+      "min": 321.5,
+      "max": 329.1
+     },
+     "mem_available_delta_mib": {
+      "mean": 292.1,
+      "min": 284.2,
+      "max": 300.1
+     },
+     "serve_pss_mib_total": {
+      "mean": 12.7,
+      "min": 11.2,
+      "max": 14.0
+     },
+     "serve_cgroup_mib_total": {
+      "mean": 969.4,
+      "min": 968.3,
+      "max": 970.5
+     },
+     "refuted_fc_only_pss_mib_total": {
+      "mean": 2559.7,
+      "min": 2523.1,
+      "max": 2583.9
+     }
+    }
+   }
+  },
+  "host-container": {
+   "cgroup_mib": {
+    "marginal_mib_per_instance": 396.6,
+    "fixed_mib": -159.6,
+    "points": [
+     [
+      1,
+      314.5
+     ],
+     [
+      1,
+      315.6
+     ],
+     [
+      1,
+      317.2
+     ],
+     [
+      2,
+      620.6
+     ],
+     [
+      2,
+      625.4
+     ],
+     [
+      2,
+      626.4
+     ],
+     [
+      4,
+      1302.8
+     ],
+     [
+      4,
+      1303.2
+     ],
+     [
+      4,
+      1303.4
+     ],
+     [
+      8,
+      3049.3
+     ],
+     [
+      8,
+      3050.1
+     ],
+     [
+      8,
+      3103.6
+     ]
+    ]
+   },
+   "pss_mib": {
+    "marginal_mib_per_instance": 374.0,
+    "fixed_mib": 76.0,
+    "points": [
+     [
+      1,
+      525.1
+     ],
+     [
+      1,
+      526.6
+     ],
+     [
+      1,
+      528.2
+     ],
+     [
+      2,
+      814.5
+     ],
+     [
+      2,
+      815.1
+     ],
+     [
+      2,
+      816.9
+     ],
+     [
+      4,
+      1450.4
+     ],
+     [
+      4,
+      1451.0
+     ],
+     [
+      4,
+      1451.3
+     ],
+     [
+      8,
+      3102.9
+     ],
+     [
+      8,
+      3105.3
+     ],
+     [
+      8,
+      3156.5
+     ]
+    ]
+   },
+   "mem_available_delta_mib": {
+    "marginal_mib_per_instance": 414.1,
+    "fixed_mib": -164.4,
+    "points": [
+     [
+      1,
+      275.8
+     ],
+     [
+      1,
+      296.8
+     ],
+     [
+      1,
+      396.6
+     ],
+     [
+      2,
+      557.9
+     ],
+     [
+      2,
+      671.0
+     ],
+     [
+      2,
+      730.5
+     ],
+     [
+      4,
+      1377.9
+     ],
+     [
+      4,
+      1380.0
+     ],
+     [
+      4,
+      1381.3
+     ],
+     [
+      8,
+      3103.2
+     ],
+     [
+      8,
+      3221.7
+     ],
+     [
+      8,
+      3269.8
+     ]
+    ]
+   },
+   "per_n": {
+    "1": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 315.8,
+      "min": 314.5,
+      "max": 317.2
+     },
+     "pss_mib": {
+      "mean": 526.6,
+      "min": 525.1,
+      "max": 528.2
+     },
+     "mem_available_delta_mib": {
+      "mean": 323.1,
+      "min": 275.8,
+      "max": 396.6
+     }
+    },
+    "2": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 312.1,
+      "min": 310.3,
+      "max": 313.2
+     },
+     "pss_mib": {
+      "mean": 407.8,
+      "min": 407.3,
+      "max": 408.5
+     },
+     "mem_available_delta_mib": {
+      "mean": 326.6,
+      "min": 278.9,
+      "max": 365.3
+     }
+    },
+    "4": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 325.8,
+      "min": 325.7,
+      "max": 325.8
+     },
+     "pss_mib": {
+      "mean": 362.7,
+      "min": 362.6,
+      "max": 362.8
+     },
+     "mem_available_delta_mib": {
+      "mean": 344.9,
+      "min": 344.5,
+      "max": 345.3
+     }
+    },
+    "8": {
+     "reps": 3,
+     "cgroup_mib": {
+      "mean": 383.5,
+      "min": 381.2,
+      "max": 387.9
+     },
+     "pss_mib": {
+      "mean": 390.2,
+      "min": 387.9,
+      "max": 394.6
+     },
+     "mem_available_delta_mib": {
+      "mean": 399.8,
+      "min": 387.9,
+      "max": 408.7
+     }
+    }
+   }
+  }
+ }
+}

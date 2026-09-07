@@ -1,0 +1,290 @@
+{
+ "reps": 42,
+ "urls": [
+  "https://example.com/",
+  "https://news.ycombinator.com/",
+  "https://developers.cloudflare.com/",
+  "https://blog.cloudflare.com/",
+  "https://en.wikipedia.org/",
+  "https://developer.mozilla.org/en-US/",
+  "https://www.elmundo.es/",
+  "https://www.rtp.pt/noticias/",
+  "https://www.theguardian.com/international",
+  "https://todomvc.com/examples/javascript-es6/dist/",
+  "https://todomvc.com/examples/react/dist/index.html",
+  "https://todomvc.com/examples/vue/dist/",
+  "https://todomvc.com/examples/angular/dist/browser/",
+  "https://todomvc.com/examples/preact/dist/"
+ ],
+ "fcvm": {
+  "n": 42,
+  "per_request_cpu_ms_p50": 1643.5,
+  "serve_cpu_ms_per_request": 110.7,
+  "per_request_cpu_ms_mean": 2149.0,
+  "min": 979.6,
+  "max": 6898.7,
+  "basis": "leaf cgroup usage_usec over one whole clone lifecycle (spawn, restore, render, teardown)",
+  "records": [
+   {
+    "i": 0,
+    "url": "https://example.com/",
+    "cpu_ms": 979.574,
+    "render_wall_ms": 352.7
+   },
+   {
+    "i": 1,
+    "url": "https://news.ycombinator.com/",
+    "cpu_ms": 1155.929,
+    "render_wall_ms": 446.9
+   },
+   {
+    "i": 2,
+    "url": "https://developers.cloudflare.com/",
+    "cpu_ms": 1865.099,
+    "render_wall_ms": 819.5
+   },
+   {
+    "i": 3,
+    "url": "https://blog.cloudflare.com/",
+    "cpu_ms": 1776.178,
+    "render_wall_ms": 765.1
+   },
+   {
+    "i": 4,
+    "url": "https://en.wikipedia.org/",
+    "cpu_ms": 1643.455,
+    "render_wall_ms": 734.0
+   },
+   {
+    "i": 5,
+    "url": "https://developer.mozilla.org/en-US/",
+    "cpu_ms": 1799.116,
+    "render_wall_ms": 750.9
+   },
+   {
+    "i": 6,
+    "url": "https://www.elmundo.es/",
+    "cpu_ms": 6898.703,
+    "render_wall_ms": 3824.3
+   },
+   {
+    "i": 7,
+    "url": "https://www.rtp.pt/noticias/",
+    "cpu_ms": 5236.644,
+    "render_wall_ms": 2476.0
+   },
+   {
+    "i": 8,
+    "url": "https://www.theguardian.com/international",
+    "cpu_ms": 2384.551,
+    "render_wall_ms": 1447.1
+   },
+   {
+    "i": 9,
+    "url": "https://todomvc.com/examples/javascript-es6/dist/",
+    "cpu_ms": 1143.697,
+    "render_wall_ms": 486.7
+   },
+   {
+    "i": 10,
+    "url": "https://todomvc.com/examples/react/dist/index.html",
+    "cpu_ms": 1259.113,
+    "render_wall_ms": 506.7
+   },
+   {
+    "i": 11,
+    "url": "https://todomvc.com/examples/vue/dist/",
+    "cpu_ms": 1171.558,
+    "render_wall_ms": 438.8
+   },
+   {
+    "i": 12,
+    "url": "https://todomvc.com/examples/angular/dist/browser/",
+    "cpu_ms": 1328.524,
+    "render_wall_ms": 539.6
+   },
+   {
+    "i": 13,
+    "url": "https://todomvc.com/examples/preact/dist/",
+    "cpu_ms": 1164.647,
+    "render_wall_ms": 453.8
+   },
+   {
+    "i": 14,
+    "url": "https://example.com/",
+    "cpu_ms": 980.727,
+    "render_wall_ms": 351.1
+   },
+   {
+    "i": 15,
+    "url": "https://news.ycombinator.com/",
+    "cpu_ms": 1146.677,
+    "render_wall_ms": 446.3
+   },
+   {
+    "i": 16,
+    "url": "https://developers.cloudflare.com/",
+    "cpu_ms": 1816.9,
+    "render_wall_ms": 809.3
+   },
+   {
+    "i": 17,
+    "url": "https://blog.cloudflare.com/",
+    "cpu_ms": 1860.004,
+    "render_wall_ms": 808.1
+   },
+   {
+    "i": 18,
+    "url": "https://en.wikipedia.org/",
+    "cpu_ms": 1896.224,
+    "render_wall_ms": 1347.0
+   },
+   {
+    "i": 19,
+    "url": "https://developer.mozilla.org/en-US/",
+    "cpu_ms": 1875.037,
+    "render_wall_ms": 812.6
+   },
+   {
+    "i": 20,
+    "url": "https://www.elmundo.es/",
+    "cpu_ms": 6807.813,
+    "render_wall_ms": 3741.2
+   },
+   {
+    "i": 21,
+    "url": "https://www.rtp.pt/noticias/",
+    "cpu_ms": 5464.834,
+    "render_wall_ms": 2645.5
+   },
+   {
+    "i": 22,
+    "url": "https://www.theguardian.com/international",
+    "cpu_ms": 2352.664,
+    "render_wall_ms": 1089.5
+   },
+   {
+    "i": 23,
+    "url": "https://todomvc.com/examples/javascript-es6/dist/",
+    "cpu_ms": 1179.636,
+    "render_wall_ms": 455.9
+   },
+   {
+    "i": 24,
+    "url": "https://todomvc.com/examples/react/dist/index.html",
+    "cpu_ms": 1248.405,
+    "render_wall_ms": 462.2
+   },
+   {
+    "i": 25,
+    "url": "https://todomvc.com/examples/vue/dist/",
+    "cpu_ms": 1255.034,
+    "render_wall_ms": 487.0
+   },
+   {
+    "i": 26,
+    "url": "https://todomvc.com/examples/angular/dist/browser/",
+    "cpu_ms": 1326.432,
+    "render_wall_ms": 559.2
+   },
+   {
+    "i": 27,
+    "url": "https://todomvc.com/examples/preact/dist/",
+    "cpu_ms": 1250.339,
+    "render_wall_ms": 460.6
+   },
+   {
+    "i": 28,
+    "url": "https://example.com/",
+    "cpu_ms": 1045.058,
+    "render_wall_ms": 350.0
+   },
+   {
+    "i": 29,
+    "url": "https://news.ycombinator.com/",
+    "cpu_ms": 1135.25,
+    "render_wall_ms": 466.2
+   },
+   {
+    "i": 30,
+    "url": "https://developers.cloudflare.com/",
+    "cpu_ms": 1796.422,
+    "render_wall_ms": 779.8
+   },
+   {
+    "i": 31,
+    "url": "https://blog.cloudflare.com/",
+    "cpu_ms": 1710.864,
+    "render_wall_ms": 711.8
+   },
+   {
+    "i": 32,
+    "url": "https://en.wikipedia.org/",
+    "cpu_ms": 1733.132,
+    "render_wall_ms": 778.7
+   },
+   {
+    "i": 33,
+    "url": "https://developer.mozilla.org/en-US/",
+    "cpu_ms": 1895.433,
+    "render_wall_ms": 790.2
+   },
+   {
+    "i": 34,
+    "url": "https://www.elmundo.es/",
+    "cpu_ms": 6887.413,
+    "render_wall_ms": 3494.6
+   },
+   {
+    "i": 35,
+    "url": "https://www.rtp.pt/noticias/",
+    "cpu_ms": 5235.616,
+    "render_wall_ms": 2463.0
+   },
+   {
+    "i": 36,
+    "url": "https://www.theguardian.com/international",
+    "cpu_ms": 2402.45,
+    "render_wall_ms": 1060.0
+   },
+   {
+    "i": 37,
+    "url": "https://todomvc.com/examples/javascript-es6/dist/",
+    "cpu_ms": 1183.754,
+    "render_wall_ms": 490.7
+   },
+   {
+    "i": 38,
+    "url": "https://todomvc.com/examples/react/dist/index.html",
+    "cpu_ms": 1183.98,
+    "render_wall_ms": 446.8
+   },
+   {
+    "i": 39,
+    "url": "https://todomvc.com/examples/vue/dist/",
+    "cpu_ms": 1280.668,
+    "render_wall_ms": 471.5
+   },
+   {
+    "i": 40,
+    "url": "https://todomvc.com/examples/angular/dist/browser/",
+    "cpu_ms": 1323.846,
+    "render_wall_ms": 540.3
+   },
+   {
+    "i": 41,
+    "url": "https://todomvc.com/examples/preact/dist/",
+    "cpu_ms": 1177.782,
+    "render_wall_ms": 439.1
+   }
+  ]
+ },
+ "host": {
+  "n": 42,
+  "per_request_cpu_ms": 733.1,
+  "total_cpu_ms": 30788.8,
+  "total_wall_ms": 20531.3,
+  "cgroup": "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/libpod-a81153febeb54cd98cf70c06caf6c35dbeb4773beac259f03617e781e5974afb.scope",
+  "basis": "container cgroup usage_usec differenced across the renders, divided by the renders; includes the container's idle cost between them"
+ }
+}
