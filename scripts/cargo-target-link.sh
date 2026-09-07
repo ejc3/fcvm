@@ -27,7 +27,7 @@
 #    self-heals for exactly this reason; target/ did not.
 #
 # 3. A FALLBACK MUST BE REVERSIBLE, AND MUST NOT SURVIVE ITS OUTAGE. A real
-#    target/ the script did not create is retained for good (its dentry may
+#    target/ or explicit container cache mount is retained (its dentry may
 #    carry a mount visible only in another mount namespace), so a fallback
 #    shaped as a real target/ would keep every later build on the root
 #    filesystem after the volume returned. The fallback is a symlink to a
@@ -640,11 +640,27 @@ finally:
 
 mkdir -p -- "$(dirname "$WT_TARGET")"
 
+# Podman can mount its cache through the fallback symlink. Retain that mount
+# just like a real target/ directory, even when btrfs has become writable.
+mounted_target=0
+if [ -L target ] && [ -d target ]; then
+	mount_rc=0
+	mountpoint -q -- target || mount_rc=$?
+	case "$mount_rc" in
+		0) mounted_target=1 ;;
+		32) ;;
+		*)
+			echo "ERROR: cannot determine whether target/ is mounted (mountpoint rc=$mount_rc); refusing to replace it" >&2
+			exit 1
+			;;
+	esac
+fi
+
 # A pre-protocol real target cannot be replaced safely: another mount
 # namespace may have a mount on that exact dentry. Keep it local and unmanaged;
 # the disk guard will fail its hard floor and quarantine the runner rather than
 # corrupt a hidden mount. Fresh checkouts always take the managed-symlink path.
-if [ -e target ] && ! [ -L target ]; then
+if [ -e target ] && { [ ! -L target ] || ((mounted_target)); }; then
 	if [ ! -d target ]; then
 		echo "ERROR: target exists but is not a usable directory:" >&2
 		ls -ld target >&2

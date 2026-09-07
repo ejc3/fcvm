@@ -3773,6 +3773,52 @@ fn stage_outage_fallback(checkout: &Path, absent_volume: &Path) -> PathBuf {
     assert_local_fallback_link(checkout, absent_volume, "volume down")
 }
 
+/// Podman mounts the Cargo cache through the fallback symlink before build
+/// setup runs again, now with a usable btrfs root. The mounted cache must stay
+/// published, including when target/ itself is still a symlink.
+#[cfg(feature = "privileged-tests")]
+#[test]
+fn cargo_target_link_keeps_a_mounted_fallback_after_btrfs_recovery() {
+    let checkout = tempfile::tempdir().expect("checkout tempdir");
+    let volume_parent = tempfile::tempdir().expect("volume parent");
+    let btrfs = volume_parent.path().join("fcvm-btrfs");
+    let payload = stage_outage_fallback(checkout.path(), &btrfs);
+    let target = checkout.path().join("target");
+    let before = std::fs::read_link(&target).expect("fallback link");
+    let cache = tempfile::tempdir().expect("container cache");
+    std::fs::write(cache.path().join("artifact"), b"container cache").expect("cached artifact");
+    let status = Command::new("mount")
+        .arg("--bind")
+        .arg(cache.path())
+        .arg(&target)
+        .status()
+        .expect("mount container cache through target");
+    assert!(status.success(), "bind mount failed: {status:?}");
+    let mount = BindMountGuard(payload);
+    for volume_available in [false, true] {
+        if volume_available {
+            std::fs::create_dir(&btrfs).expect("container-build creates btrfs root");
+        }
+        let (ok, out) = run_link(checkout.path(), &btrfs);
+        assert!(ok, "setup failed with a mounted fallback:\n{out}");
+        let (ok, out) = run_link_with(checkout.path(), &btrfs, &["--rotate"]);
+        assert!(
+            !ok && out.contains("refusing unsafe clean"),
+            "rotated a mounted cache:\n{out}"
+        );
+        assert_eq!(
+            std::fs::read_link(&target).unwrap(),
+            before,
+            "setup replaced the mounted fallback"
+        );
+        assert_eq!(
+            std::fs::read(target.join("artifact")).unwrap(),
+            b"container cache"
+        );
+    }
+    mount.unmount();
+}
+
 /// Reclaiming an unpublished payload must not cross a mount boundary.
 ///
 /// `rm -rf` descends into whatever is mounted underneath and unlinks it. A
