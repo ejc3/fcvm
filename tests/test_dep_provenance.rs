@@ -587,15 +587,20 @@ fn container_dependency_override_mounts_and_rewrites_the_selected_path() {
     let local = scratch.path().join("selected-backend");
     fs::create_dir_all(checkout.join("scripts")).unwrap();
     fs::create_dir_all(&local).unwrap();
-    // The fake launcher only records the actual expanded container command.
+    // Run the actual mock-container caller without its host setup prerequisites.
+    // The fake launcher records argv rather than starting Podman.
     write_executable(
         &checkout.join("scripts/cargo-target-run.sh"),
-        "#!/bin/bash\nprintf '%s\\n' \"$@\"\n",
+        "#!/bin/bash\nprintf 'ARGV\\0'; printf '%s\\0' \"$@\"; printf 'ENDARGV\\0'\n",
     );
+    let caller = rule(&repo_makefile(), "container-test-fc-mock")
+        .unwrap()
+        .1
+        .join("\n\t");
     fs::write(
         checkout.join("Makefile"),
         format!(
-            "FUSE_BACKEND_RS_OVERRIDE := {}\n{}\nfixture-container:\n\t@$(CONTAINER_RUN_BASE) /bin/true\n",
+            "FUSE_BACKEND_RS_OVERRIDE := {}\nSTREAM := 1\nLIST := 1\nFILTER := --test selected_mock\nTEST_LOG := trace\n{}\nFC_MOCK_CONTAINER_FILTER := package(fcvm) & test(=selected_mock)\nfixture-container:\n\t{caller}\n",
             local.display(),
             repo_makefile()
         ),
@@ -608,18 +613,85 @@ fn container_dependency_override_mounts_and_rewrites_the_selected_path() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).unwrap();
+    let argv = stdout
+        .split_once("ARGV\0")
+        .unwrap()
+        .1
+        .split_once("ENDARGV\0")
+        .unwrap()
+        .0
+        .split_terminator('\0')
+        .collect::<Vec<_>>();
     assert!(
-        stdout
-            .lines()
-            .any(|line| line == format!("{}:/workspace/fuse-backend-rs", local.display())),
+        argv.contains(&format!("{}:/workspace/fuse-backend-rs", local.display()).as_str()),
         "the selected override must be mounted: {stdout}"
     );
     assert!(
-        stdout
-            .lines()
-            .any(|line| line == "FUSE_BACKEND_RS_OVERRIDE=/workspace/fuse-backend-rs"),
+        argv.contains(&"FUSE_BACKEND_RS_OVERRIDE=/workspace/fuse-backend-rs"),
         "the inner Make must receive the container-visible override: {stdout}"
     );
+    let image = argv
+        .iter()
+        .position(|arg| *arg == "fcvm-test:latest")
+        .unwrap();
+    let command = &argv[image + 1..];
+    assert!(
+        !command
+            .iter()
+            .any(|arg| arg.contains(local.to_str().unwrap())),
+        "host-expanded Cargo arguments leaked into the container command: {command:?}"
+    );
+
+    // Execute that command as the container would, with its own override path.
+    // Stub only setup/build work and Cargo execution; inner Make must construct
+    // the nextest command and preserve the caller's flags and build ordering.
+    fs::write(
+        checkout.join("Makefile"),
+        format!(
+            "FUSE_BACKEND_RS_OVERRIDE := /workspace/fuse-backend-rs\n{}\n\
+             build build-fc-mock:\n\t@echo BUILD-$@\n",
+            repo_makefile()
+        ),
+    )
+    .unwrap();
+    write_executable(
+        &checkout.join("scripts/cargo-target-link.sh"),
+        "#!/bin/bash\nexit 0\n",
+    );
+    write_executable(
+        &checkout.join("scripts/cargo-target-run.sh"),
+        "#!/bin/bash\nif [[ $1 == -c ]]; then exec /bin/bash \"$@\"; fi\n\
+         printf 'MOCK=%s LOG=%s\\n' \"$FCVM_FIRECRACKER_BIN\" \"$RUST_LOG\"\n\
+         printf 'CARGO-ARGV\\n'; printf '%s\\n' \"$@\"\n",
+    );
+    chown_tree(scratch.path());
+    let mut inner = Command::new(command[0]);
+    inner
+        .args(&command[1..])
+        .current_dir(&checkout)
+        .env_remove("MAKEFLAGS")
+        .env_remove("MFLAGS");
+    drop_priv(&mut inner);
+    let out = inner.output().unwrap();
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8(out.stdout).unwrap();
+    let cargo = stdout.find("CARGO-ARGV\n").unwrap();
+    assert!(stdout.find("BUILD-build\n").unwrap() < stdout.find("BUILD-build-fc-mock\n").unwrap());
+    assert!(stdout.find("BUILD-build-fc-mock\n").unwrap() < cargo);
+    assert!(stdout.contains("MOCK=/usr/local/bin/fc-mock LOG=trace"));
+    let args = &stdout[cargo..];
+    for expected in [
+        "patch.\"https://github.com/ejc3/fuse-backend-rs.git\".fuse-backend-rs.path=\"/workspace/fuse-backend-rs\"",
+        "nextest\nlist\n", "--no-capture", "--profile\nfc-mock", "--features\nprivileged-tests",
+        "-E\npackage(fcvm) & test(=selected_mock)", "--test\nselected_mock",
+    ] {
+        assert!(args.contains(expected), "missing {expected:?} from inner Cargo argv: {args}");
+    }
+    assert!(!args.contains(local.to_str().unwrap()));
 }
 
 #[test]

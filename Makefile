@@ -632,12 +632,17 @@ test-fc-mock: show-notes check-disk build build-fc-mock setup-fcvm _test-fc-mock
 FC_MOCK_CONTAINER_FILTER := package(fcvm) & (test(/fc_mock/) | test(/state_manager/) | test(/health_monitor/) | test(/no_sudo/)) & not test(=test_fc_mock_sanity) & not test(=test_fc_mock_container_launch)
 container-test-fc-mock: check-disk container-build setup-btrfs
 	@echo "==> Running fc-mock tests in container (unit tests only)..."
-	$(CONTAINER_RUN) $(CONTAINER_TAG) bash -c '\
-		make build build-fc-mock && \
-		FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
-		RUST_LOG="$(TEST_LOG)" \
-		$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E "$(FC_MOCK_CONTAINER_FILTER)" $(FILTER) || \
-		{ echo "TEST FAILED (fc-mock container mode)"; exit 1; }'
+	$(CONTAINER_RUN) $(CONTAINER_TAG) bash -c 'make build build-fc-mock && exec make _test-container-fc-mock "$$@"' -- \
+		FILTER='$(FILTER)' STREAM='$(STREAM)' LIST='$(LIST)' TEST_LOG='$(TEST_LOG)' \
+		FC_MOCK_CONTAINER_FILTER='$(FC_MOCK_CONTAINER_FILTER)'
+
+# Construct Cargo arguments after the dependency override is remapped inside.
+.PHONY: _test-container-fc-mock
+_test-container-fc-mock: cargo-target-link
+	FCVM_FIRECRACKER_BIN=/usr/local/bin/fc-mock \
+	RUST_LOG="$(TEST_LOG)" \
+	$(NEXTEST) $(NEXTEST_CAPTURE) --profile fc-mock --features privileged-tests -E "$(FC_MOCK_CONTAINER_FILTER)" $(FILTER) || \
+	{ echo "TEST FAILED (fc-mock container mode)"; exit 1; }
 
 container-test-unit: check-disk container-build
 	@echo "==> Running unit tests in container..."
