@@ -379,4 +379,13 @@ Write the disposition as the FIRST thing in a reply of its own (`RED-VERIFIED: .
 AFTER the finding it answers, and use the same three words for findings that arrive in a
 review body rather than inline. All three are enforced, and all three were once holes.
 
-Verify the gate itself with `scripts/test-check-review-threads.sh` before trusting a CLEAR.
+Verify the gate itself before trusting a CLEAR. It has two harnesses and CI runs only the
+second, so a gate change needs both:
+
+```bash
+bash scripts/test-check-review-threads.sh                 # shell fixtures, not run by CI
+make test-unit FILTER="-E 'binary(test_log_scan)'"        # tests/test_log_scan.rs, run by CI
+```
+
+`make test-unit FILTER=log_scan` selects nothing (0 tests, exit 4): FILTER matches test names,
+and no test name carries that substring.

@@ -55,12 +55,20 @@ END {
   if (e == 0) { print "BLOCKED: unterminated VERDICT_JQ in " gate > "/dev/stderr"; exit 2 }
   jq = substr(rest, 1, e - 1)
 
-  # The accounting primitive: every discard inside it is the primitive doing its job.
-  ps = index(jq, "def strip_accounted(")
-  if (ps == 0) { print "BLOCKED: strip_accounted is gone; nothing accounts for a removal" > "/dev/stderr"; exit 2 }
-  tail = substr(jq, ps + 1)
-  pe = index(tail, "\ndef ")
-  pe = (pe == 0) ? length(jq) : ps + pe
+  # The accounting primitives: every discard inside one is that primitive doing its job.
+  # strip_accounted removes a declared region after checking its content against the
+  # shapes that region declares. strip_hidden_comments is the check the html_comment
+  # region declares instead: it removes a comment only where CommonMark hides it, and
+  # leaves every other one in the body.
+  nprim = split("def strip_accounted(|def strip_hidden_comments:", prim, "|")
+  for (i = 1; i <= nprim; i++) {
+    p = index(jq, prim[i])
+    if (p == 0) { print "BLOCKED: " prim[i] " is gone; nothing accounts for a removal" > "/dev/stderr"; exit 2 }
+    pstart[i] = p
+    tail = substr(jq, p + 1)
+    q = index(tail, "\ndef ")
+    pend[i] = (q == 0) ? length(jq) : p + q
+  }
 
   # Normalizations. Each drops nothing a reader could read, and what survives is still
   # shape-checked by the caller.
@@ -75,6 +83,8 @@ END {
   ok[norm("select([scan(cr_marker_re)] == [cr_summarize_marker])")] = "whole-comment guard: the summarize marker is the only marker"
   ok[norm("select(test(\"(?m)^>[[:space:]]*##\") | not)")] = "whole-comment guard: no blockquoted notice heading"
   ok[norm("select(test(\"No actionable comments were generated in the recent review\"))")] = "whole-block guard: the review finished clean"
+  ok[norm("select(.name == \"f\")")] = "pick a named capture out of a match; no body text is touched"
+  ok[norm("gsub(\"\\t\"; \"    \")")] = "count a tab as four columns while measuring indentation; no body text is touched"
 
   bad = 0
   split("gsub( sub( select(", kw, " ")
@@ -89,7 +99,8 @@ END {
       call = callat(jq, pos + length(key) - 1)
       if (call == "") { print "BLOCKED: unbalanced parentheses at offset " pos > "/dev/stderr"; exit 2 }
       text = norm(substr(jq, pos, length(key) - 1) call)
-      inside = (pos >= ps && pos <= pe)
+      inside = 0
+      for (i = 1; i <= nprim; i++) if (pos >= pstart[i] && pos <= pend[i]) inside = 1
       total++
       if (inside) { printf "  primitive     %s\n", text }
       else if (text in ok) { printf "  %-13s %s\n", "normalization", text }
