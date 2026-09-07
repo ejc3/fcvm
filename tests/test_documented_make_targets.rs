@@ -605,26 +605,28 @@ fn parallel_make_never_runs_two_benchmark_suites_at_once() {
 /// criterion reports the failure and carries on.
 #[test]
 fn bench_recipes_pin_criterion_output_to_an_absolute_path() {
-    let run = Harness::new("criterion-home", &["bench"])
-        .keep_default_criterion_home()
-        .run();
-    assert!(run.ok, "make bench failed: {}", run.stderr);
-    assert_eq!(
-        run.criterion_homes.len(),
-        3,
-        "expected one criterion home per suite; got {:?}",
-        run.criterion_homes
-    );
-
-    let target = repo_root().join("target/criterion");
-    for home in &run.criterion_homes {
+    for goal in ["bench", "_bench"] {
+        let run = Harness::new("criterion-home", &[goal])
+            .keep_default_criterion_home()
+            .run();
+        assert!(run.ok, "make {goal} failed: {}", run.stderr);
         assert_eq!(
-            Path::new(home),
-            target,
-            "a bench recipe leaves criterion to choose its own output directory. Its second \
-             choice is $CARGO_TARGET_DIR/criterion, relative to the bench binary's working \
-             directory, which is the package root and not the repo root."
+            run.criterion_homes.len(),
+            3,
+            "expected one criterion home per suite; got {:?}",
+            run.criterion_homes
         );
+
+        let target = repo_root().join("target/criterion");
+        for home in &run.criterion_homes {
+            assert_eq!(
+                Path::new(home),
+                target,
+                "{goal} leaves criterion to choose its own output directory. Its second \
+                 choice is $CARGO_TARGET_DIR/criterion, relative to the bench binary's working \
+                 directory, which is the package root and not the repo root."
+            );
+        }
     }
 }
 
@@ -687,7 +689,7 @@ fn a_failed_ownership_repair_fails_the_privileged_bench_target() {
 /// ran and left nothing behind.
 #[test]
 fn a_bench_that_persisted_nothing_fails_its_target() {
-    for goal in ["bench-throughput", "bench-protocol"] {
+    for goal in ["bench-throughput", "bench-protocol", "_bench"] {
         let missing = Harness::new("criterion-home-missing", &[goal])
             .without_criterion_output()
             .run();

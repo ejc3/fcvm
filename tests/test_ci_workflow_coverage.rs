@@ -51,6 +51,32 @@ fn workflow_job<'a>(workflow: &'a Value, name: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("workflow has no `{name}` job"))
 }
 
+#[test]
+fn daily_benchmarks_require_results_from_the_container_target_mount() {
+    let daily = parse_workflow("weekly.yml");
+    let steps = workflow_job(&daily, "benchmarks")["steps"]
+        .as_sequence()
+        .expect("benchmark steps");
+    let upload = steps
+        .iter()
+        .find(|step| {
+            step["uses"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("actions/upload-artifact@"))
+        })
+        .expect("benchmark result upload");
+    assert_eq!(
+        upload["with"]["path"].as_str(),
+        Some("/tmp/fcvm-container-target/criterion/"),
+        "upload the target directory mounted by container-bench"
+    );
+    assert_eq!(
+        upload["with"]["if-no-files-found"].as_str(),
+        Some("error"),
+        "a daily benchmark with no saved results must fail"
+    );
+}
+
 /// A base-branch filter on `pull_request` silently excludes stacked PRs.
 #[test]
 fn ci_runs_on_pull_requests_regardless_of_base_branch() {
