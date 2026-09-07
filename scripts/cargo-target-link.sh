@@ -118,6 +118,7 @@ published_fallback() {
 	[ -L target ] || return 1
 	local linked
 	linked="$(readlink target)"
+	[[ $linked = /* ]] || linked="$p/$linked"
 	case "$linked" in
 		"$LOCAL_TARGET_PREFIX".generation-*) printf '%s' "$linked" ;;
 		*) return 1 ;;
@@ -418,7 +419,9 @@ require_writable_local_target() {
 				ls -ld -- "$p" >&2 2>/dev/null || true
 				exit 1
 			fi
-			publish_target_link "$payload"
+			# The checkout is mounted at /workspace/fcvm inside containers.
+			# A host-absolute fallback is dangling in that mount namespace.
+			publish_target_link "$(basename -- "$payload")"
 			echo "==> Symlinked target/ → $payload (local fallback)" >&2
 		fi
 	fi
@@ -455,6 +458,7 @@ drop_managed_link() {
 	[ -L target ] || return 0
 	local linked
 	linked="$(readlink target)"
+	[[ $linked = /* ]] || linked="$p/$linked"
 	case "$linked" in
 		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET_PREFIX".generation-*) ;;
 		*) return 0 ;;

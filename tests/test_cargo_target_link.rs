@@ -3348,6 +3348,7 @@ fn assert_local_fallback_link(checkout: &Path, btrfs_root: &Path, ctx: &str) -> 
             std::fs::symlink_metadata(&target).map(|m| m.file_type())
         )
     });
+    let link = checkout.join(link);
     assert!(
         !link.starts_with(btrfs_root),
         "{ctx}: target/ -> {link:?} points into the btrfs root {btrfs_root:?}"
@@ -3539,6 +3540,39 @@ fn cargo_target_link_returns_to_btrfs_after_a_volume_outage() {
     );
 }
 
+/// The hosted benchmark mounts the checkout at /workspace/fcvm before mounting
+/// its Cargo cache over target/. The fallback must resolve in that new view
+/// before the container starts. Moving a scratch checkout removes its old
+/// pathname and exercises the same resolution without a container or privileges.
+#[test]
+fn cargo_target_link_fallback_survives_a_remapped_checkout() {
+    let root = tempfile::tempdir().expect("scratch root");
+    let host = root.path().join("host-checkout");
+    let container = root.path().join("container-checkout");
+    let absent_volume = root.path().join("absent-volume");
+    std::fs::create_dir(&host).expect("host checkout");
+    let (ok, out) = run_link(&host, &absent_volume);
+    assert!(ok, "host target setup failed:\n{out}");
+    std::fs::write(host.join("target/artifact"), b"cached").expect("cached artifact");
+
+    std::fs::rename(&host, &container).expect("remap checkout");
+    assert_target_usable(&container, "remapped checkout before container startup");
+    let before = std::fs::symlink_metadata(container.join("target")).unwrap();
+    let (ok, out) = run_link(&container, &absent_volume);
+    assert!(ok, "container target setup failed:\n{out}");
+    let after = std::fs::symlink_metadata(container.join("target")).unwrap();
+    assert_eq!(
+        before.ino(),
+        after.ino(),
+        "setup replaced the published link"
+    );
+    assert_eq!(
+        std::fs::read(container.join("target/artifact")).expect("read cached artifact"),
+        b"cached",
+        "container target setup discarded the published payload"
+    );
+}
+
 /// A real target/ the script did not create is retained, volume or no volume.
 /// Its dentry may carry a mount that exists only in another mount namespace,
 /// and renaming or removing it could move or detach that mount; only the
@@ -3606,7 +3640,9 @@ fn cargo_target_link_rotate_refuses_the_local_fallback_while_the_volume_is_down(
         "--rotate reported a clean it cannot perform on the fallback link:\n{out}"
     );
     assert_eq!(
-        std::fs::read_link(&target).expect("readlink"),
+        checkout
+            .path()
+            .join(std::fs::read_link(&target).expect("readlink")),
         payload,
         "a refused rotation must leave the fallback link in place"
     );
