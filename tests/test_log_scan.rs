@@ -1588,9 +1588,22 @@ fn a_comment_is_removed_unread_only_where_github_hides_it() {
         .and_then(|(_, rest)| rest.split_once('\''))
         .map(|(prog, _)| prog.to_string())
         .expect("VERDICT_JQ must be a single-quoted assignment in the gate");
+    // Rebuilding the accumulated output array took 4.08s for 30,000 short lines on
+    // the reproducing host. Pin constant-size foreach state, not a wall-clock limit.
+    let scanner = jq_prog
+        .split_once("def strip_hidden_comments:")
+        .and_then(|(_, rest)| rest.split_once("\ndef "))
+        .map(|(scanner, _)| scanner)
+        .expect("strip_hidden_comments must be a named scanner");
+    assert!(
+        scanner.contains("[foreach $lines[] as $raw ({fence: null, line: \"\"};")
+            && scanner.contains("; .line)]")
+            && !scanner.contains(".out"),
+        "emit each line from constant-size state, without rebuilding the output prefix"
+    );
     let strip = |body: &str| -> String {
         let out = Command::new("jq")
-            .args(["-Rrs", &format!("{jq_prog} strip_hidden_comments")])
+            .args(["-Rrjs", &format!("{jq_prog} strip_hidden_comments")])
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
@@ -1606,9 +1619,11 @@ fn a_comment_is_removed_unread_only_where_github_hides_it() {
             "strip_hidden_comments must exist and run: {}",
             String::from_utf8_lossy(&out.stderr)
         );
-        // jq -Rrs adds no trailing newline of its own beyond the input's.
+        // Join-output suppresses jq's record separator so this is the scanner's exact text.
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
+    let many_lines = "x\n".repeat(30_000);
+    assert_eq!(strip(&many_lines), many_lines);
     for (name, body, want) in [
         ("a column-0 comment is removed", "<!-- m -->", ""),
         (

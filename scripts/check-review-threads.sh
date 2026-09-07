@@ -773,8 +773,8 @@ def strip_hidden_comments:
   | if any($lines[]; sub(quote_prefix_re; "")
            | (fence_mark == null)
              and ([scan("`+")] | group_by(length) | any(length % 2 != 0))) then $body
-    else $lines
-  | reduce .[] as $raw ({fence: null, out: []};
+    # Collect emitted lines once; carrying the output prefix in state copies it per line.
+    else [foreach $lines[] as $raw ({fence: null, line: ""};
       . as $st
       | ($raw | sub(quote_prefix_re; "")) as $c
       | if $st.fence != null then
@@ -782,15 +782,15 @@ def strip_hidden_comments:
           | { fence: (if ($f != null) and ($f[0:1] == ($st.fence | .[0:1]))
                          and (($f | length) >= ($st.fence | length)) and ($c | test(fence_close_re))
                       then null else $st.fence end),
-              out: ($st.out + [$raw]) }
-        elif ($c | lead_cols) >= 4 then { fence: null, out: ($st.out + [$raw]) }
+              line: $raw }
+        elif ($c | lead_cols) >= 4 then { fence: null, line: $raw }
         else ($c | fence_mark) as $f
-          | if $f != null then { fence: $f, out: ($st.out + [$raw]) }
-            elif ($c | test("<!--.*`")) then { fence: null, out: ($st.out + [$raw]) }
-            else { fence: null, out: ($st.out + [($raw | gsub(hidden_comment_re; ""))]) }
+          | if $f != null then { fence: $f, line: $raw }
+            elif ($c | test("<!--.*`")) then { fence: null, line: $raw }
+            else { fence: null, line: ($raw | gsub(hidden_comment_re; "")) }
             end
-        end)
-  | .out | join("\n") end;
+        end; .line)]
+  | join("\n") end;
 def strip_accounted($names):
   if ($names | any(. as $n | ([accounted_regions[] | .name] | index($n)) == null)) then null
   else reduce accounted_regions[] as $r (.;
