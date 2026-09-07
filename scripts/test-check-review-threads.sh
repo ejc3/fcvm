@@ -181,7 +181,7 @@ run_case "reviews exist but none cover the head blocks" \
   "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}}]')" \
   1 "UNREVIEWED HEAD"
 run_case "a review covering the head clears" \
-  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]')" \
   0 "CLEAR"
 # Flipped by finding 29: this case expected CLEAR, which was the fail-open itself.
 run_case "no reviews at all is an unreviewed head, not a clear one (was CLEAR)" \
@@ -212,7 +212,7 @@ run_case "only the author reviewed the head" \
   "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-01T00:00:00Z","body":"","commit":{"oid":"0ldc0mm1t"}},{"author":{"login":"me"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"NOT-A-DEFECT: fixed","commit":{"oid":"deadbeef"}}]')" \
   1 "UNREVIEWED HEAD"
 run_case "someone else reviewed the head" \
-  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]')" \
+  "$(wrap5 deadbeef '[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]')" \
   0 "CLEAR"
 
 echo "== finding 19: a reviewer with nothing to say posts no review object =="
@@ -238,7 +238,7 @@ cmt() { printf '{"author":{"login":"%s","__typename":"%s"},"createdAt":"%s","upd
 #
 # wrap9 is the wrap6 head with a review object already on it, for cases about whether a
 # comment needs a disposition rather than about what covers the head.
-wrap9() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${2:-$1}"; }
+wrap9() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":[]},"reviews":{"nodes":[{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$1" "${2:-$1}"; }
 # Codex's no-findings comment as posted: the phrase with sign-off $1, the reviewed commit
 # $2, and the folded About Codex block. Emits a JSON string literal.
 codex_body() { jq -n --arg s "$1" --arg sha "$2" '"Codex Review: Didn\u0027t find any major issues.\($s)\n\n**Reviewed commit:** `\($sha)`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>"'; }
@@ -771,7 +771,7 @@ printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPa
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments2.json"
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/threads.json"
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":false,"comments":{"totalCount":1,"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"body":"P1: this landed while the gate was paging"}]}}]}}}}}' > "$TMP/threads2.json"
-review_payload() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"prcommits":{"totalCount":1,"nodes":[{"commit":{"oid":"deadbeef"}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":%s,"commit":{"oid":"deadbeef"}}]}}}}}' "$1"; }
+review_payload() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"prcommits":{"totalCount":1,"nodes":[{"commit":{"oid":"deadbeef"}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":%s,"commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]}}}}}' "$1"; }
 review_payload '""' > "$TMP/reviews.json"
 review_payload '"P1: this landed while the gate was paging"' > "$TMP/reviews2.json"
 cat > "$TMP/bin/gh" <<'SHIM'
@@ -904,7 +904,7 @@ echo "== finding 19: a 128 KiB thread body must not kill the live-path merge =="
 mkdir -p "$TMP/bin"
 big_body=$(printf 'x%.0s' $(seq 1 200000))
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"databaseId":1,"author":{"login":"reviewer"},"path":"a.ts","line":1,"createdAt":"2026-01-01T00:00:00Z","body":"%s"},{"databaseId":2,"author":{"login":"me"},"path":"a.ts","line":1,"createdAt":"2026-01-02T00:00:00Z","body":"NOT-A-DEFECT: fixture padding, not a finding"}]}}]}}}}}' "$big_body" > "$TMP/threads.json"
-printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]}}}}}' > "$TMP/reviews.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments.json"
 # Quoted delimiter: nothing in the shim expands at write time; GATE_TEST_DIR
 # arrives via the environment when the gate execs gh.
@@ -1058,7 +1058,7 @@ thread_read() {  # $1 the reply on the thread, $2 totalCount, $3.. the page-1 co
 }
 thread_read '"NOT-A-DEFECT: renamed only, no behaviour change"' > "$TMP/threads.json"
 thread_read '"Actually the rename changed behaviour, this still drops the row"' > "$TMP/threads2.json"
-printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]}}}}}' > "$TMP/reviews.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/comments.json"
 # An oversized thread: page 1 holds the finding and one line of chatter, page 2 holds the
 # reply, and the reply is what gets edited between the reads.
@@ -1176,7 +1176,7 @@ printf '{"data":{"node":{"comments":{"pageInfo":{"hasNextPage":true,"endCursor":
 # list) already says another page follows and names no cursor. The disposition is on the
 # page nobody can ask for, so a run that skips the paging judges the thread undisposed.
 printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"id":"T1","isResolved":true,"isOutdated":false,"comments":{"totalCount":3,"pageInfo":{"hasNextPage":true,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"path":"a.ts","line":1,"originalLine":1,"body":"this drops the last row"},{"author":{"login":"onlooker"},"path":"a.ts","line":1,"originalLine":1,"body":"discussion"}]}}]}}}}}' > "$TMP/pagednocursor.json"
-printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"}}]}}}}}' > "$TMP/reviews.json"
+printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviews":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[{"author":{"login":"reviewer"},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}]}}}}}' > "$TMP/reviews.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[%s]}}}}}' "$CLAIM42" > "$TMP/comments.json"
 printf '{"data":{"repository":{"pullRequest":{"comments":{"pageInfo":{"hasNextPage":false,"endCursor":null},"nodes":[]}}}}}' > "$TMP/nocomments.json"
 printf '%s' "$PRCOMMITS_LIVE" > "$TMP/prcommits.json"
@@ -1545,6 +1545,75 @@ else
   echo "  FAIL  every discard in VERDICT_JQ is a declared region or a listed normalization"
   sed 's/^/          /' <<<"$out" | head -8; fail=$((fail+1))
 fi
+
+echo "== finding 46: an EMPTY review object is not a review =="
+# #897 merged on head 27b1b943 with its last two commits reviewed by nobody. CodeRabbit
+# reviewed the previous head 34f66d47, posted two findings, and was refused under Fair
+# Usage on every request after that. The author fixed both findings, pushed, replied in
+# both threads and resolved them. GitHub minted an empty COMMENTED review object as the
+# container for each of those bot replies, bound to the new head:
+#     [coderabbitai] COMMENTED body_len=0  14:16:37Z  commit=27b1b943
+#     [coderabbitai] COMMENTED body_len=0  14:16:41Z  commit=27b1b943
+# `reviewed` counted them, the gate said CLEAR, and the merge went through 12 minutes
+# later. A reply to a comment thread is not a review of the code; the container carries
+# nothing that could only exist because a review ran.
+#
+# What counts now, and why each: a non-empty BODY (the reviewer wrote something), a state
+# of APPROVED or CHANGES_REQUESTED (GitHub only mints those from the review form; a reply
+# container is always COMMENTED), or an inline comment of its own that is not a reply
+# (the reviewer placed a finding). The last is not decoration: a human who reviews with
+# inline comments and no summary submits exactly that shape, and refusing it would leave
+# such a head permanently uncoverable once its threads were answered.
+CR_REVIEW='**Actionable comments posted: 2**\n\n<details>\n<summary>scripts/x.sh (1)</summary>\n\nP1: this drops the last row.\n\n</details>'
+# A review object as GraphQL returns it: $1 login, $2 state, $3 submittedAt, $4 commit,
+# $5 body, $6 the comments connection (default: none, the shape of a fixture captured
+# before the gate read them).
+rev() { printf '{"author":{"login":"%s"},"state":"%s","submittedAt":"%s","commit":{"oid":"%s"},"body":"%s"%s}' \
+  "$1" "$2" "$3" "$4" "$5" "${6:+,\"comments\":$6}"; }
+REPLY_CONTAINER='{"totalCount":1,"nodes":[{"replyTo":{"id":"PRRC_reply"}}]}'
+INLINE_FINDING='{"totalCount":1,"nodes":[{"replyTo":null}]}'
+# The #897 payload: findings raised on the OLD head, both threads answered and resolved,
+# the author's disposition review, and two empty bot containers on the current head.
+wrap11() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":[{"createdAt":"2026-01-02T00:30:00Z"}]}}}]},"reviewThreads":{"nodes":%s},"reviews":{"nodes":%s},"comments":{"nodes":[]},"recheck":{"comments":{"nodes":[]}}}}}}' "${2:-$ANSWERED_THREADS}" "$1"; }
+ANSWERED_THREADS='[{"id":"PRRT_1","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/x.sh","line":10,"originalLine":10,"body":"P1: this drops the last row"},{"author":{"login":"me"},"path":"scripts/x.sh","line":10,"originalLine":10,"body":"RED-VERIFIED: tests/row.rs"}]}},{"id":"PRRT_2","isResolved":true,"isOutdated":false,"comments":{"nodes":[{"author":{"login":"coderabbitai"},"path":"scripts/x.sh","line":20,"originalLine":20,"body":"P2: the count is off by one"},{"author":{"login":"me"},"path":"scripts/x.sh","line":20,"originalLine":20,"body":"NOT-A-DEFECT: reworded the message only"}]}}]'
+PR897=$(printf '[%s,%s,%s,%s]' \
+  "$(rev coderabbitai COMMENTED 2026-01-02T00:10:00Z 0ldc0mm1t "$CR_REVIEW")" \
+  "$(rev me COMMENTED 2026-01-02T01:00:00Z deadbeef 'RED-VERIFIED: tests/row.rs — both findings answered')" \
+  "$(rev coderabbitai COMMENTED 2026-01-02T00:50:00Z deadbeef '' "$REPLY_CONTAINER")" \
+  "$(rev coderabbitai COMMENTED 2026-01-02T00:50:04Z deadbeef '' "$REPLY_CONTAINER")")
+run_case "the #897 shape: two empty bot reply containers on the head cover nothing" \
+  "$(wrap11 "$PR897")" 1 "UNREVIEWED HEAD"
+run_case "one empty-bodied COMMENTED review on the head is not coverage" \
+  "$(wrap5 deadbeef "[$(rev coderabbitai COMMENTED 2026-01-02T00:50:00Z deadbeef '' "$REPLY_CONTAINER")]")" \
+  1 "UNREVIEWED HEAD"
+# A fixture captured before the gate read review comments carries no comments connection
+# at all. That is no evidence, not evidence of a review, and it declines.
+run_case "an empty COMMENTED review with no comments connection is not coverage" \
+  "$(wrap5 deadbeef "[$(rev coderabbitai COMMENTED 2026-01-02T00:50:00Z deadbeef '')]")" \
+  1 "UNREVIEWED HEAD"
+
+# The other direction, which matters just as much: an over-tight rule refuses real
+# coverage, and a gate that cries wolf gets switched off. Each of these must still cover.
+run_case "a bot review with findings on the head covers it" \
+  "$(wrap11 "$(printf '[%s,%s]' \
+     "$(rev coderabbitai COMMENTED 2026-01-02T00:40:00Z deadbeef "$CR_REVIEW" '{"totalCount":2,"nodes":[{"replyTo":null},{"replyTo":null}]}')" \
+     "$(rev me COMMENTED 2026-01-02T01:00:00Z deadbeef 'RED-VERIFIED: tests/row.rs')")")" \
+  0 "CLEAR"
+run_case "a stranger's APPROVED review with an empty body covers the head" \
+  "$(wrap5 deadbeef "[$(rev reviewer APPROVED 2026-01-02T00:50:00Z deadbeef '')]")" 0 "CLEAR"
+run_case "a CHANGES_REQUESTED review with an empty body covers the head" \
+  "$(wrap5 deadbeef "[$(rev reviewer CHANGES_REQUESTED 2026-01-02T00:50:00Z deadbeef '')]")" 0 "CLEAR"
+run_case "a review that placed an inline finding but wrote no summary covers the head" \
+  "$(wrap11 "[$(rev reviewer COMMENTED 2026-01-02T00:40:00Z deadbeef '' "$INLINE_FINDING")]")" \
+  0 "CLEAR"
+# A review object this gate cannot read must block, not be waved past as coverage and not
+# be silently dropped from the count.
+run_case "a review on the head with a non-string state exits 2" \
+  "$(wrap5 deadbeef '[{"author":{"login":"reviewer"},"state":null,"submittedAt":"2026-01-02T00:50:00Z","commit":{"oid":"deadbeef"},"body":""}]')" \
+  2 "BLOCKED"
+run_case "a review whose comments connection is truncated exits 2" \
+  "$(wrap5 deadbeef "[$(rev reviewer COMMENTED 2026-01-02T00:50:00Z deadbeef '' '{"totalCount":7,"nodes":[{"replyTo":{"id":"PRRC_reply"}}]}')]")" \
+  2 "BLOCKED"
 
 
 echo

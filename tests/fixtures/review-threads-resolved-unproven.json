@@ -33,6 +33,10 @@
               "body": "",
               "commit": {
                 "oid": "cb226f8d3418b51af89484d7bfc5387fed6c5114"
+              },
+              "comments": {
+                "totalCount": 0,
+                "nodes": []
               }
             }
           ]
