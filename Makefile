@@ -1255,8 +1255,8 @@ define run_privileged_bench
 	exit $$bench_rc
 endef
 
-# One criterion suite as the invoking user. Nothing here writes as root, so
-# there is no ownership to repair.
+# One criterion suite without privilege elevation. Container callers already
+# run as root and do not need the host ownership repair.
 define run_unprivileged_bench
 	CRITERION_HOME='$(CRITERION_HOME)' $(CARGO) bench -p fuse-pipe --bench $(1) $(BENCH_SEPARATED); \
 	bench_rc=$$?; \
@@ -1364,9 +1364,9 @@ container-bench: check-disk container-build
 
 _bench: cargo-target-link
 	@echo "==> Running benchmarks..."
-	$(CARGO) bench -p fuse-pipe --bench throughput
-	$(CARGO) bench -p fuse-pipe --bench operations
-	$(CARGO) bench -p fuse-pipe --bench protocol
+	$(call run_unprivileged_bench,throughput)
+	$(call run_unprivileged_bench,operations)
+	$(call run_unprivileged_bench,protocol)
 
 # Lint tools versions (keep in sync with CI)
 CARGO_AUDIT_VERSION := 0.22.0
