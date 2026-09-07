@@ -3573,11 +3573,56 @@ fn cargo_target_link_fallback_survives_a_remapped_checkout() {
     );
 }
 
+#[test]
+fn cargo_target_link_preserves_fallback_path_aliases() {
+    for prefix in ["", "./", "././", ".//./"] {
+        for absolute in [false, true] {
+            let root = tempfile::tempdir().expect("scratch root");
+            let checkout = root.path().join("checkout");
+            let generation = checkout.join(".cargo-target-local.generation-existing");
+            std::fs::create_dir_all(&generation).expect("generation directory");
+            std::fs::write(generation.join("artifact"), b"cached").expect("cached artifact");
+            let relative = format!("{prefix}.cargo-target-local.generation-existing");
+            let destination = if absolute {
+                checkout.join(&relative)
+            } else {
+                PathBuf::from(relative)
+            };
+            std::os::unix::fs::symlink(&destination, checkout.join("target"))
+                .expect("fallback alias");
+
+            let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+            assert!(ok, "fallback alias {destination:?} failed:\n{out}");
+            assert_eq!(
+                std::fs::read(checkout.join("target/artifact"))
+                    .ok()
+                    .as_deref(),
+                Some(b"cached".as_slice()),
+                "fallback alias {destination:?} lost its cache:\n{out}"
+            );
+        }
+    }
+    // Parent components remain valid for an ordinary external cache link.
+    let root = tempfile::tempdir().expect("scratch root");
+    let checkout = root.path().join("checkout");
+    let outside = root.path().join("outside");
+    std::fs::create_dir(&checkout).expect("checkout");
+    std::fs::create_dir(&outside).expect("outside cache");
+    std::fs::write(outside.join("artifact"), b"cached").expect("cached artifact");
+    std::os::unix::fs::symlink("../outside", checkout.join("target")).expect("external cache link");
+    let (ok, out) = run_link(&checkout, &root.path().join("absent-volume"));
+    assert!(ok, "external cache link failed:\n{out}");
+    assert_eq!(
+        std::fs::read(checkout.join("target/artifact")).unwrap(),
+        b"cached"
+    );
+}
+
 /// A fallback identifies one checkout-local generation, not a path through it.
 /// Reject malformed links before mkdir or cleanup can alter either directory.
 #[test]
 fn cargo_target_link_rejects_fallback_path_traversal_before_mutation() {
-    for absolute in [false, true] {
+    for (absolute, prefix) in [(false, ""), (true, ""), (false, "././"), (true, ".//./")] {
         for outside_exists in [false, true] {
             let root = tempfile::tempdir().expect("scratch root");
             let checkout = root.path().join("checkout");
@@ -3589,11 +3634,13 @@ fn cargo_target_link_rejects_fallback_path_traversal_before_mutation() {
                 std::fs::create_dir(&outside).expect("outside directory");
                 std::fs::write(outside.join("sentinel"), b"untouched").expect("outside sentinel");
             }
-            let relative = Path::new(".cargo-target-local.generation-existing/../../outside");
+            let relative = PathBuf::from(format!(
+                "{prefix}.cargo-target-local.generation-existing/../../outside"
+            ));
             let destination = if absolute {
-                checkout.join(relative)
+                checkout.join(&relative)
             } else {
-                relative.to_path_buf()
+                relative
             };
             let target = checkout.join("target");
             std::os::unix::fs::symlink(&destination, &target).expect("malformed fallback link");

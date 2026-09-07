@@ -112,17 +112,24 @@ WT_TARGET="$BTRFS_ROOT/cargo-target/$name-$hash"
 # payload is reachable only while target/ names it.
 LOCAL_TARGET_PREFIX="$p/.cargo-target-local"
 
-# A fallback names one direct child. Traversing through that child would let
-# cleanup remove an intermediate directory that target/ still needs to resolve.
-if [ -L target ]; then
-	linked="$(readlink target)"
-	[[ $linked = /* ]] || linked="$p/$linked"
-	case "$linked" in
-		"$LOCAL_TARGET_PREFIX".generation-*/*)
-			echo "ERROR: invalid fallback target $linked; expected one generation basename" >&2
-			exit 1
+# Classify aliases consistently without following generation symlinks. Reject
+# paths through a reserved generation component before normalization can erase
+# that traversal and cleanup can remove a directory target/ still needs.
+target_link_destination() {
+	local destination
+	destination="$(readlink target)" || return 1
+	case "/$destination" in
+		*/.cargo-target-local.generation-*/*)
+			echo "ERROR: invalid fallback target $destination; expected one generation basename" >&2
+			return 1
 			;;
 	esac
+	realpath -m -s -- "$destination"
+}
+
+# Validate before any filesystem mutation, including when btrfs is available.
+if [ -L target ]; then
+	target_link_destination >/dev/null || exit 1
 fi
 
 # The fallback payload target/ publishes right now, on stdout. Non-zero when
@@ -130,8 +137,7 @@ fi
 published_fallback() {
 	[ -L target ] || return 1
 	local linked
-	linked="$(readlink target)"
-	[[ $linked = /* ]] || linked="$p/$linked"
+	linked="$(target_link_destination)" || exit 1
 	case "$linked" in
 		"$LOCAL_TARGET_PREFIX".generation-*) printf '%s' "$linked" ;;
 		*) return 1 ;;
@@ -470,8 +476,7 @@ it is removed by hand" >&2
 drop_managed_link() {
 	[ -L target ] || return 0
 	local linked
-	linked="$(readlink target)"
-	[[ $linked = /* ]] || linked="$p/$linked"
+	linked="$(target_link_destination)" || exit 1
 	case "$linked" in
 		"$BTRFS_ROOT"/cargo-target/* | "$LOCAL_TARGET_PREFIX".generation-*) ;;
 		*) return 0 ;;
@@ -690,7 +695,7 @@ fi
 
 candidate="$WT_TARGET"
 if [ -L target ]; then
-	linked="$(readlink target)"
+	linked="$(target_link_destination)" || exit 1
 	# target/ is replaced only under an exclusive lease on the generation it
 	# publishes: a cargo wrapper past the checkout→target lock handoff holds
 	# only that lease, shared, and the flock below blocks until it is done. A
