@@ -29,7 +29,20 @@ jobs:
     # skips every Claude job (they all `needs:` it without always(), and
     # `eligible` stays unset) — strictly more restrictive than running the
     # eligibility gate, so this only ever reduces what runs. Fail-closed.
-    if: github.actor != 'dependabot[bot]'
+    # GitHub's fork-PR approval policy does not gate issue comments or
+    # workflow_run. Reject drive-by events before allocating this job or
+    # minting an App token. The PR-author/code checks below remain required.
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      ((github.event_name == 'pull_request' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.pull_request.author_association)) ||
+       (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+       (github.event_name == 'pull_request_review_comment' &&
+        contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association)) ||
+       (github.event_name == 'workflow_run' &&
+        github.event.workflow_run.head_repository.full_name == github.repository &&
+        contains(fromJSON('["push","pull_request","workflow_dispatch"]'), github.event.workflow_run.event)))
     runs-on: ubuntu-latest
     outputs:
       safe: ${{ steps.check.outputs.safe }}
@@ -43,10 +56,13 @@ jobs:
     steps:
       - name: Generate token
         id: token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          permission-metadata: read
+          permission-issues: read
+          permission-pull-requests: read
 
       - name: Get PR number
         id: get-pr
