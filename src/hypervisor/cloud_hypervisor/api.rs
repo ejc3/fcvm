@@ -10,7 +10,10 @@
 //! `ch-remote info` output on v52).
 
 use anyhow::Result;
-use hyper::{Body, Client, Method, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::{Method, Request, StatusCode};
+use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
 use serde::Serialize;
 use std::path::PathBuf;
@@ -23,7 +26,7 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Clone)]
 pub struct ChClient {
     socket_path: PathBuf,
-    client: Client<hyperlocal::UnixConnector>,
+    client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
     request_timeout: Duration,
 }
 
@@ -56,7 +59,7 @@ impl ChClient {
             .method(Method::PUT)
             .uri(self.uri(path))
             .header("Content-Type", "application/json")
-            .body(Body::from(json))?;
+            .body(Full::new(Bytes::from(json)))?;
         self.send(path, req).await
     }
 
@@ -65,11 +68,11 @@ impl ChClient {
         let req = Request::builder()
             .method(Method::PUT)
             .uri(self.uri(path))
-            .body(Body::empty())?;
+            .body(Full::default())?;
         self.send(path, req).await
     }
 
-    async fn send(&self, path: &str, req: Request<Body>) -> Result<()> {
+    async fn send(&self, path: &str, req: Request<Full<Bytes>>) -> Result<()> {
         let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
             .await
             .map_err(|_| {
@@ -81,7 +84,7 @@ impl ChClient {
             })??;
         let status = resp.status();
         if status != StatusCode::NO_CONTENT && status != StatusCode::OK {
-            let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+            let body_bytes = resp.into_body().collect().await?.to_bytes();
             let body_str = String::from_utf8_lossy(&body_bytes);
             anyhow::bail!(
                 "Cloud Hypervisor API error: {} {} - {}",
@@ -98,7 +101,7 @@ impl ChClient {
         let req = Request::builder()
             .method(Method::GET)
             .uri(self.uri("/api/v1/vmm.ping"))
-            .body(Body::empty())?;
+            .body(Full::default())?;
         self.send("/api/v1/vmm.ping", req).await
     }
 

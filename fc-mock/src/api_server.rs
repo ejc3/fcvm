@@ -4,8 +4,11 @@
 //! and triggers container launch on InstanceStart.
 
 use anyhow::{Context, Result};
+use http_body_util::{BodyExt, Full};
+use hyper::body::{Bytes, Incoming};
 use hyper::service::service_fn;
-use hyper::{Body, Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::{Mutex, Notify};
@@ -81,8 +84,8 @@ pub async fn start_server(
                     let state = state.clone();
                     async move { handle_request(req, state).await }
                 });
-                if let Err(e) = hyper::server::conn::Http::new()
-                    .serve_connection(stream, service)
+                if let Err(e) = hyper::server::conn::http1::Builder::new()
+                    .serve_connection(TokioIo::new(stream), service)
                     .await
                 {
                     // Connection reset is normal during shutdown
@@ -102,15 +105,15 @@ pub async fn start_server(
 
 /// Handle a single API request.
 async fn handle_request(
-    req: Request<Body>,
+    req: Request<Incoming>,
     state: SharedState,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     let method = req.method().clone();
     let path = req.uri().path().to_string();
 
     debug!(%method, %path, "API request");
 
-    let body_bytes = hyper::body::to_bytes(req.into_body()).await?;
+    let body_bytes = req.into_body().collect().await?.to_bytes();
 
     let result: Result<(), String> = match (method, path.as_str()) {
         // Boot source - extract boot_args for network config
@@ -243,16 +246,16 @@ async fn handle_request(
             let msg = format!("{{\"fault_message\": \"{}\"}}", e);
             Ok(Response::builder()
                 .status(StatusCode::BAD_REQUEST)
-                .body(Body::from(msg))
+                .body(Full::new(Bytes::from(msg)))
                 .unwrap())
         }
     }
 }
 
-fn response_204() -> Response<Body> {
+fn response_204() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::NO_CONTENT)
-        .body(Body::empty())
+        .body(Full::default())
         .unwrap()
 }
 
