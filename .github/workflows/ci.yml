@@ -795,6 +795,9 @@ jobs:
         run: |
           echo 512 | sudo tee /proc/sys/vm/nr_hugepages
           echo "Allocated $(cat /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages) hugepages"
+      - name: Build Cloud Hypervisor backend for reboot regression
+        working-directory: fcvm
+        run: make setup-cloud-hypervisor
       - name: test-root
         working-directory: fcvm
         run: |

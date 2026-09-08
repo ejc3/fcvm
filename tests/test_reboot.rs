@@ -4,7 +4,7 @@
 //! relaunches in place from the same provisioned disk and comes back healthy, with
 //! the container's writable layer ("the work") preserved and its identity
 //! regenerated. The fcvm process (and therefore its PID) stays stable across the
-//! reboot — only the Firecracker child restarts.
+//! reboot, only the VMM child restarts.
 //!
 //! Both VM lifecycle paths are covered:
 //!   * fresh `podman run` boot (`--no-snapshot` pins the run_vm_loop path)
@@ -34,7 +34,7 @@ async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
 
     // `reboot` goes through systemd, which starts fcvm-reboot-notify.service
     // (WantedBy=reboot.target) -> fc-agent --notify-reboot -> host relaunches
-    // Firecracker in place. The exec dies mid-command as the VM resets.
+    // the VMM in place. The exec dies mid-command as the VM resets.
     let _ = common::exec_in_vm(pid, &["reboot"]).await;
 
     let deadline = Instant::now() + Duration::from_secs(150);
@@ -122,6 +122,54 @@ async fn test_vm_reboot_comes_back_healthy_and_preserves_work() -> Result<()> {
     common::kill_process(pid).await;
     let _ = child.kill().await;
     Ok(())
+}
+
+/// A normal Cloud Hypervisor VM must consume reboot intent before its final exit.
+// Host-Root CI provisions Cloud Hypervisor; container-test-all does not.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_cloud_hypervisor_reboot_recovers_and_then_exits() -> Result<()> {
+    fcvm::commands::common::find_cloud_hypervisor()
+        .context("CH reboot test requires the backend")?;
+    let (name, _, _, _) = common::unique_names("ch-reboot");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            "--no-snapshot",
+            "nginx:alpine",
+            "sh",
+            "-c",
+            "while [ ! -e /stop ]; do sleep 1; done",
+        ],
+        "ch-reboot-base",
+    )
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        let token = format!("ch-reboot-token-{pid}");
+        write_work_marker(pid, &token).await?;
+        reboot_and_assert_relaunch(pid, &token).await?;
+
+        // The exec response may disappear when its container exits; the process
+        // exit below proves the stop marker was consumed and the final boot ended.
+        let _ = common::exec_in_container(pid, &["touch", "/stop"]).await;
+        let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+            .await
+            .context("CH VM did not terminate after its container exited")??;
+        anyhow::ensure!(status.success(), "CH VM final exit must be zero: {status}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if child.try_wait()?.is_none() {
+        common::kill_process(pid).await;
+        let _ = child.kill().await;
+    }
+    result
 }
 
 /// Data-disk preservation: an in-place reboot must NOT rebuild --disk-dir
