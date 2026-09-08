@@ -523,6 +523,7 @@ class CampaignSummary(unittest.TestCase):
         self.assertEqual(cell["diag"], {
             "diag_passed": True, "violations_count": 0,
             "max_load_ms": {"https://example.com/": 812.5},
+            "errors": {"https://example.com/": {}},
         })
 
     def test_an_unclean_dns_verdict_refuses_and_writes_nothing(self):
@@ -884,16 +885,23 @@ class CampaignSummary(unittest.TestCase):
             self.assertIn("dns-evidence.json", text)
 
     def test_diag_fields_flow_into_the_cell(self):
-        """The cell carries the diag's verdict, its violation count and the
-        slowest load event per URL, and the index names the summary among
-        the files it was generated from.
+        """The cell carries the diag verdict, loads and request error counts.
 
         Watched red 2026-08-28 at 55d6fb7d: the cell's diag was the whole
         summary object (`AssertionError: {'engine': 'chromium', ...} != {'diag_passed': True, ...}`).
+
+        #900: a passing diag with request errors must retain their counts,
+        including pages with no errors, without calling them violations.
+        Watched red with errors absent from the index, then green, then red
+        again after removing only the production change.
         """
         urls = ("https://example.com/", "https://news.ycombinator.com/")
         summary = diag_summary(urls=urls)
         summary["urls"]["https://news.ycombinator.com/"]["max_load_ms"] = 2210.0
+        summary["urls"]["https://news.ycombinator.com/"]["errors"] = {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 4,
+        }
         with tempfile.TemporaryDirectory() as d:
             run_dir = os.path.join(d, "run")
             paths = write_run(run_dir, diag=summary)
@@ -908,8 +916,54 @@ class CampaignSummary(unittest.TestCase):
             "violations_count": 0,
             "max_load_ms": {"https://example.com/": 812.5,
                             "https://news.ycombinator.com/": 2210.0},
+            "errors": {
+                "https://example.com/": {},
+                "https://news.ycombinator.com/": {
+                    "net::ERR_ABORTED": 45,
+                    "net::ERR_CONNECTION_RESET": 4,
+                },
+            },
         })
         self.assertIn(paths["diag"], {entry["path"] for entry in index["generated_from"]})
+
+    def test_diag_error_counts_require_nonnegative_integers(self):
+        """Missing or malformed request counts cannot be published as evidence.
+
+        Watched all seven invalid shapes publish successfully before the
+        validator and again after reverting only the validator.
+        """
+        cases = (
+            ("missing", None, False),
+            ("null", None, False),
+            ("list", [], False),
+            ("negative", {"net::ERR_ABORTED": -1}, False),
+            ("boolean", {"net::ERR_ABORTED": True}, False),
+            ("float", {"net::ERR_ABORTED": 1.0}, False),
+            ("string", {"net::ERR_ABORTED": "1"}, False),
+            ("empty", {}, True),
+            ("zero", {"net::ERR_ABORTED": 0}, True),
+        )
+        url = "https://example.com/"
+        for label, errors, valid in cases:
+            with self.subTest(case=label), tempfile.TemporaryDirectory() as d:
+                summary = diag_summary()
+                if label == "missing":
+                    del summary["urls"][url]["errors"]
+                else:
+                    summary["urls"][url]["errors"] = errors
+                if valid:
+                    run_dir = os.path.join(d, "run")
+                    write_run(run_dir, diag=summary)
+                    out = os.path.join(d, "campaign-x-summary.json")
+                    rc, text = self._summarize(out, [run_dir])
+                    self.assertEqual(rc, 0, text)
+                    with open(out) as handle:
+                        self.assertEqual(json.load(handle)["cells"][0]["diag"]["errors"],
+                                         {url: errors})
+                else:
+                    _, text = self._refused(d, diag=summary)
+                    self.assertIn("errors", text)
+                    self.assertIn(url, text)
 
     def test_a_corpus_cell_without_its_diag_is_refused(self):
         """A run whose guest resolved through the baked resolver had the

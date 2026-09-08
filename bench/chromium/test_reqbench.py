@@ -10816,6 +10816,7 @@ class CampaignSummaryFromAnalyzerOutput(unittest.TestCase):
         self.assertEqual(cell["diag"], {
             "diag_passed": True, "violations_count": 0,
             "max_load_ms": {url: 812.5 for url in self.CORPUS},
+            "errors": {url: {} for url in self.CORPUS},
         })
         self.assertEqual(
             {os.path.basename(entry["path"]) for entry in index["generated_from"]},

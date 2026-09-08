@@ -42,7 +42,8 @@ during the measured run, when the evidence records it), load_evidence with
 descriptive statistics from the continuous owner sampler and every measured
 request (overall and per arm), the headline median
 blocking_ms per arm with its CI, and for the diag its verdict, violation
-count and slowest load event per URL.
+count, slowest load event and browser request error counts per URL. Request
+errors are reported separately from the limits that determine the verdict.
 
 The publication rule (REVIEW.md) is to quote only from sealed runs that passed
 their gates and were never withdrawn, and publishable=true alone proves none
@@ -1162,7 +1163,7 @@ DIAG_IDENTITY = (
 
 
 def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
-    """The diag's verdict, violation count and slowest load per URL; RunError otherwise.
+    """The diag's verdict, violations, loads and request errors; RunError otherwise.
 
     addresses is the set recorded_addresses derived for the cell, and
     stall_max_ms the run's armed stall gate: the two things the diag's
@@ -1244,6 +1245,15 @@ def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
             raise RunError(f"{run_dir}: diag/summary.json max_load_ms for {url} is {value!r}")
         max_load[url] = value
+        counts = data.get("errors")
+        if not isinstance(counts, dict) or any(
+            not isinstance(error, str) or type(count) is not int or count < 0
+            for error, count in counts.items()
+        ):
+            raise RunError(
+                f"{run_dir}: diag/summary.json errors for {url} must map "
+                "error texts to nonnegative integer counts"
+            )
     # A diag over other pages says nothing about the pages this run measured,
     # and a cell that names no url gives the comparison nothing to hold the
     # diag to.
@@ -1264,7 +1274,12 @@ def summarize_diag(run_dir, diag, cell, measured_urls, addresses, stall_max_ms):
             f"{len(violations)} violation(s) {kinds}; a run whose diag failed is not indexed"
         )
     check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms)
-    return {"diag_passed": True, "violations_count": 0, "max_load_ms": max_load}
+    return {
+        "diag_passed": True,
+        "violations_count": 0,
+        "max_load_ms": max_load,
+        "errors": {url: data.get("errors") for url, data in urls.items()},
+    }
 
 
 def check_diag_limits(run_dir, diag, measured_urls, addresses, stall_max_ms):

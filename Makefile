@@ -246,7 +246,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
 	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium analyze-chromium-request bench-clone-latency test-chromium-request \
+	bench-container-import bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -325,6 +325,7 @@ help:
 	@echo "  bench-chromium-hostcdp         Host direct-CDP baseline (COMPARISON_LABEL=standalone CPU_BUDGET=unlimited; CPUS= needs CPU_BUDGET=vm-matched)"
 	@echo "  bench-chromium-fault           Page-fault bench (FAULT_OUT= required; needs bench.sh goldens)"
 	@echo "  analyze-chromium-request  Re-run publication gates for RESULTS=/path/to/run"
+	@echo "  analyze-chromium-campaign  Index retained CAMPAIGN_RUNS='run1 run2' into CAMPAIGN_OUT=path"
 	@echo "  test-chromium          Run ALL bench unit tests (what CI runs)"
 	@echo "  test-chromium-request  Run the request benchmark's deterministic unit tests"
 	@echo "  bench-chromium-scale  Open-loop FILE/UFFD Chromium request scalability run"
@@ -1121,6 +1122,11 @@ analyze-chromium-request:
 	@test -f "$(RESULTS)/reqbench.jsonl" || { echo "ERROR: no $(RESULTS)/reqbench.jsonl" >&2; exit 2; }
 	@python3 bench/chromium/reqanalyze.py --json-out "$(RESULTS)/analysis.json" \
 		$(if $(STALL_MAX_MS),--stall-max-ms $(STALL_MAX_MS),) "$(RESULTS)/reqbench.jsonl"
+
+analyze-chromium-campaign:
+	@test -n "$(CAMPAIGN_OUT)" || { echo "ERROR: CAMPAIGN_OUT required" >&2; exit 2; }
+	@test -n "$(CAMPAIGN_RUNS)" || { echo "ERROR: CAMPAIGN_RUNS required" >&2; exit 2; }
+	@python3 bench/chromium/campaign_summary.py --out "$(CAMPAIGN_OUT)" $(CAMPAIGN_RUNS)
 
 # What CI runs (ci.yml globs test_*.py). The per-harness targets below are
 # narrower dev conveniences; run THIS before pushing, because a new test file is
