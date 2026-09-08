@@ -186,9 +186,9 @@ compute_hash() {
     printf '%s\n' "$host_kernel_version"
     # Include boot_args from config to invalidate cache when they change
     grep -E '^boot_args\s*=' "$repo_root/rootfs-config.toml" 2>/dev/null || true
-    # Include the passt build inputs so a pin or patch change rebuilds the AMI
+    # Include the passt build inputs so a pin change rebuilds the AMI
     # instead of reusing one whose baked-in pasta no longer matches CI.
-    cat "$SCRIPT_DIR/build-passt.sh" "$SCRIPT_DIR"/passt-*.patch 2>/dev/null
+    cat "$SCRIPT_DIR/build-passt.sh"
     # Include the disk guard's script and units: they are baked into the AMI,
     # so a change to them must produce a new AMI rather than silently reusing
     # one without the fix.
@@ -315,7 +315,7 @@ sudo -u ubuntu env HOME=/home/ubuntu bash -c \
 cd /tmp/fcvm
 
 # Build pasta/passt from the repo's pinned source so the AMI matches CI
-# (scripts/build-passt.sh owns the pin and the local patches).
+# (scripts/build-passt.sh owns the pin).
 ./scripts/build-passt.sh
 
 # Use repo's config which has nested profile defined

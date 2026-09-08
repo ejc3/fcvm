@@ -245,7 +245,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -292,6 +292,7 @@ help:
 	@echo "Setup:"
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
+	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
 	@echo "  install-host-kernel  Build and install host kernel with patches (requires reboot)"
@@ -678,6 +679,9 @@ container-clean:
 	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
 
 # Setup targets
+setup-passt:
+	./scripts/build-passt.sh
+
 setup-pjdfstest:
 	@if [ ! -x /tmp/pjdfstest-check/pjdfstest ]; then \
 		echo '==> Building pjdfstest...'; \

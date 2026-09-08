@@ -1409,7 +1409,7 @@ impl PastaNetwork {
         );
 
         // Resolve the pasta binary through the pinned-build machinery: with a
-        // [pasta] config section the content-addressed patched build is
+        // [pasta] config section the content-addressed upstream build is
         // required (a distro pasta would reintroduce the addr_seen inbound
         // poisoning, #661); without one, PATH is used as before.
         let (config, _, _) =

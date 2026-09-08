@@ -377,7 +377,6 @@ fn make_fixture() -> tempfile::TempDir {
         "scripts/build-ami.sh",
         "#!/bin/sh\n# pinned provisioning script\n",
     );
-    w("scripts/passt-0001.patch", "passt\n");
     w("scripts/runner-disk-preflight.sh", "#!/bin/sh\n");
     w("scripts/prune-cargo-target.sh", "#!/bin/sh\n");
     w("scripts/runner-disk-guard.service", "[Unit]\n");

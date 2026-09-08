@@ -1,19 +1,12 @@
-//! Build pasta (passt) from a pinned upstream commit plus fcvm-carried patches.
+//! Build pasta (passt) from a pinned upstream commit.
 //!
-//! fcvm's rootless networking depends on pasta behavior that upstream hasn't
-//! released yet — currently the addr_seen fix (pasta otherwise adopts the last
-//! source address it overhears on its tap as "the guest", and the namespace
-//! bridge's own broadcasts poison inbound port forwarding; see issue #661 and
-//! the patch submitted to passt-dev). Until a fixed release ships in distros,
-//! fcvm builds its own pasta the same way it builds its firecracker fork:
-//! content-addressed in the shared assets dir, built on demand by `fcvm setup`.
+//! The pin contains the upstream addr_seen fix for issue #661. fcvm builds
+//! pasta on demand into the content-addressed shared assets directory, so
+//! rootless networking does not depend on the host's distro pasta version.
 //!
-//! Robustness choices (deliberately stricter than the firecracker builder):
+//! Build and publication rules:
 //! - The upstream ref is a PINNED COMMIT, not a branch: the binary path is
 //!   computable offline (no ls-remote, no network-failure fallback paths).
-//! - Patches are EMBEDDED in the fcvm binary (include_str!), not read from
-//!   the repo checkout: builds work from any working directory, and editing
-//!   a patch automatically produces a new content hash (and thus a rebuild).
 //! - Installs are atomic (temp file + rename) and serialized by an exclusive
 //!   flock, double-checked after acquisition.
 
@@ -26,25 +19,13 @@ use tracing::{debug, info};
 use crate::paths;
 use crate::setup::rootfs::PastaConfig;
 
-/// Patches applied on top of the pinned upstream commit, in order.
-/// Embedded so the build is independent of the working directory and the
-/// content hash tracks patch edits automatically.
-const PATCHES: &[(&str, &str)] = &[(
-    "0001-tap-dont-let-overheard-traffic-move-addr_seen.patch",
-    include_str!("../../pasta/patches/0001-tap-dont-let-overheard-traffic-move-addr_seen.patch"),
-)];
-
-/// Content hash for the pasta binary: upstream repo + pinned commit + every
-/// embedded patch + the host libc (dynamically linked binaries must not be
+/// Content hash for the pasta binary: upstream repo + pinned commit +
+/// the host libc (dynamically linked binaries must not be
 /// shared across incompatible C libraries — same rule as firecracker).
 fn compute_pasta_sha(config: &PastaConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(config.repo.as_bytes());
     hasher.update(config.commit.as_bytes());
-    for (name, content) in PATCHES {
-        hasher.update(name.as_bytes());
-        hasher.update(content.as_bytes());
-    }
     hasher.update(super::kernel::libc_version_tag().as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..6])
@@ -63,7 +44,7 @@ pub fn pasta_bin_path(config: &PastaConfig) -> PathBuf {
 ///
 /// With a `[pasta]` config section, the content-addressed build is REQUIRED:
 /// a missing binary is an error pointing at `fcvm setup`, not a silent
-/// fallback to a distro pasta with the bug fcvm is patching around.
+/// fallback to a distro pasta without the upstream fix.
 /// Without the section, the system pasta from PATH is used unchanged.
 pub fn get_pasta_for_config(config: Option<&PastaConfig>) -> Result<PathBuf> {
     match config {
@@ -71,7 +52,7 @@ pub fn get_pasta_for_config(config: Option<&PastaConfig>) -> Result<PathBuf> {
             let path = pasta_bin_path(cfg);
             if !path.exists() {
                 bail!(
-                    "patched pasta not found at {}. Run 'fcvm setup' (or 'make setup-fcvm') \
+                    "pinned pasta not found at {}. Run 'fcvm setup' (or 'make setup-fcvm') \
                      to build it from {} @ {}",
                     path.display(),
                     cfg.repo,
@@ -84,7 +65,7 @@ pub fn get_pasta_for_config(config: Option<&PastaConfig>) -> Result<PathBuf> {
     }
 }
 
-/// Ensure the patched pasta binary exists, building it if needed.
+/// Ensure the pinned pasta binary exists, building it if needed.
 /// Returns `Ok(None)` when no `[pasta]` section is configured.
 pub async fn ensure_pasta(config: Option<&PastaConfig>) -> Result<Option<PathBuf>> {
     let config = match config {
@@ -110,10 +91,9 @@ pub async fn ensure_pasta(config: Option<&PastaConfig>) -> Result<Option<PathBuf
 
     let sha = compute_pasta_sha(config);
     println!(
-        "  → Building pasta from {} @ {} ({} patch(es), sha: {})...",
+        "  → Building pasta from {} @ {} (sha: {})...",
         config.repo,
         &config.commit[..config.commit.len().min(12)],
-        PATCHES.len(),
         sha
     );
 
@@ -176,29 +156,6 @@ async fn build_pasta(
             config.commit,
             config.repo
         );
-    }
-
-    for (name, content) in PATCHES {
-        let patch_path = build_dir.join(name);
-        tokio::fs::write(&patch_path, content)
-            .await
-            .with_context(|| format!("writing embedded patch {}", name))?;
-        let status = super::run_build_as_sudo_invoker(
-            Command::new("git")
-                .args(["apply", "--verbose", name])
-                .current_dir(build_dir),
-        )
-        .status()
-        .await
-        .with_context(|| format!("applying pasta patch {}", name))?;
-        if !status.success() {
-            bail!(
-                "pasta patch {} does not apply to {} @ {} — rebase the patch or move the pin",
-                name,
-                config.repo,
-                &config.commit[..config.commit.len().min(12)]
-            );
-        }
     }
 
     let status =

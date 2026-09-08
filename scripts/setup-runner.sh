@@ -84,7 +84,7 @@ ln -sf /home/ubuntu/.cargo/bin/rustc /usr/local/bin/rustc
 ln -sf /home/ubuntu/.cargo/bin/rustup /usr/local/bin/rustup
 
 # Build pasta/passt from the repo's pinned source so runners match CI
-# (scripts/build-passt.sh owns the pin and the local patches).
+# (scripts/build-passt.sh owns the pin).
 git clone --depth 1 https://github.com/ejc3/fcvm.git /tmp/fcvm-passt
 /tmp/fcvm-passt/scripts/build-passt.sh
 

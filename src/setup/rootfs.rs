@@ -56,7 +56,7 @@ pub struct Plan {
     /// `fcvm setup --cloud-hypervisor`, content-addressed like firecracker.
     #[serde(default)]
     pub cloud_hypervisor: Option<CloudHypervisorConfig>,
-    /// Pinned pasta build (upstream commit + fcvm-carried patches).
+    /// Pinned pasta build (upstream commit).
     /// When set, rootless networking REQUIRES the built binary — see
     /// src/setup/pasta.rs for the why and the robustness rules.
     #[serde(default)]

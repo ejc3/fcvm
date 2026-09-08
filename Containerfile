@@ -21,8 +21,8 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Build passt from source for consistent version across environments
-COPY scripts/build-passt.sh scripts/passt-*.patch /tmp/
-RUN /tmp/build-passt.sh && rm -rf /tmp/passt-build* /tmp/build-passt.sh /tmp/passt-*.patch
+COPY scripts/build-passt.sh /tmp/
+RUN /tmp/build-passt.sh && rm -rf /tmp/passt-build* /tmp/build-passt.sh
 
 # Install Firecracker
 ARG ARCH=aarch64
