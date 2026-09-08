@@ -107,7 +107,7 @@ jobs:
                   ['systemctl', 'show', service, '--property=' + key, '--value'],
                   text=True, timeout=5).strip()
           validate({'identity': identity, 'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
-              'machine': os.uname().machine, 'settings': json.loads((directory / '.runner').read_text()),
+              'machine': os.uname().machine, 'settings': json.loads((directory / '.runner').read_bytes()),
               'service': service, 'cgroup': Path('/proc/self/cgroup').read_text(),
               'dropin': dropin.read_text(), 'dropin_uid': info.st_uid,
               'dropin_mode': stat.S_IMODE(info.st_mode), 'restart': properties['Restart'],

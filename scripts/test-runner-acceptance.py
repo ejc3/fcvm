@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """Offline tests of the exact manual runner-acceptance workflow (no AWS calls)."""
 import ast
+import json
 from pathlib import Path
 import re
 import shlex
 import subprocess
+import tempfile
 import textwrap
 import unittest
 
@@ -17,6 +19,7 @@ class RunnerAcceptanceTests(unittest.TestCase):
         cls.workflow = WORKFLOW.read_text()
         body = cls.workflow.split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
         tree = ast.parse(textwrap.dedent(body))
+        cls.workflow_tree = tree
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
         namespace = {'re': re, 'shlex': shlex}
         exec(compile(ast.Module(body=functions, type_ignores=[]), '<workflow>', 'exec'), namespace)
@@ -40,6 +43,28 @@ class RunnerAcceptanceTests(unittest.TestCase):
 
     def test_brokered_host_is_accepted(self):
         self.validate(self.valid())
+
+    def test_actual_settings_loader_accepts_utf8_with_or_without_bom(self):
+        # The pinned runner writes a UTF-8 BOM to .runner. Execute the shipped
+        # loader expression, not a test-only decoder or the validation function.
+        loaders = [node for node in ast.walk(self.workflow_tree)
+                   if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and isinstance(node.func.value, ast.Name)
+                   and node.func.value.id == 'json' and node.func.attr == 'loads'
+                   and any(isinstance(child, ast.Constant) and child.value == '.runner'
+                           for child in ast.walk(node))]
+        self.assertEqual(len(loaders), 1)
+        loader = compile(ast.Expression(loaders[0]), '<workflow-settings-loader>', 'eval')
+        expected = self.valid()['settings']
+        with tempfile.TemporaryDirectory(prefix='runner-settings-') as temporary:
+            directory = Path(temporary)
+            for prefix in (b'', b'\xef\xbb\xbf'):
+                with self.subTest(bom=bool(prefix)):
+                    (directory / '.runner').write_bytes(prefix + json.dumps(expected).encode())
+                    self.assertEqual(eval(loader, {'json': json, 'directory': directory}), expected)
+            (directory / '.runner').write_bytes(b'\xef\xbb\xbf{')
+            with self.assertRaises(json.JSONDecodeError):
+                eval(loader, {'json': json, 'directory': directory})
 
     def test_legacy_or_missing_ephemeral_flag_is_rejected(self):
         for value in (False, None, 'true', 1):
@@ -78,6 +103,15 @@ class RunnerAcceptanceTests(unittest.TestCase):
             data = self.valid()
             data[key] = value
             with self.assertRaises(ValueError):
+                self.validate(data)
+
+    def test_root_owned_nonwritable_modes_satisfy_the_contract(self):
+        # The gate requires root ownership and no untrusted writers, not an
+        # exact copy of the bootstrap's 0644 mode. Effective service checks remain.
+        for mode in (0o644, 0o600, 0o444, 0o755):
+            with self.subTest(mode=oct(mode)):
+                data = self.valid()
+                data['dropin_mode'] = mode
                 self.validate(data)
 
     def test_effective_poweroff_must_match_without_extra_commands(self):
