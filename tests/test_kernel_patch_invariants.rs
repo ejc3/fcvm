@@ -4,6 +4,74 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// Exercise the actual stable-kernel functions after applying our carried fix.
+/// Stub only their dependencies, so removing the production patch reintroduces
+/// the stale CPU/flag/count state without running a kernel-crashing NV2 guest.
+#[test]
+fn arm64_vncr_retranslation_releases_cpu_mapping_before_vcpu_put() {
+    let temp = tempfile::tempdir().expect("create isolated VNCR fixture");
+    let source_dir = temp.path().join("arch/arm64/kvm");
+    fs::create_dir_all(&source_dir).unwrap();
+    fs::write(
+        source_dir.join("nested.c"),
+        include_str!("fixtures/vncr/nested.c"),
+    )
+    .unwrap();
+    fs::write(
+        temp.path().join("harness.c"),
+        include_str!("fixtures/vncr/harness.c"),
+    )
+    .unwrap();
+
+    let patch = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("kernel/patches-arm64/vncr-fixmap-state.patch");
+    // When the fix is absent, execute the original functions and fail on the
+    // broken state, not merely on a missing patch file.
+    if patch.exists() {
+        let applied = Command::new("patch")
+            .args(["--batch", "--forward", "--fuzz=0", "-p1", "-i"])
+            .arg(patch)
+            .current_dir(temp.path())
+            .output()
+            .expect("apply the VNCR fix to stable source excerpts");
+        assert!(
+            applied.status.success(),
+            "VNCR patch did not apply:\n{}{}",
+            String::from_utf8_lossy(&applied.stdout),
+            String::from_utf8_lossy(&applied.stderr)
+        );
+    }
+
+    let binary = temp.path().join("vncr-regression");
+    let compiled = Command::new("cc")
+        .args(["-std=gnu11", "-Werror=implicit-function-declaration", "-o"])
+        .arg(&binary)
+        .arg(temp.path().join("harness.c"))
+        .output()
+        .expect("compile the actual VNCR functions with test dependencies");
+    assert!(
+        compiled.status.success(),
+        "VNCR fixture failed to compile:\n{}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+
+    let mut failures = Vec::new();
+    for (scenario, name) in [
+        ("1", "mapped successful retranslation"),
+        ("2", "mapped translation failure"),
+        ("0", "unmapped control"),
+    ] {
+        let result = Command::new(&binary).arg(scenario).output().unwrap();
+        if !result.status.success() {
+            failures.push(format!(
+                "{name}: {}",
+                String::from_utf8_lossy(&result.stderr)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
 /// Apply the ARM64 vsock patch to a minimal source file with the same line and
 /// statement layout as Linux 7.1.7, then ask a C compiler to parse it.
 ///
