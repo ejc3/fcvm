@@ -39,6 +39,10 @@ endif
 show-notes:
 	@echo "━━━ fcvm ━━━  FILTER=$(FILTER) STREAM=$(STREAM)  Assets=SHA-cached  (see .claude/CLAUDE.md)"
 
+.PHONY: test-runner-acceptance
+test-runner-acceptance:
+	python3 scripts/test-runner-acceptance.py
+
 # Paths (can be overridden via environment)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSE_BACKEND_RS_OVERRIDE ?=
