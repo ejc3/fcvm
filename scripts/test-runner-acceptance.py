@@ -3,6 +3,7 @@
 import ast
 from pathlib import Path
 import re
+import shlex
 import textwrap
 import unittest
 
@@ -16,7 +17,7 @@ class RunnerAcceptanceTests(unittest.TestCase):
         body = cls.workflow.split("          python3 - <<'PY'\n", 1)[1].split('\n          PY', 1)[0]
         tree = ast.parse(textwrap.dedent(body))
         functions = [node for node in tree.body if isinstance(node, ast.FunctionDef)]
-        namespace = {'re': re}
+        namespace = {'re': re, 'shlex': shlex}
         exec(compile(ast.Module(body=functions, type_ignores=[]), '<workflow>', 'exec'), namespace)
         cls.validate = staticmethod(namespace['validate'])
 
@@ -29,9 +30,10 @@ class RunnerAcceptanceTests(unittest.TestCase):
             'runner_name': f'runner-{instance}', 'machine': 'aarch64',
             'settings': {'agentName': f'runner-{instance}', 'ephemeral': True},
             'service': service, 'cgroup': f'0::/system.slice/{service}\n',
-            'dropin': '[Service]\nRestart=no\nExecStopPost=+/usr/bin/systemctl --no-block poweroff\n',
+            'dropin': '[Service]\nRestart=no\nEnvironment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1\nExecStopPost=+/usr/bin/systemctl --no-block poweroff\n',
             'dropin_uid': 0, 'dropin_mode': 0o644,
             'restart': 'no', 'active': 'active',
+            'environment': 'GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1',
             'stop_post': '{ path=/usr/bin/systemctl ; argv[]=/usr/bin/systemctl --no-block poweroff ; ignore_errors=no ; }',
         }
 
@@ -85,6 +87,18 @@ class RunnerAcceptanceTests(unittest.TestCase):
             data['stop_post'] = value
             with self.assertRaises(ValueError):
                 self.validate(data)
+
+    def test_failure_retry_environment_must_be_effective_and_exact(self):
+        for value in ('', 'GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=2',
+                      'PREFIX_GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1',
+                      'GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1 GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=2'):
+            data = self.valid()
+            data['environment'] = value
+            with self.assertRaises(ValueError):
+                self.validate(data)
+        data = self.valid()
+        data['environment'] += ' "OTHER=unrelated value"'
+        self.validate(data)
 
     def test_workflow_is_manual_main_only_single_short_arm_job(self):
         self.assertIn('on:\n  workflow_dispatch:\n', self.workflow)

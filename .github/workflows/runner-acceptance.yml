@@ -29,6 +29,7 @@ jobs:
           import os
           from pathlib import Path
           import re
+          import shlex
           import stat
           import subprocess
           import time
@@ -51,10 +52,16 @@ jobs:
                       or not any(service in group for group in groups)):
                   raise ValueError('Job does not belong to the recorded runner service')
               expected_dropin = ['[Service]', 'Restart=no',
+                                 'Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1',
                                  'ExecStopPost=+/usr/bin/systemctl --no-block poweroff']
               if (data['dropin'].splitlines() != expected_dropin or data['dropin_uid'] != 0
                       or data['dropin_mode'] & 0o022):
                   raise ValueError('Missing or unsafe broker ephemeral service drop-in')
+              # Inspect only the expected setting; never print the unit environment.
+              failure_limit = [item for item in shlex.split(data['environment'])
+                               if item.startswith('GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=')]
+              if failure_limit != ['GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1']:
+                  raise ValueError('Effective service retry limit is missing or incorrect')
               stop_post = data['stop_post']
               if (data['restart'] != 'no' or data['active'] != 'active'
                       or stop_post.count('path=') != 1
@@ -82,7 +89,7 @@ jobs:
           if not stat.S_ISREG(info.st_mode):
               raise ValueError('Ephemeral drop-in must be a regular file')
           properties = {}
-          for key in ('Restart', 'ActiveState', 'ExecStopPost'):
+          for key in ('Restart', 'ActiveState', 'ExecStopPost', 'Environment'):
               properties[key] = subprocess.check_output(
                   ['systemctl', 'show', service, '--property=' + key, '--value'],
                   text=True, timeout=5).strip()
@@ -91,7 +98,8 @@ jobs:
               'service': service, 'cgroup': Path('/proc/self/cgroup').read_text(),
               'dropin': dropin.read_text(), 'dropin_uid': info.st_uid,
               'dropin_mode': stat.S_IMODE(info.st_mode), 'restart': properties['Restart'],
-              'active': properties['ActiveState'], 'stop_post': properties['ExecStopPost']})
+              'active': properties['ActiveState'], 'stop_post': properties['ExecStopPost'],
+              'environment': properties['Environment']})
           if sum(range(100)) != 4950:
               raise RuntimeError('Benign Python smoke test failed')
           print(json.dumps({'phase': 'ready-for-observer', 'runner': os.environ['ACCEPTANCE_RUNNER_NAME'],
