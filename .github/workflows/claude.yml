@@ -60,6 +60,9 @@ jobs:
         with:
           app-id: ${{ vars.CLAUDE_APP_ID }}
           private-key: ${{ secrets.CLAUDE_APP_PRIVATE_KEY }}
+          permission-metadata: read
+          permission-issues: read
+          permission-pull-requests: read
 
       - name: Get PR number
         id: get-pr

@@ -44,8 +44,14 @@ def evaluate(expression, context):
             parent = visit(node.value)
             return parent.get(node.attr, '') if isinstance(parent, dict) else ''
         if isinstance(node, ast.BoolOp):
-            values = [bool(visit(value)) for value in node.values]
-            return all(values) if isinstance(node.op, ast.And) else any(values)
+            # GitHub's && / || return operands, including checkout SHA strings.
+            for value in node.values:
+                result = visit(value)
+                if isinstance(node.op, ast.And) and not result:
+                    return result
+                if isinstance(node.op, ast.Or) and result:
+                    return result
+            return result
         if isinstance(node, ast.Compare) and len(node.ops) == 1:
             left, right = visit(node.left), visit(node.comparators[0])
             if isinstance(node.ops[0], ast.Eq):
@@ -60,7 +66,7 @@ def evaluate(expression, context):
                 return args[1] in args[0]
         raise AssertionError(f'Unsupported job-gate expression: {ast.dump(node)}')
 
-    return bool(visit(tree))
+    return visit(tree)
 
 
 def github(event_name, event=None, **extra):
@@ -124,11 +130,31 @@ class WorkflowSecurityTest(unittest.TestCase):
         content = (ROOT / '.github/workflows/build-runner-ami.yml').read_text()
         self.assertIn('role/github-actions-ami-builder', content)
         self.assertNotIn('role/github-actions-terraform', content)
-        self.assertIn('ref: ${{ github.sha }}', content)
         self.assertIn('persist-credentials: false', content)
         self.assertIn('fetch-depth: 0', content)
         self.assertRegex(content, r'uses: actions/checkout@[0-9a-f]{40}')
         self.assertRegex(content, r'uses: aws-actions/configure-aws-credentials@[0-9a-f]{40}')
+
+    def test_builder_checkout_matches_triggering_commit(self):
+        content = (ROOT / '.github/workflows/build-runner-ami.yml').read_text()
+        refs = re.findall(r'^          ref: \$\{\{ (.*?) \}\}$', content, re.M)
+        self.assertEqual(len(refs), 1)
+        for event_name, expected in [('workflow_run', 'a' * 40),
+                                     ('workflow_dispatch', 'b' * 40)]:
+            with self.subTest(event_name=event_name):
+                context = github(event_name, {'workflow_run': {'head_sha': 'a' * 40}},
+                                 sha='b' * 40)
+                self.assertEqual(evaluate(refs[0], context), expected)
+
+    def test_safety_check_app_token_is_read_only(self):
+        content = (ROOT / '.github/workflows/claude.yml').read_text()
+        gate = re.search(r'^  safety-check:\n(.*?)(?=^  [\w-]+:|\Z)',
+                         content, re.M | re.S)[1]
+        # Read the token step itself, not another job's broader token grant.
+        token = gate.split('      - name: Generate token\n', 1)[1].split('\n      - name:', 1)[0]
+        permissions = dict(re.findall(r'^          permission-([\w-]+): (\w+)$', token, re.M))
+        self.assertEqual(permissions, {'metadata': 'read', 'issues': 'read',
+                                       'pull-requests': 'read'})
 
 
 if __name__ == '__main__':
