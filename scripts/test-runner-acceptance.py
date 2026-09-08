@@ -4,6 +4,7 @@ import ast
 from pathlib import Path
 import re
 import shlex
+import subprocess
 import textwrap
 import unittest
 
@@ -102,12 +103,13 @@ class RunnerAcceptanceTests(unittest.TestCase):
 
     def test_workflow_is_manual_main_only_single_short_arm_job(self):
         self.assertIn('on:\n  workflow_dispatch:\n', self.workflow)
-        self.assertIn("if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'", self.workflow)
+        self.assertIn('  accept:\n    needs: authorize\n', self.workflow)
         self.assertIn('runs-on: [self-hosted, Linux, ARM64]', self.workflow)
         self.assertIn('timeout-minutes: 5', self.workflow)
         self.assertIn('permissions: {}', self.workflow)
         jobs = self.workflow.split('jobs:\n', 1)[1]
-        self.assertEqual(re.findall(r'^  [\w-]+:$', jobs, re.M), ['  accept:'])
+        self.assertEqual(re.findall(r'^  [\w-]+:$', jobs, re.M), ['  authorize:', '  accept:'])
+        self.assertEqual(self.workflow.count('runs-on: [self-hosted,'), 1)
         for forbidden in ['pull_request:', 'push:', 'schedule:', 'workflow_run:', 'inputs:',
                           'uses:', 'secrets.', 'id-token:', 'configure-aws', 'aws ssm',
                           'iam/security-credentials', 'get-secret-value']:
@@ -134,6 +136,21 @@ class RunnerAcceptanceTests(unittest.TestCase):
         lint = ci.split('  actionlint:\n', 1)[1].split('\n  skip-check:', 1)[0]
         self.assertIn('runs-on: ubuntu-latest', lint)
         self.assertIn('run: make test-runner-acceptance', lint)
+
+    def test_non_main_dispatch_fails_instead_of_skipping_green(self):
+        gate = re.search(r'^  authorize:\n(.*?)(?=^  accept:)', self.workflow, re.M | re.S)
+        self.assertIsNotNone(gate, 'No executing authorization job: a skipped acceptance can look green')
+        self.assertIn('runs-on: ubuntu-latest', gate[1])
+        self.assertIsNone(re.search(r'^    if:', gate[1], re.M))
+        script = textwrap.dedent(gate[1].split('        run: |\n', 1)[1])
+        for event, ref, allowed in [('workflow_dispatch', 'refs/heads/main', True),
+                                   ('workflow_dispatch', 'refs/heads/feature', False),
+                                   ('workflow_dispatch', 'refs/tags/main', False),
+                                   ('pull_request', 'refs/heads/main', False),
+                                   ('workflow_dispatch', '', False)]:
+            result = subprocess.run(['/bin/bash', '-c', script], text=True, capture_output=True,
+                                    env={'GITHUB_EVENT_NAME': event, 'GITHUB_REF': ref}, timeout=5)
+            self.assertEqual(result.returncode == 0, allowed, (event, ref, result.stderr))
 
 
 if __name__ == '__main__':

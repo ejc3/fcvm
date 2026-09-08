@@ -12,8 +12,21 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Reject any dispatch outside main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Runner acceptance must be manually dispatched on main.'
+            exit 1
+          fi
+
   accept:
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
+    needs: authorize
     runs-on: [self-hosted, Linux, ARM64]
     timeout-minutes: 5
     steps:
