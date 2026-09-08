@@ -1,30 +1,16 @@
 #!/bin/bash
-# Build passt/pasta from source using a pinned Debian source tarball.
-# Pinned to commit 038c51e (2026-05-26, upstream release 2026_05_26.038c51e)
-# from https://passt.top/passt. This pin includes the upstream fix for the
-# netlink neighbour-sync race that made pasta exit right after startup
-# ("netlink: Unexpected sequence number"), previously carried here as a patch.
-# Served from snapshot.debian.org: deb.debian.org drops superseded versions
-# from its pool (which 404'd a previous pin), while snapshot.debian.org
-# archives every version permanently. The checksum guards the pin.
-#
-# Local patches (passt-*.patch, kept next to this script) are applied on top:
-#   - passt-addr-seen.patch: stops overheard bridge traffic from retargeting
-#     pasta's inbound port forwarding away from the guest.
+# Build the same upstream commit as rootfs-config.toml, without local patches.
+# This commit includes the addr_seen fix for #661 and the earlier netlink
+# neighbour-sync fix. The checksum verifies the immutable upstream archive.
 set -euo pipefail
 
-PASST_TARBALL_URL="https://snapshot.debian.org/archive/debian/20260527T083727Z/pool/main/p/passt/passt_0.0~git20260526.038c51e.orig.tar.xz"
-PASST_TARBALL_SHA256="78d9a5c11592a30ebbb35e39614d4ae5059c443f7f4f96ddce195ba3e9129172"
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PASST_PATCHES=(
-    "$SCRIPT_DIR/passt-addr-seen.patch"
-)
-# Key the build dir on the tarball and patch contents so a cached build tree
-# from an older pin or patch set is rebuilt instead of silently reused.
-BUILD_FINGERPRINT="$({ echo "$PASST_TARBALL_SHA256"; cat "${PASST_PATCHES[@]}"; } | sha256sum | cut -c1-12)"
+PASST_COMMIT="3f57f0382f6a72c0b8ce0c5ff92248b5117ed9b6"
+PASST_TARBALL_URL="https://passt.top/passt/snapshot/passt-${PASST_COMMIT}.tar.xz"
+PASST_TARBALL_SHA256="2d698e3f7a96408231aa11bb1b27775de6964e2de7b0fa29399847d012044e3a"
+BUILD_FINGERPRINT="${PASST_TARBALL_SHA256:0:12}"
 BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${BUILD_FINGERPRINT}}"
 
-echo "==> Building passt from Debian source tarball (commit 038c51e)..."
+echo "==> Building passt from upstream commit ${PASST_COMMIT}..."
 
 if [ ! -f "$BUILD_DIR/Makefile" ]; then
     rm -rf "$BUILD_DIR"
@@ -32,14 +18,11 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     curl -fsSL -o "$BUILD_DIR/passt.orig.tar.xz" "$PASST_TARBALL_URL"
     echo "$PASST_TARBALL_SHA256  $BUILD_DIR/passt.orig.tar.xz" | sha256sum -c -
     tar -xJf "$BUILD_DIR/passt.orig.tar.xz" -C "$BUILD_DIR" --strip-components=1
-    for p in "${PASST_PATCHES[@]}"; do
-        patch -p1 -d "$BUILD_DIR" < "$p"
-    done
 fi
 
 cd "$BUILD_DIR"
 make clean 2>/dev/null || true
-make -j"$(nproc)"
+make -j"$(nproc)" VERSION="$PASST_COMMIT"
 
 # Install (atomic rename avoids ETXTBSY when pasta/passt are running)
 for bin in pasta passt; do

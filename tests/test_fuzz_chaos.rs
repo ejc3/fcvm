@@ -821,8 +821,8 @@ async fn dump_port_silence_forensics(pid: u32, ip: &str, port: u16) {
             )
             .await;
 
-            // Where the bridge thinks the guest's MAC lives. This repo already
-            // carries scripts/passt-addr-seen.patch because pasta's forwarding
+            // Where the bridge thinks the guest's MAC lives. The pinned upstream
+            // pasta includes the addr_seen fix because its forwarding
             // target could be retargeted by overheard bridge traffic; an FDB
             // entry pointing at pasta0 rather than the tap is that bug, visible.
             for (label, cmd) in [

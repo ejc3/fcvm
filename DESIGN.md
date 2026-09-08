@@ -1699,7 +1699,7 @@ fcvm/
 │   └── setup/              # Setup utilities
 │       ├── mod.rs
 │       ├── kernel.rs       # Kernel + firecracker setup/build
-│       ├── pasta.rs        # Pinned pasta build (upstream commit + patches)
+│       ├── pasta.rs        # Pinned pasta build (upstream commit)
 │       ├── rootfs.rs       # Rootfs setup
 │       └── storage.rs      # btrfs storage setup
 │

@@ -1908,8 +1908,8 @@ pub async fn curl_check(ip: &str, port: u16, timeout_secs: u32) -> CurlResult {
 ///
 /// Used for the first request through a clone's port forward after restore.
 /// The request must succeed on the first attempt (pasta's forwarding target is
-/// no longer retargeted by overheard bridge traffic, see
-/// scripts/passt-addr-seen.patch); a failure dumps the pasta and namespace
+/// no longer retargeted by overheard bridge traffic, fixed upstream in
+/// passt commit 3f57f0382f6a); a failure dumps the pasta and namespace
 /// state needed to debug it.
 pub async fn curl_check_with_diag(
     ip: &str,
