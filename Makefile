@@ -43,6 +43,14 @@ show-notes:
 test-runner-acceptance:
 	python3 scripts/test-runner-acceptance.py
 
+# Offline CI trust and AWS argument regressions. No credentials or builds.
+.PHONY: test-ci-security test-ci-workflow-security test-ami-security
+test-ci-security: test-ci-workflow-security test-ami-security
+test-ci-workflow-security:
+	python3 scripts/test-ci-workflows.py
+test-ami-security:
+	python3 scripts/test-ami-security.py
+
 # Paths (can be overridden via environment)
 FUSE_BACKEND_RS ?= /home/ubuntu/fuse-backend-rs
 FUSE_BACKEND_RS_OVERRIDE ?=

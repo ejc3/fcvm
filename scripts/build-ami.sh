@@ -207,7 +207,7 @@ check_existing_ami() {
   aws ec2 describe-images \
     --region "$REGION" \
     --owners self \
-    --filters "Name=tag:BuildHash,Values=$hash" \
+    --filters "Name=tag:BuildHash,Values=$hash" "Name=state,Values=available" \
     --query 'Images[0].ImageId' --output text
 }
 
@@ -373,6 +373,7 @@ USERDATA
 wait_for_build() {
   local instance_id="$1"
   local timeout="${2:-120}"  # 120 iterations * 30s = 60 minutes max
+  local status i
 
   echo "Waiting for build to complete..."
   for i in $(seq 1 "$timeout"); do
@@ -380,92 +381,17 @@ wait_for_build() {
       --region "$REGION" \
       --filters "Name=resource-id,Values=$instance_id" "Name=key,Values=BuildStatus" \
       --query 'Tags[0].Value' --output text)
-
-    # Check for failure immediately
+    echo "[$i/$timeout] Build status: $status (instance: $instance_id)"
     if [ "$status" = "failed" ]; then
-      echo "================================================"
-      echo "BUILD FAILED - Fetching error log..."
-      echo "================================================"
-      # Try to get error context via SSM (wait longer for command)
-      cmd_id=$(aws ssm send-command \
-        --region "$REGION" \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["tail -100 /var/log/ami-build.log"]' \
-        --query 'Command.CommandId' --output text) || true
-      if [ -n "$cmd_id" ]; then
-        # Wait for command to complete
-        for j in $(seq 1 10); do
-          sleep 2
-          cmd_status=$(aws ssm get-command-invocation \
-            --region "$REGION" \
-            --command-id "$cmd_id" \
-            --instance-id "$instance_id" \
-            --query 'Status' --output text 2>/dev/null) || true
-          if [ "$cmd_status" = "Success" ] || [ "$cmd_status" = "Failed" ]; then
-            break
-          fi
-        done
-        # Print the log output
-        echo "--- Build Log (last 100 lines) ---"
-        aws ssm get-command-invocation \
-          --region "$REGION" \
-          --command-id "$cmd_id" \
-          --instance-id "$instance_id" \
-          --query 'StandardOutputContent' --output text || echo "Could not fetch log"
-        echo "--- End Log ---"
-      else
-        echo "Could not send SSM command"
-      fi
+      echo "Build failed. Detailed host diagnostics require an administration session."
       return 1
     fi
-
-    # Show progress
-    echo "[$i/$timeout] Build status: $status (instance: $instance_id)"
-    if [ "$status" = "building" ] && [ "${SSM_LOG_FETCH_DENIED:-0}" != 1 ]; then
-      # Try SSM first. The `|| true` matters even though this function's only
-      # call site is an `if !` condition (which already suppresses `set -e`):
-      # a future direct call must not turn a failed advisory fetch into a
-      # build abort.
-      echo "  Fetching logs via SSM..."
-      cmd_id=$(aws ssm send-command \
-        --region "$REGION" \
-        --instance-ids "$instance_id" \
-        --document-name "AWS-RunShellScript" \
-        --parameters 'commands=["tail -15 /var/log/ami-build.log"]' \
-        --query 'Command.CommandId' --output text 2>&1) || true
-      echo "  SSM command: $cmd_id"
-      # The progress fetch is advisory. When the workflow role lacks
-      # ssm:SendCommand, every poll prints the same AccessDeniedException;
-      # note it once and stop asking instead of spamming 100+ error lines.
-      if [[ "$cmd_id" == *AccessDeniedException* ]]; then
-        echo "  SSM log fetch not authorized for this role; skipping further fetches"
-        SSM_LOG_FETCH_DENIED=1
-        cmd_id=""
-      fi
-      if [ -n "$cmd_id" ] && [[ ! "$cmd_id" =~ "error" ]]; then
-        sleep 5
-        echo "  Getting SSM output..."
-        ssm_output=$(aws ssm get-command-invocation \
-          --region "$REGION" \
-          --command-id "$cmd_id" \
-          --instance-id "$instance_id" \
-          --output text 2>&1) || true
-        # A role allowed SendCommand but denied GetCommandInvocation would
-        # otherwise spam the same denial on every poll.
-        if [[ "$ssm_output" == *AccessDeniedException* ]]; then
-          echo "  SSM invocation fetch not authorized for this role; skipping further fetches"
-          SSM_LOG_FETCH_DENIED=1
-        else
-          printf '%s\n' "$ssm_output" | head -20
-        fi
-      fi
-    fi
-
     if [ "$status" = "complete" ]; then
       return 0
     fi
-    sleep 28  # 2s already spent on SSM
+    # CI cannot read arbitrary SSM command output. Its only progress channel is
+    # the builder role's narrowly writable BuildStatus/KernelVersion tags.
+    sleep 30
   done
   echo "Build timeout!"
   return 1
@@ -474,6 +400,12 @@ wait_for_build() {
 # Main
 main() {
   local hash repo_root source_commit
+  for tool in aws jq git; do
+    command -v "$tool" >/dev/null 2>&1 || {
+      echo "ERROR: required tool '$tool' is missing" >&2
+      exit 1
+    }
+  done
   repo_root="$(dirname "$KERNEL_DIR")"
   if ! source_commit="$(git -C "$repo_root" rev-parse HEAD)" || \
     [[ ! $source_commit =~ ^[0-9a-f]{40}$ ]]; then
@@ -503,6 +435,21 @@ main() {
 
   echo "No cached AMI, building..."
 
+  # Terraform's builder role permits only the isolated runner VPC. Discover its
+  # current IDs instead of inheriting the administration/dev network or profile.
+  local builder_subnet builder_security_group
+  builder_subnet=$(aws ec2 describe-subnets --region "$REGION" \
+    --filters "Name=tag:Name,Values=github-runner-subnet" \
+    --query 'Subnets[].SubnetId' --output text)
+  builder_security_group=$(aws ec2 describe-security-groups --region "$REGION" \
+    --filters "Name=group-name,Values=github-runner-sg" \
+    --query 'SecurityGroups[].GroupId' --output text)
+  if [[ ! $builder_subnet =~ ^subnet-[0-9a-f]+$ ]] || \
+    [[ ! $builder_security_group =~ ^sg-[0-9a-f]+$ ]]; then
+    echo "ERROR: expected exactly one Terraform runner subnet and security group" >&2
+    exit 1
+  fi
+
   # Clean up any orphaned builder instances (from cancelled runs)
   orphans=$(aws ec2 describe-instances \
     --region "$REGION" \
@@ -521,39 +468,34 @@ main() {
   user_data_file=$(mktemp)
   create_user_data "$source_commit" > "$user_data_file"
 
-  # Launch instance - try spot first, fall back to on-demand
+  # All resources created by RunInstances need the scoped name tag. Keep one
+  # argument array so the on-demand fallback cannot silently regain privileges.
+  local launch_tags
+  launch_tags='[{"ResourceType":"instance","Tags":[{"Key":"Name","Value":"ami-builder-temp"},{"Key":"BuildStatus","Value":"starting"}]},{"ResourceType":"volume","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]},{"ResourceType":"network-interface","Tags":[{"Key":"Name","Value":"ami-builder-temp"}]}]'
+  local -a launch_args=(
+    --region "$REGION"
+    --image-id "$base_ami"
+    --instance-type c7gd.8xlarge
+    --subnet-id "$builder_subnet"
+    --security-group-ids "$builder_security_group"
+    --iam-instance-profile Name=ami-builder-profile
+    --associate-public-ip-address
+    --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","Encrypted":true,"DeleteOnTermination":true}}]'
+    --tag-specifications "$launch_tags"
+    --user-data "file://$user_data_file"
+    --query 'Instances[0].InstanceId'
+    --output text
+  )
   echo "Trying spot instance..."
-  instance_id=$(aws ec2 run-instances \
-    --region "$REGION" \
-    --image-id "$base_ami" \
-    --instance-type c7gd.8xlarge \
-    --instance-market-options '{"MarketType":"spot"}' \
-    --subnet-id subnet-05c215519b2150ecd \
-    --security-group-ids sg-0ebf2d8c6a0acc1a3 \
-    --iam-instance-profile Name=jumpbox-admin-profile \
-    --associate-public-ip-address \
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
-    --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
-    --user-data "file://$user_data_file" \
-    --query 'Instances[0].InstanceId' \
-    --output text 2>&1) || true
-
-  # Fall back to on-demand if spot fails
-  if [[ -z "$instance_id" ]] || [[ "$instance_id" == *"error"* ]] || [[ "$instance_id" == *"Error"* ]]; then
+  if ! instance_id=$(aws ec2 run-instances "${launch_args[@]}" \
+    --instance-market-options '{"MarketType":"spot"}'); then
     echo "Spot failed, using on-demand..."
-    instance_id=$(aws ec2 run-instances \
-      --region "$REGION" \
-      --image-id "$base_ami" \
-      --instance-type c7gd.8xlarge \
-      --subnet-id subnet-05c215519b2150ecd \
-      --security-group-ids sg-0ebf2d8c6a0acc1a3 \
-      --iam-instance-profile Name=jumpbox-admin-profile \
-      --associate-public-ip-address \
-      --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":40,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
-      --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=ami-builder-temp},{Key=BuildStatus,Value=starting}]' \
-      --user-data "file://$user_data_file" \
-      --query 'Instances[0].InstanceId' \
-      --output text)
+    instance_id=$(aws ec2 run-instances "${launch_args[@]}")
+  fi
+  if [[ ! $instance_id =~ ^i-[0-9a-f]+$ ]]; then
+    echo "ERROR: RunInstances did not return exactly one instance ID" >&2
+    exit 1
   fi
   echo "Launched instance: $instance_id"
 
@@ -585,12 +527,16 @@ main() {
   # Create AMI
   timestamp=$(date +%Y%m%d-%H%M)
   ami_name="fcvm-runner-${kernel_version}-${timestamp}"
+  local image_tags
+  image_tags=$(jq -cn --arg name "$ami_name" --arg kernel "${kernel_version}-nested" --arg hash "$hash" \
+    '[{ResourceType:"image",Tags:[{Key:"Name",Value:$name},{Key:"Kernel",Value:$kernel},{Key:"BuildHash",Value:$hash},{Key:"Purpose",Value:"github-runner"}]},{ResourceType:"snapshot",Tags:[{Key:"Purpose",Value:"github-runner"}]}]')
 
   ami_id=$(aws ec2 create-image \
     --region "$REGION" \
     --instance-id "$instance_id" \
     --name "$ami_name" \
     --description "fcvm CI runner with kernel ${kernel_version}-nested" \
+    --tag-specifications "$image_tags" \
     --query 'ImageId' --output text)
   echo "Created AMI: $ami_id ($ami_name)"
 
@@ -607,13 +553,6 @@ main() {
     fi
     sleep 30
   done
-
-  # Tag AMI
-  aws ec2 create-tags --region "$REGION" --resources "$ami_id" --tags \
-    Key=Name,Value="$ami_name" \
-    Key=Kernel,Value="${kernel_version}-nested" \
-    Key=BuildHash,Value="$hash" \
-    Key=Purpose,Value=github-runner
 
   echo "SUCCESS: $ami_id"
   echo "ami_id=$ami_id" >> "${GITHUB_OUTPUT:-/dev/null}"
