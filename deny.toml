@@ -31,6 +31,10 @@ ignore = true
 # Warn on duplicate crate versions
 multiple-versions = "warn"
 wildcards = "allow"
+deny = [
+    { name = "hyper", version = "<1.0" },
+    { name = "hyperlocal", version = "<0.9" },
+]
 
 [sources]
 # Only allow crates.io

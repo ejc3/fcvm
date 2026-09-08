@@ -1,5 +1,8 @@
 use anyhow::Result;
-use hyper::{Body, Client, Method, Request, StatusCode};
+use http_body_util::{BodyExt, Full};
+use hyper::body::Bytes;
+use hyper::{Method, Request, StatusCode};
+use hyper_util::client::legacy::Client;
 use hyperlocal::{UnixClientExt, Uri as UnixUri};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
@@ -9,7 +12,7 @@ use std::time::Duration;
 #[derive(Debug, Clone)]
 pub struct FirecrackerClient {
     socket_path: PathBuf,
-    client: Client<hyperlocal::UnixConnector>,
+    client: Client<hyperlocal::UnixConnector, Full<Bytes>>,
     /// Timeout for individual API requests
     request_timeout: Duration,
 }
@@ -51,7 +54,7 @@ impl FirecrackerClient {
             .method(Method::PUT)
             .uri(self.uri(path))
             .header("Content-Type", "application/json")
-            .body(Body::from(json))?;
+            .body(Full::new(Bytes::from(json)))?;
 
         let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
             .await
@@ -64,7 +67,7 @@ impl FirecrackerClient {
             })??;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
             let status = resp.status();
-            let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+            let body_bytes = resp.into_body().collect().await?.to_bytes();
             let body_str = String::from_utf8_lossy(&body_bytes);
             anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
         }
@@ -78,7 +81,7 @@ impl FirecrackerClient {
             .method(Method::PATCH)
             .uri(self.uri(path))
             .header("Content-Type", "application/json")
-            .body(Body::from(json))?;
+            .body(Full::new(Bytes::from(json)))?;
 
         let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
             .await
@@ -91,7 +94,7 @@ impl FirecrackerClient {
             })??;
         if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
             let status = resp.status();
-            let body_bytes = hyper::body::to_bytes(resp.into_body()).await?;
+            let body_bytes = resp.into_body().collect().await?.to_bytes();
             let body_str = String::from_utf8_lossy(&body_bytes);
             anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
         }
