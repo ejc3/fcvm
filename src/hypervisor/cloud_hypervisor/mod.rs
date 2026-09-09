@@ -17,10 +17,13 @@ pub mod api;
 
 use anyhow::{anyhow, bail, Context, Result};
 use std::collections::VecDeque;
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -87,6 +90,8 @@ pub struct CloudHypervisorBackend {
     /// Guest console (hvc0) lines observed by the console tail since spawn
     /// (see [`Hypervisor::console_line_counter`]).
     console_lines: Arc<std::sync::atomic::AtomicU64>,
+    /// One event reader per VMM child. It must finish before the API path is reused.
+    reboot_monitor: Option<JoinHandle<Result<()>>>,
 }
 
 impl CloudHypervisorBackend {
@@ -110,11 +115,21 @@ impl CloudHypervisorBackend {
             vsock_path: None,
             console_tail: None,
             console_lines: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            reboot_monitor: None,
         }
     }
 
     fn client(&self) -> Result<&ChClient> {
         self.client.as_ref().context("Cloud Hypervisor not started")
+    }
+
+    async fn stop_reboot_monitor(&mut self) {
+        // Keep ownership across await: wait() can be cancelled by the VM loop.
+        if let Some(monitor) = self.reboot_monitor.as_mut() {
+            monitor.abort();
+            let _ = monitor.await;
+        }
+        self.reboot_monitor = None;
     }
 
     /// Merge a spawn spec into the retained namespace isolation: only fields the spec
@@ -299,6 +314,7 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn spawn(&mut self, spec: &ProcessSpec) -> Result<()> {
+        self.stop_reboot_monitor().await;
         // A reboot relaunch re-enters spawn() with a minimal spec (binary + args). Update
         // retained state only when the spec provides a value, so the namespace isolation
         // and name captured on the first spawn persist across reboots (mirrors the
@@ -320,6 +336,11 @@ impl Hypervisor for CloudHypervisorBackend {
 
         let mut cmd = Command::new(&spec.binary);
         cmd.arg("--api-socket").arg(&self.api_socket);
+        let (events, child_events) = UnixStream::pair().context("creating CH event socketpair")?;
+        events.set_nonblocking(true)?;
+        let events = tokio::net::UnixStream::from_std(events)?;
+        let event_fd = child_events.as_raw_fd();
+        cmd.arg("--event-monitor").arg(format!("fd={event_fd}"));
         if let Some(log_path) = &self.log_path {
             cmd.arg("--log-file").arg(log_path);
             cmd.arg("-v");
@@ -330,6 +351,18 @@ impl Hypervisor for CloudHypervisorBackend {
             }
         }
 
+        // Clear CLOEXEC only in this child. Changing it in the parent would let
+        // unrelated concurrent spawns inherit the event socket. Namespace setup
+        // remains the last pre_exec so its post-setns PDEATHSIG is preserved.
+        // SAFETY: fcntl is async-signal-safe, and child_events owns the fd until spawn returns.
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::fcntl(event_fd, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
         install_namespace_pre_exec(&mut cmd, &self.namespace)?;
 
         let stderr_tail = Arc::clone(&self.stderr_tail);
@@ -353,11 +386,23 @@ impl Hypervisor for CloudHypervisorBackend {
             }
         })
         .context("spawning Cloud Hypervisor process")?;
+        drop(child_events);
 
         self.process = Some(spawned.child);
         self.stderr_reader = Some(spawned.stderr_reader);
         self.wait_for_api().await?;
         self.client = Some(ChClient::new(self.api_socket.clone()));
+        let client = self.client()?.clone();
+        self.reboot_monitor = Some(tokio::spawn(async move {
+            if read_reboot_event(BufReader::new(events)).await? {
+                // The guest's vsock notification is early intent, before shutdown
+                // writeback. CH emits this event only when it handles the actual
+                // reset. Exit the VMM here so fcvm consumes intent and cold-relaunches.
+                info!("Cloud Hypervisor guest reset, shutting down VMM for host relaunch");
+                client.shutdown_vmm().await?;
+            }
+            Ok(())
+        }));
 
         // Tail the guest console (hvc0 → file) into fcvm's tracing logs, mirroring the
         // Firecracker serial-to-stdout capture. Abort any prior tail first: a reboot
@@ -387,6 +432,9 @@ impl Hypervisor for CloudHypervisorBackend {
         match self.process.as_mut() {
             Some(p) => match p.try_wait().context("checking Cloud Hypervisor status")? {
                 Some(status) => {
+                    if let Some(monitor) = &self.reboot_monitor {
+                        monitor.abort();
+                    }
                     self.process = None;
                     Ok(Some(status))
                 }
@@ -397,17 +445,43 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn wait(&mut self) -> Result<ExitStatus> {
-        match self.process.as_mut() {
-            Some(p) => {
-                let status = p.wait().await.context("waiting for Cloud Hypervisor")?;
-                self.process = None;
-                Ok(status)
+        let process = self
+            .process
+            .as_mut()
+            .context("Cloud Hypervisor process not running")?;
+        let mut monitor_failure = None;
+        let status = if let Some(monitor) = self.reboot_monitor.as_mut() {
+            tokio::select! {
+                biased;
+                status = process.wait() => status,
+                result = monitor => {
+                    self.reboot_monitor = None;
+                    if let Err(error) = result.context("CH reboot monitor task failed").and_then(|r| r) {
+                        warn!(%error, "CH reboot monitor failed, terminating VMM");
+                        // The caller treats any wait() return as child termination.
+                        // Never report this failure while the VMM can still be alive.
+                        process.start_kill().context("terminating CH after event monitor failure")?;
+                        monitor_failure = Some(error);
+                    }
+                    process.wait().await
+                }
             }
-            None => bail!("Cloud Hypervisor process not running"),
+        } else {
+            process.wait().await
         }
+        .context("waiting for Cloud Hypervisor")?;
+        self.stop_reboot_monitor().await;
+        self.process = None;
+        if let Some(error) = monitor_failure {
+            return Err(error);
+        }
+        Ok(status)
     }
 
     fn start_kill(&mut self) -> Result<()> {
+        if let Some(monitor) = &self.reboot_monitor {
+            monitor.abort();
+        }
         if let Some(tail) = self.console_tail.take() {
             tail.abort();
         }
@@ -420,6 +494,7 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn reap(&mut self) {
+        self.stop_reboot_monitor().await;
         if let Some(mut p) = self.process.take() {
             let _ = p.wait().await;
         }
@@ -536,6 +611,43 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 }
 
+impl Drop for CloudHypervisorBackend {
+    fn drop(&mut self) {
+        if let Some(monitor) = &self.reboot_monitor {
+            monitor.abort();
+        }
+    }
+}
+
+/// CH writes pretty-printed JSON objects separated by a blank line, not JSONL.
+async fn read_reboot_event(reader: impl AsyncBufRead + Unpin) -> Result<bool> {
+    #[derive(serde::Deserialize)]
+    struct Event {
+        source: String,
+        event: String,
+    }
+
+    let mut lines = reader.lines();
+    let mut frame = String::new();
+    while let Some(line) = lines.next_line().await.context("reading CH events")? {
+        if line.is_empty() {
+            if frame.is_empty() {
+                continue;
+            }
+            let event: Event = serde_json::from_str(&frame).context("decoding CH event")?;
+            if event.source == "vm" && event.event == "rebooting" {
+                return Ok(true);
+            }
+            frame.clear();
+        } else {
+            frame.push_str(&line);
+            frame.push('\n');
+        }
+    }
+    anyhow::ensure!(frame.is_empty(), "CH event stream ended within an event");
+    Ok(false)
+}
+
 /// The default guest CID Cloud Hypervisor uses for the host↔guest vsock device.
 pub const fn default_guest_cid() -> u32 {
     GUEST_CID
@@ -601,6 +713,86 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reboot_monitor_cleanup_retains_handle_when_cancelled() {
+        use std::future::Future;
+
+        let mut be = backend();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // A started blocking task models a reader still in its current poll:
+        // abort requests cancellation but cannot finish the join until it yields.
+        be.reboot_monitor = Some(tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+            Ok(())
+        }));
+        started_rx.await.unwrap();
+        let pending = {
+            let mut cleanup = std::pin::pin!(be.stop_reboot_monitor());
+            let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+            cleanup.as_mut().poll(&mut context).is_pending()
+        };
+        let retained = be.reboot_monitor.is_some();
+        // Release even on a failed assertion, so the fixture cannot strand a worker.
+        drop(release_tx);
+        be.stop_reboot_monitor().await;
+        assert!(pending, "cleanup must wait for the reader to finish");
+        assert!(
+            retained,
+            "cancelled cleanup must retain the reader's join handle"
+        );
+        assert!(be.reboot_monitor.is_none());
+    }
+
+    #[tokio::test]
+    async fn reboot_monitor_failure_reaps_child_before_returning() {
+        let mut be = backend();
+        be.process = Some(
+            Command::new("sleep")
+                .arg("60")
+                .kill_on_drop(true)
+                .spawn()
+                .unwrap(),
+        );
+        be.reboot_monitor = Some(tokio::spawn(async { bail!("injected CH event failure") }));
+        let result = tokio::time::timeout(Duration::from_secs(2), be.wait()).await;
+        let reaped = be.process.is_none();
+        be.start_kill().unwrap();
+        be.reap().await;
+        assert!(result
+            .unwrap()
+            .unwrap_err()
+            .to_string()
+            .contains("injected CH event failure"));
+        assert!(
+            reaped,
+            "wait must not report a monitor failure with a live VMM child"
+        );
+    }
+
+    #[tokio::test]
+    async fn reboot_monitor_requires_complete_vm_reset_event() {
+        let other_events = concat!(
+            "{\n  \"source\": \"vmm\",\n  \"event\": \"rebooting\"\n}\n\n",
+            "{\n  \"source\": \"vm\",\n  \"event\": \"rebooted\"\n}\n\n",
+        );
+        assert!(!read_reboot_event(other_events.as_bytes()).await.unwrap());
+        let events = format!(
+            "{other_events}{{\n  \"source\": \"vm\",\n  \"event\": \"rebooting\",\n  \"properties\": null\n}}\n\n"
+        );
+        // One-byte reads split both the JSON and its delimiter across reads.
+        assert!(
+            read_reboot_event(BufReader::with_capacity(1, events.as_bytes()))
+                .await
+                .unwrap()
+        );
+        assert!(read_reboot_event(b"{\n  \"source\": \"vm\"".as_slice())
+            .await
+            .is_err());
+        assert!(read_reboot_event(b"not-json\n\n".as_slice()).await.is_err());
+    }
 
     fn backend() -> CloudHypervisorBackend {
         CloudHypervisorBackend::new(
