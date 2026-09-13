@@ -270,7 +270,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             author { login }
             headRefOid
-            commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
+            commits(last: 1) { nodes { commit { oid committedDate checkSuites(first: 50) { totalCount nodes { createdAt app { slug } checkRuns(first: 50) { totalCount nodes { name status conclusion startedAt completedAt summary } } } } } } }
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
               nodes { author { login __typename } state body submittedAt commit { oid }
@@ -283,6 +283,8 @@ fetch_payload() {
     headoid=$(jq -r '.data.repository.pullRequest.headRefOid // ""' <<<"$rresp")
     headdate=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.committedDate // ""' <<<"$rresp")
     headsuites=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // []' <<<"$rresp")
+    headsuitecount=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.totalCount // null' <<<"$rresp")
+    headcommitoid=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.oid // ""' <<<"$rresp")
     [ "$(jq -r '.data.repository.pullRequest.reviews.pageInfo.hasNextPage' <<<"$rresp")" = "true" ] || break
     rcursor=$(jq -r '.data.repository.pullRequest.reviews.pageInfo.endCursor' <<<"$rresp")
   done
@@ -432,6 +434,22 @@ fetch_payload() {
     return 2
   fi
 
+  # Re-read the head commit's check suites after all paging, for the reason the comments are
+  # re-read: a Greptile run that read as a clean review of the head can be followed mid-run by a
+  # newer run of the same commit. The verdict compares the Greptile runs of the two reads.
+  local suites2resp headsuites2 headsuitecount2
+  suites2resp=$(gh api graphql -f query="
+    { repository(owner: \"$REPO_OWNER\", name: \"$REPO_NAME\") {
+        pullRequest(number: $pr) {
+          commits(last: 1) { nodes { commit { oid checkSuites(first: 50) { totalCount nodes { createdAt app { slug } checkRuns(first: 50) { totalCount nodes { name status conclusion startedAt completedAt summary } } } } } } } } } }" 2>/dev/null) || return 1
+  headsuites2=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.nodes // "absent"' <<<"$suites2resp")
+  headsuitecount2=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites.totalCount // null' <<<"$suites2resp")
+  if [ "$headsuites2" = '"absent"' ] || [ -z "$headsuites2" ]; then
+    echo "verdict: BLOCKED. The second read of the head commit's check suites returned no suite" >&2
+    echo "list, so a Greptile run on the head cannot be compared against the first read." >&2
+    return 2
+  fi
+
   # The three arrays ride file descriptors, not argv: a single argv string is
   # capped at MAX_ARG_STRLEN (128 KiB on Linux), so --argjson with a real PR's
   # thread bodies dies with "Argument list too long" and the gate fail-closes
@@ -441,14 +459,18 @@ fetch_payload() {
         --slurpfile r <(printf '%s' "$reviews") \
         --slurpfile c <(printf '%s' "$prcomments") \
         --slurpfile rc <(printf '%s' "$recheckcomments") \
-        --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --argjson cs "${headsuites:-[]}" \
+        --arg a "$prauthor" --arg h "$headoid" --arg d "$headdate" --arg ho "$headcommitoid" \
+        --slurpfile cs <(printf '%s' "${headsuites:-[]}") --argjson cst "${headsuitecount:-null}" \
+        --slurpfile cs2 <(printf '%s' "${headsuites2:-[]}") --argjson cst2 "${headsuitecount2:-null}" \
         --slurpfile pc <(printf '%s' "${prcommits:-[]}") --argjson pct "${prcommitcount:-null}" \
      '{data:{repository:{pullRequest:{author:{login:$a}, headRefOid:$h,
-                                      commits:{nodes:[{commit:{committedDate:$d, checkSuites:{nodes:$cs}}}]},
+                                      commits:{nodes:[{commit:{oid:$ho, committedDate:$d,
+                                                               checkSuites:{totalCount:$cst, nodes:$cs[0]}}}]},
                                       prcommits:{totalCount:$pct, nodes:$pc[0]},
                                       reviewThreads:{nodes:$t[0]}, reviews:{nodes:$r[0]},
                                       comments:{nodes:$c[0]},
-                                      recheck:{comments:{nodes:$rc[0]}}}}}}'
+                                      recheck:{comments:{nodes:$rc[0]},
+                                               checkSuites:{totalCount:$cst2, nodes:$cs2[0]}}}}}}'
 }
 
 # A fixture must be the payload the gate actually consumes, not a hand-written guess at
@@ -977,7 +999,17 @@ def is_greptile_status_notice:
                  and all(range(0; $shape | length); . as $i | $rest[$i] | test($shape[$i]))));
 def greptile_pause_re: "^Greptile has paused reviews on this repository — it used its [0-9]+ free open-source review credits for this billing period\\. Reviews resume automatically on (January|February|March|April|May|June|July|August|September|October|November|December) [0-9]{1,2}\\. To continue before then, an organization admin can \\[keep reviews running past the free credits\\]\\(https://app\\.greptile\\.com/-/repositories\\?oss=https%3A%2F%2Fgithub\\.com%2F[A-Za-z0-9_.-]+%2F[A-Za-z0-9_.-]+\\) — those bill as normal usage\\.$";
 def is_greptile_pause_notice:
-  greptile_lines as $l | ($l | length) == 1 and ($l[0] | test(greptile_pause_re));'
+  greptile_lines as $l | ($l | length) == 1 and ($l[0] | test(greptile_pause_re));
+def is_greptile_summary: (. // "") | test("<h3>Greptile Summary</h3>|<!-- greptile_summary -->");
+def greptile_clean_run_re: "^Greptile has reviewed the Pull Request\\.\n\n[0-9]+ files reviewed, 0 comments added\\.$";
+def greptile_summary_sha($owner; $repo):
+  (. // "") as $b
+  | if ($b | test("<!-- greptile_failed_comments -->")) then ""
+    else (([ $b | capture("Last reviewed commit: \\[[^\\]\n]*\\]\\(https://github\\.com/(?<owner>[A-Za-z0-9_.-]+)/(?<repo>[A-Za-z0-9_.-]+)/commit/(?<sha>[0-9a-f]{40})\\)")
+             | if ((.owner | ascii_downcase) == ($owner | ascii_downcase))
+                  and ((.repo | ascii_downcase) == ($repo | ascii_downcase))
+               then .sha else "" end ] | first) // "")
+    end;'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
 # any other, never coverage. Entries are logins; their mention handles (@codex,
@@ -994,6 +1026,8 @@ CODERABBIT_LOGIN=${CODERABBIT_LOGIN:-coderabbitai}
 # Greptile's notices belong to its bot the same way. It grants no no-findings coverage, so it
 # is not in VERDICT_BOTS.
 GREPTILE_LOGIN=${GREPTILE_LOGIN:-greptile-apps}
+# The app whose "Greptile Review" check run binds a Greptile result to the commit it reviewed.
+GREPTILE_APP=${GREPTILE_APP:-greptile-apps}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 
@@ -1011,14 +1045,17 @@ prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload"
 # which of two instants came first. A timestamp that differs between the reads, in value or in
 # shape, makes the fingerprints differ, which blocks.
 COVERAGE_FP_JQ="$VERDICT_JQ"'($bots | split(",")) as $botlogins
-  | [ .[] | select(((.author.__typename // "") == "Bot") and (.author.login | IN($botlogins[])))
-          | select(((.body // "") | is_verdict)
+  | [ .[] | select(((.author.__typename // "") == "Bot")
+                   and ((.author.login | IN($botlogins[])) or ((.author.login // "") == $greptile)))
+          | ((.author.login // "") | IN($botlogins[])) as $listed
+          | select(($listed and ((.body // "") | is_verdict))
                    or (((.author.login // "") == $codex) and ((.body // "") | is_codex_summary))
-                   or ((.body // "") | contains(cr_summarize_marker)))
+                   or ($listed and ((.body // "") | contains(cr_summarize_marker)))
+                   or (((.author.login // "") == $greptile) and ((.body // "") | is_greptile_summary)))
           | {login: .author.login, createdAt: (.createdAt // ""),
              updatedAt: (.updatedAt // ""), body: (.body // "")} ]
   | sort_by([.createdAt, .login, .body])'
-capturedfp=$(jq -c --arg bots "$VERDICT_BOTS" --arg codex "$CODEX_LOGIN" "$COVERAGE_FP_JQ" <<<"$prcomments") || {
+capturedfp=$(jq -c --arg bots "$VERDICT_BOTS" --arg codex "$CODEX_LOGIN" --arg greptile "$GREPTILE_LOGIN" "$COVERAGE_FP_JQ" <<<"$prcomments") || {
   echo "verdict: BLOCKED — could not read the coverage-bearing comments." >&2; exit 2; }
 if [ "$capturedfp" != "[]" ]; then
   recheckcomments=$(jq -c '.data.repository.pullRequest.recheck.comments.nodes // "absent"' \
@@ -1035,7 +1072,7 @@ if [ "$capturedfp" != "[]" ]; then
     echo "verdict: BLOCKED — the second read of the PR comments is not an array of comments." >&2
     exit 2
   fi
-  recheckfp=$(jq -c --arg bots "$VERDICT_BOTS" --arg codex "$CODEX_LOGIN" "$COVERAGE_FP_JQ" <<<"$recheckcomments") || {
+  recheckfp=$(jq -c --arg bots "$VERDICT_BOTS" --arg codex "$CODEX_LOGIN" --arg greptile "$GREPTILE_LOGIN" "$COVERAGE_FP_JQ" <<<"$recheckcomments") || {
     echo "verdict: BLOCKED — could not read the re-fetched coverage-bearing comments." >&2; exit 2; }
   if [ "$capturedfp" != "$recheckfp" ]; then
     echo "verdict: BLOCKED — a comment that can grant head coverage changed under us while" >&2
@@ -1064,6 +1101,75 @@ if [ "$finalcomments" != '"absent"' ] && [ -n "$finalcomments" ]; then
   fi
 fi
 
+# GREPTILE. Greptile reviews but is not a verdict bot: its summary comment's score and prose are
+# not a verdict, and a finding it cannot anchor lands inside that summary. What binds a result to
+# a commit is the "Greptile Review" check run the greptile-apps app writes on the commit it
+# reviewed, whose summary counts the comments that review added, summary-only findings included.
+# The conclusion is success either way (manaflow-ai/cmux pr10764: success, "4 files reviewed,
+# 1 comments added."), so the count is the verdict and the conclusion alone is not.
+#
+# greptileclean is the completedAt of a clean Greptile review of the head, or null. Clean: the
+# commit these suites were read from is the head, and the LATEST Greptile Review run on it by
+# startedAt finished with success and a summary saying 0 comments added. A newer run that is
+# still going, cancelled or errored decides against an older clean one, because the newest result
+# is the one that stands; a startedAt that will not parse sorts as newest, so it can only decline.
+#
+# Every suite and every Greptile run must be accounted for (totalCount == nodes): a fragment of
+# the runs can omit the newest one, and a fragment of the suites can omit the earliest, which
+# dates the head's arrival. An ABSENT totalCount is the shape of fixtures captured before this
+# gate read check runs; it reads as no Greptile runs, which covers nothing. The Greptile runs are
+# read a second time after all paging, and any difference blocks.
+greptile_runs_jq='def greptile_runs($app; $name):
+    [ (.nodes // [])[] | select((.app.slug // "") == $app)
+      | (.checkRuns.nodes // [])[] | select((.name // "") == $name)
+      | {name, status, conclusion, startedAt, completedAt, summary} ]
+    | sort_by([.startedAt, .completedAt, .status, .conclusion, .summary] | map(tostring));
+  def suites_complete($app):
+    ((.totalCount | type) != "number" or .totalCount == ((.nodes // []) | length))
+    and all((.nodes // [])[]; ((.app.slug // "") != $app)
+            or ((.checkRuns.totalCount | type) != "number")
+            or (.checkRuns.totalCount == ((.checkRuns.nodes // []) | length)));'
+headchecks=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites // {}' <<<"$payload" 2>/dev/null)
+if ! jq -e --arg app "$GREPTILE_APP" "$greptile_runs_jq"'suites_complete($app)' >/dev/null 2>&1 <<<"$headchecks"; then
+  echo "verdict: BLOCKED — the head commit's check suites, or a Greptile suite's runs, are not all" >&2
+  echo "in the payload, so the newest Greptile run or the head's arrival could be missing." >&2
+  exit 2
+fi
+greptilefp=$(jq -c --arg app "$GREPTILE_APP" "$greptile_runs_jq"'greptile_runs($app; "Greptile Review")' \
+  <<<"$headchecks") || {
+  echo "verdict: BLOCKED — could not read the Greptile runs on the head." >&2; exit 2; }
+if [ "$greptilefp" != "[]" ]; then
+  headchecks2=$(jq -c '.data.repository.pullRequest.recheck.checkSuites // "absent"' <<<"$payload" 2>/dev/null)
+  if [ "$headchecks2" = '"absent"' ] || [ -z "$headchecks2" ]; then
+    echo "verdict: BLOCKED — the head carries a Greptile run, and the payload has no second read of" >&2
+    echo "the head's check suites to compare it against. Re-run the gate, or regenerate the fixture." >&2
+    exit 2
+  fi
+  if ! jq -e --arg app "$GREPTILE_APP" "$greptile_runs_jq"'suites_complete($app)' >/dev/null 2>&1 <<<"$headchecks2"; then
+    echo "verdict: BLOCKED — the second read of the head's check suites is not complete." >&2
+    exit 2
+  fi
+  greptilefp2=$(jq -c --arg app "$GREPTILE_APP" "$greptile_runs_jq"'greptile_runs($app; "Greptile Review")' \
+    <<<"$headchecks2") || {
+    echo "verdict: BLOCKED — could not read the re-fetched Greptile runs." >&2; exit 2; }
+  if [ "$greptilefp" != "$greptilefp2" ]; then
+    echo "verdict: BLOCKED — a Greptile run on the head changed while this gate was reading the PR." >&2
+    echo "The reading below was taken from what it said before. Re-run against a PR that is" >&2
+    echo "holding still." >&2
+    exit 2
+  fi
+fi
+headcommit=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.oid // ""' <<<"$payload" 2>/dev/null)
+greptileclean=$(jq -c --arg h "$headoid" --arg ho "$headcommit" "$TS_JQ$VERDICT_JQ"'
+  if ($h == "") or (($ho | ascii_downcase) != ($h | ascii_downcase)) or (length == 0) then null
+  else (max_by((.startedAt | ts) // 1e18)) as $last
+    | if ($last.status == "COMPLETED") and ($last.conclusion == "SUCCESS")
+         and (($last.summary // "") | test(greptile_clean_run_re))
+         and (($last.completedAt | ts) != null)
+      then $last.completedAt else null end
+  end' <<<"$greptilefp") || {
+  echo "verdict: BLOCKED — could not evaluate the Greptile runs on the head." >&2; exit 2; }
+
 #
 # Each top-level comment also records `reviewed_rows`: every {sha, at} pair by which a
 # listed bot says it reviewed a commit, and when it said so. There are three sources, and
@@ -1078,7 +1184,8 @@ fi
 # arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
    --arg codex "$CODEX_LOGIN" --arg cr "$CODERABBIT_LOGIN" --arg greptile "$GREPTILE_LOGIN" \
-   --arg me "$prauthor" \
+   --arg me "$prauthor" --arg head "$headoid" --argjson gclean "${greptileclean:-null}" \
+   --arg owner "$REPO_OWNER" --arg repo "$REPO_NAME" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
   | (.[0] | map(((((.author.__typename // "") == "Bot") and ((.author.login // "") == $greptile)
@@ -1095,8 +1202,12 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
                        or (($c.author.login // "") == $cr and ($c.body | is_cr_notice))))
          or ((($c.author.__typename // "") == "Bot") and (($c.author.login // "") == $greptile)
              and ($c.body | is_greptile_status_notice))) as $notice
+      | (($gclean != null) and (($c.author.__typename // "") == "Bot")
+         and (($c.author.login // "") == $greptile) and ($c.body | is_greptile_summary)
+         and (($c.body | greptile_summary_sha($owner; $repo)) as $gs
+              | $gs != "" and (($gs | ascii_downcase) == ($head | ascii_downcase)))) as $gsum
       | {author, state: "COMMENT", body, at: .updatedAt,
-         verdict: ($v or $sum), notice: $notice,
+         verdict: ($v or $sum or $gsum), notice: $notice,
          reviewed_rows: ((if $notice then []
                           elif $v then [{sha: ($c.body | verdict_sha), at: .createdAt}]
                           elif $sum then ($c.body | summary_rows)
@@ -1105,7 +1216,7 @@ bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" 
                          | map(select((.sha // "") != "" and (.at // "") != ""))),
          claimable: ((.author.login | IN($skip[]) | not)
                      and ((.body // "") | test($trig; "i") | not)
-                     and (($v or $sum or $notice) | not))}))' \
+                     and (($v or $sum or $notice or $gsum) | not))}))' \
          <(echo "$reviews") <(echo "$prcomments")) || {
   echo "verdict: BLOCKED — could not merge PR-level bodies." >&2; exit 2; }
 
@@ -1432,9 +1543,18 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # a verdict bound to it. Nothing else counts, and in particular the existence of review
   # objects on OTHER commits does not: the blocking branch used to require one, so a PR
   # with no review objects and an unbound verdict printed neither line and went CLEAR.
+  greptilecovers=$(jq -rn --argjson at "${greptileclean:-null}" --arg hd "$arrived" "$TS_JQ"'
+    if $at == null then 0
+    else ($at | ts) as $g | ($hd | ts) as $h
+      | if $g != null and $h != null and $g > $h then 1 else 0 end
+    end') || {
+    echo "verdict: BLOCKED — could not date Greptile's review against the head's arrival." >&2; exit 2; }
   if [ "${reviewed:-0}" -eq 0 ] && [ "${verdicts:-0}" -gt 0 ]; then
     echo
     echo "  HEAD COVERED  ${headoid:0:9}: no review object, but $verdicts no-findings verdict(s) bound to it (arrived $arrived)"
+  elif [ "${reviewed:-0}" -eq 0 ] && [ "${greptilecovers:-0}" -eq 1 ]; then
+    echo
+    echo "  HEAD COVERED  ${headoid:0:9}: Greptile's review of this commit finished with 0 comments added at $(jq -r . <<<"$greptileclean") (arrived $arrived)"
   elif [ "${reviewed:-0}" -eq 0 ]; then
     echo
     echo "  UNREVIEWED HEAD  ${headoid:0:9} — no review of this commit from anyone but the author (an empty review object is a reply container, not a review), and no no-findings verdict bound to it"
