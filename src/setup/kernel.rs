@@ -2642,13 +2642,11 @@ pub async fn ensure_cloud_hypervisor(repo: &str, branch: &str) -> Result<PathBuf
             .context("removing old cloud-hypervisor build directory")?;
     }
 
-    // Clone repo (shallow, single branch, as the sudo invoker so the
-    // checkout is not root-owned)
+    // Clone the selected branch as the sudo invoker so the checkout is not root-owned.
     let clone_url = format!("https://github.com/{}", repo);
     let mut clone_cmd = Command::new("git");
     clone_cmd.args([
         "clone",
-        "--depth=1",
         "-b",
         branch,
         &clone_url,

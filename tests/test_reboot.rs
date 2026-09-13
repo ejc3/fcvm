@@ -4,7 +4,7 @@
 //! relaunches in place from the same provisioned disk and comes back healthy, with
 //! the container's writable layer ("the work") preserved and its identity
 //! regenerated. The fcvm process (and therefore its PID) stays stable across the
-//! reboot — only the Firecracker child restarts.
+//! reboot, only the VMM child restarts.
 //!
 //! Both VM lifecycle paths are covered:
 //!   * fresh `podman run` boot (`--no-snapshot` pins the run_vm_loop path)
@@ -24,17 +24,47 @@ fn process_alive(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
+/// True when `after` is a machine-id that differs from the one read before the reboot.
+fn machine_id_regenerated(before: &str, after: &str) -> bool {
+    let (before, after) = (before.trim(), after.trim());
+    !before.is_empty() && !after.is_empty() && after != before
+}
+
+/// The regeneration witness must compare against a real pre-reboot machine-id. An empty baseline,
+/// which a failed read produced through `unwrap_or_default()`, made any machine-id read after the
+/// reboot count as regenerated, including one from a VM that never rebooted (CodeRabbit on #921).
+#[test]
+fn a_regenerated_machine_id_needs_a_real_baseline() {
+    let before = "0123456789abcdef0123456789abcdef";
+    let after = "fedcba9876543210fedcba9876543210\n";
+    assert!(machine_id_regenerated(before, after));
+    assert!(!machine_id_regenerated(before, before));
+    assert!(!machine_id_regenerated(before, ""));
+    assert!(
+        !machine_id_regenerated("", after),
+        "an empty pre-reboot machine-id witnesses nothing"
+    );
+    assert!(
+        !machine_id_regenerated("\n", after),
+        "a blank pre-reboot machine-id witnesses nothing"
+    );
+}
+
 /// Reboot the guest and assert the SAME fcvm process relaunches it in place:
 /// machine-id regenerates (positive witness of the re-boot), health recovers,
 /// and the container's writable layer survives.
 async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
     let mid_before = common::exec_in_vm(pid, &["cat", "/etc/machine-id"])
         .await
-        .unwrap_or_default();
+        .context("reading the machine-id before the reboot")?;
+    anyhow::ensure!(
+        !mid_before.trim().is_empty(),
+        "the machine-id read before the reboot is empty, so a regenerated one cannot be told apart"
+    );
 
     // `reboot` goes through systemd, which starts fcvm-reboot-notify.service
     // (WantedBy=reboot.target) -> fc-agent --notify-reboot -> host relaunches
-    // Firecracker in place. The exec dies mid-command as the VM resets.
+    // the VMM in place. The exec dies mid-command as the VM resets.
     let _ = common::exec_in_vm(pid, &["reboot"]).await;
 
     let deadline = Instant::now() + Duration::from_secs(150);
@@ -45,8 +75,7 @@ async fn reboot_and_assert_relaunch(pid: u32, token: &str) -> Result<()> {
             "fcvm process (pid {pid}) must stay alive across an in-place reboot"
         );
         if let Ok(mid) = common::exec_in_vm(pid, &["cat", "/etc/machine-id"]).await {
-            let mid = mid.trim().to_string();
-            if !mid.is_empty() && mid != mid_before.trim() {
+            if machine_id_regenerated(&mid_before, &mid) {
                 recovered = true;
                 break;
             }
@@ -124,6 +153,54 @@ async fn test_vm_reboot_comes_back_healthy_and_preserves_work() -> Result<()> {
     Ok(())
 }
 
+/// A normal Cloud Hypervisor VM must consume reboot intent before its final exit.
+// Host-Root CI provisions Cloud Hypervisor; container-test-all does not.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_cloud_hypervisor_reboot_recovers_and_then_exits() -> Result<()> {
+    fcvm::commands::common::find_cloud_hypervisor()
+        .context("CH reboot test requires the backend")?;
+    let (name, _, _, _) = common::unique_names("ch-reboot");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--hypervisor",
+            "cloud-hypervisor",
+            "--no-snapshot",
+            "nginx:alpine",
+            "sh",
+            "-c",
+            "while [ ! -e /stop ]; do sleep 1; done",
+        ],
+        "ch-reboot-base",
+    )
+    .await?;
+    let result = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        let token = format!("ch-reboot-token-{pid}");
+        write_work_marker(pid, &token).await?;
+        reboot_and_assert_relaunch(pid, &token).await?;
+
+        // The exec response may disappear when its container exits; the process
+        // exit below proves the stop marker was consumed and the final boot ended.
+        let _ = common::exec_in_container(pid, &["touch", "/stop"]).await;
+        let status = tokio::time::timeout(Duration::from_secs(60), child.wait())
+            .await
+            .context("CH VM did not terminate after its container exited")??;
+        anyhow::ensure!(status.success(), "CH VM final exit must be zero: {status}");
+        Ok::<_, anyhow::Error>(())
+    }
+    .await;
+    if child.try_wait()?.is_none() {
+        common::kill_process(pid).await;
+        let _ = child.kill().await;
+    }
+    result
+}
+
 /// Data-disk preservation: an in-place reboot must NOT rebuild --disk-dir
 /// images from the host directory — guest writes to the data disk live only in
 /// the per-VM image and would be silently destroyed (confirmed review finding).
@@ -168,7 +245,11 @@ async fn test_vm_reboot_preserves_disk_dir_writes() -> Result<()> {
     // Reboot; wait for the relaunch (machine-id change is the positive witness).
     let mid_before = common::exec_in_vm(pid, &["cat", "/etc/machine-id"])
         .await
-        .unwrap_or_default();
+        .context("reading the machine-id before the reboot")?;
+    anyhow::ensure!(
+        !mid_before.trim().is_empty(),
+        "the machine-id read before the reboot is empty, so a regenerated one cannot be told apart"
+    );
     let _ = common::exec_in_vm(pid, &["reboot"]).await;
     let deadline = Instant::now() + Duration::from_secs(150);
     loop {
@@ -177,7 +258,7 @@ async fn test_vm_reboot_preserves_disk_dir_writes() -> Result<()> {
             "fcvm process must stay alive across the reboot"
         );
         if let Ok(mid) = common::exec_in_vm(pid, &["cat", "/etc/machine-id"]).await {
-            if !mid.trim().is_empty() && mid.trim() != mid_before.trim() {
+            if machine_id_regenerated(&mid_before, &mid) {
                 break;
             }
         }
