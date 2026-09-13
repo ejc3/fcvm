@@ -624,7 +624,17 @@ jobs:
           # exit 125 before any test ran, 2026-08-13).
           ./fcvm/scripts/runner-podman-hygiene.sh
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates, and copied in by "Save disk I/O record".
+          # Detached from the step's output so the step does not wait on it; the runner
+          # reaps it with the job's other processes.
+          pkill -x iostat 2>/dev/null || true
+          setsid nohup bash -c 'stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7) > /tmp/fcvm-iostat.log 2>&1' \
+            < /dev/null > /dev/null 2>&1 &
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -666,6 +676,12 @@ jobs:
         if: always()
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh post
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          pkill -x iostat 2>/dev/null || true
+          mkdir -p /tmp/fcvm-test-logs
+          cp /tmp/fcvm-iostat.log /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -840,7 +856,17 @@ jobs:
           # Install iperf3 for network benchmarks
           ./fcvm/scripts/ci-apt-get.sh update && ./fcvm/scripts/ci-apt-get.sh install -y iperf3 || true
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates, and copied in by "Save disk I/O record".
+          # Detached from the step's output so the step does not wait on it; the runner
+          # reaps it with the job's other processes.
+          pkill -x iostat 2>/dev/null || true
+          setsid nohup bash -c 'stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7) > /tmp/fcvm-iostat.log 2>&1' \
+            < /dev/null > /dev/null 2>&1 &
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -937,6 +963,12 @@ jobs:
             LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
           } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
           echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          pkill -x iostat 2>/dev/null || true
+          mkdir -p /tmp/fcvm-test-logs
+          cp /tmp/fcvm-iostat.log /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -1050,7 +1082,17 @@ jobs:
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates, and copied in by "Save disk I/O record".
+          # Detached from the step's output so the step does not wait on it; the runner
+          # reaps it with the job's other processes.
+          pkill -x iostat 2>/dev/null || true
+          setsid nohup bash -c 'stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7) > /tmp/fcvm-iostat.log 2>&1' \
+            < /dev/null > /dev/null 2>&1 &
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -1080,6 +1122,12 @@ jobs:
         run: |
           # Filter dmesg for UFFD/memory/VM related messages only
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          pkill -x iostat 2>/dev/null || true
+          mkdir -p /tmp/fcvm-test-logs
+          cp /tmp/fcvm-iostat.log /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
