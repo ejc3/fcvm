@@ -273,7 +273,7 @@ fetch_payload() {
             commits(last: 1) { nodes { commit { committedDate checkSuites(first: 10) { nodes { createdAt } } } } }
             reviews(first: $REVIEWS_PAGE_SIZE$rafter) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt commit { oid }
+              nodes { author { login __typename } state body submittedAt commit { oid }
                     comments(first: $REVIEWS_PAGE_SIZE) { totalCount nodes { replyTo { id } } } }
             } } } }" 2>/dev/null) || return 1
     require_page "$rresp" data.repository.pullRequest.reviews "the reviews" "$pr" || return 2
@@ -376,7 +376,7 @@ fetch_payload() {
           pullRequest(number: $pr) {
             reviews(first: $REVIEWS_PAGE_SIZE$rv2after) {
               pageInfo { hasNextPage endCursor }
-              nodes { author { login } state body submittedAt commit { oid }
+              nodes { author { login __typename } state body submittedAt commit { oid }
                     comments(first: $REVIEWS_PAGE_SIZE) { totalCount nodes { replyTo { id } } } }
             } } } }" 2>/dev/null) || return 1
     require_page "$rv2resp" data.repository.pullRequest.reviews "the second read of the reviews" "$pr" || return 2
@@ -584,14 +584,16 @@ fi
 # Add to IGNORED_COMMENT_AUTHORS deliberately, and never a bot that reviews.
 IGNORED_COMMENT_AUTHORS=${IGNORED_COMMENT_AUTHORS:-vercel,vercel[bot],dependabot,dependabot[bot],github-actions,github-actions[bot],codecov,codecov[bot]}
 # Comments that are ONLY a documented bot command: "@codex review", "@codex security
-# review", or "@coderabbitai" followed by one of review, full review, resume, pause,
-# ignore, resolve, summary, help, configuration. The handles are the mention names of the
-# bots in VERDICT_BOTS and the commands are the ones each bot documents (Codex in its
-# About block, CodeRabbit in its command reference). Case-insensitive, because GitHub
-# logins are. Any other comment that opens with a mention is a finding and stays
-# claimable: "@me drops records" and "@codex drops records" both need a disposition. An
-# earlier version exempted any mention plus up to two words, which exempted exactly those.
-TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coderabbitai[[:space:]]+(full[[:space:]]+review|review|resume|pause|ignore|resolve|summary|help|configuration))[[:space:]]*\z'
+# review", "@coderabbitai" followed by one of review, full review, resume, pause, ignore,
+# resolve, summary, help, configuration, or "@greptileai" or "@greptile-apps", alone or
+# followed by review. The handles are the mention names of the reviewing bots and the
+# commands are the ones each bot documents (Codex in its About block, CodeRabbit in its
+# command reference, Greptile in its docs and its file-limit notice). Case-insensitive,
+# because GitHub logins are. Any other comment that opens with a mention is a finding and
+# stays claimable: "@me drops records", "@codex drops records" and "@greptileai is this
+# thread-safe?" all need a disposition. An earlier version exempted any mention plus up
+# to two words, which exempted exactly those.
+TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coderabbitai[[:space:]]+(full[[:space:]]+review|review|resume|pause|ignore|resolve|summary|help|configuration)|greptile(ai|-apps)([[:space:]]+review)?)[[:space:]]*\z'
 # A reviewer with nothing to say posts no review object. Codex answers with a plain
 # comment: "Codex Review: Didn't find any major issues." plus one of a few short
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
@@ -678,6 +680,13 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 #     disposition. The range
 #     that notice quotes is not coverage (walkthrough_sha never read it). Once the comment
 #     holds a walkthrough or a recent-review block it is a walkthrough, judged as one.
+#   - Greptile (GREPTILE_LOGIN), which reviews but is not in VERDICT_BOTS: a top-level
+#     comment whose first line is "<!-- greptile-status -->" and whose rest is the
+#     file-limit notice in either wording it has used, or its error notice
+#     (manaflow-ai/cmux pr12342, pr7670, pr6705); and, out of open-source review credits,
+#     a REVIEW whose whole body is the one-line pause notice (pr10764). A review body
+#     covers its commit, so that pause text is also barred from coverage whoever posts it
+#     (see covers); only the Greptile bot's is exempt from answers.
 #
 # ACCOUNTING. A body is exempt from dispositions only if the classifier read every byte of
 # it. Content removed before classification is content nobody evaluated, so a finding in a
@@ -949,7 +958,26 @@ def is_cr_summary_notice:
                        | cr_notice_payload_ok)
                   and ((($p[0] + $q[1]) | strip_accounted(["cr_tips", "html_comment"])) as $rest
                        | $rest != null and ($rest | test("[^[:space:]]") | not))));
-def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;'
+def is_cr_notice: is_cr_reply_notice or is_cr_summary_notice;
+def greptile_status_marker: "<!-- greptile-status -->";
+def greptile_bypass_re: "^Bypass the limit by tagging `@greptile-apps` to review\\.$";
+def greptile_status_shapes:
+  [ [ "^Too many files changed for review \\([0-9]+ files, [0-9]+ file limit\\)\\.$", greptile_bypass_re ]
+  , [ "^Too many files changed for review\\. \\(`[0-9]+ files found`, `[0-9]+ file limit`\\)$", greptile_bypass_re ]
+  , [ "^Greptile encountered an error while reviewing this PR\\. Please reach out to support@greptile\\.com for assistance\\.$" ]
+  ];
+def greptile_lines:
+  (. // "") | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; "")) | map(select(length > 0));
+def is_greptile_status_notice:
+  greptile_lines as $l
+  | ($l | length) >= 2 and $l[0] == greptile_status_marker
+    and ($l[1:] as $rest
+         | any(greptile_status_shapes[]; . as $shape
+               | ($shape | length) == ($rest | length)
+                 and all(range(0; $shape | length); . as $i | $rest[$i] | test($shape[$i]))));
+def greptile_pause_re: "^Greptile has paused reviews on this repository — it used its [0-9]+ free open-source review credits for this billing period\\. Reviews resume automatically on (January|February|March|April|May|June|July|August|September|October|November|December) [0-9]{1,2}\\. To continue before then, an organization admin can \\[keep reviews running past the free credits\\]\\(https://app\\.greptile\\.com/-/repositories\\?oss=https%3A%2F%2Fgithub\\.com%2F[A-Za-z0-9_.-]+%2F[A-Za-z0-9_.-]+\\) — those bill as normal usage\\.$";
+def is_greptile_pause_notice:
+  greptile_lines as $l | ($l | length) == 1 and ($l[0] | test(greptile_pause_re));'
 # Only these bots issue verdicts, and only from the account GitHub types as a Bot.
 # Anyone else posting the same words has written an ordinary comment: claimable like
 # any other, never coverage. Entries are logins; their mention handles (@codex,
@@ -963,6 +991,9 @@ CODEX_LOGIN=${CODEX_LOGIN:-chatgpt-codex-connector}
 # not-completed and summary notices are CodeRabbit's. From any other account they are
 # ordinary comments.
 CODERABBIT_LOGIN=${CODERABBIT_LOGIN:-coderabbitai}
+# Greptile's notices belong to its bot the same way. It grants no no-findings coverage, so it
+# is not in VERDICT_BOTS.
+GREPTILE_LOGIN=${GREPTILE_LOGIN:-greptile-apps}
 
 prauthor=$(jq -r '.data.repository.pullRequest.author.login // ""' <<<"$payload" 2>/dev/null)
 
@@ -1046,18 +1077,24 @@ fi
 # The coverage check below asks only whether some row names the head and postdates its
 # arrival, so a comment carrying several results is judged row by row.
 bodies=$(jq -s --arg ignore "$IGNORED_COMMENT_AUTHORS" --arg trig "$TRIGGER_RE" --arg bots "$VERDICT_BOTS" \
-   --arg codex "$CODEX_LOGIN" --arg cr "$CODERABBIT_LOGIN" --arg me "$prauthor" \
+   --arg codex "$CODEX_LOGIN" --arg cr "$CODERABBIT_LOGIN" --arg greptile "$GREPTILE_LOGIN" \
+   --arg me "$prauthor" \
    "$VERDICT_JQ"'($ignore | split(",")) as $skip
   | ($bots | split(",")) as $botlogins
-  | (.[0] | map({author, state, body, at: .submittedAt,
-                 claimable: (((.state // "COMMENTED") != "APPROVED")
-                             and (($me == "") or ((.author.login // "") != $me)))}))
+  | (.[0] | map(((((.author.__typename // "") == "Bot") and ((.author.login // "") == $greptile)
+                  and ((.body // "") | is_greptile_pause_notice))) as $gpause
+                | {author, state, body, at: .submittedAt, notice: $gpause,
+                   claimable: (($gpause | not)
+                               and ((.state // "COMMENTED") != "APPROVED")
+                               and (($me == "") or ((.author.login // "") != $me)))}))
   + (.[1] | map(. as $c
       | (($c.author.__typename // "") == "Bot" and ($c.author.login | IN($botlogins[]))) as $listed
       | ($listed and ($c.body | is_verdict)) as $v
       | ($listed and (($c.author.login // "") == $codex) and ($c.body | is_codex_summary)) as $sum
-      | ($listed and ((($c.author.login // "") == $codex and ($c.body | is_codex_limit_notice))
-                      or (($c.author.login // "") == $cr and ($c.body | is_cr_notice)))) as $notice
+      | (($listed and ((($c.author.login // "") == $codex and ($c.body | is_codex_limit_notice))
+                       or (($c.author.login // "") == $cr and ($c.body | is_cr_notice))))
+         or ((($c.author.__typename // "") == "Bot") and (($c.author.login // "") == $greptile)
+             and ($c.body | is_greptile_status_notice))) as $notice
       | {author, state: "COMMENT", body, at: .updatedAt,
          verdict: ($v or $sum), notice: $notice,
          reviewed_rows: ((if $notice then []
@@ -1233,7 +1270,9 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   #
   # So an object counts only when it carries something that could ONLY exist because a
   # review ran. Three things can, and a reply container has none of them:
-  #   - a non-empty BODY. The reviewer wrote a summary. A container's body is "".
+  #   - a non-empty BODY. The reviewer wrote a summary. A container's body is "". Not
+  #     Greptile's pause notice (is_greptile_pause_notice): that body says no review will
+  #     run, and it covers nothing whoever posts it.
   #   - a state of APPROVED or CHANGES_REQUESTED. GitHub mints those only from the review
   #     form; a reply container is always COMMENTED. DISMISSED is a review withdrawn and
   #     PENDING one never submitted, so neither covers on its own.
@@ -1247,8 +1286,9 @@ if [ "${REQUIRE_REVIEWED_HEAD:-1}" = "1" ]; then
   # Emptiness is judged on the object, not on who wrote it. Authorship has decided nothing
   # in this gate since the claimable rule was rewritten, and a human's reply container is
   # as empty as a bot's: #897 carried two of each.
-  covering_jq='def covers:
-      (((.body // "") | type) == "string" and ((.body // "") | test("[^[:space:]]")))
+  covering_jq="$VERDICT_JQ"'def covers:
+      (((.body // "") | type) == "string" and ((.body // "") | test("[^[:space:]]"))
+       and (((.body // "") | is_greptile_pause_notice) | not))
       or (((.state // "") | type) == "string" and ((.state // "") | IN("APPROVED", "CHANGES_REQUESTED")))
       or (any(.comments.nodes[]?; has("replyTo") and .replyTo == null));'
   headreviews=$(jq -c --arg h "$headoid" --arg me "$prauthor" \

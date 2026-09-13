@@ -1,0 +1,10 @@
+{
+  "triggerOnUpdates": false,
+  "triggerOnDrafts": false,
+  "statusCheck": true,
+  "shouldUpdateDescription": false,
+  "updateSummaryOnly": false,
+  "autoApprove": {
+    "enabled": false
+  }
+}

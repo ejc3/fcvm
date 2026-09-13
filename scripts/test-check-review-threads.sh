@@ -1758,6 +1758,60 @@ scan_case "an inline comment is removed"         '- [ ] <!-- {"checkboxId":"a"} 
 scan_case "a quoted column-0 comment is removed" '> <!-- m -->'             '> '
 scan_case "a comment inside a multiline code span is kept" $'`code\n<!-- P1 -->\ncode`' $'`code\n<!-- P1 -->\ncode`'
 
+echo "== finding 47: Greptile's pause notice covers nothing, and its notices and triggers are not findings =="
+# Bodies as greptile-apps posted them on manaflow-ai/cmux. Out of open-source credits it posts
+# the pause notice as a COMMENTED review on the head (pr10764, review 5025193699). A non-empty
+# review body covers its commit, so once a disposition answered it the head read as reviewed by
+# a reviewer that had said it would not review. Its other notices are top-level comments under
+# <!-- greptile-status -->: the file limit (pr12342; pr7670 for the July wording) and an error
+# (pr6705). `@greptileai` is the documented trigger; the file-limit notice names `@greptile-apps`.
+GREPTILE=greptile-apps
+G_PAUSE=$(jq -n '"Greptile has paused reviews on this repository — it used its 2000 free open-source review credits for this billing period. Reviews resume automatically on September 19. To continue before then, an organization admin can [keep reviews running past the free credits](https://app.greptile.com/-/repositories?oss=https%3A%2F%2Fgithub.com%2Fmanaflow-ai%2Fcmux) — those bill as normal usage."')
+G_FILES=$(jq -n '"<!-- greptile-status -->\nToo many files changed for review (117 files, 100 file limit).\n\nBypass the limit by tagging `@greptile-apps` to review."')
+G_FILES_JULY=$(jq -n '"<!-- greptile-status -->\nToo many files changed for review. (`155 files found`, `100 file limit`)\n\nBypass the limit by tagging `@greptile-apps` to review."')
+G_ERROR=$(jq -n '"<!-- greptile-status -->\nGreptile encountered an error while reviewing this PR. Please reach out to support@greptile.com for assistance."')
+# A review object as GraphQL returns it, author typename included: login $1, typename $2,
+# submittedAt $3, body $4 (a JSON string literal), commit $5 (default the head).
+grev() { printf '{"author":{"login":"%s","__typename":"%s"},"state":"COMMENTED","submittedAt":"%s","body":%s,"commit":{"oid":"%s"},"comments":{"totalCount":0,"nodes":[]}}' "$1" "$2" "$3" "$4" "${5:-deadbeef}"; }
+# A review that covers the head by placing a finding of its own.
+G_COVER='{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}'
+# The wrap8 head with reviews $1 and comments $2 (both reads).
+wrapg() { printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"deadbeef","commits":{"nodes":[{"commit":{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{"nodes":%s}}}]},"prcommits":%s,"reviewThreads":{"nodes":[]},"reviews":{"nodes":[%s]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]}}}}}}' "$SUITE" "$PRCOMMITS_HEAD" "$1" "$2" "$2"; }
+G_DISPOSE=$(cmt me User 2026-01-02T02:00:00Z '"NOT-A-DEFECT: Greptile said it paused, which claims nothing"')
+G_PAUSE_REV=$(grev "$GREPTILE" Bot 2026-01-02T01:00:00Z "$G_PAUSE")
+run_case "a greptile pause review on the head, answered, is still an unreviewed head" \
+  "$(wrapg "$G_PAUSE_REV" "$G_DISPOSE")" 1 "UNREVIEWED HEAD"
+run_case "the pause text on the head from a human account covers nothing either" \
+  "$(wrapg "$(grev someone User 2026-01-02T01:00:00Z "$G_PAUSE")" "$G_DISPOSE")" 1 "UNREVIEWED HEAD"
+run_case "a greptile pause review needs no disposition" \
+  "$(wrapg "$G_COVER,$G_PAUSE_REV" "")" 0 "CLEAR"
+run_case "a greptile file-limit notice needs no disposition" \
+  "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$G_FILES")")" 0 "CLEAR"
+run_case "the July file-limit wording needs no disposition" \
+  "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$G_FILES_JULY" 2026-01-02T01:30:00Z)")" 0 "CLEAR"
+run_case "a greptile error notice needs no disposition" \
+  "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$G_ERROR")")" 0 "CLEAR"
+for t in '@greptileai' '@greptileai review' '@greptile-apps' '@greptile-apps review' '@GreptileAI Review'; do
+  run_case "$t is a trigger, not a finding" \
+    "$(wrap9 "$(cmt me User 2026-01-02T01:00:00Z "$(jq -n --arg t "$t" '$t')")")" 0 "CLEAR"
+done
+# Guards, green before and after: the match is the whole body, the notice belongs to the
+# Greptile bot, and a notice covers no head.
+run_case "a greptile status notice covers no head" \
+  "$(wrap8 "$SUITE" "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$G_ERROR")")" 1 "UNREVIEWED HEAD"
+run_case "a greptile pause review with a finding appended is claimable" \
+  "$(wrapg "$G_COVER,$(grev "$GREPTILE" Bot 2026-01-02T01:00:00Z "$(jq -n --argjson b "$G_PAUSE" '$b + "\n\nP1: this drops the last row"')")" "")" 1 "carry no disposition"
+run_case "the pause text from a human account is claimable" \
+  "$(wrapg "$G_COVER,$(grev "$GREPTILE" User 2026-01-02T01:00:00Z "$G_PAUSE")" "")" 1 "carry no disposition"
+run_case "a greptile status notice with a finding appended is claimable" \
+  "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$(jq -n --argjson b "$G_ERROR" '$b + "\n\nP1: this drops the last row"')")")" 1 "carry no disposition"
+run_case "a human posting the greptile status notice is claimable" \
+  "$(wrap9 "$(cmt helpful-human User 2026-01-02T01:00:00Z "$G_FILES")")" 1 "carry no disposition"
+run_case "greptile posting the codex notice is claimable" \
+  "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "carry no disposition"
+run_case "a question for greptile is a comment, not a trigger" \
+  "$(wrap9 "$(cmt me User 2026-01-02T01:00:00Z '"@greptileai is this thread-safe?"')")" 1 "carry no disposition"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]

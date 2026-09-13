@@ -1667,3 +1667,151 @@ fn a_comment_is_removed_unread_only_where_github_hides_it() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Greptile's pause notice covers no head, and its status notices and triggers are not findings.
+///
+/// Out of open-source review credits, Greptile posts a COMMENTED review on the head whose whole
+/// body says reviews are paused (manaflow-ai/cmux pr10764). A non-empty review body covers its
+/// commit, so once a disposition answered that notice the head read as reviewed. Its file-limit
+/// and error notices are top-level comments under `<!-- greptile-status -->` (pr12342, pr6705),
+/// and `@greptileai` is its documented trigger. The shell harness
+/// (scripts/test-check-review-threads.sh, "finding 47") carries the full matrix; these run in CI.
+#[test]
+fn greptile_pause_notice_covers_nothing_and_its_notices_are_not_findings() {
+    require_jq();
+    const PAUSE: &str = r#""Greptile has paused reviews on this repository — it used its 2000 free open-source review credits for this billing period. Reviews resume automatically on September 19. To continue before then, an organization admin can [keep reviews running past the free credits](https://app.greptile.com/-/repositories?oss=https%3A%2F%2Fgithub.com%2Fmanaflow-ai%2Fcmux) — those bill as normal usage.""#;
+    const FILES: &str = r#""<!-- greptile-status -->\nToo many files changed for review (117 files, 100 file limit).\n\nBypass the limit by tagging `@greptile-apps` to review.""#;
+    const ERROR: &str = r#""<!-- greptile-status -->\nGreptile encountered an error while reviewing this PR. Please reach out to support@greptile.com for assistance.""#;
+    // A review that covers the head by placing a finding of its own.
+    const COVER: &str = r#"{"author":{"login":"codex"},"state":"COMMENTED","submittedAt":"2026-01-03T00:00:00Z","body":"","commit":{"oid":"deadbeef"},"comments":{"totalCount":1,"nodes":[{"replyTo":null}]}}"#;
+    let review = |login: &str, kind: &str, body: &str| {
+        format!(
+            r#"{{"author":{{"login":"{login}","__typename":"{kind}"}},"state":"COMMENTED","submittedAt":"2026-01-02T01:00:00Z","body":{body},"commit":{{"oid":"deadbeef"}},"comments":{{"totalCount":0,"nodes":[]}}}}"#
+        )
+    };
+    let comment = |login: &str, kind: &str, body: &str| {
+        format!(
+            r#"{{"author":{{"login":"{login}","__typename":"{kind}"}},"createdAt":"2026-01-02T01:30:00Z","updatedAt":"2026-01-02T01:30:00Z","body":{body}}}"#
+        )
+    };
+    let payload = |reviews: &str, comments: &str| {
+        format!(
+            r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"prcommits":{{"totalCount":1,"nodes":[{{"commit":{{"oid":"deadbeef"}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[{reviews}]}},"comments":{{"nodes":[{comments}]}},"recheck":{{"comments":{{"nodes":[{comments}]}}}}}}}}}}}}"#
+        )
+    };
+
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-greptile-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    let dispose = comment(
+        "me",
+        "User",
+        r#""NOT-A-DEFECT: Greptile said it paused, which claims nothing""#,
+    );
+    let (out, code) = run(
+        "pause-answered.json",
+        payload(&review("greptile-apps", "Bot", PAUSE), &dispose),
+    );
+    assert_eq!(
+        code, 1,
+        "Greptile's pause notice says no review will run. Answering it must not turn the head \
+         into a reviewed one.\n{out}"
+    );
+    assert!(out.contains("UNREVIEWED HEAD"), "{out}");
+
+    let (out, code) = run(
+        "pause-beside-review.json",
+        payload(
+            &format!("{COVER},{}", review("greptile-apps", "Bot", PAUSE)),
+            "",
+        ),
+    );
+    assert_eq!(
+        code, 0,
+        "the pause notice claims nothing, so it needs no disposition.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    let notices = [
+        comment("greptile-apps", "Bot", FILES),
+        comment("greptile-apps", "Bot", ERROR),
+        comment("me", "User", r#""@greptileai""#),
+        comment("me", "User", r#""@greptile-apps review""#),
+    ]
+    .join(",");
+    let (out, code) = run("notices.json", payload(COVER, &notices));
+    assert_eq!(
+        code, 0,
+        "Greptile's status notices and its trigger commands are not findings.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    for (name, body) in [
+        ("human-notice.json", comment("helpful-human", "User", FILES)),
+        (
+            "question.json",
+            comment("me", "User", r#""@greptileai is this thread-safe?""#),
+        ),
+    ] {
+        let (out, code) = run(name, payload(COVER, &body));
+        assert_eq!(
+            code, 1,
+            "{name}: a notice from another account, or a question for Greptile, is a comment \
+             like any other and needs an answer.\n{out}"
+        );
+        assert!(out.contains("carry no disposition"), "{name}: {out}");
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `.greptile/config.json` keeps Greptile's results where the review gate reads them.
+///
+/// The gate reads review threads, review bodies and top-level comments, never the PR
+/// description, so `shouldUpdateDescription: true` would put Greptile's findings where nothing
+/// asks for an answer, and `updateSummaryOnly: true` would drop its inline threads.
+/// `statusCheck: true` makes it post a check run instead of a status comment the gate has no
+/// shape for. Auto-approval stays off because an APPROVED review covers the head. And a push
+/// does not start a review (`triggerOnUpdates: false`): each review spends one of the free
+/// open-source review credits for the billing period, so a review is asked for with `@greptileai`.
+#[test]
+fn greptile_config_keeps_its_results_where_the_gate_reads_them() {
+    let path = repo_root().join(".greptile/config.json");
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    let config: serde_json::Value = serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is not JSON: {e}", path.display()));
+    for (key, want) in [
+        ("shouldUpdateDescription", false),
+        ("updateSummaryOnly", false),
+        ("statusCheck", true),
+        ("triggerOnUpdates", false),
+    ] {
+        assert_eq!(
+            config[key],
+            serde_json::Value::Bool(want),
+            "`{key}` must be {want} in .greptile/config.json: {config}"
+        );
+    }
+    assert_eq!(
+        config["autoApprove"]["enabled"],
+        serde_json::Value::Bool(false),
+        "`autoApprove.enabled` must be false in .greptile/config.json: {config}"
+    );
+}
