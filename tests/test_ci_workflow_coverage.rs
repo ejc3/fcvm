@@ -15,7 +15,10 @@
 //! claims, and a base-branch filter is what pries them apart.
 
 use serde_norway::Value;
+use std::collections::{BTreeMap, BTreeSet};
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn workflow_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1727,4 +1730,320 @@ esac
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Every self-hosted job ci.yml can run, under the names GitHub gives them.
+const SELF_HOSTED_JOBS: [&str; 8] = [
+    "Host-arm64",
+    "Host-x64",
+    "Host-Root-arm64-SnapshotDisabled",
+    "Host-Root-arm64-SnapshotEnabled",
+    "Host-Root-x64-SnapshotDisabled",
+    "Host-Root-x64-SnapshotEnabled",
+    "Container-arm64",
+    "Container-x64",
+];
+
+fn job_set(names: &[&str]) -> BTreeSet<String> {
+    names.iter().map(|name| name.to_string()).collect()
+}
+
+/// Run skip-check's planning step with fake `gh` and `git` on PATH and return what it
+/// wrote to `$GITHUB_OUTPUT`. The fake `gh` reports one successful PR run, whose commit
+/// has this push's tree when `pr_tree_matches`, with `pr_jobs` as that run's jobs. Any
+/// other `gh` or `git` call fails the step.
+fn run_matrix_plan(
+    event: &str,
+    pr_tree_matches: bool,
+    pr_jobs: &[&str],
+) -> BTreeMap<String, String> {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    let ci = parse_workflow("ci.yml");
+    let run = workflow_job(&ci, "skip-check")
+        .get("steps")
+        .and_then(Value::as_sequence)
+        .expect("`skip-check` job has no `steps:`")
+        .iter()
+        .find(|step| step.get("id").and_then(Value::as_str) == Some("check"))
+        .and_then(|step| step.get("run"))
+        .and_then(Value::as_str)
+        .expect("`skip-check` has no `check` step with a `run:` script")
+        .to_string();
+
+    let dir = std::env::temp_dir().join(format!(
+        "fcvm-matrix-plan-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    for (name, body) in [
+        (
+            "gh",
+            r#"#!/bin/bash
+case "$1 $2" in
+  'run list') echo '101 feedface' ;;
+  'api repos/o/r/git/commits/feedface') echo "$FAKE_PR_TREE" ;;
+  'api repos/o/r/actions/runs/101/jobs') printf '%s\n' "$FAKE_PR_JOBS" ;;
+  *) echo "unexpected: gh $*" >&2; exit 1 ;;
+esac
+"#,
+        ),
+        (
+            "git",
+            r#"#!/bin/bash
+if [ "$*" = 'rev-parse HEAD^{tree}' ]; then echo push-tree; exit 0; fi
+echo "unexpected: git $*" >&2
+exit 1
+"#,
+        ),
+    ] {
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write fake command");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake command executable");
+    }
+    let out_file = dir.join("github_output");
+    std::fs::write(&out_file, "").expect("seed GITHUB_OUTPUT");
+    let path = format!(
+        "{}:{}",
+        dir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let result = std::process::Command::new("bash")
+        .arg("-c")
+        .arg(&run)
+        .env("PATH", path)
+        .env("EVENT", event)
+        .env("REPO", "o/r")
+        .env("GH_TOKEN", "unused")
+        .env("GITHUB_OUTPUT", &out_file)
+        .env(
+            "FAKE_PR_TREE",
+            if pr_tree_matches {
+                "push-tree"
+            } else {
+                "another-tree"
+            },
+        )
+        .env("FAKE_PR_JOBS", pr_jobs.join("\n"))
+        .output()
+        .expect("run the skip-check planner");
+    assert!(
+        result.status.success(),
+        "the planner failed for {event}: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let outputs = std::fs::read_to_string(&out_file).expect("read GITHUB_OUTPUT");
+    let _ = std::fs::remove_dir_all(&dir);
+    outputs
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .map(|(key, value)| (key.to_string(), value.to_string()))
+        .collect()
+}
+
+/// The job names a plan expands to. Also checks that every `*_run` flag and `skip`
+/// agree with the lists, because GitHub fails a run on an empty matrix rather than
+/// skipping the job.
+fn planned_jobs(outputs: &BTreeMap<String, String>) -> BTreeSet<String> {
+    let mut jobs = BTreeSet::new();
+    for (key, prefix) in [
+        ("host", "Host"),
+        ("host_root", "Host-Root"),
+        ("container", "Container"),
+    ] {
+        let raw = outputs
+            .get(key)
+            .unwrap_or_else(|| panic!("the planner wrote no `{key}` output: {outputs:?}"));
+        let matrix: serde_json::Value = serde_json::from_str(raw)
+            .unwrap_or_else(|e| panic!("`{key}` is not a JSON matrix ({e}): {raw}"));
+        let names: Vec<String> = if key == "host_root" {
+            matrix["include"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`host_root` has no include list: {raw}"))
+                .iter()
+                .map(|entry| {
+                    let arch = entry["arch"].as_str().expect("entry without arch");
+                    let mode = entry["mode"].as_str().expect("entry without mode");
+                    let (no_snapshot, runs) = if mode == "SnapshotDisabled" {
+                        ("1", "1")
+                    } else {
+                        ("", "2")
+                    };
+                    assert_eq!(
+                        (
+                            entry["fcvm_no_snapshot"].as_str(),
+                            entry["test_runs"].as_str()
+                        ),
+                        (Some(no_snapshot), Some(runs)),
+                        "{mode} must set FCVM_NO_SNAPSHOT='{no_snapshot}' and run the suite \
+                         {runs} time(s): {entry}"
+                    );
+                    format!("{prefix}-{arch}-{mode}")
+                })
+                .collect()
+        } else {
+            matrix["arch"]
+                .as_array()
+                .unwrap_or_else(|| panic!("`{key}` has no arch list: {raw}"))
+                .iter()
+                .map(|arch| format!("{prefix}-{}", arch.as_str().expect("arch is not a string")))
+                .collect()
+        };
+        let flag = if names.is_empty() { "false" } else { "true" };
+        assert_eq!(
+            outputs.get(&format!("{key}_run")).map(String::as_str),
+            Some(flag),
+            "`{key}_run` disagrees with `{key}` = {raw}"
+        );
+        jobs.extend(names);
+    }
+    let skip = if jobs.is_empty() { "true" } else { "false" };
+    assert_eq!(
+        outputs.get("skip").map(String::as_str),
+        Some(skip),
+        "`skip` disagrees with the planned jobs {jobs:?}"
+    );
+    jobs
+}
+
+/// A pull request runs every arm64 job but only ONE x64 job.
+///
+/// Four x64 metal instances per PR push were most of the x86 CI bill, and three of those
+/// jobs run paths the arm64 jobs already cover. Host-Root-x64-SnapshotEnabled is the one
+/// kept: it takes the privileged suite through a snapshot miss and a restore, which is
+/// where the x86-specific KVM and vCPU state code lives.
+#[test]
+fn a_pull_request_runs_every_arm64_job_and_one_x64_job() {
+    let jobs = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
+    let x64: BTreeSet<String> = jobs.iter().filter(|j| j.contains("x64")).cloned().collect();
+    assert_eq!(
+        x64,
+        job_set(&["Host-Root-x64-SnapshotEnabled"]),
+        "a pull request must run exactly one x64 job"
+    );
+    let arm64: BTreeSet<String> = jobs
+        .iter()
+        .filter(|j| j.contains("arm64"))
+        .cloned()
+        .collect();
+    let every_arm64: BTreeSet<String> = job_set(&SELF_HOSTED_JOBS)
+        .into_iter()
+        .filter(|j| j.contains("arm64"))
+        .collect();
+    assert_eq!(
+        arm64, every_arm64,
+        "a pull request must still run every arm64 job"
+    );
+}
+
+/// Main runs whatever its PR run of the same tree did not.
+///
+/// Together the two runs are the full matrix, so x86 is still fully tested before a
+/// release, and nothing that already passed on the PR runs again on main. Other jobs in
+/// the PR run's list (Lint here) must not change the plan.
+#[test]
+fn main_runs_the_x64_jobs_its_pull_request_left_out() {
+    let pr = planned_jobs(&run_matrix_plan("pull_request", false, &[]));
+    let mut reported: Vec<&str> = pr.iter().map(String::as_str).collect();
+    reported.push("Lint");
+    let main = planned_jobs(&run_matrix_plan("push", true, &reported));
+    assert!(
+        pr.is_disjoint(&main),
+        "main re-ran jobs that already passed on the PR: {:?}",
+        pr.intersection(&main).collect::<Vec<_>>()
+    );
+    let both: BTreeSet<String> = pr.union(&main).cloned().collect();
+    assert_eq!(
+        both,
+        job_set(&SELF_HOSTED_JOBS),
+        "the PR run and the main run together must cover the full matrix"
+    );
+}
+
+/// Nothing is assumed without a passing PR run of the same tree: a push whose tree never
+/// passed on a PR, a manual dispatch and the Build Kernels trigger all run everything.
+#[test]
+fn runs_without_a_passing_pull_request_tree_get_the_full_matrix() {
+    assert_eq!(
+        planned_jobs(&run_matrix_plan("push", false, &SELF_HOSTED_JOBS)),
+        job_set(&SELF_HOSTED_JOBS),
+        "a push whose tree never passed on a PR must run the full matrix"
+    );
+    for event in ["workflow_dispatch", "workflow_run"] {
+        assert_eq!(
+            planned_jobs(&run_matrix_plan(event, false, &[])),
+            job_set(&SELF_HOSTED_JOBS),
+            "{event} must run the full matrix"
+        );
+    }
+}
+
+/// When the matching PR run already covered everything, main runs nothing: either that
+/// run had the full matrix, or its `changes` job skipped the matrix, which the jobs API
+/// reports under the unexpanded matrix names.
+#[test]
+fn main_skips_the_matrix_when_its_pull_request_needed_nothing_more() {
+    assert!(
+        planned_jobs(&run_matrix_plan("push", true, &SELF_HOSTED_JOBS)).is_empty(),
+        "every self-hosted job already passed for this tree, so main must run none"
+    );
+    let skipped = [
+        "Host-${{ matrix.arch }}",
+        "Host-Root-${{ matrix.arch }}-${{ matrix.mode }}",
+        "Container-${{ matrix.arch }}",
+        "Lint",
+    ];
+    assert!(
+        planned_jobs(&run_matrix_plan("push", true, &skipped)).is_empty(),
+        "the PR run skipped the matrix for this tree, so main must skip it too"
+    );
+}
+
+/// The plan only takes effect if the jobs read it: each self-hosted job must take its
+/// matrix from skip-check and check that list's flag before the matrix expands.
+#[test]
+fn self_hosted_jobs_take_their_matrix_from_the_plan() {
+    let ci = parse_workflow("ci.yml");
+    let declared = workflow_job(&ci, "skip-check")
+        .get("outputs")
+        .and_then(Value::as_mapping)
+        .expect("`skip-check` declares no outputs");
+    for (job, output) in [
+        ("host", "host"),
+        ("host-root", "host_root"),
+        ("container", "container"),
+    ] {
+        let definition = workflow_job(&ci, job);
+        let matrix = definition
+            .get("strategy")
+            .and_then(|strategy| strategy.get("matrix"))
+            .and_then(Value::as_str);
+        let wanted = format!("${{{{ fromJSON(needs.skip-check.outputs.{output}) }}}}");
+        assert_eq!(
+            matrix,
+            Some(wanted.as_str()),
+            "`{job}` does not take its matrix from skip-check's `{output}` plan"
+        );
+        let cond = definition
+            .get("if")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            cond.contains(&format!("needs.skip-check.outputs.{output}_run == 'true'")),
+            "`{job}` does not check `{output}_run`, so an empty plan fails the run instead of \
+             skipping the job"
+        );
+        for name in [output.to_string(), format!("{output}_run")] {
+            let expr = declared
+                .get(Value::from(name.as_str()))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                expr,
+                format!("${{{{ steps.check.outputs.{name} }}}}"),
+                "`skip-check` does not pass the planner's `{name}` output through"
+            );
+        }
+    }
 }

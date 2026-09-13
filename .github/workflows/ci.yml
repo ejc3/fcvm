@@ -50,9 +50,6 @@ env:
   CACHE_KEY_HOST: cargo-tools-nextest-0.9.115-audit-0.22.0-deny-0.18.9
 
 jobs:
-  # Skip expensive CI jobs on main pushes when the tree SHA already passed on a PR.
-  # When a PR merges via fast-forward or rebase, the merge commit has the same tree
-  # SHA as the PR tip. Re-running all tests on self-hosted runners is wasteful.
   # Which paths make the expensive matrix meaningful. A PR touching only these
   # (docs, the assistant tooling, the claude workflows) still runs `actionlint`
   # and still publishes `Summary`; it just skips the VM matrix, which cannot say
@@ -191,49 +188,127 @@ jobs:
       - name: Test runner acceptance contract without AWS credentials
         run: make test-runner-acceptance
 
+  # Plans which self-hosted jobs this run needs.
+  #
+  # A pull_request runs every arm64 job and ONE x64 job, Host-Root-x64-SnapshotEnabled.
+  # It runs the privileged suite through a snapshot miss and then a restore, which is
+  # where the x86-specific code lives (KVM setup, vCPU state save and restore). The other
+  # three x64 jobs run paths the arm64 jobs already cover on every PR.
+  #
+  # A push to main runs every job that has NOT already succeeded on a PR run of the same
+  # tree. A fast-forward or rebase merge keeps the PR tip's tree, so main runs exactly
+  # the x64 jobs the PR left out, and x86 still gets its full matrix before a release.
+  # If that PR run skipped the matrix altogether (its `changes` job found nothing the
+  # matrix can check), main skips it too.
+  #
+  # Anything else - workflow_dispatch, the Build Kernels workflow_run, a push whose tree
+  # never passed on a PR - runs the full matrix.
   skip-check:
     name: Skip Check
     runs-on: ubuntu-latest
     outputs:
       skip: ${{ steps.check.outputs.skip }}
+      host: ${{ steps.check.outputs.host }}
+      host_run: ${{ steps.check.outputs.host_run }}
+      host_root: ${{ steps.check.outputs.host_root }}
+      host_root_run: ${{ steps.check.outputs.host_root_run }}
+      container: ${{ steps.check.outputs.container }}
+      container_run: ${{ steps.check.outputs.container_run }}
     steps:
       - uses: actions/checkout@v7
-      - name: Check if tree SHA already passed CI
+      - name: Plan the self-hosted matrix
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          REPO: ${{ github.repository }}
         run: |
-          if [ "${{ github.event_name }}" != "push" ]; then
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-            echo "Not a push event, running CI"
-            exit 0
-          fi
-
-          TREE_SHA=$(git rev-parse HEAD^{tree})
-          echo "Current tree SHA: $TREE_SHA"
-
-          # GitHub Actions results are check runs, not commit statuses, so the
-          # legacy status API never reports them. Look for a successful run of
-          # this CI workflow on a PR whose head commit has the same tree SHA.
-          SKIP=false
-          if ! HEAD_SHAS=$(gh run list --repo "${{ github.repository }}" --workflow ci.yml \
-              --event pull_request --status success --limit 30 --json headSha --jq '.[].headSha'); then
-            echo "Could not list workflow runs, running CI"
-            HEAD_SHAS=""
-          fi
-          for sha in $HEAD_SHAS; do
-            if ! COMMIT_TREE=$(gh api "repos/${{ github.repository }}/git/commits/$sha" --jq '.tree.sha'); then
-              echo "Could not look up commit $sha, ignoring it"
-              continue
+          set -euo pipefail
+          # Names of the jobs that already passed for this tree on a PR, one per line.
+          PASSED=""
+          if [ "$EVENT" = "push" ]; then
+            TREE_SHA=$(git rev-parse 'HEAD^{tree}')
+            echo "Current tree SHA: $TREE_SHA"
+            # GitHub Actions results are check runs, not commit statuses, so the
+            # legacy status API never reports them. Look for successful runs of
+            # this CI workflow on a PR whose head commit has the same tree SHA.
+            if ! RUNS=$(gh run list --repo "$REPO" --workflow ci.yml --event pull_request \
+                --status success --limit 30 --json databaseId,headSha \
+                --jq '.[] | "\(.databaseId) \(.headSha)"'); then
+              echo "Could not list workflow runs, running the full matrix"
+              RUNS=""
             fi
-            if [ "$COMMIT_TREE" = "$TREE_SHA" ]; then
-              SKIP=true
-              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha"
-              break
+            while read -r run sha; do
+              [ -n "$run" ] || continue
+              if ! COMMIT_TREE=$(gh api "repos/$REPO/git/commits/$sha" --jq '.tree.sha'); then
+                echo "Could not look up commit $sha, ignoring it"
+                continue
+              fi
+              [ "$COMMIT_TREE" = "$TREE_SHA" ] || continue
+              if ! NAMES=$(gh api "repos/$REPO/actions/runs/$run/jobs" --paginate \
+                  --jq '.jobs[] | select(.conclusion == "success" or .conclusion == "skipped") | .name'); then
+                echo "Could not list the jobs of run $run, ignoring it"
+                continue
+              fi
+              echo "Tree SHA $TREE_SHA already passed CI on PR commit $sha (run $run)"
+              PASSED="$PASSED"$'\n'"$NAMES"
+            done <<< "$RUNS"
+          fi
+          # A matrix job skipped by its `if:` is reported under its unexpanded name,
+          # with the literal matrix.arch placeholder in it. In a passing PR run that
+          # means `changes` skipped the matrix for this tree.
+          MATRIX_SKIPPED=false
+          if grep -q 'matrix\.arch' <<< "$PASSED"; then
+            MATRIX_SKIPPED=true
+          fi
+          want() {
+            case "$EVENT" in
+              pull_request)
+                case "$1" in
+                  *-arm64 | *-arm64-* | Host-Root-x64-SnapshotEnabled) return 0 ;;
+                  *) return 1 ;;
+                esac
+                ;;
+              push)
+                [ "$MATRIX_SKIPPED" = false ] && ! grep -qxF -- "$1" <<< "$PASSED"
+                ;;
+              *) return 0 ;;
+            esac
+          }
+          host=""
+          host_root=""
+          container=""
+          planned=""
+          for arch in arm64 x64; do
+            if want "Host-$arch"; then
+              host="$host${host:+,}\"$arch\""
+              planned="$planned Host-$arch"
+            fi
+            for mode in SnapshotDisabled SnapshotEnabled; do
+              want "Host-Root-$arch-$mode" || continue
+              # SnapshotDisabled runs the suite once with FCVM_NO_SNAPSHOT=1.
+              # SnapshotEnabled runs it twice on one runner: a snapshot miss, then a hit.
+              if [ "$mode" = SnapshotDisabled ]; then nosnap=1; runs=1; else nosnap=""; runs=2; fi
+              host_root="$host_root${host_root:+,}{\"arch\":\"$arch\",\"mode\":\"$mode\",\"fcvm_no_snapshot\":\"$nosnap\",\"test_runs\":\"$runs\"}"
+              planned="$planned Host-Root-$arch-$mode"
+            done
+            if want "Container-$arch"; then
+              container="$container${container:+,}\"$arch\""
+              planned="$planned Container-$arch"
             fi
           done
-
-          echo "skip=$SKIP" >> "$GITHUB_OUTPUT"
+          echo "Self-hosted jobs for this $EVENT:${planned:- none}"
+          # A matrix with no combinations fails the run instead of skipping the job, so
+          # every list comes with a flag the job's `if:` checks first.
+          {
+            echo "host={\"arch\":[$host]}"
+            echo "host_run=$([ -n "$host" ] && echo true || echo false)"
+            echo "host_root={\"include\":[$host_root]}"
+            echo "host_root_run=$([ -n "$host_root" ] && echo true || echo false)"
+            echo "container={\"arch\":[$container]}"
+            echo "container_run=$([ -n "$container" ] && echo true || echo false)"
+            echo "skip=$([ -z "$planned" ] && echo true || echo false)"
+          } >> "$GITHUB_OUTPUT"
 
   # Runner 0: Lint (default GitHub runner, no KVM needed)
   # Fast checks: fmt, clippy, audit, deny
@@ -376,7 +451,7 @@ jobs:
   host:
     name: Host-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_run == 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 12 min. GitHub's default is SIX HOURS, which is
     # how a wedged runner held a job all day on 2026-08-06 (one job stuck >5h) while the
@@ -385,8 +460,8 @@ jobs:
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        arch: [arm64, x64]
+      # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
+      matrix: ${{ fromJSON(needs.skip-check.outputs.host) }}
     steps:
       # Fix ownership of root-owned files from previous test runs (sudo cargo test)
       - name: Fix workspace permissions (pre-checkout)
@@ -620,10 +695,13 @@ jobs:
   #   Run 1: Snapshot miss - creates snapshots for container images
   #   Run 2: Snapshot hit - reuses snapshots from Run 1 (should be faster)
   #   This validates the full snapshot lifecycle: create -> persist -> restore
+  #
+  # The arch x mode combinations, with fcvm_no_snapshot and test_runs for each mode, are
+  # planned by skip-check; a pull_request gets only x64 SnapshotEnabled on x86.
   host-root:
     name: Host-Root-${{ matrix.arch }}-${{ matrix.mode }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ github.event.inputs.job != 'container' && needs.skip-check.outputs.host_root_run == 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 43 min (arm64 SnapshotEnabled, which runs the
     # whole suite twice, plus the nested + btrfs kernel builds). ~3x headroom.
@@ -631,16 +709,7 @@ jobs:
     timeout-minutes: 120
     strategy:
       fail-fast: false
-      matrix:
-        arch: [arm64, x64]
-        mode: [SnapshotDisabled, SnapshotEnabled]
-        include:
-          - mode: SnapshotDisabled
-            fcvm_no_snapshot: "1"
-            test_runs: "1"
-          - mode: SnapshotEnabled
-            fcvm_no_snapshot: ""
-            test_runs: "2"
+      matrix: ${{ fromJSON(needs.skip-check.outputs.host_root) }}
     env:
       FCVM_NO_SNAPSHOT: ${{ matrix.fcvm_no_snapshot }}
     steps:
@@ -889,15 +958,15 @@ jobs:
   container:
     name: Container-${{ matrix.arch }}
     needs: [changes, skip-check]
-    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.skip != 'true' && needs.changes.outputs.code == 'true' }}
+    if: ${{ github.event.inputs.job != 'host' && needs.skip-check.outputs.container_run == 'true' && needs.changes.outputs.code == 'true' }}
     runs-on: [self-hosted, Linux, '${{ matrix.arch }}']
     # Longest of the last 6 successful runs: 21 min. ~3x headroom.
     # See the Host job comment for why the 6h default is not acceptable here.
     timeout-minutes: 60
     strategy:
       fail-fast: false
-      matrix:
-        arch: [arm64, x64]
+      # arm64 and x64, as planned by skip-check (arm64 only on a pull_request).
+      matrix: ${{ fromJSON(needs.skip-check.outputs.container) }}
     permissions:
       packages: write
     env:
@@ -1093,7 +1162,7 @@ jobs:
 
       - name: Report skipped
         if: needs.skip-check.outputs.skip == 'true'
-        run: echo "::notice::Skipped self-hosted tests — tree SHA already passed CI on a PR branch"
+        run: echo "::notice::Skipped self-hosted tests — every self-hosted job already passed for this tree on a PR branch"
       # When the test matrix was skipped, no artifacts exist and there is
       # nothing to analyze; downloading would fail on the missing directory.
       - uses: actions/checkout@v7
