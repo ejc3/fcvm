@@ -1697,5 +1697,34 @@ esac
     );
     assert_eq!(calls.len(), 1, "{calls:?}");
 
+    // A retry sleep that crosses the deadline ends the wait. Checking the deadline only before
+    // the sleep started one more apt-get after it had passed (CodeRabbit on #925).
+    let _ = std::fs::remove_file(dir.join("calls"));
+    std::fs::write(dir.join("plan"), held.join("\n") + "\n").unwrap();
+    let out = std::process::Command::new("bash")
+        .arg(&script)
+        .arg("update")
+        .env("APT_GET", &fake)
+        .env("SUDO", "")
+        .env("APT_LOCK_RETRY_S", "2")
+        .env("APT_LOCK_WAIT", "1")
+        .output()
+        .expect("bash must be runnable");
+    let calls: Vec<String> = std::fs::read_to_string(dir.join("calls"))
+        .unwrap_or_default()
+        .lines()
+        .map(str::to_string)
+        .collect();
+    assert_eq!(
+        out.status.code(),
+        Some(100),
+        "the last apt-get status is returned: {calls:?}"
+    );
+    assert_eq!(
+        calls.len(),
+        1,
+        "no apt-get attempt may start after the sleep crossed the deadline: {calls:?}"
+    );
+
     let _ = std::fs::remove_dir_all(&dir);
 }

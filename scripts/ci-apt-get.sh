@@ -42,6 +42,7 @@ while :; do
   if grep -qE '^E: Could not get lock ' "$out" && [ "$SECONDS" -lt "$deadline" ]; then
     echo "ci-apt-get: attempt $attempt found an apt lock held by another process; retrying in ${retry_s}s ($((deadline - SECONDS))s left)" >&2
     sleep "$retry_s"
+    [ "$SECONDS" -lt "$deadline" ] || exit "$rc"
     continue
   fi
   exit "$rc"
