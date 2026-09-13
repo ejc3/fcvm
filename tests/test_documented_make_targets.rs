@@ -1303,3 +1303,80 @@ fn test_root_provisions_the_cloud_hypervisor_its_reboot_test_requires() {
          {prerequisites:?}"
     );
 }
+
+/// A target that runs `fcvm setup` must mount the assets store before its recipe runs.
+///
+/// `fcvm setup` writes under /mnt/fcvm-btrfs, which `setup-btrfs` mounts as a loopback on a host
+/// that is not btrfs. Make runs a recipe after that target's own prerequisites only, and sibling
+/// prerequisites run in any order under `make -j`, so a target that reaches `setup-btrfs` only
+/// through a sibling can write into the bare directory and have the mount hide what it wrote.
+/// `setup-cloud-hypervisor` did that under `test-root` (CodeRabbit on #921). Excluded:
+/// `--generate-config`, which writes the user's config and not the store, and `_`-prefixed
+/// targets, which run inside the container their host-side wrapper starts after that wrapper's
+/// own prerequisites (`container-setup-fcvm` runs `_setup-fcvm`).
+#[test]
+fn targets_that_run_fcvm_setup_mount_the_assets_store_first() {
+    let makefile = repo_file("Makefile");
+    let mut prerequisites: std::collections::HashMap<&str, Vec<&str>> = Default::default();
+    let mut runs_setup: Vec<&str> = Vec::new();
+    let mut current: Option<&str> = None;
+    for line in makefile.lines() {
+        if let Some(command) = line.strip_prefix('\t') {
+            if let Some(target) = current {
+                if command.contains("target/release/fcvm setup")
+                    && !command.contains("--generate-config")
+                    && !runs_setup.contains(&target)
+                {
+                    runs_setup.push(target);
+                }
+            }
+            continue;
+        }
+        let rule = line.split_once(':').filter(|(name, _)| {
+            !name.is_empty()
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+        });
+        match rule {
+            Some((name, rest)) => {
+                current = Some(name);
+                // `target: private SHELL := ...` sets a variable; it names no prerequisites.
+                if !rest.contains('=') {
+                    prerequisites
+                        .entry(name)
+                        .or_default()
+                        .extend(rest.split_whitespace());
+                }
+            }
+            None if !line.trim().is_empty() => current = None,
+            None => {}
+        }
+    }
+
+    for expected in ["setup-default", "setup-fcvm", "setup-cloud-hypervisor"] {
+        assert!(
+            runs_setup.contains(&expected),
+            "`{expected}` no longer runs `fcvm setup` as far as this parse can tell \
+             ({runs_setup:?}), so it is not reading the recipes it thinks it is"
+        );
+    }
+
+    for target in runs_setup.iter().filter(|t| !t.starts_with('_')) {
+        let mut seen: Vec<&str> = Vec::new();
+        let mut stack = vec![*target];
+        while let Some(t) = stack.pop() {
+            if seen.contains(&t) {
+                continue;
+            }
+            seen.push(t);
+            stack.extend(prerequisites.get(t).into_iter().flatten().copied());
+        }
+        assert!(
+            seen.contains(&"setup-btrfs"),
+            "`{target}` runs `fcvm setup`, which writes under /mnt/fcvm-btrfs, but `setup-btrfs` \
+             is not among its prerequisites. Under `make -j` it can run before the mount and \
+             write into a directory the mount then hides. Prerequisites reached: {seen:?}"
+        );
+    }
+}

@@ -680,7 +680,7 @@ container-clean:
 
 # Setup targets
 setup-cloud-hypervisor: private SHELL := $(TARGET_LEASE_SHELL)
-setup-cloud-hypervisor: build
+setup-cloud-hypervisor: build setup-btrfs
 	./target/release/fcvm setup --cloud-hypervisor
 
 setup-passt:
