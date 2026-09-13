@@ -250,6 +250,7 @@ impl CloudHypervisorBackend {
             memory: MemoryConfig {
                 size: self.pending.mem_mib as u64 * 1024 * 1024,
                 shared: false,
+                thp: false,
             },
             payload: PayloadConfig {
                 kernel: kernel.display().to_string(),
@@ -800,6 +801,21 @@ mod tests {
             PathBuf::from("/tmp/ch-test.sock"),
             None,
         )
+    }
+
+    /// CH madvises guest RAM MADV_HUGEPAGE unless the request says `thp: false`, so an
+    /// absent field opts in. See `MemoryConfig::thp` for what that cost on CI.
+    #[test]
+    fn vm_config_opts_guest_memory_out_of_transparent_hugepages() {
+        let mut be = backend();
+        be.pending.kernel = Some(PathBuf::from("/boot/Image"));
+        let config = serde_json::to_value(be.build_vm_config().unwrap()).unwrap();
+        assert_eq!(
+            config["memory"]["thp"],
+            serde_json::Value::Bool(false),
+            "vm.create memory config: {}",
+            config["memory"]
+        );
     }
 
     /// Codex #632 P1 #1: a reboot relaunches with a minimal spec (binary + args only).

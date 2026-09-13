@@ -176,6 +176,12 @@ pub struct MemoryConfig {
     pub size: u64,
     /// Back guest RAM with a shared mmap (required for vhost-user / some restore modes).
     pub shared: bool,
+    /// When true (CH's default) CH madvises guest RAM MADV_HUGEPAGE. Under the host's
+    /// `defrag=madvise` each guest fault on that memory can then compact synchronously.
+    /// On a fragmented CI host that kept kcompactd near 100%, put every CH VMM at
+    /// 100-180% of a core in the kernel, and stretched a file restore to 183 s from
+    /// 11 s. Firecracker guest RAM is not madvised either.
+    pub thp: bool,
 }
 
 #[derive(Debug, Serialize)]
