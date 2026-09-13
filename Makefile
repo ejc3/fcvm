@@ -594,7 +594,7 @@ test-unit: show-notes check-disk build _test-unit
 test-agent-unit: show-notes check-disk cargo-target-link _test-agent-unit
 test-fast: show-notes check-disk setup-fcvm _test-fast
 test-all: show-notes check-disk setup-fcvm _test-all
-test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages _test-root
+test-root: show-notes check-disk setup-fcvm setup-pjdfstest setup-hugepages setup-cloud-hypervisor _test-root
 test: test-root
 
 # Seeded lifecycle chaos fuzz (tests/test_fuzz_chaos.rs): one rootless VM per
@@ -679,6 +679,7 @@ container-clean:
 	podman rmi $(CONTAINER_TAG) 2>/dev/null || true
 
 # Setup targets
+setup-cloud-hypervisor: private SHELL := $(TARGET_LEASE_SHELL)
 setup-cloud-hypervisor: build
 	./target/release/fcvm setup --cloud-hypervisor
 

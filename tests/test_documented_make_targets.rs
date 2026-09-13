@@ -1263,3 +1263,43 @@ fn hugepage_lock_recipes_are_valid_shell_as_make_runs_them() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+/// `make test-root` must provision the Cloud Hypervisor backend its reboot test needs.
+///
+/// `test_cloud_hypervisor_reboot_recovers_and_then_exits` in tests/test_reboot.rs is compiled
+/// under `privileged-tests`, the feature `_test-root` enables, and it fails at
+/// `find_cloud_hypervisor()` when the backend binary is absent. `fcvm setup` does not build CH,
+/// so a `test-root` that does not depend on `setup-cloud-hypervisor` fails on a clean
+/// developer box while CI, which called that target as its own step, passes.
+#[test]
+fn test_root_provisions_the_cloud_hypervisor_its_reboot_test_requires() {
+    let makefile = repo_file("Makefile");
+    let prerequisites: Vec<&str> = makefile
+        .lines()
+        .find_map(|line| line.strip_prefix("test-root:"))
+        .expect(
+            "the Makefile defines no `test-root:` rule, so this cannot fail for the right reason",
+        )
+        .split_whitespace()
+        .collect();
+    assert!(
+        prerequisites.contains(&"setup-fcvm"),
+        "`test-root:` names no `setup-fcvm` prerequisite ({prerequisites:?}), so the parse is not \
+         reading the rule it thinks it is"
+    );
+
+    let reboot = repo_file("tests/test_reboot.rs");
+    assert!(
+        reboot.contains("fn test_cloud_hypervisor_reboot_recovers_and_then_exits")
+            && reboot.contains("find_cloud_hypervisor()"),
+        "the Cloud Hypervisor reboot test is gone or no longer requires the backend; remove this \
+         pin with it"
+    );
+
+    assert!(
+        prerequisites.contains(&"setup-cloud-hypervisor"),
+        "`make test-root` runs test_cloud_hypervisor_reboot_recovers_and_then_exits, which needs \
+         the Cloud Hypervisor binary, but does not depend on `setup-cloud-hypervisor`: \
+         {prerequisites:?}"
+    );
+}
