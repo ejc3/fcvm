@@ -197,7 +197,10 @@ the "Greptile Review" check run the greptile-apps app writes on the commit it re
 latest such run on the head must have finished with success and a summary saying 0 comments
 added (success alone is not clean: a review that placed a finding still concludes success),
 after the head arrived, and it must read the same on the gate's second read of the head's
-check suites. A check-suite or run list that does not account for every entry blocks.
+check suites. "Latest" is by start time, so a run whose start time will not parse leaves the
+runs unordered and nothing covers. A check-suite or run list that does not account for every
+entry blocks, and once a Greptile suite is present both lists must carry a numeric count to
+account with.
 Greptile's summary comment then needs no disposition when its footer names the head and it
 carries no comments-outside-diff block. A PR with no review result of any kind is an
 unreviewed head, not a clear one.

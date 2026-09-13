@@ -1943,6 +1943,46 @@ fn a_clean_greptile_review_covers_the_head_through_its_check_run() {
     );
     assert!(out.contains("BLOCKED"), "{out}");
 
+    // CodeRabbit on #927. A startedAt that will not parse cannot be ordered, so no run covers.
+    // It used to sort as newest, which let a clean run outrank a newer run still in progress.
+    let mut unordered = clean.clone();
+    unordered["startedAt"] = json!("not a time");
+    let pair = suites("greptile-apps", vec![unordered, running.clone()]);
+    let (out, code) = gate("unordered.json", payload(pair.clone(), 2, pair, vec![]));
+    assert_eq!(
+        code, 1,
+        "a run whose startedAt will not parse cannot outrank a newer run.\n{out}"
+    );
+    assert!(out.contains("UNREVIEWED HEAD"), "{out}");
+
+    // Without a numeric totalCount on the Greptile suite's runs, or on the suite list holding
+    // it, the payload cannot show the newest run is in it.
+    let mut uncounted_runs = clean_suites.clone();
+    uncounted_runs[1]["checkRuns"]["totalCount"] = Value::Null;
+    let mut uncounted_suites: Value = serde_json::from_str(&payload(
+        clean_suites.clone(),
+        2,
+        clean_suites.clone(),
+        vec![],
+    ))
+    .unwrap();
+    uncounted_suites["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+        ["checkSuites"]["totalCount"] = Value::Null;
+    for (name, body) in [
+        (
+            "runs-uncounted.json",
+            payload(uncounted_runs.clone(), 2, uncounted_runs, vec![]),
+        ),
+        ("suites-uncounted.json", uncounted_suites.to_string()),
+    ] {
+        let (out, code) = gate(name, body);
+        assert_eq!(
+            code, 2,
+            "{name}: a Greptile suite without numeric counts cannot certify the head.\n{out}"
+        );
+        assert!(out.contains("BLOCKED"), "{name}: {out}");
+    }
+
     let (out, code) = gate(
         "runs-changed.json",
         payload(

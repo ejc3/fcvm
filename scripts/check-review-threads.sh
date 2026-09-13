@@ -1112,23 +1112,30 @@ fi
 # commit these suites were read from is the head, and the LATEST Greptile Review run on it by
 # startedAt finished with success and a summary saying 0 comments added. A newer run that is
 # still going, cancelled or errored decides against an older clean one, because the newest result
-# is the one that stands; a startedAt that will not parse sorts as newest, so it can only decline.
+# is the one that stands. A startedAt that will not parse leaves the runs unordered, so no run
+# covers: sorted as newest, a clean run so marked outranked a newer run in progress (#927).
 #
 # Every suite and every Greptile run must be accounted for (totalCount == nodes): a fragment of
 # the runs can omit the newest one, and a fragment of the suites can omit the earliest, which
-# dates the head's arrival. An ABSENT totalCount is the shape of fixtures captured before this
-# gate read check runs; it reads as no Greptile runs, which covers nothing. The Greptile runs are
-# read a second time after all paging, and any difference blocks.
+# dates the head's arrival. Once a Greptile suite is present, both counts must be numbers; without
+# one, a fragment carrying a clean run certified the head (#927). An ABSENT suite count is still
+# accepted when no Greptile suite is present, the shape of fixtures captured before this gate read
+# check runs, which covers nothing through Greptile. The Greptile runs are read a second time
+# after all paging, and any difference blocks.
 greptile_runs_jq='def greptile_runs($app; $name):
     [ (.nodes // [])[] | select((.app.slug // "") == $app)
       | (.checkRuns.nodes // [])[] | select((.name // "") == $name)
       | {name, status, conclusion, startedAt, completedAt, summary} ]
     | sort_by([.startedAt, .completedAt, .status, .conclusion, .summary] | map(tostring));
   def suites_complete($app):
-    ((.totalCount | type) != "number" or .totalCount == ((.nodes // []) | length))
-    and all((.nodes // [])[]; ((.app.slug // "") != $app)
-            or ((.checkRuns.totalCount | type) != "number")
-            or (.checkRuns.totalCount == ((.checkRuns.nodes // []) | length)));'
+    [ (.nodes // [])[] | select((.app.slug // "") == $app) ] as $greptile
+    | if ($greptile | length) == 0 then
+        (.totalCount | type) != "number" or .totalCount == ((.nodes // []) | length)
+      else
+        ((.totalCount | type) == "number") and .totalCount == ((.nodes // []) | length)
+        and all($greptile[]; ((.checkRuns.totalCount | type) == "number")
+                and (.checkRuns.totalCount == ((.checkRuns.nodes // []) | length)))
+      end;'
 headchecks=$(jq -c '.data.repository.pullRequest.commits.nodes[0].commit.checkSuites // {}' <<<"$payload" 2>/dev/null)
 if ! jq -e --arg app "$GREPTILE_APP" "$greptile_runs_jq"'suites_complete($app)' >/dev/null 2>&1 <<<"$headchecks"; then
   echo "verdict: BLOCKED — the head commit's check suites, or a Greptile suite's runs, are not all" >&2
@@ -1162,7 +1169,8 @@ fi
 headcommit=$(jq -r '.data.repository.pullRequest.commits.nodes[0].commit.oid // ""' <<<"$payload" 2>/dev/null)
 greptileclean=$(jq -c --arg h "$headoid" --arg ho "$headcommit" "$TS_JQ$VERDICT_JQ"'
   if ($h == "") or (($ho | ascii_downcase) != ($h | ascii_downcase)) or (length == 0) then null
-  else (max_by((.startedAt | ts) // 1e18)) as $last
+  elif any(.[]; (.startedAt | ts) == null) then null
+  else (max_by(.startedAt | ts)) as $last
     | if ($last.status == "COMPLETED") and ($last.conclusion == "SUCCESS")
          and (($last.summary // "") | test(greptile_clean_run_re))
          and (($last.completedAt | ts) != null)

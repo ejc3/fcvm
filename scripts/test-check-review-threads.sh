@@ -1909,6 +1909,17 @@ run_case "a greptile summary naming an older commit is claimable" \
   "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum "$BASE40")")")" 1 "carry no disposition"
 run_case "a greptile summary naming the head is claimable when its run added a comment" \
   "$(wrapc "$(gsuites "$G_RUN_FOUND")" "$G_SUM_HEAD")" 1 "carry no disposition"
+# CodeRabbit on #927. A startedAt that will not parse cannot be ordered against the other runs,
+# so no run covers. It used to sort as newest, which let a clean run outrank a newer one in progress.
+G_RUN_CLEAN_UNORDERED=$(jq -c '.startedAt = "not a time"' <<<"$G_RUN_CLEAN")
+run_case "a clean greptile run whose startedAt will not parse does not cover past a newer run" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN_UNORDERED,$G_RUN_RUNNING")")" 1 "UNREVIEWED HEAD"
+# Without a numeric totalCount on the Greptile suite's runs, or on the suite list holding it, the
+# payload cannot show the newest run is in it.
+run_case "a greptile suite whose runs carry no totalCount blocks" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN" greptile-apps null)")" 2 "BLOCKED"
+run_case "suites with no totalCount block once a greptile suite is among them" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "" "" null)" 2 "BLOCKED"
 run_case "a human posting the greptile summary is claimable" \
   "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt helpful-human User 2026-01-02T00:51:00Z "$(gsum "$HEAD40")")")" 1 "carry no disposition"
 
