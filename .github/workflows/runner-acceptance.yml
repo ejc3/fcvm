@@ -1,0 +1,125 @@
+name: Runner Bootstrap Acceptance
+
+# Operator-controlled acceptance only. First drain/select a newly brokered host;
+# an old reusable runner must fail, never count as a successful migration.
+on:
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: runner-bootstrap-acceptance
+  cancel-in-progress: false
+
+jobs:
+  authorize:
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      - name: Reject any dispatch outside main
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_EVENT_NAME" != workflow_dispatch || "$GITHUB_REF" != refs/heads/main ]]; then
+            echo '::error::Runner acceptance must be manually dispatched on main.'
+            exit 1
+          fi
+
+  accept:
+    needs: authorize
+    runs-on: [self-hosted, Linux, ARM64]
+    timeout-minutes: 5
+    steps:
+      - name: Verify ephemeral host, smoke test, and hold for independent observation
+        env:
+          ACCEPTANCE_RUNNER_NAME: ${{ runner.name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shlex
+          import stat
+          import subprocess
+          import time
+          import urllib.request
+
+          def validate(data):
+              identity = data['identity']
+              instance = identity['instanceId']
+              if (identity['accountId'] != '928413605543' or identity['region'] != 'us-west-1'
+                      or identity['architecture'] != 'arm64' or data['machine'] != 'aarch64'
+                      or not re.fullmatch(r'i-[0-9a-f]{17}', instance)):
+                  raise ValueError('Unexpected instance identity or architecture')
+              expected_name = 'runner-' + instance
+              if (data['runner_name'] != expected_name or data['settings']['agentName'] != expected_name
+                      or data['settings'].get('ephemeral') is not True):
+                  raise ValueError('Not this instance\'s ephemeral runner: legacy hosts cannot pass')
+              service = data['service']
+              groups = [line.rsplit(':', 1)[-1].split('/') for line in data['cgroup'].splitlines()]
+              if (not re.fullmatch(r'actions\.runner\.[A-Za-z0-9_.-]+\.service', service)
+                      or not any(service in group for group in groups)):
+                  raise ValueError('Job does not belong to the recorded runner service')
+              expected_dropin = ['[Service]', 'Restart=no',
+                                 'Environment=GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1',
+                                 'ExecStopPost=+/usr/bin/systemctl --no-block poweroff']
+              if (data['dropin'].splitlines() != expected_dropin or data['dropin_uid'] != 0
+                      or data['dropin_mode'] & 0o022):
+                  raise ValueError('Missing or unsafe broker ephemeral service drop-in')
+              # Inspect only the expected setting; never print the unit environment.
+              failure_limit = [item for item in shlex.split(data['environment'])
+                               if item.startswith('GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=')]
+              if failure_limit != ['GITHUB_ACTIONS_SERVICE_EXIT_AFTER_N_FAILURES=1']:
+                  raise ValueError('Effective service retry limit is missing or incorrect')
+              stop_post = data['stop_post']
+              if (data['restart'] != 'no' or data['active'] != 'active'
+                      or stop_post.count('path=') != 1
+                      or 'path=/usr/bin/systemctl ;' not in stop_post
+                      or not re.search(r'argv\[\]=/usr/bin/systemctl --no-block poweroff\s*;', stop_post)):
+                  raise ValueError('Effective runner service does not power off after one job')
+
+          # No credential endpoint: only an IMDSv2 session and public instance identity.
+          opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+          request = urllib.request.Request('http://169.254.169.254/latest/api/token', method='PUT',
+              headers={'X-aws-ec2-metadata-token-ttl-seconds': '60'})
+          with opener.open(request, timeout=5) as response:
+              imds_token = response.read(4096).decode()
+          request = urllib.request.Request('http://169.254.169.254/latest/dynamic/instance-identity/document',
+              headers={'X-aws-ec2-metadata-token': imds_token})
+          with opener.open(request, timeout=5) as response:
+              identity = json.loads(response.read(16384))
+          del imds_token, request
+          directory = Path('/opt/actions-runner')
+          service = (directory / '.service').read_text().strip()
+          if not re.fullmatch(r'actions\.runner\.[A-Za-z0-9_.-]+\.service', service):
+              raise ValueError('Invalid runner service name')
+          dropin = Path('/etc/systemd/system') / (service + '.d') / 'ephemeral.conf'
+          info = dropin.lstat()
+          if not stat.S_ISREG(info.st_mode):
+              raise ValueError('Ephemeral drop-in must be a regular file')
+          properties = {}
+          for key in ('Restart', 'ActiveState', 'ExecStopPost', 'Environment'):
+              properties[key] = subprocess.check_output(
+                  ['systemctl', 'show', service, '--property=' + key, '--value'],
+                  text=True, timeout=5).strip()
+          validate({'identity': identity, 'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
+              'machine': os.uname().machine, 'settings': json.loads((directory / '.runner').read_bytes()),
+              'service': service, 'cgroup': Path('/proc/self/cgroup').read_text(),
+              'dropin': dropin.read_text(), 'dropin_uid': info.st_uid,
+              'dropin_mode': stat.S_IMODE(info.st_mode), 'restart': properties['Restart'],
+              'active': properties['ActiveState'], 'stop_post': properties['ExecStopPost'],
+              'environment': properties['Environment']})
+          if sum(range(100)) != 4950:
+              raise RuntimeError('Benign Python smoke test failed')
+          print(json.dumps({'phase': 'ready-for-observer', 'runner': os.environ['ACCEPTANCE_RUNNER_NAME'],
+              'instance_id': identity['instanceId'], 'region': identity['region'],
+              'observed_at': datetime.datetime.now(datetime.timezone.utc).isoformat()}), flush=True)
+          # The administrator checks parameter metadata while this job is alive;
+          # the job itself never reads or deletes the bootstrap credential.
+          time.sleep(90)
+          print(json.dumps({'phase': 'smoke-complete', 'instance_id': identity['instanceId']}), flush=True)
+          PY

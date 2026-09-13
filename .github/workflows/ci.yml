@@ -188,6 +188,8 @@ jobs:
         # claude.yml's run blocks are fixed; actionlint's own checks
         # (expressions, action inputs, needs references, runner labels) apply.
         run: /tmp/actionlint -shellcheck=
+      - name: Test runner acceptance contract without AWS credentials
+        run: make test-runner-acceptance
 
   skip-check:
     name: Skip Check
