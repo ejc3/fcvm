@@ -215,7 +215,7 @@ Three rules the gate enforces, each of them a hole it once had:
   on a PR reporting CLEAR.
 - **But not everything is a claim.** An APPROVED review is GitHub saying the reviewer is
   not asking for changes. A listed notification bot's comment is not a finding, nor is a
-  documented trigger command (`@codex review`, `@coderabbitai review`). Nor is a REVIEW BODY
+  documented trigger command (`@codex review`, `@coderabbitai review`, `@greptileai`). Nor is a REVIEW BODY
   FROM THE PR AUTHOR: a review is the channel this gate names for answering, so counting the
   author's own review as a claim made every acknowledgement create the obligation it was
   posted to discharge, and the count grew by one each round (#874 was carrying 4 such bodies,
@@ -235,7 +235,17 @@ Three rules the gate enforces, each of them a hole it once had:
   listed bot's comment whose whole body is one of those notices, matched line for line, now
   needs no disposition and covers no head. The same words with anything added, or from any
   other account, stay claimable, and a summary comment that has grown a walkthrough is a
-  walkthrough.
+  walkthrough. Greptile is not a verdict bot, and its own notices get the same treatment: a
+  top-level comment under `<!-- greptile-status -->` saying the file limit or an error stopped
+  the review, and, out of open-source review credits, a review whose whole body says reviews
+  are paused. That pause notice is a non-empty review body on the head, and a non-empty review
+  body covers its commit, so once answered it marked the head reviewed by a reviewer that had
+  said it would not review. Its text covers nothing now, whoever posts it.
+  `.greptile/config.json` keeps Greptile's findings in comments and threads the gate reads
+  (not the PR description), posts its result as a check run, leaves auto-approval off, and
+  reviews when a PR opens and on `@greptileai`, not on every push, because each review
+  spends a free open-source credit. `greptile_config_keeps_its_results_where_the_gate_reads_them`
+  pins it.
 - **The head commit must have been reviewed.** Answering every finding proves nothing if
   nobody reviewed the code you are merging. This gate shipped with five open findings that
   way: the branch was pushed, the prior round was answered, the gate went CLEAR, and it
