@@ -1546,3 +1546,156 @@ fn the_changes_job_emits_every_output_the_matrix_gates_on() {
         );
     }
 }
+
+/// Every apt-get call in a self-hosted job goes through `scripts/ci-apt-get.sh`.
+///
+/// A self-hosted runner is a freshly booted instance, and its boot-time apt can still hold a
+/// lock when the job starts. On 2026-09-13 Host-arm64 on #921 was assigned 74 s after its
+/// runner launched and failed in "Install dependencies" with
+/// `E: Could not get lock /var/lib/dpkg/lock-frontend. It is held by process 3180 (apt)`.
+/// A bare `sudo apt-get` fails on a held lock; the script waits for it.
+#[test]
+fn self_hosted_apt_calls_wait_for_apt_locks() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".github/workflows");
+    let entries =
+        std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("cannot read {}: {e}", dir.display()));
+
+    let mut checked = 0usize;
+    for entry in entries {
+        let path = entry.expect("dir entry").path();
+        if path.extension().and_then(|e| e.to_str()) != Some("yml") {
+            continue;
+        }
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        let wf: Value = serde_norway::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|e| panic!("{name} is not valid YAML: {e}"));
+        let Some(jobs) = wf.get("jobs").and_then(Value::as_mapping) else {
+            continue;
+        };
+        for (job_name, job) in jobs {
+            let runs_on = job
+                .get("runs-on")
+                .map(|v| format!("{v:?}"))
+                .unwrap_or_default();
+            if !runs_on.contains("self-hosted") {
+                continue;
+            }
+            let job_label = job_name.as_str().unwrap_or("<job>");
+            let Some(steps) = job.get("steps").and_then(Value::as_sequence) else {
+                continue;
+            };
+            for step in steps {
+                let Some(run) = step.get("run").and_then(Value::as_str) else {
+                    continue;
+                };
+                for line in run.lines().map(|l| l.split('#').next().unwrap_or("")) {
+                    if !line.contains("apt-get") {
+                        continue;
+                    }
+                    checked += 1;
+                    assert!(
+                        !line
+                            .replace("./fcvm/scripts/ci-apt-get.sh", "")
+                            .contains("apt-get"),
+                        "{name}: self-hosted job `{job_label}` calls apt-get directly: `{}`. \
+                         A boot-time apt on a fresh runner can hold the dpkg or lists lock, and \
+                         apt-get fails on it at once. Use ./fcvm/scripts/ci-apt-get.sh.",
+                        line.trim()
+                    );
+                    // The path is relative to the workspace root, where `path: fcvm` checks
+                    // the repo out.
+                    assert!(
+                        step.get("working-directory").is_none(),
+                        "{name}: job `{job_label}` calls ./fcvm/scripts/ci-apt-get.sh from a step \
+                         with a working-directory, where that path does not resolve"
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        checked > 0,
+        "found no apt-get calls in self-hosted jobs to inspect. The walk is broken, and a check \
+         that inspects nothing must not report success"
+    );
+}
+
+/// `scripts/ci-apt-get.sh` retries a held apt lock until its deadline, and nothing else.
+///
+/// Driven with a fake apt-get that records its arguments and plays one outcome per call:
+/// `lock` prints apt's held-lock error, `other` prints a different error (both exit 100),
+/// and anything else exits 0.
+#[test]
+fn ci_apt_get_retries_a_held_lock_and_nothing_else() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/ci-apt-get.sh");
+    let dir = std::env::temp_dir().join(format!("fcvm-ci-apt-get-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fake = dir.join("apt-get");
+    std::fs::write(
+        &fake,
+        r#"#!/bin/bash
+d=$(dirname "$0")
+echo "$*" >> "$d/calls"
+step=$(sed -n "$(wc -l < "$d/calls")p" "$d/plan")
+case "$step" in
+  lock) echo 'E: Could not get lock /var/lib/apt/lists/lock. It is held by process 3180 (apt)'; exit 100 ;;
+  other) echo 'E: Unable to locate package no-such-package'; exit 100 ;;
+  *) exit 0 ;;
+esac
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let run = |plan: &[&str], wait_s: &str| -> (i32, Vec<String>) {
+        let _ = std::fs::remove_file(dir.join("calls"));
+        std::fs::write(dir.join("plan"), plan.join("\n") + "\n").unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("update")
+            .env("APT_GET", &fake)
+            .env("SUDO", "")
+            .env("APT_LOCK_RETRY_S", "0")
+            .env("APT_LOCK_WAIT", wait_s)
+            .output()
+            .expect("bash must be runnable");
+        let calls = std::fs::read_to_string(dir.join("calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        (out.status.code().unwrap_or(-1), calls)
+    };
+
+    let (code, calls) = run(&["lock", "lock", "ok"], "60");
+    assert_eq!(
+        code, 0,
+        "a lock released after two attempts must end in success: {calls:?}"
+    );
+    assert_eq!(calls.len(), 3, "{calls:?}");
+    assert!(
+        calls
+            .iter()
+            .all(|c| c.starts_with("-o DPkg::Lock::Timeout=") && c.ends_with(" update")),
+        "every attempt must pass the dpkg lock timeout and the caller's arguments: {calls:?}"
+    );
+
+    let (code, calls) = run(&["other", "ok"], "60");
+    assert_eq!(
+        code, 100,
+        "a failure that is not a held lock is apt-get's answer: {calls:?}"
+    );
+    assert_eq!(calls.len(), 1, "it must not be retried: {calls:?}");
+
+    let held = vec!["lock"; 20];
+    let (code, calls) = run(&held, "0");
+    assert_eq!(
+        code, 100,
+        "a lock still held at the deadline must fail with apt-get's status: {calls:?}"
+    );
+    assert_eq!(calls.len(), 1, "{calls:?}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

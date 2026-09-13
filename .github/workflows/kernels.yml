@@ -62,8 +62,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -127,8 +127,8 @@ jobs:
       - name: Install GitHub CLI
         run: |
           if ! command -v gh &> /dev/null; then
-            sudo apt-get update
-            sudo apt-get install -y gh
+            ./fcvm/scripts/ci-apt-get.sh update
+            ./fcvm/scripts/ci-apt-get.sh install -y gh
           else
             echo "GitHub CLI already installed: $(gh --version)"
           fi
@@ -244,8 +244,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -286,8 +286,8 @@ jobs:
         run: |
           if ! command -v gh &> /dev/null; then
             echo "Installing GitHub CLI..."
-            sudo apt-get update
-            sudo apt-get install -y gh
+            ./fcvm/scripts/ci-apt-get.sh update
+            ./fcvm/scripts/ci-apt-get.sh install -y gh
           else
             echo "GitHub CLI already installed: $(gh --version)"
           fi
@@ -469,8 +469,8 @@ jobs:
 
       - name: Install build dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -511,8 +511,8 @@ jobs:
         run: |
           if ! command -v gh &> /dev/null; then
             echo "Installing GitHub CLI..."
-            sudo apt-get update
-            sudo apt-get install -y gh
+            ./fcvm/scripts/ci-apt-get.sh update
+            ./fcvm/scripts/ci-apt-get.sh install -y gh
           else
             echo "GitHub CLI already installed: $(gh --version)"
           fi

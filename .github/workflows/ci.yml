@@ -443,8 +443,8 @@ jobs:
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev nfs-kernel-server \
@@ -699,8 +699,8 @@ jobs:
           shared-key: deps-${{ steps.deps.outputs.fuser }}-${{ steps.deps.outputs.fuse-backend-rs }}
       - name: Install dependencies
         run: |
-          sudo apt-get update
-          sudo apt-get install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
+          ./fcvm/scripts/ci-apt-get.sh update
+          ./fcvm/scripts/ci-apt-get.sh install -y fuse3 libfuse3-dev libclang-dev clang musl-tools \
             iproute2 iptables passt dnsmasq qemu-utils e2fsprogs parted patch \
             podman skopeo busybox-static cpio zstd autoconf automake libtool cmake \
             libseccomp-dev nfs-kernel-server \
@@ -769,7 +769,7 @@ jobs:
           # exit 125 before any test ran, 2026-08-13).
           ./fcvm/scripts/runner-podman-hygiene.sh
           # Install iperf3 for network benchmarks
-          sudo apt-get update && sudo apt-get install -y iperf3 || true
+          ./fcvm/scripts/ci-apt-get.sh update && ./fcvm/scripts/ci-apt-get.sh install -y iperf3 || true
       - name: Create test log directory
         run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
       - name: Clean test data
