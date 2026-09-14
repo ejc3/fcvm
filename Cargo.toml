@@ -64,7 +64,7 @@ hyperlocal = { version = "0.9", default-features = false, features = ["client"] 
 shellexpand = "3"
 userfaultfd = { version = "0.9", features = ["linux5_13"] }
 memmap2 = "0.9"
-vmm-sys-util = "0.12"
+vmm-sys-util = "0.15"
 shell-words = "1"
 fuse-pipe = { path = "fuse-pipe", default-features = false }
 exec-proto = { path = "exec-proto" }
