@@ -1192,11 +1192,11 @@ fn wait_for_verdict(
     use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::poll::{poll, PollFd, PollFlags, PollTimeout};
     use nix::unistd::{read, write};
-    use std::os::fd::{AsFd, AsRawFd};
+    use std::os::fd::AsFd;
 
-    if let Ok(flags) = fcntl(sock.as_raw_fd(), FcntlArg::F_GETFL) {
+    if let Ok(flags) = fcntl(sock, FcntlArg::F_GETFL) {
         let new_flags = OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK;
-        let _ = fcntl(sock.as_raw_fd(), FcntlArg::F_SETFL(new_flags));
+        let _ = fcntl(sock, FcntlArg::F_SETFL(new_flags));
     }
 
     let mut buf = [0u8; 64];
@@ -1284,7 +1284,7 @@ fn wait_for_verdict(
             .revents()
             .is_some_and(|r| r.contains(PollFlags::POLLHUP) || r.contains(PollFlags::POLLERR));
 
-        match read(sock.as_raw_fd(), &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
+        match read(sock, &mut buf[total_read..]) as Result<usize, nix::errno::Errno> {
             Ok(n) if n > 0 => {
                 total_read += n;
                 let received = std::str::from_utf8(&buf[..total_read]).unwrap_or("");

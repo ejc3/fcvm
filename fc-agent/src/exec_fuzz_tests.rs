@@ -25,6 +25,10 @@
 
 use super::read_request_and_handshake;
 use crate::types::ExecRequest;
+use std::io::{Read, Write};
+use std::net::Shutdown;
+use std::os::fd::OwnedFd;
+use std::os::unix::net::UnixStream;
 use std::time::{Duration, Instant};
 
 /// A canonical valid request line (raw bytes, newline-terminated).
@@ -34,41 +38,21 @@ const REQUEST: &[u8] = b"{\"command\":[\"true\"],\"in_container\":false}\n";
 /// the 5s handshake deadline; 2s is generous slack for a loaded CI host.
 const EOF_CUT_BOUND: Duration = Duration::from_secs(2);
 
-fn socketpair() -> (i32, i32) {
-    let mut fds = [0i32; 2];
-    let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-    assert_eq!(rc, 0, "socketpair failed");
-    (fds[0], fds[1])
+/// A connected pair: the server end as the OwnedFd the handshake consumes, the
+/// client end as the peer stream the test drives.
+fn socketpair() -> (OwnedFd, UnixStream) {
+    let (server, client) = UnixStream::pair().expect("socketpair failed");
+    (OwnedFd::from(server), client)
 }
 
-/// Write all of `data`, looping over partial writes (large payloads exceed the
-/// socketpair buffer and drain only as the server consumes them).
-fn write_all_loop(fd: i32, data: &[u8]) {
-    let mut off = 0;
-    while off < data.len() {
-        let n = unsafe { libc::write(fd, data[off..].as_ptr().cast(), data.len() - off) };
-        assert!(n > 0, "write to socketpair failed at offset {}", off);
-        off += n as usize;
-    }
-}
-
-fn shutdown(fd: i32, how: i32) {
-    let rc = unsafe { libc::shutdown(fd, how) };
-    assert_eq!(rc, 0, "shutdown failed");
-}
-
-/// Read everything from `fd` until EOF (terminates because the handshake
-/// function closes the server fd on every path we drive it down).
-fn read_to_eof(fd: i32) -> Vec<u8> {
+/// Read everything from the client end until EOF (terminates because the
+/// handshake function closes the server fd on every path we drive it down). A
+/// reset (the agent closed with peer bytes still unread) ends the read the same
+/// way; bytes already received are kept.
+fn read_to_eof(client: &mut UnixStream) -> Vec<u8> {
     let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-        if n <= 0 {
-            return out;
-        }
-        out.extend_from_slice(&buf[..n as usize]);
-    }
+    let _ = client.read_to_end(&mut out);
+    out
 }
 
 struct CutOutcome {
@@ -82,20 +66,18 @@ struct CutOutcome {
 /// (SHUT_WR → the server sees clean EOF after the prefix), then run the
 /// handshake. Fully deterministic: no threads, no sleeps.
 fn run_prebuffered_cut(prefix: &[u8]) -> CutOutcome {
-    let (server_fd, client_fd) = socketpair();
-    write_all_loop(client_fd, prefix);
-    shutdown(client_fd, libc::SHUT_WR);
+    let (server, mut client) = socketpair();
+    client.write_all(prefix).expect("write to socketpair");
+    client
+        .shutdown(Shutdown::Write)
+        .expect("shutdown write half");
 
     let start = Instant::now();
     let result =
-        read_request_and_handshake(server_fd, Duration::from_secs(5)).map(|(request, fd)| {
-            unsafe { libc::close(fd) };
-            request
-        });
+        read_request_and_handshake(server, Duration::from_secs(5)).map(|(request, _conn)| request);
     let elapsed = start.elapsed();
 
-    let client_saw = read_to_eof(client_fd);
-    unsafe { libc::close(client_fd) };
+    let client_saw = read_to_eof(&mut client);
     CutOutcome {
         result,
         client_saw,
@@ -160,15 +142,15 @@ fn fuzz_peer_death_after_full_request() {
 /// proceeding to the GO phase.
 #[test]
 fn fuzz_peer_read_shutdown_fails_ack_write() {
-    let (server_fd, client_fd) = socketpair();
-    write_all_loop(client_fd, REQUEST);
+    let (server, mut client) = socketpair();
+    client.write_all(REQUEST).expect("write to socketpair");
     // Peer will never read: the ACK write must fail with EPIPE. The write half
     // stays open, so a buggy path that survived the failed ACK would then park
     // on the GO read for the full 5s deadline — the elapsed bound catches it.
-    shutdown(client_fd, libc::SHUT_RD);
+    client.shutdown(Shutdown::Read).expect("shutdown read half");
 
     let start = Instant::now();
-    let result = read_request_and_handshake(server_fd, Duration::from_secs(5));
+    let result = read_request_and_handshake(server, Duration::from_secs(5));
     let elapsed = start.elapsed();
 
     assert!(result.is_none(), "failed ACK write must not execute");
@@ -177,7 +159,7 @@ fn fuzz_peer_read_shutdown_fails_ack_write() {
         "EPIPE on ACK must return promptly, took {:?}",
         elapsed
     );
-    unsafe { libc::close(client_fd) };
+    drop(client);
 }
 
 /// Peer reads the ACK (proving the ACK write completed) and then dies before
@@ -185,27 +167,30 @@ fn fuzz_peer_read_shutdown_fails_ack_write() {
 /// interleaving, driven by a real reader thread rather than pre-buffered bytes.
 #[test]
 fn fuzz_peer_death_after_reading_ack_before_go() {
-    let (server_fd, client_fd) = socketpair();
-    write_all_loop(client_fd, REQUEST);
+    let (server, mut client) = socketpair();
+    client.write_all(REQUEST).expect("write to socketpair");
 
     let reader = std::thread::spawn(move || {
         // Read exactly one line (the ACK), then die (SHUT_WR → EOF at the GO read).
         let mut seen = Vec::new();
         let mut byte = [0u8; 1];
         loop {
-            let n = unsafe { libc::read(client_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
-            assert!(n > 0, "agent closed before writing full ACK");
+            client
+                .read_exact(&mut byte)
+                .expect("agent closed before writing full ACK");
             seen.push(byte[0]);
             if byte[0] == b'\n' {
                 break;
             }
         }
-        shutdown(client_fd, libc::SHUT_WR);
-        (client_fd, seen)
+        client
+            .shutdown(Shutdown::Write)
+            .expect("shutdown write half");
+        seen
     });
 
     let start = Instant::now();
-    let result = read_request_and_handshake(server_fd, Duration::from_secs(5));
+    let result = read_request_and_handshake(server, Duration::from_secs(5));
     let elapsed = start.elapsed();
 
     assert!(
@@ -218,9 +203,8 @@ fn fuzz_peer_death_after_reading_ack_before_go() {
         elapsed
     );
 
-    let (client_fd, seen) = reader.join().unwrap();
+    let seen = reader.join().unwrap();
     assert_eq!(seen, ack_line(), "peer must have read exactly the ACK line");
-    unsafe { libc::close(client_fd) };
 }
 
 /// Peer dies mid-GO (one byte of "GO" then EOF): a partial GO line must never
@@ -304,23 +288,23 @@ fn fuzz_full_go_then_peer_death_executes_exactly_once() {
 fn fuzz_oversized_request_gets_pre_ack_error_line() {
     // MAX_EXEC_LINE_LENGTH is 1 MiB; the cap check fires when byte cap+1 arrives.
     const OVERSIZED: usize = 1_048_576 + 1;
-    let (server_fd, client_fd) = socketpair();
+    let (server, mut client) = socketpair();
 
     // The payload exceeds the socketpair buffer, so a writer thread feeds it
     // while the server consumes; it then collects the server's response.
     let writer = std::thread::spawn(move || {
         let data = vec![b'a'; OVERSIZED];
-        write_all_loop(client_fd, &data);
-        shutdown(client_fd, libc::SHUT_WR);
-        let seen = read_to_eof(client_fd);
-        unsafe { libc::close(client_fd) };
-        seen
+        client.write_all(&data).expect("write to socketpair");
+        client
+            .shutdown(Shutdown::Write)
+            .expect("shutdown write half");
+        read_to_eof(&mut client)
     });
 
     // Generous deadline: the byte-by-byte 1 MiB consume takes a few seconds of
     // syscalls; the point of this case is the Error line, not the latency bound
     // (which the EOF cuts above already pin).
-    let result = read_request_and_handshake(server_fd, Duration::from_secs(60));
+    let result = read_request_and_handshake(server, Duration::from_secs(60));
     assert!(result.is_none(), "oversized request must not execute");
 
     let seen = String::from_utf8_lossy(&writer.join().unwrap()).into_owned();

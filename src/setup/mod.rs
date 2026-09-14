@@ -5,7 +5,6 @@ pub mod storage;
 
 use anyhow::{Context, Result};
 use nix::fcntl::{Flock, FlockArg, OFlag};
-use std::os::fd::AsRawFd;
 use std::path::Path;
 use tracing::warn;
 
@@ -45,13 +44,11 @@ pub(crate) fn sudo_invoker() -> Option<&'static nix::unistd::User> {
 /// whatever it points at. Opening with O_NOFOLLOW and chowning the descriptor
 /// makes that impossible: a symlink fails the open (ELOOP) and is skipped.
 fn open_store_entry_nofollow(path: &Path) -> nix::Result<std::os::fd::OwnedFd> {
-    let raw = nix::fcntl::open(
+    nix::fcntl::open(
         path,
         OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
         nix::sys::stat::Mode::empty(),
-    )?;
-    // SAFETY: open just returned this descriptor; nothing else owns it.
-    Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
+    )
 }
 
 /// Hand a content-addressed store entry back to the user who invoked sudo.
@@ -85,7 +82,7 @@ pub(crate) fn give_store_entry_to_invoker(path: &Path) {
             return;
         }
     };
-    if let Err(err) = nix::unistd::fchown(fd.as_raw_fd(), Some(user.uid), Some(user.gid)) {
+    if let Err(err) = nix::unistd::fchown(&fd, Some(user.uid), Some(user.gid)) {
         warn!(
             path = %path.display(),
             invoker = %user.name,

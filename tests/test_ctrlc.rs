@@ -12,12 +12,13 @@
 mod common;
 
 use anyhow::{Context, Result};
+use nix::fcntl::{fcntl, FcntlArg, OFlag};
 use nix::pty::openpty;
 use nix::sys::signal::{kill, Signal};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
-use nix::unistd::{close, dup2, fork, ForkResult};
+use nix::unistd::{fork, ForkResult};
 use std::io::{Read, Write};
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+use std::os::unix::io::{AsRawFd, IntoRawFd};
 use std::time::Duration;
 
 /// Test that Ctrl+C (sent via PTY) reaches fcvm and triggers signal handling
@@ -62,34 +63,23 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
         }
     }
 
-    let master_fd = pty.master.into_raw_fd();
-    let slave_fd = pty.slave.into_raw_fd();
-
     // Fork: child runs fcvm, parent sends Ctrl+C
     let child_pid = match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
             // Child: set up PTY as controlling terminal and run fcvm
-            unsafe {
-                // Create new session - this makes us the session leader
-                libc::setsid();
-
-                // Set the PTY slave as our controlling terminal
-                // TIOCSCTTY with arg 0 means "make this my controlling terminal"
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-
-                // Make ourselves the foreground process group
-                libc::tcsetpgrp(slave_fd, libc::getpid());
-
-                // Redirect stdio to PTY slave
-                dup2(slave_fd, 0).ok();
-                dup2(slave_fd, 1).ok();
-                dup2(slave_fd, 2).ok();
-
-                // Close original fds
-                if slave_fd > 2 {
-                    close(slave_fd).ok();
+            // login_tty: new session, slave as controlling terminal and
+            // stdin/stdout/stderr, slave closed if above fd 2. Acquiring the
+            // controlling terminal also makes this process group the foreground
+            // group, so ^C on the master delivers SIGINT here. Drop the master
+            // first: if it sat in fd 0-2, dropping it afterwards would close a
+            // stdio copy of the slave.
+            drop(pty.master);
+            if unsafe { libc::login_tty(pty.slave.into_raw_fd()) } != 0 {
+                let msg = b"login_tty failed\n";
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
                 }
-                close(master_fd).ok();
             }
 
             // Exec fcvm
@@ -102,19 +92,17 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
         }
         ForkResult::Parent { child } => {
             // Close slave in parent
-            close(slave_fd).ok();
+            drop(pty.slave);
             child
         }
     };
 
     // Parent: wait for VM to start, then send Ctrl+C via PTY
-    let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+    let mut master = std::fs::File::from(pty.master);
 
     // Set non-blocking for reads
-    unsafe {
-        let flags = libc::fcntl(master_fd, libc::F_GETFL);
-        libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-    }
+    let flags = OFlag::from_bits_retain(fcntl(&master, FcntlArg::F_GETFL)?);
+    fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 
     // CRITICAL: Enable ISIG on the master AFTER child has set up
     // The child's setsid() + TIOCSCTTY may affect terminal settings.
@@ -122,10 +110,10 @@ async fn test_ctrlc_via_terminal() -> Result<()> {
     std::thread::sleep(Duration::from_millis(500)); // Let child set up
     unsafe {
         let mut termios: libc::termios = std::mem::zeroed();
-        if libc::tcgetattr(master_fd, &mut termios) == 0 {
+        if libc::tcgetattr(master.as_raw_fd(), &mut termios) == 0 {
             termios.c_lflag |= libc::ISIG;
             termios.c_cc[libc::VINTR] = 0x03;
-            libc::tcsetattr(master_fd, libc::TCSANOW, &termios);
+            libc::tcsetattr(master.as_raw_fd(), libc::TCSANOW, &termios);
             println!("  Enabled ISIG on PTY master");
         }
     }
