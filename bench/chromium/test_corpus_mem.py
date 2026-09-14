@@ -296,6 +296,35 @@ def kill_and_reap_test_process_group(process):
     return process.communicate(timeout=5)
 
 
+def wait_for_adopted_children(timeout):
+    """Wait for this process's children to exit; kill and name any left at timeout.
+
+    HostCdpProducer runs each test as a child subreaper, so hostcdp.sh's detached
+    lifecycle guardian becomes a child of the test when the producer dies. This
+    reaps every exited child, which takes a Popen's exit status, so reap a Popen
+    before its TemporaryDirectory is removed.
+    """
+    deadline = time.monotonic() + timeout
+    while phase_supervisor.direct_children_remain():
+        if time.monotonic() >= deadline:
+            survivors = phase_supervisor.direct_live_children(os.getpid())
+            kill_deadline = time.monotonic() + 5
+            while time.monotonic() < kill_deadline:
+                live = phase_supervisor.direct_live_children(os.getpid())
+                if not live:
+                    break
+                # A killed guardian's own children are reparented here next.
+                phase_supervisor.signal_direct_children(
+                    live, os.getpid(), signal.SIGKILL)
+                time.sleep(0.01)
+                phase_supervisor.direct_children_remain()
+            phase_supervisor.direct_children_remain()
+            raise AssertionError(
+                "processes adopted from the test were still running after "
+                f"{timeout}s: {phase_supervisor.format_identities(survivors)}")
+        time.sleep(0.01)
+
+
 def communicate_test_process_group(process, timeout):
     try:
         return process.communicate(timeout=timeout)
@@ -1396,6 +1425,42 @@ class HostCdpProducer(unittest.TestCase):
     IMAGE_ID = "sha256:" + "a" * 64
     OTHER_IMAGE_ID = "sha256:" + "e" * 64
 
+    # Seconds TemporaryDirectory removal waits for the processes a test adopted.
+    adopted_drain_timeout = 30
+
+    def setUp(self):
+        """Remove a temporary directory only after the processes the test adopted exit.
+
+        hostcdp.sh starts a detached lifecycle guardian that outlives the
+        producer and keeps writing under the test's tmp: after the fake
+        `podman rm` it still creates `exists-called`, `results/WITHDRAWN` and
+        `inspect-called`. A SIGKILL test that removed its TemporaryDirectory
+        first failed with `OSError: [Errno 39] Directory not empty` on main
+        750b5ae5 (CI run 34792491419). The test process is a child subreaper
+        for the whole test, so every such guardian becomes its child however
+        the producer was launched or killed, and TemporaryDirectory removal
+        drains those children first.
+        """
+        original = phase_supervisor.get_process_control(
+            phase_supervisor.PR_GET_CHILD_SUBREAPER)
+        phase_supervisor.become_subreaper()
+        self.addCleanup(
+            phase_supervisor.set_process_control,
+            phase_supervisor.PR_SET_CHILD_SUBREAPER, original)
+        remove = tempfile.TemporaryDirectory.cleanup
+        test = self
+
+        def drain_then_remove(directory):
+            try:
+                wait_for_adopted_children(test.adopted_drain_timeout)
+            finally:
+                remove(directory)
+
+        patcher = mock.patch.object(
+            tempfile.TemporaryDirectory, "cleanup", drain_then_remove)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def environment(self, tmp, mode="ok", **overrides):
         bindir = os.path.join(tmp, "bin")
         os.makedirs(bindir)
@@ -1921,6 +1986,34 @@ exec {real_date!r} "$@"
                 for pipe in (producer.stdout, producer.stderr):
                     if pipe is not None:
                         pipe.close()
+
+    def test_a_temporary_directory_outlives_every_adopted_process(self):
+        """Temporary directory removal waits for what outlives the producer.
+
+        Greptile on #934: a per-test drain enforced by matching
+        `Popen(["bash", HOSTCDP])` and `os.kill(producer.pid, SIGKILL)` missed
+        every other spelling. This launches hostcdp.sh from a command variable
+        and kills it with `producer.kill()`. The hung fake create ignores TERM
+        and its supervisor waits the 30 s term grace before KILL, and the
+        worker's cleanup cannot start until that create returns, so the
+        lifecycle guardian is still running when the test leaves its tmp.
+        """
+        self.adopted_drain_timeout = 1
+        with self.assertRaisesRegex(AssertionError, "still running after 1s"):
+            with tempfile.TemporaryDirectory() as tmp:
+                env, _removed, _state = self.environment(
+                    tmp, mode="hung-create", PODMAN_CREATE_KILL_AFTER_SECS="30")
+                command = ("bash", HOSTCDP)
+                producer = subprocess.Popen(
+                    command, env=env, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                await_phase_pid(
+                    env["PODMAN_CREATE_STARTED_FILE"], 10, self.fail,
+                    "podman create did not start", proc=producer,
+                    early="hostcdp exited before create started")
+                producer.kill()
+                producer.wait(timeout=5)
 
     def test_failed_inspect_cannot_claim_absence_when_container_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
