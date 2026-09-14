@@ -3829,44 +3829,75 @@ class ProcStateReadOnce(unittest.TestCase):
     TeardownProbeGuards.test_a_survivor_blocks_the_reap_and_is_killed raised
     `TypeError: 'NoneType' object is not subscriptable` from exactly that shape.
 
-    RED BEFORE THE FIX (this file with the three sites restored):
-    `['test_reqbench.py:2052 proc_stat_fields', 'test_reqbench.py:3905
-    proc_stat_fields', 'test_reqbench.py:3911 proc_stat_fields'] != []`, the
-    ExecArmTimeout leak list and TeardownProbeGuards' wait loop and survivor list.
+    RED BEFORE THE FIX: with the three call sites restored, the scan listed
+    `test_reqbench.py:<line> proc_stat_fields` three times != [], for
+    ExecArmTimeout's leak list and TeardownProbeGuards' wait loop and survivor list.
     """
 
     READERS = {"proc_stat_fields", "proc_state", "read_process_stat", "proc_comm"}
 
-    def test_no_expression_reads_one_process_twice(self):
+    @classmethod
+    def repeated_reads(cls, source, filename):
+        """`<file>:<line> <reader>` for each expression that reads one process twice."""
         import ast
         import collections
-        import glob
 
-        def reader(call):
+        def read_target(call):
             func = call.func
             name = getattr(func, "attr", None) or getattr(func, "id", None)
-            return name if name in self.READERS and call.args else None
+            if name not in cls.READERS:
+                return None
+            if call.args:
+                return name, ast.dump(call.args[0])
+            for keyword in call.keywords:
+                if keyword.arg == "pid":
+                    return name, ast.dump(keyword.value)
+            return None
 
         found = set()
+        for node in ast.walk(ast.parse(source, filename=filename)):
+            if not isinstance(node, (ast.BoolOp, ast.IfExp, ast.Compare,
+                                     ast.ListComp, ast.GeneratorExp,
+                                     ast.SetComp, ast.DictComp)):
+                continue
+            reads = collections.defaultdict(list)
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call):
+                    target = read_target(call)
+                    if target is not None:
+                        reads[target].append(call.lineno)
+            for (name, _pid), lines in reads.items():
+                if len(lines) > 1:
+                    found.add(f"{os.path.basename(filename)}:{min(lines)} {name}")
+        return sorted(found)
+
+    def test_no_expression_reads_one_process_twice(self):
+        import glob
+
+        found = []
         for path in sorted(glob.glob(os.path.join(HERE, "*.py"))):
             with open(path) as handle:
-                tree = ast.parse(handle.read(), filename=path)
-            for node in ast.walk(tree):
-                if not isinstance(node, (ast.BoolOp, ast.IfExp, ast.Compare,
-                                         ast.ListComp, ast.GeneratorExp,
-                                         ast.SetComp, ast.DictComp)):
-                    continue
-                calls = [call for call in ast.walk(node)
-                         if isinstance(call, ast.Call) and reader(call)]
-                reads = collections.defaultdict(list)
-                for call in calls:
-                    reads[(reader(call), ast.dump(call.args[0]))].append(call.lineno)
-                for (name, _arg), lines in reads.items():
-                    if len(lines) > 1:
-                        found.add(f"{os.path.basename(path)}:{min(lines)} {name}")
+                found += self.repeated_reads(handle.read(), path)
         self.assertEqual(
-            sorted(found), [],
+            found, [],
             "read the process state once and decide from that one value",
+        )
+
+    def test_a_pid_passed_by_keyword_is_the_same_process(self):
+        """Greptile on #933: a reader called with `pid=` escaped the scan.
+
+        RED BEFORE THE FIX: `[] != ['snippet.py:2 proc_stat_fields']`, because
+        the scan keyed each read on its first positional argument only.
+        """
+        source = (
+            "alive = [k for k in kids\n"
+            "         if reqbench.proc_stat_fields(pid=k) is not None\n"
+            "         and reqbench.proc_stat_fields(k)[0] not in ('Z', 'X', 'x')]\n"
+        )
+        self.assertEqual(
+            self.repeated_reads(source, "snippet.py"),
+            ["snippet.py:2 proc_stat_fields"],
+            "a pid passed by keyword reads the same process as a positional one",
         )
 
 
