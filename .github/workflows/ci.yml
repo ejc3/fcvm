@@ -624,7 +624,19 @@ jobs:
           # exit 125 before any test ran, 2026-08-13).
           ./fcvm/scripts/runner-podman-hygiene.sh
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -666,6 +678,18 @@ jobs:
         if: always()
         working-directory: fcvm
         run: ./scripts/ci-stray-vm-guard.sh post
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          # Stop this job's sampler and wait for it to exit, so the copy holds its last
+          # samples. Checking the name first keeps a recycled PID from being signalled.
+          pid=$(cat "$RUNNER_TEMP/fcvm-iostat.pid" 2>/dev/null) || pid=
+          if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid" 2>/dev/null)" = iostat ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+          fi
+          mkdir -p /tmp/fcvm-test-logs
+          cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -840,7 +864,19 @@ jobs:
           # Install iperf3 for network benchmarks
           ./fcvm/scripts/ci-apt-get.sh update && ./fcvm/scripts/ci-apt-get.sh install -y iperf3 || true
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -937,6 +973,18 @@ jobs:
             LC_ALL=C sar -u 2>&1 || echo "sar -u unavailable"
           } > /tmp/fcvm-test-logs/host-load.log 2>&1 || true
           echo "load at capture: $(cat /proc/loadavg) on $(nproc) CPUs"
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          # Stop this job's sampler and wait for it to exit, so the copy holds its last
+          # samples. Checking the name first keeps a recycled PID from being signalled.
+          pid=$(cat "$RUNNER_TEMP/fcvm-iostat.pid" 2>/dev/null) || pid=
+          if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid" 2>/dev/null)" = iostat ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+          fi
+          mkdir -p /tmp/fcvm-test-logs
+          cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -1050,7 +1098,19 @@ jobs:
           key: container-cargo-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('fcvm/Cargo.lock') }}
           restore-keys: container-cargo-${{ runner.os }}-${{ runner.arch }}-
       - name: Create test log directory
-        run: sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+        run: |
+          sudo rm -rf /tmp/fcvm-test-logs && mkdir -p /tmp/fcvm-test-logs
+          # Record disk I/O for the rest of the job in 10 s samples. The suite's real
+          # throughput and IOPS decide whether a runner type without local NVMe (btrfs on
+          # EBS instead) would slow it down. Written outside fcvm-test-logs, which
+          # `make clean-test-data` recreates. It goes to $RUNNER_TEMP, which the runner empties
+          # for each job, so a job whose sampler never started saves no record rather than an
+          # earlier job's. `exec` keeps $! the PID of iostat itself, which "Save disk I/O
+          # record" stops and waits on. Detached from the step's output so the step does not
+          # wait on it; the runner reaps it with the job's other processes.
+          setsid nohup bash -c 'exec stdbuf -oL iostat -dxmty 10 $(lsblk -dno NAME -e 7)' \
+            < /dev/null > "$RUNNER_TEMP/fcvm-iostat.log" 2>&1 &
+          echo $! > "$RUNNER_TEMP/fcvm-iostat.pid"
       - name: Clean test data
         working-directory: fcvm
         run: make clean-test-data || true
@@ -1080,6 +1140,18 @@ jobs:
         run: |
           # Filter dmesg for UFFD/memory/VM related messages only
           sudo dmesg | grep -iE 'userfault|uffd|kvm|firecracker|oom|killed|segfault|page.fault' > /tmp/fcvm-test-logs/dmesg-filtered.log || true
+      - name: Save disk I/O record
+        if: always()
+        run: |
+          # Stop this job's sampler and wait for it to exit, so the copy holds its last
+          # samples. Checking the name first keeps a recycled PID from being signalled.
+          pid=$(cat "$RUNNER_TEMP/fcvm-iostat.pid" 2>/dev/null) || pid=
+          if [ -n "$pid" ] && [ "$(ps -o comm= -p "$pid" 2>/dev/null)" = iostat ]; then
+            kill "$pid" 2>/dev/null || true
+            for _ in $(seq 50); do kill -0 "$pid" 2>/dev/null || break; sleep 0.1; done
+          fi
+          mkdir -p /tmp/fcvm-test-logs
+          cp "$RUNNER_TEMP/fcvm-iostat.log" /tmp/fcvm-test-logs/iostat.log 2>/dev/null || echo "no disk I/O record was captured"
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v6
