@@ -191,8 +191,19 @@ limited, in progress), the range must end at the head, and the edit must postdat
 head's arrival at GitHub. Both of those signals live in a comment its bot edits in
 place, so the gate re-reads the PR comments after all its paging and blocks when one of
 them changed while it was reading: the head standing still does not mean a clean
-walkthrough is still clean. Both bots' no-findings replies need no disposition. A PR
-with no review result of any kind is an unreviewed head, not a clear one.
+walkthrough is still clean. Both bots' no-findings replies need no disposition. Greptile
+is not a verdict bot, and neither its score nor its prose names a clean result; what does is
+the "Greptile Review" check run the greptile-apps app writes on the commit it reviewed. The
+latest such run on the head must have finished with success and a summary saying 0 comments
+added (success alone is not clean: a review that placed a finding still concludes success),
+after the head arrived, and it must read the same on the gate's second read of the head's
+check suites. "Latest" is by start time, so a run whose start time will not parse leaves the
+runs unordered and nothing covers. A check-suite or run list that does not account for every
+entry blocks, and once a Greptile suite is present both lists must carry a numeric count to
+account with.
+Greptile's summary comment then needs no disposition when its footer names the head and it
+carries no comments-outside-diff block. A PR with no review result of any kind is an
+unreviewed head, not a clear one.
 
 | `RED-VERIFIED: <test>` | a defect claim, closed by a test watched failing without the fix |
 | `NOT-A-DEFECT: <reason>` | naming, docs, style |

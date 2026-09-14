@@ -614,6 +614,7 @@ case "$*" in
   *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)
     n=$(cat "$GATE_TEST_DIR/ccount" 2>/dev/null || echo 0); n=$((n+1))
     printf '%s' "$n" > "$GATE_TEST_DIR/ccount"
@@ -783,6 +784,7 @@ case "$*" in
     if [ "$(nth threads)" -le 1 ]; then cat "$GATE_TEST_DIR/threads.json"; else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS2:-threads}.json"; fi ;;
   *"reviews(first"*)
     if [ "$(nth reviews)" -le 1 ]; then cat "$GATE_TEST_DIR/reviews.json"; else cat "$GATE_TEST_DIR/${GATE_TEST_REVIEWS2:-reviews}.json"; fi ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq
 esac
@@ -914,6 +916,7 @@ case "$*" in
   *"commits(first"*)   cat "$GATE_TEST_DIR/prcommits.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
 esac
@@ -943,6 +946,7 @@ case "$*" in
   *"node(id"*)         cat "$GATE_TEST_DIR/threadpage.json" ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq; apply it here
 esac
@@ -1029,6 +1033,7 @@ case "$*" in
     if [ "$n" -le 1 ]; then cat "$GATE_TEST_DIR/prcommits.json"; else cat "$GATE_TEST_DIR/prcommits2.json"; fi ;;
   *reviewThreads*)     cat "$GATE_TEST_DIR/threads.json" ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf '%s\n' "$GATE_TEST_HEAD" ;;  # the recheck passes --jq
 esac
@@ -1079,6 +1084,7 @@ case "$*" in
     if [ "$(nth threads)" -le 1 ]; then cat "$GATE_TEST_DIR/${GATE_TEST_THREADS1:-threads}.json"
     else cat "$GATE_TEST_DIR/${GATE_TEST_THREADS2:-${GATE_TEST_THREADS1:-threads}}.json"; fi ;;
   *"reviews(first"*)   cat "$GATE_TEST_DIR/reviews.json" ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)  cat "$GATE_TEST_DIR/comments.json" ;;
   *headRefOid*)        printf 'deadbeef\n' ;;  # the recheck passes --jq
 esac
@@ -1210,6 +1216,7 @@ case "$*" in
   *"reviews(first"*)
     if [ "${GATE_TEST_NULL:-}" = "$(which_read reviews)" ]; then bad reviews
     else cat "$GATE_TEST_DIR/reviews.json"; fi ;;
+  *"checkRuns(first"*)  jq -c '{data:{repository:{pullRequest:{commits:(.data.repository.pullRequest.commits // {nodes:[{commit:{checkSuites:{nodes:[]}}}]})}}}}' "$GATE_TEST_DIR/reviews.json" ;;  # the second read of the head's check suites
   *"comments(first"*)
     if [ "${GATE_TEST_NULL:-}" = "$(which_read comments)" ]; then bad comments
     else cat "$GATE_TEST_DIR/${GATE_TEST_COMMENTS:-comments}.json"; fi ;;
@@ -1811,6 +1818,133 @@ run_case "greptile posting the codex notice is claimable" \
   "$(wrap9 "$(cmt "$GREPTILE" Bot 2026-01-02T01:00:00Z "$CODEX_LIMIT2")")" 1 "carry no disposition"
 run_case "a question for greptile is a comment, not a trigger" \
   "$(wrap9 "$(cmt me User 2026-01-02T01:00:00Z '"@greptileai is this thread-safe?"')")" 1 "carry no disposition"
+
+echo "== finding 48: a clean Greptile review covers the head, bound through its check run =="
+# Greptile writes a "Greptile Review" check run on the commit it reviewed. Its summary says how
+# many comments the review placed, including a finding it could only put in the summary, and its
+# conclusion is success either way, so success alone is not clean (manaflow-ai/cmux pr10764:
+# success, "4 files reviewed, 1 comments added."). Only the greptile-apps app can write a run under
+# its own slug. The summary comment is edited in place per review, and its footer names the
+# reviewed commit by full sha. Bodies below are pr10763's, with the commit URL pointed at this repo.
+G_RUN_CLEAN='{"name":"Greptile Review","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02T00:40:00Z","completedAt":"2026-01-02T00:50:00Z","summary":"Greptile has reviewed the Pull Request.\n\n4 files reviewed, 0 comments added."}'
+G_RUN_FOUND='{"name":"Greptile Review","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02T00:40:00Z","completedAt":"2026-01-02T00:50:00Z","summary":"Greptile has reviewed the Pull Request.\n\n4 files reviewed, 1 comments added."}'
+G_RUN_RUNNING='{"name":"Greptile Review","status":"IN_PROGRESS","conclusion":null,"startedAt":"2026-01-02T00:55:00Z","completedAt":null,"summary":"Greptile Review is in progress"}'
+G_RUN_CANCELLED='{"name":"Greptile Review","status":"COMPLETED","conclusion":"NEUTRAL","startedAt":"2026-01-02T00:40:00Z","completedAt":"2026-01-02T00:50:00Z","summary":"Review was cancelled"}'
+G_RUN_EARLY='{"name":"Greptile Review","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02T00:10:00Z","completedAt":"2026-01-02T00:20:00Z","summary":"Greptile has reviewed the Pull Request.\n\n4 files reviewed, 0 comments added."}'
+# The head's check suites: GitHub Actions (dating arrival at 00:30) and one app suite holding the
+# runs $1 (comma-joined). $2 is the app slug, $3 the runs connection's totalCount.
+gsuites() {
+  local runs=${1:-} slug=${2:-greptile-apps} n
+  n=${3:-$(jq -n "[$runs] | length")}
+  printf '[{"createdAt":"2026-01-02T00:30:00Z","app":{"slug":"github-actions"},"checkRuns":{"totalCount":0,"nodes":[]}},{"createdAt":"2026-01-02T00:30:00Z","app":{"slug":"%s"},"checkRuns":{"totalCount":%s,"nodes":[%s]}}]' "$slug" "$n" "$runs"
+}
+PRCOMMITS_HEAD40='{"totalCount":1,"nodes":[{"commit":{"oid":"'"$HEAD40"'"}}]}'
+# Head $HEAD40 with check suites $1, comments $2 (both reads), second read of the suites $3
+# (default $1), the suites' totalCount $4 (default their length) and the last commit's oid $5.
+wrapc() {
+  local suites=$1 comments=${2:-} again=${3:-$1}
+  printf '{"data":{"repository":{"pullRequest":{"author":{"login":"me"},"headRefOid":"%s","commits":{"nodes":[{"commit":{"oid":"%s","committedDate":"2026-01-02T00:00:00Z","checkSuites":{"totalCount":%s,"nodes":%s}}}]},"prcommits":%s,"reviewThreads":{"nodes":[]},"reviews":{"nodes":[]},"comments":{"nodes":[%s]},"recheck":{"comments":{"nodes":[%s]},"checkSuites":{"totalCount":%s,"nodes":%s}}}}}}' \
+    "$HEAD40" "${5:-$HEAD40}" "${4:-$(jq length <<<"$suites")}" "$suites" "$PRCOMMITS_HEAD40" "$comments" "$comments" "$(jq length <<<"$again")" "$again"
+}
+G_SUMMARY_TEMPLATE=$(cat <<'GREPTILE_SUMMARY'
+<h3>Greptile Summary</h3>
+
+Updates device-route test authentication to model production token identity semantics and restore reliable ownership-guard coverage.
+- Derives mocked access and refresh tokens from the simulated user ID.
+- Clears the native authentication cache and resets identity state before each test.
+
+<h3>Confidence Score: 5/5</h3>
+
+The PR appears safe to merge, with no actionable defects identified in the test-only changes.
+
+The updated test setup keeps each mocked token pair aligned with its simulated identity and synchronously clears the relevant authentication cache before every test, preventing stale identity reuse without affecting production code.
+
+<h3>Important Files Changed</h3>
+
+
+
+
+| Filename | Overview |
+|----------|----------|
+| web/tests/devices-route.test.ts | Correctly isolates cached authentication state and gives each simulated user a distinct token pair without changing production behavior. |
+
+
+<!-- greptile_other_comments_section -->
+
+<sub>Reviews (1): Last reviewed commit: ["fix(web): restore device-registry owners..."](https://github.com/ejc3/fcvm/commit/@SHA@) | [Re-trigger Greptile](https://app.greptile.com/api/retrigger?id=56876719)</sub>
+GREPTILE_SUMMARY
+)
+# The summary naming commit $1, as a JSON string literal.
+gsum() { jq -n --arg t "$G_SUMMARY_TEMPLATE" --arg sha "$1" '$t | gsub("@SHA@"; $sha)'; }
+G_SUM_HEAD=$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum "$HEAD40")")
+
+run_case "a clean greptile review run on the head covers it" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")")" 0 "HEAD COVERED"
+run_case "a clean greptile summary naming a covered head needs no disposition" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$G_SUM_HEAD")" 0 "CLEAR"
+run_case "check suites the payload does not account for block" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "" "" 5)" 2 "BLOCKED"
+run_case "greptile runs the payload does not account for block" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN" greptile-apps 2)")" 2 "BLOCKED"
+run_case "greptile runs that changed between the two reads block" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "" "$(gsuites "$G_RUN_CLEAN,$G_RUN_RUNNING")")" 2 "BLOCKED"
+run_case "a greptile summary edited between the two reads blocks" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$G_SUM_HEAD" | jq -c --argjson c "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum "$BASE40")" 2026-01-02T00:52:00Z)" '.data.repository.pullRequest.recheck.comments.nodes = [$c]')" 2 "BLOCKED"
+# Guards, green before and after.
+run_case "a greptile run that added a comment does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_FOUND")")" 1 "UNREVIEWED HEAD"
+run_case "a greptile run still in progress does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_RUNNING")")" 1 "UNREVIEWED HEAD"
+run_case "a cancelled greptile run does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_CANCELLED")")" 1 "UNREVIEWED HEAD"
+run_case "a clean run with a newer greptile run in progress does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN,$G_RUN_RUNNING")")" 1 "UNREVIEWED HEAD"
+run_case "a clean run completed before the head arrived does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_EARLY")")" 1 "UNREVIEWED HEAD"
+run_case "another app's run named Greptile Review does not cover" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN" not-greptile)")" 1 "UNREVIEWED HEAD"
+run_case "check suites of a commit other than the head cover nothing" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "" "" "" 0ldc0mm1t0ldc0mm1t0ldc0mm1t0ldc0mm1t0ldc)" 1 "UNREVIEWED HEAD"
+run_case "a greptile summary naming an older commit is claimable" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum "$BASE40")")")" 1 "carry no disposition"
+run_case "a greptile summary naming the head is claimable when its run added a comment" \
+  "$(wrapc "$(gsuites "$G_RUN_FOUND")" "$G_SUM_HEAD")" 1 "carry no disposition"
+# CodeRabbit on #927. A startedAt that will not parse cannot be ordered against the other runs,
+# so no run covers. It used to sort as newest, which let a clean run outrank a newer one in progress.
+G_RUN_CLEAN_UNORDERED=$(jq -c '.startedAt = "not a time"' <<<"$G_RUN_CLEAN")
+run_case "a clean greptile run whose startedAt will not parse does not cover past a newer run" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN_UNORDERED,$G_RUN_RUNNING")")" 1 "UNREVIEWED HEAD"
+# Without a numeric totalCount on the Greptile suite's runs, or on the suite list holding it, the
+# payload cannot show the newest run is in it.
+run_case "a greptile suite whose runs carry no totalCount blocks" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN" greptile-apps null)")" 2 "BLOCKED"
+run_case "suites with no totalCount block once a greptile suite is among them" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "" "" null)" 2 "BLOCKED"
+run_case "a human posting the greptile summary is claimable" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt helpful-human User 2026-01-02T00:51:00Z "$(gsum "$HEAD40")")")" 1 "carry no disposition"
+
+# pr10761 at 22:40:22: the same summary carrying a finding it could not anchor, verbatim.
+G_FAILED_BLOCK=$(cat <<'GREPTILE_FAILED'
+<!-- greptile_failed_comments -->
+<details><summary><h3>Comments Outside Diff (1)</h3></summary>
+
+1. `Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Server/SocketControlServer+AcceptSource.swift`, line 155-163 ([link](https://github.com/manaflow-ai/cmux/blob/c3f4565979f85b23ed266f9530adcfd32f50ebbf/Packages/macOS/CmuxControlSocket/Sources/CmuxControlSocket/Server/SocketControlServer+AcceptSource.swift#L155-L163)) 
+
+   <a href="#"><img alt="P2" src="https://greptile-static-assets.s3.amazonaws.com/badges/p2.svg?v=9" align="top"></a> **Test-only production seam**
+
+   `handleAcceptFailure` is widened from `private` to package-internal solely so the stress test can invoke the state transition directly. This weakens the production boundary for test control; drive the behavior through the listener lifecycle or limit `@testable import` usage to observing internal state.
+
+   **Rule Used:** Do not add new test/debug seams (`ForTesting`-styl... ([source](https://app.greptile.com/manaflow-org-2/github/manaflow-ai/cmux/-/custom-context?memory=7ed9f2be-8ee5-453b-a2e6-1c28e2469155))
+   
+   Note: If this suggestion doesn't match your team's coding style, reply to this and let me know. I'll remember it for next time!
+</details>
+
+<!-- /greptile_failed_comments -->
+GREPTILE_FAILED
+)
+gsum_failed() { jq -n --arg t "$G_SUMMARY_TEMPLATE" --arg f "$G_FAILED_BLOCK" --arg sha "$1" '$t | sub("<!-- greptile_other_comments_section -->"; $f + "\n\n<!-- greptile_other_comments_section -->") | gsub("@SHA@"; $sha)'; }
+run_case "a greptile summary naming the head with comments outside the diff is claimable" \
+  "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum_failed "$HEAD40")")")" 1 "carry no disposition"
 
 echo
 echo "passed=$pass failed=$fail"

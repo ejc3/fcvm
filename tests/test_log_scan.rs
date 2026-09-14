@@ -1815,3 +1815,188 @@ fn greptile_config_keeps_its_results_where_the_gate_reads_them() {
         "`autoApprove.enabled` must be false in .greptile/config.json: {config}"
     );
 }
+
+/// A clean Greptile review covers the head through its "Greptile Review" check run.
+///
+/// Greptile is not a verdict bot, and its summary comment's score is not a verdict. The check run
+/// the greptile-apps app writes on the commit it reviewed counts the comments that review added,
+/// findings it could only put in the summary included, and its conclusion is success either way
+/// (manaflow-ai/cmux pr10764: success, "4 files reviewed, 1 comments added."). The run is read
+/// twice, like the comments, and a check-suite list that does not account for every suite blocks.
+/// The shell harness (scripts/test-check-review-threads.sh, "finding 48") carries the full matrix;
+/// these run in CI.
+#[test]
+fn a_clean_greptile_review_covers_the_head_through_its_check_run() {
+    use serde_json::{json, Value};
+    require_jq();
+    const HEAD: &str = "5f8a63e13cd9fdc777d23165ecd5f149fb93f848";
+    let run = |status: &str, summary: &str| {
+        json!({"name": "Greptile Review", "status": status, "conclusion": "SUCCESS",
+               "startedAt": "2026-01-02T00:40:00Z", "completedAt": "2026-01-02T00:50:00Z",
+               "summary": summary})
+    };
+    let clean = run(
+        "COMPLETED",
+        "Greptile has reviewed the Pull Request.\n\n4 files reviewed, 0 comments added.",
+    );
+    let found = run(
+        "COMPLETED",
+        "Greptile has reviewed the Pull Request.\n\n4 files reviewed, 1 comments added.",
+    );
+    let mut running = run("IN_PROGRESS", "Greptile Review is in progress");
+    running["startedAt"] = json!("2026-01-02T00:55:00Z");
+    running["conclusion"] = Value::Null;
+    running["completedAt"] = Value::Null;
+    // GitHub Actions dates the head's arrival at 00:30; `app` holds the Greptile runs.
+    let suites = |app: &str, runs: Vec<Value>| {
+        json!([
+            {"createdAt": "2026-01-02T00:30:00Z", "app": {"slug": "github-actions"},
+             "checkRuns": {"totalCount": 0, "nodes": []}},
+            {"createdAt": "2026-01-02T00:30:00Z", "app": {"slug": app},
+             "checkRuns": {"totalCount": runs.len(), "nodes": runs}}
+        ])
+    };
+    let payload = |first: Value, suite_count: usize, again: Value, comments: Vec<Value>| {
+        let again_count = again.as_array().map_or(0, Vec::len);
+        json!({"data": {"repository": {"pullRequest": {
+            "author": {"login": "me"}, "headRefOid": HEAD,
+            "commits": {"nodes": [{"commit": {"oid": HEAD, "committedDate": "2026-01-02T00:00:00Z",
+                "checkSuites": {"totalCount": suite_count, "nodes": first}}}]},
+            "prcommits": {"totalCount": 1, "nodes": [{"commit": {"oid": HEAD}}]},
+            "reviewThreads": {"nodes": []}, "reviews": {"nodes": []},
+            "comments": {"nodes": comments.clone()},
+            "recheck": {"comments": {"nodes": comments},
+                        "checkSuites": {"totalCount": again_count, "nodes": again}}
+        }}}})
+        .to_string()
+    };
+    let summary = json!({
+        "author": {"login": "greptile-apps", "__typename": "Bot"},
+        "createdAt": "2026-01-02T00:51:00Z", "updatedAt": "2026-01-02T00:51:00Z",
+        "body": format!("<h3>Greptile Summary</h3>\n\nUpdates device-route test authentication to model production token identity semantics.\n\n<h3>Confidence Score: 5/5</h3>\n\nThe PR appears safe to merge, with no actionable defects identified in the test-only changes.\n\n<!-- greptile_other_comments_section -->\n\n<sub>Reviews (1): Last reviewed commit: [\"fix(web): restore device-registry owners...\"](https://github.com/ejc3/fcvm/commit/{HEAD}) | [Re-trigger Greptile](https://app.greptile.com/api/retrigger?id=56876719)</sub>")
+    });
+
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-greptile-cover-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gate = |name: &str, body: String| {
+        let f = dir.join(name);
+        std::fs::write(&f, body).unwrap();
+        let out = Command::new("bash")
+            .arg(repo_root().join("scripts/check-review-threads.sh"))
+            .arg("--from-file")
+            .arg(&f)
+            .output()
+            .expect("check-review-threads.sh must be runnable");
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (combined, out.status.code().unwrap_or(-1))
+    };
+
+    let clean_suites = suites("greptile-apps", vec![clean.clone()]);
+    let (out, code) = gate(
+        "clean.json",
+        payload(clean_suites.clone(), 2, clean_suites.clone(), vec![]),
+    );
+    assert_eq!(
+        code, 0,
+        "a clean Greptile review run on the head covers it.\n{out}"
+    );
+    assert!(out.contains("HEAD COVERED"), "{out}");
+
+    let (out, code) = gate(
+        "clean-summary.json",
+        payload(
+            clean_suites.clone(),
+            2,
+            clean_suites.clone(),
+            vec![summary.clone()],
+        ),
+    );
+    assert_eq!(
+        code, 0,
+        "Greptile's summary naming a head its clean run covers needs no disposition.\n{out}"
+    );
+    assert!(out.contains("CLEAR"), "{out}");
+
+    for (name, first) in [
+        ("found.json", suites("greptile-apps", vec![found])),
+        ("impostor.json", suites("not-greptile", vec![clean.clone()])),
+    ] {
+        let (out, code) = gate(name, payload(first.clone(), 2, first, vec![]));
+        assert_eq!(
+            code, 1,
+            "{name}: a run that added a comment, or a run from another app, covers nothing.\n{out}"
+        );
+        assert!(out.contains("UNREVIEWED HEAD"), "{name}: {out}");
+    }
+
+    let (out, code) = gate(
+        "suites-truncated.json",
+        payload(clean_suites.clone(), 5, clean_suites.clone(), vec![]),
+    );
+    assert_eq!(
+        code, 2,
+        "a check-suite list that does not account for every suite can omit the newest run.\n{out}"
+    );
+    assert!(out.contains("BLOCKED"), "{out}");
+
+    // CodeRabbit on #927. A startedAt that will not parse cannot be ordered, so no run covers.
+    // It used to sort as newest, which let a clean run outrank a newer run still in progress.
+    let mut unordered = clean.clone();
+    unordered["startedAt"] = json!("not a time");
+    let pair = suites("greptile-apps", vec![unordered, running.clone()]);
+    let (out, code) = gate("unordered.json", payload(pair.clone(), 2, pair, vec![]));
+    assert_eq!(
+        code, 1,
+        "a run whose startedAt will not parse cannot outrank a newer run.\n{out}"
+    );
+    assert!(out.contains("UNREVIEWED HEAD"), "{out}");
+
+    // Without a numeric totalCount on the Greptile suite's runs, or on the suite list holding
+    // it, the payload cannot show the newest run is in it.
+    let mut uncounted_runs = clean_suites.clone();
+    uncounted_runs[1]["checkRuns"]["totalCount"] = Value::Null;
+    let mut uncounted_suites: Value = serde_json::from_str(&payload(
+        clean_suites.clone(),
+        2,
+        clean_suites.clone(),
+        vec![],
+    ))
+    .unwrap();
+    uncounted_suites["data"]["repository"]["pullRequest"]["commits"]["nodes"][0]["commit"]
+        ["checkSuites"]["totalCount"] = Value::Null;
+    for (name, body) in [
+        (
+            "runs-uncounted.json",
+            payload(uncounted_runs.clone(), 2, uncounted_runs, vec![]),
+        ),
+        ("suites-uncounted.json", uncounted_suites.to_string()),
+    ] {
+        let (out, code) = gate(name, body);
+        assert_eq!(
+            code, 2,
+            "{name}: a Greptile suite without numeric counts cannot certify the head.\n{out}"
+        );
+        assert!(out.contains("BLOCKED"), "{name}: {out}");
+    }
+
+    let (out, code) = gate(
+        "runs-changed.json",
+        payload(
+            clean_suites.clone(),
+            2,
+            suites("greptile-apps", vec![clean, running]),
+            vec![],
+        ),
+    );
+    assert_eq!(
+        code, 2,
+        "Greptile runs that changed between the two reads cannot certify the head.\n{out}"
+    );
+    assert!(out.contains("BLOCKED"), "{out}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
