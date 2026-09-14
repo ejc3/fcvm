@@ -3834,7 +3834,7 @@ class ProcStateReadOnce(unittest.TestCase):
     ExecArmTimeout's leak list and TeardownProbeGuards' wait loop and survivor list.
     """
 
-    READERS = {"proc_stat_fields", "proc_state", "read_process_stat", "proc_comm"}
+    READERS = frozenset({"proc_stat_fields", "proc_state", "read_process_stat", "proc_comm"})
 
     @classmethod
     def repeated_reads(cls, source, filename):
