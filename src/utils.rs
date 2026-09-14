@@ -703,18 +703,16 @@ pub fn install_namespace_pre_exec(
                 use nix::mount::{mount, MsFlags};
                 use nix::sched::{setns, unshare, CloneFlags};
                 use nix::sys::stat::Mode;
-                use std::os::unix::io::{FromRawFd, OwnedFd};
 
                 // Step 0: Enter user namespace if specified (rootless clones). MUST be first
                 // to get CAP_SYS_ADMIN for mount operations. The user namespace was created
                 // by the holder (unshare --user --net) with external UID/GID mappings, so
                 // entering it gives UID 0 with full capabilities inside the namespace.
                 if let Some(ref user_ns_path) = user_ns_cstr {
-                    let ns_fd_raw = open(user_ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
+                    let ns_fd = open(user_ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
                         .map_err(|e| {
-                        std::io::Error::other(format!("failed to open user namespace: {}", e))
-                    })?;
-                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
+                            std::io::Error::other(format!("failed to open user namespace: {}", e))
+                        })?;
                     setns(&ns_fd, CloneFlags::CLONE_NEWUSER).map_err(|e| {
                         std::io::Error::other(format!("failed to enter user namespace: {}", e))
                     })?;
@@ -761,11 +759,10 @@ pub fn install_namespace_pre_exec(
                 // (/var/run/netns/NAME, bridged mode).
                 let net_ns_to_enter = net_ns_cstr.as_ref().or(ns_path_cstr.as_ref());
                 if let Some(ns_path) = net_ns_to_enter {
-                    let ns_fd_raw = open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty())
-                        .map_err(|e| {
+                    let ns_fd =
+                        open(ns_path.as_c_str(), OFlag::O_RDONLY, Mode::empty()).map_err(|e| {
                             std::io::Error::other(format!("failed to open net namespace: {}", e))
                         })?;
-                    let ns_fd = OwnedFd::from_raw_fd(ns_fd_raw);
                     setns(&ns_fd, CloneFlags::CLONE_NEWNET).map_err(|e| {
                         std::io::Error::other(format!("failed to enter net namespace: {}", e))
                     })?;

@@ -10,7 +10,6 @@
 mod common;
 
 use std::fs;
-use std::os::unix::io::AsRawFd;
 
 use common::{cleanup, unique_paths, FuseMount};
 use nix::unistd::{lseek, Whence};
@@ -318,7 +317,7 @@ fn test_lseek_supports_negative_offsets() {
         .open(&path)
         .expect("open for lseek");
 
-    let pos = lseek(file.as_raw_fd(), -2, Whence::SeekEnd).expect("lseek");
+    let pos = lseek(&file, -2, Whence::SeekEnd).expect("lseek");
     assert_eq!(pos, 4, "should allow negative offsets relative to SEEK_END");
 
     // Must drop file handle before unmounting to avoid hanging

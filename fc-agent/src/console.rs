@@ -182,22 +182,18 @@ fn setup(console_fd: OwnedFd) -> nix::Result<Arc<ConsoleShared>> {
     // transiently full pipe must block the producer momentarily (the writer
     // thread always drains it), never return EAGAIN into eprintln!.
     //
-    // nix 0.29 API split: `fcntl` and `read` still take `RawFd`, while `write`
-    // and `poll` already take `AsFd` — the `as_raw_fd()` calls here and at the
-    // writer-loop `read` are required by those signatures, not an opt-out from
-    // the safe wrappers. (Raw `libc::ioctl` below is different: nix has no
-    // TIOCOUTQ/FIONREAD wrapper.)
+    // Raw `libc::ioctl` below is deliberate: nix has no TIOCOUTQ/FIONREAD wrapper.
     let (pipe_rd, pipe_wr) = nix::unistd::pipe2(OFlag::O_CLOEXEC)?;
-    let flags = fcntl(pipe_rd.as_raw_fd(), FcntlArg::F_GETFL)?;
+    let flags = fcntl(&pipe_rd, FcntlArg::F_GETFL)?;
     fcntl(
-        pipe_rd.as_raw_fd(),
+        &pipe_rd,
         FcntlArg::F_SETFL(OFlag::from_bits_truncate(flags) | OFlag::O_NONBLOCK),
     )?;
     // Belt-and-braces: the console fd must be non-blocking even if the caller
     // forgot O_NONBLOCK at open time.
-    let cflags = fcntl(console_fd.as_raw_fd(), FcntlArg::F_GETFL)?;
+    let cflags = fcntl(&console_fd, FcntlArg::F_GETFL)?;
     fcntl(
-        console_fd.as_raw_fd(),
+        &console_fd,
         FcntlArg::F_SETFL(OFlag::from_bits_truncate(cflags) | OFlag::O_NONBLOCK),
     )?;
 
@@ -252,7 +248,7 @@ fn writer_loop(state: Arc<ConsoleShared>) {
 
         // 1) Drain the pipe (non-blocking) so producers can never wedge on it.
         loop {
-            match read(state.pipe_rd.as_raw_fd(), &mut buf) {
+            match read(&state.pipe_rd, &mut buf) {
                 Ok(0) => break, // all write ends closed (cannot happen: we hold one)
                 Ok(n) => {
                     state.enqueued.fetch_add(n as u64, Ordering::SeqCst);

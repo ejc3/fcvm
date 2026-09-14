@@ -3,7 +3,6 @@
 //! This module contains shared functions used by both baseline VM creation (podman.rs)
 //! and clone VM creation (snapshot.rs) to ensure consistent behavior.
 
-use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::sync::OnceLock;
 
@@ -288,7 +287,6 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
         .open(base_path)
         .with_context(|| format!("opening base snapshot for writing: {}", base_path.display()))?;
 
-    let diff_fd = diff_file.as_raw_fd();
     let file_size = diff_file
         .metadata()
         .context("getting diff file metadata")?
@@ -304,7 +302,7 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
 
     loop {
         // Find next data block (skip holes)
-        let data_start = match lseek(diff_fd, offset, Whence::SeekData) {
+        let data_start = match lseek(&diff_file, offset, Whence::SeekData) {
             Ok(pos) => pos,
             Err(nix::errno::Errno::ENXIO) => {
                 // ENXIO means no more data after this offset - we're done
@@ -320,7 +318,7 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<u64> {
         };
 
         // Find end of this data block (start of next hole)
-        let data_end = match lseek(diff_fd, data_start, Whence::SeekHole) {
+        let data_end = match lseek(&diff_file, data_start, Whence::SeekHole) {
             Ok(pos) => pos,
             Err(_) => file_size, // Data extends to EOF
         };

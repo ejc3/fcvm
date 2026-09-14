@@ -126,7 +126,7 @@ impl VsockStream {
 
         // Set non-blocking for AsyncFd
         nix::fcntl::fcntl(
-            fd.as_raw_fd(),
+            &fd,
             nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
         )
         .context("setting O_NONBLOCK on vsock")?;

@@ -866,9 +866,10 @@ async fn run_exec_with_pty(
     cmd: &[&str],
     stdin_input: Option<&str>,
 ) -> Result<(i32, Duration, String)> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::pty::openpty;
-    use nix::unistd::{close, dup2, fork, ForkResult};
-    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use nix::unistd::{fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
 
     let pid_str = pid.to_string();
     let start = std::time::Instant::now();
@@ -894,34 +895,21 @@ async fn run_exec_with_pty(
         }
     }
 
-    // Transfer ownership of fds from OwnedFd to raw fds.
-    // This prevents double-close: OwnedFd would close on drop, but we also
-    // wrap master in a File which owns the fd. Using into_raw_fd() transfers
-    // ownership so only the File (or manual close) is responsible for closing.
-    let master_fd = pty.master.into_raw_fd();
-    let slave_fd = pty.slave.into_raw_fd();
-
     // Fork to run fcvm exec in child with PTY as stdin/stdout/stderr
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
             // Child: set up PTY slave as stdin/stdout/stderr
-            unsafe {
-                // Create new session
-                libc::setsid();
-
-                // Set controlling terminal
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-
-                // Redirect stdio to PTY slave
-                dup2(slave_fd, 0).ok();
-                dup2(slave_fd, 1).ok();
-                dup2(slave_fd, 2).ok();
-
-                // Close original fds
-                if slave_fd > 2 {
-                    close(slave_fd).ok();
+            // login_tty: new session, slave as controlling terminal and
+            // stdin/stdout/stderr, slave closed if above fd 2. Drop the master
+            // first: if it sat in fd 0-2, dropping it afterwards would close a
+            // stdio copy of the slave.
+            drop(pty.master);
+            if unsafe { libc::login_tty(pty.slave.into_raw_fd()) } != 0 {
+                let msg = b"login_tty failed\n";
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
                 }
-                close(master_fd).ok();
             }
 
             // Build command args as CStrings
@@ -958,10 +946,10 @@ async fn run_exec_with_pty(
         }
         ForkResult::Parent { child } => {
             // Parent: close slave, use master for I/O
-            close(slave_fd).ok();
+            drop(pty.slave);
 
             // Wrap master fd in File for I/O (File takes ownership, will close on drop)
-            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+            let mut master = std::fs::File::from(pty.master);
 
             // Delay to let child start - container exec via podman needs more time.
             // Async, not std::thread::sleep: these helpers run on tokio's
@@ -984,10 +972,8 @@ async fn run_exec_with_pty(
             let mut buf = [0u8; 4096];
 
             // Set non-blocking
-            unsafe {
-                let flags = libc::fcntl(master_fd, libc::F_GETFL);
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            let flags = OFlag::from_bits_retain(fcntl(&master, FcntlArg::F_GETFL)?);
+            fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 
             let deadline = std::time::Instant::now() + Duration::from_secs(30); // 30s for CI under load
             loop {
@@ -1051,9 +1037,10 @@ async fn run_exec_with_pty_interrupt(
     wait_for: &str,
     control_char: u8,
 ) -> Result<(i32, Duration, String)> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::pty::openpty;
-    use nix::unistd::{close, dup2, fork, ForkResult};
-    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use nix::unistd::{fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
 
     let pid_str = pid.to_string();
     let start = std::time::Instant::now();
@@ -1073,22 +1060,20 @@ async fn run_exec_with_pty_interrupt(
         }
     }
 
-    let master_fd = pty.master.into_raw_fd();
-    let slave_fd = pty.slave.into_raw_fd();
-
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
             // Child: set up PTY slave as stdin/stdout/stderr
-            unsafe {
-                libc::setsid();
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-                dup2(slave_fd, 0).ok();
-                dup2(slave_fd, 1).ok();
-                dup2(slave_fd, 2).ok();
-                if slave_fd > 2 {
-                    close(slave_fd).ok();
+            // login_tty: new session, slave as controlling terminal and
+            // stdin/stdout/stderr, slave closed if above fd 2. Drop the master
+            // first: if it sat in fd 0-2, dropping it afterwards would close a
+            // stdio copy of the slave.
+            drop(pty.master);
+            if unsafe { libc::login_tty(pty.slave.into_raw_fd()) } != 0 {
+                let msg = b"login_tty failed\n";
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
                 }
-                close(master_fd).ok();
             }
 
             // Build command
@@ -1116,14 +1101,12 @@ async fn run_exec_with_pty_interrupt(
             }
         }
         ForkResult::Parent { child } => {
-            close(slave_fd).ok();
-            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+            drop(pty.slave);
+            let mut master = std::fs::File::from(pty.master);
 
             // Set non-blocking
-            unsafe {
-                let flags = libc::fcntl(master_fd, libc::F_GETFL);
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            let flags = OFlag::from_bits_retain(fcntl(&master, FcntlArg::F_GETFL)?);
+            fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 
             let mut output = Vec::new();
             let mut buf = [0u8; 4096];
@@ -1499,9 +1482,10 @@ async fn test_exec_parallel_pipe_stress() -> Result<()> {
 /// Uses `tty` command to verify TTY is allocated when -t flag is used.
 #[tokio::test]
 async fn test_podman_run_tty() -> Result<()> {
+    use nix::fcntl::{fcntl, FcntlArg, OFlag};
     use nix::pty::openpty;
-    use nix::unistd::{close, dup2, fork, ForkResult};
-    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use nix::unistd::{fork, ForkResult};
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
     use std::time::Duration;
 
     println!("\nTest: fcvm podman run -t (TTY allocation)");
@@ -1523,23 +1507,21 @@ async fn test_podman_run_tty() -> Result<()> {
         }
     }
 
-    let master_fd = pty.master.into_raw_fd();
-    let slave_fd = pty.slave.into_raw_fd();
-
     // Fork to run fcvm with PTY
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
             // Child: set up PTY and exec fcvm
-            unsafe {
-                libc::setsid();
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-                dup2(slave_fd, 0).ok();
-                dup2(slave_fd, 1).ok();
-                dup2(slave_fd, 2).ok();
-                if slave_fd > 2 {
-                    close(slave_fd).ok();
+            // login_tty: new session, slave as controlling terminal and
+            // stdin/stdout/stderr, slave closed if above fd 2. Drop the master
+            // first: if it sat in fd 0-2, dropping it afterwards would close a
+            // stdio copy of the slave.
+            drop(pty.master);
+            if unsafe { libc::login_tty(pty.slave.into_raw_fd()) } != 0 {
+                let msg = b"login_tty failed\n";
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
                 }
-                close(master_fd).ok();
             }
 
             // Exec fcvm podman run -t ... tty
@@ -1562,19 +1544,17 @@ async fn test_podman_run_tty() -> Result<()> {
             }
         }
         ForkResult::Parent { child } => {
-            close(slave_fd).ok();
+            drop(pty.slave);
 
-            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+            let mut master = std::fs::File::from(pty.master);
 
             // Read output with timeout
             let mut output = Vec::new();
             let mut buf = [0u8; 4096];
 
             // Set non-blocking
-            unsafe {
-                let flags = libc::fcntl(master_fd, libc::F_GETFL);
-                libc::fcntl(master_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
-            }
+            let flags = OFlag::from_bits_retain(fcntl(&master, FcntlArg::F_GETFL)?);
+            fcntl(&master, FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK))?;
 
             let deadline = std::time::Instant::now() + Duration::from_secs(120);
             loop {
@@ -1626,9 +1606,9 @@ async fn test_podman_run_tty() -> Result<()> {
 #[tokio::test]
 async fn test_podman_run_interactive_tty() -> Result<()> {
     use nix::pty::openpty;
-    use nix::unistd::{close, dup2, fork, ForkResult};
+    use nix::unistd::{fork, ForkResult};
     use std::io::Write;
-    use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd};
+    use std::os::unix::io::{AsRawFd, IntoRawFd};
     use std::time::Duration;
 
     println!("\nTest: fcvm podman run -it (interactive + TTY)");
@@ -1650,23 +1630,21 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
         }
     }
 
-    let master_fd = pty.master.into_raw_fd();
-    let slave_fd = pty.slave.into_raw_fd();
-
     // Fork to run fcvm with PTY
     match unsafe { fork() }.context("forking")? {
         ForkResult::Child => {
             // Child: set up PTY and exec fcvm
-            unsafe {
-                libc::setsid();
-                libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-                dup2(slave_fd, 0).ok();
-                dup2(slave_fd, 1).ok();
-                dup2(slave_fd, 2).ok();
-                if slave_fd > 2 {
-                    close(slave_fd).ok();
+            // login_tty: new session, slave as controlling terminal and
+            // stdin/stdout/stderr, slave closed if above fd 2. Drop the master
+            // first: if it sat in fd 0-2, dropping it afterwards would close a
+            // stdio copy of the slave.
+            drop(pty.master);
+            if unsafe { libc::login_tty(pty.slave.into_raw_fd()) } != 0 {
+                let msg = b"login_tty failed\n";
+                unsafe {
+                    libc::write(libc::STDERR_FILENO, msg.as_ptr().cast(), msg.len());
+                    libc::_exit(1);
                 }
-                close(master_fd).ok();
             }
 
             // Exec fcvm podman run -it ... head -1
@@ -1690,9 +1668,9 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
             }
         }
         ForkResult::Parent { child } => {
-            close(slave_fd).ok();
+            drop(pty.slave);
 
-            let mut master = unsafe { std::fs::File::from_raw_fd(master_fd) };
+            let mut master = std::fs::File::from(pty.master);
 
             // Heartbeat strategy: periodically send stdin lines until the
             // container is actually running and `head -1` consumes one.
@@ -1712,7 +1690,7 @@ async fn test_podman_run_interactive_tty() -> Result<()> {
             let mut heartbeats_sent = 0u32;
 
             let mut poll_fd = [libc::pollfd {
-                fd: master_fd,
+                fd: master.as_raw_fd(),
                 events: libc::POLLIN,
                 revents: 0,
             }];

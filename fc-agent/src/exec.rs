@@ -1,4 +1,5 @@
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::io::Write;
+use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -204,25 +205,6 @@ async fn write_line_async(conn: &AsyncFd<OwnedFd>, data: &str) {
     }
 }
 
-/// Blocking write helper — used for error responses before fd is made non-blocking.
-fn write_line_to_fd(fd: i32, data: &str) {
-    let bytes = format!("{}\n", data);
-    let mut written = 0;
-    while written < bytes.len() {
-        let n = unsafe {
-            libc::write(
-                fd,
-                bytes[written..].as_ptr() as *const libc::c_void,
-                bytes.len() - written,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        written += n as usize;
-    }
-}
-
 /// Why a line read failed (used for handshake diagnostics).
 #[derive(Debug, PartialEq, Eq)]
 enum LineReadError {
@@ -350,8 +332,9 @@ fn write_line_bounded(fd: i32, deadline: Instant, line: &str) -> bool {
 /// characters as raw UTF-8 — decoding byte-by-byte (Latin-1) would silently corrupt
 /// multi-byte arguments and paths.
 ///
-/// Returns (ExecRequest, raw_fd) once GO is consumed, or None (fd closed).
-fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest, i32)> {
+/// Returns the request and the still-open connection once GO is consumed. Every
+/// other path returns None and closes the connection by dropping it.
+fn read_request_and_handshake(conn: OwnedFd, timeout: Duration) -> Option<(ExecRequest, OwnedFd)> {
     const MAX_EXEC_LINE_LENGTH: usize = 1_048_576;
     /// GO is 2 bytes; anything longer is a protocol violation.
     const MAX_GO_LINE_LENGTH: usize = 16;
@@ -361,6 +344,7 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
     // (not a mock). Sync hit(): this fn runs inside spawn_blocking.
     failpoint::hit("exec.post_accept_pre_read");
 
+    let fd = conn.as_raw_fd();
     let deadline = Instant::now() + timeout;
 
     // Phase 1: request line.
@@ -387,7 +371,6 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
                 }
                 LineReadError::Closed | LineReadError::Failed => {}
             }
-            unsafe { libc::close(fd) };
             return None;
         }
     };
@@ -397,7 +380,6 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
         Err(e) => {
             let response = ExecResponse::Error(format!("Invalid request: {}", e));
             write_line_bounded(fd, deadline, &serde_json::to_string(&response).unwrap());
-            unsafe { libc::close(fd) };
             return None;
         }
     };
@@ -405,13 +387,11 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
     if request.command.is_empty() {
         let response = ExecResponse::Error("Empty command".to_string());
         write_line_bounded(fd, deadline, &serde_json::to_string(&response).unwrap());
-        unsafe { libc::close(fd) };
         return None;
     }
 
     // Phase 2: ACK — the request is fully consumed and will execute iff GO arrives.
     if !write_line_bounded(fd, deadline, exec_proto::HANDSHAKE_ACK) {
-        unsafe { libc::close(fd) };
         return None;
     }
 
@@ -427,13 +407,12 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
     // post-GO error on the client for a command that never ran).
     let go_deadline = deadline.max(Instant::now() + Duration::from_secs(2));
     match read_line_bounded(fd, go_deadline, MAX_GO_LINE_LENGTH) {
-        Ok(go) if go == exec_proto::HANDSHAKE_GO.as_bytes() => Some((request, fd)),
+        Ok(go) if go == exec_proto::HANDSHAKE_GO.as_bytes() => Some((request, conn)),
         Ok(other) => {
             eprintln!(
                 "[fc-agent] exec handshake: expected GO, got {:?}; closing without executing",
                 String::from_utf8_lossy(&other)
             );
-            unsafe { libc::close(fd) };
             None
         }
         Err(reason) => {
@@ -442,7 +421,6 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
                  (connection likely orphaned by a snapshot pause); closing without executing",
                 reason
             );
-            unsafe { libc::close(fd) };
             None
         }
     }
@@ -450,16 +428,17 @@ fn read_request_and_handshake(fd: i32, timeout: Duration) -> Option<(ExecRequest
 
 async fn handle_connection(client_fd: OwnedFd) {
     // Read the request line and run the ACK/GO handshake in spawn_blocking
-    // (blocking byte-by-byte I/O, bounded by HANDSHAKE_TIMEOUT).
-    let raw_fd = client_fd.into_raw_fd();
-    let parsed =
-        tokio::task::spawn_blocking(move || read_request_and_handshake(raw_fd, HANDSHAKE_TIMEOUT))
-            .await;
+    // (blocking byte-by-byte I/O, bounded by HANDSHAKE_TIMEOUT). The task owns
+    // the connection, so a task that panics or is dropped unstarted closes it.
+    let parsed = tokio::task::spawn_blocking(move || {
+        read_request_and_handshake(client_fd, HANDSHAKE_TIMEOUT)
+    })
+    .await;
 
-    let (request, raw_fd) = match parsed {
-        Ok(Some((req, fd))) => (req, fd),
-        Ok(None) => return, // closed, timed out, or invalid (already handled)
-        Err(_) => return,   // spawn_blocking panicked
+    let (request, conn) = match parsed {
+        Ok(Some(handshaken)) => handshaken,
+        Ok(None) => return, // closed, timed out, or invalid (conn already dropped)
+        Err(_) => return,   // task panicked or was cancelled (conn dropped with it)
     };
 
     // TTY path: must be blocking (fork/PTY)
@@ -486,11 +465,17 @@ async fn handle_connection(client_fd: OwnedFd) {
         };
 
         tokio::task::spawn_blocking(move || {
-            crate::tty::run_with_pty_fd(raw_fd, &command, request.tty, request.interactive);
+            // run_with_pty_fd takes ownership of the raw fd and closes it.
+            crate::tty::run_with_pty_fd(
+                conn.into_raw_fd(),
+                &command,
+                request.tty,
+                request.interactive,
+            );
         });
     } else {
         // Pipe path: fully async
-        handle_pipe_async(raw_fd, &request).await;
+        handle_pipe_async(conn, &request).await;
     }
 }
 
@@ -539,7 +524,7 @@ async fn wait_for_peer_close(watch: &AsyncFd<OwnedFd>) {
     }
 }
 
-async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
+async fn handle_pipe_async(conn: OwnedFd, request: &ExecRequest) {
     let proxy_settings = crate::system::read_proxy_settings();
 
     let mut cmd = if request.in_container {
@@ -593,8 +578,11 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
                 e,
                 crate::vitals::sample_line()
             ));
-            write_line_to_fd(raw_fd, &serde_json::to_string(&response).unwrap());
-            unsafe { libc::close(raw_fd) };
+            // conn is still blocking here, so write_all delivers the whole line
+            // (retrying EINTR). A write error is ignored: the connection closes
+            // right after either way, when the File drops.
+            let line = format!("{}\n", serde_json::to_string(&response).unwrap());
+            let _ = std::fs::File::from(conn).write_all(line.as_bytes());
             return;
         }
     };
@@ -602,41 +590,30 @@ async fn handle_pipe_async(raw_fd: i32, request: &ExecRequest) {
     // Capture the child's PID now (used as the PGID for killpg on host disconnect, #636).
     let child_pid = child.id();
 
-    // Spawn succeeded — set non-blocking, take ownership, wrap in AsyncFd
+    // Spawn succeeded: set non-blocking, then wrap in AsyncFd.
     nix::fcntl::fcntl(
-        raw_fd,
+        &conn,
         nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
     )
     .ok();
     // Independent CLOEXEC dup of the connection for read-side peer-close detection. Polling
     // readability on a separate fd avoids holding the write Mutex across readable().await
     // (which would deadlock the stdout/stderr writer tasks). The two OwnedFds own distinct
-    // fd numbers, so there is no double-close.
-    let peer_watch: Option<AsyncFd<OwnedFd>> =
-        match nix::fcntl::fcntl(raw_fd, nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(0)) {
-            Ok(dup) => match AsyncFd::new(unsafe { OwnedFd::from_raw_fd(dup) }) {
-                Ok(afd) => Some(afd),
-                // Extremely rare (reactor registration failure). Don't fail the exec, but
-                // don't fail silently either: without the watcher, host-disconnect kill is
-                // disabled for this exec (degrades to the pre-#636 wait-only behavior).
-                Err(e) => {
-                    eprintln!(
-                        "[fc-agent] WARN: peer-close watcher AsyncFd failed ({e}); \
-                         host-disconnect kill disabled for this exec"
-                    );
-                    None
-                }
-            },
-            Err(e) => {
-                eprintln!(
-                    "[fc-agent] WARN: peer-close watcher dup failed ({e}); \
-                     host-disconnect kill disabled for this exec"
-                );
-                None
-            }
-        };
-    let owned_fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
-    let async_fd = match AsyncFd::new(owned_fd) {
+    // fd numbers, so there is no double-close. try_clone duplicates with F_DUPFD_CLOEXEC.
+    let peer_watch: Option<AsyncFd<OwnedFd>> = match conn.try_clone().and_then(AsyncFd::new) {
+        Ok(afd) => Some(afd),
+        // Extremely rare (fd exhaustion or reactor registration failure). Don't fail the
+        // exec, but don't fail silently either: without the watcher, host-disconnect kill
+        // is disabled for this exec (degrades to the pre-#636 wait-only behavior).
+        Err(e) => {
+            eprintln!(
+                "[fc-agent] WARN: peer-close watcher setup failed (dup or AsyncFd registration: {e}); \
+                 host-disconnect kill disabled for this exec"
+            );
+            None
+        }
+    };
+    let async_fd = match AsyncFd::new(conn) {
         Ok(fd) => Arc::new(Mutex::new(fd)),
         Err(_) => return, // fd closed by OwnedFd drop
     };
@@ -739,53 +716,34 @@ mod exec_fuzz_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixStream;
 
-    fn socketpair() -> (i32, i32) {
-        let mut fds = [0i32; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
-        assert_eq!(rc, 0, "socketpair failed");
-        (fds[0], fds[1])
+    /// A connected pair: the server end as the OwnedFd the handshake consumes,
+    /// the client end as a stream the test drives.
+    fn socketpair() -> (OwnedFd, UnixStream) {
+        let (server, client) = UnixStream::pair().expect("socketpair failed");
+        (OwnedFd::from(server), client)
     }
 
-    fn write_all(fd: i32, data: &[u8]) {
-        let written = unsafe { libc::write(fd, data.as_ptr().cast(), data.len()) };
-        assert_eq!(written, data.len() as isize, "short write to socketpair");
-    }
-
-    /// Read everything available from `fd` until EOF (bounded, blocking).
-    fn read_to_eof(fd: i32) -> Vec<u8> {
+    /// Read everything from the client end until EOF. A reset (the agent closed
+    /// with client bytes still unread) ends the read the same way; bytes already
+    /// received are kept.
+    fn read_to_eof(client: &mut UnixStream) -> Vec<u8> {
         let mut out = Vec::new();
-        let mut buf = [0u8; 256];
-        loop {
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
-            if n <= 0 {
-                return out;
-            }
-            out.extend_from_slice(&buf[..n as usize]);
-        }
+        let _ = client.read_to_end(&mut out);
+        out
     }
 
     /// Send `data` over a socketpair (with a pre-buffered GO line so the
     /// handshake can complete) and parse it with read_request_and_handshake.
     fn parse_request(data: &[u8]) -> Option<ExecRequest> {
-        let (server_fd, client_fd) = socketpair();
-        write_all(client_fd, data);
-        write_all(
-            client_fd,
-            format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes(),
-        );
-
-        // read_request_and_handshake closes server_fd on error; on success it
-        // returns it open.
-        let request = match read_request_and_handshake(server_fd, Duration::from_secs(5)) {
-            Some((request, fd)) => {
-                unsafe { libc::close(fd) };
-                Some(request)
-            }
-            None => None,
-        };
-        unsafe { libc::close(client_fd) };
-        request
+        let (server, mut client) = socketpair();
+        client.write_all(data).expect("write request");
+        client
+            .write_all(format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes())
+            .expect("write GO");
+        read_request_and_handshake(server, Duration::from_secs(5)).map(|(request, _conn)| request)
     }
 
     #[test]
@@ -816,38 +774,35 @@ mod tests {
     /// ACK line, then sends GO — the server returns the request only after GO.
     #[test]
     fn test_handshake_ack_then_go() {
-        let (server_fd, client_fd) = socketpair();
+        let (server, mut client) = socketpair();
 
         let client = std::thread::spawn(move || {
-            write_all(
-                client_fd,
-                b"{\"command\":[\"true\"],\"in_container\":false}\n",
-            );
+            client
+                .write_all(b"{\"command\":[\"true\"],\"in_container\":false}\n")
+                .expect("write request");
             // Wait for the full ACK line before sending GO.
             let mut ack = Vec::new();
             let mut byte = [0u8; 1];
             loop {
-                let n = unsafe { libc::read(client_fd, byte.as_mut_ptr() as *mut libc::c_void, 1) };
-                assert!(n > 0, "server closed before ACK");
+                client
+                    .read_exact(&mut byte)
+                    .expect("server closed before ACK");
                 if byte[0] == b'\n' {
                     break;
                 }
                 ack.push(byte[0]);
             }
             assert_eq!(ack, exec_proto::HANDSHAKE_ACK.as_bytes());
-            write_all(
-                client_fd,
-                format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes(),
-            );
-            client_fd
+            client
+                .write_all(format!("{}\n", exec_proto::HANDSHAKE_GO).as_bytes())
+                .expect("write GO");
+            client
         });
 
-        let (request, fd) = read_request_and_handshake(server_fd, Duration::from_secs(5))
+        let (request, _conn) = read_request_and_handshake(server, Duration::from_secs(5))
             .expect("handshake should complete");
         assert_eq!(request.command, vec!["true"]);
-        unsafe { libc::close(fd) };
-        let client_fd = client.join().unwrap();
-        unsafe { libc::close(client_fd) };
+        client.join().unwrap();
     }
 
     /// No GO after ACK (the snapshot-pause orphan shape): the server must time
@@ -856,14 +811,13 @@ mod tests {
     /// is the proof nothing executed.
     #[test]
     fn test_handshake_no_go_times_out_without_executing() {
-        let (server_fd, client_fd) = socketpair();
-        write_all(
-            client_fd,
-            b"{\"command\":[\"true\"],\"in_container\":false}\n",
-        );
+        let (server, mut client) = socketpair();
+        client
+            .write_all(b"{\"command\":[\"true\"],\"in_container\":false}\n")
+            .expect("write request");
 
         let start = Instant::now();
-        let result = read_request_and_handshake(server_fd, Duration::from_millis(200));
+        let result = read_request_and_handshake(server, Duration::from_millis(200));
         assert!(result.is_none(), "handshake without GO must not execute");
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -872,22 +826,21 @@ mod tests {
         );
 
         // Server closed the fd; the client sees the ACK it sent, then clean EOF.
-        let seen = read_to_eof(client_fd);
+        let seen = read_to_eof(&mut client);
         assert_eq!(
             seen,
             format!("{}\n", exec_proto::HANDSHAKE_ACK).into_bytes()
         );
-        unsafe { libc::close(client_fd) };
     }
 
     /// No request line at all (connection accepted, host bytes lost in a vsock
     /// reset): bounded timeout, no ACK, fd closed, thread reclaimed.
     #[test]
     fn test_handshake_request_timeout_is_bounded() {
-        let (server_fd, client_fd) = socketpair();
+        let (server, mut client) = socketpair();
 
         let start = Instant::now();
-        let result = read_request_and_handshake(server_fd, Duration::from_millis(200));
+        let result = read_request_and_handshake(server, Duration::from_millis(200));
         assert!(result.is_none());
         assert!(
             start.elapsed() < Duration::from_secs(5),
@@ -896,22 +849,73 @@ mod tests {
         );
 
         // No ACK was ever written — the request was never consumed.
-        let seen = read_to_eof(client_fd);
+        let seen = read_to_eof(&mut client);
         assert!(seen.is_empty(), "no bytes expected, got {:?}", seen);
-        unsafe { libc::close(client_fd) };
+    }
+
+    /// The blocking handshake task owns the connection, so a task that never runs
+    /// (spawn_blocking on a runtime that is shutting down drops it unstarted)
+    /// still closes the fd instead of leaking it.
+    #[test]
+    fn handshake_task_dropped_unstarted_closes_connection() {
+        use std::future::Future;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let handle = rt.handle().clone();
+        rt.shutdown_background();
+        let _enter = handle.enter();
+
+        let (server, mut client) = socketpair();
+        let mut conn = std::pin::pin!(handle_connection(server));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        // One poll reaches spawn_blocking, which drops the task unstarted because
+        // the pool is shut down; the join then resolves to a cancellation error.
+        let _ = conn.as_mut().poll(&mut cx);
+
+        client.set_nonblocking(true).unwrap();
+        let mut byte = [0u8; 1];
+        match client.read(&mut byte) {
+            Ok(0) => {}
+            other => panic!("connection left open after the handshake task was dropped: {other:?}"),
+        }
     }
 
     /// Client vanishes after the request (EOF before GO): close without executing.
     #[test]
     fn test_handshake_client_close_before_go() {
-        let (server_fd, client_fd) = socketpair();
-        write_all(
-            client_fd,
-            b"{\"command\":[\"true\"],\"in_container\":false}\n",
-        );
-        unsafe { libc::close(client_fd) };
+        let (server, mut client) = socketpair();
+        client
+            .write_all(b"{\"command\":[\"true\"],\"in_container\":false}\n")
+            .expect("write request");
+        drop(client);
 
-        let result = read_request_and_handshake(server_fd, Duration::from_secs(5));
+        let result = read_request_and_handshake(server, Duration::from_secs(5));
         assert!(result.is_none(), "EOF before GO must not execute");
+    }
+
+    /// A command that cannot be spawned gets exactly one Error line carrying the
+    /// spawn error, and then EOF.
+    #[tokio::test]
+    async fn spawn_failure_writes_one_error_line_then_closes() {
+        let (server, mut client) = socketpair();
+        let request = ExecRequest {
+            command: vec!["/nonexistent/fc-agent-spawn-failure".to_string()],
+            in_container: false,
+            interactive: false,
+            tty: false,
+        };
+        handle_pipe_async(server, &request).await;
+
+        let seen = String::from_utf8(read_to_eof(&mut client)).expect("UTF-8 response");
+        let line = seen
+            .strip_suffix('\n')
+            .unwrap_or_else(|| panic!("response must end with a newline: {seen:?}"));
+        assert!(!line.contains('\n'), "exactly one line expected: {seen:?}");
+        let response: serde_json::Value = serde_json::from_str(line).expect("response is JSON");
+        assert_eq!(response["type"], "error", "got {seen:?}");
+        let message = response["data"].as_str().expect("error data is a string");
+        assert!(message.starts_with("Failed to spawn: "), "got {message:?}");
     }
 }

@@ -4,7 +4,7 @@
 //! used by both `podman run -it` and `exec -it` paths.
 
 use std::io::Write;
-use std::os::unix::io::{AsRawFd, BorrowedFd};
+use std::os::unix::io::{AsFd, AsRawFd, BorrowedFd};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Arc;
@@ -186,15 +186,23 @@ pub fn run_tty_session_connected(
     guard: crate::commands::exec::SnapshotOrphanGuard,
 ) -> Result<i32> {
     // Set up raw terminal mode if TTY requested
-    let stdin_fd = std::io::stdin().as_raw_fd();
+    let stdin = std::io::stdin();
+    let stdin_fd = stdin.as_fd();
 
     // Debug: check if stdin is non-blocking
-    let stdin_flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
-    let is_nonblocking = (stdin_flags & libc::O_NONBLOCK) != 0;
-    debug!(
-        "run_tty_session_connected: stdin_fd={}, flags=0x{:x}, O_NONBLOCK={}",
-        stdin_fd, stdin_flags, is_nonblocking
-    );
+    match nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_GETFL) {
+        Ok(flags) => debug!(
+            "run_tty_session_connected: stdin_fd={}, flags=0x{:x}, O_NONBLOCK={}",
+            stdin_fd.as_raw_fd(),
+            flags,
+            nix::fcntl::OFlag::from_bits_retain(flags).contains(nix::fcntl::OFlag::O_NONBLOCK)
+        ),
+        Err(e) => debug!(
+            "run_tty_session_connected: stdin_fd={}, F_GETFL failed: {}",
+            stdin_fd.as_raw_fd(),
+            e
+        ),
+    }
     let orig_termios = if tty {
         setup_raw_terminal(stdin_fd)?
     } else {
@@ -249,11 +257,8 @@ pub fn run_tty_session_connected(
 }
 
 /// Set up raw terminal mode
-fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<Termios>> {
-    // SAFETY: stdin_fd is valid for the duration of this call
-    let fd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
-
-    if !nix::unistd::isatty(stdin_fd).unwrap_or(false) {
+fn setup_raw_terminal(fd: BorrowedFd<'_>) -> Result<Option<Termios>> {
+    if !nix::unistd::isatty(fd).unwrap_or(false) {
         bail!("TTY mode requires a terminal. Use without -t for non-interactive mode.");
     }
 
@@ -261,11 +266,11 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<Termios>> {
     install_signal_handlers();
 
     // Ensure stdin is in blocking mode (tokio may have set it non-blocking)
-    if let Ok(flags) = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_GETFL) {
+    if let Ok(flags) = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_GETFL) {
         let oflags = nix::fcntl::OFlag::from_bits_truncate(flags);
         if oflags.contains(nix::fcntl::OFlag::O_NONBLOCK) {
             let new_flags = oflags & !nix::fcntl::OFlag::O_NONBLOCK;
-            let _ = nix::fcntl::fcntl(stdin_fd, nix::fcntl::FcntlArg::F_SETFL(new_flags));
+            let _ = nix::fcntl::fcntl(fd, nix::fcntl::FcntlArg::F_SETFL(new_flags));
             debug!("setup_raw_terminal: cleared O_NONBLOCK from stdin");
         }
     }
@@ -275,7 +280,7 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<Termios>> {
 
     // Store in global for signal handler access (async-signal-safe approach)
     // SAFETY: We only write while TERMIOS_SAVED is false, ensuring no concurrent read
-    ORIG_FD.store(stdin_fd, Ordering::Release);
+    ORIG_FD.store(fd.as_raw_fd(), Ordering::Release);
     unsafe {
         ORIG_TERMIOS = Some(orig.clone());
     }
@@ -296,12 +301,9 @@ fn setup_raw_terminal(stdin_fd: i32) -> Result<Option<Termios>> {
 }
 
 /// Restore terminal to original settings
-fn restore_terminal(stdin_fd: i32, orig_termios: Termios) {
+fn restore_terminal(fd: BorrowedFd<'_>, orig_termios: Termios) {
     // Clear global first (signal handler won't need to restore anymore)
     TERMIOS_SAVED.store(false, Ordering::Release);
-
-    // SAFETY: stdin_fd is valid for the duration of this call
-    let fd = unsafe { BorrowedFd::borrow_raw(stdin_fd) };
 
     if let Err(e) = termios::tcsetattr(fd, SetArg::TCSANOW, &orig_termios) {
         warn!("Failed to restore terminal settings: {}", e);
