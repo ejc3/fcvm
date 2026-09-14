@@ -201,6 +201,16 @@ def wait_for_child(pid, timeout=5.0):
         time.sleep(0.005)
 
 
+def process_running(pid):
+    """True while pid runs; False once it is absent, a zombie, or released.
+
+    One read of /proc/<pid>/stat: reading it again to inspect the state can find
+    the process reaped in between and get None (ProcStateReadOnce).
+    """
+    state = reqbench.proc_stat_fields(pid)
+    return state is not None and state[0] not in ("Z", "X", "x")
+
+
 def kill_tree(p):
     """SIGKILL a parent and anything still under it. Tests must not leak either."""
     for pid in reqbench.children_of(p.pid):
@@ -680,17 +690,13 @@ class TeardownNormalLeakVerdict(unittest.TestCase):
                 reqbench.teardown_normal(p, p.pid, 0.4)
             self.assertTrue(cm.exception.teardown.get("survivors"))
             # ...and the survivor was SIGKILLed rather than left on the box.
-            def alive(pid):
-                state = reqbench.proc_stat_fields(pid)
-                return state is not None and state[0] not in ("Z", "X", "x")
-
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
-                if not any(alive(k) for k in kids):
+                if not any(process_running(k) for k in kids):
                     break
                 time.sleep(0.01)
             self.assertEqual(
-                [k for k in kids if alive(k)],
+                [k for k in kids if process_running(k)],
                 [],
                 "the survivor must be killed before we abort",
             )
@@ -2049,8 +2055,7 @@ class ExecArmTimeout(unittest.TestCase):
             self.assertIs(rec["timed_out"], True)
             leaked = [
                 pid for pid in reqbench.children_of(os.getpid())
-                if pid not in before and reqbench.proc_stat_fields(pid)
-                and reqbench.proc_stat_fields(pid)[0] not in ("Z", "X", "x")
+                if pid not in before and process_running(pid)
             ]
             self.assertEqual(leaked, [], f"stub survived the timeout: {leaked}")
 
@@ -3814,6 +3819,88 @@ class AnalyzerAvailability(unittest.TestCase):
             self.assertIn("below /proc tick resolution", text)
 
 
+class ProcStateReadOnce(unittest.TestCase):
+    """A decision about a process reads its /proc state once.
+
+    `reqbench.proc_stat_fields(pid)` returns None once the pid is gone, so an
+    expression that reads it twice, `f(pid) is None or f(pid)[0] in (...)`, can
+    see a live process on the first read and None on the second when the process
+    is reaped in between. On main 4494a9c4 (CI run 34800602976)
+    TeardownProbeGuards.test_a_survivor_blocks_the_reap_and_is_killed raised
+    `TypeError: 'NoneType' object is not subscriptable` from exactly that shape.
+
+    RED BEFORE THE FIX: with the three call sites restored, the scan listed
+    `test_reqbench.py:<line> proc_stat_fields` three times != [], for
+    ExecArmTimeout's leak list and TeardownProbeGuards' wait loop and survivor list.
+    """
+
+    READERS = frozenset({"proc_stat_fields", "proc_state", "read_process_stat", "proc_comm"})
+
+    @classmethod
+    def repeated_reads(cls, source, filename):
+        """`<file>:<line> <reader>` for each expression that reads one process twice."""
+        import ast
+        import collections
+
+        def read_target(call):
+            func = call.func
+            name = getattr(func, "attr", None) or getattr(func, "id", None)
+            if name not in cls.READERS:
+                return None
+            if call.args:
+                return name, ast.dump(call.args[0])
+            for keyword in call.keywords:
+                if keyword.arg == "pid":
+                    return name, ast.dump(keyword.value)
+            return None
+
+        found = set()
+        for node in ast.walk(ast.parse(source, filename=filename)):
+            if not isinstance(node, (ast.BoolOp, ast.IfExp, ast.Compare,
+                                     ast.ListComp, ast.GeneratorExp,
+                                     ast.SetComp, ast.DictComp)):
+                continue
+            reads = collections.defaultdict(list)
+            for call in ast.walk(node):
+                if isinstance(call, ast.Call):
+                    target = read_target(call)
+                    if target is not None:
+                        reads[target].append(call.lineno)
+            for (name, _pid), lines in reads.items():
+                if len(lines) > 1:
+                    found.add(f"{os.path.basename(filename)}:{min(lines)} {name}")
+        return sorted(found)
+
+    def test_no_expression_reads_one_process_twice(self):
+        import glob
+
+        found = []
+        for path in sorted(glob.glob(os.path.join(HERE, "*.py"))):
+            with open(path) as handle:
+                found += self.repeated_reads(handle.read(), path)
+        self.assertEqual(
+            found, [],
+            "read the process state once and decide from that one value",
+        )
+
+    def test_a_pid_passed_by_keyword_is_the_same_process(self):
+        """Greptile on #933: a reader called with `pid=` escaped the scan.
+
+        RED BEFORE THE FIX: `[] != ['snippet.py:2 proc_stat_fields']`, because
+        the scan keyed each read on its first positional argument only.
+        """
+        source = (
+            "alive = [k for k in kids\n"
+            "         if reqbench.proc_stat_fields(pid=k) is not None\n"
+            "         and reqbench.proc_stat_fields(k)[0] not in ('Z', 'X', 'x')]\n"
+        )
+        self.assertEqual(
+            self.repeated_reads(source, "snippet.py"),
+            ["snippet.py:2 proc_stat_fields"],
+            "a pid passed by keyword reads the same process as a positional one",
+        )
+
+
 class TeardownProbeGuards(unittest.TestCase):
     """The probe imported `reap_disk` but not the RULE that governs it.
 
@@ -3851,14 +3938,10 @@ class TeardownProbeGuards(unittest.TestCase):
                 self.assertTrue(row["disk_reap_skipped"])
                 deadline = time.monotonic() + 5
                 while time.monotonic() < deadline:
-                    if all(reqbench.proc_stat_fields(k) is None
-                           or reqbench.proc_stat_fields(k)[0] in ("Z", "X", "x")
-                           for k in kids):
+                    if not any(process_running(k) for k in kids):
                         break
                     time.sleep(0.01)
-                alive = [k for k in kids
-                         if reqbench.proc_stat_fields(k) is not None
-                         and reqbench.proc_stat_fields(k)[0] not in ("Z", "X", "x")]
+                alive = [k for k in kids if process_running(k)]
                 self.assertEqual(alive, [], "a survivor must be SIGKILLed, not left")
             finally:
                 kill_tree(p)
