@@ -22,7 +22,7 @@ bincode = "1.3"
 libc = "0.2"
 anyhow = "1"
 thiserror = "1"
-nix = { version = "0.29", features = ["fs", "user"] }
+nix = { version = "0.30", features = ["fs", "user"] }
 crossbeam-channel = "0.5"
 
 # Async runtime
