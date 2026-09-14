@@ -1732,6 +1732,111 @@ esac
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// "Save disk I/O record" must save a finished record of this job's own sampler. It ran
+/// `pkill -x iostat` and copied `/tmp/fcvm-iostat.log` straight away: the copy raced the
+/// sampler's last write, and on a runner that streams jobs, a job whose sampler never
+/// started copied the log an earlier job left in `/tmp` (CodeRabbit on #924).
+#[test]
+fn disk_io_record_is_this_jobs_and_complete() {
+    let ci = parse_workflow("ci.yml");
+    let dir = std::env::temp_dir().join(format!("fcvm-iostat-record-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let bin = dir.join("bin");
+    std::fs::create_dir_all(&bin).expect("temp dir");
+    for (name, body) in [
+        // One sample at once, and on SIGTERM a last one half a second later, the way a
+        // report in progress lands. It exits by itself after 20 s, so a missed stop leaks
+        // nothing.
+        (
+            "iostat",
+            "#!/bin/bash\ntrap 'sleep 0.5; echo last-sample; exit 0' TERM\necho first-sample\nfor _ in $(seq 200); do sleep 0.1; done\n",
+        ),
+        ("lsblk", "#!/bin/bash\necho nvme0n1\n"),
+    ] {
+        let path = bin.join(name);
+        std::fs::write(&path, body).expect("write fake command");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("make fake command executable");
+    }
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut problems = Vec::new();
+    for job in ["host", "host-root", "container"] {
+        let steps = workflow_job(&ci, job)
+            .get("steps")
+            .and_then(Value::as_sequence)
+            .unwrap_or_else(|| panic!("`{job}` job has no `steps:`"));
+        let run_of = |name: &str| {
+            steps
+                .iter()
+                .find(|step| step.get("name").and_then(Value::as_str) == Some(name))
+                .and_then(|step| step.get("run"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("`{job}` has no `{name}` step with a `run:` script"))
+                .to_string()
+        };
+        let create = run_of("Create test log directory");
+        let save = run_of("Save disk I/O record");
+        for (name, script) in [
+            ("Create test log directory", &create),
+            ("Save disk I/O record", &save),
+        ] {
+            if script.contains("pkill") {
+                problems.push(format!(
+                    "`{job}` \"{name}\" signals every iostat on the host, not its own sampler's PID"
+                ));
+            }
+            if script.contains("/tmp/fcvm-iostat") {
+                problems.push(format!(
+                    "`{job}` \"{name}\" keeps the sampler's files in /tmp, where an earlier job's survive, not $RUNNER_TEMP"
+                ));
+            }
+        }
+
+        let temp = dir.join(job);
+        let logs = dir.join(format!("{job}-logs"));
+        std::fs::create_dir_all(&temp).expect("runner temp dir");
+        let run = |script: &str| {
+            std::process::Command::new("bash")
+                .arg("-c")
+                .arg(script.replace("/tmp/fcvm-test-logs", &logs.display().to_string()))
+                .env("PATH", &path)
+                .env("RUNNER_TEMP", &temp)
+                .output()
+                .expect("bash must be runnable")
+        };
+        let start = create
+            .find("setsid")
+            .map(|at| &create[at..])
+            .unwrap_or_else(|| panic!("`{job}` starts no iostat sampler"));
+        let started = run(start);
+        assert!(
+            started.status.success(),
+            "`{job}` sampler start failed: {}",
+            String::from_utf8_lossy(&started.stderr)
+        );
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        let saved = run(&save);
+        assert!(
+            saved.status.success(),
+            "`{job}` \"Save disk I/O record\" failed: {}",
+            String::from_utf8_lossy(&saved.stderr)
+        );
+        let record = std::fs::read_to_string(logs.join("iostat.log")).unwrap_or_default();
+        if !(record.contains("first-sample") && record.contains("last-sample")) {
+            problems.push(format!(
+                "`{job}` saved {record:?}: copied before the sampler had finished writing"
+            ));
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(problems.is_empty(), "{}", problems.join("\n"));
+}
+
 /// Every self-hosted job ci.yml can run, under the names GitHub gives them.
 const SELF_HOSTED_JOBS: [&str; 8] = [
     "Host-arm64",
