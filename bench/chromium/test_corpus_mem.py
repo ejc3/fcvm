@@ -34,7 +34,7 @@ import threading
 import textwrap
 import time
 import unittest
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
 from unittest import mock
 
@@ -294,6 +294,43 @@ def kill_and_reap_test_process_group(process):
     except ProcessLookupError:
         pass
     return process.communicate(timeout=5)
+
+
+@contextmanager
+def reaps_adopted_descendants(test, timeout=30):
+    """Adopt what the body's processes leave behind and wait for it to exit.
+
+    hostcdp.sh's lifecycle guardian detaches from the producer and keeps writing
+    under the test's tmp after the producer is killed. As a child subreaper this
+    process becomes that guardian's parent, so leaving the block waits for it
+    instead of racing its cleanup. Reap the producer inside the block: the drain
+    reaps every exited child, which would take a Popen's exit status.
+    """
+    original = phase_supervisor.get_process_control(
+        phase_supervisor.PR_GET_CHILD_SUBREAPER)
+    phase_supervisor.become_subreaper()
+    try:
+        yield
+    finally:
+        try:
+            deadline = time.monotonic() + timeout
+            while phase_supervisor.direct_children_remain():
+                if time.monotonic() >= deadline:
+                    live = phase_supervisor.direct_live_children(os.getpid())
+                    phase_supervisor.signal_direct_children(
+                        live, os.getpid(), signal.SIGKILL)
+                    reap_deadline = time.monotonic() + 5
+                    while (phase_supervisor.direct_children_remain()
+                           and time.monotonic() < reap_deadline):
+                        time.sleep(0.01)
+                    test.fail(
+                        "processes adopted from the test were still running "
+                        f"after {timeout}s: "
+                        f"{phase_supervisor.format_identities(live)}")
+                time.sleep(0.01)
+        finally:
+            phase_supervisor.set_process_control(
+                phase_supervisor.PR_SET_CHILD_SUBREAPER, original)
 
 
 def communicate_test_process_group(process, timeout):
@@ -1388,6 +1425,80 @@ class RunScopedContainerCleanup(unittest.TestCase):
                          ["container", "fcvm", "fcvm", "cgroup", "output"])
 
 
+class ProducerKillDrainsAdoptedDescendants(unittest.TestCase):
+    """A test that SIGKILLs a hostcdp producer waits for what outlives it.
+
+    hostcdp.sh starts a detached phase_supervisor guardian that outlives the
+    producer by design. Its cleanup keeps creating files under the test's tmp
+    after the fake `podman rm` removes `.name`: `exists-called`, then
+    `results/WITHDRAWN`, then `inspect-called`. A test that leaves its
+    TemporaryDirectory while that guardian runs races it, and on main 750b5ae5
+    (CI run 34792491419) test_sigkill_during_create_commit_reaps_the_owned_container
+    failed with `OSError: [Errno 39] Directory not empty`.
+
+    RED BEFORE THE FIX: `['HostCdpProducer.test_sigkill_after_start_reaps_the_standalone_container',
+    'HostCdpProducer.test_sigkill_during_create_commit_reaps_the_owned_container',
+    'HostCdpProducer.test_hung_create_timeout_cleanup_reaps_the_process_tree'] != []`.
+    """
+
+    def test_every_hostcdp_producer_kill_runs_inside_the_drain(self):
+        with open(__file__) as handle:
+            tree = ast.parse(handle.read(), filename=__file__)
+
+        def is_hostcdp_popen(node):
+            return (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr == "Popen"
+                    and node.args
+                    and isinstance(node.args[0], ast.List)
+                    and any(isinstance(item, ast.Name) and item.id == "HOSTCDP"
+                            for item in node.args[0].elts))
+
+        def is_producer_sigkill(node):
+            return (isinstance(node, ast.Call)
+                    and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in ("kill", "killpg")
+                    and isinstance(node.func.value, ast.Name)
+                    and node.func.value.id == "os"
+                    and len(node.args) == 2
+                    and isinstance(node.args[0], ast.Attribute)
+                    and node.args[0].attr == "pid"
+                    and isinstance(node.args[0].value, ast.Name)
+                    and node.args[0].value.id == "producer"
+                    and isinstance(node.args[1], ast.Attribute)
+                    and node.args[1].attr == "SIGKILL")
+
+        unguarded = []
+        for cls in tree.body:
+            if not isinstance(cls, ast.ClassDef):
+                continue
+            for method in cls.body:
+                if (not isinstance(method, ast.FunctionDef)
+                        or not method.name.startswith("test_")):
+                    continue
+                nodes = list(ast.walk(method))
+                spawns = [node for node in nodes if is_hostcdp_popen(node)]
+                kills = [node for node in nodes if is_producer_sigkill(node)]
+                if not spawns or not kills:
+                    continue
+                drained = set()
+                for node in nodes:
+                    if isinstance(node, ast.With) and any(
+                            isinstance(item.context_expr, ast.Call)
+                            and isinstance(item.context_expr.func, ast.Name)
+                            and item.context_expr.func.id
+                            == "reaps_adopted_descendants"
+                            for item in node.items):
+                        drained.update(id(inner) for inner in ast.walk(node))
+                if any(id(node) not in drained for node in spawns + kills):
+                    unguarded.append(f"{cls.name}.{method.name}")
+        self.assertEqual(
+            unguarded, [],
+            "spawn and SIGKILL the hostcdp producer inside "
+            "reaps_adopted_descendants so its guardian exits before tmp is removed",
+        )
+
+
 class HostCdpProducer(unittest.TestCase):
     """The standalone host control publishes one owned, attributable run."""
 
@@ -1829,7 +1940,7 @@ exec {real_date!r} "$@"
         detached container started, leaving its state present and recording no
         removal.
         """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, reaps_adopted_descendants(self):
             started = os.path.join(tmp, "driver-started")
             release = os.path.join(tmp, "driver-release")
             env, removed, state = self.environment(
@@ -1880,7 +1991,7 @@ exec {real_date!r} "$@"
         death, but nothing surviving the producer inspected and removed the
         container that had already committed.
         """
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, reaps_adopted_descendants(self):
             env, removed, state = self.environment(tmp, mode="committed-wait")
             producer = subprocess.Popen(
                 ["bash", HOSTCDP], env=env, stdout=subprocess.PIPE,
@@ -2064,7 +2175,7 @@ exec {real_date!r} "$@"
             )
 
     def test_hung_create_timeout_cleanup_reaps_the_process_tree(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, reaps_adopted_descendants(self):
             env, _removed, _state = self.environment(
                 tmp, mode="hung-create", PODMAN_CREATE_TIMEOUT_SECS="30",
                 PODMAN_CREATE_KILL_AFTER_SECS="1",
