@@ -89,6 +89,9 @@ struct Case {
     /// Close our end of the client's stdout once this many bytes have arrived,
     /// as `| head -1` does.
     close_stdout_after: Option<usize>,
+    /// Some podman versions never return here. That is their defect, not a
+    /// behaviour to match: when the reference hangs, fcvm must still return.
+    reference_may_hang: bool,
 }
 
 fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) -> Case {
@@ -104,6 +107,7 @@ fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) ->
         rust_log: None,
         container_only: false,
         close_stdout_after: None,
+        reference_may_hang: false,
     }
 }
 
@@ -141,6 +145,10 @@ impl Case {
     }
     fn container_only(mut self) -> Self {
         self.container_only = true;
+        self
+    }
+    fn reference_may_hang(mut self) -> Self {
+        self.reference_may_hang = true;
         self
     }
 }
@@ -205,7 +213,10 @@ fn cases(env_file: &str) -> Vec<Case> {
             &[],
             "[ -t 0 ] && echo tty0 || echo notty0; [ -t 1 ] && echo tty1 || echo notty1",
         ),
-        sh("plain_term_unset", &[], "echo TERM=${TERM-unset}"),
+        // TERM without -t is not compared. It is whatever the container's
+        // environment holds, and podman versions differ on whether a container
+        // gets TERM=xterm by default. fc-agent's
+        // `term_is_not_inherited_without_a_pty` pins that fcvm adds none.
         sh("plain_args_with_hyphens", &[], "echo \"$@\"").with_args(&["_", "-la", "--foo", "-x"]),
         case(
             "plain_args_with_spaces_and_quotes",
@@ -301,7 +312,9 @@ fn cases(env_file: &str) -> Vec<Case> {
             .input(Input::Bytes(b"hello\n".to_vec())),
         case("i_cat_empty_input", &["-i"], &["cat"]).input(Input::Bytes(Vec::new())),
         case("i_cat_dev_null", &["-i"], &["cat"]),
-        case("i_cat_closed_stdin", &["-i"], &["cat"]).input(Input::Closed),
+        case("i_cat_closed_stdin", &["-i"], &["cat"])
+            .input(Input::Closed)
+            .reference_may_hang(),
         case("i_wc_1mib", &["-i"], &["wc", "-c"]).input(Input::Bytes(vec![b'z'; 1 << 20])),
         case("i_binary_roundtrip", &["-i"], &["cat"]).input(Input::Bytes(all_bytes.repeat(1024))),
         case("i_no_trailing_newline", &["-i"], &["cat"]).input(Input::Bytes(b"abc".to_vec())),
@@ -705,6 +718,12 @@ fn show(bytes: &[u8]) -> String {
 
 /// Compare one target's outcome with podman's. Returns the mismatches.
 fn differences(case: &Case, podman: &Outcome, fcvm: &Outcome) -> Vec<String> {
+    if case.reference_may_hang && podman.exit.is_none() {
+        return match fcvm.exit {
+            Some(_) => Vec::new(),
+            None => vec!["returned: fcvm false, and the reference hanging is no reason to".into()],
+        };
+    }
     let mut found = Vec::new();
     for check in case.checks {
         let (same, what) = match check {
@@ -852,7 +871,13 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 prefix.extend(case.command.iter().cloned());
                 prefix
             };
-            let expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
+            let mut expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
+            // podman's own failures are sometimes transient under load (seen: a
+            // user lookup in the image failing once). One that is real repeats.
+            if expected.stderr.starts_with(b"Error:") {
+                println!("  {:44} podman reported {}; asking again", case.name, show(&expected.stderr));
+                expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
+            }
             let report = |label: &str, outcome: &Outcome| {
                 println!(
                     "  {:44} {:16} exit {:?} in {:.2?}",
@@ -875,7 +900,10 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
             }
         }
         // A detached command really runs: it leaves a marker that a later exec sees.
-        // With -t it has a terminal and no TERM, and what it reports must match.
+        // With -t it has a terminal of its own. TERM is not compared: whether a
+        // container's environment holds one differs between podman versions.
+        // fc-agent's `a_detached_tty_command_has_a_terminal_and_outlives_the_session`
+        // pins that fcvm adds none, as podman 5.8 does.
         let mut detached_terminals = Vec::new();
         for (label, prefix, separator) in [
             ("podman exec", podman.clone(), reference.0.clone()),
@@ -915,7 +943,7 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
 
             let report = format!("{marker}-tty");
             let script = format!(
-                "exec 3>{report}.part; tty >&3; echo TERM in the environment: $(env | grep -c '^TERM=') >&3; echo unread; \
+                "exec 3>{report}.part; tty >&3; echo unread; \
                  mv {report}.part {report}; sleep 30"
             );
             run_with(&["-d", "-t"], &["sh", "-c", &script])?;

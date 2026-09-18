@@ -523,6 +523,14 @@ impl StateManager {
                             );
                         }
                     },
+                    // A VM that exits deletes its state file, and this scan can
+                    // be between the directory entry and the read. Not an error.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        tracing::debug!(
+                            path = %path.display(),
+                            "list_vms: state file vanished during the scan"
+                        );
+                    }
                     Err(e) => {
                         tracing::warn!(
                             path = %path.display(),
@@ -772,6 +780,69 @@ impl StateManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Everything `list_vms` logs at WARN or above while scanning `dir`.
+    fn warnings_from_listing(dir: &std::path::Path) -> (usize, String) {
+        #[derive(Clone, Default)]
+        struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+            type Writer = Captured;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(captured.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+        let manager = StateManager::new(dir.to_path_buf());
+        let listed = tracing::subscriber::with_default(subscriber, || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(manager.list_vms())
+                .expect("list_vms")
+                .len()
+        });
+        let log = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        (listed, log)
+    }
+
+    /// A VM that exits deletes its state file, and another process may be
+    /// listing the directory at that moment. That is not worth a warning: the
+    /// default log level prints warnings, and `fcvm exec` shares its stderr
+    /// with the command it runs.
+    #[test]
+    fn a_state_file_that_vanishes_during_a_listing_is_not_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        // Listed by read_dir, gone by the time it is read.
+        std::os::unix::fs::symlink(dir.path().join("deleted"), dir.path().join("vm-gone.json"))
+            .unwrap();
+        let (listed, log) = warnings_from_listing(dir.path());
+        assert_eq!(listed, 0);
+        assert_eq!(log, "", "a vanished state file was reported");
+    }
+
+    /// Control for the test above: the capture does see `list_vms` warn.
+    #[test]
+    fn an_unparsable_state_file_is_still_a_warning() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vm-bad.json"), "not json").unwrap();
+        let (listed, log) = warnings_from_listing(dir.path());
+        assert_eq!(listed, 0);
+        assert!(log.contains("failed to parse state file"), "{log:?}");
+    }
 
     #[test]
     fn state_lock_waiter_rejects_unlinked_inode() {
