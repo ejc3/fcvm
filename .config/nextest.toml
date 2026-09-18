@@ -147,6 +147,18 @@ filter = "package(fcvm) & (test(/snapshot/) | test(/clone/))"
 test-group = "snapshot-tests"
 slow-timeout = { period = "600s", terminate-after = 1 }
 
+# The exec flood test fails on a guest kernel that starves its own threads
+# (tests/test_exec_flood.rs). Its first version failed on the broken kernel,
+# passed on the retry, and the run exited 0 with a "flaky" footnote, so it is
+# never retried. Listed before the vm-tests override so it wins.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(=test_a_container_flooding_conmon_leaves_the_vm_reachable)"
+test-group = "vm-tests"
+# Alone, so that its 3 s ceiling measures the guest and not the other tests' load.
+threads-required = "num-test-threads"
+slow-timeout = { period = "600s", terminate-after = 1 }
+retries = 0
+
 # VM tests get 10 minute timeout (non-snapshot tests)
 [[profile.default.overrides]]
 filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/) & !test(/snapshot/) & !test(/clone/)"

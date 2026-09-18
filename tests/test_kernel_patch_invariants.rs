@@ -4,6 +4,30 @@ use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
 
+/// The excerpts in `fixtures/vncr/nested.c` stand in for the pinned kernel's
+/// source. When the pin moved without them, the test below kept applying the
+/// patch to a file the build never sees, and stayed green while the patch no
+/// longer applied to the pinned kernel.
+#[test]
+fn the_vncr_fixture_is_cut_from_the_pinned_arm64_kernel() {
+    let config: toml::Value = toml::from_str(
+        &fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rootfs-config.toml"))
+            .expect("read rootfs-config.toml"),
+    )
+    .expect("parse rootfs-config.toml");
+    let pinned = config["kernel_profiles"]["nested"]["arm64"]["kernel_version"]
+        .as_str()
+        .expect("nested.arm64 pins a kernel_version");
+    let fixture = include_str!("fixtures/vncr/nested.c");
+    assert!(
+        fixture.contains(&format!("Linux v{pinned} arch/arm64/kvm/nested.c")),
+        "tests/fixtures/vncr/nested.c is not cut from the pinned Linux {pinned}. Cut the \
+         excerpts again from that release's arch/arm64/kvm/nested.c and record its SHA-256 in \
+         the header. Editing the header alone hides a stale fixture: the file is the same from \
+         6.18.44 to 6.18.50 and changes in 6.18.51"
+    );
+}
+
 /// Exercise the actual stable-kernel functions after applying our carried fix.
 /// Stub only their dependencies, so removing the production patch reintroduces
 /// the stale CPU/flag/count state without running a kernel-crashing NV2 guest.
