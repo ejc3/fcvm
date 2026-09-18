@@ -37,7 +37,7 @@ pub async fn run() -> Result<()> {
                 if crate::vitals::sample_due(previous, tick) {
                     eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
                 }
-                if let Some(line) = pileup.tick() {
+                if let Some(line) = pileup.tick(tick) {
                     eprintln!("[fcvm-vitals] pileup {line}");
                 }
                 // To the next deadline still ahead, so a slow scan neither

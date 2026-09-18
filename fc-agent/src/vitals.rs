@@ -275,9 +275,13 @@ pub fn sample_due(previous: Option<u64>, tick: u64) -> bool {
     previous.is_none_or(|previous| previous / 10 != tick / 10)
 }
 
-/// Whether the `piled_for`-th consecutive piled-up second gets a line.
-fn prints_on(piled_for: u32) -> bool {
-    piled_for <= PILEUP_EVERY_SECOND_FOR || piled_for.is_multiple_of(10)
+/// Whether a pile-up that began at second `since` prints at second `tick`,
+/// having last printed at `last`. Seconds are the sampler's clock, not a count
+/// of scans: a scan that overruns skips seconds, and both the 30 s of
+/// per-second lines and the 10 s between lines after that are in seconds.
+fn prints_at(since: u64, last: Option<u64>, tick: u64) -> bool {
+    tick.saturating_sub(since) < u64::from(PILEUP_EVERY_SECOND_FOR)
+        || last.is_none_or(|last| tick.saturating_sub(last) >= 10)
 }
 
 /// Every thread's /proc directory and stat line plus the number of unreadable
@@ -532,7 +536,8 @@ fn format_pileup(
 /// The sampler's once-a-second pile-up check.
 #[derive(Default)]
 pub struct Pileup {
-    piled_for: u32,
+    since: Option<u64>,
+    last: Option<u64>,
     said_unavailable: bool,
     vsock: Option<Option<String>>,
 }
@@ -540,8 +545,8 @@ pub struct Pileup {
 impl Pileup {
     /// The line to print this second, if any: which threads are runnable while
     /// many are, or, once, why that cannot be told.
-    pub fn tick(&mut self) -> Option<String> {
-        match self.line() {
+    pub fn tick(&mut self, now: u64) -> Option<String> {
+        match self.line(now) {
             Ok(line) => line,
             Err(_) if self.said_unavailable => None,
             Err(error) => {
@@ -551,15 +556,24 @@ impl Pileup {
         }
     }
 
-    fn line(&mut self) -> Result<Option<String>, String> {
+    /// Whether a line is due at second `now` of a pile-up, which this records.
+    fn due(&mut self, now: u64) -> bool {
+        let since = *self.since.get_or_insert(now);
+        let due = prints_at(since, self.last, now);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    fn line(&mut self, now: u64) -> Result<Option<String>, String> {
         let loadavg = read_proc("/proc/loadavg")?;
         let stat = read_proc("/proc/stat")?;
         let Some(counts) = piled_up(&loadavg, &stat)? else {
-            self.piled_for = 0;
+            (self.since, self.last) = (None, None);
             return Ok(None);
         };
-        self.piled_for = self.piled_for.saturating_add(1);
-        if !prints_on(self.piled_for) {
+        if !self.due(now) {
             return Ok(None);
         }
         let vsock = self.vsock.get_or_insert_with(vsock_device).clone();
@@ -569,7 +583,9 @@ impl Pileup {
         };
         let up = read_proc("/proc/uptime").unwrap_or_default();
         let up = up.split_whitespace().next().unwrap_or("?");
-        let suffix = if self.piled_for > PILEUP_EVERY_SECOND_FOR {
+        let suffix = if now.saturating_sub(self.since.unwrap_or(now))
+            >= u64::from(PILEUP_EVERY_SECOND_FOR)
+        {
             " (every 10th second now)"
         } else {
             ""
@@ -814,13 +830,22 @@ mod tests {
         assert!(piled_up("4.11 1.06 0.36 16/133 2343", "cpu0 1 0 1 1 0 0 0 0 0 0\n").is_err());
     }
 
+    /// A pile-up whose scans take 5 s each: a line per scan for the first 30 s
+    /// of the pile-up, then one per 10 s, both by the sampler's clock. Counting
+    /// scans would keep a line per scan going for thirty scans, 150 s here.
     #[test]
-    fn a_long_pileup_is_printed_every_second_then_every_tenth() {
-        assert!((1..=30).all(prints_on));
-        assert_eq!(
-            (31..=60).filter(|&n| prints_on(n)).collect::<Vec<_>>(),
-            vec![40, 50, 60]
-        );
+    fn a_long_pileup_is_paced_in_seconds_not_in_scans() {
+        let mut pileup = Pileup::default();
+        let printed: Vec<u64> = (0..=60)
+            .step_by(5)
+            .filter(|&tick| pileup.due(tick))
+            .collect();
+        assert_eq!(printed, vec![0, 5, 10, 15, 20, 25, 35, 45, 55]);
+        // One scan a second: every second for 30 s, then every tenth.
+        let mut pileup = Pileup::default();
+        let printed: Vec<u64> = (100..=160).filter(|&tick| pileup.due(tick)).collect();
+        assert_eq!(printed.len(), 33, "{printed:?}");
+        assert_eq!(&printed[30..], &[139, 149, 159]);
     }
 
     fn threads(lines: &[&str]) -> ThreadScan {
