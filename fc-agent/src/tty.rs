@@ -355,26 +355,55 @@ enum StdinSink {
 /// is the point of -d, and the one case where #636 does not apply.
 async fn run_detached(spec: &SessionSpec, writer: &FrameWriter) -> i32 {
     let started = base_command(spec).and_then(|(mut cmd, identity)| {
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::null());
-        cmd.stderr(Stdio::null());
+        // With -t the command gets a terminal of its own and no TERM, which is
+        // what `podman exec -d -t` gives it. Without -t it gets /dev/null.
+        let terminal = if spec.tty {
+            let (master, slave) = open_pty()?;
+            if let Some(size) = spec.size {
+                set_winsize(master.as_raw_fd(), size)?;
+            }
+            cmd.stdin(Stdio::from(slave.try_clone()?));
+            cmd.stdout(Stdio::from(slave.try_clone()?));
+            cmd.stderr(Stdio::from(slave));
+            if !spec.env.iter().any(|(key, _)| key == "TERM") {
+                cmd.env_remove("TERM");
+            }
+            Some(master)
+        } else {
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            None
+        };
+        let has_terminal = terminal.is_some();
         unsafe {
-            cmd.pre_exec(|| {
+            cmd.pre_exec(move || {
                 if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if has_terminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
             });
         }
         run_as(&mut cmd, identity);
-        // tokio reaps a dropped child in the background once it exits.
-        cmd.spawn()
+        let child = cmd.spawn()?;
+        // Command holds the parent's copies of the terminal's slave side.
+        drop(cmd);
+        Ok((child, terminal))
+    });
+    let started = started.map(|(child, terminal)| {
+        let pid = child.id().unwrap_or(0);
+        match terminal {
+            Some(master) => hold_detached_terminal(master, child),
+            // tokio reaps a dropped child in the background once it exits.
+            None => drop(child),
+        }
+        pid
     });
     let (frame, code) = match started {
-        Ok(child) => {
-            let pid = child.id().unwrap_or(0);
-            (Message::Data(format!("{pid}\n").into_bytes()), 0)
-        }
+        Ok(pid) => (Message::Data(format!("{pid}\n").into_bytes()), 0),
         Err(e) => {
             let code = if e.kind() == std::io::ErrorKind::NotFound {
                 EXIT_NOT_FOUND
@@ -455,6 +484,29 @@ fn resolve_identity(spec: &str) -> std::io::Result<Identity> {
         groups,
         home: known.map(|user| user.dir),
     })
+}
+
+/// Keep a detached command's terminal open and empty for as long as the
+/// command lives. Nobody reads it, but closing the master would hang the
+/// command up, and a full terminal would block its writes.
+fn hold_detached_terminal(master: OwnedFd, mut child: tokio::process::Child) {
+    tokio::spawn(async move {
+        match AsyncFdStream::new(master) {
+            Ok(mut master) => {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut master, &mut buf).await {
+                        Ok(n) if n > 0 => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        // Hung up: every holder of the terminal has gone.
+                        _ => break,
+                    }
+                }
+            }
+            Err(e) => eprintln!("[fc-agent] exec: cannot hold a detached terminal: {e}"),
+        }
+        let _ = child.wait().await;
+    });
 }
 
 /// The command with its arguments, environment and directory, plus the

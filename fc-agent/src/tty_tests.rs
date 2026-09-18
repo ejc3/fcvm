@@ -456,6 +456,52 @@ async fn an_unknown_user_exits_126_without_running_the_command() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_detached_tty_command_has_a_terminal_and_outlives_the_session() {
+    // What `podman exec -d -t` gives a command: a terminal on its stdio, no
+    // TERM, and a life that goes on after the client has returned.
+    let report = std::env::temp_dir().join(format!("fc-agent-detached-tty-{}", std::process::id()));
+    let _ = std::fs::remove_file(&report);
+    let script = format!(
+        "exec 3>{path}; tty >&3; echo TERM in the environment: $(env | grep -c '^TERM=') >&3; \
+         echo written to the terminal nobody reads; sleep 1; echo late >&3; sleep 60",
+        path = report.display()
+    );
+    let mut session = sh(&script, true, false);
+    session.detach = true;
+    let outcome = run(session, vec![]).await;
+    assert_eq!(outcome.exit, Some(0));
+    let pid: i32 = String::from_utf8_lossy(&outcome.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a pid line, got {:?}", outcome.stdout));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let text = loop {
+        let text = std::fs::read_to_string(&report).unwrap_or_default();
+        if text.contains("late") || Instant::now() > deadline {
+            break text;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    unsafe { libc::kill(pid, libc::SIGKILL) };
+    let _ = std::fs::remove_file(&report);
+
+    let lines: Vec<&str> = text.lines().collect();
+    assert!(
+        lines
+            .first()
+            .is_some_and(|line| line.starts_with("/dev/pts/")),
+        "the command had no terminal: {text:?}"
+    );
+    // Counted in the environment: some shells invent a TERM variable of their own.
+    assert_eq!(
+        &lines[1..],
+        ["TERM in the environment: 0", "late"],
+        "{text:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn a_detached_command_outlives_the_session_in_its_own_session() {
     let mut session = spec(&["sleep", "60"], false, false);
     session.detach = true;

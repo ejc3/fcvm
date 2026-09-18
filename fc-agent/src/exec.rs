@@ -462,8 +462,9 @@ fn session_spec(request: &ExecRequest) -> crate::tty::SessionSpec {
         argv,
         env,
         // A detached command keeps nothing attached here. For a container,
-        // `-d -t` went to podman above, which gives the command its own TTY.
-        tty: request.tty && !request.detach,
+        // `-d -t` went to podman above, which gives the command its own TTY;
+        // for a guest command fc-agent does the same.
+        tty: request.tty && !(request.detach && request.in_container),
         interactive: request.interactive && !request.detach,
         size: request.tty_size,
         raw_pty: request.in_container,
@@ -501,6 +502,21 @@ mod tests {
             .expect("argv runs podman exec");
         assert_eq!(spec.argv[exec - 1], "podman");
         spec.argv[exec + 1..].iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_detached_guest_command_keeps_its_tty() {
+        // fc-agent starts a guest command itself, so it allocates the terminal
+        // that podman would. A detached command takes no stdin either way.
+        let spec = session_spec(&ExecRequest {
+            command: vec!["true".to_string()],
+            in_container: false,
+            interactive: true,
+            tty: true,
+            detach: true,
+            ..Default::default()
+        });
+        assert!(spec.detach && spec.tty && !spec.interactive);
     }
 
     #[test]

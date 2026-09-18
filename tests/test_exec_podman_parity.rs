@@ -875,6 +875,8 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
             }
         }
         // A detached command really runs: it leaves a marker that a later exec sees.
+        // With -t it has a terminal and no TERM, and what it reports must match.
+        let mut detached_terminals = Vec::new();
         for (label, prefix, separator) in [
             ("podman exec", podman.clone(), reference.0.clone()),
             ("fcvm exec", fcvm(false), "--".to_string()),
@@ -909,6 +911,36 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                     "detached_command_runs [{label}] started ok: {}, identifier lines: {identifier_lines}, marker seen: {seen}",
                     started.status.success()
                 ));
+            }
+
+            let report = format!("{marker}-tty");
+            let script = format!(
+                "exec 3>{report}.part; tty >&3; echo TERM in the environment: $(env | grep -c '^TERM=') >&3; echo unread; \
+                 mv {report}.part {report}; sleep 30"
+            );
+            run_with(&["-d", "-t"], &["sh", "-c", &script])?;
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let text = loop {
+                let shown = run_with(&[], &["cat", &report])?;
+                if shown.status.success() || Instant::now() > deadline {
+                    break String::from_utf8_lossy(&shown.stdout).into_owned();
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            };
+            // Which pts it is differs; that it is one does not.
+            let text = match text.strip_prefix("/dev/pts/") {
+                Some(rest) => format!("/dev/pts/N{}", rest.trim_start_matches(|c: char| c.is_ascii_digit())),
+                None => text,
+            };
+            detached_terminals.push((label, text));
+        }
+        let expected = detached_terminals[0].1.clone();
+        if !expected.starts_with("/dev/pts/N") {
+            failures.push(format!("detached_tty_command [podman exec] reported {expected:?}, expected a terminal"));
+        }
+        for (label, text) in &detached_terminals[1..] {
+            if *text != expected {
+                failures.push(format!("detached_tty_command [{label}] podman {expected:?} fcvm {text:?}"));
             }
         }
 

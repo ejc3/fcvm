@@ -1338,7 +1338,7 @@ The guest is configured to support rootless Podman:
 | `-e`, `--env-file` | Environment | Resolved on the host into `KEY=VALUE`, files first so `-e` wins |
 | `-w`, `-u` | Directory, user | `podman exec` applies them in a container; fc-agent applies them to a guest command |
 | `--privileged` | Extended capabilities | Container only; a `--vm` command is already the guest's root |
-| `-d` | Detach | Returns one identifier line and exit 0; the command keeps running |
+| `-d` | Detach | Returns one identifier line and exit 0; the command keeps running. With `-t` it has a terminal of its own and no `TERM`, as under podman |
 
 `-t` does not need a terminal on the host. With a pipe or file on stdin the guest still allocates the PTY and the host skips raw mode, as `podman exec -t` does.
 
