@@ -563,6 +563,12 @@ pub struct Pileup {
     vsock: Option<Option<String>>,
 }
 
+/// The line that says, once, why a pile-up cannot be told. The error can carry
+/// a whole malformed /proc file, so it is bounded like every other line.
+fn unavailable_line(error: &str) -> String {
+    bounded(format!("unavailable: {error}"), PILEUP_LIMIT)
+}
+
 impl Pileup {
     /// The line to print this second, if any: which threads are runnable while
     /// many are, or, once, why that cannot be told.
@@ -572,7 +578,7 @@ impl Pileup {
             Err(_) if self.said_unavailable => None,
             Err(error) => {
                 self.said_unavailable = true;
-                Some(format!("unavailable: {error}"))
+                Some(unavailable_line(&error))
             }
         }
     }
@@ -725,6 +731,17 @@ pub fn snapshot_bounded(budget: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_unavailable_line_is_bounded_like_every_other_line() {
+        let line = unavailable_line(&"9".repeat(PILEUP_LIMIT * 4));
+        assert!(line.len() <= PILEUP_LIMIT, "{} bytes", line.len());
+        assert!(line.ends_with("...truncated"), "{line}");
+        assert_eq!(
+            unavailable_line("/proc/loadavg: no runnable count"),
+            "unavailable: /proc/loadavg: no runnable count"
+        );
+    }
 
     /// `read_dir` can succeed and its iterator still fail. An entry that fails
     /// for any reason but having vanished is a thread left out of the scan.
