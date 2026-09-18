@@ -1,14 +1,11 @@
-use std::io::Write;
-use std::os::fd::{AsRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::unix::AsyncFd;
-use tokio::io::{AsyncBufReadExt, BufReader};
-use tokio::sync::{Mutex, Notify};
+use exec_proto::ExecRequest;
+use tokio::sync::Notify;
 
-use crate::types::{ExecRequest, ExecResponse};
 use crate::vsock;
 
 /// Overall deadline for the pre-execution handshake (request line, ACK write,
@@ -165,42 +162,6 @@ async fn do_re_register(listener: vsock::VsockListener) -> vsock::VsockListener 
                     }
                 }
             }
-        }
-    }
-}
-
-/// Async write helper — writes a JSON line to the vsock fd using AsyncFd.
-async fn write_line_async(conn: &AsyncFd<OwnedFd>, data: &str) {
-    let bytes = format!("{}\n", data);
-    let buf = bytes.as_bytes();
-    let mut pos = 0;
-    while pos < buf.len() {
-        let mut guard = match conn.writable().await {
-            Ok(g) => g,
-            Err(_) => break,
-        };
-        match guard.try_io(|inner| {
-            let n = unsafe {
-                libc::write(
-                    inner.as_raw_fd(),
-                    buf[pos..].as_ptr().cast(),
-                    buf.len() - pos,
-                )
-            };
-            if n < 0 {
-                Err(std::io::Error::last_os_error())
-            } else if n == 0 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::WriteZero,
-                    "write returned 0",
-                ))
-            } else {
-                Ok(n as usize)
-            }
-        }) {
-            Ok(Ok(n)) => pos += n,
-            Ok(Err(_)) => break,
-            Err(_would_block) => continue,
         }
     }
 }
@@ -363,11 +324,14 @@ fn read_request_and_handshake(conn: OwnedFd, timeout: Duration) -> Option<(ExecR
                     // A pre-ACK Error line makes the client fail deterministically
                     // (Rejected); a silent close would read as no-ACK and trigger
                     // futile resends of the same oversized request.
-                    let response = ExecResponse::Error(format!(
-                        "Request line exceeds {} bytes",
-                        MAX_EXEC_LINE_LENGTH
-                    ));
-                    write_line_bounded(fd, deadline, &serde_json::to_string(&response).unwrap());
+                    write_line_bounded(
+                        fd,
+                        deadline,
+                        &exec_proto::rejection_line(&format!(
+                            "Request line exceeds {} bytes",
+                            MAX_EXEC_LINE_LENGTH
+                        )),
+                    );
                 }
                 LineReadError::Closed | LineReadError::Failed => {}
             }
@@ -378,15 +342,17 @@ fn read_request_and_handshake(conn: OwnedFd, timeout: Duration) -> Option<(ExecR
     let request: ExecRequest = match serde_json::from_slice(&line) {
         Ok(r) => r,
         Err(e) => {
-            let response = ExecResponse::Error(format!("Invalid request: {}", e));
-            write_line_bounded(fd, deadline, &serde_json::to_string(&response).unwrap());
+            write_line_bounded(
+                fd,
+                deadline,
+                &exec_proto::rejection_line(&format!("Invalid request: {}", e)),
+            );
             return None;
         }
     };
 
     if request.command.is_empty() {
-        let response = ExecResponse::Error("Empty command".to_string());
-        write_line_bounded(fd, deadline, &serde_json::to_string(&response).unwrap());
+        write_line_bounded(fd, deadline, &exec_proto::rejection_line("Empty command"));
         return None;
     }
 
@@ -441,270 +407,71 @@ async fn handle_connection(client_fd: OwnedFd) {
         Err(_) => return,   // task panicked or was cancelled (conn dropped with it)
     };
 
-    // TTY path: must be blocking (fork/PTY)
-    if request.tty || request.interactive {
-        let command = if request.in_container {
-            let prefix = crate::container::podman_cmd_prefix();
-            let mut cmd: Vec<String> = prefix.to_vec();
-            cmd.extend(["podman".to_string(), "exec".to_string()]);
-            if request.interactive {
-                cmd.push("-i".to_string());
-            }
-            if request.tty {
-                cmd.push("-t".to_string());
-            }
-            for (key, value) in crate::system::read_proxy_settings() {
-                cmd.push("-e".to_string());
-                cmd.push(format!("{}={}", key, value));
-            }
-            cmd.push("--latest".to_string());
-            cmd.extend(request.command.iter().cloned());
-            cmd
-        } else {
-            request.command.clone()
-        };
-
-        tokio::task::spawn_blocking(move || {
-            // run_with_pty_fd takes ownership of the raw fd and closes it.
-            crate::tty::run_with_pty_fd(
-                conn.into_raw_fd(),
-                &command,
-                request.tty,
-                request.interactive,
-            );
-        });
-    } else {
-        // Pipe path: fully async
-        handle_pipe_async(conn, &request).await;
-    }
+    crate::tty::run_session(conn, session_spec(&request)).await;
 }
 
-/// Resolve when the vsock peer (host `fcvm exec`) closes the connection.
+/// Turn a request into the command fc-agent runs for it.
 ///
-/// Polls a dup'd, independent `AsyncFd` for readability and peeks one byte: 0 (EOF), or a
-/// reset/disconnect error (ECONNRESET/ENOTCONN/EPIPE), means the host is gone. In the
-/// non-TTY pipe path the host sends nothing after the handshake's GO line (which was fully
-/// consumed before this watcher exists — it only reads responses from here on), so any
-/// readable EOF is equivalent to "host gone" — used to kill the guest child (#636).
-async fn wait_for_peer_close(watch: &AsyncFd<OwnedFd>) {
-    loop {
-        let mut guard = match watch.readable().await {
-            Ok(g) => g,
-            Err(_) => return, // fd error -> treat as closed
-        };
-        let fd = watch.get_ref().as_raw_fd();
-        let mut byte = [0u8; 1];
-        let n = unsafe {
-            libc::recv(
-                fd,
-                byte.as_mut_ptr().cast(),
-                1,
-                libc::MSG_PEEK | libc::MSG_DONTWAIT,
-            )
-        };
-        if n == 0 {
-            return; // EOF: peer closed its write half
-        }
-        if n < 0 {
-            // EAGAIN/EWOULDBLOCK (same value on Linux): spurious readiness, keep watching.
-            // Any other error (ECONNRESET/ENOTCONN/EPIPE/…) means the peer is gone.
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN) {
-                guard.clear_ready();
-                continue;
-            }
-            return;
-        }
-        // n > 0: the host should send nothing after the handshake (it only reads responses,
-        // and never half-closes its write side while waiting — see the host exec client).
-        // This branch is therefore defensive: drain one byte and loop WITHOUT clear_ready
-        // (calling clear_ready after a successful read is a tokio anti-pattern). The fd
-        // stays marked ready, so the next readable() drains again until EAGAIN, which then
-        // clears readiness and parks until the eventual close edge.
-        let _ = unsafe { libc::recv(fd, byte.as_mut_ptr().cast(), 1, libc::MSG_DONTWAIT) };
-    }
-}
-
-async fn handle_pipe_async(conn: OwnedFd, request: &ExecRequest) {
+/// A container exec runs `podman exec` with the same -i and -t the client
+/// asked for, so podman attaches the container process the same way.
+fn session_spec(request: &ExecRequest) -> crate::tty::SessionSpec {
     let proxy_settings = crate::system::read_proxy_settings();
-
-    let mut cmd = if request.in_container {
-        let prefix = crate::container::podman_cmd_prefix();
-        let mut cmd = if prefix.is_empty() {
-            let mut c = tokio::process::Command::new("podman");
-            c.arg("exec");
-            c
-        } else {
-            // Run as target user: env XDG_RUNTIME_DIR=... runuser -u user -- podman exec
-            let mut c = tokio::process::Command::new(&prefix[0]);
-            c.args(&prefix[1..]);
-            c.arg("podman").arg("exec");
-            c
-        };
+    let (argv, env) = if request.in_container {
+        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+        argv.extend(["podman".to_string(), "exec".to_string()]);
         if request.interactive {
-            cmd.arg("-i");
+            argv.push("-i".to_string());
         }
-        for (key, value) in &proxy_settings {
-            cmd.arg("-e").arg(format!("{}={}", key, value));
+        if request.tty {
+            argv.push("-t".to_string());
         }
-        cmd.arg("--latest");
-        cmd.args(&request.command);
-        cmd
+        if request.detach {
+            argv.push("-d".to_string());
+        }
+        if request.privileged {
+            argv.push("--privileged".to_string());
+        }
+        if let Some(workdir) = &request.workdir {
+            argv.extend(["-w".to_string(), workdir.clone()]);
+        }
+        if let Some(user) = &request.user {
+            argv.extend(["-u".to_string(), user.clone()]);
+        }
+        // The request's entries come last, so they win over the proxy settings.
+        let proxy_env = proxy_settings
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"));
+        for entry in proxy_env.chain(request.env.iter().cloned()) {
+            argv.extend(["-e".to_string(), entry]);
+        }
+        argv.push("--latest".to_string());
+        argv.extend(request.command.iter().cloned());
+        (argv, Vec::new())
     } else {
-        let mut cmd = tokio::process::Command::new(&request.command[0]);
-        cmd.args(&request.command[1..]);
-        for (key, value) in &proxy_settings {
-            cmd.env(key, value);
-        }
-        cmd
+        let mut env = proxy_settings;
+        env.extend(request.env.iter().map(|entry| {
+            let (key, value) = entry.split_once('=').unwrap_or((entry, ""));
+            (key.to_string(), value.to_string())
+        }));
+        (request.command.clone(), env)
     };
-
-    cmd.stdout(std::process::Stdio::piped());
-    cmd.stderr(std::process::Stdio::piped());
-    if request.interactive {
-        cmd.stdin(std::process::Stdio::piped());
+    // In a container, podman applies the directory, the user and the detach.
+    // For a guest command fc-agent does.
+    let guest = !request.in_container;
+    crate::tty::SessionSpec {
+        argv,
+        env,
+        // A detached command keeps nothing attached here. For a container,
+        // `-d -t` went to podman above, which gives the command its own TTY.
+        tty: request.tty && !request.detach,
+        interactive: request.interactive && !request.detach,
+        size: request.tty_size,
+        raw_pty: request.in_container,
+        workdir: request.workdir.clone().filter(|_| guest),
+        user: request.user.clone().filter(|_| guest),
+        detach: request.detach && guest,
+        kill_on_disconnect: true,
     }
-    // Own process group so a host disconnect can kill the whole subtree (the command and
-    // anything it spawns), not just the immediate child (#636).
-    cmd.process_group(0);
-
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            // A spawn failure is the case a host-side pull can never diagnose:
-            // serving that pull would need this same fork. Carry the fork-free
-            // sample in the error itself.
-            let response = ExecResponse::Error(format!(
-                "Failed to spawn: {} | guest vitals: {}",
-                e,
-                crate::vitals::sample_line()
-            ));
-            // conn is still blocking here, so write_all delivers the whole line
-            // (retrying EINTR). A write error is ignored: the connection closes
-            // right after either way, when the File drops.
-            let line = format!("{}\n", serde_json::to_string(&response).unwrap());
-            let _ = std::fs::File::from(conn).write_all(line.as_bytes());
-            return;
-        }
-    };
-
-    // Capture the child's PID now (used as the PGID for killpg on host disconnect, #636).
-    let child_pid = child.id();
-
-    // Spawn succeeded: set non-blocking, then wrap in AsyncFd.
-    nix::fcntl::fcntl(
-        &conn,
-        nix::fcntl::FcntlArg::F_SETFL(nix::fcntl::OFlag::O_NONBLOCK),
-    )
-    .ok();
-    // Independent CLOEXEC dup of the connection for read-side peer-close detection. Polling
-    // readability on a separate fd avoids holding the write Mutex across readable().await
-    // (which would deadlock the stdout/stderr writer tasks). The two OwnedFds own distinct
-    // fd numbers, so there is no double-close. try_clone duplicates with F_DUPFD_CLOEXEC.
-    let peer_watch: Option<AsyncFd<OwnedFd>> = match conn.try_clone().and_then(AsyncFd::new) {
-        Ok(afd) => Some(afd),
-        // Extremely rare (fd exhaustion or reactor registration failure). Don't fail the
-        // exec, but don't fail silently either: without the watcher, host-disconnect kill
-        // is disabled for this exec (degrades to the pre-#636 wait-only behavior).
-        Err(e) => {
-            eprintln!(
-                "[fc-agent] WARN: peer-close watcher setup failed (dup or AsyncFd registration: {e}); \
-                 host-disconnect kill disabled for this exec"
-            );
-            None
-        }
-    };
-    let async_fd = match AsyncFd::new(conn) {
-        Ok(fd) => Arc::new(Mutex::new(fd)),
-        Err(_) => return, // fd closed by OwnedFd drop
-    };
-
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-
-    // Spawn async stdout reader
-    let conn_stdout = async_fd.clone();
-    let stdout_task = stdout.map(|stdout| {
-        tokio::spawn(async move {
-            let reader = BufReader::new(stdout);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let response = ExecResponse::Stdout(format!("{}\n", line));
-                let conn = conn_stdout.lock().await;
-                write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
-            }
-        })
-    });
-
-    // Spawn async stderr reader
-    let conn_stderr = async_fd.clone();
-    let stderr_task = stderr.map(|stderr| {
-        tokio::spawn(async move {
-            let reader = BufReader::new(stderr);
-            let mut lines = reader.lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let response = ExecResponse::Stderr(format!("{}\n", line));
-                let conn = conn_stderr.lock().await;
-                write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
-            }
-        })
-    });
-
-    // Wait for the child, but also watch for the host (vsock peer) disconnecting. If the
-    // host `fcvm exec` dies (e.g. host-side timeout, #622), the connection closes; without
-    // this we would `child.wait()` forever while the guest command keeps running (#636).
-    let mut peer_closed = false;
-    let exit_status = match peer_watch {
-        Some(watch) => {
-            tokio::select! {
-                status = child.wait() => status,
-                _ = wait_for_peer_close(&watch) => {
-                    peer_closed = true;
-                    if let Some(pid) = child_pid {
-                        // Negative pid -> the child's process group (process_group(0) above),
-                        // so the whole subtree is killed, not just the immediate child.
-                        unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
-                    }
-                    let _ = child.start_kill();
-                    child.wait().await
-                }
-            }
-        }
-        None => child.wait().await,
-    };
-
-    if peer_closed {
-        // Host is gone: stop the writer tasks (nothing to deliver to) and don't bother
-        // writing Exit. fds close on drop.
-        if let Some(task) = stdout_task {
-            task.abort();
-        }
-        if let Some(task) = stderr_task {
-            task.abort();
-        }
-        return;
-    }
-
-    if let Some(task) = stdout_task {
-        let _ = task.await;
-    }
-    if let Some(task) = stderr_task {
-        let _ = task.await;
-    }
-
-    let exit_code = match exit_status {
-        Ok(status) => status.code().unwrap_or(1),
-        Err(e) => {
-            let response = ExecResponse::Error(format!("Wait failed: {}", e));
-            let conn = async_fd.lock().await;
-            write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
-            1
-        }
-    };
-
-    let response = ExecResponse::Exit(exit_code);
-    let conn = async_fd.lock().await;
-    write_line_async(&conn, &serde_json::to_string(&response).unwrap()).await;
-    // fd closed by OwnedFd drop (inside AsyncFd, inside Mutex, inside Arc)
 }
 
 // TIER 0 protocol-interleaving fuzz: systematic peer-death enumeration for the
@@ -716,7 +483,87 @@ mod exec_fuzz_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+
+    fn request(command: &[&str], in_container: bool) -> ExecRequest {
+        ExecRequest {
+            command: command.iter().map(|arg| arg.to_string()).collect(),
+            in_container,
+            ..Default::default()
+        }
+    }
+
+    /// The part of a container exec's argv that follows `podman exec`.
+    fn podman_exec_args(spec: &crate::tty::SessionSpec) -> Vec<&str> {
+        let exec = spec
+            .argv
+            .iter()
+            .position(|arg| arg == "exec")
+            .expect("argv runs podman exec");
+        assert_eq!(spec.argv[exec - 1], "podman");
+        spec.argv[exec + 1..].iter().map(String::as_str).collect()
+    }
+
+    #[test]
+    fn a_container_exec_hands_every_flag_to_podman() {
+        let mut request = request(&["id", "-u"], true);
+        request.interactive = true;
+        request.tty = true;
+        request.privileged = true;
+        request.workdir = Some("/tmp".to_string());
+        request.user = Some("nobody:users".to_string());
+        request.env = vec!["A=1".to_string(), "B=two words".to_string()];
+
+        let spec = session_spec(&request);
+        let args = podman_exec_args(&spec);
+        for flag in ["-i", "-t", "--privileged"] {
+            assert!(args.contains(&flag), "{flag} missing from {args:?}");
+        }
+        let pair = |flag: &str, value: &str| args.windows(2).any(|w| w == [flag, value]);
+        assert!(pair("-w", "/tmp") && pair("-u", "nobody:users"), "{args:?}");
+        assert!(pair("-e", "A=1") && pair("-e", "B=two words"), "{args:?}");
+        // The command comes last, after --latest, so its own flags stay its own.
+        assert_eq!(&args[args.len() - 3..], ["--latest", "id", "-u"]);
+        // podman applies these; fc-agent must not apply them to the podman client.
+        assert!(spec.workdir.is_none() && spec.user.is_none() && !spec.detach);
+        assert!(spec.tty && spec.interactive && spec.raw_pty);
+    }
+
+    #[test]
+    fn a_detached_container_exec_keeps_its_tty_flag_but_attaches_nothing() {
+        let mut request = request(&["sleep", "30"], true);
+        request.detach = true;
+        request.tty = true;
+        let spec = session_spec(&request);
+        let args = podman_exec_args(&spec);
+        assert!(args.contains(&"-d") && args.contains(&"-t"), "{args:?}");
+        assert!(!spec.tty && !spec.interactive && !spec.detach);
+    }
+
+    #[test]
+    fn a_guest_command_is_run_as_given_and_fc_agent_applies_the_flags() {
+        let mut request = request(&["id", "-u"], false);
+        request.workdir = Some("/tmp".to_string());
+        request.user = Some("nobody".to_string());
+        request.detach = true;
+        request.env = vec!["A=1".to_string(), "EQ=a=b".to_string(), "BARE".to_string()];
+
+        let spec = session_spec(&request);
+        assert_eq!(spec.argv, ["id", "-u"]);
+        assert_eq!(spec.workdir.as_deref(), Some("/tmp"));
+        assert_eq!(spec.user.as_deref(), Some("nobody"));
+        assert!(spec.detach && !spec.raw_pty);
+        let env = |key: &str| {
+            spec.env
+                .iter()
+                .rev()
+                .find(|(k, _)| k == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(env("A"), Some("1"));
+        assert_eq!(env("EQ"), Some("a=b"), "only the first = separates");
+        assert_eq!(env("BARE"), Some(""));
+    }
+    use std::io::{Read, Write};
     use std::os::unix::net::UnixStream;
 
     /// A connected pair: the server end as the OwnedFd the handshake consumes,
@@ -893,29 +740,5 @@ mod tests {
 
         let result = read_request_and_handshake(server, Duration::from_secs(5));
         assert!(result.is_none(), "EOF before GO must not execute");
-    }
-
-    /// A command that cannot be spawned gets exactly one Error line carrying the
-    /// spawn error, and then EOF.
-    #[tokio::test]
-    async fn spawn_failure_writes_one_error_line_then_closes() {
-        let (server, mut client) = socketpair();
-        let request = ExecRequest {
-            command: vec!["/nonexistent/fc-agent-spawn-failure".to_string()],
-            in_container: false,
-            interactive: false,
-            tty: false,
-        };
-        handle_pipe_async(server, &request).await;
-
-        let seen = String::from_utf8(read_to_eof(&mut client)).expect("UTF-8 response");
-        let line = seen
-            .strip_suffix('\n')
-            .unwrap_or_else(|| panic!("response must end with a newline: {seen:?}"));
-        assert!(!line.contains('\n'), "exactly one line expected: {seen:?}");
-        let response: serde_json::Value = serde_json::from_str(line).expect("response is JSON");
-        assert_eq!(response["type"], "error", "got {seen:?}");
-        let message = response["data"].as_str().expect("error data is a string");
-        assert!(message.starts_with("Failed to spawn: "), "got {message:?}");
     }
 }

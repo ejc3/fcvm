@@ -628,6 +628,8 @@ dependencies = [
 name = "exec-proto"
 version = "0.1.0"
 dependencies = [
+ "serde",
+ "serde_json",
  "tokio",
 ]
 

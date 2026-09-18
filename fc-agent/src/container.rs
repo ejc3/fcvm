@@ -1674,11 +1674,11 @@ fn setup_user_mapping(args: &mut Vec<String>, username: &str, runtime_dir: &str)
     }
 }
 
-/// Run container in TTY mode (blocks until exit).
-pub fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String]) -> ! {
+/// Run container in TTY mode. Never returns: powers the VM off when the container exits.
+pub async fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String]) -> ! {
     vsock::notify_container_started();
 
-    let exit_code = crate::tty::run_with_pty(podman_args, plan.tty, plan.interactive);
+    let exit_code = crate::tty::run_with_pty(podman_args, plan.tty, plan.interactive).await;
 
     vsock::notify_container_exit(exit_code);
 

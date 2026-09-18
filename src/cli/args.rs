@@ -734,6 +734,33 @@ pub struct ExecArgs {
     #[arg(short, long)]
     pub quiet: bool,
 
+    /// Set an environment variable for the command: KEY=VALUE, or KEY alone to
+    /// pass this process's value. Repeatable; overrides --env-file
+    #[arg(short, long = "env", value_name = "KEY[=VALUE]")]
+    pub env: Vec<String>,
+
+    /// Read environment variables from a file of KEY=VALUE lines. `#` starts a
+    /// comment, and KEY alone passes this process's value. Repeatable
+    #[arg(long = "env-file", value_name = "FILE")]
+    pub env_file: Vec<std::path::PathBuf>,
+
+    /// Working directory for the command
+    #[arg(short, long, value_name = "DIR")]
+    pub workdir: Option<String>,
+
+    /// User, and optionally group, to run the command as: names or numbers
+    #[arg(short, long, value_name = "USER[:GROUP]")]
+    pub user: Option<String>,
+
+    /// Give the command extended capabilities inside the container. A --vm
+    /// command already runs as the guest's root
+    #[arg(long, conflicts_with = "vm")]
+    pub privileged: bool,
+
+    /// Start the command and return at once, printing one identifier line
+    #[arg(short, long)]
+    pub detach: bool,
+
     /// VM name to exec into (mutually exclusive with --pid)
     #[arg(long, conflicts_with = "pid")]
     pub name: Option<String>,

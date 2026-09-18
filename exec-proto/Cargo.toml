@@ -5,6 +5,8 @@ edition = "2021"
 license = "MIT OR Apache-2.0"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 tokio = { version = "1", features = ["io-util"] }
 
 [dev-dependencies]

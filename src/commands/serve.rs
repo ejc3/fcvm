@@ -956,6 +956,7 @@ async fn ws_terminal_handler(
         in_container: true,
         interactive: true,
         tty: true,
+        ..Default::default()
     };
 
     // Connect and complete the exec handshake (request → ACK → GO); the
@@ -1056,8 +1057,22 @@ async fn ws_terminal_handler(
         }
     });
 
+    let mut input = TerminalInput::default();
+
     // Main loop: read from WS and from vsock channel
     loop {
+        // Send as much of the waiting input as the guest's window allows.
+        while let Some(chunk) = input.next_chunk() {
+            if vsock_write
+                .write_all(&exec_proto::Message::Stdin(chunk).encode())
+                .await
+                .is_err()
+            {
+                reader_task.abort();
+                return;
+            }
+        }
+
         tokio::select! {
             msg = vsock_rx.recv() => {
                 match msg {
@@ -1084,8 +1099,18 @@ async fn ws_terminal_handler(
                             .await;
                         break;
                     }
-                    // The guest never sends Stdin frames; ignore if one arrives
-                    Some(exec_proto::Message::Stdin(_)) => {}
+                    // A PTY session has one output stream, so Stderr does not
+                    // occur; forward it rather than lose it if that changes.
+                    Some(exec_proto::Message::Stderr(data)) => {
+                        if ws.send(WsMessage::Binary(data.into())).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(exec_proto::Message::StdinWindow(bytes)) => input.grant(bytes),
+                    // Host-to-guest frames; the guest never sends them.
+                    Some(exec_proto::Message::Stdin(_))
+                    | Some(exec_proto::Message::StdinEof)
+                    | Some(exec_proto::Message::Resize(_)) => {}
                     // vsock closed without an Exit frame
                     None => {
                         let _ = ws
@@ -1098,29 +1123,15 @@ async fn ws_terminal_handler(
                     }
                 }
             }
-            result = ws.recv() => {
+            // Read while input waits for the window too: a closed tab must be
+            // seen, or the session and its command would outlive it. Reading
+            // stops only while a full buffer waits on a program that is not
+            // reading, which pushes back on the browser instead of growing.
+            result = ws.recv(), if input.wants_more() => {
                 match result {
-                    Some(Ok(WsMessage::Binary(data))) => {
-                        // Binary frames: encode as exec-proto stdin message
-                        // (fc-agent expects framed messages on the vsock)
-                        let mut buf = Vec::new();
-                        if exec_proto::write_stdin(&mut buf, &data).is_err() {
-                            break;
-                        }
-                        if vsock_write.write_all(&buf).await.is_err() {
-                            break;
-                        }
-                    }
-                    Some(Ok(WsMessage::Text(text))) => {
-                        // Text frames: encode as exec-proto stdin message
-                        let mut buf = Vec::new();
-                        if exec_proto::write_stdin(&mut buf, text.as_bytes()).is_err() {
-                            break;
-                        }
-                        if vsock_write.write_all(&buf).await.is_err() {
-                            break;
-                        }
-                    }
+                    // Binary and text frames alike are the terminal's input.
+                    Some(Ok(WsMessage::Binary(data))) => input.offer(&data),
+                    Some(Ok(WsMessage::Text(text))) => input.offer(text.as_bytes()),
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     _ => {}
                 }
@@ -1130,6 +1141,116 @@ async fn ws_terminal_handler(
 
     // Cancel the reader task so it doesn't leak if vsock_read is blocked
     reader_task.abort();
+}
+
+/// Browser input on its way to the terminal, forwarded only within the stdin
+/// window the guest has granted (see exec-proto). Sending ahead of the window
+/// would end the session.
+#[derive(Default)]
+struct TerminalInput {
+    waiting: std::collections::VecDeque<u8>,
+    window: usize,
+}
+
+impl TerminalInput {
+    /// A program that does not read leaves input waiting here. Once this much
+    /// waits, the bridge takes no more from the browser until some has gone.
+    const LIMIT: usize = 1 << 20;
+
+    fn grant(&mut self, bytes: u32) {
+        self.window += bytes as usize;
+    }
+
+    /// Whether to read more from the browser. One message is always taken
+    /// whole, so a paste larger than the limit still arrives.
+    fn wants_more(&self) -> bool {
+        self.waiting.len() < Self::LIMIT
+    }
+
+    fn offer(&mut self, data: &[u8]) {
+        self.waiting.extend(data);
+    }
+
+    /// The next piece that fits the window, at most one frame's worth.
+    fn next_chunk(&mut self) -> Option<Vec<u8>> {
+        let n = self
+            .window
+            .min(self.waiting.len())
+            .min(exec_proto::IO_CHUNK);
+        if n == 0 {
+            return None;
+        }
+        self.window -= n;
+        Some(self.waiting.drain(..n).collect())
+    }
+}
+
+#[cfg(test)]
+mod terminal_input_tests {
+    use super::TerminalInput;
+
+    #[test]
+    fn input_goes_out_only_within_the_window_and_in_order() {
+        let mut input = TerminalInput::default();
+        input.offer(b"hello world");
+        assert_eq!(input.next_chunk(), None, "nothing before the first grant");
+
+        input.grant(5);
+        assert_eq!(input.next_chunk().as_deref(), Some(&b"hello"[..]));
+        assert_eq!(input.next_chunk(), None);
+
+        input.grant(100);
+        assert_eq!(input.next_chunk().as_deref(), Some(&b" world"[..]));
+        assert_eq!(input.next_chunk(), None);
+        // The unused window stays open for what comes next.
+        input.offer(b"!");
+        assert_eq!(input.next_chunk().as_deref(), Some(&b"!"[..]));
+    }
+
+    #[test]
+    fn a_large_paste_goes_out_in_frame_sized_pieces() {
+        let mut input = TerminalInput::default();
+        input.grant(200_000);
+        input.offer(&vec![b'p'; 150_000]);
+        let sizes: Vec<usize> =
+            std::iter::from_fn(|| input.next_chunk().map(|c| c.len())).collect();
+        assert_eq!(sizes, [65_536, 65_536, 18_928]);
+    }
+
+    #[test]
+    fn a_paste_larger_than_the_limit_is_delivered_whole() {
+        // The program is reading normally; the paste is simply large.
+        let paste: Vec<u8> = (0..(TerminalInput::LIMIT + (512 << 10)))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let mut input = TerminalInput::default();
+        input.offer(&paste);
+        let mut delivered = Vec::new();
+        loop {
+            input.grant(256 * 1024);
+            let mut progressed = false;
+            while let Some(chunk) = input.next_chunk() {
+                delivered.extend(chunk);
+                progressed = true;
+            }
+            if !progressed {
+                break;
+            }
+        }
+        assert_eq!(delivered.len(), paste.len());
+        assert!(delivered == paste, "the paste arrived changed");
+    }
+
+    #[test]
+    fn reading_pauses_while_the_limit_waits_and_resumes_when_some_has_gone() {
+        let mut input = TerminalInput::default();
+        assert!(input.wants_more());
+        input.offer(&vec![0u8; TerminalInput::LIMIT]);
+        assert!(!input.wants_more(), "a full buffer must stop the reading");
+        input.grant(10);
+        input.next_chunk().unwrap();
+        assert!(input.wants_more());
+    }
 }
 
 // ============================================================================

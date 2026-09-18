@@ -24,7 +24,7 @@
 //! in the EOF paths — the elapsed assertions prove that.
 
 use super::read_request_and_handshake;
-use crate::types::ExecRequest;
+use exec_proto::ExecRequest;
 use std::io::{Read, Write};
 use std::net::Shutdown;
 use std::os::fd::OwnedFd;

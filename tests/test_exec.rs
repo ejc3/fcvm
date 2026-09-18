@@ -1889,18 +1889,78 @@ async fn test_exec_host_disconnect_kills_guest_child() -> Result<()> {
 
         let check = common::exec_in_vm(
             fcvm_pid,
-            &[
-                "sh",
-                "-c",
-                &format!("test -f {} && echo EXISTS || echo GONE", marker),
-            ],
+            // One script: exec_in_vm joins its arguments and runs them under `sh -c`.
+            &[&format!("test -f {} && echo EXISTS || echo GONE", marker)],
         )
         .await
         .context("checking marker in guest")?;
 
         anyhow::ensure!(
-            check.contains("GONE"),
+            check.trim() == "GONE",
             "#636 regression: guest command survived host exec disconnect (marker present): {:?}",
+            check
+        );
+
+        // Same again with -i, endless input and a command that never reads its
+        // stdin. Over vsock a host hangup does not reach the guest across a
+        // connection that has backed up: without flow control the forwarded
+        // input fills the connection and this command outlives its killed
+        // client. With the window the client stops after 256 KiB,
+        // fc-agent keeps reading, and the disconnect is seen at once.
+        let marker = format!("/tmp/fcvm636-unread-stdin-{}", fcvm_pid);
+        let guest_cmd = format!("echo READY; sleep 8; touch {}", marker);
+        let mut exec = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "exec",
+                "--pid",
+                &fcvm_pid.to_string(),
+                "--vm",
+                "-i",
+                "--",
+                "sh",
+                "-c",
+                &guest_cmd,
+            ])
+            .stdin(Stdio::from(
+                std::fs::File::open("/dev/zero").context("opening /dev/zero")?,
+            ))
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .context("spawning host fcvm exec -i")?;
+        let stdout = exec.stdout.take().context("exec stdout missing")?;
+        let mut lines = tokio::io::BufReader::new(stdout).lines();
+        let ready = tokio::time::timeout(Duration::from_secs(120), async {
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.contains("READY") {
+                    return true;
+                }
+            }
+            false
+        })
+        .await
+        .unwrap_or(false);
+        anyhow::ensure!(
+            ready,
+            "guest command with unread stdin never signaled READY"
+        );
+        // Give the client time to spend its whole window before severing.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let _ = exec.start_kill();
+        let _ = exec.wait().await;
+        tokio::time::sleep(Duration::from_secs(10)).await;
+
+        let check = common::exec_in_vm(
+            fcvm_pid,
+            // One script: exec_in_vm joins its arguments and runs them under `sh -c`.
+            &[&format!("test -f {} && echo EXISTS || echo GONE", marker)],
+        )
+        .await
+        .context("checking the unread-stdin marker in guest")?;
+        anyhow::ensure!(
+            check.trim() == "GONE",
+            "#636 regression: guest command with unread stdin survived the disconnect: {:?}",
             check
         );
         Ok(())

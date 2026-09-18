@@ -72,31 +72,19 @@ async fn test_readonly_volume_bridged() -> Result<()> {
 
     // Test 2: Write should fail (will get EROFS - read-only file system)
     println!("Test 2: Writing to read-only mount should fail...");
-    let result = common::exec_in_container(
+    // exec_in_container joins its arguments and runs them under `sh -c`, so
+    // this is one script, not an argv. The shell reports the refused
+    // redirection on stderr; stdout carries only the marker.
+    let output = common::exec_in_container(
         fcvm_pid,
-        &[
-            "sh",
-            "-c",
-            "echo 'new' > /config/readonly.txt 2>&1 || echo WRITE_FAILED",
-        ],
+        &["echo new > /config/readonly.txt || echo WRITE_FAILED"],
     )
-    .await;
-
-    // Verify write was blocked
-    match result {
-        Ok(output) => {
-            assert!(
-                output.contains("WRITE_FAILED")
-                    || output.contains("Read-only")
-                    || output.contains("read-only"),
-                "Write should fail on read-only mount, got: {}",
-                output
-            );
-        }
-        Err(_) => {
-            // Command failing is also acceptable
-        }
-    }
+    .await?;
+    assert_eq!(
+        output.trim(),
+        "WRITE_FAILED",
+        "the write to a read-only mount should be refused"
+    );
 
     // Verify the file wasn't modified on host
     let content = tokio::fs::read_to_string(format!("{}/readonly.txt", host_dir)).await?;
