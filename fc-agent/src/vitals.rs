@@ -426,6 +426,21 @@ fn vanished(error: &std::io::Error) -> bool {
     error.kind() == std::io::ErrorKind::NotFound // exited
 }
 
+/// One entry of a /proc directory listing. `read_dir` can succeed and its
+/// iterator still fail, and an entry that fails is a process or thread left
+/// out of the scan, so it is counted unless it had only vanished.
+fn listed<T>(entry: std::io::Result<T>, unreadable: &mut u32) -> Option<T> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            if !vanished(&error) {
+                *unreadable += 1;
+            }
+            None
+        }
+    }
+}
+
 /// Every thread's /proc directory and stat line, and how many could not be
 /// read. Reads `stat` only: unlike `cmdline` it does not fault the target's
 /// memory, so it cannot hang on a wedged process.
@@ -433,7 +448,10 @@ fn thread_stats() -> ThreadScan {
     let mut threads = Vec::new();
     let mut unreadable = 0;
     let procs = std::fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))?;
-    for proc_entry in procs.flatten() {
+    for proc_entry in procs {
+        let Some(proc_entry) = listed(proc_entry, &mut unreadable) else {
+            continue;
+        };
         let name = proc_entry.file_name();
         if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
             continue;
@@ -447,7 +465,10 @@ fn thread_stats() -> ThreadScan {
                 continue;
             }
         };
-        for task in tasks.flatten() {
+        for task in tasks {
+            let Some(task) = listed(task, &mut unreadable) else {
+                continue;
+            };
             match std::fs::read(task.path().join("stat")) {
                 Ok(raw) => threads.push((task.path(), stat_text(&raw))),
                 Err(error) if vanished(&error) => {}
@@ -704,6 +725,25 @@ pub fn snapshot_bounded(budget: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `read_dir` can succeed and its iterator still fail. An entry that fails
+    /// for any reason but having vanished is a thread left out of the scan.
+    #[test]
+    fn a_directory_entry_that_cannot_be_read_is_counted_unless_it_vanished() {
+        use std::io::{Error, ErrorKind};
+        let mut unreadable = 0;
+        assert_eq!(listed(Ok(7), &mut unreadable), Some(7));
+        let gone = Error::from(ErrorKind::NotFound);
+        assert_eq!(listed::<u8>(Err(gone), &mut unreadable), None);
+        assert_eq!(unreadable, 0);
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        assert_eq!(listed::<u8>(Err(denied), &mut unreadable), None);
+        assert_eq!(
+            listed::<u8>(Err(Error::other("short read")), &mut unreadable),
+            None
+        );
+        assert_eq!(unreadable, 2);
+    }
 
     /// The sampler must never be empty, or its absence in a log is ambiguous
     /// between "not collected" and "collected nothing".
