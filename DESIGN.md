@@ -1301,9 +1301,9 @@ The guest is configured to support rootless Podman:
 
 ---
 
-## TTY & Interactive Mode
+## Exec Sessions, TTY & Interactive Mode
 
-fcvm provides full interactive terminal support for both `podman run -it` and `exec -it`, matching docker/podman semantics.
+`fcvm exec` and `podman run -it` share one session implementation on each side. Its reference is `podman exec`: `tests/test_exec_podman_parity.rs` runs every case through `podman exec`, `fcvm exec` and `fcvm exec --vm` (one case, `--privileged`, has no `--vm` form) and requires the compared parts of each result to match: stdout bytes, stderr bytes, exit code, and whether the call returned. A case says which parts it compares, and why, where it leaves one out.
 
 ### Architecture
 
@@ -1311,8 +1311,8 @@ fcvm provides full interactive terminal support for both `podman run -it` and `e
 ┌─────────────────────────────────────────────────────────────────────────┐
 │ Host Process (fcvm)                                                     │
 │  ┌──────────────┐     ┌──────────────────┐     ┌──────────────────────┐│
-│  │ User Terminal│────►│ Raw Mode Handler │────►│ exec_proto Encoder   ││
-│  │ (stdin/out)  │◄────│ (tcsetattr)      │◄────│ (binary framing)     ││
+│  │ stdin/stdout │────►│ Raw mode (-t on  │────►│ exec_proto frames    ││
+│  │ stderr       │◄────│ a terminal only) │◄────│                      ││
 │  └──────────────┘     └──────────────────┘     └──────────┬───────────┘│
 │                                                           │            │
 └───────────────────────────────────────────────────────────┼────────────┘
@@ -1321,8 +1321,8 @@ fcvm provides full interactive terminal support for both `podman run -it` and `e
 ┌───────────────────────────────────────────────────────────────────────┐
 │ Guest (fc-agent)                                          │           │
 │  ┌──────────────────┐     ┌──────────────┐     ┌──────────▼─────────┐ │
-│  │ exec_proto       │────►│ PTY Master   │────►│ Container Process  │ │
-│  │ Decoder          │◄────│ (openpty)    │◄────│ (sh, vim, etc.)    │ │
+│  │ exec_proto       │────►│ PTY (-t) or  │────►│ Command, or the    │ │
+│  │ frames           │◄────│ three pipes  │◄────│ `podman exec` client│ │
 │  └──────────────────┘     └──────────────┘     └────────────────────┘ │
 └───────────────────────────────────────────────────────────────────────┘
 ```
@@ -1331,14 +1331,20 @@ fcvm provides full interactive terminal support for both `podman run -it` and `e
 
 | Flag | Meaning | Implementation |
 |------|---------|----------------|
-| `-i` | Keep stdin open | Host reads stdin, sends via STDIN messages |
-| `-t` | Allocate PTY | Guest allocates PTY master/slave pair |
+| `-i` | Forward stdin | Host sends STDIN frames, then STDIN_EOF when its stdin ends |
+| `-t` | Allocate PTY | Guest runs the command on a PTY sized like the host's terminal |
 | `-it` | Both | Interactive shell with full terminal support |
-| neither | Plain exec | Pipes for stdin/stdout, no PTY |
+| neither | Plain exec | Pipes for stdout and stderr, `/dev/null` on stdin |
+| `-e`, `--env-file` | Environment | Resolved on the host into `KEY=VALUE`, files first so `-e` wins |
+| `-w`, `-u` | Directory, user | `podman exec` applies them in a container; fc-agent applies them to a guest command |
+| `--privileged` | Extended capabilities | Container only; a `--vm` command is already the guest's root |
+| `-d` | Detach | Returns one identifier line and exit 0; the command keeps running |
+
+`-t` does not need a terminal on the host. With a pipe or file on stdin the guest still allocates the PTY and the host skips raw mode, as `podman exec -t` does.
 
 ### Wire Protocol (exec_proto)
 
-Binary framed protocol over vsock for efficient transport of terminal data:
+The handshake is three text lines: the JSON `ExecRequest`, the server's `ACK2`, the client's `GO`. The ACK token names the protocol version. A client that reads the older `ACK` refuses the session before GO, so nothing runs on an agent that would not understand the frames below. After GO every mode speaks length-prefixed frames:
 
 ```
 ┌─────────┬─────────┬──────────────────┐
@@ -1347,81 +1353,49 @@ Binary framed protocol over vsock for efficient transport of terminal data:
 ```
 
 **Message Types**:
-- `DATA (0x01)`: Output from command (stdout/stderr)
+- `DATA (0x01)`: Command stdout, or everything the PTY produced with `-t`
 - `EXIT (0x02)`: Command exit code (4 bytes, big-endian i32)
 - `ERROR (0x03)`: Error message string
-- `STDIN (0x04)`: Input from user terminal
+- `STDIN (0x04)`: Input from the host
+- `STDIN_EOF (0x05)`: The host's stdin ended (no payload)
+- `STDERR (0x06)`: Command stderr; never sent with `-t`, where the PTY merges both streams
+- `RESIZE (0x07)`: The host terminal's size (rows and cols, big-endian u16 each)
+- `STDIN_WINDOW (0x08)`: Guest to host: this many more STDIN bytes may be sent (big-endian u32). The first one is the first frame of a session that forwards stdin
 
-**Why binary framing?**
-- Handles escape sequences (Ctrl+C = 0x03, Ctrl+D = 0x04)
-- Preserves all bytes without escaping
-- Efficient for high-throughput terminal output
+Frames carry raw bytes, so output is exact: no line splitting, no UTF-8 requirement, no added newline.
 
-### Host-Side Implementation (`src/commands/tty.rs`)
+**STDIN is flow-controlled by the guest**, the way SSH does it. The host starts with no window. fc-agent grants 256 KiB when an `-i` session starts and grants back every chunk once the command has taken it, so the host sends exactly as fast as the command reads and the connection itself never backs up. This is what keeps the client-death kill (below) true with `-i`: measured on a VM, a host hangup does not reach the guest across a vsock connection that has backed up, and a command that ignored its stdin survived its killed client. With the window, fc-agent always has a read outstanding and sees the hangup at once. A host that sends beyond its window is treated as gone. Grants travel to the host on the same connection as the command's output, so a client whose output consumer has stalled also stops uploading stdin, as with SSH.
 
-```rust
-// 1. Set terminal to raw mode
-let original = tcgetattr(stdin)?;
-let mut raw = original.clone();
-cfmakeraw(&mut raw);
-tcsetattr(stdin, TCSANOW, &raw)?;
+### Host Side (`src/commands/tty.rs`)
 
-// 2. Spawn reader/writer tasks
-tokio::spawn(async move {
-    // Reader: terminal stdin → vsock
-    loop {
-        let n = stdin.read(&mut buf)?;
-        exec_proto::write_stdin(&mut vsock, &buf[..n])?;
-    }
-});
+- A reader thread writes DATA to stdout and STDERR to stderr, and returns the EXIT code. A session that ends without one (connection closed, snapshot-pause orphan, not a frame) is an error, never an invented exit code. When the client's own stdout is gone, as in `fcvm exec ... | head -1`, the client dies of SIGPIPE like any Unix tool.
+- The session socket has no write timeout, so a write that is slow for any reason never drops input. When the session ends the socket is shut down before the input thread is joined, which releases a write that is still blocked.
+- An input thread polls stdin (with `-i`, and only while the guest's window is open), a pipe the SIGWINCH handler writes to (with `-t` and a terminal on stdin), a pipe the reader thread pokes when a window grant arrives, and a wake pipe that ends the thread when the session is over. End of input, including a closed fd 0, becomes STDIN_EOF.
+- With `-t` and a terminal on stdin, `fcvm exec` puts the terminal's size in the request, so the PTY is sized before the command starts. Such a session also sends its size as the first frame, which is what `podman run -it` relies on because it has no request. With `-t` and a pipe on stdin there is no size to send.
 
-tokio::spawn(async move {
-    // Writer: vsock → terminal stdout
-    loop {
-        match exec_proto::Message::read_from(&mut vsock)? {
-            Message::Data(data) => stdout.write_all(&data)?,
-            Message::Exit(code) => return code,
-            _ => {}
-        }
-    }
-});
-```
+### Guest Side (`fc-agent/src/tty.rs`)
 
-### Guest-Side Implementation (`fc-agent/src/tty.rs`)
+One async session per connection:
 
-```rust
-// 1. Allocate PTY
-let (master, slave) = openpty()?;
+- Without `-t` the command gets three pipes and its own process group. With `-t` it gets a PTY as controlling terminal in a new session.
+- For a container exec the command is `podman exec` with the same `-i` and `-t`. Its PTY starts in raw mode: the container's own PTY does the echo, line editing and signal keys, and fc-agent's PTY only carries bytes to it.
+- The session ends when the command exits. Whatever it wrote is forwarded first: a pipe is drained of the bytes it held at exit, and a PTY is read until it hangs up, for at most a second. A background process that inherited the output does not hold the session open, and what it writes afterwards is dropped.
+- Frames from the host are read by one task and applied by another. A command that does not read its stdin blocks only the applier. The reader never stops, because the window bounds what the host may send, so it notices the host hanging up at once.
+- STDIN_EOF closes the command's stdin. A PTY has no half-close, so with `-t` it does nothing and Ctrl-D is the way to end input.
+- A command killed by signal N exits `128+N`. One that cannot be found exits 127, and one that cannot be run exits 126. When fcvm itself fails (no such VM, no connection, a refused request) the client exits 125.
 
-// 2. Fork child process
-match fork() {
-    0 => {
-        // Child: setup PTY as controlling terminal
-        setsid();
-        ioctl(slave, TIOCSCTTY, 0);
-        dup2(slave, STDIN);
-        dup2(slave, STDOUT);
-        dup2(slave, STDERR);
-        execvp(command, args);
-    }
-    pid => {
-        // Parent: relay between vsock and PTY master
-        // Reader thread: PTY master → vsock (DATA messages)
-        // Writer thread: vsock (STDIN messages) → PTY master
-    }
-}
-```
+### Differences from `podman exec`
 
-### Supported Features
-
-- **Escape sequences**: Colors (ANSI), cursor movement, screen clearing
-- **Control characters**: Ctrl+C (SIGINT), Ctrl+D (EOF), Ctrl+Z (SIGTSTP)
-- **Line editing**: Arrow keys, backspace, history (shell-dependent)
-- **Full-screen apps**: vim, htop, less, nano, tmux
+- **Client death kills a guest command.** When the host side of an `fcvm exec --vm` disappears, fc-agent kills the command's process group (#636), so a host-side timeout cannot leak a guest process. For a container exec the group is the guest's `podman exec` client; the process inside the container outlives it, exactly as it does under podman. Exempt: a detached command (`-d`), and the VM's own `podman run -it` console, whose connection a snapshot drops and whose container a snapshot must not disturb.
+- **Shell auto-detection.** `fcvm exec -- bash` on a terminal behaves as `-it`. `podman exec` requires the flags.
+- **`-t` implies `--quiet`.** fcvm's own log shares stderr with the command, so a terminal session suppresses it.
+- **`-d` on a guest command prints its pid.** podman prints an exec session id. Both print one line and exit 0.
+- **Old agents are refused.** The handshake token names the protocol version. A VM started, or a snapshot taken, by an fcvm from before the framed protocol is refused before GO, with a message that says to restart or re-create it. Nothing runs. The `podman run -it` console has no handshake. The stdin window is the first frame of every session that forwards stdin, so there the host reports an older fc-agent when output arrives before one.
+- **Not offered:** `--detach-keys` (a session ends with its command), `--preserve-fd`, `--preserve-fds`, `--cidfile`, `--latest`, `--no-session`.
 
 ### Limitations
 
-- **Window resize (SIGWINCH)**: Not implemented. Terminal size is fixed at session start.
+- **Web terminal, closed tab.** While 1 MiB of input waits for a program that is not reading it, the `fcvm serve` bridge stops reading the websocket, so a tab closed in that state is noticed only when the program reads again or exits. Before stdin was flow-controlled, any input the program left unread had this effect, and guest output stopped with it.
 - **Job control**: Background/foreground (`bg`, `fg`) work within the container, but signals are not forwarded to the host.
 
 ---

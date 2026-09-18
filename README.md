@@ -185,6 +185,17 @@ fcvm supports `-i` and `-t` flags just like docker/podman:
 echo "data" | ./fcvm podman run --name pipe -i alpine:latest cat  # Pipe stdin
 ```
 
+`fcvm exec` follows `podman exec`: byte-exact output with stdout and stderr kept apart, the command's exit code (128+N for a signal, 127 for a missing command, 126 for one that cannot run, 125 when fcvm itself fails), end of input on `-i`, and a PTY that tracks the terminal's size on `-t`.
+
+```bash
+tar c src | ./fcvm exec --name web -i -- tar x -C /tmp         # Pipe into a command; it sees end of input
+./fcvm exec --name web -e KEY=value -w /tmp -u nobody -- env     # Environment, directory, user
+./fcvm exec --name web --env-file prod.env -- printenv           # KEY=VALUE lines; -e wins over the file
+./fcvm exec --name web -d -- long-running-job                    # Start it and return
+```
+
+Where fcvm differs on purpose, such as killing a guest command when its `fcvm exec` dies, [DESIGN.md](DESIGN.md#differences-from-podman-exec) lists it.
+
 ---
 
 ## Nested Virtualization
