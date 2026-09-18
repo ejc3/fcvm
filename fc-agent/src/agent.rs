@@ -32,15 +32,19 @@ pub async fn run() -> Result<()> {
         .spawn(|| {
             let start = std::time::Instant::now();
             let mut pileup = crate::vitals::Pileup::default();
-            for tick in 0u64.. {
-                if tick.is_multiple_of(10) {
+            let (mut tick, mut previous) = (0u64, None);
+            loop {
+                if crate::vitals::sample_due(previous, tick) {
                     eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
                 }
                 if let Some(line) = pileup.tick() {
                     eprintln!("[fcvm-vitals] pileup {line}");
                 }
-                // To a deadline, so a slow scan does not stretch either cadence.
-                let next = start + std::time::Duration::from_secs(tick + 1);
+                // To the next deadline still ahead, so a slow scan neither
+                // stretches the cadence nor is followed by a burst of scans.
+                previous = Some(tick);
+                tick = crate::vitals::next_tick(tick, start.elapsed());
+                let next = start + std::time::Duration::from_secs(tick);
                 std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
             }
         });

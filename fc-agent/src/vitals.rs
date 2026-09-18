@@ -261,6 +261,20 @@ fn piled_up(loadavg: &str, stat: &str) -> Result<Option<(u32, u32)>, String> {
     Ok((runnable.saturating_add(blocked) >= threshold).then_some((runnable, blocked)))
 }
 
+/// The sampler's next wake, in whole seconds since it started: the first
+/// deadline still ahead. A scan that overran several deadlines skips them; it
+/// does not run once for each of them, back to back, in a guest that is
+/// already piled up.
+pub fn next_tick(tick: u64, elapsed: Duration) -> u64 {
+    (tick + 1).max(elapsed.as_secs() + 1)
+}
+
+/// Whether the 10s line is due on moving from `previous` to `tick`, which is
+/// also true when a skip jumped over its second.
+pub fn sample_due(previous: Option<u64>, tick: u64) -> bool {
+    previous.is_none_or(|previous| previous / 10 != tick / 10)
+}
+
 /// Whether the `piled_for`-th consecutive piled-up second gets a line.
 fn prints_on(piled_for: u32) -> bool {
     piled_for <= PILEUP_EVERY_SECOND_FOR || piled_for.is_multiple_of(10)
@@ -299,13 +313,14 @@ fn stat_text(raw: &[u8]) -> String {
 /// `String::truncate` panics inside a multi-byte character, and a thread name
 /// may hold one; a panic here would end the sampler thread without a word.
 fn bounded(mut text: String, limit: usize) -> String {
+    const MARK: &str = " ...truncated";
     if text.len() > limit {
-        let mut end = limit;
+        let mut end = limit.saturating_sub(MARK.len());
         while !text.is_char_boundary(end) {
             end -= 1;
         }
         text.truncate(end);
-        text.push_str(" ...truncated");
+        text.push_str(MARK);
     }
     text
 }
@@ -400,6 +415,13 @@ fn cpu_times(stat: &str) -> String {
         .join(" ")
 }
 
+/// Whether a failed read under /proc means the process or thread exited since
+/// it was listed, which is not a failed read. Any other failure is counted, so
+/// `unreadable=0` cannot stand over threads that were left out.
+fn vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound // exited
+}
+
 /// Every thread's /proc directory and stat line, and how many could not be
 /// read. Reads `stat` only: unlike `cmdline` it does not fault the target's
 /// memory, so it cannot hang on a wedged process.
@@ -412,14 +434,19 @@ fn thread_stats() -> ThreadScan {
         if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
-        // A process that exited since the listing is not a failed read.
-        let Ok(tasks) = std::fs::read_dir(proc_entry.path().join("task")) else {
-            continue;
+        let tasks = match std::fs::read_dir(proc_entry.path().join("task")) {
+            Ok(tasks) => tasks,
+            // A process that exited since the listing is not a failed read.
+            Err(error) if vanished(&error) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
         };
         for task in tasks.flatten() {
             match std::fs::read(task.path().join("stat")) {
                 Ok(raw) => threads.push((task.path(), stat_text(&raw))),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if vanished(&error) => {}
                 Err(_) => unreadable += 1,
             }
         }
@@ -475,7 +502,14 @@ fn vsock_workers(threads: &[(PathBuf, String)]) -> String {
 
 /// One pile-up line from its sources. `up` is the guest's own clock: the host
 /// stamps a line when it arrives, which in a pile-up is late.
-fn format_pileup(up: &str, counts: (u32, u32), scan: &ThreadScan, irq: &str, stat: &str) -> String {
+fn format_pileup(
+    up: &str,
+    counts: (u32, u32),
+    scan: &ThreadScan,
+    irq: &str,
+    stat: &str,
+    suffix: &str,
+) -> String {
     let (runnable, blocked) = counts;
     let threads = match scan {
         Ok((threads, unreadable)) => format!(
@@ -488,7 +522,7 @@ fn format_pileup(up: &str, counts: (u32, u32), scan: &ThreadScan, irq: &str, sta
     };
     bounded(
         format!(
-            "up={up} runnable={runnable} blocked={blocked} {threads} irq=[{irq}] cpu=[{}]",
+            "up={up} runnable={runnable} blocked={blocked} {threads} irq=[{irq}] cpu=[{}]{suffix}",
             cpu_times(stat)
         ),
         PILEUP_LIMIT,
@@ -535,11 +569,19 @@ impl Pileup {
         };
         let up = read_proc("/proc/uptime").unwrap_or_default();
         let up = up.split_whitespace().next().unwrap_or("?");
-        let mut line = format_pileup(up, counts, &thread_stats(), &irq, &stat);
-        if self.piled_for > PILEUP_EVERY_SECOND_FOR {
-            line.push_str(" (every 10th second now)");
-        }
-        Ok(Some(line))
+        let suffix = if self.piled_for > PILEUP_EVERY_SECOND_FOR {
+            " (every 10th second now)"
+        } else {
+            ""
+        };
+        Ok(Some(format_pileup(
+            up,
+            counts,
+            &thread_stats(),
+            &irq,
+            &stat,
+            suffix,
+        )))
     }
 }
 
@@ -811,6 +853,7 @@ mod tests {
             &piled,
             &virtio_irqs(interrupts, Some("virtio2")),
             STAT_2CPU,
+            "",
         );
         assert!(
             line.starts_with(
@@ -844,7 +887,14 @@ mod tests {
     /// must not print like a scan that found nothing, and a failed scan says so.
     #[test]
     fn no_vsock_named_thread_and_a_failed_scan_both_say_so() {
-        let line = format_pileup("1.00", (9, 0), &threads(&["50 (yes) R 1"]), "", STAT_2CPU);
+        let line = format_pileup(
+            "1.00",
+            (9, 0),
+            &threads(&["50 (yes) R 1"]),
+            "",
+            STAT_2CPU,
+            "",
+        );
         assert!(line.contains("vsock=[none-named]"), "{line}");
         let line = format_pileup(
             "1.00",
@@ -852,6 +902,7 @@ mod tests {
             &Err("/proc: denied".to_string()),
             "unavailable(x)",
             STAT_2CPU,
+            "",
         );
         assert!(
             line.contains("threads-unavailable(/proc: denied)")
@@ -875,11 +926,32 @@ mod tests {
         let text = format!("{}{}", "a".repeat(PILEUP_LIMIT - 1), "\u{e9}".repeat(40));
         let cut = bounded(text, PILEUP_LIMIT);
         assert!(
-            cut.ends_with(" ...truncated") && cut.len() < PILEUP_LIMIT + 16,
+            cut.ends_with(" ...truncated") && cut.len() <= PILEUP_LIMIT,
             "{}",
             cut.len()
         );
         assert_eq!(bounded("short".to_string(), PILEUP_LIMIT), "short");
+    }
+
+    /// A scan that takes seconds must not be followed by one scan per missed
+    /// deadline, and the 10s line must survive a skip over its second.
+    #[test]
+    fn a_slow_scan_skips_the_deadlines_it_missed() {
+        assert_eq!(next_tick(3, Duration::from_millis(3200)), 4);
+        assert_eq!(next_tick(3, Duration::from_millis(8700)), 9);
+        assert!(sample_due(None, 0));
+        assert!(!sample_due(Some(3), 9));
+        assert!(sample_due(Some(8), 12));
+    }
+
+    /// A thread that exited between the listing and the read is not unreadable.
+    /// A read refused for any other reason is, or the count would hide it.
+    #[test]
+    fn only_a_vanished_process_is_left_out_of_the_unreadable_count() {
+        use std::io::{Error, ErrorKind};
+        assert!(vanished(&Error::from(ErrorKind::NotFound)));
+        assert!(!vanished(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!vanished(&Error::other("anything else")));
     }
 
     /// The scan must see real threads: this test's own thread is running.

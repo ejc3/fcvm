@@ -287,11 +287,19 @@ pub async fn graceful_kill_async(pid: u32, timeout_ms: u64) {
 /// Whether a guest console line is logged at INFO (fc-agent's own lines and
 /// container output) or at DEBUG (everything else).
 pub fn console_line_is_important(clean: &str) -> bool {
-    // Vitals first: a pile-up line can name a thread called `fc-agent`.
-    if clean.contains("[fcvm-vitals]") {
-        return false;
+    let marker = ["[fc-agent]", "[ctr:"]
+        .iter()
+        .filter_map(|marker| clean.find(marker))
+        .min();
+    // A vitals line is one whose prefix comes before any agent or container
+    // marker. After that prefix it can name a thread called `fc-agent`, and a
+    // marked line can mention the prefix further along and still be marked.
+    if let Some(vitals) = clean.find("[fcvm-vitals]") {
+        if marker.is_none_or(|marker| vitals < marker) {
+            return false;
+        }
     }
-    clean.contains("fc-agent") || clean.contains("[ctr:")
+    marker.is_some() || clean.contains("fc-agent")
 }
 
 /// Strip Firecracker timestamp and instance prefix from log lines.
@@ -1010,6 +1018,22 @@ mod tests {
         ));
         assert!(!console_line_is_important(
             "ubuntu login: [fcvm-vitals] MemFree: 1 kB"
+        ));
+    }
+
+    /// Container output and fc-agent's own lines carry their marker first. One
+    /// that mentions the vitals prefix further along is still theirs.
+    #[test]
+    fn a_marked_line_that_mentions_the_vitals_prefix_stays_in_the_job_log() {
+        assert!(console_line_is_important(
+            "[ctr:out] grep '[fcvm-vitals]' vm.log"
+        ));
+        assert!(console_line_is_important(
+            "[fc-agent] exec: cannot run \"x\" | guest vitals: [fcvm-vitals] MemFree: 1 kB"
+        ));
+        // A vitals line that names a thread called `[ctr:` after its prefix is still a vitals line.
+        assert!(!console_line_is_important(
+            "[fcvm-vitals] pileup busy=[R:[ctr:*1 R:fc-agent*1]"
         ));
     }
 
