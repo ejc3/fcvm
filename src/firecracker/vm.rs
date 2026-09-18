@@ -323,7 +323,7 @@ impl VmManager {
         let spawned = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);
             // fc-agent and container output at INFO/WARN, everything else at DEBUG
-            let is_important = clean.contains("fc-agent") || clean.contains("[ctr:");
+            let is_important = crate::utils::console_line_is_important(clean);
             if !is_stderr {
                 // Firecracker writes the guest serial console to its stdout
                 // (its own logs go to --log-path), so every stdout line is

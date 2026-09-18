@@ -284,6 +284,16 @@ pub async fn graceful_kill_async(pid: u32, timeout_ms: u64) {
         .await;
 }
 
+/// Whether a guest console line is logged at INFO (fc-agent's own lines and
+/// container output) or at DEBUG (everything else).
+pub fn console_line_is_important(clean: &str) -> bool {
+    // Vitals first: a pile-up line can name a thread called `fc-agent`.
+    if clean.contains("[fcvm-vitals]") {
+        return false;
+    }
+    clean.contains("fc-agent") || clean.contains("[ctr:")
+}
+
 /// Strip Firecracker timestamp and instance prefix from log lines.
 /// Input:  "2025-11-15T17:18:55.027478889 [anonymous-instance:main] message"
 /// Output: "message"
@@ -983,6 +993,24 @@ mod tests {
             ),
             "Running Firecracker"
         );
+    }
+
+    /// A guest vitals line can name a thread called `fc-agent`. It is still a
+    /// vitals line: at INFO it would put up to 1 KiB a second per busy VM into
+    /// the job log.
+    #[test]
+    fn a_vitals_line_naming_fc_agent_stays_out_of_the_job_log() {
+        assert!(console_line_is_important(
+            "[fc-agent] exec server: accepted connection"
+        ));
+        assert!(console_line_is_important("[ctr:out] hello"));
+        assert!(!console_line_is_important("[    1.2] random kernel line"));
+        assert!(!console_line_is_important(
+            "[fcvm-vitals] pileup up=41.75 runnable=9 blocked=0 scanned=140 unreadable=0 busy=[R:yes*8 R:fc-agent*1]"
+        ));
+        assert!(!console_line_is_important(
+            "ubuntu login: [fcvm-vitals] MemFree: 1 kB"
+        ));
     }
 
     #[test]
