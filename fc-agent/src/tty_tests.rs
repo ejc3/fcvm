@@ -455,6 +455,47 @@ async fn an_unknown_user_exits_126_without_running_the_command() {
     assert!(text.contains("definitely-no-such-user"), "{text:?}");
 }
 
+/// Kill a detached command's whole process group, which it leads, and wait
+/// until nothing of it is left. Killing the leader alone would leave its
+/// children behind, holding the terminal.
+async fn kill_group(leader: i32) {
+    unsafe { libc::kill(-leader, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while unsafe { libc::kill(-leader, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "process group {leader} outlived SIGKILL"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_detached_tty_leader_is_reaped_while_a_descendant_holds_the_terminal() {
+    // The command exits at once; its background child keeps the terminal
+    // open for much longer. The exited leader must not wait for that as a zombie.
+    let mut session = sh("setsid sleep 30 & exit 0", true, false);
+    session.detach = true;
+    let outcome = run(session, vec![]).await;
+    assert_eq!(outcome.exit, Some(0));
+    let pid: i32 = String::from_utf8_lossy(&outcome.stdout)
+        .trim()
+        .parse()
+        .unwrap_or_else(|_| panic!("expected a pid line, got {:?}", outcome.stdout));
+
+    let stat = format!("/proc/{pid}/stat");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let left_behind = loop {
+        match std::fs::read_to_string(&stat) {
+            Err(_) => break None, // reaped
+            Ok(text) if Instant::now() > deadline => break Some(text),
+            Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
+        }
+    };
+    kill_group(pid).await;
+    assert_eq!(left_behind, None, "the exited leader was never reaped");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_detached_tty_command_has_a_terminal_and_outlives_the_session() {
     // What `podman exec -d -t` gives a command: a terminal on its stdio, no
@@ -483,7 +524,7 @@ async fn a_detached_tty_command_has_a_terminal_and_outlives_the_session() {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     };
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    kill_group(pid).await;
     let _ = std::fs::remove_file(&report);
 
     let lines: Vec<&str> = text.lines().collect();
@@ -526,7 +567,7 @@ async fn a_detached_command_outlives_the_session_in_its_own_session() {
         "detached command {pid} is gone"
     );
     assert_eq!(unsafe { libc::getsid(pid) }, pid);
-    unsafe { libc::kill(pid, libc::SIGKILL) };
+    kill_group(pid).await;
 }
 
 /// Read the first line the command prints (its pid) from the PTY or stdout.

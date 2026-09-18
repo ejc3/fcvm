@@ -489,6 +489,10 @@ fn resolve_identity(spec: &str) -> std::io::Result<Identity> {
 /// Keep a detached command's terminal open and empty for as long as the
 /// command lives. Nobody reads it, but closing the master would hang the
 /// command up, and a full terminal would block its writes.
+///
+/// The command leads the terminal's session, so the kernel hangs the terminal
+/// up when it exits, whoever else still holds it. The read then fails and the
+/// command is reaped at once; it does not wait as a zombie for a descendant.
 fn hold_detached_terminal(master: OwnedFd, mut child: tokio::process::Child) {
     tokio::spawn(async move {
         match AsyncFdStream::new(master) {
@@ -498,7 +502,7 @@ fn hold_detached_terminal(master: OwnedFd, mut child: tokio::process::Child) {
                     match tokio::io::AsyncReadExt::read(&mut master, &mut buf).await {
                         Ok(n) if n > 0 => {}
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
-                        // Hung up: every holder of the terminal has gone.
+                        // Hung up: the command has exited.
                         _ => break,
                     }
                 }
