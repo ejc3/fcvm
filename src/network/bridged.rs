@@ -55,6 +55,23 @@ fn peer_of(host_ip: &str) -> Option<String> {
     Some(format!("{}.{}", prefix, n.checked_add(1)?))
 }
 
+/// The address through which the host reaches this VM's guest: the /30 peer of the host
+/// end of the VM's own veth.
+///
+/// In a baseline the guest holds that address itself, because the namespace bridges the
+/// TAP and the veth at layer 2. In a VM restored from a snapshot the namespace end of the
+/// veth holds it, and the namespace DNATs every TCP and UDP port on it to the guest
+/// (`veth::setup_in_namespace_nat`), which is also how that VM's published ports arrive.
+/// Either way `setup` has required the kernel to route this address through the VM's own
+/// veth (`kernel_routes_peer_via_veth`), and no other VM has it.
+///
+/// `guest_ip` does not identify a VM. Every VM restored from one snapshot has the same
+/// one, and the host's `/32` route to it belongs to whichever of them set up last
+/// (`veth::add_host_route_to_guest`).
+pub fn host_reachable_ip(net: &NetworkConfig) -> Option<String> {
+    peer_of(net.host_ip.as_deref()?)
+}
+
 /// After the candidate /30 is assigned, ask the kernel where the pair's
 /// namespace-side address routes NOW. Anything but our veth means a more
 /// specific host route claims it and the subnet is unusable (#820): AWS DHCP
@@ -575,8 +592,8 @@ impl NetworkManager for BridgedNetwork {
             "network namespace configured successfully"
         );
 
-        // Return network config with auto-generated health check URL
-        // For clones, use the veth inner IP (which gets DNATed to guest)
+        // The health probe does not use `guest_ip`, which a restored VM shares with its
+        // siblings. It derives this VM's own address from `host_ip` (`host_reachable_ip`).
         Ok(NetworkConfig {
             tap_device: self.tap_device.clone(),
             guest_mac,
@@ -751,6 +768,39 @@ mod tests {
                  launch config's hashed value via with_dns_server instead"
             );
         }
+    }
+
+    /// The health probe's target, in both layouts `setup` builds. The host end comes from
+    /// `derive_host_ip`. A baseline's guest sits at the peer (172.30.x.y+1), and a
+    /// restored VM's namespace veth does (10.x.y.z+1), with the guest behind its DNAT.
+    #[test]
+    fn host_reachable_ip_is_the_peer_of_the_vms_own_host_address() {
+        let config = |host_ip: Option<&str>, guest_ip: &str| NetworkConfig {
+            host_ip: host_ip.map(str::to_string),
+            guest_ip: Some(guest_ip.to_string()),
+            ..Default::default()
+        };
+
+        let baseline_host = derive_host_ip(1, false);
+        assert_eq!(baseline_host, "172.30.0.5");
+        assert_eq!(
+            host_reachable_ip(&config(Some(&baseline_host), "172.30.0.6")).as_deref(),
+            Some("172.30.0.6"),
+            "a baseline is reached at its guest address"
+        );
+
+        // Two VMs restored from one snapshot: one guest address, two addresses of their own.
+        let (first_host, second_host) = (derive_host_ip(1, true), derive_host_ip(2, true));
+        let first = host_reachable_ip(&config(Some(&first_host), "172.30.135.98"));
+        let second = host_reachable_ip(&config(Some(&second_host), "172.30.135.98"));
+        assert_eq!(first.as_deref(), Some("10.0.1.6"));
+        assert_eq!(second.as_deref(), Some("10.0.2.10"));
+
+        assert_eq!(host_reachable_ip(&config(None, "172.30.135.98")), None);
+        assert_eq!(
+            host_reachable_ip(&config(Some("not-an-address"), "172.30.135.98")),
+            None
+        );
     }
 
     #[test]

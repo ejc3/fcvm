@@ -886,8 +886,9 @@ pub async fn add_host_route_to_guest(
 /// Bridged clones restored from the same snapshot share one guest IP, and
 /// `add_host_route_to_guest` deliberately lets the newest clone replace the
 /// {guest_ip}/32 route. Deleting unconditionally on cleanup would remove the route
-/// out from under a surviving clone, breaking host -> guest access (and HTTP health
-/// checks) for it. The delete is therefore qualified with `via {veth_inner_ip}`:
+/// out from under a surviving clone, breaking host -> guest access for it. (Health
+/// checks do not use this route: `bridged::host_reachable_ip`.) The delete is therefore
+/// qualified with `via {veth_inner_ip}`:
 /// it only matches the route that points at this clone's namespace veth, so a route
 /// owned by another clone is left in place. The kernel evaluates the qualifier
 /// atomically, so this stays correct even if another clone replaces the route

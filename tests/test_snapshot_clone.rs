@@ -1108,14 +1108,14 @@ async fn clone_while_baseline_running_impl(network_mode: &str) -> Result<()> {
 /// veth with a unique /30 subnet. The host route `{guest_ip}/32 via {veth_inner_ip}` determines
 /// which clone is reachable from the host.
 ///
-/// Without route replacement, the second clone's HTTP health check fails because:
-/// - SO_BINDTODEVICE constrains the packet to clone2's veth
-/// - But the host route says "via clone1's gateway" (wrong /30 subnet for clone2's veth)
-/// - ARP resolution fails → health check timeout
+/// Without route replacement the newest clone could not be reached at the guest address
+/// from the host. Health checks do not depend on this route (they use each clone's own
+/// veth address, see `test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route`),
+/// so the route itself is what this test reads.
 ///
 /// This test spawns two clones from the same serve and verifies:
 /// 1. Clone1's route is created
-/// 2. Clone2 replaces clone1's route and becomes healthy
+/// 2. Clone2 replaces clone1's route
 /// 3. Clone1's VM process is still alive (just not reachable via host route)
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
@@ -1268,11 +1268,9 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     .await
     .context("spawning clone2")?;
 
-    // Clone2 becoming healthy PROVES route replacement worked:
-    // - Clone2's health monitor sends HTTP to guest_ip via clone2's veth (SO_BINDTODEVICE)
-    // - Without route replacement, ARP for clone1's gateway fails on clone2's veth
-    // - With route replacement, ARP for clone2's gateway succeeds
-    println!("  Waiting for clone2 to become healthy (proves route replacement)...");
+    // Clone2 is up once it reads healthy. That says nothing about the route, which
+    // step 7 reads directly.
+    println!("  Waiting for clone2 to become healthy...");
     common::poll_health_by_pid(clone2_pid, 120).await?;
     println!("  ✓ Clone2 healthy (PID: {})", clone2_pid);
 
