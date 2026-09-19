@@ -1091,7 +1091,11 @@ async fn check_http_health_bridged(
     timeout_secs: u64,
 ) -> Result<bool> {
     // Build a reqwest client, optionally bound to the veth device
-    let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(timeout_secs));
+    // `no_proxy`: reqwest would otherwise take `http_proxy` from the environment and
+    // send the guest's health check to it.
+    let mut builder = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(timeout_secs));
 
     if let Some(veth) = veth_device {
         builder = builder.interface(veth);
@@ -1163,6 +1167,11 @@ fn build_nsenter_curl_args(
         "%{http_code}".to_string(),
         "--max-time".to_string(),
         timeout_secs.to_string(),
+        // This curl inherits fcvm's environment. A guest address is never behind a
+        // proxy, and with `http_proxy` set curl would ask it from inside the namespace,
+        // fail with nothing on stderr, and leave the VM unhealthy forever.
+        "--noproxy".to_string(),
+        "*".to_string(),
     ];
     // Add Host header if specified (needed for servers that route by Host)
     if let Some(host) = host_header {
@@ -1247,5 +1256,110 @@ mod tests {
 
         // URL must be last
         assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
+    }
+
+    const PROXY_PROBE_CHILD: &str = "FCVM_TEST_HEALTH_PROXY_PROBE_CHILD";
+
+    /// The bridged probe is a reqwest client, and reqwest takes `http_proxy` from the
+    /// environment unless told not to. A guest address is never behind a proxy, so a
+    /// host that exports one for image pulls would send every health check to it.
+    ///
+    /// The variable is set on a re-executed child, per `crate::test_env`. The parent
+    /// plays a guest that answers 200 and a proxy that answers 502, and counts who
+    /// was asked.
+    #[test]
+    fn bridged_probe_never_asks_a_proxy_for_the_guest() {
+        use std::io::{Read, Write};
+        if let Some(target) = std::env::var_os(PROXY_PROBE_CHILD) {
+            let target = target.to_string_lossy().to_string();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("child runtime");
+            let healthy = runtime.block_on(check_http_health_bridged(&target, None, None, 5));
+            assert!(
+                matches!(healthy, Ok(true)),
+                "probe of {target} returned {healthy:?}"
+            );
+            return;
+        }
+
+        let guest = std::net::TcpListener::bind("127.0.0.1:0").expect("guest listener");
+        let proxy = std::net::TcpListener::bind("127.0.0.1:0").expect("proxy listener");
+        guest.set_nonblocking(true).expect("nonblocking guest");
+        proxy.set_nonblocking(true).expect("nonblocking proxy");
+        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let mut child = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "--exact",
+                "health::tests::bridged_probe_never_asks_a_proxy_for_the_guest",
+                "--nocapture",
+            ])
+            .env(
+                PROXY_PROBE_CHILD,
+                format!("http://{}/", guest.local_addr().unwrap()),
+            )
+            .env("http_proxy", &proxy_url)
+            .env("HTTP_PROXY", &proxy_url)
+            .env_remove("no_proxy")
+            .env_remove("NO_PROXY")
+            .spawn()
+            .expect("spawning the probe child");
+
+        let answer = |mut stream: std::net::TcpStream, status: &str| {
+            stream.set_nonblocking(false).expect("blocking stream");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .expect("read timeout");
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        };
+        let (mut guest_hits, mut proxy_hits) = (0, 0);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Ok((stream, _)) = guest.accept() {
+                guest_hits += 1;
+                answer(stream, "200 OK");
+            }
+            if let Ok((stream, _)) = proxy.accept() {
+                proxy_hits += 1;
+                answer(stream, "502 Bad Gateway");
+            }
+            if let Some(status) = child.try_wait().expect("polling the probe child") {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the probe child never exited");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        assert_eq!(
+            proxy_hits, 0,
+            "the health probe asked http_proxy for the guest ({guest_hits} direct requests)"
+        );
+        assert!(status.success(), "the probe child failed: {status}");
+        assert_eq!(guest_hits, 1);
+    }
+
+    /// fcvm's environment reaches this curl, and a host that needs `http_proxy` to pull
+    /// images has it set. Without `--noproxy` curl asks that proxy for the guest's
+    /// address from inside the VM's namespace, exits non-zero with nothing on stderr,
+    /// and a `--health-check` VM never reads healthy. Measured on one command: never
+    /// healthy in 240 s with `http_proxy` exported, healthy in 4 s once the guest
+    /// address was in `no_proxy`. The routed probe passes the same flag.
+    #[test]
+    fn nsenter_curl_never_asks_a_proxy_for_the_guest() {
+        for host_header in [None, Some("myapp.local")] {
+            let args =
+                build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", host_header, 5);
+            let noproxy_pos = args
+                .iter()
+                .position(|a| a == "--noproxy")
+                .unwrap_or_else(|| panic!("no --noproxy in {args:?}"));
+            assert_eq!(args[noproxy_pos + 1], "*", "{args:?}");
+            assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
+        }
     }
 }
