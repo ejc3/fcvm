@@ -70,7 +70,7 @@ apt-get install -y curl wget git jq build-essential \
   podman uidmap passt fuse-overlayfs containernetworking-plugins \
   fuse3 libfuse3-dev libclang-dev clang musl-tools \
   iproute2 iptables dnsmasq qemu-utils e2fsprogs parted \
-  skopeo busybox-static cpio zstd autoconf automake libtool python3 util-linux
+  skopeo busybox-static cpio zstd autoconf automake libtool libseccomp-dev python3 util-linux
 
 # Node.js 22.x
 curl -fsSL https://deb.nodesource.com/setup_22.x | bash -

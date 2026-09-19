@@ -289,9 +289,9 @@ impl CloneFixture {
         };
 
         // Make one HTTP request to nginx via the loopback port forward (pasta).
-        // verify_port_forwarding() already confirmed the L2 path, and pasta no
-        // longer retargets forwarding from overheard bridge traffic
-        // (scripts/passt-addr-seen.patch), so the first request must succeed.
+        // The baseline ran with --health-check, so the snapshot holds a listening
+        // nginx and this clone inherited the check: it read healthy only after
+        // nginx answered, and the first request must succeed.
         let addr = format!("{}:{}", loopback_ip, health_port);
         let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
 
@@ -429,8 +429,20 @@ fn bench_clone_exec(c: &mut Criterion) {
 fn bench_clone_http(c: &mut Criterion) {
     eprintln!("\n=== Setting up snapshot for clone HTTP benchmarks ===");
 
-    // Port mappings are baked into the snapshot from the baseline VM
-    let fixture = CloneFixture::setup("clone2-http", "rootless", &["--publish", "8080:80"]);
+    // Port mappings are baked into the snapshot from the baseline VM. Without the
+    // health check "healthy" means only that the container is running, so a snapshot
+    // taken then can hold nginx still inside its entrypoint, and every clone of it
+    // resets the first request until nginx binds its port (#943).
+    let fixture = CloneFixture::setup(
+        "clone2-http",
+        "rootless",
+        &[
+            "--publish",
+            "8080:80",
+            "--health-check",
+            "http://localhost:80",
+        ],
+    );
 
     let mut group = c.benchmark_group("clone");
     group.sample_size(10);

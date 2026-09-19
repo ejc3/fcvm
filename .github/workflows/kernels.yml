@@ -63,7 +63,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -245,7 +245,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -470,7 +470,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm

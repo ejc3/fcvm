@@ -213,3 +213,111 @@ fn kernel_workflow_builds_and_releases_default_for_both_runner_arches() {
         "release-default-kernel no longer builds the default profile; recipe is:\n{recipe}"
     );
 }
+
+fn kernels_workflow() -> YamlValue {
+    let path = repo_root().join(".github/workflows/kernels.yml");
+    serde_norway::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+}
+
+/// A step's `run` script, or nothing for a step that uses an action.
+fn run_script(step: &YamlValue) -> &str {
+    step.get("run").and_then(YamlValue::as_str).unwrap_or("")
+}
+
+/// The packages a shell script installs with apt. Comments are dropped and
+/// backslash continuations joined first, so a package named only in a comment
+/// does not count and one on a continuation line does.
+fn apt_packages(script: &str) -> std::collections::BTreeSet<String> {
+    let joined = script.replace("\\\n", " ");
+    let mut packages = std::collections::BTreeSet::new();
+    for line in joined.lines() {
+        let line = line.split('#').next().unwrap_or("");
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(install) = words.iter().position(|word| *word == "install") else {
+            continue;
+        };
+        if !words[..install].iter().any(|word| word.contains("apt-get")) {
+            continue;
+        }
+        packages.extend(
+            words[install + 1..]
+                .iter()
+                .filter(|word| !word.starts_with('-'))
+                .map(|word| word.to_string()),
+        );
+    }
+    packages
+}
+
+#[test]
+fn apt_packages_reads_continuations_and_ignores_comments() {
+    let script = "./scripts/ci-apt-get.sh update\n\
+                  ./scripts/ci-apt-get.sh install -y flex bison \\\n    libseccomp-dev  # linked by firecracker\n\
+                  ./scripts/ci-apt-get.sh install -y gh  # libelf-dev comes from the image\n\
+                  echo install nothing\n";
+    let packages = apt_packages(script);
+    let expected = ["bison", "flex", "gh", "libseccomp-dev"];
+    assert_eq!(
+        packages.iter().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+}
+
+/// Every job here runs `fcvm setup`, and setup builds Firecracker, which links
+/// libseccomp. The build step runs only when the pinned kernel has no release
+/// yet, so a missing package stays hidden until the next kernel bump: the
+/// amd64 default job first built on the move to 6.18.50 and failed with
+/// `unable to find library -lseccomp` after the kernel itself was ready. The
+/// arm64 runner image carried the package and the x64 bootstrap did not.
+#[test]
+fn every_kernel_workflow_job_installs_what_setup_links() {
+    let workflow = kernels_workflow();
+    let jobs = workflow["jobs"].as_mapping().expect("jobs is a mapping");
+    let mut names: Vec<&str> = jobs.keys().filter_map(YamlValue::as_str).collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "build-btrfs-kernel",
+            "build-default-kernel",
+            "build-nested-kernel"
+        ],
+        "a job was added to or removed from kernels.yml; decide whether it runs setup and \
+         update this test"
+    );
+    for name in names {
+        let steps = workflow["jobs"][name]["steps"].as_sequence().unwrap();
+        let setup = steps
+            .iter()
+            .position(|step| {
+                run_script(step).contains("fcvm setup")
+                    || run_script(step).contains("make release-default-kernel")
+            })
+            .unwrap_or_else(|| panic!("job `{name}` no longer runs setup"));
+        // Only a step that always runs, before setup does, provides the package.
+        let installed: std::collections::BTreeSet<String> = steps[..setup]
+            .iter()
+            .filter(|step| step.get("if").is_none())
+            .flat_map(|step| apt_packages(run_script(step)))
+            .collect();
+        assert!(
+            installed.contains("libseccomp-dev"),
+            "job `{name}` runs fcvm setup, which builds Firecracker, and no unconditional step \
+             before it installs libseccomp-dev; those steps install: {installed:?}"
+        );
+    }
+}
+
+/// Both runner images have to carry it too, or the two architectures disagree
+/// about what a job may assume. That disagreement is what hid the missing
+/// install above.
+#[test]
+fn both_runner_images_install_libseccomp() {
+    for script in ["scripts/setup-runner.sh", "scripts/build-ami.sh"] {
+        let text = std::fs::read_to_string(repo_root().join(script)).unwrap();
+        assert!(
+            apt_packages(&text).contains("libseccomp-dev"),
+            "{script} does not install libseccomp-dev"
+        );
+    }
+}
