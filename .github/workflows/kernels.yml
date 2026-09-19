@@ -210,8 +210,20 @@ jobs:
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
 
   build-nested-kernel:
-    name: Build Nested Kernel
-    runs-on: [self-hosted, Linux, ARM64]
+    name: Build Nested Kernel (${{ matrix.config_arch }})
+    # One leg per architecture table the nested profile defines in
+    # rootfs-config.toml, for the reason given on build-btrfs-kernel: setup
+    # downloads the release named for the host it runs on, and
+    # kernel_profiles.nested.amd64 names a kernel_repo.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -258,19 +270,52 @@ jobs:
       - name: Compute kernel version and SHA
         id: kernel
         working-directory: fcvm
+        env:
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # SHA must match fcvm's content-addressed kernel naming:
-          # build_inputs for kernel_profiles.nested.arm64 in rootfs-config.toml
-          SHA=$(cat kernel/nested.conf kernel/patches-arm64/*.patch | sha256sum | cut -c1-12)
+          # Both values come from this leg's table, kernel_profiles.nested.<arch>
+          # in the checked-out rootfs-config.toml. The SHA is fcvm's content
+          # address: the first 12 hex digits of the SHA-256 over the table's
+          # build_inputs, globs expanded in sorted order, *.disabled left out.
+          mapfile -t METADATA < <(python3 - <<'PY'
+          import glob
+          import hashlib
+          import os
+          import pathlib
+          import tomllib
 
-          # Version from the checked-out repo config (the source of truth)
-          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['nested']['arm64']['kernel_version'])")
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: kernel_version not found for kernel_profiles.nested.arm64 in rootfs-config.toml"
+          config = tomllib.load(open("rootfs-config.toml", "rb"))
+          profile = config["kernel_profiles"]["nested"][os.environ["CONFIG_ARCH"]]
+          digest = hashlib.sha256()
+          for pattern in profile["build_inputs"]:
+              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
+              if not matches:
+                  raise SystemExit(f"build input matched no files: {pattern}")
+              for path in matches:
+                  if not str(path).endswith(".disabled"):
+                      digest.update(path.read_bytes())
+          print(profile["kernel_version"])
+          print(digest.hexdigest()[:12])
+          PY
+          )
+
+          VERSION="${METADATA[0]:-}"
+          SHA="${METADATA[1]:-}"
+          if [ -z "$VERSION" ] || [ -z "$SHA" ]; then
+            echo "ERROR: could not read kernel_profiles.nested.$CONFIG_ARCH from rootfs-config.toml"
             exit 1
           fi
 
           ARCH=$(uname -m)
+          case "$CONFIG_ARCH" in
+            arm64) EXPECTED_ARCH=aarch64 ;;
+            amd64) EXPECTED_ARCH=x86_64 ;;
+            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
+          esac
+          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
+            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
+            exit 1
+          fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "arch=$ARCH" >> $GITHUB_OUTPUT
@@ -365,6 +410,7 @@ jobs:
         working-directory: fcvm
         env:
           GH_TOKEN: ${{ github.token }}
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
           TAG="${{ steps.kernel.outputs.tag }}"
           FILENAME="${{ steps.kernel.outputs.filename }}"
@@ -377,10 +423,11 @@ jobs:
             gh release delete "$TAG" --yes 2>/dev/null || true
           fi
 
-          # Create release with kernel binary
-          gh release create "$TAG" \
-            --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
-            --notes "Nested kernel for running fcvm inside fcvm (nested virtualization).
+          # The legs nest by different mechanisms (FEAT_NV2 on arm64, VT-x or
+          # AMD-V on x86_64), so each publishes notes that are true for it.
+          case "$CONFIG_ARCH" in
+            arm64)
+              NOTES="Nested kernel for running fcvm inside fcvm (nested virtualization).
 
           ## Kernel Details
 
@@ -416,7 +463,46 @@ jobs:
           fcvm podman run --kernel-profile nested --privileged --name outer alpine:latest
           # Inside VM: fcvm podman run --name inner alpine:latest
           \`\`\`
-          " \
+          "
+              ;;
+            amd64)
+              NOTES="Nested kernel for running fcvm inside fcvm (nested virtualization).
+
+          ## Kernel Details
+
+          | Property | Value |
+          |----------|-------|
+          | Version | ${VERSION} |
+          | Build SHA | ${SHA} |
+          | Architecture | ${ARCH} |
+
+          ## Features
+
+          - **CONFIG_KVM=y, CONFIG_KVM_INTEL=y, CONFIG_KVM_AMD=y** - KVM hypervisor built-in for Intel VT-x and AMD-V
+          - **FUSE support** - For volume mounts between host and guest
+          - **FUSE remap_file_range patch** - Enables reflink/CoW through FUSE
+
+          ## Requirements
+
+          - **Host**: x86_64 with Intel VT-x or AMD-V (AWS: c5.metal or another bare-metal instance)
+          - **Host KVM**: nested virtualization enabled (\`nested=1\` for \`kvm_intel\` or \`kvm_amd\`)
+
+          ## Usage
+
+          \`\`\`bash
+          fcvm setup --kernel-profile nested
+          fcvm podman run --kernel-profile nested --privileged --name outer alpine:latest
+          # Inside VM: fcvm podman run --name inner alpine:latest
+          \`\`\`
+          "
+              ;;
+            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
+          esac
+
+          # Create release with kernel binary
+          gh release create "$TAG" \
+            --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "$NOTES" \
             "/tmp/$FILENAME"
 
           echo "✅ Created release: $TAG"
@@ -435,8 +521,21 @@ jobs:
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
 
   build-btrfs-kernel:
-    name: Build Btrfs Kernel
-    runs-on: [self-hosted, Linux, ARM64]
+    name: Build Btrfs Kernel (${{ matrix.config_arch }})
+    # One leg per architecture table the btrfs profile defines in
+    # rootfs-config.toml. `fcvm setup --kernel-profile btrfs` downloads the
+    # release named for the host it runs on, so an architecture with a table
+    # and no leg here has nothing to download: after the move to 6.18.50 an
+    # x86_64 host got a 404 for kernel-btrfs-6.18.50-x86_64-<sha>.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -483,19 +582,52 @@ jobs:
       - name: Compute kernel version and SHA
         id: kernel
         working-directory: fcvm
+        env:
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # SHA must match fcvm's content-addressed kernel naming:
-          # build_inputs for kernel_profiles.btrfs.arm64 in rootfs-config.toml (no patches)
-          SHA=$(cat kernel/btrfs.conf | sha256sum | cut -c1-12)
+          # Both values come from this leg's table, kernel_profiles.btrfs.<arch>
+          # in the checked-out rootfs-config.toml. The SHA is fcvm's content
+          # address: the first 12 hex digits of the SHA-256 over the table's
+          # build_inputs, globs expanded in sorted order, *.disabled left out.
+          mapfile -t METADATA < <(python3 - <<'PY'
+          import glob
+          import hashlib
+          import os
+          import pathlib
+          import tomllib
 
-          # Version from the checked-out repo config (the source of truth)
-          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['btrfs']['arm64']['kernel_version'])")
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: kernel_version not found for kernel_profiles.btrfs.arm64 in rootfs-config.toml"
+          config = tomllib.load(open("rootfs-config.toml", "rb"))
+          profile = config["kernel_profiles"]["btrfs"][os.environ["CONFIG_ARCH"]]
+          digest = hashlib.sha256()
+          for pattern in profile["build_inputs"]:
+              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
+              if not matches:
+                  raise SystemExit(f"build input matched no files: {pattern}")
+              for path in matches:
+                  if not str(path).endswith(".disabled"):
+                      digest.update(path.read_bytes())
+          print(profile["kernel_version"])
+          print(digest.hexdigest()[:12])
+          PY
+          )
+
+          VERSION="${METADATA[0]:-}"
+          SHA="${METADATA[1]:-}"
+          if [ -z "$VERSION" ] || [ -z "$SHA" ]; then
+            echo "ERROR: could not read kernel_profiles.btrfs.$CONFIG_ARCH from rootfs-config.toml"
             exit 1
           fi
 
           ARCH=$(uname -m)
+          case "$CONFIG_ARCH" in
+            arm64) EXPECTED_ARCH=aarch64 ;;
+            amd64) EXPECTED_ARCH=x86_64 ;;
+            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
+          esac
+          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
+            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
+            exit 1
+          fi
 
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "arch=$ARCH" >> $GITHUB_OUTPUT

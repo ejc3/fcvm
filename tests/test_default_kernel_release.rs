@@ -1,4 +1,4 @@
-//! Release invariants for the source-built default guest kernel.
+//! Release invariants for the guest kernels that `kernels.yml` builds and publishes.
 
 use serde_norway::Value as YamlValue;
 use sha2::{Digest, Sha256};
@@ -320,4 +320,196 @@ fn both_runner_images_install_libseccomp() {
             "{script} does not install libseccomp-dev"
         );
     }
+}
+
+/// The architecture a runner label builds for, under the name
+/// rootfs-config.toml gives it.
+fn config_arch_of_runner(label: &str) -> Option<&'static str> {
+    match label {
+        "ARM64" => Some("arm64"),
+        "X64" => Some("amd64"),
+        _ => None,
+    }
+}
+
+/// Every (kernel profile, architecture) leg a kernels workflow builds and
+/// publishes, read from the workflow alone.
+///
+/// A job's profile is the one name its scripts pass to `--kernel-profile`.
+/// `make release-default-kernel` is the default profile, which
+/// `kernel_workflow_builds_and_releases_default_for_both_runner_arches` pins to
+/// the recipe. A job's architectures are its matrix legs, or, for a job with no
+/// matrix, the one runner architecture `runs-on` names.
+fn published_kernel_legs(workflow: &YamlValue) -> std::collections::BTreeSet<(String, String)> {
+    let mut legs = std::collections::BTreeSet::new();
+    let jobs = workflow["jobs"].as_mapping().expect("jobs is a mapping");
+    for (name, job) in jobs {
+        let name = name.as_str().expect("job ids are strings");
+        let steps = job["steps"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("job `{name}` has no steps"));
+        let mut profiles = std::collections::BTreeSet::new();
+        for script in steps.iter().map(run_script) {
+            if script.contains("make release-default-kernel") {
+                profiles.insert("default".to_string());
+            }
+            let mut words = script.split_whitespace();
+            while let Some(word) = words.next() {
+                if word == "--kernel-profile" {
+                    let profile = words.next().unwrap_or_else(|| {
+                        panic!("job `{name}` ends a script on --kernel-profile")
+                    });
+                    profiles.insert(profile.to_string());
+                }
+            }
+        }
+        assert_eq!(
+            profiles.len(),
+            1,
+            "job `{name}` must build exactly one kernel profile, found {profiles:?}"
+        );
+        let profile = profiles.into_iter().next().unwrap();
+
+        let runs_on: Vec<&str> = job["runs-on"]
+            .as_sequence()
+            .unwrap_or_else(|| panic!("job `{name}` does not list its runner labels"))
+            .iter()
+            .filter_map(YamlValue::as_str)
+            .collect();
+        let arches: Vec<&str> = match job["strategy"]["matrix"]["include"].as_sequence() {
+            Some(include) => {
+                assert!(
+                    runs_on.contains(&"${{ matrix.runner_arch }}"),
+                    "job `{name}` has a matrix and does not take its runner from it: {runs_on:?}"
+                );
+                include
+                    .iter()
+                    .map(|leg| {
+                        let config_arch = leg["config_arch"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("a `{name}` leg has no config_arch"));
+                        let runner_arch = leg["runner_arch"]
+                            .as_str()
+                            .unwrap_or_else(|| panic!("a `{name}` leg has no runner_arch"));
+                        assert_eq!(
+                            config_arch_of_runner(runner_arch),
+                            Some(config_arch),
+                            "job `{name}` builds {config_arch} on a {runner_arch} runner"
+                        );
+                        config_arch
+                    })
+                    .collect()
+            }
+            None => {
+                let arches: Vec<&str> = runs_on
+                    .iter()
+                    .filter_map(|label| config_arch_of_runner(label))
+                    .collect();
+                assert_eq!(
+                    arches.len(),
+                    1,
+                    "job `{name}` has no matrix, so runs-on must name one runner architecture: \
+                     {runs_on:?}"
+                );
+                arches
+            }
+        };
+        for arch in arches {
+            legs.insert((profile.clone(), arch.to_string()));
+        }
+    }
+    legs
+}
+
+#[test]
+fn published_kernel_legs_reads_matrix_jobs_and_single_runner_jobs() {
+    let workflow: YamlValue = serde_norway::from_str(
+        r#"
+jobs:
+  both:
+    strategy:
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    steps:
+      - run: make release-default-kernel
+  one:
+    runs-on: [self-hosted, Linux, ARM64]
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+"#,
+    )
+    .unwrap();
+    let legs: Vec<(String, String)> = published_kernel_legs(&workflow).into_iter().collect();
+    let legs: Vec<(&str, &str)> = legs
+        .iter()
+        .map(|(profile, arch)| (profile.as_str(), arch.as_str()))
+        .collect();
+    assert_eq!(
+        legs,
+        [
+            ("btrfs", "arm64"),
+            ("default", "amd64"),
+            ("default", "arm64")
+        ]
+    );
+}
+
+/// `fcvm setup --kernel-profile <name>` downloads the release named for the
+/// host it runs on, and without `--build-kernels` it fails when that release
+/// does not exist. An architecture table that names a `kernel_repo` is what
+/// makes setup look for one. The btrfs job built arm64 only while
+/// `kernel_profiles.btrfs.amd64` named a repo, so once the pin moved to 6.18.50
+/// an x86_64 host got a 404 for `kernel-btrfs-6.18.50-x86_64-<sha>`. The nested
+/// job had the same gap: `kernel_profiles.nested.amd64` names a repo and no
+/// x86_64 nested kernel was ever published.
+///
+/// A profile no job builds (the mountinfo experiment) is a local build. Nothing
+/// publishes it for any architecture, so it needs no leg and no exemption here.
+#[test]
+fn every_published_kernel_profile_is_built_for_each_architecture_it_names() {
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    assert!(!legs.is_empty(), "kernels.yml builds no kernel at all");
+    let published: std::collections::BTreeSet<&str> =
+        legs.iter().map(|(profile, _)| profile.as_str()).collect();
+
+    let mut missing = Vec::new();
+    for profile in &published {
+        let tables = config["kernel_profiles"]
+            .get(*profile)
+            .and_then(toml::Value::as_table)
+            .unwrap_or_else(|| {
+                panic!("kernels.yml builds `{profile}`, which rootfs-config.toml does not define")
+            });
+        let mut named = 0usize;
+        for (arch, table) in tables {
+            let repo = table
+                .get("kernel_repo")
+                .and_then(toml::Value::as_str)
+                .unwrap_or("");
+            if repo.is_empty() {
+                continue;
+            }
+            named += 1;
+            if !legs.contains(&(profile.to_string(), arch.clone())) {
+                missing.push(format!("{profile}.{arch}"));
+            }
+        }
+        assert!(
+            named > 0,
+            "kernels.yml publishes `{profile}`, and no architecture table of it names a kernel_repo"
+        );
+    }
+    assert!(
+        missing.is_empty(),
+        "rootfs-config.toml names a kernel_repo for {missing:?}, so `fcvm setup` downloads a \
+         release for each, and no kernels.yml job leg builds them. Legs built: {legs:?}"
+    );
 }
