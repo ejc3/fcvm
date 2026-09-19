@@ -426,53 +426,34 @@ async fn test_fc_mock_exec_connect_protocol() -> Result<()> {
         .await?;
     println!("  Sent: GO");
 
-    // Read responses (stdout, then exit)
-    let mut got_stdout = false;
-    let mut got_exit = false;
-    let mut stdout_data = String::new();
-    let mut exit_code: Option<i32> = None;
-
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    loop {
-        if std::time::Instant::now() > deadline {
-            anyhow::bail!("timeout reading exec responses");
+    // Read response frames (stdout, then exit). The ACK line was read through
+    // `reader`, so keep reading through it: it may already hold frame bytes.
+    let mut stdout_data = Vec::new();
+    let exit_code = loop {
+        let frame = tokio::time::timeout(
+            Duration::from_secs(10),
+            exec_proto::Message::read_from_async(&mut reader),
+        )
+        .await
+        .context("timeout reading exec frames")?
+        .context("reading exec frame")?;
+        match frame {
+            exec_proto::Message::Data(data) => stdout_data.extend_from_slice(&data),
+            exec_proto::Message::Exit(code) => break code,
+            other => anyhow::bail!("unexpected frame from fc-mock: {other:?}"),
         }
-
-        let mut line = String::new();
-        match tokio::time::timeout(Duration::from_secs(5), reader.read_line(&mut line)).await {
-            Ok(Ok(0)) => break,
-            Ok(Ok(_)) => {
-                let resp: serde_json::Value =
-                    serde_json::from_str(line.trim()).context("parsing exec response JSON")?;
-                match resp["type"].as_str() {
-                    Some("stdout") => {
-                        stdout_data = resp["data"].as_str().unwrap_or("").to_string();
-                        got_stdout = true;
-                        println!("  Received stdout: {:?}", stdout_data);
-                    }
-                    Some("exit") => {
-                        exit_code = resp["data"].as_i64().map(|v| v as i32);
-                        got_exit = true;
-                        println!("  Received exit: {:?}", exit_code);
-                        break;
-                    }
-                    Some(t) => println!("  Received {}: {:?}", t, resp["data"]),
-                    None => println!("  Unknown response: {}", line.trim()),
-                }
-            }
-            Ok(Err(e)) => anyhow::bail!("read error: {}", e),
-            Err(_) => anyhow::bail!("timeout reading response line"),
-        }
-    }
-
-    assert!(got_stdout, "should have received stdout response");
-    assert!(
-        stdout_data.contains("hello-from-exec-protocol"),
-        "stdout should contain our echo, got: {:?}",
-        stdout_data
+    };
+    println!(
+        "  Received stdout {:?}, exit {}",
+        String::from_utf8_lossy(&stdout_data),
+        exit_code
     );
-    assert!(got_exit, "should have received exit response");
-    assert_eq!(exit_code, Some(0), "exit code should be 0");
+
+    assert_eq!(
+        stdout_data, b"hello-from-exec-protocol\n",
+        "stdout should be exactly what echo wrote"
+    );
+    assert_eq!(exit_code, 0, "exit code should be 0");
 
     // --- TIER 0 parity: drop-after-ACK against the real fc-mock server ---
     // Abandon a handshake between ACK and GO (the snapshot-pause orphan shape).
@@ -553,27 +534,22 @@ async fn test_fc_mock_exec_connect_protocol() -> Result<()> {
             .await?;
 
         let mut post_stdout = String::new();
-        let mut post_exit: Option<i32> = None;
-        loop {
-            line.clear();
-            let n = tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-                .await
-                .context("timeout reading post-orphan responses")?
-                .context("reading post-orphan response line")?;
-            if n == 0 {
-                break;
-            }
-            let resp: serde_json::Value =
-                serde_json::from_str(line.trim()).context("parsing post-orphan response")?;
-            match resp["type"].as_str() {
-                Some("stdout") => post_stdout.push_str(resp["data"].as_str().unwrap_or("")),
-                Some("exit") => {
-                    post_exit = resp["data"].as_i64().map(|v| v as i32);
-                    break;
+        let post_exit = loop {
+            let frame = tokio::time::timeout(
+                Duration::from_secs(10),
+                exec_proto::Message::read_from_async(&mut reader),
+            )
+            .await
+            .context("timeout reading post-orphan frames")?
+            .context("reading post-orphan frame")?;
+            match frame {
+                exec_proto::Message::Data(data) => {
+                    post_stdout.push_str(&String::from_utf8_lossy(&data))
                 }
+                exec_proto::Message::Exit(code) => break Some(code),
                 _ => {}
             }
-        }
+        };
         assert!(
             post_stdout.contains("alive-after-orphan"),
             "exec after an orphaned handshake should work, got stdout: {:?}",

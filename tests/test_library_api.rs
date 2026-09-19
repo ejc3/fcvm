@@ -146,8 +146,6 @@ async fn test_library_api_exec_captured() -> Result<()> {
 /// usable tokio stream carrying post-GO exec responses (the WS bridge use case)
 #[tokio::test(flavor = "multi_thread")]
 async fn test_library_api_async_connection() -> Result<()> {
-    use tokio::io::AsyncReadExt;
-
     let (vm_name, _, _, _) = common::unique_names("api-conn");
     let args = test_run_args(&vm_name);
 
@@ -167,22 +165,22 @@ async fn test_library_api_async_connection() -> Result<()> {
         in_container: true,
         interactive: false,
         tty: false,
+        ..Default::default()
     };
     let (mut stream, _guard) =
         exec::start_exec_session_async(&vsock, request, &handle.vm_id).await?;
 
-    // Non-TTY responses are JSON lines; the agent closes after Exit, so read
-    // to EOF and check both the output and the exit message arrived.
-    let mut responses = String::new();
-    stream.read_to_string(&mut responses).await?;
-    assert!(
-        responses.contains("async-session"),
-        "responses should contain the echoed output, got: {responses:?}"
-    );
-    assert!(
-        responses.contains("\"exit\""),
-        "responses should contain an exit message, got: {responses:?}"
-    );
+    // The stream carries exec-proto frames: the output, then the exit code.
+    let mut stdout = Vec::new();
+    let exit_code = loop {
+        match exec_proto::Message::read_from_async(&mut stream).await? {
+            exec_proto::Message::Data(data) => stdout.extend_from_slice(&data),
+            exec_proto::Message::Exit(code) => break code,
+            other => anyhow::bail!("unexpected frame: {other:?}"),
+        }
+    };
+    assert_eq!(stdout, b"async-session\n");
+    assert_eq!(exit_code, 0);
 
     handle.stop().await?;
     Ok(())

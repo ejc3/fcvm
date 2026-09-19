@@ -94,6 +94,22 @@ macro_rules! impl_async_write {
     };
 }
 
+/// Connect a blocking vsock socket. The connect itself is instant for
+/// same-machine vsock, so it is safe to call from async code.
+pub fn connect_blocking(cid: u32, port: u32) -> Result<OwnedFd> {
+    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+
+    let fd = socket(
+        AddressFamily::Vsock,
+        SockType::Stream,
+        SockFlag::SOCK_CLOEXEC,
+        None,
+    )
+    .context("creating vsock socket")?;
+    connect(fd.as_raw_fd(), &VsockAddr::new(cid, port)).context("connecting vsock")?;
+    Ok(fd)
+}
+
 /// Async vsock stream — wraps an OwnedFd in Arc<AsyncFd> for non-blocking I/O.
 ///
 /// Uses Arc internally so the fd can be shared between read/write halves
@@ -110,19 +126,7 @@ impl VsockStream {
     /// Creates a blocking socket, connects (instant for vsock), then sets
     /// non-blocking for use with tokio's AsyncFd.
     pub fn connect(cid: u32, port: u32) -> Result<Self> {
-        use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
-
-        // Create blocking socket, connect (instant for same-machine vsock),
-        // then switch to non-blocking for AsyncFd.
-        let fd = socket(
-            AddressFamily::Vsock,
-            SockType::Stream,
-            SockFlag::empty(),
-            None,
-        )
-        .context("creating vsock socket")?;
-        let addr = VsockAddr::new(cid, port);
-        connect(fd.as_raw_fd(), &addr).context("connecting vsock")?;
+        let fd = connect_blocking(cid, port)?;
 
         // Set non-blocking for AsyncFd
         nix::fcntl::fcntl(
@@ -212,6 +216,41 @@ pub struct VsockWriteHalf {
 }
 
 impl_async_write!(VsockWriteHalf);
+
+/// Async byte stream over any pollable fd: an exec connection or a PTY master.
+///
+/// Handles share one fd, so one task can read while another writes.
+pub struct AsyncFdStream {
+    inner: Arc<AsyncFd<OwnedFd>>,
+}
+
+impl AsyncFdStream {
+    /// Take ownership of `fd`, switch it to non-blocking and register it with tokio.
+    pub fn new(fd: OwnedFd) -> std::io::Result<Self> {
+        let flags = nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_GETFL)?;
+        let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
+        nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags))?;
+        Ok(Self {
+            inner: Arc::new(AsyncFd::new(fd)?),
+        })
+    }
+
+    /// Another handle on the same fd. The fd closes when the last handle drops.
+    pub fn handle(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl AsRawFd for AsyncFdStream {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.inner.get_ref().as_raw_fd()
+    }
+}
+
+impl_async_read!(AsyncFdStream);
+impl_async_write!(AsyncFdStream);
 
 /// Async vsock listener for accept loops (exec server).
 pub struct VsockListener {

@@ -341,6 +341,16 @@ fn user_cmd_prefix(name: &str, user_spec: Option<&str>) -> Vec<String> {
     ]
 }
 
+/// Whether a failed `fcvm exec ... podman inspect` means the container does
+/// not exist yet, which is expected while the VM starts.
+///
+/// podman exits 125 for a missing container. `fcvm exec` exits 125 too when it
+/// fails itself (no connection, a refused request), and that must stay a
+/// warning, so the exit code alone does not decide it: podman's message does.
+fn container_not_created_yet(code: i32, stderr: &str) -> bool {
+    code == 125 && (stderr.contains("no such container") || stderr.contains("no such object"))
+}
+
 /// Check if the container is running via podman inspect.
 ///
 /// Returns:
@@ -412,7 +422,7 @@ async fn check_container_running(
         // Exit code 125 = container not found (expected during startup).
         // Any other failure is unexpected and worth warning about.
         let code = output.status.code().unwrap_or(-1);
-        if code == 125 {
+        if container_not_created_yet(code, &stderr) {
             debug!(target: "health-monitor", "waiting for container to be created");
         } else {
             warn!(target: "health-monitor", stderr = %stderr, code, "podman inspect failed");
@@ -498,7 +508,7 @@ async fn check_podman_healthcheck(
         // Container may not be running yet, don't assume healthy - keep checking
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         let code = output.status.code().unwrap_or(-1);
-        if code == 125 {
+        if container_not_created_yet(code, &stderr) {
             debug!(target: "health-monitor", "waiting for container to be created");
         } else {
             warn!(target: "health-monitor", stderr = %stderr, code, "podman healthcheck inspect failed");
@@ -1177,6 +1187,32 @@ fn build_nsenter_curl_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// podman exits 125 when the container is missing, and `fcvm exec` exits
+    /// 125 when fcvm itself fails. Only the first is an expected startup state;
+    /// the second must stay loud, or a VM whose exec can never work looks like
+    /// one that is still starting.
+    #[test]
+    fn only_podmans_missing_container_counts_as_not_created_yet() {
+        for stderr in [
+            "Error: no such container fcvm-container",
+            "Error: no such object: \"fcvm-container\"",
+        ] {
+            assert!(container_not_created_yet(125, stderr), "{stderr}");
+        }
+        for stderr in [
+            "ERROR fcvm::commands::exec: Error: fc-agent rejected the exec request: this VM's fc-agent speaks an older exec protocol",
+            "ERROR fcvm::commands::exec: Error: exec request was never acknowledged after 3 attempts",
+            "ERROR fcvm::commands::exec: Error: connecting to exec socket: No such file or directory (os error 2)",
+            "",
+        ] {
+            assert!(!container_not_created_yet(125, stderr), "{stderr}");
+        }
+        assert!(!container_not_created_yet(
+            1,
+            "Error: no such container fcvm-container"
+        ));
+    }
 
     #[test]
     fn test_nsenter_curl_args_without_host_header() {

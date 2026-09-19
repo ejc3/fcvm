@@ -528,10 +528,10 @@ pub async fn run() -> Result<()> {
         container::build_podman_args(&plan, &image_ref, user_ref)
     };
 
-    // TTY mode: blocks, never returns
+    // TTY mode: never returns
     if plan.tty {
         eprintln!("[fc-agent] TTY mode enabled, using PTY");
-        container::run_tty(&podman_args, &plan, &mounted_fuse_paths);
+        container::run_tty(&podman_args, &plan, &mounted_fuse_paths).await;
     }
 
     // Non-TTY mode: async

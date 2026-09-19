@@ -1,223 +1,917 @@
-//! Unified TTY handling for fc-agent.
+//! Framed exec sessions for fc-agent.
 //!
-//! This module provides a single implementation for running commands with PTY support,
-//! used by both `podman run -it` and `exec -it` paths.
+//! One implementation runs the command for every `fcvm exec` mode and for
+//! `podman run -it`: on a PTY (-t) or on pipes, with stdin forwarded (-i) or
+//! tied to /dev/null. Output travels to the host as exec-proto frames, so it is
+//! byte-exact, and without a PTY stdout and stderr stay separate streams.
+//!
+//! The behaviour follows `podman exec`:
+//! - the session ends when the command exits, even if a background process it
+//!   started still holds the output open;
+//! - end of input on the host closes the command's stdin (pipes only, a PTY has
+//!   no half-close);
+//! - a PTY starts at the size of the host's terminal and follows its resizes;
+//! - a command killed by signal N exits 128+N, a command that cannot be found
+//!   exits 127, and one that cannot be run exits 126.
+//!
+//! Deliberate difference: when the host side of an `fcvm exec` goes away, the
+//! command's process group is killed (#636), so a host-side timeout cannot
+//! leak a guest command. `podman exec` leaves it running. Two cases are
+//! exempt: a detached command (-d), and the VM's own `podman run -it`
+//! console, whose connection a snapshot drops and whose container a snapshot
+//! must not disturb. For a container exec the group is the guest's
+//! `podman exec` client, and the process inside the container outlives it, as
+//! it does under podman.
 
-use std::io::{Read, Write};
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::unix::process::ExitStatusExt;
+use std::process::Stdio;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::Arc;
+
+use exec_proto::Message;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::{watch, Notify};
+
+use crate::vsock::AsyncFdStream;
 
 /// Vsock port for TTY I/O (used by podman run -it)
 pub const TTY_VSOCK_PORT: u32 = 4996;
 
-/// Host CID for vsock connections
-const HOST_CID: u32 = 2;
+/// Exit code when the command was not found (`podman exec` uses the same).
+const EXIT_NOT_FOUND: i32 = 127;
+/// Exit code when the command exists but could not be run.
+const EXIT_CANNOT_RUN: i32 = 126;
 
-/// Run a command with PTY, connecting to host first.
+/// What to run and how to attach it.
+pub struct SessionSpec {
+    /// Program and arguments.
+    pub argv: Vec<String>,
+    /// Extra environment for the command.
+    pub env: Vec<(String, String)>,
+    /// Attach a PTY (-t).
+    pub tty: bool,
+    /// Forward the host's stdin (-i). Without it stdin is /dev/null.
+    pub interactive: bool,
+    /// Size the PTY before the command starts. Later sizes arrive as frames.
+    pub size: Option<exec_proto::TtySize>,
+    /// Start the PTY in raw mode. Set when the command is a podman client
+    /// running with -t: the container's own PTY does the echo, line editing
+    /// and signal keys, and this PTY only has to carry bytes to it. podman
+    /// switches its terminal to raw itself, but input that arrives first would
+    /// be echoed and edited twice.
+    pub raw_pty: bool,
+    /// Working directory for the command. One that does not exist fails the
+    /// start like a missing command, as `podman exec -w` does.
+    pub workdir: Option<String>,
+    /// `USER[:GROUP]` to run the command as, names or numbers.
+    pub user: Option<String>,
+    /// Start the command in its own session with no stdio, report its pid, and
+    /// return without waiting for it.
+    pub detach: bool,
+    /// Kill the command when the host side of the connection goes away (#636).
+    /// True for `fcvm exec`. False for the VM's own `podman run -it` console:
+    /// a snapshot resets vsock and drops that connection, and the container
+    /// it carries must not be disturbed by a snapshot.
+    pub kill_on_disconnect: bool,
+}
+
+/// Connect to the host's TTY listener and run `command` on that connection.
 ///
-/// Used by `podman run -it` where fc-agent initiates the connection.
-pub fn run_with_pty(command: &[String], tty: bool, interactive: bool) -> i32 {
+/// Used by `podman run -it`, where fc-agent initiates the connection.
+pub async fn run_with_pty(command: &[String], tty: bool, interactive: bool) -> i32 {
     if command.is_empty() {
         eprintln!("[fc-agent] tty: empty command");
         return 1;
     }
-
-    // Connect to host via vsock
-    let vsock_fd = match connect_vsock(TTY_VSOCK_PORT) {
+    let conn = match crate::vsock::connect_blocking(crate::vsock::HOST_CID, TTY_VSOCK_PORT) {
         Ok(fd) => fd,
         Err(e) => {
-            eprintln!("[fc-agent] tty: failed to connect vsock: {}", e);
+            eprintln!("[fc-agent] tty: failed to connect vsock: {:#}", e);
             return 1;
         }
     };
-
-    run_with_pty_fd(vsock_fd, command, tty, interactive)
+    let spec = SessionSpec {
+        argv: command.to_vec(),
+        env: Vec::new(),
+        tty,
+        interactive,
+        // A host with a terminal on stdin sends its size as the first frame.
+        size: None,
+        // `command` is `podman run -t`.
+        raw_pty: true,
+        workdir: None,
+        user: None,
+        detach: false,
+        kill_on_disconnect: false,
+    };
+    run_session(conn, spec).await
 }
 
-/// Run a command with PTY using a pre-connected fd.
+/// Run one command on an established connection and return its exit code.
 ///
-/// Used by `exec -it` where the host has already connected to fc-agent.
-/// Also called by `run_with_pty` after connecting.
-pub fn run_with_pty_fd(vsock_fd: i32, command: &[String], tty: bool, interactive: bool) -> i32 {
-    // Allocate PTY or pipes
-    let (master_fd, slave_fd, stdin_read, stdin_write, stdout_read, stdout_write) = if tty {
-        match allocate_pty() {
-            Ok((m, s)) => (m, s, -1, -1, -1, -1),
-            Err(e) => {
-                eprintln!("[fc-agent] tty: failed to allocate PTY: {}", e);
-                unsafe { libc::close(vsock_fd) };
-                return 1;
-            }
-        }
-    } else {
-        match allocate_pipes() {
-            Ok((sr, sw, or, ow)) => (-1, -1, sr, sw, or, ow),
-            Err(e) => {
-                eprintln!("[fc-agent] tty: failed to allocate pipes: {}", e);
-                unsafe { libc::close(vsock_fd) };
-                return 1;
-            }
-        }
-    };
-
-    // Fork
-    let pid = unsafe { libc::fork() };
-    if pid < 0 {
-        eprintln!("[fc-agent] tty: fork failed");
-        cleanup_fds(
-            tty,
-            master_fd,
-            slave_fd,
-            stdin_read,
-            stdin_write,
-            stdout_read,
-            stdout_write,
-        );
-        unsafe { libc::close(vsock_fd) };
+/// The connection is closed when this returns.
+pub async fn run_session(conn: OwnedFd, spec: SessionSpec) -> i32 {
+    // The command must not inherit the connection: the host would never see it close.
+    if let Err(e) = set_cloexec(conn.as_raw_fd()) {
+        eprintln!("[fc-agent] exec: cannot set close-on-exec on the connection: {e}");
         return 1;
     }
-
-    if pid == 0 {
-        // Child process
-        unsafe { libc::close(vsock_fd) };
-
-        if tty {
-            setup_child_pty(slave_fd, master_fd);
-        } else {
-            setup_child_pipes(stdin_read, stdin_write, stdout_read, stdout_write);
+    let conn = match AsyncFdStream::new(conn) {
+        Ok(conn) => conn,
+        Err(e) => {
+            eprintln!("[fc-agent] exec: cannot register the connection: {e}");
+            return 1;
         }
+    };
+    let (writer, writer_task) = FrameWriter::start(conn.handle());
 
-        exec_command(command);
-        // exec_command never returns on success
-        eprintln!("[fc-agent] tty: exec failed");
-        unsafe { libc::_exit(127) };
+    if spec.detach {
+        let code = run_detached(&spec, &writer).await;
+        writer.finish(writer_task).await;
+        return code;
     }
 
-    // Parent process
-    if tty {
-        unsafe { libc::close(slave_fd) };
-    } else {
-        unsafe {
-            libc::close(stdin_read);
-            libc::close(stdout_write);
-        }
+    // The window is the first frame of every interactive session, ahead of
+    // any output and of a failure to start the command. The host reads output
+    // that arrives before it as the mark of an fc-agent without flow control.
+    let window = spec
+        .interactive
+        .then(|| Arc::new(AtomicI64::new(i64::from(STDIN_WINDOW))));
+    if window.is_some() {
+        let _ = send(&writer, &Message::StdinWindow(STDIN_WINDOW)).await;
     }
 
-    // Create File wrappers for I/O
-    let mut vsock = unsafe { std::fs::File::from_raw_fd(vsock_fd) };
-
-    let output_fd = if tty { master_fd } else { stdout_read };
-
-    // Spawn writer thread (only if interactive)
-    let writer_thread = if interactive {
-        let vsock_clone = match vsock.try_clone() {
-            Ok(f) => f,
-            Err(e) => {
-                eprintln!("[fc-agent] tty: failed to clone vsock: {}", e);
-                // Clean up FDs before returning
-                if tty {
-                    unsafe { libc::close(master_fd) };
-                } else {
-                    unsafe {
-                        libc::close(stdout_read);
-                        libc::close(stdin_write);
-                    }
-                }
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
-                return 1;
-            }
-        };
-
-        // For TTY, duplicate the master fd so we can use it for writing
-        // while the main thread uses it for reading
-        let input_file = if tty {
-            let dup_fd = unsafe { libc::dup(master_fd) };
-            if dup_fd < 0 {
-                eprintln!("[fc-agent] tty: failed to dup master fd");
-                // Clean up master_fd before returning
-                unsafe { libc::close(master_fd) };
-                unsafe {
-                    libc::kill(pid, libc::SIGKILL);
-                    libc::waitpid(pid, std::ptr::null_mut(), 0);
-                }
-                return 1;
-            }
-            unsafe { std::fs::File::from_raw_fd(dup_fd) }
-        } else {
-            unsafe { std::fs::File::from_raw_fd(stdin_write) }
-        };
-
-        Some(std::thread::spawn(move || {
-            writer_loop(vsock_clone, input_file);
-        }))
-    } else {
-        // Close stdin pipe if not interactive
-        if !tty && stdin_write >= 0 {
-            unsafe { libc::close(stdin_write) };
+    let Spawned {
+        mut child,
+        outputs,
+        stdin,
+        pty,
+    } = match spawn(&spec) {
+        Ok(spawned) => spawned,
+        Err(e) => {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                EXIT_NOT_FOUND
+            } else {
+                EXIT_CANNOT_RUN
+            };
+            let text = spawn_error_text(&spec.argv[0], &e);
+            let frame = if spec.tty {
+                Message::Data(text.into_bytes())
+            } else {
+                Message::Stderr(text.into_bytes())
+            };
+            let _ = send(&writer, &frame).await;
+            let _ = send(&writer, &Message::Exit(code)).await;
+            writer.finish(writer_task).await;
+            return code;
         }
-        None
+    };
+    debug_assert_eq!(stdin.is_some(), spec.interactive);
+
+    let (exited_tx, exited_rx) = watch::channel(false);
+    let pumps: Vec<_> = outputs
+        .into_iter()
+        .map(|output| {
+            tokio::spawn(pump(
+                output,
+                writer.clone(),
+                exited_rx.clone(),
+                // The console's command runs on without a host. Keep reading
+                // its output so it never blocks on a full pipe or PTY.
+                !spec.kill_on_disconnect,
+            ))
+        })
+        .collect();
+
+    // Reading frames is split from applying them, so a command that does not
+    // read its stdin blocks only the applier. The reader never stops: forwarded
+    // input is bounded by the window granted here, not by a full connection,
+    // so a read is always outstanding to notice the host going away. A host
+    // hangup does not cross a vsock connection that has backed up.
+    //
+    // The queue between the two holds stdin only, which the window bounds.
+    let peer_gone = Arc::new(Notify::new());
+    let (input_tx, input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let helpers = vec![
+        tokio::spawn(read_frames(
+            conn.handle(),
+            input_tx,
+            window.clone(),
+            pty,
+            peer_gone.clone(),
+        )),
+        tokio::spawn(apply_input(input_rx, stdin, window, writer.clone())),
+    ];
+    let stop_helpers = |helpers: Vec<tokio::task::JoinHandle<()>>| async move {
+        for helper in &helpers {
+            helper.abort();
+        }
+        // Wait for them, so their connection handles are released and the fd
+        // closes when this function returns.
+        for helper in helpers {
+            let _ = helper.await;
+        }
     };
 
-    // Reader loop in main thread
-    let output_file = unsafe { std::fs::File::from_raw_fd(output_fd) };
-    let exit_code = reader_loop(output_file, &mut vsock, pid);
+    let status = tokio::select! {
+        status = child.wait() => status,
+        () = peer_gone.notified() => {
+            if spec.kill_on_disconnect {
+                // Nobody can receive output or the exit code. Kill the whole
+                // process group; the child is its leader in both modes
+                // (process_group(0) for pipes, setsid for a PTY). The child is
+                // not reaped yet, so its pid cannot have been reused.
+                if let Some(pid) = child.id() {
+                    unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+                }
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                for pump in pumps {
+                    pump.abort();
+                    let _ = pump.await;
+                }
+                stop_helpers(helpers).await;
+                // Nobody is listening, so what is queued is dropped. Waiting for
+                // the task releases its handle on the connection.
+                writer_task.abort();
+                let _ = writer_task.await;
+                return EXIT_CANNOT_RUN;
+            }
+            // The console: the host is gone and the container is not ours to stop.
+            child.wait().await
+        }
+    };
 
-    // Send exit message and flush to ensure it's sent before we exit
-    let _ = exec_proto::write_exit(&mut vsock, exit_code);
-    let _ = vsock.flush();
-
-    // Wait for writer thread
-    if let Some(handle) = writer_thread {
-        let _ = handle.join();
+    // The command has exited, so everything it wrote is already in the pipe or
+    // PTY. The pumps forward that and stop; they do not wait for a background
+    // process that inherited the output.
+    let _ = exited_tx.send(true);
+    for pump in pumps {
+        let _ = pump.await;
     }
+    stop_helpers(helpers).await;
 
-    // Drop vsock explicitly to ensure close is sent before process exits
-    drop(vsock);
-
+    let exit_code = match status {
+        Ok(status) => status
+            .code()
+            .unwrap_or_else(|| 128 + status.signal().unwrap_or(0)),
+        Err(e) => {
+            eprintln!("[fc-agent] exec: wait failed: {e}");
+            1
+        }
+    };
+    let _ = send(&writer, &Message::Exit(exit_code)).await;
+    writer.finish(writer_task).await;
     exit_code
 }
 
-/// Connect to host via vsock
-fn connect_vsock(port: u32) -> Result<i32, String> {
-    let fd = unsafe { libc::socket(libc::AF_VSOCK, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err("socket creation failed".to_string());
-    }
-
-    let addr = libc::sockaddr_vm {
-        svm_family: libc::AF_VSOCK as u16,
-        svm_reserved1: 0,
-        svm_port: port,
-        svm_cid: HOST_CID,
-        svm_zero: [0u8; 4],
-    };
-
-    let result = unsafe {
-        libc::connect(
-            fd,
-            &addr as *const libc::sockaddr_vm as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_vm>() as u32,
-        )
-    };
-
-    if result < 0 {
-        unsafe { libc::close(fd) };
-        return Err(format!(
-            "connect failed: {}",
-            std::io::Error::last_os_error()
-        ));
-    }
-
-    Ok(fd)
+/// The one writer of the connection. Everything bound for the host is handed
+/// to it as a whole frame.
+///
+/// Handing a frame over is cancel-safe: a sender that is aborted either queued
+/// its frame or did not. A socket write is not: cut off part-way it leaves a
+/// torn frame, and the Exit that follows would be misread. The session aborts
+/// its helper tasks when the command exits, and one of them sends window
+/// grants, so no sender may write to the socket itself.
+///
+/// The queue is short, so a host that reads slowly still slows the pumps down.
+#[derive(Clone)]
+struct FrameWriter {
+    frames: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
-/// Allocate PTY pair
-fn allocate_pty() -> Result<(i32, i32), String> {
-    let mut master: libc::c_int = 0;
-    let mut slave: libc::c_int = 0;
+impl FrameWriter {
+    /// The task ends when every `FrameWriter` is dropped and the queue is
+    /// written out, or when the host stops taking frames.
+    fn start(mut conn: AsyncFdStream) -> (Self, tokio::task::JoinHandle<()>) {
+        let (frames, mut queued) = tokio::sync::mpsc::channel::<Vec<u8>>(4);
+        let task = tokio::spawn(async move {
+            while let Some(frame) = queued.recv().await {
+                if let Err(e) = conn.write_all(&frame).await {
+                    eprintln!("[fc-agent] exec: writing to the host failed: {e}");
+                    return; // dropping the queue fails every later send
+                }
+            }
+        });
+        (Self { frames }, task)
+    }
 
+    /// Write out everything queued, Exit included, and release the
+    /// connection. Every other sender must be gone: the task ends when the
+    /// last one is dropped.
+    async fn finish(self, task: tokio::task::JoinHandle<()>) {
+        drop(self);
+        let _ = task.await;
+    }
+}
+
+/// Which frame type an output stream is sent as.
+#[derive(Clone, Copy)]
+enum OutputStream {
+    /// stdout, or everything the PTY produced
+    Data,
+    Stderr,
+}
+
+impl OutputStream {
+    fn frame(self, bytes: &[u8]) -> Message {
+        match self {
+            OutputStream::Data => Message::Data(bytes.to_vec()),
+            OutputStream::Stderr => Message::Stderr(bytes.to_vec()),
+        }
+    }
+}
+
+trait Source: AsyncRead + AsRawFd + Unpin + Send {}
+impl<T: AsyncRead + AsRawFd + Unpin + Send> Source for T {}
+
+struct Output {
+    source: Box<dyn Source>,
+    stream: OutputStream,
+    /// A PTY master and a pipe reach "everything delivered" differently.
+    is_pty: bool,
+}
+
+struct Spawned {
+    child: tokio::process::Child,
+    outputs: Vec<Output>,
+    /// Where forwarded stdin goes; `None` without -i.
+    stdin: Option<StdinSink>,
+    /// The PTY master, for applying resizes; `None` without -t.
+    pty: Option<AsyncFdStream>,
+}
+
+enum StdinSink {
+    /// Dropping it closes the command's stdin.
+    Pipe(tokio::process::ChildStdin),
+    /// A PTY has no half-close, so end of input leaves it open.
+    Pty(AsyncFdStream),
+}
+
+/// Start the command with no stdio in a session of its own, and report its pid.
+///
+/// Nothing is attached, so the host going away does not end the command. That
+/// is the point of -d, and the one case where #636 does not apply.
+async fn run_detached(spec: &SessionSpec, writer: &FrameWriter) -> i32 {
+    let started = base_command(spec).and_then(|(mut cmd, identity)| {
+        // With -t the command gets a terminal of its own and no TERM, which is
+        // what `podman exec -d -t` gives it. Without -t it gets /dev/null.
+        let terminal = if spec.tty {
+            let (master, slave) = open_pty()?;
+            if let Some(size) = spec.size {
+                set_winsize(master.as_raw_fd(), size)?;
+            }
+            cmd.stdin(Stdio::from(slave.try_clone()?));
+            cmd.stdout(Stdio::from(slave.try_clone()?));
+            cmd.stderr(Stdio::from(slave));
+            if !spec.env.iter().any(|(key, _)| key == "TERM") {
+                cmd.env_remove("TERM");
+            }
+            Some(master)
+        } else {
+            cmd.stdin(Stdio::null());
+            cmd.stdout(Stdio::null());
+            cmd.stderr(Stdio::null());
+            None
+        };
+        let has_terminal = terminal.is_some();
+        unsafe {
+            cmd.pre_exec(move || {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if has_terminal && libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        run_as(&mut cmd, identity);
+        let child = cmd.spawn()?;
+        // Command holds the parent's copies of the terminal's slave side.
+        drop(cmd);
+        Ok((child, terminal))
+    });
+    let started = started.map(|(child, terminal)| {
+        let pid = child.id().unwrap_or(0);
+        match terminal {
+            Some(master) => hold_detached_terminal(master, child),
+            // tokio reaps a dropped child in the background once it exits.
+            None => drop(child),
+        }
+        pid
+    });
+    let (frame, code) = match started {
+        Ok(pid) => (Message::Data(format!("{pid}\n").into_bytes()), 0),
+        Err(e) => {
+            let code = if e.kind() == std::io::ErrorKind::NotFound {
+                EXIT_NOT_FOUND
+            } else {
+                EXIT_CANNOT_RUN
+            };
+            let text = spawn_error_text(&spec.argv[0], &e);
+            (Message::Stderr(text.into_bytes()), code)
+        }
+    };
+    let _ = send(writer, &frame).await;
+    let _ = send(writer, &Message::Exit(code)).await;
+    code
+}
+
+/// The identity a command runs as, resolved before fork so the child only
+/// makes system calls.
+struct Identity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    groups: Vec<libc::gid_t>,
+    home: Option<std::path::PathBuf>,
+}
+
+/// Resolve `USER[:GROUP]` the way `podman exec -u` does: a known user brings
+/// its group, supplementary groups and home; an unknown number runs with gid
+/// 0; an explicit group replaces the supplementary groups.
+fn resolve_identity(spec: &str) -> std::io::Result<Identity> {
+    use nix::unistd::{Gid, Group, Uid, User};
+    let invalid = |what: String| std::io::Error::new(std::io::ErrorKind::InvalidInput, what);
+    let (user_part, group_part) = match spec.split_once(':') {
+        Some((user, group)) => (user, Some(group)),
+        None => (spec, None),
+    };
+
+    let known = match user_part.parse::<u32>() {
+        Ok(uid) => User::from_uid(Uid::from_raw(uid)).map_err(std::io::Error::from)?,
+        Err(_) => Some(
+            User::from_name(user_part)
+                .map_err(std::io::Error::from)?
+                .ok_or_else(|| invalid(format!("unable to find user {user_part}")))?,
+        ),
+    };
+    let uid = match &known {
+        Some(user) => user.uid.as_raw(),
+        None => user_part.parse::<u32>().expect("parsed above"),
+    };
+
+    let (gid, groups) = match group_part {
+        Some(group) => {
+            let gid = match group.parse::<u32>() {
+                Ok(gid) => gid,
+                Err(_) => Group::from_name(group)
+                    .map_err(std::io::Error::from)?
+                    .ok_or_else(|| invalid(format!("unable to find group {group}")))?
+                    .gid
+                    .as_raw(),
+            };
+            (gid, vec![gid])
+        }
+        None => match &known {
+            Some(user) => {
+                let name = std::ffi::CString::new(user.name.as_str())
+                    .map_err(|_| invalid(format!("user name {:?} contains NUL", user.name)))?;
+                let groups = nix::unistd::getgrouplist(&name, Gid::from_raw(user.gid.as_raw()))
+                    .map_err(std::io::Error::from)?
+                    .into_iter()
+                    .map(Gid::as_raw)
+                    .collect();
+                (user.gid.as_raw(), groups)
+            }
+            None => (0, vec![0]),
+        },
+    };
+    Ok(Identity {
+        uid,
+        gid,
+        groups,
+        home: known.map(|user| user.dir),
+    })
+}
+
+/// Keep a detached command's terminal open and empty for as long as the
+/// command lives. Nobody reads it, but closing the master would hang the
+/// command up, and a full terminal would block its writes.
+///
+/// The command leads the terminal's session, so the kernel hangs the terminal
+/// up when it exits, whoever else still holds it. The read then fails and the
+/// command is reaped at once; it does not wait as a zombie for a descendant.
+fn hold_detached_terminal(master: OwnedFd, mut child: tokio::process::Child) {
+    tokio::spawn(async move {
+        match AsyncFdStream::new(master) {
+            Ok(mut master) => {
+                let mut buf = vec![0u8; 4096];
+                loop {
+                    match tokio::io::AsyncReadExt::read(&mut master, &mut buf).await {
+                        Ok(n) if n > 0 => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        // Hung up: the command has exited.
+                        _ => break,
+                    }
+                }
+            }
+            Err(e) => eprintln!("[fc-agent] exec: cannot hold a detached terminal: {e}"),
+        }
+        let _ = child.wait().await;
+    });
+}
+
+/// The command with its arguments, environment and directory, plus the
+/// identity it should run as. The caller applies the identity with
+/// [`run_as`] after its own `pre_exec` setup, so that the drop is the last
+/// thing the child does before exec.
+fn base_command(
+    spec: &SessionSpec,
+) -> std::io::Result<(tokio::process::Command, Option<Identity>)> {
+    let mut cmd = tokio::process::Command::new(&spec.argv[0]);
+    cmd.args(&spec.argv[1..]);
+    // fc-agent's own TERM describes the serial console, not this session: a
+    // PTY gets podman's default, anything else gets none. Set first, so the
+    // request's -e TERM=... wins.
+    if spec.tty {
+        cmd.env("TERM", "xterm");
+    } else {
+        cmd.env_remove("TERM");
+    }
+    let identity = spec.user.as_deref().map(resolve_identity).transpose()?;
+    if let Some(home) = identity
+        .as_ref()
+        .and_then(|identity| identity.home.as_ref())
+    {
+        cmd.env("HOME", home);
+    }
+    // After the identity's HOME, so an explicit -e HOME=... wins.
+    for (key, value) in &spec.env {
+        cmd.env(key, value);
+    }
+    if let Some(workdir) = &spec.workdir {
+        cmd.current_dir(workdir);
+    }
+    Ok((cmd, identity))
+}
+
+/// Make the child switch to `identity` just before exec. Register this after
+/// every other `pre_exec`: std runs them in order. The groups were resolved
+/// before fork, so the child only makes system calls.
+fn run_as(cmd: &mut tokio::process::Command, identity: Option<Identity>) {
+    let Some(Identity {
+        uid, gid, groups, ..
+    }) = identity
+    else {
+        return;
+    };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::setgroups(groups.len(), groups.as_ptr()) < 0
+                || libc::setgid(gid) < 0
+                || libc::setuid(uid) < 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+fn spawn(spec: &SessionSpec) -> std::io::Result<Spawned> {
+    let (mut cmd, identity) = base_command(spec)?;
+
+    if spec.tty {
+        let (master, slave) = open_pty()?;
+        if let Some(size) = spec.size {
+            set_winsize(master.as_raw_fd(), size)?;
+        }
+        if spec.raw_pty {
+            make_raw(slave.as_raw_fd())?;
+        }
+        cmd.stdin(Stdio::from(slave.try_clone()?));
+        cmd.stdout(Stdio::from(slave.try_clone()?));
+        cmd.stderr(Stdio::from(slave));
+        // New session with the PTY as controlling terminal, so Ctrl-C and
+        // window changes reach the command. Runs after stdio is in place.
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        run_as(&mut cmd, identity);
+        let child = cmd.spawn()?;
+        // Command holds the parent's slave fds. Close them now, or the master
+        // never reports end of output.
+        drop(cmd);
+        let master = AsyncFdStream::new(master)?;
+        let stdin = spec.interactive.then(|| StdinSink::Pty(master.handle()));
+        let pty = Some(master.handle());
+        Ok(Spawned {
+            child,
+            outputs: vec![Output {
+                source: Box::new(master),
+                stream: OutputStream::Data,
+                is_pty: true,
+            }],
+            stdin,
+            pty,
+        })
+    } else {
+        cmd.stdin(if spec.interactive {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        });
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+        // Own process group, so a host disconnect can kill the command and
+        // everything it started.
+        cmd.process_group(0);
+        run_as(&mut cmd, identity);
+        let mut child = cmd.spawn()?;
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let stderr = child.stderr.take().expect("stderr was piped");
+        let stdin = child.stdin.take().map(StdinSink::Pipe);
+        Ok(Spawned {
+            child,
+            outputs: vec![
+                Output {
+                    source: Box::new(stdout),
+                    stream: OutputStream::Data,
+                    is_pty: false,
+                },
+                Output {
+                    source: Box::new(stderr),
+                    stream: OutputStream::Stderr,
+                    is_pty: false,
+                },
+            ],
+            stdin,
+            pty: None,
+        })
+    }
+}
+
+/// Text sent to the client when the command could not be started.
+///
+/// A failed fork is the one case a host-side diagnostic can never reach,
+/// because serving it needs the same fork. Carry the fork-free vitals sample
+/// for every error except the two that only describe the path.
+fn spawn_error_text(program: &str, error: &std::io::Error) -> String {
+    match error.kind() {
+        std::io::ErrorKind::NotFound | std::io::ErrorKind::PermissionDenied => {
+            format!("Error: cannot run {:?}: {}\n", program, error)
+        }
+        _ => format!(
+            "Error: cannot run {:?}: {} | guest vitals: {}\n",
+            program,
+            error,
+            crate::vitals::sample_line()
+        ),
+    }
+}
+
+/// How many STDIN bytes the host may have in flight: sent, and not yet taken
+/// by the command. It is also the most input fc-agent holds for one session.
+const STDIN_WINDOW: u32 = 256 * 1024;
+
+/// How long a PTY is read after the command exits. It normally hangs up at
+/// once; the wait only runs out when a background process keeps it open.
+const PTY_DRAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Forward one output stream to the host until it ends or the command exits.
+///
+/// With `keep_reading`, a host that stopped listening does not stop the pump:
+/// output is read and dropped, so the command never blocks on it.
+async fn pump(
+    output: Output,
+    writer: FrameWriter,
+    mut exited: watch::Receiver<bool>,
+    keep_reading: bool,
+) {
+    let Output {
+        mut source,
+        stream,
+        is_pty,
+    } = output;
+    let mut buf = vec![0u8; exec_proto::IO_CHUNK];
+    let mut host_listening = true;
+    // Checked on every pass, so a source that is never empty cannot keep the
+    // pump from noticing that the command has exited.
+    while !*exited.borrow() {
+        tokio::select! {
+            read = source.read(&mut buf) => match read {
+                // End of output. A PTY master reports EIO once every slave fd is closed.
+                Ok(0) => return,
+                Ok(n) => {
+                    if host_listening && send(&writer, &stream.frame(&buf[..n])).await.is_err() {
+                        if !keep_reading {
+                            return;
+                        }
+                        host_listening = false;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => return,
+            },
+            // The block drops wait_for's guard, which is not Send, before the next await.
+            () = async { let _ = exited.wait_for(|exited| *exited).await; } => {}
+        }
+    }
+    if !host_listening {
+        return;
+    }
+    if is_pty {
+        drain_pty(&mut source, stream, &writer, &mut buf).await;
+    } else {
+        drain(source.as_raw_fd(), stream, &writer, &mut buf).await;
+    }
+}
+
+/// Forward what a pipe held when the command exited, and no more.
+///
+/// A pipe write lands in the pipe before `write` returns, so the byte count at
+/// exit covers everything the command wrote. A background process that
+/// inherited the pipe may keep writing; that is not this session's output, and
+/// following it would never end. Reads go straight to the fd, because tokio's
+/// readiness can lag behind bytes written just before the exit.
+async fn drain(fd: RawFd, stream: OutputStream, writer: &FrameWriter, buf: &mut [u8]) {
+    let mut buffered: libc::c_int = 0;
+    if unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut buffered) } < 0 {
+        return;
+    }
+    let mut remaining = buffered.max(0) as usize;
+    while remaining > 0 {
+        let want = remaining.min(buf.len());
+        // The fd is non-blocking: tokio sets that on child pipes.
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), want) };
+        if n > 0 {
+            let n = n as usize;
+            if send(writer, &stream.frame(&buf[..n])).await.is_err() {
+                return;
+            }
+            remaining -= n;
+            continue;
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return;
+    }
+}
+
+/// Forward a PTY's output until it hangs up.
+///
+/// The kernel moves slave writes to the master in a deferred flush, so neither
+/// a byte count nor an empty read proves the command's last output has
+/// arrived. The hangup does: it follows the flush once every slave fd is
+/// closed. A background process that holds the PTY open is cut off after
+/// [`PTY_DRAIN_WAIT`].
+async fn drain_pty(
+    source: &mut Box<dyn Source>,
+    stream: OutputStream,
+    writer: &FrameWriter,
+    buf: &mut [u8],
+) {
+    let deadline = tokio::time::Instant::now() + PTY_DRAIN_WAIT;
+    loop {
+        match tokio::time::timeout_at(deadline, source.read(buf)).await {
+            Ok(Ok(n)) if n > 0 => {
+                if send(writer, &stream.frame(&buf[..n])).await.is_err() {
+                    return;
+                }
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            // Hung up (EIO or end of file), or still held open after the wait.
+            _ => return,
+        }
+    }
+}
+
+/// What the host sends that has to wait for the command.
+enum HostInput {
+    Stdin(Vec<u8>),
+    Eof,
+}
+
+/// Read the host's frames. A failed read means the host is gone.
+///
+/// Only stdin is queued for [`apply_input`], and `window` counts the bytes of
+/// it the host may still send, so the queue never holds more than the window.
+/// A host that sends more has broken the protocol, and the session ends as if
+/// it had gone away. Everything else is dealt with here: a resize is one
+/// ioctl, and it must not wait behind a command that is not reading.
+async fn read_frames(
+    mut conn: AsyncFdStream,
+    input: tokio::sync::mpsc::UnboundedSender<HostInput>,
+    window: Option<Arc<AtomicI64>>,
+    pty: Option<AsyncFdStream>,
+    peer_gone: Arc<Notify>,
+) {
+    let mut ended = false;
+    while let Ok(frame) = Message::read_from_async(&mut conn).await {
+        let queued = match frame {
+            Message::Stdin(data) => {
+                // Without -i there is no stdin to deliver to, and an empty
+                // chunk delivers nothing and has nothing to grant back.
+                let Some(window) = &window else { continue };
+                if data.is_empty() {
+                    continue;
+                }
+                let taken = data.len() as i64;
+                if window.fetch_sub(taken, Ordering::AcqRel) < taken {
+                    eprintln!("[fc-agent] exec: the host sent stdin beyond the granted window");
+                    break;
+                }
+                input.send(HostInput::Stdin(data))
+            }
+            // Once is enough, and a repeat must not grow the queue.
+            Message::StdinEof if ended => continue,
+            Message::StdinEof => {
+                ended = true;
+                input.send(HostInput::Eof)
+            }
+            Message::Resize(size) => {
+                // The kernel signals the PTY's foreground process group when
+                // the size changes, which is how the command learns of it.
+                if let Some(pty) = &pty {
+                    if let Err(e) = set_winsize(pty.as_raw_fd(), size) {
+                        eprintln!("[fc-agent] exec: cannot resize the PTY: {e}");
+                    }
+                }
+                continue;
+            }
+            // Guest-to-host frame types: a host has no business sending them.
+            Message::Data(_)
+            | Message::Stderr(_)
+            | Message::Exit(_)
+            | Message::Error(_)
+            | Message::StdinWindow(_) => continue,
+        };
+        if queued.is_err() {
+            return; // the session is over
+        }
+    }
+    // notify_one stores a permit, so the session sees this even if it is not
+    // waiting yet.
+    peer_gone.notify_one();
+}
+
+/// Deliver the host's stdin to the command.
+///
+/// Every chunk that has been dealt with, written to the command or dropped
+/// because the command closed its stdin, reopens that much of the window. The
+/// host therefore sends exactly as fast as the command reads.
+async fn apply_input(
+    mut input: tokio::sync::mpsc::UnboundedReceiver<HostInput>,
+    mut stdin: Option<StdinSink>,
+    window: Option<Arc<AtomicI64>>,
+    writer: FrameWriter,
+) {
+    while let Some(item) = input.recv().await {
+        match item {
+            HostInput::Stdin(data) => {
+                let delivered = match stdin.as_mut() {
+                    Some(StdinSink::Pipe(pipe)) => write_all(pipe, &data).await,
+                    Some(StdinSink::Pty(pty)) => write_all(pty, &data).await,
+                    None => true,
+                };
+                if !delivered {
+                    stdin = None; // the command closed its stdin
+                }
+                if let Some(window) = &window {
+                    // A frame never exceeds exec-proto's 1 MiB cap.
+                    let taken = data.len() as u32;
+                    window.fetch_add(i64::from(taken), Ordering::AcqRel);
+                    if send(&writer, &Message::StdinWindow(taken)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            HostInput::Eof => {
+                if matches!(stdin, Some(StdinSink::Pipe(_))) {
+                    stdin = None;
+                }
+            }
+        }
+    }
+}
+
+async fn write_all<W: AsyncWrite + Unpin>(sink: &mut W, data: &[u8]) -> bool {
+    sink.write_all(data).await.is_ok() && sink.flush().await.is_ok()
+}
+
+/// Queue one frame for the host. Fails once the host no longer takes frames.
+async fn send(writer: &FrameWriter, message: &Message) -> std::io::Result<()> {
+    writer
+        .frames
+        .send(message.encode())
+        .await
+        .map_err(|_| std::io::ErrorKind::BrokenPipe.into())
+}
+
+fn open_pty() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut master: libc::c_int = -1;
+    let mut slave: libc::c_int = -1;
     let result = unsafe {
         libc::openpty(
             &mut master,
@@ -227,200 +921,50 @@ fn allocate_pty() -> Result<(i32, i32), String> {
             std::ptr::null_mut(),
         )
     };
-
     if result != 0 {
-        return Err("openpty failed".to_string());
+        return Err(std::io::Error::last_os_error());
     }
-
+    let (master, slave) = unsafe { (OwnedFd::from_raw_fd(master), OwnedFd::from_raw_fd(slave)) };
+    // The command gets the slave as fds 0-2 only. It must not inherit the
+    // master, or the PTY would never close.
+    set_cloexec(master.as_raw_fd())?;
+    set_cloexec(slave.as_raw_fd())?;
     Ok((master, slave))
 }
 
-/// Allocate stdin/stdout pipes
-fn allocate_pipes() -> Result<(i32, i32, i32, i32), String> {
-    let mut stdin_pipe = [0i32; 2];
-    let mut stdout_pipe = [0i32; 2];
-
-    if unsafe { libc::pipe(stdin_pipe.as_mut_ptr()) } != 0 {
-        return Err("stdin pipe failed".to_string());
+fn make_raw(pty: RawFd) -> std::io::Result<()> {
+    let mut termios: libc::termios = unsafe { std::mem::zeroed() };
+    if unsafe { libc::tcgetattr(pty, &mut termios) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-
-    if unsafe { libc::pipe(stdout_pipe.as_mut_ptr()) } != 0 {
-        unsafe {
-            libc::close(stdin_pipe[0]);
-            libc::close(stdin_pipe[1]);
-        }
-        return Err("stdout pipe failed".to_string());
+    unsafe { libc::cfmakeraw(&mut termios) };
+    if unsafe { libc::tcsetattr(pty, libc::TCSANOW, &termios) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-
-    // stdin_pipe[0] = read end (child reads from this)
-    // stdin_pipe[1] = write end (parent writes to this)
-    // stdout_pipe[0] = read end (parent reads from this)
-    // stdout_pipe[1] = write end (child writes to this)
-    Ok((stdin_pipe[0], stdin_pipe[1], stdout_pipe[0], stdout_pipe[1]))
+    Ok(())
 }
 
-/// Clean up file descriptors on error
-fn cleanup_fds(
-    tty: bool,
-    master_fd: i32,
-    slave_fd: i32,
-    stdin_read: i32,
-    stdin_write: i32,
-    stdout_read: i32,
-    stdout_write: i32,
-) {
-    unsafe {
-        if tty {
-            if master_fd >= 0 {
-                libc::close(master_fd);
-            }
-            if slave_fd >= 0 {
-                libc::close(slave_fd);
-            }
-        } else {
-            if stdin_read >= 0 {
-                libc::close(stdin_read);
-            }
-            if stdin_write >= 0 {
-                libc::close(stdin_write);
-            }
-            if stdout_read >= 0 {
-                libc::close(stdout_read);
-            }
-            if stdout_write >= 0 {
-                libc::close(stdout_write);
-            }
-        }
-    }
-}
-
-/// Set up child process for PTY
-fn setup_child_pty(slave_fd: i32, master_fd: i32) {
-    unsafe {
-        // Create new session and set controlling terminal
-        libc::setsid();
-        libc::ioctl(slave_fd, libc::TIOCSCTTY as _, 0);
-
-        // Redirect stdin/stdout/stderr to PTY slave
-        libc::dup2(slave_fd, 0);
-        libc::dup2(slave_fd, 1);
-        libc::dup2(slave_fd, 2);
-
-        // Close original fds
-        if slave_fd > 2 {
-            libc::close(slave_fd);
-        }
-        libc::close(master_fd);
-    }
-}
-
-/// Set up child process for pipes
-fn setup_child_pipes(stdin_read: i32, stdin_write: i32, stdout_read: i32, stdout_write: i32) {
-    unsafe {
-        // Redirect stdin to read end of stdin pipe
-        libc::dup2(stdin_read, 0);
-        // Redirect stdout/stderr to write end of stdout pipe
-        libc::dup2(stdout_write, 1);
-        libc::dup2(stdout_write, 2);
-
-        // Close original pipe fds
-        libc::close(stdin_read);
-        libc::close(stdin_write);
-        libc::close(stdout_read);
-        libc::close(stdout_write);
-    }
-}
-
-/// Exec the command
-fn exec_command(command: &[String]) {
-    use std::ffi::CString;
-
-    let prog = match CString::new(command[0].as_str()) {
-        Ok(s) => s,
-        Err(_) => return,
+fn set_winsize(pty: RawFd, size: exec_proto::TtySize) -> std::io::Result<()> {
+    let winsize = libc::winsize {
+        ws_row: size.rows,
+        ws_col: size.cols,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
     };
-
-    let args: Vec<CString> = command
-        .iter()
-        .filter_map(|s| CString::new(s.as_str()).ok())
-        .collect();
-
-    let arg_ptrs: Vec<*const libc::c_char> = args
-        .iter()
-        .map(|s| s.as_ptr())
-        .chain(std::iter::once(std::ptr::null()))
-        .collect();
-
-    unsafe {
-        libc::execvp(prog.as_ptr(), arg_ptrs.as_ptr());
+    if unsafe { libc::ioctl(pty, libc::TIOCSWINSZ as _, &winsize) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
+    Ok(())
 }
 
-/// Writer loop: read STDIN messages from vsock, write to PTY/pipe
-fn writer_loop(mut vsock: std::fs::File, mut target: std::fs::File) {
-    loop {
-        match exec_proto::Message::read_from(&mut vsock) {
-            Ok(exec_proto::Message::Stdin(data)) => {
-                if target.write_all(&data).is_err() {
-                    break;
-                }
-                if target.flush().is_err() {
-                    break;
-                }
-            }
-            Ok(exec_proto::Message::Exit(_)) | Ok(exec_proto::Message::Error(_)) => {
-                break;
-            }
-            Ok(_) => {
-                // Unexpected message type, ignore
-            }
-            Err(_) => {
-                break;
-            }
-        }
+fn set_cloexec(fd: RawFd) -> std::io::Result<()> {
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+    if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error());
     }
-    // Drop target to close pipe/PTY, signaling EOF to child
+    Ok(())
 }
 
-/// Reader loop: read from PTY/pipe, send DATA messages via exec_proto
-fn reader_loop(mut source: std::fs::File, vsock: &mut std::fs::File, child_pid: i32) -> i32 {
-    let mut buf = [0u8; 4096];
-
-    loop {
-        match source.read(&mut buf) {
-            Ok(0) => {
-                break;
-            }
-            Ok(n) => {
-                if exec_proto::write_data(vsock, &buf[..n]).is_err() {
-                    break;
-                }
-            }
-            Err(e) => {
-                if e.kind() != std::io::ErrorKind::Interrupted {
-                    break;
-                }
-            }
-        }
-    }
-
-    // Wait for child and get exit code
-    let mut status: libc::c_int = 0;
-    let ret = unsafe { libc::waitpid(child_pid, &mut status, 0) };
-
-    if ret < 0 {
-        eprintln!(
-            "[fc-agent] tty: waitpid failed: {}",
-            std::io::Error::last_os_error()
-        );
-        return 1;
-    }
-
-    if libc::WIFEXITED(status) {
-        libc::WEXITSTATUS(status)
-    } else if libc::WIFSIGNALED(status) {
-        128 + libc::WTERMSIG(status)
-    } else {
-        1
-    }
-}
+#[cfg(test)]
+#[path = "tty_tests.rs"]
+mod tests;

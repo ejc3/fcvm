@@ -1,16 +1,28 @@
-//! Length-prefixed binary protocol for TTY exec
+//! Length-prefixed binary protocol for exec sessions
 //!
 //! Wire format:
 //!   [1-byte type][4-byte length (big-endian)][payload]
 //!
 //! Message types:
-//!   0x01 DATA  - raw PTY output (payload = bytes)
-//!   0x02 EXIT  - process exit (payload = 4-byte i32 exit code)
-//!   0x03 ERROR - error message (payload = UTF-8 string)
-//!   0x04 STDIN - input to PTY from host (payload = bytes)
+//!   0x01 DATA      - command stdout, or PTY output with -t (payload = bytes)
+//!   0x02 EXIT      - process exit (payload = 4-byte i32 exit code)
+//!   0x03 ERROR     - error message (payload = UTF-8 string)
+//!   0x04 STDIN     - input from the host (payload = bytes)
+//!   0x05 STDIN_EOF - the host's stdin reached end of file (no payload)
+//!   0x06 STDERR    - command stderr, never sent with -t (payload = bytes)
+//!   0x07 RESIZE    - the host terminal's size (payload = rows u16, cols u16, big-endian)
+//!   0x08 STDIN_WINDOW - the guest will take this many more STDIN bytes (payload = u32, big-endian)
 //!
-//! This protocol is used for TTY mode exec to cleanly separate
-//! control messages (exit code) from raw terminal data.
+//! Every exec mode uses this framing after the handshake, so output is
+//! byte-exact: no line splitting, no UTF-8 requirement, no added newline.
+//!
+//! STDIN is flow-controlled by the guest, the way SSH does it. A host sends
+//! STDIN bytes only against a window the guest has granted, and the guest
+//! grants more as the command consumes them. The connection itself therefore
+//! never backs up behind a command that is not reading its stdin, the guest
+//! always has a read outstanding, and it learns at once when the host goes
+//! away. That last part is what makes "kill the command when the client dies"
+//! hold: a host hangup does not cross a vsock connection that is backed up.
 
 use std::io::{self, Read, Write};
 
@@ -25,8 +37,8 @@ const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 /// Every exec connection starts with three newline-terminated lines:
 ///
 /// 1. client → server: `ExecRequest` JSON
-/// 2. server → client: `ACK` — the request line was fully consumed; nothing
-///    has executed yet
+/// 2. server → client: `ACK2` ([`HANDSHAKE_ACK`]). The request line was fully
+///    consumed; nothing has executed yet
 /// 3. client → server: `GO` — the server may start executing ONLY after
 ///    consuming this line
 ///
@@ -38,11 +50,25 @@ const MAX_MESSAGE_SIZE: usize = 1024 * 1024;
 /// may have started), and a dead connection is a loud bounded error instead of
 /// a silent hang. The server closes any connection whose handshake stalls, so
 /// orphaned connections can never execute and never leak a thread.
-pub const HANDSHAKE_ACK: &str = "ACK";
+///
+/// The token also names the protocol version. `ACK2` is a server that answers
+/// every exec mode with exec-proto frames, understands STDIN_EOF, STDERR and
+/// RESIZE, and grants STDIN_WINDOW.
+pub const HANDSHAKE_ACK: &str = "ACK2";
+/// The token servers sent before the framed protocol covered every mode. Such
+/// a server answers a plain exec with JSON lines, and stops forwarding stdin
+/// at the first frame type it does not know. A client that reads this token
+/// must not send GO. It occurs when a VM was started, or a snapshot taken, by
+/// an older fcvm.
+pub const HANDSHAKE_ACK_V1: &str = "ACK";
 /// See [`HANDSHAKE_ACK`].
 pub const HANDSHAKE_GO: &str = "GO";
 
-/// Message types for the TTY exec protocol
+/// How much either side reads from a command or a terminal at a time, and so
+/// the largest payload it puts in one frame.
+pub const IO_CHUNK: usize = 64 * 1024;
+
+/// Frame types of the exec protocol
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageType {
@@ -50,6 +76,10 @@ pub enum MessageType {
     Exit = 0x02,
     ErrorMsg = 0x03,
     Stdin = 0x04,
+    StdinEof = 0x05,
+    Stderr = 0x06,
+    Resize = 0x07,
+    StdinWindow = 0x08,
 }
 
 impl MessageType {
@@ -69,50 +99,71 @@ impl MessageType {
             0x02 => Some(MessageType::Exit),
             0x03 => Some(MessageType::ErrorMsg),
             0x04 => Some(MessageType::Stdin),
+            0x05 => Some(MessageType::StdinEof),
+            0x06 => Some(MessageType::Stderr),
+            0x07 => Some(MessageType::Resize),
+            0x08 => Some(MessageType::StdinWindow),
             _ => None,
         }
     }
 }
 
-/// A message in the TTY exec protocol
+/// One frame of the exec protocol
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// Raw terminal output data
+    /// Command stdout, or everything a PTY produced
     Data(Vec<u8>),
     /// Process exit code
     Exit(i32),
     /// Error message
     Error(String),
-    /// Input data from host to PTY
+    /// Input from the host, for the command's stdin or its PTY
     Stdin(Vec<u8>),
+    /// The host's stdin reached end of file. Without a PTY the guest closes
+    /// the command's stdin, so a command that reads to end of input finishes.
+    StdinEof,
+    /// Command stderr. Only sent without a PTY; a PTY merges both streams.
+    Stderr(Vec<u8>),
+    /// The host terminal's size. A client with a terminal on stdin sends it
+    /// when a PTY session starts and on every window change, and the guest
+    /// applies it to the PTY.
+    Resize(TtySize),
+    /// Guest to host: this many more STDIN bytes may be sent. The host starts
+    /// with none, and the guest's first grant opens the window.
+    StdinWindow(u32),
 }
 
 impl Message {
+    /// Encode a message as one frame.
+    pub fn encode(&self) -> Vec<u8> {
+        let exit;
+        let resize;
+        let window;
+        let (msg_type, payload): (MessageType, &[u8]) = match self {
+            Message::Data(data) => (MessageType::Data, data),
+            Message::Exit(code) => {
+                exit = code.to_be_bytes();
+                (MessageType::Exit, &exit)
+            }
+            Message::Error(msg) => (MessageType::ErrorMsg, msg.as_bytes()),
+            Message::Stdin(data) => (MessageType::Stdin, data),
+            Message::StdinEof => (MessageType::StdinEof, &[]),
+            Message::Stderr(data) => (MessageType::Stderr, data),
+            Message::Resize(size) => {
+                resize = size.to_payload();
+                (MessageType::Resize, &resize)
+            }
+            Message::StdinWindow(bytes) => {
+                window = bytes.to_be_bytes();
+                (MessageType::StdinWindow, &window)
+            }
+        };
+        encode_frame(msg_type, payload)
+    }
+
     /// Write a message to a writer using the binary protocol
     pub fn write_to<W: Write>(&self, writer: &mut W) -> io::Result<()> {
-        match self {
-            Message::Data(data) => {
-                writer.write_all(&[MessageType::Data as u8])?;
-                writer.write_all(&(data.len() as u32).to_be_bytes())?;
-                writer.write_all(data)?;
-            }
-            Message::Exit(code) => {
-                writer.write_all(&[MessageType::Exit as u8])?;
-                writer.write_all(&4u32.to_be_bytes())?;
-                writer.write_all(&code.to_be_bytes())?;
-            }
-            Message::Error(msg) => {
-                let bytes = msg.as_bytes();
-                writer.write_all(&[MessageType::ErrorMsg as u8])?;
-                writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
-                writer.write_all(bytes)?;
-            }
-            Message::Stdin(data) => {
-                writer.write_all(&[MessageType::Stdin as u8])?;
-                writer.write_all(&(data.len() as u32).to_be_bytes())?;
-                writer.write_all(data)?;
-            }
-        }
+        writer.write_all(&self.encode())?;
         writer.flush()
     }
 
@@ -200,8 +251,50 @@ impl Message {
                 Ok(Message::Error(msg))
             }
             MessageType::Stdin => Ok(Message::Stdin(payload)),
+            MessageType::StdinEof => {
+                if !payload.is_empty() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "stdin-eof message must have an empty payload",
+                    ));
+                }
+                Ok(Message::StdinEof)
+            }
+            MessageType::Stderr => Ok(Message::Stderr(payload)),
+            MessageType::Resize => match payload.as_slice() {
+                [r0, r1, c0, c1] => Ok(Message::Resize(TtySize {
+                    rows: u16::from_be_bytes([*r0, *r1]),
+                    cols: u16::from_be_bytes([*c0, *c1]),
+                })),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "resize message must have a 4-byte payload",
+                )),
+            },
+            MessageType::StdinWindow => match <[u8; 4]>::try_from(payload.as_slice()) {
+                Ok(bytes) => Ok(Message::StdinWindow(u32::from_be_bytes(bytes))),
+                Err(_) => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "stdin-window message must have a 4-byte payload",
+                )),
+            },
         }
     }
+}
+
+/// Build one frame: type byte, big-endian length, payload.
+fn encode_frame(msg_type: MessageType, payload: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::with_capacity(5 + payload.len());
+    frame.push(msg_type as u8);
+    frame.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+    frame.extend_from_slice(payload);
+    frame
+}
+
+/// Write one frame and flush.
+fn write_frame<W: Write>(writer: &mut W, msg_type: MessageType, payload: &[u8]) -> io::Result<()> {
+    writer.write_all(&encode_frame(msg_type, payload))?;
+    writer.flush()
 }
 
 /// Validate a payload length against the maximum message size.
@@ -221,35 +314,118 @@ fn validate_len(len: u32) -> io::Result<usize> {
 
 /// Write a Data message directly (convenience function for high-frequency writes)
 pub fn write_data<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
-    writer.write_all(&[MessageType::Data as u8])?;
-    writer.write_all(&(data.len() as u32).to_be_bytes())?;
-    writer.write_all(data)?;
-    writer.flush()
+    write_frame(writer, MessageType::Data, data)
+}
+
+/// Write a Stderr message directly
+pub fn write_stderr<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
+    write_frame(writer, MessageType::Stderr, data)
 }
 
 /// Write an Exit message directly
 pub fn write_exit<W: Write>(writer: &mut W, code: i32) -> io::Result<()> {
-    writer.write_all(&[MessageType::Exit as u8])?;
-    writer.write_all(&4u32.to_be_bytes())?;
-    writer.write_all(&code.to_be_bytes())?;
-    writer.flush()
+    write_frame(writer, MessageType::Exit, &code.to_be_bytes())
 }
 
 /// Write an Error message directly
 pub fn write_error<W: Write>(writer: &mut W, msg: &str) -> io::Result<()> {
-    let bytes = msg.as_bytes();
-    writer.write_all(&[MessageType::ErrorMsg as u8])?;
-    writer.write_all(&(bytes.len() as u32).to_be_bytes())?;
-    writer.write_all(bytes)?;
-    writer.flush()
+    write_frame(writer, MessageType::ErrorMsg, msg.as_bytes())
 }
 
 /// Write a Stdin message directly
 pub fn write_stdin<W: Write>(writer: &mut W, data: &[u8]) -> io::Result<()> {
-    writer.write_all(&[MessageType::Stdin as u8])?;
-    writer.write_all(&(data.len() as u32).to_be_bytes())?;
-    writer.write_all(data)?;
-    writer.flush()
+    write_frame(writer, MessageType::Stdin, data)
+}
+
+/// Write a StdinEof message directly
+pub fn write_stdin_eof<W: Write>(writer: &mut W) -> io::Result<()> {
+    write_frame(writer, MessageType::StdinEof, &[])
+}
+
+/// Write a Resize message directly
+pub fn write_resize<W: Write>(writer: &mut W, size: TtySize) -> io::Result<()> {
+    write_frame(writer, MessageType::Resize, &size.to_payload())
+}
+
+/// A terminal's size in character cells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TtySize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl TtySize {
+    fn to_payload(self) -> [u8; 4] {
+        let (rows, cols) = (self.rows.to_be_bytes(), self.cols.to_be_bytes());
+        [rows[0], rows[1], cols[0], cols[1]]
+    }
+}
+
+// ---- Exec request and pre-ACK rejection ----
+//
+// Shared by the host client, fc-agent and fc-mock so the three cannot drift.
+
+/// The request line a client sends before the ACK/GO handshake.
+///
+/// Fields a plain exec does not use are left out of the JSON, so the line for
+/// such a request stays the same as fields are added.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ExecRequest {
+    pub command: Vec<String>,
+    /// Run inside the container (true) or in the guest OS (false).
+    #[serde(default)]
+    pub in_container: bool,
+    /// Forward the client's stdin (-i)
+    #[serde(default)]
+    pub interactive: bool,
+    /// Allocate a pseudo-TTY (-t)
+    #[serde(default)]
+    pub tty: bool,
+    /// Size of the client's terminal, so the PTY has it before the command
+    /// starts. Absent without -t, or when the client has no terminal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tty_size: Option<TtySize>,
+    /// Environment for the command as `KEY=VALUE`, already resolved by the
+    /// client (-e, --env-file). Later entries win.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub env: Vec<String>,
+    /// Working directory for the command (-w)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// `USER[:GROUP]`, names or numbers, to run the command as (-u)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Extended capabilities inside the container (--privileged)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub privileged: bool,
+    /// Start the command and return without waiting for it (-d)
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub detach: bool,
+}
+
+/// A server refuses a request before ACK with this one JSON line, so the
+/// client fails with the reason instead of resending a request that can
+/// never succeed.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Rejection {
+    #[serde(rename = "type")]
+    kind: String,
+    data: String,
+}
+
+/// Build the pre-ACK rejection line (no trailing newline).
+pub fn rejection_line(reason: &str) -> String {
+    serde_json::to_string(&Rejection {
+        kind: "error".to_string(),
+        data: reason.to_string(),
+    })
+    .expect("a struct of two strings always serializes")
+}
+
+/// Parse a pre-ACK line as a rejection, returning its reason.
+pub fn parse_rejection(line: &[u8]) -> Option<String> {
+    let rejection: Rejection = serde_json::from_slice(line).ok()?;
+    (rejection.kind == "error").then_some(rejection.data)
 }
 
 // ---- Restore-completion ACK framing ----
@@ -389,6 +565,159 @@ mod tests {
             Message::Stdin(data) => assert_eq!(data, b"user input"),
             _ => panic!("wrong message type"),
         }
+    }
+
+    #[test]
+    fn test_stdin_eof_roundtrip_has_no_payload() {
+        let mut buf = Vec::new();
+        write_stdin_eof(&mut buf).unwrap();
+        assert_eq!(buf, [MessageType::StdinEof as u8, 0, 0, 0, 0]);
+
+        let decoded = Message::read_from(&mut Cursor::new(buf)).unwrap();
+        assert!(matches!(decoded, Message::StdinEof));
+    }
+
+    #[test]
+    fn test_stdin_eof_with_payload_is_rejected() {
+        let mut buf = vec![MessageType::StdinEof as u8];
+        buf.extend_from_slice(&1u32.to_be_bytes());
+        buf.push(b'x');
+        let err = Message::read_from(&mut Cursor::new(buf)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_stderr_is_a_distinct_stream_from_data() {
+        let mut buf = Vec::new();
+        write_data(&mut buf, b"out").unwrap();
+        write_stderr(&mut buf, b"err").unwrap();
+
+        let mut cursor = Cursor::new(buf);
+        match Message::read_from(&mut cursor).unwrap() {
+            Message::Data(data) => assert_eq!(data, b"out"),
+            other => panic!("expected Data, got {:?}", other),
+        }
+        match Message::read_from(&mut cursor).unwrap() {
+            Message::Stderr(data) => assert_eq!(data, b"err"),
+            other => panic!("expected Stderr, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_encode_matches_write_to_for_every_message() {
+        for msg in [
+            Message::Data(vec![0, 255, b'\n']),
+            Message::Exit(-7),
+            Message::Error("boom".to_string()),
+            Message::Stdin(b"in".to_vec()),
+            Message::StdinEof,
+            Message::Stderr(vec![0xff, 0xfe]),
+            Message::Resize(TtySize { rows: 24, cols: 80 }),
+            Message::StdinWindow(262_144),
+        ] {
+            let mut written = Vec::new();
+            msg.write_to(&mut written).unwrap();
+            assert_eq!(written, msg.encode(), "{:?}", msg);
+        }
+    }
+
+    #[test]
+    fn test_rejection_line_roundtrip() {
+        let line = rejection_line("Empty command");
+        assert_eq!(line, r#"{"type":"error","data":"Empty command"}"#);
+        assert_eq!(
+            parse_rejection(line.as_bytes()).as_deref(),
+            Some("Empty command")
+        );
+        assert_eq!(parse_rejection(b"ACK"), None);
+        assert_eq!(parse_rejection(br#"{"type":"exit","data":"0"}"#), None);
+    }
+
+    #[test]
+    fn test_exec_request_defaults_missing_flags_to_false() {
+        let request: ExecRequest = serde_json::from_str(r#"{"command":["true"]}"#).unwrap();
+        assert_eq!(
+            request,
+            ExecRequest {
+                command: vec!["true".to_string()],
+                in_container: false,
+                interactive: false,
+                tty: false,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn test_exec_request_omits_the_fields_a_plain_exec_does_not_use() {
+        let request = ExecRequest {
+            command: vec!["true".to_string()],
+            in_container: false,
+            interactive: false,
+            tty: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&request).unwrap(),
+            r#"{"command":["true"],"in_container":false,"interactive":false,"tty":false}"#
+        );
+    }
+
+    #[test]
+    fn test_exec_request_flag_fields_roundtrip() {
+        let request = ExecRequest {
+            command: vec!["id".to_string()],
+            in_container: true,
+            env: vec!["A=1".to_string(), "B=two words".to_string()],
+            workdir: Some("/tmp".to_string()),
+            user: Some("nobody:users".to_string()),
+            privileged: true,
+            detach: true,
+            ..Default::default()
+        };
+        let line = serde_json::to_string(&request).unwrap();
+        assert_eq!(serde_json::from_str::<ExecRequest>(&line).unwrap(), request);
+    }
+
+    #[test]
+    fn test_stdin_window_roundtrip_and_payload_length() {
+        let frame = Message::StdinWindow(0x0004_0000).encode();
+        assert_eq!(
+            frame,
+            [MessageType::StdinWindow as u8, 0, 0, 0, 4, 0, 4, 0, 0]
+        );
+        match Message::read_from(&mut Cursor::new(frame)).unwrap() {
+            Message::StdinWindow(bytes) => assert_eq!(bytes, 262_144),
+            other => panic!("expected StdinWindow, got {:?}", other),
+        }
+
+        let mut short = vec![MessageType::StdinWindow as u8];
+        short.extend_from_slice(&3u32.to_be_bytes());
+        short.extend_from_slice(&[0, 0, 1]);
+        let err = Message::read_from(&mut Cursor::new(short)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn test_resize_roundtrip_and_payload_length() {
+        let size = TtySize {
+            rows: 41,
+            cols: 300,
+        };
+        let mut buf = Vec::new();
+        write_resize(&mut buf, size).unwrap();
+        assert_eq!(buf, [MessageType::Resize as u8, 0, 0, 0, 4, 0, 41, 1, 44]);
+        assert_eq!(buf, Message::Resize(size).encode());
+        match Message::read_from(&mut Cursor::new(buf)).unwrap() {
+            Message::Resize(decoded) => assert_eq!(decoded, size),
+            other => panic!("expected Resize, got {:?}", other),
+        }
+
+        let mut short = vec![MessageType::Resize as u8];
+        short.extend_from_slice(&2u32.to_be_bytes());
+        short.extend_from_slice(&[0, 41]);
+        let err = Message::read_from(&mut Cursor::new(short)).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]

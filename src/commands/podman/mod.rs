@@ -1907,7 +1907,13 @@ async fn join_tty_session(
     if let Some(socket_path) = tty_socket_path {
         let _ = std::os::unix::net::UnixStream::connect(&socket_path);
     }
-    let join = tokio::task::spawn_blocking(move || handle.join().ok().and_then(|r| r.ok()));
+    let join = tokio::task::spawn_blocking(move || {
+        handle.join().ok().and_then(|session| {
+            session
+                .map_err(|error| warn!(error = %format!("{error:#}"), "TTY session ended without an exit code"))
+                .ok()
+        })
+    });
     match tokio::time::timeout(std::time::Duration::from_secs(10), join).await {
         Ok(Ok(code)) => code,
         Ok(Err(e)) => {

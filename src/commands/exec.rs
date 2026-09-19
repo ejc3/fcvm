@@ -19,15 +19,16 @@
 //! session loudly instead of hanging, while honest silence (a command quiet
 //! for hours) keeps waiting indefinitely.
 //!
-//! TTY mode uses a length-prefixed binary protocol (see exec_proto.rs) to cleanly
-//! separate control messages from raw terminal data. Non-TTY mode continues to use
-//! JSON line protocol.
+//! After GO every mode speaks exec-proto's length-prefixed frames, so output
+//! is byte-exact and stdout, stderr, the exit code and control messages never
+//! mix. The reference for the command's behaviour is `podman exec`; see
+//! `tests/test_exec_podman_parity.rs`.
 
 use crate::cli::ExecArgs;
 use crate::paths;
 use crate::state::StateManager;
 use anyhow::{bail, Context, Result};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -251,8 +252,8 @@ enum AckOutcome {
 /// across the WHOLE line — mirroring the agent side's `read_line_bounded`.
 ///
 /// Reads byte-by-byte so no bytes past the ACK newline are ever consumed —
-/// everything after ACK belongs to the post-GO exec protocol (JSON lines or
-/// TTY frames), which the mode loops read from the raw stream.
+/// everything after ACK belongs to the post-GO exec frames, which the session
+/// reads from the raw stream.
 ///
 /// The socket read timeout restarts on every byte, so on its own a
 /// byte-dribbling peer could stretch one ACK wait to ~MAX_ACK_LINE_LENGTH ×
@@ -306,11 +307,20 @@ fn read_ack_line(stream: &mut UnixStream, timeout: Duration) -> AckOutcome {
     if line == exec_proto::HANDSHAKE_ACK.as_bytes() {
         return AckOutcome::Acked;
     }
+    if line == exec_proto::HANDSHAKE_ACK_V1.as_bytes() {
+        // GO is never sent, so nothing runs in the guest.
+        return AckOutcome::Rejected(
+            "this VM's fc-agent speaks an older exec protocol: the VM was started, or its \
+             snapshot taken, by an older fcvm. Restart the VM, or re-create the snapshot, \
+             with this fcvm"
+                .to_string(),
+        );
+    }
 
     // Not ACK: the agent rejects invalid requests with an Error response line
     // before ever ACKing. Surface its message rather than a raw protocol dump.
-    if let Ok(ExecResponse::Error(msg)) = serde_json::from_slice::<ExecResponse>(&line) {
-        return AckOutcome::Rejected(msg);
+    if let Some(reason) = exec_proto::parse_rejection(&line) {
+        return AckOutcome::Rejected(reason);
     }
     AckOutcome::Rejected(format!(
         "protocol violation: expected ACK, got {:?}",
@@ -604,20 +614,110 @@ pub async fn run_exec_in_vm(
             in_container,
             interactive: false,
             tty: false,
+            ..Default::default()
         };
 
         // Connect, send the request, and complete the ACK/GO handshake
         let (stream, guard) = connect_and_start_exec(&vsock_socket, &request, &vm_id)?;
         debug!("exec handshake complete");
 
-        // Run in line mode and capture exit code
-        run_line_mode_with_exit_code(stream, guard)
+        // Pass the command's output through and return its exit code. It goes
+        // straight to the descriptors, so first write out what std's buffer
+        // still holds, or the two would come out in the wrong order. std's
+        // stdout is not kept locked: `snapshot run --exec` prints the
+        // container's output from another task meanwhile, and must not block.
+        let _ = std::io::stdout().flush();
+        let reader = BufReader::new(EpochGuardedReader::new(stream, guard));
+        read_exec_frames(
+            reader,
+            |data| super::tty::FdWriter(libc::STDOUT_FILENO).write_all(data),
+            |data| super::tty::FdWriter(libc::STDERR_FILENO).write_all(data),
+            |_| {}, // no stdin is forwarded
+        )
     })
     .await
     .context("exec task panicked")?
 }
 
+/// Exit code when fcvm itself fails before or around the command: no such VM,
+/// no connection, a refused request, a session cut short. `podman exec` uses
+/// the same code, which keeps these apart from anything the command returns.
+const EXEC_FAILED_EXIT_CODE: i32 = 125;
+
 pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
+    // Suppress logs when in TTY or quiet mode (they mix with command output)
+    let quiet = args.quiet || args.tty;
+    // Only a --quiet caller is a subprocess whose failures are routine. A -t
+    // user is a person, and is told why the shell went away.
+    let subprocess = args.quiet;
+    let Err(e) = exec(args, quiet).await else {
+        return Ok(());
+    };
+    // A closed output pipe ends `podman exec`, like any Unix tool, by SIGPIPE,
+    // and a shell reports that as 141. Rust ignores SIGPIPE, so the write
+    // failed with EPIPE instead; take the default action now. The closed
+    // connection makes fc-agent kill the command.
+    let broken_pipe = e
+        .downcast_ref::<ClientOutputClosed>()
+        .is_some_and(|closed| closed.0.kind() == std::io::ErrorKind::BrokenPipe);
+    if broken_pipe {
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+            libc::raise(libc::SIGPIPE);
+        }
+    }
+    // Downgrade the benign "stream closed before exit" race to debug ONLY for quiet
+    // (subprocess) callers, such as the health monitor's `--quiet` inspect during
+    // teardown. A user-invoked exec (not quiet) gets a visible ERROR.
+    if is_benign_quiet_exec_close(subprocess, &e) {
+        debug!("{:#}", e);
+    } else {
+        tracing::error!("Error: {:#}", e);
+    }
+    std::process::exit(EXEC_FAILED_EXIT_CODE);
+}
+
+/// Resolve -e and --env-file into `KEY=VALUE` entries, in the order podman
+/// applies them: files first, then -e, so -e wins.
+///
+/// `KEY` alone passes this process's value, and is dropped when there is none.
+fn resolve_env(
+    files: &[std::path::PathBuf],
+    flags: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Vec<String>> {
+    let mut entries: Vec<String> = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(file)
+            .with_context(|| format!("reading --env-file {}", file.display()))?;
+        for line in text.lines() {
+            let line = line.trim_start();
+            if !line.is_empty() && !line.starts_with('#') {
+                entries.push(line.to_string());
+            }
+        }
+    }
+    entries.extend(flags.iter().cloned());
+
+    let mut resolved = Vec::new();
+    for entry in entries {
+        let key = entry.split('=').next().unwrap_or_default();
+        if key.is_empty() {
+            bail!(
+                "invalid environment variable {:?}: the name is empty",
+                entry
+            );
+        }
+        if entry.contains('=') {
+            resolved.push(entry);
+        } else if let Some(value) = lookup(key) {
+            resolved.push(format!("{key}={value}"));
+        }
+    }
+    Ok(resolved)
+}
+
+async fn exec(args: ExecArgs, quiet: bool) -> Result<()> {
     // Find the VM by name or PID
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
@@ -642,8 +742,6 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     // socket outside vm_runtime_dir, so reconstructing it breaks exec/health.
     let vsock_socket = exec_vsock_socket_path(&vm_state)?;
 
-    // Suppress logs when in TTY or quiet mode (they mix with command output)
-    let quiet = args.quiet || args.tty;
     if !quiet {
         info!(
             vm_id = %vm_state.vm_id,
@@ -675,7 +773,10 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
     // Determine effective flags:
     // - If explicitly set, use those
     // - If running a shell with TTY stdin, auto-enable -it
-    let (interactive, tty) = if args.interactive || args.tty {
+    let (interactive, tty) = if args.detach {
+        // Nothing stays attached to this client.
+        (false, false)
+    } else if args.interactive || args.tty {
         // User explicitly specified flags
         (args.interactive, args.tty)
     } else if is_shell && stdin_is_tty {
@@ -694,7 +795,17 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         command: args.command.clone(),
         in_container: !args.vm,
         interactive,
-        tty,
+        // A detached container command can still have a TTY of its own, as
+        // with `podman exec -d -t`. The session to this client has none.
+        tty: tty || (args.detach && args.tty),
+        tty_size: tty
+            .then(|| super::tty::terminal_size(libc::STDIN_FILENO))
+            .flatten(),
+        env: resolve_env(&args.env_file, &args.env, |key| std::env::var(key).ok())?,
+        workdir: args.workdir.clone(),
+        user: args.user.clone(),
+        privileged: args.privileged,
+        detach: args.detach,
     };
 
     // Connect, send the request, and complete the ACK/GO handshake
@@ -710,69 +821,81 @@ pub async fn cmd_exec(args: ExecArgs) -> Result<()> {
         );
     }
 
-    // Use binary framing for any mode needing TTY or stdin forwarding
-    // JSON line mode only for plain non-interactive commands
-    let result = if tty || interactive {
-        match super::tty::run_tty_session_connected(stream, tty, interactive, guard) {
-            Ok(exit_code) => {
-                if exit_code != 0 {
-                    std::process::exit(exit_code);
-                }
-                Ok(())
-            }
-            Err(e) => Err(e),
+    // Every mode runs the same framed session. It exits this process with the
+    // command's code, the way `podman exec` does.
+    super::tty::run_tty_session_connected(stream, tty, interactive, guard).map(|exit_code| {
+        if exit_code != 0 {
+            std::process::exit(exit_code);
         }
-    } else {
-        run_line_mode(stream, guard)
-    };
-
-    // Downgrade the benign "stream closed before exit" race to debug ONLY for quiet
-    // (subprocess) callers — e.g. the health monitor's `--quiet` inspect during
-    // teardown. Still exit non-zero. A user-invoked exec (not quiet) propagates the
-    // error so `main` logs a visible ERROR rather than failing silently.
-    if let Err(e) = &result {
-        if is_benign_quiet_exec_close(quiet, e) {
-            debug!("{:#}", e);
-            std::process::exit(1);
-        }
-    }
-    result
+    })
 }
 
-/// Read JSON-line exec responses until an Exit (or Error) message arrives.
+/// Read exec frames until the command's Exit arrives, and return its code.
 ///
-/// Stdout/stderr payloads are passed to the provided callbacks. Returns the
-/// command's exit code (Error messages map to exit code 1).
+/// Stdout and stderr payloads are passed to the callbacks as raw bytes, in
+/// arrival order. This is the one frame reader on the host: `fcvm exec`, the
+/// `podman run -it` console and the library calls all use it.
 ///
-/// If the stream ends before an Exit message is received (fc-agent crash, VM
-/// reboot, vsock reset), the command's outcome is unknown, so this returns an
-/// error rather than reporting success.
-fn read_exec_responses<R: BufRead>(
-    reader: R,
-    mut on_stdout: impl FnMut(&str),
-    mut on_stderr: impl FnMut(&str),
+/// A session that ends any other way has no exit status, which is an error and
+/// never an invented exit code:
+/// - the stream ends before Exit (fc-agent crash, VM reboot, vsock reset), or
+///   a frame is cut short by the close: [`ExecConnectionClosed`];
+/// - the guest reports with an Error frame that it could not run the session;
+/// - a callback fails because nobody takes the output any more:
+///   [`ClientOutputClosed`].
+pub(crate) fn read_exec_frames<R: Read>(
+    mut reader: R,
+    mut on_stdout: impl FnMut(&[u8]) -> std::io::Result<()>,
+    mut on_stderr: impl FnMut(&[u8]) -> std::io::Result<()>,
+    mut on_stdin_window: impl FnMut(u32),
 ) -> Result<i32> {
-    for line in reader.lines() {
-        let line = line.context("reading from exec socket")?;
-
-        // Parse the line as JSON; skip lines that aren't valid responses
-        let Ok(response) = serde_json::from_str::<ExecResponse>(&line) else {
-            continue;
-        };
-
-        match response {
-            ExecResponse::Stdout(data) => on_stdout(&data),
-            ExecResponse::Stderr(data) => on_stderr(&data),
-            ExecResponse::Exit(code) => return Ok(code),
-            ExecResponse::Error(msg) => {
-                on_stderr(&format!("Error: {}\n", msg));
-                return Ok(1);
+    loop {
+        match exec_proto::Message::read_from(&mut reader) {
+            Ok(exec_proto::Message::Data(data)) => on_stdout(&data).map_err(ClientOutputClosed)?,
+            Ok(exec_proto::Message::Stderr(data)) => {
+                on_stderr(&data).map_err(ClientOutputClosed)?
+            }
+            Ok(exec_proto::Message::Exit(code)) => return Ok(code),
+            // The guest will take this many more bytes of forwarded stdin.
+            Ok(exec_proto::Message::StdinWindow(bytes)) => on_stdin_window(bytes),
+            Ok(exec_proto::Message::Error(msg)) => {
+                bail!("fc-agent could not run the command: {msg}")
+            }
+            // Host-to-guest frames; the guest never sends them.
+            Ok(exec_proto::Message::Stdin(_))
+            | Ok(exec_proto::Message::StdinEof)
+            | Ok(exec_proto::Message::Resize(_)) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                return Err(ExecConnectionClosed.into());
+            }
+            // A snapshot-pause orphan names itself; anything else is not a frame.
+            Err(e) => {
+                let orphaned = e
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<ExecOrphanedBySnapshotPause>());
+                return Err(if orphaned {
+                    anyhow::Error::new(e)
+                } else {
+                    anyhow::Error::new(e).context("exec protocol error")
+                });
             }
         }
     }
-
-    Err(ExecConnectionClosed.into())
 }
+
+/// The client's own stdout or stderr stopped taking output, as stdout does in
+/// `fcvm exec ... | head -1`. The session ends: carrying on would run the
+/// guest command forever with its output thrown away.
+#[derive(Debug)]
+pub struct ClientOutputClosed(pub std::io::Error);
+
+impl std::fmt::Display for ClientOutputClosed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cannot write the command's output: {}", self.0)
+    }
+}
+
+impl std::error::Error for ClientOutputClosed {}
 
 /// The exec stream ended before an Exit message arrived.
 ///
@@ -809,56 +932,12 @@ fn is_benign_quiet_exec_close(quiet: bool, err: &anyhow::Error) -> bool {
     quiet && err.downcast_ref::<ExecConnectionClosed>().is_some()
 }
 
-/// Run in line-buffered mode (non-TTY), returns exit code
-fn run_line_mode_with_exit_code(stream: UnixStream, guard: SnapshotOrphanGuard) -> Result<i32> {
-    let reader = BufReader::new(EpochGuardedReader::new(stream, guard));
-    read_exec_responses(
-        reader,
-        |data| print!("{}", data),
-        |data| eprint!("{}", data),
-    )
-}
-
-/// Run in line-buffered mode (non-TTY)
-fn run_line_mode(stream: UnixStream, guard: SnapshotOrphanGuard) -> Result<()> {
-    let exit_code = run_line_mode_with_exit_code(stream, guard)?;
-
-    // Exit with the command's exit code
-    if exit_code != 0 {
-        std::process::exit(exit_code);
-    }
-
-    Ok(())
-}
-
-/// Request sent to fc-agent exec server
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct ExecRequest {
-    pub command: Vec<String>,
-    pub in_container: bool,
-    /// Keep STDIN open (-i)
-    #[serde(default)]
-    pub interactive: bool,
-    /// Allocate a pseudo-TTY (-t)
-    #[serde(default)]
-    pub tty: bool,
-}
-
-/// Response from fc-agent exec server
-#[derive(serde::Serialize, serde::Deserialize)]
-#[serde(tag = "type", content = "data")]
-pub enum ExecResponse {
-    #[serde(rename = "stdout")]
-    Stdout(String),
-    #[serde(rename = "stderr")]
-    Stderr(String),
-    #[serde(rename = "exit")]
-    Exit(i32),
-    #[serde(rename = "error")]
-    Error(String),
-}
+pub use exec_proto::ExecRequest;
 
 /// Captured output from an exec command (for programmatic/server use).
+///
+/// The streams are byte-exact on the wire; they are converted to strings here,
+/// with invalid UTF-8 replaced, because every caller wants text.
 pub struct ExecOutput {
     pub stdout: String,
     pub stderr: String,
@@ -896,24 +975,32 @@ pub async fn run_exec_in_vm_captured(
             in_container,
             interactive: false,
             tty: false,
+            ..Default::default()
         };
 
         // Connect, send the request, and complete the ACK/GO handshake
         let (stream, guard) = connect_and_start_exec(&vsock_socket, &request, &vm_id)?;
 
-        // Read lines and capture into strings instead of printing
+        // Capture the streams instead of printing them
         let reader = BufReader::new(EpochGuardedReader::new(stream, guard));
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let exit_code = read_exec_responses(
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let exit_code = read_exec_frames(
             reader,
-            |data| stdout.push_str(data),
-            |data| stderr.push_str(data),
+            |data| {
+                stdout.extend_from_slice(data);
+                Ok(())
+            },
+            |data| {
+                stderr.extend_from_slice(data);
+                Ok(())
+            },
+            |_| {}, // no stdin is forwarded
         )?;
 
         Ok(ExecOutput {
-            stdout,
-            stderr,
+            stdout: String::from_utf8_lossy(&stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&stderr).into_owned(),
             exit_code,
         })
     })
@@ -1013,49 +1100,136 @@ mod tests {
         );
     }
 
-    fn response_line(response: &ExecResponse) -> String {
-        format!("{}\n", serde_json::to_string(response).unwrap())
+    #[test]
+    fn resolve_env_orders_files_before_flags_and_passes_host_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("env");
+        std::fs::write(
+            &file,
+            "A=1\n# a comment\n\nB=two words\nEMPTY=\nFROM_HOST\nNOT_SET\n",
+        )
+        .unwrap();
+        let host =
+            |key: &str| (key == "FROM_HOST" || key == "ALSO").then(|| "inherited".to_string());
+
+        let resolved = resolve_env(
+            &[file],
+            &[
+                "A=override".to_string(),
+                "ALSO".to_string(),
+                "EQ=a=b".to_string(),
+            ],
+            host,
+        )
+        .unwrap();
+        assert_eq!(
+            resolved,
+            [
+                "A=1",
+                "B=two words",
+                "EMPTY=",
+                "FROM_HOST=inherited",
+                // NOT_SET has no value here, so it is dropped.
+                "A=override",
+                "ALSO=inherited",
+                "EQ=a=b",
+            ]
+        );
     }
 
     #[test]
-    fn read_exec_responses_returns_exit_code() {
-        let mut input = String::new();
-        input.push_str(&response_line(&ExecResponse::Stdout("hello\n".into())));
-        input.push_str(&response_line(&ExecResponse::Stderr("warning\n".into())));
-        input.push_str(&response_line(&ExecResponse::Exit(7)));
+    fn resolve_env_rejects_an_empty_name_and_a_missing_file() {
+        let err = resolve_env(&[], &["=value".to_string()], |_| None).unwrap_err();
+        assert!(err.to_string().contains("name is empty"), "{err}");
+        let err = resolve_env(&["/no/such/env/file".into()], &[], |_| None).unwrap_err();
+        assert!(err.to_string().contains("/no/such/env/file"), "{err}");
+    }
 
-        let mut stdout = String::new();
-        let mut stderr = String::new();
-        let code = read_exec_responses(
-            input.as_bytes(),
-            |d| stdout.push_str(d),
-            |d| stderr.push_str(d),
+    #[test]
+    fn read_exec_frames_returns_exit_code_and_exact_bytes() {
+        let mut input = Vec::new();
+        // No trailing newline, invalid UTF-8 and CRLF must all pass through.
+        exec_proto::write_data(&mut input, b"hel\xfflo\r\n").unwrap();
+        exec_proto::write_stderr(&mut input, b"warning").unwrap();
+        exec_proto::write_data(&mut input, b"tail").unwrap();
+        exec_proto::write_exit(&mut input, 7).unwrap();
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let code = read_exec_frames(
+            input.as_slice(),
+            |d| {
+                stdout.extend_from_slice(d);
+                Ok(())
+            },
+            |d| {
+                stderr.extend_from_slice(d);
+                Ok(())
+            },
+            |_| {},
         )
         .unwrap();
 
         assert_eq!(code, 7);
-        assert_eq!(stdout, "hello\n");
-        assert_eq!(stderr, "warning\n");
+        assert_eq!(stdout, b"hel\xfflo\r\ntail");
+        assert_eq!(stderr, b"warning");
     }
 
     #[test]
-    fn read_exec_responses_error_message_yields_exit_one() {
-        let input = response_line(&ExecResponse::Error("spawn failed".into()));
+    fn read_exec_frames_a_guest_error_is_an_error_not_an_exit_code() {
+        let mut input = Vec::new();
+        exec_proto::write_error(&mut input, "spawn failed").unwrap();
 
-        let mut stderr = String::new();
-        let code = read_exec_responses(input.as_bytes(), |_| {}, |d| stderr.push_str(d)).unwrap();
-
-        assert_eq!(code, 1);
-        assert_eq!(stderr, "Error: spawn failed\n");
+        let err = read_exec_frames(input.as_slice(), |_| Ok(()), |_| Ok(()), |_| {}).unwrap_err();
+        assert!(err.to_string().contains("spawn failed"), "{err}");
     }
 
     #[test]
-    fn read_exec_responses_eof_without_exit_is_an_error() {
+    fn read_exec_frames_passes_on_every_stdin_window_grant() {
+        let mut input = exec_proto::Message::StdinWindow(262_144).encode();
+        exec_proto::write_data(&mut input, b"out").unwrap();
+        input.extend(exec_proto::Message::StdinWindow(4096).encode());
+        exec_proto::write_exit(&mut input, 0).unwrap();
+
+        let mut grants = Vec::new();
+        let code = read_exec_frames(
+            input.as_slice(),
+            |_| Ok(()),
+            |_| Ok(()),
+            |bytes| grants.push(bytes),
+        )
+        .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(grants, [262_144, 4096]);
+    }
+
+    #[test]
+    fn read_exec_frames_stops_when_the_output_is_closed() {
+        let mut input = Vec::new();
+        exec_proto::write_data(&mut input, b"y\n").unwrap();
+        exec_proto::write_exit(&mut input, 0).unwrap();
+
+        let err = read_exec_frames(
+            input.as_slice(),
+            |_| Err(std::io::ErrorKind::BrokenPipe.into()),
+            |_| Ok(()),
+            |_| {},
+        )
+        .unwrap_err();
+        let closed = err
+            .downcast_ref::<ClientOutputClosed>()
+            .expect("typed error");
+        assert_eq!(closed.0.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn read_exec_frames_eof_without_exit_is_an_error() {
         // Connection dropped after some output but before the Exit message:
         // the command's outcome is unknown, so this must not report success.
-        let input = response_line(&ExecResponse::Stdout("partial output\n".into()));
+        let mut input = Vec::new();
+        exec_proto::write_data(&mut input, b"partial output\n").unwrap();
 
-        let err = read_exec_responses(input.as_bytes(), |_| {}, |_| {}).unwrap_err();
+        let err = read_exec_frames(input.as_slice(), |_| Ok(()), |_| Ok(()), |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("before an exit status"),
             "unexpected error: {err}"
@@ -1063,12 +1237,15 @@ mod tests {
     }
 
     #[test]
-    fn read_exec_responses_truncated_final_line_is_an_error() {
-        // A connection drop mid-message leaves a partial JSON line and no Exit.
-        let mut input = response_line(&ExecResponse::Stdout("ok\n".into()));
-        input.push_str("{\"type\":\"exit\",\"da");
+    fn read_exec_frames_truncated_final_frame_is_an_error() {
+        // A connection drop mid-frame leaves a partial Exit and no outcome.
+        let mut input = Vec::new();
+        exec_proto::write_data(&mut input, b"ok\n").unwrap();
+        let mut exit = Vec::new();
+        exec_proto::write_exit(&mut exit, 0).unwrap();
+        input.extend_from_slice(&exit[..exit.len() - 2]);
 
-        let err = read_exec_responses(input.as_bytes(), |_| {}, |_| {}).unwrap_err();
+        let err = read_exec_frames(input.as_slice(), |_| Ok(()), |_| Ok(()), |_| {}).unwrap_err();
         assert!(
             err.to_string().contains("before an exit status"),
             "unexpected error: {err}"
@@ -1080,26 +1257,20 @@ mod tests {
     #[test]
     fn read_ack_line_acked_consumes_nothing_past_newline() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        server
-            .write_all(
-                format!(
-                    "{}\n{{\"type\":\"exit\",\"data\":0}}\n",
-                    exec_proto::HANDSHAKE_ACK
-                )
-                .as_bytes(),
-            )
-            .unwrap();
+        let mut wire = format!("{}\n", exec_proto::HANDSHAKE_ACK).into_bytes();
+        exec_proto::write_exit(&mut wire, 0).unwrap();
+        server.write_all(&wire).unwrap();
 
         assert!(matches!(
             read_ack_line(&mut client, ACK_TIMEOUT),
             AckOutcome::Acked
         ));
 
-        // The exec response following ACK must still be readable in full.
-        let mut reader = BufReader::new(client);
-        let mut line = String::new();
-        reader.read_line(&mut line).unwrap();
-        assert_eq!(line, "{\"type\":\"exit\",\"data\":0}\n");
+        // The exec frame following ACK must still be readable in full.
+        match exec_proto::Message::read_from(&mut client).unwrap() {
+            exec_proto::Message::Exit(code) => assert_eq!(code, 0),
+            other => panic!("expected Exit(0), got {:?}", other),
+        }
     }
 
     /// Peer closes without ACK → NotAcked (safe to resend).
@@ -1162,12 +1333,29 @@ mod tests {
         writer.join().unwrap();
     }
 
+    /// An agent from before the framed protocol ACKs with the old token. It
+    /// must be refused here, before GO: it would answer in JSON lines and drop
+    /// stdin forwarding at the first frame type it does not know.
+    #[test]
+    fn read_ack_line_refuses_an_agent_that_predates_the_framed_protocol() {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        server.write_all(b"ACK\n").unwrap();
+
+        match read_ack_line(&mut client, Duration::from_secs(1)) {
+            AckOutcome::Rejected(msg) => {
+                assert!(msg.contains("older exec protocol"), "{msg}");
+                assert!(msg.contains("Restart the VM"), "{msg}");
+            }
+            other => panic!("expected Rejected, got {:?}", other),
+        }
+    }
+
     /// A pre-ACK Error response (invalid/empty request) → Rejected with the
     /// agent's message; deterministic, so the client must not resend.
     #[test]
     fn read_ack_line_error_response_is_rejected() {
         let (mut client, mut server) = UnixStream::pair().unwrap();
-        let error_line = response_line(&ExecResponse::Error("Empty command".into()));
+        let error_line = format!("{}\n", exec_proto::rejection_line("Empty command"));
         server.write_all(error_line.as_bytes()).unwrap();
 
         match read_ack_line(&mut client, Duration::from_secs(1)) {

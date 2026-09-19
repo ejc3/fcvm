@@ -5,6 +5,7 @@
 //! with "OK 4998\n" then handle the exec request.
 
 use anyhow::{Context, Result};
+use exec_proto::{ExecRequest, Message};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{debug, info, warn};
@@ -98,9 +99,8 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
     // an Error line BEFORE the ACK, so the client sees a deterministic
     // rejection instead of a mid-handshake close.
     if request.command.is_empty() {
-        let resp = ExecResponse::Error("Empty command".to_string());
-        let json = serde_json::to_string(&resp)?;
-        write_half.write_all(json.as_bytes()).await?;
+        let line = exec_proto::rejection_line("Empty command");
+        write_half.write_all(line.as_bytes()).await?;
         write_half.write_all(b"\n").await?;
         return Ok(());
     }
@@ -130,17 +130,19 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
     debug!("exec handshake complete (ACK/GO)");
 
     // Execute the command
-    if request.tty || request.interactive {
-        // TTY mode - not supported yet, send error
-        let resp = ExecResponse::Error("TTY mode not supported in fc-mock".to_string());
-        let json = serde_json::to_string(&resp)?;
-        write_half.write_all(json.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
-
-        let exit = ExecResponse::Exit(1);
-        let json = serde_json::to_string(&exit)?;
-        write_half.write_all(json.as_bytes()).await?;
-        write_half.write_all(b"\n").await?;
+    // fc-mock runs a command to completion and reports its output. Refuse what
+    // it cannot honour, so a test never passes on a flag that was ignored.
+    let unsupported = [
+        (request.tty || request.interactive, "-i and -t"),
+        (!request.env.is_empty(), "-e and --env-file"),
+        (request.workdir.is_some(), "-w"),
+        (request.user.is_some(), "-u"),
+        (request.privileged, "--privileged"),
+        (request.detach, "-d"),
+    ];
+    if let Some((_, flags)) = unsupported.iter().find(|(used, _)| *used) {
+        let error = Message::Error(format!("{flags} are not supported in fc-mock"));
+        write_half.write_all(&error.encode()).await?;
         return Ok(());
     }
 
@@ -156,13 +158,6 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
         ("podman".to_string(), exec_args)
     } else {
         // Run directly on the host (VM-level exec)
-        if request.command.is_empty() {
-            let resp = ExecResponse::Error("empty command".to_string());
-            let json = serde_json::to_string(&resp)?;
-            write_half.write_all(json.as_bytes()).await?;
-            write_half.write_all(b"\n").await?;
-            return Ok(());
-        }
         // If the command is podman, prepend rootless storage args
         let program = request.command[0].clone();
         let args = if program == "podman" {
@@ -191,73 +186,43 @@ async fn handle_connection(stream: tokio::net::UnixStream) -> Result<()> {
 
     let result = cmd.output().await;
 
-    match result {
+    // The frames and exit codes fc-agent uses for a plain exec: byte-exact
+    // streams, 128+signal for a signal death, 127 when the command is missing,
+    // 126 otherwise. Output goes out in 64 KiB frames, under the frame cap.
+    use std::os::unix::process::ExitStatusExt;
+    let (stdout, stderr, exit_code) = match result {
         Ok(output) => {
-            // Send stdout
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            if !stdout.is_empty() {
-                let resp = ExecResponse::Stdout(stdout.to_string());
-                let json = serde_json::to_string(&resp)?;
-                write_half.write_all(json.as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
-            }
-
-            // Send stderr
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stderr.is_empty() {
-                let resp = ExecResponse::Stderr(stderr.to_string());
-                let json = serde_json::to_string(&resp)?;
-                write_half.write_all(json.as_bytes()).await?;
-                write_half.write_all(b"\n").await?;
-            }
-
-            // Send exit code
-            let exit_code = output.status.code().unwrap_or(1);
-            let resp = ExecResponse::Exit(exit_code);
-            let json = serde_json::to_string(&resp)?;
-            write_half.write_all(json.as_bytes()).await?;
-            write_half.write_all(b"\n").await?;
-
-            debug!(exit_code, "exec completed");
+            let exit_code = output
+                .status
+                .code()
+                .unwrap_or_else(|| 128 + output.status.signal().unwrap_or(0));
+            (output.stdout, output.stderr, exit_code)
         }
         Err(e) => {
-            let resp = ExecResponse::Error(format!("failed to execute: {}", e));
-            let json = serde_json::to_string(&resp)?;
-            write_half.write_all(json.as_bytes()).await?;
-            write_half.write_all(b"\n").await?;
-
-            let exit = ExecResponse::Exit(127);
-            let json = serde_json::to_string(&exit)?;
-            write_half.write_all(json.as_bytes()).await?;
-            write_half.write_all(b"\n").await?;
+            let exit_code = if e.kind() == std::io::ErrorKind::NotFound {
+                127
+            } else {
+                126
+            };
+            let text = format!("Error: cannot run {:?}: {}\n", program, e);
+            (Vec::new(), text.into_bytes(), exit_code)
         }
+    };
+    debug!(exit_code, "exec completed");
+    for chunk in stdout.chunks(exec_proto::IO_CHUNK) {
+        write_half
+            .write_all(&Message::Data(chunk.to_vec()).encode())
+            .await?;
     }
+    for chunk in stderr.chunks(exec_proto::IO_CHUNK) {
+        write_half
+            .write_all(&Message::Stderr(chunk.to_vec()).encode())
+            .await?;
+    }
+    write_half
+        .write_all(&Message::Exit(exit_code).encode())
+        .await?;
 
     write_half.flush().await?;
     Ok(())
-}
-
-/// Request sent by fcvm's exec command (matches src/commands/exec.rs)
-#[derive(serde::Deserialize, Debug)]
-struct ExecRequest {
-    command: Vec<String>,
-    in_container: bool,
-    #[serde(default)]
-    interactive: bool,
-    #[serde(default)]
-    tty: bool,
-}
-
-/// Response sent back to fcvm (matches src/commands/exec.rs)
-#[derive(serde::Serialize)]
-#[serde(tag = "type", content = "data")]
-enum ExecResponse {
-    #[serde(rename = "stdout")]
-    Stdout(String),
-    #[serde(rename = "stderr")]
-    Stderr(String),
-    #[serde(rename = "exit")]
-    Exit(i32),
-    #[serde(rename = "error")]
-    Error(String),
 }

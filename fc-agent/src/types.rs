@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 
 #[derive(Debug, Deserialize)]
@@ -96,30 +96,6 @@ pub struct LatestMetadata {
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
     #[serde(rename = "clone-ipv6", default)]
     pub clone_ipv6: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct ExecRequest {
-    pub command: Vec<String>,
-    #[serde(default)]
-    pub in_container: bool,
-    #[serde(default)]
-    pub interactive: bool,
-    #[serde(default)]
-    pub tty: bool,
-}
-
-#[derive(Debug, Serialize)]
-#[serde(tag = "type", content = "data")]
-pub enum ExecResponse {
-    #[serde(rename = "stdout")]
-    Stdout(String),
-    #[serde(rename = "stderr")]
-    Stderr(String),
-    #[serde(rename = "exit")]
-    Exit(i32),
-    #[serde(rename = "error")]
-    Error(String),
 }
 
 #[cfg(test)]
@@ -225,13 +201,5 @@ mod tests {
         let json = r#"{"host-time": "1731301800"}"#;
         let meta: LatestMetadata = serde_json::from_str(json).unwrap();
         assert!(meta.restore_epoch.is_none());
-    }
-
-    #[test]
-    fn test_exec_response_serialization() {
-        let resp = ExecResponse::Exit(0);
-        let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains("\"type\":\"exit\""));
-        assert!(json.contains("\"data\":0"));
     }
 }
