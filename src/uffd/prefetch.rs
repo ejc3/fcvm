@@ -17,7 +17,7 @@
 use tracing::debug;
 use userfaultfd::Uffd;
 
-use super::working_set::PageSet;
+use super::working_set::{PageSet, RunIter};
 
 /// Bytes populated per ioctl.
 ///
@@ -26,17 +26,6 @@ use super::working_set::PageSet;
 /// over 512 4 KiB pages. It is also exactly one 2 MiB granule, so a hugepage clone never gets
 /// a chunk that splits a page.
 pub const CHUNK_BYTES: usize = 2 * 1024 * 1024;
-
-/// Maximum fragmentation accepted from an on-disk performance hint.
-///
-/// The hint is untrusted cache state. Planning must have a fixed CPU/allocation ceiling, so a
-/// hint with more runs than this keeps only its LARGEST runs (a fixed-size selection, never an
-/// allocation proportional to a corrupt bitmap) and leaves the rest to demand paging. Large
-/// honest workloads sit past this cap routinely: a warmed 128 GiB guest's restore set
-/// fragments into millions of runs, and discarding the whole plan (which is what this cap
-/// used to do) silently turned prefetch off exactly where it had the most to do.
-pub const MAX_PREFETCH_RUNS: usize = 65_536;
-pub const MAX_PREFETCH_SEGMENTS: usize = 65_536;
 
 /// One guest memory region of a clone, as needed to place snapshot offsets in its address
 /// space. A view of the handshake's `GuestRegionUffdMapping`, not the wire type.
@@ -85,166 +74,156 @@ pub enum Stop {
 /// Runs are clipped to the regions the clone actually mapped, aligned out to its page size
 /// (prefetching a few neighbouring pages is free; a partial page is not addressable), clipped
 /// to the memory file, and finally merged so alignment cannot produce overlapping copies.
-pub fn plan(set: &PageSet, regions: &[Region], page_size: usize, mem_len: u64) -> Vec<Segment> {
-    let mut segments: Vec<Segment> = Vec::new();
-    if !page_size.is_power_of_two() || !(4096..=CHUNK_BYTES).contains(&page_size) {
-        return segments;
+///
+/// The plan is lazy, and every recorded run is planned. The hint is untrusted cache state, so
+/// planning keeps a fixed ceiling on what it can cost: the iterator holds one pending segment
+/// and allocates nothing, and its work is one pass over the bitmap, whose length the
+/// snapshot's memory size fixes. A warmed 128 GiB guest's restore set fragments into millions
+/// of runs a few pages long (measured: 3.7M pages in 1.6M runs), so a plan limited to a fixed
+/// number of runs leaves most of that set to demand paging.
+pub fn plan<'a>(
+    set: &'a PageSet,
+    regions: &'a [Region],
+    page_size: usize,
+    mem_len: u64,
+) -> Plan<'a> {
+    let usable = page_size.is_power_of_two() && (4096..=CHUNK_BYTES).contains(&page_size);
+    Plan {
+        runs: usable.then(|| set.runs()),
+        regions,
+        page_size,
+        mem_len,
+        run: None,
+        next_region: 0,
+        pending: None,
     }
+}
 
-    // Keep the largest runs when the hint fragments past the planning cap. The heap never
-    // grows past the cap, so allocation stays fixed no matter what the bitmap holds; length
-    // ties break toward lower offsets deterministically. The kept runs are re-sorted by
-    // offset because the merge below relies on encounter order.
-    let mut heap: std::collections::BinaryHeap<std::cmp::Reverse<(u64, std::cmp::Reverse<u64>)>> =
-        std::collections::BinaryHeap::new();
-    let mut dropped_runs: u64 = 0;
-    let mut dropped_bytes: u64 = 0;
-    for run in set.runs() {
-        let run_end = run.offset.saturating_add(run.len).min(mem_len);
-        if run_end <= run.offset {
-            continue;
-        }
-        let candidate = (run_end - run.offset, std::cmp::Reverse(run.offset));
-        if heap.len() == MAX_PREFETCH_RUNS {
-            // Full: most candidates lose to the smallest kept run, and a
-            // peek rejects them in O(1) instead of paying a push+pop.
-            match heap.peek() {
-                Some(&std::cmp::Reverse(smallest)) if candidate > smallest => {
-                    if let Some(std::cmp::Reverse((len, _))) = heap.pop() {
-                        dropped_runs += 1;
-                        dropped_bytes += len;
-                    }
-                    heap.push(std::cmp::Reverse(candidate));
+/// The segments of one [`plan`], produced as they are asked for: runs in ascending file offset,
+/// each placed in the order the regions are listed.
+pub struct Plan<'a> {
+    /// `None` when the clone's page size cannot be planned for. The plan is then empty.
+    runs: Option<RunIter<'a>>,
+    regions: &'a [Region],
+    page_size: usize,
+    mem_len: u64,
+    /// The run being placed, as `(start, end)` file offsets clipped to the memory file.
+    run: Option<(u64, u64)>,
+    /// The next region to place `run` in. One run can span several regions.
+    next_region: usize,
+    /// The newest segment, held back because the next piece may merge into it.
+    pending: Option<Segment>,
+}
+
+impl Iterator for Plan<'_> {
+    type Item = Segment;
+
+    fn next(&mut self) -> Option<Segment> {
+        loop {
+            let Some((run_offset, run_end)) = self.run else {
+                let Some(run) = self.runs.as_mut().and_then(Iterator::next) else {
+                    return self.pending.take();
+                };
+                let run_end = run.offset.saturating_add(run.len).min(self.mem_len);
+                if run_end > run.offset {
+                    self.run = Some((run.offset, run_end));
+                    self.next_region = 0;
                 }
-                _ => {
-                    dropped_runs += 1;
-                    dropped_bytes += candidate.0;
-                }
-            }
-        } else {
-            heap.push(std::cmp::Reverse(candidate));
-        }
-    }
-    let mut runs: Vec<(u64, u64)> = heap
-        .into_iter()
-        .map(|std::cmp::Reverse((len, std::cmp::Reverse(offset)))| (offset, offset + len))
-        .collect();
-    runs.sort_unstable_by_key(|&(offset, _)| offset);
-    if dropped_runs > 0 {
-        debug!(
-            dropped_runs,
-            dropped_mib = dropped_bytes >> 20,
-            kept_runs = runs.len(),
-            "working-set hint fragments past the planning cap; prefetching its largest runs \
-             and leaving the rest to demand paging"
-        );
-    }
-
-    'runs: for &(run_offset, run_end) in &runs {
-        for region in regions {
-            let Ok(region_size) = u64::try_from(region.size) else {
                 continue;
             };
-            let Some(region_end) = region.file_offset.checked_add(region_size) else {
+            let Some(region) = self.regions.get(self.next_region) else {
+                self.run = None;
                 continue;
             };
-            let start = run_offset.max(region.file_offset);
-            let end = run_end.min(region_end).min(mem_len);
-            if end <= start {
-                continue;
-            }
-
-            // Align within the region: the region base is page-aligned, so aligning the
-            // offset *relative to it* keeps host addresses aligned too.
-            let Ok(rel_start) = usize::try_from(start - region.file_offset) else {
+            self.next_region += 1;
+            let Some(segment) = place(run_offset, run_end, region, self.page_size, self.mem_len)
+            else {
                 continue;
             };
-            let Ok(rel_end) = usize::try_from(end - region.file_offset) else {
-                continue;
-            };
-            let rel_start = rel_start & !(page_size - 1);
-            let Some(rel_end) = rel_end.checked_next_multiple_of(page_size) else {
-                continue;
-            };
-            let rel_end = rel_end.min(region.size);
-            if rel_end <= rel_start {
-                continue;
-            }
-            // A page that runs past the end of the memory file cannot be copied whole; leave
-            // it to the fault path, which zero-fills the missing tail.
-            let Ok(rel_start_u64) = u64::try_from(rel_start) else {
-                continue;
-            };
-            let Some(file_offset) = region.file_offset.checked_add(rel_start_u64) else {
-                continue;
-            };
-            let len = rel_end - rel_start;
-            let Ok(len_u64) = u64::try_from(len) else {
-                continue;
-            };
-            let Some(file_end) = file_offset.checked_add(len_u64) else {
-                continue;
-            };
-            if file_end > mem_len {
-                continue;
-            }
-            let Some(host_addr) = region.base_host_virt_addr.checked_add(rel_start_u64) else {
-                continue;
-            };
-            let Ok(host_addr) = usize::try_from(host_addr) else {
-                continue;
-            };
-
-            let segment = Segment {
-                host_addr,
-                file_offset,
-                len,
-            };
-
-            // Alignment can make this segment overlap or abut the previous one (two runs in
-            // the same page, or two adjacent pages). Merge instead of copying twice.
-            //
-            // The gap is computed with `checked_sub` rather than compared: guest memory
-            // regions are separate mmaps, so a region holding LATER file offsets can sit at a
-            // LOWER host address, and a plain subtraction would underflow on such a snapshot
-            // (panicking in debug, silently wrapping in release).
-            let merged = segments.last_mut().is_some_and(|prev| {
-                let Some(gap) = segment.host_addr.checked_sub(prev.host_addr) else {
-                    return false;
-                };
-                let Ok(gap_u64) = u64::try_from(gap) else {
-                    return false;
-                };
-                let Some(expected_offset) = prev.file_offset.checked_add(gap_u64) else {
-                    return false;
-                };
-                if gap > prev.len || segment.file_offset != expected_offset {
-                    return false;
-                }
-                let Some(merged_len) = gap.checked_add(segment.len) else {
-                    return false;
-                };
-                prev.len = prev.len.max(merged_len);
-                true
-            });
+            let merged = self
+                .pending
+                .as_mut()
+                .is_some_and(|previous| merge(previous, &segment));
             if !merged {
-                if segments.len() >= MAX_PREFETCH_SEGMENTS {
-                    // Same ceiling, same degradation: keep what is planned so
-                    // far and leave the rest to demand paging, never discard
-                    // the whole plan.
-                    debug!(
-                        segments = segments.len(),
-                        "prefetch plan reached the segment cap; the remaining \
-                         runs fall back to demand paging"
-                    );
-                    break 'runs;
+                if let Some(previous) = self.pending.replace(segment) {
+                    return Some(previous);
                 }
-                segments.push(segment);
             }
         }
     }
+}
 
-    segments
+/// The part of the run `[run_offset, run_end)` that lies in `region`, as whole pages of the
+/// clone. `None` when the run misses the region or an address does not fit.
+fn place(
+    run_offset: u64,
+    run_end: u64,
+    region: &Region,
+    page_size: usize,
+    mem_len: u64,
+) -> Option<Segment> {
+    let region_size = u64::try_from(region.size).ok()?;
+    let region_end = region.file_offset.checked_add(region_size)?;
+    let start = run_offset.max(region.file_offset);
+    let end = run_end.min(region_end).min(mem_len);
+    if end <= start {
+        return None;
+    }
+
+    // Align within the region: the region base is page-aligned, so aligning the offset
+    // *relative to it* keeps host addresses aligned too.
+    let rel_start = usize::try_from(start - region.file_offset).ok()? & !(page_size - 1);
+    let rel_end = usize::try_from(end - region.file_offset)
+        .ok()?
+        .checked_next_multiple_of(page_size)?
+        .min(region.size);
+    if rel_end <= rel_start {
+        return None;
+    }
+
+    // A page that runs past the end of the memory file cannot be copied whole; leave it to
+    // the fault path, which zero-fills the missing tail.
+    let rel_start_u64 = u64::try_from(rel_start).ok()?;
+    let file_offset = region.file_offset.checked_add(rel_start_u64)?;
+    let len = rel_end - rel_start;
+    let file_end = file_offset.checked_add(u64::try_from(len).ok()?)?;
+    if file_end > mem_len {
+        return None;
+    }
+    let host_addr = usize::try_from(region.base_host_virt_addr.checked_add(rel_start_u64)?).ok()?;
+
+    Some(Segment {
+        host_addr,
+        file_offset,
+        len,
+    })
+}
+
+/// Extend `previous` over `segment` when alignment made the two overlap or abut (two runs in
+/// the same page, or two adjacent pages), so nothing is copied twice.
+///
+/// The gap is computed with `checked_sub` rather than compared: guest memory regions are
+/// separate mmaps, so a region holding LATER file offsets can sit at a LOWER host address, and
+/// a plain subtraction would underflow on such a snapshot (panicking in debug, silently
+/// wrapping in release).
+fn merge(previous: &mut Segment, segment: &Segment) -> bool {
+    let Some(gap) = segment.host_addr.checked_sub(previous.host_addr) else {
+        return false;
+    };
+    let Ok(gap_u64) = u64::try_from(gap) else {
+        return false;
+    };
+    let Some(expected_offset) = previous.file_offset.checked_add(gap_u64) else {
+        return false;
+    };
+    if gap > previous.len || segment.file_offset != expected_offset {
+        return false;
+    }
+    let Some(merged_len) = gap.checked_add(segment.len) else {
+        return false;
+    };
+    previous.len = previous.len.max(merged_len);
+    true
 }
 
 /// Materialise up to [`CHUNK_BYTES`] of `segment`, starting `done` bytes into it, in ONE
@@ -398,7 +377,7 @@ mod tests {
         let set = set_of(mem_len, &[0, 1, 2, 9]);
 
         assert_eq!(
-            plan(&set, &regions, PAGE, mem_len),
+            plan(&set, &regions, PAGE, mem_len).collect::<Vec<_>>(),
             vec![
                 Segment {
                     host_addr: 0x7f00_0000_0000,
@@ -435,7 +414,7 @@ mod tests {
         let set = set_of(mem_len, &[15, 16, 17]);
 
         assert_eq!(
-            plan(&set, &regions, PAGE, mem_len),
+            plan(&set, &regions, PAGE, mem_len).collect::<Vec<_>>(),
             vec![
                 Segment {
                     host_addr: 0x1000_0000 + 15 * PAGE,
@@ -472,7 +451,7 @@ mod tests {
         let set = set_of(mem_len, &[15, 16, 17]);
 
         assert_eq!(
-            plan(&set, &regions, PAGE, mem_len),
+            plan(&set, &regions, PAGE, mem_len).collect::<Vec<_>>(),
             vec![
                 Segment {
                     host_addr: 0x9000_0000 + 15 * PAGE,
@@ -504,7 +483,7 @@ mod tests {
         // the second.
         let set = set_of(mem_len, &[1, 300, 700]);
 
-        let segments = plan(&set, &regions, HUGE, mem_len);
+        let segments: Vec<Segment> = plan(&set, &regions, HUGE, mem_len).collect();
         assert_eq!(
             segments,
             vec![Segment {
@@ -538,7 +517,7 @@ mod tests {
         let set = set_of(mem_len, &[0, 1, 3, 6, 7]);
 
         assert_eq!(
-            plan(&set, &regions, PAGE, mem_len),
+            plan(&set, &regions, PAGE, mem_len).collect::<Vec<_>>(),
             vec![Segment {
                 host_addr: 0x2000_0000 + PAGE,
                 file_offset: 3 * G,
@@ -550,7 +529,7 @@ mod tests {
         let short_file = 3 * G + 100;
         let set = set_of(mem_len, &[3]);
         assert!(
-            plan(&set, &regions, PAGE, short_file).is_empty(),
+            plan(&set, &regions, PAGE, short_file).next().is_none(),
             "a page that runs past the end of the memory file must be left to the fault path"
         );
     }
@@ -562,7 +541,9 @@ mod tests {
             file_offset: 0,
             size: (8 * G) as usize,
         }];
-        assert!(plan(&PageSet::empty(8 * G), &regions, PAGE, 8 * G).is_empty());
+        assert!(plan(&PageSet::empty(8 * G), &regions, PAGE, 8 * G)
+            .next()
+            .is_none());
     }
 
     #[test]
@@ -575,71 +556,35 @@ mod tests {
             size: (4 * G) as usize,
         }];
         assert!(
-            plan(&set, &regions, PAGE, mem_len).is_empty(),
+            plan(&set, &regions, PAGE, mem_len).next().is_none(),
             "mapping a file offset must never wrap the clone's host address"
         );
     }
 
     #[test]
-    fn plan_keeps_the_budget_of_runs_from_an_oversized_hint() {
-        // A warmed large guest's restore set fragments into more runs than the
-        // planning budget as a matter of course. The budget bounds the plan;
-        // it must not discard it: an earlier version returned an EMPTY plan
-        // here, which silently turned prefetch off for exactly the workloads
-        // with the most pages to prefetch (observed live: a 128 GiB guest's
-        // 31M-page hint replayed zero pages, reported as segments=0).
-        let run_count = MAX_PREFETCH_RUNS + 10;
-        let mem_len = u64::try_from(run_count * 2).unwrap() * G;
+    fn plan_covers_every_run_of_a_badly_fragmented_hint() {
+        // A warmed large guest's restore set is millions of runs a few pages long (measured on
+        // a 128 GiB guest: 3.7M pages in 1.6M runs). Every run has to be planned. A plan that
+        // keeps only some of them leaves the rest of the recorded set to demand paging.
+        let run_count: u64 = 200_000;
+        let mem_len = run_count * 2 * G;
         let mut set = PageSet::empty(mem_len);
         for run in 0..run_count {
-            set.insert_range(u64::try_from(run * 2).unwrap() * G, G);
+            set.insert_range(run * 2 * G, G);
         }
         let regions = [Region {
             base_host_virt_addr: 0x4000_0000,
             file_offset: 0,
             size: usize::try_from(mem_len).unwrap(),
         }];
-        let segments = plan(&set, &regions, PAGE, mem_len);
-        assert_eq!(
-            segments.len(),
-            MAX_PREFETCH_RUNS,
-            "an oversized hint must fill the planning budget, not abandon it"
-        );
-    }
-
-    #[test]
-    fn plan_prefers_the_largest_runs_of_an_oversized_hint() {
-        // When the budget forces a choice, bytes win: every multi-granule run
-        // must survive selection ahead of single-granule ones.
-        let filler_count = MAX_PREFETCH_RUNS + 20;
-        let big_run_granules: u64 = 8;
-        let filler_len = u64::try_from(filler_count * 2).unwrap() * G;
-        let big_base = filler_len + 16 * G;
-        let mem_len = big_base + 4 * (big_run_granules + 4) * G;
-        let mut set = PageSet::empty(mem_len);
-        for run in 0..filler_count {
-            set.insert_range(u64::try_from(run * 2).unwrap() * G, G);
+        let mut planned = 0u64;
+        let mut bytes = 0u64;
+        for segment in plan(&set, &regions, PAGE, mem_len) {
+            planned += 1;
+            bytes += u64::try_from(segment.len).unwrap();
         }
-        let mut big_offsets = Vec::new();
-        for big in 0..4u64 {
-            let offset = big_base + big * (big_run_granules + 4) * G;
-            set.insert_range(offset, big_run_granules * G);
-            big_offsets.push(offset);
-        }
-        let regions = [Region {
-            base_host_virt_addr: 0x4000_0000,
-            file_offset: 0,
-            size: usize::try_from(mem_len).unwrap(),
-        }];
-        let segments = plan(&set, &regions, PAGE, mem_len);
-        assert_eq!(segments.len(), MAX_PREFETCH_RUNS);
-        for offset in big_offsets {
-            assert!(
-                segments.iter().any(|segment| segment.file_offset == offset
-                    && segment.len == usize::try_from(big_run_granules).unwrap() * PAGE),
-                "a large run must not lose its budget slot to single-page filler"
-            );
-        }
+        assert_eq!(planned, run_count, "every recorded run becomes a segment");
+        assert_eq!(bytes, run_count * G, "and every recorded page is planned");
     }
 
     // =========================================================================
@@ -761,7 +706,7 @@ mod tests {
         }];
 
         let recorded = set_of(len as u64, &[0, 1, 2, 5]);
-        let segments = plan(&recorded, &regions, PAGE, len as u64);
+        let segments: Vec<Segment> = plan(&recorded, &regions, PAGE, len as u64).collect();
         assert_eq!(segments.len(), 2, "0-2 coalesce, 5 stands alone");
         run_plan(&uffd, &Source::Copy(&snapshot), &segments, PAGE);
 
@@ -907,7 +852,7 @@ mod tests {
                 file_offset: 0,
                 size: len,
             }];
-            let segments = plan(&recorded, &regions, PAGE, len as u64);
+            let segments: Vec<Segment> = plan(&recorded, &regions, PAGE, len as u64).collect();
             assert!(
                 segments.is_empty(),
                 "[{label}] nothing to prefetch means no segments"
@@ -1052,7 +997,7 @@ mod tests {
                 file_offset: 0,
                 size: len,
             }];
-            let segments = plan(&recorded, &regions, PAGE, len as u64);
+            let segments: Vec<Segment> = plan(&recorded, &regions, PAGE, len as u64).collect();
             run_plan(&uffd, &Source::Copy(&snapshot), &segments, PAGE);
             clones.push((base, uffd));
         }

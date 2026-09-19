@@ -1557,7 +1557,6 @@ async fn replay_working_set(
             size: mapping.size,
         })
         .collect();
-    let segments = prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64);
     let source = match ctx.source {
         PageSource::Copy { mmap } => prefetch::Source::Copy(&mmap[..]),
         PageSource::Minor { .. } => prefetch::Source::Minor,
@@ -1565,8 +1564,11 @@ async fn replay_working_set(
     let started = std::time::Instant::now();
     let mut bytes = 0u64;
     let mut refused = 0u64;
+    let mut segments = 0u64;
 
-    'segments: for segment in &segments {
+    'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
+    {
+        segments += 1;
         let mut done = 0usize;
         'chunk: while done < segment.len {
             for step in replay_steps_after_drain(drain_events(async_uffd.get_ref(), ctx, state)?) {
@@ -1594,7 +1596,7 @@ async fn replay_working_set(
             match prefetch::populate_chunk(
                 async_uffd.get_ref(),
                 &source,
-                segment,
+                &segment,
                 done,
                 ctx.page_size,
                 ctx.vm_id,
@@ -1619,7 +1621,7 @@ async fn replay_working_set(
         vm_id = %ctx.vm_id,
         prefetched_pages = bytes / ctx.page_size as u64,
         prefetched_mib = bytes / (1024 * 1024),
-        segments = segments.len(),
+        segments,
         refused_segments = refused,
         prefetch_ms = started.elapsed().as_millis(),
         demand_faults_during_replay = state.fault_count,
