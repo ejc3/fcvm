@@ -378,7 +378,7 @@ impl Hypervisor for CloudHypervisorBackend {
                 }
                 debug!(target: "cloud-hypervisor", "{}", clean);
             } else {
-                let important = clean.contains("fc-agent") || clean.contains("[ctr:");
+                let important = crate::utils::console_line_is_important(clean);
                 if important {
                     info!(target: "cloud-hypervisor", "{}", clean);
                 } else {
@@ -688,7 +688,7 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
                                 pos += n as u64;
                                 console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                                 let clean = line.trim_end();
-                                if clean.contains("fc-agent") || clean.contains("[ctr:") {
+                                if crate::utils::console_line_is_important(clean) {
                                     info!(target: "cloud-hypervisor", "{}", clean);
                                 } else {
                                     debug!(target: "cloud-hypervisor", "{}", clean);

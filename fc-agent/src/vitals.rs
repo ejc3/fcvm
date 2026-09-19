@@ -17,9 +17,14 @@
 //! guest can no longer create a process.
 //!
 //! Cost: one ~200 byte line per 10s over the serial console at DEBUG, which the
-//! host writes to the per-VM file and keeps out of the job log.
+//! host writes to the per-VM file and keeps out of the job log. While the guest
+//! is piled up ([`Pileup`]), one more line of at most 1 KiB per second names
+//! the threads, and after 30 s one per 10 s. An idle guest costs a read of
+//! /proc/loadavg and /proc/stat per second.
 
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::path::PathBuf;
 use std::time::Duration;
 
 /// Cap on any single collected section, so one pathological file cannot push
@@ -195,6 +200,434 @@ pub fn sample_line() -> String {
     out
 }
 
+/// Runnable plus blocked threads per CPU at which the sampler names them, and
+/// the floor for small guests. An idle 2-vCPU guest reads 1 to 3. The exec
+/// stalls seen with #938 read 12 to 18 for 20 s, with no vsock connection
+/// accepted and no process forked, and the 10s line could only say how many
+/// threads were runnable, not which.
+const PILEUP_PER_CPU: u32 = 3;
+const PILEUP_FLOOR: u32 = 6;
+
+/// Cap on one pile-up line. The console writer is sized for under 2 KiB/s.
+const PILEUP_LIMIT: usize = 1024;
+
+/// Distinct `state:comm` names, and vsock-named threads, kept in one line.
+const PILEUP_NAMES: usize = 12;
+const VSOCK_NAMES: usize = 4;
+
+/// After this many consecutive piled-up seconds only every tenth is printed,
+/// so a guest that is busy for its whole life (a build, a benchmark) costs a
+/// scan every 10s, not every second.
+const PILEUP_EVERY_SECOND_FOR: u32 = 30;
+
+/// The number of runnable threads, from the `16/133` field of /proc/loadavg.
+/// That field leaves out uninterruptible sleep; see [`blocked_count`].
+fn runnable_count(loadavg: &str) -> Option<u32> {
+    loadavg
+        .split_whitespace()
+        .nth(3)?
+        .split('/')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Threads in uninterruptible sleep, from the `procs_blocked` line of
+/// /proc/stat. A guest wedged on I/O has none runnable and many of these.
+fn blocked_count(stat: &str) -> Option<u32> {
+    stat.lines()
+        .find_map(|line| line.strip_prefix("procs_blocked "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+fn online_cpus(stat: &str) -> u32 {
+    let cpus = stat
+        .lines()
+        .filter(|line| line.starts_with("cpu") && !line.starts_with("cpu "))
+        .count();
+    u32::try_from(cpus).unwrap_or(u32::MAX).max(1)
+}
+
+/// `(runnable, blocked)` when together they reach the threshold, which is the
+/// only gate. An unreadable count is an error, never "idle": a collector that
+/// cannot run must say so.
+fn piled_up(loadavg: &str, stat: &str) -> Result<Option<(u32, u32)>, String> {
+    let runnable = runnable_count(loadavg)
+        .ok_or_else(|| format!("no runnable count in /proc/loadavg: {:?}", loadavg.trim()))?;
+    let blocked = blocked_count(stat).ok_or("no procs_blocked line in /proc/stat")?;
+    let threshold = PILEUP_FLOOR.max(PILEUP_PER_CPU.saturating_mul(online_cpus(stat)));
+    Ok((runnable.saturating_add(blocked) >= threshold).then_some((runnable, blocked)))
+}
+
+/// The sampler's next wake, in whole seconds since it started: the first
+/// deadline still ahead. A scan that overran several deadlines skips them; it
+/// does not run once for each of them, back to back, in a guest that is
+/// already piled up.
+pub fn next_tick(tick: u64, elapsed: Duration) -> u64 {
+    (tick + 1).max(elapsed.as_secs() + 1)
+}
+
+/// Whether the 10s line is due on moving from `previous` to `tick`, which is
+/// also true when a skip jumped over its second.
+pub fn sample_due(previous: Option<u64>, tick: u64) -> bool {
+    previous.is_none_or(|previous| previous / 10 != tick / 10)
+}
+
+/// Whether a pile-up that began at second `since` prints at second `tick`,
+/// having last printed at `last`. Seconds are the sampler's clock, not a count
+/// of scans: a scan that overruns skips seconds, and both the 30 s of
+/// per-second lines and the 10 s between lines after that are in seconds.
+fn prints_at(since: u64, last: Option<u64>, tick: u64) -> bool {
+    tick.saturating_sub(since) < u64::from(PILEUP_EVERY_SECOND_FOR)
+        || last.is_none_or(|last| tick.saturating_sub(last) >= 10)
+}
+
+/// Every thread's /proc directory and stat line plus the number of unreadable
+/// ones, or why /proc could not be listed.
+type ThreadScan = Result<(Vec<(PathBuf, String)>, u32), String>;
+
+/// The state and name from one /proc/<tid>/stat line. The name may hold spaces
+/// and parentheses (`fc_vcpu 0`, `(sd-pam)`), so it ends at the LAST `)`.
+fn parse_stat(raw: &str) -> Option<(char, String)> {
+    let open = raw.find('(')?;
+    let close = raw.rfind(')')?;
+    let comm = raw.get(open + 1..close)?.to_string();
+    let state = raw
+        .get(close + 1..)?
+        .split_whitespace()
+        .next()?
+        .chars()
+        .next()?;
+    Some((state, comm))
+}
+
+/// A stat line as text. `prctl(PR_SET_NAME)` takes any bytes and procfs does
+/// not escape them: an invalid byte must not drop the thread from the count,
+/// and a newline must not split the console record in two.
+fn stat_text(raw: &[u8]) -> String {
+    String::from_utf8_lossy(raw)
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// Cut `text` to `limit` bytes on a character boundary and say so.
+/// `String::truncate` panics inside a multi-byte character, and a thread name
+/// may hold one; a panic here would end the sampler thread without a word.
+fn bounded(mut text: String, limit: usize) -> String {
+    const MARK: &str = " ...truncated";
+    if text.len() > limit {
+        let mut end = limit.saturating_sub(MARK.len());
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
+        text.push_str(MARK);
+    }
+    text
+}
+
+/// Threads that are running, runnable or in uninterruptible sleep, counted by
+/// `state:comm`, most numerous first.
+fn busy_summary<'a>(stats: impl IntoIterator<Item = &'a str>) -> String {
+    let mut counts: BTreeMap<String, u32> = BTreeMap::new();
+    for raw in stats {
+        if let Some((state, comm)) = parse_stat(raw) {
+            if state == 'R' || state == 'D' {
+                *counts.entry(format!("{state}:{comm}")).or_default() += 1;
+            }
+        }
+    }
+    let mut ranked: Vec<(String, u32)> = counts.into_iter().collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut out = ranked
+        .iter()
+        .take(PILEUP_NAMES)
+        .map(|(name, count)| format!("{name}*{count}"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if ranked.len() > PILEUP_NAMES {
+        let _ = write!(out, " (+{} more names)", ranked.len() - PILEUP_NAMES);
+    }
+    out
+}
+
+/// The virtio device that is the vsock (device id 19), such as `virtio2`.
+/// Which index it gets depends on the VM's disks and network devices.
+fn vsock_device() -> Option<String> {
+    for entry in std::fs::read_dir("/sys/bus/virtio/devices").ok()?.flatten() {
+        let id = std::fs::read_to_string(entry.path().join("device")).unwrap_or_default();
+        if id.trim() == "0x0013" {
+            return Some(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    None
+}
+
+/// Interrupt totals of the virtio devices, summed over CPUs, from
+/// /proc/interrupts, with the vsock's marked. Its count standing still while
+/// the host is connecting says the device raised nothing; its count moving
+/// while nothing is accepted says the guest did not get to the work.
+fn virtio_irqs(interrupts: &str, vsock: Option<&str>) -> String {
+    interrupts
+        .lines()
+        .filter(|line| line.contains("virtio"))
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next()?; // the irq number
+            let total: u64 = fields.clone().map_while(|f| f.parse::<u64>().ok()).sum();
+            let name = fields.last()?;
+            // MMIO names the line `virtio2`, PCI one per queue (`virtio2-input.0`).
+            let is_vsock = vsock.is_some_and(|v| {
+                name == v
+                    || name
+                        .strip_prefix(v)
+                        .is_some_and(|rest| rest.starts_with('-'))
+            });
+            Some(format!(
+                "{name}{}:{total}",
+                if is_vsock { "(vsock)" } else { "" }
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Per-CPU user, system, idle, interrupt (hard plus soft) and steal ticks from
+/// /proc/stat. With the line's `up=`, two lines tell a guest whose own threads
+/// hold the CPUs (user and system advance) from a host that is not running the
+/// vCPU (steal advances, where the VMM reports it).
+fn cpu_times(stat: &str) -> String {
+    stat.lines()
+        .filter(|line| line.starts_with("cpu") && !line.starts_with("cpu "))
+        .filter_map(|line| {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            let ticks = |i: usize| f.get(i)?.parse::<u64>().ok();
+            Some(format!(
+                "{}:u{},s{},i{},q{},st{}",
+                f.first()?,
+                ticks(1)?,
+                ticks(3)?,
+                ticks(4)?,
+                ticks(6)? + ticks(7)?,
+                ticks(8)?
+            ))
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Whether a failed read under /proc means the process or thread exited since
+/// it was listed, which is not a failed read. Any other failure is counted, so
+/// `unreadable=0` cannot stand over threads that were left out.
+fn vanished(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound // exited
+}
+
+/// One entry of a /proc directory listing. `read_dir` can succeed and its
+/// iterator still fail, and an entry that fails is a process or thread left
+/// out of the scan, so it is counted unless it had only vanished.
+fn listed<T>(entry: std::io::Result<T>, unreadable: &mut u32) -> Option<T> {
+    match entry {
+        Ok(entry) => Some(entry),
+        Err(error) => {
+            if !vanished(&error) {
+                *unreadable += 1;
+            }
+            None
+        }
+    }
+}
+
+/// Every thread's /proc directory and stat line, and how many could not be
+/// read. Reads `stat` only: unlike `cmdline` it does not fault the target's
+/// memory, so it cannot hang on a wedged process.
+fn thread_stats() -> ThreadScan {
+    let mut threads = Vec::new();
+    let mut unreadable = 0;
+    let procs = std::fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))?;
+    for proc_entry in procs {
+        let Some(proc_entry) = listed(proc_entry, &mut unreadable) else {
+            continue;
+        };
+        let name = proc_entry.file_name();
+        if !name.to_string_lossy().bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let tasks = match std::fs::read_dir(proc_entry.path().join("task")) {
+            Ok(tasks) => tasks,
+            // A process that exited since the listing is not a failed read.
+            Err(error) if vanished(&error) => continue,
+            Err(_) => {
+                unreadable += 1;
+                continue;
+            }
+        };
+        for task in tasks {
+            let Some(task) = listed(task, &mut unreadable) else {
+                continue;
+            };
+            match std::fs::read(task.path().join("stat")) {
+                Ok(raw) => threads.push((task.path(), stat_text(&raw))),
+                Err(error) if vanished(&error) => {}
+                Err(_) => unreadable += 1,
+            }
+        }
+    }
+    Ok((threads, unreadable))
+}
+
+/// State, wait channel and the top of the kernel stack of the threads named
+/// for vsock. A kworker carries `virtio_vsock` in its name only while it runs
+/// that work or just after. Work that is queued and that no worker has picked
+/// up has no name here, which prints as `none-named`: then `busy` says which
+/// kworkers, if any, are runnable.
+fn vsock_workers(threads: &[(PathBuf, String)]) -> String {
+    let named: Vec<String> = threads
+        .iter()
+        .filter_map(|(dir, raw)| {
+            let (state, comm) = parse_stat(raw)?;
+            if !comm.contains("vsock") {
+                return None;
+            }
+            let read = |file: &str| {
+                std::fs::read_to_string(dir.join(file)).map_err(|_| "<unreadable>".to_string())
+            };
+            let wchan = read("wchan")
+                .map(|text| text.trim().to_string())
+                .unwrap_or_else(|e| e);
+            let stack = read("stack")
+                .map(|text| {
+                    text.lines()
+                        .take(4)
+                        .filter_map(|line| line.split_whitespace().nth(1))
+                        .collect::<Vec<_>>()
+                        .join("<")
+                })
+                .unwrap_or_else(|e| e);
+            Some(format!("{comm}:{state}:{wchan}:{stack}"))
+        })
+        .collect();
+    if named.is_empty() {
+        return "none-named".to_string();
+    }
+    let mut out = named
+        .iter()
+        .take(VSOCK_NAMES)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if named.len() > VSOCK_NAMES {
+        let _ = write!(out, " (+{} more)", named.len() - VSOCK_NAMES);
+    }
+    out
+}
+
+/// One pile-up line from its sources. `up` is the guest's own clock: the host
+/// stamps a line when it arrives, which in a pile-up is late.
+fn format_pileup(
+    up: &str,
+    counts: (u32, u32),
+    scan: &ThreadScan,
+    irq: &str,
+    stat: &str,
+    suffix: &str,
+) -> String {
+    let (runnable, blocked) = counts;
+    let threads = match scan {
+        Ok((threads, unreadable)) => format!(
+            "scanned={} unreadable={unreadable} busy=[{}] vsock=[{}]",
+            threads.len(),
+            busy_summary(threads.iter().map(|(_, raw)| raw.as_str())),
+            vsock_workers(threads),
+        ),
+        Err(error) => format!("threads-unavailable({error})"),
+    };
+    bounded(
+        format!(
+            "up={up} runnable={runnable} blocked={blocked} {threads} irq=[{irq}] cpu=[{}]{suffix}",
+            cpu_times(stat)
+        ),
+        PILEUP_LIMIT,
+    )
+}
+
+/// The sampler's once-a-second pile-up check.
+#[derive(Default)]
+pub struct Pileup {
+    since: Option<u64>,
+    last: Option<u64>,
+    said_unavailable: bool,
+    vsock: Option<Option<String>>,
+}
+
+/// The line that says, once, why a pile-up cannot be told. The error can carry
+/// a whole malformed /proc file, so it is bounded like every other line.
+fn unavailable_line(error: &str) -> String {
+    bounded(format!("unavailable: {error}"), PILEUP_LIMIT)
+}
+
+impl Pileup {
+    /// The line to print this second, if any: which threads are runnable while
+    /// many are, or, once, why that cannot be told.
+    pub fn tick(&mut self, now: u64) -> Option<String> {
+        match self.line(now) {
+            Ok(line) => line,
+            Err(_) if self.said_unavailable => None,
+            Err(error) => {
+                self.said_unavailable = true;
+                Some(unavailable_line(&error))
+            }
+        }
+    }
+
+    /// Whether a line is due at second `now` of a pile-up, which this records.
+    fn due(&mut self, now: u64) -> bool {
+        let since = *self.since.get_or_insert(now);
+        let due = prints_at(since, self.last, now);
+        if due {
+            self.last = Some(now);
+        }
+        due
+    }
+
+    fn line(&mut self, now: u64) -> Result<Option<String>, String> {
+        let loadavg = read_proc("/proc/loadavg")?;
+        let stat = read_proc("/proc/stat")?;
+        let Some(counts) = piled_up(&loadavg, &stat)? else {
+            (self.since, self.last) = (None, None);
+            return Ok(None);
+        };
+        if !self.due(now) {
+            return Ok(None);
+        }
+        let vsock = self.vsock.get_or_insert_with(vsock_device).clone();
+        let irq = match read_proc("/proc/interrupts") {
+            Ok(raw) => virtio_irqs(&raw, vsock.as_deref()),
+            Err(error) => format!("unavailable({error})"),
+        };
+        let up = read_proc("/proc/uptime").unwrap_or_default();
+        let up = up.split_whitespace().next().unwrap_or("?");
+        let suffix = if now.saturating_sub(self.since.unwrap_or(now))
+            >= u64::from(PILEUP_EVERY_SECOND_FOR)
+        {
+            " (every 10th second now)"
+        } else {
+            ""
+        };
+        Ok(Some(format_pileup(
+            up,
+            counts,
+            &thread_stats(),
+            &irq,
+            &stat,
+            suffix,
+        )))
+    }
+}
+
 /// The full block, for failure sites.
 pub fn snapshot() -> String {
     let mut out = String::new();
@@ -299,6 +732,36 @@ pub fn snapshot_bounded(budget: Duration) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_unavailable_line_is_bounded_like_every_other_line() {
+        let line = unavailable_line(&"9".repeat(PILEUP_LIMIT * 4));
+        assert!(line.len() <= PILEUP_LIMIT, "{} bytes", line.len());
+        assert!(line.ends_with("...truncated"), "{line}");
+        assert_eq!(
+            unavailable_line("/proc/loadavg: no runnable count"),
+            "unavailable: /proc/loadavg: no runnable count"
+        );
+    }
+
+    /// `read_dir` can succeed and its iterator still fail. An entry that fails
+    /// for any reason but having vanished is a thread left out of the scan.
+    #[test]
+    fn a_directory_entry_that_cannot_be_read_is_counted_unless_it_vanished() {
+        use std::io::{Error, ErrorKind};
+        let mut unreadable = 0;
+        assert_eq!(listed(Ok(7), &mut unreadable), Some(7));
+        let gone = Error::from(ErrorKind::NotFound);
+        assert_eq!(listed::<u8>(Err(gone), &mut unreadable), None);
+        assert_eq!(unreadable, 0);
+        let denied = Error::from(ErrorKind::PermissionDenied);
+        assert_eq!(listed::<u8>(Err(denied), &mut unreadable), None);
+        assert_eq!(
+            listed::<u8>(Err(Error::other("short read")), &mut unreadable),
+            None
+        );
+        assert_eq!(unreadable, 2);
+    }
+
     /// The sampler must never be empty, or its absence in a log is ambiguous
     /// between "not collected" and "collected nothing".
     #[test]
@@ -371,5 +834,217 @@ mod tests {
         assert!(filtered.contains("MemTotal:"), "{filtered}");
         assert!(filtered.contains("SwapFree:"), "{filtered}");
         assert!(!filtered.contains("MemFree:"), "{filtered}");
+    }
+
+    /// `fc_vcpu 0` and `(sd-pam)` hold a space and parentheses. Splitting the
+    /// line on whitespace reads the wrong field as the state for both.
+    #[test]
+    fn a_thread_name_with_spaces_or_parentheses_keeps_its_state() {
+        assert_eq!(
+            parse_stat("71 (fc_vcpu 0) R 1 71 71 0"),
+            Some(('R', "fc_vcpu 0".to_string()))
+        );
+        assert_eq!(
+            parse_stat("9 ((sd-pam)) S 1 9 9 0"),
+            Some(('S', "(sd-pam)".to_string()))
+        );
+        assert_eq!(parse_stat("not a stat line"), None);
+    }
+
+    const STAT_2CPU: &str = "cpu  10 0 10 100 0 1 2 0 0 0\ncpu0 5 0 6 50 0 1 0 3 0 0\ncpu1 5 0 4 50 0 0 2 9 0 0\nintr 1\nprocs_running 1\nprocs_blocked 0\n";
+
+    /// The gate is runnable plus blocked against three per CPU, six at least.
+    /// An idle guest prints nothing, and eight CPUs move the line to 24.
+    #[test]
+    fn the_gate_counts_runnable_and_blocked_and_scales_with_the_cpus() {
+        assert_eq!(piled_up("0.10 0.05 0.01 1/120 900", STAT_2CPU), Ok(None));
+        assert_eq!(
+            piled_up("4.11 1.06 0.36 16/133 2343", STAT_2CPU),
+            Ok(Some((16, 0)))
+        );
+        // Nothing runnable and many in uninterruptible sleep is a pile-up too:
+        // the runnable field of /proc/loadavg leaves those out.
+        let wedged = STAT_2CPU.replace("procs_blocked 0", "procs_blocked 40");
+        assert_eq!(
+            piled_up("9.00 5.00 1.00 1/120 900", &wedged),
+            Ok(Some((1, 40)))
+        );
+        let eight: String = (0..8)
+            .map(|n| format!("cpu{n} 1 0 1 1 0 0 0 0 0 0\n"))
+            .collect::<String>()
+            + "procs_blocked 0\n";
+        assert_eq!(piled_up("9.00 5.00 1.00 16/400 900", &eight), Ok(None));
+        assert_eq!(
+            piled_up("9.00 5.00 1.00 24/400 900", &eight),
+            Ok(Some((24, 0)))
+        );
+    }
+
+    /// A count that cannot be read is reported, not taken for an idle guest.
+    #[test]
+    fn an_unreadable_count_is_an_error_not_an_idle_guest() {
+        assert!(piled_up("garbage", STAT_2CPU).is_err());
+        assert!(piled_up("4.11 1.06 0.36 16/133 2343", "cpu0 1 0 1 1 0 0 0 0 0 0\n").is_err());
+    }
+
+    /// A pile-up whose scans take 5 s each: a line per scan for the first 30 s
+    /// of the pile-up, then one per 10 s, both by the sampler's clock. Counting
+    /// scans would keep a line per scan going for thirty scans, 150 s here.
+    #[test]
+    fn a_long_pileup_is_paced_in_seconds_not_in_scans() {
+        let mut pileup = Pileup::default();
+        let printed: Vec<u64> = (0..=60)
+            .step_by(5)
+            .filter(|&tick| pileup.due(tick))
+            .collect();
+        assert_eq!(printed, vec![0, 5, 10, 15, 20, 25, 35, 45, 55]);
+        // One scan a second: every second for 30 s, then every tenth.
+        let mut pileup = Pileup::default();
+        let printed: Vec<u64> = (100..=160).filter(|&tick| pileup.due(tick)).collect();
+        assert_eq!(printed.len(), 33, "{printed:?}");
+        assert_eq!(&printed[30..], &[139, 149, 159]);
+    }
+
+    fn threads(lines: &[&str]) -> ThreadScan {
+        Ok((
+            lines
+                .iter()
+                .map(|raw| (PathBuf::from("/nonexistent"), raw.to_string()))
+                .collect(),
+            2,
+        ))
+    }
+
+    /// The line names who is runnable or in uninterruptible sleep, leaves out
+    /// sleepers, and says which interrupt line is the vsock's. A worker whose
+    /// wchan and stack cannot be read says so.
+    #[test]
+    fn a_pileup_names_the_busy_threads_and_the_vsock_worker() {
+        let piled = threads(&[
+            "50 (yes) R 1",
+            "51 (yes) R 1",
+            "52 (conmon) R 1",
+            "23 (kworker/1:0-virtio_vsock) R 2",
+            "60 (podman) D 1",
+            "1 (systemd) S 0",
+        ]);
+        let interrupts = "           CPU0       CPU1\n 27:         10          5   IO-APIC  27-fasteoi   virtio1\n 28:        100       2497   IO-APIC  28-fasteoi   virtio2\n  4:          7          0   IO-APIC   4-edge      ttyS0\n";
+        let line = format_pileup(
+            "41.75",
+            (16, 1),
+            &piled,
+            &virtio_irqs(interrupts, Some("virtio2")),
+            STAT_2CPU,
+            "",
+        );
+        assert!(
+            line.starts_with(
+                "up=41.75 runnable=16 blocked=1 scanned=6 unreadable=2 busy=[R:yes*2 "
+            ),
+            "{line}"
+        );
+        for part in [
+            "D:podman*1",
+            "R:conmon*1",
+            "vsock=[kworker/1:0-virtio_vsock:R:<unreadable>:<unreadable>]",
+            "irq=[virtio1:15 virtio2(vsock):2597]",
+            "cpu=[cpu0:u5,s6,i50,q1,st3 cpu1:u5,s4,i50,q2,st9]",
+        ] {
+            assert!(line.contains(part), "missing {part:?} in {line}");
+        }
+        assert!(
+            !line.contains("systemd"),
+            "a sleeping thread is not busy: {line}"
+        );
+        assert_eq!(
+            virtio_irqs(
+                " 30: 1 2 PCI-MSI virtio2-input.0\n 31: 1 1 PCI-MSI virtio20-input.0\n",
+                Some("virtio2")
+            ),
+            "virtio2-input.0(vsock):3 virtio20-input.0:2"
+        );
+    }
+
+    /// Queued vsock work that no worker has picked up names no thread. That
+    /// must not print like a scan that found nothing, and a failed scan says so.
+    #[test]
+    fn no_vsock_named_thread_and_a_failed_scan_both_say_so() {
+        let line = format_pileup(
+            "1.00",
+            (9, 0),
+            &threads(&["50 (yes) R 1"]),
+            "",
+            STAT_2CPU,
+            "",
+        );
+        assert!(line.contains("vsock=[none-named]"), "{line}");
+        let line = format_pileup(
+            "1.00",
+            (9, 0),
+            &Err("/proc: denied".to_string()),
+            "unavailable(x)",
+            STAT_2CPU,
+            "",
+        );
+        assert!(
+            line.contains("threads-unavailable(/proc: denied)")
+                && line.contains("irq=[unavailable(x)]"),
+            "{line}"
+        );
+    }
+
+    /// A thread name is any bytes. An invalid one still counts, and a newline
+    /// does not split the console record.
+    #[test]
+    fn a_thread_name_with_invalid_bytes_or_a_newline_stays_one_counted_record() {
+        let text = stat_text(b"77 (bad\xffna\nme) R 1 77");
+        assert!(!text.contains('\n'), "{text:?}");
+        assert_eq!(parse_stat(&text).map(|(state, _)| state), Some('R'));
+    }
+
+    /// Byte 1024 of the line can fall inside a multi-byte thread name.
+    #[test]
+    fn the_line_is_cut_on_a_character_boundary_and_says_so() {
+        let text = format!("{}{}", "a".repeat(PILEUP_LIMIT - 1), "\u{e9}".repeat(40));
+        let cut = bounded(text, PILEUP_LIMIT);
+        assert!(
+            cut.ends_with(" ...truncated") && cut.len() <= PILEUP_LIMIT,
+            "{}",
+            cut.len()
+        );
+        assert_eq!(bounded("short".to_string(), PILEUP_LIMIT), "short");
+    }
+
+    /// A scan that takes seconds must not be followed by one scan per missed
+    /// deadline, and the 10s line must survive a skip over its second.
+    #[test]
+    fn a_slow_scan_skips_the_deadlines_it_missed() {
+        assert_eq!(next_tick(3, Duration::from_millis(3200)), 4);
+        assert_eq!(next_tick(3, Duration::from_millis(8700)), 9);
+        assert!(sample_due(None, 0));
+        assert!(!sample_due(Some(3), 9));
+        assert!(sample_due(Some(8), 12));
+    }
+
+    /// A thread that exited between the listing and the read is not unreadable.
+    /// A read refused for any other reason is, or the count would hide it.
+    #[test]
+    fn only_a_vanished_process_is_left_out_of_the_unreadable_count() {
+        use std::io::{Error, ErrorKind};
+        assert!(vanished(&Error::from(ErrorKind::NotFound)));
+        assert!(!vanished(&Error::from(ErrorKind::PermissionDenied)));
+        assert!(!vanished(&Error::other("anything else")));
+    }
+
+    /// The scan must see real threads: this test's own thread is running.
+    #[test]
+    fn the_thread_scan_finds_this_running_thread() {
+        let (all, _) = thread_stats().expect("/proc is readable");
+        let summary = busy_summary(all.iter().map(|(_, raw)| raw.as_str()));
+        assert!(
+            summary.contains("R:"),
+            "no running thread among {} scanned: {summary:?}",
+            all.len()
+        );
     }
 }

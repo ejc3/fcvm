@@ -472,6 +472,7 @@ Guest side, pushed by fc-agent (`fc-agent/src/vitals.rs`):
 | `statvfs` of `/run` | same | rootless podman's runroot is `/run/user/<uid>/containers`; ENOSPC there means conmon could not create its socket or exit file and therefore wrote NOTHING, which is issue #841's exact signature |
 | `oom_kill` from `/proc/vmstat` | same | monotonic, cannot wrap, unlike the 128 KiB printk ring |
 | cgroup `pids.current` / `pids.max` | same | the pids controller rejects forks with no message the caller sees |
+| which threads are runnable or blocked, the vsock-named workers' state and stack, virtio interrupt totals, per-CPU ticks | once a second while runnable plus blocked threads reach three per CPU (six at least), every 10s after 30s of that | the exec stalls of #938 read 12 to 18 runnable for 20 s and the 10s line could not name them; exec cannot reach a guest in that state |
 
 **It is PUSHED, never pulled, and that is not a style choice.** The obvious design is to run
 `fcvm exec --pid P --vm -- sh -c '...'` from the host at the failure site. That cannot work for
@@ -481,8 +482,9 @@ whose fcvm already exited, an L2 guest, or a test nextest killed. Everything in 
 `read`/`readdir`/`statvfs` from an already-running process, so it still answers when the guest
 can no longer create one.
 
-Routing is by prefix and it is load-bearing (`src/firecracker/vm.rs` classifies console lines):
-`[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
+Routing is by prefix and it is load-bearing (`console_line_is_important` in `src/utils.rs`
+classifies console lines for both backends, and checks this prefix before anything else, because
+a pile-up line can name a thread called `fc-agent`): `[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
 is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
 on-failure block also reaches the test's captured output.
 

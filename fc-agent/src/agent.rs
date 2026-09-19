@@ -23,10 +23,34 @@ pub async fn run() -> Result<()> {
     // The `[fcvm-vitals]` prefix routes these to the per-VM debug file and NOT
     // the job log (src/firecracker/vm.rs classifies console lines), which is
     // what lets this run for every VM without flooding a runner.
-    std::thread::spawn(|| loop {
-        eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
-        std::thread::sleep(std::time::Duration::from_secs(10));
-    });
+    //
+    // Every 10s the compact line. Every second, while the guest is piled up,
+    // the line that names the threads (`vitals::Pileup`). The thread has its
+    // own name so that it does not count itself as `fc-agent`.
+    let sampler = std::thread::Builder::new()
+        .name("fcvm-vitals".to_string())
+        .spawn(|| {
+            let start = std::time::Instant::now();
+            let mut pileup = crate::vitals::Pileup::default();
+            let (mut tick, mut previous) = (0u64, None);
+            loop {
+                if crate::vitals::sample_due(previous, tick) {
+                    eprintln!("[fcvm-vitals] {}", crate::vitals::sample_line());
+                }
+                if let Some(line) = pileup.tick(tick) {
+                    eprintln!("[fcvm-vitals] pileup {line}");
+                }
+                // To the next deadline still ahead, so a slow scan neither
+                // stretches the cadence nor is followed by a burst of scans.
+                previous = Some(tick);
+                tick = crate::vitals::next_tick(tick, start.elapsed());
+                let next = start + std::time::Duration::from_secs(tick);
+                std::thread::sleep(next.saturating_duration_since(std::time::Instant::now()));
+            }
+        });
+    if let Err(error) = sampler {
+        eprintln!("[fc-agent] guest vitals sampler did not start: {error}");
+    }
 
     eprintln!("[fc-agent] run_agent starting");
 
