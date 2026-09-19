@@ -7,9 +7,6 @@ on:
       # The release tag/filename are derived from rootfs-config.toml (kernel_version,
       # build_inputs), so config-only changes must also trigger a rebuild.
       - 'rootfs-config.toml'
-      # A fix to this workflow has to run it. With every release present the
-      # build steps skip, so this costs a few minutes.
-      - '.github/workflows/kernels.yml'
     branches: [main]
   workflow_dispatch:
     inputs:
