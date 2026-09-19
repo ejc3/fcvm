@@ -1342,22 +1342,17 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     Ok(())
 }
 
-/// One `fcvm ls --json --pid` reading of a VM's health status, as the state file spells it.
+/// One VM in the hold of
+/// `test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route`.
 #[cfg(feature = "privileged-tests")]
-async fn health_status_of(fcvm_path: &std::path::Path, pid: u32) -> Result<String> {
-    let output = tokio::process::Command::new(fcvm_path)
-        .args(["ls", "--json", "--pid", &pid.to_string()])
-        .output()
-        .await
-        .with_context(|| format!("running fcvm ls for PID {pid}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout)
-        .with_context(|| format!("parsing fcvm ls output for PID {pid}: {stdout}"))?;
-    parsed
-        .first()
-        .and_then(|vm| vm.get("health_status")?.as_str())
-        .map(str::to_string)
-        .with_context(|| format!("no health_status for PID {pid} in {stdout}"))
+struct HeldVm<'a> {
+    label: &'static str,
+    child: &'a mut tokio::process::Child,
+    vm_id: String,
+    /// The newest `last_updated` read from the VM's state file.
+    last_updated: chrono::DateTime<chrono::Utc>,
+    /// How often `last_updated` has advanced during the hold.
+    persisted_checks: u32,
 }
 
 /// A bridged clone's HTTP health check keeps passing after a sibling takes the host route (#948).
@@ -1367,9 +1362,10 @@ async fn health_status_of(fcvm_path: &std::path::Path, pid: u32) -> Result<Strin
 /// (`test_route_replacement_on_clone_bridged`). A health check that needs that route reads
 /// unhealthy for every clone but the newest, for as long as the newest lives.
 ///
-/// Clone1 reads healthy while it holds the route, then clone2 takes it. A healthy VM is
-/// probed every 10 s and one failed probe flips its state, so holding for 30 s gives clone1's
-/// monitor at least two probes without the route.
+/// Clone1 reads healthy while it holds the route, then clone2 takes it. From then on every
+/// VM here has to keep passing its health check: clone1 without the route, clone2 with it,
+/// and the baseline, whose reachable address is the guest address that the route now sends
+/// to clone2.
 ///
 /// The baseline's health check URL is this test's own, so its startup snapshot is too: a
 /// baseline restored from a startup snapshot that another running test also restored from
@@ -1380,75 +1376,89 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
     let (baseline_name, clone1_name, snapshot_name, serve_name) =
         common::unique_names("sibling-health");
     let clone2_name = format!("{}-c2", clone1_name);
-    let fcvm_path = common::find_fcvm_binary()?;
-    let mut started: Vec<u32> = Vec::new();
+    // The child handles are kept until cleanup. A PID this test signals then still names the
+    // process it spawned, and the hold can ask each handle whether its VM has exited.
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut clone1: Option<(tokio::process::Child, u32)> = None;
+    let mut clone2: Option<(tokio::process::Child, u32)> = None;
 
-    let result: Result<()> = async {
-        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-            &[
-                "podman",
-                "run",
-                "--name",
+    let verdict: Result<()> = async {
+        baseline = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &baseline_name,
+                    "--network",
+                    "bridged",
+                    "--health-check",
+                    "http://localhost/index.html",
+                    common::TEST_IMAGE,
+                ],
                 &baseline_name,
-                "--network",
-                "bridged",
-                "--health-check",
-                "http://localhost/index.html",
-                common::TEST_IMAGE,
-            ],
-            &baseline_name,
-        )
-        .await
-        .context("spawning baseline VM")?;
-        started.push(baseline_pid);
-        common::poll_health_by_pid(baseline_pid, 120)
+            )
+            .await
+            .context("spawning baseline VM")?,
+        );
+        let (baseline_child, baseline_pid) = baseline.as_mut().unwrap();
+        let baseline_pid = *baseline_pid;
+        common::poll_health(baseline_child, 120)
             .await
             .context("baseline never read healthy")?;
         println!("baseline healthy (PID {baseline_pid})");
 
         common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
-        let (_serve_child, serve_pid) =
+        serve = Some(
             common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
                 .await
-                .context("spawning memory server")?;
-        started.push(serve_pid);
+                .context("spawning memory server")?,
+        );
+        let serve_pid = serve.as_ref().unwrap().1;
         common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
         let serve_pid_str = serve_pid.to_string();
 
-        let (_clone1_child, clone1_pid) = common::spawn_fcvm_with_logs(
-            &[
-                "snapshot",
-                "run",
-                "--pid",
-                &serve_pid_str,
-                "--name",
+        clone1 = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_str,
+                    "--name",
+                    &clone1_name,
+                ],
                 &clone1_name,
-            ],
-            &clone1_name,
-        )
-        .await
-        .context("spawning clone1")?;
-        started.push(clone1_pid);
-        common::poll_health_by_pid(clone1_pid, 120)
+            )
+            .await
+            .context("spawning clone1")?,
+        );
+        let (clone1_child, clone1_pid) = clone1.as_mut().unwrap();
+        let clone1_pid = *clone1_pid;
+        common::poll_health(clone1_child, 120)
             .await
             .context("clone1 never read healthy while it held the host route")?;
         println!("clone1 healthy (PID {clone1_pid})");
 
-        let (_clone2_child, clone2_pid) = common::spawn_fcvm_with_logs(
-            &[
-                "snapshot",
-                "run",
-                "--pid",
-                &serve_pid_str,
-                "--name",
+        clone2 = Some(
+            common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--pid",
+                    &serve_pid_str,
+                    "--name",
+                    &clone2_name,
+                ],
                 &clone2_name,
-            ],
-            &clone2_name,
-        )
-        .await
-        .context("spawning clone2")?;
-        started.push(clone2_pid);
-        common::poll_health_by_pid(clone2_pid, 120)
+            )
+            .await
+            .context("spawning clone2")?,
+        );
+        let (clone2_child, clone2_pid) = clone2.as_mut().unwrap();
+        let clone2_pid = *clone2_pid;
+        common::poll_health(clone2_child, 120)
             .await
             .context("clone2 never read healthy")?;
         println!("clone2 healthy (PID {clone2_pid})");
@@ -1479,32 +1489,96 @@ async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route()
         );
         println!("host route: {route}");
 
-        let hold = Duration::from_secs(30);
+        // A healthy VM is probed every 10 s, and each check its monitor persists rewrites
+        // the state file, which advances `last_updated` (`StateManager::update_state`).
+        // Reading healthy says nothing by itself: the file reads the same when no probe ran.
+        // So each VM has to persist two checks from here on, read healthy at every reading,
+        // and still be running.
+        let state_manager = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+        let mut held = Vec::new();
+        for (label, entry) in [
+            ("clone1", &mut clone1),
+            ("clone2", &mut clone2),
+            ("baseline", &mut baseline),
+        ] {
+            let (child, pid) = entry.as_mut().expect("spawned above");
+            let state = state_manager
+                .load_state_by_pid(*pid)
+                .await
+                .with_context(|| format!("reading the state of {label}"))?;
+            held.push(HeldVm {
+                label,
+                child,
+                vm_id: state.vm_id,
+                last_updated: state.last_updated,
+                persisted_checks: 0,
+            });
+        }
+        let hold_limit = Duration::from_secs(60);
         let held_from = Instant::now();
-        while held_from.elapsed() < hold {
-            let status = health_status_of(&fcvm_path, clone1_pid).await?;
+        while held.iter().any(|vm| vm.persisted_checks < 2) {
             anyhow::ensure!(
-                status == "healthy",
-                "clone1 read {status} {:.1}s after clone2 took the host route to {guest_ip} \
-                 ({route}). Its health check must not depend on that route.",
-                held_from.elapsed().as_secs_f64()
+                held_from.elapsed() < hold_limit,
+                "a healthy VM is probed every 10 s, but {hold_limit:?} into the hold the \
+                 monitors had persisted: {}",
+                held.iter()
+                    .map(|vm| format!("{} {} checks", vm.label, vm.persisted_checks))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
             tokio::time::sleep(Duration::from_secs(1)).await;
+            for vm in held.iter_mut() {
+                if let Some(status) = vm.child.try_wait()? {
+                    anyhow::bail!("{} exited during the hold: {status}", vm.label);
+                }
+                let state = state_manager
+                    .load_state(&vm.vm_id)
+                    .await
+                    .with_context(|| format!("reading the state of {}", vm.label))?;
+                anyhow::ensure!(
+                    state.health_status == fcvm::state::HealthStatus::Healthy,
+                    "{} read {:?} {:.1}s into the hold, with the host route to {guest_ip} on \
+                     clone2's veth ({route}). No VM's health check may depend on that route.",
+                    vm.label,
+                    state.health_status,
+                    held_from.elapsed().as_secs_f64()
+                );
+                if state.last_updated > vm.last_updated {
+                    vm.last_updated = state.last_updated;
+                    vm.persisted_checks += 1;
+                }
+            }
         }
-        println!("clone1 stayed healthy for {hold:?} without the host route");
-
-        for (label, pid) in [("clone2", clone2_pid), ("baseline", baseline_pid)] {
-            let status = health_status_of(&fcvm_path, pid).await?;
-            anyhow::ensure!(status == "healthy", "{label} read {status} at the end");
-        }
+        println!(
+            "every VM persisted two healthy checks in {:.1}s with the host route on clone2's veth",
+            held_from.elapsed().as_secs_f64()
+        );
         Ok(())
     }
     .await;
 
-    for pid in started.into_iter().rev() {
-        common::kill_process(pid).await;
+    // Cleanup runs after every outcome, newest first.
+    let mut cleanup_errors = Vec::new();
+    for (entry, label) in [
+        (&mut clone2, "clone2"),
+        (&mut clone1, "clone1"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = entry.take() {
+            if let Err(e) = terminate_and_reap(&mut child, pid, label).await {
+                cleanup_errors.push(format!("{label}: {e:#}"));
+            }
+        }
     }
-    result
+    if cleanup_errors.is_empty() {
+        return verdict;
+    }
+    let cleanup = cleanup_errors.join("; ");
+    match verdict {
+        Ok(()) => anyhow::bail!("test cleanup failed: {cleanup}"),
+        Err(e) => Err(e.context(format!("cleanup also failed: {cleanup}"))),
+    }
 }
 
 /// Test that clones can reach the internet in bridged mode

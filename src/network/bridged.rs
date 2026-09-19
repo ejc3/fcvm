@@ -58,12 +58,18 @@ fn peer_of(host_ip: &str) -> Option<String> {
 /// The address through which the host reaches this VM's guest: the /30 peer of the host
 /// end of the VM's own veth.
 ///
-/// In a baseline the guest holds that address itself, because the namespace bridges the
-/// TAP and the veth at layer 2. In a VM restored from a snapshot the namespace end of the
-/// veth holds it, and the namespace DNATs every TCP and UDP port on it to the guest
+/// In a VM restored from a snapshot the namespace end of the veth holds that address, so it
+/// is the VM's own. The namespace DNATs every TCP and UDP port on it to the guest
 /// (`veth::setup_in_namespace_nat`), which is also how that VM's published ports arrive.
+///
+/// In a baseline the guest holds the address itself, because the namespace bridges the TAP
+/// and the veth at layer 2. It is the baseline's guest address, and every VM restored from
+/// the baseline's snapshot has the same one. The health probe still reaches the baseline,
+/// because its socket is bound to the baseline's veth and leaves through that device
+/// whatever the host's routing table says about the address.
+///
 /// Either way `setup` has required the kernel to route this address through the VM's own
-/// veth (`kernel_routes_peer_via_veth`), and no other VM has it.
+/// veth (`kernel_routes_peer_via_veth`).
 ///
 /// `guest_ip` does not identify a VM. Every VM restored from one snapshot has the same
 /// one, and the host's `/32` route to it belongs to whichever of them set up last

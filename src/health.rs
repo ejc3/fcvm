@@ -24,7 +24,9 @@ const HEALTH_POLL_HEALTHY_INTERVAL: Duration = Duration::from_secs(10);
 /// - Adaptive during startup (matches check duration, min 100ms)
 /// - 10s after VM is healthy
 ///
-/// Health check tests HTTP connectivity using reqwest to the guest IP.
+/// With a health check URL the task probes it over HTTP, and `check_health_once` says
+/// where each network mode connects. Without one, health is the container's running
+/// state and its podman healthcheck.
 ///
 /// Returns a JoinHandle that can be used to cancel the task.
 /// The task runs until cancelled or until the tokio runtime shuts down.
@@ -680,13 +682,16 @@ async fn check_health_once(
                     // HTTP health check
                     let url = url::Url::parse(url_str)
                         .with_context(|| format!("parsing health check URL: {}", url_str))?;
-                    let health_path = url.path();
+                    let (port, health_path) = probe_port_and_path(&url);
                     let net = &state.config.network;
 
-                    // Extract Host header from the URL hostname.
-                    // The URL hostname is the virtual host the server routes by.
-                    // We override the connection IP with the guest IP but send
-                    // the original hostname as the Host header.
+                    // The URL's hostname is the virtual host the server routes by, and it
+                    // only travels as the Host header. Where the probe connects depends
+                    // on the network mode:
+                    // - Rootless: the guest address, from inside the holder's namespaces.
+                    // - Routed: the guest address, from inside the VM's named namespace.
+                    // - Bridged: the VM's own veth address, from the host
+                    //   (`bridged::host_reachable_ip`).
                     let url_host = url.host_str();
                     let health_timeout = state.config.health_check_timeout.max(1);
 
@@ -699,7 +704,6 @@ async fn check_health_once(
                             .as_ref()
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("192.168.1.2");
-                        let port = url.port().unwrap_or(80);
                         debug!(target: "health-monitor", holder_pid, guest_ip = %guest_ip, port, host = ?url_host, "HTTP health check via nsenter");
 
                         match check_http_health_nsenter(
@@ -742,7 +746,6 @@ async fn check_health_once(
                             .as_ref()
                             .map(|ip| ip.split('/').next().unwrap_or(ip))
                             .unwrap_or("10.0.2.100");
-                        let port = url.port().unwrap_or(80);
                         debug!(target: "health-monitor", ns_name = ns_name, guest_ip = %guest_ip, port = port, host = ?url_host, "HTTP health check via ip netns exec");
 
                         match check_http_health_netns(
@@ -779,23 +782,29 @@ async fn check_health_once(
                             }
                         }
                     } else {
-                        // Bridged mode: probe the address that is this VM's own, through
-                        // its own veth. Not `guest_ip`: every VM restored from one
-                        // snapshot has the same one, and the host's route to it belongs
-                        // to whichever of them set up last (#948).
+                        // Bridged mode: probe the VM's reachable address
+                        // (`bridged::host_reachable_ip`) through its own veth. Not
+                        // `guest_ip` over the host's route to it: every VM restored from
+                        // one snapshot has the same one, and that route belongs to
+                        // whichever of them set up last (#948).
                         let veth_device = net.host_veth.as_deref();
-                        let effective_url = bridged_probe_url(net, &url)?;
+                        // A state that names no probe target fails the check the way an
+                        // unanswered probe does: it reads unhealthy and is persisted, so
+                        // a status an earlier check wrote cannot outlive it.
+                        let probed = async {
+                            let effective_url = bridged_probe_url(net, &url)?;
+                            debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
+                            check_http_health_bridged(
+                                &effective_url,
+                                veth_device,
+                                url_host,
+                                health_timeout,
+                            )
+                            .await
+                        }
+                        .await;
 
-                        debug!(target: "health-monitor", original_url = %url_str, effective_url = %effective_url, veth = ?veth_device, "HTTP health check via veth");
-
-                        match check_http_health_bridged(
-                            &effective_url,
-                            veth_device,
-                            url_host,
-                            health_timeout,
-                        )
-                        .await
-                        {
+                        match probed {
                             Ok(true) => {
                                 debug!(target: "health-monitor", "health check passed");
                                 *last_failure_log = None;
@@ -1031,10 +1040,11 @@ async fn check_http_health_netns(
 
 /// Check if HTTP service is responding using reqwest with optional interface binding (bridged mode)
 ///
-/// `url` names the address that is this VM's own (`bridged_probe_url`), which sits on the
-/// /30 of the VM's veth. When a veth device is given the client binds to it
-/// (SO_BINDTODEVICE through reqwest's `.interface()`), so the request leaves through that
-/// VM's veth whatever else the host's routing table holds.
+/// `url` names the VM's reachable address (`bridged_probe_url`), which sits on the /30 of
+/// the VM's veth. When a veth device is given the client binds to it (SO_BINDTODEVICE
+/// through reqwest's `.interface()`), so the request leaves through that VM's veth whatever
+/// else the host's routing table holds. A baseline depends on that: its reachable address
+/// is its guest address, which the host routes to the newest VM restored from its snapshot.
 async fn check_http_health_bridged(
     url: &str,
     veth_device: Option<&str>,
@@ -1123,11 +1133,23 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// The URL the bridged probe requests: the health check's port and path on the address
-/// that is this VM's own (`bridged::host_reachable_ip`).
+/// The port and the path, query included, that a health check URL asks for.
 ///
-/// The connection never goes to the URL's host, in this mode as in the other two. The
-/// hostname travels as the `Host` header, which is what `--health-check` documents.
+/// The probe is plain HTTP in every mode, so the URL's scheme only picks the port when the
+/// URL names none. A fragment is not part of a request.
+fn probe_port_and_path(url: &url::Url) -> (u16, &str) {
+    (
+        url.port_or_known_default().unwrap_or(80),
+        &url[url::Position::BeforePath..url::Position::AfterQuery],
+    )
+}
+
+/// The URL the bridged probe requests: the health check's port, path and query on the
+/// VM's reachable address (`bridged::host_reachable_ip`).
+///
+/// The probe is plain HTTP in every mode and connects to an address of the VM's own, never
+/// to the health check URL's host. That host is only the `Host` header, which is what
+/// `--health-check` documents.
 fn bridged_probe_url(net: &crate::network::NetworkConfig, url: &url::Url) -> Result<String> {
     let ip = crate::network::bridged::host_reachable_ip(net).with_context(|| {
         format!(
@@ -1135,24 +1157,24 @@ fn bridged_probe_url(net: &crate::network::NetworkConfig, url: &url::Url) -> Res
             net.host_ip
         )
     })?;
-    Ok(format!(
-        "http://{}:{}{}",
-        ip,
-        url.port().unwrap_or(80),
-        url.path()
-    ))
+    let (port, path) = probe_port_and_path(url);
+    Ok(format!("http://{}:{}{}", ip, port, path))
 }
 
-/// What a failed curl probe reports: curl's own message, and its exit status, which still
-/// says something when curl printed nothing.
+/// What a failed curl probe reports: what the probe command printed, and its exit status,
+/// which still says something when nothing was printed.
+///
+/// The status belongs to the outermost command (`nsenter`, `ip netns exec` or `sudo`). It
+/// is curl's when curl ran, and the wrapper's own when the wrapper could not start curl, so
+/// the message does not call it curl's.
 fn curl_probe_failure(target: &str, via: &str, exit_code: Option<i32>, stderr: &str) -> String {
     let status = match exit_code {
-        Some(code) => format!("curl exit {}", code),
-        None => "curl was killed by a signal".to_string(),
+        Some(code) => format!("probe command exit {}", code),
+        None => "probe command was killed by a signal".to_string(),
     };
     match stderr.trim() {
         "" => format!(
-            "Health check of {} via {} failed: {}, and curl printed nothing",
+            "Health check of {} via {} failed: {}, and it printed nothing",
             target, via, status
         ),
         said => format!(
@@ -1162,53 +1184,9 @@ fn curl_probe_failure(target: &str, via: &str, exit_code: Option<i32>, stderr: &
     }
 }
 
-/// Build the `ip netns exec` + curl argument list for routed health checks.
-///
-/// Separated from check_http_health_netns for testability.
-fn build_netns_curl_args(
-    ns_name: &str,
-    url: &str,
-    host_header: Option<&str>,
-    timeout_secs: u64,
-) -> Vec<String> {
-    let mut args: Vec<String> = [
-        "ip",
-        "netns",
-        "exec",
-        ns_name,
-        "curl",
-        // Quiet, but still printing its error: see `build_nsenter_curl_args`.
-        "-sS",
-        "-o",
-        "/dev/null",
-        "-w",
-        "%{http_code}",
-        "-m",
-    ]
-    .iter()
-    .map(|arg| arg.to_string())
-    .collect();
-    args.push(timeout_secs.to_string());
-    args.push("--noproxy".to_string());
-    args.push("*".to_string());
-    if let Some(host) = host_header {
-        args.push("-H".to_string());
-        args.push(format!("Host: {}", host));
-    }
-    args.push(url.to_string());
-    args
-}
-
-/// Build the nsenter + curl argument list for rootless health checks.
-///
-/// Separated from check_http_health_nsenter for testability.
-fn build_nsenter_curl_args(
-    holder_pid: u32,
-    url: &str,
-    host_header: Option<&str>,
-    timeout_secs: u64,
-) -> Vec<String> {
-    let mut curl_args = vec![
+/// The curl that the rootless and routed probes run inside the VM's namespace.
+fn curl_probe_args(url: &str, host_header: Option<&str>, timeout_secs: u64) -> Vec<String> {
+    let mut args = vec![
         "curl".to_string(),
         // `-s` alone silences curl's error message along with its progress meter, and a
         // failed probe then has nothing to report. `-S` keeps the message.
@@ -1219,20 +1197,45 @@ fn build_nsenter_curl_args(
         "%{http_code}".to_string(),
         "--max-time".to_string(),
         timeout_secs.to_string(),
-        // This curl inherits fcvm's environment. A guest address is never behind a
-        // proxy, and with `http_proxy` set curl would ask it from inside the namespace,
-        // fail with nothing on stderr, and leave the VM unhealthy forever.
+        // This curl inherits fcvm's environment. A guest address is never behind a proxy:
+        // with `http_proxy` set curl would ask the proxy for an address that only this
+        // namespace can reach, and the VM would never read healthy.
         "--noproxy".to_string(),
         "*".to_string(),
     ];
-    // Add Host header if specified (needed for servers that route by Host)
+    // Servers that route by virtual host need the health check URL's hostname.
     if let Some(host) = host_header {
-        curl_args.push("-H".to_string());
-        curl_args.push(format!("Host: {}", host));
+        args.push("-H".to_string());
+        args.push(format!("Host: {}", host));
     }
-    curl_args.push(url.to_string());
+    args.push(url.to_string());
+    args
+}
 
-    let mut nsenter_args: Vec<String> = vec![
+/// The routed probe's command line: `ip netns exec <namespace>` in front of the shared curl.
+fn build_netns_curl_args(
+    ns_name: &str,
+    url: &str,
+    host_header: Option<&str>,
+    timeout_secs: u64,
+) -> Vec<String> {
+    let mut args: Vec<String> = ["ip", "netns", "exec", ns_name]
+        .iter()
+        .map(|arg| arg.to_string())
+        .collect();
+    args.extend(curl_probe_args(url, host_header, timeout_secs));
+    args
+}
+
+/// The rootless probe's arguments to `nsenter`: the holder's user and network namespaces in
+/// front of the shared curl. `--preserve-credentials` keeps the UID/GID mapping.
+fn build_nsenter_curl_args(
+    holder_pid: u32,
+    url: &str,
+    host_header: Option<&str>,
+    timeout_secs: u64,
+) -> Vec<String> {
+    let mut args = vec![
         "-t".to_string(),
         holder_pid.to_string(),
         "-U".to_string(),
@@ -1240,9 +1243,8 @@ fn build_nsenter_curl_args(
         "--preserve-credentials".to_string(),
         "--".to_string(),
     ];
-    nsenter_args.extend(curl_args);
-
-    nsenter_args
+    args.extend(curl_probe_args(url, host_header, timeout_secs));
+    args
 }
 
 #[cfg(test)]
@@ -1275,58 +1277,85 @@ mod tests {
         ));
     }
 
+    /// The curl that the rootless and routed probes run.
+    ///
+    /// - `-sS` is quiet and still prints curl's error, which is what a failed probe reports.
+    ///   A bare `-s` silences the error along with the progress meter.
+    /// - `--max-time` carries the health check timeout.
+    /// - `--noproxy '*'`: fcvm's environment reaches this curl, and a host that needs
+    ///   `http_proxy` to pull images has it set. Without the flag curl asks that proxy for
+    ///   the guest's address from inside the VM's namespace, and a `--health-check` VM never
+    ///   reads healthy. Measured on one command: never healthy in 240 s with `http_proxy`
+    ///   exported, healthy in 4 s once the guest address was in `no_proxy`.
+    /// - The `Host` header is sent only when there is one to send, and the URL comes last.
     #[test]
-    fn test_nsenter_curl_args_without_host_header() {
-        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None, 5);
-        // Find --max-time and verify "5" immediately follows it
-        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+    fn curl_probe_args_are_quiet_bounded_and_ask_no_proxy() {
         assert_eq!(
-            args[max_time_pos + 1],
-            "5",
-            "\"5\" must immediately follow \"--max-time\", got {:?}",
-            &args[max_time_pos..]
+            curl_probe_args("http://10.0.2.100:80/health", Some("myapp.local"), 7),
+            [
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "7",
+                "--noproxy",
+                "*",
+                "-H",
+                "Host: myapp.local",
+                "http://10.0.2.100:80/health",
+            ]
+        );
+        assert_eq!(
+            curl_probe_args("http://10.0.2.100:80/health", None, 5),
+            [
+                "curl",
+                "-sS",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "--max-time",
+                "5",
+                "--noproxy",
+                "*",
+                "http://10.0.2.100:80/health",
+            ]
         );
     }
 
+    /// The rootless probe runs the shared curl in the holder's user and network namespaces.
     #[test]
-    fn test_nsenter_curl_args_with_host_header() {
+    fn nsenter_probe_wraps_the_shared_curl() {
         let args =
             build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", Some("myapp.local"), 5);
-
-        // --max-time must be immediately followed by "5"
-        let max_time_pos = args.iter().position(|a| a == "--max-time").unwrap();
+        let (wrapper, curl) = args.split_at(6);
         assert_eq!(
-            args[max_time_pos + 1],
-            "5",
-            "\"5\" must immediately follow \"--max-time\", but got {:?}",
-            &args[max_time_pos..]
+            wrapper,
+            ["-t", "12345", "-U", "-n", "--preserve-credentials", "--"]
         );
-
-        // Host header must be present
-        let h_pos = args.iter().position(|a| a == "-H").unwrap();
-        assert_eq!(args[h_pos + 1], "Host: myapp.local");
-
-        // URL must be last
-        assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
+        assert_eq!(
+            curl,
+            curl_probe_args("http://10.0.2.100:80/health", Some("myapp.local"), 5)
+        );
     }
 
-    /// curl's `-s` silences its error message along with the progress meter, so a failed
-    /// probe logged `Failed to connect to 10.0.2.100:80 via nsenter:` with nothing after
-    /// the colon. A refused connection during boot, a timeout and a proxy that could not
-    /// be resolved all read the same. `-S` brings the message back and leaves the meter
-    /// off.
+    /// The routed probe runs the shared curl behind `ip netns exec <namespace>`.
     #[test]
-    fn nsenter_curl_prints_its_own_error() {
-        let args = build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", None, 5);
-        assert!(args.iter().any(|a| a == "-sS"), "no -sS in {args:?}");
-        assert!(
-            !args.iter().any(|a| a == "-s"),
-            "a bare -s silences curl's error: {args:?}"
+    fn netns_probe_wraps_the_shared_curl() {
+        let args = build_netns_curl_args("fcvm-vm-abc12", "http://10.0.2.100:80/health", None, 7);
+        let (wrapper, curl) = args.split_at(4);
+        assert_eq!(wrapper, ["ip", "netns", "exec", "fcvm-vm-abc12"]);
+        assert_eq!(
+            curl,
+            curl_probe_args("http://10.0.2.100:80/health", None, 7)
         );
     }
 
-    /// The bridged probe named every connect error `Connection refused`. A probe that had
-    /// no route to its target, or whose veth was gone, then blamed a guest that was fine
+    /// A failed bridged probe reports the error the operating system gave. A probe with no
+    /// route to its target, or whose veth is gone, must not read as a guest that refused
     /// (#948). Binding to a device that does not exist is a connect error that is not a
     /// refusal, and needs no privilege to provoke.
     #[tokio::test]
@@ -1346,34 +1375,12 @@ mod tests {
         );
     }
 
-    /// The routed probe is the same curl behind `ip netns exec`, and had the same `-s`.
+    /// A failed curl probe reports what the probe command printed and its exit status, so
+    /// the message never ends at a colon. The status is the outermost command's
+    /// (`curl_probe_failure`): the message does not call it curl's, and a wrapper that could
+    /// not start curl reads the same way.
     #[test]
-    fn netns_curl_prints_its_own_error_and_asks_no_proxy() {
-        let args = build_netns_curl_args(
-            "fcvm-vm-abc12",
-            "http://10.0.2.100:80/health",
-            Some("myapp.local"),
-            7,
-        );
-        assert_eq!(args[..5], ["ip", "netns", "exec", "fcvm-vm-abc12", "curl"]);
-        assert!(args.iter().any(|a| a == "-sS"), "no -sS in {args:?}");
-        assert!(
-            !args.iter().any(|a| a == "-s"),
-            "a bare -s silences curl's error: {args:?}"
-        );
-        let timeout_pos = args.iter().position(|a| a == "-m").unwrap();
-        assert_eq!(args[timeout_pos + 1], "7");
-        let noproxy_pos = args.iter().position(|a| a == "--noproxy").unwrap();
-        assert_eq!(args[noproxy_pos + 1], "*");
-        let h_pos = args.iter().position(|a| a == "-H").unwrap();
-        assert_eq!(args[h_pos + 1], "Host: myapp.local");
-        assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
-    }
-
-    /// A failed curl probe reports what curl said. When curl said nothing, the exit status
-    /// still tells a refusal (7) from a timeout (28), so the message never ends at a colon.
-    #[test]
-    fn a_failed_curl_probe_reports_what_curl_said() {
+    fn a_failed_curl_probe_reports_the_commands_output_and_exit_status() {
         let said = curl_probe_failure(
             "10.0.2.100:80",
             "nsenter",
@@ -1382,15 +1389,27 @@ mod tests {
         );
         assert_eq!(
             said,
-            "Health check of 10.0.2.100:80 via nsenter failed: curl exit 7: curl: (7) Failed to \
-             connect to 10.0.2.100 port 80 after 0 ms: Couldn't connect to server"
+            "Health check of 10.0.2.100:80 via nsenter failed: probe command exit 7: curl: (7) \
+             Failed to connect to 10.0.2.100 port 80 after 0 ms: Couldn't connect to server"
+        );
+
+        let wrapper = curl_probe_failure(
+            "10.0.2.100:80",
+            "nsenter",
+            Some(1),
+            "nsenter: cannot open /proc/12345/ns/user: No such file or directory\n",
+        );
+        assert_eq!(
+            wrapper,
+            "Health check of 10.0.2.100:80 via nsenter failed: probe command exit 1: nsenter: \
+             cannot open /proc/12345/ns/user: No such file or directory"
         );
 
         let silent = curl_probe_failure("10.0.2.100:80", "netns fcvm-vm-abc12", Some(28), " \n");
         assert_eq!(
             silent,
-            "Health check of 10.0.2.100:80 via netns fcvm-vm-abc12 failed: curl exit 28, and \
-             curl printed nothing"
+            "Health check of 10.0.2.100:80 via netns fcvm-vm-abc12 failed: probe command exit \
+             28, and it printed nothing"
         );
 
         let killed = curl_probe_failure("10.0.2.100:80", "nsenter", None, "");
@@ -1439,6 +1458,33 @@ mod tests {
         assert!(
             error.to_string().contains("no usable host veth address"),
             "{error}"
+        );
+    }
+
+    /// The probe asks for what the health check URL asks for: its port, or the scheme's
+    /// default when it names none, and its path with the query. A fragment never reaches a
+    /// server.
+    #[test]
+    fn bridged_probe_url_keeps_the_query_and_the_schemes_default_port() {
+        let net = crate::network::NetworkConfig {
+            host_ip: Some("10.73.23.93".to_string()),
+            ..Default::default()
+        };
+        let probed: Vec<String> = [
+            "http://localhost:8080/ready?full=1&source=fcvm",
+            "https://myapp.example.com/status",
+            "http://localhost/health?x=1#top",
+        ]
+        .iter()
+        .map(|text| bridged_probe_url(&net, &url::Url::parse(text).unwrap()).unwrap())
+        .collect();
+        assert_eq!(
+            probed,
+            [
+                "http://10.73.23.94:8080/ready?full=1&source=fcvm",
+                "http://10.73.23.94:443/status",
+                "http://10.73.23.94:80/health?x=1",
+            ]
         );
     }
 
@@ -1525,25 +1571,5 @@ mod tests {
         );
         assert!(status.success(), "the probe child failed: {status}");
         assert_eq!(guest_hits, 1);
-    }
-
-    /// fcvm's environment reaches this curl, and a host that needs `http_proxy` to pull
-    /// images has it set. Without `--noproxy` curl asks that proxy for the guest's
-    /// address from inside the VM's namespace, exits non-zero with nothing on stderr,
-    /// and a `--health-check` VM never reads healthy. Measured on one command: never
-    /// healthy in 240 s with `http_proxy` exported, healthy in 4 s once the guest
-    /// address was in `no_proxy`. The routed probe passes the same flag.
-    #[test]
-    fn nsenter_curl_never_asks_a_proxy_for_the_guest() {
-        for host_header in [None, Some("myapp.local")] {
-            let args =
-                build_nsenter_curl_args(12345, "http://10.0.2.100:80/health", host_header, 5);
-            let noproxy_pos = args
-                .iter()
-                .position(|a| a == "--noproxy")
-                .unwrap_or_else(|| panic!("no --noproxy in {args:?}"));
-            assert_eq!(args[noproxy_pos + 1], "*", "{args:?}");
-            assert_eq!(args.last().unwrap(), "http://10.0.2.100:80/health");
-        }
     }
 }

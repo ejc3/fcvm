@@ -189,8 +189,8 @@ fn answer_with(
 ///
 /// Every VM restored from one snapshot has the snapshot's guest address, and the host's
 /// route to that address belongs to whichever of them set up last. A probe aimed at the
-/// guest address therefore reaches a sibling, or nothing. The address that is a VM's own is
-/// the peer of the host end of its veth /30.
+/// guest address therefore reaches a sibling, or nothing. A restored VM's own address is
+/// the peer of the host end of its veth /30 (`bridged::host_reachable_ip`).
 ///
 /// Loopback stands in for both, because all of 127/8 is local and binds with no setup. The
 /// host end is 127.0.0.1, so the VM's own address is 127.0.0.2 and answers 200. 127.0.0.3
@@ -254,4 +254,60 @@ async fn bridged_health_check_goes_to_the_vms_own_veth_address() {
     );
     assert_eq!(status, HealthStatus::Healthy);
     assert_eq!(own_hits.load(Ordering::SeqCst), 1);
+}
+
+/// A bridged VM whose state names no probe target reads unhealthy, and the monitor writes
+/// that down.
+///
+/// The bridged probe derives its target from `host_ip` (`bridged::host_reachable_ip`). A
+/// state where that is missing or unparsable has nothing to probe, which is a failed health
+/// check like any other. The status an earlier check persisted must not outlive it.
+#[tokio::test]
+async fn a_bridged_vm_with_no_probe_target_is_persisted_unhealthy() {
+    let base_dir = create_unique_test_dir();
+    paths::init_with_paths(&base_dir, &base_dir);
+    let manager = StateManager::new(base_dir.join("state"));
+    manager.init().await.unwrap();
+
+    for (vm_id, host_ip) in [
+        ("no-host-address-vm", None),
+        ("bad-host-address-vm", Some("not-an-address")),
+    ] {
+        let mut state = vm_state(
+            vm_id,
+            std::process::id(),
+            NetworkConfig {
+                guest_ip: Some("127.0.0.3".to_string()),
+                host_ip: host_ip.map(str::to_string),
+                host_veth: None,
+                ..Default::default()
+            },
+            "http://localhost/health",
+        );
+        // What a passing check left in the state file earlier.
+        state.health_status = HealthStatus::Healthy;
+        manager.save_state(&state).await.unwrap();
+
+        let monitor = spawn_health_monitor_with_state_dir(
+            vm_id.to_string(),
+            Some(std::process::id()),
+            base_dir.join("state"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let persisted = loop {
+            let status = manager.load_state(vm_id).await.unwrap().health_status;
+            if status != HealthStatus::Healthy || std::time::Instant::now() >= deadline {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        monitor.abort();
+        let _ = monitor.await;
+
+        assert_eq!(
+            persisted,
+            HealthStatus::Unhealthy,
+            "host_ip {host_ip:?}: the monitor left the earlier status in the state file"
+        );
+    }
 }
