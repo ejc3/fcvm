@@ -311,3 +311,44 @@ async fn a_bridged_vm_with_no_probe_target_is_persisted_unhealthy() {
         );
     }
 }
+
+/// What `test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route` has to keep
+/// doing, read from its source because only a host with bridged networking can run it.
+///
+/// - A VM that dies during the hold fails the test. A killed fcvm leaves its state file
+///   reading healthy, and until the test reaps it the process still has a `/proc` entry, so
+///   `fcvm ls` goes on reporting healthy. The child handle (`try_wait`) says it exited, and
+///   an advancing `last_updated` says a monitor is still persisting checks.
+/// - Cleanup goes through the child handles (`terminate_and_reap`). Once a handle is dropped
+///   the child can be reaped and its PID handed out again, so a `kill_process(pid)` after
+///   that has no claim on the process it signals.
+#[test]
+fn the_sibling_health_test_watches_the_processes_it_spawned() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test_snapshot_clone.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let name = "async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route(";
+    let start = source
+        .find(name)
+        .unwrap_or_else(|| panic!("{} has no `{name}`", path.display()));
+    let end = start
+        + source[start..]
+            .find("\n}\n")
+            .expect("the test function never ends");
+    let body = &source[start..end];
+
+    let missing: Vec<&str> = ["try_wait()", "last_updated", "terminate_and_reap("]
+        .into_iter()
+        .filter(|needed| !body.contains(needed))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the test no longer uses {missing:?}, so a VM that died during the hold, or a monitor \
+         that stopped probing, would pass it"
+    );
+    assert!(
+        !body.contains("kill_process("),
+        "the test signals a bare PID after dropping the child handle that pinned it"
+    );
+}
