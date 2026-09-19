@@ -213,3 +213,72 @@ fn kernel_workflow_builds_and_releases_default_for_both_runner_arches() {
         "release-default-kernel no longer builds the default profile; recipe is:\n{recipe}"
     );
 }
+
+/// Every job here ends in `fcvm setup`, and setup builds Firecracker, which
+/// links libseccomp. The build step runs only when the pinned kernel has no
+/// release yet, so a missing package stays hidden until the next kernel bump:
+/// the amd64 default job first built on the move to 6.18.50 and failed with
+/// `unable to find library -lseccomp` after the kernel itself was ready.
+#[test]
+fn every_kernel_workflow_job_installs_what_setup_links() {
+    let path = repo_root().join(".github/workflows/kernels.yml");
+    let workflow: YamlValue =
+        serde_norway::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let jobs = workflow["jobs"].as_mapping().expect("jobs is a mapping");
+    let mut checked = 0;
+    for (name, job) in jobs {
+        let name = name.as_str().unwrap_or("?");
+        let scripts = job["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .filter_map(|step| step.get("run").and_then(YamlValue::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if !scripts.contains("fcvm setup") && !scripts.contains("make release-default-kernel") {
+            continue;
+        }
+        checked += 1;
+        let installs = scripts
+            .lines()
+            .filter(|line| line.contains("ci-apt-get.sh install"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            installs
+                .split_whitespace()
+                .any(|word| word == "libseccomp-dev"),
+            "job `{name}` runs fcvm setup, which builds Firecracker, and does not install \
+             libseccomp-dev; its install lines are: {installs}"
+        );
+    }
+    assert_eq!(
+        checked, 3,
+        "expected the default, nested and btrfs kernel jobs"
+    );
+}
+
+/// A change to this workflow has to run it, or a fix to it sits unused until
+/// the next kernel change. With every release present the build steps skip.
+#[test]
+fn the_kernel_workflow_runs_when_it_changes() {
+    let path = repo_root().join(".github/workflows/kernels.yml");
+    let workflow: YamlValue =
+        serde_norway::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    let paths: Vec<&str> = workflow["on"]["push"]["paths"]
+        .as_sequence()
+        .expect("push.paths is a list")
+        .iter()
+        .filter_map(YamlValue::as_str)
+        .collect();
+    for required in [
+        "kernel/**",
+        "rootfs-config.toml",
+        ".github/workflows/kernels.yml",
+    ] {
+        assert!(
+            paths.contains(&required),
+            "push.paths lacks `{required}`: {paths:?}"
+        );
+    }
+}

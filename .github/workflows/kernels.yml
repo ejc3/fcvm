@@ -7,6 +7,9 @@ on:
       # The release tag/filename are derived from rootfs-config.toml (kernel_version,
       # build_inputs), so config-only changes must also trigger a rebuild.
       - 'rootfs-config.toml'
+      # A fix to this workflow has to run it. With every release present the
+      # build steps skip, so this costs a few minutes.
+      - '.github/workflows/kernels.yml'
     branches: [main]
   workflow_dispatch:
     inputs:
@@ -63,7 +66,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -245,7 +248,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
@@ -470,7 +473,7 @@ jobs:
       - name: Install build dependencies
         run: |
           ./fcvm/scripts/ci-apt-get.sh update
-          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libclang-dev clang musl-tools
+          ./fcvm/scripts/ci-apt-get.sh install -y flex bison bc libelf-dev libssl-dev libfuse3-dev libseccomp-dev libclang-dev clang musl-tools
 
       - name: Build fcvm and fc-agent
         working-directory: fcvm
