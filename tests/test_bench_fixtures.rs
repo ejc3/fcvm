@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::Path;
 
-/// One `[...]` literal that holds the string `"--publish"`.
+/// The argument list that holds a `"--publish"`: its innermost `[...]`, or its line.
 #[derive(Debug)]
 struct PublishingArgs {
     line: usize,
@@ -27,11 +27,13 @@ impl PublishingArgs {
     }
 }
 
-/// Every innermost `[...]` in `source` that contains the literal `"--publish"`.
+/// Every innermost `[...]` in `source` that contains the literal `"--publish"`,
+/// or the literal's own line when no bracket encloses it.
 ///
-/// `//` comments, string literals and char literals are skipped, so a
-/// commented-out fixture is not a finding and a literal such as `"[::1]"` or
-/// `'['` cannot unbalance the brackets.
+/// Line comments, block comments (nested ones too), string literals and char
+/// literals are skipped, so a commented-out fixture is not a finding, and a
+/// `]` inside a comment or a literal such as `"[::1]"` or `'['` cannot
+/// unbalance the brackets.
 fn publishing_args(source: &str) -> Vec<PublishingArgs> {
     let bytes = source.as_bytes();
     let mut open = Vec::new();
@@ -40,6 +42,21 @@ fn publishing_args(source: &str) -> Vec<PublishingArgs> {
     let mut i = 0;
     while i < bytes.len() {
         match bytes[i] {
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                let mut depth = 1;
+                i += 2;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
             b'/' if bytes.get(i + 1) == Some(&b'/') => {
                 while i < bytes.len() && bytes[i] != b'\n' {
                     i += 1;
@@ -67,7 +84,7 @@ fn publishing_args(source: &str) -> Vec<PublishingArgs> {
             }
             b']' => {
                 if let Some(start) = open.pop() {
-                    spans.push((start, i));
+                    spans.push((start, i + 1));
                 }
                 i += 1;
             }
@@ -76,15 +93,25 @@ fn publishing_args(source: &str) -> Vec<PublishingArgs> {
     }
     literals
         .into_iter()
-        .filter_map(|literal| {
-            spans
+        .map(|literal| {
+            // Outside every `[...]`, as in `.arg("--publish")`, the finding is the
+            // line itself: dropping it would let that spelling escape the check.
+            let (start, end) = spans
                 .iter()
                 .filter(|(start, end)| *start < literal && literal < *end)
                 .min_by_key(|(start, end)| end - start)
-                .map(|&(start, end)| PublishingArgs {
-                    line: 1 + source[..start].matches('\n').count(),
-                    text: source[start..=end].to_string(),
-                })
+                .copied()
+                .unwrap_or_else(|| {
+                    let start = source[..literal].rfind('\n').map_or(0, |n| n + 1);
+                    let end = source[literal..]
+                        .find('\n')
+                        .map_or(source.len(), |n| literal + n);
+                    (start, end)
+                });
+            PublishingArgs {
+                line: 1 + source[..start].matches('\n').count(),
+                text: source[start..end].to_string(),
+            }
         })
         .collect()
 }
@@ -157,4 +184,19 @@ fn every_bench_that_publishes_a_port_waits_for_its_server() {
          can hold a server that is not listening yet and a clone resets the first request:\n{}",
         missing.join("\n")
     );
+}
+
+#[test]
+fn a_bracket_inside_a_block_comment_does_not_end_the_args() {
+    let found = publishing_args("let a = [/* ] /* nested ] */ */ \"--publish\", \"80:80\"];");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(!found[0].waits_for_the_server(), "{found:?}");
+}
+
+#[test]
+fn a_publish_outside_any_brackets_is_still_found() {
+    let found = publishing_args("let x = 1;\ncmd.arg(\"--publish\").arg(\"8080:80\");\n");
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert_eq!(found[0].line, 2);
+    assert!(!found[0].waits_for_the_server(), "{found:?}");
 }
