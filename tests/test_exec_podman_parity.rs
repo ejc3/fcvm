@@ -11,9 +11,11 @@
 #![cfg(feature = "integration-slow")]
 
 mod common;
+mod parity_reference;
 
 use anyhow::{Context, Result};
-use std::io::Write;
+use std::cell::RefCell;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
@@ -814,6 +816,245 @@ fn start_reference_container(name: &str) -> Result<ReferenceContainer> {
     Ok(reference)
 }
 
+/// Replace the reference container with a fresh one, which is what nextest's
+/// retry does by starting the test over. The new container is up before the old
+/// one goes, and a start that fails leaves the old one in place.
+fn replace_reference(
+    reference: &RefCell<ReferenceContainer>,
+    base_name: &str,
+    replacements: &mut usize,
+) -> Result<()> {
+    *replacements += 1;
+    let fresh = start_reference_container(&format!("{base_name}-r{replacements}"))?;
+    println!("the reference container is now {}", fresh.0);
+    // Dropping the old guard removes its container.
+    drop(reference.replace(fresh));
+    Ok(())
+}
+
+/// How long one host-side probe of the reference container may take.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// One host command's result, or the reason there is none.
+struct Probe {
+    command: String,
+    /// The exit code, when the command ran to its end.
+    exit: Option<i32>,
+    stdout: String,
+    stderr: String,
+    /// Why there is no result, when there is none.
+    failure: Option<String>,
+}
+
+impl Probe {
+    fn succeeded(&self) -> bool {
+        self.failure.is_none() && self.exit == Some(0)
+    }
+
+    /// The command, how it ended, and the first `lines` lines of what it
+    /// printed. A probe that could not run says why: silence would read as a
+    /// clean result.
+    fn render(&self, lines: usize) -> String {
+        let mut text = format!("$ {}\n", self.command);
+        match (&self.failure, self.exit) {
+            (Some(failure), _) => text += &format!("  no result: {failure}\n"),
+            (None, Some(code)) => text += &format!("  exit {code}\n"),
+            (None, None) => text += "  no result: ended without an exit code\n",
+        }
+        for (stream, content) in [("stdout", &self.stdout), ("stderr", &self.stderr)] {
+            let total = content.lines().count();
+            for line in content.lines().take(lines) {
+                text += &format!("  {stream} | {line}\n");
+            }
+            if total > lines {
+                text += &format!("  {stream} | ({total} lines, first {lines} shown)\n");
+            }
+        }
+        text
+    }
+}
+
+/// Run a host command with a time limit. Its output goes to unnamed temporary
+/// files, so a command that prints more than a pipe holds cannot block on us.
+fn probe(argv: &[&str]) -> Probe {
+    let mut result = Probe {
+        command: argv.join(" "),
+        exit: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        failure: None,
+    };
+    let files = tempfile::tempfile().and_then(|out| Ok((out, tempfile::tempfile()?)));
+    let (mut out, mut err) = match files {
+        Ok(files) => files,
+        Err(e) => {
+            result.failure = Some(format!("no temporary file for its output: {e}"));
+            return result;
+        }
+    };
+    let spawned = out
+        .try_clone()
+        .and_then(|out_end| Ok((out_end, err.try_clone()?)))
+        .and_then(|(out_end, err_end)| {
+            Command::new(argv[0])
+                .args(&argv[1..])
+                .env_remove("RUST_LOG")
+                .stdin(Stdio::null())
+                .stdout(out_end)
+                .stderr(err_end)
+                .spawn()
+        });
+    let mut child = match spawned {
+        Ok(child) => child,
+        Err(e) => {
+            result.failure = Some(format!("could not start: {e}"));
+            return result;
+        }
+    };
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                result.exit = status.code();
+                if result.exit.is_none() {
+                    result.failure = Some(format!("ended without an exit code: {status}"));
+                }
+                break;
+            }
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(50)),
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                result.failure = Some(format!("no answer in {PROBE_TIMEOUT:?}, killed"));
+                break;
+            }
+            Err(e) => {
+                result.failure = Some(format!("could not wait for it: {e}"));
+                break;
+            }
+        }
+    }
+    let read_back = |file: &mut std::fs::File| {
+        let mut bytes = Vec::new();
+        match file
+            .seek(SeekFrom::Start(0))
+            .and_then(|_| file.read_to_end(&mut bytes))
+        {
+            Ok(_) => String::from_utf8_lossy(&bytes).into_owned(),
+            Err(e) => format!("(could not read this output back: {e})"),
+        }
+    };
+    result.stdout = read_back(&mut out);
+    result.stderr = read_back(&mut err);
+    result
+}
+
+/// What the host can see of the reference container, collected the moment
+/// podman fails on its own inside it (issue #944). The three questions separate
+/// a container whose root went away from a lookup that failed over a root that
+/// is there: which passwd file the container itself sees, what state podman
+/// reports, and whether the merged root still holds the file.
+struct ReferenceEvidence {
+    text: String,
+    /// The container's own `/etc/passwd` has a `nobody` entry. `None`: unread.
+    passwd_has_nobody: Option<bool>,
+    /// podman's state for the container. `None`: not reported.
+    status: Option<String>,
+    /// `<MergedDir>/etc/passwd` exists. `None`: could not be checked.
+    merged_passwd_present: Option<bool>,
+}
+
+fn reference_evidence(name: &str) -> ReferenceEvidence {
+    // `cat` runs as the image's default user, so no user lookup is involved.
+    let passwd = probe(&["podman", "exec", name, "cat", "/etc/passwd"]);
+    let passwd_has_nobody = passwd.succeeded().then(|| {
+        passwd
+            .stdout
+            .lines()
+            .any(|line| line.starts_with("nobody:"))
+    });
+    let mut text = passwd.render(3);
+    text += &match passwd_has_nobody {
+        Some(true) => "  a nobody entry: yes\n".to_string(),
+        Some(false) => "  a nobody entry: NO\n".to_string(),
+        None => "  a nobody entry: unknown, the file could not be read\n".to_string(),
+    };
+
+    let inspect = probe(&[
+        "podman",
+        "inspect",
+        "--format",
+        "{{.State.Status}} {{.GraphDriver.Data.MergedDir}}",
+        name,
+    ]);
+    text += &inspect.render(3);
+    let mut fields = inspect.stdout.split_whitespace();
+    let status = inspect
+        .succeeded()
+        .then(|| fields.next().map(str::to_string))
+        .flatten();
+    let merged = inspect
+        .succeeded()
+        .then(|| fields.next())
+        .flatten()
+        .filter(|dir| dir.starts_with('/'));
+
+    let merged_passwd_present = match merged {
+        None => {
+            text += "merged root: podman reported none, so whether it still holds etc/passwd is unknown\n";
+            None
+        }
+        Some(merged) if nix::unistd::geteuid().is_root() => {
+            let path = format!("{merged}/etc/passwd");
+            match std::fs::metadata(&path) {
+                Ok(found) => {
+                    text += &format!(
+                        "{path}: present, {} bytes, seen from the host\n",
+                        found.len()
+                    );
+                    Some(true)
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    text += &format!("{path}: ABSENT, seen from the host\n");
+                    Some(false)
+                }
+                Err(e) => {
+                    text += &format!("{path}: unknown, {e}\n");
+                    None
+                }
+            }
+        }
+        Some(merged) => {
+            // Rootless podman mounts the merged root only inside its own
+            // namespace. From the host that path is an empty directory whatever
+            // state the container is in, so the question goes through podman.
+            let path = format!("{merged}/etc/passwd");
+            let listed = probe(&["podman", "unshare", "ls", "-l", &path]);
+            text += &listed.render(1);
+            match (&listed.failure, listed.exit) {
+                (None, Some(0)) => {
+                    text += "  present, seen from podman's namespace\n";
+                    Some(true)
+                }
+                (None, Some(_)) => {
+                    text += "  ABSENT, seen from podman's namespace\n";
+                    Some(false)
+                }
+                _ => {
+                    text += "  unknown, the listing did not run\n";
+                    None
+                }
+            }
+        }
+    };
+    ReferenceEvidence {
+        text,
+        passwd_has_nobody,
+        status,
+        merged_passwd_present,
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exec_matches_podman_exec() -> Result<()> {
     let fcvm_path: PathBuf = common::find_fcvm_binary()?;
@@ -838,7 +1079,23 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
     // The cases are blocking process I/O. Keep them off the runtime threads,
     // which drain the VM's log pipes.
     let result = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
-        let reference = start_reference_container(&reference_name)?;
+        let reference = RefCell::new(start_reference_container(&reference_name)?);
+        let mut replacements = 0usize;
+        // Collecting evidence and replacing the reference are for the day podman
+        // fails on its own, which is rare. Both run here first, against a healthy
+        // container, so neither can turn out to be broken on that day: a
+        // collector that cannot see a healthy container would report nothing
+        // that means anything about a failing one.
+        let healthy = reference_evidence(&reference.borrow().0);
+        println!("the reference container, healthy:\n{}", healthy.text);
+        anyhow::ensure!(
+            healthy.passwd_has_nobody == Some(true)
+                && healthy.status.as_deref() == Some("running")
+                && healthy.merged_passwd_present != Some(false),
+            "the evidence collector cannot see a healthy reference container:\n{}",
+            healthy.text
+        );
+        replace_reference(&reference, &reference_name, &mut replacements)?;
         let podman = vec!["podman".to_string(), "exec".to_string()];
         let fcvm = |vm: bool| {
             let mut prefix = vec![
@@ -854,6 +1111,7 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
         };
 
         let mut failures = Vec::new();
+        let mut reference_failures = Vec::new();
         let env_file = tempfile::NamedTempFile::new().context("creating the env file")?;
         std::fs::write(
             env_file.path(),
@@ -871,29 +1129,66 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 prefix.extend(case.command.iter().cloned());
                 prefix
             };
-            let mut expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
-            // podman's own failures are sometimes transient under load (seen: a
-            // user lookup in the image failing once). One that is real repeats.
-            if expected.stderr.starts_with(b"Error:") {
-                println!("  {:44} podman reported {}; asking again", case.name, show(&expected.stderr));
-                expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
-            }
             let report = |label: &str, outcome: &Outcome| {
                 println!(
                     "  {:44} {:16} exit {:?} in {:.2?}",
                     case.name, label, outcome.exit, outcome.wall
                 );
             };
-            report("podman exec", &expected);
-            for (label, vm) in [("fcvm exec", false), ("fcvm exec --vm", true)] {
-                if vm && case.container_only {
-                    continue;
-                }
-                let actual = run(&case, &target(fcvm(vm), &["--"]))?;
-                report(label, &actual);
-                for difference in differences(&case, &expected, &actual) {
-                    failures.push(format!("{} [{label}] {difference}", case.name));
-                }
+            // fcvm's outcomes: run once per case, however often podman is asked.
+            let mut actuals: Option<Vec<(&str, Outcome)>> = None;
+            // podman's own failures (stderr starting `Error:`) are sometimes
+            // transient, so such an answer is asked for again. Most are the
+            // case's answer: a missing command fails that way under both tools,
+            // fcvm agrees, and nothing more happens. One that repeats while fcvm
+            // disagrees is issue #944, where `podman exec -u nobody` could not
+            // find a user the image has, twice in one reference container, and
+            // nextest's retry with a fresh container passed. Of the two honest
+            // options named there this is "restart the reference and rerun the
+            // case": evidence is collected from the container that failed, a
+            // fresh one replaces it, and the case is asked once more. The other
+            // option, a fixed expectation for the case, would stop comparing it
+            // with real podman, and that comparison is the point of this test.
+            let settled = parity_reference::settle(
+                || run(&case, &target(podman.clone(), &[reference.borrow().0.as_str()])),
+                |expected: &Outcome| {
+                    expected
+                        .stderr
+                        .starts_with(b"Error:")
+                        .then(|| show(&expected.stderr))
+                },
+                |expected: &Outcome| {
+                    report("podman exec", expected);
+                    if actuals.is_none() {
+                        let mut outcomes = Vec::new();
+                        for (label, vm) in [("fcvm exec", false), ("fcvm exec --vm", true)] {
+                            if vm && case.container_only {
+                                continue;
+                            }
+                            let actual = run(&case, &target(fcvm(vm), &["--"]))?;
+                            report(label, &actual);
+                            outcomes.push((label, actual));
+                        }
+                        actuals = Some(outcomes);
+                    }
+                    let mut found = Vec::new();
+                    for (label, actual) in actuals.iter().flatten() {
+                        for difference in differences(&case, expected, actual) {
+                            found.push(format!("{} [{label}] {difference}", case.name));
+                        }
+                    }
+                    Ok(found)
+                },
+                || reference_evidence(&reference.borrow().0).text,
+                || replace_reference(&reference, &reference_name, &mut replacements),
+                |line| println!("  {:44} {line}", case.name),
+            )?;
+            failures.extend(settled.differences);
+            if let Some(evidence) = settled.reference_failure {
+                reference_failures.push(format!(
+                    "{}: podman failed on its own in two reference containers. The first one:\n{evidence}",
+                    case.name
+                ));
             }
             if failures.len() >= MAX_DIFFERENCES {
                 break;
@@ -906,7 +1201,7 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
         // pins that fcvm adds none, as podman 5.8 does.
         let mut detached_terminals = Vec::new();
         for (label, prefix, separator) in [
-            ("podman exec", podman.clone(), reference.0.clone()),
+            ("podman exec", podman.clone(), reference.borrow().0.clone()),
             ("fcvm exec", fcvm(false), "--".to_string()),
             ("fcvm exec --vm", fcvm(true), "--".to_string()),
         ] {
@@ -1004,6 +1299,9 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 "stopped at {MAX_DIFFERENCES} differences after {ran} of {total} cases; later cases did not run"
             ));
         }
+        // Not differences either: what the reference container looked like
+        // where podman itself failed.
+        failures.extend(reference_failures);
         Ok(failures)
     })
     .await
