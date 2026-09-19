@@ -301,6 +301,24 @@ fn nested_profile_remap_test_covers_request_lengths_above_u32() {
     );
 }
 
+/// Every `kernel_version` in the config, with the table that holds it.
+fn kernel_versions(value: &toml::Value, path: &str, found: &mut Vec<(String, String)>) {
+    let Some(table) = value.as_table() else {
+        return;
+    };
+    for (key, child) in table {
+        if key == "kernel_version" {
+            if let Some(version) = child.as_str() {
+                found.push((path.to_string(), version.to_string()));
+            }
+        } else if path.is_empty() {
+            kernel_versions(child, key, found);
+        } else {
+            kernel_versions(child, &format!("{path}.{key}"), found);
+        }
+    }
+}
+
 /// These profiles are user-deployable, so they must pin a kernel that is both
 /// kernel.org-supported and actually works as an NV2 L1. Linux 7.0.14 reached
 /// EOL on 2026-06-27. Worse, every 7.x kernel probed to date (7.0.14, 7.1.7,
@@ -310,6 +328,27 @@ fn nested_profile_remap_test_covers_request_lengths_above_u32() {
 /// other variable held fixed (same host kernel, same Firecracker, same box).
 /// Until a fixed 7.x release is verified, the pin stays on the 6.18 longterm
 /// line.
+///
+/// Within that line the pin has a floor and, for now, a ceiling.
+///
+/// The floor is 6.18.45. Older releases re-place the running entity in
+/// `reweight_entity()` with `place_entity()`, which upstream reverted
+/// (101f3498b4bd). A container process flooding a pipe to `conmon` reweights
+/// the group entities above it tens of thousands of times a second, and on
+/// 6.18.44 the guest then gives runnable kernel threads, the virtio-vsock
+/// worker among them, no CPU for as long as the flood lasts.
+/// `tests/test_exec_flood.rs` holds the behaviour.
+///
+/// The ceiling is 6.18.50. 6.18.52 carries upstream's own rework of the VNCR
+/// fixmap fix, so `kernel/patches-arm64/vncr-fixmap-state.patch` does not
+/// apply to it, and 6.18.51 already changes `arch/arm64/kvm/nested.c`. That
+/// file is byte-identical from 6.18.44 to 6.18.50, which is the source the
+/// patch and its fixture (`tests/fixtures/vncr/`) were verified against.
+/// Moving past 6.18.50 means dropping that patch and verifying nested guests
+/// on arm64 hardware.
+///
+/// The mountinfo A/B pair stays on 6.16.1 on purpose. It times reads of
+/// /proc/self/mountinfo, runs no container, and is not deployable.
 #[test]
 fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
     let config = repo_file("rootfs-config.toml");
@@ -328,7 +367,39 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         );
     }
 
+    let parsed: toml::Value = toml::from_str(&config).expect("parse rootfs-config.toml");
+    let mut pins = Vec::new();
+    kernel_versions(&parsed, "", &mut pins);
+    assert!(
+        pins.len() >= 8,
+        "found only {} kernel_version pins",
+        pins.len()
+    );
+    for (profile, version) in &pins {
+        let Some(release) = version.strip_prefix("6.18.") else {
+            continue;
+        };
+        let release: u32 = release
+            .parse()
+            .unwrap_or_else(|_| panic!("[{profile}] has an unparsable kernel_version {version:?}"));
+        assert!(
+            release >= 45,
+            "[{profile}] pins 6.18.{release}. Releases before 6.18.45 starve the \
+             guest's kernel threads under a pipe flood between a container and conmon: a \
+             harness that leaves such floods behind stalled in 8 of 28 runs on 6.18.44, \
+             and in 28 of 28 with NO_DELAY_DEQUEUE, against 0 of 71 and 0 of 70 on 6.18.50"
+        );
+        assert!(
+            release <= 50,
+            "[{profile}] pins 6.18.{release}. 6.18.51 changes arch/arm64/kvm/nested.c and \
+             kernel/patches-arm64/vncr-fixmap-state.patch does not apply to 6.18.52; see the \
+             doc comment on this test before moving past 6.18.50"
+        );
+    }
+
     for profile in [
+        "kernel_profiles.default.arm64",
+        "kernel_profiles.default.amd64",
         "kernel_profiles.nested.arm64",
         "kernel_profiles.nested.arm64.host_kernel",
         "kernel_profiles.nested.amd64",
@@ -340,8 +411,8 @@ fn deployable_kernel_profiles_pin_a_supported_working_kernel() {
         assert!(
             section
                 .lines()
-                .any(|line| line.trim() == "kernel_version = \"6.18.44\""),
-            "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.44"
+                .any(|line| line.trim() == "kernel_version = \"6.18.50\""),
+            "deployable profile [{profile}] must pin exact supported longterm Linux 6.18.50"
         );
     }
 }

@@ -3,9 +3,10 @@
  * Author: Jintack Lim <jintack.lim@linaro.org>
  */
 /*
- * Verbatim function excerpts from Linux v6.18.44 arch/arm64/kvm/nested.c:
- * https://raw.githubusercontent.com/gregkh/linux/v6.18.44/arch/arm64/kvm/nested.c
+ * Verbatim function excerpts from Linux v6.18.50 arch/arm64/kvm/nested.c:
+ * https://raw.githubusercontent.com/gregkh/linux/v6.18.50/arch/arm64/kvm/nested.c
  * Complete source SHA256: 6d9e8d4eaf264de6bcbb7b73c2c58f6da1488b0dc195b78074445dcf4d5ea12d
+ * The file has that hash in every release from v6.18.44 to v6.18.50.
  * kvm_vcpu_load_hw_mmu is retained as context for the upstream patch.
  * The test applies the production patch to this file, then executes the C.
  */
