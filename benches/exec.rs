@@ -600,31 +600,24 @@ impl CloneFixture {
             std::thread::sleep(Duration::from_millis(50));
         };
 
-        // Make HTTP request to nginx (retry briefly — pasta networking may need
-        // a moment after clone restore to establish L4 translation)
+        // Make one HTTP request to nginx via the loopback port forward (pasta).
+        // The baseline ran with --health-check, so the snapshot holds a listening
+        // nginx and this clone inherited the check: it read healthy only after
+        // nginx answered, and the first request must succeed. A retry would also
+        // hide its own delay inside the time this bench reports.
         let addr = format!("{}:{}", loopback_ip, health_port);
+        let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
         let mut last_response = String::new();
-        let mut http_ok = false;
-        for attempt in 0..10 {
-            if attempt > 0 {
-                std::thread::sleep(Duration::from_millis(500));
-            }
-            if let Ok(mut stream) = TcpStream::connect(&addr) {
-                stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
-                stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-                let request = "GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-                if stream.write_all(request.as_bytes()).is_ok() {
-                    let mut response = Vec::new();
-                    let _ = stream.read_to_end(&mut response);
-                    last_response = String::from_utf8_lossy(&response).to_string();
-                    if last_response.contains("200 OK") {
-                        http_ok = true;
-                        break;
-                    }
-                }
+        if let Ok(mut stream) = TcpStream::connect(&addr) {
+            stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
+            stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
+            if stream.write_all(request.as_bytes()).is_ok() {
+                let mut response = Vec::new();
+                let _ = stream.read_to_end(&mut response);
+                last_response = String::from_utf8_lossy(&response).to_string();
             }
         }
-        if !http_ok {
+        if !last_response.contains("200 OK") {
             // Comprehensive diagnostics for CI debugging
             let clone_log = std::fs::read_to_string(&clone_log_path).unwrap_or_default();
 
@@ -726,7 +719,7 @@ impl CloneFixture {
                 .unwrap_or_else(|e| format!("exec ss failed: {}", e));
 
             panic!(
-                "clone HTTP failed after 10 attempts\n\
+                "clone HTTP request failed\n\
                  addr: {}:{}\n\
                  last_response: {} bytes\n\
                  clone_pid: {}\n\
@@ -829,7 +822,19 @@ fn bench_clone_exec(c: &mut Criterion) {
 fn bench_clone_http(c: &mut Criterion) {
     eprintln!("\n=== Setting up snapshot for clone HTTP benchmarks ===");
 
-    let fixture = CloneFixture::setup("clone-http", "rootless", &["--publish", "8080:80"]);
+    // Without the health check "healthy" means only that the container is running, so a
+    // snapshot taken then can hold nginx still inside its entrypoint, and every clone of
+    // it resets the first request until nginx binds its port (#943).
+    let fixture = CloneFixture::setup(
+        "clone-http",
+        "rootless",
+        &[
+            "--publish",
+            "8080:80",
+            "--health-check",
+            "http://localhost:80",
+        ],
+    );
 
     let mut group = c.benchmark_group("clone_http");
     group.sample_size(10);
