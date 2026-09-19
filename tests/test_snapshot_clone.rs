@@ -1344,6 +1344,171 @@ async fn test_route_replacement_on_clone_bridged() -> Result<()> {
     Ok(())
 }
 
+/// One `fcvm ls --json --pid` reading of a VM's health status, as the state file spells it.
+#[cfg(feature = "privileged-tests")]
+async fn health_status_of(fcvm_path: &std::path::Path, pid: u32) -> Result<String> {
+    let output = tokio::process::Command::new(fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .with_context(|| format!("running fcvm ls for PID {pid}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(&stdout)
+        .with_context(|| format!("parsing fcvm ls output for PID {pid}: {stdout}"))?;
+    parsed
+        .first()
+        .and_then(|vm| vm.get("health_status")?.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("no health_status for PID {pid} in {stdout}"))
+}
+
+/// A bridged clone's HTTP health check keeps passing after a sibling takes the host route (#948).
+///
+/// Bridged clones of one snapshot share the snapshot's guest address, and the host's `/32`
+/// route to it belongs to whichever clone set up last
+/// (`test_route_replacement_on_clone_bridged`). A health check that needs that route reads
+/// unhealthy for every clone but the newest, for as long as the newest lives.
+///
+/// Clone1 reads healthy while it holds the route, then clone2 takes it. A healthy VM is
+/// probed every 10 s and one failed probe flips its state, so holding for 30 s gives clone1's
+/// monitor at least two probes without the route.
+///
+/// The baseline's health check URL is this test's own, so its startup snapshot is too: a
+/// baseline restored from a startup snapshot that another running test also restored from
+/// would share the guest address with VMs this test does not control.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route() -> Result<()> {
+    let (baseline_name, clone1_name, snapshot_name, serve_name) =
+        common::unique_names("sibling-health");
+    let clone2_name = format!("{}-c2", clone1_name);
+    let fcvm_path = common::find_fcvm_binary()?;
+    let mut started: Vec<u32> = Vec::new();
+
+    let result: Result<()> = async {
+        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "bridged",
+                "--health-check",
+                "http://localhost/index.html",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning baseline VM")?;
+        started.push(baseline_pid);
+        common::poll_health_by_pid(baseline_pid, 120)
+            .await
+            .context("baseline never read healthy")?;
+        println!("baseline healthy (PID {baseline_pid})");
+
+        common::create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;
+        let (_serve_child, serve_pid) =
+            common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], &serve_name)
+                .await
+                .context("spawning memory server")?;
+        started.push(serve_pid);
+        common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+        let serve_pid_str = serve_pid.to_string();
+
+        let (_clone1_child, clone1_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_str,
+                "--name",
+                &clone1_name,
+            ],
+            &clone1_name,
+        )
+        .await
+        .context("spawning clone1")?;
+        started.push(clone1_pid);
+        common::poll_health_by_pid(clone1_pid, 120)
+            .await
+            .context("clone1 never read healthy while it held the host route")?;
+        println!("clone1 healthy (PID {clone1_pid})");
+
+        let (_clone2_child, clone2_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_str,
+                "--name",
+                &clone2_name,
+            ],
+            &clone2_name,
+        )
+        .await
+        .context("spawning clone2")?;
+        started.push(clone2_pid);
+        common::poll_health_by_pid(clone2_pid, 120)
+            .await
+            .context("clone2 never read healthy")?;
+        println!("clone2 healthy (PID {clone2_pid})");
+
+        // The situation under test, stated from the host: one guest address, two live
+        // clones, and the route to that address on clone2's veth.
+        let guest_ip = common::get_network_field(clone1_pid, "guest_ip").await?;
+        let clone2_guest_ip = common::get_network_field(clone2_pid, "guest_ip").await?;
+        anyhow::ensure!(
+            guest_ip == clone2_guest_ip,
+            "the clones do not share a guest address ({guest_ip} and {clone2_guest_ip}), \
+             so this run cannot show anything about the shared route"
+        );
+        let clone1_veth = common::get_network_field(clone1_pid, "host_veth").await?;
+        let clone2_veth = common::get_network_field(clone2_pid, "host_veth").await?;
+        let route_output = tokio::process::Command::new("ip")
+            .args(["route", "show", &format!("{guest_ip}/32")])
+            .output()
+            .await
+            .context("reading the host route to the guest address")?;
+        let route = String::from_utf8_lossy(&route_output.stdout)
+            .trim()
+            .to_string();
+        anyhow::ensure!(
+            route.contains(&clone2_veth) && !route.contains(&clone1_veth),
+            "the host route to {guest_ip} should be on clone2's veth {clone2_veth} and off \
+             clone1's {clone1_veth}, got: {route:?}"
+        );
+        println!("host route: {route}");
+
+        let hold = Duration::from_secs(30);
+        let held_from = Instant::now();
+        while held_from.elapsed() < hold {
+            let status = health_status_of(&fcvm_path, clone1_pid).await?;
+            anyhow::ensure!(
+                status == "healthy",
+                "clone1 read {status} {:.1}s after clone2 took the host route to {guest_ip} \
+                 ({route}). Its health check must not depend on that route.",
+                held_from.elapsed().as_secs_f64()
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        println!("clone1 stayed healthy for {hold:?} without the host route");
+
+        for (label, pid) in [("clone2", clone2_pid), ("baseline", baseline_pid)] {
+            let status = health_status_of(&fcvm_path, pid).await?;
+            anyhow::ensure!(status == "healthy", "{label} read {status} at the end");
+        }
+        Ok(())
+    }
+    .await;
+
+    for pid in started.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    result
+}
+
 /// Test that clones can reach the internet in bridged mode
 ///
 /// This verifies that DNS resolution and outbound connectivity work after snapshot restore.
