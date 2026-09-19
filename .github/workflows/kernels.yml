@@ -37,6 +37,8 @@ jobs:
           - config_arch: amd64
             runner_arch: X64
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -76,53 +78,12 @@ jobs:
         env:
           CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          mapfile -t METADATA < <(python3 - <<'PY'
-          import glob
-          import hashlib
-          import os
-          import pathlib
-          import tomllib
-
-          config = tomllib.load(open("rootfs-config.toml", "rb"))
-          profile = config["kernel_profiles"]["default"][os.environ["CONFIG_ARCH"]]
-          digest = hashlib.sha256()
-          for pattern in profile["build_inputs"]:
-              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
-              if not matches:
-                  raise SystemExit(f"build input matched no files: {pattern}")
-              for path in matches:
-                  if not str(path).endswith(".disabled"):
-                      digest.update(path.read_bytes())
-          print(profile["kernel_version"])
-          print(digest.hexdigest()[:12])
-          print(profile["kernel_sha"])
-          PY
-          )
-
-          VERSION="${METADATA[0]}"
-          SHA="${METADATA[1]}"
-          MANIFEST_SHA="${METADATA[2]}"
-          if [ "$SHA" != "$MANIFEST_SHA" ]; then
-            echo "ERROR: kernel_sha $MANIFEST_SHA does not match build_inputs hash $SHA"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-          case "$CONFIG_ARCH" in
-            arm64) EXPECTED_ARCH=aarch64 ;;
-            amd64) EXPECTED_ARCH=x86_64 ;;
-            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
-          esac
-          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
-            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
-            exit 1
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-default-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-default-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
+          # One script derives the version, SHA, tag and file name for every job
+          # here, the way `fcvm setup` derives what it downloads. It checks
+          # kernel_sha and the runner's architecture, and prints nothing unless
+          # all of it holds, so a failure stops the job here.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py default "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -224,6 +185,8 @@ jobs:
           - config_arch: amd64
             runner_arch: X64
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -267,65 +230,15 @@ jobs:
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force
 
-      - name: Compute kernel version and SHA
+      - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
         env:
           CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # Both values come from this leg's table, kernel_profiles.nested.<arch>
-          # in the checked-out rootfs-config.toml. The SHA is fcvm's content
-          # address: the first 12 hex digits of the SHA-256 over the table's
-          # build_inputs, globs expanded in sorted order, *.disabled left out.
-          mapfile -t METADATA < <(python3 - <<'PY'
-          import glob
-          import hashlib
-          import os
-          import pathlib
-          import tomllib
-
-          config = tomllib.load(open("rootfs-config.toml", "rb"))
-          profile = config["kernel_profiles"]["nested"][os.environ["CONFIG_ARCH"]]
-          digest = hashlib.sha256()
-          for pattern in profile["build_inputs"]:
-              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
-              if not matches:
-                  raise SystemExit(f"build input matched no files: {pattern}")
-              for path in matches:
-                  if not str(path).endswith(".disabled"):
-                      digest.update(path.read_bytes())
-          print(profile["kernel_version"])
-          print(digest.hexdigest()[:12])
-          PY
-          )
-
-          VERSION="${METADATA[0]:-}"
-          SHA="${METADATA[1]:-}"
-          if [ -z "$VERSION" ] || [ -z "$SHA" ]; then
-            echo "ERROR: could not read kernel_profiles.nested.$CONFIG_ARCH from rootfs-config.toml"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-          case "$CONFIG_ARCH" in
-            arm64) EXPECTED_ARCH=aarch64 ;;
-            amd64) EXPECTED_ARCH=x86_64 ;;
-            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
-          esac
-          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
-            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
-            exit 1
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-nested-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-nested-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
-
-          echo "Kernel version: $VERSION"
-          echo "Architecture: $ARCH"
-          echo "Build SHA: $SHA"
+          # The shared identity script; see build-default-kernel.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py nested "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -387,9 +300,21 @@ jobs:
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
+        env:
+          FORCE_BUILD: ${{ inputs.force_build }}
         run: |
-          # Build the nested kernel using fcvm
-          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+          # A forced rebuild must skip the release download. --build-kernels
+          # builds only after a download fails, and the release being replaced
+          # is still published, so setup would fetch that artifact and the
+          # release step would upload the same bytes again.
+          # --force-build-kernels rebuilds the profile kernel from source.
+          # --build-kernels stays because setup fetches the default kernel
+          # first and has to build it when that release is absent.
+          if [ "$FORCE_BUILD" = "true" ]; then
+            sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --force-build-kernels
+          else
+            sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+          fi
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
@@ -418,13 +343,10 @@ jobs:
           SHA="${{ steps.kernel.outputs.sha }}"
           ARCH="${{ steps.kernel.outputs.arch }}"
 
-          # Delete existing release if force rebuilding
-          if [ "${{ inputs.force_build }}" == "true" ]; then
-            gh release delete "$TAG" --yes 2>/dev/null || true
-          fi
-
           # The legs nest by different mechanisms (FEAT_NV2 on arm64, VT-x or
           # AMD-V on x86_64), so each publishes notes that are true for it.
+          # This runs before the delete below, so an architecture with no notes
+          # fails while its published release still exists.
           case "$CONFIG_ARCH" in
             arm64)
               NOTES="Nested kernel for running fcvm inside fcvm (nested virtualization).
@@ -499,6 +421,11 @@ jobs:
             *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
           esac
 
+          # Delete existing release if force rebuilding
+          if [ "${{ inputs.force_build }}" == "true" ]; then
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          fi
+
           # Create release with kernel binary
           gh release create "$TAG" \
             --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
@@ -536,6 +463,8 @@ jobs:
           - config_arch: amd64
             runner_arch: X64
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -579,65 +508,15 @@ jobs:
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force
 
-      - name: Compute kernel version and SHA
+      - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
         env:
           CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # Both values come from this leg's table, kernel_profiles.btrfs.<arch>
-          # in the checked-out rootfs-config.toml. The SHA is fcvm's content
-          # address: the first 12 hex digits of the SHA-256 over the table's
-          # build_inputs, globs expanded in sorted order, *.disabled left out.
-          mapfile -t METADATA < <(python3 - <<'PY'
-          import glob
-          import hashlib
-          import os
-          import pathlib
-          import tomllib
-
-          config = tomllib.load(open("rootfs-config.toml", "rb"))
-          profile = config["kernel_profiles"]["btrfs"][os.environ["CONFIG_ARCH"]]
-          digest = hashlib.sha256()
-          for pattern in profile["build_inputs"]:
-              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
-              if not matches:
-                  raise SystemExit(f"build input matched no files: {pattern}")
-              for path in matches:
-                  if not str(path).endswith(".disabled"):
-                      digest.update(path.read_bytes())
-          print(profile["kernel_version"])
-          print(digest.hexdigest()[:12])
-          PY
-          )
-
-          VERSION="${METADATA[0]:-}"
-          SHA="${METADATA[1]:-}"
-          if [ -z "$VERSION" ] || [ -z "$SHA" ]; then
-            echo "ERROR: could not read kernel_profiles.btrfs.$CONFIG_ARCH from rootfs-config.toml"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-          case "$CONFIG_ARCH" in
-            arm64) EXPECTED_ARCH=aarch64 ;;
-            amd64) EXPECTED_ARCH=x86_64 ;;
-            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
-          esac
-          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
-            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
-            exit 1
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-btrfs-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-btrfs-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
-
-          echo "Kernel version: $VERSION"
-          echo "Architecture: $ARCH"
-          echo "Build SHA: $SHA"
+          # The shared identity script; see build-default-kernel.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py btrfs "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -699,9 +578,15 @@ jobs:
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
+        env:
+          FORCE_BUILD: ${{ inputs.force_build }}
         run: |
-          # Build the btrfs kernel using fcvm
-          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+          # Forced rebuilds skip the release download; see build-nested-kernel.
+          if [ "$FORCE_BUILD" = "true" ]; then
+            sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels --force-build-kernels
+          else
+            sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+          fi
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"

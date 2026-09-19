@@ -401,13 +401,7 @@ async fn ensure_custom_kernel(
     }
 
     // Try to download from GitHub releases
-    let tag = format!(
-        "kernel-{}-{}-{}-{}",
-        profile_name,
-        profile.kernel_version,
-        std::env::consts::ARCH,
-        sha
-    );
+    let tag = custom_kernel_release_tag(profile_name, &profile.kernel_version, &sha);
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         profile.kernel_repo, tag, filename
@@ -517,7 +511,7 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
 /// configured inputs are hashed and must match. A packaged binary has no
 /// `kernel/` tree, so a published profile's validated manifest SHA is the
 /// authoritative release identifier there.
-fn compute_profile_kernel_sha_at_root(
+pub fn compute_profile_kernel_sha_at_root(
     profile: &KernelProfile,
     repo_root: Option<&Path>,
 ) -> Result<String> {
@@ -637,6 +631,20 @@ fn compute_profile_kernel_sha_from_inputs(
     }
 
     Ok(compute_sha256_short(&content))
+}
+
+/// Get the release tag a custom kernel is published under and downloaded from.
+///
+/// scripts/kernel-release-identity.py derives the same tag for the jobs that
+/// publish; tests/test_default_kernel_release.rs compares the two.
+pub fn custom_kernel_release_tag(profile_name: &str, kernel_version: &str, sha: &str) -> String {
+    format!(
+        "kernel-{}-{}-{}-{}",
+        profile_name,
+        kernel_version,
+        std::env::consts::ARCH,
+        sha
+    )
 }
 
 /// Get the custom kernel filename.
