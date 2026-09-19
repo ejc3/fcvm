@@ -1213,6 +1213,30 @@ pub async fn exec_in_container(pid: u32, cmd: &[&str]) -> anyhow::Result<String>
     exec_with_timeout(pid, cmd, false).await
 }
 
+/// Wait until nginx in the VM's container answers on its own loopback.
+pub async fn wait_for_nginx(pid: u32, limit: Duration) -> anyhow::Result<()> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        let fetch = [
+            "wget",
+            "-q",
+            "-O",
+            "/dev/null",
+            "--timeout=2",
+            "http://127.0.0.1:80/",
+        ];
+        let error = match exec_in_container(pid, &fetch).await {
+            Ok(_) => return Ok(()),
+            Err(error) => error,
+        };
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "nginx in VM {pid} did not answer on 127.0.0.1:80 within {limit:?}: {error:#}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Create a snapshot from a running VM by PID
 ///
 /// # Arguments
@@ -1421,6 +1445,14 @@ impl SnapshotFixture {
         )
         .await?;
         poll_health_by_pid(baseline_pid, 120).await?;
+
+        // "Healthy" without a health check means only that the container is running, and
+        // nginx is still inside its entrypoint then. Snapshot it once it serves, or every
+        // clone refuses connections until its own entrypoint finishes (#943). This asks
+        // over exec and not with --health-check: a bridged health probe reaches the guest
+        // through a host route keyed by guest address, baselines restored from one cached
+        // snapshot share that address, and the newest takes the route (#948).
+        wait_for_nginx(baseline_pid, Duration::from_secs(60)).await?;
 
         // Snapshot
         create_snapshot_by_pid(baseline_pid, &snapshot_name).await?;

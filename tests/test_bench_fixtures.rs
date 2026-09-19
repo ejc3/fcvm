@@ -10,6 +10,10 @@
 //!
 //! With `--health-check` the baseline is healthy only once nginx answers, so
 //! the snapshot holds a listening server, and clones inherit the URL.
+//!
+//! `SnapshotFixture` in `tests/common/mod.rs` had the same gap: a test that
+//! fetched from nginx in its clone got `Connection refused`. It waits for nginx
+//! over exec before it snapshots, for the reason given on its test below.
 
 use std::fs;
 use std::path::Path;
@@ -199,4 +203,41 @@ fn a_publish_outside_any_brackets_is_still_found() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].line, 2);
     assert!(!found[0].waits_for_the_server(), "{found:?}");
+}
+
+/// `SnapshotFixture` snapshots nginx for the tests in `test_clone_restore_fixes.rs`, and
+/// `test_restore_network_cleanup_reestablishes_gateway` fetches from nginx as soon as its
+/// clone reads healthy. The fixture passes no health check, so its baseline is "healthy"
+/// while nginx is still starting, and the clone answered `Connection refused`: on the
+/// test's first try on main's x64 root job at 6f06bd1d, and on all four tries on #946's.
+///
+/// The fixture waits over exec and not with `--health-check`. A bridged health probe
+/// reaches the guest through a host route keyed by guest address, baselines restored from
+/// one cached snapshot share that address, and the newest takes the route (#948), so with
+/// a health check the older baseline never read healthy.
+#[test]
+fn the_shared_snapshot_fixture_snapshots_a_serving_nginx() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/common/mod.rs");
+    let source =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let start = source
+        .find("impl SnapshotFixture")
+        .expect("tests/common/mod.rs has no `impl SnapshotFixture`");
+    let fixture = &source[start..];
+    let healthy = fixture
+        .find("poll_health_by_pid(baseline_pid")
+        .expect("SnapshotFixture::new no longer polls its baseline's health");
+    let snapshot = fixture
+        .find("create_snapshot_by_pid(baseline_pid")
+        .expect("SnapshotFixture::new no longer snapshots its baseline");
+    assert!(
+        healthy < snapshot,
+        "the fixture snapshots before it polls health"
+    );
+    let between = &fixture[healthy..snapshot];
+    assert!(
+        between.contains("wait_for_nginx(baseline_pid"),
+        "SnapshotFixture snapshots its baseline as soon as the container is running, so the \
+         snapshot can hold nginx before it listens:\n{between}"
+    );
 }
