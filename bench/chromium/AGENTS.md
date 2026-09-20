@@ -867,8 +867,9 @@ average it in. `make test-chromium-fault` guards all four.
 - **An output directory is used once.** `requests.jsonl` is appended to and traces are
   matched by mtime, so reusing `--out` blends two runs, possibly taken with different
   arguments, into one analysis. `require_fresh_out_dir` refuses anything non-empty.
-- **A parked CONTINUE is timed to its retry.** When `UFFDIO_CONTINUE` returns EAGAIN
-  the vCPU stays blocked, so `src/uffd/server.rs` keeps the trace interval open across
+- **A parked fault is timed to its retry.** When the resolving ioctl (`UFFDIO_CONTINUE`
+  for a MINOR clone, `UFFDIO_COPY` for a COPY one) returns EAGAIN with no progress, the
+  vCPU stays blocked, so `src/uffd/server.rs` keeps the trace interval open across
   the park and closes it at the retry that actually resolved the fault. Closing it
   around the failed ioctl would report the EAGAIN as the resolution cost, and these
   intervals are read as exact ioctl service time.

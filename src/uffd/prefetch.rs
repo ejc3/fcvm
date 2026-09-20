@@ -244,6 +244,10 @@ fn merge(previous: &mut Segment, segment: &Segment) -> bool {
 ///
 /// * `EAGAIN` after progress — the kernel stopped early (`mmap_changing`, or it hit a page
 ///   that is already present); the copied prefix still counts.
+/// * `EAGAIN` with no progress: `mmap_changing` is raised. A balloon's REMOVE event raises
+///   it, and it drops only when the thread inside `madvise` runs again, which it can do
+///   once the handler has read the event. The kernel populates nothing until then. That
+///   is [`Stop::Refused`], never a byte count.
 /// * `EEXIST` with no progress — the page is already resident (a demand fault beat us to it,
 ///   or a previous chunk covered it). Skip exactly one page and carry on.
 /// * `ESRCH` — the clone's mm is gone.
@@ -313,7 +317,9 @@ pub fn populate_chunk(
         // The kernel never reports zero-byte success; treat it as no progress rather than
         // spinning on the same address forever.
         Ok(_) => Ok(page_size.min(len)),
-        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied > 0 => Ok(copied),
+        // The variant carries the ioctl's signed `copy` field. Only a positive one is a byte
+        // count; `errno_of` decodes the rest.
+        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied as isize > 0 => Ok(copied),
         Err(e) => match errno_of(&e) {
             Some(libc::EEXIST) => Ok(page_size.min(len)),
             Some(libc::ESRCH) => Err(Stop::VmGone),
@@ -347,12 +353,25 @@ pub fn populate_chunk(
 ///
 /// The crate pins its own `nix`, so the `Errno` values cannot be matched directly against
 /// fcvm's — compare the raw integer instead.
-fn errno_of(e: &userfaultfd::Error) -> Option<i32> {
+///
+/// `PartiallyCopied` is the variant that hides one. The crate builds it from a `UFFDIO_COPY`
+/// that failed with `EAGAIN`, and stores the ioctl's signed `copy` field in it as a `usize`.
+/// A positive field is a byte count: the kernel copied a prefix, which is progress for the
+/// caller to count and not an errno. Otherwise nothing was copied, and the kernel either
+/// wrote `-EAGAIN` into the field (6.15 and later) or did not write it at all, which leaves
+/// the crate's initial 0 (earlier kernels, in the `mmap_changing` exit taken before the copy
+/// starts). Issue #961 was the negated errno read as a byte count.
+pub(super) fn errno_of(e: &userfaultfd::Error) -> Option<i32> {
     match e {
         userfaultfd::Error::CopyFailed(errno) | userfaultfd::Error::ZeropageFailed(errno) => {
             Some(*errno as i32)
         }
         userfaultfd::Error::SystemError(errno) => Some(*errno as i32),
+        userfaultfd::Error::PartiallyCopied(copy) => match *copy as isize {
+            1.. => None,
+            0 => Some(libc::EAGAIN),
+            negated => i32::try_from(negated.unsigned_abs()).ok(),
+        },
         _ => None,
     }
 }
@@ -649,10 +668,19 @@ mod tests {
     }
 
     fn register_missing(base: usize, len: usize) -> Uffd {
+        register_missing_with(base, len, userfaultfd::FeatureFlags::empty())
+    }
+
+    /// [`register_missing`] on a userfaultfd that also asked the kernel for `features`.
+    /// Firecracker asks for `EVENT_REMOVE` when the clone has a balloon:
+    /// `madvise(MADV_DONTNEED)` on the range then queues a REMOVE event and blocks until the
+    /// handler reads it.
+    fn register_missing_with(base: usize, len: usize, features: userfaultfd::FeatureFlags) -> Uffd {
         let uffd = userfaultfd::UffdBuilder::new()
             .close_on_exec(true)
             .non_blocking(true)
             .user_mode_only(true)
+            .require_features(features)
             .create()
             .expect("creating userfaultfd (via /dev/userfaultfd)");
         uffd.register(base as *mut std::ffi::c_void, len)
@@ -719,6 +747,97 @@ mod tests {
 
         // SAFETY: unmapping our own mapping.
         unsafe { libc::munmap(base as *mut std::ffi::c_void, PAGE) };
+    }
+
+    /// The crate reports every `UFFDIO_COPY` that failed with `EAGAIN` as `PartiallyCopied`,
+    /// carrying the ioctl's `copy` field cast to `usize`. With nothing copied the kernel
+    /// leaves `-EAGAIN` there (6.15 and later) or does not write the field at all, so the
+    /// crate's initial 0 comes back (earlier kernels). Both are an errno, and only a positive
+    /// field is a byte count. Issue #961: the wrapped `-EAGAIN` was read as progress.
+    #[test]
+    fn errno_of_reads_a_copy_that_made_no_progress_as_eagain() {
+        let negated = userfaultfd::Error::PartiallyCopied(-(libc::EAGAIN as isize) as usize);
+        assert_eq!(
+            errno_of(&negated),
+            Some(libc::EAGAIN),
+            "the copy field holds -EAGAIN; it is an errno, not a byte count"
+        );
+        assert_eq!(
+            errno_of(&userfaultfd::Error::PartiallyCopied(0)),
+            Some(libc::EAGAIN),
+            "a copy field the kernel never wrote is the same EAGAIN with no progress"
+        );
+        assert_eq!(
+            errno_of(&userfaultfd::Error::PartiallyCopied(PAGE)),
+            None,
+            "a positive copy field is progress for the caller to count, not an error"
+        );
+    }
+
+    /// Issue #961, replay half. While a REMOVE event is unread the context's `mmap_changing`
+    /// stays raised, and the kernel answers every `UFFDIO_COPY` with `EAGAIN` and no
+    /// progress. That is a refusal: the replay loop drains the queue before its next
+    /// populate. Counted as progress it advanced `done` by the wrapped
+    /// `-EAGAIN`, which overflows in a debug build and reports pages nobody copied in release.
+    #[test]
+    fn populate_chunk_refuses_while_a_remove_event_is_unread() {
+        const PAGES: usize = 4;
+        let len = PAGES * PAGE;
+        let snapshot = vec![0xC3u8; len];
+        let base = guest_memory(len);
+        let uffd = register_missing_with(base, len, userfaultfd::FeatureFlags::EVENT_REMOVE);
+
+        // The balloon. madvise raises mmap_changing, queues the REMOVE and sleeps until the
+        // event is read.
+        let balloon = std::thread::spawn(move || {
+            // SAFETY: advising this test's own live mapping.
+            unsafe { libc::madvise(base as *mut std::ffi::c_void, PAGE, libc::MADV_DONTNEED) }
+        });
+        assert!(
+            wait_for_event(&uffd, 5000),
+            "the REMOVE event never reached the userfaultfd"
+        );
+
+        let segment = Segment {
+            host_addr: base + PAGE,
+            file_offset: PAGE as u64,
+            len: 2 * PAGE,
+        };
+        let populate = || {
+            populate_chunk(
+                &uffd,
+                &Source::Copy(&snapshot),
+                &segment,
+                0,
+                PAGE,
+                "remove-unread",
+            )
+        };
+        let while_unread = populate();
+
+        // Read the event and let madvise return before asserting, so a failure here cannot
+        // leave the balloon thread asleep in the kernel.
+        let event = uffd.read_event().expect("reading the REMOVE event");
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        assert!(
+            matches!(event, Some(userfaultfd::Event::Remove { .. })),
+            "expected the queued REMOVE, got {event:?}"
+        );
+
+        assert_eq!(
+            while_unread,
+            Err(Stop::Refused),
+            "UFFDIO_COPY copied nothing while the REMOVE event was unread; that is a \
+             refusal, never a byte count"
+        );
+
+        // Control: the unread event was the only thing in the way. With it read and madvise
+        // returned, the same chunk populates and carries the snapshot's bytes.
+        assert_eq!(populate(), Ok(2 * PAGE));
+        assert_eq!(read_u8(base + PAGE), 0xC3);
+
+        // SAFETY: unmapping our own mapping.
+        unsafe { libc::munmap(base as *mut std::ffi::c_void, len) };
     }
 
     /// A page in the recorded set is resident with the right contents and produces NO fault
