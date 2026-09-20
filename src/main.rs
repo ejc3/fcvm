@@ -57,6 +57,10 @@ async fn run() -> Result<()> {
     // Parse CLI arguments
     let cli = cli::Cli::parse();
 
+    // A value of FCVM_FIRECRACKER_LOG_LEVEL that names no level stops the command here, before
+    // it prepares a disk or a namespace for a VM that could not start.
+    fcvm::firecracker::check_log_level_env()?;
+
     // Initialize paths - some commands don't need config
     match &cli.cmd {
         Commands::Setup(_) => {

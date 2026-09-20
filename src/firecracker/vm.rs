@@ -58,6 +58,13 @@ fn firecracker_log_level(requested: Option<&str>) -> Result<&'static str> {
         })
 }
 
+/// Fails when `FCVM_FIRECRACKER_LOG_LEVEL` names no Firecracker log level. `main` calls this
+/// before a command prepares anything, and [`VmManager::start`] checks again for callers of the
+/// library.
+pub fn check_log_level_env() -> Result<()> {
+    firecracker_log_level(std::env::var(FIRECRACKER_LOG_LEVEL_ENV).ok().as_deref()).map(|_| ())
+}
+
 /// Connection probe boundary for the API-socket readiness state machine.
 ///
 /// Production uses Tokio's Unix stream. Tests provide exact NotFound,
