@@ -14,14 +14,10 @@ on:
         description: 'Force rebuild even if release exists'
         type: boolean
         default: false
-  schedule:
-    # Weekly, for verify-releases alone. The build jobs skip this event.
-    - cron: '23 5 * * 1'
 
-# Cancel in-progress runs when a new revision is pushed. The weekly check gets
-# a group of its own, so it cannot cancel a build running on main.
+# Cancel in-progress runs when a new revision is pushed
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && '-verify' || '' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -32,8 +28,6 @@ env:
 jobs:
   build-default-kernel:
     name: Build Default Kernel (${{ matrix.config_arch }})
-    # The weekly schedule is for verify-releases; nothing builds on it.
-    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -156,7 +150,10 @@ jobs:
             gh release delete "$TAG" --yes
           fi
 
-          gh release create "$TAG" \
+          # The tag is created at the commit that was built, so checking it out
+          # gives the inputs it names. Without --target it lands on the default
+          # branch's head.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
             --title "Default Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "Default fcvm guest kernel with FUSE and snapshot-safe selective socket cleanup support.
 
@@ -178,8 +175,6 @@ jobs:
 
   build-nested-kernel:
     name: Build Nested Kernel (${{ matrix.config_arch }})
-    # The weekly schedule is for verify-releases; nothing builds on it.
-    if: github.event_name != 'schedule'
     # One leg per architecture table the nested profile defines in
     # rootfs-config.toml, for the reason given on build-btrfs-kernel: setup
     # downloads the release named for the host it runs on, and
@@ -432,8 +427,9 @@ jobs:
             gh release delete "$TAG" --yes 2>/dev/null || true
           fi
 
-          # Create release with kernel binary
-          gh release create "$TAG" \
+          # Create the release, and its tag at the commit that was built; see
+          # build-default-kernel.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
             --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "$NOTES" \
             "/tmp/$FILENAME"
@@ -455,8 +451,6 @@ jobs:
 
   build-btrfs-kernel:
     name: Build Btrfs Kernel (${{ matrix.config_arch }})
-    # The weekly schedule is for verify-releases; nothing builds on it.
-    if: github.event_name != 'schedule'
     # One leg per architecture table the btrfs profile defines in
     # rootfs-config.toml. `fcvm setup --kernel-profile btrfs` downloads the
     # release named for the host it runs on, so an architecture with a table
@@ -621,8 +615,9 @@ jobs:
             gh release delete "$TAG" --yes 2>/dev/null || true
           fi
 
-          # Create release with kernel binary
-          gh release create "$TAG" \
+          # Create the release, and its tag at the commit that was built; see
+          # build-default-kernel.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
             --title "Btrfs Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "Kernel with FUSE and btrfs support for efficient container storage.
 
@@ -675,10 +670,12 @@ jobs:
     # Every automated consumer passes --build-kernels, so a release that is
     # missing becomes a silent local build and nobody sees the 404. That is how
     # the x86_64 btrfs and nested kernels stayed unpublished. This asks for each
-    # asset `fcvm setup` downloads: after the build jobs of the same run,
-    # whatever they concluded, weekly, and on a manual run.
+    # asset `fcvm setup` downloads, after the build jobs of the same run whatever
+    # they concluded. A cancelled run is left alone: its legs may not have
+    # published yet, and a red check there would only report the cancellation.
+    # verify-kernel-releases.yml runs the same check weekly.
     needs: [build-default-kernel, build-nested-kernel, build-btrfs-kernel]
-    if: always()
+    if: ${{ !cancelled() }}
     runs-on: ubuntu-latest
     # Six HEAD requests after a checkout. 10 is generous; GitHub's default is six hours.
     timeout-minutes: 10

@@ -325,8 +325,9 @@ build_inputs = [
 
 kernel_config = "kernel/btrfs.conf"
 # The FUSE patches: remap_file_range, which the release notes advertise, and the
-# utimensat fix. An omitted patches_dir applies this same directory by default;
-# naming it keeps the table saying what the build does.
+# utimensat fix. Keep this line. The build applies kernel/patches when it is
+# omitted, but scripts/kernel-patch.sh falls back to kernel/patches-arm64 on
+# arm64, so `make kernel-patch-validate PROFILE=btrfs` would check other patches.
 patches_dir = "kernel/patches"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
@@ -347,8 +348,9 @@ build_inputs = [
 
 kernel_config = "kernel/btrfs-x86.conf"
 # The FUSE patches: remap_file_range, which the release notes advertise, and the
-# utimensat fix. An omitted patches_dir applies this same directory by default;
-# naming it keeps the table saying what the build does.
+# utimensat fix. Keep this line. The build applies kernel/patches when it is
+# omitted, but scripts/kernel-patch.sh falls back to kernel/patches-arm64 on
+# arm64, so `make kernel-patch-validate PROFILE=btrfs` would check other patches.
 patches_dir = "kernel/patches"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"

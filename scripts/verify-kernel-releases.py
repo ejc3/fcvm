@@ -14,6 +14,7 @@ Exit status: 0 when every asset is there, 1 when at least one is missing, 2 when
 it could not check, which is never reported as missing or as present.
 """
 
+import http.client
 import importlib.util
 import pathlib
 import sys
@@ -38,8 +39,10 @@ LEGS = [
     ("btrfs", "amd64"),
 ]
 
-# GitHub answers a release download with a redirect to the asset's storage.
-FOUND = {200, 301, 302, 303, 307, 308}
+# GitHub answers a release download with a 302 to the asset's storage. No other
+# redirect is an answer about the asset: a renamed or transferred repository
+# answers 301 for every path under its old name, present or not.
+FOUND = {200, 302}
 ATTEMPTS = 2
 
 
@@ -72,14 +75,17 @@ def probe(url):
                 status = response.status
         except urllib.error.HTTPError as error:
             status = error.code
-        except (urllib.error.URLError, OSError) as error:
-            reason = f"request failed: {error}"
+        except (urllib.error.URLError, http.client.HTTPException, OSError) as error:
+            reason = f"request failed: {type(error).__name__}: {error}"
             continue
         if status in FOUND:
             return "present"
         if status == 404:
             return "missing"
         reason = f"unexpected HTTP status {status}"
+        if status < 500:
+            # Asking again gets the same answer.
+            break
     return reason
 
 
@@ -91,6 +97,12 @@ def main(argv):
     base_url = "https://github.com"
     if len(arguments) == 2 and arguments[0] == "--base-url":
         base_url = arguments[1].rstrip("/")
+        if not base_url.startswith(("http://", "https://")):
+            print(
+                f"ERROR: --base-url must be an http or https URL, got '{base_url}'",
+                file=sys.stderr,
+            )
+            return 2
     elif arguments:
         print(__doc__.split("\n\n")[1], file=sys.stderr)
         return 2
@@ -134,5 +146,14 @@ def main(argv):
     return 0
 
 
+def run(argv):
+    """main, with every unforeseen failure reported as "could not check"."""
+    try:
+        return main(argv)
+    except Exception as error:  # pylint: disable=broad-except
+        print(f"ERROR: could not check: {type(error).__name__}: {error}", file=sys.stderr)
+        return 2
+
+
 if __name__ == "__main__":
-    sys.exit(main(sys.argv))
+    sys.exit(run(sys.argv))

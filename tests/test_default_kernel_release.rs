@@ -790,6 +790,11 @@ fn makefile_recipe(target: &str) -> String {
 /// own "built kernel not found" check and copies nothing.
 const UNBUILT_KERNEL: &str = "vmlinux-kernel-workflow-test-never-built.bin";
 
+/// The condition on a job's build step and on its release step: build when the
+/// release is absent or a manual run asks for a replacement, and publish
+/// exactly then.
+const BUILD_OR_FORCE: &str = "steps.check.outputs.exists == 'false' || inputs.force_build == true";
+
 /// A job reaches its build step only after it has decided to build: the release
 /// is absent, or `force_build` asked for a replacement. Either way the artifact
 /// has to come from source in that run. `fcvm setup --build-kernels` returns a
@@ -802,11 +807,12 @@ const UNBUILT_KERNEL: &str = "vmlinux-kernel-workflow-test-never-built.bin";
 /// first and has to build that when its release is absent.
 ///
 /// The nested and btrfs build steps run here for real, with `sudo` replaced by
-/// a function that logs the setup command. The default job hands the build to
-/// `make release-default-kernel`, which forces only under FORCE=1: the recipe
-/// then passes `--force-build-kernels` without `--build-kernels`, and setup
-/// cannot fetch a default kernel that has no release yet without permission to
-/// build it.
+/// a function that logs the setup command. They do not read `force_build`: the
+/// step's `if:` decides whether it runs, and whenever it runs it builds from
+/// source. The default job hands the build to `make release-default-kernel`,
+/// which forces only under FORCE=1: the recipe then passes
+/// `--force-build-kernels` without `--build-kernels`, and setup cannot fetch a
+/// default kernel that has no release yet without permission to build it.
 #[test]
 fn a_kernel_build_step_always_builds_from_source() {
     let workflow = kernels_workflow();
@@ -814,12 +820,19 @@ fn a_kernel_build_step_always_builds_from_source() {
     let mut ran = 0usize;
     for (name, job) in kernel_build_jobs(&workflow) {
         let (step, profile) = kernel_build_step(name, job);
-        let condition = step["if"].as_str().unwrap_or("");
-        assert!(
-            condition.contains("steps.check.outputs.exists == 'false'")
-                && condition.contains("inputs.force_build == true"),
-            "job `{name}` must build when its release is absent and when force_build asks \
-             for a replacement, and its build step runs on `{condition}`"
+        // Pinned whole: `&&` in place of `||` keeps both clauses and never
+        // builds a release that is merely absent.
+        assert_eq!(
+            step["if"].as_str(),
+            Some(BUILD_OR_FORCE),
+            "job `{name}` must build when its release is absent or force_build asks for a \
+             replacement"
+        );
+        assert_eq!(
+            release_step(name, job)["if"].as_str(),
+            Some(BUILD_OR_FORCE),
+            "job `{name}` must publish exactly when it builds, or a forced rebuild builds a \
+             kernel and never releases it"
         );
         let script = run_script(step);
 
@@ -839,45 +852,41 @@ fn a_kernel_build_step_always_builds_from_source() {
             continue;
         }
 
-        // Whatever force_build says, a step that runs builds from source.
-        for input in ["true", "false", ""] {
-            let run = run_step_script(
-                script,
-                &[("steps.kernel.outputs.filename", UNBUILT_KERNEL)],
-                &logging_stub("sudo", "SUDO"),
-                &[("FORCE_BUILD", input)],
-                scratch.path(),
-            );
-            let setups = run.calls("SUDO");
-            assert_eq!(
-                setups.len(),
-                1,
-                "job `{name}` with force_build={input:?} must run setup once, ran {setups:?}\n{}",
-                run.stderr
-            );
-            let words: Vec<&str> = setups[0].split_whitespace().collect();
-            assert!(
-                words
-                    .windows(2)
-                    .any(|pair| pair == ["--kernel-profile", profile.as_str()]),
-                "job `{name}` ran `{}`, which does not build `{profile}`",
-                setups[0]
-            );
-            assert!(
-                words.contains(&"--force-build-kernels"),
-                "job `{name}` with force_build={input:?} ran `{}`. Without \
-                 --force-build-kernels setup returns a kernel file already on the runner, or \
-                 downloads the release being replaced, and that becomes the release",
-                setups[0]
-            );
-            assert!(
-                words.contains(&"--build-kernels"),
-                "job `{name}` with force_build={input:?} ran `{}`. Without --build-kernels \
-                 setup cannot build the default kernel it fetches first when that has no \
-                 release yet",
-                setups[0]
-            );
-        }
+        let run = run_step_script(
+            script,
+            &[("steps.kernel.outputs.filename", UNBUILT_KERNEL)],
+            &logging_stub("sudo", "SUDO"),
+            &[],
+            scratch.path(),
+        );
+        let setups = run.calls("SUDO");
+        assert_eq!(
+            setups.len(),
+            1,
+            "job `{name}` must run setup once, ran {setups:?}\n{}",
+            run.stderr
+        );
+        let words: Vec<&str> = setups[0].split_whitespace().collect();
+        assert!(
+            words
+                .windows(2)
+                .any(|pair| pair == ["--kernel-profile", profile.as_str()]),
+            "job `{name}` ran `{}`, which does not build `{profile}`",
+            setups[0]
+        );
+        assert!(
+            words.contains(&"--force-build-kernels"),
+            "job `{name}` ran `{}`. Without --force-build-kernels setup returns a kernel file \
+             already on the runner, or downloads the release being replaced, and that becomes \
+             the release",
+            setups[0]
+        );
+        assert!(
+            words.contains(&"--build-kernels"),
+            "job `{name}` ran `{}`. Without --build-kernels setup cannot build the default \
+             kernel it fetches first when that has no release yet",
+            setups[0]
+        );
         assert!(
             !script.contains("inputs."),
             "job `{name}` interpolates a workflow input into its build script"
@@ -887,6 +896,9 @@ fn a_kernel_build_step_always_builds_from_source() {
     assert_eq!(ran, 2, "expected to run the nested and btrfs build steps");
 }
 
+/// The commit a release step is told it built, in the tests that run one.
+const BUILT_COMMIT: &str = "0123456789abcdef0123456789abcdef01234567";
+
 /// A forced rebuild deletes the published release before it creates the new
 /// one. Anything in the release step that can refuse the leg has to run before
 /// that delete, or the refusal costs the release users are downloading. The
@@ -894,20 +906,21 @@ fn a_kernel_build_step_always_builds_from_source() {
 /// has no notes for only after the delete.
 ///
 /// Every release step runs here for an architecture no job has notes for, with
-/// `gh` replaced by a function that logs its arguments.
+/// `gh` replaced by a function that logs its arguments. A step that publishes
+/// creates its tag at the commit that was built: without `--target` the tag
+/// lands on the default branch's head, whose tree can hash to a different
+/// identity than the one the tag names.
 #[test]
 fn a_release_step_that_refuses_a_leg_has_not_deleted_the_release() {
     let workflow = kernels_workflow();
     let scratch = tempfile::tempdir().unwrap();
+    let tag = "kernel-test-1.2.3-riscv64-0123456789ab";
     let mut refused = 0usize;
     for (name, job) in kernel_build_jobs(&workflow) {
         let run = run_step_script(
             run_script(release_step(name, job)),
             &[
-                (
-                    "steps.kernel.outputs.tag",
-                    "kernel-test-1.2.3-riscv64-0123456789ab",
-                ),
+                ("steps.kernel.outputs.tag", tag),
                 ("steps.kernel.outputs.filename", UNBUILT_KERNEL),
                 ("steps.kernel.outputs.version", "1.2.3"),
                 ("steps.kernel.outputs.sha", "0123456789ab"),
@@ -916,7 +929,11 @@ fn a_release_step_that_refuses_a_leg_has_not_deleted_the_release() {
                 ("inputs.force_build", "true"),
             ],
             &logging_stub("gh", "GH"),
-            &[("CONFIG_ARCH", "riscv64"), ("GH_TOKEN", "unused")],
+            &[
+                ("CONFIG_ARCH", "riscv64"),
+                ("GH_TOKEN", "unused"),
+                ("GITHUB_SHA", BUILT_COMMIT),
+            ],
             scratch.path(),
         );
         let calls: Vec<&str> = run
@@ -928,15 +945,31 @@ fn a_release_step_that_refuses_a_leg_has_not_deleted_the_release() {
             // This job's notes do not depend on the architecture.
             assert_eq!(calls.len(), 2, "job `{name}` ran {calls:?}");
             assert!(
-                calls[0].starts_with("release delete ") && calls[1].starts_with("release create "),
+                calls[0].starts_with("release delete "),
                 "job `{name}` ran {calls:?}"
             );
+            assert!(
+                calls[1].starts_with(&format!("release create {tag} --target {BUILT_COMMIT} ")),
+                "job `{name}` does not create its tag at the commit it built: `{}`",
+                calls[1]
+            );
         } else {
+            assert_eq!(
+                run.code,
+                Some(1),
+                "job `{name}` failed some other way than refusing the leg:\n{}\n{}",
+                run.stdout,
+                run.stderr
+            );
+            assert!(
+                run.stdout.contains("unsupported config arch riscv64"),
+                "job `{name}` exited 1 without saying it refused the architecture:\n{}",
+                run.stdout
+            );
             assert!(
                 calls.is_empty(),
-                "job `{name}` refused the leg (exit {:?}) after running {calls:?}. On a forced \
-                 rebuild that deletes the published release and publishes nothing in its place",
-                run.code
+                "job `{name}` refused the leg after running {calls:?}. On a forced rebuild that \
+                 deletes the published release and publishes nothing in its place"
             );
             refused += 1;
         }
@@ -1223,16 +1256,14 @@ fn a_failing_identity_helper_fails_the_step_and_publishes_nothing() {
     }
 }
 
-/// A throwaway checkout: the identity script, a rootfs-config.toml holding
-/// `tables`, and `files`.
+/// A throwaway checkout: the identity script and the release check, a
+/// rootfs-config.toml holding `tables`, and `files`.
 fn identity_fixture(tables: &str, files: &[(&str, &str)]) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("scripts")).unwrap();
-    std::fs::copy(
-        repo_root().join(IDENTITY_SCRIPT),
-        dir.path().join(IDENTITY_SCRIPT),
-    )
-    .unwrap();
+    for script in [IDENTITY_SCRIPT, VERIFY_SCRIPT] {
+        std::fs::copy(repo_root().join(script), dir.path().join(script)).unwrap();
+    }
     std::fs::write(dir.path().join("rootfs-config.toml"), tables).unwrap();
     for (relative, contents) in files {
         let path = dir.path().join(relative);
@@ -1338,6 +1369,18 @@ kernel_repo = "example/kernels"
     }
 }
 
+/// The script refused: a non-zero exit, a message, and nothing on stdout for a
+/// step to publish.
+fn assert_refused(what: &str, run: StepRun) {
+    assert_ne!(run.code, Some(0), "{what}: accepted\n{}", run.stdout);
+    assert_eq!(run.stdout, "", "{what}: printed an identity while failing");
+    assert!(
+        run.stderr.contains("ERROR"),
+        "{what}: no error message:\n{}",
+        run.stderr
+    );
+}
+
 /// Whatever the client refuses, the script must refuse too, with nothing on
 /// stdout for a step to publish. It also refuses what only a release job can
 /// get wrong: a table that is not a source release, and a runner of the wrong
@@ -1387,9 +1430,16 @@ build_inputs = ["inputs/a.conf"]
 description = "runtime settings only"
 "#
     );
+    // `inputs/sub/b.conf` is what `inputs/**/*.conf` matches when `**` is read as
+    // `*`, the way Python's glob reads it without `recursive`. With the file in
+    // place, only the script's own refusal of `**` can fail that table.
     let fixture = identity_fixture(
         &tables,
-        &[("inputs/a.conf", "a\n"), ("inputs/off.disabled", "off\n")],
+        &[
+            ("inputs/a.conf", "a\n"),
+            ("inputs/off.disabled", "off\n"),
+            ("inputs/sub/b.conf", "b\n"),
+        ],
     );
     let config: toml::Value = toml::from_str(&tables).unwrap();
 
@@ -1398,15 +1448,7 @@ description = "runtime settings only"
     assert_eq!(run.code, Some(0), "the control failed:\n{}", run.stderr);
     assert_eq!(identity_lines(&run.stdout)["sha"], pinned);
 
-    let refused = |what: &str, run: StepRun| {
-        assert_ne!(run.code, Some(0), "{what}: accepted\n{}", run.stdout);
-        assert_eq!(run.stdout, "", "{what}: printed an identity while failing");
-        assert!(
-            run.stderr.contains("ERROR"),
-            "{what}: no error message:\n{}",
-            run.stderr
-        );
-    };
+    let refused = assert_refused;
     for name in ["stale", "malformed", "unmatched", "alldisabled"] {
         assert!(
             compute_profile_kernel_sha_at_root(
@@ -1446,6 +1488,47 @@ description = "runtime settings only"
     );
 }
 
+/// An installed binary has no `kernel/` tree to hash, so it finds the default
+/// release only through the table's `kernel_sha`. The default job's own step
+/// failed on a table without one, and the shared script has to as well. Only
+/// the default profile: the nested and btrfs tables carry no `kernel_sha`.
+#[test]
+fn a_default_table_without_kernel_sha_is_refused() {
+    let arch = host_config_arch();
+    let machine = runtime_arch_of(arch);
+    let source = "kernel_version = \"1.2.3\"\nkernel_repo = \"example/kernels\"\n\
+                  build_inputs = [\"inputs/a.conf\"]";
+    let files = [("inputs/a.conf", "a\n")];
+
+    let bare = identity_fixture(
+        &format!(
+            "[kernel_profiles.default.{arch}]\n{source}\n\n\
+             [kernel_profiles.other.{arch}]\n{source}\n"
+        ),
+        &files,
+    );
+    let run = run_identity_script(bare.path(), "default", arch, machine);
+    let said = run.stderr.clone();
+    assert_refused("a default table with no kernel_sha", run);
+    assert!(
+        said.contains("kernel_sha"),
+        "refused for some other reason:\n{said}"
+    );
+    let run = run_identity_script(bare.path(), "other", arch, machine);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+
+    // The control: the same default table with its kernel_sha publishes.
+    let pinned = identity_fixture(
+        &format!(
+            "[kernel_profiles.default.{arch}]\n{source}\nkernel_sha = \"{}\"\n",
+            sha256_short(b"a\n")
+        ),
+        &files,
+    );
+    let run = run_identity_script(pinned.path(), "default", arch, machine);
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+}
+
 /// The patch files a VM kernel build applies from `dir`. The generated build
 /// script loops over `"$PATCHES_DIR"/*.patch`, and a shell glob skips
 /// dot-prefixed names.
@@ -1462,6 +1545,35 @@ fn applied_patches(root: &Path, dir: &str) -> Vec<PathBuf> {
     patches
 }
 
+/// Every source-built table in rootfs-config.toml, as `(profile, arch, table)`.
+fn source_built_tables(config: &toml::Value) -> Vec<(String, String, KernelProfile)> {
+    let mut tables = Vec::new();
+    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
+        for arch in arches.as_table().unwrap().keys() {
+            let profile = kernel_profile_table(config, profile_name, arch);
+            if profile.is_custom() && !profile.is_url_based() {
+                tables.push((profile_name.clone(), arch.clone(), profile));
+            }
+        }
+    }
+    tables
+}
+
+/// The files a table's `build_inputs` hash: each glob expanded and `*.disabled`
+/// left out, as the client does.
+fn hashed_build_inputs(root: &Path, profile: &KernelProfile) -> BTreeSet<PathBuf> {
+    let mut hashed = BTreeSet::new();
+    for pattern in &profile.build_inputs {
+        let pattern = root.join(pattern).to_string_lossy().into_owned();
+        for path in glob::glob(&pattern).unwrap().filter_map(Result::ok) {
+            if !path.to_string_lossy().ends_with(".disabled") {
+                hashed.insert(path);
+            }
+        }
+    }
+    hashed
+}
+
 /// A kernel's tag is the hash of its table's `build_inputs`, and the release
 /// check skips the build when that tag already has a release. So every patch a
 /// build applies has to be one of those inputs. Both btrfs tables omitted
@@ -1472,41 +1584,26 @@ fn applied_patches(root: &Path, dir: &str) -> Vec<PathBuf> {
 #[test]
 fn every_patch_a_build_applies_is_part_of_what_its_tag_hashes() {
     let root = repo_root();
-    let config = rootfs_config();
     let mut unhashed = Vec::new();
     let mut tables_with_patches = 0usize;
-    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
-        for arch in arches.as_table().unwrap().keys() {
-            let profile = kernel_profile_table(&config, profile_name, arch);
-            if !profile.is_custom() || profile.is_url_based() {
-                continue;
-            }
-            let Some(dir) = vm_kernel_patches_dir(&profile) else {
-                continue;
-            };
-            let applied = applied_patches(&root, dir);
-            assert!(
-                !applied.is_empty(),
-                "{profile_name}.{arch} applies `{dir}`, which holds no patch"
-            );
-            tables_with_patches += 1;
+    for (profile_name, arch, profile) in source_built_tables(&rootfs_config()) {
+        let Some(dir) = vm_kernel_patches_dir(&profile) else {
+            continue;
+        };
+        let applied = applied_patches(&root, dir);
+        assert!(
+            !applied.is_empty(),
+            "{profile_name}.{arch} applies `{dir}`, which holds no patch"
+        );
+        tables_with_patches += 1;
 
-            let mut hashed = BTreeSet::new();
-            for pattern in &profile.build_inputs {
-                let pattern = root.join(pattern).to_string_lossy().into_owned();
-                for path in glob::glob(&pattern).unwrap().filter_map(Result::ok) {
-                    if !path.to_string_lossy().ends_with(".disabled") {
-                        hashed.insert(path);
-                    }
-                }
-            }
-            for patch in applied {
-                if !hashed.contains(&patch) {
-                    unhashed.push(format!(
-                        "{profile_name}.{arch}: {}",
-                        patch.strip_prefix(&root).unwrap().display()
-                    ));
-                }
+        let hashed = hashed_build_inputs(&root, &profile);
+        for patch in applied {
+            if !hashed.contains(&patch) {
+                unhashed.push(format!(
+                    "{profile_name}.{arch}: {}",
+                    patch.strip_prefix(&root).unwrap().display()
+                ));
             }
         }
     }
@@ -1521,6 +1618,67 @@ fn every_patch_a_build_applies_is_part_of_what_its_tag_hashes() {
          editing one leaves the kernel's tag unchanged and the release check skips the \
          rebuild:\n  {}",
         unhashed.join("\n  ")
+    );
+}
+
+/// The config fragment is a build input the same way: the build applies it, so
+/// the tag has to change when it does.
+#[test]
+fn every_kernel_config_is_part_of_what_its_tag_hashes() {
+    let root = repo_root();
+    let mut checked = 0usize;
+    for (profile_name, arch, profile) in source_built_tables(&rootfs_config()) {
+        let Some(fragment) = profile
+            .kernel_config
+            .as_deref()
+            .filter(|fragment| !fragment.is_empty())
+        else {
+            continue;
+        };
+        checked += 1;
+        assert!(
+            hashed_build_inputs(&root, &profile).contains(&root.join(fragment)),
+            "{profile_name}.{arch} builds with `{fragment}` and its build_inputs does not list \
+             it, so editing the fragment leaves the kernel's tag unchanged"
+        );
+    }
+    assert!(
+        checked >= 6,
+        "expected the default, nested and btrfs tables at least to name a kernel_config, \
+         found {checked}"
+    );
+}
+
+/// Two tools read a table's `patches_dir`, and they read an omitted one
+/// differently. The build applies `kernel/patches` (`vm_kernel_patches_dir`);
+/// scripts/kernel-patch.sh falls back to `kernel/patches-arm64` on arm64. A
+/// table that names its directory, or names none with an empty string, gives
+/// both the same answer, so `make kernel-patch-validate` checks the patches the
+/// build applies.
+#[test]
+fn every_source_built_table_names_its_patches_dir() {
+    let tables = source_built_tables(&rootfs_config());
+    assert!(
+        tables.len() >= 6,
+        "expected the default, nested and btrfs tables at least, found {}",
+        tables.len()
+    );
+    let omitted: Vec<String> = tables
+        .iter()
+        .filter(|(_, _, profile)| profile.patches_dir.is_none())
+        .map(|(profile_name, arch, _)| format!("{profile_name}.{arch}"))
+        .collect();
+    assert!(
+        omitted.is_empty(),
+        "these tables omit patches_dir, which the build and scripts/kernel-patch.sh resolve \
+         differently: {omitted:?}"
+    );
+    // The script's fallback is why an omission matters. If it goes, so can this rule.
+    let script = std::fs::read_to_string(repo_root().join("scripts/kernel-patch.sh")).unwrap();
+    assert!(
+        script.contains("kernel/patches-arm64"),
+        "scripts/kernel-patch.sh no longer falls back to kernel/patches-arm64, so the premise \
+         of this test is gone"
     );
 }
 
@@ -1552,14 +1710,20 @@ fn the_x86_64_nested_notes_say_the_outer_vm_must_cold_boot() {
             ("inputs.force_build", "false"),
         ],
         &logging_stub("gh", "GH"),
-        &[("CONFIG_ARCH", "amd64"), ("GH_TOKEN", "unused")],
+        &[
+            ("CONFIG_ARCH", "amd64"),
+            ("GH_TOKEN", "unused"),
+            ("GITHUB_SHA", BUILT_COMMIT),
+        ],
         scratch.path(),
     );
     assert_eq!(run.code, Some(0), "{}", run.stderr);
     let notes = run.stdout;
     assert!(
-        notes.contains("GH release create "),
-        "the release step created no release:\n{notes}"
+        notes.contains(&format!(
+            "GH release create kernel-nested-1.2.3-x86_64-0123456789ab --target {BUILT_COMMIT} "
+        )),
+        "the release step did not create the release at the commit it built:\n{notes}"
     );
     for required in ["--no-snapshot", "#664"] {
         assert!(
@@ -1661,6 +1825,12 @@ fn every_kernel_leg_has_its_profile_table() {
 
 const VERIFY_SCRIPT: &str = "scripts/verify-kernel-releases.py";
 
+/// The workflow that runs the release check weekly.
+const WEEKLY_CHECK: &str = "verify-kernel-releases.yml";
+
+/// What the release check prints only when every asset is there.
+const PUBLISHED_LINE: &str = "kernel release assets are published";
+
 /// #949 went unnoticed because nothing asks whether a published release
 /// exists: every automated consumer passes `--build-kernels`, so a 404 becomes
 /// a silent local build. The release check has to cover exactly the legs the
@@ -1693,11 +1863,160 @@ fn the_release_check_covers_every_leg_the_workflow_publishes() {
     );
 }
 
-/// The check runs where a missing release can be seen: after the build jobs of
-/// the same run whatever they concluded, weekly, and on a manual run. The
-/// weekly run must not start six builds.
+/// Every workflow file, by file name.
+fn all_workflows() -> Vec<(String, YamlValue)> {
+    let dir = repo_root().join(".github/workflows");
+    let mut workflows = Vec::new();
+    for entry in std::fs::read_dir(&dir).unwrap() {
+        let path = entry.unwrap().path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let file = path.file_name().unwrap().to_string_lossy().into_owned();
+        let workflow = serde_norway::from_str(&std::fs::read_to_string(&path).unwrap())
+            .unwrap_or_else(|error| panic!("{file} is not valid YAML: {error}"));
+        workflows.push((file, workflow));
+    }
+    workflows.sort_by(|left, right| left.0.cmp(&right.0));
+    workflows
+}
+
+/// A workflow's `on:` block. YAML 1.1 reads a bare `on` as boolean true and
+/// YAML 1.2 keeps the string.
+fn workflow_triggers<'a>(file: &str, workflow: &'a YamlValue) -> &'a YamlValue {
+    workflow
+        .get("on")
+        .or_else(|| workflow.get(YamlValue::Bool(true)))
+        .unwrap_or_else(|| panic!("{file} has no `on:` block"))
+}
+
+/// The events a workflow starts on. `on:` may be one event, a list of events,
+/// or a mapping keyed by event.
+fn trigger_events(file: &str, workflow: &YamlValue) -> BTreeSet<String> {
+    match workflow_triggers(file, workflow) {
+        YamlValue::String(event) => BTreeSet::from([event.clone()]),
+        YamlValue::Sequence(events) => events
+            .iter()
+            .map(|event| event.as_str().expect("an event name").to_string())
+            .collect(),
+        YamlValue::Mapping(events) => events
+            .keys()
+            .map(|event| event.as_str().expect("an event name").to_string())
+            .collect(),
+        other => panic!("{file}: `on:` is neither an event, a list nor a mapping: {other:?}"),
+    }
+}
+
+/// A `workflow_run` consumer starts on every completed run of the workflow it
+/// names, whatever event began that run, unless it filters the event itself.
+/// ci.yml and build-runner-ami.yml name "Build Kernels" and filter nothing. The
+/// weekly release check was a schedule trigger on that workflow, so every
+/// Monday a run that only asks six URLs would have started the full
+/// self-hosted CI matrix and queued a runner AMI build, and both consumers
+/// cancel what is already running on main.
+///
+/// So a workflow that a consumer names runs on no schedule. Work that needs one
+/// gets a workflow name of its own.
 #[test]
-fn the_release_check_runs_after_the_builds_weekly_and_on_demand() {
+fn no_workflow_run_consumer_names_a_workflow_that_runs_on_a_schedule() {
+    let workflows = all_workflows();
+    let mut edges = 0usize;
+    let mut scheduled = Vec::new();
+    for (consumer_file, consumer) in &workflows {
+        let sources = workflow_triggers(consumer_file, consumer)
+            .get("workflow_run")
+            .and_then(|trigger| trigger.get("workflows"))
+            .and_then(YamlValue::as_sequence);
+        let Some(sources) = sources else { continue };
+        for source in sources {
+            let source = source.as_str().expect("a workflow name");
+            let named: Vec<&(String, YamlValue)> = workflows
+                .iter()
+                .filter(|(_, workflow)| workflow["name"].as_str() == Some(source))
+                .collect();
+            assert_eq!(
+                named.len(),
+                1,
+                "{consumer_file} starts on runs of `{source}`, and {} workflow files carry \
+                 that name",
+                named.len()
+            );
+            edges += 1;
+            let (source_file, source_workflow) = named[0];
+            if trigger_events(source_file, source_workflow).contains("schedule") {
+                scheduled.push(format!(
+                    "{consumer_file} starts on every completed run of `{source}`, and \
+                     {source_file} runs on a schedule"
+                ));
+            }
+        }
+    }
+    assert!(
+        edges >= 3,
+        "expected at least three workflows that start on another workflow's runs, two on \
+         Build Kernels and one on CI, found {edges} such edges"
+    );
+    assert!(
+        scheduled.is_empty(),
+        "a scheduled run completes like any other, so its consumers start every time the \
+         schedule fires. Give the scheduled work a workflow name of its own:\n  {}",
+        scheduled.join("\n  ")
+    );
+}
+
+/// A job that runs the release check and cannot be skipped or silenced: a
+/// hosted runner, a timeout, read-only permissions, the script as a command,
+/// and nothing that lets a failure pass.
+fn assert_runs_the_release_check(file: &str, name: &str, job: &YamlValue) {
+    assert_eq!(
+        job["runs-on"].as_str(),
+        Some("ubuntu-latest"),
+        "{file}: `{name}` needs no self-hosted runner"
+    );
+    let minutes = job["timeout-minutes"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{file}: `{name}` sets no timeout-minutes"));
+    assert!(
+        (1..=30).contains(&minutes),
+        "{file}: `{name}` allows {minutes} minutes for six requests"
+    );
+    let permissions = job["permissions"]
+        .as_mapping()
+        .unwrap_or_else(|| panic!("{file}: `{name}` does not limit its token"));
+    assert!(
+        permissions.len() == 1 && job["permissions"]["contents"].as_str() == Some("read"),
+        "{file}: `{name}` needs `contents: read` and nothing else, has {permissions:?}"
+    );
+    assert!(
+        job.get("continue-on-error").is_none(),
+        "{file}: `{name}` sets continue-on-error, so a missing release would not fail the run"
+    );
+    let steps = job_steps(name, job);
+    for step in steps {
+        assert!(
+            step.get("if").is_none() && step.get("continue-on-error").is_none(),
+            "{file}: a step of `{name}` carries `if:` or continue-on-error, which can skip or \
+             silence the check: {step:?}"
+        );
+    }
+    assert!(
+        steps
+            .iter()
+            .flat_map(|step| command_lines(run_script(step)))
+            .any(|words| words == ["python3", VERIFY_SCRIPT]),
+        "{file}: `{name}` does not run {VERIFY_SCRIPT}"
+    );
+}
+
+/// The check runs after the build jobs of every Build Kernels run, whatever
+/// they concluded. It does not run on a cancelled run: the concurrency group
+/// cancels a run that a newer push supersedes, its legs may not have published
+/// yet, and a red check there would only report the cancellation.
+#[test]
+fn the_release_check_runs_after_the_builds_of_every_build_kernels_run() {
     let workflow = kernels_workflow();
     let job = &workflow["jobs"]["verify-releases"];
     assert!(job.is_mapping(), "kernels.yml has no verify-releases job");
@@ -1718,47 +2037,76 @@ fn the_release_check_runs_after_the_builds_weekly_and_on_demand() {
     );
     assert_eq!(
         job["if"].as_str(),
-        Some("always()"),
-        "verify-releases must run when a build job failed or was skipped"
+        Some("${{ !cancelled() }}"),
+        "verify-releases must run when a build job failed or was skipped, and not on a \
+         cancelled run"
     );
-    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
-    assert!(
-        job_steps("verify-releases", job)
-            .iter()
-            .flat_map(|step| command_lines(run_script(step)))
-            .any(|words| words == ["python3", VERIFY_SCRIPT]),
-        "verify-releases does not run {VERIFY_SCRIPT}"
-    );
+    assert_runs_the_release_check("kernels.yml", "verify-releases", job);
 
-    // YAML 1.1 reads a bare `on` as boolean true and YAML 1.2 keeps the string.
-    let triggers = workflow
-        .get("on")
-        .or_else(|| workflow.get(YamlValue::Bool(true)))
-        .expect("kernels.yml has no `on:` block");
+    let events = trigger_events("kernels.yml", &workflow);
     assert!(
-        triggers["schedule"]
-            .as_sequence()
-            .is_some_and(|entries| entries.len() == 1 && entries[0]["cron"].as_str().is_some()),
-        "kernels.yml has no weekly schedule"
-    );
-    assert!(
-        triggers
-            .as_mapping()
-            .is_some_and(|map| map.contains_key(YamlValue::from("workflow_dispatch"))),
+        events.contains("workflow_dispatch"),
         "kernels.yml cannot be run by hand"
     );
-    for (name, build) in kernel_build_jobs(&workflow) {
-        assert_eq!(
-            build["if"].as_str(),
-            Some("github.event_name != 'schedule'"),
-            "job `{name}` would build on the weekly schedule"
-        );
-    }
+    assert!(
+        !events.contains("schedule"),
+        "kernels.yml runs on a schedule. ci.yml and build-runner-ami.yml start on every \
+         completed Build Kernels run on main; the weekly check belongs in {WEEKLY_CHECK}"
+    );
 }
 
-/// A local stand-in for the release host: a redirect for the paths in `found`,
-/// a server error for those in `broken`, not found for the rest.
-fn release_host(found: BTreeSet<String>, broken: BTreeSet<String>) -> String {
+/// The weekly run of the same check, in a workflow no `workflow_run` consumer
+/// names (`no_workflow_run_consumer_names_a_workflow_that_runs_on_a_schedule`).
+#[test]
+fn the_weekly_release_check_is_a_workflow_of_its_own() {
+    let path = repo_root().join(".github/workflows").join(WEEKLY_CHECK);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    let workflow: YamlValue = serde_norway::from_str(&text).unwrap();
+    assert_ne!(
+        workflow["name"].as_str(),
+        kernels_workflow()["name"].as_str(),
+        "{WEEKLY_CHECK} must not share the name the workflow_run consumers listen for"
+    );
+    assert_eq!(
+        trigger_events(WEEKLY_CHECK, &workflow),
+        BTreeSet::from(["schedule".to_string(), "workflow_dispatch".to_string()]),
+        "{WEEKLY_CHECK} runs weekly and by hand, and on nothing else"
+    );
+    let crons = workflow_triggers(WEEKLY_CHECK, &workflow)["schedule"]
+        .as_sequence()
+        .expect("a schedule");
+    assert!(
+        crons.len() == 1 && crons[0]["cron"].as_str().is_some(),
+        "{WEEKLY_CHECK} needs exactly one cron entry, has {crons:?}"
+    );
+
+    let jobs = workflow_jobs(&workflow);
+    assert_eq!(jobs.len(), 1, "{WEEKLY_CHECK} has one job");
+    let (name, job) = jobs[0];
+    assert!(
+        job.get("if").is_none() && job.get("needs").is_none(),
+        "{WEEKLY_CHECK}: `{name}` must run every time the workflow does"
+    );
+    assert_runs_the_release_check(WEEKLY_CHECK, name, job);
+}
+
+/// One whole HTTP response with no body.
+fn http_answer(status: &str, headers: &str) -> String {
+    format!("HTTP/1.1 {status}\r\n{headers}Content-Length: 0\r\nConnection: close\r\n\r\n")
+}
+
+/// What GitHub answers for a release asset that exists.
+fn found_answer() -> String {
+    http_answer(
+        "302 Found",
+        "Location: http://127.0.0.1:1/asset-storage\r\n",
+    )
+}
+
+/// A local stand-in for the release host. It sends `answers[path]` as the whole
+/// response, and "404 Not Found" for any other path.
+fn release_host(answers: BTreeMap<String, String>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -1778,26 +2126,21 @@ fn release_host(found: BTreeSet<String>, broken: BTreeSet<String>) -> String {
                 }
             }
             let path = request.split_whitespace().nth(1).unwrap_or("");
-            let status = if found.contains(path) {
-                "302 Found\r\nLocation: http://127.0.0.1:1/asset"
-            } else if broken.contains(path) {
-                "500 Internal Server Error"
-            } else {
-                "404 Not Found"
-            };
-            let _ = write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-            );
+            let response = answers
+                .get(path)
+                .cloned()
+                .unwrap_or_else(|| http_answer("404 Not Found", ""));
+            let _ = stream.write_all(response.as_bytes());
         }
     });
     format!("http://127.0.0.1:{port}")
 }
 
-fn run_release_check(base_url: &str) -> StepRun {
+/// Run a checkout's release check against `base_url`, with no proxy in the way.
+fn run_release_check_at(root: &Path, base_url: &str) -> StepRun {
     let mut command = Command::new("python3");
     command
-        .arg(repo_root().join(VERIFY_SCRIPT))
+        .arg(root.join(VERIFY_SCRIPT))
         .args(["--base-url", base_url])
         .current_dir("/");
     for proxy in [
@@ -1813,14 +2156,29 @@ fn run_release_check(base_url: &str) -> StepRun {
     StepRun::from_output(command.output().expect("run python3"))
 }
 
-/// The check asks for what the client downloads, names exactly what is
-/// missing, and never reports an asset it could not ask about as missing or as
-/// present. The expected paths come from the client's own functions.
-#[test]
-fn the_release_check_names_what_is_missing_and_fails_closed() {
+fn run_release_check(base_url: &str) -> StepRun {
+    run_release_check_at(&repo_root(), base_url)
+}
+
+/// What the check printed after `prefix` on the lines that start with it.
+fn lines_with(run: &StepRun, prefix: &str) -> Vec<String> {
+    run.stdout
+        .lines()
+        .filter_map(|line| line.strip_prefix(prefix))
+        .map(|rest| rest.trim().to_string())
+        .collect()
+}
+
+/// Each published leg's asset as the check prints it, and the path the client
+/// downloads it from, keyed by `(profile, config arch)`.
+type PublishedAssets = BTreeMap<(String, String), (String, String)>;
+
+/// The published assets of the real config. Names and paths come from the
+/// client's own functions.
+fn published_assets() -> PublishedAssets {
     let root = repo_root();
     let config = rootfs_config();
-    let mut assets: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    let mut assets = BTreeMap::new();
     for (profile_name, config_arch) in published_kernel_legs(&kernels_workflow()) {
         let machine = runtime_arch_of(&config_arch);
         let profile = kernel_profile_table(&config, &profile_name, &config_arch);
@@ -1833,36 +2191,52 @@ fn the_release_check_names_what_is_missing_and_fails_closed() {
         let path = format!("/{}/releases/download/{asset}", profile.kernel_repo);
         assets.insert((profile_name, config_arch), (asset, path));
     }
-    let all: BTreeSet<String> = assets.values().map(|(_, path)| path.clone()).collect();
-    let lines_with = |run: &StepRun, prefix: &str| -> Vec<String> {
-        run.stdout
-            .lines()
-            .filter_map(|line| line.strip_prefix(prefix))
-            .map(|rest| rest.trim().to_string())
-            .collect()
-    };
+    assets
+}
+
+/// A host on which every asset in `assets` exists.
+fn all_found(assets: &PublishedAssets) -> BTreeMap<String, String> {
+    assets
+        .values()
+        .map(|(_, path)| (path.clone(), found_answer()))
+        .collect()
+}
+
+/// The check asks for what the client downloads, names exactly what is
+/// missing, and never reports an asset it could not ask about as missing or as
+/// present.
+#[test]
+fn the_release_check_names_what_is_missing_and_fails_closed() {
+    let assets = published_assets();
 
     // Every asset published.
-    let run = run_release_check(&release_host(all.clone(), BTreeSet::new()));
+    let run = run_release_check(&release_host(all_found(&assets)));
     assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
     assert_eq!(lines_with(&run, "present").len(), assets.len());
+    assert!(run.stdout.contains(PUBLISHED_LINE), "{}", run.stdout);
 
     // One missing: exit 1, and that asset alone is named.
     let (gone_asset, gone_path) = &assets[&("btrfs".to_string(), "amd64".to_string())];
-    let mut found = all.clone();
-    found.remove(gone_path);
-    let run = run_release_check(&release_host(found.clone(), BTreeSet::new()));
+    let mut answers = all_found(&assets);
+    answers.remove(gone_path);
+    let run = run_release_check(&release_host(answers.clone()));
     assert_eq!(run.code, Some(1), "{}\n{}", run.stdout, run.stderr);
     assert_eq!(
         lines_with(&run, "MISSING"),
         std::slice::from_ref(gone_asset)
     );
+    assert!(!run.stdout.contains(PUBLISHED_LINE), "{}", run.stdout);
 
     // One the host cannot answer for: exit 2, and it is not called missing.
-    let run = run_release_check(&release_host(found, BTreeSet::from([gone_path.clone()])));
+    answers.insert(
+        gone_path.clone(),
+        http_answer("500 Internal Server Error", ""),
+    );
+    let run = run_release_check(&release_host(answers));
     assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
     assert!(lines_with(&run, "MISSING").is_empty(), "{}", run.stdout);
     assert_eq!(lines_with(&run, "UNKNOWN").len(), 1, "{}", run.stdout);
+    assert!(!run.stdout.contains(PUBLISHED_LINE), "{}", run.stdout);
 
     // Nothing listening: exit 2, and nothing is called missing or present.
     let closed = {
@@ -1874,4 +2248,162 @@ fn the_release_check_names_what_is_missing_and_fails_closed() {
     assert!(lines_with(&run, "MISSING").is_empty(), "{}", run.stdout);
     assert!(lines_with(&run, "present").is_empty(), "{}", run.stdout);
     assert_eq!(lines_with(&run, "UNKNOWN").len(), assets.len());
+}
+
+/// GitHub answers a release download with a 302 to the asset's storage. A
+/// renamed or transferred repository answers 301 for every path under its old
+/// name, whether the asset exists or not, so no other redirect may read as
+/// present: the check would stay green for good without checking anything.
+#[test]
+fn the_release_check_does_not_read_another_redirect_as_present() {
+    let assets = published_assets();
+    let (_, moved_path) = &assets[&("btrfs".to_string(), "amd64".to_string())];
+    for status in [
+        "301 Moved Permanently",
+        "303 See Other",
+        "307 Temporary Redirect",
+        "308 Permanent Redirect",
+    ] {
+        let mut answers = all_found(&assets);
+        answers.insert(
+            moved_path.clone(),
+            http_answer(status, "Location: http://127.0.0.1:1/elsewhere\r\n"),
+        );
+        let run = run_release_check(&release_host(answers));
+        assert_eq!(
+            run.code,
+            Some(2),
+            "{status}:\n{}\n{}",
+            run.stdout,
+            run.stderr
+        );
+        assert_eq!(
+            lines_with(&run, "present").len(),
+            assets.len() - 1,
+            "{status}:\n{}",
+            run.stdout
+        );
+        assert_eq!(
+            lines_with(&run, "UNKNOWN").len(),
+            1,
+            "{status}:\n{}",
+            run.stdout
+        );
+        assert!(
+            lines_with(&run, "MISSING").is_empty(),
+            "{status}:\n{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains(PUBLISHED_LINE),
+            "{status}:\n{}",
+            run.stdout
+        );
+    }
+}
+
+/// A leg whose identity cannot be derived is a leg the check did not check. A
+/// stale `kernel_sha` is the ordinary way to get there. It must read UNKNOWN,
+/// fail the run, and never be followed by the all-published line: with the
+/// bookkeeping for that branch removed, the script printed UNKNOWN, then said
+/// all six assets were published, and exited 0.
+#[test]
+fn the_release_check_fails_a_leg_whose_identity_it_cannot_derive() {
+    let sha = sha256_short(b"a\n");
+    let mut tables = String::new();
+    let mut answers = BTreeMap::new();
+    for profile in ["default", "nested", "btrfs"] {
+        for (arch, machine) in [("arm64", "aarch64"), ("amd64", "x86_64")] {
+            tables.push_str(&format!(
+                "[kernel_profiles.{profile}.{arch}]\n\
+                 kernel_version = \"1.2.3\"\n\
+                 kernel_repo = \"example/kernels\"\n\
+                 build_inputs = [\"inputs/a.conf\"]\n"
+            ));
+            if profile == "default" {
+                // The arm64 default table carries a kernel_sha its inputs do not hash to.
+                let manifest = if arch == "arm64" {
+                    "000000000000"
+                } else {
+                    sha.as_str()
+                };
+                tables.push_str(&format!("kernel_sha = \"{manifest}\"\n"));
+            }
+            tables.push('\n');
+            answers.insert(
+                format!(
+                    "/example/kernels/releases/download/kernel-{profile}-1.2.3-{machine}-{sha}/\
+                     vmlinux-{profile}-1.2.3-{machine}-{sha}.bin"
+                ),
+                found_answer(),
+            );
+        }
+    }
+    let fixture = identity_fixture(&tables, &[("inputs/a.conf", "a\n")]);
+
+    let run = run_release_check_at(fixture.path(), &release_host(answers));
+    assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
+    let unknown = lines_with(&run, "UNKNOWN");
+    assert_eq!(unknown.len(), 1, "{}", run.stdout);
+    assert!(
+        unknown[0].starts_with("default arm64") && unknown[0].contains("kernel_sha"),
+        "{}",
+        run.stdout
+    );
+    assert_eq!(lines_with(&run, "present").len(), 5, "{}", run.stdout);
+    assert!(lines_with(&run, "MISSING").is_empty(), "{}", run.stdout);
+    assert!(!run.stdout.contains(PUBLISHED_LINE), "{}", run.stdout);
+}
+
+/// Exit 1 means an asset is missing. Every way of failing to check exits 2
+/// with a message instead, never 1 under a traceback.
+#[test]
+fn the_release_check_exits_2_whenever_it_cannot_check() {
+    let cannot_check = |what: &str, run: &StepRun| {
+        assert_eq!(run.code, Some(2), "{what}:\n{}\n{}", run.stdout, run.stderr);
+        assert!(
+            run.stderr.contains("ERROR") && !run.stderr.contains("Traceback"),
+            "{what}:\n{}",
+            run.stderr
+        );
+        assert!(
+            lines_with(run, "MISSING").is_empty(),
+            "{what}:\n{}",
+            run.stdout
+        );
+        assert!(
+            !run.stdout.contains(PUBLISHED_LINE),
+            "{what}:\n{}",
+            run.stdout
+        );
+    };
+
+    // An answer that is not HTTP.
+    let assets = published_assets();
+    let (_, garbled_path) = &assets[&("btrfs".to_string(), "amd64".to_string())];
+    let mut answers = all_found(&assets);
+    answers.insert(garbled_path.clone(), "garbage\r\n\r\n".to_string());
+    let run = run_release_check(&release_host(answers));
+    cannot_check("an answer that is not HTTP", &run);
+    assert_eq!(lines_with(&run, "UNKNOWN").len(), 1, "{}", run.stdout);
+
+    // A base URL with no scheme. A bare host name is the spelling that matters:
+    // urllib reads `host:port` as a scheme and fails in a way the script already
+    // caught, and refuses a bare name with a ValueError it did not.
+    let run = run_release_check("release-host.invalid");
+    cannot_check("a base URL with no scheme", &run);
+    assert!(lines_with(&run, "present").is_empty(), "{}", run.stdout);
+
+    // A config whose kernel_profiles is not a table.
+    let fixture = identity_fixture("kernel_profiles = \"oops\"\n", &[]);
+    let run = run_release_check_at(fixture.path(), &release_host(BTreeMap::new()));
+    cannot_check("kernel_profiles that is not a table", &run);
+    assert_eq!(lines_with(&run, "UNKNOWN").len(), 6, "{}", run.stdout);
+
+    // An identity script that does not load.
+    let fixture = identity_fixture("", &[]);
+    std::fs::write(fixture.path().join(IDENTITY_SCRIPT), "def (\n").unwrap();
+    let run = run_release_check_at(fixture.path(), &release_host(BTreeMap::new()));
+    cannot_check("an identity script that does not load", &run);
+    assert!(lines_with(&run, "present").is_empty(), "{}", run.stdout);
 }

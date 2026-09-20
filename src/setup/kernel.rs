@@ -748,19 +748,26 @@ if ! validate_kernel_tarball "$KERNEL_TARBALL"; then
 fi"#
 }
 
-/// The directory, relative to the repo root, whose `*.patch` files a VM kernel
-/// build applies.
+/// The directory, relative to the repo root, whose `*.patch` files a kernel
+/// build applies, given a table's `patches_dir`.
 ///
-/// An omitted `patches_dir` applies `kernel/patches`; only an explicit empty
-/// string applies none. A table that relies on the default still has to list
-/// those patches in `build_inputs`, or its tag does not change when they do;
-/// tests/test_default_kernel_release.rs holds every table to that.
-pub fn vm_kernel_patches_dir(profile: &KernelProfile) -> Option<&str> {
-    match profile.patches_dir.as_deref() {
+/// An omitted value applies `kernel/patches`; only an explicit empty string
+/// applies none. scripts/kernel-patch.sh reads an omitted value differently: on
+/// arm64 it falls back to `kernel/patches-arm64`. So every shipped profile
+/// table names its directory, and lists those patches in `build_inputs` so its
+/// tag changes when they do. tests/test_default_kernel_release.rs holds the
+/// tables to both.
+fn patches_dir_or_default(patches_dir: Option<&str>) -> Option<&str> {
+    match patches_dir {
         Some("") => None,
         Some(dir) => Some(dir),
         None => Some("kernel/patches"),
     }
+}
+
+/// [`patches_dir_or_default`] for a VM kernel profile.
+pub fn vm_kernel_patches_dir(profile: &KernelProfile) -> Option<&str> {
+    patches_dir_or_default(profile.patches_dir.as_deref())
 }
 
 /// Generate VM kernel build script dynamically from profile config.
@@ -1071,12 +1078,8 @@ fn generate_host_kernel_build_script(
     let kernel_version = &config.kernel_version;
     let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
-    // Empty string means no patches, None means use default
-    let patches_dir = match config.patches_dir.as_deref() {
-        Some("") => None, // Explicitly disabled
-        Some(p) => Some(repo_root.join(p)),
-        None => Some(repo_root.join("kernel/patches")), // Default
-    };
+    let patches_dir =
+        patches_dir_or_default(config.patches_dir.as_deref()).map(|p| repo_root.join(p));
 
     let script = format!(
         r##"#!/bin/bash

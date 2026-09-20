@@ -62,6 +62,10 @@ default release exists builds the default kernel locally (`--build-kernels`).
 file name the way `fcvm setup` does. A leg builds when its tag has no release
 yet or when a manual run sets `force_build`. The nested and btrfs legs then
 always build from source (`--force-build-kernels`) and never reuse a kernel
-file already on the runner. `verify-releases` runs after the build jobs, weekly,
-and on a manual run, and fails when a published leg's release asset is missing
-(`scripts/verify-kernel-releases.py`).
+file already on the runner. Each release's tag is created at the commit that
+was built. `verify-releases` runs after the build jobs of every run and fails
+when a published leg's release asset is missing
+(`scripts/verify-kernel-releases.py`). `verify-kernel-releases.yml` runs the
+same check weekly and on demand. It is a workflow of its own because `ci.yml`
+and `build-runner-ami.yml` start on every completed Build Kernels run on main,
+and a scheduled run under that name would start them every week.

@@ -91,7 +91,9 @@ def identity(profile_name, config_arch, check_runner=True):
 
     with open(ROOT / "rootfs-config.toml", "rb") as handle:
         config = tomllib.load(handle)
-    table = config.get("kernel_profiles", {}).get(profile_name, {}).get(config_arch)
+    profiles = config.get("kernel_profiles")
+    arches = profiles.get(profile_name) if isinstance(profiles, dict) else None
+    table = arches.get(config_arch) if isinstance(arches, dict) else None
     if not isinstance(table, dict):
         raise IdentityError(
             f"rootfs-config.toml has no [kernel_profiles.{profile_name}.{config_arch}]"
@@ -118,6 +120,13 @@ def identity(profile_name, config_arch, check_runner=True):
 
     sha = build_inputs_sha(table.get("build_inputs", []))
     manifest = table.get("kernel_sha")
+    if manifest is None and profile_name == "default":
+        # An installed binary has no kernel/ tree to hash, so it finds the
+        # default release only through this value.
+        raise IdentityError(
+            f"kernel_profiles.default.{config_arch} has no kernel_sha; without it an installed "
+            "binary cannot name the release this would publish"
+        )
     if manifest is not None:
         if not (isinstance(manifest, str) and re.fullmatch(r"[0-9a-f]{12}", manifest)):
             raise IdentityError(
