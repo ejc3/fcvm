@@ -67,9 +67,25 @@ const MAX_EVENTS_PER_BATCH: usize = 128;
 /// How long a connecting VMM has to complete the UFFD handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for new events before re-attempting parked faults. Retries are also
-/// attempted after every drain and between prefetch chunks, so this only bounds the
-/// idle-queue case.
+/// How long the handler keeps retrying parked faults without sleeping, after a fault is parked
+/// and after every REMOVE event it reads.
+///
+/// Reading a REMOVE event does not lower `mmap_changing`. The thread inside `madvise` lowers
+/// it when it next runs, and nothing signals that, so the only way to see it is to retry. A
+/// retry made right after the read comes too early. While a balloon inflates, the next REMOVE
+/// has raised the flag again long before a [`PARKED_RETRY_DELAY`] sleep is over, so a loop
+/// that retried only after a drain and after that sleep retried while the flag was up every
+/// time. Measured through these loops on a 6.16 host, against back-to-back single-page
+/// `madvise` calls: of 23 faults parked during replay, 17 waited over 250 ms and 6 reached
+/// the 2 s bound, and the slowest of 200 served faults waited 226 to 908 ms.
+///
+/// During the burst the pause between two rounds is a yield (see [`ParkedRetryPause`]). The
+/// loops keep draining between rounds, so other faults are served and the balloon's next
+/// event is read without waiting for the burst to end.
+const PARKED_RETRY_BURST: Duration = Duration::from_millis(2);
+
+/// How long the handler sleeps between retries of parked faults once [`PARKED_RETRY_BURST`]
+/// has run out. Retries are also attempted after every drain and between prefetch chunks.
 const PARKED_RETRY_DELAY: Duration = Duration::from_millis(2);
 
 /// How long a parked fault may stay unresolved before the handler fails closed.
@@ -1394,10 +1410,30 @@ struct ParkedFault {
     trace_t0: Option<u64>,
 }
 
+/// What the handler does between two rounds of retrying parked faults.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ParkedRetryPause {
+    /// `mmap_changing` is about to drop: let other tasks run and go round again at once.
+    Yield,
+    /// The burst ran out without a retry going through: sleep [`PARKED_RETRY_DELAY`].
+    Sleep,
+}
+
+impl ParkedRetryPause {
+    async fn wait(self) {
+        match self {
+            Self::Yield => tokio::task::yield_now().await,
+            Self::Sleep => tokio::time::sleep(PARKED_RETRY_DELAY).await,
+        }
+    }
+}
+
 /// The faults waiting for a retry, by page address.
 #[derive(Default)]
 struct ParkedFaults {
     by_page: std::collections::BTreeMap<usize, ParkedFault>,
+    /// Until when the pause between retries is a yield; see [`PARKED_RETRY_BURST`].
+    retry_without_sleeping_until: Option<std::time::Instant>,
 }
 
 impl ParkedFaults {
@@ -1412,11 +1448,38 @@ impl ParkedFaults {
     /// what [`MAX_PARKED_WAIT`] counts from, so a second fault on the page cannot extend
     /// the wait.
     fn park(&mut self, page: usize, file_offset: usize, trace_t0: Option<u64>) {
+        let now = std::time::Instant::now();
         self.by_page.entry(page).or_insert(ParkedFault {
-            parked_at: std::time::Instant::now(),
+            parked_at: now,
             file_offset,
             trace_t0,
         });
+        // The refusal means the flag is up, and the event behind it may already have been
+        // read, in which case no REMOVE is left to start the burst.
+        self.retry_without_sleeping_from(now);
+    }
+
+    /// A REMOVE event was read just now, so the thread inside `madvise` can run again and
+    /// `mmap_changing` is about to drop.
+    fn a_remove_was_read(&mut self) {
+        self.retry_without_sleeping_from(std::time::Instant::now());
+    }
+
+    fn retry_without_sleeping_from(&mut self, now: std::time::Instant) {
+        self.retry_without_sleeping_until = Some(now + PARKED_RETRY_BURST);
+    }
+
+    /// How the handler pauses before the next round of retries. Both loops ask this, and
+    /// only while something is parked.
+    fn retry_pause(&self) -> ParkedRetryPause {
+        self.retry_pause_at(std::time::Instant::now())
+    }
+
+    fn retry_pause_at(&self, now: std::time::Instant) -> ParkedRetryPause {
+        match self.retry_without_sleeping_until {
+            Some(until) if now < until => ParkedRetryPause::Yield,
+            _ => ParkedRetryPause::Sleep,
+        }
     }
 }
 
@@ -1713,7 +1776,7 @@ async fn replay_working_set(
             if replay_after_retry(!state.parked_faults.is_empty())
                 == ReplayAfterRetry::WaitForPending
             {
-                tokio::time::sleep(PARKED_RETRY_DELAY).await;
+                state.parked_faults.retry_pause().wait().await;
                 continue 'chunk;
             }
 
@@ -1769,11 +1832,11 @@ async fn serve_faults(
     state: &mut VmState,
 ) -> Result<()> {
     loop {
-        let retry_due = async {
-            if state.parked_faults.is_empty() {
-                std::future::pending::<()>().await
-            } else {
-                tokio::time::sleep(PARKED_RETRY_DELAY).await
+        let pause = (!state.parked_faults.is_empty()).then(|| state.parked_faults.retry_pause());
+        let retry_due = async move {
+            match pause {
+                Some(pause) => pause.wait().await,
+                None => std::future::pending::<()>().await,
             }
         };
 
@@ -2031,6 +2094,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     }
                 }
                 Event::Remove { start, end } => {
+                    state.parked_faults.a_remove_was_read();
                     // Balloon device removed pages - zero them
                     // Validate bounds: end must be >= start and range must be reasonable
                     let start_addr = start as usize;
@@ -4270,6 +4334,35 @@ mod tests {
             balloon
         }
 
+        /// A balloon that keeps inflating: back-to-back single-page `madvise` calls over the
+        /// first `pages` pages, until stopped. Each call sleeps until the handler reads its
+        /// REMOVE event.
+        fn inflate_until_stopped(&self, pages: usize) -> BalloonStream {
+            let base = self.base;
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let thread = std::thread::spawn({
+                let stop = Arc::clone(&stop);
+                move || {
+                    let mut calls = 0u64;
+                    while !stop.load(Ordering::Relaxed) {
+                        let page = base + (calls as usize % pages) * Self::PAGE;
+                        // SAFETY: advising this test's own live mapping.
+                        let rc = unsafe {
+                            libc::madvise(
+                                page as *mut libc::c_void,
+                                Self::PAGE,
+                                libc::MADV_DONTNEED,
+                            )
+                        };
+                        assert_eq!(rc, 0, "madvise");
+                        calls += 1;
+                    }
+                    calls
+                }
+            });
+            BalloonStream { stop, thread }
+        }
+
         /// Unmap the guest memory. Only after every thread that touches it has been joined:
         /// a thread woken from a fault on an address that is no longer mapped takes SIGSEGV,
         /// which would turn a failed assertion into a crashed test binary.
@@ -4395,6 +4488,244 @@ mod tests {
             "expected the queued REMOVE, got {event:?}"
         );
         assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
+    /// See [`BalloonedCopyClone::inflate_until_stopped`].
+    struct BalloonStream {
+        stop: Arc<std::sync::atomic::AtomicBool>,
+        thread: std::thread::JoinHandle<u64>,
+    }
+
+    impl BalloonStream {
+        /// Stop inflating and return how many `madvise` calls were made. The thread is asleep
+        /// inside one until its REMOVE event is read, so keep reading events, through the
+        /// production drain, until it has returned.
+        fn stop(self, uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> u64 {
+            self.stop.store(true, Ordering::Relaxed);
+            while !self.thread.is_finished() {
+                drain_events(uffd, ctx, state).expect("reading the balloon's last events");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            self.thread.join().expect("balloon thread")
+        }
+    }
+
+    /// After a measured phase. With the balloon stopped nothing refuses a COPY any more, so
+    /// serve whatever is still queued or parked until `guest_is_done`. A stream test does this
+    /// BEFORE it asserts, so a failure cannot leave a thread asleep in the kernel.
+    fn serve_until(
+        uffd: &Uffd,
+        ctx: &VmContext<'_>,
+        state: &mut VmState,
+        guest_is_done: impl Fn() -> bool,
+    ) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !(guest_is_done() && state.parked_faults.is_empty()) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "guest threads are still blocked 10 s after the balloon stopped"
+            );
+            drain_events(uffd, ctx, state).expect("serving after the balloon stopped");
+            // A fault that outlived the handler's bound makes this an error for as long as
+            // it is still refused. Keep going: with the balloon stopped it will not be.
+            let _ = retry_parked_faults(ctx, uffd, state);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The pause between two rounds of retrying parked faults is a yield, not a sleep, for
+    /// PARKED_RETRY_BURST after a fault is parked and after every REMOVE event that is read.
+    /// It is bounded, so a flag that stays up costs a sleeping retry loop and not a spinning
+    /// one.
+    #[test]
+    fn parked_faults_are_retried_without_sleeping_while_the_flag_is_about_to_drop() {
+        let mut parked = ParkedFaults::default();
+        assert_eq!(
+            parked.retry_pause(),
+            ParkedRetryPause::Sleep,
+            "nothing says the flag is about to drop"
+        );
+
+        parked.park(0x1000, 0, None);
+        assert_eq!(
+            parked.retry_pause(),
+            ParkedRetryPause::Yield,
+            "a fault was refused just now, so the flag is up and its drop is what frees it"
+        );
+
+        let read_at = std::time::Instant::now();
+        parked.retry_without_sleeping_from(read_at);
+        assert_eq!(
+            parked.retry_pause_at(read_at + PARKED_RETRY_BURST / 2),
+            ParkedRetryPause::Yield
+        );
+        assert_eq!(
+            parked.retry_pause_at(read_at + PARKED_RETRY_BURST),
+            ParkedRetryPause::Sleep,
+            "the burst is bounded"
+        );
+        parked.retry_without_sleeping_from(read_at + PARKED_RETRY_BURST);
+        assert_eq!(
+            parked.retry_pause_at(read_at + PARKED_RETRY_BURST),
+            ParkedRetryPause::Yield,
+            "every REMOVE that is read starts the burst again"
+        );
+    }
+
+    /// Issue #961, the wait. Reading a REMOVE event does not lower `mmap_changing`: the
+    /// thread inside `madvise` does, when it next runs, and nothing signals that. While a
+    /// balloon inflates, the next REMOVE has raised the flag again within microseconds. A
+    /// loop that retries a parked fault only right after a drain, and then sleeps, retries
+    /// while the flag is up nearly every time, and the fault stays parked until a retry
+    /// gets lucky or the handler's bound kills the VMM.
+    ///
+    /// Drives the production `replay_working_set` against a real userfaultfd while a thread
+    /// issues back-to-back single-page `madvise` calls. Each round's fault is read ahead of
+    /// the queued REMOVE, so it is always parked. Every one must resolve far inside the
+    /// bound, and replay must not fail. Five rounds, because one proves little: with the
+    /// sleeping cadence a single parked fault waited 0.8 to 1.8 s in five of eight runs on a
+    /// 6.16 host, and got through at once in two.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fault_parked_during_replay_resolves_while_the_balloon_keeps_inflating() {
+        const PAGE: usize = BalloonedCopyClone::PAGE;
+        const ROUNDS: usize = 5;
+        let (clone, uffd) = BalloonedCopyClone::new(64);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        // Something for replay to populate once the parked fault is out of its way.
+        let mut recorded = PageSet::empty(clone.mem_size as u64);
+        recorded.insert_range((48 * PAGE) as u64, (8 * PAGE) as u64);
+
+        let balloon = clone.inflate_until_stopped(16);
+        let mut rounds = Vec::new();
+        for round in 0..ROUNDS {
+            // Nothing reads events between two replays, so by now the balloon is asleep
+            // inside a `madvise`, with its REMOVE queued and the flag up.
+            wait_for_uffd_event(async_uffd.get_ref(), "a REMOVE event");
+            let vcpu = FaultingReader::spawn(clone.page(40 + round));
+            vcpu.wait_until_asleep();
+            let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state).await;
+            let failed = replayed.is_err();
+            rounds.push((vcpu, replayed));
+            if failed {
+                break;
+            }
+        }
+
+        let madvise_calls = balloon.stop(async_uffd.get_ref(), &ctx, &mut state);
+        serve_until(async_uffd.get_ref(), &ctx, &mut state, || {
+            rounds.iter().all(|(vcpu, _)| vcpu.thread.is_finished())
+        });
+        let rounds: Vec<_> = rounds
+            .into_iter()
+            .map(|(vcpu, replayed)| {
+                let (got, blocked) =
+                    vcpu.finish("the vCPU is still asleep after the balloon stopped");
+                (got, blocked, replayed)
+            })
+            .collect();
+        println!(
+            "replay under a REMOVE stream, {madvise_calls} madvise calls; each round's fault \
+             was blocked for: {:?}",
+            rounds
+                .iter()
+                .map(|(_, blocked, _)| *blocked)
+                .collect::<Vec<_>>()
+        );
+
+        for (round, (got, blocked, replayed)) in rounds.iter().enumerate() {
+            assert!(
+                matches!(replayed, Ok(false)),
+                "round {round}: replay must not fail the handler while a fault is parked \
+                 behind a balloon that keeps inflating, because the fail-closed path kills \
+                 the clone's VMM: {replayed:?}"
+            );
+            assert!(
+                *blocked < MAX_PARKED_WAIT / 8,
+                "round {round}: the parked fault was blocked for {blocked:?}; it has to \
+                 resolve far inside the {MAX_PARKED_WAIT:?} bound"
+            );
+            assert_eq!(
+                *got as usize,
+                41 + round,
+                "round {round}: the fault must be served its own snapshot page"
+            );
+        }
+        assert_eq!(rounds.len(), ROUNDS);
+        clone.unmap();
+    }
+
+    /// The same traffic against the production `serve_faults` loop, which is where a clone
+    /// spends its life: two hundred faults, one after another, while the balloon keeps
+    /// inflating. The flag is up whenever one of them is read, so each is refused at first.
+    /// None may wait anywhere near the bound, and the loop must not fail. Two hundred,
+    /// because the damage was in the tail: with the old cadence the slowest of thirty such
+    /// faults waited 210 to 551 ms across seven runs, against a median of 1 to 25 ms.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn faults_served_while_the_balloon_keeps_inflating_resolve_far_inside_the_bound() {
+        const FAULTS: usize = 200;
+        let (clone, uffd) = BalloonedCopyClone::new(256);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        // serve_faults ends when its peer does. Pin this process, which outlives the test.
+        let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
+        let async_peer_pidfd =
+            AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
+
+        let balloon = clone.inflate_until_stopped(16);
+        wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
+        let pages: Vec<usize> = (32..32 + FAULTS).map(|index| clone.page(index)).collect();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let vcpu = std::thread::spawn(move || {
+            let blocked: Vec<Duration> = pages
+                .iter()
+                .map(|&addr| {
+                    let started = std::time::Instant::now();
+                    // SAFETY: `addr` is inside a mapping that outlives this thread.
+                    unsafe { std::ptr::read_volatile(addr as *const u8) };
+                    started.elapsed()
+                })
+                .collect();
+            done_tx.send(()).ok();
+            blocked
+        });
+
+        // serve_faults returns only when its peer exits or serving fails, and the peer is
+        // this process, so any return before the vCPU is through is a failure.
+        let ended_early = tokio::select! {
+            ended = serve_faults(&ctx, &async_uffd, &async_peer_pidfd, peer.pid, &mut state) => {
+                Some(ended)
+            }
+            _ = done_rx => None,
+        };
+
+        let madvise_calls = balloon.stop(async_uffd.get_ref(), &ctx, &mut state);
+        serve_until(async_uffd.get_ref(), &ctx, &mut state, || {
+            vcpu.is_finished()
+        });
+        let mut blocked = vcpu.join().expect("vCPU thread");
+        blocked.sort();
+        let (median, longest) = (blocked[blocked.len() / 2], blocked[blocked.len() - 1]);
+        println!(
+            "serving under a REMOVE stream: {} faults blocked for a median of {median:?} and \
+             at most {longest:?} across {madvise_calls} madvise calls; ended early: \
+             {ended_early:?}",
+            blocked.len()
+        );
+
+        assert!(
+            ended_early.is_none(),
+            "serve_faults must keep serving while a balloon keeps inflating, because its \
+             failure kills the clone's VMM: {ended_early:?}"
+        );
+        assert!(
+            longest < MAX_PARKED_WAIT / 8,
+            "a fault was blocked for {longest:?} (median {median:?}) across {madvise_calls} \
+             madvise calls; every fault has to resolve far inside the {MAX_PARKED_WAIT:?} bound"
+        );
         clone.unmap();
     }
 
