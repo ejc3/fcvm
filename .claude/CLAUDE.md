@@ -1269,6 +1269,11 @@ How it works:
 - Path printed at end: `📋 Debug log: /tmp/fcvm-test-logs/{name}-{timestamp}.log`
 - CI uploads `/tmp/fcvm-test-logs/` as artifacts (7 day retention)
 - Tests add `--setup` flag automatically, so missing initrd auto-creates
+- Firecracker's own log (`firecracker.log` in the VM's data directory, copied to
+  `/tmp/fcvm-firecracker-<vm_id>.log` at teardown) is written at `Info`.
+  `FCVM_FIRECRACKER_LOG_LEVEL=Debug` raises it, and then the vsock muxer logs one line per
+  packet: 311 MiB for a 75 s FUSE workload in a small VM, and 9.99 GiB in the first 84 minutes
+  of a 128 GiB guest whose volumes are FUSE over vsock
 
 ### Common Commands
 ```bash

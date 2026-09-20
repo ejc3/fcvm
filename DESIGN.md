@@ -1901,6 +1901,10 @@ export RUST_LOG=fcvm=debug
 
 # Run with debug logs
 RUST_LOG=trace fcvm run nginx:latest
+
+# Firecracker's own level for the per-VM firecracker.log: Error, Warning, Info (default) or Debug.
+# Debug adds one line per vsock packet, which is gigabytes an hour under FUSE-over-vsock volumes.
+FCVM_FIRECRACKER_LOG_LEVEL=Debug fcvm podman run nginx:alpine
 ```
 
 ---
