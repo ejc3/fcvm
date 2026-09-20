@@ -452,6 +452,31 @@ pub struct SnapshotServeArgs {
     #[arg(long, value_name = "copy|minor", env = "FCVM_UFFD_MODE")]
     pub uffd_mode: Option<String>,
 
+    /// Experimental. Copy mode only: bytes of the snapshot to materialise around each demand
+    /// fault.
+    ///
+    /// A clone takes one userfaultfd round trip for every page it touches outside the
+    /// recorded working set. With a granule of `BYTES`, the faulting page is served first,
+    /// exactly as without the option, and the rest of its aligned granule is populated right
+    /// after, so the neighbouring pages never fault. The cost is memory: every page of a
+    /// granule becomes a private copy in the clone whether or not the guest touches it.
+    ///
+    /// Measured once, on a 128 GiB guest at 65536 (64 KiB): the first real page after a
+    /// restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and
+    /// the populate installed 17.5 million pages beyond the demanded ones, 14.5 for each fault,
+    /// because right after a restore almost every granule held one demanded page. A recorded
+    /// working set that already covered that page did better on both time and memory.
+    ///
+    /// Limitation: with the option on, a page that fault-around installed is never recorded,
+    /// so the recorded working set converges one demanded page per granule per clone, and
+    /// replay never restores what fault-around would have installed. Record the working set
+    /// with the option off.
+    ///
+    /// 0 (default) is off. Otherwise a power of two above the host page size, through 2097152.
+    /// Not implemented for `--uffd-mode minor`, where a non-zero value is an error.
+    #[arg(long, value_name = "BYTES", env = "FCVM_UFFD_FAULT_AROUND")]
+    pub uffd_fault_around: Option<u64>,
+
     /// Whether to record each clone's restore working set and replay it into the next one.
     ///
     /// - `on` (default): the pages a clone faults are recorded beside the snapshot and

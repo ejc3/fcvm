@@ -21,7 +21,7 @@ use crate::state::{
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
 use crate::uffd::{
-    record_window_from_env, Prefetch, ServeShape, UffdBacking, UffdServer,
+    record_window_from_env, FaultAround, Prefetch, ServeShape, UffdBacking, UffdServer,
     DEFAULT_PREFETCH_RECORD_WINDOW,
 };
 use crate::volume::{SpawnedVolumes, VolumeConfig};
@@ -921,6 +921,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         .map(Duration::from_secs)
         .unwrap_or(DEFAULT_PREFETCH_RECORD_WINDOW);
 
+    // Copy mode only: how much of the snapshot each demand fault materialises around the
+    // page that faulted (--uffd-fault-around / FCVM_UFFD_FAULT_AROUND). Off unless asked for.
+    let fault_around = FaultAround::new(args.uffd_fault_around.unwrap_or(0))?;
+
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
     // file (see `cmd_snapshot_run`).
@@ -936,6 +940,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             backing,
             prefetch,
             record_window,
+            fault_around,
         },
     )
     .await
@@ -970,6 +975,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("  Serve PID: {}", my_pid);
     println!("  Socket: {}", socket_path.display());
     println!("  UFFD mode: {}", backing.name());
+    if fault_around != FaultAround::OFF {
+        println!("  Fault-around: {} bytes", fault_around.bytes());
+    }
     println!("  Memory: {} MB", snapshot_config.metadata.memory_mib);
     println!("  Waiting for VMs to connect...");
     println!();
@@ -1937,10 +1945,12 @@ async fn cmd_snapshot_run_inner(
             let backing = setup_try!(UffdBacking::from_env(hugepages));
             let prefetch = setup_try!(Prefetch::from_env());
             let record_window = setup_try!(record_window_from_env());
+            let fault_around = setup_try!(FaultAround::from_env());
             info!(
                 reason = %reason,
                 mode = backing.name(),
                 prefetch = ?prefetch,
+                fault_around_bytes = fault_around.bytes(),
                 "starting implicit UFFD server for snapshot restore"
             );
 
@@ -1970,6 +1980,7 @@ async fn cmd_snapshot_run_inner(
                     backing,
                     prefetch,
                     record_window,
+                    fault_around,
                 },
             )
             .await

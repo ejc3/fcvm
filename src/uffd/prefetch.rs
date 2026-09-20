@@ -235,10 +235,50 @@ fn merge(previous: &mut Segment, segment: &Segment) -> bool {
     true
 }
 
+/// What one [`populate_chunk_counted`] call did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Progress {
+    /// How far the caller may advance: the bytes this call populated, or one page that was
+    /// already present.
+    pub advanced: usize,
+    /// Bytes this call made resident. Zero when it only stepped over a present page.
+    pub populated: usize,
+}
+
+impl Progress {
+    fn populated(bytes: usize) -> Self {
+        Self {
+            advanced: bytes,
+            populated: bytes,
+        }
+    }
+
+    fn stepped_over(bytes: usize) -> Self {
+        Self {
+            advanced: bytes,
+            populated: 0,
+        }
+    }
+}
+
+/// [`populate_chunk_counted`], for a caller that only needs to know how far to advance.
+pub fn populate_chunk(
+    uffd: &Uffd,
+    source: &Source<'_>,
+    segment: &Segment,
+    done: usize,
+    page_size: usize,
+    vm_id: &str,
+) -> Result<usize, Stop> {
+    populate_chunk_counted(uffd, source, segment, done, page_size, vm_id)
+        .map(|progress| progress.advanced)
+}
+
 /// Materialise up to [`CHUNK_BYTES`] of `segment`, starting `done` bytes into it, in ONE
 /// ioctl.
 ///
-/// Returns how many bytes are now resident from that point, or the outcome that stopped it.
+/// Returns how far the caller may advance from that point and how much of that this call
+/// populated, or the outcome that stopped it.
 /// The caller drives this one chunk at a time so it can serve demand faults in between.
 /// Partial progress is normal and is reported so the caller can continue from there:
 ///
@@ -251,14 +291,14 @@ fn merge(previous: &mut Segment, segment: &Segment) -> bool {
 /// * `EEXIST` with no progress — the page is already resident (a demand fault beat us to it,
 ///   or a previous chunk covered it). Skip exactly one page and carry on.
 /// * `ESRCH` — the clone's mm is gone.
-pub fn populate_chunk(
+pub fn populate_chunk_counted(
     uffd: &Uffd,
     source: &Source<'_>,
     segment: &Segment,
     done: usize,
     page_size: usize,
     vm_id: &str,
-) -> Result<usize, Stop> {
+) -> Result<Progress, Stop> {
     let Some(remaining) = segment
         .len
         .checked_sub(done)
@@ -313,15 +353,17 @@ pub fn populate_chunk(
     };
 
     match result {
-        Ok(copied) if copied > 0 => Ok(copied),
+        Ok(copied) if copied > 0 => Ok(Progress::populated(copied)),
         // The kernel never reports zero-byte success; treat it as no progress rather than
         // spinning on the same address forever.
-        Ok(_) => Ok(page_size.min(len)),
+        Ok(_) => Ok(Progress::stepped_over(page_size.min(len))),
         // The variant carries the ioctl's signed `copy` field. Only a positive one is a byte
         // count; `errno_of` decodes the rest.
-        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied as isize > 0 => Ok(copied),
+        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied as isize > 0 => {
+            Ok(Progress::populated(copied))
+        }
         Err(e) => match errno_of(&e) {
-            Some(libc::EEXIST) => Ok(page_size.min(len)),
+            Some(libc::EEXIST) => Ok(Progress::stepped_over(page_size.min(len))),
             Some(libc::ESRCH) => Err(Stop::VmGone),
             // Zero-progress EAGAIN: an event-generating operation is in flight
             // (`mmap_changing`). Nothing is waiting on a speculative page, so give up on

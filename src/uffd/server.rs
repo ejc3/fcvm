@@ -474,7 +474,12 @@ impl UffdBacking {
 /// Where a clone's pages come from — the per-mode server state, shared by all clones.
 enum PageSource {
     /// Read-only mapping of the snapshot memory file; pages are `UFFDIO_COPY`'d out of it.
-    Copy { mmap: memmap2::Mmap },
+    /// `fault_around` is the [`FaultAround`] granule in bytes, zero when the option is off.
+    /// It lives here because this is the only mode that implements it.
+    Copy {
+        mmap: memmap2::Mmap,
+        fault_around: usize,
+    },
     /// A memfd holding the whole snapshot image. Handed to each Firecracker over
     /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`.
     Minor { backing: File },
@@ -555,6 +560,96 @@ pub fn record_window_from_env() -> Result<Duration> {
     }
 }
 
+/// Env var behind `--uffd-fault-around`, in bytes.
+pub const FAULT_AROUND_ENV: &str = "FCVM_UFFD_FAULT_AROUND";
+
+/// The largest fault-around granule. It is one replay chunk, so one ioctl populates a whole
+/// run of missing pages, and it is one 2 MiB guest page.
+pub const MAX_FAULT_AROUND: usize = prefetch::CHUNK_BYTES;
+
+/// Copy-mode fault-around (`--uffd-fault-around`): how much of the snapshot one demand fault
+/// materialises around the page that faulted. Zero bytes, the default, is off. Experimental.
+///
+/// A clone takes one userfaultfd round trip for every page outside the recorded working
+/// set. Replay cannot help a clone that does fresh work right after restore, because the
+/// memory that work allocates lands on different pages in every clone.
+///
+/// The memory is the cost. Every page of a granule becomes a private copy in the clone
+/// whether or not the guest ever touches it. Measured once, on a 128 GiB guest with 64 KiB
+/// granules: the first real page after a restore went from 518.4 s to 336.2 s, restore to
+/// healthy went from 2m23s to 4m07s, and the populate installed 14.5 pages beyond each
+/// demanded one (17.5 million in all), because right after a restore almost every granule held one
+/// demanded page. A locality projection from a clone that had run for a long time, where
+/// touched pages are dense, had put that at 1.1 pages. It does not describe the period
+/// right after a restore.
+///
+/// Recording stays demand-only, and a page that fault-around installed is never recorded,
+/// because the guest never faults on it. With the option on the recorded working set
+/// therefore converges one demanded page per granule per clone, and replay never restores
+/// what fault-around would have installed. Replay does not expand recorded runs to their
+/// granules: right after a restore the demanded pages are sparse, so that would multiply
+/// the replayed memory by up to the granule factor. Record with the option off.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FaultAround(usize);
+
+impl FaultAround {
+    /// No fault-around: a demand fault materialises its own page and nothing else.
+    pub const OFF: Self = Self(0);
+
+    /// Validate a granule in bytes: 0 for off, or a power of two above the host page size
+    /// through [`MAX_FAULT_AROUND`]. One host page is refused. It is the page a demand fault
+    /// already serves, so the option would be announced as on and do nothing.
+    pub fn new(bytes: u64) -> Result<Self> {
+        // SAFETY: sysconf reads a constant and touches no memory.
+        let host_page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+        let host_page = usize::try_from(host_page).context("reading the host page size")?;
+        Self::for_host_page(bytes, host_page)
+    }
+
+    fn for_host_page(bytes: u64, host_page: usize) -> Result<Self> {
+        if bytes == 0 {
+            return Ok(Self::OFF);
+        }
+        match usize::try_from(bytes) {
+            Ok(granule)
+                if granule.is_power_of_two()
+                    && granule > host_page
+                    && granule <= MAX_FAULT_AROUND =>
+            {
+                Ok(Self(granule))
+            }
+            _ => anyhow::bail!(
+                "invalid fault-around size {bytes} (--uffd-fault-around / {FAULT_AROUND_ENV}): \
+                 expected 0 for off, or a power of two above {host_page} bytes (the host page \
+                 size, which a demand fault already serves) through {MAX_FAULT_AROUND} bytes \
+                 (2 MiB)"
+            ),
+        }
+    }
+
+    /// Parse a [`FAULT_AROUND_ENV`] value: a whole number of bytes.
+    pub fn parse(raw: &str) -> Result<Self> {
+        let bytes: u64 = raw.trim().parse().with_context(|| {
+            format!("{FAULT_AROUND_ENV}={raw:?} is not a whole number of bytes")
+        })?;
+        Self::new(bytes)
+    }
+
+    /// Resolve the granule from [`FAULT_AROUND_ENV`], defaulting to off. Used by the implicit
+    /// server inside `snapshot run`, which has no serve CLI to carry the flag.
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(FAULT_AROUND_ENV) {
+            Ok(raw) => Self::parse(&raw),
+            Err(_) => Ok(Self::OFF),
+        }
+    }
+
+    /// The granule in bytes. Zero when off.
+    pub fn bytes(self) -> usize {
+        self.0
+    }
+}
+
 /// How a UFFD server serves pages: the materialisation mode plus the working-set
 /// recording and replay knobs. `snapshot serve` resolves one from its CLI flags; the
 /// implicit server inside `snapshot run` resolves one from the environment.
@@ -568,6 +663,9 @@ pub struct ServeShape {
     /// How long after its UFFD handshake each clone's demand faults keep being
     /// recorded into that set. See [`DEFAULT_PREFETCH_RECORD_WINDOW`].
     pub record_window: Duration,
+    /// Copy mode only: how much of the snapshot each demand fault materialises around the
+    /// page that faulted. See [`FaultAround`].
+    pub fault_around: FaultAround,
 }
 
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
@@ -619,7 +717,28 @@ impl UffdServer {
             backing,
             prefetch,
             record_window,
+            fault_around,
         } = shape;
+
+        // Fault-around populates with UFFDIO_COPY. A minor clone's faults are resolved with
+        // UFFDIO_CONTINUE onto shared pages and there is no populate step to extend, so the
+        // pairing is refused here, the one place every shape passes through. Accepting it
+        // would be an option that silently does nothing.
+        if matches!(backing, UffdBacking::Minor { .. }) && fault_around != FaultAround::OFF {
+            anyhow::bail!(
+                "--uffd-fault-around {} needs --uffd-mode copy: fault-around is not implemented \
+                 for minor mode, whose faults are resolved with UFFDIO_CONTINUE onto shared \
+                 pages and have no populate step to extend",
+                fault_around.bytes()
+            );
+        }
+        if fault_around != FaultAround::OFF {
+            info!(
+                target: "uffd",
+                fault_around_bytes = fault_around.bytes(),
+                "copy-mode fault-around is on"
+            );
+        }
 
         // Before anything else: prove we can fail closed on this kernel.
         require_peer_pidfd_support()?;
@@ -669,7 +788,13 @@ impl UffdServer {
                         .map(&mem_file)
                         .context("mmapping memory file")?
                 };
-                (PageSource::Copy { mmap }, Some(mem_file))
+                (
+                    PageSource::Copy {
+                        mmap,
+                        fault_around: fault_around.bytes(),
+                    },
+                    Some(mem_file),
+                )
             }
             UffdBacking::Minor { hugepages } => {
                 let backing_file = tokio::task::spawn_blocking({
@@ -1172,8 +1297,15 @@ fn continue_vm_gone(e: &userfaultfd::Error) -> bool {
 /// How one attempt at resolving a fault ended, for a MINOR fault ([`continue_page`]) and a
 /// MISSING one ([`copy_page`]) alike.
 enum FaultOutcome {
-    /// The whole granule is mapped in the clone (by us, or by a racing fault — EEXIST).
+    /// The whole granule is mapped in the clone and its faulter woken. For a MINOR fault that
+    /// includes a granule a racing fault mapped first (EEXIST). For a MISSING fault that case
+    /// is [`FaultOutcome::AlreadyPresent`].
     Resolved,
+    /// `UFFDIO_COPY` found the page already present (EEXIST): another populator installed it
+    /// first. The faulter has been woken, so the fault is resolved just the same. It is an
+    /// outcome of its own because fault-around must not populate a range that another
+    /// populator owns.
+    AlreadyPresent,
     /// `EAGAIN` with no progress: `mmap_changing` is set. The fault is still pending and
     /// MUST be retried after the event queue has been drained.
     Retry,
@@ -1250,7 +1382,8 @@ fn continue_page(uffd: &Uffd, vm_id: &str, page: usize, page_size: usize) -> Res
 /// * `EEXIST`: a racing fault for the same page already filled it. Expected
 ///   (<https://docs.kernel.org/admin-guide/mm/userfaultfd.html>: "the kernel must cope with
 ///   it returning -EEXIST from ioctl(UFFDIO_COPY) as expected"), and resolved once this
-///   event's faulter has been woken.
+///   event's faulter has been woken. Reported as [`FaultOutcome::AlreadyPresent`], so the
+///   caller can tell a page it installed from one that another populator owns.
 /// * `EAGAIN` with nothing copied: `mmap_changing` is raised, which for a COPY clone means a
 ///   balloon REMOVE event. The flag drops only when the thread inside `madvise` runs again,
 ///   and it can do that once the handler has read the event. The fault is NOT resolved and
@@ -1309,7 +1442,7 @@ fn copy_page(
             // window as CONTINUE, this fault event is already consumed, and Linux's uffd
             // selftests wake after COPY EEXIST for exactly this reason.
             wake_eexist_waiters(uffd, page, page_size)?;
-            Ok(FaultOutcome::Resolved)
+            Ok(FaultOutcome::AlreadyPresent)
         }
         Some(libc::ESRCH) => {
             info!(
@@ -1445,6 +1578,34 @@ struct VmContext<'a> {
     mem_size: usize,
 }
 
+impl<'a> VmContext<'a> {
+    /// The fault-around granule in force for this clone, in bytes, and the snapshot mapping
+    /// it copies from. `None` when the option is off, when the clone is served in minor
+    /// mode, and when the clone's own page is already that large: a hugepage clone's 2 MiB
+    /// page is the largest granule there is.
+    fn fault_around(&self) -> Option<(usize, &'a [u8])> {
+        match self.source {
+            PageSource::Copy { mmap, fault_around } if *fault_around > self.page_size => {
+                Some((*fault_around, &mmap[..]))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// What fault-around added to one clone, logged when its handler exits.
+#[derive(Default)]
+struct FaultAroundStats {
+    /// Granules in which fault-around populated at least one page.
+    granules: u64,
+    /// Bytes fault-around populated. The demanded pages are not in this count, and neither
+    /// are pages that were already present.
+    extra_bytes: u64,
+    /// Granules abandoned part-way because the kernel refused a copy. Their remaining pages
+    /// fault on demand.
+    refused: u64,
+}
+
 /// A fault whose resolving ioctl (`UFFDIO_CONTINUE` for a MINOR clone, `UFFDIO_COPY` for a
 /// COPY one) returned a zero-progress EAGAIN and is waiting for a retry.
 struct ParkedFault {
@@ -1534,6 +1695,8 @@ impl ParkedFaults {
 
 struct VmState {
     fault_count: u64,
+    /// What fault-around populated beyond the demanded pages.
+    fault_around: FaultAroundStats,
     parked_faults: ParkedFaults,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
@@ -1694,9 +1857,28 @@ async fn handle_vm_page_faults(
         page_mask,
         mem_size,
     };
+    if let PageSource::Copy { fault_around, .. } = ctx.source {
+        match ctx.fault_around() {
+            Some((granule, _)) => info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                fault_around_bytes = granule,
+                "fault-around is on for this clone"
+            ),
+            None if *fault_around != 0 => warn!(
+                target: "uffd",
+                vm_id = %vm_id,
+                fault_around_bytes = *fault_around,
+                page_size,
+                "fault-around does nothing for this clone: its own pages are already that large"
+            ),
+            None => {}
+        }
+    }
     let started = std::time::Instant::now();
     let mut state = VmState {
         fault_count: 0,
+        fault_around: FaultAroundStats::default(),
         parked_faults: ParkedFaults::default(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
@@ -1792,7 +1974,7 @@ async fn replay_working_set(
         })
         .collect();
     let source = match ctx.source {
-        PageSource::Copy { mmap } => prefetch::Source::Copy(&mmap[..]),
+        PageSource::Copy { mmap, .. } => prefetch::Source::Copy(&mmap[..]),
         PageSource::Minor { .. } => prefetch::Source::Minor,
     };
     let started = std::time::Instant::now();
@@ -1931,6 +2113,19 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
     } else {
         0.0
     };
+    if let Some((granule, _)) = ctx.fault_around() {
+        let stats = &state.fault_around;
+        info!(
+            target: "uffd",
+            vm_id = %ctx.vm_id,
+            fault_around_bytes = granule,
+            granules = stats.granules,
+            extra_pages = stats.extra_bytes / ctx.page_size as u64,
+            extra_mib = stats.extra_bytes / (1024 * 1024),
+            refused_granules = stats.refused,
+            "fault-around populated pages beyond the demanded ones"
+        );
+    }
     info!(
         target: "uffd",
         vm_id = %ctx.vm_id,
@@ -1952,10 +2147,127 @@ fn resolve_fault(
 ) -> Result<FaultOutcome> {
     match ctx.source {
         PageSource::Minor { .. } => continue_page(uffd, ctx.vm_id, page, ctx.page_size),
-        PageSource::Copy { mmap } => {
+        PageSource::Copy { mmap, .. } => {
             copy_page(uffd, ctx.vm_id, mmap, page, offset_in_file, ctx.page_size)
         }
     }
+}
+
+/// Copy-mode fault-around (`--uffd-fault-around`): populate the rest of the granule around a
+/// demand fault that has just been resolved. Returns `false` when the clone's address space
+/// is gone.
+///
+/// The caller runs this after the faulting vCPU has been woken and its trace interval
+/// closed, so that fault's latency is what it is without the option. Nothing is recorded
+/// here either: the working set stays the pages the guest asked for.
+///
+/// This is speculation, under the rule replay follows: it can never fail a clone. The pages
+/// go through the ioctl loop replay uses, [`prefetch::populate_chunk_counted`]. A page that
+/// is already present is stepped over. A refusal, which includes the zero-progress EAGAIN
+/// the kernel returns while `mmap_changing` is raised, abandons the granule to demand
+/// paging.
+///
+/// A vCPU that faults inside the granule meanwhile is not stranded. `UFFDIO_COPY` wakes
+/// every sleeper in the range it installs, which also takes that vCPU's event off the queue.
+/// An event that is still read afterwards goes through [`copy_page`] like any other, and its
+/// EEXIST arm wakes the faulter. Fault-around consumes no event and skips none.
+///
+/// A fault that was parked and resolved by a later retry gets no fault-around. Parking needs
+/// a balloon REMOVE in flight, and the pages around it still fault on demand.
+fn populate_around_fault(
+    uffd: &Uffd,
+    ctx: &VmContext<'_>,
+    stats: &mut FaultAroundStats,
+    mapping: &GuestRegionUffdMapping,
+    fault_page: usize,
+    offset_in_file: usize,
+) -> bool {
+    let Some((granule, mmap)) = ctx.fault_around() else {
+        return true;
+    };
+    let source = prefetch::Source::Copy(mmap);
+    let mut populated = 0usize;
+    let mut vm_alive = true;
+    'granule: for segment in
+        granule_segments(mapping, granule, ctx.page_size, fault_page, offset_in_file)
+            .into_iter()
+            .flatten()
+    {
+        let mut done = 0usize;
+        while done < segment.len {
+            match prefetch::populate_chunk_counted(
+                uffd,
+                &source,
+                &segment,
+                done,
+                ctx.page_size,
+                ctx.vm_id,
+            ) {
+                Ok(progress) => {
+                    done += progress.advanced;
+                    populated += progress.populated;
+                }
+                Err(prefetch::Stop::VmGone) => {
+                    vm_alive = false;
+                    break 'granule;
+                }
+                Err(prefetch::Stop::Refused) => {
+                    stats.refused += 1;
+                    break 'granule;
+                }
+            }
+        }
+    }
+    if populated > 0 {
+        stats.granules += 1;
+        stats.extra_bytes += populated as u64;
+    }
+    vm_alive
+}
+
+/// The rest of the granule around a demanded page: the pages after it, then the pages before
+/// it. A sequential reader wants the pages after first. An empty piece is `None`.
+///
+/// The granule is `granule` bytes aligned in snapshot file offsets, clipped to the region
+/// that took the fault. File offsets are the space guest locality lives in: a region's file
+/// offset and its guest physical base are both 2 MiB aligned, and its host virtual base need
+/// not be.
+///
+/// The arithmetic is checked. Geometry that does not add up yields no pieces, which is
+/// demand paging, and never a panic inside the fault handler.
+fn granule_segments(
+    mapping: &GuestRegionUffdMapping,
+    granule: usize,
+    page_size: usize,
+    fault_page: usize,
+    offset_in_file: usize,
+) -> [Option<prefetch::Segment>; 2] {
+    let pieces = || {
+        let region_start = usize::try_from(mapping.offset).ok()?;
+        let region_end = region_start.checked_add(mapping.size)?;
+        let granule_start = offset_in_file & !granule.checked_sub(1)?;
+        let start = granule_start.max(region_start);
+        let end = granule_start.checked_add(granule)?.min(region_end);
+        let page_end = offset_in_file.checked_add(page_size)?;
+        let after = match end.checked_sub(page_end) {
+            Some(len) if len > 0 => Some(prefetch::Segment {
+                host_addr: fault_page.checked_add(page_size)?,
+                file_offset: u64::try_from(page_end).ok()?,
+                len,
+            }),
+            _ => None,
+        };
+        let before = match offset_in_file.checked_sub(start) {
+            Some(len) if len > 0 => Some(prefetch::Segment {
+                host_addr: fault_page.checked_sub(len)?,
+                file_offset: u64::try_from(start).ok()?,
+                len,
+            }),
+            _ => None,
+        };
+        Some([after, before])
+    };
+    pieces().unwrap_or([None, None])
 }
 
 /// Retry every parked fault once. `Ok(false)` means the clone is gone.
@@ -1971,7 +2283,7 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
     let mut resolved = Vec::new();
     for (&page, parked) in &state.parked_faults.by_page {
         match resolve_fault(uffd, ctx, page, parked.file_offset)? {
-            FaultOutcome::Resolved => resolved.push(page),
+            FaultOutcome::Resolved | FaultOutcome::AlreadyPresent => resolved.push(page),
             FaultOutcome::VmGone => return Ok(false),
             FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
                 return Err(anyhow!(
@@ -2116,10 +2428,34 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     }
 
                     match resolve_fault(uffd, ctx, fault_page, offset_in_file)? {
-                        FaultOutcome::Resolved => {
+                        outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
                             if let Some(t) = state.trace.as_mut() {
                                 let t1 = t.now_ns();
                                 t.record(offset_in_file as u64, trace_t0, t1);
+                            }
+                            // The vCPU is awake and its trace interval is closed. The rest
+                            // of its granule is speculation and costs that fault nothing.
+                            //
+                            // Speculation stands down in two cases. A parked fault is on a
+                            // deadline that ends in a killed clone, and it is retried only
+                            // once this batch is over, so nothing optional may lengthen
+                            // the batch while one is parked. And a copy that found its
+                            // page present lost a race to another populator, which owns
+                            // that range: populating it as well would be up to one EEXIST
+                            // ioctl for every page of the granule, for nothing.
+                            let speculate = matches!(outcome, FaultOutcome::Resolved)
+                                && state.parked_faults.is_empty();
+                            if speculate
+                                && !populate_around_fault(
+                                    uffd,
+                                    ctx,
+                                    &mut state.fault_around,
+                                    mapping,
+                                    fault_page,
+                                    offset_in_file,
+                                )
+                            {
+                                return Ok(DrainOutcome::VmExited);
                             }
                         }
                         FaultOutcome::VmGone => return Ok(DrainOutcome::VmExited),
@@ -2745,6 +3081,7 @@ mod tests {
         let origin = std::time::Instant::now();
         let mut state = VmState {
             fault_count: 0,
+            fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: None,
             record_until: None,
@@ -2938,6 +3275,7 @@ mod tests {
 
         let mut past_window = VmState {
             fault_count: 0,
+            fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
@@ -2957,6 +3295,7 @@ mod tests {
         // above cannot pass by never recording anything.
         let mut in_window = VmState {
             fault_count: 0,
+            fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
@@ -2994,6 +3333,7 @@ mod tests {
         let fault_time = started + Duration::from_secs(1);
         let clone_state = |window: Duration| VmState {
             fault_count: 0,
+            fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
@@ -3444,6 +3784,7 @@ mod tests {
                     backing,
                     prefetch,
                     record_window: DEFAULT_PREFETCH_RECORD_WINDOW,
+                    fault_around: FaultAround::OFF,
                 },
             )
             .await
@@ -4272,7 +4613,10 @@ mod tests {
         let (snap_path, mem_size) = write_test_snapshot();
         let mem_file = File::open(&snap_path).unwrap();
         let mmap = unsafe { MmapOptions::new().len(mem_size).map(&mem_file).unwrap() };
-        let source = Arc::new(PageSource::Copy { mmap });
+        let source = Arc::new(PageSource::Copy {
+            mmap,
+            fault_around: 0,
+        });
         std::fs::remove_file(&snap_path).ok();
 
         // The clone's VMM: a real process the server can kill.
@@ -4358,7 +4702,10 @@ mod tests {
         let mem_file = File::open(&snap_path).unwrap();
         // SAFETY: the temporary snapshot file is immutable for the mapping's lifetime.
         let mmap = unsafe { MmapOptions::new().len(mem_size).map(&mem_file).unwrap() };
-        let source = Arc::new(PageSource::Copy { mmap });
+        let source = Arc::new(PageSource::Copy {
+            mmap,
+            fault_around: 0,
+        });
         std::fs::remove_file(&snap_path).ok();
 
         let victim = spawn_victim();
@@ -4756,7 +5103,7 @@ mod tests {
         // The handler under test answers the consumed fault: it must see EEXIST and wake.
         let outcome =
             copy_page(&uffd, "eexist-copy-wake-test", &snapshot, addr, 0, PAGE).expect("copy_page");
-        assert!(matches!(outcome, FaultOutcome::Resolved));
+        assert!(matches!(outcome, FaultOutcome::AlreadyPresent));
 
         let (got, _) = reader.finish(
             "faulter still asleep after COPY EEXIST: copy_page must UFFDIO_WAKE the granule \
@@ -4792,7 +5139,10 @@ mod tests {
             let clone = Self {
                 base,
                 mem_size,
-                source: PageSource::Copy { mmap },
+                source: PageSource::Copy {
+                    mmap,
+                    fault_around: 0,
+                },
                 mappings: [GuestRegionUffdMapping {
                     base_host_virt_addr: base as u64,
                     size: mem_size,
@@ -4821,6 +5171,7 @@ mod tests {
         fn state() -> VmState {
             VmState {
                 fault_count: 0,
+                fault_around: FaultAroundStats::default(),
                 parked_faults: ParkedFaults::default(),
                 recorded: None,
                 record_until: None,
@@ -5336,5 +5687,707 @@ mod tests {
             "one yield per ended batch in each populate arm, and the one that waits out a busy \
              queue; any other yield runs after every populate call"
         );
+    }
+
+    // =========================================================================
+    // Fault-around (`--uffd-fault-around`).
+    // =========================================================================
+
+    #[test]
+    fn fault_around_accepts_zero_or_a_power_of_two_above_a_page_through_2_mib() {
+        const PAGE: usize = 4096;
+        assert_eq!(
+            FaultAround::for_host_page(0, PAGE).unwrap(),
+            FaultAround::OFF
+        );
+        for bytes in [8192u64, 65536, 2 * 1024 * 1024] {
+            assert_eq!(
+                FaultAround::for_host_page(bytes, PAGE).unwrap().bytes(),
+                bytes as usize
+            );
+        }
+
+        let refused = |bytes: u64, host_page: usize, why: &str| {
+            let error = FaultAround::for_host_page(bytes, host_page)
+                .err()
+                .unwrap_or_else(|| panic!("{bytes} must be refused: {why}"));
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("--uffd-fault-around") && error.contains(&bytes.to_string()),
+                "the refusal must name the option and the value, got: {error}"
+            );
+        };
+        for bytes in [4097, 12288, 65535, 3 * 1024 * 1024] {
+            refused(bytes, PAGE, "not a power of two");
+        }
+        refused(2048, PAGE, "below a 4 KiB host page");
+        refused(4096, 65536, "below a 64 KiB host page");
+        // One host page is the page a demand fault already serves: on, and doing nothing.
+        refused(4096, PAGE, "equal to a 4 KiB host page");
+        refused(65536, 65536, "equal to a 64 KiB host page");
+        assert_eq!(
+            FaultAround::for_host_page(131072, 65536).unwrap().bytes(),
+            131072,
+            "the first size above a 64 KiB host page"
+        );
+        refused(4 * 1024 * 1024, PAGE, "above 2 MiB");
+        refused(u64::MAX, PAGE, "above 2 MiB");
+    }
+
+    #[test]
+    fn fault_around_env_value_is_a_whole_number_of_bytes() {
+        assert_eq!(FaultAround::parse("0").unwrap(), FaultAround::OFF);
+        assert_eq!(FaultAround::parse("2097152").unwrap().bytes(), 2097152);
+        assert_eq!(FaultAround::parse(" 2097152 ").unwrap().bytes(), 2097152);
+        for raw in ["64K", "2M", "-1", "", "65536.0"] {
+            assert!(FaultAround::parse(raw).is_err(), "{raw:?} must be refused");
+        }
+    }
+
+    /// Minor mode has no populate step to extend, so the pairing is an error and not an
+    /// option that silently does nothing. `UffdServer::new` is the one place every shape
+    /// passes through, the serve CLI's and the implicit server's alike.
+    #[tokio::test]
+    async fn minor_mode_refuses_fault_around() {
+        let nowhere = tempfile::tempdir().unwrap();
+        let missing = nowhere.path().join("memory.bin");
+        let serve = |backing: UffdBacking| {
+            UffdServer::new(
+                "fault-around".to_string(),
+                &missing,
+                &missing,
+                &missing,
+                nowhere.path(),
+                ServeShape {
+                    backing,
+                    prefetch: Prefetch::Off,
+                    record_window: Duration::ZERO,
+                    fault_around: FaultAround::for_host_page(65536, 4096).unwrap(),
+                },
+            )
+        };
+
+        let refusal = serve(UffdBacking::Minor { hugepages: false })
+            .await
+            .err()
+            .expect("minor mode with fault-around must be refused");
+        let refusal = format!("{refusal:#}");
+        assert!(
+            refusal.contains("--uffd-fault-around 65536") && refusal.contains("minor"),
+            "the refusal must name the option and the mode, got: {refusal}"
+        );
+
+        // Control: copy mode gets past that check and fails on the missing snapshot instead.
+        let copy = serve(UffdBacking::Copy)
+            .await
+            .err()
+            .expect("there is no snapshot to serve");
+        assert!(
+            !format!("{copy:#}").contains("fault-around"),
+            "copy mode must accept fault-around, got: {copy:#}"
+        );
+    }
+
+    fn fault_around_region(first_file_page: usize, pages: usize) -> GuestRegionUffdMapping {
+        GuestRegionUffdMapping {
+            base_host_virt_addr: 0x7f00_0000_0000,
+            size: pages * 4096,
+            offset: (first_file_page * 4096) as u64,
+            page_size: 4096,
+        }
+    }
+
+    /// The two pieces of the granule around `region_page`, each as (first region page, first
+    /// file page, pages).
+    fn granule_pieces(
+        region: &GuestRegionUffdMapping,
+        granule_pages: usize,
+        region_page: usize,
+    ) -> [Option<(usize, usize, usize)>; 2] {
+        let base = region.base_host_virt_addr as usize;
+        granule_segments(
+            region,
+            granule_pages * 4096,
+            4096,
+            base + region_page * 4096,
+            region.offset as usize + region_page * 4096,
+        )
+        .map(|piece| {
+            piece.map(|segment| {
+                (
+                    (segment.host_addr - base) / 4096,
+                    segment.file_offset as usize / 4096,
+                    segment.len / 4096,
+                )
+            })
+        })
+    }
+
+    #[test]
+    fn a_granule_is_the_pages_after_the_demanded_one_then_the_pages_before_it() {
+        let region = fault_around_region(0, 16);
+        assert_eq!(
+            granule_pieces(&region, 4, 5),
+            [Some((6, 6, 2)), Some((4, 4, 1))]
+        );
+        assert_eq!(
+            granule_pieces(&region, 4, 4),
+            [Some((5, 5, 3)), None],
+            "the first page of a granule has nothing before it"
+        );
+        assert_eq!(
+            granule_pieces(&region, 4, 7),
+            [None, Some((4, 4, 3))],
+            "the last page of a granule has nothing after it"
+        );
+    }
+
+    /// The region maps file pages 2..10, so with 4-page granules it starts and ends in the
+    /// middle of one. Granules are aligned in the file, which is why region page 0 (file page
+    /// 2) shares a granule with region page 1 only.
+    #[test]
+    fn a_granule_is_clipped_to_the_region_that_took_the_fault() {
+        let region = fault_around_region(2, 8);
+        assert_eq!(
+            granule_pieces(&region, 4, 0),
+            [Some((1, 3, 1)), None],
+            "file pages 0 and 1 belong to no page of this region"
+        );
+        assert_eq!(
+            granule_pieces(&region, 4, 7),
+            [None, Some((6, 8, 1))],
+            "file pages 10 and 11 belong to no page of this region"
+        );
+    }
+
+    #[test]
+    fn fault_around_is_inert_for_a_clone_whose_own_page_is_already_that_large() {
+        const GRANULE: usize = 2 * 1024 * 1024;
+        let mmap = memmap2::MmapMut::map_anon(4096)
+            .expect("mapping a snapshot")
+            .make_read_only()
+            .expect("sealing the snapshot");
+        let source = PageSource::Copy {
+            mmap,
+            fault_around: GRANULE,
+        };
+        let ctx = |page_size: usize| VmContext {
+            vm_id: "fault-around-page-size",
+            mappings: &[],
+            source: &source,
+            page_size,
+            page_mask: !(page_size - 1),
+            mem_size: 4096,
+        };
+        assert_eq!(
+            ctx(4096).fault_around().map(|(granule, _)| granule),
+            Some(GRANULE)
+        );
+        assert!(
+            ctx(GRANULE).fault_around().is_none(),
+            "a 2 MiB page is already the largest granule"
+        );
+    }
+
+    // -------------------------------------------------------------------------
+    // Against a real userfaultfd, through the production `drain_events`.
+    // -------------------------------------------------------------------------
+
+    /// Indices of the resident pages in `[base, base + pages * 4096)`, read from the page
+    /// tables with `mincore`. Reading a missing page instead would block on a fault that
+    /// nothing serves.
+    fn resident_pages(base: usize, pages: usize) -> Vec<usize> {
+        let mut vec = vec![0u8; pages];
+        // SAFETY: `vec` has one byte for each page of a live mapping this test owns.
+        let rc =
+            unsafe { libc::mincore(base as *mut libc::c_void, pages * 4096, vec.as_mut_ptr()) };
+        assert_eq!(rc, 0, "mincore: {}", std::io::Error::last_os_error());
+        vec.iter()
+            .enumerate()
+            .filter(|(_, residency)| **residency & 1 == 1)
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// A COPY-mode clone served with fault-around. Its one memory region sits between two
+    /// stretches of guard pages that are registered on the same userfaultfd and belong to no
+    /// region, so a granule that escaped its region shows up as resident guard pages. Page
+    /// `i` of the snapshot file is filled with the byte `i + 1`.
+    struct FaultAroundClone {
+        base: usize,
+        guard_pages: usize,
+        region_pages: usize,
+        file_pages: usize,
+        source: PageSource,
+        mappings: [GuestRegionUffdMapping; 1],
+    }
+
+    impl FaultAroundClone {
+        const PAGE: usize = 4096;
+
+        /// `region_pages` pages of guest memory that map the snapshot from file page
+        /// `first_file_page` on, served with granules of `granule_pages` pages (0 is off).
+        fn new(granule_pages: usize, first_file_page: usize, region_pages: usize) -> (Self, Uffd) {
+            Self::with_features(
+                granule_pages,
+                first_file_page,
+                region_pages,
+                userfaultfd::FeatureFlags::empty(),
+            )
+        }
+
+        /// [`Self::new`] on a userfaultfd that also asked the kernel for `features`. A clone
+        /// with a balloon asks for `EVENT_REMOVE`.
+        fn with_features(
+            granule_pages: usize,
+            first_file_page: usize,
+            region_pages: usize,
+            features: userfaultfd::FeatureFlags,
+        ) -> (Self, Uffd) {
+            let guard_pages = granule_pages.max(1);
+            // Long enough that an unclipped granule would still be inside the file: a missing
+            // clip must show up as resident guard pages and not as a refused copy.
+            let file_pages = first_file_page + region_pages + guard_pages;
+            let mut snapshot =
+                memmap2::MmapMut::map_anon(file_pages * Self::PAGE).expect("mapping a snapshot");
+            for (index, page) in snapshot.chunks_exact_mut(Self::PAGE).enumerate() {
+                page.fill((index + 1) as u8);
+            }
+            let mmap = snapshot.make_read_only().expect("sealing the snapshot");
+            let (base, uffd) = missing_guest_memory(
+                (guard_pages + region_pages + guard_pages) * Self::PAGE,
+                features,
+            );
+            let clone = Self {
+                base,
+                guard_pages,
+                region_pages,
+                file_pages,
+                source: PageSource::Copy {
+                    mmap,
+                    fault_around: granule_pages * Self::PAGE,
+                },
+                mappings: [GuestRegionUffdMapping {
+                    base_host_virt_addr: (base + guard_pages * Self::PAGE) as u64,
+                    size: region_pages * Self::PAGE,
+                    offset: (first_file_page * Self::PAGE) as u64,
+                    page_size: Self::PAGE,
+                }],
+            };
+            (clone, uffd)
+        }
+
+        fn region_addr(&self, region_page: usize) -> usize {
+            self.base + (self.guard_pages + region_page) * Self::PAGE
+        }
+
+        fn ctx(&self) -> VmContext<'_> {
+            VmContext {
+                vm_id: "fault-around-clone",
+                mappings: &self.mappings,
+                source: &self.source,
+                page_size: Self::PAGE,
+                page_mask: !(Self::PAGE - 1),
+                mem_size: self.file_pages * Self::PAGE,
+            }
+        }
+
+        fn state(&self) -> VmState {
+            VmState {
+                fault_count: 0,
+                fault_around: FaultAroundStats::default(),
+                parked_faults: ParkedFaults::default(),
+                recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
+                record_until: None,
+                started: std::time::Instant::now(),
+                trace: None,
+            }
+        }
+
+        /// A vCPU reads one byte of `region_page` and sleeps in its fault, the handler drains
+        /// the userfaultfd once, and the read returns.
+        fn touch(&self, uffd: &Uffd, state: &mut VmState, region_page: usize) -> u8 {
+            let vcpu = FaultingReader::spawn(self.region_addr(region_page));
+            vcpu.wait_until_asleep();
+            let outcome = drain_events(uffd, &self.ctx(), state).expect("serving the fault");
+            assert_eq!(outcome, DrainOutcome::QueueDrained);
+            let (got, _) = vcpu.finish("the vCPU is still asleep after its fault was served");
+            got
+        }
+
+        /// The balloon: `madvise(MADV_DONTNEED)` on one region page from another thread. It
+        /// raises `mmap_changing`, queues a REMOVE event and sleeps until the event is read.
+        /// Returns once the event is queued. Needs `EVENT_REMOVE`.
+        fn inflate(&self, uffd: &Uffd, region_page: usize) -> std::thread::JoinHandle<libc::c_int> {
+            let addr = self.region_addr(region_page);
+            let balloon = std::thread::spawn(move || {
+                // SAFETY: advising this test's own live mapping.
+                unsafe { libc::madvise(addr as *mut libc::c_void, Self::PAGE, libc::MADV_DONTNEED) }
+            });
+            wait_for_uffd_event(uffd, "the REMOVE event");
+            balloon
+        }
+
+        fn resident_region_pages(&self) -> Vec<usize> {
+            resident_pages(self.region_addr(0), self.region_pages)
+        }
+
+        fn resident_guard_pages(&self) -> usize {
+            resident_pages(self.base, self.guard_pages).len()
+                + resident_pages(self.region_addr(self.region_pages), self.guard_pages).len()
+        }
+
+        /// The first byte of a region page. Only for a page the test has already shown to be
+        /// resident: reading a missing one faults with nothing left to serve it.
+        fn byte(&self, region_page: usize) -> u8 {
+            // SAFETY: inside this clone's live mapping.
+            unsafe { std::ptr::read_volatile(self.region_addr(region_page) as *const u8) }
+        }
+
+        /// Unmap the guest memory, once every thread that touches it has been joined.
+        fn unmap(self) {
+            let len = (self.guard_pages + self.region_pages + self.guard_pages) * Self::PAGE;
+            // SAFETY: unmapping our own mapping, with no thread left that uses it.
+            unsafe { libc::munmap(self.base as *mut libc::c_void, len) };
+        }
+    }
+
+    /// Today's behaviour, pinned: with the option off, one touch makes one page resident.
+    #[test]
+    fn without_fault_around_one_touch_leaves_exactly_one_page_resident() {
+        let (clone, uffd) = FaultAroundClone::new(0, 0, 12);
+        let mut state = clone.state();
+
+        assert_eq!(clone.touch(&uffd, &mut state, 5), 6);
+
+        assert_eq!(clone.resident_region_pages(), vec![5]);
+        assert_eq!(clone.resident_guard_pages(), 0);
+        assert_eq!(state.fault_count, 1);
+        assert_eq!(state.fault_around.granules, 0);
+        assert_eq!(state.fault_around.extra_bytes, 0);
+        clone.unmap();
+    }
+
+    /// One touch makes its whole granule resident with the snapshot's bytes, and nothing
+    /// outside that granule.
+    #[test]
+    fn one_touch_populates_its_whole_granule_and_nothing_outside_it() {
+        let (clone, uffd) = FaultAroundClone::new(4, 0, 12);
+        let mut state = clone.state();
+
+        assert_eq!(clone.touch(&uffd, &mut state, 5), 6, "the demanded page");
+
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![4, 5, 6, 7],
+            "exactly the granule that holds page 5"
+        );
+        assert_eq!(clone.resident_guard_pages(), 0);
+        for page in 4..8 {
+            assert_eq!(
+                clone.byte(page),
+                (page + 1) as u8,
+                "page {page} must hold the snapshot's bytes"
+            );
+        }
+        assert_eq!(state.fault_count, 1);
+        assert_eq!(state.fault_around.granules, 1);
+        assert_eq!(
+            state.fault_around.extra_bytes,
+            3 * FaultAroundClone::PAGE as u64,
+            "the demanded page is not an extra page"
+        );
+        assert_eq!(state.fault_around.refused, 0);
+        clone.unmap();
+    }
+
+    /// The region maps file pages 2..10, so with 4-page granules both of its ends fall inside
+    /// a granule. Populating must stop at the region's edges: the guard pages on either side
+    /// are registered on the same userfaultfd, and an unclipped copy would land in them.
+    #[test]
+    fn the_populated_granule_is_clipped_at_both_ends_of_its_region() {
+        let (clone, uffd) = FaultAroundClone::new(4, 2, 8);
+        let mut state = clone.state();
+
+        assert_eq!(clone.touch(&uffd, &mut state, 0), 3, "file page 2");
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![0, 1],
+            "file pages 2 and 3: the part of granule 0..4 that is inside the region"
+        );
+        assert_eq!(
+            clone.resident_guard_pages(),
+            0,
+            "the granule ran past the start of its region"
+        );
+
+        assert_eq!(clone.touch(&uffd, &mut state, 7), 10, "file page 9");
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![0, 1, 6, 7],
+            "file pages 8 and 9: the part of granule 8..12 that is inside the region"
+        );
+        assert_eq!(
+            clone.resident_guard_pages(),
+            0,
+            "the granule ran past the end of its region"
+        );
+        assert_eq!(clone.byte(1), 4, "file page 3");
+        assert_eq!(clone.byte(6), 9, "file page 8");
+        assert_eq!(state.fault_around.granules, 2);
+        assert_eq!(
+            state.fault_around.extra_bytes,
+            2 * FaultAroundClone::PAGE as u64
+        );
+        clone.unmap();
+    }
+
+    /// A page that is already present is stepped over, keeps its bytes, and does not stop
+    /// the pages on either side of it from being populated.
+    #[test]
+    fn pages_already_present_are_skipped_and_the_rest_of_the_granule_is_populated() {
+        let (clone, uffd) = FaultAroundClone::new(8, 0, 8);
+        let mut state = clone.state();
+
+        // Page 5 is already there, with bytes the snapshot does not hold.
+        let present = vec![0xEEu8; FaultAroundClone::PAGE];
+        // SAFETY: `present` outlives the ioctl and the target is one registered page.
+        unsafe {
+            uffd.copy(
+                present.as_ptr().cast(),
+                clone.region_addr(5) as *mut libc::c_void,
+                FaultAroundClone::PAGE,
+                true,
+            )
+        }
+        .expect("filling page 5 ahead of the fault");
+
+        assert_eq!(clone.touch(&uffd, &mut state, 2), 3);
+
+        assert_eq!(clone.resident_region_pages(), (0..8).collect::<Vec<_>>());
+        for page in 0..8 {
+            let expected = if page == 5 { 0xEE } else { (page + 1) as u8 };
+            assert_eq!(clone.byte(page), expected, "page {page}");
+        }
+        assert_eq!(state.fault_around.granules, 1);
+        assert_eq!(
+            state.fault_around.extra_bytes,
+            6 * FaultAroundClone::PAGE as u64,
+            "pages 0, 1, 3, 4, 6 and 7: neither the demanded page nor the present one"
+        );
+        assert_eq!(state.fault_around.refused, 0);
+        clone.unmap();
+    }
+
+    /// The working set records what the guest asked for. Recording the granule would turn
+    /// the hint into its own prediction, and replay would then populate it into every clone.
+    #[test]
+    fn fault_around_records_only_the_demanded_page() {
+        let (clone, uffd) = FaultAroundClone::new(4, 0, 12);
+        let mut state = clone.state();
+
+        clone.touch(&uffd, &mut state, 5);
+
+        assert_eq!(clone.resident_region_pages(), vec![4, 5, 6, 7]);
+        let recorded: Vec<(u64, u64)> = state
+            .recorded
+            .as_ref()
+            .expect("this clone records")
+            .runs()
+            .map(|run| (run.offset, run.len))
+            .collect();
+        assert_eq!(
+            recorded,
+            vec![(
+                5 * FaultAroundClone::PAGE as u64,
+                FaultAroundClone::PAGE as u64
+            )]
+        );
+        clone.unmap();
+    }
+
+    /// A second vCPU asleep on another page of the granule is released by the populate
+    /// itself: `UFFDIO_COPY` wakes every sleeper in the range it installs and takes their
+    /// events off the queue, so that vCPU's fault never reaches the handler. A populate that
+    /// did not wake would leave it to its own event, and the handler would count two faults.
+    #[test]
+    fn a_vcpu_asleep_inside_the_granule_is_woken_by_the_populate() {
+        let (clone, uffd) = FaultAroundClone::new(4, 0, 8);
+        let mut state = clone.state();
+
+        let first = FaultingReader::spawn(clone.region_addr(1));
+        first.wait_until_asleep();
+        let second = FaultingReader::spawn(clone.region_addr(2));
+        second.wait_until_asleep();
+
+        let outcome = drain_events(&uffd, &clone.ctx(), &mut state).expect("serving the faults");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+
+        let (got, _) = first.finish("the first vCPU is still asleep after its fault was served");
+        assert_eq!(got, 2);
+        let (got, _) = second.finish("the second vCPU is still asleep after the granule populate");
+        assert_eq!(got, 3);
+        assert_eq!(
+            state.fault_count, 1,
+            "the second vCPU's page was installed by the first fault's granule"
+        );
+        assert_eq!(clone.resident_region_pages(), vec![0, 1, 2, 3]);
+        clone.unmap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Fault-around and the rest of the handler: replay, parked faults, lost races.
+    // -------------------------------------------------------------------------
+
+    /// Replay restores the recorded pages and nothing more, with fault-around on as well.
+    ///
+    /// A page that fault-around installed is never recorded, because the guest never faults
+    /// on it, so with the option on the recorded set converges one demanded page per granule
+    /// per clone. Expanding every recorded run to its granule on replay would hide that, and
+    /// it is deliberately not done. Right after a restore the demanded pages are sparse: the
+    /// one measurement at 64 KiB installed 14.5 pages beyond each demanded one. Expansion
+    /// would multiply the replayed memory by up to the granule factor, in a restore the
+    /// option already slows. This pins the decision, so that replay starts honouring the
+    /// granule only on purpose.
+    #[tokio::test]
+    async fn replay_populates_only_the_recorded_pages_with_fault_around_on() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // The region maps file pages 2..10 and granules are 4 pages.
+        let (clone, uffd) = FaultAroundClone::new(4, 2, 8);
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        {
+            let ctx = clone.ctx();
+            assert!(
+                ctx.fault_around().is_some(),
+                "the option must be on for this clone, or the test pins nothing"
+            );
+            let mut state = clone.state();
+            // An earlier clone demanded file page 5 and file page 9.
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            recorded.insert_range((5 * PAGE) as u64, PAGE as u64);
+            recorded.insert_range((9 * PAGE) as u64, PAGE as u64);
+            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert!(!exited, "the clone is alive");
+            assert_eq!(
+                clone.resident_region_pages(),
+                vec![3, 7],
+                "replay populated more than the recorded pages"
+            );
+            assert_eq!(clone.resident_guard_pages(), 0);
+            assert_eq!(clone.byte(3), 6, "file page 5");
+            assert_eq!(clone.byte(7), 10, "file page 9");
+            assert_eq!(state.fault_count, 0, "nothing faulted");
+            assert_eq!(state.fault_around.granules, 0, "replay is not fault-around");
+        }
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// Speculation yields to a parked fault. A parked fault is retried between batches and
+    /// fails the handler, which kills the clone, if it is still refused after
+    /// MAX_PARKED_WAIT. A batch is up to 128 events, and with fault-around each of them could
+    /// carry a populate of up to 2 MiB, so while anything is parked a demand fault gets its
+    /// own page and nothing more.
+    #[test]
+    fn fault_around_waits_while_a_fault_is_parked() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(4, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+        // Pages 0..4 hold the balloon's page, whose residency depends on how the REMOVE was
+        // zeroed. Every assertion below is about the other three granules.
+        let resident = |clone: &FaultAroundClone| -> Vec<usize> {
+            clone
+                .resident_region_pages()
+                .into_iter()
+                .filter(|page| *page >= 4)
+                .collect()
+        };
+
+        // A balloon REMOVE is queued and unread, so the kernel refuses the first vCPU's
+        // copy with a zero-progress EAGAIN and the handler parks it.
+        let balloon = clone.inflate(&uffd, 0);
+        let parked = FaultingReader::spawn(clone.region_addr(5));
+        parked.wait_until_asleep();
+        let outcome = drain_events(&uffd, &clone.ctx(), &mut state).expect("parking the fault");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(
+            state
+                .parked_faults
+                .by_page
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![clone.region_addr(5)]
+        );
+        // That drain read the REMOVE, so madvise returns and the kernel accepts copies again.
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+
+        // A second vCPU faults while the first is still parked: its page, and only its page.
+        assert_eq!(clone.touch(&uffd, &mut state, 9), 10);
+        assert_eq!(
+            resident(&clone),
+            vec![9],
+            "a granule was populated while a fault was parked"
+        );
+        assert!(!state.parked_faults.is_empty());
+
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved after the REMOVE event was read"
+            );
+            assert!(retry_parked_faults(&clone.ctx(), &uffd, &mut state).expect("retrying"));
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let (got, _) = parked.finish("the parked vCPU is still asleep after its retry");
+        assert_eq!(got, 6);
+        assert_eq!(resident(&clone), vec![5, 9]);
+
+        // Nothing is parked any more, so the next fault populates its granule.
+        assert_eq!(clone.touch(&uffd, &mut state, 13), 14);
+        assert_eq!(resident(&clone), vec![5, 9, 12, 13, 14, 15]);
+        clone.unmap();
+    }
+
+    /// A demand fault whose copy finds the page already present lost a race to another
+    /// populator, and that populator owns the range. Populating the granule as well would be
+    /// up to 511 EEXIST ioctls on the fault path for nothing. The sleeper is still woken:
+    /// that is `copy_page`'s EEXIST arm, which this leaves alone.
+    #[test]
+    fn a_demand_fault_that_found_its_page_present_populates_nothing() {
+        let (clone, uffd) = FaultAroundClone::new(4, 0, 8);
+        let mut state = clone.state();
+
+        let vcpu = FaultingReader::spawn(clone.region_addr(5));
+        vcpu.wait_until_asleep();
+        // The winner installs the page without a wake, which stands in for a wake scan the
+        // sleeper missed, as in `eexist_copy_resolution_wakes_the_stranded_faulter`.
+        let winner = vec![0xA5u8; FaultAroundClone::PAGE];
+        // SAFETY: `winner` outlives the ioctl and the target is one registered page.
+        unsafe {
+            uffd.copy(
+                winner.as_ptr().cast(),
+                clone.region_addr(5) as *mut libc::c_void,
+                FaultAroundClone::PAGE,
+                false,
+            )
+        }
+        .expect("the winner's copy");
+
+        let outcome = drain_events(&uffd, &clone.ctx(), &mut state).expect("serving the fault");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its fault found EEXIST");
+        assert_eq!(got, 0xA5, "the winner's bytes");
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![5],
+            "the granule was populated behind a fault that another populator had already served"
+        );
+        assert_eq!(state.fault_count, 1);
+        assert_eq!(state.fault_around.granules, 0);
+        clone.unmap();
     }
 }
