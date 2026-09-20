@@ -28,6 +28,11 @@ const CHILD_ROOT: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_ROOT";
 const CHILD_REFERENCE: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_REFERENCE";
 const TEST_NAME: &str = "test_storage_image_build_leaves_running_containers_attached";
 
+/// Printed by the child once its body has run to the end. `--exact` with a name that
+/// matches no test exits 0 having run nothing, so after a rename of the test the exit
+/// status alone would keep this green with no body behind it.
+const BODY_RAN: &str = "storage-image-runroot: the test body ran to its end";
+
 const ARCHIVE: &str = "alpine.tar";
 const GRAPHROOT: &str = "store";
 const RUNROOT: &str = "run";
@@ -40,7 +45,9 @@ const REFERENCE_LIFETIME_SECS: &str = "300";
 fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
     if let Some(root) = std::env::var_os(CHILD_ROOT) {
         let reference = std::env::var(CHILD_REFERENCE).context("reference container name")?;
-        return build_next_to_a_running_container(Path::new(&root), &reference);
+        build_next_to_a_running_container(Path::new(&root), &reference)?;
+        println!("{BODY_RAN}");
+        return Ok(());
     }
     anyhow::ensure!(
         nix::unistd::geteuid().is_root(),
@@ -61,11 +68,15 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
     )?;
     let reference = format!("fcvm-runroot-{}", uuid::Uuid::new_v4().simple());
 
-    let output = Command::new(std::env::current_exe()?)
+    let mut child = Command::new(std::env::current_exe()?);
+    child
         .args(["--exact", TEST_NAME, "--nocapture"])
         .env(CHILD_ROOT, &root)
         .env(CHILD_REFERENCE, &reference)
-        .env("CONTAINERS_STORAGE_CONF", &conf)
+        .env("CONTAINERS_STORAGE_CONF", &conf);
+    // nextest kills this process at its timeout. The child must not outlive it.
+    common::set_test_pdeathsig_std(&mut child);
+    let output = child
         .output()
         .context("running the test body against the private store")?;
 
@@ -77,12 +88,19 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
         .output();
     detach_mounts_below(&root);
 
+    let (stdout, stderr) = (
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
     anyhow::ensure!(
         output.status.success(),
-        "{}\n{}\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        "{}\n{stdout}\n{stderr}",
+        output.status
+    );
+    anyhow::ensure!(
+        // Not a whole line: libtest can print `test <name> ... ` ahead of it, unterminated.
+        stdout.contains(BODY_RAN),
+        "the re-executed test exited 0 without running its body. Is TEST_NAME still the name of this test?\n{stdout}\n{stderr}"
     );
     Ok(())
 }

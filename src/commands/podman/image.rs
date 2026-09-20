@@ -647,40 +647,122 @@ mod tests {
         assert!(!runroot.exists(), "{runroot:?} outlived its store");
     }
 
-    #[test]
-    fn every_podman_graphroot_flag_is_built_by_temp_store() {
-        // A hand-built call would bring the shared runroot back, and
-        // tests/test_storage_image_runroot.rs only sees calls made by build_storage_image.
-        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    /// Source files that name a podman graphroot in code, how often, and why that is fine.
+    const GRAPHROOT_FLAG_SITES: &[(&str, usize, &str)] = &[
+        (
+            "src/commands/podman/image.rs",
+            1,
+            "TempStore::podman, which pairs the graphroot with a runroot of its own",
+        ),
+        (
+            "fc-mock/src/container.rs",
+            1,
+            "rootless_storage_args: fc-mock gives its podman an XDG_RUNTIME_DIR of its own \
+             (apply_user_ns_env), and that is where a rootless default runroot lives",
+        ),
+    ];
+
+    /// Occurrences of the podman graphroot flag in the code part of `line`. Comments
+    /// are cut at the first `//`, and a longer flag that starts the same way
+    /// (`--rootfs-size`) is another flag.
+    fn graphroot_flags_in(line: &str) -> usize {
         let graphroot_flag = flag("root");
-        let spellings = [
-            format!("\"{graphroot_flag}\""),
-            format!("\"{graphroot_flag}="),
+        let code = line.split("//").next().unwrap_or_default();
+        code.match_indices(&graphroot_flag)
+            .filter(|(at, _)| {
+                !code[at + graphroot_flag.len()..].starts_with(|next: char| {
+                    next.is_ascii_alphanumeric() || next == '-' || next == '_'
+                })
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_scan_tells_the_graphroot_flag_from_its_neighbours() {
+        let graphroot_flag = flag("root");
+        for (line, expected) in [
+            (format!(".arg(\"{graphroot_flag}\")"), 1),
+            (format!("\"{graphroot_flag}=/tmp/store\","), 1),
+            (
+                format!("[\"{graphroot_flag}\", dir, \"{graphroot_flag}\"]"),
+                2,
+            ),
+            (
+                format!("\"{graphroot_flag}fs-size\", \"{graphroot_flag}-dir\""),
+                0,
+            ),
+            (
+                format!("/// `{graphroot_flag}` moves only the graphroot"),
+                0,
+            ),
+            (format!("let x = 1; // then pass {graphroot_flag}"), 0),
+            (format!("podman {graphroot_flag}"), 1),
+        ] {
+            assert_eq!(graphroot_flags_in(&line), expected, "{line}");
+        }
+    }
+
+    /// A hand-built podman call that names a graphroot would bring the shared runroot
+    /// back, and tests/test_storage_image_runroot.rs only sees calls that
+    /// build_storage_image makes. So every source file that names the flag in code is
+    /// listed above with a count and a reason.
+    ///
+    /// It counts per file, so reformatting or moving a call does not trip it. What it
+    /// cannot see: a flag assembled at run time (`format!`, `concat!`), a graphroot chosen
+    /// through the environment or a config file (`CONTAINERS_STORAGE_CONF`,
+    /// `STORAGE_OPTS`), podman reached through a shell script, a line where `//` inside
+    /// a string comes before the flag, and crates other than the three scanned here.
+    #[test]
+    fn every_podman_graphroot_flag_is_accounted_for() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending = vec![
+            repo.join("src"),
+            repo.join("fc-agent/src"),
+            repo.join("fc-mock/src"),
         ];
-        let mut found = Vec::new();
-        let mut pending = vec![repo.join("src"), repo.join("fc-agent/src")];
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(&dir).unwrap() {
-                let path = entry.unwrap().path();
-                if path.is_dir() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                // The entry's own type, not its target's: an editor's lock file is a
+                // dangling symlink with a source file's name (`.#image.rs`).
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
                     pending.push(path);
-                } else if path.extension().is_some_and(|extension| extension == "rs") {
-                    let source = std::fs::read_to_string(&path).unwrap();
-                    for line in source.lines() {
-                        if spellings.iter().any(|spelling| line.contains(spelling)) {
-                            let file = path.strip_prefix(repo).unwrap().display();
-                            found.push(format!("{file}: {}", line.trim()));
-                        }
-                    }
+                    continue;
+                }
+                if !(kind.is_file() && path.extension().is_some_and(|extension| extension == "rs"))
+                {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let count: usize = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(graphroot_flags_in)
+                    .sum();
+                if count > 0 {
+                    let file = path.strip_prefix(repo).unwrap().display().to_string();
+                    found.insert(file, count);
                 }
             }
         }
+        let expected: std::collections::BTreeMap<String, usize> = GRAPHROOT_FLAG_SITES
+            .iter()
+            .map(|(file, count, _)| (file.to_string(), *count))
+            .collect();
         assert_eq!(
-            found,
-            [format!(
-                "src/commands/podman/image.rs: .arg(\"{graphroot_flag}\")"
-            )],
-            "podman calls that name a graphroot must be built by TempStore::podman"
+            found, expected,
+            "a podman call that names a graphroot goes through TempStore::podman, or gets an entry with a reason in GRAPHROOT_FLAG_SITES"
+        );
+
+        // The reason fc-mock is listed for, checked where it is decided.
+        let fc_mock = std::fs::read_to_string(repo.join("fc-mock/src/container.rs")).unwrap();
+        assert!(
+            fc_mock.contains("cmd.env(\"XDG_RUNTIME_DIR\""),
+            "fc-mock no longer gives podman a runtime directory of its own, so its graphroot needs a runroot"
         );
     }
 
