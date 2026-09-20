@@ -450,6 +450,16 @@ impl TempStore {
             .args(["--storage-driver", "overlay"]);
         podman
     }
+
+    /// Run `command`, which the caller aimed at this store, to its end.
+    async fn finish(
+        self,
+        mut command: tokio::process::Command,
+    ) -> std::io::Result<std::process::Output> {
+        let output = command.output().await;
+        drop(self);
+        output
+    }
 }
 
 /// Load `archive` into a new temporary store at `graphroot` and return what podman
@@ -457,12 +467,10 @@ impl TempStore {
 /// every way out of it.
 async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String> {
     let store = TempStore::new(graphroot)?;
+    let mut load = store.podman();
+    load.arg("load").arg("-i").arg(archive);
     let output = store
-        .podman()
-        .arg("load")
-        .arg("-i")
-        .arg(archive)
-        .output()
+        .finish(load)
         .await
         .context("running podman load into storage root")?;
     if !output.status.success() {
@@ -645,6 +653,41 @@ mod tests {
         std::fs::write(runroot.join("overlay-layers/mountpoints.json"), "[]").unwrap();
         drop(store);
         assert!(!runroot.exists(), "{runroot:?} outlived its store");
+    }
+
+    /// tokio lets a child run on when the future that waits for it is dropped. A load
+    /// that is cancelled must not take the runroot away under its podman. The stand-in
+    /// for podman ends by itself.
+    #[tokio::test]
+    async fn a_cancelled_command_keeps_its_runroot() {
+        let store = TempStore::new(&default_graphroot()).unwrap();
+        let runroot = store.runroot.path().to_path_buf();
+        let mut stand_in = tokio::process::Command::new("sleep");
+        stand_in.arg("2");
+        let cancelled = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            store.finish(stand_in),
+        )
+        .await;
+        assert!(cancelled.is_err(), "the stand-in ended before the timeout");
+        let kept = runroot.exists();
+        let _ = std::fs::remove_dir_all(&runroot);
+        assert!(
+            kept,
+            "{runroot:?} was removed under a command that still runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_runroot_is_removed_once_the_command_has_ended() {
+        let store = TempStore::new(&default_graphroot()).unwrap();
+        let runroot = store.runroot.path().to_path_buf();
+        let output = store
+            .finish(tokio::process::Command::new("true"))
+            .await
+            .unwrap();
+        assert!(output.status.success());
+        assert!(!runroot.exists(), "{runroot:?} outlived its command");
     }
 
     /// Source files that name a podman graphroot in code, how often, and why that is fine.
