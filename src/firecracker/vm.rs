@@ -27,6 +27,44 @@ const STDERR_TAIL_LINES: usize = 10;
 /// only bounds the pathological case of an inherited, still-open pipe.
 const STDERR_EOF_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Environment variable that names the level Firecracker logs at into the per-VM
+/// `firecracker.log`.
+const FIRECRACKER_LOG_LEVEL_ENV: &str = "FCVM_FIRECRACKER_LOG_LEVEL";
+/// The levels Firecracker's `--level` lists as its possible values.
+const FIRECRACKER_LOG_LEVELS: [&str; 4] = ["Error", "Warning", "Info", "Debug"];
+/// The level used when the environment names none.
+const DEFAULT_FIRECRACKER_LOG_LEVEL: &str = "Info";
+
+/// The `--level` Firecracker is started with: `Info` unless `requested` names another level.
+///
+/// At `Debug` Firecracker's vsock muxer writes one line per packet, so a guest whose volumes
+/// are FUSE over vsock fills the per-VM `firecracker.log`. A 128 GiB guest wrote 5.10 GiB in
+/// its first 65 minutes and 9.99 GiB by minute 84, onto the filesystem its snapshot was about
+/// to need, and teardown copies the file to `/tmp`. `Info` keeps Firecracker's API requests,
+/// warnings and errors.
+fn firecracker_log_level(requested: Option<&str>) -> Result<&'static str> {
+    let Some(requested) = requested.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_FIRECRACKER_LOG_LEVEL);
+    };
+    FIRECRACKER_LOG_LEVELS
+        .iter()
+        .copied()
+        .find(|level| level.eq_ignore_ascii_case(requested))
+        .ok_or_else(|| {
+            anyhow!(
+                "{FIRECRACKER_LOG_LEVEL_ENV}={requested:?} is not a Firecracker log level; use one of {}",
+                FIRECRACKER_LOG_LEVELS.join(", ")
+            )
+        })
+}
+
+/// Fails when `FCVM_FIRECRACKER_LOG_LEVEL` names no Firecracker log level. `main` calls this
+/// before a command prepares anything, and [`VmManager::start`] checks again for callers of the
+/// library.
+pub fn check_log_level_env() -> Result<()> {
+    firecracker_log_level(std::env::var(FIRECRACKER_LOG_LEVEL_ENV).ok().as_deref()).map(|_| ())
+}
+
 /// Connection probe boundary for the API-socket readiness state machine.
 ///
 /// Production uses Tokio's Unix stream. Tests provide exact NotFound,
@@ -67,6 +105,8 @@ pub struct VmManager {
     vm_name: Option<String>,
     socket_path: PathBuf,
     log_path: Option<PathBuf>,
+    /// What `FCVM_FIRECRACKER_LOG_LEVEL` held when this manager was made, checked in `start`.
+    firecracker_log_level: Option<String>,
     namespace_id: Option<String>,
     holder_pid: Option<u32>, // namespace holder PID for rootless mode (use nsenter to run FC)
     user_namespace_path: Option<PathBuf>, // User namespace path for rootless clones (enter via setns in pre_exec)
@@ -92,6 +132,7 @@ impl VmManager {
             vm_name: None,
             socket_path,
             log_path,
+            firecracker_log_level: std::env::var(FIRECRACKER_LOG_LEVEL_ENV).ok(),
             namespace_id: None,
             holder_pid: None,
             user_namespace_path: None,
@@ -191,6 +232,7 @@ impl VmManager {
         config_override: Option<&Path>,
         firecracker_args: Option<&str>,
     ) -> Result<()> {
+        let log_level = firecracker_log_level(self.firecracker_log_level.as_deref())?;
         if let Some(ref name) = self.vm_name {
             info!(target: "vm", vm_name = %name, vm_id = %self.vm_id, "starting Firecracker process");
         } else {
@@ -250,7 +292,7 @@ impl VmManager {
         // Setup logging
         if let Some(log_path) = &self.log_path {
             cmd.arg("--log-path").arg(log_path);
-            cmd.arg("--level").arg("Debug"); // Enable Debug logging for detailed diagnostics
+            cmd.arg("--level").arg(log_level);
             cmd.arg("--show-level");
             cmd.arg("--show-log-origin");
         }
@@ -903,5 +945,75 @@ mod tests {
             !msg.contains("socket not ready"),
             "launch failure must not be reported as a socket timeout, got: {msg}"
         );
+    }
+
+    #[test]
+    fn firecracker_logs_at_info_unless_asked_otherwise() {
+        assert_eq!(firecracker_log_level(None).unwrap(), "Info");
+        assert_eq!(firecracker_log_level(Some("  ")).unwrap(), "Info");
+        assert_eq!(firecracker_log_level(Some("debug")).unwrap(), "Debug");
+        assert_eq!(firecracker_log_level(Some(" Warning ")).unwrap(), "Warning");
+        let refused = firecracker_log_level(Some("verbose"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("FCVM_FIRECRACKER_LOG_LEVEL")
+                && refused.contains("Error, Warning, Info, Debug"),
+            "{refused}"
+        );
+    }
+
+    /// What a fake Firecracker was started with, one argument per line, or None when it never ran.
+    async fn arguments_of_a_start(requested: Option<&str>) -> (Result<()>, Option<Vec<String>>) {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let argv = dir.path().join("argv");
+        let fake_fc = dir.path().join("fake-firecracker.sh");
+        std::fs::write(
+            &fake_fc,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > '{}'\nexit 2\n",
+                argv.display()
+            ),
+        )
+        .expect("write fake firecracker");
+        std::fs::set_permissions(&fake_fc, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake firecracker");
+        let mut vm = VmManager::new(
+            "test-vm".to_string(),
+            dir.path().join("api.sock"),
+            Some(dir.path().join("firecracker.log")),
+        );
+        vm.firecracker_log_level = requested.map(str::to_string);
+        let started = vm.start(&fake_fc, None, None).await;
+        let seen = std::fs::read_to_string(&argv)
+            .ok()
+            .map(|text| text.lines().map(str::to_string).collect());
+        (started, seen)
+    }
+
+    fn level_in(arguments: &[String]) -> Option<&str> {
+        let at = arguments
+            .iter()
+            .position(|argument| argument == "--level")?;
+        arguments.get(at + 1).map(String::as_str)
+    }
+
+    #[tokio::test]
+    async fn start_passes_the_log_level_to_firecracker() {
+        let (_, seen) = arguments_of_a_start(None).await;
+        let seen = seen.expect("the fake Firecracker ran");
+        assert_eq!(level_in(&seen), Some("Info"), "{seen:?}");
+
+        let (_, seen) = arguments_of_a_start(Some("debug")).await;
+        let seen = seen.expect("the fake Firecracker ran");
+        assert_eq!(level_in(&seen), Some("Debug"), "{seen:?}");
+
+        let (started, seen) = arguments_of_a_start(Some("verbose")).await;
+        let refused = format!(
+            "{:#}",
+            started.expect_err("an unknown level must not start a VM")
+        );
+        assert!(refused.contains("FCVM_FIRECRACKER_LOG_LEVEL"), "{refused}");
+        assert!(seen.is_none(), "Firecracker must not be spawned: {seen:?}");
     }
 }

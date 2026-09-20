@@ -176,3 +176,20 @@ fn test_repeated_publish_works() {
         stderr
     );
 }
+
+#[test]
+fn an_unknown_firecracker_log_level_stops_the_command_before_it_starts() {
+    let fcvm_path = common::find_fcvm_binary().expect("fcvm binary not found");
+    let output = Command::new(&fcvm_path)
+        .env("FCVM_FIRECRACKER_LOG_LEVEL", "verbose")
+        .args(["ls"])
+        .output()
+        .expect("failed to run fcvm");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("FCVM_FIRECRACKER_LOG_LEVEL")
+            && stderr.contains("Error, Warning, Info, Debug"),
+        "{stderr}"
+    );
+}
