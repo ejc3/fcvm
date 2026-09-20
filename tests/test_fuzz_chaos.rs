@@ -1430,10 +1430,7 @@ async fn test_fuzz_lifecycle_chaos() {
 async fn a_dropped_clone_guard_kills_the_clone_it_guards() {
     use std::os::unix::process::ExitStatusExt;
 
-    let mut child = tokio::process::Command::new("sleep")
-        .arg("300")
-        .spawn()
-        .expect("spawning sleep");
+    let mut child = common::test_child::spawn_sleep(300);
     let pid = child.id().expect("child pid");
     register_clone(pid);
 
@@ -1464,10 +1461,7 @@ async fn a_disarmed_clone_guard_leaves_the_process_alone() {
     // The normal path waits for the child itself, then disarms. Signalling
     // after a reap could hit an unrelated process that inherited the number,
     // so disarm must actually suppress the kill.
-    let mut child = tokio::process::Command::new("sleep")
-        .arg("5")
-        .spawn()
-        .expect("spawning sleep");
+    let mut child = common::test_child::spawn_sleep(5);
     let pid = child.id().expect("child pid");
     register_clone(pid);
 
@@ -1483,6 +1477,4 @@ async fn a_disarmed_clone_guard_leaves_the_process_alone() {
         early
     );
     unregister_clone(pid);
-    let _ = child.kill().await;
-    let _ = child.wait().await;
 }

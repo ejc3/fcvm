@@ -330,6 +330,21 @@ fn pdeathsig_hook() -> impl FnMut() -> std::io::Result<()> + Send + Sync + 'stat
     }
 }
 
+/// The guard for a helper process that a test starts for itself (a `sleep`, never fcvm):
+/// `test_child::spawn_sleep`, `test_child::spawn_sleep_std`, and
+/// `test_child::die_with_the_spawning_thread` for a child that the test hands to the code
+/// under test. A bare `Child` is not ended when it is dropped, so a test that failed before
+/// its own cleanup left the `sleep` behind, holding the lock `make` takes on the cargo
+/// target directory.
+///
+/// This is the library's `cfg(test)` module `src/test_child.rs`, included by path so that
+/// unit tests and integration tests share one implementation. Integration tests link the
+/// library without its `cfg(test)` modules, so they cannot reach it any other way.
+///
+/// [`set_test_pdeathsig`] is not for these. It arms the fcvm processes that tests spawn.
+#[path = "../../src/test_child.rs"]
+pub mod test_child;
+
 /// Check if we're running inside a container.
 ///
 /// Containers create marker files that we can use to detect containerized environments.

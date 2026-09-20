@@ -750,13 +750,13 @@ mod tests {
     #[tokio::test]
     async fn reboot_monitor_failure_reaps_child_before_returning() {
         let mut be = backend();
-        be.process = Some(
-            Command::new("sleep")
-                .arg("60")
-                .kill_on_drop(true)
-                .spawn()
-                .unwrap(),
-        );
+        // The child moves into the backend, so it cannot sit behind a guard of the test's
+        // own. `kill_on_drop` covers a test that returns or panics, and the pdeath hook
+        // covers a test process that is killed outright, where no drop runs.
+        let mut vmm = Command::new("sleep");
+        vmm.arg("60").kill_on_drop(true);
+        crate::test_child::die_with_the_spawning_thread(vmm.as_std_mut());
+        be.process = Some(vmm.spawn().unwrap());
         be.reboot_monitor = Some(tokio::spawn(async { bail!("injected CH event failure") }));
         let result = tokio::time::timeout(Duration::from_secs(2), be.wait()).await;
         let reaped = be.process.is_none();

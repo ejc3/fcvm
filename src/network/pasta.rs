@@ -2634,6 +2634,7 @@ mod tests {
         assert!(detail.contains("signal"), "{detail}");
     }
 
+    use crate::test_child::{spawn_sleep, Pinned, TestChild};
     use crate::utils::{DirEventSource, ProcessWatch};
     use std::future::{poll_fn, Future};
     use std::pin::Pin;
@@ -2677,7 +2678,9 @@ mod tests {
         }
     }
 
-    fn live_child() -> Child {
+    /// A child that stays alive for as long as a test holds it, and no longer: the
+    /// [`TestChild`] guard ends it when the test returns, panics, or is killed.
+    fn live_child() -> TestChild<Child> {
         // Must stay alive with NO stdin dependency: tokio's Child::wait()
         // drops the child's stdin handle on its first poll (deadlock
         // avoidance), so a `cat` with piped stdin exits 0 the moment the
@@ -2685,13 +2688,106 @@ mod tests {
         // paused clock's auto-advance to the safety tick is a scheduler race
         // (observed as a TRY 1 FAIL of the safety-tick test under a loaded
         // full-suite run, 2026-08-13).
-        let mut command = Command::new("sleep");
-        command
-            .arg("3600")
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-        command.spawn().expect("spawn live child")
+        spawn_sleep(3600)
+    }
+
+    /// Runs `body` as a test body of its own: on a named thread, inside a runtime, because
+    /// tokio spawns a child only inside one.
+    fn run_as_a_test_body<F>(thread_name: &str, body: F) -> std::thread::Result<()>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        std::thread::Builder::new()
+            .name(thread_name.to_string())
+            .spawn(move || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("building the test body's runtime")
+                    .block_on(body)
+            })
+            .expect("spawning the test body's thread")
+            .join()
+    }
+
+    /// A test that fails between `live_child()` and the end of its body must not leave the
+    /// child running.
+    ///
+    /// Each `wait_for_pid_file` test below has an `expect` or an assert between the spawn and
+    /// the end of its body. A bare tokio `Child` is not killed when it is dropped, so a
+    /// failure there left `sleep 3600` behind as an orphan, and the orphan held the build's
+    /// lock on the cargo target directory for up to an hour.
+    ///
+    /// The thread below is such a test body. The pidfd names that exact process and reads
+    /// gone only once the process has been reaped, so a child that was killed and left as a
+    /// zombie fails this too.
+    #[test]
+    fn a_live_child_does_not_outlive_a_test_that_panics() {
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+        let failing_test = run_as_a_test_body("panics-on-purpose", async move {
+            let child = live_child();
+            let pinned = Pinned::new(child.id().expect("live child PID"));
+            pinned_tx.send(pinned).expect("handing the pidfd over");
+            panic!("stand-in for an expect that fails before the child is ended");
+        });
+        assert!(failing_test.is_err(), "the test body must panic");
+        let pinned = pinned_rx
+            .recv()
+            .expect("the child was pinned before the panic");
+
+        // Read the verdict, then clean up BEFORE asserting on it: where the child does
+        // outlive the panic, this test must not leak the orphan it exists to catch.
+        let outlived = pinned.is_present();
+        if outlived {
+            pinned.kill();
+            let _ = pinned.reap();
+        }
+        assert!(
+            !outlived,
+            "the live child (pid {}) was still there after the test that spawned it panicked, \
+             and nothing else would have ended it for the rest of its 3600 s",
+            pinned.pid()
+        );
+    }
+
+    /// The exit no drop guard covers is the test process being killed outright, which is
+    /// what nextest does to a test that outlives its timeout: nothing unwinds, so nothing is
+    /// dropped. `forget` stands in for that here. What is left is the kernel, which must end
+    /// the child when the thread that spawned it goes away.
+    #[test]
+    fn a_live_child_whose_guard_never_runs_dies_with_the_thread_that_spawned_it() {
+        let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+        run_as_a_test_body("forgets-its-child", async move {
+            let child = live_child();
+            let pinned = Pinned::new(child.id().expect("live child PID"));
+            pinned_tx.send(pinned).expect("handing the pidfd over");
+            std::mem::forget(child);
+        })
+        .expect("the spawning thread returns");
+        let pinned = pinned_rx.recv().expect("the child was pinned");
+
+        let died = pinned.terminated_within(std::time::Duration::from_secs(5));
+        if !died {
+            // Never leave behind the orphan this test exists to catch.
+            pinned.kill();
+        }
+        // Its handle was forgotten, so nothing else reaps it.
+        let ended_by = pinned
+            .reap()
+            .expect("reaping the live child through its pidfd");
+
+        assert!(
+            died,
+            "the live child (pid {}) was still running 5 s after the thread that spawned it \
+             returned without dropping it; a test process that is killed outright would \
+             leave it behind for the rest of its 3600 s",
+            pinned.pid()
+        );
+        assert_eq!(
+            ended_by,
+            Some(libc::SIGTERM),
+            "the kernel must end it with the pdeath signal"
+        );
     }
 
     async fn assert_pending_once<F>(mut future: Pin<&mut F>)
@@ -2720,7 +2816,6 @@ mod tests {
 
         assert_eq!(events.calls, 1);
         assert_eq!(tokio::time::Instant::now(), before, "safety tick fired");
-        child.kill().await.expect("stop live child");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2745,7 +2840,6 @@ mod tests {
             tokio::time::Instant::now() - before,
             std::time::Duration::from_millis(250)
         );
-        child.kill().await.expect("stop live child");
     }
 
     #[tokio::test(start_paused = true)]
@@ -2766,7 +2860,6 @@ mod tests {
             tokio::time::Instant::now() - before,
             std::time::Duration::from_millis(50)
         );
-        child.kill().await.expect("stop live child");
     }
 
     #[tokio::test(start_paused = true)]
