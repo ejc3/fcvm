@@ -3524,6 +3524,32 @@ mod tests {
         );
     }
 
+    /// A test that panics or returns early must not leave its stand-in behind: `sleep 600`
+    /// would hold the inherited connection and the test runner's descriptors for ten
+    /// minutes.
+    #[test]
+    fn a_dropped_stand_in_vmm_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let vmm = connect_stand_in_vmm(&path);
+        let pid = vmm.id() as libc::pid_t;
+        drop(vmm);
+
+        // SAFETY: signal 0 only asks whether the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } != 0;
+        if !gone {
+            // About to fail: do not leave the process behind on the way out.
+            // SAFETY: `pid` is this test's own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+        assert!(gone, "the stand-in (pid {pid}) outlived its handle");
+    }
+
     /// Cancelling the server stops its warmer. The server is still alive when this looks,
     /// so it is the cancel arm that stopped it and not the drop.
     #[tokio::test]
@@ -3550,16 +3576,23 @@ mod tests {
     /// get here before either. `ENOENT` means not bound yet and `ECONNREFUSED` means bound
     /// but not listening yet. Both clear within milliseconds, so the child retries them for
     /// up to ten seconds, and the caller needs no wait of its own.
-    fn connect_stand_in_vmm(socket: &Path) -> std::process::Child {
+    ///
+    /// It comes back as a [`Victim`], armed the way [`spawn_victim`] arms its own, so a test
+    /// that panics, returns early or is killed outright does not leave `sleep 600` holding
+    /// the connection and the test runner's descriptors.
+    fn connect_stand_in_vmm(socket: &Path) -> Victim {
         use std::os::unix::process::CommandExt;
 
         let addr = unix_addr(socket);
+        let test_process = std::process::id() as libc::pid_t;
         let mut command = std::process::Command::new("sleep");
         command.arg("600");
-        // SAFETY: between fork and exec the hook only calls socket(2), connect(2), close(2)
-        // and nanosleep(2), which are async-signal-safe, on an address built before the fork.
+        // SAFETY: between fork and exec the hook only calls prctl(2), getppid(2), socket(2),
+        // connect(2), close(2) and nanosleep(2), which are async-signal-safe, on values
+        // built before the fork.
         unsafe {
             command.pre_exec(move || {
+                die_with_the_test(test_process)?;
                 let pause = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 5_000_000,
@@ -3590,7 +3623,7 @@ mod tests {
                 Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
             });
         }
-        command.spawn().expect("spawning the stand-in VMM")
+        Victim(command.spawn().expect("spawning the stand-in VMM"))
     }
 
     /// Under a long-lived serve the kernel evicts the image as clones grow. Admitting a
@@ -3954,19 +3987,25 @@ mod tests {
         // async-signal-safe calls. The parent PID was captured before the fork, so the
         // hook allocates nothing.
         unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // If the parent died in between, no signal is coming: refuse to start an
-                // unsupervised process.
-                if libc::getppid() != test_process {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                Ok(())
-            });
+            command.pre_exec(move || die_with_the_test(test_process));
         }
         Victim(command.spawn().expect("spawning the stand-in VMM process"))
+    }
+
+    /// The kernel half of [`Victim`], for a pre-exec hook: die with the thread that spawned
+    /// this child, and refuse to start if that parent is already gone, because then no
+    /// signal is coming. Two async-signal-safe calls and no allocation.
+    fn die_with_the_test(test_process: libc::pid_t) -> std::io::Result<()> {
+        // SAFETY: prctl(PR_SET_PDEATHSIG) and getppid take no pointers.
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != test_process {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+        }
+        Ok(())
     }
 
     fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
