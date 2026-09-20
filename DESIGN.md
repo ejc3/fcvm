@@ -1478,13 +1478,15 @@ The memory server:
 - Serves memory pages on-demand via UFFD (userfaultfd)
 - Enables sharing physical pages across multiple clones
 - Records each clone's restore working set and replays it into the next clone
+- In copy mode, reads the recorded working set into the page cache when it starts and when
+  a clone connects, so a restore does not replay it from disk one page at a time
 
 **Flags**:
 
 | Flag | Env var | Default | Effect |
 |------|---------|---------|--------|
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
-| `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set` and replays them into later clones; `off` is fully inert — no recording, no replay, no files |
+| `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
 
 **Example**:
 ```bash
@@ -1665,7 +1667,8 @@ fcvm/
 │   │   ├── server.rs       # Userfaultfd page handler
 │   │   ├── handler.rs      # UFFD event handler
 │   │   ├── working_set.rs  # Record/persist the restore working set
-│   │   └── prefetch.rs     # Replay it into a restoring clone
+│   │   ├── prefetch.rs     # Replay it into a restoring clone
+│   │   └── warmup.rs       # Read it into the page cache ahead of replay
 │   │
 │   ├── volume/             # FUSE volume handling
 │   │   └── mod.rs          # Host → guest filesystem mapping

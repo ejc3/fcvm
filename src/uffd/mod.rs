@@ -1,6 +1,7 @@
 mod handler;
 mod prefetch;
 mod server;
+mod warmup;
 mod working_set;
 
 pub use handler::UffdHandler;

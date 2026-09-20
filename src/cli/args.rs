@@ -456,8 +456,12 @@ pub struct SnapshotServeArgs {
     ///
     /// - `on` (default): the pages a clone faults are recorded beside the snapshot and
     ///   bulk-populated into every later clone, so it does not trap for pages we already know
-    ///   it will touch. A missing, stale or wrong record just means demand paging.
-    /// - `off`: no recording, no replay — every clone faults every page in.
+    ///   it will touch. A missing, stale or wrong record just means demand paging. In copy
+    ///   mode the serve also asks the kernel to read the recorded pages into the page cache,
+    ///   when it starts and when a clone connects, so replay does not read them from disk one
+    ///   fault at a time.
+    /// - `off`: no recording, no replay, no page cache warm-up. Every clone faults every page
+    ///   in.
     #[arg(long, value_name = "on|off", env = "FCVM_UFFD_PREFETCH")]
     pub uffd_prefetch: Option<String>,
 
