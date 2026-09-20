@@ -2589,7 +2589,7 @@ do not stop fault service.
 Replay covers the pages every clone touches. It cannot cover a clone that does fresh work right
 after restore, because the memory that work allocates lands on different pages in every clone.
 Measured on a 128 GiB guest before this option existed: the first real page render in a fresh
-clone took 541 s while the clone demand-faulted 3.3 million pages (12.7 GiB), one userfaultfd
+clone took 541 s while the clone demand-faulted 3.3 million pages (12.4 GiB), one userfaultfd
 round trip each. The same render took 305 s in a clone whose recorded set already held those
 pages (110 MiB faulted).
 
