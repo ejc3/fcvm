@@ -138,8 +138,11 @@ fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
 /// directory on the host when it is removed. `remove_container` is the step that needs
 /// podman, so that the rest can be tested without one.
 ///
-/// Every step runs whatever the one before it returned. Every failure is reported, the
-/// removal's first.
+/// The wait runs whatever the removal returned, and every failure is reported, the
+/// removal's first. A store that is still in use when the wait expires is left as it is,
+/// mounts and directory: taking either away under a process that can open the store
+/// again is the race this cleanup exists to avoid. The failure names the process and
+/// the directory.
 fn clean_up_private_store(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
@@ -158,19 +161,27 @@ fn clean_up_within(
     if let Err(error) = remove_container() {
         failures.push(format!("removing the container: {error:#}"));
     }
-    if let Err(error) = wait_until_store_is_unused(&root, limit) {
-        failures.push(format!("{error:#}"));
+    match wait_until_store_is_unused(&root, limit) {
+        Ok(()) => {
+            detach_mounts_below(&root);
+            match mounts_below(&root) {
+                Ok(mounts) if mounts.is_empty() => {}
+                Ok(mounts) => failures.push(format!(
+                    "still mounted below {} after the cleanup: {mounts:?}",
+                    root.display()
+                )),
+                Err(error) => failures.push(format!("reading the mount table: {error:#}")),
+            }
+            // Dropping it would ignore a removal that fails.
+            if let Err(error) = scratch.close() {
+                failures.push(format!("removing {}: {error}", root.display()));
+            }
+        }
+        Err(error) => {
+            let kept = scratch.keep();
+            failures.push(format!("{error:#}\nleft {} in place", kept.display()));
+        }
     }
-    detach_mounts_below(&root);
-    match mounts_below(&root) {
-        Ok(mounts) if mounts.is_empty() => {}
-        Ok(mounts) => failures.push(format!(
-            "still mounted below {} after the cleanup: {mounts:?}",
-            root.display()
-        )),
-        Err(error) => failures.push(format!("reading the mount table: {error:#}")),
-    }
-    drop(scratch);
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
