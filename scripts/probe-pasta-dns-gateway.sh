@@ -140,7 +140,18 @@ ask() {
     done
     answer=$(nsenter -t "$nspid" -U -n --preserve-credentials -- \
         dig +short +time=2 +tries=1 +noedns "@$GUEST_GATEWAY" example.com 2>/dev/null | head -1 || true)
-    kill "$pastapid" "$nspid" 2>/dev/null || true
+    # SIGKILL, because SIGTERM is not certain to end either helper. An ignored
+    # signal is inherited through fork and exec, and bash cannot reset one it
+    # started with, so whether SIGTERM works in here is decided outside this
+    # script. `unshare --fork` from util-linux 2.36 and 2.37 sets SIGINT and
+    # SIGTERM to SIG_IGN before it forks and restores them only in the parent
+    # (2.38 blocks them in the parent instead), and a caller that ignores
+    # SIGTERM has the same effect under any version. The holder is a plain
+    # `sleep 60` with no handler of its own, so the `wait` below then lasted
+    # the full 60 s, once per `ask`: 120 s for a probe that takes 0.2 s. Both
+    # helpers are this probe's own, in namespaces that end with it, and the
+    # answer has been read by now.
+    kill -KILL "$pastapid" "$nspid" 2>/dev/null || true
     wait "$pastapid" "$nspid" 2>/dev/null || true
     printf '%s' "$answer"
 }
