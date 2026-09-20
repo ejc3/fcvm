@@ -14,6 +14,12 @@
 //! temporary store is the one `build_storage_image` creates, so removing its private
 //! runroot turns this test red.
 //!
+//! The child also runs in a mount namespace of its own, entered before it executes, with
+//! nothing shared in either direction. Every mount that it, podman, conmon, conmon's exit
+//! command or the product makes lives there and goes with the last process in it. None can
+//! reach the host's mount table, whatever becomes of the child, so the parent has no mount
+//! to find or detach.
+//!
 //! Root only, like the CI jobs where the failure showed up.
 
 #![cfg(feature = "privileged-tests")]
@@ -33,6 +39,17 @@ const TEST_NAME: &str = "test_storage_image_build_leaves_running_containers_atta
 /// matches no test exits 0 having run nothing, so after a rename of the test the exit
 /// status alone would keep this green with no body behind it.
 const BODY_RAN: &str = "storage-image-runroot: the test body ran to its end";
+
+/// What every line about this test's progress starts with. The parent prints how long
+/// each of its steps took and repeats what the child said about its own, in a passing run
+/// too, so that a slow run says where the time went.
+const NOTE: &str = "storage-image-runroot:";
+
+/// Set for a child that is to be killed once its container runs.
+const CHILD_DIES: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_DIES";
+
+/// Printed by that child before it dies, so that its parent knows how far it got.
+const CONTAINER_RUNS: &str = "storage-image-runroot: the reference container runs";
 
 const ARCHIVE: &str = "alpine.tar";
 const GRAPHROOT: &str = "store";
@@ -58,57 +75,211 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
         println!("{BODY_RAN}");
         return Ok(());
     }
-    anyhow::ensure!(
-        nix::unistd::geteuid().is_root(),
-        "this test needs root: run it with `make test-root`"
-    );
-
-    let scratch = tempfile::TempDir::new()?;
-    let root = scratch.path().canonicalize()?;
-    save_reference_image(&root.join(ARCHIVE))?;
-    let conf = root.join("storage.conf");
-    std::fs::write(
-        &conf,
-        format!(
-            "[storage]\ndriver = \"overlay\"\ngraphroot = {:?}\nrunroot = {:?}\n",
-            root.join(GRAPHROOT),
-            root.join(RUNROOT)
-        ),
-    )?;
-    // Named in the log so that a directory, mount or process left behind can be traced to its run.
-    println!("private store under {}", root.display());
-    let reference = format!("fcvm-runroot-{}", uuid::Uuid::new_v4().simple());
-
-    let mut child = Command::new(std::env::current_exe()?);
-    child
-        .args(["--exact", TEST_NAME, "--nocapture"])
-        .env(CHILD_ROOT, &root)
-        .env(CHILD_REFERENCE, &reference)
-        .env("CONTAINERS_STORAGE_CONF", &conf);
-    // nextest kills this process at its timeout. The child must not outlive it.
-    common::set_test_pdeathsig_std(&mut child);
-    let output = child
-        .output()
-        .context("running the test body against the private store")?;
-
-    // Before `scratch` is dropped, and whatever the child did.
-    let cleaned = clean_up_private_store(scratch, || remove_reference(&conf, &reference));
+    let fixture = Fixture::new()?;
+    let ran = fixture.run_child(false)?;
+    // The child has exited and its container still runs, in the child's namespace.
+    let on_the_host = mounts_below(&fixture.root);
+    let root = fixture.root.clone();
+    // Before the scratch directory is dropped, and whatever the child did.
+    let cleaned = fixture.clean_up(ran.namespace);
 
     let (stdout, stderr) = (
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&ran.output.stdout),
+        String::from_utf8_lossy(&ran.output.stderr),
     );
     anyhow::ensure!(
-        output.status.success(),
+        ran.output.status.success(),
         "{}\n{stdout}\n{stderr}",
-        output.status
+        ran.output.status
     );
     anyhow::ensure!(
         // Not a whole line: libtest can print `test <name> ... ` ahead of it, unterminated.
         stdout.contains(BODY_RAN),
         "the re-executed test exited 0 without running its body. Is TEST_NAME still the name of this test?\n{stdout}\n{stderr}"
     );
-    cleaned.context("cleaning up the private store")
+    cleaned.context("cleaning up the private store")?;
+    nothing_on_the_host(&root, on_the_host?)
+}
+
+/// A child that is killed runs no cleanup of its own, and its container runs on. The
+/// parent still removes the container, from inside the child's namespace, and the host's
+/// mount table never holds anything of the store.
+#[test]
+fn a_killed_child_leaves_nothing_on_the_host() -> Result<()> {
+    use std::os::unix::process::ExitStatusExt;
+    let fixture = Fixture::new()?;
+    let ran = fixture.run_child(true)?;
+    let on_the_host = mounts_below(&fixture.root);
+    let root = fixture.root.clone();
+    let cleaned = fixture.clean_up(ran.namespace);
+
+    let stdout = String::from_utf8_lossy(&ran.output.stdout);
+    anyhow::ensure!(
+        ran.output.status.signal() == Some(libc::SIGKILL) && stdout.contains(CONTAINER_RUNS),
+        "the child was to be killed once its container ran: {}\n{stdout}\n{}",
+        ran.output.status,
+        String::from_utf8_lossy(&ran.output.stderr)
+    );
+    cleaned.context("cleaning up after the killed child")?;
+    nothing_on_the_host(&root, on_the_host?)
+}
+
+/// What both tests require of the host once the cleanup has returned: its mount table
+/// held nothing of the store while the container ran, holds nothing now, and the scratch
+/// directory is gone.
+fn nothing_on_the_host(root: &Path, while_the_container_ran: Vec<PathBuf>) -> Result<()> {
+    anyhow::ensure!(
+        while_the_container_ran.is_empty(),
+        "the host's mount table had entries under {} while its container ran: {while_the_container_ran:?}",
+        root.display()
+    );
+    let now = mounts_below(root)?;
+    anyhow::ensure!(
+        now.is_empty(),
+        "the host's mount table has entries under {} after the cleanup: {now:?}",
+        root.display()
+    );
+    anyhow::ensure!(!root.exists(), "{} outlived the cleanup", root.display());
+    Ok(())
+}
+
+/// A private store under a scratch directory, for a child to run the test body against.
+struct Fixture {
+    scratch: tempfile::TempDir,
+    root: PathBuf,
+    conf: PathBuf,
+    reference: String,
+}
+
+/// What a child left behind: its output, and its mount namespace.
+struct Ran {
+    output: std::process::Output,
+    namespace: Result<std::fs::File>,
+}
+
+impl Fixture {
+    fn new() -> Result<Self> {
+        anyhow::ensure!(
+            nix::unistd::geteuid().is_root(),
+            "this test needs root: run it with `make test-root`"
+        );
+        let scratch = tempfile::TempDir::new()?;
+        let root = scratch.path().canonicalize()?;
+        let began = Instant::now();
+        save_reference_image(&root.join(ARCHIVE))?;
+        println!(
+            "{NOTE} the reference image was saved after {:.1}s",
+            began.elapsed().as_secs_f32()
+        );
+        let conf = root.join("storage.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "[storage]\ndriver = \"overlay\"\ngraphroot = {:?}\nrunroot = {:?}\n",
+                root.join(GRAPHROOT),
+                root.join(RUNROOT)
+            ),
+        )?;
+        // Named in the log so that a directory or process left behind can be traced to its run.
+        println!("private store under {}", root.display());
+        let reference = format!("fcvm-runroot-{}", uuid::Uuid::new_v4().simple());
+        Ok(Self {
+            scratch,
+            root,
+            conf,
+            reference,
+        })
+    }
+
+    /// Run the test body in a child: this binary again, with the private store as its
+    /// default store, in a mount namespace of its own. `dies` has the child killed once
+    /// its container runs.
+    fn run_child(&self, dies: bool) -> Result<Ran> {
+        let began = Instant::now();
+        let mut child = Command::new(std::env::current_exe()?);
+        child
+            .args(["--exact", TEST_NAME, "--nocapture"])
+            .env(CHILD_ROOT, &self.root)
+            .env(CHILD_REFERENCE, &self.reference)
+            .env("CONTAINERS_STORAGE_CONF", &self.conf)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        if dies {
+            child.env(CHILD_DIES, "1");
+        }
+        // nextest kills this process at its timeout. The child must not outlive it.
+        common::set_test_pdeathsig_std(&mut child);
+        in_its_own_mount_namespace(&mut child);
+        let child = child
+            .spawn()
+            .context("starting the test body against the private store")?;
+        // `spawn` returns once the child has run its hooks and called exec, so it is in its
+        // namespace by now. Its pid is this process's to wait for, so no other process
+        // can have it yet.
+        let namespace = mount_namespace_of(child.id());
+        let output = child
+            .wait_with_output()
+            .context("waiting for the test body")?;
+        println!(
+            "{NOTE} the child ran for {:.1}s",
+            began.elapsed().as_secs_f32()
+        );
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(at) = line.find(NOTE) {
+                println!("  child: {}", &line[at..]);
+            }
+        }
+        Ok(Ran { output, namespace })
+    }
+
+    /// Leave nothing of the private store behind. `namespace` is the child's.
+    fn clean_up(self, namespace: Result<std::fs::File>) -> Result<()> {
+        let Self {
+            scratch,
+            conf,
+            reference,
+            ..
+        } = self;
+        clean_up_private_store(scratch, move || {
+            let namespace = namespace.context("the child's mount namespace")?;
+            remove_reference(&conf, &reference, &namespace)
+        })
+    }
+}
+
+/// Have `command` start in a mount namespace of its own, with every mount in it private.
+/// Nothing it mounts reaches the host's mount table, and nothing mounted on the host
+/// afterwards reaches it. Only system calls are made between fork and exec.
+fn in_its_own_mount_namespace(command: &mut Command) {
+    use nix::mount::MsFlags;
+    use std::os::unix::process::CommandExt;
+    // SAFETY: the hook runs in the forked child before exec and makes two system calls.
+    unsafe {
+        command.pre_exec(|| {
+            nix::sched::unshare(nix::sched::CloneFlags::CLONE_NEWNS)?;
+            nix::mount::mount(
+                None::<&str>,
+                "/",
+                None::<&str>,
+                MsFlags::MS_REC | MsFlags::MS_PRIVATE,
+                None::<&str>,
+            )?;
+            Ok(())
+        });
+    }
+}
+
+/// The mount namespace of process `pid`, which must not be this process's own.
+fn mount_namespace_of(pid: u32) -> Result<std::fs::File> {
+    use std::os::unix::fs::MetadataExt;
+    let path = format!("/proc/{pid}/ns/mnt");
+    let namespace = std::fs::File::open(&path).with_context(|| format!("opening {path}"))?;
+    let own = std::fs::metadata("/proc/self/ns/mnt").context("reading /proc/self/ns/mnt")?;
+    anyhow::ensure!(
+        namespace.metadata()?.ino() != own.ino(),
+        "process {pid} shares this process's mount namespace"
+    );
+    Ok(namespace)
 }
 
 /// The programs that can open a store again: conmon, and the podman it runs as the
@@ -118,15 +289,28 @@ const STORE_PROGRAMS: [&str; 2] = ["conmon", "podman"];
 /// How long the cleanup waits for those programs to be gone.
 const STORE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// The child removes its container on every path it controls, and a killed child
-/// cannot. `--ignore` makes a container that is already gone a success. Anything else
-/// is a failure, with what podman said.
-fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
+/// `podman rm` on the reference container, from inside the namespace its mounts are in.
+/// A podman that opened the store from the host's namespace would mount the store's
+/// overlay home there. The child leaves its container running, and a killed child could
+/// not remove it anyway. `--ignore` makes a container that is already gone a success.
+/// Anything else is a failure, with what podman said.
+fn remove_reference(conf: &Path, reference: &str, namespace: &std::fs::File) -> Result<()> {
+    use std::os::unix::process::CommandExt;
     let mut remove = Command::new("podman");
     remove
         .args(["rm", "-f", "-t", "0", "--ignore", reference])
         .env("CONTAINERS_STORAGE_CONF", conf);
     common::set_test_pdeathsig_std(&mut remove);
+    let namespace = namespace
+        .try_clone()
+        .context("duplicating the namespace descriptor")?;
+    // SAFETY: the hook runs in the forked child before exec and makes one system call.
+    unsafe {
+        remove.pre_exec(move || {
+            nix::sched::setns(&namespace, nix::sched::CloneFlags::CLONE_NEWNS)?;
+            Ok(())
+        });
+    }
     let removed = remove.output().context("running podman rm")?;
     anyhow::ensure!(
         removed.status.success(),
@@ -138,75 +322,66 @@ fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
 }
 
 /// Leave nothing of the private store behind: no container, no process that can open
-/// the store again, no mount, and no directory. In that order, because a process that
-/// opens the store mounts its overlay home, and a mount made after the detach keeps the
-/// directory on the host when it is removed. `remove_container` is the step that needs
-/// podman, so that the rest can be tested without one.
+/// the store again, and no directory. The store's mounts are in the child's namespace
+/// and go with the last process in it, so there is none to detach here.
+/// `remove_container` is the step that needs podman, so that the rest can be tested
+/// without one.
 ///
 /// The wait runs whatever the removal returned, and every failure is reported, the
-/// removal's first. A store that is still in use when the wait expires is left as it is,
-/// mounts and directory: taking either away under a process that can open the store
-/// again is the race this cleanup exists to avoid. The failure names the process and
-/// the directory. The directory also stays when something is still mounted below it
-/// after the detach, or when the mount table cannot be read: removing it would walk into
-/// the mount.
+/// removal's first. A store that is still in use when the wait expires keeps its
+/// directory: a podman that runs on would make it again under the same name. The
+/// failure names the process and the directory. The directory also stays if this
+/// process's mount table, which is the host's, has an entry below it. The namespace
+/// rules that out, and removing the directory would walk into the mount.
 fn clean_up_private_store(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    clean_up_within(
-        scratch,
-        remove_container,
-        detach_mounts_below,
-        STORE_PROCESS_TIMEOUT,
-    )
+    clean_up_within(scratch, remove_container, STORE_PROCESS_TIMEOUT)
 }
 
-/// `clean_up_private_store` with the detach step and the wait's limit as parameters, for
-/// the tests.
+/// `clean_up_private_store` with the wait's limit as a parameter, for the tests.
 fn clean_up_within(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
-    detach: impl FnOnce(&Path),
     limit: Duration,
 ) -> Result<()> {
     let root = scratch.path().canonicalize()?;
     let mut failures = Vec::new();
+    let began = Instant::now();
     if let Err(error) = remove_container() {
         failures.push(format!("removing the container: {error:#}"));
     }
-    match wait_until_store_is_unused(&root, limit) {
-        Ok(()) => {
-            detach(&root);
-            match mounts_below(&root) {
-                // Dropping it would ignore a removal that fails.
-                Ok(mounts) if mounts.is_empty() => {
-                    if let Err(error) = scratch.close() {
-                        failures.push(format!("removing {}: {error}", root.display()));
-                    }
-                }
-                // Removing the directory would walk into what is still mounted.
-                Ok(mounts) => {
-                    let kept = scratch.keep();
-                    failures.push(format!(
-                        "still mounted below {} after the cleanup: {mounts:?}\nleft {} in place",
-                        root.display(),
-                        kept.display()
-                    ));
-                }
-                Err(error) => {
-                    let kept = scratch.keep();
-                    failures.push(format!(
-                        "reading the mount table: {error:#}\nleft {} in place",
-                        kept.display()
-                    ));
-                }
-            }
+    let removed = began.elapsed();
+    let mut keep = false;
+    if let Err(error) = wait_until_store_is_unused(&root, limit) {
+        failures.push(format!("{error:#}"));
+        keep = true;
+    }
+    println!(
+        "{NOTE} the removal took {:.1}s, the wait for the store's processes {:.1}s",
+        removed.as_secs_f32(),
+        (began.elapsed() - removed).as_secs_f32()
+    );
+    match mounts_below(&root) {
+        Ok(mounts) if mounts.is_empty() => {}
+        Ok(mounts) => {
+            failures.push(format!(
+                "the host's mount table has entries under {}: {mounts:?}",
+                root.display()
+            ));
+            keep = true;
         }
         Err(error) => {
-            let kept = scratch.keep();
-            failures.push(format!("{error:#}\nleft {} in place", kept.display()));
+            failures.push(format!("reading the mount table: {error:#}"));
+            keep = true;
         }
+    }
+    if keep {
+        failures.push(format!("left {} in place", scratch.keep().display()));
+    } else if let Err(error) = scratch.close() {
+        // Dropping it would ignore a removal that fails.
+        failures.push(format!("removing {}: {error}", root.display()));
     }
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
@@ -423,9 +598,8 @@ fn clean_up_next_to(stand_in: &mut StandIn, scratch: tempfile::TempDir) -> Resul
 /// conmon runs the container's exit command, `podman container cleanup --rm`, after it
 /// has written the exit file that `podman rm -f` waits for. So that podman process can
 /// still be running, and can open the private store again, when `podman rm` has
-/// returned. Opening the store mounts its overlay home. A cleanup that detaches the
-/// mounts and deletes the directory before that process is gone leaves a mount and a
-/// directory behind on the host.
+/// returned. A cleanup that deletes the directory before that process is gone deletes
+/// the store under a podman that still uses it.
 ///
 /// The stand-in is conmon in the state it is in while that command runs: it names the
 /// store in its arguments, it has closed everything it held under it, and it is the
@@ -458,47 +632,20 @@ fn the_cleanup_waits_for_a_process_that_holds_a_file_under_the_store() -> Result
     clean_up_next_to(&mut podman, scratch)
 }
 
-/// Detaches what a test mounted below its scratch directory on every way out of it.
-struct MountsBelow(PathBuf);
-
-impl Drop for MountsBelow {
-    fn drop(&mut self) {
-        detach_mounts_below(&self.0);
-    }
-}
-
-/// When `podman rm` fails, the store still has to be released.
+/// When `podman rm` fails, the wait still has to run.
 #[test]
-fn a_failed_removal_does_not_skip_the_wait_and_the_detach() -> Result<()> {
-    anyhow::ensure!(
-        nix::unistd::geteuid().is_root(),
-        "this test mounts something: run it with `make test-root`"
-    );
+fn a_failed_removal_does_not_skip_the_wait() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
-    let _mounts = MountsBelow(root.clone());
     let outside = tempfile::TempDir::new()?;
-    let mounted = root.join("mounted");
-    std::fs::create_dir(&mounted)?;
-    nix::mount::mount(
-        Some(&mounted),
-        &mounted,
-        None::<&str>,
-        nix::mount::MsFlags::MS_BIND,
-        None::<&str>,
-    )?;
     let mut podman = stand_in(outside.path(), "podman", STAND_IN_SECS, held_under(&root)?)?;
 
     let cleaned = clean_up_private_store(scratch, || anyhow::bail!("podman rm said no"));
 
-    let mut skipped = Vec::new();
-    if podman.0.try_wait()?.is_none() {
-        skipped.push("the wait");
-    }
-    if !mounts_below(&root)?.is_empty() {
-        skipped.push("the detach");
-    }
-    anyhow::ensure!(skipped.is_empty(), "a failed removal skipped {skipped:?}");
+    anyhow::ensure!(
+        podman.0.try_wait()?.is_some(),
+        "a failed removal skipped the wait"
+    );
     let error = format!(
         "{:#}",
         cleaned.expect_err("the removal's error is the result")
@@ -516,9 +663,8 @@ impl Drop for RemoveTree {
     }
 }
 
-/// A process that still uses the store when the wait expires keeps it. Detaching the
-/// mounts and removing the directory under it is the race this cleanup exists to avoid:
-/// it can mount the store's overlay home again afterwards.
+/// A process that still uses the store when the wait expires keeps it. Removing the
+/// directory under a podman that runs on is what the wait exists to avoid.
 #[test]
 fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
@@ -528,12 +674,7 @@ fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     let outside = tempfile::TempDir::new()?;
     let podman = stand_in(outside.path(), "podman", "600", held_under(&root)?)?;
 
-    let cleaned = clean_up_within(
-        scratch,
-        || Ok(()),
-        detach_mounts_below,
-        Duration::from_millis(300),
-    );
+    let cleaned = clean_up_within(scratch, || Ok(()), Duration::from_millis(300));
 
     let error = format!(
         "{:#}",
@@ -550,13 +691,20 @@ fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     Ok(())
 }
 
-/// What is still mounted after the detach is a filesystem of its own below the scratch
-/// directory. Removing the directory walks into it and deletes what it holds, and the
-/// mount stays on the host. The detach is a parameter so that one can fail here. The arm
-/// for a mount table that cannot be read keeps the store the same way and has no test of
-/// its own: /proc/self/mountinfo cannot be made unreadable for one test only.
+/// Unmounts what a test mounted, on every way out of it.
+struct Unmount(PathBuf);
+
+impl Drop for Unmount {
+    fn drop(&mut self) {
+        let _ = nix::mount::umount2(&self.0, nix::mount::MntFlags::MNT_DETACH);
+    }
+}
+
+/// The child's namespace keeps every mount of the store out of this process's mount
+/// table. If one is there all the same, the cleanup fails and leaves the directory:
+/// removing it would walk into the mount and delete what it holds.
 #[test]
-fn a_mount_that_survives_the_detach_keeps_the_store() -> Result<()> {
+fn a_mount_in_the_hosts_table_fails_the_cleanup_and_keeps_the_store() -> Result<()> {
     anyhow::ensure!(
         nix::unistd::geteuid().is_root(),
         "this test mounts something: run it with `make test-root`"
@@ -564,7 +712,6 @@ fn a_mount_that_survives_the_detach_keeps_the_store() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
     let _remove = RemoveTree(root.clone());
-    let _mounts = MountsBelow(root.clone());
     let mounted = root.join("mounted");
     std::fs::create_dir(&mounted)?;
     nix::mount::mount(
@@ -574,15 +721,19 @@ fn a_mount_that_survives_the_detach_keeps_the_store() -> Result<()> {
         nix::mount::MsFlags::empty(),
         None::<&str>,
     )?;
+    let _unmount = Unmount(mounted.clone());
     std::fs::write(mounted.join("kept"), "")?;
 
-    let cleaned = clean_up_within(scratch, || Ok(()), |_| {}, Duration::from_millis(300));
+    let cleaned = clean_up_within(scratch, || Ok(()), Duration::from_millis(300));
 
     let error = format!(
         "{:#}",
-        cleaned.expect_err("a mount that is still there is a failure")
+        cleaned.expect_err("a mount in the host's table is a failure")
     );
-    anyhow::ensure!(error.contains("still mounted below"), "{error}");
+    anyhow::ensure!(
+        error.contains("the host's mount table has entries under"),
+        "{error}"
+    );
     anyhow::ensure!(
         mounted.join("kept").exists(),
         "the cleanup removed what the mount holds:\n{error}"
@@ -604,13 +755,8 @@ fn a_reused_pid_is_not_the_recorded_conmon() -> Result<()> {
     let pid = other.0.id();
     let (_, started) = state_and_start(pid).context("the stand-in is not running")?;
     std::fs::write(root.join(CONMON_IDENTITY), format!("{pid} {}", started - 1))?;
-    clean_up_within(
-        scratch,
-        || Ok(()),
-        detach_mounts_below,
-        Duration::from_millis(300),
-    )
-    .context("the cleanup waited for a process that is not the recorded conmon")?;
+    clean_up_within(scratch, || Ok(()), Duration::from_millis(300))
+        .context("the cleanup waited for a process that is not the recorded conmon")?;
     anyhow::ensure!(!root.exists(), "the store is still there");
     Ok(())
 }
@@ -645,6 +791,16 @@ fn the_cleanup_never_reads_another_process_memory() -> Result<()> {
 /// The test body. Every podman call here, and every podman call the product makes,
 /// inherits the private storage.conf from the environment.
 fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()> {
+    // Every podman call below mounts something. Go no further in the mount namespace
+    // of the process that started this one.
+    let own = std::fs::read_link("/proc/self/ns/mnt")?;
+    let host = std::fs::read_link(format!("/proc/{}/ns/mnt", nix::unistd::getppid()))?;
+    anyhow::ensure!(
+        own != host,
+        "this process shares the mount namespace of the one that started it: {own:?}"
+    );
+    let began = Instant::now();
+    let note = |what: &str| println!("{NOTE} {what} after {:.1}s", began.elapsed().as_secs_f32());
     let runroot = root.join(RUNROOT);
     // A product that shares the runroot detaches every running container of the
     // store it shares it with. Go no further unless that store is the private one.
@@ -657,10 +813,12 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
         store == format!("{}\n{}", root.join(GRAPHROOT).display(), runroot.display()),
         "podman did not resolve the private store: {store}"
     );
+    note("podman resolved the private store");
 
     let archive = root.join(ARCHIVE);
     podman(&["load", "-i", utf8(&archive)?])?;
-    let _container = ReferenceContainer::start(reference, root)?;
+    note("the reference image was loaded");
+    start_reference(reference, root)?;
     let before = Observed::of(reference, &runroot)?;
     anyhow::ensure!(
         before.attached(),
@@ -673,6 +831,16 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
         on_the_host.is_empty(),
         "the host's mount table has entries under the private store: {on_the_host:?}"
     );
+    println!(
+        "{CONTAINER_RUNS} after {:.1}s",
+        began.elapsed().as_secs_f32()
+    );
+    if std::env::var_os(CHILD_DIES).is_some() {
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGKILL)?;
+        anyhow::bail!("SIGKILL did not end this process");
+    }
 
     let cache = root.join("cache");
     std::fs::create_dir(&cache)?;
@@ -682,6 +850,7 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
             &archive, &image,
         ))
         .context("building the storage image")?;
+    note("the storage image was built");
 
     // The overlay home is unmounted by the next podman process of the default
     // store that exits, not by the build. Make sure one has exited before looking.
@@ -782,42 +951,26 @@ impl std::fmt::Display for Observed {
     }
 }
 
-/// Removes the reference container as soon as the test body ends.
-struct ReferenceContainer(String);
-
-impl ReferenceContainer {
-    /// Started the way tests/test_exec_podman_parity.rs starts its reference. Its conmon
-    /// is recorded as soon as it runs.
-    fn start(name: &str, root: &Path) -> Result<Self> {
-        let pidfile = root.join(CONMON_PIDFILE);
-        // The guard exists before `podman run`: a start that fails half way can
-        // leave a created container behind.
-        let container = Self(name.to_owned());
-        podman(&[
-            "run",
-            "-d",
-            "--rm",
-            "--conmon-pidfile",
-            utf8(&pidfile)?,
-            "--name",
-            name,
-            "--network",
-            "none",
-            common::ALPINE_IMAGE,
-            "sleep",
-            REFERENCE_LIFETIME_SECS,
-        ])?;
-        record_conmon(root)?;
-        Ok(container)
-    }
-}
-
-impl Drop for ReferenceContainer {
-    fn drop(&mut self) {
-        let _ = Command::new("podman")
-            .args(["rm", "-f", "-t", "0", &self.0])
-            .output();
-    }
+/// Start the reference container the way tests/test_exec_podman_parity.rs starts its
+/// reference, and record its conmon as soon as it runs. The parent removes it, from
+/// inside this namespace, whatever becomes of this process.
+fn start_reference(name: &str, root: &Path) -> Result<()> {
+    let pidfile = root.join(CONMON_PIDFILE);
+    podman(&[
+        "run",
+        "-d",
+        "--rm",
+        "--conmon-pidfile",
+        utf8(&pidfile)?,
+        "--name",
+        name,
+        "--network",
+        "none",
+        common::ALPINE_IMAGE,
+        "sleep",
+        REFERENCE_LIFETIME_SECS,
+    ])?;
+    record_conmon(root)
 }
 
 /// Write the reference image to `archive`, from the store the environment resolves.
@@ -881,12 +1034,6 @@ fn mounts_in(table: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
         .collect();
     mounts.sort_by_key(|mount| std::cmp::Reverse(mount.components().count()));
     Ok(mounts)
-}
-
-fn detach_mounts_below(dir: &Path) {
-    for mount in mounts_below(dir).unwrap_or_default() {
-        let _ = nix::mount::umount2(&mount, nix::mount::MntFlags::MNT_DETACH);
-    }
 }
 
 /// Names in the root directory of an ext4 image, sorted. `debugfs -R "ls -p"` prints
