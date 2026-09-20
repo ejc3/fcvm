@@ -2584,22 +2584,40 @@ terminate the pinned VMM rather than leaving its guest wedged on an unserved fau
 speculative-population, and persistence failures degrade to ordinary demand paging because they
 do not stop fault service.
 
-### Fault-Around (`--uffd-fault-around <BYTES>`, default off)
+### Fault-Around (`--uffd-fault-around <BYTES>`, default off, experimental)
 
 Replay covers the pages every clone touches. It cannot cover a clone that does fresh work right
 after restore, because the memory that work allocates lands on different pages in every clone.
-Measured on a 128 GiB guest: the first real page render in a fresh clone took 541 s while the
-clone demand-faulted 3.3 million pages (12.7 GiB), one userfaultfd round trip each. The same
-render took 305 s in a clone whose recorded set already held those pages (110 MiB faulted).
+Measured on a 128 GiB guest before this option existed: the first real page render in a fresh
+clone took 541 s while the clone demand-faulted 3.3 million pages (12.7 GiB), one userfaultfd
+round trip each. The same render took 305 s in a clone whose recorded set already held those
+pages (110 MiB faulted).
 
-Those faults cluster even though their addresses differ between clones. A locality analysis of
-13.1 million demand-faulted pages from that workload projects:
+Fault-around trades memory for those round trips. The one measurement so far is mixed, which
+is why the option is experimental. One snapshot of a 128 GiB guest, 64 KiB granules, a host
+whose page cache cannot hold the memory file, and a fresh clone restored through a recording
+of 4.07 million pages that covers the path to healthy and nothing else:
 
-| granule | demand faults | memory materialised |
-|---------|---------------|---------------------|
-| 4 KiB (off) | 1x | 1x |
-| 64 KiB | 7.6x fewer | 2.1x |
-| 2 MiB | 209x fewer | 2.45x |
+| | off | `--uffd-fault-around 65536` |
+|---|---|---|
+| restore to healthy | 2m23s | 4m07s |
+| first real page, last byte | 518.4 s | 336.2 s |
+| pages installed beyond the demanded ones | none | 17,545,557, 14.5 per fault |
+| clone private memory during the first page | 14.5 to 27.0 GiB (earlier run) | 52.2 to 75.8 GiB |
+
+The first page got 35 percent shorter, and the restore itself got slower and much larger.
+Almost every granule held one demanded page. A locality projection made earlier, from a clone
+that had run for a long time, put the cost at 2.1 times the memory for 7.6 times fewer faults
+at 64 KiB. Touched pages are dense in such a clone and sparse right after a restore, so that
+projection does not describe this period. The extra copies also sit in the fault loop while
+the guest is recovering. On this workload a recorded set that already covered the first page
+did better on both time and memory (304.7 s). Not measured: granules under 64 KiB,
+fault-around held back until replay has finished, and a host whose page cache holds the
+memory file.
+
+One run with 2 MiB granules on the same host cost the restore more: 114.5 s to guest ACK and
+4m44s to healthy, against 27.6 s and 2m23s with the option off. The cost to the restore grows
+with the granule.
 
 - **What it does**: copy mode only. On a demand fault the server copies the faulting page and
   wakes its vCPU exactly as it does without the option, so that fault's latency is unchanged.
@@ -2608,27 +2626,49 @@ Those faults cluster even though their addresses differ between clones. A locali
   clipped to the memory region that took the fault. Pages that are already present are
   stepped over.
 - **The trade is density**: every fault privately materialises its whole granule whether or
-  not the guest touches the rest of it, so memory per clone grows by the projected factor in
-  the table. Where memory is what limits a host, clones per host drop by about the same
-  factor. Neither number has been measured with the option on. Idle clones are unaffected,
-  because a clone that does not fault populates nothing.
-- **When to use it**: large guests whose clones do real work right after restore, where the
-  time goes to round trips for pages no earlier clone touched. Leave it off for clones that
-  mostly stay inside the recorded working set, and for hosts packed for density.
-- **Values**: 0 (off), or a power of two from the host page size through 2097152 (2 MiB).
-  Anything else is a usage error, and so is a non-zero value with `--uffd-mode minor`, where
-  it is not implemented: minor faults are resolved with `UFFDIO_CONTINUE` onto shared pages
-  and have no populate step to extend. A hugepage clone's own page is already 2 MiB, so the
-  option does nothing for it and the server logs that. `FCVM_UFFD_FAULT_AROUND` carries the
-  same value to the implicit server inside `snapshot run`.
+  not the guest touches the rest of it. At 64 KiB that measured 14.5 extra pages per fault
+  right after a restore. Idle clones are unaffected, because a clone that does not fault
+  populates nothing.
+- **When to use it**: as an experiment, on large guests whose clones do real work right after
+  restore, where the time goes to round trips for pages no earlier clone touched and the
+  memory is available. A recorded working set that covers the work is the better fix when
+  one can exist. Leave it off for hosts packed for density.
+- **Values**: 0 (off), or a power of two above the host page size through 2097152 (2 MiB).
+  One host page is refused: it is the page a demand fault already serves, so the option
+  would be on and do nothing. Anything else is a usage error, and so is a non-zero value
+  with `--uffd-mode minor`, where it is not implemented: minor faults are resolved with
+  `UFFDIO_CONTINUE` onto shared pages and have no populate step to extend. A hugepage
+  clone's own page is already 2 MiB, so the option does nothing for it and the server logs
+  that. `FCVM_UFFD_FAULT_AROUND` carries the same value to the implicit server inside
+  `snapshot run`.
 - **It is speculation, under replay's rule**: it goes through the chunk population replay
   uses (`prefetch::populate_chunk_counted`), and a refused copy, which includes the
   zero-progress `EAGAIN` while `mmap_changing` is raised, abandons that granule to demand
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
-- **The working set stays demand-only**: only the demanded page is recorded. Recording the
-  granule would turn the hint into its own prediction, and replay would then populate that
-  into every later clone.
+  It stands down in two cases. While any fault is parked it serves demanded pages only: a
+  parked fault is retried between batches and fails the clone if it is still refused after
+  2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
+  already present it populates nothing, because another populator owns that range.
+- **Limitation: recording under the option is thin, and replay does not make up for it**:
+  only the demanded page is recorded, and a page that fault-around installed is never
+  recorded, because the guest never faults on it. So with the option on the recorded working
+  set converges one demanded page per granule per clone: clone 1 faults on A and records A,
+  clone 2 replays A alone, faults on B and records B, and so on. Replay restores the
+  recorded pages and nothing more, so it never restores what fault-around would have
+  installed. That is a reason to record with the option off: a set recorded that way holds
+  every page the guest faulted on, not one per granule.
+- **Why replay does not expand recorded runs to their granules**: it would hide the
+  limitation above, at a cost the measurement argues against. Right after a restore the
+  demanded pages are sparse: at 64 KiB, 14.5 of the 16 pages of a granule were installed
+  beyond demand. Expanding every recorded run would multiply the replayed memory by up to
+  the granule factor, in a restore the option already slows. Not expanding costs one extra
+  fault per granule per clone until the set converges.
+  `replay_populates_only_the_recorded_pages_with_fault_around_on` pins it.
+- **What the option leaves behind**: the sidecar stays a record of demand, so it is still
+  valid with the option off or with a smaller granule. It is thinner than a record made
+  without the option, and each page missing from it costs one demand fault, once, after
+  which it is recorded.
 - **Measuring it**: at handler exit the serve logs `fault-around populated pages beyond the
   demanded ones` with `granules`, `extra_pages`, `extra_mib` and `refused_granules`, next to
   the existing `VM exited` line and its `fault_count`. Compare `fault_count` between an arm
