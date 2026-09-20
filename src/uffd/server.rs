@@ -950,10 +950,11 @@ impl UffdServer {
                 // Shut down when cancellation token is triggered (Ctrl-C / SIGTERM)
                 _ = cancel.cancelled() => {
                     info!(target: "uffd", "cancellation requested, shutting down server");
-                    // Both callers cancel only at teardown: `snapshot serve` after it has
-                    // stopped its clones, and `snapshot run` when its one VM is done. So no
-                    // clone is left to read what a warm-up has not requested yet. This sets
-                    // a flag and returns.
+                    // The serve is going away, so stop asking for pages. `snapshot serve`
+                    // cancels after its clones are gone. `snapshot run` cancels its implicit
+                    // server first and ends its VM afterwards, so a clone can still fault
+                    // after this point, and those faults are served on demand, as they were
+                    // before there was a warm-up. This sets a flag and returns.
                     if let Some(warmer) = &self.warmer {
                         warmer.stop();
                     }
@@ -3449,42 +3450,144 @@ mod tests {
         );
     }
 
-    /// A stand-in VMM: a child that connects to `socket` between fork and exec and then
-    /// becomes `sleep`, which inherits the connection. The server pins that process, so its
-    /// fail-closed kill lands on the child and never on the test.
-    fn connect_stand_in_vmm(socket: &Path) -> std::process::Child {
+    /// The address of the Unix socket at `path`.
+    fn unix_addr(path: &Path) -> libc::sockaddr_un {
         use std::os::unix::ffi::OsStrExt;
-        use std::os::unix::process::CommandExt;
 
         // SAFETY: an all-zero sockaddr_un is a valid value.
         let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
         addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
-        let path = socket.as_os_str().as_bytes();
-        assert!(path.len() < addr.sun_path.len(), "socket path too long");
-        for (dst, src) in addr.sun_path.iter_mut().zip(path) {
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len(), "socket path too long");
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
             *dst = *src as libc::c_char;
         }
+        addr
+    }
 
+    /// The server binds its socket and then listens on it, two syscalls, and a connect that
+    /// lands between them is refused. The stand-in has to wait that window out, or a test
+    /// that starts it right after spawning the server fails for no fault of the server's.
+    #[test]
+    fn the_stand_in_vmm_waits_out_a_socket_that_is_bound_but_not_yet_listening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.sock");
+        let addr = unix_addr(&path);
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY: plain socket calls on a descriptor this test owns.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let rc = libc::bind(fd, std::ptr::addr_of!(addr).cast(), addr_len);
+            assert_eq!(rc, 0, "bind: {}", std::io::Error::last_os_error());
+            // A bounded accept, so a stand-in that never connects fails the test instead of
+            // hanging it.
+            let wait = libc::timeval {
+                tv_sec: 10,
+                tv_usec: 0,
+            };
+            let rc = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                std::ptr::addr_of!(wait).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "SO_RCVTIMEO: {}", std::io::Error::last_os_error());
+            fd
+        };
+        let accepting = std::thread::spawn(move || {
+            // Bound, and for this long not listening.
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: as above.
+            unsafe {
+                assert_eq!(libc::listen(listener, 1), 0);
+                let conn = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+                let error = std::io::Error::last_os_error();
+                libc::close(listener);
+                if conn < 0 {
+                    return Err(error);
+                }
+                libc::close(conn);
+                Ok(())
+            }
+        });
+
+        let mut vmm = connect_stand_in_vmm(&path);
+        let accepted = accepting.join().unwrap();
+        vmm.kill().ok();
+        vmm.wait().ok();
+
+        assert!(
+            accepted.is_ok(),
+            "the stand-in never connected: {accepted:?}"
+        );
+    }
+
+    /// Cancelling the server stops its warmer. The server is still alive when this looks,
+    /// so it is the cancel arm that stopped it and not the drop.
+    #[tokio::test]
+    async fn cancelling_the_server_stops_its_warmer() {
+        let snapshot = RecordedSnapshot::new();
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::On).await;
+        assert!(!server.warmer.as_ref().expect("copy mode").is_stopped());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        server.run(cancel).await.unwrap();
+
+        assert!(
+            server.warmer.as_ref().expect("copy mode").is_stopped(),
+            "the cancel arm must stop the warmer"
+        );
+    }
+
+    /// A stand-in VMM: a child that connects to `socket` between fork and exec and then
+    /// becomes `sleep`, which inherits the connection. The server pins that process, so its
+    /// fail-closed kill lands on the child and never on the test.
+    ///
+    /// The server binds its socket and starts listening in two syscalls, and the child can
+    /// get here before either. `ENOENT` means not bound yet and `ECONNREFUSED` means bound
+    /// but not listening yet. Both clear within milliseconds, so the child retries them for
+    /// up to ten seconds, and the caller needs no wait of its own.
+    fn connect_stand_in_vmm(socket: &Path) -> std::process::Child {
+        use std::os::unix::process::CommandExt;
+
+        let addr = unix_addr(socket);
         let mut command = std::process::Command::new("sleep");
         command.arg("600");
-        // SAFETY: the hook only calls socket(2) and connect(2), which are async-signal-safe,
-        // on an address built before the fork.
+        // SAFETY: between fork and exec the hook only calls socket(2), connect(2), close(2)
+        // and nanosleep(2), which are async-signal-safe, on an address built before the fork.
         unsafe {
             command.pre_exec(move || {
-                // No SOCK_CLOEXEC: `sleep` has to inherit the connection.
-                let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
-                if fd < 0 {
-                    return Err(std::io::Error::last_os_error());
+                let pause = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 5_000_000,
+                };
+                for _ in 0..2000 {
+                    // No SOCK_CLOEXEC: `sleep` has to inherit the connection.
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let rc = libc::connect(
+                        fd,
+                        std::ptr::addr_of!(addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    );
+                    if rc == 0 {
+                        return Ok(());
+                    }
+                    let error = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    match error.raw_os_error() {
+                        Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => {
+                            libc::nanosleep(&pause, std::ptr::null_mut());
+                        }
+                        _ => return Err(error),
+                    }
                 }
-                let rc = libc::connect(
-                    fd,
-                    std::ptr::addr_of!(addr).cast(),
-                    std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
-                );
-                if rc != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
+                Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
             });
         }
         command.spawn().expect("spawning the stand-in VMM")
@@ -3495,7 +3598,7 @@ mod tests {
     /// a cold cache.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn admitting_a_clone_warms_the_recorded_set_again() {
-        use crate::uffd::warmup::testing::{make_cold, wait_until_resident};
+        use crate::uffd::warmup::testing::{make_cold, wait_until_idle, wait_until_resident};
 
         let snapshot = RecordedSnapshot::new();
         let (image, mmap) = snapshot.cold();
@@ -3504,15 +3607,7 @@ mod tests {
         // The warm-up from `new()` runs to its end first, so it cannot be what warms the
         // cache after the eviction below.
         assert_eq!(wait_until_resident(&mmap, &snapshot.recorded), Ok(()));
-        let warmer = server.warmer.as_ref().expect("copy mode with prefetch on");
-        let idle_by = std::time::Instant::now() + Duration::from_secs(10);
-        while warmer.is_running() {
-            assert!(
-                std::time::Instant::now() < idle_by,
-                "the startup warm-up never ended"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
+        wait_until_idle(server.warmer.as_ref().expect("copy mode with prefetch on"));
         make_cold(&image, &mmap, &snapshot.recorded);
 
         let socket = server.socket_path().to_path_buf();
@@ -3521,15 +3616,7 @@ mod tests {
             let cancel = cancel.clone();
             async move { server.run(cancel).await }
         });
-        let bound_by = std::time::Instant::now() + Duration::from_secs(10);
-        while !socket.exists() {
-            assert!(
-                std::time::Instant::now() < bound_by,
-                "the server never bound its socket"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-
+        // No wait for the socket here: the stand-in retries until the server is listening.
         let mut vmm = connect_stand_in_vmm(&socket);
         let warmed = wait_until_resident(&mmap, &snapshot.recorded);
 

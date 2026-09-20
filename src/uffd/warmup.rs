@@ -14,6 +14,15 @@
 //! serve of #955: on a host where the guest is more than half of RAM the kernel evicts the
 //! image as clones grow, so a later restore can find a colder cache than the first one did.
 //!
+//! # Measured
+//!
+//! One snapshot of a 128 GiB guest in copy mode, 41.4 GiB recorded in 3.39M runs, with the
+//! memory file evicted before every run. Replay took 94.5 s and 87.7 s without the warm-up.
+//! With it, replay took 32.3 s and 32.9 s when the clone connected as soon as the serve was
+//! ready, and 22.3 s when it connected after the warm-up had logged, 19 s after the serve
+//! started. Demand faults during replay fell from 992,535 to 562,321 between the first run
+//! of each arm. The warm-up at serve start issued 3.49M requests for 41.4 GiB in 18.4 s.
+//!
 //! # What is requested, and what the kernel reads
 //!
 //! Requests follow the recorded runs in ascending file offset and are never merged across a
@@ -32,25 +41,47 @@
 //! returns when its read is queued, not when it completes. A clone that reaches a page whose
 //! read is already queued waits for that read instead of issuing its own. Whether a clone
 //! that connects during a warm-up finds its pages cached is a race this module does not
-//! decide. One request measured 6 to 7 us on a cold uncompressed extent, 21 us on a cold
-//! compressed one, and 0.1 to 0.2 us when the page was already cached, so walking a fully
-//! cached set of 3M runs costs the thread under a second. Another measurement put a cached
-//! request at 0.7 us, which makes it about two seconds.
+//! decide. One request measured 6 to 7 us on a cold uncompressed extent and 21 us on a cold
+//! compressed one. A request for a page that is already cached measured 0.1 to 0.7 us across
+//! three measurements, which puts walking a fully cached set of 3M runs between 0.3 and two
+//! seconds of one thread. On the 128 GiB guest above, the warm-up issued at a clone's
+//! admission over an already cached set of 3.5M requests took 0.8 s.
 //!
 //! # Nothing waits for it
 //!
 //! The thread is detached and nothing joins it. The serve's ready record, clone admission,
 //! fault service and the shutdown sequence do not depend on it, and `POSIX_FADV_WILLNEED`
-//! never touches the mapping, so it cannot fault on a truncated image. Cancelling or
-//! dropping the server stops it before its next request. A request stuck in a hung
-//! filesystem cannot be interrupted, and a thread in that state delays the kernel reaping
-//! the process after it exits. The fault handlers have the same exposure, because they read
-//! the same file through the mapping.
+//! never touches the mapping, so it cannot fault on a truncated image.
+//!
+//! Cancelling or dropping the server sets a flag and returns. The thread reads the flag
+//! before every request, and nothing serialises the two, because a stop that waited for the
+//! thread would wait on file I/O, which is what detaching it avoids. So at most one further
+//! request starts after a stop returns: one asynchronous readahead of up to 128 KiB that
+//! nothing waits for. A request stuck in a hung filesystem cannot be interrupted, and a
+//! thread in that state delays the kernel reaping the process after it exits. The fault
+//! handlers have the same exposure, because they read the same file through the mapping.
 //!
 //! # A hint
 //!
 //! A refused request is counted, the first one is logged, and the warm-up carries on. Clones
 //! restore correctly from a cold cache, only slower.
+//!
+//! # Known limits
+//!
+//! * **It is not paced.** On a cold cache the thread keeps the device queue full for its
+//!   whole run, so another running clone's major fault on an uncached page waits behind
+//!   readahead. A microbenchmark (6 GiB file on btrfs over a virtio disk, `nr_requests` 256,
+//!   scheduler `none`) measured a cold single-page fault at a median of 125 us alone and
+//!   1,193 us while back-to-back 128 KiB requests ran, with the p90 going from 141 us to
+//!   6.5 ms. With scattered 8 KiB runs the median went from 119 to 152 us and the p99 from
+//!   266 to 1,314 us. The admitted clone gains far more than that costs (see Measured), and
+//!   on a cached image the walk does no I/O.
+//! * **It can outrun replay.** If free page cache is smaller than the recorded set, the
+//!   warm-up can get far enough ahead that the kernel evicts the lowest offsets before
+//!   replay reads them. That case was not measured.
+//! * **A minor-mode server undoes it.** A minor-mode server that starts on the same image
+//!   ends `create_backing_memfd` with a whole-file `POSIX_FADV_DONTNEED`, which drops what a
+//!   copy-mode warm-up loaded. Only the hint is lost.
 
 use std::fs::File;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -67,10 +98,11 @@ use super::working_set::{PageSet, Run, GRANULE};
 /// A recorded run cannot always be one call. The kernel truncates a readahead request to
 /// `max(bdi->io_pages, ra_pages)` pages and still returns 0 (`force_page_cache_ra` in
 /// `mm/readahead.c`), so the tail of a long run would stay cold with nothing reported.
-/// Measured on btrfs with a 4 MiB readahead window: one call over a 64 MiB range left 4 MiB
-/// resident, and the same range in calls of this size left all of it resident. 128 KiB is
-/// the kernel default for both limits (`VM_READAHEAD_PAGES`), so a request this size is only
-/// truncated on a host that lowered them, and it is a whole number of 4, 16 or 64 KiB pages.
+/// Measured on btrfs with a 4 MiB readahead window: one call over a 64 MiB range left 1,024
+/// of its 16,384 pages resident, and the same range in calls of this size left all 16,384.
+/// 128 KiB is the kernel default for both limits (`VM_READAHEAD_PAGES`), so a request this
+/// size is only truncated on a host that lowered them, and it is a whole number of 4, 16 or
+/// 64 KiB pages.
 const REQUEST_BYTES: u64 = 128 * 1024;
 
 /// One `WILLNEED` request: `len` bytes of the memory image at `offset`.
@@ -137,7 +169,8 @@ struct WarmStats {
 
 /// Issue the requests for `recorded` through `advise`, in ascending file offset.
 ///
-/// `stop` is checked before every request, so a stopped warm-up ends within one call.
+/// `stop` is read before every request and nothing serialises it with the call that
+/// follows, so at most one further request starts after a stop.
 fn warm(
     recorded: &PageSet,
     mem_len: u64,
@@ -207,6 +240,44 @@ fn request_read(image: &File, request: Request) -> std::io::Result<()> {
         .map_err(std::io::Error::from)
 }
 
+/// One warm-up from start to finish, on whatever thread calls it: read the recorded set,
+/// issue the requests, and log the one line that says what happened.
+fn warm_up_once(
+    snapshot: &str,
+    trigger: &'static str,
+    recorded: impl FnOnce() -> PageSet,
+    mem_len: u64,
+    stop: &AtomicBool,
+    advise: impl FnMut(Request) -> std::io::Result<()>,
+) {
+    let started = Instant::now();
+    let recorded = recorded();
+    if recorded.is_empty() {
+        // The first clone of a fresh snapshot has recorded nothing yet.
+        info!(
+            target: "uffd",
+            snapshot = %snapshot,
+            trigger,
+            "no working set is recorded yet, so there is nothing to read into the page cache"
+        );
+        return;
+    }
+    let stats = warm(&recorded, mem_len, host_page_size(), stop, advise);
+    info!(
+        target: "uffd",
+        snapshot = %snapshot,
+        trigger,
+        runs = stats.runs,
+        pages = stats.bytes / GRANULE,
+        mib = stats.bytes / (1024 * 1024),
+        requests = stats.requests,
+        failures = stats.failures,
+        elapsed_ms = started.elapsed().as_millis(),
+        stopped_early = stats.stopped_early,
+        "asked the kernel to read the recorded working set into the page cache"
+    );
+}
+
 /// What one serve's warm-ups share: at most one runs at a time, and none starts once the
 /// serve is stopping.
 #[derive(Default)]
@@ -228,8 +299,9 @@ impl Drop for Claim {
 /// A copy-mode serve's page cache warm-ups.
 ///
 /// Holds the memory image open for the life of the server, because a warm-up can start at
-/// any clone admission. Stopping or dropping it ends a running warm-up before its next
-/// request and keeps any further one from starting. Nothing ever joins a warm-up thread.
+/// any clone admission. Stopping or dropping it sets a flag and returns: a running warm-up
+/// starts at most one further request, and no further warm-up starts. Nothing ever joins a
+/// warm-up thread.
 pub(crate) struct Warmer {
     snapshot: String,
     image: Arc<File>,
@@ -290,26 +362,7 @@ impl Warmer {
             .name("fcvm-ws-warm".to_string())
             .spawn(move || {
                 let _claim = claim;
-                let started = Instant::now();
-                let recorded = recorded();
-                if recorded.is_empty() {
-                    // The first clone of a fresh snapshot has recorded nothing yet.
-                    return;
-                }
-                let stats = warm(&recorded, mem_len, host_page_size(), &shared.stop, advise);
-                info!(
-                    target: "uffd",
-                    snapshot = %snapshot,
-                    trigger,
-                    runs = stats.runs,
-                    pages = stats.bytes / GRANULE,
-                    mib = stats.bytes / (1024 * 1024),
-                    requests = stats.requests,
-                    failures = stats.failures,
-                    elapsed_ms = started.elapsed().as_millis(),
-                    stopped_early = stats.stopped_early,
-                    "asked the kernel to read the recorded working set into the page cache"
-                );
+                warm_up_once(&snapshot, trigger, recorded, mem_len, &shared.stop, advise);
             });
         match worker {
             // Detached on purpose, like the working-set writer: nothing joins this thread,
@@ -334,7 +387,8 @@ impl Warmer {
         }
     }
 
-    /// End a running warm-up before its next request and start no more. Returns immediately.
+    /// Tell a running warm-up to end, and start no more. Returns without waiting for the
+    /// thread, so at most one further request starts.
     pub(crate) fn stop(&self) {
         self.shared.stop.store(true, Ordering::Relaxed);
     }
@@ -342,6 +396,11 @@ impl Warmer {
     #[cfg(test)]
     pub(crate) fn is_running(&self) -> bool {
         self.shared.running.load(Ordering::Acquire)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_stopped(&self) -> bool {
+        self.shared.stop.load(Ordering::Relaxed)
     }
 }
 
@@ -372,11 +431,6 @@ pub(crate) mod testing {
     /// How long an unrecorded range is watched after the recorded ones arrived, in case a
     /// read that should not have been requested lands late.
     pub(crate) const SETTLE: Duration = Duration::from_millis(250);
-
-    /// How long eviction gets. One `POSIX_FADV_DONTNEED` skips pages that are dirty or under
-    /// writeback and starts that writeback itself, so a second call a moment later can drop
-    /// what the first one could not.
-    const COLD_WITHIN: Duration = Duration::from_secs(2);
 
     /// Size of the file [`probe_eviction`] writes. A whole number of 4, 16 and 64 KiB pages.
     const PROBE_BYTES: u64 = 256 * 1024;
@@ -427,36 +481,33 @@ pub(crate) mod testing {
         vec.iter().filter(|byte| **byte & 1 != 0).count() as u64
     }
 
-    /// Call `evict` until none of `ranges` is resident or [`COLD_WITHIN`] runs out. Returns
-    /// how many pages were still resident at the end.
-    fn evict_until_cold(
-        file: &File,
-        mmap: &Mmap,
-        ranges: &[(u64, u64)],
-        evict: &dyn Fn(&File),
-    ) -> u64 {
-        let deadline = Instant::now() + COLD_WITHIN;
-        loop {
-            evict(file);
-            let left: u64 = ranges
-                .iter()
-                .map(|&(offset, len)| resident_pages(mmap, offset, len))
-                .sum();
-            if left == 0 || Instant::now() >= deadline {
-                return left;
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        }
+    /// One eviction attempt: call `evict` once and count what is still resident in `ranges`.
+    ///
+    /// Once, on purpose. `POSIX_FADV_DONTNEED` skips pages that are dirty or under writeback
+    /// and starts that writeback itself, so where fsync cleans nothing a second call a moment
+    /// later succeeds. A test that retried would race the asynchronous writeback of its whole
+    /// file against a timeout. These tests run where one flush and one call are enough.
+    fn evict_once(file: &File, mmap: &Mmap, ranges: &[(u64, u64)], evict: &dyn Fn(&File)) -> u64 {
+        evict(file);
+        ranges
+            .iter()
+            .map(|&(offset, len)| resident_pages(mmap, offset, len))
+            .sum()
     }
 
-    /// Whether a test can make a file in `dir` cold, and if not, why not.
+    /// Whether a test can make a file in `dir` cold with one flush and one eviction, and if
+    /// not, why not.
     ///
     /// These tests prove "cold before, warm after", so they need a directory where a written
-    /// file's pages can be evicted. The filesystem type does not say. tmpfs never evicts, and
-    /// the container CI lane's `/tmp` is an overlay that kept every page resident after
-    /// `fsync` and `POSIX_FADV_DONTNEED`. So this probes the behaviour itself, with the same
-    /// calls the tests use: write, flush, evict through `evict`, and count what `mincore`
-    /// still reports.
+    /// file's pages can be evicted on demand. The filesystem type does not say. tmpfs never
+    /// evicts. The container CI lane's `/tmp` is an overlay that `podman run --rm` mounts
+    /// `volatile`, which makes fsync a no-op, so a file written there is still dirty when the
+    /// test evicts it. Measured in that container: all 64 pages of a 256 KiB file were
+    /// resident after the first `POSIX_FADV_DONTNEED` and none 50 ms later, once the
+    /// writeback that call started had finished. A bind mount in the same container flushed
+    /// in 16 ms and was cold after the first call. So this probes the behaviour itself, with
+    /// the calls the tests use: write, flush, evict once through `evict`, and count what
+    /// `mincore` still reports.
     pub(crate) fn probe_eviction(dir: &Path, evict: impl Fn(&File)) -> Result<(), String> {
         let mut file =
             tempfile::tempfile_in(dir).map_err(|error| format!("cannot create a file: {error}"))?;
@@ -465,10 +516,10 @@ pub(crate) mod testing {
         // SAFETY: the file is private to this probe and is not written again.
         let mmap = unsafe { MmapOptions::new().len(PROBE_BYTES as usize).map(&file) }
             .map_err(|error| format!("cannot map a file: {error}"))?;
-        match evict_until_cold(&file, &mmap, &[(0, PROBE_BYTES)], &evict) {
+        match evict_once(&file, &mmap, &[(0, PROBE_BYTES)], &evict) {
             0 => Ok(()),
             left => Err(format!(
-                "{left} of {} pages still resident after fsync and POSIX_FADV_DONTNEED",
+                "{left} of {} pages still resident after one fsync and one POSIX_FADV_DONTNEED",
                 PROBE_BYTES / host_page_size()
             )),
         }
@@ -500,9 +551,13 @@ pub(crate) mod testing {
             PathBuf::from("/var/tmp"),
             PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/target")),
         ];
-        first_usable(&candidates, |dir| probe_eviction(dir, evict)).unwrap_or_else(|refused| {
-            panic!("no directory lets a test evict a file from the page cache: {refused}")
-        })
+        let dir =
+            first_usable(&candidates, |dir| probe_eviction(dir, evict)).unwrap_or_else(|refused| {
+                panic!("no directory lets a test evict a file from the page cache: {refused}")
+            });
+        // Shown for a failed test and under --nocapture: which directory this lane used.
+        eprintln!("page cache tests run in {}", dir.display());
+        dir
     }
 
     /// An unnamed file of `len` bytes on a disk. Unnamed, so nothing else on the host can
@@ -515,11 +570,11 @@ pub(crate) mod testing {
 
     /// Evict `file` and prove every listed range is cold.
     pub(crate) fn make_cold(file: &File, mmap: &Mmap, ranges: &[(u64, u64)]) {
-        let left = evict_until_cold(file, mmap, ranges, &evict);
+        let left = evict_once(file, mmap, ranges, &evict);
         assert_eq!(
             left, 0,
-            "eviction left pages resident, so this test could not tell a warm-up from a \
-             cache that was never cold"
+            "one POSIX_FADV_DONTNEED left pages resident in a directory the probe accepted, \
+             so this test could not tell a warm-up from a cache that was never cold"
         );
     }
 
@@ -560,6 +615,15 @@ pub(crate) mod testing {
                 Some(short) if Instant::now() >= deadline => return Err(short),
                 Some(_) => std::thread::sleep(Duration::from_millis(10)),
             }
+        }
+    }
+
+    /// Wait for a warmer's thread to end.
+    pub(crate) fn wait_until_idle(warmer: &super::Warmer) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while warmer.is_running() {
+            assert!(Instant::now() < deadline, "the warm-up thread never ended");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -711,6 +775,30 @@ mod tests {
             }
         );
 
+        // The check is per request, not per run: a stop that lands inside a run of four
+        // requests ends it after the second.
+        let long_len = 4 * MIB;
+        let long = set_of(long_len, &[(MIB, 4 * REQUEST_BYTES)]);
+        let stop = AtomicBool::new(false);
+        let mut calls = 0;
+        let stats = warm(&long, long_len, PAGE, &stop, |_| {
+            calls += 1;
+            if calls == 2 {
+                stop.store(true, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        assert_eq!(
+            stats,
+            WarmStats {
+                runs: 1,
+                requests: 2,
+                bytes: 2 * REQUEST_BYTES,
+                failures: 0,
+                stopped_early: true,
+            }
+        );
+
         let stats = warm(&set, mem_len, PAGE, &AtomicBool::new(true), |_| {
             panic!("a warm-up stopped before it began must not call the kernel")
         });
@@ -815,14 +903,6 @@ mod tests {
         }
     }
 
-    fn wait_until_idle(warmer: &Warmer) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while warmer.is_running() {
-            assert!(Instant::now() < deadline, "the warm-up thread never ended");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
-
     /// Nothing waits for a warm-up: the call that starts one returns while the thread is
     /// still inside its first request.
     #[test]
@@ -877,7 +957,18 @@ mod tests {
             .recv_timeout(Duration::from_secs(10))
             .expect("the thread makes its first request");
 
+        let dropping = Instant::now();
         drop(warmer);
+        let dropped_after = dropping.elapsed();
+        assert!(
+            dropped_after < PARKED_FOR,
+            "dropping the warmer took {dropped_after:?}, so it waited for a request that \
+             stays parked for {PARKED_FOR:?}"
+        );
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "the first request is still parked, so nothing else can have started"
+        );
         // Closing the channel releases the parked request and any later one at once, so a
         // warm-up that ignored the drop would run straight through its other three runs.
         drop(release_tx);
@@ -889,6 +980,94 @@ mod tests {
             vec![],
             "requests made after the warmer was dropped"
         );
+    }
+
+    /// The recorded set is read on the warm-up's thread, so copying a large guest's bitmap
+    /// never holds up the caller, which is the accept loop when a clone is admitted.
+    #[test]
+    fn the_recorded_set_is_read_on_the_warm_up_thread() {
+        let mem_len = 64 * G;
+        let warmer = scratch_warmer(mem_len);
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+
+        let begun = Instant::now();
+        let started = warmer.warm_if_idle_with(
+            "test",
+            move || {
+                entered_tx
+                    .send(std::thread::current().name().map(str::to_string))
+                    .unwrap();
+                let _ = release_rx.recv_timeout(PARKED_FOR);
+                PageSet::empty(mem_len)
+            },
+            |_| panic!("an empty set has no run to request"),
+        );
+        let returned_after = begun.elapsed();
+
+        assert!(started);
+        let thread = entered_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the recorded set is read");
+        assert_eq!(thread.as_deref(), Some("fcvm-ws-warm"));
+        assert!(
+            returned_after < PARKED_FOR,
+            "starting a warm-up took {returned_after:?}, so the caller waited for the \
+             recorded set, which stays parked for {PARKED_FOR:?}"
+        );
+
+        drop(release_tx);
+        wait_until_idle(&warmer);
+    }
+
+    /// Every warm-up logs one line, and a warm-up with nothing recorded says so.
+    #[test]
+    fn every_warm_up_logs_one_line_whether_or_not_anything_was_recorded() {
+        let mem_len = 64 * G;
+        let logged = |recorded: PageSet| {
+            let captured = Captured::default();
+            let subscriber = tracing_subscriber::fmt()
+                .with_writer(captured.clone())
+                .with_ansi(false)
+                .finish();
+            tracing::subscriber::with_default(subscriber, || {
+                warm_up_once(
+                    "snap",
+                    "clone admission",
+                    move || recorded,
+                    mem_len,
+                    &AtomicBool::new(false),
+                    |_| Ok(()),
+                );
+            });
+            let log = captured.0.lock().unwrap().clone();
+            String::from_utf8(log).unwrap()
+        };
+
+        let warmed = logged(set_of(mem_len, &[(G, G), (5 * G, G)]));
+        assert_eq!(warmed.lines().count(), 1, "{warmed}");
+        for part in [
+            "asked the kernel to read the recorded working set into the page cache",
+            "snapshot=snap",
+            "trigger=\"clone admission\"",
+            "runs=2",
+            "pages=2",
+            "requests=2",
+            "failures=0",
+            "stopped_early=false",
+        ] {
+            assert!(warmed.contains(part), "{part} is missing from: {warmed}");
+        }
+
+        let empty = logged(PageSet::empty(mem_len));
+        assert_eq!(empty.lines().count(), 1, "{empty}");
+        for part in [
+            "no working set is recorded yet",
+            "snapshot=snap",
+            "trigger=\"clone admission\"",
+        ] {
+            assert!(empty.contains(part), "{part} is missing from: {empty}");
+        }
     }
 
     /// At most one warm-up runs. A clone admitted while one is running starts nothing, and
@@ -979,6 +1158,26 @@ mod tests {
             refused.contains("pages still resident"),
             "the reason names what was observed: {refused}"
         );
+    }
+
+    /// A directory that gives its pages up only at a second attempt is refused too. That is
+    /// the container CI lane's `/tmp`: its overlay is mounted `volatile`, so fsync cleans
+    /// nothing, and the first `POSIX_FADV_DONTNEED` only starts the writeback that lets a
+    /// later one succeed. A test that retried there would race that writeback.
+    #[test]
+    fn a_directory_that_evicts_only_at_a_second_attempt_is_refused() {
+        let dir = disk_dir();
+        let attempts = AtomicU64::new(0);
+
+        let refused = probe_eviction(&dir, |file| {
+            if attempts.fetch_add(1, Ordering::Relaxed) > 0 {
+                evict(file);
+            }
+        })
+        .expect_err("the first attempt evicted nothing");
+
+        assert!(refused.contains("pages still resident"), "{refused}");
+        assert_eq!(attempts.load(Ordering::Relaxed), 1, "the probe asks once");
     }
 
     /// Candidates are tried in order, and when none works the failure names every one of

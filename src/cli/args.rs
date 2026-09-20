@@ -459,7 +459,8 @@ pub struct SnapshotServeArgs {
     ///   it will touch. A missing, stale or wrong record just means demand paging. In copy
     ///   mode the serve also asks the kernel to read the recorded pages into the page cache,
     ///   when it starts and when a clone connects, so replay does not read them from disk one
-    ///   fault at a time.
+    ///   fault at a time. On a 128 GiB guest with a cold cache that took replay from 94.5 s
+    ///   to 32.3 s, and to 22.3 s when the clone connected after the warm-up had finished.
     /// - `off`: no recording, no replay, no page cache warm-up. Every clone faults every page
     ///   in.
     #[arg(long, value_name = "on|off", env = "FCVM_UFFD_PREFETCH")]
