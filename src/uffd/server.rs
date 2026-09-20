@@ -60,8 +60,8 @@ const _: () = assert!(
 /// uninterrupted turn without building a scheduler: after each batch the handler yields and
 /// the runtime picks whoever has waited longest.
 ///
-/// A yield costs a queue push, not a syscall, so even at a million faults/second the batching
-/// overhead is noise — while the clones waiting behind it are vCPUs stopped dead on a fault.
+/// A yield per 128 events is noise even at a million faults a second (replay, which once yielded
+/// after every populate call, measured a few microseconds per yield) — while the clones waiting behind it are vCPUs stopped dead on a fault.
 const MAX_EVENTS_PER_BATCH: usize = 128;
 
 /// How long a connecting VMM has to complete the UFFD handshake.
@@ -1382,6 +1382,36 @@ fn replay_steps_after_drain(outcome: DrainOutcome) -> &'static [ReplayStep] {
     }
 }
 
+/// When replay yields to the runtime.
+///
+/// Replay drains the fault queue before every populate call, so a guest fault never waits behind
+/// more than one call of speculation. What it does once per batch is yield. A batch ends after
+/// [`prefetch::CHUNK_BYTES`] of population or [`ReplayPacer::MAX_POPULATES`] populate calls,
+/// whichever comes first. A fragmented recording needs the second bound: a 128 GiB guest's set
+/// is millions of runs a few pages long (six clones' recordings unioned to 9.4M pages in 3.09M
+/// runs), and a yield after every one of those small copies cost more than the copy.
+#[derive(Debug, Default)]
+struct ReplayPacer {
+    populates: u32,
+    bytes: usize,
+}
+
+impl ReplayPacer {
+    const MAX_POPULATES: u32 = 32;
+
+    /// Count one populate call that made `bytes` resident, and say whether replay yields now.
+    fn populated(&mut self, bytes: usize) -> bool {
+        self.populates += 1;
+        self.bytes = self.bytes.saturating_add(bytes);
+        let batch_ended =
+            self.populates >= Self::MAX_POPULATES || self.bytes >= prefetch::CHUNK_BYTES;
+        if batch_ended {
+            *self = Self::default();
+        }
+        batch_ended
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ReplayAfterRetry {
     Populate,
@@ -1557,7 +1587,6 @@ async fn replay_working_set(
             size: mapping.size,
         })
         .collect();
-    let segments = prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64);
     let source = match ctx.source {
         PageSource::Copy { mmap } => prefetch::Source::Copy(&mmap[..]),
         PageSource::Minor { .. } => prefetch::Source::Minor,
@@ -1565,8 +1594,13 @@ async fn replay_working_set(
     let started = std::time::Instant::now();
     let mut bytes = 0u64;
     let mut refused = 0u64;
+    let mut segments = 0u64;
+    let mut yields = 0u64;
 
-    'segments: for segment in &segments {
+    let mut pacer = ReplayPacer::default();
+    'segments: for segment in prefetch::plan(recorded, &regions, ctx.page_size, ctx.mem_size as u64)
+    {
+        segments += 1;
         let mut done = 0usize;
         'chunk: while done < segment.len {
             for step in replay_steps_after_drain(drain_events(async_uffd.get_ref(), ctx, state)?) {
@@ -1594,7 +1628,7 @@ async fn replay_working_set(
             match prefetch::populate_chunk(
                 async_uffd.get_ref(),
                 &source,
-                segment,
+                &segment,
                 done,
                 ctx.page_size,
                 ctx.vm_id,
@@ -1602,15 +1636,21 @@ async fn replay_working_set(
                 Ok(progress) => {
                     done += progress;
                     bytes += progress as u64;
+                    if pacer.populated(progress) {
+                        yields += 1;
+                        tokio::task::yield_now().await;
+                    }
                 }
                 Err(prefetch::Stop::VmGone) => return Ok(true),
                 Err(prefetch::Stop::Refused) => {
                     refused += 1;
-                    tokio::task::yield_now().await;
+                    if pacer.populated(0) {
+                        yields += 1;
+                        tokio::task::yield_now().await;
+                    }
                     continue 'segments;
                 }
             }
-            tokio::task::yield_now().await;
         }
     }
 
@@ -1619,8 +1659,9 @@ async fn replay_working_set(
         vm_id = %ctx.vm_id,
         prefetched_pages = bytes / ctx.page_size as u64,
         prefetched_mib = bytes / (1024 * 1024),
-        segments = segments.len(),
+        segments,
         refused_segments = refused,
+        yields,
         prefetch_ms = started.elapsed().as_millis(),
         demand_faults_during_replay = state.fault_count,
         "replayed recorded working set"
@@ -4129,5 +4170,103 @@ mod tests {
                  that is the stranded-faulter hang, do not remove the wake"
             );
         }
+    }
+    #[test]
+    fn replay_yields_once_per_batch_of_small_runs() {
+        let mut pacer = ReplayPacer::default();
+        let mut batches = Vec::new();
+        for _ in 0..3 {
+            let mut populates = 1;
+            while !pacer.populated(4096) {
+                populates += 1;
+            }
+            batches.push(populates);
+        }
+        assert_eq!(
+            batches,
+            [32, 32, 32],
+            "32 small populate calls to a yield, batch after batch"
+        );
+    }
+
+    #[test]
+    fn replay_yields_after_every_chunk_of_bytes() {
+        let mut pacer = ReplayPacer::default();
+        assert!(
+            pacer.populated(prefetch::CHUNK_BYTES),
+            "a full chunk is a batch"
+        );
+        let half = prefetch::CHUNK_BYTES / 2;
+        for _ in 0..3 {
+            assert!(!pacer.populated(half));
+            assert!(
+                pacer.populated(half),
+                "two half chunks are a batch, batch after batch"
+            );
+        }
+    }
+
+    #[test]
+    fn replay_counts_a_refused_populate_towards_the_batch() {
+        let mut pacer = ReplayPacer::default();
+        let yields = (0..ReplayPacer::MAX_POPULATES)
+            .filter(|_| pacer.populated(0))
+            .count();
+        assert_eq!(
+            yields, 1,
+            "a run of refused segments still yields once per batch"
+        );
+    }
+
+    /// The replay loop drains before every populate call and yields only when the pacer ends a
+    /// batch. A loop that made the drain conditional would let a fault wait behind a whole
+    /// batch, and one that yielded after every populate call again would pass every behavioural
+    /// test while replay time followed the run count.
+    #[test]
+    fn replay_loop_drains_before_every_populate_and_yields_by_batch() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("async fn replay_working_set")
+            .expect("replay_working_set was renamed without updating this test");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("replay_working_set ends")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("the replay loop lost `{needle}`"))
+        };
+        let count = |needle: &str| body.matches(needle).count();
+
+        assert!(
+            at("let mut pacer = ReplayPacer::default();") < at("'segments: for segment"),
+            "one pacer for the whole replay: a pacer per segment never ends a batch of small runs"
+        );
+        let chunk = at("'chunk: while done < segment.len {");
+        let drain = at("drain_events(");
+        let populate = at("prefetch::populate_chunk(");
+        assert!(
+            chunk < drain && drain < populate,
+            "every populate call follows a drain"
+        );
+        assert_eq!(count("drain_events("), 1);
+        assert!(
+            !body[chunk..drain].contains("if "),
+            "nothing may gate the drain"
+        );
+        let gates = ["if pacer.populated(progress) {", "if pacer.populated(0) {"];
+        for gate in gates {
+            assert_eq!(count(gate), 1, "`{gate}` appears once");
+            let after = &body[at(gate)..];
+            let to_yield = &after[..after.find("yield_now()").expect("a gated yield")];
+            assert!(
+                !to_yield.contains('}'),
+                "the yield after `{gate}` sits inside that branch"
+            );
+        }
+        assert_eq!(
+            count("yield_now()"),
+            gates.len() + 1,
+            "one yield per ended batch in each populate arm, and the one that waits out a busy \
+             queue; any other yield runs after every populate call"
+        );
     }
 }

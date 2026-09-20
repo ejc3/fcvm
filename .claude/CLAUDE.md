@@ -2504,7 +2504,12 @@ records the SET and replays it.
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
   chunks. This runs before the guest's first instruction (fcvm loads with `resume_vm: false`),
   but it is NOT a barrier — the resume comes from the clone process — so a drain of real
-  faults precedes every chunk and demand always beats speculation.
+  faults precedes every chunk and demand always beats speculation. Replay yields to the
+  runtime once per batch (one 2 MiB chunk, or 32 populate calls when the runs are small),
+  because a yield after every small copy cost more than the copy. Every recorded run is
+  planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
+  work is bounded by the image size, and no cap drops part of a large guest's set when it
+  fragments into millions of runs.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would
@@ -2525,7 +2530,12 @@ records the SET and replays it.
   life ends up at the same footprint, just sooner; a clone that is created and destroyed
   immediately pays for pages it would not have reached. Density claims above (idle clones cost
   only what they faulted) still hold per page — replay changes WHEN, not WHAT. Turn it off for
-  workloads that spawn many clones which never run.
+  workloads that spawn many clones which never run. That holds while the
+  recorded set is what one clone touches. The set is a union over clones and only grows, and
+  in copy mode every replayed page is a private copy, so a clone is also given pages it would
+  never have touched. On a 128 GiB guest the set went from 3.7M pages after one clone to 9.4M
+  after six, and clones held 23.0 to 23.2 GiB at first healthy after a replay of 3.7M pages
+  against 35.8 to 35.9 GiB after a replay of 9.4M (#955 tracks bounding the set).
 
 **End of clone (`PeerVmm`)**: a userfaultfd reports nothing when the process that created it
 dies — measured on this kernel, `poll` returns 0/revents=0 forever and `read` returns EAGAIN —

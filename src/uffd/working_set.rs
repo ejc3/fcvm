@@ -192,8 +192,10 @@ impl PageSet {
 
     /// Coalesce the set into as few contiguous runs as possible.
     ///
-    /// This is what turns 56k scattered fault offsets into a few hundred bulk copies: the
-    /// arrival ORDER of faults is scattered, but the SET is dense in runs.
+    /// For a Chromium clone this turns 56k scattered fault offsets into a few hundred bulk
+    /// copies: the arrival ORDER of faults is scattered, but the SET is dense in runs. A large
+    /// warmed guest coalesces far less (see `prefetch::plan`), so replay plans every run and
+    /// never a fixed number of them.
     pub fn runs(&self) -> RunIter<'_> {
         RunIter {
             set: self,
@@ -303,6 +305,15 @@ impl PageSet {
 pub struct RunIter<'a> {
     set: &'a PageSet,
     cursor: u64,
+}
+
+#[cfg(test)]
+impl RunIter<'_> {
+    /// How far into the set this iterator has read, in bytes. It is what lets a test pin that a
+    /// consumer of the runs reads the recording no further than it has to.
+    pub(crate) fn position(&self) -> u64 {
+        self.cursor * GRANULE
+    }
 }
 
 impl Iterator for RunIter<'_> {
