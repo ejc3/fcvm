@@ -23,6 +23,7 @@ mod common;
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 const CHILD_ROOT: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_ROOT";
 const CHILD_REFERENCE: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_REFERENCE";
@@ -102,25 +103,111 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
     cleaned.context("cleaning up the private store")
 }
 
-/// The child removes its container on every path it controls. A killed child cannot.
+/// Programs whose command line carries a store's paths: conmon, and the podman it runs as
+/// the container's exit command.
+const STORE_PROGRAMS: [&str; 2] = ["conmon", "podman"];
+
+/// How long the cleanup waits for those programs to be gone.
+const STORE_PROCESS_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The child removes its container on every path it controls, and a killed child
+/// cannot. `--ignore` makes a container that is already gone a success. Anything else
+/// is a failure, with what podman said.
 fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
-    let _ = Command::new("podman")
-        .args(["rm", "-f", "-t", "0", reference])
-        .env("CONTAINERS_STORAGE_CONF", conf)
-        .output();
+    let mut remove = Command::new("podman");
+    remove
+        .args(["rm", "-f", "-t", "0", "--ignore", reference])
+        .env("CONTAINERS_STORAGE_CONF", conf);
+    common::set_test_pdeathsig_std(&mut remove);
+    let removed = remove.output().context("running podman rm")?;
+    anyhow::ensure!(
+        removed.status.success(),
+        "podman rm {reference}: {}: {}",
+        removed.status,
+        String::from_utf8_lossy(&removed.stderr).trim()
+    );
     Ok(())
 }
 
-/// Leave nothing of the private store behind. `remove_container` is the step that needs
-/// podman, so that the rest can be tested without one.
+/// Leave nothing of the private store behind: no container, no process that can open
+/// the store again, and no mount. In that order, because a process that opens the store
+/// mounts its overlay home, and a mount made after the detach keeps the directory on the
+/// host when it is removed. `remove_container` is the step that needs podman, so that
+/// the rest can be tested without one.
 fn clean_up_private_store(
     root: &Path,
     remove_container: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    let _ = remove_container();
-    // A mount left below the directory would outlive its removal.
+    remove_container()?;
+    wait_until_no_process_names(root, STORE_PROCESS_TIMEOUT)?;
     detach_mounts_below(root);
+    let mounts = mounts_below(root)?;
+    anyhow::ensure!(
+        mounts.is_empty(),
+        "still mounted below {} after the cleanup: {mounts:?}",
+        root.display()
+    );
     Ok(())
+}
+
+/// `podman rm -f` returns once conmon has written the container's exit file. conmon
+/// writes it before it runs the exit command, so both can still be alive then. There is
+/// no moment between them without a process that names the store: conmon forks the exit
+/// command before it exits.
+fn wait_until_no_process_names(root: &Path, limit: Duration) -> Result<()> {
+    let deadline = Instant::now() + limit;
+    loop {
+        let survivors = processes_naming(root);
+        if survivors.is_empty() {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "still running after {limit:?}, with {} in their command line:\n{}",
+            root.display(),
+            survivors.join("\n")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Processes other than this one that are one of `STORE_PROGRAMS` and name `root` in
+/// their command line, as `pid: command line`.
+///
+/// The name comes from `/proc/<pid>/comm`, which the kernel keeps with the task. A
+/// command line is read from the process's own memory, and that read can block for good
+/// on a process that is stuck in the kernel, so it is only done for those programs.
+fn processes_naming(root: &Path) -> Vec<String> {
+    use std::os::unix::ffi::OsStrExt;
+    let needle = root.as_os_str().as_bytes();
+    let own = std::process::id();
+    let mut found = Vec::new();
+    for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid == own {
+            continue;
+        }
+        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+            continue;
+        };
+        if !STORE_PROGRAMS.contains(&comm.trim_end()) {
+            continue;
+        }
+        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+            continue;
+        };
+        if cmdline.windows(needle.len()).any(|window| window == needle) {
+            let shown = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+            found.push(format!("{pid}: {}", shown.trim_end()));
+        }
+    }
+    found
 }
 
 /// How long the stand-in below lives.
