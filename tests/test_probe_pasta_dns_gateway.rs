@@ -8,8 +8,11 @@
 //! whenever the pasta wiring is in question, which is exactly the usage that
 //! accumulates them.
 
+use std::io::Read;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 fn repo_root() -> PathBuf {
@@ -109,6 +112,160 @@ fn processes_matching(needle: &str) -> Vec<String> {
     found
 }
 
+/// How long one run of the probe may take before a test gives up on it.
+///
+/// Measured with the stubs these tests use: 0.190, 0.200 and 0.189 s on a box
+/// with a 1-minute load average of 17. A helper the probe cannot end costs
+/// 60 s per `ask`, because both helpers are `sleep 60`, so 30 s is 150 times
+/// the healthy run and half of the shortest stall.
+const PROBE_DEADLINE: Duration = Duration::from_secs(30);
+
+/// Whether a `SigIgn` mask from `/proc/<pid>/status` has SIGTERM in it.
+fn sigign_has_sigterm(hex: &str) -> bool {
+    u64::from_str_radix(hex.trim(), 16)
+        .map(|mask| mask & (1 << (libc::SIGTERM - 1)) != 0)
+        .unwrap_or(false)
+}
+
+/// One line per process in process group `pgid`: pid, state, the kernel
+/// function it sleeps in, whether it ignores SIGTERM, and its command line.
+///
+/// By group rather than by ancestry, so a process whose parent already exited
+/// is still listed. The command line is skipped for a process in
+/// uninterruptible sleep, where reading it can block on the target's mm.
+fn describe_process_group(pgid: u32) -> String {
+    let mut lines = Vec::new();
+    for entry in std::fs::read_dir("/proc").expect("read /proc").flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        // "pid (comm) state ppid pgrp ...", where comm may hold spaces and
+        // parentheses, so split at the last one.
+        let Some((head, tail)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        let mut fields = tail.split_whitespace();
+        let state = fields.next().unwrap_or("?").to_string();
+        if fields.nth(1).and_then(|f| f.parse::<u32>().ok()) != Some(pgid) {
+            continue;
+        }
+        let sigterm = std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find_map(|l| l.strip_prefix("SigIgn:").map(sigign_has_sigterm))
+            });
+        let sigterm = match sigterm {
+            Some(true) => "SIGTERM ignored",
+            Some(false) => "SIGTERM not ignored",
+            None => "SIGTERM unknown",
+        };
+        let wchan = std::fs::read_to_string(format!("/proc/{pid}/wchan")).unwrap_or_default();
+        let command = if state == "D" {
+            None
+        } else {
+            std::fs::read(format!("/proc/{pid}/cmdline"))
+                .ok()
+                .map(|bytes| String::from_utf8_lossy(&bytes).replace('\0', " "))
+                .filter(|c| !c.trim().is_empty())
+        };
+        let command = command.unwrap_or_else(|| {
+            let comm = head.split_once('(').map(|(_, c)| c).unwrap_or("?");
+            format!("[{comm}]")
+        });
+        lines.push(format!(
+            "  {pid} {state} {} ({sigterm}): {}",
+            if wchan.is_empty() { "-" } else { wchan.trim() },
+            command.trim()
+        ));
+    }
+    lines.sort();
+    lines.join("\n")
+}
+
+fn drain<R: Read + Send + 'static>(mut pipe: R) -> mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = pipe.read_to_end(&mut buf);
+        let _ = tx.send(buf);
+    });
+    rx
+}
+
+/// Runs the probe to its end, or fails once `PROBE_DEADLINE` has passed.
+///
+/// `Command::output` waits for as long as the script does, so a probe that
+/// stalls becomes the test runner's timeout, with "running 1 test" as the only
+/// captured output and nothing about what it was waiting for. Here a stalled
+/// run is described, killed and reported instead.
+///
+/// The probe gets its own process group so that the whole run can be listed
+/// and killed at once. Killing the outer shell alone would leave the `unshare`
+/// under it alive, and the namespace's init dies only when that `unshare` does.
+fn run_probe(cmd: &mut Command) -> Output {
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .expect("run the probe");
+    let pgid = child.id();
+    let stdout = drain(child.stdout.take().expect("probe stdout"));
+    let stderr = drain(child.stderr.take().expect("probe stderr"));
+    // After the run is over, or killed, every holder of the pipes is gone and
+    // the readers finish at once. The bound is for a holder that is not.
+    let collect = |rx: &mpsc::Receiver<Vec<u8>>| {
+        rx.recv_timeout(Duration::from_secs(5))
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+    };
+
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("wait for the probe") {
+            break status;
+        }
+        if started.elapsed() >= PROBE_DEADLINE {
+            let group = describe_process_group(pgid);
+            unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+            let _ = child.wait();
+            panic!(
+                "the probe was still running {}s after it started, and it finishes in \
+                 about 0.2s. Its process group when it was killed (pid, state, kernel \
+                 wait, SIGTERM, command):\n{group}\n\
+                 A `sleep 60` that ignores SIGTERM is a helper the probe signalled and \
+                 is waiting out.\nstdout:\n{}\nstderr:\n{}",
+                PROBE_DEADLINE.as_secs(),
+                collect(&stdout).unwrap_or_default(),
+                collect(&stderr).unwrap_or_default(),
+            );
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+
+    match (collect(&stdout), collect(&stderr)) {
+        (Ok(stdout), Ok(stderr)) => Output {
+            status,
+            stdout: stdout.into_bytes(),
+            stderr: stderr.into_bytes(),
+        },
+        _ => {
+            let group = describe_process_group(pgid);
+            unsafe { libc::killpg(pgid as i32, libc::SIGKILL) };
+            panic!(
+                "the probe exited with {status} and something it started still holds \
+                 its output open. Its process group (pid, state, kernel wait, SIGTERM, \
+                 command):\n{group}"
+            );
+        }
+    }
+}
+
 /// With no `PASTA_BIN`, the probe must refuse rather than pick a binary out of
 /// a directory listing.
 ///
@@ -159,23 +316,23 @@ fn the_probe_refuses_to_guess_which_pasta_to_run() {
          printf '#!/bin/sh\\nexec sleep 60\\n' >/mnt/fcvm-btrfs/pasta/pasta-stale.bin\n\
          chmod +x /mnt/fcvm-btrfs/pasta/pasta-stale.bin\n\
          exec bash \"$0\"\n";
-    let output = Command::new("unshare")
-        .args([
-            "--user",
-            "--map-root-user",
-            "--mount",
-            "--fork",
-            "--",
-            "bash",
-            "-c",
-            plant,
-        ])
-        .arg(&script)
-        .env("PATH", &path)
-        .env("TMPDIR", &work_root)
-        .env_remove("PASTA_BIN")
-        .output()
-        .expect("run the probe");
+    let output = run_probe(
+        Command::new("unshare")
+            .args([
+                "--user",
+                "--map-root-user",
+                "--mount",
+                "--fork",
+                "--",
+                "bash",
+                "-c",
+                plant,
+            ])
+            .arg(&script)
+            .env("PATH", &path)
+            .env("TMPDIR", &work_root)
+            .env_remove("PASTA_BIN"),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -243,13 +400,13 @@ fn the_probe_refuses_a_pasta_bin_that_is_not_a_regular_file() {
     let dir = tmp.path().join("pasta-is-a-directory");
     std::fs::create_dir_all(&dir).expect("create the directory to hand the guard");
 
-    let output = Command::new("bash")
-        .arg(&script)
-        .env("PATH", &path)
-        .env("TMPDIR", &work_root)
-        .env("PASTA_BIN", &dir)
-        .output()
-        .expect("run the probe");
+    let output = run_probe(
+        Command::new("bash")
+            .arg(&script)
+            .env("PATH", &path)
+            .env("TMPDIR", &work_root)
+            .env("PASTA_BIN", &dir),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -327,13 +484,13 @@ exec sleep 60
         std::env::var("PATH").unwrap_or_default()
     );
 
-    let output = Command::new("bash")
-        .arg(&script)
-        .env("PATH", &path)
-        .env("TMPDIR", &work_root)
-        .env("PASTA_BIN", bin.join("pasta"))
-        .output()
-        .expect("run the probe");
+    let output = run_probe(
+        Command::new("bash")
+            .arg(&script)
+            .env("PATH", &path)
+            .env("TMPDIR", &work_root)
+            .env("PASTA_BIN", bin.join("pasta")),
+    );
     let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
@@ -404,13 +561,13 @@ fn the_probe_leaves_no_dns_responder_behind() {
         bin.display(),
         std::env::var("PATH").unwrap_or_default()
     );
-    let output = Command::new("bash")
-        .arg(&script)
-        .env("PATH", &path)
-        .env("TMPDIR", &work_root)
-        .env("PASTA_BIN", bin.join("pasta"))
-        .output()
-        .expect("run the probe");
+    let output = run_probe(
+        Command::new("bash")
+            .arg(&script)
+            .env("PATH", &path)
+            .env("TMPDIR", &work_root)
+            .env("PASTA_BIN", bin.join("pasta")),
+    );
 
     // A probe that never got as far as starting the responders leaves nothing
     // behind for a reason that says nothing about reaping, so the assertion
@@ -447,5 +604,108 @@ fn the_probe_leaves_no_dns_responder_behind() {
         alive.len(),
         output.status,
         alive.join("\n"),
+    );
+}
+
+/// A helper that ignores SIGTERM must not hold the probe up.
+///
+/// `ask` ends its two helpers, pasta and the `sleep 60` holding the guest's
+/// namespace, and then waits for both. It ended them with the default SIGTERM,
+/// which a process that started with SIGTERM ignored never acts on, so the
+/// `wait` lasted until the `sleep` ran out: 60 s per `ask`, 120 s for a probe
+/// that otherwise takes 0.2 s.
+///
+/// Whether SIGTERM is ignored in there is not the probe's to decide. An ignored
+/// signal is inherited through every fork and exec, and a bash script cannot
+/// reset one it started with. `unshare --fork` from util-linux 2.36 and 2.37
+/// (RHEL 9, Ubuntu 22.04, Debian 11) sets SIGINT and SIGTERM to SIG_IGN before
+/// it forks and puts them back only in the parent, so on those hosts every run
+/// of the probe is in this state. 2.38 blocks the two signals in the parent and
+/// restores the mask in the child instead. A caller that ignores SIGTERM gives
+/// the same result under any util-linux, which is how this test builds it.
+///
+/// RED BEFORE THE FIX, 30 s into a run the fixed probe finishes in 0.2 s (paths
+/// shortened, the four responder processes left out):
+///
+/// ```text
+/// the probe was still running 30s after it started, and it finishes in about
+/// 0.2s. Its process group when it was killed (pid, state, kernel wait,
+/// SIGTERM, command):
+///   220716 S do_wait (SIGTERM ignored): bash scripts/probe-pasta-dns-gateway.sh
+///   220727 S do_wait (SIGTERM ignored): unshare --user --map-root-user --net --mount --pid --mount-proc --kill-child --fork -- scripts/probe-pasta-dns-gateway.sh --inside ...
+///   220734 S anon_pipe_read (SIGTERM ignored): bash scripts/probe-pasta-dns-gateway.sh --inside ...
+///   220791 S do_wait (SIGTERM ignored): bash scripts/probe-pasta-dns-gateway.sh --inside ...
+///   220792 S hrtimer_nanosleep (SIGTERM ignored): sleep 60
+///   220797 S hrtimer_nanosleep (SIGTERM ignored): sleep 60
+/// ```
+///
+/// The last three lines are the stall: the `ask` subshell in `wait4`, and under
+/// it the two helpers it had already signalled, both still asleep.
+#[test]
+fn the_probe_does_not_wait_out_a_helper_that_ignores_sigterm() {
+    require_tools();
+    let script = repo_root().join("scripts/probe-pasta-dns-gateway.sh");
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let bin = tmp.path().join("bin");
+    std::fs::create_dir_all(&bin).expect("create stub bin");
+
+    // A pasta that stays up until the probe ends it, and that first records
+    // its own SigIgn, so the test can tell whether SIGTERM really was ignored
+    // where the probe's helpers run.
+    let sigign = tmp.path().join("pasta-sigign");
+    write_exec(
+        &bin.join("pasta"),
+        &format!(
+            "#!/bin/bash\n\
+             while read -r key value; do\n\
+             \t[ \"$key\" = SigIgn: ] && echo \"$value\" >{sigign}\n\
+             done </proc/self/status\n\
+             exec sleep 60\n",
+            sigign = sigign.display()
+        ),
+    );
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    let work_root = tmp.path().join("work");
+    std::fs::create_dir_all(&work_root).expect("create work root");
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+
+    let mut cmd = Command::new("bash");
+    cmd.arg(&script)
+        .env("PATH", &path)
+        .env("TMPDIR", &work_root)
+        .env("PASTA_BIN", bin.join("pasta"));
+    // An ignored signal survives exec, so this reaches the script, the
+    // namespace and both helpers.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::signal(libc::SIGTERM, libc::SIG_IGN) == libc::SIG_ERR {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let output = run_probe(&mut cmd);
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    // A helper that did not ignore SIGTERM dies on any signal, so a run where
+    // the ignore never arrived passes for a reason that says nothing here.
+    let recorded = std::fs::read_to_string(&sigign).unwrap_or_default();
+    assert!(
+        sigign_has_sigterm(&recorded),
+        "BLOCKED: the stub pasta did not start with SIGTERM ignored (SigIgn {recorded:?}), \
+         so this says nothing about a helper that ignores it.\nstdout:\n{stdout}\nstderr:\n{stderr}"
+    );
+    assert!(
+        output.status.success()
+            && stdout.contains("OK   with -D none")
+            && stdout.contains("OK   without it"),
+        "the probe did not reach its normal end with SIGTERM ignored. status {}\n\
+         stdout:\n{stdout}\nstderr:\n{stderr}",
+        output.status,
     );
 }
