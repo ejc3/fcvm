@@ -2510,6 +2510,41 @@ records the SET and replays it.
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
   work is bounded by the image size, and no cap drops part of a large guest's set when it
   fragments into millions of runs.
+- **Page cache warm-up (copy mode)**: replay and demand faults both read the image through the
+  serve's mapping, so with a cold page cache every source page is a synchronous major fault in
+  the serve, ahead of the guest. One detached thread (`fcvm-ws-warm`, `src/uffd/warmup.rs`)
+  calls `posix_fadvise(POSIX_FADV_WILLNEED)` on the recorded runs in ascending file offset,
+  which is the order replay plans them in. A warm-up starts when the serve starts, and again
+  when a clone is admitted while none is running, because the kernel evicts the image as
+  clones grow under a long-lived serve. Measured on a 128 GiB guest (41.4 GiB recorded in
+  3.39M runs, memory file evicted before every run): replay took 94.5 s and 87.7 s on main,
+  32.3 s and 32.9 s with the warm-up when the clone connected as soon as the serve was ready,
+  and 22.3 s when it connected after the warm-up had logged. Demand faults during replay fell
+  from 992,535 to 562,321. The warm-up at serve start issued 3.49M requests in 18.4 s, and
+  the one at clone admission, over an already cached set, took 0.8 s. A request for a page
+  that is still cached measured 0.1 to 0.7 us, so walking a cached set of 3M runs costs that
+  one thread between 0.3 and two seconds. Runs are never merged across a gap, so the warm-up
+  requests exactly the recorded runs. What the kernel reads for a request is up to the
+  filesystem: on btrfs with `compress-force=zstd`, a request for one 4 KiB page inside a
+  compressed extent left 27 pages resident, the 128 KiB extent it sits in, and exactly 1 with
+  incompressible data. A read fault on that page, with read-around off, left the same 27 and
+  1, so replay's own reads bring in the same extents. A run longer than 128 KiB takes several
+  calls, because the kernel truncates one readahead request to `max(io_pages, ra_pages)` and
+  still returns 0: one call over a 64 MiB range left 1,024 of its 16,384 pages resident on
+  btrfs with a 4 MiB window, and the same range in 128 KiB calls left all of them. A request
+  returns when its read is queued, not when it completes, so whether a clone that connects
+  during a warm-up finds its pages cached is a race, not a guarantee. Nothing waits for the
+  thread: the ready record, clone admission, fault service and shutdown do not depend on it,
+  and a refused request is counted with only the first logged. Cancelling the serve sets a
+  flag the thread reads before every request, so at most one further request starts after
+  the stop returns. Every warm-up logs one line: `asked the kernel to read the recorded
+  working set into the page cache` with `trigger`, `runs`, `pages`, `failures` and
+  `elapsed_ms`, or, for a fresh snapshot, that no working set is recorded yet. Minor mode
+  reads the whole image into its memfd at startup, so it has nothing to warm, and
+  `--uffd-prefetch off` starts no warm-up. Known limits, with numbers, are in the module doc:
+  the warm-up is not paced, so on a cold cache another running clone's major fault waits
+  behind its readahead, it can outrun replay when free page cache is smaller than the
+  recorded set, and a minor-mode server starting on the same image drops what it loaded.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would

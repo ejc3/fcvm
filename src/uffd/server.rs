@@ -15,6 +15,7 @@ use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::uffd::prefetch;
+use crate::uffd::warmup::Warmer;
 use crate::uffd::working_set::{PageSet, WorkingSetPersistence, WorkingSetStore};
 
 /// 2MiB — the only huge page size fcvm supports for guest memory.
@@ -580,6 +581,10 @@ pub struct UffdServer {
     working_set: Option<Arc<WorkingSetStore>>,
     working_set_persistence: Option<WorkingSetPersistence>,
     record_window: Duration,
+    /// Page cache warm-ups for the recorded set. `Some` only for a copy-mode server with
+    /// prefetch on: minor mode reads the whole image into its memfd at startup, and prefetch
+    /// off loads no recorded set. Cancelling or dropping the server stops a running one.
+    warmer: Option<Warmer>,
 }
 
 impl UffdServer {
@@ -653,7 +658,9 @@ impl UffdServer {
             "preparing snapshot page source"
         );
 
-        let source = match backing {
+        // Copy mode keeps the memory file open after mapping it: the page cache warm-up asks
+        // the kernel for the recorded runs through this descriptor.
+        let (source, image_for_warming) = match backing {
             UffdBacking::Copy => {
                 // Safety: We're mapping a read-only file for serving pages
                 let mmap = unsafe {
@@ -662,7 +669,7 @@ impl UffdServer {
                         .map(&mem_file)
                         .context("mmapping memory file")?
                 };
-                PageSource::Copy { mmap }
+                (PageSource::Copy { mmap }, Some(mem_file))
             }
             UffdBacking::Minor { hugepages } => {
                 let backing_file = tokio::task::spawn_blocking({
@@ -671,9 +678,12 @@ impl UffdServer {
                 })
                 .await
                 .context("joining memfd population task")??;
-                PageSource::Minor {
-                    backing: backing_file,
-                }
+                (
+                    PageSource::Minor {
+                        backing: backing_file,
+                    },
+                    None,
+                )
             }
         };
 
@@ -733,7 +743,14 @@ impl UffdServer {
             None => None,
         };
 
-        Ok(Self {
+        // A warmer exists only where a warm-up has something to do: copy mode, the only
+        // mode that kept the file, with prefetch on, the only case with a recorded set.
+        let warmer = match (image_for_warming, working_set.as_ref()) {
+            (Some(image), Some(_)) => Some(Warmer::new(&snapshot_id, image, mem_size as u64)),
+            _ => None,
+        };
+
+        let server = Self {
             snapshot_id,
             socket_path: socket_path.to_path_buf(),
             source: Arc::new(source),
@@ -743,7 +760,23 @@ impl UffdServer {
             working_set,
             working_set_persistence,
             record_window,
-        })
+            warmer,
+        };
+        // Copy mode reads every page it serves through the mapping, so with a cold page
+        // cache a restore replays from disk one major fault at a time. Start reading the
+        // recorded runs now. This only spawns a detached thread: the socket bind, the
+        // caller's ready record and every clone proceed without it.
+        server.warm_page_cache("serve start");
+        Ok(server)
+    }
+
+    /// Start reading the recorded working set into the page cache, unless a warm-up is
+    /// already running or this server has no warmer.
+    fn warm_page_cache(&self, trigger: &'static str) {
+        if let (Some(warmer), Some(store)) = (&self.warmer, &self.working_set) {
+            let store = Arc::clone(store);
+            warmer.warm_if_idle(trigger, move || store.to_prefetch());
+        }
     }
 
     /// Get the socket path for this server
@@ -857,6 +890,14 @@ impl UffdServer {
                             }
                             admitted.fetch_add(1, Ordering::AcqRel);
 
+                            // A long-lived serve's image is evicted as its clones grow, so
+                            // the cache this clone is about to replay from may be cold
+                            // again. Start a warm-up unless one is running. The accept loop
+                            // pays a compare-and-swap and a thread spawn: the bitmap is
+                            // copied on the new thread, and asking again for a page that is
+                            // still cached costs that thread under a microsecond.
+                            self.warm_page_cache("clone admission");
+
                             let source = Arc::clone(&self.source);
                             let working_set = CloneWorkingSet {
                                 store: self.working_set.clone(),
@@ -925,6 +966,14 @@ impl UffdServer {
                 // Shut down when cancellation token is triggered (Ctrl-C / SIGTERM)
                 _ = cancel.cancelled() => {
                     info!(target: "uffd", "cancellation requested, shutting down server");
+                    // The serve is going away, so stop asking for pages. `snapshot serve`
+                    // cancels after its clones are gone. `snapshot run` cancels its implicit
+                    // server first and ends its VM afterwards, so a clone can still fault
+                    // after this point, and those faults are served on demand, as they were
+                    // before there was a warm-up. This sets a flag and returns.
+                    if let Some(warmer) = &self.warmer {
+                        warmer.stop();
+                    }
                     break;
                 }
             }
@@ -3330,6 +3379,358 @@ mod tests {
     }
 
     // =========================================================================
+    // Page cache warm-up wiring. The mechanism is tested in `warmup.rs`; these drive the
+    // server's own entry points.
+    // =========================================================================
+
+    /// A snapshot as `snapshot serve` sees it: an image on a disk whose pages can be evicted,
+    /// its generation config and lock, and a working set an earlier clone recorded.
+    struct RecordedSnapshot {
+        dir: tempfile::TempDir,
+        /// Not inside `dir`, which can sit under a long build path: the socket path has to
+        /// fit `sun_path`.
+        sockets: tempfile::TempDir,
+        image: std::path::PathBuf,
+        len: u64,
+        recorded: Vec<(u64, u64)>,
+    }
+
+    impl RecordedSnapshot {
+        fn new() -> Self {
+            use crate::uffd::warmup::testing::{disk_dir, write_incompressible, MIB};
+
+            let len = 8 * MIB;
+            // Whole numbers of 4, 16 and 64 KiB host pages, which `mincore` needs.
+            let recorded = vec![(MIB, 256 * 1024), (5 * MIB, 64 * 1024)];
+            let dir = tempfile::tempdir_in(disk_dir()).unwrap();
+            let image = dir.path().join("memory.bin");
+            write_incompressible(&mut File::create(&image).unwrap(), len).unwrap();
+            std::fs::write(dir.path().join("config.json"), b"generation-1").unwrap();
+            let snapshot = Self {
+                dir,
+                sockets: tempfile::tempdir().unwrap(),
+                image,
+                len,
+                recorded,
+            };
+
+            let store =
+                WorkingSetStore::open(&snapshot.image, len, &snapshot.config(), &snapshot.lock())
+                    .unwrap();
+            let mut set = store.recorder();
+            for &(offset, len) in &snapshot.recorded {
+                set.insert_range(offset, len);
+            }
+            store.merge_and_persist(&set).unwrap();
+            snapshot
+        }
+
+        fn config(&self) -> std::path::PathBuf {
+            self.dir.path().join("config.json")
+        }
+
+        fn lock(&self) -> std::path::PathBuf {
+            self.dir.path().join("snapshot.lock")
+        }
+
+        async fn serve(&self, backing: UffdBacking, prefetch: Prefetch) -> UffdServer {
+            UffdServer::new(
+                "warm".to_string(),
+                &self.image,
+                &self.config(),
+                &self.lock(),
+                self.sockets.path(),
+                ServeShape {
+                    backing,
+                    prefetch,
+                    record_window: DEFAULT_PREFETCH_RECORD_WINDOW,
+                },
+            )
+            .await
+            .unwrap()
+        }
+
+        /// Map the image, evict it, and prove the recorded runs start out cold.
+        fn cold(&self) -> (File, memmap2::Mmap) {
+            let file = File::open(&self.image).unwrap();
+            let mmap = crate::uffd::warmup::testing::cold_mapping(&file, self.len, &self.recorded);
+            (file, mmap)
+        }
+    }
+
+    /// A copy-mode server that loads a recorded set starts reading it from `new()`, before
+    /// it has bound its socket or admitted a clone.
+    #[tokio::test]
+    async fn a_copy_mode_server_warms_its_recorded_set_when_it_starts() {
+        use crate::uffd::warmup::testing::wait_until_resident;
+
+        let snapshot = RecordedSnapshot::new();
+        let (_image, mmap) = snapshot.cold();
+
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::On).await;
+
+        assert!(server.warmer.is_some());
+        assert_eq!(wait_until_resident(&mmap, &snapshot.recorded), Ok(()));
+    }
+
+    /// `--uffd-prefetch off` stays inert: with a recorded set sitting beside the image, the
+    /// server builds no warmer and reads nothing.
+    #[tokio::test]
+    async fn prefetch_off_starts_no_warm_up() {
+        use crate::uffd::warmup::testing::resident_after_settling;
+
+        let snapshot = RecordedSnapshot::new();
+        let (_image, mmap) = snapshot.cold();
+
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::Off).await;
+
+        assert!(
+            server.warmer.is_none(),
+            "prefetch off must not build a warmer"
+        );
+        for &range in &snapshot.recorded {
+            assert_eq!(
+                resident_after_settling(&mmap, range),
+                0,
+                "prefetch off read {range:#x?} of the image"
+            );
+        }
+    }
+
+    /// Minor mode reads the whole image into its memfd at startup, so it gets no warmer even
+    /// though it loads the recorded set for replay.
+    #[tokio::test]
+    async fn minor_mode_starts_no_warm_up() {
+        let snapshot = RecordedSnapshot::new();
+
+        let server = snapshot
+            .serve(UffdBacking::Minor { hugepages: false }, Prefetch::On)
+            .await;
+
+        assert!(
+            server.working_set.is_some(),
+            "the recorded set was loaded, so only the mode keeps the warm-up off"
+        );
+        assert!(
+            server.warmer.is_none(),
+            "minor mode must not build a warmer"
+        );
+    }
+
+    /// The address of the Unix socket at `path`.
+    fn unix_addr(path: &Path) -> libc::sockaddr_un {
+        use std::os::unix::ffi::OsStrExt;
+
+        // SAFETY: an all-zero sockaddr_un is a valid value.
+        let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        assert!(bytes.len() < addr.sun_path.len(), "socket path too long");
+        for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+            *dst = *src as libc::c_char;
+        }
+        addr
+    }
+
+    /// The server binds its socket and then listens on it, two syscalls, and a connect that
+    /// lands between them is refused. The stand-in has to wait that window out, or a test
+    /// that starts it right after spawning the server fails for no fault of the server's.
+    #[test]
+    fn the_stand_in_vmm_waits_out_a_socket_that_is_bound_but_not_yet_listening() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("late.sock");
+        let addr = unix_addr(&path);
+        let addr_len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+        // SAFETY: plain socket calls on a descriptor this test owns.
+        let listener = unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+            assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
+            let rc = libc::bind(fd, std::ptr::addr_of!(addr).cast(), addr_len);
+            assert_eq!(rc, 0, "bind: {}", std::io::Error::last_os_error());
+            // A bounded accept, so a stand-in that never connects fails the test instead of
+            // hanging it.
+            let wait = libc::timeval {
+                tv_sec: 10,
+                tv_usec: 0,
+            };
+            let rc = libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                std::ptr::addr_of!(wait).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "SO_RCVTIMEO: {}", std::io::Error::last_os_error());
+            fd
+        };
+        let accepting = std::thread::spawn(move || {
+            // Bound, and for this long not listening.
+            std::thread::sleep(Duration::from_millis(300));
+            // SAFETY: as above.
+            unsafe {
+                assert_eq!(libc::listen(listener, 1), 0);
+                let conn = libc::accept(listener, std::ptr::null_mut(), std::ptr::null_mut());
+                let error = std::io::Error::last_os_error();
+                libc::close(listener);
+                if conn < 0 {
+                    return Err(error);
+                }
+                libc::close(conn);
+                Ok(())
+            }
+        });
+
+        let mut vmm = connect_stand_in_vmm(&path);
+        let accepted = accepting.join().unwrap();
+        vmm.kill().ok();
+        vmm.wait().ok();
+
+        assert!(
+            accepted.is_ok(),
+            "the stand-in never connected: {accepted:?}"
+        );
+    }
+
+    /// A test that panics or returns early must not leave its stand-in behind: `sleep 600`
+    /// would hold the inherited connection and the test runner's descriptors for ten
+    /// minutes.
+    #[test]
+    fn a_dropped_stand_in_vmm_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("peer.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+
+        let vmm = connect_stand_in_vmm(&path);
+        let pid = vmm.id() as libc::pid_t;
+        drop(vmm);
+
+        // SAFETY: signal 0 only asks whether the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } != 0;
+        if !gone {
+            // About to fail: do not leave the process behind on the way out.
+            // SAFETY: `pid` is this test's own child.
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+        }
+        assert!(gone, "the stand-in (pid {pid}) outlived its handle");
+    }
+
+    /// Cancelling the server stops its warmer. The server is still alive when this looks,
+    /// so it is the cancel arm that stopped it and not the drop.
+    #[tokio::test]
+    async fn cancelling_the_server_stops_its_warmer() {
+        let snapshot = RecordedSnapshot::new();
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::On).await;
+        assert!(!server.warmer.as_ref().expect("copy mode").is_stopped());
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+        server.run(cancel).await.unwrap();
+
+        assert!(
+            server.warmer.as_ref().expect("copy mode").is_stopped(),
+            "the cancel arm must stop the warmer"
+        );
+    }
+
+    /// A stand-in VMM: a child that connects to `socket` between fork and exec and then
+    /// becomes `sleep`, which inherits the connection. The server pins that process, so its
+    /// fail-closed kill lands on the child and never on the test.
+    ///
+    /// The server binds its socket and starts listening in two syscalls, and the child can
+    /// get here before either. `ENOENT` means not bound yet and `ECONNREFUSED` means bound
+    /// but not listening yet. Both clear within milliseconds, so the child retries them for
+    /// up to ten seconds, and the caller needs no wait of its own.
+    ///
+    /// It comes back as a [`Victim`], armed the way [`spawn_victim`] arms its own, so a test
+    /// that panics, returns early or is killed outright does not leave `sleep 600` holding
+    /// the connection and the test runner's descriptors.
+    fn connect_stand_in_vmm(socket: &Path) -> Victim {
+        use std::os::unix::process::CommandExt;
+
+        let addr = unix_addr(socket);
+        let test_process = std::process::id() as libc::pid_t;
+        let mut command = std::process::Command::new("sleep");
+        command.arg("600");
+        // SAFETY: between fork and exec the hook only calls prctl(2), getppid(2), socket(2),
+        // connect(2), close(2) and nanosleep(2), which are async-signal-safe, on values
+        // built before the fork.
+        unsafe {
+            command.pre_exec(move || {
+                die_with_the_test(test_process)?;
+                let pause = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 5_000_000,
+                };
+                for _ in 0..2000 {
+                    // No SOCK_CLOEXEC: `sleep` has to inherit the connection.
+                    let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+                    if fd < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    let rc = libc::connect(
+                        fd,
+                        std::ptr::addr_of!(addr).cast(),
+                        std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+                    );
+                    if rc == 0 {
+                        return Ok(());
+                    }
+                    let error = std::io::Error::last_os_error();
+                    libc::close(fd);
+                    match error.raw_os_error() {
+                        Some(libc::ENOENT) | Some(libc::ECONNREFUSED) => {
+                            libc::nanosleep(&pause, std::ptr::null_mut());
+                        }
+                        _ => return Err(error),
+                    }
+                }
+                Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
+            });
+        }
+        Victim(command.spawn().expect("spawning the stand-in VMM"))
+    }
+
+    /// Under a long-lived serve the kernel evicts the image as clones grow. Admitting a
+    /// clone starts another warm-up when none is running, so that clone does not replay from
+    /// a cold cache.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn admitting_a_clone_warms_the_recorded_set_again() {
+        use crate::uffd::warmup::testing::{make_cold, wait_until_idle, wait_until_resident};
+
+        let snapshot = RecordedSnapshot::new();
+        let (image, mmap) = snapshot.cold();
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::On).await;
+
+        // The warm-up from `new()` runs to its end first, so it cannot be what warms the
+        // cache after the eviction below.
+        assert_eq!(wait_until_resident(&mmap, &snapshot.recorded), Ok(()));
+        wait_until_idle(server.warmer.as_ref().expect("copy mode with prefetch on"));
+        make_cold(&image, &mmap, &snapshot.recorded);
+
+        let socket = server.socket_path().to_path_buf();
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let serving = tokio::spawn({
+            let cancel = cancel.clone();
+            async move { server.run(cancel).await }
+        });
+        // No wait for the socket here: the stand-in retries until the server is listening.
+        let mut vmm = connect_stand_in_vmm(&socket);
+        let warmed = wait_until_resident(&mmap, &snapshot.recorded);
+
+        // The stand-in never sends a handshake. Ending it closes the connection, which ends
+        // its handler, so the server has nothing to drain when it is cancelled.
+        vmm.kill().ok();
+        vmm.wait().ok();
+        cancel.cancel();
+        serving.await.unwrap().unwrap();
+
+        assert_eq!(warmed, Ok(()));
+    }
+
+    // =========================================================================
     // Backing-memfd immutability (the fd every clone receives must not be able
     // to modify the golden snapshot) + MINOR/CONTINUE off the sealed fd.
     // =========================================================================
@@ -3653,19 +4054,25 @@ mod tests {
         // async-signal-safe calls. The parent PID was captured before the fork, so the
         // hook allocates nothing.
         unsafe {
-            command.pre_exec(move || {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                // If the parent died in between, no signal is coming: refuse to start an
-                // unsupervised process.
-                if libc::getppid() != test_process {
-                    return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-                }
-                Ok(())
-            });
+            command.pre_exec(move || die_with_the_test(test_process));
         }
         Victim(command.spawn().expect("spawning the stand-in VMM process"))
+    }
+
+    /// The kernel half of [`Victim`], for a pre-exec hook: die with the thread that spawned
+    /// this child, and refuse to start if that parent is already gone, because then no
+    /// signal is coming. Two async-signal-safe calls and no allocation.
+    fn die_with_the_test(test_process: libc::pid_t) -> std::io::Result<()> {
+        // SAFETY: prctl(PR_SET_PDEATHSIG) and getppid take no pointers.
+        unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != test_process {
+                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
+            }
+        }
+        Ok(())
     }
 
     fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
