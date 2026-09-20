@@ -79,8 +79,8 @@ pub enum Stop {
 /// planning keeps a fixed ceiling on what it can cost: the iterator holds one pending segment
 /// and allocates nothing, and its work is one pass over the bitmap, whose length the
 /// snapshot's memory size fixes. A warmed 128 GiB guest's restore set fragments into millions
-/// of runs a few pages long (measured: 3.7M pages in 1.6M runs), so a plan limited to a fixed
-/// number of runs leaves most of that set to demand paging.
+/// of runs a few pages long (one clone recorded 3.7M pages in 1.6M runs), so a plan limited
+/// to a fixed number of runs leaves most of that set to demand paging.
 pub fn plan<'a>(
     set: &'a PageSet,
     regions: &'a [Region],
@@ -113,6 +113,14 @@ pub struct Plan<'a> {
     next_region: usize,
     /// The newest segment, held back because the next piece may merge into it.
     pending: Option<Segment>,
+}
+
+#[cfg(test)]
+impl Plan<'_> {
+    /// How far into the recording planning has read, in bytes.
+    fn recording_position(&self) -> Option<u64> {
+        self.runs.as_ref().map(RunIter::position)
+    }
 }
 
 impl Iterator for Plan<'_> {
@@ -165,7 +173,8 @@ fn place(
     let region_size = u64::try_from(region.size).ok()?;
     let region_end = region.file_offset.checked_add(region_size)?;
     let start = run_offset.max(region.file_offset);
-    let end = run_end.min(region_end).min(mem_len);
+    // The caller clipped `run_end` to the memory file.
+    let end = run_end.min(region_end);
     if end <= start {
         return None;
     }
@@ -563,9 +572,9 @@ mod tests {
 
     #[test]
     fn plan_covers_every_run_of_a_badly_fragmented_hint() {
-        // A warmed large guest's restore set is millions of runs a few pages long (measured on
-        // a 128 GiB guest: 3.7M pages in 1.6M runs). Every run has to be planned. A plan that
-        // keeps only some of them leaves the rest of the recorded set to demand paging.
+        // A warmed large guest's restore set is millions of runs a few pages long (see `plan`).
+        // Every run has to be planned. A plan that keeps only some of them leaves the rest of
+        // the recorded set to demand paging.
         let run_count: u64 = 200_000;
         let mem_len = run_count * 2 * G;
         let mut set = PageSet::empty(mem_len);
@@ -585,6 +594,33 @@ mod tests {
         }
         assert_eq!(planned, run_count, "every recorded run becomes a segment");
         assert_eq!(bytes, run_count * G, "and every recorded page is planned");
+    }
+
+    #[test]
+    fn plan_reads_the_recording_no_further_than_it_is_consumed() {
+        // Replay populates from the first segment on, so planning must not walk the whole
+        // recording first.
+        let run_count: u64 = 10_000;
+        let mem_len = run_count * 2 * G;
+        let mut set = PageSet::empty(mem_len);
+        for run in 0..run_count {
+            set.insert_range(run * 2 * G, G);
+        }
+        let regions = [Region {
+            base_host_virt_addr: 0x4000_0000,
+            file_offset: 0,
+            size: usize::try_from(mem_len).unwrap(),
+        }];
+        let mut planned = plan(&set, &regions, PAGE, mem_len);
+        assert!(planned.next().is_some());
+        let read = planned
+            .recording_position()
+            .expect("a usable page size plans from the recording");
+        assert!(
+            read <= 3 * G,
+            "a segment needs its own run and the one after it, which might have merged into \
+             it, but planning read {read} bytes into a {mem_len}-byte recording"
+        );
     }
 
     // =========================================================================
