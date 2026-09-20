@@ -666,6 +666,13 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
         before.attached(),
         "the fixture is broken before any build:\n{before}"
     );
+    // The container runs, so the store's overlay home, the container's root and its shm
+    // are mounted now. None of it belongs in the host's mount table.
+    let on_the_host = mounts_in(&host_mount_table(), root)?;
+    anyhow::ensure!(
+        on_the_host.is_empty(),
+        "the host's mount table has entries under the private store: {on_the_host:?}"
+    );
 
     let cache = root.join("cache");
     std::fs::create_dir(&cache)?;
@@ -852,9 +859,20 @@ fn utf8(path: &Path) -> Result<&str> {
         .with_context(|| format!("{} is not UTF-8", path.display()))
 }
 
-/// Mount points at or below `dir`, deepest first.
+/// The mount table of the process that started this one: the host's.
+fn host_mount_table() -> PathBuf {
+    PathBuf::from(format!("/proc/{}/mountinfo", nix::unistd::getppid()))
+}
+
+/// Mount points at or below `dir` in this process's mount table, deepest first.
 fn mounts_below(dir: &Path) -> Result<Vec<PathBuf>> {
-    let table = std::fs::read_to_string("/proc/self/mountinfo")?;
+    mounts_in(Path::new("/proc/self/mountinfo"), dir)
+}
+
+/// Mount points at or below `dir` in the mount table `table`, deepest first.
+fn mounts_in(table: &Path, dir: &Path) -> Result<Vec<PathBuf>> {
+    let table =
+        std::fs::read_to_string(table).with_context(|| format!("reading {}", table.display()))?;
     let mut mounts: Vec<PathBuf> = table
         .lines()
         .filter_map(|line| line.split(' ').nth(4))
