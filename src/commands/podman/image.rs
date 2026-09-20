@@ -388,7 +388,7 @@ pub(super) async fn create_disk_from_dir(
 /// Loads the archive into a temporary podman storage root using the overlay driver,
 /// then packages the result as an ext4 image. The guest can mount this read-only
 /// and use it as an `additionalImageStore`, eliminating the need for `podman load`.
-pub(super) async fn build_storage_image(
+pub async fn build_storage_image(
     archive_path: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {

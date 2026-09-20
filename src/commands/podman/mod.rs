@@ -24,6 +24,9 @@ pub(crate) use types::{RebootSpec, VolumeMapping};
 // Re-exported for the #598 regression test (export must pin immutable content by image
 // ID even when the tag is rebuilt mid-export).
 pub use image::export_image_archive;
+// Re-exported for the #944 regression test (building a storage image must not detach
+// containers that are running in the default store).
+pub use image::build_storage_image;
 
 pub(crate) use listeners::{
     run_output_listener, run_status_listener, spawn_bootplan_listener,
@@ -51,7 +54,7 @@ use crate::network::{BridgedNetwork, NetworkManager, PastaNetwork, PortMapping, 
 use crate::paths;
 use crate::state::{generate_vm_id, truncate_id, validate_vm_name, StateManager, VmState};
 use crate::volume::{spawn_volume_servers, VolumeConfig};
-use image::{build_storage_image, get_image_cache_ref, validate_docker_archive};
+use image::{get_image_cache_ref, validate_docker_archive};
 use tokio_util::sync::CancellationToken;
 
 /// Resolve the rootfs filesystem type from CLI args and kernel profile config.
