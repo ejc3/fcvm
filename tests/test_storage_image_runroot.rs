@@ -106,8 +106,8 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
     cleaned.context("cleaning up the private store")
 }
 
-/// Programs whose command line carries a store's paths: conmon, and the podman it runs as
-/// the container's exit command.
+/// The programs that can open a store again: conmon, and the podman it runs as the
+/// container's exit command.
 const STORE_PROGRAMS: [&str; 2] = ["conmon", "podman"];
 
 /// How long the cleanup waits for those programs to be gone.
@@ -137,54 +137,74 @@ fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
 /// mounts its overlay home, and a mount made after the detach keeps the directory on the
 /// host when it is removed. `remove_container` is the step that needs podman, so that
 /// the rest can be tested without one.
+///
+/// Every step runs whatever the one before it returned, because the scratch directory
+/// is dropped whatever this returns. Every failure is reported, the removal's first.
 fn clean_up_private_store(
     root: &Path,
     remove_container: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    remove_container()?;
-    wait_until_no_process_names(root, STORE_PROCESS_TIMEOUT)?;
+    let mut failures = Vec::new();
+    if let Err(error) = remove_container() {
+        failures.push(format!("removing the container: {error:#}"));
+    }
+    if let Err(error) = wait_until_store_is_unused(root, STORE_PROCESS_TIMEOUT) {
+        failures.push(format!("{error:#}"));
+    }
     detach_mounts_below(root);
-    let mounts = mounts_below(root)?;
-    anyhow::ensure!(
-        mounts.is_empty(),
-        "still mounted below {} after the cleanup: {mounts:?}",
-        root.display()
-    );
+    match mounts_below(root) {
+        Ok(mounts) if mounts.is_empty() => {}
+        Ok(mounts) => failures.push(format!(
+            "still mounted below {} after the cleanup: {mounts:?}",
+            root.display()
+        )),
+        Err(error) => failures.push(format!("reading the mount table: {error:#}")),
+    }
+    anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
 
 /// `podman rm -f` returns once conmon has written the container's exit file. conmon
-/// writes it before it runs the exit command, so both can still be alive then. There is
-/// no moment between them without a process that names the store: conmon forks the exit
-/// command before it exits.
-fn wait_until_no_process_names(root: &Path, limit: Duration) -> Result<()> {
+/// writes it before it runs the exit command, so both can still be alive then.
+fn wait_until_store_is_unused(root: &Path, limit: Duration) -> Result<()> {
     let deadline = Instant::now() + limit;
     loop {
-        let survivors = processes_naming(root);
-        if survivors.is_empty() {
+        let users = store_users(root);
+        if users.is_empty() {
             return Ok(());
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "still running after {limit:?}, with {} in their command line:\n{}",
+            "still using the store under {} after {limit:?}:\n{}",
             root.display(),
-            survivors.join("\n")
+            users.join("\n")
         );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
 
-/// Processes other than this one that are one of `STORE_PROGRAMS` and name `root` in
-/// their command line, as `pid: command line`.
+/// Processes other than this one that can still open the store under `root`, one line
+/// each. Nothing here reads a process's memory: a program's name, its working directory
+/// and what its descriptors point at are kept with the task, and reading them does not
+/// block on a process that is stuck in the kernel.
 ///
-/// The name comes from `/proc/<pid>/comm`, which the kernel keeps with the task. A
-/// command line is read from the process's own memory, and that read can block for good
-/// on a process that is stuck in the kernel, so it is only done for those programs.
-fn processes_naming(root: &Path) -> Vec<String> {
-    use std::os::unix::ffi::OsStrExt;
-    let needle = root.as_os_str().as_bytes();
+/// Two things tie a process to the store. conmon's pid is in the file podman wrote it
+/// to. conmon closes what it held under the store before it runs the exit command, and
+/// its working directory is its caller's, so by then the pid is all there is. It forks
+/// the exit command and waits for it (conmon `do_exit_command`), so it is there for as
+/// long as that command is. And any conmon or podman whose working directory or open
+/// files are under `root` is using the store, whatever its arguments say.
+fn store_users(root: &Path) -> Vec<String> {
     let own = std::process::id();
-    let mut found = Vec::new();
+    let mut users = Vec::new();
+    let recorded = std::fs::read_to_string(root.join(CONMON_PIDFILE))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    if let Some(pid) = recorded {
+        if program_of(pid).as_deref() == Some("conmon") && !has_exited(pid) {
+            users.push(format!("{pid} conmon: the pid in {CONMON_PIDFILE}"));
+        }
+    }
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
         let Some(pid) = entry
             .file_name()
@@ -193,24 +213,64 @@ fn processes_naming(root: &Path) -> Vec<String> {
         else {
             continue;
         };
-        if pid == own {
+        if pid == own || Some(pid) == recorded {
             continue;
         }
-        let Ok(comm) = std::fs::read_to_string(entry.path().join("comm")) else {
+        let Some(program) = program_of(pid) else {
             continue;
         };
-        if !STORE_PROGRAMS.contains(&comm.trim_end()) {
+        if !STORE_PROGRAMS.contains(&program.as_str()) {
             continue;
         }
-        let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
-            continue;
-        };
-        if cmdline.windows(needle.len()).any(|window| window == needle) {
-            let shown = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-            found.push(format!("{pid}: {}", shown.trim_end()));
+        if let Some(held) = held_below(pid, root) {
+            users.push(format!("{pid} {program}: {held}"));
         }
     }
-    found
+    users
+}
+
+/// The kernel's name for the process, from `/proc/<pid>/comm`.
+fn program_of(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/comm"))
+        .ok()
+        .map(|name| name.trim_end().to_owned())
+}
+
+/// A process that has exited keeps its entry under /proc, and its name, until its parent
+/// has reaped it. It has no working directory any more, so that link is gone. A link
+/// that cannot be read for any other reason leaves the process counted as running.
+fn has_exited(pid: u32) -> bool {
+    matches!(
+        std::fs::read_link(format!("/proc/{pid}/cwd")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+    )
+}
+
+/// What the process holds at or below `root`: its working directory, or the first open
+/// file. Both are symbolic links under `/proc/<pid>`.
+fn held_below(pid: u32, root: &Path) -> Option<String> {
+    let process = PathBuf::from(format!("/proc/{pid}"));
+    if let Ok(cwd) = std::fs::read_link(process.join("cwd")) {
+        if cwd.starts_with(root) {
+            return Some(format!("working directory {}", cwd.display()));
+        }
+    }
+    for descriptor in std::fs::read_dir(process.join("fd"))
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        if let Ok(target) = std::fs::read_link(descriptor.path()) {
+            if target.starts_with(root) {
+                return Some(format!(
+                    "descriptor {} is {}",
+                    descriptor.file_name().to_string_lossy(),
+                    target.display()
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// How long a stand-in lives.
@@ -391,7 +451,7 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
 
     let archive = root.join(ARCHIVE);
     podman(&["load", "-i", utf8(&archive)?])?;
-    let _container = ReferenceContainer::start(reference)?;
+    let _container = ReferenceContainer::start(reference, &root.join(CONMON_PIDFILE))?;
     let before = Observed::of(reference, &runroot)?;
     anyhow::ensure!(
         before.attached(),
@@ -511,7 +571,7 @@ struct ReferenceContainer(String);
 
 impl ReferenceContainer {
     /// Started the way tests/test_exec_podman_parity.rs starts its reference.
-    fn start(name: &str) -> Result<Self> {
+    fn start(name: &str, conmon_pidfile: &Path) -> Result<Self> {
         // The guard exists before `podman run`: a start that fails half way can
         // leave a created container behind.
         let container = Self(name.to_owned());
@@ -519,6 +579,8 @@ impl ReferenceContainer {
             "run",
             "-d",
             "--rm",
+            "--conmon-pidfile",
+            utf8(conmon_pidfile)?,
             "--name",
             name,
             "--network",
