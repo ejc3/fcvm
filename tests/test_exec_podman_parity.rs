@@ -829,21 +829,30 @@ struct Look {
     outcome: Option<Outcome>,
 }
 
-fn look(argv: &[&str]) -> Look {
+fn look(looking: &mut parity_reference::Looking, argv: &[&str]) -> Look {
     let bounded = case("look", &[], &[]).timeout(LOOK_TIMEOUT_SECS);
     let command = parity_reference::shell_words(argv);
+    if let Some(text) = looking.skipped(&command) {
+        return Look {
+            text,
+            outcome: None,
+        };
+    }
     let argv: Vec<String> = argv.iter().map(|part| part.to_string()).collect();
     match run(&bounded, &argv) {
-        Ok(outcome) => Look {
-            text: parity_reference::render_probe(
-                &command,
-                outcome.exit,
-                bounded.timeout,
-                &outcome.stdout,
-                &outcome.stderr,
-            ),
-            outcome: Some(outcome),
-        },
+        Ok(outcome) => {
+            looking.ended(&command, outcome.exit);
+            Look {
+                text: parity_reference::render_probe(
+                    &command,
+                    outcome.exit,
+                    bounded.timeout,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                ),
+                outcome: Some(outcome),
+            }
+        }
         Err(error) => Look {
             text: format!("$ {command}\n  could not run: {error:#}\n"),
             outcome: None,
@@ -863,13 +872,17 @@ fn look(argv: &[&str]) -> Look {
 fn reference_evidence(name: &str) -> String {
     use parity_reference::Root;
 
-    let inspect = look(&[
-        "podman",
-        "inspect",
-        "--format",
-        parity_reference::INSPECT_FORMAT,
-        name,
-    ]);
+    let mut looking = parity_reference::Looking::default();
+    let inspect = look(
+        &mut looking,
+        &[
+            "podman",
+            "inspect",
+            "--format",
+            parity_reference::INSPECT_FORMAT,
+            name,
+        ],
+    );
     let mut text = inspect.text;
     let mut root: Option<String> = None;
     text += &match inspect.outcome {
@@ -913,7 +926,7 @@ fn reference_evidence(name: &str) -> String {
             // Rootless podman mounts the root only inside its own namespace. From the
             // host that path is an empty directory whatever state the container is in,
             // so the question goes through podman.
-            let seen = look(&["podman", "unshare", "test", "-e", &passwd]);
+            let seen = look(&mut looking, &["podman", "unshare", "test", "-e", &passwd]);
             text += &seen.text;
             text += &match seen.outcome {
                 Some(outcome) => format!(
@@ -925,7 +938,10 @@ fn reference_evidence(name: &str) -> String {
         }
     }
 
-    let store = look(&["podman", "info", "--format", parity_reference::STORE_FORMAT]);
+    let store = look(
+        &mut looking,
+        &["podman", "info", "--format", parity_reference::STORE_FORMAT],
+    );
     text += &store.text;
     let record_path = store
         .outcome
@@ -957,15 +973,18 @@ fn reference_evidence(name: &str) -> String {
         },
     };
 
-    let passwd = look(&[
-        "podman",
-        "exec",
-        name,
-        "grep",
-        "-c",
-        "^nobody:",
-        "/etc/passwd",
-    ]);
+    let passwd = look(
+        &mut looking,
+        &[
+            "podman",
+            "exec",
+            name,
+            "grep",
+            "-c",
+            "^nobody:",
+            "/etc/passwd",
+        ],
+    );
     text += &passwd.text;
     text += "  read inside the container's mount namespace, so it says nothing about the host-side lookup\n";
     text
@@ -1012,7 +1031,7 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
 
         let mut failures = Vec::new();
         // The case the reference container was looked at for, once that has happened.
-        let mut looked_at_for: Option<&'static str> = None;
+        let mut looks = parity_reference::Looks::default();
         let env_file = tempfile::NamedTempFile::new().context("creating the env file")?;
         std::fs::write(
             env_file.path(),
@@ -1051,26 +1070,23 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
             }
             // When podman's own answer is an error, the differences do not say why
             // podman failed (#944). The verdict does not change: they still fail the
-            // test. What is added, once per run and under the case that needed it, is
-            // what the host can tell about the reference container.
+            // test. What is added, under the case that needed it, is what the host can
+            // tell about the reference container.
             if failures.len() > first_difference {
-                if let Some(own) = parity_reference::own_error(&expected.stderr, expected.exit) {
-                    let note = match looked_at_for {
-                        None => {
-                            // Said before the look, so the log names the case while it runs.
-                            println!("  {:44} podman's own answer is an error: {own}", case.name);
-                            println!("  {:44} looking at the reference container from the host", case.name);
-                            let evidence = reference_evidence(&reference.0);
-                            print!("{evidence}");
-                            looked_at_for = Some(case.name);
-                            format!("podman's own answer is an error: {own}\nthe reference container, from the host:\n{evidence}")
-                        }
-                        Some(first) => {
-                            let note = format!("podman's own answer is an error: {own} (the reference container was looked at for {first})");
-                            println!("  {:44} {note}", case.name);
-                            note
-                        }
-                    };
+                if let Some(own) =
+                    parity_reference::own_error(&expected.stderr, expected.exit, false)
+                {
+                    if looks.needs_look(&own) {
+                        // Said before the look, so the log names the case while it runs.
+                        println!("  {:44} podman's own answer is an error: {own}", case.name);
+                        println!(
+                            "  {:44} looking at the reference container from the host",
+                            case.name
+                        );
+                        looks.keep(&own, case.name, reference_evidence(&reference.0));
+                    }
+                    let note = looks.note(&own, case.name);
+                    println!("  {:44} {}", case.name, note.trim_end());
                     if let Some(last) = failures.last_mut() {
                         last.push_str(&format!("\n{} {}", case.name, note.trim_end()));
                     }

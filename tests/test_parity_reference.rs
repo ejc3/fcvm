@@ -5,8 +5,8 @@ mod parity_reference;
 
 use parity_reference::{
     host_looked, mount_record_entry, mount_record_path, own_error, parse_inspect, render_probe,
-    shell_words, shown_record, unshare_test_verdict, Inspected, Looked, Root, INSPECT_FORMAT,
-    INSPECT_SEPARATOR,
+    shell_words, shown_record, unshare_test_verdict, Inspected, Looked, Looking, Looks, Root,
+    INSPECT_FORMAT, INSPECT_SEPARATOR,
 };
 use std::path::Path;
 use std::time::Duration;
@@ -22,7 +22,7 @@ fn inspect_line(status: &str, root: &str) -> String {
 
 #[test]
 fn an_error_line_is_podmans_own_error() {
-    let own = own_error(LOOKUP_FAILURE.as_bytes(), Some(255)).expect("podman's own error");
+    let own = own_error(LOOKUP_FAILURE.as_bytes(), Some(255), false).expect("podman's own error");
     assert!(own.contains("unable to find user nobody"), "{own}");
 }
 
@@ -31,28 +31,28 @@ fn a_warning_line_before_the_error_does_not_hide_it() {
     let stderr = format!(
         "time=\"2026-09-19T06:16:12Z\" level=warning msg=\"The cgroupv2 manager is set to systemd\"\n{LOOKUP_FAILURE}"
     );
-    let own = own_error(stderr.as_bytes(), Some(255)).expect("podman's own error");
+    let own = own_error(stderr.as_bytes(), Some(255), false).expect("podman's own error");
     assert!(own.contains("unable to find user nobody"), "{own}");
 }
 
 #[test]
 fn an_ask_that_hit_the_case_timeout_is_podmans_own_error() {
     // `run` reports a client it had to kill at the deadline as no exit code.
-    let own = own_error(b"", None).expect("a killed ask has no answer of the command's");
+    let own = own_error(b"", None, false).expect("a killed ask has no answer of the command's");
     assert!(own.contains("timeout"), "{own}");
 }
 
 #[test]
 fn what_the_command_printed_is_not_podmans_error() {
-    assert_eq!(own_error(b"sh: nope: not found\n", Some(127)), None);
-    assert_eq!(own_error(b"", Some(0)), None);
-    assert_eq!(own_error(b"", Some(1)), None);
+    assert_eq!(own_error(b"sh: nope: not found\n", Some(127), false), None);
+    assert_eq!(own_error(b"", Some(0), false), None);
+    assert_eq!(own_error(b"", Some(1), false), None);
 }
 
 #[test]
 fn a_warning_line_alone_is_not_an_error() {
     let stderr = "time=\"2026-09-19T06:16:12Z\" level=warning msg=\"something\"\n";
-    assert_eq!(own_error(stderr.as_bytes(), Some(0)), None);
+    assert_eq!(own_error(stderr.as_bytes(), Some(0), false), None);
 }
 
 #[test]
@@ -284,5 +284,115 @@ fn a_probe_shows_its_exit_and_the_head_of_each_stream() {
     assert_eq!(
         text,
         "$ podman exec ref cat /etc/passwd\n  exit 0\n  stdout | one\n  stdout | two\n  stdout | three\n  stdout | (5 lines, first 3 shown)\n  stderr | time=\"x\" level=warning msg=\"y\"\n"
+    );
+}
+
+#[test]
+fn a_timeout_that_the_case_expects_is_not_podmans_own_error() {
+    // `it_with_piped_stdin_never_ends` never returns, for podman as for fcvm. A difference
+    // there says nothing about the reference container.
+    assert_eq!(own_error(b"", None, true), None);
+}
+
+#[test]
+fn a_case_that_expects_a_timeout_still_reports_an_error_line() {
+    let own = own_error(LOOKUP_FAILURE.as_bytes(), Some(255), true).expect("podman's own error");
+    assert!(own.contains("unable to find user nobody"), "{own}");
+}
+
+#[test]
+fn what_the_command_wrote_before_the_error_does_not_hide_it() {
+    // `i_streams_separate` writes `err` to stderr before podman can fail.
+    let stderr = format!("err\n{LOOKUP_FAILURE}");
+    let own = own_error(stderr.as_bytes(), Some(255), false).expect("podman's own error");
+    assert!(own.contains("unable to find user nobody"), "{own}");
+}
+
+#[test]
+fn an_error_line_of_a_command_that_exited_zero_is_the_commands() {
+    assert_eq!(
+        own_error(b"Error: printed by the command\n", Some(0), false),
+        None
+    );
+}
+
+#[test]
+fn a_different_own_error_is_looked_at_again() {
+    // `workdir_missing` gets an error from podman by design and runs before
+    // `user_by_name`. Its look must not be the run's only one.
+    let mut looks = Looks::default();
+    assert!(looks.needs_look("Error: workdir does not exist"));
+    looks.keep(
+        "Error: workdir does not exist",
+        "workdir_missing",
+        "healthy\n".into(),
+    );
+    assert!(!looks.needs_look("Error: workdir does not exist"));
+    assert!(
+        looks.needs_look(LOOKUP_FAILURE.trim_end()),
+        "a store failure after an expected error got no look of its own"
+    );
+}
+
+#[test]
+fn kept_evidence_is_shown_under_the_first_case_that_differs() {
+    // The look is taken when podman answers, before anyone knows whether the case will
+    // differ. A later case with the same answer and a difference gets that evidence.
+    let own = LOOKUP_FAILURE.trim_end();
+    let mut looks = Looks::default();
+    looks.keep(
+        own,
+        "user_by_name",
+        "state running, no mounted root\n".into(),
+    );
+    let note = looks.note(own, "user_and_workdir");
+    assert!(note.contains("state running, no mounted root"), "{note}");
+    assert!(note.contains("user_by_name"), "{note}");
+    let again = looks.note(own, "user_by_id_name");
+    assert!(!again.contains("state running"), "{again}");
+    assert!(again.contains("shown under user_and_workdir"), "{again}");
+}
+
+#[test]
+fn after_a_look_that_got_no_answer_the_rest_are_not_run() {
+    // Each look may take its whole timeout. When podman hangs, every look hangs.
+    let mut looking = Looking::default();
+    assert_eq!(looking.skipped("podman inspect x"), None);
+    looking.ended("podman inspect x", None);
+    let skipped = looking
+        .skipped("podman info")
+        .expect("a look after one that got no answer");
+    assert!(skipped.contains("$ podman info"), "{skipped}");
+    assert!(skipped.contains("not run"), "{skipped}");
+    assert!(skipped.contains("podman inspect x"), "{skipped}");
+}
+
+#[test]
+fn a_look_that_failed_does_not_stop_the_rest() {
+    let mut looking = Looking::default();
+    looking.ended("podman inspect x", Some(125));
+    assert_eq!(looking.skipped("podman info"), None);
+}
+
+/// The look at the reference container has to come before the fcvm variants run. Each of
+/// them can take the case's timeout, and by then another podman process may have mounted
+/// the container's root again, so a later look shows a healthy container for an error it
+/// did not cause. The order is in the parity test's loop, which needs a VM, so it is
+/// pinned in its source here.
+#[test]
+fn the_reference_is_looked_at_before_the_fcvm_variants_run() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test_exec_podman_parity.rs");
+    let source = std::fs::read_to_string(&path).unwrap();
+    let at = |needle: &str| {
+        source
+            .find(needle)
+            .unwrap_or_else(|| panic!("{needle:?} is not in the parity test any more"))
+    };
+    let answer = at("let expected = run(");
+    let look = at("reference_evidence(&reference.0)");
+    let variants = at("for (label, vm) in [(\"fcvm exec\", false)");
+    assert!(
+        answer < look && look < variants,
+        "podman's answer at {answer}, the look at {look}, the fcvm variants at {variants}"
     );
 }

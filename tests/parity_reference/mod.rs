@@ -26,9 +26,11 @@ pub const STORE_FORMAT: &str = "{{.Store.RunRoot}}|{{.Store.GraphDriverName}}";
 ///
 /// podman reports its own failure as a line starting with `Error:`, after any lines of
 /// its log. An ask that `run` had to kill at the case's timeout has no exit code, and
-/// no answer of the command's either.
-pub fn own_error(stderr: &[u8], exit: Option<i32>) -> Option<String> {
+/// no answer of the command's either. `timeout_expected` says that the case never
+/// returns by design.
+pub fn own_error(stderr: &[u8], exit: Option<i32>, timeout_expected: bool) -> Option<String> {
     if exit.is_none() {
+        let _ = timeout_expected;
         return Some("no answer before the case's timeout".to_owned());
     }
     let text = String::from_utf8_lossy(stderr);
@@ -212,4 +214,69 @@ pub fn render_probe(
         }
     }
     text
+}
+
+/// What the run has learned about the reference container so far.
+#[derive(Default)]
+pub struct Looks {
+    seen: Vec<Seen>,
+}
+
+struct Seen {
+    own: String,
+    case: String,
+    evidence: String,
+}
+
+impl Looks {
+    /// Whether the reference container has yet to be looked at for this own error.
+    pub fn needs_look(&self, _own: &str) -> bool {
+        self.seen.is_empty()
+    }
+
+    /// Keep what a look found, taken when `case` got `own` from podman.
+    pub fn keep(&mut self, own: &str, case: &str, evidence: String) {
+        self.seen.push(Seen {
+            own: own.to_owned(),
+            case: case.to_owned(),
+            evidence,
+        });
+    }
+
+    /// What to add to the failure text of `case`, whose podman answer was `own` and
+    /// which has differences.
+    pub fn note(&mut self, own: &str, case: &str) -> String {
+        let header = format!("podman's own answer is an error: {own}");
+        match self.seen.first() {
+            Some(seen) if seen.case == case => format!(
+                "{header}\nthe reference container, from the host:\n{}",
+                seen.evidence
+            ),
+            Some(seen) => format!(
+                "{header} (the reference container was looked at for {})",
+                seen.case
+            ),
+            None => header,
+        }
+    }
+}
+
+/// Looks at the reference container run one after another, each bounded.
+#[derive(Default)]
+pub struct Looking {
+    unanswered: Option<String>,
+}
+
+impl Looking {
+    /// `None` to run `command`, or the text that stands in for a look that is not run.
+    pub fn skipped(&self, _command: &str) -> Option<String> {
+        None
+    }
+
+    /// Record how `command` ended. No exit code means that it got no answer in time.
+    pub fn ended(&mut self, command: &str, exit: Option<i32>) {
+        if exit.is_none() && self.unanswered.is_none() {
+            self.unanswered = Some(command.to_owned());
+        }
+    }
 }
