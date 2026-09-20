@@ -22,7 +22,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const CHILD_ROOT: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_ROOT";
 const CHILD_REFERENCE: &str = "FCVM_STORAGE_IMAGE_RUNROOT_TEST_REFERENCE";
@@ -66,6 +66,8 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
             root.join(RUNROOT)
         ),
     )?;
+    // Named in the log so that a directory, mount or process left behind can be traced to its run.
+    println!("private store under {}", root.display());
     let reference = format!("fcvm-runroot-{}", uuid::Uuid::new_v4().simple());
 
     let mut child = Command::new(std::env::current_exe()?);
@@ -80,13 +82,8 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
         .output()
         .context("running the test body against the private store")?;
 
-    // The child removes its container on every path it controls. A killed child
-    // cannot, and a mount left below the directory would outlive its removal.
-    let _ = Command::new("podman")
-        .args(["rm", "-f", "-t", "0", &reference])
-        .env("CONTAINERS_STORAGE_CONF", &conf)
-        .output();
-    detach_mounts_below(&root);
+    // Before `scratch` is dropped, and whatever the child did.
+    let cleaned = clean_up_private_store(&root, || remove_reference(&conf, &reference));
 
     let (stdout, stderr) = (
         String::from_utf8_lossy(&output.stdout),
@@ -101,6 +98,83 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
         // Not a whole line: libtest can print `test <name> ... ` ahead of it, unterminated.
         stdout.contains(BODY_RAN),
         "the re-executed test exited 0 without running its body. Is TEST_NAME still the name of this test?\n{stdout}\n{stderr}"
+    );
+    cleaned.context("cleaning up the private store")
+}
+
+/// The child removes its container on every path it controls. A killed child cannot.
+fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
+    let _ = Command::new("podman")
+        .args(["rm", "-f", "-t", "0", reference])
+        .env("CONTAINERS_STORAGE_CONF", conf)
+        .output();
+    Ok(())
+}
+
+/// Leave nothing of the private store behind. `remove_container` is the step that needs
+/// podman, so that the rest can be tested without one.
+fn clean_up_private_store(
+    root: &Path,
+    remove_container: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    let _ = remove_container();
+    // A mount left below the directory would outlive its removal.
+    detach_mounts_below(root);
+    Ok(())
+}
+
+/// How long the stand-in below lives.
+const STAND_IN_SECS: &str = "2";
+
+/// Kills and reaps the stand-in on every way out of the test.
+struct StandIn(std::process::Child);
+
+impl Drop for StandIn {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// conmon runs the container's exit command, `podman container cleanup --rm`, after it
+/// has written the exit file that `podman rm -f` waits for. So that podman process can
+/// still be running, and can open the private store again, when `podman rm` has
+/// returned. Opening the store mounts its overlay home. A cleanup that detaches the
+/// mounts and deletes the directory before that process is gone leaves a mount and a
+/// directory behind on the host.
+///
+/// The stand-in is that process without the podman in it: it is named `podman`, its
+/// command line names the store, and the removal returns while it is still running.
+#[test]
+fn the_cleanup_waits_for_a_process_that_still_names_the_store() -> Result<()> {
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let bin = root.join("bin");
+    std::fs::create_dir(&bin)?;
+    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .context("no sleep on this host")?;
+    std::os::unix::fs::symlink(sleep, bin.join("podman"))?;
+    let mut command = Command::new(bin.join("podman"));
+    command.arg(STAND_IN_SECS).stdin(Stdio::null());
+    common::set_test_pdeathsig_std(&mut command);
+    let mut stand_in = StandIn(command.spawn().context("starting the stand-in")?);
+
+    let mut running_at_removal = false;
+    clean_up_private_store(&root, || {
+        running_at_removal = stand_in.0.try_wait()?.is_none();
+        Ok(())
+    })?;
+
+    anyhow::ensure!(
+        running_at_removal,
+        "the stand-in was gone before the removal returned, so this run shows nothing"
+    );
+    anyhow::ensure!(
+        stand_in.0.try_wait()?.is_some(),
+        "the cleanup returned while a process that names the store was still running"
     );
     Ok(())
 }
