@@ -96,6 +96,9 @@ struct Case {
     /// Some podman versions never return here. That is their defect, not a
     /// behaviour to match: when the reference hangs, fcvm must still return.
     reference_may_hang: bool,
+    /// The call never returns, for podman as for fcvm. No answer at the timeout is the
+    /// expected answer then, and not an error of podman's own.
+    never_returns: bool,
 }
 
 fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) -> Case {
@@ -112,6 +115,7 @@ fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) ->
         container_only: false,
         close_stdout_after: None,
         reference_may_hang: false,
+        never_returns: false,
     }
 }
 
@@ -153,6 +157,11 @@ impl Case {
     }
     fn reference_may_hang(mut self) -> Self {
         self.reference_may_hang = true;
+        self
+    }
+
+    fn never_returns(mut self) -> Self {
+        self.never_returns = true;
         self
     }
 }
@@ -456,7 +465,8 @@ fn cases(env_file: &str) -> Vec<Case> {
         // and the call never returns. podman behaves the same.
         case("it_with_piped_stdin_never_ends", &["-it"], &["cat"])
             .input(Input::Bytes(b"piped\n".to_vec()))
-            .timeout(8),
+            .timeout(8)
+            .never_returns(),
     ]
 }
 
@@ -868,7 +878,7 @@ fn look(looking: &mut parity_reference::Looking, argv: &[&str]) -> Look {
 /// keeps running, and exec without `-u` keeps working (#944). So the text says whether
 /// podman has a mounted root on record, whether the host sees the file through it, and
 /// what the store's mount record holds. Nothing here can stop the run: a look that does
-/// not work says so in the text.
+/// not work says so in the text, and after one that gets no answer the rest are not run.
 fn reference_evidence(name: &str) -> String {
     use parity_reference::Root;
 
@@ -1057,6 +1067,28 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 );
             };
             report("podman exec", &expected);
+            // When podman's own answer is an error, the differences do not say why
+            // podman failed (#944), so the host looks at the reference container. It
+            // looks now, before the fcvm variants run. Each of them can take the case's
+            // timeout, and by then another podman process may have mounted the
+            // container's root again: the look would show a healthy container for an
+            // error it did not cause. What it found is kept until the comparison says
+            // whether this case needs it. There is one look for each own error, because
+            // an earlier case can get one from podman by design.
+            let own = parity_reference::own_error(
+                &expected.stderr,
+                expected.exit,
+                case.never_returns || case.reference_may_hang,
+            );
+            if let Some(own) = own.as_deref().filter(|own| looks.needs_look(own)) {
+                // Said before the look, so the log names the case while it runs.
+                println!("  {:44} podman's own answer is an error: {own}", case.name);
+                println!(
+                    "  {:44} looking at the reference container from the host",
+                    case.name
+                );
+                looks.keep(own, case.name, reference_evidence(&reference.0));
+            }
             let first_difference = failures.len();
             for (label, vm) in [("fcvm exec", false), ("fcvm exec --vm", true)] {
                 if vm && case.container_only {
@@ -1068,28 +1100,13 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                     failures.push(format!("{} [{label}] {difference}", case.name));
                 }
             }
-            // When podman's own answer is an error, the differences do not say why
-            // podman failed (#944). The verdict does not change: they still fail the
-            // test. What is added, under the case that needed it, is what the host can
-            // tell about the reference container.
-            if failures.len() > first_difference {
-                if let Some(own) =
-                    parity_reference::own_error(&expected.stderr, expected.exit, false)
-                {
-                    if looks.needs_look(&own) {
-                        // Said before the look, so the log names the case while it runs.
-                        println!("  {:44} podman's own answer is an error: {own}", case.name);
-                        println!(
-                            "  {:44} looking at the reference container from the host",
-                            case.name
-                        );
-                        looks.keep(&own, case.name, reference_evidence(&reference.0));
-                    }
-                    let note = looks.note(&own, case.name);
-                    println!("  {:44} {}", case.name, note.trim_end());
-                    if let Some(last) = failures.last_mut() {
-                        last.push_str(&format!("\n{} {}", case.name, note.trim_end()));
-                    }
+            // The verdict does not change: the differences still fail the test. What is
+            // added, under the first case that differs, is what the look found.
+            if let (true, Some(own)) = (failures.len() > first_difference, own.as_deref()) {
+                let note = looks.note(own, case.name);
+                println!("  {:44} {}", case.name, note.trim_end());
+                if let Some(last) = failures.last_mut() {
+                    last.push_str(&format!("\n{} {}", case.name, note.trim_end()));
                 }
             }
             if failures.len() >= MAX_DIFFERENCES {

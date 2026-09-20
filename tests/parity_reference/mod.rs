@@ -24,18 +24,26 @@ pub const STORE_FORMAT: &str = "{{.Store.RunRoot}}|{{.Store.GraphDriverName}}";
 /// Why an answer is podman's own error and not the command's, or `None` when it is the
 /// command's.
 ///
-/// podman reports its own failure as a line starting with `Error:`, after any lines of
-/// its log. An ask that `run` had to kill at the case's timeout has no exit code, and
-/// no answer of the command's either. `timeout_expected` says that the case never
-/// returns by design.
+/// podman reports its own failure as a line starting with `Error:`, and exits with
+/// something other than 0. Lines of its log can come before that line, and so can what
+/// the command wrote to stderr before podman failed, so every line is looked at. A
+/// command that fails and prints such a line itself is taken for podman. That costs one
+/// look at the reference container and changes no verdict. An ask that `run` had to kill
+/// at the case's timeout has no exit code, and no answer of the command's either,
+/// unless the case never returns by design (`timeout_expected`).
 pub fn own_error(stderr: &[u8], exit: Option<i32>, timeout_expected: bool) -> Option<String> {
-    if exit.is_none() {
-        let _ = timeout_expected;
-        return Some("no answer before the case's timeout".to_owned());
+    match exit {
+        None => {
+            return (!timeout_expected).then(|| "no answer before the case's timeout".to_owned())
+        }
+        Some(0) => return None,
+        Some(_) => {}
     }
     let text = String::from_utf8_lossy(stderr);
-    let line = text.lines().find(|line| !is_podman_log_line(line))?;
-    line.starts_with("Error:").then(|| line.to_owned())
+    text.lines()
+        .filter(|line| !is_podman_log_line(line))
+        .find(|line| line.starts_with("Error:"))
+        .map(str::to_owned)
 }
 
 /// A line of podman's log, which goes to stderr ahead of its answer:
@@ -216,7 +224,9 @@ pub fn render_probe(
     text
 }
 
-/// What the run has learned about the reference container so far.
+/// What the run has learned about the reference container so far: one look for each
+/// own error of podman's, taken when podman gave it, and kept until a case with
+/// differences needs it.
 #[derive(Default)]
 pub struct Looks {
     seen: Vec<Seen>,
@@ -226,12 +236,15 @@ struct Seen {
     own: String,
     case: String,
     evidence: String,
+    shown_under: Option<String>,
 }
 
 impl Looks {
-    /// Whether the reference container has yet to be looked at for this own error.
-    pub fn needs_look(&self, _own: &str) -> bool {
-        self.seen.is_empty()
+    /// Whether the reference container has yet to be looked at for this own error. An
+    /// earlier case can get an error from podman by design, so a single look for the
+    /// whole run would be spent before the error that needs one.
+    pub fn needs_look(&self, own: &str) -> bool {
+        !self.seen.iter().any(|seen| seen.own == own)
     }
 
     /// Keep what a look found, taken when `case` got `own` from podman.
@@ -240,28 +253,41 @@ impl Looks {
             own: own.to_owned(),
             case: case.to_owned(),
             evidence,
+            shown_under: None,
         });
     }
 
     /// What to add to the failure text of `case`, whose podman answer was `own` and
-    /// which has differences.
+    /// which has differences. The evidence is given once for each own error, under the
+    /// first case that differs, and says which case's answer it was taken after.
     pub fn note(&mut self, own: &str, case: &str) -> String {
         let header = format!("podman's own answer is an error: {own}");
-        match self.seen.first() {
-            Some(seen) if seen.case == case => format!(
-                "{header}\nthe reference container, from the host:\n{}",
-                seen.evidence
-            ),
-            Some(seen) => format!(
-                "{header} (the reference container was looked at for {})",
-                seen.case
-            ),
-            None => header,
+        let Some(seen) = self.seen.iter_mut().find(|seen| seen.own == own) else {
+            return header;
+        };
+        if let Some(first) = &seen.shown_under {
+            return format!("{header} (the reference container is shown under {first})");
         }
+        seen.shown_under = Some(case.to_owned());
+        let taken = if seen.case == case {
+            "taken right after podman's answer".to_owned()
+        } else {
+            format!(
+                "taken right after podman gave {} the same answer",
+                seen.case
+            )
+        };
+        format!(
+            "{header}\nthe reference container, from the host, {taken}:\n{}",
+            seen.evidence
+        )
     }
 }
 
-/// Looks at the reference container run one after another, each bounded.
+/// Looks at the reference container run one after another, each bounded. When one gets
+/// no answer, podman is most likely hanging, and each look after it would take its whole
+/// timeout as well, inside the test's own time limit. So the rest are not run, and the
+/// text says so.
 #[derive(Default)]
 pub struct Looking {
     unanswered: Option<String>,
@@ -269,8 +295,10 @@ pub struct Looking {
 
 impl Looking {
     /// `None` to run `command`, or the text that stands in for a look that is not run.
-    pub fn skipped(&self, _command: &str) -> Option<String> {
-        None
+    pub fn skipped(&self, command: &str) -> Option<String> {
+        self.unanswered.as_ref().map(|earlier| {
+            format!("$ {command}\n  not run: `{earlier}` got no answer, and this look would most likely wait as long\n")
+        })
     }
 
     /// Record how `command` ended. No exit code means that it got no answer in time.
