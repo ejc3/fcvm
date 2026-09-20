@@ -383,6 +383,35 @@ pub(super) async fn create_disk_from_dir(
     Ok(())
 }
 
+/// Directory inside a temporary store that holds that store's podman runroot.
+const TEMP_STORE_RUNROOT: &str = "runroot";
+
+/// `podman` aimed at the temporary store rooted at `store`.
+///
+/// Every podman call against a temporary store is built here, because `--root` alone does
+/// not keep it apart from the default store. `--root` moves only the graphroot. The
+/// runroot stays the default one, and podman keeps its record of mounted layers there
+/// (`overlay-layers/mountpoints.json`). A store rewrites that record from the layers it
+/// knows, so a temporary store sharing the runroot erases the record of every container
+/// running in the default store. The next podman process to exit then finds no mounted
+/// layer and lazily unmounts the default store's overlay home. Each running container
+/// loses its merged root from the host's view: inspect reports no MergedDir and
+/// `podman exec -u <name>` fails with "unable to find user" until the container is
+/// recreated (#944).
+///
+/// The runroot lives inside the temporary store, so it is deleted with it, and
+/// `clean_podman_state` drops it before the store is packaged.
+fn temp_store_podman(store: &Path) -> tokio::process::Command {
+    let mut podman = tokio::process::Command::new("podman");
+    podman
+        .arg("--root")
+        .arg(store)
+        .arg("--runroot")
+        .arg(store.join(TEMP_STORE_RUNROOT))
+        .args(["--storage-driver", "overlay"]);
+    podman
+}
+
 /// Build a podman storage image from a Docker archive.
 ///
 /// Loads the archive into a temporary podman storage root using the overlay driver,
@@ -418,16 +447,10 @@ pub async fn build_storage_image(
         tmp_dir.display()
     );
 
-    let load_output = tokio::process::Command::new("podman")
-        .args([
-            "--root",
-            tmp_dir.to_str().unwrap(),
-            "--storage-driver",
-            "overlay",
-            "load",
-            "-i",
-            archive_path.to_str().unwrap(),
-        ])
+    let load_output = temp_store_podman(&tmp_dir)
+        .arg("load")
+        .arg("-i")
+        .arg(archive_path)
         .output()
         .await
         .context("running podman load into storage root")?;
@@ -505,6 +528,77 @@ mod tests {
     #[test]
     fn missing_separator_is_an_error() {
         assert!(parse_image_cache_ref("localhost/qux", "no-tab-here\n").is_err());
+    }
+
+    /// Flag names are assembled here so that the source scan below finds the literal
+    /// only where a podman command line is built.
+    fn flag(name: &str) -> String {
+        format!("--{name}")
+    }
+
+    /// The value that follows `flag` on a command line.
+    fn flag_value<'a>(args: &[&'a std::ffi::OsStr], flag: &str) -> Option<&'a std::ffi::OsStr> {
+        let at = args.iter().position(|arg| *arg == flag)?;
+        args.get(at + 1).copied()
+    }
+
+    #[test]
+    fn temp_store_podman_keeps_its_runroot_inside_the_store() {
+        // #944: with only a graphroot, the temporary store shares the default runroot and
+        // erases the mount records of the default store's running containers.
+        let store = Path::new("/cache/tmp-storage-0000");
+        let podman = temp_store_podman(store);
+        let args: Vec<&std::ffi::OsStr> = podman.as_std().get_args().collect();
+
+        assert_eq!(flag_value(&args, &flag("root")), Some(store.as_os_str()));
+        let runroot = flag_value(&args, &flag("runroot"))
+            .map(Path::new)
+            .expect("a temporary store needs its own runroot");
+        assert!(
+            runroot.starts_with(store) && runroot != store,
+            "the runroot has to be deleted with the store, got {runroot:?}"
+        );
+        assert_eq!(
+            flag_value(&args, &flag("storage-driver")),
+            Some(std::ffi::OsStr::new("overlay"))
+        );
+    }
+
+    #[test]
+    fn every_podman_graphroot_flag_is_built_by_temp_store_podman() {
+        // A hand-built call would bring the shared runroot back, and
+        // tests/test_storage_image_runroot.rs only sees calls made by build_storage_image.
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let graphroot_flag = flag("root");
+        let spellings = [
+            format!("\"{graphroot_flag}\""),
+            format!("\"{graphroot_flag}="),
+        ];
+        let mut found = Vec::new();
+        let mut pending = vec![repo.join("src"), repo.join("fc-agent/src")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let source = std::fs::read_to_string(&path).unwrap();
+                    for line in source.lines() {
+                        if spellings.iter().any(|spelling| line.contains(spelling)) {
+                            let file = path.strip_prefix(repo).unwrap().display();
+                            found.push(format!("{file}: {}", line.trim()));
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            found,
+            [format!(
+                "src/commands/podman/image.rs: .arg(\"{graphroot_flag}\")"
+            )],
+            "podman calls that name a graphroot must be built by temp_store_podman"
+        );
     }
 
     #[test]
