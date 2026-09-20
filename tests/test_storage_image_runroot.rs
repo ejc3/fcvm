@@ -38,6 +38,9 @@ const ARCHIVE: &str = "alpine.tar";
 const GRAPHROOT: &str = "store";
 const RUNROOT: &str = "run";
 
+/// Where podman is told to write conmon's pid, below the scratch directory.
+const CONMON_PIDFILE: &str = "conmon.pid";
+
 /// Bounded, and the container runs with `--rm`: a killed test cannot run its
 /// cleanup, so the container has to remove itself.
 const REFERENCE_LIFETIME_SECS: &str = "300";
@@ -210,10 +213,10 @@ fn processes_naming(root: &Path) -> Vec<String> {
     found
 }
 
-/// How long the stand-in below lives.
+/// How long a stand-in lives.
 const STAND_IN_SECS: &str = "2";
 
-/// Kills and reaps the stand-in on every way out of the test.
+/// Kills and reaps a stand-in on every way out of its test.
 struct StandIn(std::process::Child);
 
 impl Drop for StandIn {
@@ -223,6 +226,41 @@ impl Drop for StandIn {
     }
 }
 
+/// `sleep` under another program's name: a symlink `<dir>/<program>`, run by that path,
+/// so the kernel's name for the process is `program`.
+fn stand_in(dir: &Path, program: &str, stdin: Stdio) -> Result<StandIn> {
+    std::fs::create_dir_all(dir)?;
+    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.exists())
+        .context("no sleep on this host")?;
+    std::os::unix::fs::symlink(sleep, dir.join(program))?;
+    let mut command = Command::new(dir.join(program));
+    command.arg(STAND_IN_SECS).stdin(stdin);
+    common::set_test_pdeathsig_std(&mut command);
+    Ok(StandIn(command.spawn().context("starting the stand-in")?))
+}
+
+/// Run the cleanup with a removal that returns at once, and say whether the stand-in was
+/// running at the removal and whether it was gone when the cleanup returned.
+fn clean_up_next_to(stand_in: &mut StandIn, root: &Path) -> Result<()> {
+    let mut running_at_removal = false;
+    clean_up_private_store(root, || {
+        running_at_removal = stand_in.0.try_wait()?.is_none();
+        Ok(())
+    })?;
+    anyhow::ensure!(
+        running_at_removal,
+        "the stand-in was gone before the removal returned, so this run shows nothing"
+    );
+    anyhow::ensure!(
+        stand_in.0.try_wait()?.is_some(),
+        "the cleanup returned while a process that uses the store was still running"
+    );
+    Ok(())
+}
+
 /// conmon runs the container's exit command, `podman container cleanup --rm`, after it
 /// has written the exit file that `podman rm -f` waits for. So that podman process can
 /// still be running, and can open the private store again, when `podman rm` has
@@ -230,38 +268,107 @@ impl Drop for StandIn {
 /// mounts and deletes the directory before that process is gone leaves a mount and a
 /// directory behind on the host.
 ///
-/// The stand-in is that process without the podman in it: it is named `podman`, its
-/// command line names the store, and the removal returns while it is still running.
+/// The stand-in is conmon in the state it is in while that command runs: it names the
+/// store in its arguments, it has closed everything it held under it, and its pid is
+/// the one podman recorded.
 #[test]
 fn the_cleanup_waits_for_a_process_that_still_names_the_store() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
-    let bin = root.join("bin");
-    std::fs::create_dir(&bin)?;
-    let sleep = ["/usr/bin/sleep", "/bin/sleep"]
-        .into_iter()
-        .map(Path::new)
-        .find(|path| path.exists())
-        .context("no sleep on this host")?;
-    std::os::unix::fs::symlink(sleep, bin.join("podman"))?;
-    let mut command = Command::new(bin.join("podman"));
-    command.arg(STAND_IN_SECS).stdin(Stdio::null());
-    common::set_test_pdeathsig_std(&mut command);
-    let mut stand_in = StandIn(command.spawn().context("starting the stand-in")?);
+    let mut conmon = stand_in(&root.join("bin"), "conmon", Stdio::null())?;
+    std::fs::write(root.join(CONMON_PIDFILE), conmon.0.id().to_string())?;
+    clean_up_next_to(&mut conmon, &root)
+}
 
-    let mut running_at_removal = false;
-    clean_up_private_store(&root, || {
-        running_at_removal = stand_in.0.try_wait()?.is_none();
-        Ok(())
-    })?;
+/// The exit command holds the store's database and lock files while it runs, and
+/// nothing in its arguments has to name the store. The stand-in is started from outside
+/// the scratch directory, and an open file is all that ties it to the store.
+#[test]
+fn the_cleanup_waits_for_a_process_that_holds_a_file_under_the_store() -> Result<()> {
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let outside = tempfile::TempDir::new()?;
+    std::fs::write(root.join("held"), "")?;
+    let held = std::fs::File::open(root.join("held"))?;
+    let mut podman = stand_in(outside.path(), "podman", Stdio::from(held))?;
+    clean_up_next_to(&mut podman, &root)
+}
 
+/// Detaches what a test mounted below its scratch directory on every way out of it.
+struct MountsBelow(PathBuf);
+
+impl Drop for MountsBelow {
+    fn drop(&mut self) {
+        detach_mounts_below(&self.0);
+    }
+}
+
+/// When `podman rm` fails, the store still has to be released: the scratch directory is
+/// dropped whatever the cleanup returns.
+#[test]
+fn a_failed_removal_does_not_skip_the_wait_and_the_detach() -> Result<()> {
     anyhow::ensure!(
-        running_at_removal,
-        "the stand-in was gone before the removal returned, so this run shows nothing"
+        nix::unistd::geteuid().is_root(),
+        "this test mounts something: run it with `make test-root`"
     );
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let _mounts = MountsBelow(root.clone());
+    let outside = tempfile::TempDir::new()?;
+    let mounted = root.join("mounted");
+    std::fs::create_dir(&mounted)?;
+    nix::mount::mount(
+        Some(&mounted),
+        &mounted,
+        None::<&str>,
+        nix::mount::MsFlags::MS_BIND,
+        None::<&str>,
+    )?;
+    std::fs::write(root.join("held"), "")?;
+    let held = std::fs::File::open(root.join("held"))?;
+    let mut podman = stand_in(outside.path(), "podman", Stdio::from(held))?;
+
+    let cleaned = clean_up_private_store(&root, || anyhow::bail!("podman rm said no"));
+
+    let mut skipped = Vec::new();
+    if podman.0.try_wait()?.is_none() {
+        skipped.push("the wait");
+    }
+    if !mounts_below(&root)?.is_empty() {
+        skipped.push("the detach");
+    }
+    anyhow::ensure!(skipped.is_empty(), "a failed removal skipped {skipped:?}");
+    let error = format!(
+        "{:#}",
+        cleaned.expect_err("the removal's error is the result")
+    );
+    anyhow::ensure!(error.contains("podman rm said no"), "{error}");
+    Ok(())
+}
+
+/// Two files under /proc/<pid> are read out of the process's own memory, and that read
+/// can block for good on a process that is stuck in the kernel. A bounded wait that
+/// reads them is not bounded. The names are put together here so that this test does
+/// not find itself.
+#[test]
+fn the_cleanup_never_reads_another_process_memory() -> Result<()> {
+    let source = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(file!()))?;
+    let forbidden = [["cmd", "line"].concat(), ["envi", "ron"].concat()];
+    let found: Vec<String> = source
+        .lines()
+        .enumerate()
+        .filter_map(|(number, line)| {
+            let code = line.split("//").next().unwrap_or_default();
+            forbidden
+                .iter()
+                .any(|name| code.contains(name.as_str()))
+                .then(|| format!("{}: {}", number + 1, line.trim()))
+        })
+        .collect();
     anyhow::ensure!(
-        stand_in.0.try_wait()?.is_some(),
-        "the cleanup returned while a process that names the store was still running"
+        found.is_empty(),
+        "this file reads a process's memory through /proc:\n{}",
+        found.join("\n")
     );
     Ok(())
 }
