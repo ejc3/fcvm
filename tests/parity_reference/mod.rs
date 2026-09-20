@@ -1,0 +1,310 @@
+//! How the differential exec test (`tests/test_exec_podman_parity.rs`) reads what host
+//! podman says about its reference container.
+//!
+//! Text in, verdict out: no podman and no VM, so `tests/test_parity_reference.rs` can
+//! pin each rule.
+
+// Two test binaries include this module and each uses a part of it.
+#![allow(dead_code)]
+
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+/// `podman inspect --format` for the reference container: its state, then where podman
+/// says its root is mounted.
+pub const INSPECT_FORMAT: &str = "{{.State.Status}}|{{.GraphDriver.Data.MergedDir}}";
+
+/// What separates the two fields of `INSPECT_FORMAT`. A state has no `|` in it, so the
+/// first one ends it, whatever the path holds.
+pub const INSPECT_SEPARATOR: &str = "|";
+
+/// `podman info --format` for where the store keeps its runtime state.
+pub const STORE_FORMAT: &str = "{{.Store.RunRoot}}|{{.Store.GraphDriverName}}";
+
+/// Why an answer is podman's own error and not the command's, or `None` when it is the
+/// command's.
+///
+/// podman reports its own failure as a line starting with `Error:`, and exits with
+/// something other than 0. Lines of its log can come before that line, and so can what
+/// the command wrote to stderr before podman failed, so every line is looked at. A
+/// command that fails and prints such a line itself is taken for podman. That costs one
+/// look at the reference container and changes no verdict. An ask that `run` had to kill
+/// at the case's timeout has no exit code, and no answer of the command's either,
+/// unless the case never returns by design (`timeout_expected`).
+pub fn own_error(stderr: &[u8], exit: Option<i32>, timeout_expected: bool) -> Option<String> {
+    match exit {
+        None => {
+            return (!timeout_expected).then(|| "no answer before the case's timeout".to_owned())
+        }
+        Some(0) => return None,
+        Some(_) => {}
+    }
+    let text = String::from_utf8_lossy(stderr);
+    text.lines()
+        .filter(|line| !is_podman_log_line(line))
+        .find(|line| line.starts_with("Error:"))
+        .map(str::to_owned)
+}
+
+/// A line of podman's log, which goes to stderr ahead of its answer:
+/// `time="..." level=warning msg="..."`.
+fn is_podman_log_line(line: &str) -> bool {
+    line.starts_with("time=\"") && line.contains(" level=")
+}
+
+/// Where podman says a container's root is mounted.
+#[derive(Debug, PartialEq)]
+pub enum Root<'a> {
+    /// An absolute path.
+    Path(&'a str),
+    /// podman has no mounted root on record for the container. It prints `<no value>`.
+    NotMounted,
+    /// Anything else, as printed.
+    Unexpected(&'a str),
+}
+
+/// One line of `podman inspect --format INSPECT_FORMAT`.
+#[derive(Debug, PartialEq)]
+pub struct Inspected<'a> {
+    pub status: &'a str,
+    pub root: Root<'a>,
+}
+
+/// `None` when the output is not `<state>|<root>`.
+pub fn parse_inspect(stdout: &str) -> Option<Inspected<'_>> {
+    let (status, root) = stdout.lines().next()?.split_once(INSPECT_SEPARATOR)?;
+    let root = match root {
+        "" | "<no value>" => Root::NotMounted,
+        path if path.starts_with('/') => Root::Path(path),
+        other => Root::Unexpected(other),
+    };
+    Some(Inspected { status, root })
+}
+
+/// Whether a file was there when something looked for it.
+#[derive(Debug, PartialEq)]
+pub enum Looked {
+    Present,
+    Absent,
+    /// The look itself failed, so there is no answer.
+    CouldNotLook(String),
+}
+
+impl std::fmt::Display for Looked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Looked::Present => write!(f, "present"),
+            Looked::Absent => write!(f, "ABSENT"),
+            Looked::CouldNotLook(why) => write!(f, "could not look: {why}"),
+        }
+    }
+}
+
+/// What `podman unshare test -e <path>` found, from how it ended. `test` answers with 0
+/// and 1. Every other end is podman unshare's own, or the timeout.
+pub fn unshare_test_verdict(exit: Option<i32>, stderr: &[u8]) -> Looked {
+    match exit {
+        Some(0) => Looked::Present,
+        Some(1) => Looked::Absent,
+        Some(code) => Looked::CouldNotLook(format!(
+            "exit {code}: {}",
+            String::from_utf8_lossy(stderr)
+                .lines()
+                .next()
+                .unwrap_or("nothing on stderr")
+        )),
+        None => Looked::CouldNotLook("no answer before the timeout".to_owned()),
+    }
+}
+
+/// Whether `path` exists, seen from this process. A symlink counts as present wherever
+/// it points: an absolute one inside a container's root would resolve on the host.
+pub fn host_looked(path: &Path) -> Looked {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Looked::Present,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Looked::Absent,
+        Err(error) => Looked::CouldNotLook(error.to_string()),
+    }
+}
+
+/// The file in which the store records which layers are mounted and where, from one
+/// line of `podman info --format STORE_FORMAT`.
+pub fn mount_record_path(info_stdout: &str) -> Option<PathBuf> {
+    let (runroot, driver) = info_stdout.lines().next()?.rsplit_once('|')?;
+    (runroot.starts_with('/') && !driver.is_empty()).then(|| {
+        Path::new(runroot)
+            .join(format!("{driver}-layers"))
+            .join("mountpoints.json")
+    })
+}
+
+#[derive(serde::Deserialize)]
+struct MountedLayer {
+    id: String,
+    path: String,
+    count: i64,
+}
+
+/// What the mount record says about the layer mounted at `merged`.
+pub fn mount_record_entry(record: &str, merged: &str) -> String {
+    match serde_json::from_str::<Vec<MountedLayer>>(record) {
+        Ok(layers) => match layers.iter().find(|layer| layer.path == merged) {
+            Some(layer) => format!(
+                "the record has layer {} mounted there, count {}",
+                layer.id, layer.count
+            ),
+            None => format!(
+                "the record has no layer mounted there ({} mounted elsewhere)",
+                layers.len()
+            ),
+        },
+        Err(error) => format!("the record is not the JSON this expects: {error}"),
+    }
+}
+
+/// Characters of the mount record that `shown_record` keeps.
+const SHOWN_RECORD_CHARS: usize = 2000;
+
+/// The mount record for the failure text: whole when short, else its head.
+pub fn shown_record(record: &str) -> String {
+    let total = record.chars().count();
+    if total <= SHOWN_RECORD_CHARS {
+        return record.trim_end().to_owned();
+    }
+    let head: String = record.chars().take(SHOWN_RECORD_CHARS).collect();
+    format!("{head} ({total} characters, first {SHOWN_RECORD_CHARS} shown)")
+}
+
+/// `argv` as one line that a shell reads back as the same words, so a command in the
+/// failure text can be pasted. The inspect format has a `|` in it.
+pub fn shell_words(argv: &[&str]) -> String {
+    argv.iter()
+        .map(|word| {
+            let plain = !word.is_empty()
+                && word
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || "_@%+=:,./-".contains(c));
+            if plain {
+                word.to_string()
+            } else {
+                format!("'{}'", word.replace('\'', r"'\''"))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Lines of each stream that `render_probe` shows.
+const SHOWN_LINES: usize = 3;
+
+/// One bounded host command and how it ended, as text for the failure message. A
+/// command that gave no answer says so: silence would read as a clean result.
+pub fn render_probe(
+    command: &str,
+    exit: Option<i32>,
+    timeout: Duration,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> String {
+    let mut text = format!("$ {command}\n");
+    text += &match exit {
+        Some(code) => format!("  exit {code}\n"),
+        None => format!("  no answer in {timeout:?}, killed\n"),
+    };
+    for (stream, bytes) in [("stdout", stdout), ("stderr", stderr)] {
+        let content = String::from_utf8_lossy(bytes);
+        let total = content.lines().count();
+        for line in content.lines().take(SHOWN_LINES) {
+            text += &format!("  {stream} | {line}\n");
+        }
+        if total > SHOWN_LINES {
+            text += &format!("  {stream} | ({total} lines, first {SHOWN_LINES} shown)\n");
+        }
+    }
+    text
+}
+
+/// What the run has learned about the reference container so far: one look for each
+/// own error of podman's, taken when podman gave it, and kept until a case with
+/// differences needs it.
+#[derive(Default)]
+pub struct Looks {
+    seen: Vec<Seen>,
+}
+
+struct Seen {
+    own: String,
+    case: String,
+    evidence: String,
+    shown_under: Option<String>,
+}
+
+impl Looks {
+    /// Whether the reference container has yet to be looked at for this own error. An
+    /// earlier case can get an error from podman by design, so a single look for the
+    /// whole run would be spent before the error that needs one.
+    pub fn needs_look(&self, own: &str) -> bool {
+        !self.seen.iter().any(|seen| seen.own == own)
+    }
+
+    /// Keep what a look found, taken when `case` got `own` from podman.
+    pub fn keep(&mut self, own: &str, case: &str, evidence: String) {
+        self.seen.push(Seen {
+            own: own.to_owned(),
+            case: case.to_owned(),
+            evidence,
+            shown_under: None,
+        });
+    }
+
+    /// What to add to the failure text of `case`, whose podman answer was `own` and
+    /// which has differences. The evidence is given once for each own error, under the
+    /// first case that differs, and says which case's answer it was taken after.
+    pub fn note(&mut self, own: &str, case: &str) -> String {
+        let header = format!("podman's own answer is an error: {own}");
+        let Some(seen) = self.seen.iter_mut().find(|seen| seen.own == own) else {
+            return header;
+        };
+        if let Some(first) = &seen.shown_under {
+            return format!("{header} (the reference container is shown under {first})");
+        }
+        seen.shown_under = Some(case.to_owned());
+        let taken = if seen.case == case {
+            "taken right after podman's answer".to_owned()
+        } else {
+            format!(
+                "taken right after podman gave {} the same answer",
+                seen.case
+            )
+        };
+        format!(
+            "{header}\nthe reference container, from the host, {taken}:\n{}",
+            seen.evidence
+        )
+    }
+}
+
+/// Looks at the reference container run one after another, each bounded. When one gets
+/// no answer, podman is most likely hanging, and each look after it would take its whole
+/// timeout as well, inside the test's own time limit. So the rest are not run, and the
+/// text says so.
+#[derive(Default)]
+pub struct Looking {
+    unanswered: Option<String>,
+}
+
+impl Looking {
+    /// `None` to run `command`, or the text that stands in for a look that is not run.
+    pub fn skipped(&self, command: &str) -> Option<String> {
+        self.unanswered.as_ref().map(|earlier| {
+            format!("$ {command}\n  not run: `{earlier}` got no answer, and this look would most likely wait as long\n")
+        })
+    }
+
+    /// Record how `command` ended. No exit code means that it got no answer in time.
+    pub fn ended(&mut self, command: &str, exit: Option<i32>) {
+        if exit.is_none() && self.unanswered.is_none() {
+            self.unanswered = Some(command.to_owned());
+        }
+    }
+}

@@ -7,10 +7,14 @@
 //!
 //! Known, deliberate differences are not compared and are listed at the case
 //! that would show them.
+//!
+//! When a case differs and podman's own answer is an error, the failure text also
+//! says what the host can tell about the reference container (`reference_evidence`).
 
 #![cfg(feature = "integration-slow")]
 
 mod common;
+mod parity_reference;
 
 use anyhow::{Context, Result};
 use std::io::Write;
@@ -92,6 +96,9 @@ struct Case {
     /// Some podman versions never return here. That is their defect, not a
     /// behaviour to match: when the reference hangs, fcvm must still return.
     reference_may_hang: bool,
+    /// The call never returns, for podman as for fcvm. No answer at the timeout is the
+    /// expected answer then, and not an error of podman's own.
+    never_returns: bool,
 }
 
 fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) -> Case {
@@ -108,6 +115,7 @@ fn case(name: &'static str, flags: &'static [&'static str], command: &[&str]) ->
         container_only: false,
         close_stdout_after: None,
         reference_may_hang: false,
+        never_returns: false,
     }
 }
 
@@ -149,6 +157,11 @@ impl Case {
     }
     fn reference_may_hang(mut self) -> Self {
         self.reference_may_hang = true;
+        self
+    }
+
+    fn never_returns(mut self) -> Self {
+        self.never_returns = true;
         self
     }
 }
@@ -452,7 +465,8 @@ fn cases(env_file: &str) -> Vec<Case> {
         // and the call never returns. podman behaves the same.
         case("it_with_piped_stdin_never_ends", &["-it"], &["cat"])
             .input(Input::Bytes(b"piped\n".to_vec()))
-            .timeout(8),
+            .timeout(8)
+            .never_returns(),
     ]
 }
 
@@ -814,6 +828,178 @@ fn start_reference_container(name: &str) -> Result<ReferenceContainer> {
     Ok(reference)
 }
 
+/// How long one look at the reference container may take.
+const LOOK_TIMEOUT_SECS: u64 = 20;
+
+/// One host command, bounded and collected by `run` like every case.
+struct Look {
+    /// The command and how it ended, for the failure text.
+    text: String,
+    /// `None` when the command could not be started.
+    outcome: Option<Outcome>,
+}
+
+fn look(looking: &mut parity_reference::Looking, argv: &[&str]) -> Look {
+    let bounded = case("look", &[], &[]).timeout(LOOK_TIMEOUT_SECS);
+    let command = parity_reference::shell_words(argv);
+    if let Some(text) = looking.skipped(&command) {
+        return Look {
+            text,
+            outcome: None,
+        };
+    }
+    let argv: Vec<String> = argv.iter().map(|part| part.to_string()).collect();
+    match run(&bounded, &argv) {
+        Ok(outcome) => {
+            looking.ended(&command, outcome.exit);
+            Look {
+                text: parity_reference::render_probe(
+                    &command,
+                    outcome.exit,
+                    bounded.timeout,
+                    &outcome.stdout,
+                    &outcome.stderr,
+                ),
+                outcome: Some(outcome),
+            }
+        }
+        Err(error) => Look {
+            text: format!("$ {command}\n  could not run: {error:#}\n"),
+            outcome: None,
+        },
+    }
+}
+
+/// What the host can tell about the reference container, as text for the failure
+/// message.
+///
+/// podman resolves `-u <name>` by reading `<MergedDir>/etc/passwd` from the host. A
+/// container whose root is not mounted from the host's view fails that lookup while it
+/// keeps running, and exec without `-u` keeps working (#944). So the text says whether
+/// podman has a mounted root on record, whether the host sees the file through it, and
+/// what the store's mount record holds. Nothing here can stop the run: a look that does
+/// not work says so in the text, and after one that gets no answer the rest are not run.
+fn reference_evidence(name: &str) -> String {
+    use parity_reference::Root;
+
+    let mut looking = parity_reference::Looking::default();
+    let inspect = look(
+        &mut looking,
+        &[
+            "podman",
+            "inspect",
+            "--format",
+            parity_reference::INSPECT_FORMAT,
+            name,
+        ],
+    );
+    let mut text = inspect.text;
+    let mut root: Option<String> = None;
+    text += &match inspect.outcome {
+        None => "  inspect could not run, so the container's state and root are unknown\n".to_string(),
+        Some(Outcome { exit: None, .. }) => {
+            "  inspect timed out, so the container's state and root are unknown\n".to_string()
+        }
+        Some(Outcome { exit: Some(code), .. }) if code != 0 => {
+            format!("  inspect failed with exit {code}, so the container's state and root are unknown\n")
+        }
+        Some(outcome) => match parity_reference::parse_inspect(&String::from_utf8_lossy(&outcome.stdout)) {
+            None => "  inspect printed something other than <state>|<root>\n".to_string(),
+            Some(inspected) => match inspected.root {
+                Root::Path(path) => {
+                    root = Some(path.to_string());
+                    format!("  state {}; podman has the root mounted at {path}\n", inspected.status)
+                }
+                Root::NotMounted if inspected.status == "running" => {
+                    "  state running, and podman has no mounted root on record for it: from the host's view the container's root is not mounted\n".to_string()
+                }
+                Root::NotMounted => format!(
+                    "  state {}: a container that is not running has no mounted root\n",
+                    inspected.status
+                ),
+                Root::Unexpected(printed) => format!(
+                    "  state {}; podman printed {printed:?} where the root's path belongs\n",
+                    inspected.status
+                ),
+            },
+        },
+    };
+
+    if let Some(root) = &root {
+        let passwd = format!("{root}/etc/passwd");
+        if nix::unistd::geteuid().is_root() {
+            text += &format!(
+                "{passwd}, seen from the host: {}\n",
+                parity_reference::host_looked(std::path::Path::new(&passwd))
+            );
+        } else {
+            // Rootless podman mounts the root only inside its own namespace. From the
+            // host that path is an empty directory whatever state the container is in,
+            // so the question goes through podman.
+            let seen = look(&mut looking, &["podman", "unshare", "test", "-e", &passwd]);
+            text += &seen.text;
+            text += &match seen.outcome {
+                Some(outcome) => format!(
+                    "  seen from podman's namespace: {}\n",
+                    parity_reference::unshare_test_verdict(outcome.exit, &outcome.stderr)
+                ),
+                None => "  seen from podman's namespace: could not look\n".to_string(),
+            };
+        }
+    }
+
+    let store = look(
+        &mut looking,
+        &["podman", "info", "--format", parity_reference::STORE_FORMAT],
+    );
+    text += &store.text;
+    let record_path = store
+        .outcome
+        .filter(|outcome| outcome.exit == Some(0))
+        .and_then(|outcome| {
+            parity_reference::mount_record_path(&String::from_utf8_lossy(&outcome.stdout))
+        });
+    text += &match record_path {
+        None => "  the store's runroot is unknown, so its mount record was not read\n".to_string(),
+        Some(path) => match std::fs::read_to_string(&path) {
+            Ok(record) => {
+                let mut lines = format!(
+                    "mount record {}:\n  {}\n",
+                    path.display(),
+                    parity_reference::shown_record(&record)
+                );
+                if let Some(root) = &root {
+                    lines += &format!(
+                        "  {}\n",
+                        parity_reference::mount_record_entry(&record, root)
+                    );
+                }
+                lines
+            }
+            Err(error) => format!(
+                "mount record {}: could not read it: {error}\n",
+                path.display()
+            ),
+        },
+    };
+
+    let passwd = look(
+        &mut looking,
+        &[
+            "podman",
+            "exec",
+            name,
+            "grep",
+            "-c",
+            "^nobody:",
+            "/etc/passwd",
+        ],
+    );
+    text += &passwd.text;
+    text += "  read inside the container's mount namespace, so it says nothing about the host-side lookup\n";
+    text
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn test_exec_matches_podman_exec() -> Result<()> {
     let fcvm_path: PathBuf = common::find_fcvm_binary()?;
@@ -854,6 +1040,8 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
         };
 
         let mut failures = Vec::new();
+        // The case the reference container was looked at for, once that has happened.
+        let mut looks = parity_reference::Looks::default();
         let env_file = tempfile::NamedTempFile::new().context("creating the env file")?;
         std::fs::write(
             env_file.path(),
@@ -871,13 +1059,7 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 prefix.extend(case.command.iter().cloned());
                 prefix
             };
-            let mut expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
-            // podman's own failures are sometimes transient under load (seen: a
-            // user lookup in the image failing once). One that is real repeats.
-            if expected.stderr.starts_with(b"Error:") {
-                println!("  {:44} podman reported {}; asking again", case.name, show(&expected.stderr));
-                expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
-            }
+            let expected = run(&case, &target(podman.clone(), &[&reference.0]))?;
             let report = |label: &str, outcome: &Outcome| {
                 println!(
                     "  {:44} {:16} exit {:?} in {:.2?}",
@@ -885,6 +1067,29 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 );
             };
             report("podman exec", &expected);
+            // When podman's own answer is an error, the differences do not say why
+            // podman failed (#944), so the host looks at the reference container. It
+            // looks now, before the fcvm variants run. Each of them can take the case's
+            // timeout, and by then another podman process may have mounted the
+            // container's root again: the look would show a healthy container for an
+            // error it did not cause. What it found is kept until the comparison says
+            // whether this case needs it. There is one look for each own error, because
+            // an earlier case can get one from podman by design.
+            let own = parity_reference::own_error(
+                &expected.stderr,
+                expected.exit,
+                case.never_returns || case.reference_may_hang,
+            );
+            if let Some(own) = own.as_deref().filter(|own| looks.needs_look(own)) {
+                // Said before the look, so the log names the case while it runs.
+                println!("  {:44} podman's own answer is an error: {own}", case.name);
+                println!(
+                    "  {:44} looking at the reference container from the host",
+                    case.name
+                );
+                looks.keep(own, case.name, reference_evidence(&reference.0));
+            }
+            let first_difference = failures.len();
             for (label, vm) in [("fcvm exec", false), ("fcvm exec --vm", true)] {
                 if vm && case.container_only {
                     continue;
@@ -893,6 +1098,15 @@ async fn test_exec_matches_podman_exec() -> Result<()> {
                 report(label, &actual);
                 for difference in differences(&case, &expected, &actual) {
                     failures.push(format!("{} [{label}] {difference}", case.name));
+                }
+            }
+            // The verdict does not change: the differences still fail the test. What is
+            // added, under the first case that differs, is what the look found.
+            if let (true, Some(own)) = (failures.len() > first_difference, own.as_deref()) {
+                let note = looks.note(own, case.name);
+                println!("  {:44} {}", case.name, note.trim_end());
+                if let Some(last) = failures.last_mut() {
+                    last.push_str(&format!("\n{} {}", case.name, note.trim_end()));
                 }
             }
             if failures.len() >= MAX_DIFFERENCES {
