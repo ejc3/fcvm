@@ -14,10 +14,14 @@ on:
         description: 'Force rebuild even if release exists'
         type: boolean
         default: false
+  schedule:
+    # Weekly, for verify-releases alone. The build jobs skip this event.
+    - cron: '23 5 * * 1'
 
-# Cancel in-progress runs when a new revision is pushed
+# Cancel in-progress runs when a new revision is pushed. The weekly check gets
+# a group of its own, so it cannot cancel a build running on main.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}${{ github.event_name == 'schedule' && '-verify' || '' }}
   cancel-in-progress: true
 
 env:
@@ -28,6 +32,8 @@ env:
 jobs:
   build-default-kernel:
     name: Build Default Kernel (${{ matrix.config_arch }})
+    # The weekly schedule is for verify-releases; nothing builds on it.
+    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
@@ -172,6 +178,8 @@ jobs:
 
   build-nested-kernel:
     name: Build Nested Kernel (${{ matrix.config_arch }})
+    # The weekly schedule is for verify-releases; nothing builds on it.
+    if: github.event_name != 'schedule'
     # One leg per architecture table the nested profile defines in
     # rootfs-config.toml, for the reason given on build-btrfs-kernel: setup
     # downloads the release named for the host it runs on, and
@@ -300,21 +308,15 @@ jobs:
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
-        env:
-          FORCE_BUILD: ${{ inputs.force_build }}
         run: |
-          # A forced rebuild must skip the release download. --build-kernels
-          # builds only after a download fails, and the release being replaced
-          # is still published, so setup would fetch that artifact and the
-          # release step would upload the same bytes again.
-          # --force-build-kernels rebuilds the profile kernel from source.
-          # --build-kernels stays because setup fetches the default kernel
-          # first and has to build it when that release is absent.
-          if [ "$FORCE_BUILD" = "true" ]; then
-            sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --force-build-kernels
-          else
-            sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
-          fi
+          # This step runs only when the job has decided to build: the release is
+          # absent, or force_build asked for a replacement. --force-build-kernels
+          # builds from source either way. Without it setup returns a kernel file
+          # an earlier CI job left on this runner under the same name, or
+          # downloads the release being replaced, and that becomes the release.
+          # --build-kernels stays because setup fetches the default kernel first
+          # and has to build it when that release is absent.
+          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --force-build-kernels
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
@@ -409,11 +411,15 @@ jobs:
           - **Host**: x86_64 with Intel VT-x or AMD-V (AWS: c5.metal or another bare-metal instance)
           - **Host KVM**: nested virtualization enabled (\`nested=1\` for \`kvm_intel\` or \`kvm_amd\`)
 
+          ## Known limitation
+
+          x86 nested KVM does not survive a snapshot restore of the outer VM (#664). An outer VM that fcvm restores from its snapshot cache has no usable VMX, and an inner VM started in it times out. Start the outer VM with \`--no-snapshot\` so it cold boots, as below. The inner-VM tests run on arm64 only, so CI does not cover this flow on x86_64.
+
           ## Usage
 
           \`\`\`bash
           fcvm setup --kernel-profile nested
-          fcvm podman run --kernel-profile nested --privileged --name outer alpine:latest
+          fcvm podman run --kernel-profile nested --privileged --no-snapshot --name outer alpine:latest
           # Inside VM: fcvm podman run --name inner alpine:latest
           \`\`\`
           "
@@ -449,6 +455,8 @@ jobs:
 
   build-btrfs-kernel:
     name: Build Btrfs Kernel (${{ matrix.config_arch }})
+    # The weekly schedule is for verify-releases; nothing builds on it.
+    if: github.event_name != 'schedule'
     # One leg per architecture table the btrfs profile defines in
     # rootfs-config.toml. `fcvm setup --kernel-profile btrfs` downloads the
     # release named for the host it runs on, so an architecture with a table
@@ -578,15 +586,9 @@ jobs:
       - name: Build kernel using fcvm
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
-        env:
-          FORCE_BUILD: ${{ inputs.force_build }}
         run: |
-          # Forced rebuilds skip the release download; see build-nested-kernel.
-          if [ "$FORCE_BUILD" = "true" ]; then
-            sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels --force-build-kernels
-          else
-            sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
-          fi
+          # Always from source; see build-nested-kernel.
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels --force-build-kernels
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
@@ -667,3 +669,25 @@ jobs:
           echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
+
+  verify-releases:
+    name: Verify Kernel Releases
+    # Every automated consumer passes --build-kernels, so a release that is
+    # missing becomes a silent local build and nobody sees the 404. That is how
+    # the x86_64 btrfs and nested kernels stayed unpublished. This asks for each
+    # asset `fcvm setup` downloads: after the build jobs of the same run,
+    # whatever they concluded, weekly, and on a manual run.
+    needs: [build-default-kernel, build-nested-kernel, build-btrfs-kernel]
+    if: always()
+    runs-on: ubuntu-latest
+    # Six HEAD requests after a checkout. 10 is generous; GitHub's default is six hours.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check that every published kernel has its release asset
+        run: python3 scripts/verify-kernel-releases.py

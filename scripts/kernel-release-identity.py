@@ -10,8 +10,9 @@ custom_kernel_release_tag and custom_kernel_filename for the names.
 tests/test_default_kernel_release.rs runs both sides over every leg the
 workflow builds, and over fixtures for the cases noted below.
 
-On success it prints version=, arch=, sha=, tag= and filename= lines, the
-format $GITHUB_OUTPUT takes. On any error it prints nothing to stdout and
+On success it prints repo=, version=, arch=, sha=, tag= and filename= lines, the
+format $GITHUB_OUTPUT takes. repo is the table's kernel_repo, where the client
+looks for the release. On any error it prints nothing to stdout and
 exits non-zero, so a step cannot publish part of an identity.
 """
 
@@ -32,6 +33,7 @@ RUNTIME_ARCH = {"arm64": "aarch64", "amd64": "x86_64"}
 # The profile name and kernel version become a git tag, a file name and
 # $GITHUB_OUTPUT lines.
 NAME = re.compile(r"[A-Za-z0-9._-]+")
+REPO = re.compile(r"[A-Za-z0-9._-]+/[A-Za-z0-9._-]+")
 
 
 class IdentityError(Exception):
@@ -75,7 +77,10 @@ def build_inputs_sha(patterns):
     return digest.hexdigest()[:12]
 
 
-def identity(profile_name, config_arch):
+def identity(profile_name, config_arch, check_runner=True):
+    """The identity of one leg. `check_runner=False` is for a job that checks
+    every architecture's release from one runner. It is not on the command line,
+    so a build leg cannot switch the runner check off."""
     runtime_arch = RUNTIME_ARCH.get(config_arch)
     if runtime_arch is None:
         raise IdentityError(
@@ -108,6 +113,8 @@ def identity(profile_name, config_arch):
         )
     if not NAME.fullmatch(version):
         raise IdentityError(f"kernel_version '{version}' cannot be part of a release tag")
+    if not REPO.fullmatch(repo):
+        raise IdentityError(f"kernel_repo '{repo}' is not an owner/name pair")
 
     sha = build_inputs_sha(table.get("build_inputs", []))
     manifest = table.get("kernel_sha")
@@ -125,13 +132,15 @@ def identity(profile_name, config_arch):
     # The client names the artifact after the machine it runs on, so a leg that
     # lands on a runner of the other architecture would build and publish the
     # wrong kernel under this name.
-    machine = subprocess.run(
-        ["uname", "-m"], check=True, capture_output=True, text=True
-    ).stdout.strip()
-    if machine != runtime_arch:
-        raise IdentityError(f"{config_arch} leg ran on {machine}, expected {runtime_arch}")
+    if check_runner:
+        machine = subprocess.run(
+            ["uname", "-m"], check=True, capture_output=True, text=True
+        ).stdout.strip()
+        if machine != runtime_arch:
+            raise IdentityError(f"{config_arch} leg ran on {machine}, expected {runtime_arch}")
 
     return {
+        "repo": repo,
         "version": version,
         "arch": runtime_arch,
         "sha": sha,

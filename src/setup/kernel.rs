@@ -748,6 +748,21 @@ if ! validate_kernel_tarball "$KERNEL_TARBALL"; then
 fi"#
 }
 
+/// The directory, relative to the repo root, whose `*.patch` files a VM kernel
+/// build applies.
+///
+/// An omitted `patches_dir` applies `kernel/patches`; only an explicit empty
+/// string applies none. A table that relies on the default still has to list
+/// those patches in `build_inputs`, or its tag does not change when they do;
+/// tests/test_default_kernel_release.rs holds every table to that.
+pub fn vm_kernel_patches_dir(profile: &KernelProfile) -> Option<&str> {
+    match profile.patches_dir.as_deref() {
+        Some("") => None,
+        Some(dir) => Some(dir),
+        None => Some("kernel/patches"),
+    }
+}
+
 /// Generate VM kernel build script dynamically from profile config.
 ///
 /// The script is written to a temp file and executed. This allows us to:
@@ -772,12 +787,7 @@ fn generate_vm_kernel_build_script(
     };
 
     // Get config from profile
-    // Empty string means no patches, None means use default
-    let patches_dir = match profile.patches_dir.as_deref() {
-        Some("") => None, // Explicitly disabled
-        Some(p) => Some(repo_root.join(p)),
-        None => Some(repo_root.join("kernel/patches")), // Default
-    };
+    let patches_dir = vm_kernel_patches_dir(profile).map(|p| repo_root.join(p));
 
     let kernel_config = profile.kernel_config.as_deref().map(|p| repo_root.join(p));
 

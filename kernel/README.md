@@ -54,10 +54,14 @@ way that can alter the binary, bump `build_spec` in both default build recipes.
 
 `.github/workflows/kernels.yml` builds and publishes the default, nested and
 btrfs kernels, each on the self-hosted ARM64 and X64 runners, so each of those
-profiles has a release for both architectures. The three jobs run independently;
-none waits for another. Setup fetches the default kernel before it builds a
-named profile, so a nested or btrfs leg that starts before the default release
-exists builds the default kernel locally (`--build-kernels`).
+profiles has a release for both architectures. The three build jobs run
+independently; none waits for another. Setup fetches the default kernel before
+it builds a named profile, so a nested or btrfs leg that starts before the
+default release exists builds the default kernel locally (`--build-kernels`).
 `scripts/kernel-release-identity.py` derives each leg's version, SHA, tag and
-file name the way `fcvm setup` does. A manual run with `force_build` rebuilds
-from source (`--force-build-kernels`) and replaces the published release.
+file name the way `fcvm setup` does. A leg builds when its tag has no release
+yet or when a manual run sets `force_build`. The nested and btrfs legs then
+always build from source (`--force-build-kernels`) and never reuse a kernel
+file already on the runner. `verify-releases` runs after the build jobs, weekly,
+and on a manual run, and fails when a published leg's release asset is missing
+(`scripts/verify-kernel-releases.py`).

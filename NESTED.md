@@ -1,6 +1,6 @@
 # Nested Virtualization Guide
 
-fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 nesting works. L3+ is blocked by FUSE-over-FUSE latency (~5x per level).
+fcvm supports running VMs inside VMs using ARM64 FEAT_NV2. Host → L1 → L2 nesting works. This guide covers ARM64; for x86_64 see [x86_64](#x86_64). L3+ is blocked by FUSE-over-FUSE latency (~5x per level).
 
 ## Requirements
 
@@ -132,10 +132,21 @@ make test-root FILTER=kvm
 
 ## Limitations
 
-- ARM64 only (x86_64 uses different mechanism)
+- This guide and the L2 tests cover ARM64. x86_64 nests through Intel VT-x or AMD-V and has the restriction under [x86_64](#x86_64).
 - Requires bare-metal instance (c7g.metal)
 - L3+ blocked by FUSE-over-FUSE latency (~5x per level)
 - L2 limited to single vCPU (NV2 multi-vCPU interrupt delivery issue)
+
+## x86_64
+
+The `nested` profile also has an x86_64 kernel, built with `CONFIG_KVM_INTEL` and `CONFIG_KVM_AMD` (`kernel/nested-x86.conf`). The host needs Intel VT-x or AMD-V with nested virtualization enabled (`nested=1` for `kvm_intel` or `kvm_amd`), which means a bare-metal instance such as c5.metal.
+
+What the repo's own evidence supports (#664, commit fc81ab1c):
+
+- `/dev/kvm` works inside an x86_64 guest. `test_kvm_available_in_vm` runs on both architectures.
+- Running fcvm inside that guest works only when the outer VM cold booted. In CI run 27323861536 the five L2 tests passed on the x64 runner with the snapshot cache disabled and failed with it enabled: an outer VM restored from the snapshot cache has no usable VMX, and the inner VM's start times out.
+- Start the outer VM with `--no-snapshot` (or `FCVM_NO_SNAPSHOT=1`) so it never restores from the cache.
+- The L2 tests are compiled for aarch64 only, so CI does not cover the x86_64 inner-VM flow.
 
 ## Known Issues
 

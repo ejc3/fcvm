@@ -2,11 +2,14 @@
 
 use fcvm::setup::kernel::{
     compute_profile_kernel_sha_at_root, custom_kernel_filename, custom_kernel_release_tag,
+    vm_kernel_patches_dir,
 };
 use fcvm::setup::KernelProfile;
 use serde_norway::Value as YamlValue;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{BufRead, BufReader, Write};
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -280,12 +283,22 @@ fn every_kernel_workflow_job_installs_what_setup_links() {
         [
             "build-btrfs-kernel",
             "build-default-kernel",
-            "build-nested-kernel"
+            "build-nested-kernel",
+            "verify-releases"
         ],
         "a job was added to or removed from kernels.yml; decide whether it runs setup and \
          update this test"
     );
-    for name in names {
+    // verify-releases asks whether releases exist and builds nothing. The other
+    // three must each still build: a job that lost its build command would drop
+    // out of every test that walks the build jobs.
+    let mut building: Vec<&str> = kernel_build_jobs(&workflow)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    building.sort_unstable();
+    assert_eq!(building, names[..3], "the jobs that build a kernel changed");
+    for name in building {
         let steps = workflow["jobs"][name]["steps"].as_sequence().unwrap();
         let setup = steps
             .iter()
@@ -441,6 +454,20 @@ fn workflow_jobs(workflow: &YamlValue) -> Vec<(&str, &YamlValue)> {
         .collect()
 }
 
+/// The jobs that build and publish a kernel, as opposed to the job that checks
+/// the published releases. `every_kernel_workflow_job_installs_what_setup_links`
+/// pins which jobs these are.
+fn kernel_build_jobs(workflow: &YamlValue) -> Vec<(&str, &YamlValue)> {
+    workflow_jobs(workflow)
+        .into_iter()
+        .filter(|(name, job)| {
+            job_steps(name, job)
+                .iter()
+                .any(|step| !profiles_built_by(run_script(step)).is_empty())
+        })
+        .collect()
+}
+
 fn job_steps<'a>(name: &str, job: &'a YamlValue) -> &'a [YamlValue] {
     job["steps"]
         .as_sequence()
@@ -558,7 +585,7 @@ fn job_config_arches(name: &str, job: &YamlValue) -> Vec<String> {
 /// names, for each architecture the job runs on.
 fn published_kernel_legs(workflow: &YamlValue) -> BTreeSet<(String, String)> {
     let mut legs = BTreeSet::new();
-    for (name, job) in workflow_jobs(workflow) {
+    for (name, job) in kernel_build_jobs(workflow) {
         let (_, profile) = kernel_build_step(name, job);
         for arch in job_config_arches(name, job) {
             legs.insert((profile.clone(), arch));
@@ -763,36 +790,40 @@ fn makefile_recipe(target: &str) -> String {
 /// own "built kernel not found" check and copies nothing.
 const UNBUILT_KERNEL: &str = "vmlinux-kernel-workflow-test-never-built.bin";
 
-/// `force_build` exists to replace a published kernel whose content is wrong.
-/// `fcvm setup --build-kernels` builds only after the release download FAILS,
-/// and the release being replaced is still published while the build step
-/// runs. So a build step that always passes `--build-kernels` returns the
-/// cached file or downloads the old artifact, the release step deletes the
-/// release and uploads the same bytes, and the run is green. The nested and
-/// btrfs jobs did exactly that. `--force-build-kernels` is the flag that
-/// skips the download (`rebuild_kernel_from_source`).
+/// A job reaches its build step only after it has decided to build: the release
+/// is absent, or `force_build` asked for a replacement. Either way the artifact
+/// has to come from source in that run. `fcvm setup --build-kernels` returns a
+/// cached file when there is one and otherwise downloads the published release,
+/// building only if that download fails. So a kernel file left on a persistent
+/// runner by an earlier CI job under the same content-addressed name became the
+/// release, and a forced rebuild uploaded the artifact it was asked to replace.
+/// `--force-build-kernels` skips both (`rebuild_kernel_from_source`).
+/// `--build-kernels` stays beside it because setup fetches the default kernel
+/// first and has to build that when its release is absent.
 ///
 /// The nested and btrfs build steps run here for real, with `sudo` replaced by
 /// a function that logs the setup command. The default job hands the build to
-/// `make release-default-kernel`, so its routing is checked where it lives: the
-/// FORCE value the step passes and the recipe's use of it.
+/// `make release-default-kernel`, which forces only under FORCE=1: the recipe
+/// then passes `--force-build-kernels` without `--build-kernels`, and setup
+/// cannot fetch a default kernel that has no release yet without permission to
+/// build it.
 #[test]
-fn force_build_rebuilds_from_source_in_every_kernel_job() {
+fn a_kernel_build_step_always_builds_from_source() {
     let workflow = kernels_workflow();
     let scratch = tempfile::tempdir().unwrap();
     let mut ran = 0usize;
-    for (name, job) in workflow_jobs(&workflow) {
+    for (name, job) in kernel_build_jobs(&workflow) {
         let (step, profile) = kernel_build_step(name, job);
+        let condition = step["if"].as_str().unwrap_or("");
         assert!(
-            step["if"]
-                .as_str()
-                .unwrap_or("")
-                .contains("inputs.force_build == true"),
-            "job `{name}` skips its build step on a forced rebuild of a published kernel"
+            condition.contains("steps.check.outputs.exists == 'false'")
+                && condition.contains("inputs.force_build == true"),
+            "job `{name}` must build when its release is absent and when force_build asks \
+             for a replacement, and its build step runs on `{condition}`"
         );
         let script = run_script(step);
 
-        if profiles_built_by(script).contains("default") {
+        if profile == "default" {
             assert_eq!(
                 step["env"]["FORCE"].as_str(),
                 Some("${{ inputs.force_build == true && '1' || '0' }}"),
@@ -808,7 +839,8 @@ fn force_build_rebuilds_from_source_in_every_kernel_job() {
             continue;
         }
 
-        for (input, forced) in [("true", true), ("false", false), ("", false)] {
+        // Whatever force_build says, a step that runs builds from source.
+        for input in ["true", "false", ""] {
             let run = run_step_script(
                 script,
                 &[("steps.kernel.outputs.filename", UNBUILT_KERNEL)],
@@ -831,36 +863,28 @@ fn force_build_rebuilds_from_source_in_every_kernel_job() {
                 "job `{name}` ran `{}`, which does not build `{profile}`",
                 setups[0]
             );
-            assert_eq!(
+            assert!(
                 words.contains(&"--force-build-kernels"),
-                forced,
-                "job `{name}` with force_build={input:?} ran `{}`. Only --force-build-kernels \
-                 skips the release download, and without force_build the published kernel must \
-                 stay the one that is used",
+                "job `{name}` with force_build={input:?} ran `{}`. Without \
+                 --force-build-kernels setup returns a kernel file already on the runner, or \
+                 downloads the release being replaced, and that becomes the release",
                 setups[0]
             );
             assert!(
-                forced || words.contains(&"--build-kernels"),
-                "job `{name}` with force_build={input:?} ran `{}`, which cannot build a kernel \
-                 that has no release yet",
+                words.contains(&"--build-kernels"),
+                "job `{name}` with force_build={input:?} ran `{}`. Without --build-kernels \
+                 setup cannot build the default kernel it fetches first when that has no \
+                 release yet",
                 setups[0]
             );
         }
-        assert_eq!(
-            step["env"]["FORCE_BUILD"].as_str(),
-            Some("${{ inputs.force_build }}"),
-            "job `{name}` must hand force_build to its build step through env"
-        );
         assert!(
             !script.contains("inputs."),
             "job `{name}` interpolates a workflow input into its build script"
         );
         ran += 1;
     }
-    assert!(
-        ran >= 2,
-        "expected to run the nested and btrfs build steps, ran {ran}"
-    );
+    assert_eq!(ran, 2, "expected to run the nested and btrfs build steps");
 }
 
 /// A forced rebuild deletes the published release before it creates the new
@@ -876,7 +900,7 @@ fn a_release_step_that_refuses_a_leg_has_not_deleted_the_release() {
     let workflow = kernels_workflow();
     let scratch = tempfile::tempdir().unwrap();
     let mut refused = 0usize;
-    for (name, job) in workflow_jobs(&workflow) {
+    for (name, job) in kernel_build_jobs(&workflow) {
         let run = run_step_script(
             run_script(release_step(name, job)),
             &[
@@ -951,7 +975,7 @@ fn every_kernel_workflow_job_bounds_its_runtime() {
 /// that printed nothing. One checked-in script now does it for all three.
 #[test]
 fn every_kernel_job_takes_its_release_identity_from_the_shared_script() {
-    for (name, job) in workflow_jobs(&kernels_workflow()) {
+    for (name, job) in kernel_build_jobs(&kernels_workflow()) {
         let (_, profile) = kernel_build_step(name, job);
         let step = identity_step(name, job);
         assert_eq!(
@@ -1098,7 +1122,7 @@ fn every_kernel_leg_publishes_under_the_name_setup_downloads() {
     let config = rootfs_config();
     let workflow = kernels_workflow();
     let mut checked = BTreeSet::new();
-    for (name, job) in workflow_jobs(&workflow) {
+    for (name, job) in kernel_build_jobs(&workflow) {
         let (_, profile_name) = kernel_build_step(name, job);
         let step = identity_step(name, job);
         for config_arch in job_config_arches(name, job) {
@@ -1120,6 +1144,7 @@ fn every_kernel_leg_publishes_under_the_name_setup_downloads() {
                 run.stderr
             );
             let expected: BTreeMap<String, String> = [
+                ("repo", profile.kernel_repo.clone()),
                 ("version", version.clone()),
                 ("arch", machine.to_string()),
                 ("sha", sha.clone()),
@@ -1179,7 +1204,7 @@ fn every_kernel_leg_publishes_under_the_name_setup_downloads() {
 #[test]
 fn a_failing_identity_helper_fails_the_step_and_publishes_nothing() {
     let arch = host_config_arch();
-    for (name, job) in workflow_jobs(&kernels_workflow()) {
+    for (name, job) in kernel_build_jobs(&kernels_workflow()) {
         let (run, written) = run_identity_step(
             identity_step(name, job),
             arch,
@@ -1299,6 +1324,7 @@ kernel_repo = "example/kernels"
         assert_eq!(run.code, Some(0), "profile `{name}`:\n{}", run.stderr);
         let identity = identity_lines(&run.stdout);
         assert_eq!(identity["sha"], sha, "profile `{name}`");
+        assert_eq!(identity["repo"], "example/kernels");
         assert_eq!(identity["version"], "1.2.3");
         assert_eq!(identity["arch"], machine);
         assert_eq!(
@@ -1418,4 +1444,434 @@ description = "runtime settings only"
         "a runner of the other architecture",
         run_identity_script(fixture.path(), "pinned", arch, runtime_arch_of(other_arch)),
     );
+}
+
+/// The patch files a VM kernel build applies from `dir`. The generated build
+/// script loops over `"$PATCHES_DIR"/*.patch`, and a shell glob skips
+/// dot-prefixed names.
+fn applied_patches(root: &Path, dir: &str) -> Vec<PathBuf> {
+    let mut patches: Vec<PathBuf> = std::fs::read_dir(root.join(dir))
+        .unwrap_or_else(|error| panic!("patches_dir `{dir}`: {error}"))
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            let name = path.file_name().unwrap().to_string_lossy();
+            name.ends_with(".patch") && !name.starts_with('.') && path.is_file()
+        })
+        .collect();
+    patches.sort();
+    patches
+}
+
+/// A kernel's tag is the hash of its table's `build_inputs`, and the release
+/// check skips the build when that tag already has a release. So every patch a
+/// build applies has to be one of those inputs. Both btrfs tables omitted
+/// `patches_dir`, which makes the build apply `kernel/patches`
+/// (`vm_kernel_patches_dir`), while `build_inputs` listed only the config
+/// fragment: editing a FUSE patch left both btrfs tags unchanged, the check
+/// found the old release, and hosts kept a kernel without the change.
+#[test]
+fn every_patch_a_build_applies_is_part_of_what_its_tag_hashes() {
+    let root = repo_root();
+    let config = rootfs_config();
+    let mut unhashed = Vec::new();
+    let mut tables_with_patches = 0usize;
+    for (profile_name, arches) in config["kernel_profiles"].as_table().unwrap() {
+        for arch in arches.as_table().unwrap().keys() {
+            let profile = kernel_profile_table(&config, profile_name, arch);
+            if !profile.is_custom() || profile.is_url_based() {
+                continue;
+            }
+            let Some(dir) = vm_kernel_patches_dir(&profile) else {
+                continue;
+            };
+            let applied = applied_patches(&root, dir);
+            assert!(
+                !applied.is_empty(),
+                "{profile_name}.{arch} applies `{dir}`, which holds no patch"
+            );
+            tables_with_patches += 1;
+
+            let mut hashed = BTreeSet::new();
+            for pattern in &profile.build_inputs {
+                let pattern = root.join(pattern).to_string_lossy().into_owned();
+                for path in glob::glob(&pattern).unwrap().filter_map(Result::ok) {
+                    if !path.to_string_lossy().ends_with(".disabled") {
+                        hashed.insert(path);
+                    }
+                }
+            }
+            for patch in applied {
+                if !hashed.contains(&patch) {
+                    unhashed.push(format!(
+                        "{profile_name}.{arch}: {}",
+                        patch.strip_prefix(&root).unwrap().display()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        tables_with_patches >= 4,
+        "expected the nested and btrfs tables at least to apply patches, found \
+         {tables_with_patches} tables that do"
+    );
+    assert!(
+        unhashed.is_empty(),
+        "a build applies these patches and its table's build_inputs does not list them, so \
+         editing one leaves the kernel's tag unchanged and the release check skips the \
+         rebuild:\n  {}",
+        unhashed.join("\n  ")
+    );
+}
+
+/// What a release tells its users has to be true for the architecture it is
+/// for. On x86_64, nested KVM does not survive a snapshot restore of the outer
+/// VM (#664, commit fc81ab1c): an outer VM restored from the snapshot cache has
+/// no usable VMX and its inner VM's start times out, while the same tests pass
+/// with snapshots disabled. The inner-VM tests are gated to aarch64 for that
+/// reason. The x86_64 notes published the fcvm-inside-fcvm flow with no caveat.
+#[test]
+fn the_x86_64_nested_notes_say_the_outer_vm_must_cold_boot() {
+    let workflow = kernels_workflow();
+    let scratch = tempfile::tempdir().unwrap();
+    let (name, job) = kernel_build_jobs(&workflow)
+        .into_iter()
+        .find(|(name, job)| kernel_build_step(name, job).1 == "nested")
+        .expect("kernels.yml builds the nested profile");
+    let run = run_step_script(
+        run_script(release_step(name, job)),
+        &[
+            (
+                "steps.kernel.outputs.tag",
+                "kernel-nested-1.2.3-x86_64-0123456789ab",
+            ),
+            ("steps.kernel.outputs.filename", UNBUILT_KERNEL),
+            ("steps.kernel.outputs.version", "1.2.3"),
+            ("steps.kernel.outputs.sha", "0123456789ab"),
+            ("steps.kernel.outputs.arch", "x86_64"),
+            ("inputs.force_build", "false"),
+        ],
+        &logging_stub("gh", "GH"),
+        &[("CONFIG_ARCH", "amd64"), ("GH_TOKEN", "unused")],
+        scratch.path(),
+    );
+    assert_eq!(run.code, Some(0), "{}", run.stderr);
+    let notes = run.stdout;
+    assert!(
+        notes.contains("GH release create "),
+        "the release step created no release:\n{notes}"
+    );
+    for required in ["--no-snapshot", "#664"] {
+        assert!(
+            notes.contains(required),
+            "the x86_64 nested release notes do not mention `{required}`:\n{notes}"
+        );
+    }
+    // The usage the notes print has to be the flow that works.
+    assert!(
+        notes.lines().any(|line| line.contains("fcvm podman run")
+            && line.contains("--kernel-profile nested")
+            && line.contains("--no-snapshot")),
+        "the x86_64 notes show an outer VM started without --no-snapshot:\n{notes}"
+    );
+
+    // The flag the notes name has to exist, and the guide has to agree.
+    let args = std::fs::read_to_string(repo_root().join("src/cli/args.rs")).unwrap();
+    assert!(
+        args.contains("pub no_snapshot: bool"),
+        "src/cli/args.rs no longer defines --no-snapshot, which the release notes name"
+    );
+    let guide = std::fs::read_to_string(repo_root().join("NESTED.md")).unwrap();
+    for required in ["x86_64", "--no-snapshot", "#664"] {
+        assert!(
+            guide.contains(required),
+            "NESTED.md does not mention `{required}`"
+        );
+    }
+}
+
+/// A matrix leg that is listed and then gated off publishes nothing, while
+/// every test that reads the matrix still counts it as built.
+#[test]
+fn no_kernel_job_gates_itself_or_a_step_on_its_matrix_leg() {
+    let mut conditions = 0usize;
+    for (name, job) in workflow_jobs(&kernels_workflow()) {
+        let mut gates = vec![(
+            "the job".to_string(),
+            job["if"].as_str().unwrap_or("").to_string(),
+        )];
+        for (index, step) in job_steps(name, job).iter().enumerate() {
+            let label = step["name"]
+                .as_str()
+                .or_else(|| step["uses"].as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("step {}", index + 1));
+            gates.push((label, step["if"].as_str().unwrap_or("").to_string()));
+        }
+        for (what, condition) in gates {
+            if condition.is_empty() {
+                continue;
+            }
+            conditions += 1;
+            assert!(
+                !condition.contains("matrix."),
+                "job `{name}`, {what}: `if: {condition}` reads the matrix, so a leg can be \
+                 listed and build nothing"
+            );
+        }
+    }
+    assert!(
+        conditions > 0,
+        "found no `if:` to inspect, and the build steps carry one"
+    );
+}
+
+/// Each leg builds the table `kernel_profiles.<profile>.<arch>`. A leg with no
+/// such table, or with one that is not a source release, has nothing to build
+/// or publish.
+#[test]
+fn every_kernel_leg_has_its_profile_table() {
+    let config = rootfs_config();
+    let legs = published_kernel_legs(&kernels_workflow());
+    assert!(!legs.is_empty(), "kernels.yml builds no kernel at all");
+    let mut missing = Vec::new();
+    for (profile, arch) in &legs {
+        let table = config["kernel_profiles"]
+            .get(profile.as_str())
+            .and_then(|arches| arches.get(arch.as_str()));
+        let source_release = table.is_some_and(|table| {
+            let named = |key: &str| {
+                table
+                    .get(key)
+                    .and_then(toml::Value::as_str)
+                    .is_some_and(|value| !value.is_empty())
+            };
+            named("kernel_version") && named("kernel_repo") && table.get("kernel_url").is_none()
+        });
+        if !source_release {
+            missing.push(format!("kernel_profiles.{profile}.{arch}"));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "kernels.yml has a leg for each of {missing:?}, and rootfs-config.toml has no \
+         source-release table there for it to build"
+    );
+}
+
+const VERIFY_SCRIPT: &str = "scripts/verify-kernel-releases.py";
+
+/// #949 went unnoticed because nothing asks whether a published release
+/// exists: every automated consumer passes `--build-kernels`, so a 404 becomes
+/// a silent local build. The release check has to cover exactly the legs the
+/// workflow publishes.
+#[test]
+fn the_release_check_covers_every_leg_the_workflow_publishes() {
+    let output = Command::new("python3")
+        .arg(repo_root().join(VERIFY_SCRIPT))
+        .arg("--list-legs")
+        .output()
+        .expect("run python3");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let listed: BTreeSet<(String, String)> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| {
+            let (profile, arch) = line
+                .split_once(' ')
+                .unwrap_or_else(|| panic!("not a `<profile> <arch>` line: {line:?}"));
+            (profile.to_string(), arch.to_string())
+        })
+        .collect();
+    assert_eq!(
+        listed,
+        published_kernel_legs(&kernels_workflow()),
+        "{VERIFY_SCRIPT} checks a different set of legs than kernels.yml publishes"
+    );
+}
+
+/// The check runs where a missing release can be seen: after the build jobs of
+/// the same run whatever they concluded, weekly, and on a manual run. The
+/// weekly run must not start six builds.
+#[test]
+fn the_release_check_runs_after_the_builds_weekly_and_on_demand() {
+    let workflow = kernels_workflow();
+    let job = &workflow["jobs"]["verify-releases"];
+    assert!(job.is_mapping(), "kernels.yml has no verify-releases job");
+
+    let needs: BTreeSet<&str> = job["needs"]
+        .as_sequence()
+        .expect("verify-releases lists its needs")
+        .iter()
+        .filter_map(YamlValue::as_str)
+        .collect();
+    let builders: BTreeSet<&str> = kernel_build_jobs(&workflow)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    assert_eq!(
+        needs, builders,
+        "verify-releases must wait for every build job"
+    );
+    assert_eq!(
+        job["if"].as_str(),
+        Some("always()"),
+        "verify-releases must run when a build job failed or was skipped"
+    );
+    assert_eq!(job["runs-on"].as_str(), Some("ubuntu-latest"));
+    assert!(
+        job_steps("verify-releases", job)
+            .iter()
+            .flat_map(|step| command_lines(run_script(step)))
+            .any(|words| words == ["python3", VERIFY_SCRIPT]),
+        "verify-releases does not run {VERIFY_SCRIPT}"
+    );
+
+    // YAML 1.1 reads a bare `on` as boolean true and YAML 1.2 keeps the string.
+    let triggers = workflow
+        .get("on")
+        .or_else(|| workflow.get(YamlValue::Bool(true)))
+        .expect("kernels.yml has no `on:` block");
+    assert!(
+        triggers["schedule"]
+            .as_sequence()
+            .is_some_and(|entries| entries.len() == 1 && entries[0]["cron"].as_str().is_some()),
+        "kernels.yml has no weekly schedule"
+    );
+    assert!(
+        triggers
+            .as_mapping()
+            .is_some_and(|map| map.contains_key(YamlValue::from("workflow_dispatch"))),
+        "kernels.yml cannot be run by hand"
+    );
+    for (name, build) in kernel_build_jobs(&workflow) {
+        assert_eq!(
+            build["if"].as_str(),
+            Some("github.event_name != 'schedule'"),
+            "job `{name}` would build on the weekly schedule"
+        );
+    }
+}
+
+/// A local stand-in for the release host: a redirect for the paths in `found`,
+/// a server error for those in `broken`, not found for the rest.
+fn release_host(found: BTreeSet<String>, broken: BTreeSet<String>) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request = String::new();
+            if reader.read_line(&mut request).is_err() {
+                continue;
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) if header == "\r\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let path = request.split_whitespace().nth(1).unwrap_or("");
+            let status = if found.contains(path) {
+                "302 Found\r\nLocation: http://127.0.0.1:1/asset"
+            } else if broken.contains(path) {
+                "500 Internal Server Error"
+            } else {
+                "404 Not Found"
+            };
+            let _ = write!(
+                stream,
+                "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+        }
+    });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn run_release_check(base_url: &str) -> StepRun {
+    let mut command = Command::new("python3");
+    command
+        .arg(repo_root().join(VERIFY_SCRIPT))
+        .args(["--base-url", base_url])
+        .current_dir("/");
+    for proxy in [
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+    ] {
+        command.env_remove(proxy);
+    }
+    StepRun::from_output(command.output().expect("run python3"))
+}
+
+/// The check asks for what the client downloads, names exactly what is
+/// missing, and never reports an asset it could not ask about as missing or as
+/// present. The expected paths come from the client's own functions.
+#[test]
+fn the_release_check_names_what_is_missing_and_fails_closed() {
+    let root = repo_root();
+    let config = rootfs_config();
+    let mut assets: BTreeMap<(String, String), (String, String)> = BTreeMap::new();
+    for (profile_name, config_arch) in published_kernel_legs(&kernels_workflow()) {
+        let machine = runtime_arch_of(&config_arch);
+        let profile = kernel_profile_table(&config, &profile_name, &config_arch);
+        let version = &profile.kernel_version;
+        let sha = compute_profile_kernel_sha_at_root(&profile, Some(&root)).unwrap();
+        let asset = format!(
+            "kernel-{profile_name}-{version}-{machine}-{sha}/\
+             vmlinux-{profile_name}-{version}-{machine}-{sha}.bin"
+        );
+        let path = format!("/{}/releases/download/{asset}", profile.kernel_repo);
+        assets.insert((profile_name, config_arch), (asset, path));
+    }
+    let all: BTreeSet<String> = assets.values().map(|(_, path)| path.clone()).collect();
+    let lines_with = |run: &StepRun, prefix: &str| -> Vec<String> {
+        run.stdout
+            .lines()
+            .filter_map(|line| line.strip_prefix(prefix))
+            .map(|rest| rest.trim().to_string())
+            .collect()
+    };
+
+    // Every asset published.
+    let run = run_release_check(&release_host(all.clone(), BTreeSet::new()));
+    assert_eq!(run.code, Some(0), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(lines_with(&run, "present").len(), assets.len());
+
+    // One missing: exit 1, and that asset alone is named.
+    let (gone_asset, gone_path) = &assets[&("btrfs".to_string(), "amd64".to_string())];
+    let mut found = all.clone();
+    found.remove(gone_path);
+    let run = run_release_check(&release_host(found.clone(), BTreeSet::new()));
+    assert_eq!(run.code, Some(1), "{}\n{}", run.stdout, run.stderr);
+    assert_eq!(
+        lines_with(&run, "MISSING"),
+        std::slice::from_ref(gone_asset)
+    );
+
+    // One the host cannot answer for: exit 2, and it is not called missing.
+    let run = run_release_check(&release_host(found, BTreeSet::from([gone_path.clone()])));
+    assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
+    assert!(lines_with(&run, "MISSING").is_empty(), "{}", run.stdout);
+    assert_eq!(lines_with(&run, "UNKNOWN").len(), 1, "{}", run.stdout);
+
+    // Nothing listening: exit 2, and nothing is called missing or present.
+    let closed = {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port())
+    };
+    let run = run_release_check(&closed);
+    assert_eq!(run.code, Some(2), "{}\n{}", run.stdout, run.stderr);
+    assert!(lines_with(&run, "MISSING").is_empty(), "{}", run.stdout);
+    assert!(lines_with(&run, "present").is_empty(), "{}", run.stdout);
+    assert_eq!(lines_with(&run, "UNKNOWN").len(), assets.len());
 }
