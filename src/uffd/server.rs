@@ -3651,15 +3651,13 @@ mod tests {
         use std::os::unix::process::CommandExt;
 
         let addr = unix_addr(socket);
-        let test_process = std::process::id() as libc::pid_t;
-        let mut command = std::process::Command::new("sleep");
-        command.arg("600");
-        // SAFETY: between fork and exec the hook only calls prctl(2), getppid(2), socket(2),
-        // connect(2), close(2) and nanosleep(2), which are async-signal-safe, on values
-        // built before the fork.
+        // The shared command already carries the hook that ties the child to this thread.
+        // Hooks run in the order they were added, so that one runs before the connect.
+        let mut command = crate::test_child::sleep_command(600);
+        // SAFETY: between fork and exec this hook only calls socket(2), connect(2), close(2)
+        // and nanosleep(2), which are async-signal-safe, on values built before the fork.
         unsafe {
             command.pre_exec(move || {
-                die_with_the_test(test_process)?;
                 let pause = libc::timespec {
                     tv_sec: 0,
                     tv_nsec: 5_000_000,
@@ -3690,7 +3688,7 @@ mod tests {
                 Err(std::io::Error::from_raw_os_error(libc::ETIMEDOUT))
             });
         }
-        Victim(command.spawn().expect("spawning the stand-in VMM"))
+        Victim::new(command.spawn().expect("spawning the stand-in VMM"))
     }
 
     /// Under a long-lived serve the kernel evicts the image as clones grow. Admitting a
@@ -3994,45 +3992,17 @@ mod tests {
     /// A stand-in VMM that cannot outlive the test that spawned it.
     ///
     /// `std::process::Child` does nothing on drop, so a test that panicked between
-    /// [`spawn_victim`] and its assertion left `sleep 600` behind as an orphan. Two things
-    /// end a `Victim`, because neither covers every exit on its own:
+    /// [`spawn_victim`] and its assertion left `sleep 600` behind as an orphan. A `Victim` is
+    /// a [`TestChild`](crate::test_child::TestChild), which two things end: dropping it kills
+    /// and reaps the process, and the kernel ends it if the thread that spawned it goes away
+    /// first. The second is why a victim has to be spawned from the thread that runs the
+    /// test, not from a helper thread that returns.
     ///
-    /// * Dropping it kills the process and reaps it. That covers a test that returns and a
-    ///   test that panics, since unwinding drops it.
-    /// * [`spawn_victim`] arms `PR_SET_PDEATHSIG`, so the kernel kills it when the thread
-    ///   that spawned it goes away. That covers a test process that is killed outright
-    ///   (what nextest does to a test that outlives its timeout), where nothing unwinds
-    ///   and no drop runs. It is also why a victim has to be spawned from the thread that
-    ///   runs the test, not from a helper thread that returns.
-    ///
-    /// The guard acts only when it goes out of scope. [`assert_vmm_was_killed`] takes the
-    /// victim by value and reads how it died before letting go of it, so the guard's own
-    /// SIGKILL can never stand in for the one a test asserts on.
-    struct Victim(std::process::Child);
-
-    impl std::ops::Deref for Victim {
-        type Target = std::process::Child;
-
-        fn deref(&self) -> &Self::Target {
-            &self.0
-        }
-    }
-
-    impl std::ops::DerefMut for Victim {
-        fn deref_mut(&mut self) -> &mut Self::Target {
-            &mut self.0
-        }
-    }
-
-    impl Drop for Victim {
-        fn drop(&mut self) {
-            // For a victim the test already reaped, both calls do nothing: once the exit
-            // status has been collected `kill` returns `Ok` without signalling (which also
-            // keeps it off a recycled PID) and `wait` returns that status again.
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
+    /// Neither can pass for the production kill these tests assert on. The guard acts only
+    /// when it goes out of scope, and [`assert_vmm_was_killed`] takes the victim by value and
+    /// reads how it died before letting go of it. The kernel's signal is SIGTERM, so a victim
+    /// that died with its spawning thread does not read as killed by SIGKILL.
+    type Victim = crate::test_child::TestChild<std::process::Child>;
 
     /// Spawn a harmless long-lived process to stand in for a clone's VMM.
     ///
@@ -4040,39 +4010,8 @@ mod tests {
     /// pinned handle to "the process on the other end of this connection" — so the only
     /// substitution is WHICH process gets killed. Using a real child (rather than the test
     /// process) is what lets the test assert the kill actually landed.
-    ///
-    /// It comes back as a [`Victim`]. The hook arms the kernel half of that guard the way
-    /// `tests/common` does for every fcvm it spawns: `PR_SET_PDEATHSIG`, then a check that
-    /// the parent did not die between the fork and the `prctl`.
     fn spawn_victim() -> Victim {
-        use std::os::unix::process::CommandExt;
-
-        let mut command = std::process::Command::new("sleep");
-        command.arg("600");
-        let test_process = std::process::id() as libc::pid_t;
-        // SAFETY: the hook runs in the forked child before exec and makes two
-        // async-signal-safe calls. The parent PID was captured before the fork, so the
-        // hook allocates nothing.
-        unsafe {
-            command.pre_exec(move || die_with_the_test(test_process));
-        }
-        Victim(command.spawn().expect("spawning the stand-in VMM process"))
-    }
-
-    /// The kernel half of [`Victim`], for a pre-exec hook: die with the thread that spawned
-    /// this child, and refuse to start if that parent is already gone, because then no
-    /// signal is coming. Two async-signal-safe calls and no allocation.
-    fn die_with_the_test(test_process: libc::pid_t) -> std::io::Result<()> {
-        // SAFETY: prctl(PR_SET_PDEATHSIG) and getppid take no pointers.
-        unsafe {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != test_process {
-                return Err(std::io::Error::from_raw_os_error(libc::ESRCH));
-            }
-        }
-        Ok(())
+        crate::test_child::spawn_sleep_std(600)
     }
 
     fn killed_by_sigkill(status: std::process::ExitStatus) -> bool {
@@ -4098,8 +4037,7 @@ mod tests {
                     return;
                 }
                 None if tokio::time::Instant::now() >= deadline => {
-                    let _ = victim.kill();
-                    let _ = victim.wait();
+                    // The panic drops `victim`, and its guard kills and reaps the process.
                     panic!(
                         "the clone's VMM is STILL RUNNING after its UFFD service failed — \
                          future guest faults would remain frozen, silently wedging the clone"
@@ -4120,36 +4058,41 @@ mod tests {
     /// directory, so the next `make` in that checkout blocked for up to ten minutes.
     ///
     /// The thread below is such a test body. The pidfd names that exact process and reads
-    /// dead only once the process has been reaped, so a victim that was killed and left as
-    /// a zombie fails this too.
+    /// gone only once the process has been reaped, so a victim that was killed and left as a
+    /// zombie fails this too.
     #[test]
     fn a_victim_does_not_outlive_a_test_that_panics() {
+        use crate::test_child::Pinned;
+
         let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
-        let failing_test: std::thread::JoinHandle<()> = std::thread::spawn(move || {
-            let victim = spawn_victim();
-            let peer = PeerVmm::from_pid(victim.id()).expect("pinning the stand-in VMM");
-            pinned_tx.send(peer).expect("handing the pidfd over");
-            panic!("stand-in for an expect that fails before the victim is asserted on");
-        });
+        // Named, because this panic is printed on every passing run.
+        let failing_test = std::thread::Builder::new()
+            .name("panics-on-purpose".to_string())
+            .spawn(move || {
+                let victim = spawn_victim();
+                pinned_tx
+                    .send(Pinned::new(victim.id()))
+                    .expect("handing the pidfd over");
+                panic!("stand-in for an expect that fails before the victim is asserted on");
+            })
+            .expect("spawning the failing test body");
         assert!(failing_test.join().is_err(), "the test body must panic");
-        let peer = pinned_rx
+        let pinned = pinned_rx
             .recv()
             .expect("the victim was pinned before the panic");
 
         // Read the verdict, then clean up BEFORE asserting on it: where the victim does
         // outlive the panic, this test must not leak the orphan it exists to catch.
-        let outlived = peer.is_alive();
+        let outlived = pinned.is_present();
         if outlived {
-            peer.kill_now("test cleanup: the stand-in VMM outlived its test");
-            // SAFETY: waiting on this process's own child. Nothing has reaped it, so its PID
-            // cannot have been recycled.
-            unsafe { libc::waitpid(peer.pid as libc::pid_t, std::ptr::null_mut(), 0) };
+            pinned.kill();
+            let _ = pinned.reap();
         }
         assert!(
             !outlived,
             "the stand-in VMM (pid {}) was still there after the test that spawned it \
              panicked, and nothing else would have ended it for the rest of its 600 s",
-            peer.pid
+            pinned.pid()
         );
     }
 
@@ -4157,50 +4100,51 @@ mod tests {
     /// what nextest does to a test that outlives its timeout: nothing unwinds, so nothing
     /// is dropped. `forget` stands in for that here. What is left is the kernel, which
     /// must end the victim when the thread that spawned it goes away.
+    ///
+    /// It must do so with SIGTERM. SIGKILL is what [`assert_vmm_was_killed`] expects from the
+    /// production kill, and a victim spawned by mistake from a helper thread that returns
+    /// must not satisfy that assertion.
     #[test]
     fn a_victim_whose_guard_never_runs_dies_with_the_thread_that_spawned_it() {
-        use std::os::unix::process::ExitStatusExt;
+        use crate::test_child::Pinned;
 
         let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let victim = spawn_victim();
-            let peer = PeerVmm::from_pid(victim.id()).expect("pinning the stand-in VMM");
-            pinned_tx.send(peer).expect("handing the pidfd over");
-            std::mem::forget(victim);
-        })
-        .join()
-        .expect("the spawning thread returns");
-        let peer = pinned_rx.recv().expect("the victim was pinned");
+        std::thread::Builder::new()
+            .name("forgets-its-victim".to_string())
+            .spawn(move || {
+                let victim = spawn_victim();
+                pinned_tx
+                    .send(Pinned::new(victim.id()))
+                    .expect("handing the pidfd over");
+                std::mem::forget(victim);
+            })
+            .expect("spawning the thread that forgets its victim")
+            .join()
+            .expect("the spawning thread returns");
+        let pinned = pinned_rx.recv().expect("the victim was pinned");
 
-        // A pidfd polls readable once its process has terminated, reaped or not.
-        let mut terminated = libc::pollfd {
-            fd: peer.pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialised pollfd over a pidfd this test owns.
-        let died = unsafe { libc::poll(&mut terminated, 1, 5000) } > 0;
+        let died = pinned.terminated_within(Duration::from_secs(5));
         if !died {
             // Never leave behind the orphan this test exists to catch.
-            peer.kill_now("test cleanup: the stand-in VMM outlived the thread that spawned it");
+            pinned.kill();
         }
-        // Its handle was forgotten, so nothing has reaped it: it is still this process's
-        // child and its PID cannot have been recycled.
-        let mut status = 0;
-        // SAFETY: waiting on this process's own unreaped child.
-        let reaped = unsafe { libc::waitpid(peer.pid as libc::pid_t, &mut status, 0) };
+        // Its handle was forgotten, so nothing else reaps it.
+        let ended_by = pinned
+            .reap()
+            .expect("reaping the stand-in VMM through its pidfd");
 
         assert!(
             died,
             "the stand-in VMM (pid {}) was still running 5 s after the thread that spawned \
              it returned without dropping it; a test process that is killed outright would \
              leave it behind for the rest of its 600 s",
-            peer.pid
+            pinned.pid()
         );
-        assert_eq!(reaped, peer.pid as libc::pid_t, "reaping the stand-in VMM");
-        assert!(
-            killed_by_sigkill(std::process::ExitStatus::from_raw(status)),
-            "the kernel must end it with SIGKILL, got wait status {status:#x}"
+        assert_eq!(
+            ended_by,
+            Some(libc::SIGTERM),
+            "the kernel must end it with the pdeath signal, and that must not be the \
+             SIGKILL the production kill is recognised by"
         );
     }
 

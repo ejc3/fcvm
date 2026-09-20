@@ -3120,10 +3120,13 @@ fn working_set_replay_epilogue_rejects_an_unsuccessful_process_exit() {
 async fn working_set_replay_cleans_isolation_clones_after_failed_assertion() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-    let child = tokio::process::Command::new("sleep")
-        .arg("600")
-        .spawn()
-        .expect("spawning isolation-clone stand-in");
+    // The stand-in is moved into the production cleanup helper below, so it cannot sit behind
+    // a guard that kills on drop: that kill would hide the leak this test exists to detect.
+    // The kernel half alone ends it where this test fails before the hand-off.
+    let mut stand_in = tokio::process::Command::new("sleep");
+    stand_in.arg("600");
+    common::test_child::die_with_the_spawning_thread(stand_in.as_std_mut());
+    let child = stand_in.spawn().expect("spawning isolation-clone stand-in");
     let pid = child.id().expect("stand-in child has a PID");
     // Keep a race-free process handle after the Child is moved into the production cleanup
     // helper. If the RED path leaks it, this pidfd also lets the test clean it up safely.

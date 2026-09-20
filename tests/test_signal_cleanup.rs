@@ -7,6 +7,8 @@
 
 mod common;
 
+use common::test_child::{spawn_sleep, spawn_sleep_std, Pinned, TestChild};
+
 use anyhow::{Context, Result};
 use std::process::Command;
 use std::time::Duration;
@@ -1509,10 +1511,7 @@ fn test_sigterm_cleanup_routed() -> Result<()> {
 #[test]
 fn test_zombie_is_not_running_regression_628() {
     // Spawn a child we fully own (no root needed) and pin its identity while alive.
-    let mut child = Command::new("sleep")
-        .arg("1000")
-        .spawn()
-        .expect("spawn sleep child");
+    let mut child = spawn_sleep_std(1000);
     let pid = child.id();
 
     let tracked = Tracked::capture(pid).expect("capture live child");
@@ -1562,6 +1561,126 @@ fn test_zombie_is_not_running_regression_628() {
         !tracked.running(),
         "Tracked::running() must stay false after the zombie is reaped"
     );
+}
+
+/// Runs a stand-in test body on a named thread. `spawn` starts a guarded `sleep` and
+/// `let_go` is how that body stops holding it. The body runs inside a tokio runtime because
+/// the tokio flavour spawns only inside one. Returns how the thread ended and a pidfd on the
+/// child, taken while the body still held it.
+fn run_as_a_test_body<C: 'static>(
+    thread_name: &str,
+    spawn: fn() -> (C, u32),
+    let_go: fn(C),
+) -> (std::thread::Result<()>, Pinned) {
+    let (pinned_tx, pinned_rx) = std::sync::mpsc::channel();
+    let outcome = std::thread::Builder::new()
+        .name(thread_name.to_string())
+        .spawn(move || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("building the test body's runtime")
+                .block_on(async move {
+                    let (child, pid) = spawn();
+                    pinned_tx
+                        .send(Pinned::new(pid))
+                        .expect("handing the pidfd over");
+                    let_go(child);
+                })
+        })
+        .expect("spawning the test body's thread")
+        .join();
+    let pinned = pinned_rx
+        .recv()
+        .expect("the child was pinned while the body held it");
+    (outcome, pinned)
+}
+
+fn guarded_sleep_std() -> (TestChild<std::process::Child>, u32) {
+    let child = spawn_sleep_std(1000);
+    let pid = child.id();
+    (child, pid)
+}
+
+fn guarded_sleep_tokio() -> (TestChild<tokio::process::Child>, u32) {
+    let child = spawn_sleep(1000);
+    let pid = child.id().expect("tokio child PID");
+    (child, pid)
+}
+
+/// A `sleep` started through `common::test_child` must not outlive a test that fails before
+/// its own cleanup.
+///
+/// `test_zombie_is_not_running_regression_628` above has an `expect` and an assert between
+/// its spawn and its kill. A bare `Child` does nothing when it is dropped, so a failure there
+/// left `sleep 1000` behind as an orphan, and an orphan keeps every descriptor it inherited,
+/// including the build's lock on the cargo target directory.
+///
+/// The named thread is such a test body. The pidfd reads gone only once the process has been
+/// reaped, so a guard that kills without reaping fails this too. The library's unit tests
+/// cover the same guard. These two pin that an integration test reaches it through
+/// `tests/common`.
+#[test]
+fn test_spawned_sleep_does_not_outlive_a_test_that_panics() {
+    fn check<C: 'static>(flavour: &str, spawn: fn() -> (C, u32)) {
+        let (outcome, pinned) = run_as_a_test_body("panics-on-purpose", spawn, |_child| {
+            panic!("stand-in for an assert that fails before the child is ended")
+        });
+        assert!(outcome.is_err(), "the {flavour} test body must panic");
+
+        // Read the verdict, then clean up BEFORE asserting on it: where the child does
+        // outlive the panic, this test must not leak the orphan it exists to catch.
+        let outlived = pinned.is_present();
+        if outlived {
+            pinned.kill();
+            let _ = pinned.reap();
+        }
+        assert!(
+            !outlived,
+            "the {flavour} sleep (pid {}) was still there after the test body that spawned it \
+             panicked, and nothing else would have ended it for the rest of its 1000 s",
+            pinned.pid()
+        );
+    }
+
+    check("std", guarded_sleep_std);
+    check("tokio", guarded_sleep_tokio);
+}
+
+/// The exit no drop guard covers is the test process being killed outright, which is what
+/// nextest does to a test that outlives its timeout: nothing unwinds, so nothing is dropped.
+/// `forget` stands in for that here. What is left is the kernel, which must end the child
+/// when the thread that spawned it goes away.
+#[test]
+fn test_spawned_sleep_whose_guard_never_runs_dies_with_its_spawning_thread() {
+    fn check<C: 'static>(flavour: &str, spawn: fn() -> (C, u32)) {
+        let (outcome, pinned) = run_as_a_test_body("forgets-its-child", spawn, std::mem::forget);
+        outcome.expect("the spawning thread returns");
+
+        let died = pinned.terminated_within(Duration::from_secs(5));
+        if !died {
+            // Never leave behind the orphan this test exists to catch.
+            pinned.kill();
+        }
+        // Its handle was forgotten, so nothing else reaps it.
+        let ended_by = pinned.reap().expect("reaping the sleep through its pidfd");
+
+        assert!(
+            died,
+            "the {flavour} sleep (pid {}) was still running 5 s after the thread that spawned \
+             it returned without dropping it; a test process that is killed outright would \
+             leave it behind for the rest of its 1000 s",
+            pinned.pid()
+        );
+        assert_eq!(
+            ended_by,
+            Some(libc::SIGTERM),
+            "the kernel must end the {flavour} sleep with the pdeath signal"
+        );
+    }
+
+    check("std", guarded_sleep_std);
+    check("tokio", guarded_sleep_tokio);
 }
 
 /// Regression test for #628 (PID-reuse half): identity is `(pid, start_time)`, so a live pid

@@ -4,17 +4,17 @@
 //! Requires root (cgroup manipulation needs CAP_SYS_ADMIN).
 
 #[cfg(feature = "privileged-tests")]
+mod common;
+
+#[cfg(feature = "privileged-tests")]
 mod tests {
-    use std::process::Command;
+    use crate::common::test_child::spawn_sleep_std;
 
     /// Test that disable_cgroup_swap moves a process to /sys/fs/cgroup/fcvm.slice/fcvm-{pid}.scope
     /// with memory.swap.max=0, while not affecting the original cgroup.
     #[test]
     fn test_disable_cgroup_swap_isolates_process() {
-        let mut child = Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("failed to spawn sleep");
+        let mut child = spawn_sleep_std(300);
         let pid = child.id();
 
         // Read initial cgroup
@@ -62,14 +62,8 @@ mod tests {
     /// Test that two processes get separate cgroup scopes.
     #[test]
     fn test_disable_cgroup_swap_separate_scopes() {
-        let mut child1 = Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("failed to spawn sleep 1");
-        let mut child2 = Command::new("sleep")
-            .arg("300")
-            .spawn()
-            .expect("failed to spawn sleep 2");
+        let mut child1 = spawn_sleep_std(300);
+        let mut child2 = spawn_sleep_std(300);
         let pid1 = child1.id();
         let pid2 = child2.id();
 

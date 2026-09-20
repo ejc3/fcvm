@@ -10,6 +10,8 @@ pub mod setup;
 pub mod state;
 pub mod storage;
 #[cfg(test)]
+mod test_child;
+#[cfg(test)]
 mod test_env;
 pub mod uffd;
 pub mod utils;
