@@ -451,20 +451,32 @@ impl TempStore {
         podman
     }
 
-    /// Run `command`, which the caller aimed at this store, to its end.
+    /// Run `command`, which the caller aimed at this store, to its end, and then remove
+    /// the runroot. tokio does not kill a child when the future that waits for it is
+    /// dropped, so a caller that drops this one while the command runs leaves the
+    /// command running. The runroot stays in place then. It is removed once the child has
+    /// been reaped, never under a podman that still uses it.
     async fn finish(
         self,
         mut command: tokio::process::Command,
     ) -> std::io::Result<std::process::Output> {
+        // From here on a drop of this future leaves the directory where it is.
+        let runroot = self.runroot.keep();
         let output = command.output().await;
-        drop(self);
+        if let Err(error) = std::fs::remove_dir_all(&runroot) {
+            warn!(
+                runroot = %runroot.display(),
+                %error,
+                "removing the runroot of the temporary store"
+            );
+        }
         output
     }
 }
 
 /// Load `archive` into a new temporary store at `graphroot` and return what podman
-/// printed. The store's runroot exists only inside this function, so it is removed on
-/// every way out of it.
+/// printed. The store's runroot is removed once podman has ended, whatever it returned.
+/// A caller that drops this future while podman runs leaves both where they are.
 async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String> {
     let store = TempStore::new(graphroot)?;
     let mut load = store.podman();
