@@ -71,7 +71,16 @@ fn write_exec(path: &Path, body: &str) {
 /// real answer needs the VM-less pasta wiring these tests are not measuring.
 /// `dig` only has to exist: the probe's tool check looks it up before the
 /// namespace, and the query itself goes through the `nsenter` stub.
-fn write_guest_stubs(bin: &Path, calls: &Path) {
+///
+/// With `ready_when`, the address check answers only once that path exists.
+/// That is the stub's form of "pasta has come up": the real check polls for the
+/// guest address, which pasta configures. A stub pasta with something to do
+/// before the probe may end it creates that path when it is done.
+fn write_guest_stubs(bin: &Path, calls: &Path, ready_when: Option<&Path>) {
+    let ready = match ready_when {
+        Some(path) => format!("[ -e {} ] || exit 0; ", path.display()),
+        None => String::new(),
+    };
     write_exec(
         &bin.join("nsenter"),
         &format!(
@@ -81,7 +90,7 @@ fn write_guest_stubs(bin: &Path, calls: &Path) {
              \t\tdig) n=$(cat {calls} 2>/dev/null || echo 0); n=$((n + 1)); echo \"$n\" >{calls}\n\
              \t\t\t[ \"$n\" = 1 ] && echo 10.0.2.2 || echo 203.0.113.99\n\
              \t\t\texit 0 ;;\n\
-             \t\tpasta0) echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
+             \t\tpasta0) {ready}echo '2: pasta0    inet 10.0.2.100/24 scope global pasta0' ; exit 0 ;;\n\
              \tesac\n\
              done\n\
              exit 0\n",
@@ -299,7 +308,7 @@ fn the_probe_refuses_to_guess_which_pasta_to_run() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
-    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"), None);
     let work_root = tmp.path().join("work");
     std::fs::create_dir_all(&work_root).expect("create work root");
     let path = format!(
@@ -386,7 +395,7 @@ fn the_probe_refuses_a_pasta_bin_that_is_not_a_regular_file() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
-    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"), None);
     let work_root = tmp.path().join("work");
     std::fs::create_dir_all(&work_root).expect("create work root");
     let path = format!(
@@ -461,7 +470,7 @@ fn the_probe_leaves_no_work_directory_when_the_namespace_fails() {
     let tmp = tempfile::tempdir().expect("temp dir");
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
-    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"), None);
     // The kernel's refusal, without having to reconfigure the host. The tool
     // check ahead of it only asks whether `unshare` is on PATH.
     write_exec(
@@ -549,7 +558,7 @@ fn the_probe_leaves_no_dns_responder_behind() {
     // A pasta that stays up until the probe kills it, so the probe follows its
     // ordinary path through both `ask` calls.
     write_exec(&bin.join("pasta"), "#!/bin/bash\nexec sleep 60\n");
-    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"), None);
 
     // The probe's work directory comes from `mktemp -d`, so pointing TMPDIR
     // here makes every responder's command line carry this path and nothing
@@ -649,22 +658,34 @@ fn the_probe_does_not_wait_out_a_helper_that_ignores_sigterm() {
     let bin = tmp.path().join("bin");
     std::fs::create_dir_all(&bin).expect("create stub bin");
 
-    // A pasta that stays up until the probe ends it, and that first records
-    // its own SigIgn, so the test can tell whether SIGTERM really was ignored
-    // where the probe's helpers run.
+    // A pasta that records its own SigIgn, so the test can tell whether SIGTERM
+    // really was ignored where the probe's helpers run, and then stays up until
+    // the probe ends it.
+    //
+    // The probe starts pasta in the background and ends it as soon as the guest
+    // has answered, and the stubbed guest answers at once, so nothing in the
+    // probe orders the record before the SIGKILL. The stubbed address check
+    // therefore waits for the record (`ready_when`), which appears by rename so
+    // that it is never seen half written. The `sleep` ahead of it makes losing
+    // that race the ordinary case: without the wait this test fails on every
+    // run, not once in a while.
     let sigign = tmp.path().join("pasta-sigign");
     write_exec(
         &bin.join("pasta"),
         &format!(
             "#!/bin/bash\n\
-             while read -r key value; do\n\
-             \t[ \"$key\" = SigIgn: ] && echo \"$value\" >{sigign}\n\
-             done </proc/self/status\n\
+             if [ ! -e {sigign} ]; then\n\
+             \tsleep 0.3\n\
+             \twhile read -r key value; do\n\
+             \t\t[ \"$key\" = SigIgn: ] && echo \"$value\" >{sigign}.$$\n\
+             \tdone </proc/self/status\n\
+             \tmv {sigign}.$$ {sigign}\n\
+             fi\n\
              exec sleep 60\n",
             sigign = sigign.display()
         ),
     );
-    write_guest_stubs(&bin, &tmp.path().join("dig-calls"));
+    write_guest_stubs(&bin, &tmp.path().join("dig-calls"), Some(&sigign));
     let work_root = tmp.path().join("work");
     std::fs::create_dir_all(&work_root).expect("create work root");
     let path = format!(
