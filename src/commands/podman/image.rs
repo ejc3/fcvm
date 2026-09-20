@@ -564,6 +564,26 @@ mod tests {
         );
     }
 
+    /// podman before 5.1 refuses a longer `--runroot`: "the specified runroot is longer
+    /// than 50 characters" (pkg/domain/infra/runtime_libpod.go, 4.0.0 through 5.0.3).
+    /// Ubuntu 24.04 ships podman 4.9.3.
+    const PODMAN_RUNROOT_LIMIT: usize = 50;
+
+    #[test]
+    fn the_runroot_fits_what_podman_before_5_1_accepts() {
+        // The store path build_storage_image uses with the default assets directory.
+        let store = Path::new("/mnt/fcvm-btrfs/image-cache")
+            .join(format!("tmp-storage-{}", uuid::Uuid::new_v4()));
+        let podman = temp_store_podman(&store);
+        let args: Vec<&std::ffi::OsStr> = podman.as_std().get_args().collect();
+        let runroot = flag_value(&args, &flag("runroot")).expect("a runroot");
+        assert!(
+            runroot.len() <= PODMAN_RUNROOT_LIMIT,
+            "podman before 5.1 refuses this runroot, {} bytes: {runroot:?}",
+            runroot.len()
+        );
+    }
+
     #[test]
     fn every_podman_graphroot_flag_is_built_by_temp_store_podman() {
         // A hand-built call would bring the shared runroot back, and
