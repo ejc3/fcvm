@@ -147,7 +147,9 @@ fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
 /// removal's first. A store that is still in use when the wait expires is left as it is,
 /// mounts and directory: taking either away under a process that can open the store
 /// again is the race this cleanup exists to avoid. The failure names the process and
-/// the directory.
+/// the directory. The directory also stays when something is still mounted below it
+/// after the detach, or when the mount table cannot be read: removing it would walk into
+/// the mount.
 fn clean_up_private_store(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
@@ -177,16 +179,28 @@ fn clean_up_within(
         Ok(()) => {
             detach(&root);
             match mounts_below(&root) {
-                Ok(mounts) if mounts.is_empty() => {}
-                Ok(mounts) => failures.push(format!(
-                    "still mounted below {} after the cleanup: {mounts:?}",
-                    root.display()
-                )),
-                Err(error) => failures.push(format!("reading the mount table: {error:#}")),
-            }
-            // Dropping it would ignore a removal that fails.
-            if let Err(error) = scratch.close() {
-                failures.push(format!("removing {}: {error}", root.display()));
+                // Dropping it would ignore a removal that fails.
+                Ok(mounts) if mounts.is_empty() => {
+                    if let Err(error) = scratch.close() {
+                        failures.push(format!("removing {}: {error}", root.display()));
+                    }
+                }
+                // Removing the directory would walk into what is still mounted.
+                Ok(mounts) => {
+                    let kept = scratch.keep();
+                    failures.push(format!(
+                        "still mounted below {} after the cleanup: {mounts:?}\nleft {} in place",
+                        root.display(),
+                        kept.display()
+                    ));
+                }
+                Err(error) => {
+                    let kept = scratch.keep();
+                    failures.push(format!(
+                        "reading the mount table: {error:#}\nleft {} in place",
+                        kept.display()
+                    ));
+                }
             }
         }
         Err(error) => {
