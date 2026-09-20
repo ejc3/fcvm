@@ -440,7 +440,7 @@ Btrfs mode requires a btrfs kernel profile: `./fcvm setup --kernel-profile btrfs
 
 ### Guest OS and Kernel
 
-Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. fcvm publishes its default kernel for arm64 and amd64 with FUSE plus the socket-diagnostic options required for safe snapshot cleanup. `fcvm setup` downloads the content-addressed artifact; release jobs build it from the pinned profile recipe. Custom kernels use `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
+Guest VMs run Ubuntu 24.04 LTS with Podman, crun, and fuse-overlayfs. fcvm publishes its default kernel for arm64 and amd64 with FUSE plus the socket-diagnostic options required for safe snapshot cleanup. `fcvm setup` downloads the content-addressed artifact; release jobs build it from the pinned profile recipe. The release workflow also builds and publishes the `nested` and `btrfs` profiles for both architectures. Custom kernels use `--kernel-profile`; see [DESIGN.md](DESIGN.md#kernel-profiles).
 
 ---
 

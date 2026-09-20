@@ -401,13 +401,7 @@ async fn ensure_custom_kernel(
     }
 
     // Try to download from GitHub releases
-    let tag = format!(
-        "kernel-{}-{}-{}-{}",
-        profile_name,
-        profile.kernel_version,
-        std::env::consts::ARCH,
-        sha
-    );
+    let tag = custom_kernel_release_tag(profile_name, &profile.kernel_version, &sha);
     let download_url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         profile.kernel_repo, tag, filename
@@ -517,7 +511,7 @@ pub fn compute_profile_kernel_sha(profile: &KernelProfile) -> Result<String> {
 /// configured inputs are hashed and must match. A packaged binary has no
 /// `kernel/` tree, so a published profile's validated manifest SHA is the
 /// authoritative release identifier there.
-fn compute_profile_kernel_sha_at_root(
+pub fn compute_profile_kernel_sha_at_root(
     profile: &KernelProfile,
     repo_root: Option<&Path>,
 ) -> Result<String> {
@@ -639,6 +633,20 @@ fn compute_profile_kernel_sha_from_inputs(
     Ok(compute_sha256_short(&content))
 }
 
+/// Get the release tag a custom kernel is published under and downloaded from.
+///
+/// scripts/kernel-release-identity.py derives the same tag for the jobs that
+/// publish; tests/test_default_kernel_release.rs compares the two.
+pub fn custom_kernel_release_tag(profile_name: &str, kernel_version: &str, sha: &str) -> String {
+    format!(
+        "kernel-{}-{}-{}-{}",
+        profile_name,
+        kernel_version,
+        std::env::consts::ARCH,
+        sha
+    )
+}
+
 /// Get the custom kernel filename.
 pub fn custom_kernel_filename(profile_name: &str, kernel_version: &str, sha: &str) -> String {
     format!(
@@ -740,6 +748,28 @@ if ! validate_kernel_tarball "$KERNEL_TARBALL"; then
 fi"#
 }
 
+/// The directory, relative to the repo root, whose `*.patch` files a kernel
+/// build applies, given a table's `patches_dir`.
+///
+/// An omitted value applies `kernel/patches`; only an explicit empty string
+/// applies none. scripts/kernel-patch.sh reads an omitted value differently: on
+/// arm64 it falls back to `kernel/patches-arm64`. So every shipped profile
+/// table names its directory, and lists those patches in `build_inputs` so its
+/// tag changes when they do. tests/test_default_kernel_release.rs holds the
+/// tables to both.
+fn patches_dir_or_default(patches_dir: Option<&str>) -> Option<&str> {
+    match patches_dir {
+        Some("") => None,
+        Some(dir) => Some(dir),
+        None => Some("kernel/patches"),
+    }
+}
+
+/// [`patches_dir_or_default`] for a VM kernel profile.
+pub fn vm_kernel_patches_dir(profile: &KernelProfile) -> Option<&str> {
+    patches_dir_or_default(profile.patches_dir.as_deref())
+}
+
 /// Generate VM kernel build script dynamically from profile config.
 ///
 /// The script is written to a temp file and executed. This allows us to:
@@ -764,12 +794,7 @@ fn generate_vm_kernel_build_script(
     };
 
     // Get config from profile
-    // Empty string means no patches, None means use default
-    let patches_dir = match profile.patches_dir.as_deref() {
-        Some("") => None, // Explicitly disabled
-        Some(p) => Some(repo_root.join(p)),
-        None => Some(repo_root.join("kernel/patches")), // Default
-    };
+    let patches_dir = vm_kernel_patches_dir(profile).map(|p| repo_root.join(p));
 
     let kernel_config = profile.kernel_config.as_deref().map(|p| repo_root.join(p));
 
@@ -1053,12 +1078,8 @@ fn generate_host_kernel_build_script(
     let kernel_version = &config.kernel_version;
     let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
 
-    // Empty string means no patches, None means use default
-    let patches_dir = match config.patches_dir.as_deref() {
-        Some("") => None, // Explicitly disabled
-        Some(p) => Some(repo_root.join(p)),
-        None => Some(repo_root.join("kernel/patches")), // Default
-    };
+    let patches_dir =
+        patches_dir_or_default(config.patches_dir.as_deref()).map(|p| repo_root.join(p));
 
     let script = format!(
         r##"#!/bin/bash

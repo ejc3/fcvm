@@ -1,0 +1,27 @@
+name: Verify Kernel Releases
+
+# The weekly run of the release check that kernels.yml runs after its builds.
+# It is a workflow of its own because ci.yml and build-runner-ami.yml start on
+# every completed "Build Kernels" run on main, whatever event began it. A
+# scheduled check under that name would start the full CI matrix and queue a
+# runner AMI build every week.
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+jobs:
+  verify-releases:
+    name: Verify Kernel Releases
+    runs-on: ubuntu-latest
+    # Six HEAD requests after a checkout. 10 is generous; GitHub's default is six hours.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check that every published kernel has its release asset
+        run: python3 scripts/verify-kernel-releases.py

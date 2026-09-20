@@ -37,6 +37,8 @@ jobs:
           - config_arch: amd64
             runner_arch: X64
     runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write
     steps:
@@ -76,53 +78,12 @@ jobs:
         env:
           CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          mapfile -t METADATA < <(python3 - <<'PY'
-          import glob
-          import hashlib
-          import os
-          import pathlib
-          import tomllib
-
-          config = tomllib.load(open("rootfs-config.toml", "rb"))
-          profile = config["kernel_profiles"]["default"][os.environ["CONFIG_ARCH"]]
-          digest = hashlib.sha256()
-          for pattern in profile["build_inputs"]:
-              matches = sorted(pathlib.Path(path) for path in glob.glob(pattern))
-              if not matches:
-                  raise SystemExit(f"build input matched no files: {pattern}")
-              for path in matches:
-                  if not str(path).endswith(".disabled"):
-                      digest.update(path.read_bytes())
-          print(profile["kernel_version"])
-          print(digest.hexdigest()[:12])
-          print(profile["kernel_sha"])
-          PY
-          )
-
-          VERSION="${METADATA[0]}"
-          SHA="${METADATA[1]}"
-          MANIFEST_SHA="${METADATA[2]}"
-          if [ "$SHA" != "$MANIFEST_SHA" ]; then
-            echo "ERROR: kernel_sha $MANIFEST_SHA does not match build_inputs hash $SHA"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-          case "$CONFIG_ARCH" in
-            arm64) EXPECTED_ARCH=aarch64 ;;
-            amd64) EXPECTED_ARCH=x86_64 ;;
-            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
-          esac
-          if [ "$ARCH" != "$EXPECTED_ARCH" ]; then
-            echo "ERROR: $CONFIG_ARCH matrix entry ran on $ARCH, expected $EXPECTED_ARCH"
-            exit 1
-          fi
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-default-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-default-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
+          # One script derives the version, SHA, tag and file name for every job
+          # here, the way `fcvm setup` derives what it downloads. It checks
+          # kernel_sha and the runner's architecture, and prints nothing unless
+          # all of it holds, so a failure stops the job here.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py default "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -189,7 +150,10 @@ jobs:
             gh release delete "$TAG" --yes
           fi
 
-          gh release create "$TAG" \
+          # The tag is created at the commit that was built, so checking it out
+          # gives the inputs it names. Without --target it lands on the default
+          # branch's head.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
             --title "Default Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "Default fcvm guest kernel with FUSE and snapshot-safe selective socket cleanup support.
 
@@ -210,8 +174,22 @@ jobs:
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
 
   build-nested-kernel:
-    name: Build Nested Kernel
-    runs-on: [self-hosted, Linux, ARM64]
+    name: Build Nested Kernel (${{ matrix.config_arch }})
+    # One leg per architecture table the nested profile defines in
+    # rootfs-config.toml, for the reason given on build-btrfs-kernel: setup
+    # downloads the release named for the host it runs on, and
+    # kernel_profiles.nested.amd64 names a kernel_repo.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -255,32 +233,15 @@ jobs:
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force
 
-      - name: Compute kernel version and SHA
+      - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
+        env:
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # SHA must match fcvm's content-addressed kernel naming:
-          # build_inputs for kernel_profiles.nested.arm64 in rootfs-config.toml
-          SHA=$(cat kernel/nested.conf kernel/patches-arm64/*.patch | sha256sum | cut -c1-12)
-
-          # Version from the checked-out repo config (the source of truth)
-          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['nested']['arm64']['kernel_version'])")
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: kernel_version not found for kernel_profiles.nested.arm64 in rootfs-config.toml"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-nested-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-nested-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
-
-          echo "Kernel version: $VERSION"
-          echo "Architecture: $ARCH"
-          echo "Build SHA: $SHA"
+          # The shared identity script; see build-default-kernel.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py nested "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -343,8 +304,14 @@ jobs:
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
         run: |
-          # Build the nested kernel using fcvm
-          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
+          # This step runs only when the job has decided to build: the release is
+          # absent, or force_build asked for a replacement. --force-build-kernels
+          # builds from source either way. Without it setup returns a kernel file
+          # an earlier CI job left on this runner under the same name, or
+          # downloads the release being replaced, and that becomes the release.
+          # --build-kernels stays because setup fetches the default kernel first
+          # and has to build it when that release is absent.
+          sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --force-build-kernels
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
@@ -365,6 +332,7 @@ jobs:
         working-directory: fcvm
         env:
           GH_TOKEN: ${{ github.token }}
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
           TAG="${{ steps.kernel.outputs.tag }}"
           FILENAME="${{ steps.kernel.outputs.filename }}"
@@ -372,15 +340,13 @@ jobs:
           SHA="${{ steps.kernel.outputs.sha }}"
           ARCH="${{ steps.kernel.outputs.arch }}"
 
-          # Delete existing release if force rebuilding
-          if [ "${{ inputs.force_build }}" == "true" ]; then
-            gh release delete "$TAG" --yes 2>/dev/null || true
-          fi
-
-          # Create release with kernel binary
-          gh release create "$TAG" \
-            --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
-            --notes "Nested kernel for running fcvm inside fcvm (nested virtualization).
+          # The legs nest by different mechanisms (FEAT_NV2 on arm64, VT-x or
+          # AMD-V on x86_64), so each publishes notes that are true for it.
+          # This runs before the delete below, so an architecture with no notes
+          # fails while its published release still exists.
+          case "$CONFIG_ARCH" in
+            arm64)
+              NOTES="Nested kernel for running fcvm inside fcvm (nested virtualization).
 
           ## Kernel Details
 
@@ -416,7 +382,56 @@ jobs:
           fcvm podman run --kernel-profile nested --privileged --name outer alpine:latest
           # Inside VM: fcvm podman run --name inner alpine:latest
           \`\`\`
-          " \
+          "
+              ;;
+            amd64)
+              NOTES="Nested kernel for running fcvm inside fcvm (nested virtualization).
+
+          ## Kernel Details
+
+          | Property | Value |
+          |----------|-------|
+          | Version | ${VERSION} |
+          | Build SHA | ${SHA} |
+          | Architecture | ${ARCH} |
+
+          ## Features
+
+          - **CONFIG_KVM=y, CONFIG_KVM_INTEL=y, CONFIG_KVM_AMD=y** - KVM hypervisor built-in for Intel VT-x and AMD-V
+          - **FUSE support** - For volume mounts between host and guest
+          - **FUSE remap_file_range patch** - Enables reflink/CoW through FUSE
+
+          ## Requirements
+
+          - **Host**: x86_64 with Intel VT-x or AMD-V (AWS: c5.metal or another bare-metal instance)
+          - **Host KVM**: nested virtualization enabled (\`nested=1\` for \`kvm_intel\` or \`kvm_amd\`)
+
+          ## Known limitation
+
+          x86 nested KVM does not survive a snapshot restore of the outer VM (#664). An outer VM that fcvm restores from its snapshot cache has no usable VMX, and an inner VM started in it times out. Start the outer VM with \`--no-snapshot\` so it cold boots, as below. The inner-VM tests run on arm64 only, so CI does not cover this flow on x86_64.
+
+          ## Usage
+
+          \`\`\`bash
+          fcvm setup --kernel-profile nested
+          fcvm podman run --kernel-profile nested --privileged --no-snapshot --name outer alpine:latest
+          # Inside VM: fcvm podman run --name inner alpine:latest
+          \`\`\`
+          "
+              ;;
+            *) echo "ERROR: unsupported config arch $CONFIG_ARCH"; exit 1 ;;
+          esac
+
+          # Delete existing release if force rebuilding
+          if [ "${{ inputs.force_build }}" == "true" ]; then
+            gh release delete "$TAG" --yes 2>/dev/null || true
+          fi
+
+          # Create the release, and its tag at the commit that was built; see
+          # build-default-kernel.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
+            --title "Nested Kernel ${VERSION} (${ARCH}) - ${SHA}" \
+            --notes "$NOTES" \
             "/tmp/$FILENAME"
 
           echo "✅ Created release: $TAG"
@@ -435,8 +450,23 @@ jobs:
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
 
   build-btrfs-kernel:
-    name: Build Btrfs Kernel
-    runs-on: [self-hosted, Linux, ARM64]
+    name: Build Btrfs Kernel (${{ matrix.config_arch }})
+    # One leg per architecture table the btrfs profile defines in
+    # rootfs-config.toml. `fcvm setup --kernel-profile btrfs` downloads the
+    # release named for the host it runs on, so an architecture with a table
+    # and no leg here has nothing to download: after the move to 6.18.50 an
+    # x86_64 host got a 404 for kernel-btrfs-6.18.50-x86_64-<sha>.
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - config_arch: arm64
+            runner_arch: ARM64
+          - config_arch: amd64
+            runner_arch: X64
+    runs-on: [self-hosted, Linux, "${{ matrix.runner_arch }}"]
+    # Longest successful job in the last 30 runs: 10.6 min. 60 is over 5x that; GitHub's default is six hours.
+    timeout-minutes: 60
     permissions:
       contents: write  # Required for creating releases
     steps:
@@ -480,32 +510,15 @@ jobs:
           # kernel build below uses this checkout, not stale per-runner state.
           ./target/release/fcvm setup --generate-config --force
 
-      - name: Compute kernel version and SHA
+      - name: Compute and verify release identity
         id: kernel
         working-directory: fcvm
+        env:
+          CONFIG_ARCH: ${{ matrix.config_arch }}
         run: |
-          # SHA must match fcvm's content-addressed kernel naming:
-          # build_inputs for kernel_profiles.btrfs.arm64 in rootfs-config.toml (no patches)
-          SHA=$(cat kernel/btrfs.conf | sha256sum | cut -c1-12)
-
-          # Version from the checked-out repo config (the source of truth)
-          VERSION=$(python3 -c "import tomllib; print(tomllib.load(open('rootfs-config.toml','rb'))['kernel_profiles']['btrfs']['arm64']['kernel_version'])")
-          if [ -z "$VERSION" ]; then
-            echo "ERROR: kernel_version not found for kernel_profiles.btrfs.arm64 in rootfs-config.toml"
-            exit 1
-          fi
-
-          ARCH=$(uname -m)
-
-          echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "arch=$ARCH" >> $GITHUB_OUTPUT
-          echo "sha=$SHA" >> $GITHUB_OUTPUT
-          echo "tag=kernel-btrfs-${VERSION}-${ARCH}-${SHA}" >> $GITHUB_OUTPUT
-          echo "filename=vmlinux-btrfs-${VERSION}-${ARCH}-${SHA}.bin" >> $GITHUB_OUTPUT
-
-          echo "Kernel version: $VERSION"
-          echo "Architecture: $ARCH"
-          echo "Build SHA: $SHA"
+          # The shared identity script; see build-default-kernel.
+          IDENTITY=$(python3 scripts/kernel-release-identity.py btrfs "$CONFIG_ARCH")
+          printf '%s\n' "$IDENTITY" | tee -a "$GITHUB_OUTPUT"
 
       - name: Install GitHub CLI
         run: |
@@ -568,8 +581,8 @@ jobs:
         if: steps.check.outputs.exists == 'false' || inputs.force_build == true
         working-directory: fcvm
         run: |
-          # Build the btrfs kernel using fcvm
-          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+          # Always from source; see build-nested-kernel.
+          sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels --force-build-kernels
 
           # The built kernel must match the exact version/arch/SHA we publish under
           KERNEL_PATH="/tmp/${{ steps.kernel.outputs.filename }}"
@@ -602,8 +615,9 @@ jobs:
             gh release delete "$TAG" --yes 2>/dev/null || true
           fi
 
-          # Create release with kernel binary
-          gh release create "$TAG" \
+          # Create the release, and its tag at the commit that was built; see
+          # build-default-kernel.
+          gh release create "$TAG" --target "$GITHUB_SHA" \
             --title "Btrfs Kernel ${VERSION} (${ARCH}) - ${SHA}" \
             --notes "Kernel with FUSE and btrfs support for efficient container storage.
 
@@ -650,3 +664,27 @@ jobs:
           echo "| Tag | ${{ steps.kernel.outputs.tag }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Filename | ${{ steps.kernel.outputs.filename }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Already Existed | ${{ steps.check.outputs.exists }} |" >> $GITHUB_STEP_SUMMARY
+
+  verify-releases:
+    name: Verify Kernel Releases
+    # Every automated consumer passes --build-kernels, so a release that is
+    # missing becomes a silent local build and nobody sees the 404. That is how
+    # the x86_64 btrfs and nested kernels stayed unpublished. This asks for each
+    # asset `fcvm setup` downloads, after the build jobs of the same run whatever
+    # they concluded. A cancelled run is left alone: its legs may not have
+    # published yet, and a red check there would only report the cancellation.
+    # verify-kernel-releases.yml runs the same check weekly.
+    needs: [build-default-kernel, build-nested-kernel, build-btrfs-kernel]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    # Six HEAD requests after a checkout. 10 is generous; GitHub's default is six hours.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      - name: Check that every published kernel has its release asset
+        run: python3 scripts/verify-kernel-releases.py
