@@ -1469,7 +1469,8 @@ fcvm snapshot create my-vm --tag warm-nginx
 
 **Usage**:
 ```bash
-fcvm snapshot serve <SNAPSHOT_NAME> [--uffd-mode copy|minor] [--uffd-prefetch on|off]
+fcvm snapshot serve <SNAPSHOT_NAME> [--uffd-mode copy|minor] [--uffd-fault-around BYTES]
+                    [--uffd-prefetch on|off]
 ```
 
 The memory server:
@@ -1488,6 +1489,7 @@ The memory server:
 | Flag | Env var | Default | Effect |
 |------|---------|---------|--------|
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
+| `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. `0`, or a power of two from the host page size through `2097152`. Each fault privately materialises its whole granule, so memory per clone grows and clones per host drop: a locality analysis of one 128 GiB workload projects 7.6x fewer faults for 2.1x the memory at 64 KiB, and 209x fewer for 2.45x at 2 MiB. A non-zero value with `--uffd-mode minor` is an error. For large guests whose clones do real work right after restore |
 | `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
 
 **Example**:
@@ -1499,6 +1501,7 @@ fcvm snapshot serve my-snapshot
 fcvm snapshot serve my-snapshot --uffd-prefetch off
 ```
 
+See "Fault-Around" in `AGENTS.md` for what `--uffd-fault-around` trades and when to use it.
 See "Working-Set Replay" in `AGENTS.md` for the fault-locality data behind the default and for
 the invalidation/isolation rules.
 

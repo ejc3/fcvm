@@ -2584,6 +2584,56 @@ terminate the pinned VMM rather than leaving its guest wedged on an unserved fau
 speculative-population, and persistence failures degrade to ordinary demand paging because they
 do not stop fault service.
 
+### Fault-Around (`--uffd-fault-around <BYTES>`, default off)
+
+Replay covers the pages every clone touches. It cannot cover a clone that does fresh work right
+after restore, because the memory that work allocates lands on different pages in every clone.
+Measured on a 128 GiB guest: the first real page render in a fresh clone took 541 s while the
+clone demand-faulted 3.3 million pages (12.7 GiB), one userfaultfd round trip each. The same
+render took 305 s in a clone whose recorded set already held those pages (110 MiB faulted).
+
+Those faults cluster even though their addresses differ between clones. A locality analysis of
+13.1 million demand-faulted pages from that workload projects:
+
+| granule | demand faults | memory materialised |
+|---------|---------------|---------------------|
+| 4 KiB (off) | 1x | 1x |
+| 64 KiB | 7.6x fewer | 2.1x |
+| 2 MiB | 209x fewer | 2.45x |
+
+- **What it does**: copy mode only. On a demand fault the server copies the faulting page and
+  wakes its vCPU exactly as it does without the option, so that fault's latency is unchanged.
+  It then populates the rest of the granule that holds the page: the pages after it first,
+  then the pages before it. The granule is `BYTES` aligned in snapshot file offsets and
+  clipped to the memory region that took the fault. Pages that are already present are
+  stepped over.
+- **The trade is density**: every fault privately materialises its whole granule whether or
+  not the guest touches the rest of it, so memory per clone grows by the projected factor in
+  the table. Where memory is what limits a host, clones per host drop by about the same
+  factor. Neither number has been measured with the option on. Idle clones are unaffected,
+  because a clone that does not fault populates nothing.
+- **When to use it**: large guests whose clones do real work right after restore, where the
+  time goes to round trips for pages no earlier clone touched. Leave it off for clones that
+  mostly stay inside the recorded working set, and for hosts packed for density.
+- **Values**: 0 (off), or a power of two from the host page size through 2097152 (2 MiB).
+  Anything else is a usage error, and so is a non-zero value with `--uffd-mode minor`, where
+  it is not implemented: minor faults are resolved with `UFFDIO_CONTINUE` onto shared pages
+  and have no populate step to extend. A hugepage clone's own page is already 2 MiB, so the
+  option does nothing for it and the server logs that. `FCVM_UFFD_FAULT_AROUND` carries the
+  same value to the implicit server inside `snapshot run`.
+- **It is speculation, under replay's rule**: it goes through the chunk population replay
+  uses (`prefetch::populate_chunk_counted`), and a refused copy, which includes the
+  zero-progress `EAGAIN` while `mmap_changing` is raised, abandons that granule to demand
+  paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
+  the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
+- **The working set stays demand-only**: only the demanded page is recorded. Recording the
+  granule would turn the hint into its own prediction, and replay would then populate that
+  into every later clone.
+- **Measuring it**: at handler exit the serve logs `fault-around populated pages beyond the
+  demanded ones` with `granules`, `extra_pages`, `extra_mib` and `refused_granules`, next to
+  the existing `VM exited` line and its `fault_count`. Compare `fault_count` between an arm
+  with the option and an arm without it, and read the memory cost from `extra_mib`.
+
 ### FUSE Parallelism (fuse-pipe)
 
 **Kernel clone fd model (`FUSE_DEV_IOC_CLONE`):**
