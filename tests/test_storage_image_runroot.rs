@@ -87,7 +87,7 @@ fn test_storage_image_build_leaves_running_containers_attached() -> Result<()> {
         .context("running the test body against the private store")?;
 
     // Before `scratch` is dropped, and whatever the child did.
-    let cleaned = clean_up_private_store(&root, || remove_reference(&conf, &reference));
+    let cleaned = clean_up_private_store(scratch, || remove_reference(&conf, &reference));
 
     let (stdout, stderr) = (
         String::from_utf8_lossy(&output.stdout),
@@ -133,26 +133,36 @@ fn remove_reference(conf: &Path, reference: &str) -> Result<()> {
 }
 
 /// Leave nothing of the private store behind: no container, no process that can open
-/// the store again, and no mount. In that order, because a process that opens the store
-/// mounts its overlay home, and a mount made after the detach keeps the directory on the
-/// host when it is removed. `remove_container` is the step that needs podman, so that
-/// the rest can be tested without one.
+/// the store again, no mount, and no directory. In that order, because a process that
+/// opens the store mounts its overlay home, and a mount made after the detach keeps the
+/// directory on the host when it is removed. `remove_container` is the step that needs
+/// podman, so that the rest can be tested without one.
 ///
-/// Every step runs whatever the one before it returned, because the scratch directory
-/// is dropped whatever this returns. Every failure is reported, the removal's first.
+/// Every step runs whatever the one before it returned. Every failure is reported, the
+/// removal's first.
 fn clean_up_private_store(
-    root: &Path,
+    scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
+    clean_up_within(scratch, remove_container, STORE_PROCESS_TIMEOUT)
+}
+
+/// `clean_up_private_store` with the wait's limit as a parameter, for the tests.
+fn clean_up_within(
+    scratch: tempfile::TempDir,
+    remove_container: impl FnOnce() -> Result<()>,
+    limit: Duration,
+) -> Result<()> {
+    let root = scratch.path().canonicalize()?;
     let mut failures = Vec::new();
     if let Err(error) = remove_container() {
         failures.push(format!("removing the container: {error:#}"));
     }
-    if let Err(error) = wait_until_store_is_unused(root, STORE_PROCESS_TIMEOUT) {
+    if let Err(error) = wait_until_store_is_unused(&root, limit) {
         failures.push(format!("{error:#}"));
     }
-    detach_mounts_below(root);
-    match mounts_below(root) {
+    detach_mounts_below(&root);
+    match mounts_below(&root) {
         Ok(mounts) if mounts.is_empty() => {}
         Ok(mounts) => failures.push(format!(
             "still mounted below {} after the cleanup: {mounts:?}",
@@ -160,6 +170,7 @@ fn clean_up_private_store(
         )),
         Err(error) => failures.push(format!("reading the mount table: {error:#}")),
     }
+    drop(scratch);
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("\n"));
     Ok(())
 }
@@ -286,9 +297,9 @@ impl Drop for StandIn {
     }
 }
 
-/// `sleep` under another program's name: a symlink `<dir>/<program>`, run by that path,
-/// so the kernel's name for the process is `program`.
-fn stand_in(dir: &Path, program: &str, stdin: Stdio) -> Result<StandIn> {
+/// `sleep <secs>` under another program's name: a symlink `<dir>/<program>`, run by that
+/// path, so the kernel's name for the process is `program`.
+fn stand_in(dir: &Path, program: &str, secs: &str, stdin: Stdio) -> Result<StandIn> {
     std::fs::create_dir_all(dir)?;
     let sleep = ["/usr/bin/sleep", "/bin/sleep"]
         .into_iter()
@@ -297,16 +308,16 @@ fn stand_in(dir: &Path, program: &str, stdin: Stdio) -> Result<StandIn> {
         .context("no sleep on this host")?;
     std::os::unix::fs::symlink(sleep, dir.join(program))?;
     let mut command = Command::new(dir.join(program));
-    command.arg(STAND_IN_SECS).stdin(stdin);
+    command.arg(secs).stdin(stdin);
     common::set_test_pdeathsig_std(&mut command);
     Ok(StandIn(command.spawn().context("starting the stand-in")?))
 }
 
 /// Run the cleanup with a removal that returns at once, and say whether the stand-in was
 /// running at the removal and whether it was gone when the cleanup returned.
-fn clean_up_next_to(stand_in: &mut StandIn, root: &Path) -> Result<()> {
+fn clean_up_next_to(stand_in: &mut StandIn, scratch: tempfile::TempDir) -> Result<()> {
     let mut running_at_removal = false;
-    clean_up_private_store(root, || {
+    clean_up_private_store(scratch, || {
         running_at_removal = stand_in.0.try_wait()?.is_none();
         Ok(())
     })?;
@@ -335,9 +346,15 @@ fn clean_up_next_to(stand_in: &mut StandIn, root: &Path) -> Result<()> {
 fn the_cleanup_waits_for_a_process_that_still_names_the_store() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
-    let mut conmon = stand_in(&root.join("bin"), "conmon", Stdio::null())?;
+    let mut conmon = stand_in(&root.join("bin"), "conmon", STAND_IN_SECS, Stdio::null())?;
     std::fs::write(root.join(CONMON_PIDFILE), conmon.0.id().to_string())?;
-    clean_up_next_to(&mut conmon, &root)
+    clean_up_next_to(&mut conmon, scratch)
+}
+
+/// A file under `root` that is held open, as the standard input of a stand-in.
+fn held_under(root: &Path) -> Result<Stdio> {
+    std::fs::write(root.join("held"), "")?;
+    Ok(Stdio::from(std::fs::File::open(root.join("held"))?))
 }
 
 /// The exit command holds the store's database and lock files while it runs, and
@@ -348,10 +365,8 @@ fn the_cleanup_waits_for_a_process_that_holds_a_file_under_the_store() -> Result
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
     let outside = tempfile::TempDir::new()?;
-    std::fs::write(root.join("held"), "")?;
-    let held = std::fs::File::open(root.join("held"))?;
-    let mut podman = stand_in(outside.path(), "podman", Stdio::from(held))?;
-    clean_up_next_to(&mut podman, &root)
+    let mut podman = stand_in(outside.path(), "podman", STAND_IN_SECS, held_under(&root)?)?;
+    clean_up_next_to(&mut podman, scratch)
 }
 
 /// Detaches what a test mounted below its scratch directory on every way out of it.
@@ -363,8 +378,7 @@ impl Drop for MountsBelow {
     }
 }
 
-/// When `podman rm` fails, the store still has to be released: the scratch directory is
-/// dropped whatever the cleanup returns.
+/// When `podman rm` fails, the store still has to be released.
 #[test]
 fn a_failed_removal_does_not_skip_the_wait_and_the_detach() -> Result<()> {
     anyhow::ensure!(
@@ -384,11 +398,9 @@ fn a_failed_removal_does_not_skip_the_wait_and_the_detach() -> Result<()> {
         nix::mount::MsFlags::MS_BIND,
         None::<&str>,
     )?;
-    std::fs::write(root.join("held"), "")?;
-    let held = std::fs::File::open(root.join("held"))?;
-    let mut podman = stand_in(outside.path(), "podman", Stdio::from(held))?;
+    let mut podman = stand_in(outside.path(), "podman", STAND_IN_SECS, held_under(&root)?)?;
 
-    let cleaned = clean_up_private_store(&root, || anyhow::bail!("podman rm said no"));
+    let cleaned = clean_up_private_store(scratch, || anyhow::bail!("podman rm said no"));
 
     let mut skipped = Vec::new();
     if podman.0.try_wait()?.is_none() {
@@ -403,6 +415,44 @@ fn a_failed_removal_does_not_skip_the_wait_and_the_detach() -> Result<()> {
         cleaned.expect_err("the removal's error is the result")
     );
     anyhow::ensure!(error.contains("podman rm said no"), "{error}");
+    Ok(())
+}
+
+/// Removes a directory a test had the cleanup leave in place.
+struct RemoveTree(PathBuf);
+
+impl Drop for RemoveTree {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A process that still uses the store when the wait expires keeps it. Detaching the
+/// mounts and removing the directory under it is the race this cleanup exists to avoid:
+/// it can mount the store's overlay home again afterwards.
+#[test]
+fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    // Declared first, so it runs last: after the stand-in below has been killed.
+    let _remove = RemoveTree(root.clone());
+    let outside = tempfile::TempDir::new()?;
+    let podman = stand_in(outside.path(), "podman", "600", held_under(&root)?)?;
+
+    let cleaned = clean_up_within(scratch, || Ok(()), Duration::from_millis(300));
+
+    let error = format!(
+        "{:#}",
+        cleaned.expect_err("a store that is still in use is a failure")
+    );
+    anyhow::ensure!(
+        error.contains(&format!("{} podman", podman.0.id())),
+        "{error}"
+    );
+    anyhow::ensure!(
+        root.join("held").exists(),
+        "the store was removed under a process that still uses it:\n{error}"
+    );
     Ok(())
 }
 
