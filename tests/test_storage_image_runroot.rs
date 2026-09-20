@@ -41,6 +41,11 @@ const RUNROOT: &str = "run";
 /// Where podman is told to write conmon's pid, below the scratch directory.
 const CONMON_PIDFILE: &str = "conmon.pid";
 
+/// conmon's pid and its start time, written by the test body while the reference
+/// container runs. A pid names whatever process holds the number now. With the start
+/// time it names one process.
+const CONMON_IDENTITY: &str = "conmon.identity";
+
 /// Bounded, and the container runs with `--rm`: a killed test cannot run its
 /// cleanup, so the container has to remove itself.
 const REFERENCE_LIFETIME_SECS: &str = "300";
@@ -219,12 +224,16 @@ fn wait_until_store_is_unused(root: &Path, limit: Duration) -> Result<()> {
 fn store_users(root: &Path) -> Vec<String> {
     let own = std::process::id();
     let mut users = Vec::new();
-    let recorded = std::fs::read_to_string(root.join(CONMON_PIDFILE))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok());
-    if let Some(pid) = recorded {
+    let mut counted = None;
+    if let Some((pid, started)) = recorded_conmon(root) {
         if program_of(pid).as_deref() == Some("conmon") && !has_exited(pid) {
-            users.push(format!("{pid} conmon: the pid in {CONMON_PIDFILE}"));
+            users.push(match started {
+                Some(started) => {
+                    format!("{pid} conmon: recorded in {CONMON_IDENTITY} (start time {started})")
+                }
+                None => format!("{pid} conmon: the pid in {CONMON_PIDFILE}"),
+            });
+            counted = Some(pid);
         }
     }
     for entry in std::fs::read_dir("/proc").into_iter().flatten().flatten() {
@@ -235,7 +244,7 @@ fn store_users(root: &Path) -> Vec<String> {
         else {
             continue;
         };
-        if pid == own || Some(pid) == recorded {
+        if pid == own || Some(pid) == counted {
             continue;
         }
         let Some(program) = program_of(pid) else {
@@ -249,6 +258,55 @@ fn store_users(root: &Path) -> Vec<String> {
         }
     }
     users
+}
+
+/// Write conmon's identity next to the pid file podman wrote. The caller has just
+/// started the container and goes on to require an answer from it, so conmon is running
+/// across this read, and the pid in podman's file is its own. The file appears under its
+/// name complete or not at all.
+fn record_conmon(root: &Path) -> Result<()> {
+    let pidfile = root.join(CONMON_PIDFILE);
+    let pid: u32 = std::fs::read_to_string(&pidfile)
+        .with_context(|| format!("reading {}", pidfile.display()))?
+        .trim()
+        .parse()
+        .with_context(|| format!("{} does not hold a pid", pidfile.display()))?;
+    let (_, started) =
+        state_and_start(pid).with_context(|| format!("conmon ({pid}) is not running"))?;
+    let unfinished = root.join(format!("{CONMON_IDENTITY}.tmp"));
+    std::fs::write(&unfinished, format!("{pid} {started}"))?;
+    std::fs::rename(&unfinished, root.join(CONMON_IDENTITY))?;
+    Ok(())
+}
+
+/// conmon's pid, and its start time when the test body got as far as recording it. With
+/// only podman's file there is no start time to compare.
+fn recorded_conmon(root: &Path) -> Option<(u32, Option<u64>)> {
+    let identity = std::fs::read_to_string(root.join(CONMON_IDENTITY)).ok();
+    if let Some((pid, started)) = identity
+        .as_deref()
+        .and_then(|text| text.trim().split_once(' '))
+    {
+        if let (Ok(pid), Ok(started)) = (pid.parse(), started.parse()) {
+            return Some((pid, Some(started)));
+        }
+    }
+    let pid = std::fs::read_to_string(root.join(CONMON_PIDFILE)).ok()?;
+    Some((pid.trim().parse().ok()?, None))
+}
+
+/// The state and the start time of a process, from one read of `/proc/<pid>/stat`, so
+/// that both describe the same process. The start time counts clock ticks since boot,
+/// and a pid that has been given to another process has a later one. The kernel fills
+/// this file from the task and does not read the process's memory.
+fn state_and_start(pid: u32) -> Option<(char, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // The program's name is in parentheses and can hold spaces and parentheses itself.
+    let mut fields = stat.get(stat.rfind(')')? + 1..)?.split_ascii_whitespace();
+    let state = fields.next()?.chars().next()?;
+    // The state is field 3 and the start time is field 22.
+    let started = fields.nth(18)?.parse().ok()?;
+    Some((state, started))
 }
 
 /// The kernel's name for the process, from `/proc/<pid>/comm`.
@@ -351,14 +409,15 @@ fn clean_up_next_to(stand_in: &mut StandIn, scratch: tempfile::TempDir) -> Resul
 /// directory behind on the host.
 ///
 /// The stand-in is conmon in the state it is in while that command runs: it names the
-/// store in its arguments, it has closed everything it held under it, and its pid is
-/// the one podman recorded.
+/// store in its arguments, it has closed everything it held under it, and it is the
+/// process that was recorded.
 #[test]
 fn the_cleanup_waits_for_a_process_that_still_names_the_store() -> Result<()> {
     let scratch = tempfile::TempDir::new()?;
     let root = scratch.path().canonicalize()?;
     let mut conmon = stand_in(&root.join("bin"), "conmon", STAND_IN_SECS, Stdio::null())?;
     std::fs::write(root.join(CONMON_PIDFILE), conmon.0.id().to_string())?;
+    record_conmon(&root)?;
     clean_up_next_to(&mut conmon, scratch)
 }
 
@@ -467,6 +526,26 @@ fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     Ok(())
 }
 
+/// A pid is given out again. When the recorded conmon has exited and another conmon on
+/// the host has its pid, the pid and the name both match a process that has nothing to
+/// do with the store. The stand-in is that process: a conmon outside the store, under a
+/// pid that was recorded with an earlier start time.
+#[test]
+fn a_reused_pid_is_not_the_recorded_conmon() -> Result<()> {
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let _remove = RemoveTree(root.clone());
+    let outside = tempfile::TempDir::new()?;
+    let other = stand_in(outside.path(), "conmon", "600", Stdio::null())?;
+    let pid = other.0.id();
+    let (_, started) = state_and_start(pid).context("the stand-in is not running")?;
+    std::fs::write(root.join(CONMON_IDENTITY), format!("{pid} {}", started - 1))?;
+    clean_up_within(scratch, || Ok(()), Duration::from_millis(300))
+        .context("the cleanup waited for a process that is not the recorded conmon")?;
+    anyhow::ensure!(!root.exists(), "the store is still there");
+    Ok(())
+}
+
 /// Two files under /proc/<pid> are read out of the process's own memory, and that read
 /// can block for good on a process that is stuck in the kernel. A bounded wait that
 /// reads them is not bounded. The names are put together here so that this test does
@@ -512,7 +591,7 @@ fn build_next_to_a_running_container(root: &Path, reference: &str) -> Result<()>
 
     let archive = root.join(ARCHIVE);
     podman(&["load", "-i", utf8(&archive)?])?;
-    let _container = ReferenceContainer::start(reference, &root.join(CONMON_PIDFILE))?;
+    let _container = ReferenceContainer::start(reference, root)?;
     let before = Observed::of(reference, &runroot)?;
     anyhow::ensure!(
         before.attached(),
@@ -631,8 +710,10 @@ impl std::fmt::Display for Observed {
 struct ReferenceContainer(String);
 
 impl ReferenceContainer {
-    /// Started the way tests/test_exec_podman_parity.rs starts its reference.
-    fn start(name: &str, conmon_pidfile: &Path) -> Result<Self> {
+    /// Started the way tests/test_exec_podman_parity.rs starts its reference. Its conmon
+    /// is recorded as soon as it runs.
+    fn start(name: &str, root: &Path) -> Result<Self> {
+        let pidfile = root.join(CONMON_PIDFILE);
         // The guard exists before `podman run`: a start that fails half way can
         // leave a created container behind.
         let container = Self(name.to_owned());
@@ -641,7 +722,7 @@ impl ReferenceContainer {
             "-d",
             "--rm",
             "--conmon-pidfile",
-            utf8(conmon_pidfile)?,
+            utf8(&pidfile)?,
             "--name",
             name,
             "--network",
@@ -650,6 +731,7 @@ impl ReferenceContainer {
             "sleep",
             REFERENCE_LIFETIME_SECS,
         ])?;
+        record_conmon(root)?;
         Ok(container)
     }
 }
