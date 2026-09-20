@@ -211,28 +211,36 @@ fn wait_until_store_is_unused(root: &Path, limit: Duration) -> Result<()> {
 }
 
 /// Processes other than this one that can still open the store under `root`, one line
-/// each. Nothing here reads a process's memory: a program's name, its working directory
-/// and what its descriptors point at are kept with the task, and reading them does not
-/// block on a process that is stuck in the kernel.
+/// each. Nothing here reads a process's memory: a program's name, its state and start
+/// time, its working directory and what its descriptors point at are kept with the
+/// task, and reading them does not block on a process that is stuck in the kernel.
 ///
-/// Two things tie a process to the store. conmon's pid is in the file podman wrote it
-/// to. conmon closes what it held under the store before it runs the exit command, and
-/// its working directory is its caller's, so by then the pid is all there is. It forks
-/// the exit command and waits for it (conmon `do_exit_command`), so it is there for as
-/// long as that command is. And any conmon or podman whose working directory or open
-/// files are under `root` is using the store, whatever its arguments say.
+/// Two things tie a process to the store. conmon was recorded, by pid and start time,
+/// while the container ran ([`record_conmon`]). The start time tells it from a process
+/// that was given its pid later. conmon closes what it held under the store before it
+/// runs the exit command, and its working directory is its caller's, so by then the
+/// record is all there is. It forks the exit command and waits for it (conmon
+/// `do_exit_command`), so it is there for as long as that command is. And any conmon or
+/// podman whose working directory or open files are under `root` is using the store,
+/// whatever its arguments say.
 fn store_users(root: &Path) -> Vec<String> {
     let own = std::process::id();
     let mut users = Vec::new();
     let mut counted = None;
     if let Some((pid, started)) = recorded_conmon(root) {
-        if program_of(pid).as_deref() == Some("conmon") && !has_exited(pid) {
-            users.push(match started {
-                Some(started) => {
-                    format!("{pid} conmon: recorded in {CONMON_IDENTITY} (start time {started})")
-                }
-                None => format!("{pid} conmon: the pid in {CONMON_PIDFILE}"),
-            });
+        // A process that has exited keeps its entry under /proc, with its start time,
+        // until its parent has reaped it.
+        let running = state_and_start(pid).filter(|(state, _)| !matches!(state, 'Z' | 'X'));
+        let user = match (running, started) {
+            (Some((_, start)), Some(started)) => (start == started)
+                .then(|| format!("{pid} conmon: the process recorded in {CONMON_IDENTITY}")),
+            // No start time was recorded, so the name decides. That errs towards waiting.
+            (Some(_), None) => (program_of(pid).as_deref() == Some("conmon"))
+                .then(|| format!("{pid} conmon: the pid in {CONMON_PIDFILE}")),
+            (None, _) => None,
+        };
+        if let Some(user) = user {
+            users.push(user);
             counted = Some(pid);
         }
     }
@@ -314,16 +322,6 @@ fn program_of(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/comm"))
         .ok()
         .map(|name| name.trim_end().to_owned())
-}
-
-/// A process that has exited keeps its entry under /proc, and its name, until its parent
-/// has reaped it. It has no working directory any more, so that link is gone. A link
-/// that cannot be read for any other reason leaves the process counted as running.
-fn has_exited(pid: u32) -> bool {
-    matches!(
-        std::fs::read_link(format!("/proc/{pid}/cwd")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound
-    )
 }
 
 /// What the process holds at or below `root`: its working directory, or the first open
