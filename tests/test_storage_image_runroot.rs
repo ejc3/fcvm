@@ -152,13 +152,20 @@ fn clean_up_private_store(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
 ) -> Result<()> {
-    clean_up_within(scratch, remove_container, STORE_PROCESS_TIMEOUT)
+    clean_up_within(
+        scratch,
+        remove_container,
+        detach_mounts_below,
+        STORE_PROCESS_TIMEOUT,
+    )
 }
 
-/// `clean_up_private_store` with the wait's limit as a parameter, for the tests.
+/// `clean_up_private_store` with the detach step and the wait's limit as parameters, for
+/// the tests.
 fn clean_up_within(
     scratch: tempfile::TempDir,
     remove_container: impl FnOnce() -> Result<()>,
+    detach: impl FnOnce(&Path),
     limit: Duration,
 ) -> Result<()> {
     let root = scratch.path().canonicalize()?;
@@ -168,7 +175,7 @@ fn clean_up_within(
     }
     match wait_until_store_is_unused(&root, limit) {
         Ok(()) => {
-            detach_mounts_below(&root);
+            detach(&root);
             match mounts_below(&root) {
                 Ok(mounts) if mounts.is_empty() => {}
                 Ok(mounts) => failures.push(format!(
@@ -507,7 +514,12 @@ fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     let outside = tempfile::TempDir::new()?;
     let podman = stand_in(outside.path(), "podman", "600", held_under(&root)?)?;
 
-    let cleaned = clean_up_within(scratch, || Ok(()), Duration::from_millis(300));
+    let cleaned = clean_up_within(
+        scratch,
+        || Ok(()),
+        detach_mounts_below,
+        Duration::from_millis(300),
+    );
 
     let error = format!(
         "{:#}",
@@ -520,6 +532,46 @@ fn a_user_that_outlives_the_wait_keeps_its_store() -> Result<()> {
     anyhow::ensure!(
         root.join("held").exists(),
         "the store was removed under a process that still uses it:\n{error}"
+    );
+    Ok(())
+}
+
+/// What is still mounted after the detach is a filesystem of its own below the scratch
+/// directory. Removing the directory walks into it and deletes what it holds, and the
+/// mount stays on the host. The detach is a parameter so that one can fail here. The arm
+/// for a mount table that cannot be read keeps the store the same way and has no test of
+/// its own: /proc/self/mountinfo cannot be made unreadable for one test only.
+#[test]
+fn a_mount_that_survives_the_detach_keeps_the_store() -> Result<()> {
+    anyhow::ensure!(
+        nix::unistd::geteuid().is_root(),
+        "this test mounts something: run it with `make test-root`"
+    );
+    let scratch = tempfile::TempDir::new()?;
+    let root = scratch.path().canonicalize()?;
+    let _remove = RemoveTree(root.clone());
+    let _mounts = MountsBelow(root.clone());
+    let mounted = root.join("mounted");
+    std::fs::create_dir(&mounted)?;
+    nix::mount::mount(
+        Some("tmpfs"),
+        &mounted,
+        Some("tmpfs"),
+        nix::mount::MsFlags::empty(),
+        None::<&str>,
+    )?;
+    std::fs::write(mounted.join("kept"), "")?;
+
+    let cleaned = clean_up_within(scratch, || Ok(()), |_| {}, Duration::from_millis(300));
+
+    let error = format!(
+        "{:#}",
+        cleaned.expect_err("a mount that is still there is a failure")
+    );
+    anyhow::ensure!(error.contains("still mounted below"), "{error}");
+    anyhow::ensure!(
+        mounted.join("kept").exists(),
+        "the cleanup removed what the mount holds:\n{error}"
     );
     Ok(())
 }
@@ -538,8 +590,13 @@ fn a_reused_pid_is_not_the_recorded_conmon() -> Result<()> {
     let pid = other.0.id();
     let (_, started) = state_and_start(pid).context("the stand-in is not running")?;
     std::fs::write(root.join(CONMON_IDENTITY), format!("{pid} {}", started - 1))?;
-    clean_up_within(scratch, || Ok(()), Duration::from_millis(300))
-        .context("the cleanup waited for a process that is not the recorded conmon")?;
+    clean_up_within(
+        scratch,
+        || Ok(()),
+        detach_mounts_below,
+        Duration::from_millis(300),
+    )
+    .context("the cleanup waited for a process that is not the recorded conmon")?;
     anyhow::ensure!(!root.exists(), "the store is still there");
     Ok(())
 }
