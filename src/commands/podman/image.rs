@@ -383,12 +383,103 @@ pub(super) async fn create_disk_from_dir(
     Ok(())
 }
 
+/// The longest `--runroot` podman accepts before 5.1.0. Older ones stop with "the
+/// specified runroot is longer than 50 characters", a guard for the unix socket paths
+/// conmon creates below the runroot. containers/podman fcf9327773 removed it once podman
+/// and conmon could open longer socket paths. Ubuntu 24.04 ships 4.9.3, and the image
+/// cache's own path is already longer than this on a default install.
+const PODMAN_RUNROOT_LIMIT: usize = 50;
+
+/// Where a temporary store's runroot is created. Not `std::env::temp_dir()`: TMPDIR can
+/// be any length, and the path has to fit `PODMAN_RUNROOT_LIMIT` on every host.
+const RUNROOT_PARENT: &str = "/tmp";
+
+const RUNROOT_PREFIX: &str = "fcvm-rr-";
+
+/// Random characters tempfile appends to `RUNROOT_PREFIX`.
+const RUNROOT_RANDOM_CHARS: usize = 6;
+
+// `/tmp/fcvm-rr-XXXXXX` is 19 bytes. A change here that stops it fitting fails the build.
+const _: () = assert!(
+    RUNROOT_PARENT.len() + 1 + RUNROOT_PREFIX.len() + RUNROOT_RANDOM_CHARS <= PODMAN_RUNROOT_LIMIT
+);
+
+/// A temporary podman store: a graphroot, and a runroot of its own that is removed when
+/// this is dropped.
+///
+/// Every podman call against a temporary store is built by `podman()`, because `--root`
+/// alone does not keep the store apart from the default one. `--root` moves only the
+/// graphroot. The runroot stays the default one, and podman keeps its record of mounted
+/// layers there (`overlay-layers/mountpoints.json`). A store rewrites that record from
+/// the layers it knows, so a temporary store sharing the runroot erases the record of
+/// every container running in the default store. The next podman process to exit then
+/// finds no mounted layer and lazily unmounts the default store's overlay home. Each
+/// running container loses its merged root from the host's view: inspect reports no
+/// MergedDir and `podman exec -u <name>` fails with "unable to find user" until the
+/// container is recreated (#944).
+///
+/// The runroot is not inside the graphroot, where it would be deleted with the store:
+/// that path is too long for podman before 5.1 (`PODMAN_RUNROOT_LIMIT`). It holds lock
+/// files, the mount record and the overlay driver's feature checks, a few kilobytes.
+struct TempStore {
+    graphroot: PathBuf,
+    runroot: tempfile::TempDir,
+}
+
+impl TempStore {
+    fn new(graphroot: &Path) -> Result<Self> {
+        let runroot = tempfile::Builder::new()
+            .prefix(RUNROOT_PREFIX)
+            .rand_bytes(RUNROOT_RANDOM_CHARS)
+            .tempdir_in(RUNROOT_PARENT)
+            .with_context(|| format!("creating a podman runroot under {RUNROOT_PARENT}"))?;
+        Ok(Self {
+            graphroot: graphroot.to_path_buf(),
+            runroot,
+        })
+    }
+
+    /// `podman` aimed at this store.
+    fn podman(&self) -> tokio::process::Command {
+        let mut podman = tokio::process::Command::new("podman");
+        podman
+            .arg("--root")
+            .arg(&self.graphroot)
+            .arg("--runroot")
+            .arg(self.runroot.path())
+            .args(["--storage-driver", "overlay"]);
+        podman
+    }
+}
+
+/// Load `archive` into a new temporary store at `graphroot` and return what podman
+/// printed. The store's runroot exists only inside this function, so it is removed on
+/// every way out of it.
+async fn load_into_temp_store(graphroot: &Path, archive: &Path) -> Result<String> {
+    let store = TempStore::new(graphroot)?;
+    let output = store
+        .podman()
+        .arg("load")
+        .arg("-i")
+        .arg(archive)
+        .output()
+        .await
+        .context("running podman load into storage root")?;
+    if !output.status.success() {
+        bail!(
+            "podman load into storage root failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
 /// Build a podman storage image from a Docker archive.
 ///
 /// Loads the archive into a temporary podman storage root using the overlay driver,
 /// then packages the result as an ext4 image. The guest can mount this read-only
 /// and use it as an `additionalImageStore`, eliminating the need for `podman load`.
-pub(super) async fn build_storage_image(
+pub async fn build_storage_image(
     archive_path: &std::path::Path,
     output_path: &std::path::Path,
 ) -> Result<()> {
@@ -403,10 +494,6 @@ pub(super) async fn build_storage_image(
     // "tmp-storage-{pid}" would collide too — separate PID namespaces reuse pid numbers.
     let tmp_dir = cache_dir.join(format!("tmp-storage-{}", uuid::Uuid::new_v4()));
 
-    // Clean up any stale temp dir from a previous interrupted run
-    if tmp_dir.exists() {
-        tokio::fs::remove_dir_all(&tmp_dir).await.ok();
-    }
     tokio::fs::create_dir_all(&tmp_dir)
         .await
         .context("creating temp storage dir")?;
@@ -418,28 +505,14 @@ pub(super) async fn build_storage_image(
         tmp_dir.display()
     );
 
-    let load_output = tokio::process::Command::new("podman")
-        .args([
-            "--root",
-            tmp_dir.to_str().unwrap(),
-            "--storage-driver",
-            "overlay",
-            "load",
-            "-i",
-            archive_path.to_str().unwrap(),
-        ])
-        .output()
-        .await
-        .context("running podman load into storage root")?;
-
-    if !load_output.status.success() {
-        let stderr = String::from_utf8_lossy(&load_output.stderr);
-        tokio::fs::remove_dir_all(&tmp_dir).await.ok();
-        bail!("podman load into storage root failed: {}", stderr);
-    }
-
-    let loaded_msg = String::from_utf8_lossy(&load_output.stdout);
-    info!("podman load output: {}", loaded_msg.trim());
+    let loaded_msg = match load_into_temp_store(&tmp_dir, archive_path).await {
+        Ok(message) => message,
+        Err(e) => {
+            tokio::fs::remove_dir_all(&tmp_dir).await.ok();
+            return Err(e);
+        }
+    };
+    info!("podman load output: {}", loaded_msg);
 
     // Remove podman state files that contain hardcoded paths from the temp dir.
     // Keep only image/layer data directories. When the guest mounts this read-only
@@ -505,6 +578,192 @@ mod tests {
     #[test]
     fn missing_separator_is_an_error() {
         assert!(parse_image_cache_ref("localhost/qux", "no-tab-here\n").is_err());
+    }
+
+    /// Flag names are assembled here so that the source scan below finds the literal
+    /// only where a podman command line is built.
+    fn flag(name: &str) -> String {
+        format!("--{name}")
+    }
+
+    /// The value that follows `flag` on a command line.
+    fn flag_value<'a>(args: &[&'a std::ffi::OsStr], flag: &str) -> Option<&'a std::ffi::OsStr> {
+        let at = args.iter().position(|arg| *arg == flag)?;
+        args.get(at + 1).copied()
+    }
+
+    /// The store path build_storage_image uses with the default assets directory.
+    fn default_graphroot() -> PathBuf {
+        Path::new("/mnt/fcvm-btrfs/image-cache")
+            .join(format!("tmp-storage-{}", uuid::Uuid::new_v4()))
+    }
+
+    #[test]
+    fn a_temporary_store_gets_a_runroot_of_its_own() {
+        // #944: with only a graphroot, the temporary store shares the default runroot and
+        // erases the mount records of the default store's running containers.
+        let graphroot = default_graphroot();
+        let first = TempStore::new(&graphroot).unwrap();
+        let second = TempStore::new(&graphroot).unwrap();
+        let podman = first.podman();
+        let args: Vec<&std::ffi::OsStr> = podman.as_std().get_args().collect();
+
+        assert_eq!(
+            flag_value(&args, &flag("root")),
+            Some(graphroot.as_os_str())
+        );
+        assert_eq!(
+            flag_value(&args, &flag("runroot")),
+            Some(first.runroot.path().as_os_str())
+        );
+        assert_eq!(
+            flag_value(&args, &flag("storage-driver")),
+            Some(std::ffi::OsStr::new("overlay"))
+        );
+        assert!(first.runroot.path().is_dir());
+        assert_ne!(first.runroot.path(), second.runroot.path());
+    }
+
+    #[test]
+    fn the_runroot_fits_what_podman_before_5_1_accepts() {
+        let store = TempStore::new(&default_graphroot()).unwrap();
+        let runroot = store.runroot.path();
+        assert!(
+            runroot.as_os_str().len() <= PODMAN_RUNROOT_LIMIT,
+            "podman before 5.1 refuses this runroot, {} bytes: {runroot:?}",
+            runroot.as_os_str().len()
+        );
+        // Its length does not come from the environment or from the graphroot.
+        assert_eq!(runroot.parent(), Some(Path::new(RUNROOT_PARENT)));
+    }
+
+    #[test]
+    fn the_runroot_is_removed_with_the_store() {
+        let store = TempStore::new(&default_graphroot()).unwrap();
+        let runroot = store.runroot.path().to_path_buf();
+        std::fs::create_dir(runroot.join("overlay-layers")).unwrap();
+        std::fs::write(runroot.join("overlay-layers/mountpoints.json"), "[]").unwrap();
+        drop(store);
+        assert!(!runroot.exists(), "{runroot:?} outlived its store");
+    }
+
+    /// Source files that name a podman graphroot in code, how often, and why that is fine.
+    const GRAPHROOT_FLAG_SITES: &[(&str, usize, &str)] = &[
+        (
+            "src/commands/podman/image.rs",
+            1,
+            "TempStore::podman, which pairs the graphroot with a runroot of its own",
+        ),
+        (
+            "fc-mock/src/container.rs",
+            1,
+            "rootless_storage_args: fc-mock gives its podman an XDG_RUNTIME_DIR of its own \
+             (apply_user_ns_env), and that is where a rootless default runroot lives",
+        ),
+    ];
+
+    /// Occurrences of the podman graphroot flag in the code part of `line`. Comments
+    /// are cut at the first `//`, and a longer flag that starts the same way
+    /// (`--rootfs-size`) is another flag.
+    fn graphroot_flags_in(line: &str) -> usize {
+        let graphroot_flag = flag("root");
+        let code = line.split("//").next().unwrap_or_default();
+        code.match_indices(&graphroot_flag)
+            .filter(|(at, _)| {
+                !code[at + graphroot_flag.len()..].starts_with(|next: char| {
+                    next.is_ascii_alphanumeric() || next == '-' || next == '_'
+                })
+            })
+            .count()
+    }
+
+    #[test]
+    fn the_scan_tells_the_graphroot_flag_from_its_neighbours() {
+        let graphroot_flag = flag("root");
+        for (line, expected) in [
+            (format!(".arg(\"{graphroot_flag}\")"), 1),
+            (format!("\"{graphroot_flag}=/tmp/store\","), 1),
+            (
+                format!("[\"{graphroot_flag}\", dir, \"{graphroot_flag}\"]"),
+                2,
+            ),
+            (
+                format!("\"{graphroot_flag}fs-size\", \"{graphroot_flag}-dir\""),
+                0,
+            ),
+            (
+                format!("/// `{graphroot_flag}` moves only the graphroot"),
+                0,
+            ),
+            (format!("let x = 1; // then pass {graphroot_flag}"), 0),
+            (format!("podman {graphroot_flag}"), 1),
+        ] {
+            assert_eq!(graphroot_flags_in(&line), expected, "{line}");
+        }
+    }
+
+    /// A hand-built podman call that names a graphroot would bring the shared runroot
+    /// back, and tests/test_storage_image_runroot.rs only sees calls that
+    /// build_storage_image makes. So every source file that names the flag in code is
+    /// listed above with a count and a reason.
+    ///
+    /// It counts per file, so reformatting or moving a call does not trip it. What it
+    /// cannot see: a flag assembled at run time (`format!`, `concat!`), a graphroot chosen
+    /// through the environment or a config file (`CONTAINERS_STORAGE_CONF`,
+    /// `STORAGE_OPTS`), podman reached through a shell script, a line where `//` inside
+    /// a string comes before the flag, and crates other than the three scanned here.
+    #[test]
+    fn every_podman_graphroot_flag_is_accounted_for() {
+        let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut found = std::collections::BTreeMap::new();
+        let mut pending = vec![
+            repo.join("src"),
+            repo.join("fc-agent/src"),
+            repo.join("fc-mock/src"),
+        ];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                // The entry's own type, not its target's: an editor's lock file is a
+                // dangling symlink with a source file's name (`.#image.rs`).
+                let kind = entry.file_type().unwrap();
+                if kind.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if !(kind.is_file() && path.extension().is_some_and(|extension| extension == "rs"))
+                {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(&path) else {
+                    continue;
+                };
+                let count: usize = String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(graphroot_flags_in)
+                    .sum();
+                if count > 0 {
+                    let file = path.strip_prefix(repo).unwrap().display().to_string();
+                    found.insert(file, count);
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<String, usize> = GRAPHROOT_FLAG_SITES
+            .iter()
+            .map(|(file, count, _)| (file.to_string(), *count))
+            .collect();
+        assert_eq!(
+            found, expected,
+            "a podman call that names a graphroot goes through TempStore::podman, or gets an entry with a reason in GRAPHROOT_FLAG_SITES"
+        );
+
+        // The reason fc-mock is listed for, checked where it is decided.
+        let fc_mock = std::fs::read_to_string(repo.join("fc-mock/src/container.rs")).unwrap();
+        assert!(
+            fc_mock.contains("cmd.env(\"XDG_RUNTIME_DIR\""),
+            "fc-mock no longer gives podman a runtime directory of its own, so its graphroot needs a runroot"
+        );
     }
 
     #[test]
