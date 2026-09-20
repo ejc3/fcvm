@@ -25,30 +25,17 @@ fn create_unique_test_dir() -> std::path::PathBuf {
     unique_path
 }
 
-#[tokio::test]
-async fn test_health_monitor_behaviors() {
-    // Create unique temp directory for this test instance
-    let base_dir = create_unique_test_dir();
-
-    // Initialize paths module with test directory (required for paths::vm_runtime_dir calls)
-    // OnceLock::set() is idempotent - safe to call multiple times
-    paths::init_with_paths(&base_dir, &base_dir);
-
-    // Use the shared base dir so the monitor and test agree on where state lives.
-    let manager = StateManager::new(base_dir.join("state"));
-    manager.init().await.unwrap();
-
+/// The state of a running VM with an HTTP health check on `health_check_url`.
+fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &str) -> VmState {
     let now = Utc::now();
-
-    // Create a VM state without a real process
-    let state = VmState {
+    VmState {
         schema_version: 1,
-        vm_id: "health-test-vm".to_string(),
+        vm_id: vm_id.to_string(),
         name: Some("health-test".to_string()),
         status: VmStatus::Running,
         health_status: HealthStatus::Unknown,
         exit_code: None,
-        pid: Some(4194305), // Non-existent PID (above /proc/sys/kernel/pid_max)
+        pid: Some(pid),
         pid_start_time: None,
         lifecycle_ready: false,
         holder_pid: None,
@@ -59,24 +46,11 @@ async fn test_health_monitor_behaviors() {
             image: "test:latest".to_string(),
             vcpu: 1,
             memory_mib: 256,
-            network: NetworkConfig {
-                tap_device: "tap-test".to_string(),
-                guest_mac: "02:00:00:00:00:01".to_string(),
-                guest_ip: Some("192.168.1.100".to_string()),
-                host_ip: Some("192.168.1.1".to_string()),
-                host_veth: Some("veth-test".to_string()),
-                loopback_ip: None,
-                dns_server: None,
-                guest_ipv6: None,
-                host_ipv6: None,
-                dns_search: None,
-                http_proxy: None,
-                namespace_name: None,
-            },
+            network,
             volumes: vec![],
             extra_disks: vec![],
             nfs_shares: vec![],
-            health_check_url: Some("http://localhost/health".to_string()),
+            health_check_url: Some(health_check_url.to_string()),
             snapshot_name: None,
             process_type: Some(ProcessType::Vm),
             serve_pid: None,
@@ -102,7 +76,42 @@ async fn test_health_monitor_behaviors() {
             health_check_timeout: 5,
             hypervisor: Default::default(),
         },
-    };
+    }
+}
+
+#[tokio::test]
+async fn test_health_monitor_behaviors() {
+    // Create unique temp directory for this test instance
+    let base_dir = create_unique_test_dir();
+
+    // Initialize paths module with test directory (required for paths::vm_runtime_dir calls)
+    // OnceLock::set() is idempotent - safe to call multiple times
+    paths::init_with_paths(&base_dir, &base_dir);
+
+    // Use the shared base dir so the monitor and test agree on where state lives.
+    let manager = StateManager::new(base_dir.join("state"));
+    manager.init().await.unwrap();
+
+    // Create a VM state without a real process: the PID is above /proc/sys/kernel/pid_max.
+    let state = vm_state(
+        "health-test-vm",
+        4194305,
+        NetworkConfig {
+            tap_device: "tap-test".to_string(),
+            guest_mac: "02:00:00:00:00:01".to_string(),
+            guest_ip: Some("192.168.1.100".to_string()),
+            host_ip: Some("192.168.1.1".to_string()),
+            host_veth: Some("veth-test".to_string()),
+            loopback_ip: None,
+            dns_server: None,
+            guest_ipv6: None,
+            host_ipv6: None,
+            dns_search: None,
+            http_proxy: None,
+            namespace_name: None,
+        },
+        "http://localhost/health",
+    );
 
     // Save initial state
     manager.save_state(&state).await.unwrap();
@@ -155,4 +164,191 @@ async fn test_health_monitor_behaviors() {
     }
 
     // Test passes if no panic occurred
+}
+
+/// Answer every request on `listener` with `status`, counting them in `hits`.
+fn answer_with(
+    listener: tokio::net::TcpListener,
+    status: &'static str,
+    hits: std::sync::Arc<AtomicUsize>,
+) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            hits.fetch_add(1, Ordering::SeqCst);
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let reply =
+                format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            let _ = stream.write_all(reply.as_bytes()).await;
+        }
+    });
+}
+
+/// A bridged VM's HTTP health check goes to the VM's own veth address (#948).
+///
+/// Every VM restored from one snapshot has the snapshot's guest address, and the host's
+/// route to that address belongs to whichever of them set up last. A probe aimed at the
+/// guest address therefore reaches a sibling, or nothing. A restored VM's own address is
+/// the peer of the host end of its veth /30 (`bridged::host_reachable_ip`).
+///
+/// Loopback stands in for both, because all of 127/8 is local and binds with no setup. The
+/// host end is 127.0.0.1, so the VM's own address is 127.0.0.2 and answers 200. 127.0.0.3
+/// plays the shared guest address and answers 503.
+#[tokio::test]
+async fn bridged_health_check_goes_to_the_vms_own_veth_address() {
+    let base_dir = create_unique_test_dir();
+    paths::init_with_paths(&base_dir, &base_dir);
+    let manager = StateManager::new(base_dir.join("state"));
+    manager.init().await.unwrap();
+
+    // The same port has to be free on both addresses.
+    let (own, shared, port) = {
+        let mut attempt = 0;
+        loop {
+            let own = tokio::net::TcpListener::bind("127.0.0.2:0")
+                .await
+                .expect("binding the VM's own address");
+            let port = own.local_addr().unwrap().port();
+            match tokio::net::TcpListener::bind(("127.0.0.3", port)).await {
+                Ok(shared) => break (own, shared, port),
+                Err(e) => {
+                    attempt += 1;
+                    assert!(attempt < 20, "no port free on both addresses: {e}");
+                }
+            }
+        }
+    };
+    let own_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    let shared_hits = std::sync::Arc::new(AtomicUsize::new(0));
+    answer_with(own, "200 OK", own_hits.clone());
+    answer_with(shared, "503 Service Unavailable", shared_hits.clone());
+
+    let state = vm_state(
+        "own-address-vm",
+        std::process::id(),
+        NetworkConfig {
+            guest_ip: Some("127.0.0.3".to_string()),
+            host_ip: Some("127.0.0.1".to_string()),
+            // No device to bind to: loopback has no veth.
+            host_veth: None,
+            ..Default::default()
+        },
+        &format!("http://localhost:{port}/health"),
+    );
+    manager.save_state(&state).await.unwrap();
+
+    let status = fcvm::health::run_health_check_once(
+        "own-address-vm",
+        Some(std::process::id()),
+        base_dir.join("state"),
+    )
+    .await
+    .expect("health check should complete");
+
+    assert_eq!(
+        shared_hits.load(Ordering::SeqCst),
+        0,
+        "the probe went to the guest address, which a sibling restored from the same \
+         snapshot may hold"
+    );
+    assert_eq!(status, HealthStatus::Healthy);
+    assert_eq!(own_hits.load(Ordering::SeqCst), 1);
+}
+
+/// A bridged VM whose state names no probe target reads unhealthy, and the monitor writes
+/// that down.
+///
+/// The bridged probe derives its target from `host_ip` (`bridged::host_reachable_ip`). A
+/// state where that is missing or unparsable has nothing to probe, which is a failed health
+/// check like any other. The status an earlier check persisted must not outlive it.
+#[tokio::test]
+async fn a_bridged_vm_with_no_probe_target_is_persisted_unhealthy() {
+    let base_dir = create_unique_test_dir();
+    paths::init_with_paths(&base_dir, &base_dir);
+    let manager = StateManager::new(base_dir.join("state"));
+    manager.init().await.unwrap();
+
+    for (vm_id, host_ip) in [
+        ("no-host-address-vm", None),
+        ("bad-host-address-vm", Some("not-an-address")),
+    ] {
+        let mut state = vm_state(
+            vm_id,
+            std::process::id(),
+            NetworkConfig {
+                guest_ip: Some("127.0.0.3".to_string()),
+                host_ip: host_ip.map(str::to_string),
+                host_veth: None,
+                ..Default::default()
+            },
+            "http://localhost/health",
+        );
+        // What a passing check left in the state file earlier.
+        state.health_status = HealthStatus::Healthy;
+        manager.save_state(&state).await.unwrap();
+
+        let monitor = spawn_health_monitor_with_state_dir(
+            vm_id.to_string(),
+            Some(std::process::id()),
+            base_dir.join("state"),
+        );
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let persisted = loop {
+            let status = manager.load_state(vm_id).await.unwrap().health_status;
+            if status != HealthStatus::Healthy || std::time::Instant::now() >= deadline {
+                break status;
+            }
+            sleep(Duration::from_millis(50)).await;
+        };
+        monitor.abort();
+        let _ = monitor.await;
+
+        assert_eq!(
+            persisted,
+            HealthStatus::Unhealthy,
+            "host_ip {host_ip:?}: the monitor left the earlier status in the state file"
+        );
+    }
+}
+
+/// What `test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route` has to keep
+/// doing, read from its source because only a host with bridged networking can run it.
+///
+/// - A VM that dies during the hold fails the test. A killed fcvm leaves its state file
+///   reading healthy, and until the test reaps it the process still has a `/proc` entry, so
+///   `fcvm ls` goes on reporting healthy. The child handle (`try_wait`) says it exited, and
+///   an advancing `last_updated` says a monitor is still persisting checks.
+/// - Cleanup goes through the child handles (`terminate_and_reap`). Once a handle is dropped
+///   the child can be reaped and its PID handed out again, so a `kill_process(pid)` after
+///   that has no claim on the process it signals.
+#[test]
+fn the_sibling_health_test_watches_the_processes_it_spawned() {
+    let path =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/test_snapshot_clone.rs");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("reading {}: {e}", path.display()));
+    let name = "async fn test_bridged_clone_stays_healthy_after_a_sibling_takes_the_host_route(";
+    let start = source
+        .find(name)
+        .unwrap_or_else(|| panic!("{} has no `{name}`", path.display()));
+    let end = start
+        + source[start..]
+            .find("\n}\n")
+            .expect("the test function never ends");
+    let body = &source[start..end];
+
+    let missing: Vec<&str> = ["try_wait()", "last_updated", "terminate_and_reap("]
+        .into_iter()
+        .filter(|needed| !body.contains(needed))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "the test no longer uses {missing:?}, so a VM that died during the hold, or a monitor \
+         that stopped probing, would pass it"
+    );
+    assert!(
+        !body.contains("kill_process("),
+        "the test signals a bare PID after dropping the child handle that pinned it"
+    );
 }

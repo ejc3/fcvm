@@ -283,7 +283,12 @@ pub struct RunArgs {
     pub ipv6_prefix: Option<String>,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
-    /// The URL hostname is sent as the Host header; the connection goes to the guest IP.
+    /// The probe is plain HTTP for the URL's port, path and query, and the URL hostname is
+    /// sent as the Host header.
+    /// Rootless mode connects to the guest address from inside the VM's network namespace.
+    /// Routed mode connects to the guest address from inside the VM's named namespace.
+    /// Bridged mode connects from the host to the VM's own veth address, which the guest
+    /// holds in a VM that booted and which forwards to the guest in a restored VM.
     /// Example: --health-check http://myapp.example.com/status
     #[arg(long)]
     pub health_check: Option<String>,
