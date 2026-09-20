@@ -67,13 +67,13 @@ const MAX_EVENTS_PER_BATCH: usize = 128;
 /// How long a connecting VMM has to complete the UFFD handshake.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long to wait for new events before re-attempting parked CONTINUEs. Retries are also
+/// How long to wait for new events before re-attempting parked faults. Retries are also
 /// attempted after every drain and between prefetch chunks, so this only bounds the
 /// idle-queue case.
-const CONTINUE_RETRY_DELAY: Duration = Duration::from_millis(2);
+const PARKED_RETRY_DELAY: Duration = Duration::from_millis(2);
 
-/// How long a parked MINOR fault may stay unresolved before the handler fails closed.
-const MAX_CONTINUE_WAIT: Duration = Duration::from_secs(2);
+/// How long a parked fault may stay unresolved before the handler fails closed.
+const MAX_PARKED_WAIT: Duration = Duration::from_secs(2);
 
 /// `sockaddr_un.sun_path` is a fixed 108-byte array on Linux; bind(2) fails with a bare
 /// `EINVAL` when a path overflows it. Checked up front so the error names the real problem.
@@ -1031,18 +1031,18 @@ async fn serve_clone(
     .await
 }
 
-/// Whether a UFFDIO_ZEROPAGE error means the range (or part of it) is already populated.
+/// Whether a UFFDIO_ZEROPAGE error only means the kernel stopped short, which is not fatal.
 ///
-/// Remove (balloon) events and page faults are not ordered, so a fault served with UFFDIO_COPY
-/// before the Remove event is processed leaves pages present in the removed range. The kernel
-/// then returns EEXIST (first page already present) or EAGAIN (range partially zeroed before
-/// hitting a present page) from UFFDIO_ZEROPAGE. Neither is fatal — the pages are populated.
-fn zeropage_hit_present_page(e: &userfaultfd::Error) -> bool {
-    matches!(
-        e,
-        userfaultfd::Error::ZeropageFailed(errno)
-            if (*errno as i32) == libc::EEXIST || (*errno as i32) == libc::EAGAIN
-    )
+/// * `EEXIST`: the first page is already present. Remove (balloon) events and page faults are
+///   not ordered, so a fault served with UFFDIO_COPY before the Remove event is processed
+///   leaves pages present in the removed range.
+/// * `EAGAIN`: the kernel stopped. Either it zeroed a prefix and then reached a present page,
+///   or it zeroed nothing because `mmap_changing` is raised. The second is the usual case
+///   right after a REMOVE event is read, because the flag drops only when the thread inside
+///   `madvise` runs again. The crate discards the ioctl's byte count, so the two cannot be
+///   told apart here.
+fn zeropage_stopped_short(e: &userfaultfd::Error) -> bool {
+    matches!(prefetch::errno_of(e), Some(libc::EEXIST | libc::EAGAIN))
 }
 
 /// Whether a UFFDIO_CONTINUE error means the page is already mapped in the clone.
@@ -1104,23 +1104,9 @@ fn continue_vm_gone(e: &userfaultfd::Error) -> bool {
     )
 }
 
-/// Whether a UFFDIO_COPY error means the clone's mm is gone (process exited).
-///
-/// The COPY equivalent of [`continue_vm_gone`]. A clone that exits with a fault in flight
-/// races the handler: normally the peer pidfd wins the select and ends the handler, but if
-/// a copy is already in the kernel it comes back `ESRCH` instead. That is
-/// an ordinary end of life, NOT a service failure — and the distinction now matters, because
-/// a failure here kills a VMM and reports the clone FAILED. Misreading a normal exit as a
-/// failure would fill the serve log with false alarms and devalue the real ones.
-fn copy_vm_gone(e: &userfaultfd::Error) -> bool {
-    matches!(
-        e,
-        userfaultfd::Error::CopyFailed(errno) if (*errno as i32) == libc::ESRCH
-    )
-}
-
-/// How one attempt at resolving a MINOR fault ended.
-enum ContinueOutcome {
+/// How one attempt at resolving a fault ended, for a MINOR fault ([`continue_page`]) and a
+/// MISSING one ([`copy_page`]) alike.
+enum FaultOutcome {
     /// The whole granule is mapped in the clone (by us, or by a racing fault — EEXIST).
     Resolved,
     /// `EAGAIN` with no progress: `mmap_changing` is set. The fault is still pending and
@@ -1133,22 +1119,17 @@ enum ContinueOutcome {
 /// Resolve one faulting granule (`page_size` bytes: 4 KiB shmem / 2 MiB hugetlb) with
 /// `UFFDIO_CONTINUE`, handling every outcome the kernel documents:
 ///
-/// * `Ok(mapped)` — the kernel maps from the start of the range and reports the bytes it
+/// * `Ok(mapped)`: the kernel maps from the start of the range and reports the bytes it
 ///   installed. A short count means it stopped early (the ioctl signals this as `EAGAIN`
 ///   after partial progress); advance past the mapped bytes and continue the remainder
 ///   instead of discarding the count.
-/// * `EEXIST` — the granule at the current position is already mapped (a racing guest
+/// * `EEXIST`: the granule at the current position is already mapped (a racing guest
 ///   thread won). That sub-range is DONE; skip it, it is not an error.
-/// * `EAGAIN` with zero progress — `mmap_changing` is set; report [`ContinueOutcome::Retry`]
+/// * `EAGAIN` with zero progress: `mmap_changing` is set; report [`FaultOutcome::Retry`]
 ///   so the caller drains the event queue and retries. Never drop the fault.
-/// * `ESRCH` — the clone died; report [`ContinueOutcome::VmGone`].
-/// * anything else — a real error; propagate loudly (a dropped fault is a hung vCPU).
-fn continue_page(
-    uffd: &Uffd,
-    vm_id: &str,
-    page: usize,
-    page_size: usize,
-) -> Result<ContinueOutcome> {
+/// * `ESRCH`: the clone died; report [`FaultOutcome::VmGone`].
+/// * anything else: a real error; propagate loudly (a dropped fault is a hung vCPU).
+fn continue_page(uffd: &Uffd, vm_id: &str, page: usize, page_size: usize) -> Result<FaultOutcome> {
     let mut done = 0usize;
     while done < page_size {
         let addr = (page + done) as *mut std::ffi::c_void;
@@ -1178,8 +1159,8 @@ fn continue_page(
                 // requests that is the whole remaining range.
                 done += remaining;
             }
-            Err(e) if continue_would_block(&e) => return Ok(ContinueOutcome::Retry),
-            Err(e) if continue_vm_gone(&e) => return Ok(ContinueOutcome::VmGone),
+            Err(e) if continue_would_block(&e) => return Ok(FaultOutcome::Retry),
+            Err(e) if continue_vm_gone(&e) => return Ok(FaultOutcome::VmGone),
             Err(e) => {
                 error!(
                     target: "uffd",
@@ -1192,7 +1173,102 @@ fn continue_page(
             }
         }
     }
-    Ok(ContinueOutcome::Resolved)
+    Ok(FaultOutcome::Resolved)
+}
+
+/// Resolve one MISSING fault by copying its granule (`page_size` bytes) out of the snapshot
+/// mapping with `UFFDIO_COPY`. `offset_in_file` is where the granule starts in `mmap`.
+///
+/// The outcomes mirror [`continue_page`]'s:
+///
+/// * `Ok`: the granule is installed and its faulter woken.
+/// * `EEXIST`: a racing fault for the same page already filled it. Expected
+///   (<https://docs.kernel.org/admin-guide/mm/userfaultfd.html>: "the kernel must cope with
+///   it returning -EEXIST from ioctl(UFFDIO_COPY) as expected"), and resolved once this
+///   event's faulter has been woken.
+/// * `EAGAIN` with nothing copied: `mmap_changing` is raised, which for a COPY clone means a
+///   balloon REMOVE event. The flag drops only when the thread inside `madvise` runs again,
+///   and it can do that once the handler has read the event. The fault is NOT resolved and
+///   its vCPU stays asleep, so report [`FaultOutcome::Retry`] and let the caller park it.
+///   Never drop the fault. The `userfaultfd` crate reports this case as `PartiallyCopied`
+///   and not as an errno, which [`prefetch::errno_of`] decodes.
+/// * `ESRCH`: the clone exited with this fault in flight. That is an ordinary end of life
+///   and not a service failure, which would kill a VMM and report the clone FAILED. Report
+///   [`FaultOutcome::VmGone`].
+/// * anything else: a real error. Propagate loudly (a dropped fault is a hung vCPU).
+fn copy_page(
+    uffd: &Uffd,
+    vm_id: &str,
+    mmap: &[u8],
+    page: usize,
+    offset_in_file: usize,
+    page_size: usize,
+) -> Result<FaultOutcome> {
+    // `validate_mappings` admits only page-aligned regions that end inside the memory image,
+    // and `mmap` is that image, so every granule of a registered region is wholly inside it.
+    // Checked, not indexed: a broken invariant fails through the ordinary error path.
+    let src = offset_in_file
+        .checked_add(page_size)
+        .and_then(|end| mmap.get(offset_in_file..end))
+        .ok_or_else(|| {
+            anyhow!(
+                "fault at 0x{page:x} maps to file offset {offset_in_file}, outside the {}-byte \
+                 snapshot mapping",
+                mmap.len()
+            )
+        })?;
+
+    // SAFETY: `src` is `page_size` readable bytes that outlive the ioctl, and `page` is a
+    // granule-aligned address inside a region the clone registered with this uffd.
+    let result = unsafe {
+        uffd.copy(
+            src.as_ptr() as *const std::ffi::c_void,
+            page as *mut std::ffi::c_void,
+            page_size,
+            true,
+        )
+    };
+    let Err(e) = result else {
+        return Ok(FaultOutcome::Resolved);
+    };
+
+    match prefetch::errno_of(&e) {
+        Some(libc::EEXIST) => {
+            debug!(
+                target: "uffd",
+                vm_id = %vm_id,
+                fault_addr = format!("0x{:x}", page),
+                "UFFD copy skipped - page already filled (EEXIST), waking waiters"
+            );
+            // See wake_eexist_waiters: the COPY backend has the same check-then-sleep
+            // window as CONTINUE, this fault event is already consumed, and Linux's uffd
+            // selftests wake after COPY EEXIST for exactly this reason.
+            wake_eexist_waiters(uffd, page, page_size)?;
+            Ok(FaultOutcome::Resolved)
+        }
+        Some(libc::ESRCH) => {
+            info!(
+                target: "uffd",
+                vm_id = %vm_id,
+                fault_addr = format!("0x{:x}", page),
+                "VM exited while its fault was being served"
+            );
+            Ok(FaultOutcome::VmGone)
+        }
+        Some(libc::EAGAIN) => Ok(FaultOutcome::Retry),
+        _ => {
+            // Real error - log with Debug format to show errno
+            error!(
+                target: "uffd",
+                vm_id = %vm_id,
+                fault_addr = format!("0x{:x}", page),
+                offset_in_file,
+                error = ?e,
+                "UFFD copy failed"
+            );
+            Err(e.into())
+        }
+    }
 }
 
 async fn wait_for_peer_vmm_exit(
@@ -1304,20 +1380,49 @@ struct VmContext<'a> {
     mem_size: usize,
 }
 
-/// A fault whose `UFFDIO_CONTINUE` returned EAGAIN and is waiting for a retry.
-struct PendingContinue {
+/// A fault whose resolving ioctl (`UFFDIO_CONTINUE` for a MINOR clone, `UFFDIO_COPY` for a
+/// COPY one) returned a zero-progress EAGAIN and is waiting for a retry.
+struct ParkedFault {
     parked_at: std::time::Instant,
-    /// `(file_offset, t0_ns)` for the trace interval this fault opened, carried so the
-    /// retry that actually releases the vCPU is what closes it. Closing it around the
-    /// FAILED ioctl instead would report the EAGAIN as the fault's resolution cost, and
-    /// `faultanalyze.py` reads these intervals as exact ioctl service time.
-    /// `None` when tracing is off.
-    trace: Option<(u64, u64)>,
+    /// Where the granule starts in the snapshot file. A COPY retry reads its bytes from
+    /// there, and the fault's trace record is keyed by it.
+    file_offset: usize,
+    /// `t0_ns` of the trace interval this fault opened, carried so the retry that actually
+    /// releases the vCPU is what closes it. Closing it around the FAILED ioctl instead would
+    /// report the EAGAIN as the fault's resolution cost, and `faultanalyze.py` reads these
+    /// intervals as exact ioctl service time. `None` when tracing is off.
+    trace_t0: Option<u64>,
+}
+
+/// The faults waiting for a retry, by page address.
+#[derive(Default)]
+struct ParkedFaults {
+    by_page: std::collections::BTreeMap<usize, ParkedFault>,
+}
+
+impl ParkedFaults {
+    fn is_empty(&self) -> bool {
+        self.by_page.is_empty()
+    }
+
+    /// Park a fault whose resolving ioctl returned EAGAIN, keeping the trace interval OPEN.
+    ///
+    /// A fault already parked keeps its original start: the vCPU has been blocked
+    /// since that first attempt, and that is the cost the trace is measuring. It is also
+    /// what [`MAX_PARKED_WAIT`] counts from, so a second fault on the page cannot extend
+    /// the wait.
+    fn park(&mut self, page: usize, file_offset: usize, trace_t0: Option<u64>) {
+        self.by_page.entry(page).or_insert(ParkedFault {
+            parked_at: std::time::Instant::now(),
+            file_offset,
+            trace_t0,
+        });
+    }
 }
 
 struct VmState {
     fault_count: u64,
-    pending_continues: std::collections::BTreeMap<usize, PendingContinue>,
+    parked_faults: ParkedFaults,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -1330,24 +1435,11 @@ struct VmState {
 }
 
 impl VmState {
-    /// Park a fault whose CONTINUE returned EAGAIN, keeping the trace interval OPEN.
-    ///
-    /// A fault already parked keeps its original start: the vCPU has been blocked
-    /// since that first attempt, and that is the cost the trace is measuring.
-    fn park_continue(&mut self, page: usize, trace: Option<(u64, u64)>) {
-        self.pending_continues
-            .entry(page)
-            .or_insert(PendingContinue {
-                parked_at: std::time::Instant::now(),
-                trace,
-            });
-    }
-
     /// Close a parked fault's trace interval at the retry that resolved it.
-    fn close_parked_trace(&mut self, trace: Option<(u64, u64)>) {
-        if let (Some((offset, t0)), Some(t)) = (trace, self.trace.as_mut()) {
+    fn close_parked_trace(&mut self, parked: &ParkedFault) {
+        if let (Some(t0), Some(t)) = (parked.trace_t0, self.trace.as_mut()) {
             let t1 = t.now_ns();
-            t.record(offset, t0, t1);
+            t.record(parked.file_offset as u64, t0, t1);
         }
     }
 
@@ -1372,7 +1464,7 @@ enum ReplayStep {
 fn replay_steps_after_drain(outcome: DrainOutcome) -> &'static [ReplayStep] {
     const EXITED: &[ReplayStep] = &[ReplayStep::VmExited];
     const DRAINED: &[ReplayStep] = &[ReplayStep::RetryPending, ReplayStep::Populate];
-    // A full batch still gets the same pending-CONTINUE retry as an empty queue before it
+    // A full batch still gets the same parked-fault retry as an empty queue before it
     // yields. Sustained demand must not bypass a parked fault's retry or fail-closed deadline.
     const FULL: &[ReplayStep] = &[ReplayStep::RetryPending, ReplayStep::DrainAgain];
     match outcome {
@@ -1493,7 +1585,7 @@ async fn handle_vm_page_faults(
     let started = std::time::Instant::now();
     let mut state = VmState {
         fault_count: 0,
-        pending_continues: std::collections::BTreeMap::new(),
+        parked_faults: ParkedFaults::default(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -1607,7 +1699,7 @@ async fn replay_working_set(
                 match step {
                     ReplayStep::VmExited => return Ok(true),
                     ReplayStep::RetryPending => {
-                        if !retry_pending_continues(ctx, async_uffd.get_ref(), state)? {
+                        if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
                             return Ok(true);
                         }
                     }
@@ -1618,10 +1710,10 @@ async fn replay_working_set(
                     }
                 }
             }
-            if replay_after_retry(!state.pending_continues.is_empty())
+            if replay_after_retry(!state.parked_faults.is_empty())
                 == ReplayAfterRetry::WaitForPending
             {
-                tokio::time::sleep(CONTINUE_RETRY_DELAY).await;
+                tokio::time::sleep(PARKED_RETRY_DELAY).await;
                 continue 'chunk;
             }
 
@@ -1678,10 +1770,10 @@ async fn serve_faults(
 ) -> Result<()> {
     loop {
         let retry_due = async {
-            if state.pending_continues.is_empty() {
+            if state.parked_faults.is_empty() {
                 std::future::pending::<()>().await
             } else {
-                tokio::time::sleep(CONTINUE_RETRY_DELAY).await
+                tokio::time::sleep(PARKED_RETRY_DELAY).await
             }
         };
 
@@ -1710,8 +1802,8 @@ async fn serve_faults(
             _ = retry_due => {}
         }
 
-        if !retry_pending_continues(ctx, async_uffd.get_ref(), state)? {
-            log_clone_finished(ctx, state, "clone exited during CONTINUE retry");
+        if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
+            log_clone_finished(ctx, state, "clone exited during a parked-fault retry");
             return Ok(());
         }
         if yield_after_batch {
@@ -1738,27 +1830,63 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
     );
 }
 
-fn retry_pending_continues(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
+/// One attempt at resolving the fault at `page`, with the ioctl this clone's page source
+/// calls for. A fault's first attempt and every retry of a parked one go through here.
+fn resolve_fault(
+    uffd: &Uffd,
+    ctx: &VmContext<'_>,
+    page: usize,
+    offset_in_file: usize,
+) -> Result<FaultOutcome> {
+    match ctx.source {
+        PageSource::Minor { .. } => continue_page(uffd, ctx.vm_id, page, ctx.page_size),
+        PageSource::Copy { mmap } => {
+            copy_page(uffd, ctx.vm_id, mmap, page, offset_in_file, ctx.page_size)
+        }
+    }
+}
+
+/// Retry every parked fault once. `Ok(false)` means the clone is gone.
+///
+/// A fault still refused [`MAX_PARKED_WAIT`] after it was parked fails the handler, and
+/// the fail-closed path kills the VMM. The alternative is dropping the fault, which leaves
+/// its vCPU asleep for good.
+fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
+    let ioctl = match ctx.source {
+        PageSource::Minor { .. } => "UFFDIO_CONTINUE",
+        PageSource::Copy { .. } => "UFFDIO_COPY",
+    };
     let mut resolved = Vec::new();
-    for (&page, pending) in &state.pending_continues {
-        match continue_page(uffd, ctx.vm_id, page, ctx.page_size)? {
-            ContinueOutcome::Resolved => resolved.push((page, pending.trace)),
-            ContinueOutcome::VmGone => return Ok(false),
-            ContinueOutcome::Retry if pending.parked_at.elapsed() >= MAX_CONTINUE_WAIT => {
+    for (&page, parked) in &state.parked_faults.by_page {
+        match resolve_fault(uffd, ctx, page, parked.file_offset)? {
+            FaultOutcome::Resolved => resolved.push(page),
+            FaultOutcome::VmGone => return Ok(false),
+            FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
                 return Err(anyhow!(
-                    "UFFDIO_CONTINUE at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
+                    "{ioctl} at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
                      a fault that would permanently hang a vCPU for vm {}",
-                    pending.parked_at.elapsed(),
+                    parked.parked_at.elapsed(),
                     ctx.vm_id
                 ));
             }
-            ContinueOutcome::Retry => {}
+            FaultOutcome::Retry => {}
         }
     }
-    for (page, trace) in resolved {
-        state.pending_continues.remove(&page);
+    for page in resolved {
+        let Some(parked) = state.parked_faults.by_page.remove(&page) else {
+            continue;
+        };
+        // Logged for every fault that does resolve, so a deadline that fires has a healthy
+        // distribution to be compared with.
+        debug!(
+            target: "uffd",
+            vm_id = %ctx.vm_id,
+            fault_addr = format!("0x{:x}", page),
+            parked_us = parked.parked_at.elapsed().as_micros() as u64,
+            "parked fault resolved"
+        );
         // This retry is what released the vCPU, so it is what ends the interval.
-        state.close_parked_trace(trace);
+        state.close_parked_trace(&parked);
     }
     Ok(true)
 }
@@ -1849,7 +1977,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     // ioctl that releases the faulting vCPU. Zero when tracing is off.
                     let trace_t0 = state.trace.as_ref().map(FaultTrace::now_ns).unwrap_or(0);
 
-                    let mmap = match source {
+                    match source {
                         PageSource::Minor { .. } => {
                             // MINOR mode: the page is already in the page cache of the shared
                             // memfd that this clone mapped MAP_PRIVATE. UFFDIO_CONTINUE just
@@ -1871,163 +1999,35 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                     fault_page
                                 ));
                             }
-                            let trace_start = state
-                                .trace
-                                .as_ref()
-                                .map(|_| (offset_in_file as u64, trace_t0));
-                            match continue_page(uffd, vm_id, fault_page, page_size)? {
-                                ContinueOutcome::Resolved => {
-                                    if let Some(t) = state.trace.as_mut() {
-                                        let t1 = t.now_ns();
-                                        t.record(offset_in_file as u64, trace_t0, t1);
-                                    }
-                                }
-                                ContinueOutcome::VmGone => return Ok(DrainOutcome::VmExited),
-                                ContinueOutcome::Retry => {
-                                    // mmap_changing is set and the event that raised it is
-                                    // somewhere in THIS queue. Don't spin here, park the
-                                    // fault; the caller retries it right after the drain.
-                                    // The trace interval stays OPEN across the park: the
-                                    // vCPU is still blocked, and the retry is what frees it.
-                                    debug!(
-                                        target: "uffd",
-                                        vm_id = %vm_id,
-                                        fault_addr = format!("0x{:x}", fault_page),
-                                        "UFFDIO_CONTINUE EAGAIN (mmap_changing) - parked for retry"
-                                    );
-                                    state.park_continue(fault_page, trace_start);
-                                }
-                            }
-                            continue;
                         }
-                        PageSource::Copy { mmap } => mmap,
-                    };
+                        PageSource::Copy { .. } => {}
+                    }
 
-                    let mmap_len = mmap.len();
-
-                    if offset_in_file >= mmap_len {
-                        warn!(
-                            target: "uffd",
-                            vm_id = %vm_id,
-                            fault_addr = format!("0x{:x}", fault_page),
-                            "page fault past end of snapshot memory, zero-filling page"
-                        );
-                        // Heap-allocate zero buffer (2MB on stack would overflow for hugepages)
-                        let zero_page: Vec<u8> = vec![0u8; page_size];
-                        let result = unsafe {
-                            uffd.copy(
-                                zero_page.as_ptr() as *const std::ffi::c_void,
-                                fault_page as *mut std::ffi::c_void,
-                                page_size,
-                                true,
-                            )
-                        };
-                        if let Err(e) = result {
-                            if copy_vm_gone(&e) {
-                                info!(target: "uffd", vm_id = %vm_id, "VM exited during zero-fill");
-                                return Ok(DrainOutcome::VmExited);
+                    match resolve_fault(uffd, ctx, fault_page, offset_in_file)? {
+                        FaultOutcome::Resolved => {
+                            if let Some(t) = state.trace.as_mut() {
+                                let t1 = t.now_ns();
+                                t.record(offset_in_file as u64, trace_t0, t1);
                             }
-                            error!(
+                        }
+                        FaultOutcome::VmGone => return Ok(DrainOutcome::VmExited),
+                        FaultOutcome::Retry => {
+                            // mmap_changing is set and the event that raised it is
+                            // somewhere in THIS queue. Don't spin here, park the
+                            // fault; the caller retries it right after the drain.
+                            // The trace interval stays OPEN across the park: the
+                            // vCPU is still blocked, and the retry is what frees it.
+                            debug!(
                                 target: "uffd",
                                 vm_id = %vm_id,
                                 fault_addr = format!("0x{:x}", fault_page),
-                                error = ?e,
-                                "UFFD zero-page copy failed"
+                                "fault resolution EAGAIN (mmap_changing) - parked for retry"
                             );
-                            return Err(e.into());
+                            let trace_t0 = state.trace.is_some().then_some(trace_t0);
+                            state
+                                .parked_faults
+                                .park(fault_page, offset_in_file, trace_t0);
                         }
-                        if let Some(t) = state.trace.as_mut() {
-                            let t1 = t.now_ns();
-                            t.record(offset_in_file as u64, trace_t0, t1);
-                        }
-                        continue;
-                    }
-
-                    let bytes_available = mmap_len - offset_in_file;
-
-                    let copy_result = if bytes_available >= page_size {
-                        let page_data = &mmap[offset_in_file..offset_in_file + page_size];
-                        unsafe {
-                            uffd.copy(
-                                page_data.as_ptr() as *const std::ffi::c_void,
-                                fault_page as *mut std::ffi::c_void,
-                                page_size,
-                                true,
-                            )
-                        }
-                    } else {
-                        // Partial page at end of file: copy available data, zero-fill rest
-                        // Heap-allocate (2MB on stack would overflow for hugepages)
-                        let mut temp: Vec<u8> = vec![0u8; page_size];
-                        temp[..bytes_available].copy_from_slice(
-                            &mmap[offset_in_file..offset_in_file + bytes_available],
-                        );
-                        unsafe {
-                            uffd.copy(
-                                temp.as_ptr() as *const std::ffi::c_void,
-                                fault_page as *mut std::ffi::c_void,
-                                page_size,
-                                true,
-                            )
-                        }
-                    };
-
-                    if let Err(e) = copy_result {
-                        // EEXIST means page was already filled (race with another fault for same page)
-                        // This is normal on older kernels with less aggressive page fault coalescing.
-                        // See: https://docs.kernel.org/admin-guide/mm/userfaultfd.html
-                        // "the kernel must cope with it returning -EEXIST from ioctl(UFFDIO_COPY) as expected"
-                        if let userfaultfd::Error::CopyFailed(errno) = &e {
-                            // Compare raw errno value since we may have different nix versions
-                            if (*errno as i32) == libc::EEXIST {
-                                debug!(
-                                    target: "uffd",
-                                    vm_id = %vm_id,
-                                    fault_addr = format!("0x{:x}", fault_page),
-                                    "UFFD copy skipped - page already filled (EEXIST), waking waiters"
-                                );
-                                // See wake_eexist_waiters: the COPY backend has the same
-                                // check-then-sleep window as CONTINUE, this fault event is
-                                // already consumed, and Linux's uffd selftests wake after
-                                // COPY EEXIST for exactly this reason.
-                                wake_eexist_waiters(uffd, fault_page, page_size)?;
-                                if let Some(t) = state.trace.as_mut() {
-                                    let t1 = t.now_ns();
-                                    t.record(offset_in_file as u64, trace_t0, t1);
-                                }
-                                continue;
-                            }
-                        }
-
-                        // The clone exited with this fault in flight — an ordinary end of
-                        // life, not a service failure (which would now kill a VMM and
-                        // report the clone FAILED). Same treatment as the MINOR path's
-                        // `ContinueOutcome::VmGone`.
-                        if copy_vm_gone(&e) {
-                            info!(
-                                target: "uffd",
-                                vm_id = %vm_id,
-                                fault_addr = format!("0x{:x}", fault_page),
-                                "VM exited while its fault was being served"
-                            );
-                            return Ok(DrainOutcome::VmExited);
-                        }
-
-                        // Real error - log with Debug format to show errno
-                        error!(
-                            target: "uffd",
-                            vm_id = %vm_id,
-                            fault_addr = format!("0x{:x}", fault_page),
-                            offset_in_file,
-                            error = ?e,
-                            "UFFD copy failed"
-                        );
-                        return Err(e.into());
-                    }
-
-                    if let Some(t) = state.trace.as_mut() {
-                        let t1 = t.now_ns();
-                        t.record(offset_in_file as u64, trace_t0, t1);
                     }
                 }
                 Event::Remove { start, end } => {
@@ -2084,15 +2084,17 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
 
                     // Remove events and page faults for the same range arrive in either order,
                     // so a page in this range may already have been filled by UFFDIO_COPY before
-                    // we see the Remove event. UFFDIO_ZEROPAGE then fails with EEXIST (first page
-                    // already present) or EAGAIN (range partially zeroed before hitting a present
-                    // page). Tolerate both — same as the EEXIST handling in the copy path above —
-                    // by falling back to per-page zeroing that skips already-present pages.
+                    // we see the Remove event, and UFFDIO_ZEROPAGE then fails with EEXIST. It
+                    // fails with EAGAIN when it stopped at such a page after zeroing a prefix,
+                    // and also when it zeroed nothing because `mmap_changing` is still raised,
+                    // which is the usual state this soon after the event was read (see
+                    // `zeropage_stopped_short`). Tolerate both by falling back to per-page
+                    // zeroing that skips whatever is refused.
                     // Killing the handler here would close the uffd and silently corrupt the
                     // still-running VM.
                     let bulk_result = unsafe { uffd.zeropage(start, len, true) };
                     if let Err(e) = bulk_result {
-                        if !zeropage_hit_present_page(&e) {
+                        if !zeropage_stopped_short(&e) {
                             error!(
                                 target: "uffd",
                                 vm_id = %vm_id,
@@ -2117,7 +2119,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                 uffd.zeropage(page as *mut std::ffi::c_void, page_size, true)
                             };
                             if let Err(page_err) = page_result {
-                                if !zeropage_hit_present_page(&page_err) {
+                                if !zeropage_stopped_short(&page_err) {
                                     error!(
                                         target: "uffd",
                                         vm_id = %vm_id,
@@ -2618,9 +2620,9 @@ mod tests {
     /// A fault parked on EAGAIN is still blocking its vCPU, so its trace interval must
     /// end at the retry that resolved it. Closing it around the FAILED ioctl reports the
     /// EAGAIN as the resolution cost, and faultanalyze.py reads these intervals as exact
-    /// ioctl service time, so every MINOR-mode mmap-changing event would understate it.
+    /// ioctl service time, so every fault parked behind `mmap_changing` would understate it.
     #[test]
-    fn a_parked_continue_is_timed_to_its_retry_not_to_the_eagain() {
+    fn a_parked_fault_is_timed_to_its_retry_not_to_the_eagain() {
         const PAGE: usize = 0x4000;
         const OFFSET: u64 = 0x8000;
         const PARKED: std::time::Duration = std::time::Duration::from_millis(20);
@@ -2630,7 +2632,7 @@ mod tests {
         let origin = std::time::Instant::now();
         let mut state = VmState {
             fault_count: 0,
-            pending_continues: std::collections::BTreeMap::new(),
+            parked_faults: ParkedFaults::default(),
             recorded: None,
             record_until: None,
             started: origin,
@@ -2642,7 +2644,7 @@ mod tests {
         };
 
         let t0 = state.trace.as_ref().expect("trace").now_ns();
-        state.park_continue(PAGE, Some((OFFSET, t0)));
+        state.parked_faults.park(PAGE, OFFSET as usize, Some(t0));
         assert_eq!(
             state.trace.as_ref().expect("trace").records.len(),
             0,
@@ -2653,10 +2655,11 @@ mod tests {
         std::thread::sleep(PARKED);
 
         let parked = state
-            .pending_continues
+            .parked_faults
+            .by_page
             .remove(&PAGE)
             .expect("the fault is parked");
-        state.close_parked_trace(parked.trace);
+        state.close_parked_trace(&parked);
 
         let recorded = state.trace.as_ref().expect("trace").records.clone();
         assert_eq!(recorded.len(), 1, "one interval per resolved fault");
@@ -2689,7 +2692,7 @@ mod tests {
         assert_eq!(
             replay_steps_after_drain(DrainOutcome::BatchFull),
             &[ReplayStep::RetryPending, ReplayStep::DrainAgain],
-            "BatchFull must retry parked CONTINUEs before yielding for the next drain"
+            "BatchFull must retry parked faults before yielding for the next drain"
         );
     }
 
@@ -2698,7 +2701,7 @@ mod tests {
         assert_eq!(
             replay_after_retry(true),
             ReplayAfterRetry::WaitForPending,
-            "an unresolved demand CONTINUE must block speculative population"
+            "an unresolved demand fault must block speculative population"
         );
         assert_eq!(replay_after_retry(false), ReplayAfterRetry::Populate);
     }
@@ -2822,7 +2825,7 @@ mod tests {
 
         let mut past_window = VmState {
             fault_count: 0,
-            pending_continues: std::collections::BTreeMap::new(),
+            parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -2841,7 +2844,7 @@ mod tests {
         // above cannot pass by never recording anything.
         let mut in_window = VmState {
             fault_count: 0,
-            pending_continues: std::collections::BTreeMap::new(),
+            parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -2878,7 +2881,7 @@ mod tests {
         let fault_time = started + Duration::from_secs(1);
         let clone_state = |window: Duration| VmState {
             fault_count: 0,
-            pending_continues: std::collections::BTreeMap::new(),
+            parked_faults: ParkedFaults::default(),
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -3493,7 +3496,7 @@ mod tests {
         };
         assert_eq!(fault_addr, base + 8192);
         match continue_page(&uffd, "seal-test", fault_addr, 4096).unwrap() {
-            ContinueOutcome::Resolved => {}
+            FaultOutcome::Resolved => {}
             _ => panic!("continue_page must resolve a pending MINOR fault"),
         }
         assert_eq!(
@@ -3504,7 +3507,7 @@ mod tests {
 
         // The EEXIST race (page already mapped) is success, not an error.
         match continue_page(&uffd, "seal-test", fault_addr, 4096).unwrap() {
-            ContinueOutcome::Resolved => {}
+            FaultOutcome::Resolved => {}
             _ => panic!("EEXIST on an already-mapped page must count as resolved"),
         }
 
@@ -3872,6 +3875,90 @@ mod tests {
         panic!("faulter (tid {tid}) never parked in handle_userfault within 5s");
     }
 
+    /// A guest thread that reads one byte at `addr`. It faults, sleeps in the kernel until
+    /// the fault is resolved, and then reports what it read and how long the read was blocked.
+    struct FaultingReader {
+        tid: libc::pid_t,
+        read: std::sync::mpsc::Receiver<(u8, Duration)>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl FaultingReader {
+        fn spawn(addr: usize) -> Self {
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let (read_tx, read) = std::sync::mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                // SAFETY: gettid on the current thread.
+                tid_tx.send(unsafe { libc::gettid() }).ok();
+                let blocked = std::time::Instant::now();
+                // SAFETY: `addr` is inside a mapping that outlives this thread.
+                let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+                read_tx.send((got, blocked.elapsed())).ok();
+            });
+            let tid = tid_rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("reader tid");
+            Self { tid, read, thread }
+        }
+
+        /// Returns once the thread is asleep in its fault; see
+        /// [`wait_parked_in_handle_userfault`] for why a queued event does not prove that.
+        fn wait_until_asleep(&self) {
+            wait_parked_in_handle_userfault(self.tid);
+        }
+
+        /// What the thread read and how long it was blocked, once its fault is resolved.
+        fn finish(self, why_it_must_wake: &str) -> (u8, Duration) {
+            let read = self
+                .read
+                .recv_timeout(Duration::from_secs(5))
+                .expect(why_it_must_wake);
+            self.thread.join().expect("reader thread");
+            read
+        }
+    }
+
+    /// Anonymous private memory registered MISSING on a fresh userfaultfd, which is what
+    /// Firecracker hands the server for a COPY clone. `features` is what the clone asked the
+    /// kernel for; a clone with a balloon asks for `EVENT_REMOVE`.
+    fn missing_guest_memory(len: usize, features: userfaultfd::FeatureFlags) -> (usize, Uffd) {
+        // SAFETY: fresh anonymous mapping.
+        let base = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        assert_ne!(base, libc::MAP_FAILED, "mapping stand-in guest memory");
+        let uffd = userfaultfd::UffdBuilder::new()
+            .close_on_exec(true)
+            .non_blocking(true)
+            .user_mode_only(true)
+            .require_features(features)
+            .create()
+            .expect("creating userfaultfd (via /dev/userfaultfd)");
+        uffd.register(base, len).expect("MISSING registration");
+        (base as usize, uffd)
+    }
+
+    /// Block until the userfaultfd has an event queued, or panic with `what` never arrived.
+    fn wait_for_uffd_event(uffd: &Uffd, what: &str) {
+        let mut pfd = libc::pollfd {
+            fd: uffd.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialised pollfd, owned fd.
+        assert!(
+            unsafe { libc::poll(&mut pfd, 1, 5000) } > 0,
+            "{what} never reached the userfaultfd"
+        );
+    }
+
     /// EEXIST from UFFDIO_CONTINUE proves the PTE is present — NOT that the faulter was
     /// woken. The kernel's check-then-sleep window lets a faulter enqueue AFTER a racing
     /// winner's wake scan, which is why userfaultfd(2) requires an explicit UFFDIO_WAKE
@@ -4045,7 +4132,7 @@ mod tests {
 
         // The handler under test answers the consumed fault: it must see EEXIST and wake.
         let outcome = continue_page(&uffd, "eexist-wake-test", addr, PAGE).expect("continue_page");
-        assert!(matches!(outcome, ContinueOutcome::Resolved));
+        assert!(matches!(outcome, FaultOutcome::Resolved));
 
         let got = rx.recv_timeout(Duration::from_secs(5)).expect(
             "faulter still asleep after EEXIST resolution — continue_page must UFFDIO_WAKE \
@@ -4061,116 +4148,256 @@ mod tests {
     }
 
     /// The COPY twin of the stranded-faulter test: the default (file-backed) serve mode
-    /// resolves MISSING faults with UFFDIO_COPY, whose EEXIST has the same
-    /// check-then-sleep window — Linux's own uffd selftests wake after COPY EEXIST.
-    /// Constructs the stranded state with the parked-oracle, then runs the exact
-    /// sequence the demand COPY arm runs: attempt the copy, observe EEXIST, wake.
+    /// resolves MISSING faults with UFFDIO_COPY, whose EEXIST has the same check-then-sleep
+    /// window. Linux's own uffd selftests wake after COPY EEXIST. Constructs the stranded
+    /// state with the parked-oracle, then answers the consumed fault the way the handler
+    /// does, through `copy_page`, which must see EEXIST and wake.
     #[test]
     fn eexist_copy_resolution_wakes_the_stranded_faulter() {
-        use std::sync::mpsc;
-        use std::time::Duration;
-
         const PAGE: usize = 4096;
-        // SAFETY: fresh anonymous mapping.
-        let base = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                PAGE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                -1,
-                0,
-            )
-        };
-        assert_ne!(base, libc::MAP_FAILED);
-        let uffd = userfaultfd::UffdBuilder::new()
-            .close_on_exec(true)
-            .non_blocking(true)
-            .user_mode_only(true)
-            .create()
-            .expect("creating userfaultfd");
-        uffd.register(base, PAGE).expect("MISSING registration");
+        let (addr, uffd) = missing_guest_memory(PAGE, userfaultfd::FeatureFlags::empty());
 
-        let addr = base as usize;
-        let (tid_tx, tid_rx) = mpsc::channel();
-        let (tx, rx) = mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            // SAFETY: gettid on the current thread.
-            tid_tx.send(unsafe { libc::gettid() }).ok();
-            // MISSING-faults and sleeps until woken.
-            // SAFETY: addr is a live registered mapping for the test's lifetime.
-            let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
-            tx.send(got).ok();
-        });
-        let reader_tid = tid_rx
-            .recv_timeout(Duration::from_secs(5))
-            .expect("reader tid");
-
-        let mut pfd = libc::pollfd {
-            fd: uffd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one initialised pollfd, owned fd.
-        assert!(
-            unsafe { libc::poll(&mut pfd, 1, 5000) } > 0,
-            "no fault event within 5s"
-        );
+        let reader = FaultingReader::spawn(addr);
+        wait_for_uffd_event(&uffd, "the reader's fault");
         match uffd.read_event() {
             Ok(Some(userfaultfd::Event::Pagefault { .. })) => {}
             other => panic!("expected the reader's pagefault event, got {other:?}"),
         }
-        wait_parked_in_handle_userfault(reader_tid);
+        reader.wait_until_asleep();
 
         // The racing winner: fills the page with NO wake; the event is consumed and
         // the reader is proven asleep.
-        let src = vec![0xA5u8; PAGE];
-        // SAFETY: src outlives the ioctl; base is the registered page.
-        unsafe { uffd.copy(src.as_ptr().cast(), base, PAGE, false) }
-            .expect("winner's COPY must succeed");
+        let snapshot = vec![0xA5u8; PAGE];
+        // SAFETY: `snapshot` outlives the ioctl; `addr` is the registered page.
+        unsafe {
+            uffd.copy(
+                snapshot.as_ptr().cast(),
+                addr as *mut libc::c_void,
+                PAGE,
+                false,
+            )
+        }
+        .expect("winner's COPY must succeed");
 
-        // The demand COPY arm's exact sequence: attempt, observe EEXIST, wake.
-        // SAFETY: same as above.
-        let err = unsafe { uffd.copy(src.as_ptr().cast(), base, PAGE, true) }
-            .expect_err("second COPY must report EEXIST");
-        assert!(
-            matches!(&err, userfaultfd::Error::CopyFailed(errno) if (*errno as i32) == libc::EEXIST),
-            "expected CopyFailed(EEXIST), got {err:?}"
-        );
-        wake_eexist_waiters(&uffd, addr, PAGE).expect("wake after COPY EEXIST");
+        // The handler under test answers the consumed fault: it must see EEXIST and wake.
+        let outcome =
+            copy_page(&uffd, "eexist-copy-wake-test", &snapshot, addr, 0, PAGE).expect("copy_page");
+        assert!(matches!(outcome, FaultOutcome::Resolved));
 
-        let got = rx.recv_timeout(Duration::from_secs(5)).expect(
-            "faulter still asleep after COPY EEXIST — the demand COPY arm must wake \
-             (userfaultfd(2) contract; COPY-mode half of the clone wedge)",
+        let (got, _) = reader.finish(
+            "faulter still asleep after COPY EEXIST: copy_page must UFFDIO_WAKE the granule \
+             (userfaultfd(2) EEXIST contract; the COPY-mode half of the clone wedge)",
         );
         assert_eq!(got, 0xA5, "reader must observe the winner's bytes");
-        reader.join().expect("reader thread");
-        // SAFETY: unmapping our own mapping.
-        unsafe { libc::munmap(base, PAGE) };
+        // SAFETY: unmapping our own mapping, with no thread left that uses it.
+        unsafe { libc::munmap(addr as *mut libc::c_void, PAGE) };
     }
 
-    /// The behavioral tests above bind wake_eexist_waiters' SEMANTICS; this binds the
-    /// CALL SITES. The demand COPY arm lives inline in drain_events and cannot be
-    /// driven directly by a unit test, so removing its wake would leave every
-    /// behavioral test green — this assertion goes red instead.
-    #[test]
-    fn both_eexist_arms_wake_their_waiters() {
-        let source = include_str!("server.rs");
-        for anchor in [
-            "UFFDIO_CONTINUE skipped - page already mapped (EEXIST), waking waiters",
-            "UFFD copy skipped - page already filled (EEXIST), waking waiters",
-        ] {
-            let at = source.find(anchor).unwrap_or_else(|| {
-                panic!("EEXIST arm anchor missing (renamed without updating this test): {anchor}")
+    /// A COPY-mode clone with a balloon, as far as the fault path can tell: guest memory
+    /// registered MISSING on a userfaultfd that asked for REMOVE events, and a snapshot whose
+    /// page `i` is filled with the byte `i + 1`, mapped as its page source.
+    struct BalloonedCopyClone {
+        base: usize,
+        mem_size: usize,
+        source: PageSource,
+        mappings: [GuestRegionUffdMapping; 1],
+    }
+
+    impl BalloonedCopyClone {
+        const PAGE: usize = 4096;
+
+        fn new(pages: usize) -> (Self, Uffd) {
+            let mem_size = pages * Self::PAGE;
+            let mut snapshot = memmap2::MmapMut::map_anon(mem_size).expect("mapping a snapshot");
+            for (index, page) in snapshot.chunks_exact_mut(Self::PAGE).enumerate() {
+                page.fill((index + 1) as u8);
+            }
+            let mmap = snapshot.make_read_only().expect("sealing the snapshot");
+            let (base, uffd) =
+                missing_guest_memory(mem_size, userfaultfd::FeatureFlags::EVENT_REMOVE);
+            let clone = Self {
+                base,
+                mem_size,
+                source: PageSource::Copy { mmap },
+                mappings: [GuestRegionUffdMapping {
+                    base_host_virt_addr: base as u64,
+                    size: mem_size,
+                    offset: 0,
+                    page_size: Self::PAGE,
+                }],
+            };
+            (clone, uffd)
+        }
+
+        fn page(&self, index: usize) -> usize {
+            self.base + index * Self::PAGE
+        }
+
+        fn ctx(&self) -> VmContext<'_> {
+            VmContext {
+                vm_id: "ballooned-copy-clone",
+                mappings: &self.mappings,
+                source: &self.source,
+                page_size: Self::PAGE,
+                page_mask: !(Self::PAGE - 1),
+                mem_size: self.mem_size,
+            }
+        }
+
+        fn state() -> VmState {
+            VmState {
+                fault_count: 0,
+                parked_faults: ParkedFaults::default(),
+                recorded: None,
+                record_until: None,
+                started: std::time::Instant::now(),
+                trace: None,
+            }
+        }
+
+        /// The balloon: `madvise(MADV_DONTNEED)` on page 0 from another thread. It raises
+        /// `mmap_changing`, queues a REMOVE event and sleeps until the event is read. Returns
+        /// once the event is queued. The kernel refuses every populate ioctl on this
+        /// userfaultfd from here until that thread runs again, which it cannot do before the
+        /// event is read.
+        fn inflate_page_zero(&self, uffd: &Uffd) -> std::thread::JoinHandle<libc::c_int> {
+            let base = self.base;
+            let balloon = std::thread::spawn(move || {
+                // SAFETY: advising this test's own live mapping.
+                unsafe { libc::madvise(base as *mut libc::c_void, Self::PAGE, libc::MADV_DONTNEED) }
             });
-            let window = &source[at..source.len().min(at + 800)];
-            assert!(
-                window.contains("wake_eexist_waiters("),
-                "the EEXIST arm at {anchor:?} no longer wakes its waiters — \
-                 that is the stranded-faulter hang, do not remove the wake"
-            );
+            wait_for_uffd_event(uffd, "the REMOVE event");
+            balloon
+        }
+
+        /// Unmap the guest memory. Only after every thread that touches it has been joined:
+        /// a thread woken from a fault on an address that is no longer mapped takes SIGSEGV,
+        /// which would turn a failed assertion into a crashed test binary.
+        fn unmap(self) {
+            // SAFETY: unmapping our own mapping, with no thread left that uses it.
+            unsafe { libc::munmap(self.base as *mut libc::c_void, self.mem_size) };
         }
     }
+
+    /// Issue #961, demand half. With a balloon, a REMOVE event left unread keeps
+    /// `mmap_changing` raised and the kernel answers the fault's UFFDIO_COPY with `EAGAIN`
+    /// and no progress. The vCPU behind that fault is still asleep, so the handler must
+    /// neither fail (which kills the clone's VMM) nor drop the fault: it parks it and a
+    /// retry after the drain resolves it.
+    ///
+    /// Drives the production `drain_events` and `retry_parked_faults` against a real
+    /// userfaultfd. `read` hands out a pending fault ahead of any queued event, so the COPY
+    /// is always attempted while the REMOVE is still unread.
+    #[test]
+    fn a_demand_copy_behind_an_unread_remove_event_parks_and_resolves() {
+        let (clone, uffd) = BalloonedCopyClone::new(3);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        let balloon = clone.inflate_page_zero(&uffd);
+
+        // A vCPU touches page 2 and sleeps in the kernel until the fault is resolved.
+        let addr = clone.page(2);
+        let vcpu = FaultingReader::spawn(addr);
+        vcpu.wait_until_asleep();
+
+        let outcome = drain_events(&uffd, &ctx, &mut state).expect(
+            "a demand COPY refused with a zero-progress EAGAIN must not fail the handler: \
+             the fail-closed path kills the clone's VMM",
+        );
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(state.fault_count, 1);
+        assert_eq!(
+            state
+                .parked_faults
+                .by_page
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![addr],
+            "the refused fault must stay parked; dropping it leaves its vCPU asleep for good"
+        );
+        assert!(
+            vcpu.read.try_recv().is_err(),
+            "nothing has resolved the fault yet, so the vCPU must still be asleep"
+        );
+
+        // That drain also read the REMOVE, so the thread inside madvise can run again and
+        // lower mmap_changing. Retry the way the handler does until one goes through. The
+        // deadline here is shorter than the handler's own, so a fault that stays refused
+        // fails with this message and not with the handler's error.
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked COPY never resolved after the REMOVE event was read"
+            );
+            assert!(
+                retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying the parked COPY"),
+                "the clone is alive; a retry must not report it gone"
+            );
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its parked fault resolved");
+        assert_eq!(got, 3, "the fault must be served the snapshot's page 2");
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
+    /// The wait of a parked fault is bounded, for a COPY as for a CONTINUE. While the REMOVE
+    /// event stays unread every retry is refused; a fault still refused MAX_PARKED_WAIT
+    /// after it was parked fails the handler, and the fail-closed path kills the VMM rather
+    /// than leave a vCPU asleep for good.
+    #[test]
+    fn a_parked_copy_still_refused_at_the_deadline_fails_the_handler() {
+        let (clone, uffd) = BalloonedCopyClone::new(3);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        // Queued and deliberately left unread until the end of the test.
+        let balloon = clone.inflate_page_zero(&uffd);
+
+        let page = clone.page(2);
+        state
+            .parked_faults
+            .park(page, 2 * BalloonedCopyClone::PAGE, None);
+        assert!(
+            retry_parked_faults(&ctx, &uffd, &mut state)
+                .expect("a refusal inside the wait is not a failure"),
+            "the clone is alive; a retry must not report it gone"
+        );
+        assert_eq!(
+            state.parked_faults.by_page.len(),
+            1,
+            "refused inside the wait: the fault stays parked"
+        );
+
+        // The same refusal once the fault has been parked for the whole wait.
+        state
+            .parked_faults
+            .by_page
+            .get_mut(&page)
+            .expect("the fault is parked")
+            .parked_at = std::time::Instant::now()
+            .checked_sub(MAX_PARKED_WAIT)
+            .expect("the monotonic clock is older than the wait");
+        let error = retry_parked_faults(&ctx, &uffd, &mut state)
+            .expect_err("a COPY still refused at the deadline must fail the handler");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("UFFDIO_COPY") && message.contains(&format!("0x{page:x}")),
+            "the error must name the ioctl and the fault: {message}"
+        );
+
+        // Let madvise return.
+        let event = uffd.read_event().expect("reading the REMOVE event");
+        assert!(
+            matches!(event, Some(Event::Remove { .. })),
+            "expected the queued REMOVE, got {event:?}"
+        );
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
     #[test]
     fn replay_yields_once_per_batch_of_small_runs() {
         let mut pacer = ReplayPacer::default();

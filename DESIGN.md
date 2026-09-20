@@ -2425,7 +2425,10 @@ there is ONE physical, *reclaimable* copy regardless of clone count. Only writte
 and registers it with UFFD in MISSING mode. On each fault the server `UFFDIO_COPY`s out of
 memory.bin — every faulted page becomes unswappable private anon in that clone (~76
 MiB/clone at idle), and the serve process itself faults the whole snapshot mmap in as it
-copies (205 MiB PSS measured after serving 4 clones).
+copies (205 MiB PSS measured after serving 4 clones). With a balloon, a REMOVE event keeps
+`mmap_changing` raised until the thread inside `madvise` runs again, and `UFFDIO_COPY`
+returns `EAGAIN` with nothing copied until then. The handler parks such a fault and
+retries it, bounded, exactly as the MINOR handler below does for `UFFDIO_CONTINUE`.
 
 **KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
 with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.
