@@ -379,6 +379,95 @@ where
     Ok((config, choice))
 }
 
+/// Why a restore with no serve process pages its memory in through an in-process
+/// UFFD server instead of handing memory.bin to Firecracker's File backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImplicitUffdReason {
+    /// Firecracker rejects the File backend for hugepage snapshots.
+    Hugepages,
+    /// The restore launches Firecracker with `--enable-nv2`, so the guest runs with a
+    /// virtual EL2 (ARM64 NV2). The File backend maps memory.bin MAP_PRIVATE, so the
+    /// guest's first write to each page is a host copy-on-write. On arm64 the MMU-notifier
+    /// invalidate for that copy reaches `kvm_unmap_gfn_range`, which unmaps every nested
+    /// stage-2 MMU over its whole range (`kvm_nested_s2_unmap`), so each first write
+    /// throws away all of an L2 guest's translations. UFFD copy fills anonymous memory
+    /// that a later write does not copy. This chain is read from
+    /// arch/arm64/kvm/{mmu,nested}.c and has not been traced on hardware.
+    Nv2,
+    /// `FCVM_FORCE_UFFD`, for debugging and tests.
+    Forced,
+}
+
+impl std::fmt::Display for ImplicitUffdReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Hugepages => "hugepages require UFFD",
+            Self::Nv2 => "NV2 guests avoid the File backend's copy-on-write",
+            Self::Forced => "FCVM_FORCE_UFFD",
+        })
+    }
+}
+
+/// The page-materialisation mode a UFFD server runs, given the requested one
+/// (`--uffd-mode` or `FCVM_UFFD_MODE`) and whether the guest is NV2.
+///
+/// An NV2 guest always gets copy mode: MINOR maps the snapshot memfd MAP_PRIVATE, so the
+/// guest's first write to a page is the same copy-on-write that rules out the File
+/// backend.
+fn uffd_backing_for(requested: UffdBacking, nv2: bool) -> UffdBacking {
+    if nv2 {
+        UffdBacking::Copy
+    } else {
+        requested
+    }
+}
+
+/// `snapshot serve`'s mode: the requested one, or copy when the snapshot's recorded
+/// kernel profile is NV2. A serve launches no Firecracker, so it reads the profile its
+/// clones resolve their Firecracker arguments from.
+fn serve_uffd_backing<GetProfile>(
+    requested: UffdBacking,
+    kernel_profile: Option<&str>,
+    get_profile: GetProfile,
+) -> Result<UffdBacking>
+where
+    GetProfile: FnOnce(&str) -> Result<Option<crate::setup::KernelProfile>>,
+{
+    let nv2 = get_profile(kernel_profile.unwrap_or("default"))?
+        .is_some_and(|profile| profile.enables_nv2());
+    Ok(uffd_backing_for(requested, nv2))
+}
+
+/// Memory transport for a Firecracker restore with no serve process: every
+/// `snapshot run --snapshot`, which is also how the podman snapshot cache restores,
+/// on a hit and when the NV2 miss path relaunches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirectRestoreMemory {
+    /// Firecracker maps memory.bin MAP_PRIVATE; clean pages stay shared through the
+    /// host page cache.
+    File,
+    /// An in-process UFFD server fills the guest's memory.
+    ImplicitUffd(ImplicitUffdReason),
+}
+
+/// Choose the memory transport for a restore with no serve process.
+///
+/// `nv2` says whether this restore launches Firecracker with `--enable-nv2`
+/// (`RuntimeConfig::effective_firecracker_args`). Unless the caller overrides them, the
+/// restore resolves those arguments from the snapshot's recorded kernel profile
+/// (`snapshot_restore_runtime_config`), so an NV2 snapshot restores with the flag.
+fn direct_restore_memory(hugepages: bool, nv2: bool, forced: bool) -> DirectRestoreMemory {
+    if hugepages {
+        DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages)
+    } else if nv2 {
+        DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
+    } else if forced {
+        DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Forced)
+    } else {
+        DirectRestoreMemory::File
+    }
+}
+
 /// Wait for the restored guest's output channel, which is the final fc-agent
 /// rebind handshake before health monitoring may begin.
 ///
@@ -974,11 +1063,23 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
 
     // How pages reach the clones: private per-clone UFFDIO_COPY (default) or one shared
     // memfd resolved with UFFDIO_CONTINUE (--uffd-mode minor / FCVM_UFFD_MODE=minor).
+    // An NV2 snapshot is always served in copy mode.
     let hugepages = snapshot_config.metadata.hugepages;
-    let backing = match args.uffd_mode.as_deref() {
+    let requested = match args.uffd_mode.as_deref() {
         Some(mode) => UffdBacking::parse_mode(mode, hugepages)?,
         None => UffdBacking::Copy,
     };
+    let backing = serve_uffd_backing(
+        requested,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+        crate::setup::get_kernel_profile,
+    )?;
+    if backing != requested {
+        warn!(
+            requested = requested.name(),
+            "--uffd-mode does not apply to an NV2 snapshot; serving in copy mode"
+        );
+    }
 
     // Whether clones replay the snapshot's recorded working set instead of faulting it in
     // one page at a time (--uffd-prefetch / FCVM_UFFD_PREFETCH).
@@ -1962,10 +2063,9 @@ async fn cmd_snapshot_run_inner(
         None
     };
 
-    // Choose memory backend based on mode
-    // Hugepages require UFFD restore (Firecracker rejects File backend for hugepage snapshots).
-    // When restoring from cache (no explicit serve process), start an implicit in-process
-    // UFFD server as a background tokio task.
+    // Choose memory backend based on mode. Without a serve process the restore maps
+    // memory.bin directly unless `direct_restore_memory` says the snapshot needs an
+    // implicit in-process UFFD server, which runs as a background tokio task.
     let hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
 
     // Which VMM created this snapshot — restore must use the same backend (the memory image
@@ -2003,21 +2103,28 @@ async fn cmd_snapshot_run_inner(
             },
         }
     } else {
-        // Use file-backed restore by default, UFFD when required.
-        // Hugepages require UFFD (Firecracker rejects File backend for hugepage snapshots).
-        // FCVM_FORCE_UFFD=1 forces UFFD for debugging/testing.
-        if hugepages || std::env::var("FCVM_FORCE_UFFD").is_ok() {
-            let reason = if hugepages {
+        let nv2 = runtime_config
+            .effective_firecracker_args()
+            .as_deref()
+            .is_some_and(crate::setup::firecracker_args_enable_nv2);
+        let direct_memory =
+            direct_restore_memory(hugepages, nv2, std::env::var("FCVM_FORCE_UFFD").is_ok());
+        if let DirectRestoreMemory::ImplicitUffd(reason) = direct_memory {
+            if hugepages {
                 // Same admission logic as the serve-process path above: refuse to spawn a
                 // hugepage clone the pool cannot hold at its CoW worst case.
                 setup_try!(crate::uffd::preflight_clone_hugepages(
                     args.mem.unwrap_or(snapshot_config.metadata.memory_mib) as usize,
                 ));
-                "hugepages require UFFD"
-            } else {
-                "FCVM_FORCE_UFFD"
-            };
-            let backing = setup_try!(UffdBacking::from_env(hugepages));
+            }
+            let requested = setup_try!(UffdBacking::from_env(hugepages));
+            let backing = uffd_backing_for(requested, nv2);
+            if backing != requested {
+                warn!(
+                    requested = requested.name(),
+                    "FCVM_UFFD_MODE does not apply to an NV2 snapshot; restoring in copy mode"
+                );
+            }
             let prefetch = setup_try!(Prefetch::from_env());
             let record_window = setup_try!(record_window_from_env());
             let fault_around = setup_try!(FaultAround::from_env());
@@ -2351,7 +2458,7 @@ async fn cmd_snapshot_run_inner(
     // notify needed — the listener will accept fc-agent's new connection naturally.
 
     if let Ok(RestoreAck::Acked { guest_phases }) = &restore_completion_result {
-        let is_uffd = use_uffd || std::env::var("FCVM_FORCE_UFFD").is_ok() || hugepages;
+        let is_uffd = use_uffd || implicit_uffd_handle.is_some();
         if is_uffd {
             info!(vm_id = %vm_id, vm_name = %vm_name, "VM cloned with UFFD memory");
             println!(
@@ -2473,7 +2580,7 @@ async fn cmd_snapshot_run_inner(
         // Cleanup resources (exec path has no health monitor)
         info!(result = ?exec_result, "exec finished, cleaning up");
 
-        // Stop implicit UFFD server if running (hugepage cache restore)
+        // Stop implicit UFFD server if running (see direct_restore_memory)
         implicit_uffd_cancel.cancel();
         tty_cancel.cancel();
         status_handle.abort();
@@ -3208,8 +3315,7 @@ async fn build_clone_reboot_plan(
         .context("resolving fc-agent initrd for reboot plan")?;
 
     let firecracker_bin = crate::commands::common::find_firecracker(runtime_config)?;
-    let fc_args_env = std::env::var("FCVM_FIRECRACKER_ARGS").ok();
-    let fc_args = runtime_config.firecracker_args.clone().or(fc_args_env);
+    let fc_args = runtime_config.effective_firecracker_args();
 
     let launch_config = super::podman::build_launch_config(
         &synth_args,
@@ -3885,6 +3991,14 @@ mod tests {
         }
     }
 
+    /// The nested profile: its Firecracker takes `--enable-nv2`.
+    fn nv2_kernel_profile() -> crate::setup::KernelProfile {
+        crate::setup::KernelProfile {
+            firecracker_args: Some("--enable-nv2".to_string()),
+            ..profile_with_a_newer_firecracker()
+        }
+    }
+
     #[tokio::test]
     async fn restore_runs_on_the_binary_the_snapshot_recorded() {
         let recorded = tempfile::NamedTempFile::new().unwrap();
@@ -4010,6 +4124,126 @@ mod tests {
             Some(PathBuf::from("/opt/firecracker-under-review"))
         );
         assert_eq!(runtime.firecracker_args, None);
+    }
+
+    /// CI's SnapshotEnabled nested lane restores its L1 exactly this way: no serve
+    /// process, no hugepages, no Firecracker overrides, a snapshot recorded under the
+    /// NV2 profile on the binary it records. The restore's own Firecracker arguments
+    /// carry `--enable-nv2`, and the plan pages memory in through UFFD.
+    #[tokio::test]
+    async fn nv2_snapshot_restore_pages_in_through_uffd() {
+        let recorded = tempfile::NamedTempFile::new().unwrap();
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &snapshot_runtime_args_without_overrides(),
+            Some("nested"),
+            Some(recorded.path()),
+            |name| {
+                assert_eq!(name, "nested");
+                Ok(Some(nv2_kernel_profile()))
+            },
+            |_profile, _name| async { panic!("a recorded binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(choice, FirecrackerChoice::Recorded);
+        let firecracker_args = runtime.effective_firecracker_args();
+        assert_eq!(firecracker_args.as_deref(), Some("--enable-nv2"));
+
+        let nv2 = firecracker_args
+            .as_deref()
+            .is_some_and(crate::setup::firecracker_args_enable_nv2);
+        assert_eq!(
+            direct_restore_memory(false, nv2, false),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
+        );
+    }
+
+    /// `snapshot run --firecracker-bin` on an NV2 snapshot keeps the profile's
+    /// `--enable-nv2`, so it pages in through UFFD too.
+    #[tokio::test]
+    async fn nv2_snapshot_on_an_explicit_firecracker_bin_pages_in_through_uffd() {
+        let recorded = tempfile::NamedTempFile::new().unwrap();
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &args,
+            Some("nested"),
+            Some(recorded.path()),
+            |name| {
+                assert_eq!(name, "nested");
+                Ok(Some(nv2_kernel_profile()))
+            },
+            |_profile, _name| async { panic!("an explicit binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(choice, FirecrackerChoice::Requested);
+        let nv2 = runtime
+            .effective_firecracker_args()
+            .as_deref()
+            .is_some_and(crate::setup::firecracker_args_enable_nv2);
+        assert_eq!(
+            direct_restore_memory(false, nv2, false),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Nv2)
+        );
+    }
+
+    #[test]
+    fn restores_that_are_not_nv2_keep_their_memory_transport() {
+        assert_eq!(
+            direct_restore_memory(false, false, false),
+            DirectRestoreMemory::File
+        );
+        assert_eq!(
+            direct_restore_memory(false, false, true),
+            DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Forced)
+        );
+        // An NV2 hugepage snapshot reports the hugepage reason; uffd_backing_for still
+        // pins it to copy mode.
+        for nv2 in [false, true] {
+            assert_eq!(
+                direct_restore_memory(true, nv2, false),
+                DirectRestoreMemory::ImplicitUffd(ImplicitUffdReason::Hugepages)
+            );
+        }
+        // Only the exact flag makes a restore NV2.
+        assert!(!crate::setup::firecracker_args_enable_nv2("--no-seccomp"));
+        assert!(!crate::setup::firecracker_args_enable_nv2("--enable-nv2x"));
+        assert!(crate::setup::firecracker_args_enable_nv2(
+            "--no-seccomp --enable-nv2"
+        ));
+    }
+
+    /// MINOR maps the snapshot memfd MAP_PRIVATE, which brings back the first-write
+    /// copy-on-write, so an NV2 guest copies whatever mode was requested, with or
+    /// without hugepages.
+    #[test]
+    fn nv2_restore_copies_even_when_minor_is_requested() {
+        let minor = UffdBacking::Minor { hugepages: false };
+        let huge_minor = UffdBacking::Minor { hugepages: true };
+        assert_eq!(uffd_backing_for(minor, true), UffdBacking::Copy);
+        assert_eq!(uffd_backing_for(huge_minor, true), UffdBacking::Copy);
+        // Other guests keep the requested mode.
+        assert_eq!(uffd_backing_for(minor, false), minor);
+        assert_eq!(uffd_backing_for(huge_minor, false), huge_minor);
+    }
+
+    /// `snapshot serve --uffd-mode minor` on an NV2 snapshot would hand its clones a
+    /// UffdMinor backend; it serves copy mode instead.
+    #[test]
+    fn nv2_snapshot_serve_copies_even_when_minor_is_requested() {
+        let minor = UffdBacking::Minor { hugepages: false };
+        let served = serve_uffd_backing(minor, Some("nested"), |name| {
+            assert_eq!(name, "nested");
+            Ok(Some(nv2_kernel_profile()))
+        });
+        assert_eq!(served.unwrap(), UffdBacking::Copy);
+
+        let served = serve_uffd_backing(minor, None, |name| {
+            assert_eq!(name, "default");
+            Ok(Some(crate::setup::KernelProfile::default()))
+        });
+        assert_eq!(served.unwrap(), minor);
     }
 
     #[tokio::test]

@@ -40,6 +40,16 @@ pub struct RuntimeConfig {
     pub fuse_readers: Option<u32>,
 }
 
+impl RuntimeConfig {
+    /// The extra arguments a Firecracker spawned from this config receives: the
+    /// configured ones, else `FCVM_FIRECRACKER_ARGS`.
+    pub fn effective_firecracker_args(&self) -> Option<String> {
+        self.firecracker_args
+            .clone()
+            .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok())
+    }
+}
+
 /// Vsock base port for volume servers (used by both podman and snapshot commands)
 pub const VSOCK_VOLUME_PORT_BASE: u32 = 5000;
 
@@ -2079,10 +2089,7 @@ pub async fn restore_from_snapshot(
         .ok_or_else(|| anyhow::anyhow!("clone {vm_id} has no recorded vsock socket path"))?;
     let vsock_override =
         snapshot_load_vsock_override(firecracker_version, &clone_vsock_socket_path);
-    let firecracker_args = runtime_config
-        .firecracker_args
-        .clone()
-        .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok());
+    let firecracker_args = runtime_config.effective_firecracker_args();
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
     // mount redirect — all shared with the Cloud Hypervisor restore path.

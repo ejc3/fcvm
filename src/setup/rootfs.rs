@@ -246,6 +246,19 @@ impl KernelProfile {
     pub fn inherits_kernel(&self) -> bool {
         !self.is_custom() && !self.is_url_based()
     }
+
+    /// True when this profile runs its guest with ARM64 NV2 nested virtualization:
+    /// its Firecracker takes `--enable-nv2`, which gives the vCPUs a virtual EL2.
+    pub fn enables_nv2(&self) -> bool {
+        self.firecracker_args
+            .as_deref()
+            .is_some_and(firecracker_args_enable_nv2)
+    }
+}
+
+/// True when whitespace-separated Firecracker CLI arguments include `--enable-nv2`.
+pub fn firecracker_args_enable_nv2(args: &str) -> bool {
+    args.split_whitespace().any(|arg| arg == "--enable-nv2")
 }
 
 #[derive(Debug, Deserialize, Clone)]

@@ -506,7 +506,8 @@ pub struct SnapshotRunArgs {
     #[arg(long, conflicts_with = "snapshot")]
     pub pid: Option<u32>,
 
-    /// Snapshot name to clone from (direct file mode - no UFFD server needed)
+    /// Snapshot name to clone from, with no serve process. Hugepage and NV2 snapshots
+    /// page in through an in-process UFFD server; others map the memory file directly.
     #[arg(long, conflicts_with = "pid")]
     pub snapshot: Option<String>,
 
