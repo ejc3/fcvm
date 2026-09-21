@@ -834,18 +834,48 @@ pub struct RestoreNetworkReport {
 
 /// Total budget for retiring every socket named by the manifest.
 ///
-/// Each `SOCK_DESTROY` carries its own five-second receive timeout, so a large
-/// manifest could otherwise hold an unpublished clone for minutes with no upper
-/// bound. Exceeding the budget fails closed and names the progress made, which
-/// is diagnosable; an open-ended stall is not.
+/// Every wait for an acknowledgement carries a five-second receive timeout, so
+/// a large manifest could otherwise hold an unpublished clone for minutes with
+/// no upper bound. The budget is checked before each batch. Exceeding it fails
+/// closed and names the progress made, which is diagnosable; an open-ended
+/// stall is not.
 const CLEANUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Most `SOCK_DESTROY` requests sent in one datagram.
+///
+/// The kernel handles every request in a datagram inside that one send(2) and
+/// queues one acknowledgement per request before send returns. An
+/// acknowledgement that does not fit the socket's receive buffer is dropped,
+/// and the next receive fails with ENOBUFS, so a batch has to fit the buffer.
+/// The destroyer reserves room for a full batch before its first one, and
+/// sends smaller batches when the kernel grants less.
+const DESTROY_BATCH: usize = 64;
+
+/// A bound on what one acknowledgement charges to a receive buffer. Measured
+/// in the 6.18 guest kernel: 256 error acknowledgements (the larger kind, 92
+/// bytes each) fill the default 212,992-byte buffer, 832 bytes each.
+const ACK_CHARGE_BOUND: usize = 2048;
 
 trait SocketDiagnostic {
     fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>>;
-    fn destroy(&mut self, socket: &TcpSocketIdentity) -> Result<DestroyOutcome>;
+    /// Retire `sockets` by cookie and return one outcome per socket, in order.
+    /// A socket the kernel could not retire fails the whole call.
+    fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>>;
 }
 
-struct SystemSocketDiagnostic;
+struct SystemSocketDiagnostic {
+    destroyer: CookieDestroyer<KernelDiagChannel, fn() -> Result<KernelDiagChannel>>,
+}
+
+impl SystemSocketDiagnostic {
+    fn new() -> Self {
+        Self {
+            destroyer: CookieDestroyer::new(
+                KernelDiagChannel::open as fn() -> Result<KernelDiagChannel>,
+            ),
+        }
+    }
+}
 
 impl SocketDiagnostic for SystemSocketDiagnostic {
     fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>> {
@@ -856,8 +886,8 @@ impl SocketDiagnostic for SystemSocketDiagnostic {
         Ok(sockets)
     }
 
-    fn destroy(&mut self, socket: &TcpSocketIdentity) -> Result<DestroyOutcome> {
-        destroy_socket(socket)
+    fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
+        self.destroyer.destroy(sockets)
     }
 }
 
@@ -925,7 +955,7 @@ fn append_diag_message(bytes: &mut Vec<u8>, message: InetDiagMessage) {
     bytes.extend_from_slice(&message.inode.to_ne_bytes());
 }
 
-fn netlink_align(length: usize) -> usize {
+const fn netlink_align(length: usize) -> usize {
     (length + 3) & !3
 }
 
@@ -978,27 +1008,37 @@ fn open_diag_socket() -> Result<OwnedFd> {
     Ok(fd)
 }
 
-fn send_diag_request(
-    fd: &OwnedFd,
+/// Bytes of one netlink message carrying an `InetDiagRequest`. Already
+/// aligned, so the messages of a batch pack back to back.
+const DIAG_REQUEST_MESSAGE_LEN: usize =
+    std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<InetDiagRequest>();
+const _: () = assert!(netlink_align(DIAG_REQUEST_MESSAGE_LEN) == DIAG_REQUEST_MESSAGE_LEN);
+
+fn append_diag_request_message(
+    bytes: &mut Vec<u8>,
     message_type: u16,
     flags: u16,
     request: &InetDiagRequest,
     sequence: u32,
-) -> Result<()> {
+) {
+    let start = bytes.len();
+    append_netlink_header(
+        bytes,
+        NetlinkHeader {
+            length: DIAG_REQUEST_MESSAGE_LEN as u32,
+            message_type,
+            flags,
+            sequence,
+            port_id: 0,
+        },
+    );
+    append_diag_request(bytes, *request);
+    debug_assert_eq!(bytes.len() - start, DIAG_REQUEST_MESSAGE_LEN);
+}
+
+fn send_datagram(fd: &OwnedFd, bytes: &[u8]) -> Result<()> {
     use std::os::fd::AsRawFd;
 
-    let header = NetlinkHeader {
-        length: (std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<InetDiagRequest>())
-            as u32,
-        message_type,
-        flags,
-        sequence,
-        port_id: 0,
-    };
-    let mut bytes = Vec::with_capacity(header.length as usize);
-    append_netlink_header(&mut bytes, header);
-    append_diag_request(&mut bytes, *request);
-    debug_assert_eq!(bytes.len(), header.length as usize);
     let sent = unsafe { libc::send(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
     if sent < 0 {
         return Err(io::Error::last_os_error()).context("sending SOCK_DIAG netlink request");
@@ -1012,10 +1052,10 @@ fn send_diag_request(
     Ok(())
 }
 
-fn receive_datagram(fd: &OwnedFd) -> Result<Vec<u8>> {
+/// Receive one datagram into `bytes` and return its length.
+fn receive_datagram(fd: &OwnedFd, bytes: &mut [u8]) -> Result<usize> {
     use std::os::fd::AsRawFd;
 
-    let mut bytes = vec![0u8; 256 * 1024];
     let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
     let mut iov = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
@@ -1049,13 +1089,13 @@ fn receive_datagram(fd: &OwnedFd) -> Result<Vec<u8>> {
             peer.nl_pid
         );
     }
-    bytes.truncate(received as usize);
-    Ok(bytes)
+    Ok(received as usize)
 }
 
+/// Visit every message in a netlink datagram until `callback` returns true.
+/// Every message's length is validated, including messages the callback skips.
 fn for_each_netlink_message(
     bytes: &[u8],
-    sequence: u32,
     mut callback: impl FnMut(NetlinkHeader, &[u8]) -> Result<bool>,
 ) -> Result<bool> {
     let header_size = std::mem::size_of::<NetlinkHeader>();
@@ -1066,11 +1106,9 @@ fn for_each_netlink_message(
         if length < header_size || offset + length > bytes.len() {
             bail!("invalid netlink message length {length} at offset {offset}");
         }
-        if header.sequence == sequence {
-            let payload = &bytes[offset + header_size..offset + length];
-            if callback(header, payload)? {
-                return Ok(true);
-            }
+        let payload = &bytes[offset + header_size..offset + length];
+        if callback(header, payload)? {
+            return Ok(true);
         }
         offset = offset
             .checked_add(netlink_align(length))
@@ -1128,7 +1166,7 @@ fn validate_dump_completion(header: NetlinkHeader, payload: &[u8]) -> Result<()>
 }
 
 fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
-    let fd = open_diag_socket()?;
+    let mut channel = KernelDiagChannel::open()?;
     let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let states = ((1u32 << (TCP_STATE_MAX + 1)) - 1) & !(1u32 << TCP_LISTEN);
     let request = InetDiagRequest {
@@ -1146,17 +1184,22 @@ fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
             cookie: [INET_DIAG_NOCOOKIE; 2],
         },
     };
-    send_diag_request(
-        &fd,
+    let mut message = Vec::with_capacity(DIAG_REQUEST_MESSAGE_LEN);
+    append_diag_request_message(
+        &mut message,
         SOCK_DIAG_BY_FAMILY,
         NLM_F_REQUEST | NLM_F_DUMP,
         &request,
         sequence,
-    )?;
+    );
+    channel.send(&message)?;
     let mut sockets = Vec::new();
     loop {
-        let datagram = receive_datagram(&fd)?;
-        let done = for_each_netlink_message(&datagram, sequence, |header, payload| {
+        let datagram = channel.receive()?;
+        let done = for_each_netlink_message(datagram, |header, payload| {
+            if header.sequence != sequence {
+                return Ok(false);
+            }
             match header.message_type {
                 NLMSG_DONE => {
                     validate_dump_completion(header, payload)?;
@@ -1196,73 +1239,248 @@ fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
     }
 }
 
-fn destroy_socket(socket: &TcpSocketIdentity) -> Result<DestroyOutcome> {
-    let fd = open_diag_socket()?;
-    let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let request = InetDiagRequest {
-        family: socket.family,
-        protocol: IPPROTO_TCP,
-        extensions: 0,
-        pad: 0,
-        states: 0,
-        id: socket.id,
-    };
-    send_diag_request(
-        &fd,
-        SOCK_DESTROY,
-        NLM_F_REQUEST | NLM_F_ACK,
-        &request,
-        sequence,
-    )?;
-    loop {
-        let datagram = receive_datagram(&fd)?;
-        if let Some(outcome) = parse_destroy_reply(&datagram, sequence)? {
-            return Ok(outcome);
-        }
+/// The two halves of a netlink socket that a batch of requests needs, so the
+/// batching can be driven against a model of the kernel.
+trait NetlinkChannel {
+    fn send(&mut self, datagram: &[u8]) -> Result<()>;
+    /// The next datagram the kernel queued on the socket.
+    fn receive(&mut self) -> Result<&[u8]>;
+    /// Ask for a receive buffer of `bytes`, and return the size the kernel
+    /// reports for the buffer afterwards.
+    fn reserve_receive_buffer(&mut self, bytes: usize) -> Result<usize>;
+}
+
+/// Largest datagram a receive accepts. A longer one fails closed instead of
+/// being read truncated.
+const DIAG_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
+
+/// A bound, connected NETLINK_SOCK_DIAG socket and the buffer its replies are
+/// received into.
+struct KernelDiagChannel {
+    fd: OwnedFd,
+    buffer: Vec<u8>,
+}
+
+impl KernelDiagChannel {
+    fn open() -> Result<Self> {
+        Ok(Self {
+            fd: open_diag_socket()?,
+            buffer: vec![0u8; DIAG_RECEIVE_BUFFER_BYTES],
+        })
     }
 }
 
-fn parse_destroy_reply(bytes: &[u8], sequence: u32) -> Result<Option<DestroyOutcome>> {
-    let mut outcome = None;
-    for_each_netlink_message(bytes, sequence, |header, payload| {
-        match header.message_type {
-            NLMSG_ERROR => {
-                let (error, request) = decode_netlink_error(payload)?;
-                validate_error_request(request, sequence, SOCK_DESTROY)?;
-                if error == 0 {
-                    outcome = Some(DestroyOutcome::Destroyed);
-                    return Ok(true);
-                }
-                let errno = -error;
-                if errno == libc::ENOENT || errno == libc::ESTALE {
-                    outcome = Some(DestroyOutcome::AlreadyGone);
-                    return Ok(true);
-                }
-                if errno == libc::EOPNOTSUPP || errno == libc::ENOSYS {
-                    bail!(
-                        "cookie-bound SOCK_DESTROY is unsupported (errno {errno}: {}); \
-                         the guest kernel must enable CONFIG_INET_DIAG=y and \
-                         CONFIG_INET_DIAG_DESTROY=y. Refusing tuple-only or global \
-                         conntrack cleanup",
-                        io::Error::from_raw_os_error(errno)
+impl NetlinkChannel for KernelDiagChannel {
+    fn send(&mut self, datagram: &[u8]) -> Result<()> {
+        send_datagram(&self.fd, datagram)
+    }
+
+    fn receive(&mut self) -> Result<&[u8]> {
+        let length = receive_datagram(&self.fd, &mut self.buffer)?;
+        Ok(&self.buffer[..length])
+    }
+
+    fn reserve_receive_buffer(&mut self, bytes: usize) -> Result<usize> {
+        use std::os::fd::AsRawFd;
+
+        let requested = libc::c_int::try_from(bytes)
+            .context("SOCK_DIAG receive buffer request is too large")?;
+        let set = |option| {
+            // SAFETY: the value points to a c_int of the length passed.
+            unsafe {
+                libc::setsockopt(
+                    self.fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&requested as *const libc::c_int).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            }
+        };
+        // SO_RCVBUFFORCE ignores net.core.rmem_default and rmem_max, so a guest
+        // that lowered them cannot shrink the buffer a batch needs. It takes
+        // CAP_NET_ADMIN, which SOCK_DESTROY needs as well; without it SO_RCVBUF
+        // still sets the buffer, up to rmem_max.
+        if set(libc::SO_RCVBUFFORCE) < 0 && set(libc::SO_RCVBUF) < 0 {
+            return Err(io::Error::last_os_error()).context("setting the SOCK_DIAG receive buffer");
+        }
+        let mut granted: libc::c_int = 0;
+        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: granted and length describe a writable c_int.
+        let result = unsafe {
+            libc::getsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                (&mut granted as *mut libc::c_int).cast(),
+                &mut length,
+            )
+        };
+        if result < 0 {
+            return Err(io::Error::last_os_error()).context("reading the SOCK_DIAG receive buffer");
+        }
+        usize::try_from(granted).context("the kernel reported a negative receive buffer")
+    }
+}
+
+/// Retires cookies over one sock_diag socket for a whole restore: the socket
+/// opens with the first batch and every later batch reuses it.
+struct CookieDestroyer<C, F> {
+    open: F,
+    channel: Option<C>,
+    /// Requests per datagram: `DESTROY_BATCH`, or fewer when the socket's
+    /// receive buffer cannot hold that many acknowledgements.
+    batch: usize,
+}
+
+impl<C: NetlinkChannel, F: FnMut() -> Result<C>> CookieDestroyer<C, F> {
+    fn new(open: F) -> Self {
+        Self {
+            open,
+            channel: None,
+            batch: DESTROY_BATCH,
+        }
+    }
+
+    fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
+        let channel = match &mut self.channel {
+            Some(channel) => channel,
+            empty => {
+                let mut channel = (self.open)()?;
+                // A guest, or a privileged workload in it, can lower
+                // net.core.rmem_default below what a batch needs.
+                let granted = channel
+                    .reserve_receive_buffer(DESTROY_BATCH * ACK_CHARGE_BOUND)
+                    .context("making room for SOCK_DESTROY acknowledgements")?;
+                self.batch = (granted / ACK_CHARGE_BOUND).clamp(1, DESTROY_BATCH);
+                if self.batch < DESTROY_BATCH {
+                    eprintln!(
+                        "[fc-agent] WARNING: the SOCK_DIAG receive buffer is {granted} bytes, \
+                         so snapshot sockets are destroyed {} at a time",
+                        self.batch
                     );
                 }
+                empty.insert(channel)
+            }
+        };
+        let mut outcomes = Vec::with_capacity(sockets.len());
+        for batch in sockets.chunks(self.batch) {
+            outcomes.extend(destroy_batch(channel, batch)?);
+        }
+        Ok(outcomes)
+    }
+}
+
+/// Destroy `sockets` by cookie: every request goes out in one datagram, and
+/// each acknowledgement is matched back to its socket by sequence number.
+///
+/// The kernel handles all of a datagram's requests during the send and queues
+/// their acknowledgements, so what remains is reading replies that are already
+/// there. An outcome is recorded only from an NLMSG_ERROR acknowledgement that
+/// echoes a SOCK_DESTROY request with that socket's own sequence number. The
+/// first such reply decides the socket, and any other reply for an undecided
+/// socket fails the batch closed. Requests after a failed one were already
+/// handled by then, which changes nothing: they name snapshot-time sockets,
+/// and the failure keeps the clone unpublished either way.
+fn destroy_batch<C: NetlinkChannel>(
+    channel: &mut C,
+    sockets: &[TcpSocketIdentity],
+) -> Result<Vec<DestroyOutcome>> {
+    let count = u32::try_from(sockets.len()).context("SOCK_DESTROY batch is too large")?;
+    let first_sequence = NEXT_NETLINK_SEQUENCE.fetch_add(count, Ordering::Relaxed);
+    let mut datagram = Vec::with_capacity(sockets.len() * DIAG_REQUEST_MESSAGE_LEN);
+    for (offset, socket) in (0u32..).zip(sockets) {
+        let request = InetDiagRequest {
+            family: socket.family,
+            protocol: IPPROTO_TCP,
+            extensions: 0,
+            pad: 0,
+            states: 0,
+            id: socket.id,
+        };
+        append_diag_request_message(
+            &mut datagram,
+            SOCK_DESTROY,
+            NLM_F_REQUEST | NLM_F_ACK,
+            &request,
+            first_sequence.wrapping_add(offset),
+        );
+    }
+    channel.send(&datagram)?;
+    let mut outcomes = vec![None; sockets.len()];
+    let mut undecided = sockets.len();
+    while undecided > 0 {
+        let replies = channel.receive().with_context(|| {
+            format!(
+                "waiting for SOCK_DESTROY acknowledgements: {undecided} of {} undecided",
+                sockets.len()
+            )
+        })?;
+        for_each_netlink_message(replies, |header, payload| {
+            let index = header.sequence.wrapping_sub(first_sequence) as usize;
+            // Skip anything that is not a reply to an undecided request of
+            // this batch.
+            let Some(slot) = outcomes.get_mut(index) else {
+                return Ok(false);
+            };
+            if slot.is_some() {
+                return Ok(false);
+            }
+            let outcome = parse_destroy_reply(header, payload).with_context(|| {
+                format!(
+                    "destroying snapshot-time TCP socket {}",
+                    sockets[index].describe()
+                )
+            })?;
+            if let Some(outcome) = outcome {
+                *slot = Some(outcome);
+                undecided -= 1;
+            }
+            Ok(false)
+        })?;
+    }
+    outcomes
+        .into_iter()
+        .collect::<Option<Vec<_>>>()
+        .context("SOCK_DESTROY batch ended with an undecided socket")
+}
+
+/// Classify one reply to a SOCK_DESTROY: the outcome for an acknowledgement,
+/// `None` for a NOOP, and an error for anything else.
+fn parse_destroy_reply(header: NetlinkHeader, payload: &[u8]) -> Result<Option<DestroyOutcome>> {
+    match header.message_type {
+        NLMSG_ERROR => {
+            let (error, request) = decode_netlink_error(payload)?;
+            validate_error_request(request, header.sequence, SOCK_DESTROY)?;
+            if error == 0 {
+                return Ok(Some(DestroyOutcome::Destroyed));
+            }
+            let errno = -error;
+            if errno == libc::ENOENT || errno == libc::ESTALE {
+                return Ok(Some(DestroyOutcome::AlreadyGone));
+            }
+            if errno == libc::EOPNOTSUPP || errno == libc::ENOSYS {
                 bail!(
-                    "cookie-bound SOCK_DESTROY failed with errno {errno}: {}",
+                    "cookie-bound SOCK_DESTROY is unsupported (errno {errno}: {}); \
+                     the guest kernel must enable CONFIG_INET_DIAG=y and \
+                     CONFIG_INET_DIAG_DESTROY=y. Refusing tuple-only or global \
+                     conntrack cleanup",
                     io::Error::from_raw_os_error(errno)
                 );
             }
-            NLMSG_NOOP => {}
-            NLMSG_OVERRUN => bail!("SOCK_DESTROY acknowledgement overran receive buffer"),
-            NLMSG_DONE => bail!("SOCK_DESTROY ended without a netlink acknowledgement"),
-            other => bail!(
-                "SOCK_DESTROY returned message type {other} without NLMSG_ERROR acknowledgement; \
-                 displayed socket data is not a destruction oracle"
-            ),
+            bail!(
+                "cookie-bound SOCK_DESTROY failed with errno {errno}: {}",
+                io::Error::from_raw_os_error(errno)
+            );
         }
-        Ok(false)
-    })?;
-    Ok(outcome)
+        NLMSG_NOOP => Ok(None),
+        NLMSG_OVERRUN => bail!("SOCK_DESTROY acknowledgement overran receive buffer"),
+        NLMSG_DONE => bail!("SOCK_DESTROY ended without a netlink acknowledgement"),
+        other => bail!(
+            "SOCK_DESTROY returned message type {other} without NLMSG_ERROR acknowledgement; \
+             displayed socket data is not a destruction oracle"
+        ),
+    }
 }
 
 /// Publish the network again by removing the gate, and nothing else.
@@ -1437,7 +1655,7 @@ async fn restore_with<
     let manifest = store.load()?;
     let started = std::time::Instant::now();
     let mut tally = CleanupTally::default();
-    for socket in &manifest.sockets {
+    for batch in manifest.sockets.chunks(DESTROY_BATCH) {
         let elapsed = started.elapsed();
         if elapsed >= budget {
             bail!(
@@ -1449,12 +1667,28 @@ async fn restore_with<
                 manifest.sockets.len()
             );
         }
-        let outcome = diagnostic.destroy(socket).with_context(|| {
-            format!("destroying snapshot-time TCP socket {}", socket.describe())
+        let retired = tally.destroyed + tally.already_gone;
+        let outcomes = diagnostic.destroy(batch).with_context(|| {
+            format!(
+                "retiring snapshot-time TCP sockets {} to {} of {}",
+                retired + 1,
+                retired + batch.len(),
+                manifest.sockets.len()
+            )
         })?;
-        match outcome {
-            DestroyOutcome::Destroyed => tally.destroyed += 1,
-            DestroyOutcome::AlreadyGone => tally.already_gone += 1,
+        if outcomes.len() != batch.len() {
+            bail!(
+                "cookie-bound cleanup got {} outcomes for {} sockets; the clone stays \
+                 unpublished",
+                outcomes.len(),
+                batch.len()
+            );
+        }
+        for outcome in outcomes {
+            match outcome {
+                DestroyOutcome::Destroyed => tally.destroyed += 1,
+                DestroyOutcome::AlreadyGone => tally.already_gone += 1,
+            }
         }
     }
     // Retire the armed-boundary marker before publication. Leaving it behind
@@ -1482,7 +1716,7 @@ pub async fn prepare_snapshot_network() -> Result<()> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
     let receive_barrier = SystemPacketReceiveBarrier;
-    let mut diagnostic = SystemSocketDiagnostic;
+    let mut diagnostic = SystemSocketDiagnostic::new();
     let captured = prepare_with(
         &gate,
         &receive_barrier,
@@ -1541,7 +1775,7 @@ pub async fn restore_snapshot_network() -> Result<RestoreNetworkReport> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
     let receive_barrier = SystemPacketReceiveBarrier;
-    let mut diagnostic = SystemSocketDiagnostic;
+    let mut diagnostic = SystemSocketDiagnostic::new();
     let report = restore_with(
         &gate,
         &receive_barrier,
@@ -1570,6 +1804,7 @@ pub fn boundary_is_armed() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
     use std::os::unix::process::ExitStatusExt;
     use std::sync::{Arc, Mutex};
 
@@ -1737,7 +1972,7 @@ mod tests {
             Ok(state.live.clone())
         }
 
-        fn destroy(&mut self, socket: &TcpSocketIdentity) -> Result<DestroyOutcome> {
+        fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
             let mut state = self.0.lock().unwrap();
             assert!(
                 state.gate_closed,
@@ -1750,16 +1985,278 @@ mod tests {
                 "restore took the link down: the boundary must not purge the \
                  clone's routes and neighbours"
             );
-            state.events.push("cookie-destroy");
-            if state.fail_destroy {
-                bail!("injected cookie destroy failure");
+            let mut outcomes = Vec::with_capacity(sockets.len());
+            for socket in sockets {
+                state.events.push("cookie-destroy");
+                if state.fail_destroy {
+                    bail!("injected cookie destroy failure");
+                }
+                if let Some(index) = state.live.iter().position(|candidate| candidate == socket) {
+                    state.live.remove(index);
+                    outcomes.push(DestroyOutcome::Destroyed);
+                } else {
+                    outcomes.push(DestroyOutcome::AlreadyGone);
+                }
             }
-            if let Some(index) = state.live.iter().position(|candidate| candidate == socket) {
-                state.live.remove(index);
-                Ok(DestroyOutcome::Destroyed)
-            } else {
-                Ok(DestroyOutcome::AlreadyGone)
+            Ok(outcomes)
+        }
+    }
+
+    /// How the model kernel answers each SOCK_DESTROY it is sent.
+    #[derive(Clone, Copy, Debug)]
+    enum ModelAnswer {
+        /// What sock_diag does: 0 for a live cookie, -ENOENT for any other.
+        Kernel,
+        /// An error acknowledgement with this errno for every request.
+        Errno(i32),
+        /// The socket's diag record, which is what a dump displays and is no
+        /// proof that anything was destroyed.
+        Displayed,
+        /// An acknowledgement that echoes a request of another type.
+        WrongRequest,
+        /// No reply at all, as when the receive timeout expires.
+        Silence,
+    }
+
+    /// How the model kernel hands its queued replies to the receiver.
+    #[derive(Clone, Copy, Debug)]
+    enum ModelDelivery {
+        /// One reply per datagram, in request order, as netlink_ack queues them.
+        InOrder,
+        /// One reply per datagram, last request first.
+        Reversed,
+        /// Every reply of a send packed into one datagram.
+        Packed,
+    }
+
+    /// The kernel's side of a NETLINK_SOCK_DIAG socket, as sock_diag_rcv
+    /// behaves: every request in a datagram is handled during the send, and one
+    /// reply per request is queued for the receiver. It counts what the
+    /// destroyer asked of it.
+    struct ModelKernel {
+        live: Vec<[u32; 2]>,
+        answer: ModelAnswer,
+        delivery: ModelDelivery,
+        /// Sockets opened.
+        opens: usize,
+        /// Requests carried by each datagram sent.
+        datagrams: Vec<usize>,
+        receives: usize,
+        queue: VecDeque<Vec<u8>>,
+        /// Most datagrams queued unread at once.
+        most_queued: usize,
+        /// Bytes the socket's receive buffer holds.
+        receive_capacity: usize,
+        /// Whether SO_RCVBUFFORCE succeeds, as it does with CAP_NET_ADMIN.
+        can_force: bool,
+        queued_bytes: usize,
+        /// Replies dropped because the receive buffer was full.
+        dropped: usize,
+        /// A drop that the next receive reports as ENOBUFS.
+        overrun: bool,
+    }
+
+    /// What one acknowledgement charges to a receive buffer in the 6.18 guest
+    /// kernel, where 256 of them fill the default 212,992 bytes.
+    const MODEL_ACK_CHARGE: usize = 832;
+
+    impl ModelKernel {
+        fn reply(&mut self, header: NetlinkHeader, payload: &[u8]) -> Result<Option<Vec<u8>>> {
+            let request: InetDiagRequest = read_unaligned(payload)?;
+            let errno = match self.answer {
+                ModelAnswer::Silence => return Ok(None),
+                ModelAnswer::Displayed => return Ok(Some(displayed_record(header, &request))),
+                ModelAnswer::WrongRequest => {
+                    let echoed = NetlinkHeader {
+                        message_type: SOCK_DIAG_BY_FAMILY,
+                        ..header
+                    };
+                    return Ok(Some(error_acknowledgement(echoed, payload, 0)));
+                }
+                ModelAnswer::Errno(errno) => errno,
+                ModelAnswer::Kernel => {
+                    match self
+                        .live
+                        .iter()
+                        .position(|cookie| *cookie == request.id.cookie)
+                    {
+                        Some(index) => {
+                            self.live.remove(index);
+                            0
+                        }
+                        None => libc::ENOENT,
+                    }
+                }
+            };
+            Ok(Some(error_acknowledgement(header, payload, -errno)))
+        }
+    }
+
+    /// An NLMSG_ERROR as netlink_ack builds it: the error, the request's
+    /// header, and for a failure the request's payload as well.
+    fn error_acknowledgement(request: NetlinkHeader, payload: &[u8], error: i32) -> Vec<u8> {
+        const NLM_F_CAPPED: u16 = 0x100;
+        let echoed: &[u8] = if error == 0 { &[] } else { payload };
+        let mut bytes = Vec::new();
+        append_netlink_header(
+            &mut bytes,
+            NetlinkHeader {
+                length: (2 * std::mem::size_of::<NetlinkHeader>()
+                    + std::mem::size_of::<i32>()
+                    + echoed.len()) as u32,
+                message_type: NLMSG_ERROR,
+                flags: if error == 0 { NLM_F_CAPPED } else { 0 },
+                sequence: request.sequence,
+                port_id: 0,
+            },
+        );
+        bytes.extend_from_slice(&error.to_ne_bytes());
+        append_netlink_header(&mut bytes, request);
+        bytes.extend_from_slice(echoed);
+        bytes
+    }
+
+    fn displayed_record(request: NetlinkHeader, diag: &InetDiagRequest) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        append_netlink_header(
+            &mut bytes,
+            NetlinkHeader {
+                length: (std::mem::size_of::<NetlinkHeader>()
+                    + std::mem::size_of::<InetDiagMessage>()) as u32,
+                message_type: SOCK_DIAG_BY_FAMILY,
+                flags: 0,
+                sequence: request.sequence,
+                port_id: 0,
+            },
+        );
+        append_diag_message(
+            &mut bytes,
+            InetDiagMessage {
+                family: diag.family,
+                state: 1,
+                timer: 0,
+                retransmits: 0,
+                id: diag.id,
+                expires: 0,
+                receive_queue: 0,
+                write_queue: 0,
+                uid: 0,
+                inode: 1,
+            },
+        );
+        bytes
+    }
+
+    #[derive(Clone)]
+    struct SharedKernel(Arc<Mutex<ModelKernel>>);
+
+    impl SharedKernel {
+        fn new(live: &[TcpSocketIdentity], answer: ModelAnswer, delivery: ModelDelivery) -> Self {
+            Self(Arc::new(Mutex::new(ModelKernel {
+                live: live.iter().map(|socket| socket.id.cookie).collect(),
+                answer,
+                delivery,
+                opens: 0,
+                datagrams: Vec::new(),
+                receives: 0,
+                queue: VecDeque::new(),
+                most_queued: 0,
+                receive_capacity: 212_992,
+                can_force: true,
+                queued_bytes: 0,
+                dropped: 0,
+                overrun: false,
+            })))
+        }
+
+        fn opener(&self) -> impl FnMut() -> Result<ModelChannel> {
+            let kernel = self.clone();
+            move || {
+                kernel.0.lock().unwrap().opens += 1;
+                Ok(ModelChannel {
+                    kernel: kernel.clone(),
+                    current: Vec::new(),
+                })
             }
+        }
+    }
+
+    struct ModelChannel {
+        kernel: SharedKernel,
+        current: Vec<u8>,
+    }
+
+    impl NetlinkChannel for ModelChannel {
+        fn send(&mut self, datagram: &[u8]) -> Result<()> {
+            let mut kernel = self.kernel.0.lock().unwrap();
+            let mut requests = 0;
+            let mut replies = Vec::new();
+            for_each_netlink_message(datagram, |header, payload| {
+                assert_eq!(header.message_type, SOCK_DESTROY);
+                assert_eq!(header.flags, NLM_F_REQUEST | NLM_F_ACK);
+                requests += 1;
+                replies.extend(kernel.reply(header, payload)?);
+                Ok(false)
+            })?;
+            kernel.datagrams.push(requests);
+            let datagrams = match kernel.delivery {
+                ModelDelivery::InOrder => replies,
+                ModelDelivery::Reversed => replies.into_iter().rev().collect(),
+                ModelDelivery::Packed if replies.is_empty() => Vec::new(),
+                ModelDelivery::Packed => vec![replies.concat()],
+            };
+            for datagram in datagrams {
+                // A reply that does not fit the receive buffer is dropped, and
+                // the next receive fails with ENOBUFS.
+                if kernel.queued_bytes + MODEL_ACK_CHARGE > kernel.receive_capacity {
+                    kernel.dropped += 1;
+                    kernel.overrun = true;
+                    continue;
+                }
+                kernel.queued_bytes += MODEL_ACK_CHARGE;
+                kernel.queue.push_back(datagram);
+            }
+            kernel.most_queued = kernel.most_queued.max(kernel.queue.len());
+            Ok(())
+        }
+
+        fn receive(&mut self) -> Result<&[u8]> {
+            let mut kernel = self.kernel.0.lock().unwrap();
+            kernel.receives += 1;
+            if kernel.overrun {
+                kernel.overrun = false;
+                return Err(io::Error::from_raw_os_error(libc::ENOBUFS))
+                    .context("receiving SOCK_DIAG netlink response");
+            }
+            // An empty queue is what the socket's receive timeout reports.
+            self.current = kernel
+                .queue
+                .pop_front()
+                .context("receiving SOCK_DIAG netlink response: timed out")?;
+            kernel.queued_bytes -= MODEL_ACK_CHARGE;
+            Ok(&self.current)
+        }
+
+        fn reserve_receive_buffer(&mut self, bytes: usize) -> Result<usize> {
+            let mut kernel = self.kernel.0.lock().unwrap();
+            if kernel.can_force {
+                // The kernel doubles the value to cover its own overhead.
+                kernel.receive_capacity = bytes * 2;
+            }
+            Ok(kernel.receive_capacity)
+        }
+    }
+
+    /// The restore path over the real destroyer, with the model kernel behind it.
+    struct ChannelDiag<F>(CookieDestroyer<ModelChannel, F>);
+
+    impl<F: FnMut() -> Result<ModelChannel>> SocketDiagnostic for ChannelDiag<F> {
+        fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>> {
+            bail!("a restore never dumps sockets")
+        }
+
+        fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
+            self.0.destroy(sockets)
         }
     }
 
@@ -2627,32 +3124,11 @@ COMMIT\\n\"",
 
     #[test]
     fn restore_cleanup_rejects_false_ss_stdout_destroy_confirmation() {
-        let sequence = 77;
-        let displayed = InetDiagMessage {
-            family: libc::AF_INET as u8,
-            state: 1,
-            timer: 0,
-            retransmits: 0,
-            id: socket(31, [198, 51, 100, 8]).id,
-            expires: 0,
-            receive_queue: 0,
-            write_queue: 0,
-            uid: 0,
-            inode: 1,
-        };
-        let header = NetlinkHeader {
-            length: (std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<InetDiagMessage>())
-                as u32,
-            message_type: SOCK_DIAG_BY_FAMILY,
-            flags: 0,
-            sequence,
-            port_id: 0,
-        };
-        let mut bytes = Vec::new();
-        append_netlink_header(&mut bytes, header);
-        append_diag_message(&mut bytes, displayed);
-
-        let error = parse_destroy_reply(&bytes, sequence)
+        let displayed = socket(31, [198, 51, 100, 8]);
+        let kernel =
+            SharedKernel::new(&[displayed], ModelAnswer::Displayed, ModelDelivery::InOrder);
+        let error = CookieDestroyer::new(kernel.opener())
+            .destroy(&[displayed])
             .expect_err("a displayed tuple without NLMSG_ERROR ACK must fail closed");
         assert!(
             format!("{error:#}").contains("not a destruction oracle"),
@@ -2662,32 +3138,192 @@ COMMIT\\n\"",
 
     #[test]
     fn netlink_ack_is_the_only_positive_destroy_oracle() {
-        let sequence = 91;
-        let request = NetlinkHeader {
-            length: (std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<InetDiagRequest>())
-                as u32,
-            message_type: SOCK_DESTROY,
-            flags: NLM_F_REQUEST | NLM_F_ACK,
-            sequence,
-            port_id: 0,
-        };
-        let header = NetlinkHeader {
-            length: (std::mem::size_of::<NetlinkHeader>()
-                + std::mem::size_of::<i32>()
-                + std::mem::size_of::<NetlinkHeader>()) as u32,
-            message_type: NLMSG_ERROR,
-            flags: 0,
-            sequence,
-            port_id: 0,
-        };
-        let mut bytes = Vec::new();
-        append_netlink_header(&mut bytes, header);
-        bytes.extend_from_slice(&0i32.to_ne_bytes());
-        append_netlink_header(&mut bytes, request);
+        let live = socket(91, [198, 51, 100, 8]);
+        let kernel = SharedKernel::new(&[live], ModelAnswer::Kernel, ModelDelivery::InOrder);
         assert_eq!(
-            parse_destroy_reply(&bytes, sequence).unwrap(),
-            Some(DestroyOutcome::Destroyed)
+            CookieDestroyer::new(kernel.opener())
+                .destroy(&[live])
+                .unwrap(),
+            vec![DestroyOutcome::Destroyed]
         );
+    }
+
+    /// The restore cost that mattered was per cookie: a socket opened, bound
+    /// and connected, and a blocking round trip, for every snapshot-time
+    /// socket. A large manifest must cost one socket and one datagram per
+    /// batch, and never queue more acknowledgements than a batch.
+    #[tokio::test]
+    async fn a_large_manifest_is_retired_over_one_socket_in_bounded_batches() {
+        let sockets: Vec<TcpSocketIdentity> = (0..1000)
+            .map(|cookie| socket(1000 + cookie, [198, 51, 100, 8]))
+            .collect();
+        let kernel = SharedKernel::new(&sockets, ModelAnswer::Kernel, ModelDelivery::InOrder);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: sockets.clone(),
+            })
+            .unwrap();
+        let mut diag = ChannelDiag(CookieDestroyer::new(kernel.opener()));
+
+        let report = restore_with(
+            &ModelGate(state.clone()),
+            &ModelBarrier(state.clone()),
+            &mut diag,
+            &store,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            report.tally,
+            CleanupTally {
+                destroyed: 1000,
+                already_gone: 0,
+            }
+        );
+        let kernel = kernel.0.lock().unwrap();
+        assert!(
+            kernel.live.is_empty(),
+            "{} sockets survived",
+            kernel.live.len()
+        );
+        assert_eq!(kernel.opens, 1, "the cleanup opened more than one socket");
+        assert_eq!(
+            kernel.datagrams.len(),
+            1000usize.div_ceil(DESTROY_BATCH),
+            "requests per datagram: {:?}",
+            kernel.datagrams
+        );
+        assert!(
+            kernel.most_queued <= DESTROY_BATCH,
+            "{} acknowledgements were queued at once",
+            kernel.most_queued
+        );
+        assert_eq!(kernel.receives, 1000, "one receive per acknowledgement");
+        assert!(
+            !state.lock().unwrap().gate_closed,
+            "cleanup never published"
+        );
+    }
+
+    /// A guest, or a privileged workload in it, can lower
+    /// net.core.rmem_default below what a batch of acknowledgements needs. The
+    /// kernel drops each acknowledgement that does not fit and the next receive
+    /// fails with ENOBUFS, which would fail every restore with a large manifest
+    /// closed. The destroyer has to make room first, and fit its batches to the
+    /// buffer it got when it cannot.
+    #[test]
+    fn a_lowered_receive_buffer_drops_no_acknowledgement() {
+        let sockets: Vec<TcpSocketIdentity> = (0..200)
+            .map(|cookie| socket(4000 + cookie, [198, 51, 100, 8]))
+            .collect();
+        // Room for 16 acknowledgements, as with rmem_default at 13,312 bytes.
+        let lowered = 16 * MODEL_ACK_CHARGE;
+        for can_force in [true, false] {
+            let kernel = SharedKernel::new(&sockets, ModelAnswer::Kernel, ModelDelivery::InOrder);
+            {
+                let mut model = kernel.0.lock().unwrap();
+                model.receive_capacity = lowered;
+                model.can_force = can_force;
+            }
+            let outcomes = CookieDestroyer::new(kernel.opener())
+                .destroy(&sockets)
+                .unwrap_or_else(|error| panic!("can_force={can_force}: {error:#}"));
+            assert!(outcomes
+                .iter()
+                .all(|outcome| *outcome == DestroyOutcome::Destroyed));
+            let model = kernel.0.lock().unwrap();
+            assert_eq!(
+                model.dropped, 0,
+                "can_force={can_force}: acknowledgements dropped"
+            );
+            assert!(
+                model.live.is_empty(),
+                "can_force={can_force}: sockets survived"
+            );
+            if can_force {
+                assert_eq!(
+                    model.datagrams[0], DESTROY_BATCH,
+                    "a forced buffer holds a batch"
+                );
+            } else {
+                assert!(
+                    model.datagrams[0] * MODEL_ACK_CHARGE <= lowered,
+                    "a batch of {} does not fit {lowered} bytes",
+                    model.datagrams[0]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn acknowledgements_are_matched_to_their_socket_by_sequence_number() {
+        let sockets: Vec<TcpSocketIdentity> = (0..5)
+            .map(|cookie| socket(60 + cookie, [198, 51, 100, 8]))
+            .collect();
+        // Only the first two are live. Replies read in arrival order instead
+        // of by sequence number would give the reversed and packed deliveries
+        // different outcomes.
+        let live = [sockets[0], sockets[1]];
+        let expected = vec![
+            DestroyOutcome::Destroyed,
+            DestroyOutcome::Destroyed,
+            DestroyOutcome::AlreadyGone,
+            DestroyOutcome::AlreadyGone,
+            DestroyOutcome::AlreadyGone,
+        ];
+        for delivery in [
+            ModelDelivery::InOrder,
+            ModelDelivery::Reversed,
+            ModelDelivery::Packed,
+        ] {
+            let kernel = SharedKernel::new(&live, ModelAnswer::Kernel, delivery);
+            let outcomes = CookieDestroyer::new(kernel.opener())
+                .destroy(&sockets)
+                .unwrap();
+            assert_eq!(outcomes, expected, "delivery {delivery:?}");
+        }
+    }
+
+    #[test]
+    fn any_reply_but_a_destroy_acknowledgement_fails_the_batch_closed() {
+        let sockets = [
+            socket(0x46, [198, 51, 100, 8]),
+            socket(0x47, [198, 51, 100, 9]),
+        ];
+        for (answer, expected) in [
+            (ModelAnswer::Errno(libc::EPERM), "failed with errno 1"),
+            (
+                ModelAnswer::Errno(libc::EOPNOTSUPP),
+                "SOCK_DESTROY is unsupported",
+            ),
+            (ModelAnswer::WrongRequest, "described the wrong request"),
+            (ModelAnswer::Silence, "2 of 2 undecided"),
+        ] {
+            let kernel = SharedKernel::new(&sockets, answer, ModelDelivery::InOrder);
+            let error = CookieDestroyer::new(kernel.opener())
+                .destroy(&sockets)
+                .expect_err("the batch must fail closed");
+            let diagnostic = format!("{error:#}");
+            assert!(
+                diagnostic.contains(expected),
+                "{answer:?}: unexpected diagnostic: {diagnostic}"
+            );
+            if !matches!(answer, ModelAnswer::Silence) {
+                assert!(
+                    diagnostic.contains("cookie=00000046:00000000"),
+                    "{answer:?}: the diagnostic must name the socket: {diagnostic}"
+                );
+            }
+        }
     }
 
     #[test]
