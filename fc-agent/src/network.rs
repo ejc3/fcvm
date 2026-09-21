@@ -569,9 +569,9 @@ pub async fn reconfigure_ipv6(new_ipv6: &str) {
 /// iptables DNAT doesn't work with pasta networking: DNAT'd packets retain
 /// their 127.0.0.1 source address, which pasta's L4 translation can't handle
 /// (loopback source going through an external TAP device). Instead, we spawn
-/// a TCP proxy for each port: listen on 127.0.0.1:port inside the VM and
-/// forward connections to 10.0.2.2:port (the gateway). Pasta's default
-/// --map-host-loopback maps gateway traffic to the host's 127.0.0.1.
+/// a TCP proxy for each port: listen on 127.0.0.1:port and [::1]:port inside
+/// the VM and forward connections to 10.0.2.2:port (the gateway). Pasta's
+/// default --map-host-loopback maps gateway traffic to the host's 127.0.0.1.
 pub fn setup_localhost_forwarding(ports: &[String]) {
     for port_str in ports {
         let port: u16 = match port_str.parse() {
@@ -585,47 +585,35 @@ pub fn setup_localhost_forwarding(ports: &[String]) {
             }
         };
 
-        let listener = match std::net::TcpListener::bind(format!("127.0.0.1:{}", port)) {
-            Ok(l) => {
-                eprintln!("[fc-agent] localhost proxy listening on 127.0.0.1:{}", port);
-                l
-            }
-            Err(e) => {
-                eprintln!(
-                    "[fc-agent] WARNING: failed to bind 127.0.0.1:{}: {}",
-                    port, e
-                );
-                continue;
-            }
-        };
+        for listener in bind_loopback_listeners(port) {
+            listener.set_nonblocking(true).ok();
+            let tokio_listener = match tokio::net::TcpListener::from_std(listener) {
+                Ok(l) => l,
+                Err(e) => {
+                    eprintln!(
+                        "[fc-agent] WARNING: failed to create async listener for port {}: {}",
+                        port, e
+                    );
+                    continue;
+                }
+            };
 
-        listener.set_nonblocking(true).ok();
-        let tokio_listener = match tokio::net::TcpListener::from_std(listener) {
-            Ok(l) => l,
-            Err(e) => {
-                eprintln!(
-                    "[fc-agent] WARNING: failed to create async listener for port {}: {}",
-                    port, e
-                );
-                continue;
-            }
-        };
-
-        tokio::spawn(async move {
-            loop {
-                match tokio_listener.accept().await {
-                    Ok((client, _)) => {
-                        tokio::spawn(proxy_connection(client, port));
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[fc-agent] WARNING: accept failed on localhost:{}: {}",
-                            port, e
-                        );
+            tokio::spawn(async move {
+                loop {
+                    match tokio_listener.accept().await {
+                        Ok((client, _)) => {
+                            tokio::spawn(proxy_connection(client, port));
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[fc-agent] WARNING: accept failed on localhost:{}: {}",
+                                port, e
+                            );
+                        }
                     }
                 }
-            }
-        });
+            });
+        }
     }
     if !ports.is_empty() {
         eprintln!(
@@ -633,6 +621,27 @@ pub fn setup_localhost_forwarding(ports: &[String]) {
             ports
         );
     }
+}
+
+/// Bind `port` on each loopback address a guest client may dial: 127.0.0.1 and ::1.
+/// A client that resolves `localhost` gets ::1 first on a guest with IPv6, and a relay on
+/// 127.0.0.1 alone refuses it. A guest without IPv6 cannot bind ::1; that is logged and the
+/// IPv4 listener stays.
+fn bind_loopback_listeners(port: u16) -> Vec<std::net::TcpListener> {
+    let mut listeners = Vec::new();
+    for addr in [
+        std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port)),
+        std::net::SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port)),
+    ] {
+        match std::net::TcpListener::bind(addr) {
+            Ok(l) => {
+                eprintln!("[fc-agent] localhost proxy listening on {}", addr);
+                listeners.push(l);
+            }
+            Err(e) => eprintln!("[fc-agent] WARNING: failed to bind {}: {}", addr, e),
+        }
+    }
+    listeners
 }
 
 /// Proxy a single TCP connection from localhost to the gateway (10.0.2.2).
@@ -1189,5 +1198,37 @@ mod resolv_conf_tests {
             body.starts_with('#') && body.ends_with('\n'),
             "the reason belongs in a comment, on its own line: {body}"
         );
+    }
+}
+
+#[cfg(test)]
+mod forward_localhost_tests {
+    use super::bind_loopback_listeners;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, TcpListener, TcpStream};
+
+    /// A client that resolves `localhost` to ::1 first must reach the relay, like one that
+    /// dials 127.0.0.1. Where this environment cannot bind ::1 at all, the relay must still
+    /// come up on 127.0.0.1 alone.
+    #[test]
+    fn forward_localhost_listens_on_both_loopback_addresses() {
+        let v6_available = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).is_ok();
+        let listeners = bind_loopback_listeners(0);
+        let addrs: Vec<_> = listeners.iter().map(|l| l.local_addr().unwrap()).collect();
+        assert!(
+            addrs
+                .iter()
+                .any(|a| a.ip() == IpAddr::V4(Ipv4Addr::LOCALHOST)),
+            "no 127.0.0.1 listener: {addrs:?}"
+        );
+        assert_eq!(
+            addrs
+                .iter()
+                .any(|a| a.ip() == IpAddr::V6(Ipv6Addr::LOCALHOST)),
+            v6_available,
+            "a ::1 listener must exist exactly when this environment can bind ::1: {addrs:?}"
+        );
+        for addr in &addrs {
+            TcpStream::connect(addr).unwrap_or_else(|e| panic!("connecting to {addr}: {e}"));
+        }
     }
 }
