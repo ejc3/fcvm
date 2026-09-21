@@ -206,6 +206,10 @@ pub async fn create_podman_snapshot(
         &snapshot_dir,
         snapshot_volumes,
         extra_disks,
+        crate::commands::common::api_socket_peer_pid(
+            &paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock"),
+        )
+        .await,
     )?;
     // The only record of which content a caller-named generation holds.
     snapshot_config.content_key = Some(content_key.to_string());

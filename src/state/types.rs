@@ -235,6 +235,11 @@ pub struct VmConfig {
     /// state files written before this field existed (#632 P2).
     #[serde(default)]
     pub hypervisor: crate::hypervisor::Backend,
+    /// Firecracker binary this VM runs on. Snapshots of the VM record it, so a
+    /// restore runs on the binary that made the snapshot. None for Cloud
+    /// Hypervisor VMs and for state files written before this field existed.
+    #[serde(default)]
+    pub firecracker_bin: Option<std::path::PathBuf>,
 }
 
 impl VmState {
@@ -287,6 +292,7 @@ impl VmState {
                 image_disk_path: None,
                 image_disk_identity: None,
                 hypervisor: crate::hypervisor::Backend::default(),
+                firecracker_bin: None,
             },
         }
     }

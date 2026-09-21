@@ -3391,6 +3391,7 @@ mod tests {
             &snapshot_dir,
             Vec::new(),
             Vec::new(),
+            None,
         )
         .unwrap();
         config.content_key = Some(snapshot_key.to_string());
@@ -3481,6 +3482,7 @@ mod tests {
             &dir,
             Vec::new(),
             Vec::new(),
+            None,
         )
         .unwrap();
         config.content_key = content_key.map(str::to_string);
@@ -3631,6 +3633,7 @@ mod tests {
                 std::path::Path::new("/snapshots"),
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap()
         };
@@ -3685,6 +3688,7 @@ mod tests {
                 &snapshot_dir,
                 Vec::new(),
                 Vec::new(),
+                None,
             )
             .unwrap();
             config.content_key = Some(snapshot_key.to_string());

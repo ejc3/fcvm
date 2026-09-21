@@ -252,6 +252,12 @@ pub struct SnapshotMetadata {
     /// written before this field existed (#632 P2).
     #[serde(default)]
     pub hypervisor: crate::hypervisor::Backend,
+    /// Firecracker binary that created this snapshot. Restores run on it, because
+    /// a Firecracker that writes a newer snapshot format rejects an older one.
+    /// None for Cloud Hypervisor snapshots and for snapshots written before this
+    /// field existed; those restore on the binary their kernel profile resolves to.
+    #[serde(default)]
+    pub firecracker_bin: Option<PathBuf>,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -682,6 +688,7 @@ mod tests {
                 image_disk_path: None,
                 image_disk_identity: None,
                 hypervisor: Default::default(),
+                firecracker_bin: None,
             },
         };
 
@@ -878,6 +885,7 @@ mod tests {
                 image_disk_path: None,
                 image_disk_identity: None,
                 hypervisor: Default::default(),
+                firecracker_bin: None,
             },
         };
 
@@ -959,6 +967,7 @@ mod tests {
                     image_disk_path: None,
                     image_disk_identity: None,
                     hypervisor: Default::default(),
+                    firecracker_bin: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1027,6 +1036,7 @@ mod tests {
                 image_disk_path: None,
                 image_disk_identity: None,
                 hypervisor: Default::default(),
+                firecracker_bin: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1219,6 +1229,7 @@ mod tests {
                 image_disk_path: None,
                 image_disk_identity: None,
                 hypervisor: Default::default(),
+                firecracker_bin: None,
             },
         };
 
@@ -1331,6 +1342,7 @@ mod tests {
             image_disk_path: None,
             image_disk_identity: None,
             hypervisor: Default::default(),
+            firecracker_bin: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

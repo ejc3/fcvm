@@ -451,6 +451,7 @@ mod tests {
             std::path::Path::new("/snapshots/snap"),
             Vec::new(),
             Vec::new(),
+            None,
         )
         .unwrap()
     }

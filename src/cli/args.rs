@@ -556,8 +556,10 @@ pub struct SnapshotRunArgs {
     #[arg(skip)]
     pub mem: Option<u32>,
 
-    /// Run the clone on this Firecracker binary instead of the snapshot profile's
-    /// content-addressed build. This is how a locally built Firecracker (e.g. a fork
+    /// Run the clone on this Firecracker binary instead of the one the snapshot
+    /// recorded (or, for a snapshot that records none, its kernel profile's
+    /// content-addressed build). FCVM_FIRECRACKER_BIN does not override a recorded
+    /// binary; this flag does. This is how a locally built Firecracker (e.g. a fork
     /// branch under review) is exercised by clones; also passed internally from podman
     /// run's runtime config when restoring from a snapshot cache hit.
     #[arg(long, value_name = "PATH")]

@@ -445,16 +445,14 @@ pub fn disable_cgroup_swap(pid: u32) {
 /// Fails with a clear error if Firecracker is not found or version is too old.
 ///
 /// Resolution order:
-/// 1. `RuntimeConfig.firecracker_bin` (from kernel profile or [firecracker] config)
+/// 1. `RuntimeConfig.firecracker_bin` (from --firecracker-bin, the binary a snapshot
+///    recorded, or the kernel profile / [firecracker] config)
 /// 2. `FCVM_FIRECRACKER_BIN` env var
 /// 3. PATH lookup (system firecracker)
 pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
     let firecracker_bin = if let Some(ref path) = config.firecracker_bin {
         if !path.exists() {
-            anyhow::bail!(
-                "Firecracker binary from profile does not exist: {}",
-                path.display()
-            );
+            anyhow::bail!("Firecracker binary {} does not exist", path.display());
         }
         path.clone()
     } else if let Ok(path) = std::env::var("FCVM_FIRECRACKER_BIN") {
@@ -1239,6 +1237,90 @@ pub struct SnapshotRestoreConfig {
     pub snapshot_dir: Option<PathBuf>,
 }
 
+/// What Firecracker reports when it cannot read a snapshot's format, from
+/// `SnapshotError` in src/vmm/src/snapshot/mod.rs (the same on the pre-v1.17.0 fork
+/// and on v1.17.0). A snapshot whose bytes decode reports its version
+/// ("Invalid data version: <version>"); one whose layout no longer decodes fails
+/// first ("An error occurred during bitcode serialization: <cause>"), which is what
+/// v1.17.0 reports for a format 11 snapshot.
+const FIRECRACKER_UNREADABLE_SNAPSHOT: [&str; 2] = [
+    "Invalid data version",
+    "An error occurred during bitcode serialization",
+];
+
+/// Why a Firecracker restore runs on the binary it runs on.
+///
+/// A Firecracker that writes a newer snapshot format rejects an older one, so a
+/// restore runs on the binary the snapshot recorded. The choice is logged, and a
+/// failed snapshot load reports it when the binary is not the recorded one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FirecrackerChoice {
+    /// `--firecracker-bin`, or the binary a podman cache hit's key names.
+    Requested,
+    /// The binary the snapshot recorded when it was created.
+    Recorded,
+    /// The snapshot records no binary, so its kernel profile resolved one.
+    NotRecorded,
+    /// The recorded binary no longer exists, so the kernel profile resolved one.
+    RecordedMissing(PathBuf),
+}
+
+impl FirecrackerChoice {
+    fn reason(&self) -> &'static str {
+        match self {
+            Self::Requested => "requested explicitly",
+            Self::Recorded => "recorded by the snapshot",
+            Self::NotRecorded => "the snapshot records no binary",
+            Self::RecordedMissing(_) => "the snapshot's recorded binary no longer exists",
+        }
+    }
+
+    /// Context for a snapshot load that Firecracker refused because it cannot read
+    /// the snapshot's format, on a binary the snapshot did not record.
+    fn load_failure_hint(&self, error: &anyhow::Error, firecracker_bin: &Path) -> Option<String> {
+        let rendered = format!("{error:#}");
+        if !FIRECRACKER_UNREADABLE_SNAPSHOT
+            .iter()
+            .any(|marker| rendered.contains(marker))
+        {
+            return None;
+        }
+        match self {
+            Self::Requested | Self::Recorded => None,
+            Self::NotRecorded => Some(format!(
+                "the snapshot records no Firecracker binary, so it was loaded with {}. It \
+                 predates recorded binaries and may have been made by an older Firecracker: \
+                 re-create the snapshot, or pass --firecracker-bin with the binary that made it",
+                firecracker_bin.display()
+            )),
+            Self::RecordedMissing(recorded) => Some(format!(
+                "the Firecracker binary the snapshot recorded ({}) no longer exists, so it was \
+                 loaded with {}: re-create the snapshot, or pass --firecracker-bin with the \
+                 binary that made it",
+                recorded.display(),
+                firecracker_bin.display()
+            )),
+        }
+    }
+}
+
+/// Find the Firecracker a restore runs on, log why it was chosen, and record it in
+/// the clone's state, so a snapshot of the clone restores on the same binary.
+fn restore_firecracker_bin(
+    runtime_config: &RuntimeConfig,
+    choice: &FirecrackerChoice,
+    vm_state: &mut VmState,
+) -> Result<PathBuf> {
+    let firecracker_bin = find_firecracker(runtime_config)?;
+    info!(
+        firecracker_bin = %firecracker_bin.display(),
+        reason = choice.reason(),
+        "restoring on Firecracker"
+    );
+    vm_state.config.firecracker_bin = Some(firecracker_bin.clone());
+    Ok(firecracker_bin)
+}
+
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
     pub vm_id: &'a str,
@@ -1264,6 +1346,8 @@ pub struct RestoreParams<'a> {
     /// ≈ 230MiB total PSS, ON vs OFF within 1MiB). Disabled for hugepage VMs
     /// (KVM would split 2MB TLB entries to 4K).
     pub track_dirty_pages: bool,
+    /// Why `runtime_config` names the Firecracker binary it names.
+    pub firecracker_choice: FirecrackerChoice,
 }
 
 /// Diagnostic helper (#608): the `vm-disks/<id>` directory ids whose **rootfs** path is
@@ -1886,6 +1970,7 @@ pub async fn restore_from_snapshot(
         restore_epoch,
         clone_ipv6,
         track_dirty_pages,
+        firecracker_choice,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -1903,7 +1988,7 @@ pub async fn restore_from_snapshot(
 
     // Resolve the binary before acquiring a rootless namespace holder. This is
     // pure validation and must not create a process that a later `?` can detach.
-    let firecracker_bin = find_firecracker(runtime_config)?;
+    let firecracker_bin = restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
     let firecracker_args = runtime_config
         .firecracker_args
         .clone()
@@ -2023,7 +2108,13 @@ pub async fn restore_from_snapshot(
                 }]),
             })
             .await
-            .context("loading snapshot")?;
+            .context("loading snapshot")
+            .map_err(|error| {
+                match firecracker_choice.load_failure_hint(&error, &firecracker_bin) {
+                    Some(hint) => error.context(hint),
+                    None => error,
+                }
+            })?;
         let load_duration = load_start.elapsed();
         info!(
             duration_ms = load_duration.as_millis(),
@@ -2225,9 +2316,10 @@ pub async fn restore_from_snapshot_ch(
         runtime_config: _, // CH binary is resolved via find_cloud_hypervisor (env/PATH)
         restore_config,
         network_config,
-        restore_epoch: _,     // delivered by the caller's boot-plan vsock listener
-        clone_ipv6: _,        // delivered to the guest via the boot-plan restore-epoch (caller)
-        track_dirty_pages: _, // CH has no dirty-page tracking
+        restore_epoch: _,      // delivered by the caller's boot-plan vsock listener
+        clone_ipv6: _,         // delivered to the guest via the boot-plan restore-epoch (caller)
+        track_dirty_pages: _,  // CH has no dirty-page tracking
+        firecracker_choice: _, // CH restores run find_cloud_hypervisor's binary
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -2537,6 +2629,9 @@ fn snapshot_semaphore() -> &'static Semaphore {
 /// Callers provide volume and extra_disk configs because those are stored in
 /// different formats (VolumeConfig vs SnapshotVolumeConfig, ExtraDisk vs
 /// SnapshotExtraDisk) and the conversion depends on context.
+///
+/// `firecracker_pid` is the VM's Firecracker process, when the caller can name it;
+/// the snapshot records the executable it runs (see [`snapshot_firecracker_bin`]).
 pub fn build_snapshot_config(
     vm_state: &VmState,
     snapshot_key: &str,
@@ -2544,6 +2639,7 @@ pub fn build_snapshot_config(
     snapshot_dir: &std::path::Path,
     volumes: Vec<crate::storage::SnapshotVolumeConfig>,
     extra_disks: Vec<crate::storage::SnapshotExtraDisk>,
+    firecracker_pid: Option<u32>,
 ) -> Result<crate::storage::SnapshotConfig> {
     let original_vsock_vm_id = vm_state
         .config
@@ -2620,8 +2716,54 @@ pub fn build_snapshot_config(
             image_disk_path: vm_state.config.image_disk_path.clone(),
             image_disk_identity: vm_state.config.image_disk_identity.clone(),
             hypervisor: vm_state.config.hypervisor,
+            firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
         },
     })
+}
+
+/// The Firecracker binary a snapshot of `vm_state` records.
+///
+/// The executable the VM's Firecracker process runs comes first: it is the binary
+/// that writes the snapshot, and it covers VMs booted before VmConfig recorded a
+/// binary. When that executable was deleted or replaced after the process started,
+/// no path names it any more, and the path the state recorded at launch now names a
+/// different file, so nothing is recorded. The launch path is used only when the
+/// process's executable cannot be read at all. Cloud Hypervisor VMs record none.
+fn snapshot_firecracker_bin(vm_state: &VmState, firecracker_pid: Option<u32>) -> Option<PathBuf> {
+    if vm_state.config.hypervisor != crate::hypervisor::Backend::Firecracker {
+        return None;
+    }
+    match firecracker_pid.map(running_executable) {
+        Some(RunningExecutable::Path(exe)) => Some(exe),
+        Some(RunningExecutable::Replaced) => None,
+        Some(RunningExecutable::Unreadable) | None => vm_state.config.firecracker_bin.clone(),
+    }
+}
+
+/// What /proc/<pid>/exe says about the executable a process runs.
+enum RunningExecutable {
+    /// The file the process runs, still at this path.
+    Path(PathBuf),
+    /// Deleted or replaced after the process started; the link reads back as
+    /// "<path> (deleted)".
+    Replaced,
+    /// The link could not be read (no such process, or no permission).
+    Unreadable,
+}
+
+fn running_executable(pid: u32) -> RunningExecutable {
+    match std::fs::read_link(format!("/proc/{pid}/exe")) {
+        Ok(exe) if exe.to_string_lossy().ends_with(" (deleted)") => RunningExecutable::Replaced,
+        Ok(exe) => RunningExecutable::Path(exe),
+        Err(_) => RunningExecutable::Unreadable,
+    }
+}
+
+/// PID of the process listening on a VMM API socket, as seen from this process.
+pub(crate) async fn api_socket_peer_pid(socket_path: &Path) -> Option<u32> {
+    let stream = tokio::net::UnixStream::connect(socket_path).await.ok()?;
+    let pid = stream.peer_cred().ok()?.pid()?;
+    u32::try_from(pid).ok().filter(|pid| *pid > 0)
 }
 
 /// Convert VolumeConfig objects to SnapshotVolumeConfig for snapshot metadata.
@@ -4428,6 +4570,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(config.vm_id, "vm-AAA");
@@ -4451,6 +4594,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(config.vm_id, "vm-BBB");
@@ -4472,6 +4616,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -4490,6 +4635,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(config.vm_id, "vm-CCC");
@@ -4507,11 +4653,202 @@ mod tests {
             Path::new("/mnt/snap/key"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert_eq!(config.memory_path, Path::new("/mnt/snap/key/memory.bin"));
         assert_eq!(config.vmstate_path, Path::new("/mnt/snap/key/vmstate.bin"));
         assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk.raw"));
+    }
+
+    #[test]
+    fn snapshot_records_the_firecracker_binary_the_vm_runs_on() {
+        let mut state = make_vm_state("vm-AAA", None);
+        state.config.firecracker_bin = Some(PathBuf::from("/fc/firecracker-default-abc.bin"));
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.metadata.firecracker_bin,
+            Some(PathBuf::from("/fc/firecracker-default-abc.bin"))
+        );
+    }
+
+    #[test]
+    fn load_failure_hint_names_the_cause_only_for_a_version_rejection_on_an_unrecorded_binary() {
+        let bin = Path::new("/fc/firecracker-default-newer.bin");
+        let rejected = anyhow::anyhow!(
+            "Firecracker API error: 400 Bad Request - {{\"fault_message\":\"Load snapshot error: \
+             Failed to restore from snapshot: Invalid data version: 11.0.0\"}}"
+        )
+        .context("loading snapshot");
+        // What v1.17.0 reports for a format 11 snapshot: its bytes fail to decode
+        // before the version check runs.
+        let undecodable = anyhow::anyhow!(
+            "Firecracker API error: 400 Bad Request - {{\"fault_message\":\"Load snapshot error: \
+             Failed to restore from snapshot: Failed to get snapshot state from file: Failed to \
+             load snapshot state from file: An error occurred during bitcode serialization: \
+             bitcode error\"}}"
+        )
+        .context("loading snapshot");
+        let other = anyhow::anyhow!(
+            "Firecracker API error: 400 Bad Request - {{\"fault_message\":\"Load snapshot error: \
+             No such file or directory\"}}"
+        )
+        .context("loading snapshot");
+        let hint = FirecrackerChoice::NotRecorded
+            .load_failure_hint(&rejected, bin)
+            .unwrap();
+        for expected in [
+            "predates recorded binaries",
+            "older Firecracker",
+            "re-create the snapshot",
+            "--firecracker-bin",
+            "/fc/firecracker-default-newer.bin",
+        ] {
+            assert!(hint.contains(expected), "missing {expected:?} in {hint}");
+        }
+        assert_eq!(
+            FirecrackerChoice::NotRecorded.load_failure_hint(&other, bin),
+            None
+        );
+        assert!(
+            FirecrackerChoice::NotRecorded
+                .load_failure_hint(&undecodable, bin)
+                .is_some(),
+            "a snapshot the binary cannot decode must get the hint"
+        );
+        let missing = FirecrackerChoice::RecordedMissing(PathBuf::from("/fc/older.bin"))
+            .load_failure_hint(&rejected, bin)
+            .unwrap();
+        assert!(missing.contains("/fc/older.bin"), "{missing}");
+        assert_eq!(
+            FirecrackerChoice::Recorded.load_failure_hint(&rejected, bin),
+            None
+        );
+        assert_eq!(
+            FirecrackerChoice::Requested.load_failure_hint(&rejected, bin),
+            None
+        );
+    }
+
+    /// An executable that answers `--version` like Firecracker, for tests that
+    /// resolve a binary through find_firecracker.
+    fn fake_firecracker(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("firecracker-fake.bin");
+        std::fs::write(&path, "#!/bin/sh\necho 'Firecracker v1.17.0'\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// The restore writer: a clone's state records the binary its restore runs on.
+    #[test]
+    fn restore_records_the_firecracker_it_runs_on_in_the_clone_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = fake_firecracker(dir.path());
+        let runtime = RuntimeConfig {
+            firecracker_bin: Some(firecracker.clone()),
+            ..Default::default()
+        };
+        let mut state = make_vm_state("vm-clone", Some("vm-source"));
+        let used =
+            restore_firecracker_bin(&runtime, &FirecrackerChoice::Recorded, &mut state).unwrap();
+        assert_eq!(used, firecracker);
+        assert_eq!(state.config.firecracker_bin, Some(firecracker));
+    }
+
+    /// A VM booted before VmConfig recorded its binary still gets one recorded: the
+    /// executable its Firecracker process runs.
+    #[test]
+    fn snapshot_records_the_executable_the_firecracker_process_runs() {
+        let state = make_vm_state("vm-booted-before-recording", None);
+        assert_eq!(state.config.firecracker_bin, None);
+        let mut process = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let expected = std::fs::canonicalize(which::which("sleep").unwrap()).unwrap();
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            Some(process.id()),
+        );
+        let _ = process.kill();
+        let _ = process.wait();
+        assert_eq!(config.unwrap().metadata.firecracker_bin, Some(expected));
+    }
+
+    #[test]
+    fn snapshot_records_no_firecracker_for_a_cloud_hypervisor_vm() {
+        let mut state = make_vm_state("vm-ch", None);
+        state.config.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            Some(std::process::id()),
+        )
+        .unwrap();
+        assert_eq!(config.metadata.firecracker_bin, None);
+    }
+
+    /// A binary rebuilt at the same path while the VM runs: the path the state recorded
+    /// at launch now names a different file than the one writing the snapshot.
+    #[test]
+    fn snapshot_records_no_firecracker_when_the_running_binary_was_replaced() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("firecracker-rebuilt.bin");
+        std::fs::copy(which::which("sleep").unwrap(), &path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut process = std::process::Command::new(&path).arg("30").spawn().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"a different build").unwrap();
+        let mut state = make_vm_state("vm-rebuilt-under-it", None);
+        state.config.firecracker_bin = Some(path.clone());
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            Some(process.id()),
+        );
+        let _ = process.kill();
+        let _ = process.wait();
+        assert_eq!(
+            config.unwrap().metadata.firecracker_bin,
+            None,
+            "the recorded path now names a different file than the running binary"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_socket_peer_pid_names_the_listening_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("api.sock");
+        let _listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        assert_eq!(api_socket_peer_pid(&socket).await, Some(std::process::id()));
+        assert_eq!(
+            api_socket_peer_pid(&dir.path().join("missing.sock")).await,
+            None
+        );
     }
 
     #[test]
@@ -4665,6 +5002,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         assert!(config.parent_snapshot.is_none());
@@ -4681,6 +5019,7 @@ mod tests {
             Path::new("/tmp/snap"),
             vec![],
             vec![],
+            None,
         )
         .unwrap();
         config.parent_snapshot = Some("pre-start-abc123".to_string());
@@ -4751,9 +5090,16 @@ mod tests {
             let dir = snap_root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
             let state = make_vm_state(vm_id, None);
-            let mut config =
-                build_snapshot_config(&state, name, SnapshotType::System, &dir, vec![], vec![])
-                    .unwrap();
+            let mut config = build_snapshot_config(
+                &state,
+                name,
+                SnapshotType::System,
+                &dir,
+                vec![],
+                vec![],
+                None,
+            )
+            .unwrap();
             config.parent_snapshot = parent.map(|s| s.to_string());
             let json = serde_json::to_string_pretty(&config).unwrap();
             std::fs::write(dir.join("config.json"), &json).unwrap();
