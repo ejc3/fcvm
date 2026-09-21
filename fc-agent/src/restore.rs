@@ -282,8 +282,8 @@ pub async fn handle_clone_restore(
     // purges the neighbour table any more.
     // Order matters: drop the inherited entries first, then pin the one the
     // host's health checks depend on. Flushing after the pin would delete it.
-    network::flush_stale_neighbours();
-    network::pin_namespace_neighbour();
+    network::flush_stale_neighbours().await;
+    network::pin_namespace_neighbour().await;
     // ANNOUNCE, as early as possible. The host cannot forward a packet to this
     // clone until its namespace has learned the guest's MAC, and it only learns
     // that when the guest transmits. The old boundary got this for free: taking

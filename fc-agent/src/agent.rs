@@ -88,7 +88,7 @@ pub async fn run() -> Result<()> {
     // closed and the reserved egress-proxy port is excluded.
     // Before anything can accept a connection: make the host's health-check
     // address resolve to the bridge, not to whichever ARP reply arrives first.
-    network::pin_namespace_neighbour();
+    network::pin_namespace_neighbour().await;
 
     network::publish_to_loopback(&plan.published_guest_ports);
 
