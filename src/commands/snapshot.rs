@@ -916,6 +916,24 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
     Ok(())
 }
 
+/// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
+/// path fails loud instead of silently dropping them.
+fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
+    if args.exec.is_some() {
+        bail!("--exec is not supported for disk-only clones yet (cold boot has no one-shot exec mode)");
+    }
+    if args.no_swap {
+        bail!("--no-swap is not supported for disk-only clones yet");
+    }
+    if args.firecracker_bin.is_some() {
+        bail!(
+            "--firecracker-bin does not apply to disk-only snapshots: they cold-boot on the \
+             kernel profile's Firecracker"
+        );
+    }
+    Ok(())
+}
+
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     validate_snapshot_name(&args.snapshot_name)?;
@@ -3373,13 +3391,7 @@ async fn cmd_snapshot_run_disk_only(
     let cancel = lifecycle_gate.cancellation_token();
     let meta = &snapshot_config.metadata;
 
-    // Flags the cold-boot path doesn't implement yet: fail loud, never silently drop.
-    if args.exec.is_some() {
-        bail!("--exec is not supported for disk-only clones yet (cold boot has no one-shot exec mode)");
-    }
-    if args.no_swap {
-        bail!("--no-swap is not supported for disk-only clones yet");
-    }
+    ensure_disk_only_run_supports(&args)?;
 
     // Extra disks aren't reflinked/attached on the cold-boot path yet. Fail loud
     // rather than silently booting a clone missing its data disks.
@@ -3674,6 +3686,30 @@ mod tests {
         );
         // ...but full snapshots pass through unchanged.
         assert!(ensure_not_disk_only(SnapshotKind::Full, "snapshot serve").is_ok());
+    }
+
+    #[test]
+    fn a_disk_only_run_still_refuses_no_swap() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        assert!(ensure_disk_only_run_supports(&args).is_ok());
+        args.no_swap = true;
+        assert!(ensure_disk_only_run_supports(&args).is_err());
+    }
+
+    /// A disk-only snapshot has no memory image to restore: it cold-boots on its
+    /// kernel profile's Firecracker, so an explicit binary would be silently dropped.
+    #[test]
+    fn a_disk_only_run_refuses_an_explicit_firecracker_bin() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let error = ensure_disk_only_run_supports(&args)
+            .expect_err("a disk-only run must refuse --firecracker-bin");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--firecracker-bin does not apply")
+                && message.contains("cold-boot on the kernel profile's Firecracker"),
+            "{message}"
+        );
     }
 
     #[test]
