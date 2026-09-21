@@ -125,9 +125,9 @@ so nothing is built or booted twice when it doesn't have to be.
   (`src/commands/podman/mod.rs`) carries that justification next to it; an entry without
   one is a bug.
 - **Flags that change WHERE something binds are honored at restore time, not by
-  bypassing the cache.** Example: `--vsock-dir` retargets the restore mount redirect so a
-  cache hit places the clone's listener in the caller's directory; it does not force a
-  cold boot.
+  bypassing the cache.** Example: `--vsock-dir` makes a cache hit place the clone's
+  listener in the caller's directory (through the load's vsock override, or the restore
+  mount redirect on Firecracker before 1.16.0); it does not force a cold boot.
 - **Never add per-caller data to the content key when restore can reconcile it.**
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this

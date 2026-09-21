@@ -162,10 +162,11 @@ pub struct VmConfig {
     pub vsock_socket_path: Option<std::path::PathBuf>,
     /// Exact vsock base path embedded in this VM's VMM snapshot state.
     ///
-    /// For a cold boot this equals `vsock_socket_path`. A restored clone listens
-    /// on its clone-local `vsock_socket_path`, while its VMM state still names
-    /// the ancestor path; carrying that source path is required for grand-clone
-    /// mount redirection, especially when the ancestor used `--vsock-dir`.
+    /// For a cold boot this equals `vsock_socket_path`. So does it for a restored
+    /// clone whose snapshot load overrode the vsock path (Firecracker 1.16.0 and
+    /// later). On an older Firecracker the clone listens on its clone-local
+    /// `vsock_socket_path` while its VMM state still names the ancestor path, and
+    /// carrying that source path is what grand-clone mount redirection needs.
     #[serde(default)]
     pub source_vsock_socket_path: Option<std::path::PathBuf>,
     /// Published port mappings (host:guest)

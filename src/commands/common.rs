@@ -450,6 +450,13 @@ pub fn disable_cgroup_swap(pid: u32) {
 /// 2. `FCVM_FIRECRACKER_BIN` env var
 /// 3. PATH lookup (system firecracker)
 pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
+    find_firecracker_with_version(config).map(|(firecracker_bin, _)| firecracker_bin)
+}
+
+/// [`find_firecracker`], also returning the version the binary reports.
+pub(crate) fn find_firecracker_with_version(
+    config: &RuntimeConfig,
+) -> Result<(std::path::PathBuf, FirecrackerVersion)> {
     let firecracker_bin = if let Some(ref path) = config.firecracker_bin {
         if !path.exists() {
             anyhow::bail!("Firecracker binary {} does not exist", path.display());
@@ -483,20 +490,20 @@ pub fn find_firecracker(config: &RuntimeConfig) -> Result<std::path::PathBuf> {
         )
     })?;
 
-    if version < MIN_FIRECRACKER_VERSION {
+    if version.release < MIN_FIRECRACKER_VERSION {
         anyhow::bail!(
             "Firecracker version {}.{}.{} is too old. Minimum required: {}.{}.{} (for network_overrides support in snapshot cloning)",
-            version.0, version.1, version.2,
+            version.release.0, version.release.1, version.release.2,
             MIN_FIRECRACKER_VERSION.0, MIN_FIRECRACKER_VERSION.1, MIN_FIRECRACKER_VERSION.2
         );
     }
 
     debug!(
         "Found Firecracker {}.{}.{} at {:?}",
-        version.0, version.1, version.2, firecracker_bin
+        version.release.0, version.release.1, version.release.2, firecracker_bin
     );
 
-    Ok(firecracker_bin)
+    Ok((firecracker_bin, version))
 }
 
 /// Locate the Cloud Hypervisor binary (#632).
@@ -577,9 +584,10 @@ pub fn find_cloud_hypervisor() -> Result<std::path::PathBuf> {
 /// Parse Firecracker version from --version output
 ///
 /// Expected format: "Firecracker v1.14.0" or similar
-fn parse_firecracker_version(output: &str) -> Result<(u32, u32, u32)> {
-    // Find version number pattern vX.Y.Z
-    let version_re = regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)").context("invalid regex")?;
+fn parse_firecracker_version(output: &str) -> Result<FirecrackerVersion> {
+    // Find version number pattern vX.Y.Z, with an optional pre-release suffix (-dev).
+    let version_re =
+        regex::Regex::new(r"v?(\d+)\.(\d+)\.(\d+)(-[0-9A-Za-z.]+)?").context("invalid regex")?;
 
     let caps = version_re
         .captures(output)
@@ -589,7 +597,27 @@ fn parse_firecracker_version(output: &str) -> Result<(u32, u32, u32)> {
     let minor: u32 = caps[2].parse().context("invalid minor version")?;
     let patch: u32 = caps[3].parse().context("invalid patch version")?;
 
-    Ok((major, minor, patch))
+    Ok(FirecrackerVersion {
+        release: (major, minor, patch),
+        prerelease: caps.get(4).is_some(),
+    })
+}
+
+/// A Firecracker build's version, from its `--version` output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FirecrackerVersion {
+    /// (major, minor, patch).
+    pub release: (u32, u32, u32),
+    /// Whether the version carries a pre-release suffix such as `-dev`.
+    pub prerelease: bool,
+}
+
+impl FirecrackerVersion {
+    /// Whether this build has everything release `min` shipped. A pre-release of `min`
+    /// itself does not count: a `1.16.0-dev` build can predate changes 1.16.0 includes.
+    fn at_least(&self, min: (u32, u32, u32)) -> bool {
+        self.release > min || (self.release == min && !self.prerelease)
+    }
 }
 
 /// Save VM state with complete network configuration
@@ -1217,13 +1245,15 @@ pub struct SnapshotRestoreConfig {
     pub source_disk_path: PathBuf,
     /// Original VM lineage (from original cache creation), used for disk redirects.
     pub original_vm_id: String,
-    /// Exact vsock base path embedded in the source VMM state. Its parent is
-    /// redirected to the clone's vsock target directory before the VMM starts.
+    /// Exact vsock base path embedded in the source VMM state. When the load
+    /// cannot override the vsock path, its parent is redirected to the clone's
+    /// vsock target directory before the VMM starts.
     pub source_vsock_socket_path: PathBuf,
-    /// Where the redirected vsock sockets land — the clone's actual host-side
-    /// listener directory. `None` means the clone runtime directory; a custom
-    /// `--vsock-dir` lands here so snapshot-cache hits and clones honor the
-    /// flag instead of silently ignoring it.
+    /// The clone's actual host-side listener directory, where its vsock sockets
+    /// land (through the load's vsock override, or the mount redirect before
+    /// Firecracker 1.16.0). `None` means the clone runtime directory; a custom
+    /// `--vsock-dir` lands here so snapshot-cache hits and clones honor the flag
+    /// instead of silently ignoring it.
     pub vsock_target_dir: Option<PathBuf>,
     /// Snapshot VM ID for disk path redirect (the VM that was snapshotted)
     /// This is needed because disk paths are patched during cache restore,
@@ -1305,20 +1335,57 @@ impl FirecrackerChoice {
 }
 
 /// Find the Firecracker a restore runs on, log why it was chosen, and record it in
-/// the clone's state, so a snapshot of the clone restores on the same binary.
+/// the clone's state, so a snapshot of the clone restores on the same binary. Returns
+/// the binary and the version it reports.
 fn restore_firecracker_bin(
     runtime_config: &RuntimeConfig,
     choice: &FirecrackerChoice,
     vm_state: &mut VmState,
-) -> Result<PathBuf> {
-    let firecracker_bin = find_firecracker(runtime_config)?;
+) -> Result<(PathBuf, FirecrackerVersion)> {
+    let (firecracker_bin, version) = find_firecracker_with_version(runtime_config)?;
     info!(
         firecracker_bin = %firecracker_bin.display(),
         reason = choice.reason(),
         "restoring on Firecracker"
     );
     vm_state.config.firecracker_bin = Some(firecracker_bin.clone());
-    Ok(firecracker_bin)
+    Ok((firecracker_bin, version))
+}
+
+/// First Firecracker release whose snapshot load takes `vsock_override`
+/// (upstream 3d642c5fd, "allow vsock uds path override on restore").
+const VSOCK_OVERRIDE_MIN_FIRECRACKER: (u32, u32, u32) = (1, 16, 0);
+
+/// The vsock UDS a restored clone's Firecracker is told to use, when the binary can
+/// take one.
+///
+/// Without it the vsock device keeps the snapshot's embedded path, which is under the
+/// source VM's directory and reaches the clone's sockets only through the mount
+/// redirect. When the source VM exits and removes that directory, the kernel detaches
+/// every mount on it in every namespace, and the vsock device resolves the path again
+/// for each guest-initiated connection, so from then on each one is reset. With the
+/// override the device uses the clone's own path and never depends on the redirect.
+/// A 1.16.0 pre-release counts as older, because it can predate the change.
+fn snapshot_load_vsock_override(
+    firecracker_version: FirecrackerVersion,
+    clone_vsock_socket_path: &Path,
+) -> Option<crate::firecracker::api::VsockOverride> {
+    firecracker_version
+        .at_least(VSOCK_OVERRIDE_MIN_FIRECRACKER)
+        .then(|| crate::firecracker::api::VsockOverride {
+            uds_path: clone_vsock_socket_path.display().to_string(),
+        })
+}
+
+/// The vsock base path a restored VMM's state names, which a snapshot of the clone
+/// embeds: the clone's own path when the load overrode it, else the ancestor's.
+fn restored_vsock_source_path(
+    vsock_override: Option<&crate::firecracker::api::VsockOverride>,
+    snapshot_source: &Path,
+) -> PathBuf {
+    vsock_override
+        .map(|vsock| PathBuf::from(&vsock.uds_path))
+        .unwrap_or_else(|| snapshot_source.to_path_buf())
 }
 
 /// Parameters for snapshot restore, grouping the many read-only inputs.
@@ -1430,12 +1497,23 @@ fn assert_vmstate_vsock_source_matches(vmstate_path: &Path, source_path: &Path) 
 /// the existing `disks/` directory boundary: the whole source dir goes to the
 /// vsock target first, then the clone's `disks/` is bound back on top (order
 /// matters — the second mountpoint resolves inside the first mount).
+///
+/// `vsock_redirected` is false when the snapshot load overrides the vsock path
+/// (Firecracker 1.16.0 and later): the source vsock directory then gets no pair, and
+/// its layout is not checked, because nothing resolves through it.
 fn build_clone_mount_redirects(
     disk_dirs: &[PathBuf],
     source_vsock_socket_path: &Path,
     clone_dir: &Path,
     vsock_target_dir: &Path,
+    vsock_redirected: bool,
 ) -> Result<Vec<(PathBuf, PathBuf)>> {
+    if !vsock_redirected {
+        return Ok(disk_dirs
+            .iter()
+            .map(|dir| (dir.clone(), clone_dir.to_path_buf()))
+            .collect());
+    }
     let source_vsock_dir = source_vsock_socket_path
         .parent()
         .ok_or_else(|| anyhow::anyhow!("source vsock path has no parent"))?
@@ -1703,6 +1781,8 @@ async fn prepare_clone_substrate(
     vm_id: &str,
     data_dir: &Path,
     vm_state: &mut VmState,
+    // True when the snapshot load overrides the vsock path, so it needs no redirect.
+    vsock_overridden: bool,
 ) -> Result<CloneSubstrate> {
     let vm_dir = data_dir.join("disks");
     let mut holder_child: Option<tokio::process::Child> = None;
@@ -1875,6 +1955,7 @@ async fn prepare_clone_substrate(
         &restore_config.source_vsock_socket_path,
         data_dir,
         &vsock_target_dir,
+        !vsock_overridden,
     )?;
     // A split pair binds the clone's disks back INSIDE the vsock target mount,
     // so the nested mountpoint needs a backing directory there.
@@ -1988,7 +2069,15 @@ pub async fn restore_from_snapshot(
 
     // Resolve the binary before acquiring a rootless namespace holder. This is
     // pure validation and must not create a process that a later `?` can detach.
-    let firecracker_bin = restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
+    let (firecracker_bin, firecracker_version) =
+        restore_firecracker_bin(runtime_config, &firecracker_choice, vm_state)?;
+    let clone_vsock_socket_path = vm_state
+        .config
+        .vsock_socket_path
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("clone {vm_id} has no recorded vsock socket path"))?;
+    let vsock_override =
+        snapshot_load_vsock_override(firecracker_version, &clone_vsock_socket_path);
     let firecracker_args = runtime_config
         .firecracker_args
         .clone()
@@ -1996,8 +2085,15 @@ pub async fn restore_from_snapshot(
 
     // Configure namespace isolation, create the CoW disk, copy extra disks, and compute the
     // mount redirect — all shared with the Cloud Hypervisor restore path.
-    let mut substrate =
-        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
+    let mut substrate = prepare_clone_substrate(
+        network,
+        restore_config,
+        vm_id,
+        data_dir,
+        vm_state,
+        vsock_override.is_some(),
+    )
+    .await?;
     let rootfs_path = substrate.rootfs_path;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
 
@@ -2106,6 +2202,7 @@ pub async fn restore_from_snapshot(
                     iface_id: "eth0".to_string(),
                     host_dev_name: network_config.tap_device.clone(),
                 }]),
+                vsock_override: vsock_override.clone(),
             })
             .await
             .context("loading snapshot")
@@ -2216,10 +2313,13 @@ pub async fn restore_from_snapshot(
 
         // Track original vsock vm_id for future snapshots
         // When this VM is later snapshotted, clones need to use this original_vm_id
-        // for vsock redirect because vmstate.bin stores paths from this vm
+        // for the path redirect because vmstate.bin stores paths from this vm (the
+        // vsock path among them only when the load could not override it)
         vm_state.config.original_vsock_vm_id = Some(restore_config.original_vm_id.clone());
-        vm_state.config.source_vsock_socket_path =
-            Some(restore_config.source_vsock_socket_path.clone());
+        vm_state.config.source_vsock_socket_path = Some(restored_vsock_source_path(
+            vsock_override.as_ref(),
+            &restore_config.source_vsock_socket_path,
+        ));
 
         // Update extra_disks in clone state with clone-local paths
         if !restore_config.extra_disks.is_empty() {
@@ -2355,7 +2455,7 @@ pub async fn restore_from_snapshot_ch(
 
     // Shared substrate: network namespace / CoW disk / mount-redirect / extra disks.
     let mut substrate =
-        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state).await?;
+        prepare_clone_substrate(network, restore_config, vm_id, data_dir, vm_state, false).await?;
 
     // Cloud Hypervisor reads its restore config (disk/vsock/net) from the snapshot's `ch/`
     // dir. Disk + vsock paths are the source VM's and are redirected to the clone's by the
@@ -4136,6 +4236,7 @@ mod tests {
             Path::new("/srv/dedicated-vsock/vsock.sock"),
             Path::new("/runtime/clone"),
             Path::new("/runtime/clone"),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4159,6 +4260,7 @@ mod tests {
             Path::new("/runtime/source-vm/vsock.sock"),
             Path::new("/runtime/clone"),
             Path::new("/runtime/clone"),
+            true,
         )
         .unwrap();
         assert_eq!(redirects.len(), 1);
@@ -4176,6 +4278,7 @@ mod tests {
             Path::new("/runtime/source-vm/vsock.sock"),
             Path::new("/runtime/clone"),
             Path::new("/srv/custom-vsock"),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4199,6 +4302,7 @@ mod tests {
             Path::new("/srv/dedicated-vsock/vsock.sock"),
             Path::new("/runtime/clone"),
             Path::new("/srv/custom-vsock"),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4222,6 +4326,7 @@ mod tests {
             Path::new("/srv/custom-vsock/vsock.sock"),
             Path::new("/runtime/clone"),
             Path::new("/srv/custom-vsock"),
+            true,
         )
         .unwrap();
         assert_eq!(
@@ -4254,6 +4359,7 @@ mod tests {
                 Path::new(bad),
                 Path::new("/runtime/clone"),
                 Path::new("/srv/custom-vsock"),
+                true,
             );
             assert!(result.is_err(), "{bad} must be rejected");
         }
@@ -4759,9 +4865,10 @@ mod tests {
             ..Default::default()
         };
         let mut state = make_vm_state("vm-clone", Some("vm-source"));
-        let used =
+        let (used, version) =
             restore_firecracker_bin(&runtime, &FirecrackerChoice::Recorded, &mut state).unwrap();
         assert_eq!(used, firecracker);
+        assert_eq!(version.release, (1, 17, 0));
         assert_eq!(state.config.firecracker_bin, Some(firecracker));
     }
 
@@ -4839,6 +4946,31 @@ mod tests {
         );
     }
 
+    #[test]
+    fn an_overridden_vsock_gets_no_redirect_pair_and_skips_the_layout_checks() {
+        let disk_dirs = vec![PathBuf::from("/runtime/source-vm")];
+        let clone = Path::new("/runtime/clone");
+        let target = Path::new("/srv/custom-vsock");
+        let only_disks = vec![(
+            PathBuf::from("/runtime/source-vm"),
+            PathBuf::from("/runtime/clone"),
+        )];
+        // A vsock dir nested inside a disk dir: refused while the vsock is redirected,
+        // harmless once the load overrides the vsock path.
+        let nested = Path::new("/runtime/source-vm/custom/vsock.sock");
+        assert!(build_clone_mount_redirects(&disk_dirs, nested, clone, target, true).is_err());
+        assert_eq!(
+            build_clone_mount_redirects(&disk_dirs, nested, clone, target, false).unwrap(),
+            only_disks
+        );
+        // A vsock colocated with the disks gets no split pair either.
+        let colocated = Path::new("/runtime/source-vm/vsock.sock");
+        assert_eq!(
+            build_clone_mount_redirects(&disk_dirs, colocated, clone, target, false).unwrap(),
+            only_disks
+        );
+    }
+
     #[tokio::test]
     async fn api_socket_peer_pid_names_the_listening_process() {
         let dir = tempfile::tempdir().unwrap();
@@ -4849,6 +4981,74 @@ mod tests {
             api_socket_peer_pid(&dir.path().join("missing.sock")).await,
             None
         );
+    }
+
+    #[test]
+    fn restore_overrides_the_vsock_path_where_firecracker_supports_it() {
+        let clone = Path::new("/mnt/fcvm-btrfs/vm-disks/vm-clone/vsock.sock");
+        let expected = Some(crate::firecracker::api::VsockOverride {
+            uds_path: clone.display().to_string(),
+        });
+        // The previous default build reports 1.17.0-dev and takes the field.
+        for takes in [
+            "Firecracker v1.17.0",
+            "Firecracker v1.17.0-dev",
+            "Firecracker v1.16.0",
+        ] {
+            let version = parse_firecracker_version(takes).unwrap();
+            assert_eq!(
+                snapshot_load_vsock_override(version, clone),
+                expected,
+                "{takes}"
+            );
+        }
+        // A 1.16.0 pre-release can predate the change, and 1.15 rejects the field.
+        for refuses in ["Firecracker v1.16.0-dev", "Firecracker v1.15.2"] {
+            let version = parse_firecracker_version(refuses).unwrap();
+            assert_eq!(
+                snapshot_load_vsock_override(version, clone),
+                None,
+                "{refuses}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_clone_restored_with_an_override_records_its_own_vsock_path_as_the_source() {
+        let ancestor = Path::new("/mnt/fcvm-btrfs/vm-disks/vm-source/vsock.sock");
+        let clone = crate::firecracker::api::VsockOverride {
+            uds_path: "/mnt/fcvm-btrfs/vm-disks/vm-clone/vsock.sock".to_string(),
+        };
+        assert_eq!(
+            restored_vsock_source_path(Some(&clone), ancestor),
+            PathBuf::from("/mnt/fcvm-btrfs/vm-disks/vm-clone/vsock.sock")
+        );
+        assert_eq!(restored_vsock_source_path(None, ancestor), ancestor);
+    }
+
+    #[test]
+    fn snapshot_load_sends_the_vsock_override_only_when_set() {
+        use crate::firecracker::api::{MemBackend, SnapshotLoad, VsockOverride};
+        let mut load = SnapshotLoad {
+            snapshot_path: "/snap/vmstate.bin".to_string(),
+            mem_backend: MemBackend {
+                backend_path: "/snap/memory.bin".to_string(),
+                backend_type: "File".to_string(),
+            },
+            track_dirty_pages: None,
+            resume_vm: None,
+            network_overrides: None,
+            vsock_override: None,
+        };
+        assert!(!serde_json::to_string(&load)
+            .unwrap()
+            .contains("vsock_override"));
+        load.vsock_override = Some(VsockOverride {
+            uds_path: "/clone/vsock.sock".to_string(),
+        });
+        assert!(serde_json::to_string(&load)
+            .unwrap()
+            .contains(r#""vsock_override":{"uds_path":"/clone/vsock.sock"}"#));
     }
 
     #[test]

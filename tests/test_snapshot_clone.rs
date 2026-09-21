@@ -533,19 +533,23 @@ async fn test_clone_while_baseline_running_rootless() -> Result<()> {
     clone_while_baseline_running_impl("rootless").await
 }
 
-/// A custom source vsock path is embedded verbatim in Firecracker vmstate. The
-/// restore mount namespace must redirect that exact directory while the source
-/// remains live, and every host control path must use each VM's persisted actual
-/// listener rather than reconstructing `vm_runtime_dir/vsock.sock`.
+/// A custom source vsock path is embedded verbatim in Firecracker vmstate. A clone
+/// restored while that source is still live gets its own listener: the snapshot
+/// load overrides the vsock path (Firecracker 1.16.0 and later, which the configured
+/// default is), so the clone never resolves the source's directory. The clone then
+/// records its own listener as its vsock source, because that is what its VMM state
+/// names, and a snapshot of the clone restores into a healthy grand-clone. Every
+/// host control path must use each VM's persisted listener rather than
+/// reconstructing `vm_runtime_dir/vsock.sock`.
 ///
 /// The baseline cold-boots (`--no-snapshot`): only a cold boot embeds THIS VM's
-/// custom path in vmstate, which is the scenario under test. A cache hit would
-/// restore an entry whose vmstate embeds its own creator's path — that side of
+/// custom path in vmstate, which is the scenario under test. The cache-hit side of
 /// `--vsock-dir` is pinned by test_vsock_dir_honored_on_snapshot_cache_hit.
 #[tokio::test]
 async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() -> Result<()> {
     let (baseline_name, clone_name, snapshot_name, serve_name) =
         common::unique_names("custom-vsock-live");
+    let (_, grand_clone_name, grand_snapshot_name, _) = common::unique_names("custom-vsock-grand");
     let custom_dir = tempfile::Builder::new()
         .prefix("fcvm-custom-vsock-")
         .tempdir()
@@ -555,6 +559,7 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
 
     let mut cleanup_procs: Vec<(u32, tokio::process::Child)> = Vec::new();
     let mut snapshot_created = false;
+    let mut grand_snapshot_created = false;
     let result: Result<()> = async {
         let (baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
             &[
@@ -623,14 +628,59 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
             source_state.config.vsock_socket_path.as_deref(),
             Some(expected_source.as_path())
         );
+        // The clone's listener is its own: in its runtime directory, neither the
+        // custom directory nor the still-live source's listener.
+        let clone_listener = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("vsock.sock");
         assert_eq!(
-            clone_state.config.source_vsock_socket_path.as_deref(),
-            Some(expected_source.as_path()),
-            "grand-clone metadata must retain the custom vmstate source"
+            clone_state.config.vsock_socket_path.as_deref(),
+            Some(clone_listener.as_path()),
+            "clone control listener must be clone-local"
         );
         assert_ne!(
-            clone_state.config.vsock_socket_path, clone_state.config.source_vsock_socket_path,
-            "clone control listener must be clone-local"
+            clone_listener, expected_source,
+            "clone listener must not be the custom source"
+        );
+        assert_ne!(
+            clone_state.config.vsock_socket_path, source_state.config.vsock_socket_path,
+            "clone listener must not be the live source's listener"
+        );
+        // The load pointed the clone's vsock at that listener, so its VMM state
+        // names it, and it is the source a snapshot of the clone embeds.
+        assert_eq!(
+            clone_state.config.source_vsock_socket_path.as_deref(),
+            Some(clone_listener.as_path()),
+            "clone must record its own listener as its vsock source"
+        );
+
+        // A snapshot of the clone records that source, and restoring it checks the
+        // record against the vmstate it embeds before the VMM loads it.
+        common::create_snapshot_by_pid(clone_pid, &grand_snapshot_name).await?;
+        grand_snapshot_created = true;
+        let grand_snapshot = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&grand_snapshot_name)
+            .await?;
+        assert_eq!(grand_snapshot.source_vsock_socket_path, clone_listener);
+        let (grand_child, grand_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &grand_snapshot_name,
+                "--name",
+                &grand_clone_name,
+            ],
+            &grand_clone_name,
+        )
+        .await
+        .context("restoring a grand-clone from the clone's snapshot")?;
+        cleanup_procs.push((grand_pid, grand_child));
+        common::poll_health_by_pid(grand_pid, 120).await?;
+        let grand_exec = common::exec_in_vm(grand_pid, &["echo", "grand-clone-control-ok"])
+            .await
+            .context("exec on restored grand-clone")?;
+        assert!(
+            grand_exec.contains("grand-clone-control-ok"),
+            "{grand_exec}"
         );
         Ok(())
     }
@@ -658,6 +708,18 @@ async fn test_custom_vsock_source_restores_live_and_keeps_independent_control() 
             Err(error) => {
                 cleanup_errors.push(format!("deleting snapshot {snapshot_name}: {error:#}"))
             }
+        }
+    }
+    if grand_snapshot_created {
+        match common::delete_snapshot(&grand_snapshot_name).await {
+            Ok(()) => {
+                if common::snapshot_exists(&grand_snapshot_name) {
+                    cleanup_errors.push(format!("snapshot {grand_snapshot_name} still exists"));
+                }
+            }
+            Err(error) => cleanup_errors.push(format!(
+                "deleting snapshot {grand_snapshot_name}: {error:#}"
+            )),
         }
     }
     // Custom socket paths are outside the VM runtime tree, so clean their
@@ -696,12 +758,14 @@ fn combine_with_cleanup(result: Result<()>, cleanup_errors: Vec<String>) -> Resu
 /// MAXIMUM REUSE / CACHEABILITY: a snapshot-cache hit must HONOR `--vsock-dir`
 /// rather than silently ignoring it. Run 1 cold-boots with a health check so
 /// its startup snapshot lands in the cache; run 2 (same content key, plus the
-/// flag) restores from it, and the restore mount redirect must place run 2's
-/// actual listener in the caller-owned directory while its metadata still
-/// records the true vmstate-embedded source (run 1's runtime path). Without a
-/// retargetable redirect this fails exactly as CI run 31470581069 did: the
-/// restored VM's listener and recorded source both point at the cache
-/// creator's `vm-disks/<id>/vsock.sock`.
+/// flag) restores from it. The restore must place run 2's listener in the
+/// caller-owned directory, and because the load overrides the vsock path there,
+/// run 2 records that listener as its vsock source. A cold boot with the flag
+/// records the same two paths, so what proves the hit is the lineage: a restore
+/// inherits the startup snapshot's `original_vsock_vm_id`, while a run that falls
+/// back to a cold boot starts a lineage of its own. Without restore-time handling
+/// of the flag, run 2's listener lands in a `vm-disks/<id>` directory instead (CI
+/// run 31470581069).
 #[tokio::test]
 async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
     let (creator_name, hit_name, _, _) = common::unique_names("vsockdir-hit");
@@ -786,15 +850,20 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
             );
             tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        // A restore inherits the snapshot's lineage; a run that falls back to a cold
+        // boot starts its own. This is what tells run 2's hit from a fallback.
+        let startup_lineage = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&startup_key)
+            .await?
+            .original_vsock_vm_id
+            .context("startup snapshot recorded no vsock lineage")?;
         common::kill_process(creator_pid).await;
 
         // Plant a stale file where run 2's listener must land: teardown
         // SIGKILLs the VMM, which never unlinks its socket, so a caller-owned
         // dir reused across runs holds exactly this. Without the restore-path
-        // removal, Firecracker's bind fails on it and the run falls back to a
-        // cold boot — the listener still lands at the flag's path, but the
-        // recorded source becomes this VM's own (cold) path instead of the
-        // cache creator's, which the source assert below catches.
+        // removal, Firecracker's bind fails on it and the hit falls back; the
+        // lineage assert below fails for a run 2 that did not restore.
         std::fs::write(&expected_listener, b"").context("planting stale socket file")?;
 
         // Run 2: identical content key + --vsock-dir -> startup snapshot HIT.
@@ -828,12 +897,20 @@ async fn test_vsock_dir_honored_on_snapshot_cache_hit() -> Result<()> {
             Some(expected_listener.as_path()),
             "cache hit must place the clone's actual listener in --vsock-dir"
         );
-        // Prove the flag was honored by a RESTORE, not a fallback cold boot:
-        // the recorded vmstate source is the creator's embedded path.
+        // The load pointed the vsock at that listener, so it is also the source
+        // the hit's VMM state names.
         assert_eq!(
             hit_state.config.source_vsock_socket_path.as_deref(),
-            Some(creator_source.as_path()),
-            "restored VM must record the cache creator's embedded vsock source"
+            Some(expected_listener.as_path()),
+            "cache hit must record its own listener as its vsock source"
+        );
+        // Prove the flag was honored by a RESTORE, not a fallback cold boot: the
+        // hit carries the startup snapshot's lineage, which a cold boot of run 2
+        // cannot (its lineage starts at one of its own VM ids).
+        assert_eq!(
+            hit_state.config.original_vsock_vm_id.as_deref(),
+            Some(startup_lineage.as_str()),
+            "cache hit must inherit the startup snapshot's vsock lineage"
         );
         // Control paths reach the guest through the persisted custom listener.
         let exec_out = common::exec_in_vm(hit_pid, &["echo", "vsockdir-hit-ok"]).await?;
