@@ -170,6 +170,11 @@ pub struct RestorePhases {
     pub tcp_reassert_ms: f64,
     pub tcp_destroy_ms: f64,
     pub tcp_reopen_ms: f64,
+    /// The cleanup's counts, from the same report: sockets destroyed, sockets
+    /// the kernel had already retired, and the SOCK_DESTROY datagrams sent.
+    pub tcp_destroyed: usize,
+    pub tcp_already_gone: usize,
+    pub tcp_destroy_datagrams: usize,
     pub neighbor_ms: f64,
     pub nfs_ms: f64,
     pub exec_wait_ms: f64,
@@ -178,6 +183,21 @@ pub struct RestorePhases {
 }
 
 impl RestorePhases {
+    /// Copy what the snapshot network boundary reported into the record.
+    pub(crate) fn record_boundary(
+        &mut self,
+        boundary: &crate::snapshot_network::RestoreNetworkReport,
+    ) {
+        self.tcp_verified = boundary.verified_armed;
+        self.tcp_verify_ms = boundary.verify_ms;
+        self.tcp_reassert_ms = boundary.reassert_ms;
+        self.tcp_destroy_ms = boundary.destroy_ms;
+        self.tcp_reopen_ms = boundary.reopen_ms;
+        self.tcp_destroyed = boundary.tally.destroyed;
+        self.tcp_already_gone = boundary.tally.already_gone;
+        self.tcp_destroy_datagrams = boundary.tally.datagrams;
+    }
+
     /// Compact single-line JSON for the ACK frame.
     pub fn to_frame_json(&self) -> String {
         serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
@@ -306,11 +326,7 @@ pub async fn handle_clone_restore(
         .await
         .context("restore phase tcp-cleanup")?;
     phases.tcp_cleanup_ms = elapsed_ms(tcp_cleanup_started);
-    phases.tcp_verified = boundary.verified_armed;
-    phases.tcp_verify_ms = boundary.verify_ms;
-    phases.tcp_reassert_ms = boundary.reassert_ms;
-    phases.tcp_destroy_ms = boundary.destroy_ms;
-    phases.tcp_reopen_ms = boundary.reopen_ms;
+    phases.record_boundary(&boundary);
     eprintln!(
         "[fc-agent] restore phase=tcp-cleanup epoch={} complete elapsed_ms={:.3}",
         restore_epoch, phases.tcp_cleanup_ms

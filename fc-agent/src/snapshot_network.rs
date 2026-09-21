@@ -791,10 +791,12 @@ enum DestroyOutcome {
 /// cleanup destroyed, and only the split tells an operator whether the manifest
 /// still describes the restored guest. Reporting one total for both hides a
 /// manifest that has gone entirely stale behind a healthy-looking count.
+/// `datagrams` is how many SOCK_DESTROY datagrams carried the requests.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct CleanupTally {
-    destroyed: usize,
-    already_gone: usize,
+pub(crate) struct CleanupTally {
+    pub(crate) destroyed: usize,
+    pub(crate) already_gone: usize,
+    pub(crate) datagrams: usize,
 }
 
 /// What one restore-side boundary transaction did, surfaced to the restore
@@ -815,7 +817,8 @@ pub struct RestoreNetworkReport {
     /// Milliseconds removing the gate, raising the link, and reinstating
     /// routes.
     pub reopen_ms: f64,
-    tally: CleanupTally,
+    /// What the cleanup did to the manifest's sockets.
+    pub(crate) tally: CleanupTally,
 }
 
 /// Total budget for retiring every socket named by the manifest.
@@ -847,6 +850,8 @@ trait SocketDiagnostic {
     /// Retire `sockets` by cookie and return one outcome per socket, in order.
     /// A socket the kernel could not retire fails the whole call.
     fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>>;
+    /// How many datagrams of SOCK_DESTROY requests `destroy` has sent.
+    fn destroy_datagrams(&self) -> usize;
 }
 
 struct SystemSocketDiagnostic {
@@ -872,6 +877,10 @@ impl SocketDiagnostic for SystemSocketDiagnostic {
 
     fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
         self.destroyer.destroy(sockets)
+    }
+
+    fn destroy_datagrams(&self) -> usize {
+        self.destroyer.datagrams
     }
 }
 
@@ -1015,6 +1024,8 @@ struct CookieDestroyer<C, F> {
     /// Requests per datagram: `DESTROY_BATCH`, or fewer when the socket's
     /// receive buffer cannot hold that many acknowledgements.
     batch: usize,
+    /// Datagrams of SOCK_DESTROY requests sent so far.
+    datagrams: usize,
 }
 
 impl<C: NetlinkChannel, F: FnMut() -> Result<C>> CookieDestroyer<C, F> {
@@ -1023,6 +1034,7 @@ impl<C: NetlinkChannel, F: FnMut() -> Result<C>> CookieDestroyer<C, F> {
             open,
             channel: None,
             batch: DESTROY_BATCH,
+            datagrams: 0,
         }
     }
 
@@ -1049,6 +1061,7 @@ impl<C: NetlinkChannel, F: FnMut() -> Result<C>> CookieDestroyer<C, F> {
         };
         let mut outcomes = Vec::with_capacity(sockets.len());
         for batch in sockets.chunks(self.batch) {
+            self.datagrams += 1;
             outcomes.extend(destroy_batch(channel, batch)?);
         }
         Ok(outcomes)
@@ -1375,6 +1388,7 @@ async fn restore_with<
             }
         }
     }
+    tally.datagrams = diagnostic.destroy_datagrams();
     // Retire the armed-boundary marker before publication. Leaving it behind
     // would keep the restore watcher on the restore-only control generation;
     // a removal failure therefore remains closed instead of being a warning.
@@ -1558,6 +1572,8 @@ mod tests {
         fail_barrier: bool,
         fail_dump: bool,
         fail_destroy: bool,
+        /// Calls to the model diagnostic's destroy, one datagram each.
+        destroy_calls: usize,
     }
 
     #[derive(Clone)]
@@ -1658,6 +1674,7 @@ mod tests {
 
         fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
             let mut state = self.0.lock().unwrap();
+            state.destroy_calls += 1;
             assert!(
                 state.gate_closed,
                 "restore opened the gate before destroying sockets"
@@ -1683,6 +1700,10 @@ mod tests {
                 }
             }
             Ok(outcomes)
+        }
+
+        fn destroy_datagrams(&self) -> usize {
+            self.0.lock().unwrap().destroy_calls
         }
     }
 
@@ -1941,6 +1962,10 @@ mod tests {
 
         fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
             self.0.destroy(sockets)
+        }
+
+        fn destroy_datagrams(&self) -> usize {
+            self.0.datagrams
         }
     }
 
@@ -2458,6 +2483,7 @@ COMMIT\\n\"",
             CleanupTally {
                 destroyed: 0,
                 already_gone: 1,
+                datagrams: 1,
             }
         );
         assert!(report.verified_armed);
@@ -2871,6 +2897,7 @@ COMMIT\\n\"",
             CleanupTally {
                 destroyed: 1000,
                 already_gone: 0,
+                datagrams: 16,
             }
         );
         let kernel = kernel.0.lock().unwrap();
@@ -2946,6 +2973,50 @@ COMMIT\\n\"",
                 );
             }
         }
+    }
+
+    /// The cleanup's counts reach the record fcvm prints as guest_phases.
+    /// Without them the time a restore spent destroying sockets cannot be
+    /// divided by how many it destroyed.
+    #[tokio::test]
+    async fn the_restore_record_carries_the_cleanup_counts() {
+        let sockets: Vec<TcpSocketIdentity> = (0..150)
+            .map(|cookie| socket(6000 + cookie, [198, 51, 100, 8]))
+            .collect();
+        // 100 are live and 50 already gone.
+        let kernel =
+            SharedKernel::new(&sockets[..100], ModelAnswer::Kernel, ModelDelivery::InOrder);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: Vec::new(),
+                sockets: sockets.clone(),
+            })
+            .unwrap();
+        let mut diag = ChannelDiag(CookieDestroyer::new(kernel.opener()));
+        let report = restore_with(
+            &ModelGate(state.clone()),
+            &ModelBarrier(state.clone()),
+            &mut diag,
+            &store,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
+
+        let mut phases = crate::restore::RestorePhases::default();
+        phases.record_boundary(&report);
+        let record: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        let datagrams = kernel.0.lock().unwrap().datagrams.len();
+        assert_eq!(datagrams, 3, "150 sockets at 64 to a datagram");
+        assert_eq!(record["tcp_destroyed"], 100, "{record}");
+        assert_eq!(record["tcp_already_gone"], 50, "{record}");
+        assert_eq!(record["tcp_destroy_datagrams"], datagrams, "{record}");
     }
 
     #[test]
