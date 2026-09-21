@@ -1,11 +1,20 @@
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::os::fd::OwnedFd;
+use std::sync::atomic::Ordering;
 
+use anyhow::{bail, Context};
+
+use crate::netlink::{
+    append_netlink_header, decode_netlink_error, for_each_netlink_message, netlink_align,
+    read_dump, read_unaligned, validate_error_request, KernelChannel, NetlinkChannel,
+    NetlinkHeader, OnInterrupt, NEXT_NETLINK_SEQUENCE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK,
+    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+};
 use crate::snapshot_network::SYSFS_NET_PATH;
 
 /// Open a raw kernel socket as an owned descriptor, SOCK_CLOEXEC always set.
 /// The one unsafe socket(2) call shared by this crate's raw-socket users
-/// (AF_PACKET barrier, AF_PACKET ARP probe, NETLINK_SOCK_DIAG).
+/// (AF_PACKET barrier, AF_PACKET ARP probe, netlink).
 pub(crate) fn open_raw_socket(
     domain: libc::c_int,
     socket_type: libc::c_int,
@@ -484,84 +493,321 @@ pub fn configure_ipv6_from_cmdline() {
     }
 }
 
+const NETLINK_ROUTE: i32 = 0;
+const RTM_NEWADDR: u16 = 20;
+const RTM_DELADDR: u16 = 21;
+const RTM_GETADDR: u16 = 22;
+const IFA_ADDRESS: u16 = 1;
+const IFA_LOCAL: u16 = 2;
+const IFA_F_NODAD: u8 = 0x02;
+const RT_SCOPE_UNIVERSE: u8 = 0;
+
+/// `struct ifaddrmsg`, the fixed part of every address message.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct IfAddrMessage {
+    family: u8,
+    prefix_len: u8,
+    flags: u8,
+    scope: u8,
+    index: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<IfAddrMessage>() == 8);
+
+/// An IPv6 address and its prefix length, the form `ip -6 addr` names one in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Ipv6Prefix {
+    address: Ipv6Addr,
+    prefix_len: u8,
+}
+
+impl std::fmt::Display for Ipv6Prefix {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}/{}", self.address, self.prefix_len)
+    }
+}
+
 /// Reconfigure the guest's IPv6 address on eth0 after snapshot restore.
 ///
 /// Replaces the snapshot's shared guest IPv6 with the unique per-clone address.
 /// This is called during handle_clone_restore(), BEFORE any network traffic
-/// can use the old address. Uses `ip addr replace` semantics: find the current
-/// IPv6, remove it, add the new one.
+/// can use the old address.
+///
+/// This is the swap `ip -6 addr show`, `del` and `add` performed, sent over
+/// rtnetlink by fc-agent itself. The swap runs before the restore
+/// acknowledgement, and in a restored guest every fork and exec of a binary
+/// that was cold at snapshot time faults its pages in through the memory
+/// server. Its receives block, so it runs on tokio's blocking pool (see
+/// `off_the_runtime`).
 pub async fn reconfigure_ipv6(new_ipv6: &str) {
+    reconfigure_ipv6_over(eth0_route_channel, new_ipv6).await;
+}
+
+/// `reconfigure_ipv6` over the socket `open` returns.
+async fn reconfigure_ipv6_over<C, F>(open: F, new_ipv6: &str)
+where
+    C: NetlinkChannel,
+    F: FnOnce() -> anyhow::Result<(C, u32)> + Send + 'static,
+{
     eprintln!("[fc-agent] reconfiguring IPv6: new address = {}", new_ipv6);
+    let new_ipv6 = new_ipv6.to_owned();
+    let swapped = off_the_runtime("the IPv6 swap", move || {
+        let (mut channel, index) = open()?;
+        swap_global_ipv6(&mut channel, index, &new_ipv6);
+        Ok(())
+    })
+    .await;
+    if let Err(error) = swapped {
+        eprintln!("[fc-agent] WARNING: cannot reconfigure IPv6: {error:#}");
+    }
+}
 
-    // Find current global IPv6 on eth0
-    let output = tokio::process::Command::new("ip")
-        .args(["-6", "addr", "show", "dev", "eth0", "scope", "global"])
-        .output()
-        .await;
+/// Run blocking netlink work on tokio's blocking pool and wait for it.
+///
+/// Each receive can block for the socket's five-second timeout, and a guest
+/// with one or two vCPUs has that many runtime workers. The exec rebind and
+/// the output writer need them while the restore waits on the kernel.
+async fn off_the_runtime<T: Send + 'static>(
+    work: &str,
+    step: impl FnOnce() -> anyhow::Result<T> + Send + 'static,
+) -> anyhow::Result<T> {
+    tokio::task::spawn_blocking(step)
+        .await
+        .with_context(|| format!("{work} did not finish"))?
+}
 
-    let old_addr = match output {
-        Ok(out) => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // Parse "inet6 <addr>/<prefix> scope global" line
-            stdout.lines().find_map(|line| {
-                let line = line.trim();
-                line.strip_prefix("inet6 ")
-                    .and_then(|rest| rest.split_whitespace().next().map(|s| s.to_string()))
-            })
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to list IPv6 addrs: {}", e);
-            None
-        }
-    };
+/// eth0's interface index and a NETLINK_ROUTE socket to change it with.
+fn eth0_route_channel() -> anyhow::Result<(KernelChannel, u32)> {
+    // SAFETY: the argument is a NUL-terminated string.
+    let index = unsafe { libc::if_nametoindex(c"eth0".as_ptr()) };
+    if index == 0 {
+        return Err(std::io::Error::last_os_error()).context("eth0 has no interface index");
+    }
+    Ok((KernelChannel::open(NETLINK_ROUTE, "NETLINK_ROUTE")?, index))
+}
 
-    // Remove old address if found
-    if let Some(ref old) = old_addr {
-        let del = tokio::process::Command::new("ip")
-            .args(["-6", "addr", "del", old, "dev", "eth0"])
-            .output()
-            .await;
-        match del {
-            Ok(out) if out.status.success() => {
-                eprintln!("[fc-agent] removed old IPv6 {} from eth0", old);
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                eprintln!("[fc-agent] WARNING: failed to remove old IPv6: {}", stderr);
-            }
-            Err(e) => {
-                eprintln!("[fc-agent] WARNING: ip addr del failed: {}", e);
-            }
+/// Remove the first global IPv6 on interface `index`, then add `new_ipv6` as a
+/// /128 without duplicate address detection. Every failure is a warning, and a
+/// failed lookup or removal still adds the new address.
+fn swap_global_ipv6<C: NetlinkChannel>(channel: &mut C, index: u32, new_ipv6: &str) {
+    let old = first_global_ipv6(channel, index).unwrap_or_else(|error| {
+        eprintln!("[fc-agent] WARNING: failed to list IPv6 addrs: {error:#}");
+        None
+    });
+    if let Some(old) = old {
+        match change_address(channel, RTM_DELADDR, 0, index, old, 0) {
+            Ok(()) => eprintln!("[fc-agent] removed old IPv6 {old} from eth0"),
+            Err(error) => eprintln!("[fc-agent] WARNING: failed to remove old IPv6: {error:#}"),
         }
     }
+    // nodad: DAD is pointless on a Firecracker TAP (only one endpoint), and its
+    // 1-2 s tentative period keeps the VM from using the address, which fails
+    // IPv6 connectivity in tests.
+    let added = new_ipv6
+        .parse::<Ipv6Addr>()
+        .with_context(|| format!("{new_ipv6:?} is not an IPv6 address"))
+        .and_then(|address| {
+            let address = Ipv6Prefix {
+                address,
+                prefix_len: 128,
+            };
+            let flags = NLM_F_CREATE | NLM_F_EXCL;
+            change_address(channel, RTM_NEWADDR, flags, index, address, IFA_F_NODAD)
+        });
+    match added {
+        Ok(()) => eprintln!("[fc-agent] added new IPv6 {}/128 to eth0", new_ipv6),
+        Err(error) => eprintln!("[fc-agent] WARNING: failed to add new IPv6: {error:#}"),
+    }
+}
 
-    // Add new address with nodad — DAD is pointless on a Firecracker TAP (only
-    // one endpoint) and the 1-2s tentative period prevents the VM from using
-    // the address, causing IPv6 connectivity failures in tests.
-    let add = tokio::process::Command::new("ip")
-        .args([
-            "-6",
-            "addr",
-            "add",
-            &format!("{}/128", new_ipv6),
-            "dev",
-            "eth0",
-            "nodad",
-        ])
-        .output()
-        .await;
-    match add {
-        Ok(out) if out.status.success() => {
-            eprintln!("[fc-agent] added new IPv6 {}/128 to eth0", new_ipv6);
+/// The address `ip -6 addr show dev <index> scope global` lists first: the
+/// first global-scope IPv6 on the interface, in the kernel's dump order.
+fn first_global_ipv6<C: NetlinkChannel>(
+    channel: &mut C,
+    index: u32,
+) -> anyhow::Result<Option<Ipv6Prefix>> {
+    let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    channel.send(&address_dump_request(sequence))?;
+    let mut first = None;
+    let interrupted = read_dump(
+        channel,
+        sequence,
+        RTM_GETADDR,
+        RTM_NEWADDR,
+        OnInterrupt::Keep,
+        |_, payload| {
+            if first.is_none() {
+                first = global_address_on(payload, index)?;
+            }
+            Ok(())
+        },
+    )
+    .context("IPv6 address dump failed")?;
+    // iproute2 warns about an interrupted dump and keeps what it read.
+    if interrupted {
+        eprintln!("[fc-agent] WARNING: IPv6 address dump was interrupted");
+    }
+    Ok(first)
+}
+
+/// The address one RTM_NEWADDR record describes, if it is a global IPv6 on
+/// interface `index`. That is IFA_LOCAL when the record carries one (an address
+/// with a peer) and IFA_ADDRESS otherwise, the address `ip` prints.
+fn global_address_on(payload: &[u8], index: u32) -> anyhow::Result<Option<Ipv6Prefix>> {
+    let message: IfAddrMessage = read_unaligned(payload)?;
+    if message.family != libc::AF_INET6 as u8
+        || message.index != index
+        || message.scope != RT_SCOPE_UNIVERSE
+    {
+        return Ok(None);
+    }
+    let mut local = None;
+    let mut address = None;
+    let mut offset = netlink_align(std::mem::size_of::<IfAddrMessage>());
+    while offset + 4 <= payload.len() {
+        let length = u16::from_ne_bytes([payload[offset], payload[offset + 1]]) as usize;
+        let kind = u16::from_ne_bytes([payload[offset + 2], payload[offset + 3]]);
+        if length < 4 || offset + length > payload.len() {
+            bail!("invalid address attribute length {length} at offset {offset}");
         }
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            eprintln!("[fc-agent] WARNING: failed to add new IPv6: {}", stderr);
+        if let Ok(octets) = <[u8; 16]>::try_from(&payload[offset + 4..offset + length]) {
+            match kind {
+                IFA_LOCAL => local = Some(Ipv6Addr::from(octets)),
+                IFA_ADDRESS => address = Some(Ipv6Addr::from(octets)),
+                _ => {}
+            }
         }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: ip addr add failed: {}", e);
+        offset += netlink_align(length);
+    }
+    Ok(local.or(address).map(|address| Ipv6Prefix {
+        address,
+        prefix_len: message.prefix_len,
+    }))
+}
+
+/// Send one address request and wait for the kernel's acknowledgement.
+fn change_address<C: NetlinkChannel>(
+    channel: &mut C,
+    message_type: u16,
+    flags: u16,
+    index: u32,
+    address: Ipv6Prefix,
+    address_flags: u8,
+) -> anyhow::Result<()> {
+    let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    channel.send(&address_request(
+        message_type,
+        NLM_F_REQUEST | NLM_F_ACK | flags,
+        sequence,
+        index,
+        address,
+        address_flags,
+    ))?;
+    loop {
+        let datagram = channel.receive()?;
+        let acknowledged = for_each_netlink_message(datagram, |header, payload| {
+            if header.sequence != sequence {
+                return Ok(false);
+            }
+            match header.message_type {
+                NLMSG_ERROR => {
+                    let (error, request) = decode_netlink_error(payload)?;
+                    validate_error_request(request, sequence, message_type)?;
+                    if error != 0 {
+                        return Err(std::io::Error::from_raw_os_error(error.wrapping_neg()).into());
+                    }
+                    Ok(true)
+                }
+                NLMSG_NOOP => Ok(false),
+                other => bail!("unexpected message type {other} in reply to an address request"),
+            }
+        })?;
+        if acknowledged {
+            return Ok(());
         }
     }
+}
+
+/// The request `ip -6 addr add` or `del` sends for `address` on interface
+/// `index`: an ifaddrmsg, then IFA_LOCAL and IFA_ADDRESS, both the address.
+fn address_request(
+    message_type: u16,
+    flags: u16,
+    sequence: u32,
+    index: u32,
+    address: Ipv6Prefix,
+    address_flags: u8,
+) -> Vec<u8> {
+    const ATTRIBUTE_LEN: usize = 4 + 16;
+    let length = std::mem::size_of::<NetlinkHeader>()
+        + std::mem::size_of::<IfAddrMessage>()
+        + 2 * ATTRIBUTE_LEN;
+    let mut bytes = Vec::with_capacity(length);
+    append_netlink_header(
+        &mut bytes,
+        NetlinkHeader {
+            length: length as u32,
+            message_type,
+            flags,
+            sequence,
+            port_id: 0,
+        },
+    );
+    append_ifaddr(
+        &mut bytes,
+        IfAddrMessage {
+            family: libc::AF_INET6 as u8,
+            prefix_len: address.prefix_len,
+            flags: address_flags,
+            scope: RT_SCOPE_UNIVERSE,
+            index,
+        },
+    );
+    for kind in [IFA_LOCAL, IFA_ADDRESS] {
+        bytes.extend_from_slice(&(ATTRIBUTE_LEN as u16).to_ne_bytes());
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(&address.address.octets());
+    }
+    bytes
+}
+
+/// An RTM_GETADDR dump of every IPv6 address, the request behind
+/// `ip -6 addr show`.
+fn address_dump_request(sequence: u32) -> Vec<u8> {
+    let length = std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<IfAddrMessage>();
+    let mut bytes = Vec::with_capacity(length);
+    append_netlink_header(
+        &mut bytes,
+        NetlinkHeader {
+            length: length as u32,
+            message_type: RTM_GETADDR,
+            flags: NLM_F_REQUEST | NLM_F_DUMP,
+            sequence,
+            port_id: 0,
+        },
+    );
+    append_ifaddr(
+        &mut bytes,
+        IfAddrMessage {
+            family: libc::AF_INET6 as u8,
+            prefix_len: 0,
+            flags: 0,
+            scope: 0,
+            index: 0,
+        },
+    );
+    bytes
+}
+
+fn append_ifaddr(bytes: &mut Vec<u8>, message: IfAddrMessage) {
+    bytes.extend_from_slice(&[
+        message.family,
+        message.prefix_len,
+        message.flags,
+        message.scope,
+    ]);
+    bytes.extend_from_slice(&message.index.to_ne_bytes());
 }
 
 /// Forward specific localhost ports to host gateway via TCP proxy.
@@ -1230,5 +1476,367 @@ mod forward_localhost_tests {
         for addr in &addrs {
             TcpStream::connect(addr).unwrap_or_else(|e| panic!("connecting to {addr}: {e}"));
         }
+    }
+}
+
+#[cfg(test)]
+mod ipv6_swap_tests {
+    use super::*;
+    use crate::netlink::NLMSG_DONE;
+    use std::collections::VecDeque;
+
+    const LINK_SCOPE: u8 = 253;
+    const NLM_F_MULTI: u16 = 0x2;
+    const IFA_CACHEINFO: u16 = 6;
+    const IFA_FLAGS: u16 = 8;
+
+    /// `ip -6 addr del 2001:db8::5/128 dev lo` from the guest's iproute2 6.1,
+    /// captured with `strace -e write=` inside the guest. lo is index 1, and the
+    /// request's sequence number was 0x6ab10975.
+    const IP_ADDR_DEL: [u8; 64] = [
+        0x40, 0x00, 0x00, 0x00, 0x15, 0x00, 0x05, 0x00, 0x75, 0x09, 0xb1, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x0a, 0x80, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x02, 0x00, 0x20, 0x01,
+        0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x14,
+        0x00, 0x01, 0x00, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x05,
+    ];
+
+    /// `ip -6 addr add 2001:db8::5/128 dev lo nodad`, captured the same way.
+    const IP_ADDR_ADD: [u8; 64] = [
+        0x40, 0x00, 0x00, 0x00, 0x14, 0x00, 0x05, 0x06, 0x75, 0x09, 0xb1, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x0a, 0x80, 0x02, 0x00, 0x01, 0x00, 0x00, 0x00, 0x14, 0x00, 0x02, 0x00, 0x20, 0x01,
+        0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x14,
+        0x00, 0x01, 0x00, 0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x05,
+    ];
+    const IP_SEQUENCE: u32 = 0x6ab10975;
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Entry {
+        index: u32,
+        address: Ipv6Addr,
+        prefix_len: u8,
+        scope: u8,
+        flags: u8,
+    }
+
+    fn entry(index: u32, address: &str, prefix_len: u8, scope: u8) -> Entry {
+        Entry {
+            index,
+            address: address.parse().unwrap(),
+            prefix_len,
+            scope,
+            flags: 0,
+        }
+    }
+
+    /// The kernel's side of a NETLINK_ROUTE socket for IPv6 addresses. A dump
+    /// lists the table one record per datagram and then NLMSG_DONE, the way
+    /// inet6_dump_addr fills its records. RTM_DELADDR removes the entry whose
+    /// address and prefix length match, RTM_NEWADDR adds one, and both are
+    /// acknowledged.
+    #[derive(Default)]
+    struct ModelRoute {
+        table: Vec<Entry>,
+        /// Refuse requests of this type with this errno.
+        refuse: Option<(u16, i32)>,
+        sent: Vec<Vec<u8>>,
+        queue: VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+    }
+
+    fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+        bytes.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(value);
+        bytes.resize(netlink_align(bytes.len()), 0);
+    }
+
+    impl ModelRoute {
+        fn acknowledge(&mut self, request: NetlinkHeader, error: i32) {
+            let mut bytes = Vec::new();
+            append_netlink_header(
+                &mut bytes,
+                NetlinkHeader {
+                    length: 36,
+                    message_type: NLMSG_ERROR,
+                    flags: 0,
+                    sequence: request.sequence,
+                    port_id: 0,
+                },
+            );
+            bytes.extend_from_slice(&error.to_ne_bytes());
+            append_netlink_header(&mut bytes, request);
+            self.queue.push_back(bytes);
+        }
+
+        fn record(entry: &Entry, sequence: u32) -> Vec<u8> {
+            let mut attributes = Vec::new();
+            attribute(&mut attributes, IFA_ADDRESS, &entry.address.octets());
+            attribute(&mut attributes, IFA_CACHEINFO, &[0u8; 16]);
+            attribute(
+                &mut attributes,
+                IFA_FLAGS,
+                &u32::from(entry.flags).to_ne_bytes(),
+            );
+            let mut bytes = Vec::new();
+            append_netlink_header(
+                &mut bytes,
+                NetlinkHeader {
+                    length: (16 + 8 + attributes.len()) as u32,
+                    message_type: RTM_NEWADDR,
+                    flags: NLM_F_MULTI,
+                    sequence,
+                    port_id: 0,
+                },
+            );
+            append_ifaddr(
+                &mut bytes,
+                IfAddrMessage {
+                    family: libc::AF_INET6 as u8,
+                    prefix_len: entry.prefix_len,
+                    flags: entry.flags,
+                    scope: entry.scope,
+                    index: entry.index,
+                },
+            );
+            bytes.extend_from_slice(&attributes);
+            bytes
+        }
+    }
+
+    impl NetlinkChannel for ModelRoute {
+        fn send(&mut self, datagram: &[u8]) -> anyhow::Result<()> {
+            self.sent.push(datagram.to_vec());
+            let header: NetlinkHeader = read_unaligned(datagram)?;
+            let message: IfAddrMessage = read_unaligned(&datagram[16..])?;
+            if let Some((refused, errno)) = self.refuse {
+                if refused == header.message_type {
+                    self.acknowledge(header, -errno);
+                    return Ok(());
+                }
+            }
+            match header.message_type {
+                RTM_GETADDR => {
+                    assert_eq!(header.flags, NLM_F_REQUEST | NLM_F_DUMP);
+                    for entry in &self.table {
+                        let record = Self::record(entry, header.sequence);
+                        self.queue.push_back(record);
+                    }
+                    let mut done = Vec::new();
+                    append_netlink_header(
+                        &mut done,
+                        NetlinkHeader {
+                            length: 20,
+                            message_type: NLMSG_DONE,
+                            flags: NLM_F_MULTI,
+                            sequence: header.sequence,
+                            port_id: 0,
+                        },
+                    );
+                    done.extend_from_slice(&0i32.to_ne_bytes());
+                    self.queue.push_back(done);
+                }
+                RTM_DELADDR | RTM_NEWADDR => {
+                    // IFA_LOCAL comes first, as iproute2 sends it.
+                    let local: [u8; 16] = datagram[28..44].try_into().unwrap();
+                    let address = Ipv6Addr::from(local);
+                    let position = self.table.iter().position(|entry| {
+                        entry.index == message.index
+                            && entry.address == address
+                            && entry.prefix_len == message.prefix_len
+                    });
+                    let error = match (header.message_type, position) {
+                        (RTM_DELADDR, Some(position)) => {
+                            self.table.remove(position);
+                            0
+                        }
+                        (RTM_DELADDR, None) => -libc::EADDRNOTAVAIL,
+                        (_, Some(_)) => -libc::EEXIST,
+                        (_, None) => {
+                            self.table.push(Entry {
+                                index: message.index,
+                                address,
+                                prefix_len: message.prefix_len,
+                                scope: RT_SCOPE_UNIVERSE,
+                                flags: message.flags,
+                            });
+                            0
+                        }
+                    };
+                    self.acknowledge(header, error);
+                }
+                other => panic!("unexpected request type {other}"),
+            }
+            Ok(())
+        }
+
+        fn receive(&mut self) -> anyhow::Result<&[u8]> {
+            // An empty queue is what the socket's receive timeout reports.
+            self.current = self.queue.pop_front().context("receive timed out")?;
+            Ok(&self.current)
+        }
+
+        fn reserve_receive_buffer(&mut self, bytes: usize) -> anyhow::Result<usize> {
+            Ok(bytes)
+        }
+    }
+
+    fn with_sequence(request: &[u8], sequence: u32) -> Vec<u8> {
+        let mut request = request.to_vec();
+        request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+        request
+    }
+
+    fn message_types(sent: &[Vec<u8>]) -> Vec<u16> {
+        sent.iter()
+            .map(|datagram| u16::from_ne_bytes([datagram[4], datagram[5]]))
+            .collect()
+    }
+
+    #[test]
+    fn the_swap_sends_the_requests_ip_sent() {
+        let mut route = ModelRoute {
+            table: vec![entry(1, "2001:db8::5", 128, RT_SCOPE_UNIVERSE)],
+            ..Default::default()
+        };
+        swap_global_ipv6(&mut route, 1, "2001:db8::5");
+        assert_eq!(
+            message_types(&route.sent),
+            vec![RTM_GETADDR, RTM_DELADDR, RTM_NEWADDR]
+        );
+        assert_eq!(with_sequence(&route.sent[1], IP_SEQUENCE), IP_ADDR_DEL);
+        assert_eq!(with_sequence(&route.sent[2], IP_SEQUENCE), IP_ADDR_ADD);
+    }
+
+    #[test]
+    fn only_the_first_global_address_on_the_interface_is_replaced() {
+        let other_interface = entry(3, "2001:db8:3::1", 64, RT_SCOPE_UNIVERSE);
+        let link_local = entry(2, "fe80::1", 64, LINK_SCOPE);
+        let second_global = entry(2, "2001:db8:2::1", 64, RT_SCOPE_UNIVERSE);
+        let mut route = ModelRoute {
+            table: vec![
+                other_interface.clone(),
+                link_local.clone(),
+                entry(2, "2001:db8::1", 128, RT_SCOPE_UNIVERSE),
+                second_global.clone(),
+            ],
+            ..Default::default()
+        };
+        swap_global_ipv6(&mut route, 2, "2001:db8::2");
+        let clone_address = Entry {
+            flags: IFA_F_NODAD,
+            ..entry(2, "2001:db8::2", 128, RT_SCOPE_UNIVERSE)
+        };
+        assert_eq!(
+            route.table,
+            vec![other_interface, link_local, second_global, clone_address]
+        );
+    }
+
+    #[test]
+    fn the_new_address_is_added_when_the_lookup_or_removal_fails() {
+        let snapshot_address = entry(2, "2001:db8::1", 128, RT_SCOPE_UNIVERSE);
+        let clone_address = Entry {
+            flags: IFA_F_NODAD,
+            ..entry(2, "2001:db8::2", 128, RT_SCOPE_UNIVERSE)
+        };
+        for (refuse, requests, table) in [
+            (
+                None,
+                vec![RTM_GETADDR, RTM_NEWADDR],
+                vec![entry(2, "fe80::1", 64, LINK_SCOPE)],
+            ),
+            (
+                Some((RTM_GETADDR, libc::EPERM)),
+                vec![RTM_GETADDR, RTM_NEWADDR],
+                vec![snapshot_address.clone()],
+            ),
+            (
+                Some((RTM_DELADDR, libc::EPERM)),
+                vec![RTM_GETADDR, RTM_DELADDR, RTM_NEWADDR],
+                vec![snapshot_address.clone()],
+            ),
+        ] {
+            let mut expected = table.clone();
+            expected.push(clone_address.clone());
+            let mut route = ModelRoute {
+                table,
+                refuse,
+                ..Default::default()
+            };
+            swap_global_ipv6(&mut route, 2, "2001:db8::2");
+            assert_eq!(message_types(&route.sent), requests, "{refuse:?}");
+            assert_eq!(route.table, expected, "{refuse:?}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod runtime_worker_tests {
+    use super::*;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    /// A NETLINK_ROUTE socket whose kernel is slow: the first receive says it
+    /// is waiting, waits a second, and then times out.
+    struct StallingChannel {
+        stalling: Option<mpsc::Sender<()>>,
+    }
+
+    impl NetlinkChannel for StallingChannel {
+        fn send(&mut self, _datagram: &[u8]) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        fn receive(&mut self) -> anyhow::Result<&[u8]> {
+            if let Some(stalling) = self.stalling.take() {
+                let _ = stalling.send(());
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            bail!("receive timed out")
+        }
+
+        fn reserve_receive_buffer(&mut self, bytes: usize) -> anyhow::Result<usize> {
+            Ok(bytes)
+        }
+    }
+
+    /// Run the restore step `step` builds on a one-worker runtime while its
+    /// socket stalls, and check that another task still runs on that worker.
+    /// A guest with one vCPU has one runtime worker, and the exec rebind and
+    /// the output writer need it while the restore waits on the kernel.
+    fn assert_stall_leaves_the_worker_free<Step>(step: impl FnOnce(StallingChannel) -> Step)
+    where
+        Step: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let (stalling, stalled) = mpsc::channel();
+        let restore = runtime.spawn(step(StallingChannel {
+            stalling: Some(stalling),
+        }));
+        stalled
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the restore step never waited on the kernel");
+        let (ran, has_run) = mpsc::channel();
+        runtime.spawn(async move {
+            let _ = ran.send(());
+        });
+        let progressed = has_run.recv_timeout(Duration::from_millis(500));
+        runtime.block_on(restore).unwrap();
+        assert!(
+            progressed.is_ok(),
+            "another task could not run while the restore step waited on the kernel"
+        );
+    }
+
+    #[test]
+    fn a_stalled_ipv6_swap_leaves_the_runtime_worker_free() {
+        assert_stall_leaves_the_worker_free(|channel| {
+            reconfigure_ipv6_over(move || Ok((channel, 2)), "2001:db8::2")
+        });
     }
 }

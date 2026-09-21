@@ -9,13 +9,19 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
+
+use crate::netlink::{
+    append_netlink_header, decode_netlink_error, for_each_netlink_message, netlink_align,
+    read_dump, read_unaligned, validate_error_request, KernelChannel, NetlinkChannel,
+    NetlinkHeader, OnInterrupt, NEXT_NETLINK_SEQUENCE, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP,
+    NLMSG_OVERRUN, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST,
+};
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_PATH: &str = "/run/fcvm/snapshot-network.json";
@@ -27,34 +33,15 @@ const GATE_OUTPUT_CHAIN: &str = "FCVM_SNAPSHOT_OUT";
 const NETLINK_SOCK_DIAG: i32 = 4;
 const SOCK_DIAG_BY_FAMILY: u16 = 20;
 const SOCK_DESTROY: u16 = 21;
-const NLMSG_NOOP: u16 = 1;
-const NLMSG_ERROR: u16 = 2;
-const NLMSG_DONE: u16 = 3;
-const NLMSG_OVERRUN: u16 = 4;
-const NLM_F_REQUEST: u16 = 0x01;
-const NLM_F_ACK: u16 = 0x04;
-const NLM_F_DUMP: u16 = 0x300;
-const NLM_F_DUMP_INTR: u16 = 0x10;
 const IPPROTO_TCP: u8 = 6;
 const TCP_LISTEN: u8 = 10;
 const TCP_STATE_MAX: u8 = 12;
 const INET_DIAG_NOCOOKIE: u32 = u32::MAX;
 
-static NEXT_NETLINK_SEQUENCE: AtomicU32 = AtomicU32::new(1);
 /// Distinct from the netlink sequence: this only has to make a temporary
 /// manifest filename unique within one process, and sharing the netlink counter
 /// coupled two unrelated identifiers.
 static NEXT_MANIFEST_TEMP_ID: AtomicU32 = AtomicU32::new(1);
-
-#[repr(C)]
-#[derive(Debug, Clone, Copy)]
-struct NetlinkHeader {
-    length: u32,
-    message_type: u16,
-    flags: u16,
-    sequence: u32,
-    port_id: u32,
-}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,7 +80,6 @@ struct InetDiagMessage {
     inode: u32,
 }
 
-const _: () = assert!(std::mem::size_of::<NetlinkHeader>() == 16);
 const _: () = assert!(std::mem::size_of::<InetDiagSockId>() == 48);
 const _: () = assert!(std::mem::size_of::<InetDiagRequest>() == 56);
 const _: () = assert!(std::mem::size_of::<InetDiagMessage>() == 72);
@@ -864,15 +850,13 @@ trait SocketDiagnostic {
 }
 
 struct SystemSocketDiagnostic {
-    destroyer: CookieDestroyer<KernelDiagChannel, fn() -> Result<KernelDiagChannel>>,
+    destroyer: CookieDestroyer<KernelChannel, fn() -> Result<KernelChannel>>,
 }
 
 impl SystemSocketDiagnostic {
     fn new() -> Self {
         Self {
-            destroyer: CookieDestroyer::new(
-                KernelDiagChannel::open as fn() -> Result<KernelDiagChannel>,
-            ),
+            destroyer: CookieDestroyer::new(open_diag_channel as fn() -> Result<KernelChannel>),
         }
     }
 }
@@ -889,26 +873,6 @@ impl SocketDiagnostic for SystemSocketDiagnostic {
     fn destroy(&mut self, sockets: &[TcpSocketIdentity]) -> Result<Vec<DestroyOutcome>> {
         self.destroyer.destroy(sockets)
     }
-}
-
-fn read_unaligned<T: Copy>(bytes: &[u8]) -> Result<T> {
-    if bytes.len() < std::mem::size_of::<T>() {
-        bail!(
-            "short netlink payload: {} bytes, need {}",
-            bytes.len(),
-            std::mem::size_of::<T>()
-        );
-    }
-    // SAFETY: length was checked and read_unaligned permits any byte alignment.
-    Ok(unsafe { bytes.as_ptr().cast::<T>().read_unaligned() })
-}
-
-fn append_netlink_header(bytes: &mut Vec<u8>, header: NetlinkHeader) {
-    bytes.extend_from_slice(&header.length.to_ne_bytes());
-    bytes.extend_from_slice(&header.message_type.to_ne_bytes());
-    bytes.extend_from_slice(&header.flags.to_ne_bytes());
-    bytes.extend_from_slice(&header.sequence.to_ne_bytes());
-    bytes.extend_from_slice(&header.port_id.to_ne_bytes());
 }
 
 fn append_socket_id(bytes: &mut Vec<u8>, id: InetDiagSockId) {
@@ -955,57 +919,9 @@ fn append_diag_message(bytes: &mut Vec<u8>, message: InetDiagMessage) {
     bytes.extend_from_slice(&message.inode.to_ne_bytes());
 }
 
-const fn netlink_align(length: usize) -> usize {
-    (length + 3) & !3
-}
-
-fn open_diag_socket() -> Result<OwnedFd> {
-    use std::os::fd::AsRawFd;
-
-    let fd = crate::network::open_raw_socket(libc::AF_NETLINK, libc::SOCK_RAW, NETLINK_SOCK_DIAG)
-        .context("opening NETLINK_SOCK_DIAG socket (guest kernel needs CONFIG_INET_DIAG=y)")?;
-    let mut address: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    address.nl_family = libc::AF_NETLINK as u16;
-    // SAFETY: address points to a fully initialized sockaddr_nl.
-    let bind_result = unsafe {
-        libc::bind(
-            fd.as_raw_fd(),
-            (&address as *const libc::sockaddr_nl).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if bind_result < 0 {
-        return Err(io::Error::last_os_error()).context("binding NETLINK_SOCK_DIAG socket");
-    }
-    // Connected netlink sockets can use send(2), avoiding a per-message
-    // sockaddr and making every reply come from the kernel peer (pid zero).
-    let connect_result = unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&address as *const libc::sockaddr_nl).cast(),
-            std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t,
-        )
-    };
-    if connect_result < 0 {
-        return Err(io::Error::last_os_error()).context("connecting NETLINK_SOCK_DIAG socket");
-    }
-    let timeout = libc::timeval {
-        tv_sec: 5,
-        tv_usec: 0,
-    };
-    let timeout_result = unsafe {
-        libc::setsockopt(
-            fd.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVTIMEO,
-            (&timeout as *const libc::timeval).cast(),
-            std::mem::size_of::<libc::timeval>() as libc::socklen_t,
-        )
-    };
-    if timeout_result < 0 {
-        return Err(io::Error::last_os_error()).context("setting SOCK_DIAG receive timeout");
-    }
-    Ok(fd)
+fn open_diag_channel() -> Result<KernelChannel> {
+    KernelChannel::open(NETLINK_SOCK_DIAG, "NETLINK_SOCK_DIAG")
+        .context("opening a sock_diag socket (guest kernel needs CONFIG_INET_DIAG=y)")
 }
 
 /// Bytes of one netlink message carrying an `InetDiagRequest`. Already
@@ -1036,137 +952,8 @@ fn append_diag_request_message(
     debug_assert_eq!(bytes.len() - start, DIAG_REQUEST_MESSAGE_LEN);
 }
 
-fn send_datagram(fd: &OwnedFd, bytes: &[u8]) -> Result<()> {
-    use std::os::fd::AsRawFd;
-
-    let sent = unsafe { libc::send(fd.as_raw_fd(), bytes.as_ptr().cast(), bytes.len(), 0) };
-    if sent < 0 {
-        return Err(io::Error::last_os_error()).context("sending SOCK_DIAG netlink request");
-    }
-    if sent as usize != bytes.len() {
-        bail!(
-            "short SOCK_DIAG send: wrote {sent} of {} bytes",
-            bytes.len()
-        );
-    }
-    Ok(())
-}
-
-/// Receive one datagram into `bytes` and return its length.
-fn receive_datagram(fd: &OwnedFd, bytes: &mut [u8]) -> Result<usize> {
-    use std::os::fd::AsRawFd;
-
-    let mut peer: libc::sockaddr_nl = unsafe { std::mem::zeroed() };
-    let mut iov = libc::iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
-    };
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_name = (&mut peer as *mut libc::sockaddr_nl).cast();
-    message.msg_namelen = std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t;
-    message.msg_iov = &mut iov;
-    message.msg_iovlen = 1;
-    let received = unsafe { libc::recvmsg(fd.as_raw_fd(), &mut message, 0) };
-    if received < 0 {
-        return Err(io::Error::last_os_error()).context("receiving SOCK_DIAG netlink response");
-    }
-    if received == 0 {
-        bail!("NETLINK_SOCK_DIAG returned EOF before completing request");
-    }
-    if message.msg_flags & libc::MSG_TRUNC != 0 {
-        bail!(
-            "SOCK_DIAG netlink datagram exceeded {} bytes; refusing a partial socket identity dump",
-            bytes.len()
-        );
-    }
-    if message.msg_namelen < std::mem::size_of::<libc::sockaddr_nl>() as libc::socklen_t
-        || peer.nl_family != libc::AF_NETLINK as u16
-        || peer.nl_pid != 0
-    {
-        bail!(
-            "SOCK_DIAG response did not come from the kernel peer (family={} pid={})",
-            peer.nl_family,
-            peer.nl_pid
-        );
-    }
-    Ok(received as usize)
-}
-
-/// Visit every message in a netlink datagram until `callback` returns true.
-/// Every message's length is validated, including messages the callback skips.
-fn for_each_netlink_message(
-    bytes: &[u8],
-    mut callback: impl FnMut(NetlinkHeader, &[u8]) -> Result<bool>,
-) -> Result<bool> {
-    let header_size = std::mem::size_of::<NetlinkHeader>();
-    let mut offset = 0usize;
-    while offset < bytes.len() {
-        let header: NetlinkHeader = read_unaligned(&bytes[offset..])?;
-        let length = header.length as usize;
-        if length < header_size || offset + length > bytes.len() {
-            bail!("invalid netlink message length {length} at offset {offset}");
-        }
-        let payload = &bytes[offset + header_size..offset + length];
-        if callback(header, payload)? {
-            return Ok(true);
-        }
-        offset = offset
-            .checked_add(netlink_align(length))
-            .context("netlink message offset overflow")?;
-    }
-    Ok(false)
-}
-
-fn decode_netlink_error(payload: &[u8]) -> Result<(i32, NetlinkHeader)> {
-    let error = read_unaligned::<i32>(payload)?;
-    let request = read_unaligned::<NetlinkHeader>(&payload[std::mem::size_of::<i32>()..])?;
-    Ok((error, request))
-}
-
-fn validate_error_request(
-    request: NetlinkHeader,
-    sequence: u32,
-    expected_message_type: u16,
-) -> Result<()> {
-    if request.sequence != sequence || request.message_type != expected_message_type {
-        bail!(
-            "netlink acknowledgement described the wrong request: type={} sequence={} \
-             (expected type={} sequence={})",
-            request.message_type,
-            request.sequence,
-            expected_message_type,
-            sequence
-        );
-    }
-    Ok(())
-}
-
-fn validate_dump_completion(header: NetlinkHeader, payload: &[u8]) -> Result<()> {
-    if header.flags & NLM_F_DUMP_INTR != 0 {
-        bail!("SOCK_DIAG dump was interrupted; refusing an incomplete manifest");
-    }
-    // Modern netlink dumps may carry a native-endian i32 status in
-    // NLMSG_DONE, followed by optional extended-ack attributes.  Treating the
-    // message type alone as success can publish a partial cookie manifest.
-    if payload.is_empty() {
-        return Ok(());
-    }
-    let error = read_unaligned::<i32>(payload)?;
-    if error == 0 {
-        return Ok(());
-    }
-    let errno = error
-        .checked_neg()
-        .filter(|errno| *errno > 0)
-        .context("SOCK_DIAG dump completion contained an invalid netlink error")?;
-    bail!(
-        "SOCK_DIAG dump completion failed with errno {errno} ({}); refusing an incomplete manifest",
-        io::Error::from_raw_os_error(errno)
-    )
-}
-
 fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
-    let mut channel = KernelDiagChannel::open()?;
+    let mut channel = open_diag_channel()?;
     let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let states = ((1u32 << (TCP_STATE_MAX + 1)) - 1) & !(1u32 << TCP_LISTEN);
     let request = InetDiagRequest {
@@ -1194,133 +981,29 @@ fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
     );
     channel.send(&message)?;
     let mut sockets = Vec::new();
-    loop {
-        let datagram = channel.receive()?;
-        let done = for_each_netlink_message(datagram, |header, payload| {
-            if header.sequence != sequence {
-                return Ok(false);
+    read_dump(
+        &mut channel,
+        sequence,
+        SOCK_DIAG_BY_FAMILY,
+        SOCK_DIAG_BY_FAMILY,
+        OnInterrupt::Refuse,
+        |_, payload| {
+            let message: InetDiagMessage = read_unaligned(payload)?;
+            if message.id.cookie == [INET_DIAG_NOCOOKIE; 2] {
+                bail!("kernel returned a TCP socket without an identity cookie");
             }
-            match header.message_type {
-                NLMSG_DONE => {
-                    validate_dump_completion(header, payload)?;
-                    return Ok(true);
-                }
-                NLMSG_ERROR => {
-                    let (error, request) = decode_netlink_error(payload)?;
-                    validate_error_request(request, sequence, SOCK_DIAG_BY_FAMILY)?;
-                    if error != 0 {
-                        let errno = -error;
-                        bail!(
-                            "SOCK_DIAG dump failed with errno {errno} ({}); guest kernel needs CONFIG_INET_DIAG=y",
-                            io::Error::from_raw_os_error(errno)
-                        );
-                    }
-                }
-                NLMSG_NOOP => {}
-                NLMSG_OVERRUN => bail!("SOCK_DIAG dump overran its receive buffer"),
-                SOCK_DIAG_BY_FAMILY => {
-                    let message: InetDiagMessage = read_unaligned(payload)?;
-                    if message.id.cookie == [INET_DIAG_NOCOOKIE; 2] {
-                        bail!("kernel returned a TCP socket without an identity cookie");
-                    }
-                    sockets.push(TcpSocketIdentity {
-                        family: message.family,
-                        state: message.state,
-                        id: message.id,
-                    });
-                }
-                other => bail!("unexpected SOCK_DIAG dump message type {other}"),
-            }
-            Ok(false)
-        })?;
-        if done {
-            return Ok(sockets);
-        }
-    }
-}
-
-/// The two halves of a netlink socket that a batch of requests needs, so the
-/// batching can be driven against a model of the kernel.
-trait NetlinkChannel {
-    fn send(&mut self, datagram: &[u8]) -> Result<()>;
-    /// The next datagram the kernel queued on the socket.
-    fn receive(&mut self) -> Result<&[u8]>;
-    /// Ask for a receive buffer of `bytes`, and return the size the kernel
-    /// reports for the buffer afterwards.
-    fn reserve_receive_buffer(&mut self, bytes: usize) -> Result<usize>;
-}
-
-/// Largest datagram a receive accepts. A longer one fails closed instead of
-/// being read truncated.
-const DIAG_RECEIVE_BUFFER_BYTES: usize = 256 * 1024;
-
-/// A bound, connected NETLINK_SOCK_DIAG socket and the buffer its replies are
-/// received into.
-struct KernelDiagChannel {
-    fd: OwnedFd,
-    buffer: Vec<u8>,
-}
-
-impl KernelDiagChannel {
-    fn open() -> Result<Self> {
-        Ok(Self {
-            fd: open_diag_socket()?,
-            buffer: vec![0u8; DIAG_RECEIVE_BUFFER_BYTES],
-        })
-    }
-}
-
-impl NetlinkChannel for KernelDiagChannel {
-    fn send(&mut self, datagram: &[u8]) -> Result<()> {
-        send_datagram(&self.fd, datagram)
-    }
-
-    fn receive(&mut self) -> Result<&[u8]> {
-        let length = receive_datagram(&self.fd, &mut self.buffer)?;
-        Ok(&self.buffer[..length])
-    }
-
-    fn reserve_receive_buffer(&mut self, bytes: usize) -> Result<usize> {
-        use std::os::fd::AsRawFd;
-
-        let requested = libc::c_int::try_from(bytes)
-            .context("SOCK_DIAG receive buffer request is too large")?;
-        let set = |option| {
-            // SAFETY: the value points to a c_int of the length passed.
-            unsafe {
-                libc::setsockopt(
-                    self.fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    option,
-                    (&requested as *const libc::c_int).cast(),
-                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-                )
-            }
-        };
-        // SO_RCVBUFFORCE ignores net.core.rmem_default and rmem_max, so a guest
-        // that lowered them cannot shrink the buffer a batch needs. It takes
-        // CAP_NET_ADMIN, which SOCK_DESTROY needs as well; without it SO_RCVBUF
-        // still sets the buffer, up to rmem_max.
-        if set(libc::SO_RCVBUFFORCE) < 0 && set(libc::SO_RCVBUF) < 0 {
-            return Err(io::Error::last_os_error()).context("setting the SOCK_DIAG receive buffer");
-        }
-        let mut granted: libc::c_int = 0;
-        let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        // SAFETY: granted and length describe a writable c_int.
-        let result = unsafe {
-            libc::getsockopt(
-                self.fd.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                (&mut granted as *mut libc::c_int).cast(),
-                &mut length,
-            )
-        };
-        if result < 0 {
-            return Err(io::Error::last_os_error()).context("reading the SOCK_DIAG receive buffer");
-        }
-        usize::try_from(granted).context("the kernel reported a negative receive buffer")
-    }
+            sockets.push(TcpSocketIdentity {
+                family: message.family,
+                state: message.state,
+                id: message.id,
+            });
+            Ok(())
+        },
+    )
+    .context(
+        "SOCK_DIAG dump (guest kernel needs CONFIG_INET_DIAG=y); refusing an incomplete manifest",
+    )?;
+    Ok(sockets)
 }
 
 /// Retires cookies over one sock_diag socket for a whole restore: the socket
@@ -3324,44 +3007,5 @@ COMMIT\\n\"",
                 );
             }
         }
-    }
-
-    #[test]
-    fn dump_completion_error_rejects_a_partial_cookie_manifest() {
-        let header = NetlinkHeader {
-            length: (std::mem::size_of::<NetlinkHeader>() + std::mem::size_of::<i32>()) as u32,
-            message_type: NLMSG_DONE,
-            flags: 0,
-            sequence: 101,
-            port_id: 0,
-        };
-        let error = validate_dump_completion(header, &(-libc::EINTR).to_ne_bytes())
-            .expect_err("an errored dump completion must never publish a partial manifest");
-        let diagnostic = format!("{error:#}");
-        assert!(
-            diagnostic.contains("errno 4"),
-            "unexpected diagnostic: {error:#}"
-        );
-        assert!(
-            diagnostic.contains("incomplete manifest"),
-            "unexpected diagnostic: {error:#}"
-        );
-    }
-
-    #[test]
-    fn interrupted_dump_flag_rejects_a_partial_cookie_manifest() {
-        let header = NetlinkHeader {
-            length: std::mem::size_of::<NetlinkHeader>() as u32,
-            message_type: NLMSG_DONE,
-            flags: NLM_F_DUMP_INTR,
-            sequence: 102,
-            port_id: 0,
-        };
-        let error = validate_dump_completion(header, &[])
-            .expect_err("an interrupted dump must never publish a partial manifest");
-        assert!(
-            format!("{error:#}").contains("dump was interrupted"),
-            "unexpected diagnostic: {error:#}"
-        );
     }
 }

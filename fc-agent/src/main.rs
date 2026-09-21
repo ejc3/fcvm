@@ -7,6 +7,7 @@ mod fuse;
 mod lock_test;
 mod mmds;
 mod mounts;
+mod netlink;
 mod network;
 mod output;
 mod proxy;
