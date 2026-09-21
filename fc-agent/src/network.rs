@@ -5,10 +5,10 @@ use std::sync::atomic::Ordering;
 use anyhow::{bail, Context};
 
 use crate::netlink::{
-    append_netlink_header, decode_netlink_error, for_each_netlink_message, netlink_align,
-    read_dump, read_unaligned, validate_error_request, KernelChannel, NetlinkChannel,
-    NetlinkHeader, OnInterrupt, NEXT_NETLINK_SEQUENCE, NLMSG_ERROR, NLMSG_NOOP, NLM_F_ACK,
-    NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    append_netlink_header, decode_netlink_error, netlink_align, read_dump, read_unaligned,
+    request_acknowledged, KernelChannel, NetlinkChannel, NetlinkHeader, OnInterrupt,
+    NEXT_NETLINK_SEQUENCE, NLMSG_ERROR, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
+    NLM_F_REPLACE, NLM_F_REQUEST,
 };
 use crate::snapshot_network::SYSFS_NET_PATH;
 
@@ -189,20 +189,267 @@ const NAMESPACE_MAC: &str = "02:fc:00:00:02:01";
 ///
 /// The source never runs this. Its neighbours are correct and it is not to be
 /// disturbed.
-pub fn flush_stale_neighbours() {
-    match std::process::Command::new("ip")
-        .args(["neigh", "flush", "dev", "eth0"])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            eprintln!("[fc-agent] flushed inherited neighbours on eth0 (restored clone)");
+///
+/// This is `ip neigh flush dev eth0`, sent over rtnetlink by fc-agent itself
+/// (see `flush_neighbours`), so the restore path starts no process for it.
+/// Its receives block, so it runs on tokio's blocking pool.
+pub async fn flush_stale_neighbours() {
+    flush_stale_neighbours_over(eth0_route_channel).await;
+}
+
+/// `flush_stale_neighbours` over the socket `open` returns.
+async fn flush_stale_neighbours_over<C, F>(open: F)
+where
+    C: NetlinkChannel,
+    F: FnOnce() -> anyhow::Result<(C, u32)> + Send + 'static,
+{
+    let flushed = off_the_runtime("the neighbour flush", move || {
+        let (mut channel, index) = open()?;
+        flush_neighbours(&mut channel, index)
+    })
+    .await;
+    match flushed {
+        Ok(deleted) => {
+            eprintln!("[fc-agent] flushed {deleted} inherited neighbours on eth0 (restored clone)")
         }
-        Ok(out) => eprintln!(
-            "[fc-agent] WARNING: could not flush inherited neighbours: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Err(error) => eprintln!("[fc-agent] WARNING: ip neigh flush failed: {error}"),
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: could not flush inherited neighbours: {error:#}")
+        }
     }
+}
+
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_DELNEIGH: u16 = 29;
+const RTM_GETNEIGH: u16 = 30;
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const NDA_IFINDEX: u16 = 8;
+const NUD_FAILED: u16 = 0x20;
+const NUD_NOARP: u16 = 0x40;
+const NUD_PERMANENT: u16 = 0x80;
+const NTF_PROXY: u8 = 0x08;
+const NTF_EXT_LEARNED: u8 = 0x10;
+/// iproute2's stand-in for "no state bits", which a flush selects.
+const NUD_NONE_SELECTED: u32 = 0x100;
+/// `ip neigh flush` gives up after this many rounds (iproute2's MAX_ROUNDS).
+const FLUSH_ROUNDS: usize = 10;
+/// The buffer iproute2 collects a flush's deletes in, 4096 - 512 bytes, and so
+/// the most it sends in one datagram.
+const FLUSH_DATAGRAM_BYTES: usize = 3584;
+
+/// `struct ndmsg`, the fixed part of every neighbour message.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct NeighbourMessage {
+    family: u8,
+    pad1: u8,
+    pad2: u16,
+    index: i32,
+    state: u16,
+    flags: u8,
+    kind: u8,
+}
+
+const _: () = assert!(std::mem::size_of::<NeighbourMessage>() == 12);
+
+/// `ip neigh flush dev <index>`, as iproute2 6.1 does it: dump the interface's
+/// neighbours of both families, delete every entry the flush selects, and dump
+/// again, until a dump selects nothing or ten rounds have passed.
+///
+/// A delete is the dumped record itself with its type set to RTM_DELNEIGH, its
+/// flags to NLM_F_REQUEST and a fresh sequence number, so it asks for no
+/// acknowledgement and the kernel answers only a failure. `ip` looks for one
+/// with a non-blocking peek right after the send; here it is read ahead of the
+/// next dump's records, and fails the flush the same way. ENOENT is the
+/// exception: the entry is already gone, which the table's garbage collection
+/// can cause between the dump and the delete, so the flush counts it as gone
+/// and carries on where `ip` stops. Returns how many entries this flush
+/// deleted.
+fn flush_neighbours<C: NetlinkChannel>(channel: &mut C, index: u32) -> anyhow::Result<usize> {
+    let mut states = !u32::from(NUD_PERMANENT | NUD_NOARP);
+    let mut deleted = 0;
+    let mut already_gone = 0;
+    // The deletes sent in the previous round: first sequence number, count.
+    let mut sent = (0u32, 0u32);
+    for _ in 0..FLUSH_ROUNDS {
+        let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        channel.send(&neighbour_dump_request(sequence, index))?;
+        let mut selected = Vec::new();
+        read_dump(
+            channel,
+            sequence,
+            RTM_GETNEIGH,
+            RTM_NEWNEIGH,
+            OnInterrupt::Keep,
+            |header, payload| {
+                if flush_selects(payload, index, states)? {
+                    let mut record = Vec::with_capacity(header.length as usize);
+                    append_netlink_header(&mut record, header);
+                    record.extend_from_slice(payload);
+                    selected.push(record);
+                }
+                Ok(())
+            },
+            |header, payload| {
+                if header.message_type == NLMSG_ERROR
+                    && header.sequence.wrapping_sub(sent.0) < sent.1
+                {
+                    let (error, _) = decode_netlink_error(payload)?;
+                    if error == -libc::ENOENT {
+                        already_gone += 1;
+                    } else if error != 0 {
+                        let errno = error.checked_neg().filter(|errno| *errno > 0);
+                        return Err(std::io::Error::from_raw_os_error(
+                            errno.unwrap_or(libc::EINVAL),
+                        ))
+                        .context("a neighbour delete failed");
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if selected.is_empty() {
+            return Ok(deleted - already_gone);
+        }
+        let count = u32::try_from(selected.len()).context("too many neighbours to flush")?;
+        let first = NEXT_NETLINK_SEQUENCE.fetch_add(count, Ordering::Relaxed);
+        sent = (first, count);
+        let mut datagram = Vec::new();
+        for (offset, record) in (0u32..).zip(&selected) {
+            if !datagram.is_empty()
+                && netlink_align(datagram.len()) + record.len() > FLUSH_DATAGRAM_BYTES
+            {
+                channel.send(&datagram)?;
+                datagram.clear();
+            }
+            datagram.resize(netlink_align(datagram.len()), 0);
+            datagram.extend_from_slice(&delete_request(record, first.wrapping_add(offset)));
+        }
+        channel.send(&datagram)?;
+        deleted += selected.len();
+        // After the first round iproute2 no longer selects FAILED entries.
+        states &= !u32::from(NUD_FAILED);
+    }
+    bail!("the flush was not complete after {FLUSH_ROUNDS} rounds")
+}
+
+/// Whether `ip neigh flush dev <index>` deletes this record. iproute2 6.1
+/// selects an entry on the interface whose state has a bit in `states` or has
+/// no state at all, and any proxy or externally learned entry whatever its
+/// state.
+fn flush_selects(payload: &[u8], index: u32, states: u32) -> anyhow::Result<bool> {
+    let entry: NeighbourMessage = read_unaligned(payload)?;
+    if u32::try_from(entry.index).ok() != Some(index) {
+        return Ok(false);
+    }
+    let state = u32::from(entry.state);
+    Ok(states & state != 0
+        || entry.flags & (NTF_PROXY | NTF_EXT_LEARNED) != 0
+        || (state == 0 && states & NUD_NONE_SELECTED != 0))
+}
+
+/// The RTM_GETNEIGH dump `ip neigh flush dev <index>` sends: both families
+/// (AF_UNSPEC), filtered to the interface with NDA_IFINDEX. iproute2 sends its
+/// whole 284-byte request buffer; the kernel reads only the message at the
+/// start, which is what this builds.
+fn neighbour_dump_request(sequence: u32, index: u32) -> Vec<u8> {
+    let mut request = Vec::new();
+    append_netlink_header(
+        &mut request,
+        NetlinkHeader {
+            length: 0,
+            message_type: RTM_GETNEIGH,
+            flags: NLM_F_REQUEST | NLM_F_DUMP,
+            sequence,
+            port_id: 0,
+        },
+    );
+    append_neighbour_message(
+        &mut request,
+        NeighbourMessage {
+            family: libc::AF_UNSPEC as u8,
+            pad1: 0,
+            pad2: 0,
+            index: 0,
+            state: 0,
+            flags: 0,
+            kind: 0,
+        },
+    );
+    append_attribute(&mut request, NDA_IFINDEX, &index.to_ne_bytes());
+    with_length(request)
+}
+
+/// The delete `ip neigh flush` makes of a dumped record: the record itself,
+/// with its type set to RTM_DELNEIGH, its flags to NLM_F_REQUEST, and
+/// `sequence`. Its length and port id stay as the kernel wrote them.
+fn delete_request(record: &[u8], sequence: u32) -> Vec<u8> {
+    let mut request = record.to_vec();
+    request[4..6].copy_from_slice(&RTM_DELNEIGH.to_ne_bytes());
+    request[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+    request[8..12].copy_from_slice(&sequence.to_ne_bytes());
+    request
+}
+
+/// `ip neigh replace <address> lladdr <lladdr> dev <index> nud permanent`: an
+/// RTM_NEWNEIGH that creates the entry or replaces the one there, and waits
+/// for its acknowledgement.
+fn replace_neighbour<C: NetlinkChannel>(
+    channel: &mut C,
+    index: u32,
+    address: Ipv4Addr,
+    lladdr: [u8; 6],
+) -> anyhow::Result<()> {
+    let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let mut request = Vec::new();
+    append_netlink_header(
+        &mut request,
+        NetlinkHeader {
+            length: 0,
+            message_type: RTM_NEWNEIGH,
+            flags: NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE | NLM_F_CREATE,
+            sequence,
+            port_id: 0,
+        },
+    );
+    append_neighbour_message(
+        &mut request,
+        NeighbourMessage {
+            family: libc::AF_INET as u8,
+            pad1: 0,
+            pad2: 0,
+            index: i32::try_from(index).context("interface index out of range")?,
+            state: NUD_PERMANENT,
+            flags: 0,
+            kind: 0,
+        },
+    );
+    append_attribute(&mut request, NDA_DST, &address.octets());
+    append_attribute(&mut request, NDA_LLADDR, &lladdr);
+    request_acknowledged(channel, &with_length(request), sequence, RTM_NEWNEIGH)
+}
+
+fn append_neighbour_message(bytes: &mut Vec<u8>, message: NeighbourMessage) {
+    bytes.extend_from_slice(&[message.family, message.pad1]);
+    bytes.extend_from_slice(&message.pad2.to_ne_bytes());
+    bytes.extend_from_slice(&message.index.to_ne_bytes());
+    bytes.extend_from_slice(&message.state.to_ne_bytes());
+    bytes.extend_from_slice(&[message.flags, message.kind]);
+}
+
+/// Append one netlink attribute, padded to the netlink alignment.
+fn append_attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+    bytes.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
+    bytes.extend_from_slice(&kind.to_ne_bytes());
+    bytes.extend_from_slice(value);
+    bytes.resize(netlink_align(bytes.len()), 0);
+}
+
+/// Write a message's total length into its header.
+fn with_length(mut message: Vec<u8>) -> Vec<u8> {
+    let length = message.len() as u32;
+    message[0..4].copy_from_slice(&length.to_ne_bytes());
+    message
 }
 
 /// Pin an AUTHORITATIVE neighbour entry for the host's health-check address.
@@ -220,32 +467,31 @@ pub fn flush_stale_neighbours() {
 ///
 /// A `nud permanent` entry is not replaced by ARP replies, so the race has no
 /// outcome left to win. Idempotent, and re-applied after restore because a
-/// restored guest inherits the snapshot's neighbour table.
-pub fn pin_namespace_neighbour() {
-    match std::process::Command::new("ip")
-        .args([
-            "neigh",
-            "replace",
-            NAMESPACE_IP,
-            "lladdr",
-            NAMESPACE_MAC,
-            "dev",
-            "eth0",
-            "nud",
-            "permanent",
-        ])
-        .output()
-    {
-        Ok(out) if out.status.success() => {
-            eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)");
-        }
-        Ok(out) => eprintln!(
-            "[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ),
-        Err(error) => {
-            eprintln!("[fc-agent] WARNING: could not run ip neigh for {NAMESPACE_IP}: {error}")
-        }
+/// restored guest inherits the snapshot's neighbour table. Sent as the
+/// RTM_NEWNEIGH `ip neigh replace` sends (see `replace_neighbour`), on tokio's
+/// blocking pool.
+pub async fn pin_namespace_neighbour() {
+    pin_namespace_neighbour_over(eth0_route_channel).await;
+}
+
+/// `pin_namespace_neighbour` over the socket `open` returns.
+async fn pin_namespace_neighbour_over<C, F>(open: F)
+where
+    C: NetlinkChannel,
+    F: FnOnce() -> anyhow::Result<(C, u32)> + Send + 'static,
+{
+    let pinned = off_the_runtime("the neighbour pin", move || {
+        let (mut channel, index) = open()?;
+        let address: Ipv4Addr = NAMESPACE_IP
+            .parse()
+            .context("NAMESPACE_IP is not an IPv4 address")?;
+        let lladdr = parse_mac(NAMESPACE_MAC).context("NAMESPACE_MAC is not a MAC address")?;
+        replace_neighbour(&mut channel, index, address, lladdr)
+    })
+    .await;
+    match pinned {
+        Ok(()) => eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)"),
+        Err(error) => eprintln!("[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {error:#}"),
     }
 }
 
@@ -642,6 +888,7 @@ fn first_global_ipv6<C: NetlinkChannel>(
             }
             Ok(())
         },
+        |_, _| Ok(()),
     )
     .context("IPv6 address dump failed")?;
     // iproute2 warns about an interrupted dump and keeps what it read.
@@ -696,37 +943,15 @@ fn change_address<C: NetlinkChannel>(
     address_flags: u8,
 ) -> anyhow::Result<()> {
     let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    channel.send(&address_request(
+    let request = address_request(
         message_type,
         NLM_F_REQUEST | NLM_F_ACK | flags,
         sequence,
         index,
         address,
         address_flags,
-    ))?;
-    loop {
-        let datagram = channel.receive()?;
-        let acknowledged = for_each_netlink_message(datagram, |header, payload| {
-            if header.sequence != sequence {
-                return Ok(false);
-            }
-            match header.message_type {
-                NLMSG_ERROR => {
-                    let (error, request) = decode_netlink_error(payload)?;
-                    validate_error_request(request, sequence, message_type)?;
-                    if error != 0 {
-                        return Err(std::io::Error::from_raw_os_error(error.wrapping_neg()).into());
-                    }
-                    Ok(true)
-                }
-                NLMSG_NOOP => Ok(false),
-                other => bail!("unexpected message type {other} in reply to an address request"),
-            }
-        })?;
-        if acknowledged {
-            return Ok(());
-        }
-    }
+    );
+    request_acknowledged(channel, &request, sequence, message_type)
 }
 
 /// The request `ip -6 addr add` or `del` sends for `address` on interface
@@ -1773,6 +1998,611 @@ mod ipv6_swap_tests {
 }
 
 #[cfg(test)]
+mod neighbour_tests {
+    use super::*;
+    use crate::netlink::{for_each_netlink_message, NLMSG_DONE};
+    use std::collections::VecDeque;
+    use std::net::IpAddr;
+
+    const NUD_INCOMPLETE: u16 = 0x01;
+    const NUD_REACHABLE: u16 = 0x02;
+    const NUD_STALE: u16 = 0x04;
+    const NUD_DELAY: u16 = 0x08;
+    const NUD_PROBE: u16 = 0x10;
+    const NDA_CACHEINFO: u16 = 3;
+    const NDA_PROBES: u16 = 4;
+    const NLM_F_MULTI: u16 = 0x2;
+    const NLM_F_DUMP_FILTERED: u16 = 0x20;
+    /// The port id the kernel gave `ip` in the capture. The kernel stamps it
+    /// on the records it dumps, and a flush's deletes carry it back.
+    const MODEL_PORT_ID: u32 = 1475;
+
+    /// `ip neigh flush dev eth0` from the guest's iproute2 6.1, captured with
+    /// `strace -e write=` inside a restored clone, where eth0 is index 2. The
+    /// dump request: iproute2 sends its whole 284-byte buffer, of which the
+    /// kernel reads only this message at the start.
+    const IP_NEIGH_DUMP: [u8; 36] = [
+        0x24, 0x00, 0x00, 0x00, 0x1e, 0x00, 0x01, 0x03, 0x04, 0x19, 0xb1, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00,
+        0x08, 0x00, 0x02, 0x00, 0x00, 0x00,
+    ];
+
+    /// The one datagram of deletes the same flush sent: the three entries it
+    /// selected, each the dumped record with its type, flags and sequence
+    /// number rewritten.
+    const IP_NEIGH_DELETES: [u8; 240] = [
+        0x4c, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x01, 0x00, 0x05, 0x19, 0xb1, 0x6a, 0xc3, 0x05, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x01, 0x08, 0x00,
+        0x01, 0x00, 0x0a, 0x00, 0x02, 0x4d, 0x0a, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00,
+        0x77, 0x00, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x03, 0x00,
+        0x77, 0x17, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x4c, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x01, 0x00, 0x06, 0x19, 0xb1, 0x6a, 0xc3, 0x05,
+        0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x01, 0x08,
+        0x00, 0x01, 0x00, 0xa9, 0xfe, 0xa9, 0xfe, 0x0a, 0x00, 0x02, 0x00, 0x06, 0x01, 0x23, 0x45,
+        0x67, 0x01, 0x00, 0x00, 0x08, 0x00, 0x04, 0x00, 0x04, 0x00, 0x00, 0x00, 0x14, 0x00, 0x03,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x0d, 0x00, 0x00, 0x00, 0x01, 0x00,
+        0x00, 0x00, 0x58, 0x00, 0x00, 0x00, 0x1d, 0x00, 0x01, 0x00, 0x07, 0x19, 0xb1, 0x6a, 0xc3,
+        0x05, 0x00, 0x00, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x01,
+        0x14, 0x00, 0x01, 0x00, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x00, 0x00, 0x77, 0x0a, 0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x78,
+        0x00, 0x00, 0x08, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x03, 0x00, 0x77,
+        0x17, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+
+    /// `ip neigh replace 10.0.2.1 lladdr 02:fc:00:00:02:01 dev eth0 nud
+    /// permanent`, captured the same way.
+    const IP_NEIGH_REPLACE: [u8; 48] = [
+        0x30, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x05, 0x05, 0x04, 0x19, 0xb1, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x08, 0x00,
+        0x01, 0x00, 0x0a, 0x00, 0x02, 0x01, 0x0a, 0x00, 0x02, 0x00, 0x02, 0xfc, 0x00, 0x00, 0x02,
+        0x01, 0x00, 0x00,
+    ];
+
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct Neighbour {
+        family: u8,
+        index: i32,
+        state: u16,
+        flags: u8,
+        kind: u8,
+        destination: IpAddr,
+        lladdr: [u8; 6],
+        probes: u32,
+        cacheinfo: [u8; 16],
+    }
+
+    fn neighbour(destination: &str, lladdr: &str, state: u16) -> Neighbour {
+        let destination: IpAddr = destination.parse().unwrap();
+        Neighbour {
+            family: if destination.is_ipv4() {
+                libc::AF_INET as u8
+            } else {
+                libc::AF_INET6 as u8
+            },
+            index: 2,
+            state,
+            flags: 0,
+            kind: 1,
+            destination,
+            lladdr: parse_mac(lladdr).unwrap(),
+            probes: 0,
+            cacheinfo: [0; 16],
+        }
+    }
+
+    fn captured(
+        destination: &str,
+        lladdr: &str,
+        state: u16,
+        kind: u8,
+        probes: u32,
+        cacheinfo: &str,
+    ) -> Neighbour {
+        let mut bytes = [0u8; 16];
+        for (index, byte) in bytes.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&cacheinfo[2 * index..2 * index + 2], 16).unwrap();
+        }
+        Neighbour {
+            kind,
+            probes,
+            cacheinfo: bytes,
+            ..neighbour(destination, lladdr, state)
+        }
+    }
+
+    /// eth0's table in the restored clone the capture ran in, in dump order.
+    fn captured_table() -> Vec<Neighbour> {
+        vec![
+            captured(
+                "10.0.2.77",
+                "02:00:00:00:00:77",
+                NUD_STALE,
+                1,
+                0,
+                "77170000070000000700000000000000",
+            ),
+            captured(
+                "10.0.2.1",
+                "02:fc:00:00:02:01",
+                NUD_PERMANENT,
+                1,
+                0,
+                "080000000b020000fc02000000000000",
+            ),
+            captured(
+                "169.254.169.254",
+                "06:01:23:45:67:01",
+                NUD_REACHABLE,
+                1,
+                4,
+                "000000000d0000000d00000001000000",
+            ),
+            captured(
+                "10.0.2.79",
+                "02:00:00:00:00:7a",
+                NUD_NOARP,
+                1,
+                0,
+                "06000000060000000600000000000000",
+            ),
+            captured(
+                "10.0.2.78",
+                "02:00:00:00:00:79",
+                NUD_PERMANENT,
+                1,
+                0,
+                "07000000070000000700000000000000",
+            ),
+            captured(
+                "ff02::1:ffb5:d7ae",
+                "33:33:ff:b5:d7:ae",
+                NUD_NOARP,
+                5,
+                0,
+                "ee1a00007e0300007e03000000000000",
+            ),
+            captured(
+                "fd00::77",
+                "02:00:00:00:00:78",
+                NUD_STALE,
+                1,
+                0,
+                "77170000070000000700000000000000",
+            ),
+            captured(
+                "ff02::2",
+                "33:33:00:00:00:02",
+                NUD_NOARP,
+                5,
+                0,
+                "441a0000d4020000d402000000000000",
+            ),
+            captured(
+                "ff02::1:ff00:1",
+                "33:33:ff:00:00:01",
+                NUD_NOARP,
+                5,
+                0,
+                "5c1a0000ec020000ec02000000000000",
+            ),
+            captured(
+                "ff02::16",
+                "33:33:00:00:00:16",
+                NUD_NOARP,
+                5,
+                0,
+                "031b0000930300009303000000000000",
+            ),
+        ]
+    }
+
+    fn attribute(bytes: &mut Vec<u8>, kind: u16, value: &[u8]) {
+        bytes.extend_from_slice(&((4 + value.len()) as u16).to_ne_bytes());
+        bytes.extend_from_slice(&kind.to_ne_bytes());
+        bytes.extend_from_slice(value);
+        bytes.resize(netlink_align(bytes.len()), 0);
+    }
+
+    fn octets(address: IpAddr) -> Vec<u8> {
+        match address {
+            IpAddr::V4(address) => address.octets().to_vec(),
+            IpAddr::V6(address) => address.octets().to_vec(),
+        }
+    }
+
+    /// One dumped entry, laid out as neigh_fill_info writes it.
+    fn record(entry: &Neighbour, sequence: u32) -> Vec<u8> {
+        let mut body = vec![entry.family, 0, 0, 0];
+        body.extend_from_slice(&entry.index.to_ne_bytes());
+        body.extend_from_slice(&entry.state.to_ne_bytes());
+        body.extend_from_slice(&[entry.flags, entry.kind]);
+        attribute(&mut body, NDA_DST, &octets(entry.destination));
+        attribute(&mut body, NDA_LLADDR, &entry.lladdr);
+        attribute(&mut body, NDA_PROBES, &entry.probes.to_ne_bytes());
+        attribute(&mut body, NDA_CACHEINFO, &entry.cacheinfo);
+        let mut bytes = Vec::new();
+        append_netlink_header(
+            &mut bytes,
+            NetlinkHeader {
+                length: (16 + body.len()) as u32,
+                message_type: RTM_NEWNEIGH,
+                flags: NLM_F_MULTI | NLM_F_DUMP_FILTERED,
+                sequence,
+                port_id: MODEL_PORT_ID,
+            },
+        );
+        bytes.extend_from_slice(&body);
+        bytes
+    }
+
+    fn neighbour_attribute(payload: &[u8], kind: u16) -> Option<&[u8]> {
+        let mut offset = std::mem::size_of::<NeighbourMessage>();
+        while offset + 4 <= payload.len() {
+            let length = u16::from_ne_bytes([payload[offset], payload[offset + 1]]) as usize;
+            if u16::from_ne_bytes([payload[offset + 2], payload[offset + 3]]) == kind {
+                return Some(&payload[offset + 4..offset + length]);
+            }
+            offset += netlink_align(length);
+        }
+        None
+    }
+
+    fn destination(family: u8, octets: &[u8]) -> IpAddr {
+        if family == libc::AF_INET as u8 {
+            IpAddr::from(<[u8; 4]>::try_from(octets).unwrap())
+        } else {
+            IpAddr::from(<[u8; 16]>::try_from(octets).unwrap())
+        }
+    }
+
+    /// The kernel's side of a NETLINK_ROUTE socket for neighbours. A dump
+    /// returns the interface's entries and NLMSG_DONE in one datagram, as the
+    /// capture shows. RTM_DELNEIGH removes the entry with that family,
+    /// interface and destination and answers only a failure. RTM_NEWNEIGH with
+    /// NLM_F_REPLACE creates or replaces the entry and is acknowledged.
+    #[derive(Default)]
+    struct ModelNeighbours {
+        table: Vec<Neighbour>,
+        /// A deleted entry comes back in this state, as traffic re-learns it.
+        relearned: Option<u16>,
+        /// Deletes fail with this errno.
+        refuse_deletes: Option<i32>,
+        /// Garbage collection removes this entry right after the first dump.
+        collected_after_first_dump: Option<IpAddr>,
+        /// Traffic learns this entry right after the first dump.
+        learned_after_first_dump: Option<Neighbour>,
+        dumps: usize,
+        sent: Vec<Vec<u8>>,
+        queue: VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+    }
+
+    impl ModelNeighbours {
+        fn answer(&mut self, request: NetlinkHeader, errno: i32) {
+            let mut bytes = Vec::new();
+            append_netlink_header(
+                &mut bytes,
+                NetlinkHeader {
+                    length: 36,
+                    message_type: NLMSG_ERROR,
+                    flags: 0,
+                    sequence: request.sequence,
+                    port_id: MODEL_PORT_ID,
+                },
+            );
+            bytes.extend_from_slice(&(-errno).to_ne_bytes());
+            append_netlink_header(&mut bytes, request);
+            self.queue.push_back(bytes);
+        }
+    }
+
+    impl NetlinkChannel for ModelNeighbours {
+        fn send(&mut self, datagram: &[u8]) -> anyhow::Result<()> {
+            self.sent.push(datagram.to_vec());
+            for_each_netlink_message(datagram, |header, payload| {
+                let message: NeighbourMessage = read_unaligned(payload)?;
+                let position = |table: &[Neighbour]| {
+                    let wanted = destination(
+                        message.family,
+                        neighbour_attribute(payload, NDA_DST).unwrap(),
+                    );
+                    table.iter().position(|entry| {
+                        entry.family == message.family
+                            && entry.index == message.index
+                            && entry.destination == wanted
+                    })
+                };
+                match header.message_type {
+                    RTM_GETNEIGH => {
+                        assert_eq!(header.flags, NLM_F_REQUEST | NLM_F_DUMP);
+                        let index = neighbour_attribute(payload, NDA_IFINDEX)
+                            .map(|value| i32::from_ne_bytes(value.try_into().unwrap()));
+                        let mut reply = Vec::new();
+                        for entry in &self.table {
+                            if index.is_none_or(|index| index == entry.index)
+                                && (message.family == 0 || message.family == entry.family)
+                            {
+                                reply.extend(record(entry, header.sequence));
+                            }
+                        }
+                        append_netlink_header(
+                            &mut reply,
+                            NetlinkHeader {
+                                length: 20,
+                                message_type: NLMSG_DONE,
+                                flags: NLM_F_MULTI,
+                                sequence: header.sequence,
+                                port_id: MODEL_PORT_ID,
+                            },
+                        );
+                        reply.extend_from_slice(&0i32.to_ne_bytes());
+                        self.queue.push_back(reply);
+                        self.dumps += 1;
+                        if self.dumps == 1 {
+                            if let Some(collected) = self.collected_after_first_dump {
+                                self.table.retain(|entry| entry.destination != collected);
+                            }
+                            self.table.extend(self.learned_after_first_dump.take());
+                        }
+                    }
+                    RTM_DELNEIGH => {
+                        // A flush's delete asks for no acknowledgement.
+                        assert_eq!(header.flags, NLM_F_REQUEST);
+                        if let Some(errno) = self.refuse_deletes {
+                            self.answer(header, errno);
+                        } else if let Some(found) = position(&self.table) {
+                            let mut entry = self.table.remove(found);
+                            if let Some(state) = self.relearned {
+                                entry.state = state;
+                                self.table.push(entry);
+                            }
+                        } else {
+                            self.answer(header, libc::ENOENT);
+                        }
+                    }
+                    RTM_NEWNEIGH => {
+                        assert_eq!(
+                            header.flags,
+                            NLM_F_REQUEST | NLM_F_ACK | NLM_F_REPLACE | NLM_F_CREATE
+                        );
+                        let entry = Neighbour {
+                            family: message.family,
+                            index: message.index,
+                            state: message.state,
+                            flags: message.flags,
+                            kind: 1,
+                            destination: destination(
+                                message.family,
+                                neighbour_attribute(payload, NDA_DST).unwrap(),
+                            ),
+                            lladdr: neighbour_attribute(payload, NDA_LLADDR)
+                                .unwrap()
+                                .try_into()
+                                .unwrap(),
+                            probes: 0,
+                            cacheinfo: [0; 16],
+                        };
+                        match position(&self.table) {
+                            Some(found) => self.table[found] = entry,
+                            None => self.table.push(entry),
+                        }
+                        self.answer(header, 0);
+                    }
+                    other => panic!("unexpected request type {other}"),
+                }
+                Ok(false)
+            })?;
+            Ok(())
+        }
+
+        fn receive(&mut self) -> anyhow::Result<&[u8]> {
+            // An empty queue is what the socket's receive timeout reports.
+            self.current = self.queue.pop_front().context("receive timed out")?;
+            Ok(&self.current)
+        }
+
+        fn reserve_receive_buffer(&mut self, bytes: usize) -> anyhow::Result<usize> {
+            Ok(bytes)
+        }
+    }
+
+    /// Every message's sequence number zeroed, so a datagram can be compared
+    /// with a capture.
+    fn sequences_zeroed(datagram: &[u8]) -> Vec<u8> {
+        let mut bytes = datagram.to_vec();
+        let mut offset = 0;
+        while offset + 16 <= bytes.len() {
+            let length = u32::from_ne_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+            bytes[offset + 8..offset + 12].fill(0);
+            offset += netlink_align(length.max(16));
+        }
+        bytes
+    }
+
+    fn message_types(sent: &[Vec<u8>]) -> Vec<u16> {
+        sent.iter()
+            .map(|datagram| u16::from_ne_bytes([datagram[4], datagram[5]]))
+            .collect()
+    }
+
+    #[test]
+    fn the_flush_sends_the_requests_ip_sent() {
+        let mut model = ModelNeighbours {
+            table: captured_table(),
+            ..Default::default()
+        };
+        assert_eq!(flush_neighbours(&mut model, 2).unwrap(), 3);
+        assert_eq!(
+            message_types(&model.sent),
+            vec![RTM_GETNEIGH, RTM_DELNEIGH, RTM_GETNEIGH]
+        );
+        assert_eq!(
+            sequences_zeroed(&model.sent[0]),
+            sequences_zeroed(&IP_NEIGH_DUMP)
+        );
+        assert_eq!(
+            sequences_zeroed(&model.sent[1]),
+            sequences_zeroed(&IP_NEIGH_DELETES)
+        );
+        assert_eq!(
+            sequences_zeroed(&model.sent[2]),
+            sequences_zeroed(&IP_NEIGH_DUMP)
+        );
+    }
+
+    #[test]
+    fn the_flush_deletes_only_what_ip_neigh_flush_deletes() {
+        let mut table: Vec<Neighbour> = [
+            NUD_INCOMPLETE,
+            NUD_REACHABLE,
+            NUD_STALE,
+            NUD_DELAY,
+            NUD_PROBE,
+            NUD_FAILED,
+            NUD_NOARP,
+            NUD_PERMANENT,
+            0,
+        ]
+        .into_iter()
+        .zip(11..)
+        .map(|(state, host)| {
+            neighbour(
+                &format!("10.0.2.{host}"),
+                &format!("02:00:00:00:00:{host}"),
+                state,
+            )
+        })
+        .collect();
+        table.push(Neighbour {
+            flags: NTF_EXT_LEARNED,
+            ..neighbour("10.0.2.30", "02:00:00:00:00:30", NUD_PERMANENT)
+        });
+        table.push(Neighbour {
+            index: 3,
+            ..neighbour("10.0.2.31", "02:00:00:00:00:31", NUD_STALE)
+        });
+        table.push(neighbour("fd00::1", "02:00:00:00:00:32", NUD_REACHABLE));
+        let mut model = ModelNeighbours {
+            table,
+            ..Default::default()
+        };
+        assert_eq!(flush_neighbours(&mut model, 2).unwrap(), 9);
+        let kept: Vec<String> = model
+            .table
+            .iter()
+            .map(|entry| entry.destination.to_string())
+            .collect();
+        // NOARP and PERMANENT entries on eth0 survive, as does everything on
+        // another interface; a permanent entry learned externally does not.
+        assert_eq!(kept, vec!["10.0.2.17", "10.0.2.18", "10.0.2.31"]);
+    }
+
+    #[test]
+    fn a_flush_stops_after_ten_rounds_and_does_not_chase_failed_entries() {
+        // An entry traffic keeps re-learning is deleted in every round, and
+        // the flush gives up after ten, as `ip` does.
+        let mut model = ModelNeighbours {
+            table: vec![neighbour("10.0.2.40", "02:00:00:00:00:40", NUD_STALE)],
+            relearned: Some(NUD_REACHABLE),
+            ..Default::default()
+        };
+        let error = flush_neighbours(&mut model, 2)
+            .expect_err("a table that never empties must not be flushed forever");
+        assert!(format!("{error:#}").contains("10 rounds"), "{error:#}");
+        let dumps = message_types(&model.sent)
+            .into_iter()
+            .filter(|kind| *kind == RTM_GETNEIGH)
+            .count();
+        assert_eq!(dumps, 10);
+        // One that comes back FAILED is flushed in the first round only.
+        let mut model = ModelNeighbours {
+            table: vec![neighbour("10.0.2.41", "02:00:00:00:00:41", NUD_STALE)],
+            relearned: Some(NUD_FAILED),
+            ..Default::default()
+        };
+        assert_eq!(flush_neighbours(&mut model, 2).unwrap(), 1);
+        assert_eq!(
+            message_types(&model.sent),
+            vec![RTM_GETNEIGH, RTM_DELNEIGH, RTM_GETNEIGH]
+        );
+    }
+
+    /// The kernel's neighbour garbage collection can remove an entry between a
+    /// dump and the delete made of it. The delete then fails with ENOENT, which
+    /// means only that the entry is gone, so the flush carries on and deletes
+    /// what was learned since the dump.
+    #[test]
+    fn an_entry_collected_before_its_delete_does_not_fail_the_flush() {
+        let mut model = ModelNeighbours {
+            table: vec![
+                neighbour("10.0.2.50", "02:00:00:00:00:50", NUD_STALE),
+                neighbour("10.0.2.51", "02:00:00:00:00:51", NUD_STALE),
+            ],
+            collected_after_first_dump: Some("10.0.2.51".parse().unwrap()),
+            learned_after_first_dump: Some(neighbour(
+                "10.0.2.52",
+                "02:00:00:00:00:52",
+                NUD_REACHABLE,
+            )),
+            ..Default::default()
+        };
+        let deleted = flush_neighbours(&mut model, 2)
+            .unwrap_or_else(|error| panic!("an entry already gone failed the flush: {error:#}"));
+        assert_eq!(
+            deleted, 2,
+            "10.0.2.51 was collected, not deleted by the flush"
+        );
+        assert!(model.table.is_empty(), "left behind: {:?}", model.table);
+        assert_eq!(
+            message_types(&model.sent),
+            vec![
+                RTM_GETNEIGH,
+                RTM_DELNEIGH,
+                RTM_GETNEIGH,
+                RTM_DELNEIGH,
+                RTM_GETNEIGH
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_delete_fails_the_flush() {
+        let mut model = ModelNeighbours {
+            table: vec![neighbour("10.0.2.42", "02:00:00:00:00:42", NUD_STALE)],
+            refuse_deletes: Some(libc::EPERM),
+            ..Default::default()
+        };
+        let error = flush_neighbours(&mut model, 2)
+            .expect_err("a refused delete must fail the flush, as it fails `ip`");
+        assert!(
+            format!("{error:#}").contains("Operation not permitted"),
+            "{error:#}"
+        );
+        assert_eq!(model.table.len(), 1);
+    }
+
+    #[test]
+    fn the_pin_sends_the_request_ip_sent() {
+        // The clone inherits an entry for the address, possibly learned from
+        // the wrong MAC. The pin replaces it.
+        let mut model = ModelNeighbours {
+            table: vec![neighbour(NAMESPACE_IP, "9a:55:9a:55:9a:55", NUD_STALE)],
+            ..Default::default()
+        };
+        let address: Ipv4Addr = NAMESPACE_IP.parse().unwrap();
+        replace_neighbour(&mut model, 2, address, parse_mac(NAMESPACE_MAC).unwrap()).unwrap();
+        assert_eq!(model.sent.len(), 1);
+        assert_eq!(
+            sequences_zeroed(&model.sent[0]),
+            sequences_zeroed(&IP_NEIGH_REPLACE)
+        );
+        assert_eq!(model.table.len(), 1);
+        assert_eq!(model.table[0].state, NUD_PERMANENT);
+        assert_eq!(Some(model.table[0].lladdr), parse_mac(NAMESPACE_MAC));
+    }
+}
+
+#[cfg(test)]
 mod runtime_worker_tests {
     use super::*;
     use std::sync::mpsc;
@@ -1837,6 +2667,16 @@ mod runtime_worker_tests {
     fn a_stalled_ipv6_swap_leaves_the_runtime_worker_free() {
         assert_stall_leaves_the_worker_free(|channel| {
             reconfigure_ipv6_over(move || Ok((channel, 2)), "2001:db8::2")
+        });
+    }
+
+    #[test]
+    fn stalled_neighbour_steps_leave_the_runtime_worker_free() {
+        assert_stall_leaves_the_worker_free(|channel| {
+            flush_stale_neighbours_over(move || Ok((channel, 2)))
+        });
+        assert_stall_leaves_the_worker_free(|channel| {
+            pin_namespace_neighbour_over(move || Ok((channel, 2)))
         });
     }
 }

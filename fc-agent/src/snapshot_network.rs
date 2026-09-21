@@ -999,6 +999,7 @@ fn dump_family(family: u8) -> Result<Vec<TcpSocketIdentity>> {
             });
             Ok(())
         },
+        |_, _| Ok(()),
     )
     .context(
         "SOCK_DIAG dump (guest kernel needs CONFIG_INET_DIAG=y); refusing an incomplete manifest",

@@ -16,6 +16,7 @@ pub(crate) const NLMSG_OVERRUN: u16 = 4;
 pub(crate) const NLM_F_REQUEST: u16 = 0x01;
 pub(crate) const NLM_F_ACK: u16 = 0x04;
 pub(crate) const NLM_F_DUMP_INTR: u16 = 0x10;
+pub(crate) const NLM_F_REPLACE: u16 = 0x100;
 pub(crate) const NLM_F_EXCL: u16 = 0x200;
 pub(crate) const NLM_F_DUMP: u16 = 0x300;
 pub(crate) const NLM_F_CREATE: u16 = 0x400;
@@ -319,8 +320,9 @@ pub(crate) enum OnInterrupt {
 
 /// Read the reply to the dump request sent with `sequence`, until NLMSG_DONE.
 ///
-/// Each record of `record_type` goes to `record`, and messages that answer
-/// other requests are skipped, as is NLMSG_NOOP. An error acknowledgement, an
+/// Each record of `record_type` goes to `record`, each message that answers
+/// another request goes to `other`, and NLMSG_NOOP is skipped. An error
+/// acknowledgement, an
 /// overrun, a failed completion, a message of any other type, and under
 /// `OnInterrupt::Refuse` a dump the kernel marked interrupted all fail the
 /// dump. The kernel marks the message it was filling when the table changed,
@@ -333,12 +335,14 @@ pub(crate) fn read_dump<C: NetlinkChannel>(
     record_type: u16,
     on_interrupt: OnInterrupt,
     mut record: impl FnMut(NetlinkHeader, &[u8]) -> Result<()>,
+    mut other: impl FnMut(NetlinkHeader, &[u8]) -> Result<()>,
 ) -> Result<bool> {
     let mut interrupted = false;
     loop {
         let datagram = channel.receive()?;
         let done = for_each_netlink_message(datagram, |header, payload| {
             if header.sequence != sequence {
+                other(header, payload)?;
                 return Ok(false);
             }
             interrupted |= header.flags & NLM_F_DUMP_INTR != 0;
@@ -376,6 +380,47 @@ pub(crate) fn read_dump<C: NetlinkChannel>(
         bail!("the dump was interrupted; refusing an incomplete dump");
     }
     Ok(interrupted)
+}
+
+/// Send `request`, which carries `sequence` and `message_type` and asks for an
+/// acknowledgement, and wait for that acknowledgement. Replies to other
+/// requests are skipped.
+pub(crate) fn request_acknowledged<C: NetlinkChannel>(
+    channel: &mut C,
+    request: &[u8],
+    sequence: u32,
+    message_type: u16,
+) -> Result<()> {
+    channel.send(request)?;
+    loop {
+        let datagram = channel.receive()?;
+        let acknowledged = for_each_netlink_message(datagram, |header, payload| {
+            if header.sequence != sequence {
+                return Ok(false);
+            }
+            match header.message_type {
+                NLMSG_ERROR => {
+                    let (error, request) = decode_netlink_error(payload)?;
+                    validate_error_request(request, sequence, message_type)?;
+                    if error != 0 {
+                        let errno = error
+                            .checked_neg()
+                            .filter(|errno| *errno > 0)
+                            .context("the request failed with an invalid netlink error")?;
+                        return Err(io::Error::from_raw_os_error(errno).into());
+                    }
+                    Ok(true)
+                }
+                NLMSG_NOOP => Ok(false),
+                kind => {
+                    bail!("unexpected message type {kind} in reply to request type {message_type}")
+                }
+            }
+        })?;
+        if acknowledged {
+            return Ok(());
+        }
+    }
 }
 
 /// Check the status an NLMSG_DONE carries: a native-endian i32, followed by
@@ -473,10 +518,18 @@ mod tests {
                 .datagrams
                 .push_back(message(NLMSG_DONE, 0, 7, &0i32.to_ne_bytes()));
             let mut records = 0;
-            let result = read_dump(&mut script, 7, RECORD, RECORD, on_interrupt, |_, _| {
-                records += 1;
-                Ok(())
-            });
+            let result = read_dump(
+                &mut script,
+                7,
+                RECORD,
+                RECORD,
+                on_interrupt,
+                |_, _| {
+                    records += 1;
+                    Ok(())
+                },
+                |_, _| Ok(()),
+            );
             match on_interrupt {
                 OnInterrupt::Refuse => {
                     let error = result.expect_err("an interrupted dump must be refused");
