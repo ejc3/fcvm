@@ -303,7 +303,7 @@ pub struct RunArgs {
     pub user: Option<String>,
 
     /// Forward specific localhost ports to the host gateway via TCP proxy.
-    /// Enables containers to reach host-only services via localhost.
+    /// Enables containers to reach host-only services via localhost, on 127.0.0.1 and ::1.
     /// Supported with rootless and routed networking (not bridged).
     /// Comma-separated port list, e.g., --forward-localhost 1421,9099
     #[arg(long, value_delimiter = ',')]
