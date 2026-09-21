@@ -181,9 +181,13 @@ NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
 # sudo resets the environment, so a caller's FCVM_CONFIG_DIR has to be passed
 # through explicitly; without it `fcvm setup` under sudo regenerates and reads
-# root's config instead of the caller's isolated one. The quotes keep a
-# directory containing spaces as one argument to env.
-SUDO_FCVM := sudo $(if $(FCVM_CONFIG_DIR),env "FCVM_CONFIG_DIR=$(FCVM_CONFIG_DIR)",)
+# root's config instead of the caller's isolated one. The recipe shell expands
+# "$FCVM_CONFIG_DIR" itself, so spaces and double quotes in the directory
+# survive. It is exported only when set, because fcvm rejects an empty value.
+ifneq ($(FCVM_CONFIG_DIR),)
+export FCVM_CONFIG_DIR
+endif
+SUDO_FCVM := sudo $(if $(FCVM_CONFIG_DIR),env "FCVM_CONFIG_DIR=$$FCVM_CONFIG_DIR",)
 # Extra flags forwarded to every criterion bench recipe (see bench-quick).
 #
 # Criterion's flags belong to the BENCH BINARY, so they have to follow `--`.
