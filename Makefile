@@ -179,6 +179,10 @@ export CARGO_TARGET_DIR := target
 # Cargo does not forward global --config to external subcommands.
 NEXTEST := $(CARGO) nextest $(NEXTEST_CMD) $(CARGO_LOCAL_CONFIG) --release
 TEST_CONFIG_WRAPPER := ./scripts/with-test-config.sh
+# sudo resets the environment, so a caller's FCVM_CONFIG_DIR has to be passed
+# through explicitly; without it `fcvm setup` under sudo regenerates and reads
+# root's config instead of the caller's isolated one.
+SUDO_FCVM := sudo $(if $(FCVM_CONFIG_DIR),env FCVM_CONFIG_DIR=$(FCVM_CONFIG_DIR),)
 # Extra flags forwarded to every criterion bench recipe (see bench-quick).
 #
 # Criterion's flags belong to the BENCH BINARY, so they have to follow `--`.
@@ -774,7 +778,7 @@ setup-default: build setup-btrfs
 	@# Tests run fcvm via sudo, which reads /root/.config/fcvm — sync BOTH the
 	@# user and root configs or a rootfs-config.toml change silently boots the
 	@# previous rootfs under sudo (root keeps the stale SHA).
-	sudo ./target/release/fcvm setup --generate-config --force
+	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
 	./target/release/fcvm setup --kernel-profile default --build-kernels
 
 # The default kernel as a publishable release artifact.
@@ -792,8 +796,8 @@ setup-default: build setup-btrfs
 release-default-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 release-default-kernel: build setup-btrfs
 	@if [ "$(FORCE)" = "1" ] && [ -z "$(KERNEL_FILE)" ]; then 		echo "ERROR: FORCE=1 needs KERNEL_FILE=<vmlinux-...bin> to assert the rebuild produced it"; 		exit 1; 	fi
-	sudo ./target/release/fcvm setup --generate-config --force
-	@if [ "$(FORCE)" = "1" ]; then 		echo "==> FORCE: rebuilding from source, bypassing the published release"; 		sudo ./target/release/fcvm setup --kernel-profile default --force-build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	else 		sudo ./target/release/fcvm setup --kernel-profile default --build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	fi
+	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
+	@if [ "$(FORCE)" = "1" ]; then 		echo "==> FORCE: rebuilding from source, bypassing the published release"; 		$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --force-build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	else 		$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --build-kernels 			--config "$(CURDIR)/rootfs-config.toml"; 	fi
 	@if [ -n "$(KERNEL_FILE)" ] && [ ! -f "/mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)" ]; then 		echo "ERROR: setup finished without producing /mnt/fcvm-btrfs/kernels/$(KERNEL_FILE)"; 		ls -la /mnt/fcvm-btrfs/kernels/; 		exit 1; 	fi
 
 setup-fcvm: private SHELL := $(TARGET_LEASE_SHELL)
@@ -807,7 +811,7 @@ setup-fcvm: setup-default
 # Requires reboot to activate the new kernel
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
 install-host-kernel: build setup-btrfs
-	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile nested --build-kernels --install-host-kernel
 
 # Run setup inside container (for CI - container has Firecracker)
 container-setup-fcvm: cargo-target-link container-build setup-btrfs
@@ -824,10 +828,10 @@ _setup-fcvm:
 		echo "ERROR: Need 15GB on /mnt/fcvm-btrfs (have $${FREE_GB}GB)"; \
 		exit 1; \
 	fi
-	sudo ./target/release/fcvm setup --generate-config --force
-	sudo ./target/release/fcvm setup --kernel-profile default --build-kernels
-	sudo ./target/release/fcvm setup --kernel-profile nested --build-kernels
-	sudo ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
+	$(SUDO_FCVM) ./target/release/fcvm setup --generate-config --force
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile default --build-kernels
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile nested --build-kernels
+	$(SUDO_FCVM) ./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 
 # SDK E2E test — requires computesdk package as sibling repo and Node.js
 test-serve-sdk: build
