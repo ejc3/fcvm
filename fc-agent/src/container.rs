@@ -20,7 +20,6 @@ pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
-    reset_podman_state: bool,
 ) -> Result<String> {
     eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
@@ -61,20 +60,6 @@ pub fn mount_overlay_image(
         "/etc/containers/containers.conf".to_string()
     };
     write_containers_conf(&containers_conf_path);
-
-    // Reset podman state after writing storage.conf to clear any stale db.sql
-    // that may have been created by health monitor's `podman inspect` racing
-    // with storage setup. Without this, the db.sql graph driver won't match
-    // the new storage.conf, causing "database graph driver does not match".
-    // NEVER on a provisioned re-mount (clone/reboot): the graphroot holds the
-    // captured container — a reset would erase it.
-    if reset_podman_state {
-        let _ = std::process::Command::new("podman")
-            .args(["system", "reset", "--force"])
-            .output();
-    } else {
-        eprintln!("[fc-agent] skipping podman reset (provisioned overlay re-mount)");
-    }
 
     eprintln!(
         "[fc-agent] overlay image mounted at {}, configured as additional image store (conf: {})",
@@ -181,18 +166,14 @@ fn storage_paths(username: Option<&str>) -> (String, String, String) {
     }
 }
 
-/// Write a minimal storage.conf with the correct graph driver.
+/// Write a minimal storage.conf that names the overlay graph driver.
 ///
-/// Must be called BEFORE the exec server starts. The health monitor runs
-/// `podman inspect` inside the VM as soon as the exec server accepts connections.
-/// Any `podman` invocation initializes the BoltDB with whatever driver is in
-/// storage.conf. If the default storage.conf has `driver = ""` (auto-detect),
-/// the BoltDB may be initialized with an empty or wrong driver. When
-/// `mount_overlay_image()` later writes `driver = "overlay"`, podman sees a
-/// mismatch: "database graph driver '' does not match our graph driver 'overlay'".
-///
-/// By writing `driver = "overlay"` early, all podman invocations before the full
-/// storage setup create a BoltDB that matches the final config.
+/// Podman records the graph driver in its database the first time it runs. If
+/// the default storage.conf has `driver = ""` (auto-detect), a podman command
+/// exec'd before `mount_overlay_image()` records what it detected, and the
+/// storage.conf that function writes later does not match it: "database graph
+/// driver '' does not match our graph driver 'overlay'". Naming overlay here keeps
+/// every podman invocation consistent with the final configuration.
 pub fn write_early_storage_conf() {
     let (conf_path, runroot, graphroot) = storage_paths(None);
     let conf = format!(
@@ -473,12 +454,6 @@ pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
         let _ = std::fs::set_permissions(storage_dir, std::fs::Permissions::from_mode(0o755));
     }
 
-    // Reset podman state to avoid driver mismatch errors.
-    // The rootfs may have been initialized with a different driver during setup.
-    let _ = std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output();
-
     write_btrfs_storage_conf(
         "/etc/containers/storage.conf",
         storage_dir,
@@ -490,35 +465,6 @@ pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
         storage_dir, loopback_size
     );
     Ok(())
-}
-
-/// Reset root podman state to match the current storage.conf.
-///
-/// Fixes "database graph driver does not match" errors caused by the health
-/// monitor running `podman inspect` via exec before storage setup completes,
-/// creating db.sql with an empty or wrong driver.
-///
-/// Only call for root podman (empty cmd_prefix). User-mode podman already
-/// resets in create_vm_user(). A root reset would destroy the user's btrfs
-/// storage subdirectory at /var/lib/containers/storage/user-{uid}.
-pub fn reset_podman_state() {
-    match std::process::Command::new("podman")
-        .args(["system", "reset", "--force"])
-        .output()
-    {
-        Ok(o) if o.status.success() => {
-            eprintln!("[fc-agent] podman state reset to match storage.conf");
-        }
-        Ok(o) => {
-            eprintln!(
-                "[fc-agent] WARNING: podman system reset failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-        }
-        Err(e) => {
-            eprintln!("[fc-agent] WARNING: podman system reset error: {}", e);
-        }
-    }
 }
 
 /// Marker written on the rootfs once first-boot provisioning (storage + image +
@@ -2258,5 +2204,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// fc-agent resets podman state only for a container user, inside
+    /// create_vm_user(). Root storage has nothing to reset on a fresh boot: no
+    /// podman process runs before storage.conf names the final driver, because
+    /// exec opens after storage setup; the btrfs loopback is freshly formatted;
+    /// and the rootfs images carry no podman database. A root reset that ran
+    /// while storage.conf still named overlay could leave a database recording
+    /// the overlay driver, which the btrfs pull then rejects.
+    #[test]
+    fn only_the_container_user_gets_a_podman_reset() {
+        let source = include_str!("container.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("container.rs has no test module")];
+        let resets: Vec<usize> = body.match_indices("\"reset\"").map(|(at, _)| at).collect();
+        let user_fn = body
+            .find("pub fn create_vm_user(")
+            .expect("container.rs no longer defines create_vm_user");
+        let user_fn_end = user_fn
+            + body[user_fn..]
+                .find("\n}\n")
+                .expect("create_vm_user has no closing brace");
+        assert!(
+            resets.len() == 1 && (user_fn..user_fn_end).contains(&resets[0]),
+            "fc-agent runs `podman system reset` outside create_vm_user() ({} call(s) at \
+             byte offsets {resets:?}). A root reset on a fresh boot runs while \
+             storage.conf may still name the overlay driver.",
+            resets.len()
+        );
     }
 }
