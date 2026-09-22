@@ -328,7 +328,7 @@ where
         return Ok((config, choice));
     };
     if config.firecracker_args.is_none() {
-        config.firecracker_args = profile.firecracker_args.clone();
+        config.firecracker_args = profile_firecracker_args(kernel_profile, &mut get_profile)?;
     }
 
     let configured_profile = if profile.firecracker_repo.is_some()
@@ -337,14 +337,9 @@ where
         Some((profile, profile_name.to_string()))
     } else if profile_name != "default" {
         match get_profile("default")? {
-            Some(default_profile) => {
-                if config.firecracker_args.is_none() {
-                    config.firecracker_args = default_profile.firecracker_args.clone();
-                }
-                (default_profile.firecracker_repo.is_some()
-                    || default_profile.firecracker_commit.is_some())
-                .then(|| (default_profile, "default".to_string()))
-            }
+            Some(default_profile) => (default_profile.firecracker_repo.is_some()
+                || default_profile.firecracker_commit.is_some())
+            .then(|| (default_profile, "default".to_string())),
             None => {
                 anyhow::ensure!(
                     requested,
@@ -422,19 +417,44 @@ fn uffd_backing_for(requested: UffdBacking, nv2: bool) -> UffdBacking {
     }
 }
 
-/// `snapshot serve`'s mode: the requested one, or copy when the snapshot's recorded
-/// kernel profile is NV2. A serve launches no Firecracker, so it reads the profile its
-/// clones resolve their Firecracker arguments from.
+/// The Firecracker arguments a snapshot's clones run with when the caller gives none:
+/// the recorded profile's own, or the default profile's for a profile that defines
+/// neither a Firecracker nor arguments of its own. Such a profile was created on the
+/// default profile's Firecracker, and `snapshot_restore_runtime_config_with` restores
+/// it there, so it runs with the default profile's arguments too.
+fn profile_firecracker_args<GetProfile>(
+    kernel_profile: Option<&str>,
+    mut get_profile: GetProfile,
+) -> Result<Option<String>>
+where
+    GetProfile: FnMut(&str) -> Result<Option<crate::setup::KernelProfile>>,
+{
+    let name = kernel_profile.unwrap_or("default");
+    let Some(profile) = get_profile(name)? else {
+        return Ok(None);
+    };
+    let own_firecracker =
+        profile.firecracker_repo.is_some() || profile.firecracker_commit.is_some();
+    if profile.firecracker_args.is_some() || own_firecracker || name == "default" {
+        return Ok(profile.firecracker_args);
+    }
+    Ok(get_profile("default")?.and_then(|default| default.firecracker_args))
+}
+
+/// `snapshot serve`'s mode: the requested one, or copy when the snapshot's clones run
+/// with `--enable-nv2`. A serve launches no Firecracker, so it applies the rule the
+/// clones take their Firecracker arguments by (`profile_firecracker_args`).
 fn serve_uffd_backing<GetProfile>(
     requested: UffdBacking,
     kernel_profile: Option<&str>,
     get_profile: GetProfile,
 ) -> Result<UffdBacking>
 where
-    GetProfile: FnOnce(&str) -> Result<Option<crate::setup::KernelProfile>>,
+    GetProfile: FnMut(&str) -> Result<Option<crate::setup::KernelProfile>>,
 {
-    let nv2 = get_profile(kernel_profile.unwrap_or("default"))?
-        .is_some_and(|profile| profile.enables_nv2());
+    let nv2 = profile_firecracker_args(kernel_profile, get_profile)?
+        .as_deref()
+        .is_some_and(crate::setup::firecracker_args_enable_nv2);
     Ok(uffd_backing_for(requested, nv2))
 }
 
@@ -4244,6 +4264,23 @@ mod tests {
             Ok(Some(crate::setup::KernelProfile::default()))
         });
         assert_eq!(served.unwrap(), minor);
+    }
+
+    /// A clone of a snapshot whose profile defines neither a Firecracker of its own nor
+    /// Firecracker arguments takes the default profile's arguments
+    /// (`snapshot_restore_runtime_config_with`). When those carry `--enable-nv2` the
+    /// clone is an NV2 guest, so `snapshot serve` has to serve it in copy mode too.
+    #[test]
+    fn a_profile_inheriting_nv2_arguments_from_default_is_served_in_copy_mode() {
+        let minor = UffdBacking::Minor { hugepages: false };
+        let served = serve_uffd_backing(minor, Some("btrfs"), |name| {
+            Ok(Some(match name {
+                "btrfs" => crate::setup::KernelProfile::default(),
+                "default" => nv2_kernel_profile(),
+                other => panic!("unexpected profile {other}"),
+            }))
+        });
+        assert_eq!(served.unwrap(), UffdBacking::Copy);
     }
 
     #[tokio::test]
