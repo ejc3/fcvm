@@ -30,9 +30,11 @@ commit = "3f57f0382f6a72c0b8ce0c5ff92248b5117ed9b6"
 # Default Firecracker binary
 # Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
 # 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend.
-# v1.17.0 writes snapshot format 12 and refuses format 11. A snapshot that
-# recorded the previous build keeps restoring on it (SnapshotMetadata::
-# firecracker_bin); one that records no binary restores on this build.
+# v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
+# build cannot restore format 12. A restore uses the binary the snapshot
+# recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
+# snapshot that records none is loaded with this build, so a format 11 one
+# fails to load, and the error says to re-create it or pass --firecracker-bin.
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
 # Kernel profiles can override with their own firecracker_repo/branch.
 [firecracker]
