@@ -2152,3 +2152,39 @@ fn self_hosted_jobs_take_their_matrix_from_the_plan() {
         }
     }
 }
+
+/// The SnapshotEnabled lane runs `make clean-test-data` after the suite and before
+/// "Upload test logs", so bench-vm starts on a clean slate. While that target also
+/// deleted /tmp/fcvm-test-logs, every artifact from the lane lost its per-VM debug
+/// logs, including the console of a guest that hung while shutting down.
+#[test]
+fn cleaning_test_data_keeps_the_test_logs() {
+    let makefile = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Makefile"))
+        .expect("read Makefile");
+    let lines: Vec<&str> = makefile.lines().collect();
+    let rule = lines
+        .iter()
+        .rposition(|line| line.starts_with("clean-test-data:"))
+        .expect("Makefile has a clean-test-data rule");
+    let recipe: Vec<&str> = lines[rule + 1..]
+        .iter()
+        .take_while(|line| line.starts_with('\t'))
+        .copied()
+        .collect();
+    assert!(
+        recipe.iter().any(|line| line.contains("snapshots prune")),
+        "did not find the clean-test-data recipe: {recipe:?}"
+    );
+    let deletes_logs: Vec<&str> = recipe
+        .iter()
+        .filter(|line| {
+            line.contains("rm ")
+                && (line.contains("fcvm-test-logs") || line.contains("TEST_LOG_DIR"))
+        })
+        .copied()
+        .collect();
+    assert!(
+        deletes_logs.is_empty(),
+        "clean-test-data deletes the test logs, which CI uploads after running it: {deletes_logs:?}"
+    );
+}

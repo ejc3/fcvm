@@ -488,10 +488,7 @@ clean-test-data: build
 	@echo "==> Cleaning UFFD sockets..."
 	sudo rm -f /mnt/fcvm-btrfs/uffd-*.sock
 	sudo rm -f $(ROOT_DATA_DIR)/uffd-*.sock $(CONTAINER_DATA_DIR)/uffd-*.sock
-	@echo "==> Cleaning test logs..."
-	sudo rm -rf /tmp/fcvm-test-logs
-	mkdir -p /tmp/fcvm-test-logs
-	@echo "==> Cleaned test data (preserved cached assets)"
+	@echo "==> Cleaned test data (kept cached assets and test logs)"
 
 # Record Cargo.lock's resolved FUSE Git sources, not unused sibling checkouts.
 # An explicit fuse-backend-rs override reports the selected checkout instead:

@@ -198,6 +198,22 @@ fn vmm_wants_acpi_shutdown() -> bool {
         .unwrap_or(false)
 }
 
+/// Makes a guest that wedges while shutting down name the code it is stuck in.
+///
+/// Ubuntu's 10-console-messages.conf sets kernel.printk to 4, so the console
+/// shows only the headline of a soft lockup or an RCU stall: the register dump
+/// and the backtrace print at a lower priority. Guests that hung in shutdown
+/// left only those headlines, for both vCPUs. Raising the console level to 8
+/// and asking for every CPU's backtrace on a soft lockup puts the stacks in the
+/// VM's console log.
+fn raise_console_verbosity_for_shutdown(sysctl_kernel: &std::path::Path) {
+    for (name, value) in [("printk", "8"), ("softlockup_all_cpu_backtrace", "1")] {
+        if let Err(e) = std::fs::write(sysctl_kernel.join(name), value) {
+            eprintln!("[fc-agent] could not set kernel.{name} to {value}: {e}");
+        }
+    }
+}
+
 /// How long shutdown waits for a restore's background jobs to finish.
 /// Long enough for an ordinary systemd job, short enough that a wedged
 /// service manager cannot hold the VM open for the caller's whole deadline.
@@ -247,6 +263,8 @@ pub async fn shutdown_vm(exit_code: i32) -> ! {
             let _ = sync_child.kill().await;
         }
     }
+
+    raise_console_verbosity_for_shutdown(std::path::Path::new("/proc/sys/kernel"));
 
     let acpi = vmm_wants_acpi_shutdown();
 
@@ -387,4 +405,25 @@ pub fn read_proxy_settings() -> Vec<(String, String)> {
             Some((key.to_string(), value.to_string()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_makes_a_hang_print_its_stacks() {
+        let dir = std::env::temp_dir().join(format!("fc-agent-sysctl-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("printk"), "4\t4\t1\t7\n").unwrap();
+        std::fs::write(dir.join("softlockup_all_cpu_backtrace"), "0\n").unwrap();
+
+        raise_console_verbosity_for_shutdown(&dir);
+
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap();
+        let (printk, backtrace) = (read("printk"), read("softlockup_all_cpu_backtrace"));
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(printk, "8");
+        assert_eq!(backtrace, "1");
+    }
 }
