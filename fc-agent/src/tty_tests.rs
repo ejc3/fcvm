@@ -57,6 +57,21 @@ async fn collect(host: &mut AsyncFdStream, outcome: &mut Outcome) {
     }
 }
 
+/// Send `frames` to the session as the host.
+///
+/// A command that exits at once can close the session before its frames arrive.
+/// The host then gets EPIPE, as a real client sending a late frame would, and what
+/// the session wrote before closing is still there for `collect` to read.
+async fn send_frames(host: &mut AsyncFdStream, frames: Vec<Message>) {
+    for frame in frames {
+        match host.write_all(&frame.encode()).await {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => return,
+            Err(e) => panic!("send frame: {e}"),
+        }
+    }
+}
+
 /// Run `spec`, send `frames` as the host, and collect everything up to Exit.
 async fn run(spec: SessionSpec, frames: Vec<Message>) -> Outcome {
     let started = Instant::now();
@@ -68,9 +83,7 @@ async fn run(spec: SessionSpec, frames: Vec<Message>) -> Outcome {
         elapsed: Duration::ZERO,
     };
     tokio::time::timeout(Duration::from_secs(60), async {
-        for frame in frames {
-            host.write_all(&frame.encode()).await.expect("send frame");
-        }
+        send_frames(&mut host, frames).await;
         collect(&mut host, &mut outcome).await;
     })
     .await
@@ -350,6 +363,28 @@ async fn a_pty_starts_at_the_requested_size_and_follows_resizes() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_frame_sent_after_the_command_exited_is_not_a_failure() {
+    // A command that exits at once can close the session before the host's
+    // frames arrive, and the host then gets EPIPE, as a real client sending a
+    // late resize would. The output and Exit written before the close are
+    // still there to read.
+    let (mut host, session) = start(sh("true", false, false));
+    assert_eq!(session.await.unwrap(), 0);
+    send_frames(
+        &mut host,
+        vec![Message::Resize(exec_proto::TtySize { rows: 9, cols: 9 })],
+    )
+    .await;
+    let mut outcome = Outcome {
+        stdout: Vec::new(),
+        stderr: Vec::new(),
+        exit: None,
+        elapsed: Duration::ZERO,
+    };
+    collect(&mut host, &mut outcome).await;
+    assert_eq!(outcome.exit, Some(0));
+}
+#[tokio::test(flavor = "multi_thread")]
 async fn a_resize_without_a_pty_is_ignored() {
     let outcome = run(
         sh("echo fine", false, false),
@@ -492,8 +527,14 @@ async fn a_detached_tty_leader_is_reaped_while_a_descendant_holds_the_terminal()
             Ok(_) => tokio::time::sleep(Duration::from_millis(50)).await,
         }
     };
-    kill_group(pid).await;
+    if left_behind.is_some() {
+        // Leave nothing running, but report the reaping failure: kill_group's wait
+        // cannot finish while the leader is an unreaped zombie, and its panic would
+        // hide this one.
+        unsafe { libc::kill(-pid, libc::SIGKILL) };
+    }
     assert_eq!(left_behind, None, "the exited leader was never reaped");
+    kill_group(pid).await;
 }
 
 #[tokio::test(flavor = "multi_thread")]
