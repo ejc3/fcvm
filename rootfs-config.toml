@@ -207,8 +207,8 @@ build_inputs = [
     "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
 ]
 kernel_config = "kernel/default.conf"
-# The default profile intentionally carries no source patches. An explicit
-# empty string is important: an omitted value applies kernel/patches by default.
+# Applies every patch in kernel/patches-default, and build_inputs above names
+# each one. Keep this line: an omitted value applies kernel/patches.
 patches_dir = "kernel/patches-default"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
@@ -223,6 +223,8 @@ build_inputs = [
     "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
 ]
 kernel_config = "kernel/default-x86.conf"
+# Applies every patch in kernel/patches-default, and build_inputs above names
+# each one. Keep this line: an omitted value applies kernel/patches.
 patches_dir = "kernel/patches-default"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
