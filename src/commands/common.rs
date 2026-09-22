@@ -490,10 +490,11 @@ pub(crate) fn find_firecracker_with_version(
         )
     })?;
 
-    if version.release < MIN_FIRECRACKER_VERSION {
+    if !version.at_least(MIN_FIRECRACKER_VERSION) {
         anyhow::bail!(
-            "Firecracker version {}.{}.{} is too old. Minimum required: {}.{}.{} (for network_overrides support in snapshot cloning)",
+            "Firecracker version {}.{}.{}{} is too old. Minimum required: {}.{}.{} (for network_overrides support in snapshot cloning)",
             version.release.0, version.release.1, version.release.2,
+            if version.prerelease { " (pre-release)" } else { "" },
             MIN_FIRECRACKER_VERSION.0, MIN_FIRECRACKER_VERSION.1, MIN_FIRECRACKER_VERSION.2
         );
     }
@@ -4853,6 +4854,40 @@ mod tests {
         std::fs::write(&path, "#!/bin/sh\necho 'Firecracker v1.17.0'\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// find_firecracker's minimum-version check treats a pre-release of the minimum
+    /// as older than it: a -dev build can predate what the release shipped.
+    #[test]
+    fn find_firecracker_rejects_a_prerelease_of_the_minimum_version() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let reporting = |name: &str, version: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho 'Firecracker v{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            find_firecracker_with_version(&RuntimeConfig {
+                firecracker_bin: Some(path),
+                ..Default::default()
+            })
+        };
+        let (major, minor, patch) = MIN_FIRECRACKER_VERSION;
+        let minimum = format!("{major}.{minor}.{patch}");
+
+        let error = reporting("prerelease", &format!("{minimum}-dev"))
+            .expect_err("a pre-release of the minimum version must be rejected");
+        assert!(
+            format!("{error:#}").contains(&format!("{minimum} (pre-release) is too old")),
+            "{error:#}"
+        );
+        assert!(
+            reporting("release", &minimum).is_ok(),
+            "the minimum release itself must pass"
+        );
+        assert!(
+            reporting("newer", &format!("{major}.{}.0", minor + 1)).is_ok(),
+            "a newer release must pass"
+        );
     }
 
     /// The restore writer: a clone's state records the binary its restore runs on.
