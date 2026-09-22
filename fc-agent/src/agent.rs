@@ -176,34 +176,11 @@ pub async fn run() -> Result<()> {
         });
     }
 
-    // Write storage.conf with driver = "overlay" before starting the exec server.
-    // The health monitor runs `podman inspect` as soon as exec accepts connections.
-    // Without this, podman initializes its BoltDB with driver = "" (auto-detect),
-    // which mismatches when mount_overlay_image() later writes driver = "overlay".
+    // Name the overlay driver in storage.conf before any podman process runs.
+    // Podman records the driver in its database the first time it runs, and
+    // mount_overlay_image() later rewrites storage.conf with the same driver, so a
+    // podman command exec'd before that rewrite still matches it.
     container::write_early_storage_conf();
-
-    // Start exec server with rebind signal for vsock transport reset recovery
-    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
-    let exec_rebind_clone = exec_rebind.clone();
-    let exec_rebind_needed_clone = exec_rebind_needed.clone();
-    let exec_rebind_done_clone = exec_rebind_done.clone();
-    let exec_rebind_done_notify_clone = exec_rebind_done_notify.clone();
-    tokio::spawn(async move {
-        exec::run_server(
-            exec_ready_tx,
-            exec_rebind_clone,
-            exec_rebind_needed_clone,
-            exec_rebind_done_clone,
-            exec_rebind_done_notify_clone,
-        )
-        .await;
-    });
-
-    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
-        Ok(Ok(())) => eprintln!("[fc-agent] exec server is ready"),
-        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: exec server ready signal dropped"),
-        Err(_) => eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s"),
-    }
 
     // Mount filesystems. Mount failures are fatal: the container would otherwise
     // start with a plain empty directory bind-mounted where the volume should be,
@@ -330,15 +307,33 @@ pub async fn run() -> Result<()> {
     // Store prefix globally so exec server and health checks can use it
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
-    // Reset root podman state to match storage.conf. The health monitor may have
-    // run `podman inspect` via the exec server during setup, creating a stale
-    // db.sql with the wrong graph driver. Only needed for root podman — user mode
-    // already resets in create_vm_user(), and a root reset would destroy the
-    // user's storage directory.
-    // A clone's storage already matches storage.conf and holds the captured
-    // container — a reset would erase it. Only wipe on a fresh first boot.
-    if cmd_prefix.is_empty() && !provisioned {
-        container::reset_podman_state();
+    // Open exec only now, with the rebind signal for vsock transport reset
+    // recovery. The host's health monitor runs `podman inspect` over exec as soon
+    // as the server accepts connections, so no podman command can start before
+    // storage setup, the container user and the command prefix are done. Overlay
+    // image mode rewrites storage.conf after this point, in mount_overlay_image(),
+    // with the driver write_early_storage_conf() already named. The host's exec
+    // client retries until the server listens.
+    let (exec_ready_tx, exec_ready_rx) = tokio::sync::oneshot::channel();
+    let exec_rebind_clone = exec_rebind.clone();
+    let exec_rebind_needed_clone = exec_rebind_needed.clone();
+    let exec_rebind_done_clone = exec_rebind_done.clone();
+    let exec_rebind_done_notify_clone = exec_rebind_done_notify.clone();
+    tokio::spawn(async move {
+        exec::run_server(
+            exec_ready_tx,
+            exec_rebind_clone,
+            exec_rebind_needed_clone,
+            exec_rebind_done_clone,
+            exec_rebind_done_notify_clone,
+        )
+        .await;
+    });
+
+    match tokio::time::timeout(Duration::from_secs(5), exec_ready_rx).await {
+        Ok(Ok(())) => eprintln!("[fc-agent] exec server is ready"),
+        Ok(Err(_)) => eprintln!("[fc-agent] WARNING: exec server ready signal dropped"),
+        Err(_) => eprintln!("[fc-agent] WARNING: exec server did not become ready within 5s"),
     }
 
     // Prepare image based on delivery mode. A clone already has the image in
@@ -350,7 +345,7 @@ pub async fn run() -> Result<()> {
         if let (Some("overlay"), Some(device)) = (plan.image_mode.as_deref(), &plan.image_device) {
             eprintln!("[fc-agent] re-mounting overlay image store (provisioned re-boot)");
             let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_overlay_image(device, &plan.image, username, false)?
+            container::mount_overlay_image(device, &plan.image, username)?
         } else {
             eprintln!("[fc-agent] skipping image import (clone — image already in storage)");
             plan.image.clone()
@@ -359,7 +354,7 @@ pub async fn run() -> Result<()> {
         let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
             (Some("overlay"), Some(device)) => {
                 let username = user_info.as_ref().map(|(name, _)| name.as_str());
-                container::mount_overlay_image(device, &plan.image, username, true)?
+                container::mount_overlay_image(device, &plan.image, username)?
             }
             (Some("btrfs"), Some(device)) => {
                 // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).
@@ -908,4 +903,46 @@ async fn chronyc_sources() -> std::result::Result<usize, String> {
         .skip(1)
         .filter(|line| !line.trim().is_empty())
         .count())
+}
+
+#[cfg(test)]
+mod tests {
+    /// fc-agent opens its exec server only after storage.conf names the overlay
+    /// driver, storage setup has run, and the container user and podman command
+    /// prefix exist.
+    ///
+    /// The host's health monitor runs `podman inspect` over exec from the moment
+    /// the server accepts connections, two to five times before the container
+    /// starts in every boot measured. A podman process that runs before
+    /// storage.conf names the right driver records the wrong one in podman's
+    /// database, and one that runs while podman's state is being reset fails
+    /// with "attempt to write a readonly database". Overlay image mode rewrites
+    /// storage.conf after exec opens, so it relies on the early write naming the
+    /// same driver.
+    #[test]
+    fn exec_opens_after_container_storage_is_final() {
+        let source = include_str!("agent.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("agent.rs has no test module")];
+        let exec_opens = body
+            .find("exec::run_server(")
+            .expect("fc-agent no longer starts the exec server");
+        for step in [
+            "container::write_early_storage_conf()",
+            "container::setup_btrfs_storage_if_available()",
+            "container::create_vm_user(",
+            "container::set_podman_cmd_prefix(",
+        ] {
+            let at = body
+                .find(step)
+                .unwrap_or_else(|| panic!("fc-agent no longer calls {step}"));
+            assert!(
+                at < exec_opens,
+                "fc-agent opens its exec server before {step}. A podman command \
+                 exec'd in that window runs against storage setup that has not \
+                 finished."
+            );
+        }
+    }
 }
