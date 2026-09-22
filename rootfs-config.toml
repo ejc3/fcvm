@@ -28,16 +28,18 @@ repo = "https://passt.top/passt"
 commit = "3f57f0382f6a72c0b8ce0c5ff92248b5117ed9b6"
 
 # Default Firecracker binary
-# Build from the fork's restacked patch chain on current upstream main
-# (2c4604808, 2026-08): vsock muxer capacity + the bounded UFFD-minor memory
-# backend. The old bump-vsock-max-connections branch sat on a 2026-02 base and
-# carried serial (THRE) and dump_dirty patches that upstream has since fixed
-# itself (firecracker-microvm#5764; v1.14.2), so both are dropped as redundant.
+# Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
+# 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend.
+# v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
+# build cannot restore format 12. A restore uses the binary the snapshot
+# recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
+# snapshot that records none is loaded with this build, so a format 11 one
+# fails to load, and the error says to re-create it or pass --firecracker-bin.
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
 # Kernel profiles can override with their own firecracker_repo/branch.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor"
+branch = "agent/uffd-minor-v1.17.0"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
