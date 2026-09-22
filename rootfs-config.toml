@@ -200,28 +200,30 @@ remove_dirs = [
 description = "Default fcvm guest kernel"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "aabb4e064783"
+kernel_sha = "9f397af93a08"
 build_inputs = [
     "kernel/default-arm64.build.toml",
     "kernel/default.conf",
+    "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
 ]
 kernel_config = "kernel/default.conf"
 # The default profile intentionally carries no source patches. An explicit
 # empty string is important: an omitted value applies kernel/patches by default.
-patches_dir = ""
+patches_dir = "kernel/patches-default"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
 
 [kernel_profiles.default.amd64]
 description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "3e4584a92571"
+kernel_sha = "3b83b5face2d"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
+    "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
 ]
 kernel_config = "kernel/default-x86.conf"
-patches_dir = ""
+patches_dir = "kernel/patches-default"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)

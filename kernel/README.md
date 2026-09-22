@@ -31,6 +31,15 @@ sockets are destroyed again on the RESTORE side, before the clone is published,
 because the restored memory image still contains them. A kernel without these
 options cannot safely create a restorable network snapshot.
 
+## Patches
+
+The default profiles apply `kernel/patches-default`, which holds upstream fixes
+the pinned release lacks. Today that is Linux commit 0d0eff39ceb3, without which
+about one guest shutdown in 200 spins forever in `virtnet_poll_cleantx()`
+(#990). The nested and btrfs patch directories link the same files, so every
+shipped guest kernel carries them. Drop a patch once the pinned release contains
+it: the build then fails when the patch no longer applies.
+
 ## Release identity
 
 Published default profiles carry `kernel_sha`, the first 12 hexadecimal digits
@@ -38,7 +47,8 @@ of the concatenated `build_inputs`. The inputs include:
 
 1. an architecture-specific build recipe with an immutable Firecracker commit,
    config path, patch policy, and build-spec version;
-2. the architecture-specific kernel config fragment.
+2. the architecture-specific kernel config fragment;
+3. each patch the recipe's `patches_dir` applies, named as an exact file.
 
 A source checkout recomputes and verifies the manifest SHA before building. An
 installed binary uses the recorded SHA to locate the release even though the

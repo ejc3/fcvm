@@ -74,8 +74,25 @@ fn default_release_manifest_matches_immutable_build_recipe_on_both_arches() {
         );
         assert_eq!(profile["kernel_repo"].as_str(), Some("ejc3/fcvm"));
 
+        // The recipe and the config fragment, then each patch the recipe's patches_dir
+        // applies, every one named as an exact file.
         let inputs = profile["build_inputs"].as_array().unwrap();
-        assert_eq!(inputs.len(), 2, "{arch} default profile build input drift");
+        let patches = match profile["patches_dir"].as_str() {
+            None | Some("") => Vec::new(),
+            Some(dir) => applied_patches(&root, dir),
+        };
+        assert_eq!(
+            inputs.len(),
+            2 + patches.len(),
+            "{arch} default profile build input drift"
+        );
+        for (input, patch) in inputs[2..].iter().zip(&patches) {
+            assert_eq!(
+                root.join(input.as_str().unwrap()),
+                *patch,
+                "{arch} default profile must hash each applied patch by its exact path"
+            );
+        }
         let mut bytes = Vec::new();
         for input in inputs {
             let relative = input.as_str().unwrap();
@@ -2406,4 +2423,41 @@ fn the_release_check_exits_2_whenever_it_cannot_check() {
     let run = run_release_check_at(fixture.path(), &release_host(BTreeMap::new()));
     cannot_check("an identity script that does not load", &run);
     assert!(lines_with(&run, "present").is_empty(), "{}", run.stdout);
+}
+
+/// Upstream commit 0d0eff39ceb3 ("virtio_ring: fix infinite loop in
+/// virtnet_poll_cleantx when device is broken") is not in the pinned 6.18 stable
+/// release. Without it about one guest shutdown in 200 never finishes:
+/// device_shutdown() breaks the virtio-net TX queue while completions are still
+/// unreclaimed, virtnet_poll_cleantx() then spins in softirq holding the TX queue
+/// lock, and the guest never reaches its power-off call. Every kernel fcvm ships as
+/// a guest has to carry the backport until the pinned release does.
+#[test]
+fn every_shipped_guest_kernel_applies_the_virtio_ring_shutdown_fix() {
+    const FIX: &str = "the backend will never update it";
+    let root = repo_root();
+    let mut missing = Vec::new();
+    let mut checked = 0usize;
+    for (profile_name, arch, profile) in source_built_tables(&rootfs_config()) {
+        if !["default", "nested", "btrfs"].contains(&profile_name.as_str()) {
+            continue;
+        }
+        checked += 1;
+        let applies_fix = vm_kernel_patches_dir(&profile).is_some_and(|dir| {
+            applied_patches(&root, dir)
+                .iter()
+                .any(|patch| std::fs::read_to_string(patch).is_ok_and(|text| text.contains(FIX)))
+        });
+        if !applies_fix {
+            missing.push(format!("{profile_name}.{arch}"));
+        }
+    }
+    assert_eq!(
+        checked, 6,
+        "expected default, nested and btrfs tables for both arches"
+    );
+    assert!(
+        missing.is_empty(),
+        "these guest kernels do not apply the virtio_ring broken-queue fix: {missing:?}"
+    );
 }
