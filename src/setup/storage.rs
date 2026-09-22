@@ -10,6 +10,18 @@ use crate::setup::rootfs::load_config;
 /// that uses them, allowing FCVM_DATA_DIR to point elsewhere.
 const REQUIRED_DIRS: &[&str] = &["kernels", "rootfs", "initrd", "cache", "image-cache"];
 
+/// Hand the assets directory and each asset store under it to `invoker`.
+///
+/// `sudo fcvm setup` creates these as root on the operator's behalf, and a
+/// later rootless run must be able to write them. Non-recursive: the stores'
+/// contents are handed back by the code that writes them.
+fn hand_back_asset_dirs(mount_point: &Path, invoker: Option<&nix::unistd::User>) {
+    super::give_store_entry_to(mount_point, invoker);
+    for dir in REQUIRED_DIRS {
+        super::give_store_entry_to(&mount_point.join(dir), invoker);
+    }
+}
+
 /// Unmount a path, ignoring errors
 fn cleanup_mount(path: &Path) {
     let _ = Command::new("umount").arg(path).status();
@@ -89,6 +101,15 @@ fn get_storage_paths(config_path: Option<&str>) -> Result<(PathBuf, PathBuf, Str
 ///
 /// Creating the loopback and mounting requires root privileges.
 pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
+    ensure_storage_with(config_path, super::sudo_invoker())
+}
+
+/// [`ensure_storage`], handing what it creates to `invoker` rather than to the
+/// sudo invoker it would look up.
+fn ensure_storage_with(
+    config_path: Option<&str>,
+    invoker: Option<&nix::unistd::User>,
+) -> Result<()> {
     let (mount_point, loopback_image, btrfs_size) = get_storage_paths(config_path)?;
 
     // Already btrfs? Just ensure directories exist (no root needed)
@@ -102,6 +123,7 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
                 )
             })?;
         }
+        hand_back_asset_dirs(&mount_point, invoker);
         return Ok(());
     }
 
@@ -123,6 +145,7 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
                 std::fs::create_dir_all(&path)
                     .with_context(|| format!("creating directory {}", path.display()))?;
             }
+            hand_back_asset_dirs(&mount_point, invoker);
             return Ok(());
         }
     }
@@ -235,10 +258,10 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
         }
     }
 
-    // Hand the mount point back to the user who invoked sudo (non-recursive:
-    // we just created it). Uses the shared helper, which resolves the real
-    // primary group from passwd instead of assuming group == user name.
-    super::give_store_entry_to_invoker(&mount_point);
+    // Hand the mount point and its asset stores back to the user who invoked
+    // sudo. The shared helper resolves the real primary group from passwd
+    // instead of assuming group == user name.
+    hand_back_asset_dirs(&mount_point, invoker);
 
     info!(
         "✓ btrfs storage ready at {} ({})",
@@ -247,4 +270,65 @@ pub fn ensure_storage(config_path: Option<&str>) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(all(test, feature = "privileged-tests"))]
+mod root_handback_tests {
+    use super::*;
+    use std::os::unix::fs::MetadataExt;
+
+    /// `sudo fcvm setup` creates the assets directory and its stores as root, and
+    /// they must end up owned by the user who ran sudo. Left root-owned, the next
+    /// rootless `make setup-fcvm` failed creating /mnt/fcvm-btrfs/tmp on a
+    /// devserver. The second call covers a directory an earlier root run left
+    /// root-owned, which is the state that devserver was in.
+    #[test]
+    fn a_root_setup_hands_the_asset_directories_to_the_sudo_user() {
+        assert!(
+            nix::unistd::Uid::effective().is_root(),
+            "this test needs root: run it with make test-root"
+        );
+        let nobody = nix::unistd::User::from_name("nobody")
+            .expect("passwd lookup")
+            .expect("user nobody exists");
+        let parent = tempfile::tempdir_in("/mnt/fcvm-btrfs").expect("temp dir on the btrfs store");
+        let assets = parent.path().join("assets");
+        let config = parent.path().join("rootfs-config.toml");
+        let repo_config = include_str!("../../rootfs-config.toml");
+        let line = "assets_dir = \"/mnt/fcvm-btrfs\"";
+        assert_eq!(
+            repo_config.matches(line).count(),
+            1,
+            "rootfs-config.toml no longer sets {line}"
+        );
+        std::fs::write(
+            &config,
+            repo_config.replace(line, &format!("assets_dir = \"{}\"", assets.display())),
+        )
+        .unwrap();
+        let config = config.to_str().unwrap();
+        let dirs: Vec<PathBuf> = std::iter::once(assets.clone())
+            .chain(REQUIRED_DIRS.iter().map(|dir| assets.join(dir)))
+            .collect();
+        let assert_owned = |when: &str| {
+            for dir in &dirs {
+                let uid = std::fs::metadata(dir).unwrap().uid();
+                assert_eq!(
+                    uid,
+                    nobody.uid.as_raw(),
+                    "{when}: {} is owned by uid {uid}, not the sudo user",
+                    dir.display()
+                );
+            }
+        };
+
+        ensure_storage_with(Some(config), Some(&nobody)).unwrap();
+        assert_owned("creating the assets directory");
+
+        for dir in &dirs {
+            std::os::unix::fs::chown(dir, Some(0), Some(0)).unwrap();
+        }
+        ensure_storage_with(Some(config), Some(&nobody)).unwrap();
+        assert_owned("an assets directory an earlier root run left root-owned");
+    }
 }

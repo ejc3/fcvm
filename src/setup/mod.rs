@@ -68,7 +68,16 @@ fn open_store_entry_nofollow(path: &Path) -> nix::Result<std::os::fd::OwnedFd> {
 /// else works, and a genuinely lost hand-back surfaces at the next rootless
 /// write with a clear EACCES rather than silently.
 pub(crate) fn give_store_entry_to_invoker(path: &Path) {
-    let Some(user) = sudo_invoker() else {
+    give_store_entry_to(path, sudo_invoker());
+}
+
+/// Hand a store entry to `user`, or leave it alone when there is none.
+///
+/// [`give_store_entry_to_invoker`] passes the sudo invoker. Tests pass a user
+/// directly, because this crate's tests never set `SUDO_USER` (see
+/// `test_env`).
+pub(crate) fn give_store_entry_to(path: &Path, user: Option<&nix::unistd::User>) {
+    let Some(user) = user else {
         return;
     };
     let fd = match open_store_entry_nofollow(path) {
