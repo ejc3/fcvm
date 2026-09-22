@@ -1,0 +1,1 @@
+../patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch
