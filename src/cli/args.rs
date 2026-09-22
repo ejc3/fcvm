@@ -533,8 +533,9 @@ pub struct SnapshotRunArgs {
     pub no_swap: bool,
 
     /// Place the clone's vsock control socket at DIR/vsock.sock instead of its
-    /// runtime directory (predictable path for external tooling). The restore
-    /// mount redirect retargets the snapshot's embedded vsock directory here.
+    /// runtime directory (predictable path for external tooling). The snapshot
+    /// load points the vsock device here (Firecracker 1.16.0 and later); before
+    /// that, the restore mount redirect retargets the embedded vsock directory here.
     #[arg(long)]
     pub vsock_dir: Option<String>,
 

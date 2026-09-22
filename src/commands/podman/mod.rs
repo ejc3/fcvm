@@ -1593,8 +1593,9 @@ async fn prepare_vm_for_lifecycle(
     // particular, `--vsock-dir` deliberately places it outside `data_dir`, so
     // reconstructing the path from vm_id would target the wrong socket.
     vm_state.config.vsock_socket_path = Some(vsock_socket_path.clone());
-    // A cold-boot VMM embeds the same exact path it binds. Restored clones keep
-    // this source path from snapshot metadata while using a clone-local listener.
+    // A cold-boot VMM embeds the same exact path it binds. A restored clone
+    // records the path its VMM state names: its own listener when the load
+    // overrides the vsock path, else the snapshot's embedded path.
     vm_state.config.source_vsock_socket_path = Some(vsock_socket_path.clone());
 
     // Build VolumeConfigs and spawn VolumeServers BEFORE the VM starts
@@ -3185,10 +3186,11 @@ mod tests {
     }
 
     /// MAXIMUM REUSE / CACHEABILITY: `--vsock-dir` must NOT opt the run out of
-    /// the snapshot cache. It only changes WHERE the clone's listener binds,
-    /// and the restore mount redirect retargets the cached vmstate's embedded
-    /// vsock directory to the caller-owned one (end-to-end pin:
-    /// test_vsock_dir_honored_on_snapshot_cache_hit).
+    /// the snapshot cache. It only changes WHERE the clone's listener binds, and
+    /// the restore puts it there: the snapshot load points the vsock device at
+    /// the caller-owned directory (Firecracker 1.16.0 and later), or, before
+    /// that, the mount redirect retargets the cached vmstate's embedded vsock
+    /// directory to it (end-to-end pin: test_vsock_dir_honored_on_snapshot_cache_hit).
     #[test]
     fn a_custom_vsock_dir_still_participates_in_the_snapshot_cache() {
         let mut args = test_args();
@@ -3196,7 +3198,7 @@ mod tests {
         args.vsock_dir = Some("/tmp/external-vsock".to_string());
         assert!(
             !snapshot_cache_opt_out(&args, false, false),
-            "--vsock-dir must keep using the snapshot cache; the restore redirect honors it"
+            "--vsock-dir must keep using the snapshot cache; the restore honors it"
         );
     }
 

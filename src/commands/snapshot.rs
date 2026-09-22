@@ -1589,23 +1589,20 @@ async fn cmd_snapshot_run_inner(
 
     // Setup VolumeServers for clones if snapshot has volumes
     //
-    // Mount namespace isolation for vsock:
+    // Per-clone vsock sockets:
     // - Firecracker's vmstate.bin stores the baseline's vsock uds_path
     // - Multiple clones from the same snapshot would all try to bind() to the same path
     // - This causes "Address in use" errors for all but the first clone
     //
-    // Solution: Each clone's Firecracker runs in a mount namespace where the baseline's
-    // runtime directory is bind-mounted over the clone's runtime directory.
-    // - Firecracker thinks it's binding to /baseline_dir/vsock.sock
-    // - But the bind mount redirects this to /clone_dir/vsock.sock
-    // - Each clone has its own mount namespace, so each creates unique socket files
-    // - VolumeServers listen on the clone's actual socket paths
-    // Clone's vsock socket base path
-    // With mount namespace isolation, Firecracker will create sockets here
-    // (it thinks it's writing to baseline's path but bind mount redirects to
-    // clone's). `--vsock-dir` retargets the redirect to a caller-owned
-    // directory so the clone's listener lands at a predictable path — cache
-    // hits and clones honor the flag rather than silently ignoring it.
+    // So each clone's sockets land at clone_vsock_base. The snapshot load points the
+    // vsock device there (Firecracker 1.16.0 and later). Before that, the clone's
+    // Firecracker runs in a mount namespace that bind-mounts clone_vsock_base's
+    // directory over the baseline's, so the embedded path resolves there. VolumeServers
+    // listen on the clone's actual socket paths.
+    //
+    // `--vsock-dir` puts clone_vsock_base in a caller-owned directory so the clone's
+    // listener lands at a predictable path; cache hits and clones honor the flag rather
+    // than silently ignoring it.
     let clone_vsock_base = match args.vsock_dir.as_deref() {
         Some(dir) => {
             let current_dir =
@@ -1633,8 +1630,9 @@ async fn cmd_snapshot_run_inner(
         None => data_dir.join("vsock.sock"),
     };
     // Persist the clone's actual host-side socket before restore publishes its
-    // state. A later snapshot of this clone must address this socket, not the
-    // ancestor path embedded in the restored VMM state.
+    // state; snapshot control must address this socket. The recorded source
+    // starts as the snapshot's embedded path, and the restore replaces it with
+    // this socket when the load overrides the vsock path.
     vm_state.config.vsock_socket_path = Some(clone_vsock_base.clone());
     vm_state.config.source_vsock_socket_path =
         Some(snapshot_config.source_vsock_socket_path.clone());
@@ -1943,7 +1941,8 @@ async fn cmd_snapshot_run_inner(
 
     // Build restore configuration
     // For snapshots of cache-restored VMs:
-    // - source_vsock_socket_path = exact vsock path in vmstate.bin (unchanged from cache)
+    // - source_vsock_socket_path = exact vsock path in vmstate.bin (the restored
+    //   VM's own listener when its load overrode the vsock path)
     // - original_vsock_vm_id (vm-AAA) = ancestor lineage / conventional disk directory
     // - vm_id (vm-BBB) = disk paths in vmstate.bin (patched during cache restore)
     // For snapshots of fresh VMs:

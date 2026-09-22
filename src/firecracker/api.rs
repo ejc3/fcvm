@@ -287,12 +287,21 @@ pub struct SnapshotLoad {
     pub resume_vm: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub network_overrides: Option<Vec<NetworkOverride>>,
+    /// Host UDS path for the restored vsock device (Firecracker 1.16.0 and later).
+    /// Omitted when None, so older binaries never see the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vsock_override: Option<VsockOverride>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NetworkOverride {
     pub iface_id: String,
     pub host_dev_name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VsockOverride {
+    pub uds_path: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -97,8 +97,9 @@ pub struct SnapshotConfig {
     /// Exact host-side vsock base path embedded in the VMM state.
     ///
     /// This is not necessarily `vm_runtime_dir(original_vsock_vm_id)/vsock.sock`:
-    /// a cold source may use `--vsock-dir`, and a snapshot of a restored clone
-    /// still embeds its ancestor's path while listeners are clone-local.
+    /// a cold source may use `--vsock-dir`, a snapshot of a clone restored with a
+    /// vsock override embeds the clone's own listener, and one restored without it
+    /// (Firecracker before 1.16.0) still embeds its ancestor's path.
     pub source_vsock_socket_path: PathBuf,
     /// Parent snapshot name used as the diff base for this snapshot's memory.
     /// - Full snapshots: None (no diff base needed)
