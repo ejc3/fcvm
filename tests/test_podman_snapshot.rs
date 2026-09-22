@@ -32,7 +32,7 @@ mod common;
 
 use anyhow::{Context, Result};
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 /// Check if snapshot is disabled via FCVM_NO_SNAPSHOT environment variable
@@ -52,8 +52,13 @@ fn snapshot_dir() -> PathBuf {
 
 /// List all snapshot entries (directory names that contain complete snapshot files)
 fn list_snapshot_entries() -> HashSet<String> {
+    list_snapshot_entries_in(&snapshot_dir())
+}
+
+/// Complete snapshot entries (all four files present) under `snapshots`.
+fn list_snapshot_entries_in(snapshots: &Path) -> HashSet<String> {
     let mut entries = HashSet::new();
-    if let Ok(dir) = std::fs::read_dir(snapshot_dir()) {
+    if let Ok(dir) = std::fs::read_dir(snapshots) {
         for entry in dir.flatten() {
             if let Ok(name) = entry.file_name().into_string() {
                 let path = entry.path();
@@ -71,21 +76,190 @@ fn list_snapshot_entries() -> HashSet<String> {
     entries
 }
 
-/// Wait for a new snapshot entry to appear (returns the new key)
-async fn wait_for_new_snapshot_entry(
+/// Waits for a snapshot entry that is not in `before` and was taken from the VM
+/// `vm_id`. Other tests create snapshots in the same directory at the same time, so
+/// a new entry is not necessarily this test's: taking any new one once read another
+/// test's user snapshot, and test_podman_snapshot_type_is_system failed on its type.
+async fn wait_for_snapshot_entry_from(
+    snapshots: &Path,
     before: &HashSet<String>,
+    vm_id: &str,
     timeout_secs: u64,
 ) -> Option<String> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(timeout_secs) {
-        let current = list_snapshot_entries();
-        let new_entries: Vec<_> = current.difference(before).collect();
-        if !new_entries.is_empty() {
-            return Some(new_entries[0].clone());
+        let ours = list_snapshot_entries_in(snapshots)
+            .into_iter()
+            .filter(|entry| !before.contains(entry))
+            .find(|entry| entry_is_from(snapshots, entry, vm_id));
+        if ours.is_some() {
+            return ours;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     None
+}
+
+/// True when the entry's config.json records `vm_id` as the VM it was taken from.
+/// The container command is not in config.json, so it cannot identify an entry.
+fn entry_is_from(snapshots: &Path, entry: &str, vm_id: &str) -> bool {
+    std::fs::read_to_string(snapshots.join(entry).join("config.json"))
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .is_some_and(|config| config["vm_id"] == vm_id)
+}
+
+/// The vm_id fcvm assigned the VM running as `pid`, read with `fcvm ls` while the
+/// VM is up. A snapshot records the vm_id of the VM it was taken from.
+async fn vm_id_of(pid: u32) -> Result<String> {
+    let fcvm = common::find_fcvm_binary()?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let output = tokio::process::Command::new(&fcvm)
+            .args(["ls", "--json", "--pid", &pid.to_string()])
+            .output()
+            .await?;
+        if output.status.success() {
+            if let Ok(listed) = serde_json::from_slice::<Vec<Listed>>(&output.stdout) {
+                if let Some(vm_id) = listed_vm_for(listed, fcvm::utils::process_start_time(pid))? {
+                    return Ok(vm_id);
+                }
+            }
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "fcvm pid {pid} never listed its VM"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// One record of `fcvm ls --json --pid`, trimmed to what `vm_id_of` reads.
+#[derive(serde::Deserialize)]
+struct Listed {
+    vm_id: String,
+    pid_start_time: Option<u64>,
+}
+
+/// The record that belongs to the live process. `fcvm ls --pid` compares only the
+/// numeric PID, so a stale record whose PID was reused lists alongside the live one.
+/// The start time the state file recorded tells them apart.
+fn listed_vm_for(listed: Vec<Listed>, start_time: Option<u64>) -> Result<Option<String>> {
+    let mut live: Vec<String> = listed
+        .into_iter()
+        .filter(|vm| start_time.is_some() && vm.pid_start_time == start_time)
+        .map(|vm| vm.vm_id)
+        .collect();
+    anyhow::ensure!(
+        live.len() <= 1,
+        "fcvm ls lists {} VMs for one live process: {live:?}",
+        live.len()
+    );
+    Ok(live.pop())
+}
+
+/// Waits for the fcvm process of a VM whose container only runs `echo`. The guest
+/// powers itself off once the command exits, so fcvm has to exit on its own with
+/// the container's status. Tests that discarded this wait passed after 245 to 309 s,
+/// or failed later on an unrelated assertion, when a guest never finished shutting
+/// down.
+async fn wait_for_short_lived_vm(child: &mut tokio::process::Child, vm_name: &str) -> Result<()> {
+    wait_for_short_lived_vm_within(child, vm_name, Duration::from_secs(120)).await
+}
+
+/// `wait_for_short_lived_vm` with an explicit limit. When it gives up it kills and
+/// reaps fcvm, because the spawned child is not kill_on_drop and a hung VM would
+/// otherwise outlive the test.
+async fn wait_for_short_lived_vm_within(
+    child: &mut tokio::process::Child,
+    vm_name: &str,
+    limit: Duration,
+) -> Result<()> {
+    let status = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(waited) => waited.context("waiting for fcvm")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "fcvm for {vm_name} did not exit within {}s of starting a container that only \
+                 runs echo, so the guest never finished shutting down; its console is in the \
+                 VM's debug log under /tmp/fcvm-test-logs",
+                limit.as_secs()
+            );
+        }
+    };
+    anyhow::ensure!(status.success(), "fcvm for {vm_name} exited with {status}");
+    Ok(())
+}
+
+/// `fcvm ls --pid` lists a stale record whose PID was reused alongside the live one.
+#[test]
+fn vm_id_lookup_skips_a_stale_record_with_a_reused_pid() -> Result<()> {
+    let listed = vec![
+        Listed {
+            vm_id: "vm-stale".into(),
+            pid_start_time: Some(100),
+        },
+        Listed {
+            vm_id: "vm-live".into(),
+            pid_start_time: Some(200),
+        },
+    ];
+    assert_eq!(
+        listed_vm_for(listed, Some(200))?.as_deref(),
+        Some("vm-live")
+    );
+    Ok(())
+}
+
+/// A VM that never exits is killed and reaped when the wait gives up.
+#[tokio::test]
+async fn a_short_lived_vm_that_never_exits_is_killed_when_the_wait_gives_up() -> Result<()> {
+    let mut child = tokio::process::Command::new("sleep").arg("30").spawn()?;
+    let waited =
+        wait_for_short_lived_vm_within(&mut child, "sleeper", Duration::from_secs(1)).await;
+    assert!(
+        waited.is_err(),
+        "the wait should give up on a process that never exits"
+    );
+    let exited = child.try_wait()?;
+    if exited.is_none() {
+        child.kill().await.ok();
+    }
+    assert!(
+        exited.is_some(),
+        "the wait gave up and left the process running"
+    );
+    Ok(())
+}
+
+/// A snapshot another VM leaves while this test waits is not this test's.
+#[tokio::test]
+async fn snapshot_entry_lookup_skips_other_vms_entries() -> Result<()> {
+    let snapshots = std::env::temp_dir().join(format!("fcvm-entry-lookup-{}", std::process::id()));
+    let add = |name: &str, vm_id: &str| -> Result<()> {
+        let entry = snapshots.join(name);
+        std::fs::create_dir_all(&entry)?;
+        for file in ["memory.bin", "vmstate.bin", "disk.raw"] {
+            std::fs::write(entry.join(file), b"")?;
+        }
+        std::fs::write(
+            entry.join("config.json"),
+            format!(r#"{{"vm_id":"{vm_id}"}}"#),
+        )?;
+        Ok(())
+    };
+    let before = HashSet::new();
+    add("iso-copy-snap-1", "vm-other")?;
+    let other = wait_for_snapshot_entry_from(&snapshots, &before, "vm-ours", 1).await;
+    add("969632813527", "vm-ours")?;
+    let ours = wait_for_snapshot_entry_from(&snapshots, &before, "vm-ours", 1).await;
+    std::fs::remove_dir_all(&snapshots).ok();
+    assert_eq!(
+        other, None,
+        "another VM's snapshot entry was taken for this one's"
+    );
+    assert_eq!(ours.as_deref(), Some("969632813527"));
+    Ok(())
 }
 
 /// Check if a specific snapshot entry exists and is complete
@@ -142,12 +316,11 @@ async fn test_podman_snapshot_miss_creates_snapshot() -> Result<()> {
     .await
     .context("spawning fcvm")?;
 
-    // Wait for container (may exit quickly)
-    let _ = common::poll_health_by_pid(pid, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
+    let vm_id = vm_id_of(pid).await?;
+    wait_for_short_lived_vm(&mut child, &vm_name).await?;
 
-    // Verify at least one new snapshot entry was created
-    let new_key = wait_for_new_snapshot_entry(&before, 10).await;
+    // Verify this run created its own snapshot entry
+    let new_key = wait_for_snapshot_entry_from(&snapshot_dir(), &before, &vm_id, 10).await;
     assert!(new_key.is_some(), "A snapshot entry should be created");
     println!("New snapshot entry: {}", new_key.unwrap());
 
@@ -247,7 +420,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
     // Run with rootless
     let (vm_name1, _, _, _) = common::unique_names("net-rootless");
     println!("Running rootless: {}", vm_name1);
-    let (mut child1, pid1) = common::spawn_fcvm(&[
+    let (mut child1, _pid1) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
@@ -259,8 +432,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
         "rootless",
     ])
     .await?;
-    let _ = common::poll_health_by_pid(pid1, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), child1.wait()).await;
+    wait_for_short_lived_vm(&mut child1, &vm_name1).await?;
 
     // Wait for snapshot
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -270,7 +442,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
     // Run with bridged (requires sudo, handled by test harness)
     let (vm_name2, _, _, _) = common::unique_names("net-bridged");
     println!("Running bridged: {}", vm_name2);
-    let (mut child2, pid2) = common::spawn_fcvm(&[
+    let (mut child2, _pid2) = common::spawn_fcvm(&[
         "podman",
         "run",
         "--name",
@@ -282,8 +454,7 @@ async fn test_podman_snapshot_different_network_modes() -> Result<()> {
         "bridged",
     ])
     .await?;
-    let _ = common::poll_health_by_pid(pid2, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), child2.wait()).await;
+    wait_for_short_lived_vm(&mut child2, &vm_name2).await?;
 
     // Wait for snapshot
     tokio::time::sleep(Duration::from_secs(2)).await;
@@ -339,8 +510,8 @@ async fn test_podman_no_snapshot_flag() -> Result<()> {
     ])
     .await?;
 
-    let _ = common::poll_health_by_pid(pid, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(60), child.wait()).await;
+    let vm_id = vm_id_of(pid).await?;
+    wait_for_short_lived_vm(&mut child, &vm_name).await?;
 
     // Wait extra time for snapshot creation (if it were to happen)
     tokio::time::sleep(Duration::from_secs(5)).await;
@@ -354,17 +525,16 @@ async fn test_podman_no_snapshot_flag() -> Result<()> {
         new_entries.len()
     );
 
-    // Verify no new entry contains our unique message in its config
-    for entry in &new_entries {
-        let config_path = snapshot_dir().join(entry).join("config.json");
-        if let Ok(config) = std::fs::read_to_string(&config_path) {
-            assert!(
-                !config.contains(&unique_msg),
-                "--no-snapshot flag failed: snapshot entry {} was created for our command",
-                entry
-            );
-        }
-    }
+    // A snapshot of this VM would record its vm_id. The command is not in
+    // config.json, so checking entries for it could never fail.
+    let ours: Vec<_> = new_entries
+        .iter()
+        .filter(|entry| entry_is_from(&snapshot_dir(), entry.as_str(), &vm_id))
+        .collect();
+    assert!(
+        ours.is_empty(),
+        "--no-snapshot flag failed: snapshot entries {ours:?} were taken from this VM"
+    );
 
     println!("Test passed (--no-snapshot prevented snapshot creation)");
     Ok(())
@@ -499,12 +669,11 @@ async fn test_podman_snapshot_type_is_system() -> Result<()> {
     .await
     .context("spawning fcvm")?;
 
-    // Wait for container
-    let _ = common::poll_health_by_pid(pid, 180).await;
-    let _ = tokio::time::timeout(Duration::from_secs(120), child.wait()).await;
+    let vm_id = vm_id_of(pid).await?;
+    wait_for_short_lived_vm(&mut child, &vm_name).await?;
 
-    // Wait for snapshot to be created
-    let new_key = wait_for_new_snapshot_entry(&before, 10).await;
+    // Wait for this run's snapshot entry
+    let new_key = wait_for_snapshot_entry_from(&snapshot_dir(), &before, &vm_id, 10).await;
     assert!(new_key.is_some(), "A snapshot entry should be created");
     let snapshot_key = new_key.unwrap();
     println!("New snapshot entry: {}", snapshot_key);
