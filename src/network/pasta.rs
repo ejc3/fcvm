@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::collections::VecDeque;
 use std::ffi::OsString;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};
@@ -1808,10 +1808,9 @@ impl PastaNetwork {
     /// constitute a valid request. Guest liveness is established before this
     /// runs, by the guest's TCP answer in [`wait_for_guest_to_answer`].
     async fn wait_for_port_forwarding_until(&self, deadline: tokio::time::Instant) -> Result<()> {
-        use tokio::net::TcpStream;
-
         let readiness_budget = deadline.saturating_duration_since(tokio::time::Instant::now());
         let loopback = self.loopback_ip.as_deref().unwrap_or("127.0.0.1");
+        let pasta_pid = self.pasta_process.as_ref().and_then(|child| child.id());
 
         for mapping in &self.port_mappings {
             if mapping.proto != Protocol::Tcp {
@@ -1822,19 +1821,27 @@ impl PastaNetwork {
                 Some(ip) => ip.as_str(),
                 None => loopback,
             };
-            let addr = format!("{}:{}", bind_addr, mapping.host_port);
+            let ip: IpAddr = bind_addr
+                .parse()
+                .with_context(|| format!("port forward host address {bind_addr}"))?;
+            let sock_addr = SocketAddr::new(ip, mapping.host_port);
+            let addr = sock_addr.to_string();
 
             loop {
                 let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
                 if remaining.is_zero() {
                     return Err(port_forward_deadline_error(&addr, readiness_budget));
                 }
-                match tokio::time::timeout(remaining, TcpStream::connect(&addr)).await {
-                    Ok(Ok(_)) => {
+                match tokio::time::timeout(remaining, port_forward_listener_ready(sock_addr)).await
+                {
+                    Ok(true) => {
                         debug!(addr = %addr, "port forward ready");
                         break;
                     }
-                    Ok(Err(_)) => {
+                    Ok(false) => {
+                        if pasta_pid.is_some_and(process_has_exited) {
+                            anyhow::bail!("pasta exited before it listened on {addr}");
+                        }
                         let remaining =
                             deadline.saturating_duration_since(tokio::time::Instant::now());
                         if remaining.is_zero() {
@@ -1854,6 +1861,70 @@ impl PastaNetwork {
     async fn wait_for_port_forwarding(&self) -> Result<()> {
         self.wait_for_port_forwarding_until(tokio::time::Instant::now() + GUEST_ANSWER_DEADLINE)
             .await
+    }
+}
+
+/// Whether `addr` has pasta's listener, not merely something that accepts there.
+///
+/// A connect to `addr` also succeeds against a listener on the wildcard address and
+/// the same port. In port_conflict_failure_names_pastas_own_error that was the test's
+/// own squatter: pasta had failed to bind, and fcvm booted a VM with no port forward.
+/// pasta binds the exact address it forwards, and it marks itself non-dumpable, so its
+/// sockets show in this network namespace's table while its file descriptors do not.
+async fn port_forward_listener_ready(addr: SocketAddr) -> bool {
+    tokio::net::TcpStream::connect(addr).await.is_ok() && listening_on_exactly(addr)
+}
+
+/// True when a TCP socket in this network namespace listens on exactly `addr`:
+/// state 0A in /proc/net/tcp or /proc/net/tcp6, with that local address.
+fn listening_on_exactly(addr: SocketAddr) -> bool {
+    let table = if addr.is_ipv4() {
+        "/proc/net/tcp"
+    } else {
+        "/proc/net/tcp6"
+    };
+    let Ok(text) = std::fs::read_to_string(table) else {
+        return false;
+    };
+    text.lines().skip(1).any(|line| {
+        let mut fields = line.split_whitespace();
+        let local = fields.nth(1);
+        let state = fields.nth(1);
+        state == Some("0A") && local.and_then(parse_proc_net_socket) == Some(addr)
+    })
+}
+
+/// Parses a /proc/net/tcp or tcp6 address such as `0100007F:1F90` (127.0.0.1:8080).
+/// The kernel prints each 32-bit word of the address in host byte order.
+fn parse_proc_net_socket(field: &str) -> Option<SocketAddr> {
+    let (ip_hex, port_hex) = field.split_once(':')?;
+    let port = u16::from_str_radix(port_hex, 16).ok()?;
+    let word = |hex: &str| u32::from_str_radix(hex, 16).ok().map(u32::to_ne_bytes);
+    let ip = match ip_hex.len() {
+        8 => IpAddr::V4(Ipv4Addr::from(word(ip_hex)?)),
+        32 => {
+            let mut bytes = [0u8; 16];
+            for (i, chunk) in bytes.chunks_mut(4).enumerate() {
+                chunk.copy_from_slice(&word(&ip_hex[i * 8..i * 8 + 8])?);
+            }
+            IpAddr::V6(Ipv6Addr::from(bytes))
+        }
+        _ => return None,
+    };
+    Some(SocketAddr::new(ip, port))
+}
+
+/// True when `pid` has exited: gone, or a zombie its parent has not reaped yet.
+/// `utils::is_process_alive` checks only that /proc/<pid> exists, so it reports an
+/// unreaped pasta, the case this has to catch, as alive.
+fn process_has_exited(pid: u32) -> bool {
+    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        Ok(stat) => {
+            stat.rsplit_once(')')
+                .and_then(|(_, rest)| rest.split_whitespace().next())
+                == Some("Z")
+        }
+        Err(_) => true,
     }
 }
 
@@ -2009,7 +2080,9 @@ impl NetworkManager for PastaNetwork {
         // causing subsequent connections to return 0 bytes. The port check happens
         // later via verify_port_forwarding() after the VM is actually running.
         if !self.restore_mode && !self.port_mappings.is_empty() {
-            self.wait_for_port_forwarding().await?;
+            if let Err(error) = self.wait_for_port_forwarding().await {
+                anyhow::bail!("{error:#}{}", self.pasta_exit_context().await);
+            }
         }
 
         info!(holder_pid = holder_pid, "pasta + bridge setup complete");
@@ -3808,5 +3881,40 @@ mod tests {
             !String::from_utf8_lossy(&out.stdout).contains("TRAILING_RAN"),
             "set -e must stop the script when the batch aborts"
         );
+    }
+
+    #[test]
+    fn proc_net_addresses_parse_in_host_byte_order() {
+        assert_eq!(
+            parse_proc_net_socket("0100007F:1F90"),
+            Some("127.0.0.1:8080".parse().unwrap())
+        );
+        assert_eq!(
+            parse_proc_net_socket("00000000000000000000000001000000:0050"),
+            Some("[::1]:80".parse().unwrap())
+        );
+        assert_eq!(parse_proc_net_socket("0100007F"), None);
+    }
+
+    /// A listener on the wildcard address answers a connect to any address on its
+    /// port, so a connect alone reported pasta's forward ready when only the test's
+    /// squatter was listening.
+    #[tokio::test]
+    async fn a_wildcard_squatter_does_not_make_a_port_forward_ready() {
+        let squatter = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let squatted: SocketAddr = format!("127.0.0.1:{}", squatter.local_addr().unwrap().port())
+            .parse()
+            .unwrap();
+        assert!(
+            tokio::net::TcpStream::connect(squatted).await.is_ok(),
+            "the squatter should answer a connect"
+        );
+        assert!(
+            !port_forward_listener_ready(squatted).await,
+            "a wildcard squatter was taken for pasta's listener"
+        );
+
+        let exact = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        assert!(port_forward_listener_ready(exact.local_addr().unwrap()).await);
     }
 }
