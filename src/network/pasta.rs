@@ -1835,6 +1835,13 @@ impl PastaNetwork {
                 match tokio::time::timeout(remaining, port_forward_listener_ready(sock_addr)).await
                 {
                     Ok(true) => {
+                        // pasta binds every forwarded port before it writes its PID
+                        // file and exits when a bind fails, so the exact listener is
+                        // pasta's only while pasta runs. Another process can hold the
+                        // exact address too.
+                        if pasta_pid.is_some_and(process_has_exited) {
+                            anyhow::bail!("pasta exited before it listened on {addr}");
+                        }
                         debug!(addr = %addr, "port forward ready");
                         break;
                     }
@@ -3916,5 +3923,50 @@ mod tests {
 
         let exact = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         assert!(port_forward_listener_ready(exact.local_addr().unwrap()).await);
+    }
+
+    /// A listener on the exact forwarded address proves nothing while pasta is dead.
+    /// When another process already holds that address, pasta exits on the bind
+    /// conflict and the other listener still answers, so readiness has to see pasta
+    /// running too.
+    #[tokio::test]
+    async fn an_exact_address_squatter_does_not_make_an_exited_pastas_forward_ready() {
+        let squatter = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = squatter.local_addr().unwrap().port();
+        let mut network = PastaNetwork::new(
+            "exact-squatter".into(),
+            "tap0".into(),
+            vec![PortMapping {
+                host_ip: Some("127.0.0.1".into()),
+                host_port: port,
+                guest_port: 80,
+                proto: Protocol::Tcp,
+            }],
+        );
+        // Left unreaped, so its PID cannot be reused while the check runs.
+        let exited = tokio::process::Command::new("true")
+            .spawn()
+            .expect("spawning true");
+        let pid = exited.id().expect("child PID");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !process_has_exited(pid) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "true did not exit within 5s"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        network.pasta_process = Some(exited);
+
+        let error = network
+            .wait_for_port_forwarding_until(
+                tokio::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await
+            .expect_err("an exited pasta's forward was reported ready");
+        assert!(
+            format!("{error:#}").contains("pasta exited before it listened on"),
+            "unexpected error: {error:#}"
+        );
     }
 }
