@@ -1467,6 +1467,23 @@ impl Drop for AbortOnDrop {
     }
 }
 
+/// The VMM binary a cold boot launches. A Firecracker binary is also recorded in the
+/// VM's state, so a snapshot of the VM restores on the same binary.
+fn select_vmm_binary(
+    backend: Backend,
+    runtime_config: &crate::commands::common::RuntimeConfig,
+    vm_state: &mut crate::state::VmState,
+) -> Result<std::path::PathBuf> {
+    match backend {
+        Backend::Firecracker => {
+            let firecracker = crate::commands::common::find_firecracker(runtime_config)?;
+            vm_state.config.firecracker_bin = Some(firecracker.clone());
+            Ok(firecracker)
+        }
+        Backend::CloudHypervisor => crate::commands::common::find_cloud_hypervisor(),
+    }
+}
+
 /// Inner VM setup: creates the CoW disk, starts Firecracker, and configures the VM.
 ///
 /// The Firecracker manager and (for rootless mode) the namespace-holder child are
@@ -1547,10 +1564,7 @@ async fn run_vm_setup_inner(
 
     // Select the VMM backend (#632) and its binary.
     let backend: Backend = args.hypervisor.into();
-    let vmm_bin = match backend {
-        Backend::Firecracker => crate::commands::common::find_firecracker(runtime_config)?,
-        Backend::CloudHypervisor => crate::commands::common::find_cloud_hypervisor()?,
-    };
+    let vmm_bin = select_vmm_binary(backend, runtime_config, vm_state)?;
 
     // Firecracker extra args (e.g. --enable-nv2 from the kernel profile, or
     // FCVM_FIRECRACKER_ARGS) are Firecracker-specific; Cloud Hypervisor ignores them.
@@ -1732,6 +1746,25 @@ mod tests {
     }
 
     use super::*;
+
+    /// The cold-boot writer: a VM's state records the Firecracker it launches.
+    #[test]
+    fn cold_boot_records_the_firecracker_it_launches_in_the_vm_state() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let firecracker = dir.path().join("firecracker-fake.bin");
+        std::fs::write(&firecracker, "#!/bin/sh\necho 'Firecracker v1.17.0'\n").unwrap();
+        std::fs::set_permissions(&firecracker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = crate::commands::common::RuntimeConfig {
+            firecracker_bin: Some(firecracker.clone()),
+            ..Default::default()
+        };
+        let mut state =
+            crate::state::VmState::new("vm-cold".to_string(), "alpine".to_string(), 1, 512);
+        let launched = select_vmm_binary(Backend::Firecracker, &runtime, &mut state).unwrap();
+        assert_eq!(launched, firecracker);
+        assert_eq!(state.config.firecracker_bin, Some(firecracker));
+    }
 
     /// Fail-closed inventory of the runtime kernel-cmdline tokens. Everything
     /// build_runtime_boot_args emits is guest-visible, so each token must be

@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal::unix::{signal, SignalKind};
@@ -27,8 +27,8 @@ use crate::uffd::{
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
 use super::common::{
-    MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig, VSOCK_OUTPUT_PORT,
-    VSOCK_RESTORE_COMPLETE_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
+    FirecrackerChoice, MemoryBackend, RestoreParams, RuntimeConfig, SnapshotRestoreConfig,
+    VSOCK_OUTPUT_PORT, VSOCK_RESTORE_COMPLETE_PORT, VSOCK_STATUS_PORT, VSOCK_TTY_PORT,
 };
 use super::podman::{
     run_output_listener, run_status_listener, spawn_restore_completion_listener,
@@ -241,10 +241,12 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
 async fn snapshot_restore_runtime_config(
     args: &SnapshotRunArgs,
     kernel_profile: Option<&str>,
-) -> Result<RuntimeConfig> {
+    recorded_firecracker: Option<&Path>,
+) -> Result<(RuntimeConfig, FirecrackerChoice)> {
     snapshot_restore_runtime_config_with(
         args,
         kernel_profile,
+        recorded_firecracker,
         crate::setup::get_kernel_profile,
         |profile, name| async move {
             crate::setup::get_configured_firecracker_for_profile(&profile, &name).await
@@ -253,12 +255,23 @@ async fn snapshot_restore_runtime_config(
     .await
 }
 
+/// Choose the Firecracker binary and args a restore runs with.
+///
+/// An explicit `--firecracker-bin` chooses the binary. Otherwise the restore runs on
+/// the binary the snapshot recorded, and the snapshot's kernel profile resolves one
+/// only when the snapshot records none or its binary no longer exists. Whichever
+/// binary runs, the args are the caller's, else the snapshot's kernel profile's.
+///
+/// FCVM_FIRECRACKER_BIN does not apply to a restore that uses the recorded binary:
+/// find_firecracker consults it only when neither the snapshot nor a kernel profile
+/// names a binary.
 async fn snapshot_restore_runtime_config_with<GetProfile, Resolve, ResolveFuture>(
     args: &SnapshotRunArgs,
     kernel_profile: Option<&str>,
+    recorded_firecracker: Option<&Path>,
     mut get_profile: GetProfile,
     mut resolve: Resolve,
-) -> Result<RuntimeConfig>
+) -> Result<(RuntimeConfig, FirecrackerChoice)>
 where
     GetProfile: FnMut(&str) -> Result<Option<crate::setup::KernelProfile>>,
     Resolve: FnMut(crate::setup::KernelProfile, String) -> ResolveFuture,
@@ -270,63 +283,100 @@ where
         boot_args: None,
         fuse_readers: None,
     };
+    let requested = config.firecracker_bin.is_some();
 
-    // If no explicit firecracker_bin, resolve the Firecracker (and its args) from
-    // the SNAPSHOT's kernel profile — the clone must run on the same binary the
-    // snapshot was created with. Resolving "default" for a nested-profile
-    // snapshot would restore a vEL2 (NV2) guest on a Firecracker without NV2
-    // support. Profiles that define no firecracker of their own (e.g. btrfs)
-    // were CREATED on the default profile's custom Firecracker (prepare_vm
-    // falls back to it), so the restore must fall back the same way — a plain
-    // PATH `firecracker` would be a different binary than created the snapshot.
-    if config.firecracker_bin.is_none() {
-        let profile_name = kernel_profile.unwrap_or("default");
-        let profile = get_profile(profile_name)?.ok_or_else(|| {
-            anyhow::anyhow!(
-                "snapshot kernel profile '{}' is not configured; refusing to restore with a different Firecracker",
-                profile_name
-            )
-        })?;
-        if config.firecracker_args.is_none() {
-            config.firecracker_args = profile.firecracker_args.clone();
-        }
-
-        let configured_profile = if profile.firecracker_repo.is_some()
-            || profile.firecracker_commit.is_some()
-        {
-            Some((profile, profile_name.to_string()))
-        } else if profile_name != "default" {
-            let default_profile = get_profile("default")?.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "default kernel profile is not configured; refusing to restore snapshot profile '{}' through PATH Firecracker",
-                    profile_name
-                )
-            })?;
-            if config.firecracker_args.is_none() {
-                config.firecracker_args = default_profile.firecracker_args.clone();
-            }
-            (default_profile.firecracker_repo.is_some()
-                || default_profile.firecracker_commit.is_some())
-            .then(|| (default_profile, "default".to_string()))
-        } else {
-            None
-        };
-
-        if let Some((configured_profile, configured_name)) = configured_profile {
-            config.firecracker_bin = Some(
-                resolve(configured_profile, configured_name.clone())
-                    .await?
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "profile '{}' configures Firecracker but resolved no binary",
-                            configured_name
-                        )
-                    })?,
+    // The clone must run on the binary that created the snapshot: a Firecracker
+    // that writes a newer snapshot format rejects an older one. The snapshot
+    // records that binary. Resolving one from the kernel profile is the fallback
+    // for a snapshot that records none or whose binary no longer exists.
+    let choice = match recorded_firecracker {
+        _ if requested => FirecrackerChoice::Requested,
+        Some(path) if path.exists() => FirecrackerChoice::Recorded,
+        Some(path) => {
+            warn!(
+                recorded = %path.display(),
+                "the snapshot's recorded Firecracker binary no longer exists; \
+                 resolving one from its kernel profile"
             );
+            FirecrackerChoice::RecordedMissing(path.to_path_buf())
         }
+        None => FirecrackerChoice::NotRecorded,
+    };
+
+    // The snapshot's kernel profile supplies the Firecracker args, under an explicit
+    // --firecracker-bin too: SnapshotRunArgs.firecracker_args has no CLI flag, and a
+    // nested snapshot needs its profile's --enable-nv2 whichever binary restores it.
+    // The profile also supplies the binary when the snapshot records none. Resolving
+    // "default" for a nested-profile snapshot would restore a vEL2 (NV2) guest on a
+    // Firecracker without NV2 support. Profiles that define no firecracker of their
+    // own (e.g. btrfs) were CREATED on the default profile's custom Firecracker
+    // (prepare_vm falls back to it), so the restore falls back the same way; a plain
+    // PATH `firecracker` would be a different binary than the one that created the
+    // snapshot.
+    let profile_name = kernel_profile.unwrap_or("default");
+    let Some(profile) = get_profile(profile_name)? else {
+        anyhow::ensure!(
+            requested,
+            "snapshot kernel profile '{}' is not configured; refusing to restore with a different Firecracker",
+            profile_name
+        );
+        warn!(
+            profile = %profile_name,
+            "the snapshot's kernel profile is not configured; restoring on the requested \
+             Firecracker without the profile's arguments"
+        );
+        return Ok((config, choice));
+    };
+    if config.firecracker_args.is_none() {
+        config.firecracker_args = profile.firecracker_args.clone();
     }
 
-    Ok(config)
+    let configured_profile = if profile.firecracker_repo.is_some()
+        || profile.firecracker_commit.is_some()
+    {
+        Some((profile, profile_name.to_string()))
+    } else if profile_name != "default" {
+        match get_profile("default")? {
+            Some(default_profile) => {
+                if config.firecracker_args.is_none() {
+                    config.firecracker_args = default_profile.firecracker_args.clone();
+                }
+                (default_profile.firecracker_repo.is_some()
+                    || default_profile.firecracker_commit.is_some())
+                .then(|| (default_profile, "default".to_string()))
+            }
+            None => {
+                anyhow::ensure!(
+                    requested,
+                    "default kernel profile is not configured; refusing to restore snapshot profile '{}' through PATH Firecracker",
+                    profile_name
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // An explicit binary is never resolved from the profile.
+    if choice == FirecrackerChoice::Recorded {
+        config.firecracker_bin = recorded_firecracker.map(Path::to_path_buf);
+    } else if let Some((configured_profile, configured_name)) =
+        configured_profile.filter(|_| !requested)
+    {
+        config.firecracker_bin = Some(
+            resolve(configured_profile, configured_name.clone())
+                .await?
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "profile '{}' configures Firecracker but resolved no binary",
+                        configured_name
+                    )
+                })?,
+        );
+    }
+
+    Ok((config, choice))
 }
 
 /// Wait for the restored guest's output channel, which is the final fc-agent
@@ -645,6 +695,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
 
     let extra_disk_configs = super::common::extra_disks_to_snapshot(&vm_state);
 
+    // The VM's Firecracker process, found through its API socket, so the snapshot
+    // records the executable it runs even when the VM's state names none.
+    let firecracker_pid = super::common::api_socket_peer_pid(&socket_path).await;
+
     // Build snapshot config from VmState (single source of truth)
     let mut snapshot_config = super::common::build_snapshot_config(
         &vm_state,
@@ -653,6 +707,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         &snapshot_dir,
         volume_configs,
         extra_disk_configs,
+        firecracker_pid,
     )?;
     if args.disk_only {
         snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
@@ -856,6 +911,24 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
             "snapshot is disk-only (no memory image); `{command}` needs a full \
              snapshot. Disk-only snapshots are cold-booted, not resumed (cold-boot \
              support is in progress)."
+        );
+    }
+    Ok(())
+}
+
+/// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
+/// path fails loud instead of silently dropping them.
+fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
+    if args.exec.is_some() {
+        bail!("--exec is not supported for disk-only clones yet (cold boot has no one-shot exec mode)");
+    }
+    if args.no_swap {
+        bail!("--no-swap is not supported for disk-only clones yet");
+    }
+    if args.firecracker_bin.is_some() {
+        bail!(
+            "--firecracker-bin does not apply to disk-only snapshots: they cold-boot on the \
+             kernel profile's Firecracker"
         );
     }
     Ok(())
@@ -1416,9 +1489,12 @@ async fn cmd_snapshot_run_inner(
     // state) and relaunches through here. No pre-restore exec session can
     // reference this state file, so restore needs no vsock-epoch bump.
     let vm_id = generate_vm_id();
-    let runtime_config =
-        snapshot_restore_runtime_config(&args, snapshot_config.metadata.kernel_profile.as_deref())
-            .await?;
+    let (runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
+        &args,
+        snapshot_config.metadata.kernel_profile.as_deref(),
+        snapshot_config.metadata.firecracker_bin.as_deref(),
+    )
+    .await?;
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])
@@ -2157,6 +2233,7 @@ async fn cmd_snapshot_run_inner(
         restore_epoch: &restore_epoch,
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
         track_dirty_pages: needs_dirty_tracking,
+        firecracker_choice,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
@@ -3314,13 +3391,7 @@ async fn cmd_snapshot_run_disk_only(
     let cancel = lifecycle_gate.cancellation_token();
     let meta = &snapshot_config.metadata;
 
-    // Flags the cold-boot path doesn't implement yet: fail loud, never silently drop.
-    if args.exec.is_some() {
-        bail!("--exec is not supported for disk-only clones yet (cold boot has no one-shot exec mode)");
-    }
-    if args.no_swap {
-        bail!("--no-swap is not supported for disk-only clones yet");
-    }
+    ensure_disk_only_run_supports(&args)?;
 
     // Extra disks aren't reflinked/attached on the cold-boot path yet. Fail loud
     // rather than silently booting a clone missing its data disks.
@@ -3505,6 +3576,7 @@ mod tests {
             image_disk_path: Some(std::path::PathBuf::from("/cache/img.storage-v2.img")),
             image_disk_identity: None,
             hypervisor: Default::default(),
+            firecracker_bin: None,
         };
         let args =
             run_args_from_snapshot_metadata(&meta, "clone".to_string(), 2, 1024, false, None);
@@ -3588,6 +3660,7 @@ mod tests {
             image_disk_path: None,
             image_disk_identity: None,
             hypervisor: crate::hypervisor::Backend::CloudHypervisor,
+            firecracker_bin: None,
         };
         let args = run_args_from_snapshot_metadata(&base, "c".to_string(), 1, 512, false, None);
         assert_eq!(
@@ -3613,6 +3686,30 @@ mod tests {
         );
         // ...but full snapshots pass through unchanged.
         assert!(ensure_not_disk_only(SnapshotKind::Full, "snapshot serve").is_ok());
+    }
+
+    #[test]
+    fn a_disk_only_run_still_refuses_no_swap() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        assert!(ensure_disk_only_run_supports(&args).is_ok());
+        args.no_swap = true;
+        assert!(ensure_disk_only_run_supports(&args).is_err());
+    }
+
+    /// A disk-only snapshot has no memory image to restore: it cold-boots on its
+    /// kernel profile's Firecracker, so an explicit binary would be silently dropped.
+    #[test]
+    fn a_disk_only_run_refuses_an_explicit_firecracker_bin() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let error = ensure_disk_only_run_supports(&args)
+            .expect_err("a disk-only run must refuse --firecracker-bin");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--firecracker-bin does not apply")
+                && message.contains("cold-boot on the kernel profile's Firecracker"),
+            "{message}"
+        );
     }
 
     #[test]
@@ -3677,9 +3774,21 @@ mod tests {
             vsock_dir: None,
         };
 
-        let runtime = snapshot_restore_runtime_config(&args, Some("nested"))
-            .await
-            .unwrap();
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &args,
+            Some("nested"),
+            None,
+            |_name| {
+                Ok(Some(crate::setup::KernelProfile {
+                    firecracker_args: Some("--from-the-profile".to_string()),
+                    ..profile_with_a_newer_firecracker()
+                }))
+            },
+            |_profile, _name| async { panic!("an explicit binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(choice, FirecrackerChoice::Requested);
         assert_eq!(
             runtime.firecracker_bin,
             Some(PathBuf::from("/opt/firecracker-profile"))
@@ -3712,6 +3821,7 @@ mod tests {
         let error = snapshot_restore_runtime_config_with(
             &args,
             None,
+            None,
             |_name| Ok(None),
             |_profile, _name| async { panic!("missing profiles must not be resolved") },
         )
@@ -3726,6 +3836,7 @@ mod tests {
         let error = snapshot_restore_runtime_config_with(
             &args,
             Some("btrfs"),
+            None,
             |name| match name {
                 "btrfs" => Ok(Some(crate::setup::KernelProfile::default())),
                 "default" => Ok(None),
@@ -3749,6 +3860,7 @@ mod tests {
         let error = snapshot_restore_runtime_config_with(
             &args,
             Some("nested"),
+            None,
             move |name| {
                 assert_eq!(name, "nested");
                 Ok(Some(profile.clone()))
@@ -3761,6 +3873,144 @@ mod tests {
             format!("{error:#}").contains("missing exact configured Firecracker artifact"),
             "{error:#}"
         );
+    }
+
+    /// A profile whose Firecracker resolves to a different binary than the one a
+    /// snapshot recorded: the state after rootfs-config.toml's [firecracker]
+    /// section moves to a new build.
+    fn profile_with_a_newer_firecracker() -> crate::setup::KernelProfile {
+        crate::setup::KernelProfile {
+            firecracker_repo: Some("ejc3/firecracker".to_string()),
+            firecracker_branch: Some("newer-build".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn restore_runs_on_the_binary_the_snapshot_recorded() {
+        let recorded = tempfile::NamedTempFile::new().unwrap();
+        let resolved = std::sync::atomic::AtomicUsize::new(0);
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &snapshot_runtime_args_without_overrides(),
+            None,
+            Some(recorded.path()),
+            |name| {
+                assert_eq!(name, "default");
+                Ok(Some(profile_with_a_newer_firecracker()))
+            },
+            |_profile, _name| {
+                resolved.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async { Ok(Some(PathBuf::from("/fc/firecracker-default-newer.bin"))) }
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(runtime.firecracker_bin.as_deref(), Some(recorded.path()));
+        assert_eq!(choice, FirecrackerChoice::Recorded);
+        assert_eq!(
+            resolved.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "a recorded binary must not be resolved from the profile"
+        );
+    }
+
+    #[tokio::test]
+    async fn restore_resolves_the_profile_binary_when_the_recorded_one_is_gone() {
+        let gone = PathBuf::from("/nonexistent/firecracker-default-older.bin");
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &snapshot_runtime_args_without_overrides(),
+            None,
+            Some(&gone),
+            |_name| Ok(Some(profile_with_a_newer_firecracker())),
+            |_profile, _name| async {
+                Ok(Some(PathBuf::from("/fc/firecracker-default-newer.bin")))
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.firecracker_bin,
+            Some(PathBuf::from("/fc/firecracker-default-newer.bin"))
+        );
+        assert_eq!(choice, FirecrackerChoice::RecordedMissing(gone));
+    }
+
+    #[tokio::test]
+    async fn explicit_firecracker_bin_wins_over_the_recorded_binary() {
+        let recorded = tempfile::NamedTempFile::new().unwrap();
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &args,
+            None,
+            Some(recorded.path()),
+            |_name| Ok(Some(profile_with_a_newer_firecracker())),
+            |_profile, _name| async { panic!("an explicit binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            runtime.firecracker_bin,
+            Some(PathBuf::from("/opt/firecracker-under-review"))
+        );
+        assert_eq!(choice, FirecrackerChoice::Requested);
+    }
+
+    /// `--firecracker-bin` replaces only the binary. SnapshotRunArgs.firecracker_args
+    /// has no CLI flag, so the snapshot's kernel profile is the only source of the
+    /// args a nested snapshot needs, such as --enable-nv2.
+    #[tokio::test]
+    async fn explicit_firecracker_bin_keeps_the_profile_firecracker_args() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &args,
+            Some("nested"),
+            None,
+            |name| {
+                assert_eq!(name, "nested");
+                Ok(Some(crate::setup::KernelProfile {
+                    firecracker_args: Some("--enable-nv2".to_string()),
+                    ..profile_with_a_newer_firecracker()
+                }))
+            },
+            |_profile, _name| async { panic!("an explicit binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(choice, FirecrackerChoice::Requested);
+        assert_eq!(
+            runtime.firecracker_bin,
+            Some(PathBuf::from("/opt/firecracker-under-review"))
+        );
+        assert_eq!(
+            runtime.firecracker_args.as_deref(),
+            Some("--enable-nv2"),
+            "--firecracker-bin must keep the snapshot profile's Firecracker args"
+        );
+    }
+
+    /// An explicit binary never needed a configured profile, and still does not;
+    /// the restore then runs with the args the caller passed.
+    #[tokio::test]
+    async fn explicit_firecracker_bin_restores_without_a_configured_profile() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.firecracker_bin = Some("/opt/firecracker-under-review".to_string());
+        let (runtime, choice) = snapshot_restore_runtime_config_with(
+            &args,
+            Some("nested"),
+            None,
+            |_name| Ok(None),
+            |_profile, _name| async { panic!("an explicit binary must not be resolved") },
+        )
+        .await
+        .unwrap();
+        assert_eq!(choice, FirecrackerChoice::Requested);
+        assert_eq!(
+            runtime.firecracker_bin,
+            Some(PathBuf::from("/opt/firecracker-under-review"))
+        );
+        assert_eq!(runtime.firecracker_args, None);
     }
 
     #[tokio::test]
