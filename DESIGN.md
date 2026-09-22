@@ -1518,7 +1518,7 @@ fcvm snapshot run --snapshot <NAME> [OPTIONS]
 **Options**:
 ```
 --pid <SERVE_PID>         Memory server PID (UFFD lazy-restore mode)
---snapshot <NAME>         Snapshot name (direct file mode, no server needed)
+--snapshot <NAME>         Snapshot name (no serve process needed)
                           (Either --pid or --snapshot is required; mutually exclusive)
 --name <NAME>             Clone VM name (auto-generated if not provided)
 --exec <CMD>              Execute command in container after clone is healthy

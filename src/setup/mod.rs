@@ -186,7 +186,8 @@ pub use kernel::{
 };
 pub use pasta::{ensure_pasta, get_pasta_for_config};
 pub use rootfs::{
-    ensure_fc_agent_initrd, ensure_rootfs, get_kernel_profile, resolve_rootfs_type, KernelProfile,
+    ensure_fc_agent_initrd, ensure_rootfs, firecracker_args_enable_nv2, get_kernel_profile,
+    resolve_rootfs_type, KernelProfile,
 };
 pub use storage::ensure_storage;
 

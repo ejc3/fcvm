@@ -1569,10 +1569,7 @@ async fn run_vm_setup_inner(
     // Firecracker extra args (e.g. --enable-nv2 from the kernel profile, or
     // FCVM_FIRECRACKER_ARGS) are Firecracker-specific; Cloud Hypervisor ignores them.
     let vmm_extra_args: Option<String> = match backend {
-        Backend::Firecracker => runtime_config
-            .firecracker_args
-            .clone()
-            .or_else(|| std::env::var("FCVM_FIRECRACKER_ARGS").ok()),
+        Backend::Firecracker => runtime_config.effective_firecracker_args(),
         Backend::CloudHypervisor => None,
     };
 

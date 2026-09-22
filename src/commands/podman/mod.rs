@@ -682,7 +682,6 @@ fn publish_prepared_snapshot(prepared: &PreparedSnapshot) -> Result<()> {
     Ok(())
 }
 
-/// Best-effort removal of host state persisted during a failed `prepare_vm`.
 /// True when the VM's kernel profile enables ARM64 NV2 nested virtualization
 /// (the profile's firecracker_args carry --enable-nv2). Drives the
 /// miss-path-converges-on-restore behavior, which exists for NV2 guests only.
@@ -692,10 +691,7 @@ fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     };
     matches!(
         crate::setup::get_kernel_profile(name),
-        Ok(Some(profile)) if profile
-            .firecracker_args
-            .as_deref()
-            .is_some_and(|args| args.contains("--enable-nv2"))
+        Ok(Some(profile)) if profile.enables_nv2()
     )
 }
 
@@ -758,6 +754,7 @@ async fn invalidate_unusable_snapshot(
     }
 }
 
+/// Best-effort removal of host state persisted during a failed `prepare_vm`.
 ///
 /// `prepare_vm` creates the per-VM data directory and (for rootless and routed modes
 /// with published ports) persists the VM state file with an allocated loopback IP

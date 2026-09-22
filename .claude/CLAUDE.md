@@ -1159,6 +1159,18 @@ create+resume stormed 3/3 under load; restore was clean 12/12. Fix: the snapshot
 CONVERGES on the restore path — create the pre-start snapshot, tear the throwaway VM down,
 and relaunch by restoring it. Snapshot hit and miss now run the exact same flow.
 
+**Copy-on-write on the File backend (2026-09).** In CI's arm64 SnapshotEnabled lane
+`test_nested_run_fcvm_inside_vm` took 470 to 708 s, against 22 s in the SnapshotDisabled lane
+on the same heads. The only difference is that the SnapshotEnabled L1 is restored from its
+pre-start snapshot, and that restore used Firecracker's File backend. File maps memory.bin
+MAP_PRIVATE, so L1's first write to each page is a host copy-on-write. On arm64 the
+MMU-notifier invalidate for that copy reaches `kvm_unmap_gfn_range`, which calls
+`kvm_nested_s2_unmap` and unmaps every nested stage-2 MMU over its whole range, so each first
+write by L1 discards all of L2's translations. NV2 restores therefore page in through an
+implicit UFFD copy server (`direct_restore_memory` in `src/commands/snapshot.rs`), which fills
+anonymous memory that later writes do not copy. The chain is from reading
+arch/arm64/kvm/mmu.c and nested.c; it has not been traced on hardware.
+
 **Debugging these**: guest `dd if=/dev/zero of=/dev/null` per-CPU (healthy ≈ 19 GB/s on
 Graviton3; storms read 0.07-0.3 GB/s), host `ftrace` on `kvm:kvm_timer_emulate`, per-thread
 CPU of the firecracker process (`/proc/<fc>/task/*/stat` field 14+15), and the fork's
@@ -2481,7 +2493,9 @@ fcvm snapshot run --pid <serve_pid> --name clone1
   set materializes (faulted pages are per-VM copies, #632)
 - File-backend restores (`snapshot run --snapshot`): clones genuinely share
   clean pages via the page cache (MAP_PRIVATE) — measured 3x 1GiB clones
-  ≈ 230MiB total PSS, with or without dirty tracking (#632)
+  ≈ 230MiB total PSS, with or without dirty tracking (#632). Hugepage and NV2
+  snapshots never take this path: `snapshot run --snapshot` restores them through
+  an implicit UFFD server (`direct_restore_memory`)
 
 ### Working-Set Replay (`--uffd-prefetch`, default on)
 
