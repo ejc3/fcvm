@@ -112,10 +112,6 @@ fn entry_is_from(snapshots: &Path, entry: &str, vm_id: &str) -> bool {
 /// The vm_id fcvm assigned the VM running as `pid`, read with `fcvm ls` while the
 /// VM is up. A snapshot records the vm_id of the VM it was taken from.
 async fn vm_id_of(pid: u32) -> Result<String> {
-    #[derive(serde::Deserialize)]
-    struct Listed {
-        vm_id: String,
-    }
     let fcvm = common::find_fcvm_binary()?;
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
@@ -125,8 +121,8 @@ async fn vm_id_of(pid: u32) -> Result<String> {
             .await?;
         if output.status.success() {
             if let Ok(listed) = serde_json::from_slice::<Vec<Listed>>(&output.stdout) {
-                if let Some(vm) = listed.into_iter().next() {
-                    return Ok(vm.vm_id);
+                if let Some(vm_id) = listed_vm_for(listed, fcvm::utils::process_start_time(pid))? {
+                    return Ok(vm_id);
                 }
             }
         }
@@ -138,25 +134,101 @@ async fn vm_id_of(pid: u32) -> Result<String> {
     }
 }
 
+/// One record of `fcvm ls --json --pid`, trimmed to what `vm_id_of` reads.
+#[derive(serde::Deserialize)]
+struct Listed {
+    vm_id: String,
+    pid_start_time: Option<u64>,
+}
+
+/// The record that belongs to the live process. `fcvm ls --pid` compares only the
+/// numeric PID, so a stale record whose PID was reused lists alongside the live one.
+/// The start time the state file recorded tells them apart.
+fn listed_vm_for(listed: Vec<Listed>, start_time: Option<u64>) -> Result<Option<String>> {
+    let mut live: Vec<String> = listed
+        .into_iter()
+        .filter(|vm| start_time.is_some() && vm.pid_start_time == start_time)
+        .map(|vm| vm.vm_id)
+        .collect();
+    anyhow::ensure!(
+        live.len() <= 1,
+        "fcvm ls lists {} VMs for one live process: {live:?}",
+        live.len()
+    );
+    Ok(live.pop())
+}
+
 /// Waits for the fcvm process of a VM whose container only runs `echo`. The guest
 /// powers itself off once the command exits, so fcvm has to exit on its own with
 /// the container's status. Tests that discarded this wait passed after 245 to 309 s,
 /// or failed later on an unrelated assertion, when a guest never finished shutting
 /// down.
 async fn wait_for_short_lived_vm(child: &mut tokio::process::Child, vm_name: &str) -> Result<()> {
-    const LIMIT: Duration = Duration::from_secs(120);
-    let status = tokio::time::timeout(LIMIT, child.wait())
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
+    wait_for_short_lived_vm_within(child, vm_name, Duration::from_secs(120)).await
+}
+
+/// `wait_for_short_lived_vm` with an explicit limit. When it gives up it kills and
+/// reaps fcvm, because the spawned child is not kill_on_drop and a hung VM would
+/// otherwise outlive the test.
+async fn wait_for_short_lived_vm_within(
+    child: &mut tokio::process::Child,
+    vm_name: &str,
+    limit: Duration,
+) -> Result<()> {
+    let status = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(waited) => waited.context("waiting for fcvm")?,
+        Err(_) => {
+            let _ = child.kill().await;
+            anyhow::bail!(
                 "fcvm for {vm_name} did not exit within {}s of starting a container that only \
                  runs echo, so the guest never finished shutting down; its console is in the \
                  VM's debug log under /tmp/fcvm-test-logs",
-                LIMIT.as_secs()
-            )
-        })?
-        .context("waiting for fcvm")?;
+                limit.as_secs()
+            );
+        }
+    };
     anyhow::ensure!(status.success(), "fcvm for {vm_name} exited with {status}");
+    Ok(())
+}
+
+/// `fcvm ls --pid` lists a stale record whose PID was reused alongside the live one.
+#[test]
+fn vm_id_lookup_skips_a_stale_record_with_a_reused_pid() -> Result<()> {
+    let listed = vec![
+        Listed {
+            vm_id: "vm-stale".into(),
+            pid_start_time: Some(100),
+        },
+        Listed {
+            vm_id: "vm-live".into(),
+            pid_start_time: Some(200),
+        },
+    ];
+    assert_eq!(
+        listed_vm_for(listed, Some(200))?.as_deref(),
+        Some("vm-live")
+    );
+    Ok(())
+}
+
+/// A VM that never exits is killed and reaped when the wait gives up.
+#[tokio::test]
+async fn a_short_lived_vm_that_never_exits_is_killed_when_the_wait_gives_up() -> Result<()> {
+    let mut child = tokio::process::Command::new("sleep").arg("30").spawn()?;
+    let waited =
+        wait_for_short_lived_vm_within(&mut child, "sleeper", Duration::from_secs(1)).await;
+    assert!(
+        waited.is_err(),
+        "the wait should give up on a process that never exits"
+    );
+    let exited = child.try_wait()?;
+    if exited.is_none() {
+        child.kill().await.ok();
+    }
+    assert!(
+        exited.is_some(),
+        "the wait gave up and left the process running"
+    );
     Ok(())
 }
 
