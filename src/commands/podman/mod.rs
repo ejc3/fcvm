@@ -1996,14 +1996,45 @@ pub(crate) async fn wait_for_reboot_decision(
     reboot_requested.load(Ordering::Acquire)
 }
 
+/// How long the guest gets to power off after the container's exit status reached fcvm.
+///
+/// fc-agent sends the exit status and then calls `poweroff -f` (arm64) or `reboot -f` (x86); a
+/// healthy guest takes well under a second from there (#990). A guest that wedges in shutdown used
+/// to leave `fcvm podman run` waiting on Firecracker forever (#998). The bound is generous
+/// because Firecracker also has to unmap a multi-GiB guest before the process exits.
+const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Resolves `deadline` after `container_exit_seen` turns true; never resolves while it is false.
+async fn poweroff_deadline_expired(
+    container_exit_seen: &std::sync::atomic::AtomicBool,
+    deadline: std::time::Duration,
+) {
+    while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    tokio::time::sleep(deadline).await;
+}
+
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
 /// Returns the container exit code (None if cancelled/signalled).
 pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
+    let mut poweroff_deadline_hit = false;
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 info!("cancellation requested, shutting down VM");
                 return Ok(None);
+            }
+            // The container has exited and the guest has not powered off in time. Kill the VMM;
+            // the arm below then wakes as for any exit and reports the status fcvm already has.
+            _ = poweroff_deadline_expired(&ctx.container_exit_seen, GUEST_POWEROFF_DEADLINE), if !poweroff_deadline_hit => {
+                poweroff_deadline_hit = true;
+                warn!(
+                    deadline_s = GUEST_POWEROFF_DEADLINE.as_secs(),
+                    log = %ctx.data_dir.join("firecracker.log").display(),
+                    "the guest did not power off after the container exited; killing the VMM and reporting the container's exit code"
+                );
+                ctx.vm_manager.start_kill().context("killing a VMM whose guest did not power off")?;
             }
             status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "Firecracker child exited");
@@ -3966,5 +3997,50 @@ mod image_disk_identity_classifier_tests {
         assert!(super::is_snapshot_load_failure(&err));
         let unrelated = anyhow::anyhow!("some other failure");
         assert!(!super::is_snapshot_load_failure(&unrelated));
+    }
+}
+
+#[cfg(test)]
+mod poweroff_deadline_tests {
+    use super::{poweroff_deadline_expired, GUEST_POWEROFF_DEADLINE};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Nothing ends the wait while the container is still running, however long that takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_container_never_expires_the_deadline() {
+        let seen = AtomicBool::new(false);
+        let expired = tokio::time::timeout(
+            Duration::from_secs(86_400),
+            poweroff_deadline_expired(&seen, GUEST_POWEROFF_DEADLINE),
+        )
+        .await;
+        assert!(
+            expired.is_err(),
+            "the deadline expired with no container exit"
+        );
+    }
+
+    /// The deadline is measured from the container's exit, not from the start of the loop.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_runs_from_the_container_exit() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let setter = seen.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            setter.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        poweroff_deadline_expired(&seen, GUEST_POWEROFF_DEADLINE).await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_secs(600) + GUEST_POWEROFF_DEADLINE,
+            "expired {waited:?} after the loop started, before the exit plus the deadline"
+        );
+        assert!(
+            waited < Duration::from_secs(600) + GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            "expired {waited:?} after the loop started, long after the exit plus the deadline"
+        );
     }
 }
