@@ -1380,3 +1380,34 @@ fn targets_that_run_fcvm_setup_mount_the_assets_store_first() {
         );
     }
 }
+
+/// `setup-btrfs` must hand /mnt/fcvm-btrfs itself to the invoking user when the directory already
+/// sits on btrfs. A root `fcvm setup` can have created it as root:root, and the recipe then runs
+/// `mkdir -p /mnt/fcvm-btrfs/{state,snapshots,vm-disks,tmp}` unprivileged, which failed with
+/// "Permission denied" on devvm9796 (#1000). Only the top-level directory: state/, snapshots/ and
+/// vm-disks/ legitimately hold root-owned entries from root-mode runs.
+#[test]
+fn setup_btrfs_hands_an_existing_assets_directory_to_the_invoking_user() {
+    let makefile = repo_file("Makefile");
+    let recipe: Vec<&str> = makefile
+        .lines()
+        .skip_while(|l| !l.starts_with("setup-btrfs:"))
+        .skip(1)
+        .take_while(|l| l.starts_with('\t'))
+        .collect();
+    assert!(!recipe.is_empty(), "no setup-btrfs recipe found");
+    let recipe = recipe.join("\n");
+    let branch = recipe
+        .split("elif")
+        .next()
+        .expect("split always yields a first piece");
+    assert!(
+        branch.contains("already on btrfs") && branch.contains("sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs"),
+        "the branch for an existing btrfs /mnt/fcvm-btrfs never chowns the directory, so a root:root \
+         one stays unwritable for the unprivileged mkdir below it: {branch}"
+    );
+    assert!(
+        !branch.contains("chown -R"),
+        "the existing-directory branch must not chown recursively: {branch}"
+    );
+}
