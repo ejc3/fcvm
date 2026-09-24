@@ -2029,7 +2029,24 @@ struct PoweroffWatchdog {
     /// next poll would begin late, and one held in the future `expired` returns would restart each
     /// time another select arm wins.
     deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+    deadline_after_exit: std::time::Duration,
     tracker: tokio::task::JoinHandle<()>,
+}
+
+/// Waits for the container's exit flag, stamps the deadline once, and ends. `rearm` starts a new one
+/// for a relaunched guest, so nothing depends on observing the flag go false in between.
+fn spawn_deadline_tracker(
+    container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    deadline_after_exit: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        *deadline.lock().unwrap() = Some(tokio::time::Instant::now() + deadline_after_exit);
+    })
 }
 
 impl PoweroffWatchdog {
@@ -2037,29 +2054,17 @@ impl PoweroffWatchdog {
         container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
         deadline_after_exit: std::time::Duration,
     ) -> Self {
-        use std::sync::atomic::Ordering;
         let deadline = Arc::new(std::sync::Mutex::new(None));
-        let stamped = deadline.clone();
-        let poll = std::time::Duration::from_millis(100);
-        let tracker = tokio::spawn(async move {
-            loop {
-                while !container_exit_seen.load(Ordering::Acquire) {
-                    tokio::time::sleep(poll).await;
-                }
-                stamped
-                    .lock()
-                    .unwrap()
-                    .get_or_insert_with(|| tokio::time::Instant::now() + deadline_after_exit);
-                // The loop clears the flag when it relaunches a rebooted guest.
-                while container_exit_seen.load(Ordering::Acquire) {
-                    tokio::time::sleep(poll).await;
-                }
-                *stamped.lock().unwrap() = None;
-            }
-        });
+        let tracker = spawn_deadline_tracker(
+            container_exit_seen.clone(),
+            deadline.clone(),
+            deadline_after_exit,
+        );
         Self {
             fired: false,
             deadline,
+            container_exit_seen,
+            deadline_after_exit,
             tracker,
         }
     }
@@ -2085,10 +2090,17 @@ impl PoweroffWatchdog {
         vmm.start_kill()
     }
 
-    /// A rebooted guest was relaunched: watch its next power-off too.
+    /// A rebooted guest was relaunched: watch its next power-off too. The old tracker is replaced,
+    /// so a replacement container that exits before anything polls is still timed.
     fn rearm(&mut self) {
+        self.tracker.abort();
         self.fired = false;
         *self.deadline.lock().unwrap() = None;
+        self.tracker = spawn_deadline_tracker(
+            self.container_exit_seen.clone(),
+            self.deadline.clone(),
+            self.deadline_after_exit,
+        );
     }
 }
 
@@ -4215,6 +4227,31 @@ mod poweroff_deadline_tests {
         assert!(
             waited <= Duration::from_secs(1),
             "the countdown began when the loop next asked: waited another {waited:?} after a 100 s handler"
+        );
+    }
+
+    /// A relaunched guest's replacement container can exit before any poll sees the exit flag go
+    /// false; the loop's clear-then-rearm must not depend on being observed (Codex on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn a_rearm_does_not_depend_on_anyone_seeing_the_flag_clear() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        let mut vmm = FakeVmm::default();
+        watchdog.expired().await;
+        watchdog.fire(&mut vmm).unwrap();
+        // The loop stores false and the new container's exit stores true again, all inside one
+        // 100 ms poll: nothing ever observes false.
+        seen.store(false, Ordering::Release);
+        watchdog.rearm();
+        seen.store(true, Ordering::Release);
+        let second = tokio::time::timeout(
+            GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            watchdog.expired(),
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "the watchdog never re-stamped a deadline for the new guest"
         );
     }
 
