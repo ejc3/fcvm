@@ -2898,9 +2898,15 @@ async fn cmd_snapshot_run_inner(
                         log = %data_dir.join("firecracker.log").display(),
                         "the guest did not power off after the container exited; killing the VMM"
                     );
-                    watchdog
-                        .fire(vm_manager.as_mut())
-                        .context("killing a VMM whose guest did not power off")?;
+                    if let Err(error) = watchdog.fire(vm_manager.as_mut()) {
+                        // Through the common cleanup below, not a `?` past it: the VMM may still
+                        // be alive, and the holder, network helpers and state file are ours to remove.
+                        clone_failure = Some(format!(
+                            "its guest did not power off after the container exited, and fcvm \
+                             could not kill the VMM: {error:#}"
+                        ));
+                        break;
+                    }
                     watchdog_killed = true;
                 }
                 // `serve_watch` is None for file-backed restores, so this branch is
@@ -4600,7 +4606,10 @@ mod watchdog_exit_classification_tests {
         let start = source
             .find("let mut watchdog = super::podman::PoweroffWatchdog::new(")
             .expect("no watchdog");
-        let body = &source[start..start + 12_000];
+        let end = source[start..]
+            .find("fn clone_failure_after_vmm_exit")
+            .expect("classifier not found after the loop");
+        let body = &source[start..start + end];
         assert!(body.contains("watchdog.expired()"), "no watchdog arm");
         assert!(
             body.contains(".fire(vm_manager.as_mut())"),
@@ -4613,6 +4622,29 @@ mod watchdog_exit_classification_tests {
         assert!(
             body.contains("watchdog.rearm();\n                        watchdog_killed = false;"),
             "relaunch does not rearm"
+        );
+    }
+
+    /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
+    /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
+    #[test]
+    fn a_failed_watchdog_kill_goes_through_cleanup() {
+        let source = include_str!("snapshot.rs");
+        let arm_start = source
+            .find("_ = watchdog.expired() => {")
+            .expect("no watchdog arm");
+        let arm = &source[arm_start
+            ..arm_start
+                + source[arm_start..]
+                    .find("watchdog_killed = true;")
+                    .expect("arm never marks the kill")];
+        assert!(
+            !arm.contains("?;"),
+            "the watchdog arm returns past cleanup with `?`: {arm}"
+        );
+        assert!(
+            arm.contains("clone_failure = Some("),
+            "a failed kill is not recorded as the clone's failure: {arm}"
         );
     }
 
