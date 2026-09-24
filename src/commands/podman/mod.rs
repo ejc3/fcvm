@@ -2002,6 +2002,10 @@ pub(crate) async fn wait_for_reboot_decision(
 /// healthy guest takes well under a second from there (#990). A guest that wedges in shutdown used
 /// to leave `fcvm podman run` waiting on Firecracker forever (#998). The bound is generous
 /// because Firecracker also has to unmap a multi-GiB guest before the process exits.
+///
+/// The countdown starts when the run loop first observes the container's exit, so time the loop
+/// spends inside a startup-snapshot operation (bounded, with its own cancel handling) is not
+/// counted against the guest.
 const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Something the power-off watchdog can kill; the run loop's VMM is one.
