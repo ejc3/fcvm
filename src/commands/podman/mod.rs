@@ -2003,9 +2003,8 @@ pub(crate) async fn wait_for_reboot_decision(
 /// to leave `fcvm podman run` waiting on Firecracker forever (#998). The bound is generous
 /// because Firecracker also has to unmap a multi-GiB guest before the process exits.
 ///
-/// The countdown starts when the run loop first observes the container's exit, so time the loop
-/// spends inside a startup-snapshot operation (bounded, with its own cancel handling) is not
-/// counted against the guest.
+/// The countdown starts within 100 ms of the container's exit even while the run loop is busy in
+/// another arm's handler, such as a startup snapshot that takes minutes.
 const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Something the power-off watchdog can kill; the run loop's VMM is one.
@@ -2024,42 +2023,60 @@ impl Killable for dyn crate::hypervisor::Hypervisor {
 /// rebooted guest, whose container_exit_seen flag the loop has cleared.
 struct PoweroffWatchdog {
     fired: bool,
-    /// When the container's exit was first seen, plus the deadline. Kept here, not in the future
-    /// `expired` returns, because the run loop drops that future each time another select arm
-    /// wins; a countdown held in it would restart and a busy loop could postpone the kill forever.
-    deadline: Option<tokio::time::Instant>,
+    /// When the guest must have powered off by: stamped by `tracker` within 100 ms of the container's
+    /// exit, whether or not the run loop is polling `expired` at that moment. The loop can spend
+    /// minutes inside another arm's handler (a startup snapshot), so a countdown started by the loop's
+    /// next poll would begin late, and one held in the future `expired` returns would restart each
+    /// time another select arm wins.
+    deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    tracker: tokio::task::JoinHandle<()>,
 }
 
 impl PoweroffWatchdog {
-    fn new() -> Self {
+    fn new(
+        container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+        deadline_after_exit: std::time::Duration,
+    ) -> Self {
+        use std::sync::atomic::Ordering;
+        let deadline = Arc::new(std::sync::Mutex::new(None));
+        let stamped = deadline.clone();
+        let poll = std::time::Duration::from_millis(100);
+        let tracker = tokio::spawn(async move {
+            loop {
+                while !container_exit_seen.load(Ordering::Acquire) {
+                    tokio::time::sleep(poll).await;
+                }
+                stamped
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(|| tokio::time::Instant::now() + deadline_after_exit);
+                // The loop clears the flag when it relaunches a rebooted guest.
+                while container_exit_seen.load(Ordering::Acquire) {
+                    tokio::time::sleep(poll).await;
+                }
+                *stamped.lock().unwrap() = None;
+            }
+        });
         Self {
             fired: false,
-            deadline: None,
+            deadline,
+            tracker,
         }
     }
 
-    /// Resolves once `deadline` has passed since `container_exit_seen` first turned true; never
-    /// resolves while the flag is false or once the watchdog has fired.
-    async fn expired(
-        &mut self,
-        container_exit_seen: &std::sync::atomic::AtomicBool,
-        deadline: std::time::Duration,
-    ) {
+    /// Resolves once the guest's deadline has passed; never resolves while the container is
+    /// running or once the watchdog has fired.
+    async fn expired(&mut self) {
         if self.fired {
             return std::future::pending().await;
         }
-        let at = match self.deadline {
-            Some(at) => at,
-            None => {
-                while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                let at = tokio::time::Instant::now() + deadline;
-                self.deadline = Some(at);
-                at
+        loop {
+            let at = *self.deadline.lock().unwrap();
+            match at {
+                Some(at) => return tokio::time::sleep_until(at).await,
+                None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
             }
-        };
-        tokio::time::sleep_until(at).await;
+        }
     }
 
     /// The deadline passed: kill the VMM. The run loop's wait arm then wakes as for any exit.
@@ -2071,14 +2088,21 @@ impl PoweroffWatchdog {
     /// A rebooted guest was relaunched: watch its next power-off too.
     fn rearm(&mut self) {
         self.fired = false;
-        self.deadline = None;
+        *self.deadline.lock().unwrap() = None;
+    }
+}
+
+impl Drop for PoweroffWatchdog {
+    fn drop(&mut self) {
+        self.tracker.abort();
     }
 }
 
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
 /// Returns the container exit code (None if cancelled/signalled).
 pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
-    let mut watchdog = PoweroffWatchdog::new();
+    let mut watchdog =
+        PoweroffWatchdog::new(ctx.container_exit_seen.clone(), GUEST_POWEROFF_DEADLINE);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
@@ -2087,7 +2111,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
             }
             // The container has exited and the guest has not powered off in time. Kill the VMM;
             // the arm below then wakes as for any exit and reports the status fcvm already has.
-            _ = watchdog.expired(&ctx.container_exit_seen, GUEST_POWEROFF_DEADLINE) => {
+            _ = watchdog.expired() => {
                 warn!(
                     deadline_s = GUEST_POWEROFF_DEADLINE.as_secs(),
                     log = %ctx.data_dir.join("firecracker.log").display(),
@@ -4084,10 +4108,10 @@ mod poweroff_deadline_tests {
     /// Nothing ends the wait while the container is still running, however long that takes.
     #[tokio::test(start_paused = true)]
     async fn a_running_container_never_expires_the_deadline() {
-        let seen = AtomicBool::new(false);
+        let seen = Arc::new(AtomicBool::new(false));
         let expired = tokio::time::timeout(
             Duration::from_secs(86_400),
-            PoweroffWatchdog::new().expired(&seen, GUEST_POWEROFF_DEADLINE),
+            PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE).expired(),
         )
         .await;
         assert!(
@@ -4106,8 +4130,8 @@ mod poweroff_deadline_tests {
             setter.store(true, Ordering::Release);
         });
         let start = tokio::time::Instant::now();
-        PoweroffWatchdog::new()
-            .expired(&seen, GUEST_POWEROFF_DEADLINE)
+        PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE)
+            .expired()
             .await;
         let waited = start.elapsed();
         assert!(
@@ -4123,32 +4147,33 @@ mod poweroff_deadline_tests {
     /// Firing kills the VMM once and disarms the watchdog until it is rearmed.
     #[tokio::test(start_paused = true)]
     async fn firing_kills_the_vmm_once_and_then_stays_quiet() {
-        let seen = AtomicBool::new(true);
-        let mut watchdog = PoweroffWatchdog::new();
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
         let mut vmm = FakeVmm::default();
-        watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE).await;
+        watchdog.expired().await;
         watchdog.fire(&mut vmm).unwrap();
         assert_eq!(vmm.kills, 1);
-        let again = tokio::time::timeout(
-            Duration::from_secs(86_400),
-            watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE),
-        )
-        .await;
+        let again = tokio::time::timeout(Duration::from_secs(86_400), watchdog.expired()).await;
         assert!(again.is_err(), "a fired watchdog expired a second time");
     }
 
     /// A rebooted guest is relaunched after the watchdog fired; its next hang must be caught too.
     #[tokio::test(start_paused = true)]
     async fn a_relaunched_guest_gets_a_fresh_deadline() {
-        let seen = AtomicBool::new(true);
-        let mut watchdog = PoweroffWatchdog::new();
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
         let mut vmm = FakeVmm::default();
-        watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE).await;
+        watchdog.expired().await;
         watchdog.fire(&mut vmm).unwrap();
+        // What the loop does when it relaunches a rebooted guest: clear the exit flag, rearm, and
+        // let the new guest's container exit again later.
+        seen.store(false, Ordering::Release);
         watchdog.rearm();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seen.store(true, Ordering::Release);
         let second = tokio::time::timeout(
             GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
-            watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE),
+            watchdog.expired(),
         )
         .await;
         assert!(second.is_ok(), "the watchdog stayed off after a relaunch");
@@ -4159,19 +4184,37 @@ mod poweroff_deadline_tests {
     /// time the loop came round (CodeRabbit on #1002).
     #[tokio::test(start_paused = true)]
     async fn a_competing_event_does_not_restart_the_countdown() {
-        let seen = AtomicBool::new(true);
-        let mut watchdog = PoweroffWatchdog::new();
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
         let start = tokio::time::Instant::now();
         // Another arm wins after 30 s, and the loop comes round again.
         tokio::select! {
-            _ = watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE) => panic!("expired before the deadline"),
+            _ = watchdog.expired() => panic!("expired before the deadline"),
             _ = tokio::time::sleep(Duration::from_secs(30)) => {}
         }
-        watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE).await;
+        watchdog.expired().await;
         let waited = start.elapsed();
         assert!(
             waited <= GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
             "the countdown restarted: expired {waited:?} after the exit, deadline {GUEST_POWEROFF_DEADLINE:?}"
+        );
+    }
+
+    /// The container can exit while the loop is inside another arm's handler (a startup snapshot
+    /// takes minutes), where nothing polls the watchdog. The countdown still runs from the exit,
+    /// not from the next time the loop asks (Codex on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_during_a_long_handler_still_counts_from_the_exit() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        // The loop is busy for 100 s and never polls the watchdog.
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let asked = tokio::time::Instant::now();
+        watchdog.expired().await;
+        let waited = asked.elapsed();
+        assert!(
+            waited <= Duration::from_secs(1),
+            "the countdown began when the loop next asked: waited another {waited:?} after a 100 s handler"
         );
     }
 
@@ -4182,9 +4225,10 @@ mod poweroff_deadline_tests {
         let source = include_str!("mod.rs");
         let body = &source[source.find("pub async fn run_vm_loop").unwrap()..];
         let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("watchdog.expired()"), "no watchdog arm");
         assert!(
-            body.contains("watchdog.expired(&ctx.container_exit_seen"),
-            "no watchdog arm"
+            body.contains("PoweroffWatchdog::new(ctx.container_exit_seen.clone()"),
+            "the watchdog does not track the loop's exit flag"
         );
         assert!(
             body.contains("watchdog\n                    .fire(ctx.vm_manager.as_mut())"),
