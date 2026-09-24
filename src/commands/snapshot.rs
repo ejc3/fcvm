@@ -2877,12 +2877,37 @@ async fn cmd_snapshot_run_inner(
             }
         }
 
+        // Bounds the wait for a guest that never powers off after its container exited (#998).
+        let mut watchdog = super::podman::PoweroffWatchdog::new(
+            container_exit_seen.clone(),
+            super::podman::GUEST_POWEROFF_DEADLINE,
+        );
+        let mut watchdog_killed = false;
         // Wait for cancellation, VM exit, memory-server death, or startup snapshot trigger
         while clone_failure.is_none() && lifecycle_ready_result.is_ok() && !lifecycle_cancelled {
             tokio::select! {
                 _ = cancel.cancelled() => {
                     container_exit_code = None;
                     break;
+                }
+                // The container has exited and the guest has not powered off in time. Kill the
+                // VMM; the wait arm below then wakes as for any exit, and the kill is not a failure.
+                _ = watchdog.expired() => {
+                    warn!(
+                        deadline_s = super::podman::GUEST_POWEROFF_DEADLINE.as_secs(),
+                        log = %data_dir.join("firecracker.log").display(),
+                        "the guest did not power off after the container exited; killing the VMM"
+                    );
+                    if let Err(error) = watchdog.fire(vm_manager.as_mut()) {
+                        // Through the common cleanup below, not a `?` past it: the VMM may still
+                        // be alive, and the holder, network helpers and state file are ours to remove.
+                        clone_failure = Some(format!(
+                            "its guest did not power off after the container exited, and fcvm \
+                             could not kill the VMM: {error:#}"
+                        ));
+                        break;
+                    }
+                    watchdog_killed = true;
                 }
                 // `serve_watch` is None for file-backed restores, so this branch is
                 // disabled entirely there rather than firing on a dummy future.
@@ -2933,6 +2958,8 @@ async fn cmd_snapshot_run_inner(
                         reboot_requested.store(false, std::sync::atomic::Ordering::Release);
                         // Clear racing pre-reboot exit signal/files (fresh lifecycle).
                         container_exit_seen.store(false, std::sync::atomic::Ordering::Release);
+                        watchdog.rearm();
+                        watchdog_killed = false;
                         let _ = std::fs::remove_file(data_dir.join("container-exit"));
                         let _ = std::fs::remove_file(data_dir.join("container-ready"));
                         // The relaunched fc-agent cold-boots and re-sends cache-ready.
@@ -3045,11 +3072,8 @@ async fn cmd_snapshot_run_inner(
                     // snapshot's memory server failing closed on a clone whose faults it
                     // could not serve. Record it so the clone reports FAILED instead of
                     // exiting 0 as if nothing happened.
-                    clone_failure = if guest_rebooted {
-                        None
-                    } else {
-                        vmm_exit_failure(&status)
-                    };
+                    clone_failure =
+                        clone_failure_after_vmm_exit(&status, guest_rebooted, watchdog_killed);
                     // If in TTY mode, get exit code from TTY handle
                     if let Some(handle) = tty_handle.take() {
                         container_exit_code = handle.join().ok().and_then(|r| r.ok());
@@ -3243,6 +3267,25 @@ async fn cmd_snapshot_run_inner(
     }
 
     Ok(())
+}
+
+/// What a VMM exit means for the clone's report. A guest reboot is orderly, and so is a VMM that
+/// fcvm's own power-off watchdog killed after the container had exited (#998); any other signal
+/// death or unreadable status is something that happened to the clone.
+fn clone_failure_after_vmm_exit(
+    status: &Result<std::process::ExitStatus>,
+    guest_rebooted: bool,
+    watchdog_killed: bool,
+) -> Option<String> {
+    if guest_rebooted {
+        return None;
+    }
+    // The watchdog's own SIGKILL is expected, but a `wait()` that failed says nothing about how the
+    // VMM exited, so that is still reported.
+    if watchdog_killed && status.is_ok() {
+        return None;
+    }
+    vmm_exit_failure(status)
 }
 
 /// Classify how a restored clone's VMM exited: `Some(reason)` when the exit is a FAILURE.
@@ -4533,5 +4576,96 @@ mod tests {
     #[tokio::test]
     async fn clone_exec_invocation_waits_for_exact_restore_ack() {
         assert_restore_consumer_waits_for_ack("clone --exec invocation").await;
+    }
+}
+
+#[cfg(test)]
+mod watchdog_exit_classification_tests {
+    use super::clone_failure_after_vmm_exit;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    fn killed() -> anyhow::Result<ExitStatus> {
+        Ok(ExitStatus::from_raw(9)) // SIGKILL
+    }
+
+    /// The watchdog's own SIGKILL of a guest that would not power off is not a clone failure.
+    #[test]
+    fn a_vmm_the_watchdog_killed_is_not_a_failure() {
+        assert_eq!(clone_failure_after_vmm_exit(&killed(), false, true), None);
+    }
+
+    /// The same signal with no watchdog behind it is still reported.
+    #[test]
+    fn a_vmm_killed_by_someone_else_is_still_a_failure() {
+        assert!(clone_failure_after_vmm_exit(&killed(), false, false).is_some());
+    }
+
+    /// The loop must consult the watchdog, kill through it, classify the exit with the flag it
+    /// sets, and rearm where it relaunches a rebooted guest. No fake hypervisor can drive the
+    /// restore loop, so the wiring is pinned by its source.
+    #[test]
+    fn the_restore_loop_uses_the_watchdog_and_rearms_it_on_relaunch() {
+        let source = include_str!("snapshot.rs");
+        let start = source
+            .find("let mut watchdog = super::podman::PoweroffWatchdog::new(")
+            .expect("no watchdog");
+        let end = source[start..]
+            .find("fn clone_failure_after_vmm_exit")
+            .expect("classifier not found after the loop");
+        let body = &source[start..start + end];
+        assert!(body.contains("watchdog.expired()"), "no watchdog arm");
+        assert!(
+            body.contains(".fire(vm_manager.as_mut())"),
+            "the arm does not kill the VMM"
+        );
+        assert!(
+            body.contains("clone_failure_after_vmm_exit(&status, guest_rebooted, watchdog_killed)"),
+            "the exit is not classified with the watchdog flag"
+        );
+        assert!(
+            body.contains("watchdog.rearm();\n                        watchdog_killed = false;"),
+            "relaunch does not rearm"
+        );
+    }
+
+    /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
+    /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
+    #[test]
+    fn a_failed_watchdog_kill_goes_through_cleanup() {
+        let source = include_str!("snapshot.rs");
+        let arm_start = source
+            .find("_ = watchdog.expired() => {")
+            .expect("no watchdog arm");
+        let arm = &source[arm_start
+            ..arm_start
+                + source[arm_start..]
+                    .find("watchdog_killed = true;")
+                    .expect("arm never marks the kill")];
+        assert!(
+            !arm.contains("?;"),
+            "the watchdog arm returns past cleanup with `?`: {arm}"
+        );
+        assert!(
+            arm.contains("clone_failure = Some("),
+            "a failed kill is not recorded as the clone's failure: {arm}"
+        );
+    }
+
+    /// A successful kill requests termination; it does not establish how the VMM exited. When
+    /// `wait()` itself failed, the clone must still report that (CodeRabbit on #1004).
+    #[test]
+    fn a_watchdog_kill_does_not_hide_a_failed_wait() {
+        let failed_wait: anyhow::Result<ExitStatus> = Err(anyhow::anyhow!("process not running"));
+        let reason = clone_failure_after_vmm_exit(&failed_wait, false, true);
+        assert!(
+            reason.is_some_and(|r| r.contains("could not determine how the VMM exited")),
+            "a watchdog kill followed by a wait error reported the clone as finished"
+        );
+    }
+
+    #[test]
+    fn a_guest_reboot_is_not_a_failure() {
+        assert_eq!(clone_failure_after_vmm_exit(&killed(), true, false), None);
     }
 }
