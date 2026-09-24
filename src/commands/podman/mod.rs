@@ -2020,27 +2020,42 @@ impl Killable for dyn crate::hypervisor::Hypervisor {
 /// rebooted guest, whose container_exit_seen flag the loop has cleared.
 struct PoweroffWatchdog {
     fired: bool,
+    /// When the container's exit was first seen, plus the deadline. Kept here, not in the future
+    /// `expired` returns, because the run loop drops that future each time another select arm
+    /// wins; a countdown held in it would restart and a busy loop could postpone the kill forever.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl PoweroffWatchdog {
     fn new() -> Self {
-        Self { fired: false }
+        Self {
+            fired: false,
+            deadline: None,
+        }
     }
 
-    /// Resolves `deadline` after `container_exit_seen` turns true; never resolves while the flag
-    /// is false or once the watchdog has fired.
+    /// Resolves once `deadline` has passed since `container_exit_seen` first turned true; never
+    /// resolves while the flag is false or once the watchdog has fired.
     async fn expired(
-        &self,
+        &mut self,
         container_exit_seen: &std::sync::atomic::AtomicBool,
         deadline: std::time::Duration,
     ) {
         if self.fired {
             return std::future::pending().await;
         }
-        while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        }
-        tokio::time::sleep(deadline).await;
+        let at = match self.deadline {
+            Some(at) => at,
+            None => {
+                while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let at = tokio::time::Instant::now() + deadline;
+                self.deadline = Some(at);
+                at
+            }
+        };
+        tokio::time::sleep_until(at).await;
     }
 
     /// The deadline passed: kill the VMM. The run loop's wait arm then wakes as for any exit.
@@ -2052,6 +2067,7 @@ impl PoweroffWatchdog {
     /// A rebooted guest was relaunched: watch its next power-off too.
     fn rearm(&mut self) {
         self.fired = false;
+        self.deadline = None;
     }
 }
 
@@ -4132,6 +4148,27 @@ mod poweroff_deadline_tests {
         )
         .await;
         assert!(second.is_ok(), "the watchdog stayed off after a relaunch");
+    }
+
+    /// The run loop drops and recreates the watchdog's future whenever another select arm wins.
+    /// The countdown must survive that: it runs from the container's exit, not from the last
+    /// time the loop came round (CodeRabbit on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn a_competing_event_does_not_restart_the_countdown() {
+        let seen = AtomicBool::new(true);
+        let mut watchdog = PoweroffWatchdog::new();
+        let start = tokio::time::Instant::now();
+        // Another arm wins after 30 s, and the loop comes round again.
+        tokio::select! {
+            _ = watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE) => panic!("expired before the deadline"),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
+        watchdog.expired(&seen, GUEST_POWEROFF_DEADLINE).await;
+        let waited = start.elapsed();
+        assert!(
+            waited <= GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            "the countdown restarted: expired {waited:?} after the exit, deadline {GUEST_POWEROFF_DEADLINE:?}"
+        );
     }
 
     /// The loop must consult the watchdog, kill through it, and rearm it where it relaunches a
