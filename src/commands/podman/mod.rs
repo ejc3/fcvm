@@ -2005,10 +2005,10 @@ pub(crate) async fn wait_for_reboot_decision(
 ///
 /// The countdown starts within 100 ms of the container's exit even while the run loop is busy in
 /// another arm's handler, such as a startup snapshot that takes minutes.
-const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+pub(crate) const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Something the power-off watchdog can kill; the run loop's VMM is one.
-trait Killable {
+pub(crate) trait Killable {
     fn start_kill(&mut self) -> Result<()>;
 }
 
@@ -2046,7 +2046,7 @@ impl DeadlineState {
     }
 }
 
-struct PoweroffWatchdog {
+pub(crate) struct PoweroffWatchdog {
     fired: bool,
     /// When the guest must have powered off by: stamped by `tracker` within 100 ms of the container's
     /// exit, whether or not the run loop is polling `expired` at that moment. The loop can spend
@@ -2079,7 +2079,7 @@ fn spawn_deadline_tracker(
 }
 
 impl PoweroffWatchdog {
-    fn new(
+    pub(crate) fn new(
         container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
         deadline_after_exit: std::time::Duration,
     ) -> Self {
@@ -2101,7 +2101,7 @@ impl PoweroffWatchdog {
 
     /// Resolves once the guest's deadline has passed; never resolves while the container is
     /// running or once the watchdog has fired.
-    async fn expired(&mut self) {
+    pub(crate) async fn expired(&mut self) {
         if self.fired {
             return std::future::pending().await;
         }
@@ -2115,14 +2115,14 @@ impl PoweroffWatchdog {
     }
 
     /// The deadline passed: kill the VMM. The run loop's wait arm then wakes as for any exit.
-    fn fire<K: Killable + ?Sized>(&mut self, vmm: &mut K) -> Result<()> {
+    pub(crate) fn fire<K: Killable + ?Sized>(&mut self, vmm: &mut K) -> Result<()> {
         self.fired = true;
         vmm.start_kill()
     }
 
     /// A rebooted guest was relaunched: watch its next power-off too. The old tracker is replaced,
     /// so a replacement container that exits before anything polls is still timed.
-    fn rearm(&mut self) {
+    pub(crate) fn rearm(&mut self) {
         self.tracker.abort();
         self.fired = false;
         let generation = self.deadline.lock().unwrap().retire();
