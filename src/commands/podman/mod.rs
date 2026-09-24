@@ -2010,17 +2010,11 @@ const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_s
 /// Something the power-off watchdog can kill; the run loop's VMM is one.
 trait Killable {
     fn start_kill(&mut self) -> Result<()>;
-    /// Whether the VMM has already exited (and so was not this watchdog's kill).
-    fn has_exited(&mut self) -> Result<bool>;
 }
 
 impl Killable for dyn crate::hypervisor::Hypervisor {
     fn start_kill(&mut self) -> Result<()> {
         crate::hypervisor::Hypervisor::start_kill(self)
-    }
-
-    fn has_exited(&mut self) -> Result<bool> {
-        Ok(crate::hypervisor::Hypervisor::try_wait(self)?.is_some())
     }
 }
 
@@ -2121,17 +2115,9 @@ impl PoweroffWatchdog {
     }
 
     /// The deadline passed: kill the VMM. The run loop's wait arm then wakes as for any exit.
-    /// Returns whether this watchdog killed it.
-    fn fire<K: Killable + ?Sized>(&mut self, vmm: &mut K) -> Result<bool> {
+    fn fire<K: Killable + ?Sized>(&mut self, vmm: &mut K) -> Result<()> {
         self.fired = true;
-        // A VMM that already exited was not killed by this watchdog: leave its exit to the wait arm.
-        // This narrows the window against another killer but cannot close it, since a kill that is
-        // signalled and not yet reaped still looks alive here.
-        if vmm.has_exited()? {
-            return Ok(false);
-        }
-        vmm.start_kill()?;
-        Ok(true)
+        vmm.start_kill()
     }
 
     /// A rebooted guest was relaunched: watch its next power-off too. The old tracker is replaced,
@@ -2174,7 +2160,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     log = %ctx.data_dir.join("firecracker.log").display(),
                     "the guest did not power off after the container exited; killing the VMM and reporting the container's exit code"
                 );
-                let _killed = watchdog
+                watchdog
                     .fire(ctx.vm_manager.as_mut())
                     .context("killing a VMM whose guest did not power off")?;
             }
@@ -4153,17 +4139,12 @@ mod poweroff_deadline_tests {
     #[derive(Default)]
     struct FakeVmm {
         kills: usize,
-        exited: bool,
     }
 
     impl Killable for FakeVmm {
         fn start_kill(&mut self) -> anyhow::Result<()> {
             self.kills += 1;
             Ok(())
-        }
-
-        fn has_exited(&mut self) -> anyhow::Result<bool> {
-            Ok(self.exited)
         }
     }
 
@@ -4322,25 +4303,6 @@ mod poweroff_deadline_tests {
         assert!(
             state.at.is_some(),
             "the current tracker's write was dropped"
-        );
-    }
-
-    /// Something else (a fail-closed memory server) may have killed the VMM just before the deadline.
-    /// The watchdog must not take ownership of that exit (Codex on #1004).
-    #[tokio::test(start_paused = true)]
-    async fn fire_leaves_an_already_exited_vmm_alone() {
-        let seen = Arc::new(AtomicBool::new(true));
-        let mut watchdog = PoweroffWatchdog::new(seen, GUEST_POWEROFF_DEADLINE);
-        let mut vmm = FakeVmm {
-            exited: true,
-            ..Default::default()
-        };
-        watchdog.expired().await;
-        let killed = watchdog.fire(&mut vmm).unwrap();
-        assert!(!killed, "the watchdog claimed an exit it did not cause");
-        assert_eq!(
-            vmm.kills, 0,
-            "the watchdog signalled a VMM that had already exited"
         );
     }
 
