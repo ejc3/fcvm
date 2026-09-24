@@ -737,6 +737,7 @@ setup-hugepages:
 setup-btrfs:
 	@if [ -d /mnt/fcvm-btrfs ] && stat -f -c '%T' /mnt/fcvm-btrfs 2>/dev/null | grep -q btrfs; then \
 		echo '==> /mnt/fcvm-btrfs already on btrfs'; \
+		sudo chown $$(id -un):$$(id -gn) /mnt/fcvm-btrfs; \
 	elif stat -f -c '%T' /mnt 2>/dev/null | grep -q btrfs; then \
 		echo '==> /mnt is btrfs, creating /mnt/fcvm-btrfs as directory (no loopback needed)'; \
 		sudo mkdir -p /mnt/fcvm-btrfs && \
