@@ -1996,14 +1996,173 @@ pub(crate) async fn wait_for_reboot_decision(
     reboot_requested.load(Ordering::Acquire)
 }
 
+/// How long the guest gets to power off after the container's exit status reached fcvm.
+///
+/// fc-agent sends the exit status and then calls `poweroff -f` (arm64) or `reboot -f` (x86); a
+/// healthy guest takes well under a second from there (#990). A guest that wedges in shutdown used
+/// to leave `fcvm podman run` waiting on Firecracker forever (#998). The bound is generous
+/// because Firecracker also has to unmap a multi-GiB guest before the process exits.
+///
+/// The countdown starts within 100 ms of the container's exit even while the run loop is busy in
+/// another arm's handler, such as a startup snapshot that takes minutes.
+const GUEST_POWEROFF_DEADLINE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Something the power-off watchdog can kill; the run loop's VMM is one.
+trait Killable {
+    fn start_kill(&mut self) -> Result<()>;
+}
+
+impl Killable for dyn crate::hypervisor::Hypervisor {
+    fn start_kill(&mut self) -> Result<()> {
+        crate::hypervisor::Hypervisor::start_kill(self)
+    }
+}
+
+/// Bounds how long the run loop waits for a guest to power off after the container has exited
+/// (#998). Fires once per guest lifetime: `rearm` starts a new one when the loop relaunches a
+/// rebooted guest, whose container_exit_seen flag the loop has cleared.
+/// The guest's power-off deadline and which lifecycle it belongs to. A tracker task carries the
+/// generation it was started for; `rearm` bumps the generation under the same lock that guards the
+/// deadline, so a retired tracker that is mid-write when it is aborted (`abort` does not stop a task
+/// that is running, only one that reaches its next await) cannot leave a stale deadline behind.
+#[derive(Default)]
+struct DeadlineState {
+    generation: u64,
+    at: Option<tokio::time::Instant>,
+}
+
+impl DeadlineState {
+    fn stamp_if_current(&mut self, generation: u64, at: tokio::time::Instant) {
+        if self.generation == generation {
+            self.at = Some(at);
+        }
+    }
+
+    /// Start a new lifecycle: forget the deadline and return the generation its tracker must use.
+    fn retire(&mut self) -> u64 {
+        self.generation += 1;
+        self.at = None;
+        self.generation
+    }
+}
+
+struct PoweroffWatchdog {
+    fired: bool,
+    /// When the guest must have powered off by: stamped by `tracker` within 100 ms of the container's
+    /// exit, whether or not the run loop is polling `expired` at that moment. The loop can spend
+    /// minutes inside another arm's handler (a startup snapshot), so a countdown started by the loop's
+    /// next poll would begin late, and one held in the future `expired` returns would restart each
+    /// time another select arm wins.
+    deadline: Arc<std::sync::Mutex<DeadlineState>>,
+    container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+    deadline_after_exit: std::time::Duration,
+    tracker: tokio::task::JoinHandle<()>,
+}
+
+/// Waits for the container's exit flag, stamps the deadline once, and ends. `rearm` starts a new one
+/// for a relaunched guest, so nothing depends on observing the flag go false in between.
+fn spawn_deadline_tracker(
+    container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+    deadline: Arc<std::sync::Mutex<DeadlineState>>,
+    generation: u64,
+    deadline_after_exit: std::time::Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        deadline.lock().unwrap().stamp_if_current(
+            generation,
+            tokio::time::Instant::now() + deadline_after_exit,
+        );
+    })
+}
+
+impl PoweroffWatchdog {
+    fn new(
+        container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
+        deadline_after_exit: std::time::Duration,
+    ) -> Self {
+        let deadline = Arc::new(std::sync::Mutex::new(DeadlineState::default()));
+        let tracker = spawn_deadline_tracker(
+            container_exit_seen.clone(),
+            deadline.clone(),
+            0,
+            deadline_after_exit,
+        );
+        Self {
+            fired: false,
+            deadline,
+            container_exit_seen,
+            deadline_after_exit,
+            tracker,
+        }
+    }
+
+    /// Resolves once the guest's deadline has passed; never resolves while the container is
+    /// running or once the watchdog has fired.
+    async fn expired(&mut self) {
+        if self.fired {
+            return std::future::pending().await;
+        }
+        loop {
+            let at = self.deadline.lock().unwrap().at;
+            match at {
+                Some(at) => return tokio::time::sleep_until(at).await,
+                None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+            }
+        }
+    }
+
+    /// The deadline passed: kill the VMM. The run loop's wait arm then wakes as for any exit.
+    fn fire<K: Killable + ?Sized>(&mut self, vmm: &mut K) -> Result<()> {
+        self.fired = true;
+        vmm.start_kill()
+    }
+
+    /// A rebooted guest was relaunched: watch its next power-off too. The old tracker is replaced,
+    /// so a replacement container that exits before anything polls is still timed.
+    fn rearm(&mut self) {
+        self.tracker.abort();
+        self.fired = false;
+        let generation = self.deadline.lock().unwrap().retire();
+        self.tracker = spawn_deadline_tracker(
+            self.container_exit_seen.clone(),
+            self.deadline.clone(),
+            generation,
+            self.deadline_after_exit,
+        );
+    }
+}
+
+impl Drop for PoweroffWatchdog {
+    fn drop(&mut self) {
+        self.tracker.abort();
+    }
+}
+
 /// Event loop: waits for VM exit, cancellation, or snapshot requests.
 /// Returns the container exit code (None if cancelled/signalled).
 pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Result<Option<i32>> {
+    let mut watchdog =
+        PoweroffWatchdog::new(ctx.container_exit_seen.clone(), GUEST_POWEROFF_DEADLINE);
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {
                 info!("cancellation requested, shutting down VM");
                 return Ok(None);
+            }
+            // The container has exited and the guest has not powered off in time. Kill the VMM;
+            // the arm below then wakes as for any exit and reports the status fcvm already has.
+            _ = watchdog.expired() => {
+                warn!(
+                    deadline_s = GUEST_POWEROFF_DEADLINE.as_secs(),
+                    log = %ctx.data_dir.join("firecracker.log").display(),
+                    "the guest did not power off after the container exited; killing the VMM and reporting the container's exit code"
+                );
+                watchdog
+                    .fire(ctx.vm_manager.as_mut())
+                    .context("killing a VMM whose guest did not power off")?;
             }
             status = ctx.vm_manager.wait() => {
                 info!(status = ?status, "Firecracker child exited");
@@ -2048,6 +2207,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     let _ = std::fs::remove_file(ctx.data_dir.join("container-exit"));
                     let _ = std::fs::remove_file(ctx.data_dir.join("container-ready"));
                     info!("guest rebooted — relaunching VM in place");
+                    watchdog.rearm();
                     // A reboot is a clean cold boot from the already-provisioned disk
                     // (disk-only-clone semantics) — don't re-create the pre-start /
                     // startup snapshot. The Continue verdict set below makes the
@@ -3966,5 +4126,211 @@ mod image_disk_identity_classifier_tests {
         assert!(super::is_snapshot_load_failure(&err));
         let unrelated = anyhow::anyhow!("some other failure");
         assert!(!super::is_snapshot_load_failure(&unrelated));
+    }
+}
+
+#[cfg(test)]
+mod poweroff_deadline_tests {
+    use super::{DeadlineState, Killable, PoweroffWatchdog, GUEST_POWEROFF_DEADLINE};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    #[derive(Default)]
+    struct FakeVmm {
+        kills: usize,
+    }
+
+    impl Killable for FakeVmm {
+        fn start_kill(&mut self) -> anyhow::Result<()> {
+            self.kills += 1;
+            Ok(())
+        }
+    }
+
+    /// Nothing ends the wait while the container is still running, however long that takes.
+    #[tokio::test(start_paused = true)]
+    async fn a_running_container_never_expires_the_deadline() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let expired = tokio::time::timeout(
+            Duration::from_secs(86_400),
+            PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE).expired(),
+        )
+        .await;
+        assert!(
+            expired.is_err(),
+            "the deadline expired with no container exit"
+        );
+    }
+
+    /// The deadline is measured from the container's exit, not from the start of the loop.
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_runs_from_the_container_exit() {
+        let seen = Arc::new(AtomicBool::new(false));
+        let setter = seen.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            setter.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE)
+            .expired()
+            .await;
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_secs(600) + GUEST_POWEROFF_DEADLINE,
+            "expired {waited:?} after the loop started, before the exit plus the deadline"
+        );
+        assert!(
+            waited < Duration::from_secs(600) + GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            "expired {waited:?} after the loop started, long after the exit plus the deadline"
+        );
+    }
+
+    /// Firing kills the VMM once and disarms the watchdog until it is rearmed.
+    #[tokio::test(start_paused = true)]
+    async fn firing_kills_the_vmm_once_and_then_stays_quiet() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        let mut vmm = FakeVmm::default();
+        watchdog.expired().await;
+        watchdog.fire(&mut vmm).unwrap();
+        assert_eq!(vmm.kills, 1);
+        let again = tokio::time::timeout(Duration::from_secs(86_400), watchdog.expired()).await;
+        assert!(again.is_err(), "a fired watchdog expired a second time");
+    }
+
+    /// A rebooted guest is relaunched after the watchdog fired; its next hang must be caught too.
+    #[tokio::test(start_paused = true)]
+    async fn a_relaunched_guest_gets_a_fresh_deadline() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        let mut vmm = FakeVmm::default();
+        watchdog.expired().await;
+        watchdog.fire(&mut vmm).unwrap();
+        // What the loop does when it relaunches a rebooted guest: clear the exit flag, rearm, and
+        // let the new guest's container exit again later.
+        seen.store(false, Ordering::Release);
+        watchdog.rearm();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        seen.store(true, Ordering::Release);
+        let second = tokio::time::timeout(
+            GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            watchdog.expired(),
+        )
+        .await;
+        assert!(second.is_ok(), "the watchdog stayed off after a relaunch");
+    }
+
+    /// The run loop drops and recreates the watchdog's future whenever another select arm wins.
+    /// The countdown must survive that: it runs from the container's exit, not from the last
+    /// time the loop came round (CodeRabbit on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn a_competing_event_does_not_restart_the_countdown() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        let start = tokio::time::Instant::now();
+        // Another arm wins after 30 s, and the loop comes round again.
+        tokio::select! {
+            _ = watchdog.expired() => panic!("expired before the deadline"),
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {}
+        }
+        watchdog.expired().await;
+        let waited = start.elapsed();
+        assert!(
+            waited <= GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            "the countdown restarted: expired {waited:?} after the exit, deadline {GUEST_POWEROFF_DEADLINE:?}"
+        );
+    }
+
+    /// The container can exit while the loop is inside another arm's handler (a startup snapshot
+    /// takes minutes), where nothing polls the watchdog. The countdown still runs from the exit,
+    /// not from the next time the loop asks (Codex on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn an_exit_during_a_long_handler_still_counts_from_the_exit() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        // The loop is busy for 100 s and never polls the watchdog.
+        tokio::time::sleep(Duration::from_secs(100)).await;
+        let asked = tokio::time::Instant::now();
+        watchdog.expired().await;
+        let waited = asked.elapsed();
+        assert!(
+            waited <= Duration::from_secs(1),
+            "the countdown began when the loop next asked: waited another {waited:?} after a 100 s handler"
+        );
+    }
+
+    /// A relaunched guest's replacement container can exit before any poll sees the exit flag go
+    /// false; the loop's clear-then-rearm must not depend on being observed (Codex on #1002).
+    #[tokio::test(start_paused = true)]
+    async fn a_rearm_does_not_depend_on_anyone_seeing_the_flag_clear() {
+        let seen = Arc::new(AtomicBool::new(true));
+        let mut watchdog = PoweroffWatchdog::new(seen.clone(), GUEST_POWEROFF_DEADLINE);
+        let mut vmm = FakeVmm::default();
+        watchdog.expired().await;
+        watchdog.fire(&mut vmm).unwrap();
+        // The loop stores false and the new container's exit stores true again, all inside one
+        // 100 ms poll: nothing ever observes false.
+        seen.store(false, Ordering::Release);
+        watchdog.rearm();
+        seen.store(true, Ordering::Release);
+        let second = tokio::time::timeout(
+            GUEST_POWEROFF_DEADLINE + Duration::from_secs(1),
+            watchdog.expired(),
+        )
+        .await;
+        assert!(
+            second.is_ok(),
+            "the watchdog never re-stamped a deadline for the new guest"
+        );
+    }
+
+    /// `abort()` does not stop a tracker that is already past its last await, so a retired tracker
+    /// can still write its deadline after `rearm` cleared it. The write must not survive (Codex on #1002).
+    #[test]
+    fn a_retired_trackers_late_write_does_not_survive_a_rearm() {
+        let mut state = DeadlineState::default();
+        let old_generation = state.generation;
+        let new_generation = state.retire();
+        let at = tokio::time::Instant::now();
+        state.stamp_if_current(old_generation, at);
+        assert!(
+            state.at.is_none(),
+            "a retired tracker's late write survived the rearm"
+        );
+        state.stamp_if_current(new_generation, at);
+        assert!(
+            state.at.is_some(),
+            "the current tracker's write was dropped"
+        );
+    }
+
+    /// The loop must consult the watchdog, kill through it, and rearm it where it relaunches a
+    /// guest. No fake hypervisor can drive `run_vm_loop`, so the wiring is pinned by its source.
+    #[test]
+    fn the_run_loop_uses_the_watchdog_and_rearms_it_on_relaunch() {
+        let source = include_str!("mod.rs");
+        let body = &source[source.find("pub async fn run_vm_loop").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        assert!(body.contains("watchdog.expired()"), "no watchdog arm");
+        assert!(
+            body.contains("PoweroffWatchdog::new(ctx.container_exit_seen.clone()"),
+            "the watchdog does not track the loop's exit flag"
+        );
+        assert!(
+            body.contains("watchdog\n                    .fire(ctx.vm_manager.as_mut())"),
+            "the arm does not kill the VMM"
+        );
+        let relaunch = body
+            .find("guest rebooted — relaunching VM in place")
+            .unwrap();
+        let rearm = body
+            .find("watchdog.rearm()")
+            .expect("relaunch never rearms the watchdog");
+        assert!(
+            rearm > relaunch && rearm - relaunch < 200,
+            "rearm is not at the relaunch site"
+        );
     }
 }
