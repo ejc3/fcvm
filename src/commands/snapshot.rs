@@ -2898,20 +2898,16 @@ async fn cmd_snapshot_run_inner(
                         log = %data_dir.join("firecracker.log").display(),
                         "the guest did not power off after the container exited; killing the VMM"
                     );
-                    match watchdog.fire(vm_manager.as_mut()) {
-                        // Only a VMM this watchdog killed is orderly. One that had already exited
-                        // (a fail-closed kill just before the deadline) is left to the wait arm.
-                        Ok(killed) => watchdog_killed = killed,
-                        Err(error) => {
-                            // Through the common cleanup below, not a `?` past it: the VMM may still
-                            // be alive, and the holder, network helpers and state file are ours to remove.
-                            clone_failure = Some(format!(
-                                "its guest did not power off after the container exited, and fcvm \
-                                 could not kill the VMM: {error:#}"
-                            ));
-                            break;
-                        }
+                    if let Err(error) = watchdog.fire(vm_manager.as_mut()) {
+                        // Through the common cleanup below, not a `?` past it: the VMM may still
+                        // be alive, and the holder, network helpers and state file are ours to remove.
+                        clone_failure = Some(format!(
+                            "its guest did not power off after the container exited, and fcvm \
+                             could not kill the VMM: {error:#}"
+                        ));
+                        break;
                     }
+                    watchdog_killed = true;
                 }
                 // `serve_watch` is None for file-backed restores, so this branch is
                 // disabled entirely there rather than firing on a dummy future.
@@ -4640,8 +4636,8 @@ mod watchdog_exit_classification_tests {
         let arm = &source[arm_start
             ..arm_start
                 + source[arm_start..]
-                    .find("// `serve_watch` is None")
-                    .expect("next arm not found")];
+                    .find("watchdog_killed = true;")
+                    .expect("arm never marks the kill")];
         assert!(
             !arm.contains("?;"),
             "the watchdog arm returns past cleanup with `?`: {arm}"
