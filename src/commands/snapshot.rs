@@ -3277,11 +3277,15 @@ fn clone_failure_after_vmm_exit(
     guest_rebooted: bool,
     watchdog_killed: bool,
 ) -> Option<String> {
-    if guest_rebooted || watchdog_killed {
-        None
-    } else {
-        vmm_exit_failure(status)
+    if guest_rebooted {
+        return None;
     }
+    // The watchdog's own SIGKILL is expected, but a `wait()` that failed says nothing about how the
+    // VMM exited, so that is still reported.
+    if watchdog_killed && status.is_ok() {
+        return None;
+    }
+    vmm_exit_failure(status)
 }
 
 /// Classify how a restored clone's VMM exited: `Some(reason)` when the exit is a FAILURE.
@@ -4645,6 +4649,18 @@ mod watchdog_exit_classification_tests {
         assert!(
             arm.contains("clone_failure = Some("),
             "a failed kill is not recorded as the clone's failure: {arm}"
+        );
+    }
+
+    /// A successful kill requests termination; it does not establish how the VMM exited. When
+    /// `wait()` itself failed, the clone must still report that (CodeRabbit on #1004).
+    #[test]
+    fn a_watchdog_kill_does_not_hide_a_failed_wait() {
+        let failed_wait: anyhow::Result<ExitStatus> = Err(anyhow::anyhow!("process not running"));
+        let reason = clone_failure_after_vmm_exit(&failed_wait, false, true);
+        assert!(
+            reason.is_some_and(|r| r.contains("could not determine how the VMM exited")),
+            "a watchdog kill followed by a wait error reported the clone as finished"
         );
     }
 
