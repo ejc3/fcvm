@@ -2021,6 +2021,31 @@ impl Killable for dyn crate::hypervisor::Hypervisor {
 /// Bounds how long the run loop waits for a guest to power off after the container has exited
 /// (#998). Fires once per guest lifetime: `rearm` starts a new one when the loop relaunches a
 /// rebooted guest, whose container_exit_seen flag the loop has cleared.
+/// The guest's power-off deadline and which lifecycle it belongs to. A tracker task carries the
+/// generation it was started for; `rearm` bumps the generation under the same lock that guards the
+/// deadline, so a retired tracker that is mid-write when it is aborted (`abort` does not stop a task
+/// that is running, only one that reaches its next await) cannot leave a stale deadline behind.
+#[derive(Default)]
+struct DeadlineState {
+    generation: u64,
+    at: Option<tokio::time::Instant>,
+}
+
+impl DeadlineState {
+    fn stamp_if_current(&mut self, generation: u64, at: tokio::time::Instant) {
+        if self.generation == generation {
+            self.at = Some(at);
+        }
+    }
+
+    /// Start a new lifecycle: forget the deadline and return the generation its tracker must use.
+    fn retire(&mut self) -> u64 {
+        self.generation += 1;
+        self.at = None;
+        self.generation
+    }
+}
+
 struct PoweroffWatchdog {
     fired: bool,
     /// When the guest must have powered off by: stamped by `tracker` within 100 ms of the container's
@@ -2028,7 +2053,7 @@ struct PoweroffWatchdog {
     /// minutes inside another arm's handler (a startup snapshot), so a countdown started by the loop's
     /// next poll would begin late, and one held in the future `expired` returns would restart each
     /// time another select arm wins.
-    deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    deadline: Arc<std::sync::Mutex<DeadlineState>>,
     container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
     deadline_after_exit: std::time::Duration,
     tracker: tokio::task::JoinHandle<()>,
@@ -2038,14 +2063,18 @@ struct PoweroffWatchdog {
 /// for a relaunched guest, so nothing depends on observing the flag go false in between.
 fn spawn_deadline_tracker(
     container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
-    deadline: Arc<std::sync::Mutex<Option<tokio::time::Instant>>>,
+    deadline: Arc<std::sync::Mutex<DeadlineState>>,
+    generation: u64,
     deadline_after_exit: std::time::Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         while !container_exit_seen.load(std::sync::atomic::Ordering::Acquire) {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        *deadline.lock().unwrap() = Some(tokio::time::Instant::now() + deadline_after_exit);
+        deadline.lock().unwrap().stamp_if_current(
+            generation,
+            tokio::time::Instant::now() + deadline_after_exit,
+        );
     })
 }
 
@@ -2054,10 +2083,11 @@ impl PoweroffWatchdog {
         container_exit_seen: Arc<std::sync::atomic::AtomicBool>,
         deadline_after_exit: std::time::Duration,
     ) -> Self {
-        let deadline = Arc::new(std::sync::Mutex::new(None));
+        let deadline = Arc::new(std::sync::Mutex::new(DeadlineState::default()));
         let tracker = spawn_deadline_tracker(
             container_exit_seen.clone(),
             deadline.clone(),
+            0,
             deadline_after_exit,
         );
         Self {
@@ -2076,7 +2106,7 @@ impl PoweroffWatchdog {
             return std::future::pending().await;
         }
         loop {
-            let at = *self.deadline.lock().unwrap();
+            let at = self.deadline.lock().unwrap().at;
             match at {
                 Some(at) => return tokio::time::sleep_until(at).await,
                 None => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
@@ -2095,10 +2125,11 @@ impl PoweroffWatchdog {
     fn rearm(&mut self) {
         self.tracker.abort();
         self.fired = false;
-        *self.deadline.lock().unwrap() = None;
+        let generation = self.deadline.lock().unwrap().retire();
         self.tracker = spawn_deadline_tracker(
             self.container_exit_seen.clone(),
             self.deadline.clone(),
+            generation,
             self.deadline_after_exit,
         );
     }
@@ -4100,7 +4131,7 @@ mod image_disk_identity_classifier_tests {
 
 #[cfg(test)]
 mod poweroff_deadline_tests {
-    use super::{Killable, PoweroffWatchdog, GUEST_POWEROFF_DEADLINE};
+    use super::{DeadlineState, Killable, PoweroffWatchdog, GUEST_POWEROFF_DEADLINE};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
     use std::time::Duration;
@@ -4252,6 +4283,26 @@ mod poweroff_deadline_tests {
         assert!(
             second.is_ok(),
             "the watchdog never re-stamped a deadline for the new guest"
+        );
+    }
+
+    /// `abort()` does not stop a tracker that is already past its last await, so a retired tracker
+    /// can still write its deadline after `rearm` cleared it. The write must not survive (Codex on #1002).
+    #[test]
+    fn a_retired_trackers_late_write_does_not_survive_a_rearm() {
+        let mut state = DeadlineState::default();
+        let old_generation = state.generation;
+        let new_generation = state.retire();
+        let at = tokio::time::Instant::now();
+        state.stamp_if_current(old_generation, at);
+        assert!(
+            state.at.is_none(),
+            "a retired tracker's late write survived the rearm"
+        );
+        state.stamp_if_current(new_generation, at);
+        assert!(
+            state.at.is_some(),
+            "the current tracker's write was dropped"
         );
     }
 
