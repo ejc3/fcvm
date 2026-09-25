@@ -599,12 +599,9 @@ async fn test_remap_fs_snapshot_file_replace() -> Result<()> {
 /// 2. Clone can write new files (FUSE mount works bidirectionally)
 /// 3. Host sees clone's writes (data integrity through clone VolumeServer)
 ///
-/// Note: The inode table serialize/restore path runs in the pre-start
-/// snapshot cache (production path). The CLI `fcvm snapshot create` path
-/// used by tests creates snapshots in a separate process that doesn't have
-/// access to the running VolumeServer's RemapFs. In the CLI path, inodes
-/// are re-discovered via FUSE TTL expiry (~1s) which the test accommodates
-/// via retry loops in fuse_read().
+/// `fcvm snapshot create` gets the inode tables from the VM's own fcvm process
+/// (crate::volume::fetch_inode_tables); test_file_open_across_snapshot_keeps_reading
+/// below covers a handle held open across the snapshot.
 #[tokio::test]
 async fn test_open_handle_survives_snapshot_restore() -> Result<()> {
     let (vm_name, clone_name, snap_name, _) = common::unique_names("pv-handle");
@@ -680,4 +677,100 @@ async fn test_open_handle_survives_snapshot_restore() -> Result<()> {
 
     println!("PASSED: test_open_handle_survives_snapshot_restore");
     Ok(())
+}
+
+// =============================================================================
+// A file held open across `fcvm snapshot create` keeps reading in the clone
+// =============================================================================
+
+const BIG_FILE_MIB: usize = 64;
+
+/// Start a reader in the VM's container that holds `/mnt/test/big` open on fd 3 and reads one 4 KiB
+/// block every 0.2 s through that descriptor, 64 blocks apart, logging the block's first byte.
+async fn start_held_open_reader(pid: u32) -> Result<()> {
+    common::exec_in_container(
+        pid,
+        &[
+            "nohup sh -c 'exec 3< /mnt/test/big; n=0; while [ $n -lt 250 ]; do \
+           c=$(dd bs=4096 count=1 skip=63 <&3 2>/dev/null | head -c 1); \
+           echo \"$n ${c:-EMPTY}\" >> /tmp/reader.log; n=$((n+1)); sleep 0.2; done' \
+           > /dev/null 2>&1 &",
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+/// The reader's log lines, as (sequence number, first byte read) pairs.
+async fn reader_log(pid: u32) -> Result<Vec<(u32, String)>> {
+    let out = common::exec_in_container(pid, &["cat /tmp/reader.log 2>/dev/null || true"]).await?;
+    Ok(out
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?.parse().ok()?, parts.next()?.to_string()))
+        })
+        .collect())
+}
+
+/// Snapshot a VM whose container holds a file open, restore a clone, and require the held-open reader
+/// to keep reading its file.
+async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
+    let (vm_name, clone_name, snap_name, _) = common::unique_names(prefix);
+    let host_dir = format!("/tmp/fcvm-{}-{}", prefix, std::process::id());
+    tokio::fs::create_dir_all(&host_dir).await?;
+    tokio::fs::write(format!("{}/big", host_dir), vec![b'A'; BIG_FILE_MIB << 20]).await?;
+
+    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+    common::poll_health_by_pid(pid, 180).await?;
+    start_held_open_reader(pid).await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while reader_log(pid).await?.len() < 5 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "reader did not start in the baseline"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+
+    common::create_snapshot_by_pid(pid, &snap_name).await?;
+    let at_snapshot = reader_log(pid).await?.len();
+    common::kill_process(pid).await;
+
+    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+    common::poll_health_by_pid(clone_pid, 180).await?;
+
+    // Give the reader 10 s of clone time, then read its log.
+    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+    let log = reader_log(clone_pid).await?;
+    let after: Vec<_> = log
+        .iter()
+        .filter(|(n, _)| *n as usize >= at_snapshot)
+        .collect();
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    tokio::fs::remove_dir_all(&host_dir).await.ok();
+
+    anyhow::ensure!(
+        after.len() >= 10,
+        "the reader held open across the snapshot read {} blocks in 10 s of the clone (at the snapshot \
+         it had read {}); the clone's volume server did not serve its handle",
+        after.len(),
+        at_snapshot
+    );
+    let wrong: Vec<_> = after.iter().filter(|(_, c)| c != "A").collect();
+    anyhow::ensure!(
+        wrong.is_empty(),
+        "the reader held open across the snapshot read something other than its file: {:?}",
+        &wrong[..wrong.len().min(5)]
+    );
+    Ok(())
+}
+
+/// A handle opened before `fcvm snapshot create` keeps reading its file in the clone.
+#[tokio::test]
+async fn test_file_open_across_snapshot_keeps_reading() -> Result<()> {
+    held_open_file_across_snapshot("pv-heldopen").await
 }

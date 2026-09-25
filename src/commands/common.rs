@@ -3133,7 +3133,8 @@ pub(crate) fn validate_snapshot_vm_identity(
 /// Returns (filename, contents) pairs. Invoked after the Firecracker snapshot is taken
 /// (and the VM resumed) so contents reflect host-side state at snapshot time — e.g.
 /// portable-volume inode tables.
-pub type SnapshotExtraFiles<'a> = Option<&'a (dyn Fn() -> Vec<(String, Vec<u8>)> + Send + Sync)>;
+pub type SnapshotExtraFiles<'a> =
+    Option<&'a (dyn Fn() -> Result<Vec<(String, Vec<u8>)>> + Send + Sync)>;
 
 /// What to do with the source VM after capturing its memory and disks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3892,7 +3893,14 @@ pub async fn create_snapshot_core(
     // must never be missing these files — clones would silently restore without them —
     // so a write failure here fails the snapshot instead of being logged and ignored.
     if let Some(extra_files) = extra_files {
-        for (filename, contents) in extra_files() {
+        let files = match extra_files() {
+            Ok(files) => files,
+            Err(e) => {
+                let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
+                return Err(e).context("gathering snapshot extra files");
+            }
+        };
+        for (filename, contents) in files {
             let path = temp_snapshot_dir.join(&filename);
             if let Err(e) = tokio::fs::write(&path, &contents).await {
                 let _ = tokio::fs::remove_dir_all(&temp_snapshot_dir).await;
