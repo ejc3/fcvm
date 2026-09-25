@@ -713,16 +713,33 @@ async fn reader_log(pid: u32) -> Result<Vec<(u32, String)>> {
         .collect())
 }
 
-/// Snapshot a VM whose container holds a file open, restore a clone, and require the held-open reader
-/// to keep reading its file.
-async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
+/// Snapshot a VM whose container holds a file open, restore a clone, optionally open `holders` new
+/// handles on another file in the clone, and require the held-open reader to keep reading its own file.
+async fn held_open_file_across_snapshot(prefix: &str, holders: usize) -> Result<()> {
+    // Handle numbers are never reused, so opening and closing files first gives the reader a handle
+    // number the clone's server will hand out again once it has opened that many files.
     let (vm_name, clone_name, snap_name, _) = common::unique_names(prefix);
     let host_dir = format!("/tmp/fcvm-{}-{}", prefix, std::process::id());
     tokio::fs::create_dir_all(&host_dir).await?;
     tokio::fs::write(format!("{}/big", host_dir), vec![b'A'; BIG_FILE_MIB << 20]).await?;
+    tokio::fs::write(
+        format!("{}/other", host_dir),
+        vec![b'B'; BIG_FILE_MIB << 20],
+    )
+    .await?;
 
     let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
     common::poll_health_by_pid(pid, 180).await?;
+    if holders > 0 {
+        common::exec_in_container(
+            pid,
+            &[&format!(
+                "for i in $(seq 1 {}); do head -c 1 /mnt/test/other > /dev/null; done",
+                holders - 1
+            )],
+        )
+        .await?;
+    }
     start_held_open_reader(pid).await?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while reader_log(pid).await?.len() < 5 {
@@ -741,6 +758,29 @@ async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
     let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
     common::poll_health_by_pid(clone_pid, 180).await?;
 
+    if holders > 0 {
+        // Each holder keeps its own descriptor on `other` open and logs the first byte it reads.
+        let opens: String = (0..holders)
+            .map(|i| format!("exec {}< /mnt/test/other; ", 4 + i))
+            .collect();
+        let reads: String = (0..holders)
+            .map(|i| {
+                let fd = 4 + i;
+                // Deep into the file, past anything the baseline's reads left in the page cache,
+                // so the read reaches the volume server with this descriptor's handle.
+                let block = 8192 + 64 * i;
+                format!("c=$(dd bs=4096 count=1 skip={block} <&{fd} 2>/dev/null | head -c 1); echo \"fd{fd} ${{c:-EMPTY}}\" >> /tmp/holders.log; ")
+            })
+            .collect();
+        common::exec_in_container(
+            clone_pid,
+            &[&format!(
+                "nohup sh -c '{opens}{reads}sleep 120' > /dev/null 2>&1 &"
+            )],
+        )
+        .await?;
+    }
+
     // Give the reader 10 s of clone time, then read its log.
     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
     let log = reader_log(clone_pid).await?;
@@ -748,6 +788,8 @@ async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
         .iter()
         .filter(|(n, _)| *n as usize >= at_snapshot)
         .collect();
+    let holder_log =
+        common::exec_in_container(clone_pid, &["cat /tmp/holders.log 2>/dev/null || true"]).await?;
 
     common::kill_process(clone_pid).await;
     common::kill_process(serve_pid).await;
@@ -760,6 +802,14 @@ async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
         after.len(),
         at_snapshot
     );
+    if holders > 0 {
+        let lines: Vec<&str> = holder_log.lines().collect();
+        anyhow::ensure!(
+            lines.len() == holders && lines.iter().all(|line| line.ends_with(" B")),
+            "handles the clone opened on another file after the restore did not all read that file: {:?}",
+            lines
+        );
+    }
     let wrong: Vec<_> = after.iter().filter(|(_, c)| c != "A").collect();
     anyhow::ensure!(
         wrong.is_empty(),
@@ -772,5 +822,14 @@ async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
 /// A handle opened before `fcvm snapshot create` keeps reading its file in the clone.
 #[tokio::test]
 async fn test_file_open_across_snapshot_keeps_reading() -> Result<()> {
-    held_open_file_across_snapshot("pv-heldopen").await
+    held_open_file_across_snapshot("pv-heldopen", 0).await
+}
+
+/// A handle opened before the snapshot still reads its own file after the clone opens new handles.
+///
+/// The clone's volume server numbers handles from the start again, so without a separate handle range
+/// its first new handles reuse the numbers the guest still holds from before the snapshot.
+#[tokio::test]
+async fn test_restored_handle_does_not_read_a_new_handles_file() -> Result<()> {
+    held_open_file_across_snapshot("pv-collide", 6).await
 }

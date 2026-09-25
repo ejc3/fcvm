@@ -29,7 +29,18 @@ pub struct RemapFs<T: FilesystemHandler> {
     paths: DashMap<u64, String>,
     /// old_fh → new_fh (stale handles lazily reopened after snapshot restore)
     handle_remap: DashMap<u64, u64>,
+    /// Handles this server gives the guest are the inner handle plus this base. It is the highest
+    /// handle the snapshot's source ever gave its guest, so every handle the guest held before the
+    /// restore is at or below it and is reopened by inode, and no handle issued here shares its
+    /// number. 0 for a server that was not restored, whose handles are the inner ones.
+    handle_base: u64,
+    /// Highest handle given to the guest, recorded in the table for the next restore.
+    max_guest_handle: std::sync::atomic::AtomicU64,
 }
+
+/// Handle base for a table written before tables recorded one. A server numbers its handles from 1,
+/// so every handle such a guest holds is far below this.
+const LEGACY_HANDLE_BASE: u64 = 1 << 32;
 
 impl<T: FilesystemHandler> RemapFs<T> {
     /// Create a new RemapFs wrapping the given handler.
@@ -51,6 +62,8 @@ impl<T: FilesystemHandler> RemapFs<T> {
             stable_to_inner,
             paths,
             handle_remap: DashMap::new(),
+            handle_base: 0,
+            max_guest_handle: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -518,15 +531,56 @@ impl<T: FilesystemHandler> RemapFs<T> {
 
     /// Serialize the inode mapping table as JSON.
     ///
-    /// Returns a JSON object mapping stable_ino (as string key) to path.
+    /// `{"handle_base": N, "paths": {stable_ino: path}}`, where N is the highest handle this server
+    /// or its source gave the guest, which a server restored from the table numbers above.
     /// Used for portable snapshot restore.
     pub fn serialize_table(&self) -> String {
-        let map: std::collections::BTreeMap<u64, String> = self
+        let paths: std::collections::BTreeMap<u64, String> = self
             .paths
             .iter()
             .map(|e| (*e.key(), e.value().clone()))
             .collect();
-        serde_json::to_string(&map).unwrap_or_default()
+        let handle_base = self
+            .max_guest_handle
+            .load(std::sync::atomic::Ordering::SeqCst)
+            .max(self.handle_base);
+        serde_json::to_string(&serde_json::json!({ "handle_base": handle_base, "paths": paths }))
+            .unwrap_or_default()
+    }
+
+    /// Parse a serialized table into its handle base and paths. A table from before the handle base
+    /// was recorded is a bare map of paths, and gets LEGACY_HANDLE_BASE.
+    fn parse_table(json: &str) -> (u64, std::collections::BTreeMap<u64, String>) {
+        let value: serde_json::Value = match serde_json::from_str(json) {
+            Ok(value) => value,
+            Err(e) => {
+                error!(
+                    "failed to parse inode table JSON, starting with empty table: {}",
+                    e
+                );
+                return (LEGACY_HANDLE_BASE, std::collections::BTreeMap::new());
+            }
+        };
+        let (handle_base, paths) = match value.get("paths") {
+            Some(paths) => (
+                value
+                    .get("handle_base")
+                    .and_then(|b| b.as_u64())
+                    .unwrap_or(LEGACY_HANDLE_BASE),
+                paths.clone(),
+            ),
+            None => (LEGACY_HANDLE_BASE, value),
+        };
+        match serde_json::from_value(paths) {
+            Ok(paths) => (handle_base, paths),
+            Err(e) => {
+                error!(
+                    "failed to parse inode table paths, starting with empty table: {}",
+                    e
+                );
+                (handle_base, std::collections::BTreeMap::new())
+            }
+        }
     }
 
     /// Restore a RemapFs from a serialized inode table.
@@ -536,16 +590,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
     ///
     /// Paths that no longer exist on the host are skipped (logged as warnings).
     pub fn restore_from_table(inner: T, json: &str) -> Self {
-        let table: std::collections::BTreeMap<u64, String> = match serde_json::from_str(json) {
-            Ok(t) => t,
-            Err(e) => {
-                error!(
-                    "failed to parse inode table JSON, starting with empty table: {}",
-                    e
-                );
-                std::collections::BTreeMap::new()
-            }
-        };
+        let (handle_base, table) = Self::parse_table(json);
 
         let inner_to_stable = DashMap::new();
         let stable_to_inner = DashMap::new();
@@ -602,6 +647,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
         info!(
             restored = paths.len(),
             total = table.len(),
+            handle_base,
             "RemapFs restored from table"
         );
 
@@ -611,12 +657,49 @@ impl<T: FilesystemHandler> RemapFs<T> {
             stable_to_inner,
             paths,
             handle_remap: DashMap::new(),
+            // At least 1, so a restored server always treats the guest's earlier handles as stale.
+            handle_base: handle_base.max(1),
+            max_guest_handle: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Get a reference to the inner handler.
     pub fn inner(&self) -> &T {
         &self.inner
+    }
+
+    /// Whether `guest_fh` was given to the guest before the restore this server was built from.
+    fn is_stale_handle(&self, guest_fh: u64) -> bool {
+        self.handle_base > 0 && guest_fh <= self.handle_base
+    }
+
+    /// The inner handle for guest handle `guest_fh` on stable inode `stable_ino`.
+    ///
+    /// A handle issued before the restore is reopened by inode (once, then remembered) rather than
+    /// passed on: the inner handle table numbers from 1 again, so the stale number could name another
+    /// open file.
+    fn inner_handle(&self, guest_fh: u64, stable_ino: Option<u64>, is_dir: bool) -> Option<u64> {
+        if !self.is_stale_handle(guest_fh) {
+            return Some(guest_fh - self.handle_base);
+        }
+        if let Some(inner_fh) = self.handle_remap.get(&guest_fh) {
+            return Some(*inner_fh);
+        }
+        self.try_reopen_handle(stable_ino?, guest_fh, is_dir)
+    }
+
+    /// Give the guest `inner_fh + handle_base` for a handle an open or create returned.
+    fn guest_handle_response(&self, mut response: VolumeResponse) -> VolumeResponse {
+        let fh = match &mut response {
+            VolumeResponse::Opened { fh, .. }
+            | VolumeResponse::Openeddir { fh }
+            | VolumeResponse::Created { fh, .. } => fh,
+            _ => return response,
+        };
+        *fh += self.handle_base;
+        self.max_guest_handle
+            .fetch_max(*fh, std::sync::atomic::Ordering::SeqCst);
+        response
     }
 
     /// Lazily reopen a stale file handle after snapshot restore.
@@ -642,17 +725,27 @@ impl<T: FilesystemHandler> RemapFs<T> {
                 pid: 0,
             })
         } else {
-            self.inner.handle_request(&VolumeRequest::Open {
-                ino: inner_ino,
-                flags: libc::O_RDWR as u32,
-                uid: 0,
-                gid: 0,
-                pid: 0,
-            })
+            // The original open's access mode is not known here, so take the widest the server is
+            // allowed: a file it may only read, or only write, still reopens.
+            let open = |flags: i32| {
+                self.inner.handle_request(&VolumeRequest::Open {
+                    ino: inner_ino,
+                    flags: flags as u32,
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                })
+            };
+            [libc::O_RDWR, libc::O_RDONLY, libc::O_WRONLY]
+                .into_iter()
+                .map(open)
+                .find(|resp| !resp.is_error())
+                .unwrap_or_else(|| open(libc::O_RDONLY))
         };
 
         let new_fh = match &resp {
             VolumeResponse::Opened { fh, .. } => *fh,
+            VolumeResponse::Openeddir { fh } => *fh,
             VolumeResponse::Created { fh, .. } => *fh,
             _ => return None,
         };
@@ -702,10 +795,30 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
             return VolumeResponse::io_error();
         }
 
-        // Translate stale file handles from snapshot restore
-        if let Some(old_fh) = remapped.fh() {
-            if let Some(new_fh) = self.handle_remap.get(&old_fh) {
-                remapped = remapped.with_fh(*new_fh);
+        // A handle from before the restore that is being released: release what it was reopened as.
+        if let VolumeRequest::Release { fh, .. } | VolumeRequest::Releasedir { fh, .. } = request {
+            if self.is_stale_handle(*fh) {
+                if let Some((_, inner_fh)) = self.handle_remap.remove(fh) {
+                    let _ = self.inner.handle_request_with_groups(
+                        &remapped.with_fh(inner_fh),
+                        supplementary_groups,
+                    );
+                }
+                return VolumeResponse::Ok;
+            }
+        }
+
+        // Guest handles → inner handles, reopening the guest's handles from before the restore.
+        if let Some(guest_fh) = request.fh() {
+            match self.inner_handle(guest_fh, request.ino(), request.is_dir_handle_op()) {
+                Some(inner_fh) => remapped = remapped.with_fh(inner_fh),
+                None => return VolumeResponse::error(libc::EBADF),
+            }
+        }
+        if let Some((ino_out, guest_fh)) = request.fh_out() {
+            match self.inner_handle(guest_fh, Some(ino_out), false) {
+                Some(inner_fh) => remapped = remapped.with_fh_out(inner_fh),
+                None => return VolumeResponse::error(libc::EBADF),
             }
         }
 
@@ -713,34 +826,7 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
         let response = self
             .inner
             .handle_request_with_groups(&remapped, supplementary_groups);
-
-        // If EBADF and this request uses a file handle, try lazy re-open
-        if response.is_ebadf() {
-            if let Some(old_fh) = request.fh() {
-                if let Some(stable_ino) = request.ino() {
-                    if let Some(new_fh) =
-                        self.try_reopen_handle(stable_ino, old_fh, request.is_dir_handle_op())
-                    {
-                        // Retry with the reopened handle
-                        let retry = remapped.with_fh(new_fh);
-                        let retry_resp = self
-                            .inner
-                            .handle_request_with_groups(&retry, supplementary_groups);
-                        return self.remap_response(request, retry_resp);
-                    }
-                }
-            }
-        }
-
-        // Handle Release/Releasedir: clean up handle_remap entry
-        if matches!(
-            request,
-            VolumeRequest::Release { .. } | VolumeRequest::Releasedir { .. }
-        ) {
-            if let Some(old_fh) = request.fh() {
-                self.handle_remap.remove(&old_fh);
-            }
-        }
+        let response = self.guest_handle_response(response);
 
         // Remap response inodes (inner → stable) and register new mappings
         // Use ORIGINAL request (stable inodes) for path computation
@@ -751,6 +837,149 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A RemapFs over a real PassthroughFs, driven through the volume server's entry point.
+    struct Real {
+        fs: RemapFs<crate::server::PassthroughFs>,
+        uid: u32,
+        gid: u32,
+    }
+
+    impl Real {
+        fn call(&self, req: VolumeRequest) -> VolumeResponse {
+            self.fs.handle_request_with_groups(&req, &[])
+        }
+        fn lookup(&self, name: &str) -> u64 {
+            match self.call(VolumeRequest::Lookup {
+                parent: 1,
+                name: name.as_bytes().to_vec(),
+                uid: self.uid,
+                gid: self.gid,
+                pid: 0,
+            }) {
+                VolumeResponse::Entry { attr, .. } => attr.ino,
+                other => panic!("lookup {name}: {other:?}"),
+            }
+        }
+        fn open(&self, ino: u64) -> u64 {
+            match self.call(VolumeRequest::Open {
+                ino,
+                flags: libc::O_RDONLY as u32,
+                uid: self.uid,
+                gid: self.gid,
+                pid: 0,
+            }) {
+                VolumeResponse::Opened { fh, .. } => fh,
+                other => panic!("open {ino}: {other:?}"),
+            }
+        }
+        fn first_byte(&self, ino: u64, fh: u64) -> Result<u8, VolumeResponse> {
+            match self.call(VolumeRequest::Read {
+                ino,
+                fh,
+                offset: 0,
+                size: 1,
+                uid: self.uid,
+                gid: self.gid,
+                pid: 0,
+            }) {
+                VolumeResponse::Data { data } if data.len() == 1 => Ok(data[0]),
+                other => Err(other),
+            }
+        }
+    }
+
+    /// A table written before the handle base was recorded, a bare map of paths, still restores its
+    /// paths, and its handles are treated as stale up to LEGACY_HANDLE_BASE.
+    #[test]
+    fn a_table_without_a_handle_base_still_restores() {
+        let (base, paths) = RemapFs::<MockFs>::parse_table(r#"{"1":"","42":"data.txt"}"#);
+        assert_eq!(base, LEGACY_HANDLE_BASE);
+        assert_eq!(paths.get(&42).map(String::as_str), Some("data.txt"));
+        let (base, paths) =
+            RemapFs::<MockFs>::parse_table(r#"{"handle_base":7,"paths":{"42":"data.txt"}}"#);
+        assert_eq!(base, 7);
+        assert_eq!(paths.get(&42).map(String::as_str), Some("data.txt"));
+    }
+
+    /// A handle from before the restore on a file the server may only read still reads: the reopen
+    /// does not insist on read-write access.
+    #[test]
+    fn a_restored_handle_on_a_read_only_file_reopens() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro");
+        std::fs::write(&path, b"R").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        if uid == 0 {
+            eprintln!("root ignores file modes, so this case cannot be exercised as root");
+            return;
+        }
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::new(dir.path())),
+            uid,
+            gid,
+        };
+        let ino = source.lookup("ro");
+        let fh = source.open(ino);
+        let table = source.fs.serialize_table();
+        let clone = Real {
+            fs: RemapFs::restore_from_table(crate::server::PassthroughFs::new(dir.path()), &table),
+            uid,
+            gid,
+        };
+        assert_eq!(clone.first_byte(ino, fh), Ok(b'R'));
+    }
+
+    /// Handles the guest held before a restore and handles the clone opens after it never share a
+    /// number, so each keeps reading its own file.
+    #[test]
+    fn restored_handles_do_not_collide_with_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("held"), b"A").unwrap();
+        std::fs::write(dir.path().join("other"), b"B").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::new(dir.path())),
+            uid,
+            gid,
+        };
+        let held = source.lookup("held");
+        let other = source.lookup("other");
+        // Burn handle numbers, so the held handle's number is one the clone will hand out again.
+        for _ in 0..5 {
+            let fh = source.open(other);
+            source.call(VolumeRequest::Release { ino: other, fh });
+        }
+        let held_fh = source.open(held);
+        assert_eq!(source.first_byte(held, held_fh), Ok(b'A'));
+        let table = source.fs.serialize_table();
+
+        let clone = Real {
+            fs: RemapFs::restore_from_table(crate::server::PassthroughFs::new(dir.path()), &table),
+            uid,
+            gid,
+        };
+        // The guest reads through its pre-snapshot handle first, as a running reader does.
+        assert_eq!(clone.first_byte(held, held_fh), Ok(b'A'));
+        let new_fhs: Vec<u64> = (0..8).map(|_| clone.open(other)).collect();
+        for fh in &new_fhs {
+            assert_ne!(
+                *fh, held_fh,
+                "a new handle reused the number the guest holds from before the snapshot"
+            );
+            assert_eq!(
+                clone.first_byte(other, *fh),
+                Ok(b'B'),
+                "new handle {fh} (held handle {held_fh})"
+            );
+        }
+        assert_eq!(clone.first_byte(held, held_fh), Ok(b'A'));
+    }
     use crate::protocol::{DirEntry, DirEntryPlus, FileAttr};
     use std::sync::Mutex;
 
@@ -1138,7 +1367,7 @@ mod tests {
         remap.handle_request_with_groups(&lookup, &[]);
 
         let json = remap.serialize_table();
-        let parsed: std::collections::BTreeMap<u64, String> = serde_json::from_str(&json).unwrap();
+        let parsed = RemapFs::<MockFs>::parse_table(&json).1;
 
         // Should contain root ("") and "data.txt"
         assert_eq!(parsed.len(), 2);
@@ -1519,7 +1748,7 @@ mod tests {
 
         // Serialize should reflect the corrected path
         let json = remap.serialize_table();
-        let parsed: std::collections::BTreeMap<u64, String> = serde_json::from_str(&json).unwrap();
+        let parsed = RemapFs::<MockFs>::parse_table(&json).1;
         assert!(
             parsed.values().any(|v| v == "renamed"),
             "serialized table should have corrected path"

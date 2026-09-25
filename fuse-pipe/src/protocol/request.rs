@@ -457,14 +457,35 @@ impl VolumeRequest {
             | Self::Setlk { fh, .. }
             | Self::Readdirplus { fh, .. } => *fh = new_fh,
             Self::Setattr { fh, .. } => *fh = Some(new_fh),
-            // Only remap fh_in; fh_out references a different file and is NOT
-            // currently remapped after snapshot restore. This is a known limitation:
-            // copy_file_range/remap_file_range with a stale fh_out will fail.
-            // TODO: add fh_out()/with_fh_out() helpers for independent remapping.
+            // fh_out references a different file; see fh_out() and with_fh_out().
             Self::CopyFileRange { fh_in, .. } | Self::RemapFileRange { fh_in, .. } => {
                 *fh_in = new_fh;
             }
             _ => {}
+        }
+        cloned
+    }
+
+    /// The destination file handle of a copy or remap between two files, with its inode.
+    pub fn fh_out(&self) -> Option<(u64, u64)> {
+        match self {
+            Self::CopyFileRange {
+                ino_out, fh_out, ..
+            }
+            | Self::RemapFileRange {
+                ino_out, fh_out, ..
+            } => Some((*ino_out, *fh_out)),
+            _ => None,
+        }
+    }
+
+    /// Clone this request with a different destination file handle.
+    pub fn with_fh_out(&self, new_fh: u64) -> Self {
+        let mut cloned = self.clone();
+        if let Self::CopyFileRange { fh_out, .. } | Self::RemapFileRange { fh_out, .. } =
+            &mut cloned
+        {
+            *fh_out = new_fh;
         }
         cloned
     }
