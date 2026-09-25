@@ -218,16 +218,17 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 description = "Default fcvm guest kernel (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
-kernel_sha = "3b83b5face2d"
+kernel_sha = "ce5378155114"
 build_inputs = [
     "kernel/default-amd64.build.toml",
     "kernel/default-x86.conf",
-    "kernel/patches-default/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
+    "kernel/patches-default-x86/0001-virtio_ring-fix-infinite-loop-in-virtnet_poll_cleantx.patch",
+    "kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch",
 ]
 kernel_config = "kernel/default-x86.conf"
-# Applies every patch in kernel/patches-default, and build_inputs above names
-# each one. Keep this line: an omitted value applies kernel/patches.
-patches_dir = "kernel/patches-default"
+# Applies every patch in kernel/patches-default-x86 (the arm64 patches plus
+# x86-only ones), and build_inputs above names each one. Keep this line: an omitted value applies kernel/patches.
+patches_dir = "kernel/patches-default-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
@@ -349,15 +350,14 @@ kernel_repo = "ejc3/fcvm"
 # change when one of them does.
 build_inputs = [
     "kernel/btrfs-x86.conf",
-    "kernel/patches/*.patch",
+    "kernel/patches-btrfs-x86/*.patch",
 ]
 
 kernel_config = "kernel/btrfs-x86.conf"
-# The FUSE patches: remap_file_range, which the release notes advertise, and the
-# utimensat fix. Keep this line. The build applies kernel/patches when it is
-# omitted, but scripts/kernel-patch.sh falls back to kernel/patches-arm64 on
-# arm64, so `make kernel-patch-validate PROFILE=btrfs` would check other patches.
-patches_dir = "kernel/patches"
+# kernel/patches (the FUSE patches and the virtio_ring fix) plus x86-only
+# patches, linked. Keep this line: the build applies kernel/patches when it is
+# omitted.
+patches_dir = "kernel/patches-btrfs-x86"
 
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/main/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 

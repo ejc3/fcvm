@@ -1,0 +1,93 @@
+From ea5551659032e9c13782e763603ceb501310ac7c Mon Sep 17 00:00:00 2001
+From: EJ Campbell <ejc3@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 18:13:23 -0700
+Subject: [PATCH] x86/kvm: Leave the async #PF reason for the fault it belongs
+ to
+
+A KVM guest panics with "Host injected async #PF in interrupt disabled
+region" when an NMI arrives between the delivery of an async #PF and
+the moment its handler reads the reason flags, and the NMI handler
+itself takes a page fault. perf does exactly that when it samples with
+user call chains: the sampling NMI reads user memory, and a read past
+the top of the stack, or through a frame pointer that is not one,
+faults. The nested fault calls __kvm_handle_async_pf(), reads and
+clears the per-CPU reason flags of the outer async #PF, sees that the
+NMI context has interrupts disabled, and panics.
+
+The NMI entry code saves and restores CR2 for this nesting, but not the
+async #PF reason. The race was described when async #PF was reworked
+in 2020, with perf as the example, and left open.
+
+Since that rework the guest does not set KVM_ASYNC_PF_SEND_ALWAYS, so
+the host delivers async #PF only to user mode, and the reason flags
+belong to a user-mode fault. Read them only for a fault from user mode.
+A kernel-mode fault inside an NMI, #MC or #DB, which all enter through
+irqentry_nmi_enter(), is a real fault and returns without touching the
+flags, which the outer handler then finds intact once the NMI returns.
+A kernel-mode fault outside those handlers only checks whether a reason
+is pending, and keeps the "async #PF in kernel mode" panic for a host
+that delivers one.
+
+Reproduced in a 4-vCPU guest restored from a snapshot with its memory
+served on demand through userfaultfd, so that reading it back takes
+async #PFs, while perf samples hardware cycles with user call chains
+and the reading loop's frame pointer points at an unmapped page: the
+guest panicked about 20 seconds after boot in every run.
+---
+ arch/x86/kernel/kvm.c | 29 ++++++++++++++++++++++++++---
+ 1 file changed, 26 insertions(+), 3 deletions(-)
+
+diff --git a/arch/x86/kernel/kvm.c b/arch/x86/kernel/kvm.c
+index b67d7c5..ac566fd 100644
+--- a/arch/x86/kernel/kvm.c
++++ b/arch/x86/kernel/kvm.c
+@@ -255,11 +255,36 @@ noinstr u32 kvm_read_and_reset_apf_flags(void)
+ }
+ EXPORT_SYMBOL_GPL(kvm_read_and_reset_apf_flags);
+ 
++static __always_inline bool kvm_apf_reason_pending(void)
++{
++	return __this_cpu_read(async_pf_enabled) &&
++	       __this_cpu_read(apf_reason.flags);
++}
++
+ noinstr bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ {
+-	u32 flags = kvm_read_and_reset_apf_flags();
+ 	irqentry_state_t state;
++	u32 flags;
++
++	/*
++	 * The host delivers async #PF only to user mode, because the guest
++	 * does not enable KVM_ASYNC_PF_SEND_ALWAYS, so the reason flags belong
++	 * to a fault from user mode. A #PF from kernel mode can be nested in an
++	 * NMI (or #MC, or #DB) that arrived after an async #PF was delivered
++	 * and before its handler read the flags, for instance perf reading
++	 * user memory for a call chain. That fault is a real one: leave the
++	 * flags for the fault they belong to. Outside such a handler, pending
++	 * flags on a kernel-mode fault mean the host is broken.
++	 */
++	if (!user_mode(regs)) {
++		if (likely(in_nmi() || !kvm_apf_reason_pending()))
++			return false;
++		state = irqentry_enter(regs);
++		instrumentation_begin();
++		panic("Host injected async #PF in kernel mode\n");
++	}
+ 
++	flags = kvm_read_and_reset_apf_flags();
+ 	if (!flags)
+ 		return false;
+ 
+@@ -275,8 +300,6 @@ noinstr bool __kvm_handle_async_pf(struct pt_regs *regs, u32 token)
+ 		panic("Host injected async #PF in interrupt disabled region\n");
+ 
+ 	if (flags & KVM_PV_REASON_PAGE_NOT_PRESENT) {
+-		if (unlikely(!(user_mode(regs))))
+-			panic("Host injected async #PF in kernel mode\n");
+ 		/* Page is swapped out by the host. */
+ 		kvm_async_pf_task_wait_schedule(token);
+ 	} else {
+-- 
+2.53.0-Meta
+

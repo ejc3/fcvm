@@ -2434,30 +2434,68 @@ fn the_release_check_exits_2_whenever_it_cannot_check() {
 /// a guest has to carry the backport until the pinned release does.
 #[test]
 fn every_shipped_guest_kernel_applies_the_virtio_ring_shutdown_fix() {
-    const FIX: &str = "the backend will never update it";
-    let root = repo_root();
-    let mut missing = Vec::new();
-    let mut checked = 0usize;
-    for (profile_name, arch, profile) in source_built_tables(&rootfs_config()) {
-        if !["default", "nested", "btrfs"].contains(&profile_name.as_str()) {
-            continue;
-        }
-        checked += 1;
-        let applies_fix = vm_kernel_patches_dir(&profile).is_some_and(|dir| {
-            applied_patches(&root, dir)
-                .iter()
-                .any(|patch| std::fs::read_to_string(patch).is_ok_and(|text| text.contains(FIX)))
-        });
-        if !applies_fix {
-            missing.push(format!("{profile_name}.{arch}"));
-        }
-    }
+    let applies = shipped_guest_kernels_applying("the backend will never update it");
     assert_eq!(
-        checked, 6,
+        applies.len(),
+        6,
         "expected default, nested and btrfs tables for both arches"
     );
+    let missing: Vec<_> = applies
+        .iter()
+        .filter(|(_, applied)| !applied)
+        .map(|(table, _)| table)
+        .collect();
     assert!(
         missing.is_empty(),
         "these guest kernels do not apply the virtio_ring broken-queue fix: {missing:?}"
     );
+}
+
+/// The pinned release lets a page fault nested in an NMI take the reason flags of an async page fault
+/// that was delivered just before the NMI, and the guest then panics with "Host injected async #PF in
+/// interrupt disabled region". perf sampling with user call chains triggers it in a restored guest,
+/// where reading memory the host has not yet paged in takes async page faults. The patch consults the
+/// flags only for faults from user mode, the only mode the host delivers async page faults to. Every
+/// x86_64 guest kernel has to carry it, and the arm64 kernels must not, so their release identities
+/// and the snapshots keyed on them stay valid. `test_async_pf_inside_nmi_does_not_panic_a_restored_guest`
+/// in test_snapshot_clone.rs exercises the fix at runtime.
+#[test]
+fn only_the_x86_guest_kernels_apply_the_async_pf_nmi_fix() {
+    // The patch's code change, not its comment: an edit that drops or moves the early return fails here.
+    const FIX: &str = "+\tif (!user_mode(regs)) {\n+\t\tif (likely(in_nmi() || !kvm_apf_reason_pending()))\n+\t\t\treturn false;";
+    let applies = shipped_guest_kernels_applying(FIX);
+    assert_eq!(
+        applies.len(),
+        6,
+        "expected default, nested and btrfs tables for both arches"
+    );
+    let wrong: Vec<_> = applies
+        .iter()
+        .filter(|(table, applied)| *applied != table.ends_with(".amd64"))
+        .map(|(table, applied)| format!("{table} applies={applied}"))
+        .collect();
+    assert!(
+        wrong.is_empty(),
+        "the async #PF / NMI fix must be applied by exactly the x86_64 guest kernels: {wrong:?}"
+    );
+}
+
+/// For each default, nested and btrfs guest kernel table, as `("profile.arch", applies)`, whether the
+/// patches it applies contain `fix`.
+fn shipped_guest_kernels_applying(fix: &str) -> Vec<(String, bool)> {
+    let root = repo_root();
+    source_built_tables(&rootfs_config())
+        .into_iter()
+        .filter(|(profile_name, _, _)| {
+            ["default", "nested", "btrfs"].contains(&profile_name.as_str())
+        })
+        .map(|(profile_name, arch, profile)| {
+            let applies = vm_kernel_patches_dir(&profile).is_some_and(|dir| {
+                applied_patches(&root, dir).iter().any(|patch| {
+                    std::fs::read_to_string(patch).is_ok_and(|text| text.contains(fix))
+                })
+            });
+            (format!("{profile_name}.{arch}"), applies)
+        })
+        .collect()
 }
