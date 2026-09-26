@@ -267,8 +267,9 @@ class ReportContent(unittest.TestCase):
         whenever the count supports a reliability claim; each corpus run's
         failure_rate_ci is [0, 0.0159] over 230 attempts.
 
-        Every zero-failure count must carry an exact interval, and one about
-        the corpus runs must carry theirs. "zero-failure gate" names the gate
+        Every text unit that states a zero-failure count must carry an exact
+        interval, and one about the corpus runs must carry theirs and its 230
+        attempts. "zero-failure gate" names the gate
         and is not a count."""
         cited = set(re.findall(r"results/(reqbench-[0-9-]+-corpus[a-z0-9-]*)", self.page))
         self.assertEqual(cited, set(self.CORPUS_RUNS), "the page must cite the four published corpus runs")
@@ -419,6 +420,12 @@ class PhoneLayout(unittest.TestCase):
         self.assertEqual(len(stacking), 1, "the stacking rule was not found")
         width = int(re.search(r"max-width:\s*(\d+)px", stacking[0]).group(1))
         self.assertGreaterEqual(width, 720, "stacked tables must stack up to 720 px")
+        # The header is hidden and the cells become blocks in the same query.
+        blocks = [sels for media, sels, body in self.rules
+                  if media == stacking[0] and declaration(body, "display") == "block"]
+        for element in ("table.stack", "table.stack tbody", "table.stack tr", "table.stack td"):
+            self.assertTrue(any(element in sels for sels in blocks),
+                            f"{element} is not display: block where the header is hidden")
 
     # Chart rows at 320 px: 16 px page gutters, a 1 px figure border and 12 px
     # figure padding each side leave a 262 px track. Rows inside a .grp keep a
