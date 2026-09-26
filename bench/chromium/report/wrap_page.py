@@ -30,6 +30,7 @@ def wrap(fragment):
 
 
 def main(argv):
+    """Write the wrapped document for the one source path in argv to stdout."""
     if len(argv) != 2:
         sys.stderr.write(__doc__)
         return 2

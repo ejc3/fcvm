@@ -28,6 +28,7 @@ def read(path):
 
 class WrappedReport(unittest.TestCase):
     def test_the_fragment_becomes_one_complete_document(self):
+        """The wrapper adds only the document skeleton around the fragment."""
         fragment = read(REPORT)
         page = wrap_page.wrap(fragment)
         self.assertTrue(page.startswith("<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"))
@@ -55,6 +56,7 @@ class WrappedReport(unittest.TestCase):
         self.assertEqual(stripped, fragment.rstrip("\n") + "\n")
 
     def test_a_fragment_without_main_is_refused(self):
+        """There is nothing to put in <body> without a <main>."""
         with self.assertRaisesRegex(ValueError, "no <main>"):
             wrap_page.wrap("<title>x</title>\n<style></style>\n<p>no main</p>\n")
 
@@ -76,7 +78,21 @@ class WrappedReport(unittest.TestCase):
         )
         self.assertRegex(workflow, r"path: *_site\b", "the site directory is what is uploaded")
 
+    def test_the_deliverable_contract_names_github_pages(self):
+        """Codex on #1012: AGENTS.md required publishing through the Artifact tool,
+        which this PR retires. The contract names the Pages path instead.
+
+        RED BEFORE THE FIX: deliverable 6 read "Publish an artifact (HTML via the
+        Artifact tool)" and named no Pages URL."""
+        agents = read(os.path.join(HERE, "AGENTS.md"))
+        start = agents.index("6. **Publish")
+        deliverable = agents[start:agents.index("7. **", start)]
+        self.assertIn("https://ejc3.github.io/fcvm/shared-nothing-renders.html", deliverable)
+        self.assertIn("report/wrap_page.py", deliverable)
+        self.assertNotIn("Artifact tool", deliverable)
+
     def test_the_docs_index_links_the_report(self):
+        """The published page is reachable from the docs index."""
         index = read(os.path.join(REPO, "docs", "index.html"))
         self.assertIn('href="shared-nothing-renders.html"', index)
 
