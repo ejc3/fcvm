@@ -285,7 +285,7 @@ echo "== finding 21: a verdict is a fixed shape, not a phrase with an open tail 
 # one-line phrase with no reviewed-commit line, which Codex never posts. The sign-off is
 # now one of an enumerated list; the reviewed-commit line is required; and only the About
 # Codex details block is stripped, since any other details block is where findings fold.
-for signoff in ' :rocket:' ' Keep it up!' " You're on a roll."; do
+for signoff in ' :rocket:' ' Keep it up!' " You're on a roll." ' Breezy!'; do
   run_case "the codex sign-off '$signoff' is a verdict" \
     "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(codex_body "$signoff" deadbeef)")]")" \
     0 "HEAD COVERED"

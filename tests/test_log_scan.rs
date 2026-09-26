@@ -947,6 +947,50 @@ fn review_gate_orders_timestamps_as_instants_not_as_strings() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// Codex's "Breezy!" sign-off is a no-findings verdict.
+///
+/// The gate matches Codex's no-findings comment against the sign-offs Codex has posted on
+/// this repo (codex_line_re), and an unlisted one is a claim until someone answers it. On
+/// 2026-09-26 Codex signed off #1013's head with "Didn't find any major issues. Breezy!",
+/// the gate reported the comment UNANSWERED and the head UNREVIEWED, and the author had to
+/// post a NOT-A-DEFECT review answering text that claimed nothing. The body below is that
+/// comment as posted, with the commit renamed; only the sign-off differs from the verdicts
+/// the gate already accepted.
+#[test]
+fn review_gate_accepts_the_codex_breezy_signoff() {
+    require_jq();
+    const VERDICT: &str = r#""Codex Review: Didn't find any major issues. Breezy!\n\n**Reviewed commit:** `deadbeef`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>""#;
+    let comments = format!(
+        r#"[{{"author":{{"login":"chatgpt-codex-connector","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{VERDICT}}}]"#
+    );
+    let payload = format!(
+        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+    );
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-breezy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("breezy.json");
+    std::fs::write(&f, payload).unwrap();
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&f)
+        .output()
+        .expect("check-review-threads.sh must be runnable");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "Codex's 'Breezy!' no-findings comment is a verdict, not a claim.\n{combined}"
+    );
+    assert!(combined.contains("HEAD COVERED"), "{combined}");
+    assert!(!combined.contains("UNANSWERED"), "{combined}");
+}
+
 /// A bot saying that its review did NOT run is not a finding, and covers no head.
 ///
 /// Codex out of quota posts "You have reached your Codex usage limits for code reviews" as

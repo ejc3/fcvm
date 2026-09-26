@@ -843,7 +843,7 @@ def verdict_lines:
   | if $s == null then null
     else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
              | map(select(length > 0 and . != cr_note))) end;
-def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| 👍)?$";
+def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
   verdict_lines as $l
