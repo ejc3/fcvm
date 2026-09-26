@@ -255,12 +255,12 @@ class ReportContent(unittest.TestCase):
         self.page = read(REPORT)
 
     def test_every_published_cloudflare_row_is_quoted_cell_for_cell(self):
-        """RED BEFORE THE FIX: the table titled "Every row Cloudflare published"
+        """RED BEFORE THE FIX: the table then titled "Every row Cloudflare published"
         printed the CPU rows as "380 core-ms" where Cloudflare prints "380 ms",
         and dropped the published relative column (3.1x less CPU ... 1.8x
         slower), which is where their CPU and memory against wall-time trade is
         stated."""
-        title = self.page.index('<p class="tbl-title">Every row Cloudflare published</p>')
+        title = self.page.index('<p class="tbl-title">Cloudflare&#8217;s published table, with fcvm&#8217;s figures</p>')
         table = re.search(r"<table\b.*?</table>", self.page[title:], re.S).group(0)
         rows = []
         for tr in re.findall(r"<tr>(.*?)</tr>", table, re.S):
