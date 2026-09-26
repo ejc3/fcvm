@@ -69,6 +69,7 @@ class WrappedReport(unittest.TestCase):
 
         page = wrap_page.wrap(read(REPORT))
         parents = {}
+        suppressed = []
 
         class Landmarks(HTMLParser):
             VOID = {"meta", "wbr", "br", "img", "link"}
@@ -82,6 +83,9 @@ class WrappedReport(unittest.TestCase):
                     return
                 if tag in ("header", "main", "footer"):
                     parents.setdefault(tag, []).append(self.stack[-1] if self.stack else None)
+                    named = dict(attrs)
+                    if "role" in named or named.get("aria-hidden") == "true":
+                        suppressed.append((tag, named))
                 self.stack.append(tag)
 
             def handle_endtag(self, tag):
@@ -91,6 +95,7 @@ class WrappedReport(unittest.TestCase):
         Landmarks().feed(page)
         self.assertEqual(parents, {"header": ["body"], "main": ["body"], "footer": ["body"]},
                          "header, main and footer must each be a single child of <body>")
+        self.assertEqual(suppressed, [], "a role or aria-hidden would replace or hide the landmark")
         body = page[page.index("<body>"):]
         self.assertLess(body.index("<header"), body.index("<main>"))
         self.assertLess(body.index("</main>"), body.index("<footer"))
@@ -202,6 +207,13 @@ def declaration(body, prop):
     return m.group(1).strip() if m else None
 
 
+def last_declaration(body, prop):
+    """The last value of `prop` in a run of declaration blocks, as the cascade
+    resolves equal-specificity rules in source order."""
+    found = re.findall(r"(?:^|;)\s*" + re.escape(prop) + r"\s*:\s*([^;]+)", body)
+    return found[-1].strip() if found else None
+
+
 def applies_at(media, width):
     """Whether a rule's @media prelude (or None) applies at a viewport width,
     for the prelude shapes this page uses."""
@@ -300,6 +312,23 @@ class ReportContent(unittest.TestCase):
                 self.assertEqual(set(counts), {"230"}, f"attempt counts {counts} in: {text[:160]!r}")
         self.assertGreaterEqual(checked, 2, "the tile and the sample-gate bullet were not both checked")
 
+        # The fixture caption states three counts; each needs its own bound, read
+        # from the records: every reqbench fixture arm, and HC's 202 attempts.
+        caption = next((plain(u) for u in units if "(200 for HC)" in plain(u)), None)
+        self.assertIsNotNone(caption, "the fixture caption was not found")
+        fixture_bounds = set()
+        for rid in re.findall(r"results/(reqbench-[0-9a-f]{32}|reqbench-2026081\d-\d{6}-uffd)", self.page):
+            with open(os.path.join(HERE, "results", rid, "analysis.json")) as f:
+                for arm in json.load(f)["arms"].values():
+                    self.assertEqual(arm["failed"], 0, rid)
+                    fixture_bounds.add(round(arm["failure_rate_ci"][1] * 100, 2))
+        self.assertTrue(fixture_bounds, "no fixture record was read")
+        self.assertIn(f"at most {max(fixture_bounds):.2f}%", caption)
+        hc = [line for line in open(os.path.join(HERE, "results", "hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b",
+                                                 "hostcdp.jsonl")) if line.strip()]
+        self.assertTrue(all(json.loads(line)["ok"] for line in hc))
+        self.assertIn(f"HC 0 in {len(hc)}, 0 to {(1 - 0.025 ** (1 / len(hc))) * 100:.2f}%", caption)
+
     CORPUS_RUNS = (
         "reqbench-20260830-171007-corpus",
         "reqbench-20260902-023115-corpus-c2",
@@ -352,6 +381,12 @@ class ReportContent(unittest.TestCase):
         rest = self.page.replace(fc, "")
         self.assertEqual({b for b in branches if b in rest}, set(),
                          "a branch is named outside Firecracker builds, where it is not tied to runs")
+        # A link to any other branch of the fork is attributed to nothing.
+        for where, html in subsections.items():
+            linked = set(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", html))
+            self.assertEqual(linked, expected[where], f"{where} links a branch its runs did not use")
+        self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
+                         "a Firecracker branch link outside Firecracker builds")
 
 
 class PhoneLayout(unittest.TestCase):
@@ -376,16 +411,28 @@ class PhoneLayout(unittest.TestCase):
         the chart blue, 4.42:1 in light mode and 3.64:1 in dark, under the
         4.5:1 WCAG AA minimum for text of that size. Every numbered badge is
         checked, including the untimed step's."""
-        badges = [(sel, body) for media, sels, body in self.rules if media is None
-                  for sel in sels if sel.startswith(".flow li") and sel.endswith("::before")]
-        self.assertGreaterEqual(len(badges), 2, "the badge rules were not found")
-        base = dict(badges)[".flow li::before"]
+        def badge_rules(dark):
+            """Badge declarations that apply in one scheme, in source order: the
+            top-level rules, then any dark-scheme override."""
+            out = {}
+            for media, sels, body in self.rules:
+                applies = media is None or (dark and "prefers-color-scheme: dark" in media)
+                if not applies or (media and not "prefers-color-scheme" in media):
+                    continue
+                for sel in sels:
+                    if sel.startswith(".flow li") and sel.endswith("::before"):
+                        out[sel] = out.get(sel, "") + ";" + body
+            return out
+
+        self.assertGreaterEqual(len(badge_rules(False)), 2, "the badge rules were not found")
         for dark in (False, True):
             names = self.variables(dark)
-            for selector, body in badges:
+            rules = badge_rules(dark)
+            base = rules[".flow li::before"]
+            for selector, body in rules.items():
                 colours = []
                 for prop in ("color", "background"):
-                    value = declaration(body, prop) or declaration(base, prop)
+                    value = last_declaration(body, prop) or last_declaration(base, prop)
                     var = re.fullmatch(r"var\((--[\w-]+)\)", value)
                     value = names[var.group(1)] if var else value
                     m = HEX.fullmatch(value)
