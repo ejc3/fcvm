@@ -1,7 +1,7 @@
 # Report source of record
 
 `shared-nothing-renders.html` is the source for the published benchmark report:
-https://claude.ai/code/artifact/bc59e62a-a8b3-49f1-b759-878061c94a2e
+https://ejc3.github.io/fcvm/shared-nothing-renders.html
 
 The HTML is the maintained report source. `../REVIEW.md` records withdrawals
 and the status of historical evidence.
@@ -13,32 +13,27 @@ and the status of historical evidence.
 - Fixture measurements remain explicitly labelled optimisation evidence.
 - Useful August 30 records are retained under `evidence/20260830/`, with their
   limitations and reproduction inputs. They are not publication-qualified results.
-- **External publication is pending.** This session has no Artifact publisher.
-  The public URL returns a loader, not a report body that can be checked against
-  this file. Republish to the existing URL with an authorized publisher, then
-  verify the headline and removal of the historical comparison tables there.
+- **External publication (2026-09-26):** GitHub Pages publishes this file at the
+  URL above on every merge to main that changes it (see Publishing). The Claude
+  artifact route is retired.
 
 ## Publishing
 
-The file is the artifact BODY: a `<title>`, a `<style>`, and a `<main>`. It
-carries no `<!doctype>`, `<html>`, `<head>` or `<body>` — the publisher wraps it.
+The file is a page BODY: a `<title>`, a `<style>`, and a `<main>`. It carries no
+`<!doctype>`, `<html>`, `<head>` or `<body>`. `wrap_page.py` adds them, and
+`.github/workflows/pages.yml` runs it on every push to main that touches this
+file or the wrapper, publishing the result beside `docs/` at
+https://ejc3.github.io/fcvm/shared-nothing-renders.html. There is no second
+copy: edit here, merge, and the deploy follows. `../test_report_page.py` checks
+the wrapping and that the workflow still runs it.
 
-Edit here, then republish to the SAME artifact so the URL is stable:
+Preview locally:
 
-    Artifact(file_path="bench/chromium/report/shared-nothing-renders.html",
-             url="https://claude.ai/code/artifact/bc59e62a-a8b3-49f1-b759-878061c94a2e",
-             favicon="🔬",
-             description="Per-request-isolated Chromium in Firecracker microVMs, measured on Cloudflare's 14-URL corpus")
+    python3 bench/chromium/report/wrap_page.py \
+        bench/chromium/report/shared-nothing-renders.html > /tmp/report.html
 
-`favicon` is REQUIRED — a publish without it is rejected, and the incantation
-above is meant to be pasted. Keep the same emoji across redeploys: readers find
-the tab by its icon. `description` is the gallery subtitle; omitting it on a
-redeploy drops the one already there.
-
-Publishing WITHOUT `url=` creates a second artifact. That already happened once:
-`6fe16829-6ac7-4603-ad6e-3ed7a83c5a9e` holds the same sections and differs
-only in a cache-busting `<base href>`. It is stale the moment this file changes,
-and it is public.
+The Claude artifacts that carried earlier revisions are not maintained; this
+page is the publication.
 
 ## Publication rule: corpus only
 

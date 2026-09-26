@@ -896,8 +896,12 @@ the spirit of `~/src/editor-loop-bench/SUMMARY.md` (read it before writing). Mat
    regression (show intercept AND slope, with a CI band), the utilization→throughput
    curve from the scalability run, and a mode-comparison interval plot that shows
    overlapping CIs honestly rather than implying an ordering.
-6. **Publish an artifact** (HTML via the Artifact tool) for the visual version, and
-   keep the markdown as the in-repo source of record. Self-contained, theme-aware.
+6. **Publish the visual version on GitHub Pages.** `report/shared-nothing-renders.html`
+   is the in-repo source of record; `report/wrap_page.py` wraps it into a complete
+   document inside the Pages workflow, which serves it at
+   https://ejc3.github.io/fcvm/shared-nothing-renders.html. Self-contained,
+   theme-aware. The Claude Artifact route that stood here is retired (2026-09-26);
+   `test_report_page.py` pins this path.
 7. **`REVIEW.md` is a first-class deliverable**, not an appendix: what holds, what was
    refuted, what remains unmeasured.
 

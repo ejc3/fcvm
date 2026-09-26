@@ -1,6 +1,8 @@
 name: Deploy design docs to GitHub Pages
 
-# Publishes the hand-authored HTML under docs/ to GitHub Pages.
+# Publishes the hand-authored HTML under docs/ to GitHub Pages, plus the
+# benchmark report, which bench/chromium/report/wrap_page.py wraps into a
+# complete document from its fragment source at deploy time (one copy).
 # Trigger is push-to-main (trusted context) or manual dispatch — never untrusted
 # PR code, so no secrets are exposed to fork content.
 on:
@@ -8,6 +10,8 @@ on:
     branches: [main]
     paths:
       - 'docs/**'
+      - 'bench/chromium/report/shared-nothing-renders.html'
+      - 'bench/chromium/report/wrap_page.py'
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
@@ -31,10 +35,18 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: actions/configure-pages@v6
-      - name: Upload docs/ artifact
+      - name: Assemble the site
+        run: |
+          set -euo pipefail
+          rm -rf _site
+          cp -r docs _site
+          python3 bench/chromium/report/wrap_page.py \
+            bench/chromium/report/shared-nothing-renders.html \
+            > _site/shared-nothing-renders.html
+      - name: Upload site artifact
         uses: actions/upload-pages-artifact@v5
         with:
-          path: docs
+          path: _site
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
