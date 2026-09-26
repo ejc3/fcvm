@@ -397,6 +397,72 @@ class ReportContent(unittest.TestCase):
         self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
                          "a Firecracker branch link outside Firecracker builds")
 
+    def figure(self, label):
+        """The HTML of the <figure> whose caption has id=label."""
+        start = self.page.rindex("<figure", 0, self.page.index(f'aria-labelledby="{label}"'))
+        return self.page[start:self.page.index("</figure>", start)]
+
+    def test_setup_is_the_first_section(self):
+        """RED BEFORE THE FIX: "Two answers to one question", a section with
+        a full diagram, sat ahead of Setup, which moved the host, guest and
+        software provenance further down the page. bench/chromium/AGENTS.md
+        puts machine and versions in the first screenful."""
+        article = self.page[self.page.index("<article"):]
+        sections = re.findall(r'<h2 id="([^"]+)"', article)
+        self.assertEqual(sections[0], "setup")
+        toc = re.search(r'<nav class="toc".*?</nav>', self.page, re.S).group(0)
+        self.assertEqual(re.findall(r'href="#([^"]+)"', toc), sections, "the contents list the sections in page order")
+
+    LADDER = CORPUS_RUNS[1:]
+
+    def test_each_figure_computed_from_request_records_names_them(self):
+        """RED BEFORE THE FIX: the mean stage split (#d-split) and the
+        capacity arithmetic (#c-cap) printed means computed from per-request
+        records and named neither the file nor the fields. bench/chromium/
+        AGENTS.md: every figure traceable to a raw record, cited next to it."""
+        c4 = "results/reqbench-20260902-025115-corpus-c4/"
+        want = {
+            "d-split": [c4 + "reqbench.jsonl", "blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
+            "c-cap": [f"results/{run}/reqbench.jsonl" for run in self.LADDER] + ["wall_ms", c4 + "hostinfo.json", "nproc"],
+            "c-dens": ["results/20260808-corrected/corrected.json", "density", "host_pool"],
+        }
+        for label, needles in want.items():
+            src = re.findall(r'<p class="src">(.*?)</p>', self.figure(label), re.S)
+            self.assertEqual(len(src), 1, f"#{label} carries one source line")
+            for needle in needles:
+                self.assertIn(needle, src[0].replace("<wbr>", ""), f"#{label}'s source line must name {needle}")
+
+    def density_fits(self):
+        with open(os.path.join(HERE, "results", "20260808-corrected", "corrected.json")) as f:
+            record = json.load(f)
+        fits = {k: record["density"][k]["fits"]["cgroup"] for k in ("uffd-4k-minor", "file-4k", "uffd-4k-copy")}
+        fits["host_pool"] = record["host_pool"]["fits"]["cgroup"]
+        for fit in fits.values():
+            fit["slope"] = fit.get("slope_mib_per_clone", fit.get("slope_mib_per_container"))
+        return fits
+
+    def test_the_density_slopes_carry_their_standard_errors(self):
+        """RED BEFORE THE FIX: #c-dens printed the fitted slopes as bare
+        values (132.5, 143.5, 257.8 and 156.5 MiB) although the record gives
+        their standard errors, 0.4 to 5.0 MiB. bench/chromium/AGENTS.md:
+        quote uncertainty."""
+        fig = plain(self.figure("c-dens"))
+        for key, fit in self.density_fits().items():
+            self.assertIn(f"{fit['slope']:.1f} ± {fit['slope_se']:.1f} MiB", fig, key)
+
+    def test_the_density_figure_gives_intercepts_and_the_total_at_16(self):
+        """RED BEFORE THE FIX: #c-dens showed slopes only. The fits'
+        intercepts run from 17.3 to 249.8 MiB, so memory at a given count is
+        intercept + N x slope and the slopes alone cannot give it.
+        bench/chromium/AGENTS.md: slope and intercept with uncertainty, and a
+        value at a concrete N inside the measured range."""
+        fig = plain(self.figure("c-dens"))
+        for key, fit in self.density_fits().items():
+            self.assertIn(f"{fit['intercept_mib']:.1f} ± {fit['intercept_se']:.1f} MiB", fig, key)
+            total = fit["intercept_mib"] + 16 * fit["slope"]
+            self.assertIn(f"{total:,.0f} MiB", fig, key)
+            self.assertIn(f"{fit['reqs_per_gib_at_n']['16']:.1f} per GiB", fig, key)
+
 
 class PhoneLayout(unittest.TestCase):
     """Source-level checks of the page's layout on a phone. No browser runs in
