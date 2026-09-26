@@ -207,10 +207,13 @@ def declaration(body, prop):
     return m.group(1).strip() if m else None
 
 
-def last_declaration(body, prop):
+def last_declaration(body, prop, with_color_longhand=False):
     """The last value of `prop` in a run of declaration blocks, as the cascade
-    resolves equal-specificity rules in source order."""
-    found = re.findall(r"(?:^|;)\s*" + re.escape(prop) + r"\s*:\s*([^;]+)", body)
+    resolves equal-specificity rules in source order. With with_color_longhand,
+    a later `<prop>-color` declaration counts too (background-color after a
+    background shorthand)."""
+    name = re.escape(prop) + (r"(?:-color)?" if with_color_longhand else "")
+    found = re.findall(r"(?:^|;)\s*" + name + r"\s*:\s*([^;]+)", body)
     return found[-1].strip() if found else None
 
 
@@ -316,14 +319,20 @@ class ReportContent(unittest.TestCase):
         # from the records: every reqbench fixture arm, and HC's 202 attempts.
         caption = next((plain(u) for u in units if "(200 for HC)" in plain(u)), None)
         self.assertIsNotNone(caption, "the fixture caption was not found")
-        fixture_bounds = set()
+        fixture_bounds, attempts = set(), set()
         for rid in re.findall(r"results/(reqbench-[0-9a-f]{32}|reqbench-2026081\d-\d{6}-uffd)", self.page):
             with open(os.path.join(HERE, "results", rid, "analysis.json")) as f:
                 for arm in json.load(f)["arms"].values():
                     self.assertEqual(arm["failed"], 0, rid)
                     fixture_bounds.add(round(arm["failure_rate_ci"][1] * 100, 2))
+                    attempts.add(arm["attempted"])
         self.assertTrue(fixture_bounds, "no fixture record was read")
         self.assertIn(f"at most {max(fixture_bounds):.2f}%", caption)
+        # The caption names every per-arm attempt count the records hold, and no other.
+        stated = re.search(r"0 in ([\d, or]+) attempts per arm", caption)
+        self.assertTrue(stated, f"the fixture caption states no attempt counts: {caption[:160]!r}")
+        self.assertEqual(sorted(int(n) for n in re.findall(r"\d+", stated.group(1))), sorted(attempts),
+                         "the fixture caption's attempt counts must be the records' per-arm counts")
         hc = [line for line in open(os.path.join(HERE, "results", "hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b",
                                                  "hostcdp.jsonl")) if line.strip()]
         self.assertTrue(all(json.loads(line)["ok"] for line in hc))
@@ -432,7 +441,9 @@ class PhoneLayout(unittest.TestCase):
             for selector, body in rules.items():
                 colours = []
                 for prop in ("color", "background"):
-                    value = last_declaration(body, prop) or last_declaration(base, prop)
+                    # background-color overrides a background shorthand declared before it.
+                    value = (last_declaration(body, prop, prop == "background")
+                             or last_declaration(base, prop, prop == "background"))
                     var = re.fullmatch(r"var\((--[\w-]+)\)", value)
                     value = names[var.group(1)] if var else value
                     m = HEX.fullmatch(value)
