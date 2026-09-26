@@ -9,6 +9,7 @@ one source, and the lints in test_reqbench.py keep reading it unchanged.
 
     python3 bench/chromium/report/wrap_page.py SOURCE > OUT
 """
+import re
 import sys
 
 PREAMBLE = (
@@ -23,12 +24,15 @@ PREAMBLE = (
 def wrap(fragment):
     """The fragment's <title> and <style> go in <head>; everything after the
     style goes in <body>, so the header and footer sit outside <main>."""
-    if "<main>" not in fragment:
-        raise ValueError("the fragment has no <main>")
-    head, closing, body = fragment.partition("</style>\n")
-    if not closing:
+    split = re.search(r"</style>\r?\n?", fragment)
+    if not split:
         raise ValueError("the fragment has no </style>")
-    return (PREAMBLE + head + closing + "</head>\n<body>\n" + body.rstrip("\n")
+    head, body = fragment[:split.end()], fragment[split.end():]
+    if "<main>" in head:
+        raise ValueError("the fragment has a <main> before the end of its style")
+    if "<main>" not in body:
+        raise ValueError("the fragment has no <main> after its style")
+    return (PREAMBLE + head + "</head>\n<body>\n" + body.rstrip("\n")
             + "\n</body>\n</html>\n")
 
 
