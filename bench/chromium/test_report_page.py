@@ -137,6 +137,36 @@ class WrappedReport(unittest.TestCase):
         )
         self.assertRegex(workflow, r"path: *_site\b", "the site directory is what is uploaded")
 
+    def test_the_site_is_assembled_without_deploy_credentials(self):
+        """RED BEFORE THE FIX (#1014): pages.yml ran one job that held
+        pages: write and id-token: write and also executed
+        bench/chromium/report/wrap_page.py from the checked-out ref, so any
+        change to the wrapper that reached a deployable ref ran with the
+        deployment identity. The job that runs repository code must hold no
+        deploy permission, and the job that holds it must run no repository
+        code and deploy only from main."""
+        workflow = read(PAGES_WORKFLOW)
+        self.assertRegex(workflow, r"(?m)^permissions: *\{\}\s*$",
+                         "the workflow grants nothing by default; each job asks for its own")
+        body = workflow[workflow.index("\njobs:\n") + len("\njobs:\n"):]
+        jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", body))
+        self.assertTrue(jobs, "no jobs parsed from pages.yml; the check is vacuous")
+        deploying = [name for name, job in jobs.items()
+                     if re.search(r"(?m)^ +(?:pages|id-token): *write\b", job)]
+        self.assertEqual(len(deploying), 1, f"exactly one job may hold deploy permissions: {deploying}")
+        deploy = jobs[deploying[0]]
+        self.assertNotRegex(deploy, r"(?m)^ +(?:- )?run:", "the deploy job runs no shell steps")
+        self.assertNotIn("actions/checkout", deploy, "the deploy job checks out no repository code")
+        self.assertIn("actions/deploy-pages", deploy)
+        self.assertRegex(deploy, r"(?m)^    if: *github\.ref *== *'refs/heads/main' *$",
+                         "only a run on main deploys")
+        for name, job in jobs.items():
+            if "wrap_page.py" in job or re.search(r"(?m)^ +(?:- )?run:", job):
+                self.assertNotRegex(job, r"(?m)^ +(?:pages|id-token): *write\b",
+                                    f"job {name!r} runs repository code while holding a deploy permission")
+                self.assertRegex(job, r"(?m)^    permissions:\n      contents: *read *$",
+                                 f"job {name!r} must declare contents: read and nothing more")
+
     def test_the_deliverable_contract_names_github_pages(self):
         """Codex on #1012: AGENTS.md required publishing through the Artifact tool,
         which this PR retires. The contract names the Pages path instead.

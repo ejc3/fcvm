@@ -3,7 +3,7 @@ name: Deploy design docs to GitHub Pages
 # Publishes the hand-authored HTML under docs/ to GitHub Pages, plus the
 # benchmark report, which bench/chromium/report/wrap_page.py wraps into a
 # complete document from its fragment source at deploy time (one copy).
-# Trigger is push-to-main (trusted context) or manual dispatch — never untrusted
+# Trigger is push-to-main (trusted context) or manual dispatch, never untrusted
 # PR code, so no secrets are exposed to fork content.
 on:
   push:
@@ -15,11 +15,8 @@ on:
       - '.github/workflows/pages.yml'
   workflow_dispatch:
 
-# Least privilege: only what deploy-pages needs.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Nothing by default; each job asks for what it needs (#1014).
+permissions: {}
 
 # One in-flight deploy at a time; don't cancel a running publish.
 concurrency:
@@ -27,14 +24,13 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # Runs repository code (wrap_page.py), so it holds no deploy permission.
+  build:
     runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/configure-pages@v6
       - name: Assemble the site
         run: |
           set -euo pipefail
@@ -47,6 +43,21 @@ jobs:
         uses: actions/upload-pages-artifact@v5
         with:
           path: _site
+
+  # Holds the Pages and OIDC permissions and runs no repository code. Only a
+  # run on main deploys; a manual dispatch from another branch stops after build.
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/configure-pages@v6
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
