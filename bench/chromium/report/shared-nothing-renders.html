@@ -128,9 +128,12 @@ tbody tr:nth-child(2n) { background: var(--canvas-subtle); }
 td.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
 table.kv td:first-child { font-weight: 600; white-space: nowrap; width: 1%; }
 table.records td:first-child { white-space: nowrap; }
+table.records code { font-size: 80%; }
 @media (max-width: 640px) {
-  table.kv td { display: block; width: auto; border: 0; padding: 2px 0; }
+  table.kv td, table.kv td:first-child { display: block; width: auto; border: 0; padding: 2px 0; }
   table.kv td:first-child { padding-top: 10px; white-space: normal; }
+  th, td { padding: 6px 8px; }
+  table { font-size: 13px; }
   table.kv tr { display: block; border-bottom: 1px solid var(--border); padding-bottom: 8px; }
   table.kv thead { display: none; }
   table.kv, table.kv tbody { display: block; }
@@ -138,10 +141,13 @@ table.records td:first-child { white-space: nowrap; }
   table.stack, table.stack tbody, table.stack tr, table.stack td { display: block; width: auto; }
   table.stack thead { display: none; }
   table.stack tr { border: 1px solid var(--border); border-radius: 6px; margin-bottom: 12px; padding: 8px 12px; background: var(--canvas) !important; }
-  table.stack td { border: 0; padding: 3px 0; display: grid; grid-template-columns: 8.5rem minmax(0, 1fr); gap: 8px; }
-  table.stack td::before { content: attr(data-label); color: var(--fg-muted); font-weight: 600; }
-  table.stack td:first-child { font-weight: 600; font-size: 15px; display: block; padding-bottom: 6px; }
+  table.stack td { border: 0; padding: 3px 0 3px 9rem; position: relative; min-height: 1.5em; }
+  table.stack td::before { content: attr(data-label); position: absolute; left: 0; top: 3px; width: 8.5rem; color: var(--fg-muted); font-weight: 600; }
+  table.stack td:first-child { font-weight: 600; font-size: 15px; display: block; padding: 0 0 6px; }
   table.stack td:first-child::before { content: none; }
+  table.records td { padding-left: 5rem; }
+  table.records td::before { width: 4.5rem; }
+  td:not(.n) { overflow-wrap: anywhere; }
 }
 
 /* Alerts, after GitHub's markdown alerts */
@@ -170,13 +176,16 @@ table.records td:first-child { white-space: nowrap; }
 .legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 16px; padding: 0; margin: 0 0 12px; font-size: 13px; color: var(--fg-muted); }
 .legend li { margin: 0; }
 .sw { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 6px; vertical-align: -1px; }
-.sw.tick { width: 3px; height: 14px; border-radius: 0; vertical-align: -3px; background: var(--fg-muted); }
+.sw.thin { width: 12px; height: 4px; border-radius: 0 2px 2px 0; vertical-align: 2px; background: var(--ref); }
 .rows { display: grid; gap: 6px; }
 .r { display: grid; grid-template-columns: minmax(0, 12rem) minmax(0, 1fr); align-items: center; gap: 12px; }
 .r .l { font-size: 14px; text-align: right; overflow-wrap: anywhere; }
 .r .t { position: relative; height: 24px; border-left: 1px solid var(--axis); }
 .r .b { position: absolute; left: 0; top: 4px; height: 16px; width: var(--w); border-radius: 0 4px 4px 0; }
-.r .k { position: absolute; top: 1px; height: 22px; width: 3px; margin-left: -1px; left: var(--t); background: var(--fg-muted); border-radius: 1px; }
+.r .t.two { height: 26px; }
+.r .t.two .b { top: 2px; height: 14px; }
+.r .t.two .v { line-height: 18px; }
+.r .b2 { position: absolute; left: 0; top: 20px; height: 4px; width: var(--t); border-radius: 0 2px 2px 0; background: var(--ref); }
 .r .wh { position: absolute; top: 11px; height: 2px; left: var(--lo); width: calc(var(--hi) - var(--lo)); background: var(--whisker); }
 .r .wh::before, .r .wh::after { content: ""; position: absolute; top: -5px; width: 2px; height: 12px; background: var(--whisker); }
 .r .wh::before { left: 0; }
@@ -292,7 +301,7 @@ table.records td:first-child { white-space: nowrap; }
 </figure>
 <p>Going from 2 to 4 vCPUs is the step that matters: 549.4 ms is 28.7% below 770.3, and all 14 sites are faster at 4 than at 2. From 4 to 8 the medians do not separate. Each sits inside the other&#8217;s interval, and 8 vCPUs is slower than 4 on 11 of the 14 sites.</p>
 <p>The 4-to-8 difference is not in the rendering. Navigate falls from 301.0 to 267.2 ms and screenshot from 67.1 to 64.1 ms, while the wait for the target rises from 153.1 to 204.6 ms: one extra 50 ms poll (median attempts 4, then 5). So 4 vCPUs is the latency operating point. More vCPUs per render also means fewer renders per host, and no run here measures density.</p>
-<p>Each configuration ran once. The two 2 vCPU runs, on different goldens, fcvm builds and host boots, read 770.3 and 712.6 ms, 57.7 ms apart; that is the only view of run-to-run spread here. The host&#8217;s 1-minute load peaked at 2.62, 18.3 and 16.97 during the 2, 4 and 8 vCPU runs, while the no-render baseline stayed at 44.9, 45.1 and 45.8 ms.</p>
+<p>No configuration was measured twice under the same conditions. The two 2 vCPU runs, on different goldens, fcvm builds and host boots, read 770.3 and 712.6 ms, 57.7 ms apart; that is the only view of run-to-run spread here. The host&#8217;s 1-minute load peaked at 2.62, 18.3 and 16.97 during the 2, 4 and 8 vCPU runs, while the no-render baseline stayed at 44.9, 45.1 and 45.8 ms.</p>
 <p class="tbl-title">Ladder medians (ms)</p>
 <div class="table-wrap"><table>
 <thead><tr><th>Guest vCPUs</th><th>Request median</th><th>Within-run interval</th><th>No-render baseline</th></tr></thead>
@@ -300,37 +309,39 @@ table.records td:first-child { white-space: nowrap; }
 <tr><td>2</td><td class="n">770.3</td><td class="n">596.2–807.8</td><td class="n">44.9</td></tr>
 <tr><td>4</td><td class="n">549.4</td><td class="n">467.9–632.4</td><td class="n">45.1</td></tr>
 <tr><td>8</td><td class="n">580.2</td><td class="n">520.8–645.9</td><td class="n">45.8</td></tr>
-<tr><td>2 (2026-08-30 run)</td><td class="n">712.6</td><td class="n">610.5–808.5</td><td class="n">44.8</td></tr>
+<tr><td>2, earlier run</td><td class="n">712.6</td><td class="n">610.5–808.5</td><td class="n">44.8</td></tr>
 </tbody></table></div>
 <p class="tbl-title">Stage medians by vCPU count (ms)</p>
 <div class="table-wrap"><table>
-<thead><tr><th>Guest vCPUs</th><th>Restore</th><th>Wait for target</th><th>WS upgrade</th><th>Page.enable</th><th>Navigate</th><th>Screenshot</th></tr></thead>
+<thead><tr><th>Stage</th><th>2 vCPU</th><th>4 vCPU</th><th>8 vCPU</th><th>2 vCPU, earlier run</th></tr></thead>
 <tbody>
-<tr><td>2</td><td class="n">43.1</td><td class="n">152.9</td><td class="n">6.1</td><td class="n">2.5</td><td class="n">414.1</td><td class="n">81.4</td></tr>
-<tr><td>4</td><td class="n">44.7</td><td class="n">153.1</td><td class="n">2.6</td><td class="n">2.8</td><td class="n">301.0</td><td class="n">67.1</td></tr>
-<tr><td>8</td><td class="n">45.5</td><td class="n">204.6</td><td class="n">3.1</td><td class="n">3.8</td><td class="n">267.2</td><td class="n">64.1</td></tr>
-<tr><td>2 (2026-08-30 run)</td><td class="n">44.5</td><td class="n">154.3</td><td class="n">6.2</td><td class="n">4.3</td><td class="n">409.1</td><td class="n">80.3</td></tr>
+<tr><td>Restore</td><td class="n">43.1</td><td class="n">44.7</td><td class="n">45.5</td><td class="n">44.5</td></tr>
+<tr><td>Wait for target</td><td class="n">152.9</td><td class="n">153.1</td><td class="n">204.6</td><td class="n">154.3</td></tr>
+<tr><td>WS upgrade</td><td class="n">6.1</td><td class="n">2.6</td><td class="n">3.1</td><td class="n">6.2</td></tr>
+<tr><td>Page.enable</td><td class="n">2.5</td><td class="n">2.8</td><td class="n">3.8</td><td class="n">4.3</td></tr>
+<tr><td>Navigate</td><td class="n">414.1</td><td class="n">301.0</td><td class="n">267.2</td><td class="n">409.1</td></tr>
+<tr><td>Screenshot</td><td class="n">81.4</td><td class="n">67.1</td><td class="n">64.1</td><td class="n">80.3</td></tr>
 </tbody></table></div>
 <p class="src">Records: <code>results/reqbench-20260902-023115-corpus-c2</code>, <code>results/reqbench-20260902-025115-corpus-c4</code>, <code>results/reqbench-20260902-031115-corpus-c8</code>, indexed by <code>results/campaign-20260902-box2-ladder-summary.json</code>; the earlier run is <code>results/reqbench-20260830-171007-corpus</code>, indexed by <code>results/campaign-20260830-box2-summary.json</code>.</p>
 <h2 id="sites">Per-site latency</h2>
 <figure class="chart" aria-labelledby="c-site">
-<figcaption id="c-site"><span class="ct">Median per site at 4 vCPUs</span><span class="cs">14 or 15 renders per site. The tick marks the same site&#8217;s median at 2 vCPUs.</span></figcaption>
-<ul class="legend"><li><span class="sw s1"></span>4 vCPUs</li><li><span class="sw tick"></span>2 vCPUs</li></ul>
+<figcaption id="c-site"><span class="ct">Median per site at 4 vCPUs</span><span class="cs">14 or 15 renders per site. The thin grey bar is the same site&#8217;s median at 2 vCPUs.</span></figcaption>
+<ul class="legend"><li><span class="sw s1"></span>4 vCPUs</li><li><span class="sw thin"></span>2 vCPUs</li></ul>
 <div class="rows">
-<div class="r" title="elmundo.es: 2,945.2 ms at 4 vCPUs, 3,716.8 ms at 2 vCPUs"><span class="l">elmundo.es</span><span class="t" style="--w:57.05%;--t:72.00%;--end:72.00%"><span class="b s1"></span><span class="k"></span><span class="v">2,945.2 ms</span></span></div>
-<div class="r" title="rtp.pt/noticias: 2,195.0 ms at 4 vCPUs, 2,576.9 ms at 2 vCPUs"><span class="l">rtp.pt/noticias</span><span class="t" style="--w:42.52%;--t:49.92%;--end:49.92%"><span class="b s1"></span><span class="k"></span><span class="v">2,195.0 ms</span></span></div>
-<div class="r" title="theguardian.com: 913.7 ms at 4 vCPUs, 1,181.5 ms at 2 vCPUs"><span class="l">theguardian.com</span><span class="t" style="--w:17.70%;--t:22.89%;--end:22.89%"><span class="b s1"></span><span class="k"></span><span class="v">913.7 ms</span></span></div>
-<div class="r" title="developers.cloudflare.com: 656.5 ms at 4 vCPUs, 876.7 ms at 2 vCPUs"><span class="l">developers.cloudflare.com</span><span class="t" style="--w:12.72%;--t:16.98%;--end:16.98%"><span class="b s1"></span><span class="k"></span><span class="v">656.5 ms</span></span></div>
-<div class="r" title="en.wikipedia.org: 651.2 ms at 4 vCPUs, 817.3 ms at 2 vCPUs"><span class="l">en.wikipedia.org</span><span class="t" style="--w:12.61%;--t:15.83%;--end:15.83%"><span class="b s1"></span><span class="k"></span><span class="v">651.2 ms</span></span></div>
-<div class="r" title="developer.mozilla.org: 643.3 ms at 4 vCPUs, 830.4 ms at 2 vCPUs"><span class="l">developer.mozilla.org</span><span class="t" style="--w:12.46%;--t:16.09%;--end:16.09%"><span class="b s1"></span><span class="k"></span><span class="v">643.3 ms</span></span></div>
-<div class="r" title="blog.cloudflare.com: 577.8 ms at 4 vCPUs, 809.6 ms at 2 vCPUs"><span class="l">blog.cloudflare.com</span><span class="t" style="--w:11.19%;--t:15.68%;--end:15.68%"><span class="b s1"></span><span class="k"></span><span class="v">577.8 ms</span></span></div>
-<div class="r" title="TodoMVC, Angular: 478.5 ms at 4 vCPUs, 616.7 ms at 2 vCPUs"><span class="l">TodoMVC, Angular</span><span class="t" style="--w:9.27%;--t:11.95%;--end:11.95%"><span class="b s1"></span><span class="k"></span><span class="v">478.5 ms</span></span></div>
-<div class="r" title="TodoMVC, ES6: 432.7 ms at 4 vCPUs, 538.5 ms at 2 vCPUs"><span class="l">TodoMVC, ES6</span><span class="t" style="--w:8.38%;--t:10.43%;--end:10.43%"><span class="b s1"></span><span class="k"></span><span class="v">432.7 ms</span></span></div>
-<div class="r" title="TodoMVC, Vue: 429.8 ms at 4 vCPUs, 546.2 ms at 2 vCPUs"><span class="l">TodoMVC, Vue</span><span class="t" style="--w:8.33%;--t:10.58%;--end:10.58%"><span class="b s1"></span><span class="k"></span><span class="v">429.8 ms</span></span></div>
-<div class="r" title="TodoMVC, React: 427.4 ms at 4 vCPUs, 558.0 ms at 2 vCPUs"><span class="l">TodoMVC, React</span><span class="t" style="--w:8.28%;--t:10.81%;--end:10.81%"><span class="b s1"></span><span class="k"></span><span class="v">427.4 ms</span></span></div>
-<div class="r" title="TodoMVC, Preact: 411.3 ms at 4 vCPUs, 527.9 ms at 2 vCPUs"><span class="l">TodoMVC, Preact</span><span class="t" style="--w:7.97%;--t:10.23%;--end:10.23%"><span class="b s1"></span><span class="k"></span><span class="v">411.3 ms</span></span></div>
-<div class="r" title="news.ycombinator.com: 395.8 ms at 4 vCPUs, 505.3 ms at 2 vCPUs"><span class="l">news.ycombinator.com</span><span class="t" style="--w:7.67%;--t:9.79%;--end:9.79%"><span class="b s1"></span><span class="k"></span><span class="v">395.8 ms</span></span></div>
-<div class="r" title="example.com: 326.2 ms at 4 vCPUs, 416.2 ms at 2 vCPUs"><span class="l">example.com</span><span class="t" style="--w:6.32%;--t:8.06%;--end:8.06%"><span class="b s1"></span><span class="k"></span><span class="v">326.2 ms</span></span></div>
+<div class="r" title="elmundo.es: 2,945.2 ms at 4 vCPUs, 3,716.8 ms at 2 vCPUs"><span class="l">elmundo.es</span><span class="t two" style="--w:57.05%;--t:72.00%;--end:57.05%"><span class="b s1"></span><span class="b2"></span><span class="v">2,945.2 ms</span></span></div>
+<div class="r" title="rtp.pt/noticias: 2,195.0 ms at 4 vCPUs, 2,576.9 ms at 2 vCPUs"><span class="l">rtp.pt/noticias</span><span class="t two" style="--w:42.52%;--t:49.92%;--end:42.52%"><span class="b s1"></span><span class="b2"></span><span class="v">2,195.0 ms</span></span></div>
+<div class="r" title="theguardian.com: 913.7 ms at 4 vCPUs, 1,181.5 ms at 2 vCPUs"><span class="l">theguardian.com</span><span class="t two" style="--w:17.70%;--t:22.89%;--end:17.70%"><span class="b s1"></span><span class="b2"></span><span class="v">913.7 ms</span></span></div>
+<div class="r" title="developers.cloudflare.com: 656.5 ms at 4 vCPUs, 876.7 ms at 2 vCPUs"><span class="l">developers.cloudflare.com</span><span class="t two" style="--w:12.72%;--t:16.98%;--end:12.72%"><span class="b s1"></span><span class="b2"></span><span class="v">656.5 ms</span></span></div>
+<div class="r" title="en.wikipedia.org: 651.2 ms at 4 vCPUs, 817.3 ms at 2 vCPUs"><span class="l">en.wikipedia.org</span><span class="t two" style="--w:12.61%;--t:15.83%;--end:12.61%"><span class="b s1"></span><span class="b2"></span><span class="v">651.2 ms</span></span></div>
+<div class="r" title="developer.mozilla.org: 643.3 ms at 4 vCPUs, 830.4 ms at 2 vCPUs"><span class="l">developer.mozilla.org</span><span class="t two" style="--w:12.46%;--t:16.09%;--end:12.46%"><span class="b s1"></span><span class="b2"></span><span class="v">643.3 ms</span></span></div>
+<div class="r" title="blog.cloudflare.com: 577.8 ms at 4 vCPUs, 809.6 ms at 2 vCPUs"><span class="l">blog.cloudflare.com</span><span class="t two" style="--w:11.19%;--t:15.68%;--end:11.19%"><span class="b s1"></span><span class="b2"></span><span class="v">577.8 ms</span></span></div>
+<div class="r" title="TodoMVC, Angular: 478.5 ms at 4 vCPUs, 616.7 ms at 2 vCPUs"><span class="l">TodoMVC, Angular</span><span class="t two" style="--w:9.27%;--t:11.95%;--end:9.27%"><span class="b s1"></span><span class="b2"></span><span class="v">478.5 ms</span></span></div>
+<div class="r" title="TodoMVC, ES6: 432.7 ms at 4 vCPUs, 538.5 ms at 2 vCPUs"><span class="l">TodoMVC, ES6</span><span class="t two" style="--w:8.38%;--t:10.43%;--end:8.38%"><span class="b s1"></span><span class="b2"></span><span class="v">432.7 ms</span></span></div>
+<div class="r" title="TodoMVC, Vue: 429.8 ms at 4 vCPUs, 546.2 ms at 2 vCPUs"><span class="l">TodoMVC, Vue</span><span class="t two" style="--w:8.33%;--t:10.58%;--end:8.33%"><span class="b s1"></span><span class="b2"></span><span class="v">429.8 ms</span></span></div>
+<div class="r" title="TodoMVC, React: 427.4 ms at 4 vCPUs, 558.0 ms at 2 vCPUs"><span class="l">TodoMVC, React</span><span class="t two" style="--w:8.28%;--t:10.81%;--end:8.28%"><span class="b s1"></span><span class="b2"></span><span class="v">427.4 ms</span></span></div>
+<div class="r" title="TodoMVC, Preact: 411.3 ms at 4 vCPUs, 527.9 ms at 2 vCPUs"><span class="l">TodoMVC, Preact</span><span class="t two" style="--w:7.97%;--t:10.23%;--end:7.97%"><span class="b s1"></span><span class="b2"></span><span class="v">411.3 ms</span></span></div>
+<div class="r" title="news.ycombinator.com: 395.8 ms at 4 vCPUs, 505.3 ms at 2 vCPUs"><span class="l">news.ycombinator.com</span><span class="t two" style="--w:7.67%;--t:9.79%;--end:7.67%"><span class="b s1"></span><span class="b2"></span><span class="v">395.8 ms</span></span></div>
+<div class="r" title="example.com: 326.2 ms at 4 vCPUs, 416.2 ms at 2 vCPUs"><span class="l">example.com</span><span class="t two" style="--w:6.32%;--t:8.06%;--end:6.32%"><span class="b s1"></span><span class="b2"></span><span class="v">326.2 ms</span></span></div>
 </div>
 </figure>
 <p>The simple pages (example.com, Hacker News and the five TodoMVC apps) take 326.2 to 478.5 ms at 4 vCPUs. The documentation and reference sites take 577.8 to 656.5 ms. The three news sites take 913.7 to 2,945.2 ms, and part of that is Chromium waiting on the ad and consent requests the replay does not answer.</p>
@@ -411,7 +422,7 @@ table.records td:first-child { white-space: nowrap; }
 <p>The request medians are 477.9 ms in the VM and 133.0 ms in the container (driver-internal time). Most of the gap is in the wait for the target (+114.0 ms) and navigation (+156.4 ms); the screenshot costs about the same in both (+3.1 ms). These are differences between two separately measured setups on the synthetic page, not a split of the cost into virtualization and memory.</p>
 <details><summary>All fixture configurations</summary>
 <div class="table-wrap"><table>
-<thead><tr><th>Run and configuration</th><th>Restore-only p50</th><th>Direct CDP p50</th><th>With fast teardown</th></tr></thead>
+<thead><tr><th>Run and configuration</th><th>Restore-only p50</th><th>Direct CDP p50</th><th>Fast teardown</th></tr></thead>
 <tbody>
 <tr><td>RB-uffd: copy, 4 KB, first golden</td><td class="n">59.3</td><td class="n">413.2</td><td class="n">413.0</td></tr>
 <tr><td>RB-file: file-backed, 4 KB, first golden</td><td class="n">58.5</td><td class="n">458.9</td><td class="n">453.8</td></tr>
@@ -432,7 +443,7 @@ table.records td:first-child { white-space: nowrap; }
 <li><strong>CPU and memory per request</strong> on the corpus. Cloudflare publishes both; we have no whole-system CPU figure and no memory figure on a reconciled basis.</li>
 <li><strong>HTML extraction</strong>, Cloudflare&#8217;s second operation. No run performs it.</li>
 <li><strong>Density.</strong> How many concurrent renders a host sustains, and at what latency.</li>
-<li><strong>Run-to-run variance.</strong> Each configuration ran once. Five independent runs per configuration would put error bars on the medians.</li>
+<li><strong>Run-to-run variance.</strong> No configuration was measured twice under the same conditions. Five independent runs per configuration would put error bars on the medians.</li>
 <li><strong>Other network modes.</strong> Only rootless (pasta) is published. A bridged-network run was refused by the zero-failure gate at 1 failure in 205 requests; the failure is tracked in <a href="https://github.com/ejc3/fcvm/issues/820">#820</a>.</li>
 <li><strong>Other engines</strong>, including WebKit.</li>
 </ul>
@@ -460,18 +471,18 @@ table.records td:first-child { white-space: nowrap; }
 <p>Restored guests need their monotonic clock to continue from the snapshot instant, or every armed timer fires at once. On these plain-EL1 guests the host kernel handles it: since the <a href="https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/">March 2023 arm64 KVM counter-offset series</a>, KVM recomputes the VM-wide counter offset when a restore replays the saved counter registers. The timer storm fcvm fixed for nested virtualization (<a href="https://github.com/ejc3/fcvm/issues/630">#630</a>) needs a virtual-EL2 guest and does not apply to this build.</p>
 <h2 id="records">Records</h2>
 <p>Every figure on this page comes from a committed record under <code>bench/chromium/results/</code>. Each run records content hashes of the harness, fcvm and fc-agent, the snapshot generation and its config digest.</p>
-<div class="table-wrap"><table class="records">
+<div class="table-wrap"><table class="stack records">
 <thead><tr><th>Id</th><th>What</th><th>Record</th></tr></thead>
 <tbody>
-<tr><td>CL2, CL4, CL8</td><td>Corpus vCPU ladder, 2026-09-02, one golden per rung, DNS-verified</td><td><code>results/reqbench-20260902-023115-corpus-c2</code>, <code>results/reqbench-20260902-025115-corpus-c4</code>, <code>results/reqbench-20260902-031115-corpus-c8</code>; index <code>results/campaign-20260902-box2-ladder-summary.json</code></td></tr>
-<tr><td>CV</td><td>Corpus, 2 vCPU, 2026-08-30, DNS-verified</td><td><code>results/reqbench-20260830-171007-corpus</code>; index <code>results/campaign-20260830-box2-summary.json</code></td></tr>
-<tr><td>RB-uffd, RB-file</td><td>Fixture, first golden</td><td><code>results/reqbench-86d0f4aca0ca486b8b1a9239792a2d7d</code>, <code>results/reqbench-ccd7655151d94a6ea47fba8aa23f352d</code></td></tr>
-<tr><td>AB-copy, AB-minor</td><td>Fixture, second golden</td><td><code>results/reqbench-c61bd9e8e4764a23aca3d0ab7ca07a3a</code>, <code>results/reqbench-8fbec71a1863427fa4daddc9f1f53af1</code></td></tr>
-<tr><td>PF-on, PF-off</td><td>Fixture, prefetch pinned on and off, third golden</td><td><code>results/reqbench-9c23e9d7da424351a390b5c1ddfd8e1d</code>, <code>results/reqbench-134b408e1a3d42feb866bb4c5fed774c</code></td></tr>
-<tr><td>HM, HK</td><td>Fixture, 2 MB hugepages, minor and copy, shared golden</td><td><code>results/reqbench-20260814-001144-uffd</code>, <code>results/reqbench-20260814-002056-uffd</code></td></tr>
-<tr><td>NC, FG</td><td>Fixture, optimized configuration on two goldens</td><td><code>results/reqbench-20260814-024029-uffd</code>, <code>results/reqbench-20260814-035757-uffd</code></td></tr>
-<tr><td>HC</td><td>Warm host container, no VM</td><td><code>results/hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b</code></td></tr>
-<tr><td>FB</td><td>userfaultfd fault counts, prefetch excluded</td><td><code>results/faultbench-0813-073507-690998</code></td></tr>
+<tr><td data-label="Id">CL2, CL4, CL8</td><td data-label="What">Corpus vCPU ladder, 2026-09-02, one golden per rung, DNS-verified</td><td data-label="Record"><code>results/reqbench-20260902-023115-corpus-c2</code>, <code>results/reqbench-20260902-025115-corpus-c4</code>, <code>results/reqbench-20260902-031115-corpus-c8</code>; index <code>results/campaign-20260902-box2-ladder-summary.json</code></td></tr>
+<tr><td data-label="Id">CV</td><td data-label="What">Corpus, 2 vCPU, 2026-08-30, DNS-verified</td><td data-label="Record"><code>results/reqbench-20260830-171007-corpus</code>; index <code>results/campaign-20260830-box2-summary.json</code></td></tr>
+<tr><td data-label="Id">RB-uffd, RB-file</td><td data-label="What">Fixture, first golden</td><td data-label="Record"><code>results/reqbench-86d0f4aca0ca486b8b1a9239792a2d7d</code>, <code>results/reqbench-ccd7655151d94a6ea47fba8aa23f352d</code></td></tr>
+<tr><td data-label="Id">AB-copy, AB-minor</td><td data-label="What">Fixture, second golden</td><td data-label="Record"><code>results/reqbench-c61bd9e8e4764a23aca3d0ab7ca07a3a</code>, <code>results/reqbench-8fbec71a1863427fa4daddc9f1f53af1</code></td></tr>
+<tr><td data-label="Id">PF-on, PF-off</td><td data-label="What">Fixture, prefetch pinned on and off, third golden</td><td data-label="Record"><code>results/reqbench-9c23e9d7da424351a390b5c1ddfd8e1d</code>, <code>results/reqbench-134b408e1a3d42feb866bb4c5fed774c</code></td></tr>
+<tr><td data-label="Id">HM, HK</td><td data-label="What">Fixture, 2 MB hugepages, minor and copy, shared golden</td><td data-label="Record"><code>results/reqbench-20260814-001144-uffd</code>, <code>results/reqbench-20260814-002056-uffd</code></td></tr>
+<tr><td data-label="Id">NC, FG</td><td data-label="What">Fixture, optimized configuration on two goldens</td><td data-label="Record"><code>results/reqbench-20260814-024029-uffd</code>, <code>results/reqbench-20260814-035757-uffd</code></td></tr>
+<tr><td data-label="Id">HC</td><td data-label="What">Warm host container, no VM</td><td data-label="Record"><code>results/hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b</code></td></tr>
+<tr><td data-label="Id">FB</td><td data-label="What">userfaultfd fault counts, prefetch excluded</td><td data-label="Record"><code>results/faultbench-0813-073507-690998</code></td></tr>
 </tbody></table></div>
 </article>
 <footer class="site-footer"><p>Source: <a href="https://github.com/ejc3/fcvm/blob/main/bench/chromium/report/shared-nothing-renders.html">bench/chromium/report/shared-nothing-renders.html</a>, published by <a href="https://github.com/ejc3/fcvm/blob/main/.github/workflows/pages.yml">pages.yml</a>. Corrections and withdrawn results: <a href="https://github.com/ejc3/fcvm/blob/main/bench/chromium/REVIEW.md">REVIEW.md</a>.</p></footer>
