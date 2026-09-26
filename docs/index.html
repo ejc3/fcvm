@@ -29,8 +29,8 @@
   <p class="sub">Architecture &amp; design notes for the fcvm microVM manager.</p>
 
   <a class="card" href="shared-nothing-renders.html">
-    <h2>Shared-nothing renders <span class="tag">measurement report</span></h2>
-    <p>Per-request-isolated Chromium in Firecracker microVMs, measured on Cloudflare&rsquo;s 14-URL Kitesurf corpus: 549.4 ms p50 at 4 vCPU, DNS-verified, with Cloudflare&rsquo;s published Kitesurf rows beside it. Every claim cites its run.</p>
+    <h2>One microVM per page: Chromium on Firecracker snapshots <span class="tag">benchmark</span></h2>
+    <p>A new Firecracker microVM per screenshot request, restored from a warm Chromium snapshot: 549.4 ms median at 4 vCPUs on Cloudflare&rsquo;s 14-URL Kitesurf corpus, with their published numbers alongside and every figure tied to a committed record.</p>
   </a>
 
   <a class="card" href="https://github.com/ejc3/fcvm/blob/main/docs/durable-workloads.md">

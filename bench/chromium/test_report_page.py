@@ -45,9 +45,10 @@ class WrappedReport(unittest.TestCase):
         # The SVG charts carry their own <title> children; the document title
         # is the one in the head.
         self.assertEqual(re.findall(r"<title>[^<]*</title>", head),
-                         ["<title>Shared-Nothing Renders</title>"])
-        for tag in ("<!DOCTYPE", "<html", "<head", "<body"):
-            self.assertEqual(page.count(tag), 1, tag)
+                         ["<title>One microVM per page: Chromium on Firecracker snapshots</title>"])
+        # Match whole tag names: the page body has a <header> element.
+        for tag in ("!DOCTYPE", "html", "head", "body"):
+            self.assertEqual(len(re.findall(rf"<{tag}[\s>]", page)), 1, tag)
         # Removing the skeleton the wrapper adds gives back the fragment,
         # so nothing else was added, dropped or reordered.
         stripped = (page.removeprefix(wrap_page.PREAMBLE)
