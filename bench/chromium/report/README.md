@@ -19,11 +19,13 @@ and the status of historical evidence.
 
 ## Publishing
 
-The file is a page BODY: a `<title>`, a `<style>`, and a `<main>`. It carries no
-`<!doctype>`, `<html>`, `<head>` or `<body>`. `wrap_page.py` adds them, and
-`.github/workflows/pages.yml` runs it on every push to main that touches this
-file or the wrapper, publishing the result beside `docs/` at
-https://ejc3.github.io/fcvm/shared-nothing-renders.html. There is no second
+The file is a page fragment: a `<title>` and a `<style>`, followed by a header,
+a `<main>` and a footer. It carries no `<!doctype>`, `<html>`, `<head>` or
+`<body>`. `wrap_page.py` splits it after `</style>`, puts the title and style in
+`<head>` and the rest in `<body>`, and `.github/workflows/pages.yml` runs it on
+every push to main that touches this file or the wrapper, publishing the result
+beside `docs/` at https://ejc3.github.io/fcvm/shared-nothing-renders.html.
+There is no second
 copy: edit here, merge, and the deploy follows. `../test_report_page.py` checks
 the wrapping and that the workflow still runs it.
 
@@ -55,10 +57,11 @@ n=202, 14 URLs cycled uniformly, 4 guest vCPUs, from
 verdict clean, first_mismatch null, diag violations none). Four corpus cells now
 have a shipped record, a real workload and a verified resolver: the 2026-09-02
 ladder at 2, 4 and 8 vCPU, and `results/reqbench-20260830-171007-corpus` at
-712.6 ms [610.5, 808.5] on 2 vCPU. The headline is the 4 vCPU cell because the
-ladder puts the knee between 2 and 4 (see "Corpus latency by guest vCPU count"
-below), so 4 is the operating point; the 2 vCPU figures are quoted beside it
-wherever it appears, because most of the rest of this report is 2 vCPU work.
+712.6 ms [610.5, 808.5] on 2 vCPU. The headline is the 4 vCPU cell, the lowest
+request median of the ladder's three single runs; the runs do not show that 4 is
+faster than 8 (see "Corpus latency by guest vCPU count" below). The 2 vCPU
+figures are quoted beside it wherever it appears, because most of the rest of
+this report is 2 vCPU work.
 The 695.7 ms at 4 vCPU that stood here before came from
 `results/reqbench-20260816-123529-corpus`, which is withdrawn.
 
@@ -148,7 +151,8 @@ The ladder was re-run on a source_revision that contains `90733b854e`
 (`1e9e9b70937c`): three rungs measured back to back in one session, one runtime
 bundle (`b1194fed78b8`), one golden per rung because the guest vCPU count is
 baked into the snapshot. Every rung passed its gates: 202 measured non-warmup
-cdp requests at zero failures, `dns-evidence.json` verdict clean with
+cdp requests, 0 failures in 230 attempts per arm (202 measured plus 28 warmup;
+exact 95% interval 0 to 1.59%), `dns-evidence.json` verdict clean with
 first_mismatch null, diag violations none, teardown failures none.
 
 | guest vCPUs | cdp p50 | CI | noop | record |
@@ -161,11 +165,13 @@ Index: `results/campaign-20260902-box2-ladder-summary.json`, which carries the
 per-cell seals, DNS verdicts and load evidence.
 
 2 to 4 vCPU is a step of 220.9 ms: 549.4 is 28.7% below 770.3, and all 14 URLs
-are faster at 4 than at 2. 4 to 8 does not separate. Each rung's median sits
-inside the other's interval, and 8 vCPU is slower than 4 on 11 of the 14 URLs,
-faster only on the three heaviest (elmundo 2,907.2 against 2,945.2, rtp.pt
-1,945.8 against 2,195.0, theguardian 894.9 against 913.7). So the knee is
-between 2 and 4, and 4 vCPU is the operating point.
+had a lower median at 4 than at 2. 4 to 8 does not separate. Each rung's median
+sits inside the other's interval, and 8 vCPU had the higher median on 11 of the
+14 URLs, the lower only on the three heaviest (elmundo 2,907.2 against 2,945.2,
+rtp.pt 1,945.8 against 2,195.0, theguardian 894.9 against 913.7). 4 vCPU has
+the lower request median in these runs, but each rung ran once and the stage
+where 8 loses moves in 50 ms poll steps (below), so the runs do not show that 4
+is faster than 8.
 
 Two limits on that reading. The intervals are within-run: 202 requests of one
 run, not run-to-run variance. The 2 and 4 intervals overlap between 596.2 and
@@ -188,8 +194,10 @@ by 51.5 ms, and that stage is a poll, not a lookup. cdpdrive.py's
 `resolve_target` GETs `http://{cdp_host}/json/list` until the answer carries a
 page target, sleeping `RESOLVE_RETRY_S = 0.05` between attempts
 (`cdpdrive.py:107,184`). `cdp_host` is `127.0.0.2:9222` in every record, an IP
-literal, so nothing is name-resolved; the GET crosses the same forwarded
-loopback path as `tcp_ms` and Chromium inside the guest answers it.
+literal, so nothing is name-resolved. The GET goes to pasta's host-side listener
+for the forwarded port, the same path as `tcp_ms`; a poll gets a page target
+only once Chromium in the restored guest answers with one, and the records do
+not say whether an earlier poll failed to connect or found no page.
 
 So the stage advances in 50 ms steps. `render.resolve_attempts` has median 4, 4
 and 5 at 2, 4 and 8 vCPU, and pooled over the four verified runs the median
@@ -206,22 +214,28 @@ request.
 The box was not equally quiet at every rung. `load_max_1min` is 2.62 at
 2 vCPU, 18.3 at 4 and 16.97 at 8, against 2.87 in the 2026-08-30 run, and the
 per-request samples in the campaign index have medians 2.14, 4.41 and 4.19. The
-quiet-box gate is checked at run start, and the noop arm, which restores, boots
-and tears down without rendering, is the drift canary the analyzer rejects a
-run on: it reads 44.9, 45.1 and 45.8 ms across the three rungs, so the extra
-load did not move the lifecycle baseline.
+quiet-box gate is checked only at run start, with a limit of 2.0. The noop arm,
+which the drift gate watches, restores a clone and stops its clock at the first
+successful TCP connect to pasta's host-side forwarded-port listener, which can
+accept before the snapshot is loaded; it does not navigate, and its teardown is
+timed separately, outside that figure. It reads 44.9, 45.1 and 45.8 ms across
+the three rungs. That figure ends before any render stage, so it says nothing
+about whether the extra load changed the render stages, and no run here
+measures that.
 
 The two verified 2 vCPU cells are 57.7 ms apart: this ladder's 770.3 and the
-2026-08-30 run's 712.6, measured on different goldens, fcvm binaries and host
-boots (`cell.host_boot_id` 291f8bad and 21ffa582). Both ran on kernel
+2026-08-30 run's 712.6, measured on different goldens, fcvm binaries, container
+images (`cell.image_id` 5b870d814e5d and 334fc21f7c8c) and host boots
+(`cell.host_boot_id` 21ffa582 and 291f8bad). Both ran on kernel
 6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` names its machine
 (box parallel-box-2, instance i-0b8def825d4e9bcc2) and the 2026-08-30 run has
 no `hostinfo.json`, so whether that is one box rebooted or two is not
 established. Their within-run intervals overlap, which says nothing about
 run-to-run variation: no configuration here was measured twice under the same
-conditions, so nothing in this report prices that term. What the pair does
-bound is the spread between two 2 vCPU runs, 57.7 ms, against the 220.9 ms
-step from 2 to 4 vCPU inside the ladder. Five bursts per rung would price the
+conditions, so nothing in this report prices that term. The pair gives one
+observed spread between two 2 vCPU runs, 57.7 ms. One pair does not bound
+run-to-run variation, so it cannot show that the 220.9 ms step from 2 to 4 vCPU
+inside the ladder exceeds that variation. Five bursts per rung would price the
 run-to-run term, and that campaign has not been run.
 
 The direction argument that stood here, derived from the six URLs whose
@@ -250,11 +264,14 @@ Two things about the withdrawn table, so nobody restores it from memory:
   more (2.5 against 4.3 ms, a 1.9 ms gap) than the ladder spans from 2 to 8
   (1.4 ms). The section makes no claim about why 2 vCPU is slower than 4.
 
-**elmundo was waiting on live DNS.** The 31,046 ms median this file called an
-unresolved guest-specific stall, and the "untested: DNS through the wildcard
-override" hedge under it, were the defect above: elmundo's third-party request
-chains, which the replay leaves unanswered, went out to the live internet and
-waited for real timeouts. The DNS-verified run measures elmundo at 3,842 ms
+**elmundo was waiting on the live internet.** The 31,046 ms median this file
+called an unresolved guest-specific stall, and the "untested: DNS through the
+wildcard override" hedge under it, were the defect above: the guest resolved
+elmundo's hostnames on the live internet, so its requests went to the live
+hosts instead of the replay server, and the render waited on those hosts. The
+replay answers every request that reaches it: an uncaptured GET, HEAD or POST
+gets an empty 404, and a CORS preflight gets 204. The DNS-verified run
+measures elmundo at 3,842 ms
 median [3,714, 3,879], n=14, on 2 vCPUs, one screenshot form across all 14
 renders. The 114 ms it used to add to the mix median and the 581.8 ms
 elmundo-excluded figure are withdrawn with the run that produced them. The

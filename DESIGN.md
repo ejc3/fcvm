@@ -51,7 +51,7 @@
    - `fcvm snapshot serve`: Start UFFD memory server for cloning
    - `fcvm snapshot run`: Spawn clone from memory server
    - Lightning-fast clone startup (<1 second)
-   - Shares memory via UFFD page fault handler
+   - Serves guest memory through a UFFD page fault handler; clones share clean pages only in minor mode (`--uffd-mode minor`)
    - Creates independent VM with its own networking
 
 4. **Networking Modes**
@@ -1041,8 +1041,13 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 **Step 2: Start Memory Server** (`fcvm snapshot serve`)
 ```
 ┌─────────────────────────────────────────────────────────┐
-│ 1. Load snapshot memory file (mmap, MAP_SHARED)         │
-│    - Kernel shares physical pages via page cache        │
+│ 1. Open the snapshot memory file                        │
+│    - copy mode (default): map it read-only; each served │
+│      page is copied into the clone's private memory     │
+│    - minor mode: copy it once into a sealed memfd that  │
+│      every clone maps; clean pages are shared           │
+│    - prefetch on (default): load the recorded working   │
+│      set; copy mode reads it into the page cache        │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
@@ -1086,13 +1091,20 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 ┌─────────────────────────────────────────────────────────┐
 │ 4. Load snapshot via Firecracker API                    │
 │    - track_dirty_pages = !hugepages                     │
-│    - resume_vm = true                                   │
+│    - resume_vm = false; the load retargets the TAP,     │
+│      fcvm patches the rootfs drive, then resumes the VM │
+│    - Working-set replay starts at the UFFD handshake;   │
+│      the resume does not wait for it                    │
 └────────────────┬────────────────────────────────────────┘
                  ▼
 ┌─────────────────────────────────────────────────────────┐
 │ 5. VM resumes (< 1 second total startup)                │
-│    - Memory pages loaded on-demand                      │
-│    - Shared pages via kernel page cache                 │
+│    - prefetch on (default): recorded working set        │
+│      populated in 2 MiB chunks, demand faults served    │
+│      between chunks                                     │
+│    - Other pages served on first touch                  │
+│    - copy mode: every served page is private to clone   │
+│    - minor mode: clean pages shared via sealed memfd    │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -1470,14 +1482,14 @@ fcvm snapshot create my-vm --tag warm-nginx
 **Usage**:
 ```bash
 fcvm snapshot serve <SNAPSHOT_NAME> [--uffd-mode copy|minor] [--uffd-fault-around BYTES]
-                    [--uffd-prefetch on|off]
+                    [--uffd-prefetch on|off] [--uffd-prefetch-record-window SECS]
 ```
 
 The memory server:
 - Loads the snapshot's memory file
 - Listens for clone connections via Unix socket
 - Serves memory pages on-demand via UFFD (userfaultfd)
-- Enables sharing physical pages across multiple clones
+- In copy mode (the default), copies each page a clone is served into that clone's private memory, so clones share no guest pages. In minor mode (`--uffd-mode minor`), clones map one sealed memfd: a clean page has one physical copy, and a page a clone writes becomes private to that clone
 - Records each clone's restore working set and replays it into the next clone
 - In copy mode, reads the recorded working set into the page cache when it starts and when
   a clone connects, so a restore does not replay it from disk one page at a time. On a
@@ -1491,6 +1503,7 @@ The memory server:
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
 | `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises its whole granule, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
 | `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
+| `--uffd-prefetch-record-window SECS` | `FCVM_UFFD_PREFETCH_RECORD_WINDOW` | `300` | Seconds after a clone's UFFD handshake during which its demand faults are recorded into the working set. Later faults are served but not recorded. `0` records nothing; replay of an existing record is unaffected |
 
 **Example**:
 ```bash
@@ -1670,7 +1683,7 @@ fcvm/
 │   ├── uffd/               # UFFD memory server
 │   │   ├── mod.rs
 │   │   ├── server.rs       # Userfaultfd page handler
-│   │   ├── handler.rs      # UFFD event handler
+│   │   ├── handler.rs      # UffdHandler: spawns an external uffd_handler binary; nothing calls it and no crate builds that binary
 │   │   ├── working_set.rs  # Record/persist the restore working set
 │   │   ├── prefetch.rs     # Replay it into a restoring clone
 │   │   └── warmup.rs       # Read it into the page cache ahead of replay
