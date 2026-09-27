@@ -811,19 +811,22 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=`, `GUEST_ENV=` (own `TAG=`) |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
 | `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
-| `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `DIAG_URLS=`, `DIAG_REPS=`, `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=` |
-| `bench-webkit-request-diag` | none (sealed bundle) | the diag knobs above; `ENGINE=webkit`, default `TAG=cb-req-webkit` |
-| `bench-chromium-request-all` | `build` + `setup-default` | all of the above, one seal |
+| `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `DIAG_URLS=`, `DIAG_REPS=` (default 3), `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=`. The serve always runs with `--uffd-prefetch off`, and `UFFD_PREFETCH=` set to anything but `off` is refused |
+| `bench-webkit-request-diag` | none (sealed bundle) | the diag knobs above except `DIAG_EXPECT_IPS=` (refused); the recipe sets `ENGINE=webkit`, default `TAG=cb-req-webkit` |
+| `bench-chromium-request-all` | `build` + `setup-default` | the build, golden, verify and run knobs above, one seal. It runs no diag phase, and it defaults `SETTLE_WAIT_SECS=120`, so the run's quiet gate re-samples for up to 120 s before it refuses |
 | `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM; `COMPARISON_LABEL=` (default `standalone`), `CPU_BUDGET=` (default `unlimited`), `CPUS=` (requires `CPU_BUDGET=vm-matched`), `BENCH_RESOLVE_ALL_TO=` |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
 
 - **verify/diag/run must never gain a `build` dependency.** reqbench.sh seals
-  fcvm + fc-agent + its five sources into a hash-bound runtime bundle; the
-  run refuses a golden recorded under a different bundle hash. A rebuild (or
-  any edit to a sealed file) between golden and run invalidates the chain —
-  regolden, don't fight the seal. Sealed set: reqbench.{sh,py},
-  reqanalyze.py, cdpdrive.py, render.py, fcvm, fc-agent — the Makefile and
-  test files are NOT sealed and stay editable mid-run.
+  fcvm, fc-agent and its six sources into a hash-bound runtime bundle; the
+  run refuses a golden recorded under a different bundle hash. A rebuild, an
+  edit to a sealed file, or a new commit between golden and run invalidates
+  the chain: the run also refuses a golden whose recorded source_revision is
+  not the current git HEAD. Regolden instead of working around the seal.
+  Sealed set: reqbench.{sh,py}, reqanalyze.py, cdpdrive.py, render.py,
+  wddrive.py, fcvm, fc-agent. The Makefile and test files are not sealed:
+  uncommitted edits to them do not affect a golden or a run in progress, but
+  committing them before the run does.
 - Hugepage goldens are part of the snapshot identity: distinct tag, e.g.
   `make bench-chromium-request-golden TAG=cb-req-golden-huge HUGEPAGES=1`
   (the golden grows the pool to 2048x2MB pages and fails closed if the
@@ -834,16 +837,20 @@ then on "Custom firecracker not found", because a hand-rolled runner called
   background agents — while a measured run is in flight; the noop drift gate
   catches the contamination and voids the run (burned twice, 2026-08-13).
 - BACKEND=file is refused against a hugepage TAG (fcvm restores those via an
-  implicit UFFD server; the record would be mislabeled), and the pool is
-  ensured MEM-derived (4 x MEM/2 pages) at golden, verify, AND run time.
-- The diag phase renders each URL on its own clone with cdpdrive's
-  `--net-trace` and refuses on any remote IP outside `DIAG_EXPECT_IPS=`, a
-  trace naming no remote address while that knob is set, any name that did
-  not resolve, any load event over `DIAG_MAX_LOAD_MS=`, any failed render (a
-  record for another URL, not ok, written under a non-zero driver exit
-  status, or without a load event timing), an unclean clone teardown, or a
-  sealed bundle that changed during the phase; `$RESULTS/diag/summary.json`
-  holds the verdict and names the snapshot generation and config it
+  implicit UFFD server, so the record would be mislabeled). The pool is grown
+  to 4 x (guest MiB / 2) pages: at golden time from `MEM=`, and at verify, run
+  and diag time from the snapshot's recorded `memory_mib` (falling back to
+  `MEM=` only when the snapshot's config.json has no `memory_mib`).
+- The diag phase renders each URL `DIAG_REPS` times (default 3), each render
+  on its own clone with cdpdrive's `--net-trace`. With `DIAG_EXPECT_IPS=` set,
+  it refuses on any remote IP outside that list, on a trace in which no
+  request names a remote address, and on any traced http(s) request that
+  names no remote address and was not served from cache or a service worker.
+  It also refuses on any name that did not resolve, any load event over
+  `DIAG_MAX_LOAD_MS=`, any failed render (a record for another URL, not ok,
+  written under a non-zero driver exit status, or without a load event
+  timing), an unclean clone or serve teardown, or a sealed bundle that
+  changed during the phase; `$RESULTS/diag/summary.json` holds the verdict and names the snapshot generation and config it
   diagnosed. WebKit renders carry no trace, so the webkit diag refuses
   `DIAG_EXPECT_IPS=`. `make bench-chromium-corpus` runs it after the golden's
   verify with the corpus URLs, `DIAG_EXPECT_IPS=10.0.2.2` (Chromium only) and
@@ -2258,8 +2265,14 @@ fuse-pipe/benches/
    - Clone memory load time: ~2.3ms
    - UFFD clones populate lazily (faulted pages are per-VM copies); File-backend
      clones share clean pages via the page cache (measured in #632)
-   - **Performance**: Original VM + 2 idle clones ≈ ~512MB RAM total (not 1.5GB) —
-     only each clone's faulted working set materializes
+   - **Memory per clone**: no committed record measures an idle UFFD clone.
+     `bench/chromium/results/20260808-corrected` measured 2 GiB Chromium guests, each
+     sampled while it idled after one render, on a binary without working-set replay.
+     As the slope of cgroup `memory.current` over 1 to 16 concurrent clones, it found
+     257.8 MiB per clone in copy mode, 132.5 MiB in minor mode and 143.5 MiB
+     file-backed. Its 2 MiB hugepage cell does not count the guest's hugepages and is
+     not a per-clone cost (`bench/chromium/REVIEW.md`). With prefetch on (the default),
+     a copy-mode clone also holds a private copy of every page in the recorded set.
 
 3. **True Rootless Networking** (2025-11-25)
    - `--network rootless` (default): pasta, no root required
@@ -2479,18 +2492,33 @@ fcvm snapshot run --pid <serve_pid> --name clone1
 ```
 
 **How it works:**
-- Memory server mmaps the snapshot file once; the page cache holds one copy
-- Guest RAM is MAP_ANONYMOUS; faults are filled with UFFDIO_COPY (a private
-  per-VM copy of each faulted page — lazy population, not cross-VM sharing)
+- Two modes, chosen by `--uffd-mode` / `FCVM_UFFD_MODE` (default `copy`; an NV2
+  snapshot is always served in copy mode):
+  - `copy`: the server maps the snapshot file read-only, so the page cache holds one
+    copy. Guest RAM is anonymous memory, and each fault is filled with `UFFDIO_COPY`,
+    a private per-clone copy of the page.
+  - `minor`: at startup the server copies the snapshot into one memfd (all-zero 4 KiB
+    pages stay holes), seals it, and passes a read-only descriptor to every clone's
+    Firecracker over the handshake socket. Guest RAM maps it `MAP_PRIVATE`, and each
+    minor fault is resolved with `UFFDIO_CONTINUE`, which maps the shared page
+    read-only. Clean pages have one physical copy across all clones; a page a clone
+    writes becomes private to it.
 - Server uses tokio AsyncFd to handle UFFD events non-blocking
 - tokio::select! multiplexes: accept new VMs + monitor VM exits
 - Each VM gets dedicated async task (JoinSet) for page faults
-- All tasks share Arc<Mmap> reference to memory file
-- Server exits gracefully when last VM disconnects
+- All clone tasks share one `Arc<PageSource>`: the copy-mode mapping or the
+  minor-mode memfd.
+- The serve runs until SIGTERM, or SIGINT when none of its clones is running (with
+  clones running, a second SIGINT within 3 s), or until the server task fails.
+  Shutdown stops this serve's clones first (SIGTERM, then SIGKILL after a timeout)
+  and then cancels the server. The server stops accepting and keeps serving any
+  still-connected clone until its Firecracker exit is seen through its pidfd.
 
 **Memory efficiency:**
-- UFFD path: density comes from laziness — only each clone's faulted working
-  set materializes (faulted pages are per-VM copies, #632)
+- UFFD path, copy mode: every page a clone faults, and with prefetch on (the
+  default) every page of the replayed recorded set, is a private copy in that
+  clone. Minor mode: faulted and replayed clean pages map the one shared memfd,
+  and only pages a clone writes become private to it.
 - File-backend restores (`snapshot run --snapshot`): clones genuinely share
   clean pages via the page cache (MAP_PRIVATE) — measured 3x 1GiB clones
   ≈ 230MiB total PSS, with or without dirty tracking (#632). Hugepage and NV2
@@ -2499,15 +2527,30 @@ fcvm snapshot run --pid <serve_pid> --name clone1
 
 ### Working-Set Replay (`--uffd-prefetch`, default on)
 
-Demand paging is the UFFD path's latency tax: a Chromium clone takes ~56,300 faults at
-~5.6 us marginal each (+316 ms versus a file-backed restore on the same page). Clones of one
-snapshot fault almost the same PAGES — pairwise Jaccard median 0.927 across 8 clones, 82.2% of
-the union faulted by all 8 — but NOT in the same ORDER (only 8.6% of faults are the next
-sequential page, which is why readahead and fault-around do nothing here). So the server
-records the SET and replays it.
+Demand paging is the UFFD path's latency tax. Commit 86a05b9a (not on main) reports,
+from a 2026-08-08 Chromium run that is not committed, ~56,300 faults per clone and
+316 ms more request latency than a file-backed restore of the same image. Its ~5.6 us
+per fault equals 316 ms divided by 56,300. The same message gives a pairwise page-set
+Jaccard median of 0.927 across 8 clones, 82.2% of the union faulted by all 8, and 8.6%
+of faults on the page after the previous fault. The only committed fault record is
+`bench/chromium/results/faultbench-0813-073507-690998`. It used 2 GiB guests with
+prefetch at its unrecorded default, and its trace holds demand faults only, so replayed
+pages are absent from it. It gives a mean pairwise Jaccard of 0.69 in copy mode and
+0.65 in minor mode (lowest pair 0.54), and 49% and 42% of the union faulted by every
+restore. It also shows 1.9 to 5.0% of faults on the next page, and 45 to 59% of faults
+per request in runs of 4 or more consecutive pages. Clones fault an overlapping set of
+pages in a different order each time, so the server records the SET and replays it. On
+the synthetic page, replay cut the request median from 762.6 to 477.9 ms on one golden
+(`results/reqbench-134b408e1a3d42feb866bb4c5fed774c` off,
+`results/reqbench-9c23e9d7da424351a390b5c1ddfd8e1d` on; commit e78350c5 names which run
+had prefetch on). Fault-around (below) covers neighbouring pages and is measured
+separately.
 
-- **Record**: every demand fault marks its snapshot file offset in a 4 KiB-granular bitmap
-  (32 KiB per GiB of guest RAM). On handler exit the bitmap is unioned into the serve
+- **Record**: every demand fault within the clone's recording window marks its snapshot
+  file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). The window starts
+  at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
+  `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
+  served but not recorded. On handler exit the bitmap is unioned into the serve
   process's in-memory set and scheduled onto one bounded, coalescing background writer. The
   writer publishes `<memory.bin>.working-set` beside the snapshot under an `flock` + atomic
   rename, and only writes when the union actually grew — so the steady state writes nothing,
@@ -2521,9 +2564,11 @@ records the SET and replays it.
   cannot land in between.
 - **Replay**: at handshake the recorded set is coalesced into runs, mapped into that clone's
   regions, aligned to its page size, and populated in 2 MiB `UFFDIO_COPY`/`UFFDIO_CONTINUE`
-  chunks. This runs before the guest's first instruction (fcvm loads with `resume_vm: false`),
-  but it is NOT a barrier — the resume comes from the clone process — so a drain of real
-  faults precedes every chunk and demand always beats speculation. Replay yields to the
+  chunks. Replay starts during the snapshot load, when Firecracker hands the server its
+  userfaultfd (fcvm loads with `resume_vm: false`), but nothing waits for it: fcvm patches
+  the root drive and resumes the guest as soon as the load returns, and replay continues
+  while the guest runs. The handler drains pending demand faults before every populate
+  call, so a demand fault waits behind at most one call. Replay yields to the
   runtime once per batch (one 2 MiB chunk, or 32 populate calls when the runs are small),
   because a yield after every small copy cost more than the copy. Every recorded run is
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
@@ -2579,17 +2624,17 @@ records the SET and replays it.
   `prefetched_pages`, and `VM exited` with `fault_count`. Compare a recording clone against a
   replaying one; `--uffd-prefetch off` (or `FCVM_UFFD_PREFETCH=off`) gives an inert baseline
   arm — no recording, no replay, no files.
-- **The trade is latency for eagerness, not for total memory.** A replaying clone materialises
-  its working set at restore instead of over the first ~750 ms, so a clone that lives a full
-  life ends up at the same footprint, just sooner; a clone that is created and destroyed
-  immediately pays for pages it would not have reached. Density claims above (idle clones cost
-  only what they faulted) still hold per page — replay changes WHEN, not WHAT. Turn it off for
-  workloads that spawn many clones which never run. That holds while the
-  recorded set is what one clone touches. The set is a union over clones and only grows, and
-  in copy mode every replayed page is a private copy, so a clone is also given pages it would
-  never have touched. On a 128 GiB guest the set went from 3.7M pages after one clone to 9.4M
-  after six, and clones held 23.0 to 23.2 GiB at first healthy after a replay of 3.7M pages
-  against 35.8 to 35.9 GiB after a replay of 9.4M (#955 tracks bounding the set).
+- **Replay trades memory for latency.** A replaying clone materialises the recorded set at
+  restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
+  that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
+  clones' recording windows and only grows. In copy mode every replayed page is a private
+  copy, so a clone also holds pages it would never have touched, including a clone that is
+  created and destroyed at once. On one 128 GiB guest the set grew from 3.7M pages after one
+  clone to 9.4M after six (issue #955). PR #956 measured two clones on that guest at first
+  healthy. They held 23.0 and 23.2 GiB of private memory when replay planned 3.7M of the
+  9.4M recorded pages (main's run cap at the time), and 35.8 and 35.9 GiB when it planned
+  all 9.4M. Turn replay off for workloads that spawn many clones which never run. #955
+  tracks bounding the set.
 
 **End of clone (`PeerVmm`)**: a userfaultfd reports nothing when the process that created it
 dies — measured on this kernel, `poll` returns 0/revents=0 forever and `read` returns EAGAIN —

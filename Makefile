@@ -962,7 +962,7 @@ bench-chromium-request-all: build setup-default
 #     corpus_campaign.sh: line 201: not: command not found
 # which killed a three-cell sweep after its first cell had already gated clean.
 #
-# reqbench.sh already solves this FOR ITSELF: it stages its five sources plus
+# reqbench.sh already solves this FOR ITSELF: it stages its six sources plus
 # the two binaries into a content-addressed bundle, chmod 0555, and execs the
 # copy. This applies the same discipline one layer up, from make, so a campaign
 # is immune to edits in the working tree for its whole lifetime. Everything for

@@ -175,7 +175,7 @@ marks `from_cache` or `from_service_worker`, which had no network hop to name
 an address for.
 
 `verify`, `diag` and `run` deliberately have NO build dependency: reqbench.sh
-seals fcvm + fc-agent + its five sources into a hash-bound runtime bundle, and
+seals fcvm + fc-agent + its six sources into a hash-bound runtime bundle, and
 the run refuses a golden whose provenance records a different bundle hash.
 Rebuilding — or editing any sealed file — between golden and run therefore
 invalidates the chain; regolden instead of fighting the seal. The structural
@@ -375,8 +375,9 @@ easy to get wrong:
   Root-caused from a symbolized core dump; report + patch in `upstream/`.
 - **THE PARITY TRAP.** That race depends on whether glibc's realloc happens to grow
   in place. Adding *any* env var flips parity, so a clean natural run is **NOT**
-  evidence of a fix — adding one dummy var gave 0/336 failures, statistically
-  identical to the real fix, and 15/15 failures under amplification. Same trap
+  evidence of a fix: adding one dummy var gave 0/336 failures (exact 95% interval
+  0 to 1.09%), which does not distinguish it from the real fix, and 15/15 failures
+  under amplification. Same trap
   killed a `--no-zygote` "fix". **Verify race fixes with a race amplifier**
   (a `getenv` that sleeps mid-walk), not with natural rates.
 - **RSS lies about shared memory.** `--single-process` looked like it saved ~460 MB
@@ -503,19 +504,27 @@ Under the chosen design (Chromium's DevTools port exposed and driven from the ho
 the CDP connect happens on every request. Under the superseded resident-server
 design it would have happened once, before the snapshot. It is therefore the one
 cost that design would have removed, and it must be reported rather than quietly
-dropped. `render.py`'s `connect` stage — `/json/list` + TCP + the RFC 6455 upgrade —
-is what to look at.
+dropped. `cdpdrive.py` times it in stages. Every committed reqbench `analysis.json`
+holds their medians per arm, and the corpus runs' `reqbench.jsonl` holds each
+request's values under `render.stages`: `tcp_ms`, the host connect to pasta's
+forwarded-port listener, which accepts without the guest (0.03 ms median at 4 vCPU
+in `results/reqbench-20260902-025115-corpus-c4`), `upgrade_ms` (2.6 ms) and
+`enable_ms` (2.8 ms). `resolve_ms` (153.1 ms there) polls `/json/list` every 50 ms
+until a page target appears. Less its sleeps it has a median of 3.2 ms per request;
+the rest is time the restored guest was not serving a page target, not handshake
+cost and not harness overhead.
 
-**The only auditable figure is the primary cell of the record run.** It is
-`corrected.json` -> `primary_cell.stages.r_connect_ms`:
+The in-guest figure, from the 2026-08-08 record run where `render.py` ran inside
+the guest, is `corrected.json` -> `primary_cell.stages.r_connect_ms`:
 
 | Source | n | median | 95% CI |
 |---|---|---|---|
 | restored clone, primary cell, one request at a time (`corrected.json`) | 12 | 16.7 ms | 16.4–16.9 ms |
 
-That is the *in-guest* connect to `127.0.0.1:9222`, so it excludes the host↔guest
-hop the chosen design adds; a host-driven connect over fcvm port forwarding will
-be **larger**.
+That is `render.py`'s `connect` stage inside the guest (`/json/list`, the TCP
+connect to `127.0.0.1:9222`, the upgrade, `Page.enable` and
+`Page.setLifecycleEventsEnabled`), measured on another host, page and golden, so it
+is not comparable to the host-driven stages above.
 
 **Three scavenged rows were deleted from this table on 2026-08-08.** They quoted
 a host-container p50 of 3.5 ms (n=1332), a quiet-box clone p50 of 10.7 ms
@@ -636,15 +645,19 @@ The current request path has no benchmark-owned relay:
 
 | Hop | Mechanism | Cost |
 |---|---|---|
-| host -> published guest port | `--publish 9222:9222`; clones inherit `port_mappings` from snapshot metadata | measured by `cdpdrive` as `tcp_ms` |
-| guest external interface -> guest loopback:9222 | fc-agent PREROUTING DNAT plus `route_localnet` | included in the successful TCP connection above |
+| host -> pasta's host-side listener for the published port | `--publish 9222:9222`; clones inherit `port_mappings` from snapshot metadata | `cdpdrive`'s `tcp_ms`, 0.03 ms median at 4 vCPU (`results/reqbench-20260902-025115-corpus-c4`); pasta completes this connect without the guest |
+| pasta -> guest external interface -> guest loopback:9222 | pasta's guest-side connection, then fc-agent PREROUTING DNAT plus `route_localnet` | not in `tcp_ms`; paid in each `/json/list` poll (`resolve_ms`) and in the WebSocket upgrade (`upgrade_ms`) |
 
 The deleted `socat TCP-LISTEN:9223,fork` relay was one process and one byte-path
 hop per clone. Do not reuse the old 0.12 ms `port_wait_ms` as an ingress cost:
 that timer started only after the restored VM's final PID state save. A later
 harness change moved its boundary before network setup and restore, so the same
-field then clustered near 50 ms. Use one stable spawn-to-first-connect boundary
-for readiness and `tcp_ms` for a successful connection.
+field then clustered near 50 ms. `spawn_to_port_ms`, launch to the first
+successful connect, is a stable boundary but not readiness: it ends when pasta's
+host-side listener accepts, which can happen before the snapshot is loaded. The
+records do not mark when the restore completes; restore work left after that
+connect falls in the wait for a page target (`resolve_ms`). `tcp_ms` times only
+the host-side connect to pasta.
 
 Verified working on `--network rootless` (no root needed). `reqbench.sh` defaults
 to rootless for this reason.
@@ -729,8 +742,9 @@ A 4-point fit over medians of 3, with the CPU column quantized, supports roughly
 **60 ms wall/GiB and 80–130 ms CPU/GiB** — a fitted RANGE, not a measurement, and
 stated as one. Over most of that range CPU exceeds wall, so reclaim runs on more
 than one core: moving it off the response path does not make it free, it makes it
-concurrent. **The claim "early response converts teardown from LATENCY into
-THROUGHPUT cost" is supported — "converts", never "removes".** At saturation that
+concurrent. **This synthetic table suggests that early response converts teardown
+from LATENCY into THROUGHPUT cost; on a VM the claim is untested (REVIEW.md), and
+if it holds the word is "converts", never "removes".** At saturation that
 CPU competes with new requests. Do not report the latency win as a capacity win.
 
 **What this table does NOT support:** "CPU exceeds wall" as stated for the 256 MiB
@@ -743,11 +757,17 @@ observed ~78 ms VM teardown for a ~1 GB VM sits on the ~60 ms/GiB line.
 
 ## Failure-time evidence capture: what the probe takes, and what it cannot say
 
-An 808-clone run produced 3 CDP failures. Every one came from a clone whose
+An 808-clone run (described in commit 10bea5f3's message; no record of it is
+committed) produced 3 CDP failures. Every one came from a clone whose
 ARP-triggering readiness ping got no reply (5 clones had no reply, 3 of them
-failed; of the 803 whose ping replied, none failed), the guest stayed alive for
-the whole 100+ seconds, and the `exec` and `noop` arms, which reach the guest
-over vsock, never failed. **Why the guest stopped answering on the IP path, and
+failed; the 803 whose ping replied had 0 failures, exact 95% interval 0 to
+0.46%), and the guest stayed alive for the whole 100+ seconds. The `exec` arm,
+which reaches the guest over vsock, never failed. The `noop` arm never failed
+either, but it sends nothing to the guest: its timed figure stops when pasta's
+host-side listener accepts. From a42eda55 on, its success also waits for fcvm to
+publish the clone ready, which fcvm does only after fc-agent's output connection
+has reconnected over vsock and fcvm's own port-forwarding check has passed. No
+record says which harness revision the run used. **Why the guest stopped answering on the IP path, and
 why it never recovered, is UNSOLVED.** The leading hypothesis, which nothing has
 yet proved, is that the guest's post-restore network re-initialisation never
 ran or never finished for that clone.
@@ -876,20 +896,23 @@ average it in. `make test-chromium-fault` guards all four.
 
 ## Deliverables
 
-The end product is a **readable markdown benchmark with inline visualizations**, in
+The end product is a **readable benchmark page with inline visualizations**, in
 the spirit of `~/src/editor-loop-bench/SUMMARY.md` (read it before writing). Match the
 *idea*, not the literal format:
 
 1. **Lead with the one idea.** That report opens with a conceptual split (O(repo) vs
    O(closure)) that makes every later number obvious. Find ours and state it first —
    a table of numbers with no thesis is a data dump, not a benchmark.
-2. **Machine + versions in the first screenful**, with a pointer to the raw file that
-   records them (`hostinfo.json`). Reader must be able to tell what hardware this was.
+2. **Machine + versions in the first screenful**, each with the record that holds it
+   (`hostinfo.json` where the run has one), and a plain statement of what no record
+   holds (on the current page: the Firecracker commit, the Chromium version, the
+   2026-08-30 run's instance, the fixture host's instance type, CPU model and core
+   count, and any host for the fault-count run).
 3. **Every figure traceable to a raw record** — cite the json file (and the cell) next
    to the table it came from. Extrapolations **labeled as extrapolations**.
 4. **Tables organized by the question a reader has** (per-request cost, density,
    throughput, mode comparison), not by the order you ran the phases.
-5. **Charts inline.** `charts/*.svg`, referenced from the markdown. **Load the
+5. **Charts inline**, drawn in the report page itself; it loads no chart files. **Load the
    `dataviz` skill BEFORE writing any chart code** — it is not optional, and it covers
    palette, light/dark, and stat tiles so the set reads as one system.
    Best candidates here: the per-request stage-breakdown stack, the memory-vs-concurrency
@@ -905,5 +928,8 @@ the spirit of `~/src/editor-loop-bench/SUMMARY.md` (read it before writing). Mat
 7. **`REVIEW.md` is a first-class deliverable**, not an appendix: what holds, what was
    refuted, what remains unmeasured.
 
-`results/` is gitignored — commit the harness, the charts, and the findings, not the
-raw output. Uncertainty goes in the tables, not just the prose.
+Raw run output under `results/` is gitignored; the curated records are committed.
+`bench/chromium/.gitignore` re-includes most of them by name (`analysis.json`,
+`reqbench.jsonl`, `run.json`, `summary.json`, the DNS evidence and replay logs,
+`WITHDRAWN`), and every published figure cites one (rule 3). Uncertainty goes in
+the tables, not just the prose.

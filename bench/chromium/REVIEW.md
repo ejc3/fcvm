@@ -2,10 +2,15 @@
 
 **Quote only from sealed runs that passed their gates and were never withdrawn.**
 When this ledger was written (2026-08-08) three runs existed and the only quotable
-one was `20260808-corrected`; every later gated reqbench run (noop drift canary
-inside its CI band, generation and runtime-bundle seals verified) joins the record
-under the same rule. Withdrawn runs stay unquotable forever — the table below
-records why.
+one was `20260808-corrected`; every later reqbench run joins the record under the
+same rule once reqanalyze marks it publishable (every gate in its analysis.json
+passes: at least 200 measured requests per CDP arm, zero failures over every attempt
+including warmups, the no-render arm's first-half to second-half shift with a 95%
+confidence interval inside ±10 ms, and the stall and teardown gates), its generation
+and runtime-bundle seals verify, and, for a corpus run, dns-evidence.json records a
+clean verdict. The no-render arm stops when the forwarded port accepts, so the drift
+gate says nothing about the render stages. Withdrawn runs stay unquotable forever;
+the table below records why.
 
 | run | date | verdict |
 |---|---|---|
@@ -14,7 +19,7 @@ records why.
 | `reqbench` CDP A/B | 2026-08-08 | **WITHDRAWN IN FULL** — see "The CDP-path A/B" below. Harness defects invalidate every figure it produced. |
 | `results/reqbench-20260816-*-corpus` (14 runs), `results/reqbench-20260814-042319-uffd`, `results/cpuprobe-20260816` | 2026-08-14 to 2026-08-16 | **WITHDRAWN IN FULL** on 2026-09-02, live-DNS contamination; see "The 2026-08-16 corpus series" below. Each directory carries a `WITHDRAWN` marker with its evidence and stays in the tree. `results/campaign-20260816-summary.json` is a hand-written index of these cells, not a record. |
 | `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU. Still verified; the headline moved to the 4 vCPU rung of the ladder below. |
-| `results/reqbench-20260902-023115-corpus-c2`, `results/reqbench-20260902-025115-corpus-c4`, `results/reqbench-20260902-031115-corpus-c8` | 2026-09-02 | DNS-verified 2/4/8 vCPU ladder, one golden per rung on one runtime bundle (each `dns-evidence.json` verdict clean, first_mismatch null, diag violations none); cdp p50 770.3 [596.2, 807.8], 549.4 [467.9, 632.4] and 580.2 [520.8, 645.9] ms, n=202 each. 549.4 at 4 vCPU is the current corpus headline: the knee is between 2 and 4, and 4 does not separate from 8. Indexed by `results/campaign-20260902-box2-ladder-summary.json`. |
+| `results/reqbench-20260902-023115-corpus-c2`, `results/reqbench-20260902-025115-corpus-c4`, `results/reqbench-20260902-031115-corpus-c8` | 2026-09-02 | DNS-verified 2/4/8 vCPU ladder, one golden per rung on one runtime bundle (each `dns-evidence.json` verdict clean, first_mismatch null, diag violations none); cdp p50 770.3 [596.2, 807.8], 549.4 [467.9, 632.4] and 580.2 [520.8, 645.9] ms, n=202 each. 549.4 at 4 vCPU is the current corpus headline. Each rung ran once: from 2 to 4 vCPUs the median fell 220.9 ms, the 4 and 8 vCPU medians each sit inside the other's interval, and the stage where 8 loses (the wait for the target, +53.1 ms in the mean) moves in 50 ms poll steps, so these runs do not show that 4 is faster than 8 or locate a knee. Indexed by `results/campaign-20260902-box2-ladder-summary.json`. |
 
 ---
 
@@ -99,10 +104,10 @@ Evidence, from the runs' own `reqbench.jsonl` (paths under fcvm-main):
 | withdrawn figure | why it cannot stand |
 |---|---|
 | corpus mix p50 **695.7 ms [560.9, 747.1]** at 4 vCPU (`results/reqbench-20260816-123529-corpus/analysis.json`), the report's headline and its Kitesurf comparison cell | Rendered under live DNS: `dns_ms` hits at 149-158 ms, `ttfb_ms` p99 279 ms and max 3.6 s, elmundo at 31 s. Replaced first by 712.6 ms [610.5, 808.5] at 2 vCPU from `results/reqbench-20260830-171007-corpus/analysis.json`, and since 2026-09-02 by the DNS-verified 4 vCPU cell 549.4 ms [467.9, 632.4] from `results/reqbench-20260902-025115-corpus-c4/analysis.json`, which is the headline. The withdrawn 695.7 is not evidence for it and is not used to size anything. |
-| the vCPU ladder **982.9 / 695.7 / 647.2 ms** at 2/4/8, its steps (287 ms, 48 ms), its 66 ms noise floor (916.9, 951.2, 982.9) and "4 vCPU is the operating point" | All ten runs contaminated. 982.9 was also the maximum of the five uffd/minor 2 vCPU cells (916.9-982.9, mean 949.0), inflating the 2->4 step from 253 to 287 ms; the eight 2 vCPU cells across uffd/minor, uffd/copy and file backends and four fcvm binaries span 878.5-982.9 (mean 938.2). Superseded by the DNS-verified 2/4/8 ladder of 2026-09-02, 770.3 / 549.4 / 580.2 ms (`results/reqbench-20260902-023115-corpus-c2/analysis.json`, `results/reqbench-20260902-025115-corpus-c4/analysis.json`, `results/reqbench-20260902-031115-corpus-c8/analysis.json`, indexed by `results/campaign-20260902-box2-ladder-summary.json`). The knee is measured there: 220.9 ms from 2 to 4, and 4 to 8 does not separate. The six-URL direction argument that stood here in the interim, built from these withdrawn rungs because no verified ladder existed, is removed from the report and is not quotable either. Nothing from the 2026-08-16 series is used to size the step. |
+| the vCPU ladder **982.9 / 695.7 / 647.2 ms** at 2/4/8, its steps (287 ms, 48 ms), its 66 ms noise floor (916.9, 951.2, 982.9) and "4 vCPU is the operating point" | All ten runs contaminated. 982.9 was also the maximum of the five uffd/minor 2 vCPU cells (916.9-982.9, mean 949.0), inflating the 2->4 step from 253 to 287 ms; the eight 2 vCPU cells across uffd/minor, uffd/copy and file backends and four fcvm binaries span 878.5-982.9 (mean 938.2). Superseded by the DNS-verified 2/4/8 ladder of 2026-09-02, 770.3 / 549.4 / 580.2 ms (`results/reqbench-20260902-023115-corpus-c2/analysis.json`, `results/reqbench-20260902-025115-corpus-c4/analysis.json`, `results/reqbench-20260902-031115-corpus-c8/analysis.json`, indexed by `results/campaign-20260902-box2-ladder-summary.json`). Each of its rungs ran once: the median fell 220.9 ms from 2 to 4 vCPUs, and the 4 and 8 vCPU medians each sit inside the other's interval, so it does not locate a knee or show that 4 is faster than 8. The six-URL direction argument that stood here in the interim, built from these withdrawn rungs because no verified ladder existed, is removed from the report and is not quotable either. Nothing from the 2026-08-16 series is used to size the step. |
 | the probed trio **966.2 / 685.5 / 660.5 ms** and its per-render peak-core captions (`results/cpuprobe-20260816/*.json`), the "probe overhead −1.5%" comparison (685.5 vs 695.7), and the 1630 -> 1885 -> 2340 core-ms totals | Source runs `-152156`, `-145649`, `-154831` are contaminated; the samples were taken while renders waited on live DNS, and a difference between two live-network runs says nothing about the probe. The censoring shape at 2 and 4 vCPU is kept as a lead, not a measurement. |
-| "the guest is CPU-starved, not slow: `Page.enable` 6.8 vs 3.9 ms, TCP connect is 0.1 ms throughout" | `stages.tcp_ms` is cdpdrive.py's own TCP connect to the WebSocket endpoint, the harness reaching the guest's forwarded CDP port on 127.0.0.2:9222 over loopback (`cdpdrive.py` line 16). It is not the page's connection to any origin and cannot exclude network effects. The page-side timings in the same records (`render.nav`) show live DNS. Conclusion withdrawn. The 2026-09-02 verified ladder supplies the `render.nav` the re-derivation needed and does not support it: `dns_ms` is zero in all 230 render records of every rung, and `Page.enable` runs 2.5 / 2.8 / 3.8 ms at 2 / 4 / 8 vCPU, rising as cores are added, with the two verified 2 vCPU runs 1.9 ms apart against 1.4 ms across the ladder. The stage does not discriminate; no CPU-starvation claim stands. |
-| elmundo **31,046 ms** "unresolved, guest-specific stall", its 114 ms contribution to the mix and the 581.8 ms elmundo-excluded figure | The cause was the untested item on that list: DNS. Third-party chains the replay leaves unanswered went to the live internet and waited for real timeouts. Verified value 3,842 ms at 2 vCPU. |
+| "the guest is CPU-starved, not slow: `Page.enable` 6.8 vs 3.9 ms, TCP connect is 0.1 ms throughout" | `stages.tcp_ms` is cdpdrive.py's own TCP connect to the WebSocket endpoint, the harness connecting over loopback to 127.0.0.2:9222, pasta's host-side listener for the CDP port forwarded to the guest, which accepts on the host without the guest, so the connect contains no guest round trip (`cdpdrive.py` line 16). It is not the page's connection to any origin and cannot exclude network effects. The page-side timings in the same records (`render.nav`) show live DNS. Conclusion withdrawn. The 2026-09-02 verified ladder supplies the `render.nav` the re-derivation needed and does not support it: `dns_ms` is zero in all 230 render records of every rung, and `Page.enable` runs 2.5 / 2.8 / 3.8 ms at 2 / 4 / 8 vCPU, rising as cores are added, with the two verified 2 vCPU runs 1.9 ms apart against 1.4 ms across the ladder. The stage does not discriminate; no CPU-starvation claim stands. |
+| elmundo **31,046 ms** "unresolved, guest-specific stall", its 114 ms contribution to the mix and the 581.8 ms elmundo-excluded figure | The cause was the untested item on that list: DNS. pasta sent the guest's lookups to the host's resolver, so elmundo's third-party hosts resolved on the live internet, those requests never reached the replay server, and the page waited on them. The replay server leaves nothing unanswered: it returns an empty 404 for an uncaptured GET, HEAD or POST and 204 for any OPTIONS. Verified value 3,842 ms in the 2026-08-30 2 vCPU run. |
 | CX, **615.1 ms** at 2 vCPU (`results/reqbench-20260814-042319-uffd/analysis.json`), the report's original corpus run | Same class: source_revision 50d343f8 predates the fix, `dns_ms` nonzero in 52 of 460 records, no resolver evidence. |
 
 The guard is `test_reqbench.DocLint`: `test_every_corpus_record_cited_by_the_report_is_dns_verified_or_withdrawn` (a cited corpus record loads clean through `campaign_summary.load_cell` or is cited as withdrawn; every committed corpus record is one or the other; a cited campaign index is `campaign_summary` output whose hashes match the committed bytes) and `test_every_corpus_figure_in_the_ladder_is_a_verified_headline` (every figure in a vCPU or cdp-headline table equals a median, lo or hi of a verified record at its printed precision).
@@ -129,10 +134,13 @@ harness defect that caused it is fixed in this PR with a regression test.
 **Availability gate for the re-run.** Per the two-sided Clopper-Pearson convention
 used throughout this file: at least **200 CDP requests per backend at 0 failures**
 before any CDP latency figure is quoted. At 0/200 the CP upper bound is 1.8%
-(`reqanalyze.clopper_pearson(0, 200)` -> [0.000%, 1.828%]); n=200 is where the
-zero-failure upper bound first falls below 2%, which is the first point at which
-"we do not drop requests" is a defensible statement rather than a hope. Today the
-observed rates are ~1 in 60 (file) and ~1 in 10 (UFFD), so this gate fails loudly.
+(`reqanalyze.clopper_pearson(0, 200)` -> [0.000%, 1.828%]); the zero-failure
+upper bound first falls below 2% at n=183 (1.996%), and 200 is the round number past
+it; below 2% is where "we do not drop requests" becomes a defensible statement rather
+than a hope. On 2026-08-08 the observed rates were ~1 in 60 (file) and ~1 in 10
+(UFFD), so the gate failed. reqanalyze now enforces it (at least 200 measured requests
+per CDP arm, zero failures over every attempt including warmups); each of the four
+published corpus runs passed it at 0/230 attempts per arm, [0, 1.59%].
 
 *(This said **1.5%** and attributed the gate to "AGENTS.md's amplification
 discipline". 1.5% is the ONE-sided bound, `1 - 0.05**(1/200) = 1.487%`, i.e. 22%
@@ -171,7 +179,7 @@ change mid-run (sha256 in `hostinfo.json`).
 
 | # | claim | status now |
 |---|---|---|
-| 1 | "fcvm marginal memory beats a warm container pool (129 vs 151 MiB)" | **SUPPORTED, but much smaller than claimed, and only for some backends.** On a matched cgroup basis: file-backed **143.5 ± 0.4** vs pool **156.5 ± 5.0** MiB/req — an 8% win, not a comfortable one. UFFD copy-mode **loses** (257.8 ± 1.1). UFFD `minor` wins clearly at 4K (132.5 ± 1.0). **The hugepage cell is NOT on the matched basis and must not be quoted as a win:** 34.7 ± 0.4 counts only non-hugetlb memory, because this host's cgroup2 mounts without `memory_hugetlb_accounting` (no hugetlb controller at all) and the pool was pre-allocated before the sample, so neither basis can see the guest's 2 MiB pages. On the pool-consumption basis that can, hugepage-minor costs **553-611 MiB per concurrent clone**, i.e. it LOSES to 4K minor on memory and buys render latency instead. Load during the density phases that produced every number in this row (continuous record: corrected.json load.by_phase dens1-dens16): median 0.56-0.64, p90 2.21, max 6.32 on 64 cores. |
+| 1 | "fcvm marginal memory beats a warm container pool (129 vs 151 MiB)" | **SUPPORTED, but much smaller than claimed, and only for some backends.** On a matched cgroup basis: file-backed **143.5 ± 0.4** vs pool **156.5 ± 5.0** MiB/req, an 8% win and not a comfortable one. UFFD copy-mode **loses** (257.8 ± 1.1). UFFD `minor` wins clearly at 4K (132.5 ± 1.0). **The hugepage cell is NOT on the matched basis and must not be quoted as a win:** 34.7 ± 0.4 counts only non-hugetlb memory, because this host's cgroup2 mounts without `memory_hugetlb_accounting` (no hugetlb controller at all) and the pool was pre-allocated before the sample, so neither basis can see the guest's 2 MiB pages. The 553-611 MiB per concurrent clone once quoted here, on a pool-consumption basis that can see those pages, came from a later report table, not from this run; no committed record holds it and the 2026-09-07 closeout took it out of current evidence, so the hugepage cell's per-clone memory cost is not established. Load during the density phases that produced every number in this row (continuous record: corrected.json load.by_phase dens1-dens16): median 0.56-0.64, p90 2.21, max 6.32 on 64 cores. |
 | 2 | any egress-mode *ordering* | **STILL NOT SUPPORTED.** The confound is gone (drift term −68.8 ± 51.9 ms/h, n.s.) and within-run SE is now 8.4 ms, but run-to-run shifts reach 52 ms and the IPv6 modes swap rank. Only "the two IPv4 rootless modes are fastest" reproduces; total spread ~110 ms of ~800 ms. |
 | 3 | "16 clones sustain 5.5–6.3 req/s" | **SUPERSEDED.** Throughput, file-backed N=16, sustained phase: **7.3 rps** — 462 completions in 63.6 s, a **SINGLE** sustained window per cell, so n=1 window and no run-to-run rate interval is derivable from the data as collected (the burst cells are replicated 5x and do carry CIs). all 462 launched requests completed — 0/462 incomplete, CP 95% [0, 0.80%]. *Burst figures are NOT throughput and must not be quoted as such* (see the binding requirement below); for completeness the burst cell, with the burst as the experimental unit (5 bursts/cell), came out at 6.4 req/s measured **within** the burst window (CI 6.4–6.7) file-backed and 7.4 (7.2–7.7) hugepage-minor — i.e. the burst *understates* capacity, which is why leading with it was the original defect. |
 | 4 | "7.9 vs 5.3 req/GB" (slope without intercept) | **REPLACED.** Slopes now carry intercepts and SEs and req/GiB is quoted at concrete N. At N=8: hugepage-minor 27.7, minor-4K 7.5, file-4K 7.0, pool 5.5, copy-4K 3.9. |
@@ -197,8 +205,10 @@ change mid-run (sha256 in `hostinfo.json`).
   2 MiB pages, and the pool was pre-allocated before the sample, so MemAvailable cannot move for
   them either. The "4.5x better than the warm container pool, 7.4x better than copy-mode"
   reading that accompanied it compared a number excluding the guest's RAM against numbers
-  including it. On the pool-consumption basis, hugepage-minor is **553-611 MiB per concurrent
-  clone** — 4x WORSE than 4K minor on memory, and it is bought for render latency, not density.
+  including it. The 553-611 MiB per concurrent clone once quoted here on a
+  pool-consumption basis was not measured in this run: it came from a later report table, no
+  committed record holds it, and the 2026-09-07 closeout took it out of current evidence, so
+  this cell's per-clone memory cost is not established.
 - **`minor` buys memory, not rate.** At a sustained 8 rps the 4K `minor` cell needed 165 s to
   drain 459 requests (2.8 rps achieved, p50 1224 ms, 1 request timed out — 1/459 = 0.22%
   [0.006%, 1.21%]) while file-backed held 7.3 rps with 462/462 complete. Both rates come from a
@@ -228,8 +238,12 @@ change mid-run (sha256 in `hostinfo.json`).
   suspected; not proven).
 - **Hugepage `minor` at 4K-equivalent page counts** — the hugepage win conflates page size with
   sharing mode; a 4K `minor` vs 2 MiB `minor` decomposition would separate them.
-- **Teardown** (175 ms, post-artifact) was not moved off the response path; the AGENTS.md
-  reclaim measurements suggest it converts to throughput cost rather than disappearing.
+- **Teardown** (175 ms, post-artifact) was not moved off the response path in this run.
+  reqbench.py has since moved it after the answer: `blocking_ms` ends when the CDP driver
+  returns and excludes teardown (median 63.7 ms at 4 vCPUs in
+  `results/reqbench-20260902-025115-corpus-c4`), and `wall_ms` includes it. The AGENTS.md
+  reclaim measurements suggest the moved teardown converts to throughput cost rather than
+  disappearing; no run here measures that cost.
 
 ## Harness bugs found in `reqbench.py` / `reqanalyze.py` / `reqbench.sh` (2026-08-08)
 
