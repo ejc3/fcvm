@@ -297,12 +297,12 @@ class ReportContent(unittest.TestCase):
         self.page = read(REPORT)
 
     def test_every_published_cloudflare_row_is_quoted_cell_for_cell(self):
-        """RED BEFORE THE FIX: the table titled "Every row Cloudflare published"
+        """RED BEFORE THE FIX: the table then titled "Every row Cloudflare published"
         printed the CPU rows as "380 core-ms" where Cloudflare prints "380 ms",
         and dropped the published relative column (3.1x less CPU ... 1.8x
         slower), which is where their CPU and memory against wall-time trade is
         stated."""
-        title = self.page.index('<p class="tbl-title">Every row Cloudflare published</p>')
+        title = self.page.index('<p class="tbl-title">Cloudflare&#8217;s published table, with fcvm&#8217;s figures</p>')
         table = re.search(r"<table\b.*?</table>", self.page[title:], re.S).group(0)
         rows = []
         for tr in re.findall(r"<tr>(.*?)</tr>", table, re.S):
@@ -438,6 +438,106 @@ class ReportContent(unittest.TestCase):
             self.assertEqual(linked, expected[where], f"{where} links a branch its runs did not use")
         self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
                          "a Firecracker branch link outside Firecracker builds")
+
+    def figure(self, label):
+        """The HTML of the <figure> whose caption has id=label."""
+        start = self.page.rindex("<figure", 0, self.page.index(f'aria-labelledby="{label}"'))
+        return self.page[start:self.page.index("</figure>", start)]
+
+    def test_setup_is_the_first_section(self):
+        """RED BEFORE THE FIX: "Two answers to one question", a section with
+        a full diagram, sat ahead of Setup, which moved the host, guest and
+        software provenance further down the page. bench/chromium/AGENTS.md
+        puts machine and versions in the first screenful."""
+        article = self.page[self.page.index("<article"):]
+        sections = re.findall(r'<h2 id="([^"]+)"', article)
+        self.assertEqual(sections[0], "setup")
+        toc = re.search(r'<nav class="toc".*?</nav>', self.page, re.S).group(0)
+        self.assertEqual(re.findall(r'href="#([^"]+)"', toc), sections, "the contents list the sections in page order")
+
+    LADDER = CORPUS_RUNS[1:]
+
+    def test_each_figure_computed_from_request_records_names_them(self):
+        """RED BEFORE THE FIX: the mean stage split (#d-split) and the
+        capacity arithmetic (#c-cap) printed means computed from per-request
+        records and named neither the file nor the fields. bench/chromium/
+        AGENTS.md: every figure traceable to a raw record, cited next to it."""
+        c4 = "results/reqbench-20260902-025115-corpus-c4/"
+        want = {
+            "d-split": [c4 + "reqbench.jsonl", "blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
+            "c-cap": [f"results/{run}/reqbench.jsonl" for run in self.LADDER] + ["wall_ms", c4 + "hostinfo.json", "nproc"],
+            "c-dens": ["results/20260808-corrected/corrected.json", "density", "host_pool"],
+        }
+        for label, needles in want.items():
+            src = re.findall(r'<p class="src">(.*?)</p>', self.figure(label), re.S)
+            self.assertEqual(len(src), 1, f"#{label} carries one source line")
+            for needle in needles:
+                self.assertIn(needle, src[0].replace("<wbr>", ""), f"#{label}'s source line must name {needle}")
+
+    def density_fits(self):
+        with open(os.path.join(HERE, "results", "20260808-corrected", "corrected.json")) as f:
+            record = json.load(f)
+        fits = {k: record["density"][k]["fits"]["cgroup"] for k in ("uffd-4k-minor", "file-4k", "uffd-4k-copy")}
+        fits["host_pool"] = record["host_pool"]["fits"]["cgroup"]
+        for fit in fits.values():
+            fit["slope"] = fit.get("slope_mib_per_clone", fit.get("slope_mib_per_container"))
+        return fits
+
+    # The row label each fit is printed under, in the chart and in the table.
+    DENSITY_LABELS = {"uffd-4k-minor": "minor mode", "file-4k": "file-backed",
+                      "uffd-4k-copy": "copy mode", "host_pool": "warm container pool"}
+
+    def density_rows(self):
+        """{fit key: (chart row text, table row text)}, each row found by its label."""
+        fig = self.figure("c-dens")
+        chart = {plain(label).lower(): plain(rest) for label, rest in
+                 re.findall(r'<div class="r"[^>]*><span class="l">(.*?)</span>(.*?)</div>', fig, re.S)}
+        table = {plain(label).lower(): plain(rest) for label, rest in
+                 re.findall(r"<tr><td>(.*?)</td>(.*?)</tr>", fig, re.S)}
+        rows = {}
+        for key, label in self.DENSITY_LABELS.items():
+            self.assertIn(label, chart, f"no chart row labelled {label!r}")
+            self.assertIn(label, table, f"no table row labelled {label!r}")
+            rows[key] = (chart[label], table[label])
+        return rows
+
+    def test_the_density_slopes_carry_their_standard_errors(self):
+        """RED BEFORE THE FIX: #c-dens printed the fitted slopes as bare
+        values (132.5, 143.5, 257.8 and 156.5 MiB) although the record gives
+        their standard errors, 0.4 to 5.0 MiB. bench/chromium/AGENTS.md:
+        quote uncertainty. Each value is checked in its own labelled row, so
+        two rows' values cannot trade places."""
+        rows = self.density_rows()
+        for key, fit in self.density_fits().items():
+            self.assertEqual(rows[key][0], f"{fit['slope']:.1f} ± {fit['slope_se']:.1f} MiB", key)
+
+    def test_the_density_figure_gives_intercepts_and_the_total_at_16(self):
+        """RED BEFORE THE FIX: #c-dens showed slopes only. The fits'
+        intercepts run from 17.3 to 249.8 MiB, so memory at a given count is
+        intercept + N x slope and the slopes alone cannot give it.
+        bench/chromium/AGENTS.md: slope and intercept with uncertainty, and a
+        value at a concrete N inside the measured range. Checked per
+        labelled row."""
+        rows = self.density_rows()
+        for key, fit in self.density_fits().items():
+            total = fit["intercept_mib"] + 16 * fit["slope"]
+            want = (f"{fit['intercept_mib']:.1f} ± {fit['intercept_se']:.1f} MiB {total:,.0f} MiB "
+                    f"{fit['reqs_per_gib_at_n']['16']:.1f} per GiB")
+            self.assertEqual(rows[key][1], want, key)
+
+    def test_the_sequence_shows_replay_can_outlast_the_resume(self):
+        """RED BEFORE THE FIX: step 8 read "replay recorded pages in chunks
+        of up to 2 MiB" above step 9's resume, and the caption named only the
+        harness's polls as overlapping steps 5 to 9, so the diagram showed
+        replay finishing before the VM resumes. The VM resumes without
+        waiting for replay (src/uffd/prefetch.rs), as #d-replay states."""
+        fig = self.figure("d-seq")
+        steps = {int(n): plain(text) for n, text in
+                 re.findall(r'<span class="n">(\d+)</span>(.*?)</span></div>', fig, re.S)}
+        self.assertTrue(steps[8].startswith("start replaying"), steps[8])
+        self.assertIn("resume the VM", steps[9])
+        caption = plain(re.search(r"<figcaption.*?</figcaption>", fig, re.S).group(0))
+        self.assertIn("Replay (step 8) can continue after the resume (step 9)", caption)
 
 
 class PhoneLayout(unittest.TestCase):

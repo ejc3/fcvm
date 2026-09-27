@@ -191,6 +191,97 @@ table.records td:first-child { white-space: nowrap; }
 .flow li.untimed { border-style: dashed; color: var(--fg-muted); }
 .flow li.untimed::before { background: var(--fg-muted); color: var(--canvas); }
 
+/* Diagrams: boxes and arrows in HTML, so they reflow on phones */
+.diagram { margin: 16px 0 24px; padding: 16px; border: 1px solid var(--border); border-radius: 6px; }
+.diagram figcaption { margin-bottom: 14px; }
+.diagram .ct { display: block; font-weight: 600; }
+.diagram .cs { display: block; color: var(--fg-muted); font-size: 14px; }
+.diagram code { font-size: 80%; }
+.box { border: 1px solid var(--border); border-radius: 6px; background: var(--canvas-subtle); padding: 8px 12px; font-size: 14px; }
+.box b { display: block; font-size: 14px; }
+.box span { display: block; color: var(--fg-muted); font-size: 13px; }
+.box.edge { border: 2px dashed var(--fg-muted); background: var(--canvas); }
+.box.shared { border-color: var(--s1); box-shadow: inset 4px 0 0 var(--s1); }
+.box.private { border-color: var(--s2); box-shadow: inset 4px 0 0 var(--s2); }
+.down { position: relative; min-height: 34px; margin: 0; padding: 6px 0 12px calc(50% + 12px); display: flex; align-items: center; color: var(--fg-muted); font-size: 12px; line-height: 1.35; }
+.down::before { content: ""; position: absolute; left: 50%; top: 2px; bottom: 8px; border-left: 2px solid var(--fg-muted); }
+.down::after { content: ""; position: absolute; left: calc(50% - 5px); bottom: 0; border: 5px solid transparent; border-top: 8px solid var(--fg-muted); border-bottom: 0; }
+.down.tall { min-height: 46px; }
+@media (max-width: 640px) {
+  .down { padding-left: 34px; }
+  .down::before { left: 16px; }
+  .down::after { left: 11px; }
+}
+
+/* Two isolation stacks side by side */
+.duo { display: grid; grid-template-columns: repeat(auto-fit, minmax(15rem, 1fr)); gap: 16px 24px; }
+.lane h3 { font-size: 15px; margin: 0 0 10px; padding: 0 0 6px; border-bottom: 1px solid var(--border-muted); }
+.lane h3 small { display: block; font-weight: 400; color: var(--fg-muted); font-size: 13px; }
+
+/* Request sequence: lanes on wide screens, a list on phones */
+.seq { position: relative; margin-top: 4px; }
+.seq-lanes { display: grid; grid-template-columns: repeat(4, 1fr); gap: 0; margin-bottom: 6px; }
+.seq-lanes span { text-align: center; font-size: 13px; font-weight: 600; padding: 4px 2px; border-bottom: 2px solid var(--border); }
+.seq-body { position: relative; background: linear-gradient(to right, transparent calc(12.5% - 1px), var(--axis) calc(12.5% - 1px), var(--axis) calc(12.5% + 1px), transparent calc(12.5% + 1px), transparent calc(37.5% - 1px), var(--axis) calc(37.5% - 1px), var(--axis) calc(37.5% + 1px), transparent calc(37.5% + 1px), transparent calc(62.5% - 1px), var(--axis) calc(62.5% - 1px), var(--axis) calc(62.5% + 1px), transparent calc(62.5% + 1px), transparent calc(87.5% - 1px), var(--axis) calc(87.5% - 1px), var(--axis) calc(87.5% + 1px), transparent calc(87.5% + 1px)); }
+.msg { position: relative; padding: 2px 0 16px; }
+.msg .ml { display: block; margin-left: var(--l); width: var(--w); text-align: center; font-size: 13px; line-height: 1.25; padding: 0 4px; }
+.msg .ln { position: absolute; left: var(--l); width: var(--w); bottom: 8px; border-top: 2px solid var(--fg); }
+.msg .ln::after { content: ""; position: absolute; top: -6px; border: 5px solid transparent; }
+.msg.rt .ln::after { right: -2px; border-left: 8px solid var(--fg); border-right: 0; }
+.msg.lt .ln::after { left: -2px; border-right: 8px solid var(--fg); border-left: 0; }
+.msg.self .ln { display: none; }
+.msg.self { padding-bottom: 8px; }
+.msg.self .ml { padding: 3px 6px; border: 1px solid var(--border); border-radius: 4px; background: var(--canvas); }
+.msg.hot .ml { font-weight: 600; }
+.msg .n { display: inline-block; min-width: 18px; height: 18px; margin-right: 4px; border-radius: 9px; background: var(--badge); color: #fff; font-size: 11px; font-weight: 600; line-height: 18px; text-align: center; vertical-align: 1px; }
+.msg .who { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+@media (max-width: 640px) {
+  .seq-lanes { display: none; }
+  .seq-body { background: none; display: grid; gap: 6px; }
+  .msg, .msg.self { padding: 0; }
+  .msg .ml, .msg.self .ml { display: block; position: static; margin-left: 0; width: auto; text-align: left; padding: 6px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--canvas-subtle); }
+  .msg .ln { display: none; }
+  .msg .who { position: static; width: auto; height: auto; overflow: visible; clip: auto; white-space: normal; display: block; color: var(--fg-muted); font-size: 12px; font-weight: 400; }
+}
+
+/* Where the time goes: one bar split into stages */
+.split { display: flex; height: 30px; margin: 4px 0 10px; border-radius: 4px; overflow: hidden; gap: 2px; }
+.split > span { display: block; height: 100%; flex: 0 1 auto; min-width: 3px; }
+.split .restore { background: var(--s2); }
+.split .render { background: var(--s1); }
+.split .other { background: var(--ref); }
+.split-after { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--fg-muted); margin-bottom: 12px; }
+.split-after i { flex: none; display: inline-block; height: 12px; border-radius: 2px; background: repeating-linear-gradient(135deg, var(--ref) 0 3px, transparent 3px 6px); border: 1px solid var(--ref); }
+dl.parts { margin: 0; font-size: 14px; }
+dl.parts > div { display: grid; grid-template-columns: 11rem minmax(0, 1fr) auto; grid-template-areas: "t d v"; gap: 2px 12px; align-items: baseline; padding: 3px 0; }
+dl.parts dt { grid-area: t; font-weight: 600; }
+dl.parts dd { margin: 0; }
+dl.parts dd.d { grid-area: d; color: var(--fg-muted); }
+dl.parts dd.v { grid-area: v; text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+@media (max-width: 640px) {
+  dl.parts > div { grid-template-columns: minmax(0, 1fr) auto; grid-template-areas: "t v" "d d"; padding: 4px 0 6px; border-bottom: 1px solid var(--border-muted); }
+}
+
+/* One snapshot, many clones */
+.clones { display: grid; grid-template-columns: repeat(auto-fit, minmax(9.5rem, 1fr)); gap: 10px; }
+.clone { border: 1px solid var(--border); border-radius: 6px; padding: 8px 10px; font-size: 13px; }
+.clone b { display: block; font-size: 14px; margin-bottom: 6px; }
+.clone .pg { display: flex; align-items: center; gap: 6px; margin: 3px 0; color: var(--fg-muted); }
+.clone .pg i { flex: none; width: 12px; height: 12px; border-radius: 2px; }
+.clone .pg i.sh { background: repeating-linear-gradient(135deg, var(--s1) 0 3px, transparent 3px 6px); border: 1px solid var(--s1); }
+.clone .pg i.pv { background: var(--s2); }
+
+/* Record, union, replay */
+.cycle { list-style: none; padding: 0; margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(12rem, 1fr)); gap: 12px; counter-reset: cyc; }
+.cycle li { counter-increment: cyc; margin: 0; position: relative; border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px 10px 44px; font-size: 14px; }
+.cycle li::before { content: counter(cyc); position: absolute; left: 10px; top: 10px; width: 24px; height: 24px; border-radius: 50%; background: var(--badge); color: #fff; font-weight: 600; font-size: 13px; line-height: 24px; text-align: center; }
+.cycle li b { display: block; }
+.cycle-note { margin: 10px 0 0; font-size: 13px; color: var(--fg-muted); }
+
+/* Arithmetic, drawn unlike a measurement */
+.b.arith { background: repeating-linear-gradient(135deg, var(--s1) 0 4px, transparent 4px 8px); border: 1px dashed var(--s1); }
+.sw.arith { background: repeating-linear-gradient(135deg, var(--s1) 0 3px, transparent 3px 6px); border: 1px dashed var(--s1); }
+
 /* Charts: HTML bars that reflow on narrow screens */
 .chart { margin: 16px 0 24px; padding: 16px; border: 1px solid var(--border); border-radius: 6px; }
 .chart figcaption { margin-bottom: 12px; }
@@ -235,13 +326,14 @@ table.records td:first-child { white-space: nowrap; }
 <main>
 <article class="markdown-body">
 <h1>One microVM per page: Chromium on Firecracker snapshots</h1>
-<p class="lede">In this benchmark each screenshot request gets a new Firecracker microVM, restored by fcvm from a snapshot of a Chromium that is already booted and warm. The VM renders one page, returns a JPEG and is destroyed. Requests share no writable guest state: each clone&#8217;s writes are private and are discarded with it. They do share the read-only snapshot, the memory server that serves it and, with prefetch on (the default), that server&#8217;s record of which pages earlier clones touched, which it prefetches into the next clone. This page reports the latency on Cloudflare&#8217;s 14-URL Kitesurf corpus replayed locally and, on a synthetic page, how the memory configuration changes it.</p>
+<p class="lede">In August Cloudflare introduced <a href="https://blog.cloudflare.com/kitesurf/">Kitesurf</a>, a browser for agents that runs on Workers, one V8 isolate per navigation, and uses native Rust compiled directly to WebAssembly where possible. Their starting point is that Chromium is too heavy: it uses &#8220;so much memory and compute that providing every agent with its own instance is prohibitively expensive&#8221;. This page looks at the other answer: keep unmodified Chromium and give each request its own microVM, restored from a snapshot in which Chromium is already booted and warm, with the memory server recording which pages clones touch and mapping them into the next one. It measures how long that takes on Cloudflare&#8217;s 14-URL corpus. What it costs per request in CPU and memory, the axis Cloudflare&#8217;s post is about, is not measured here.</p>
 <div class="verdict">
   <div><span class="num">549.4 ms</span><span class="lbl">median per request at 4 guest vCPUs, from launching the VM to the screenshot returned, 202 requests over the 14 corpus URLs</span></div>
   <div><span class="num">770.3 ms</span><span class="lbl">the same at 2 guest vCPUs; a second 2 vCPU run on another day read 712.6 ms</span></div>
+  <div><span class="num">37% shorter</span><span class="lbl">request median with working-set replay on than off, synthetic page, copy mode, one golden (477.9 against 762.6 ms)</span></div>
   <div><span class="num">0 failures</span><span class="lbl">in each of the four published corpus runs: 0 of 230 render attempts per run (202 measured, 28 warmup), exact 95% interval 0 to 1.59%; the interleaved no-render arm also had 0 failures in 230</span></div>
 </div>
-<nav class="toc" aria-label="Contents"><strong>On this page</strong><ol><li><a href="#setup">Setup</a></li><li><a href="#cloudflare">Against Cloudflare&#8217;s numbers</a></li><li><a href="#request">What one request does</a></li><li><a href="#vcpu">Guest vCPU count</a></li><li><a href="#sites">Per-site latency</a></li><li><a href="#synthetic">Memory configuration and VM overhead</a></li><li><a href="#limits">Not measured</a></li><li><a href="#method">Method and gates</a></li><li><a href="#firecracker">Firecracker builds</a></li><li><a href="#records">Records</a></li></ol></nav>
+<nav class="toc" aria-label="Contents"><strong>On this page</strong><ol><li><a href="#setup">Setup</a></li><li><a href="#answers">Two answers to one question</a></li><li><a href="#cloudflare">The same corpus</a></li><li><a href="#request">What one request does</a></li><li><a href="#sharing">One snapshot, many clones</a></li><li><a href="#amortize">On a large host</a></li><li><a href="#vcpu">Guest vCPU count</a></li><li><a href="#sites">Per-site latency</a></li><li><a href="#synthetic">Memory configuration and VM overhead</a></li><li><a href="#limits">Not measured</a></li><li><a href="#method">Method and gates</a></li><li><a href="#firecracker">Firecracker builds</a></li><li><a href="#records">Records</a></li></ol></nav>
 <h2 id="setup">Setup</h2>
 <div class="table-wrap"><table class="kv">
 <thead><tr><th>Item</th><th>Value</th></tr></thead>
@@ -262,10 +354,42 @@ table.records td:first-child { white-space: nowrap; }
 <dt>Within-run interval</dt><dd>The 95% bootstrap confidence interval of a run&#8217;s median, computed from that run&#8217;s 202 requests. It does not include run-to-run variance.</dd>
 <dt>No-render arm</dt><dd>Requests interleaved with the renders that restore a clone and stop the clock when its forwarded DevTools port accepts a connection, with no navigation. The drift gate watches it.</dd>
 </dl>
-<h2 id="cloudflare">Against Cloudflare&#8217;s numbers</h2>
-<p>Cloudflare&#8217;s <a href="https://blog.cloudflare.com/kitesurf/">Kitesurf post</a> measures per-request browser isolation on the same 14 URLs: Kitesurf, a rebuilt browser engine isolated per request, against a pool of warm Chromium instances. We ran unmodified Chromium in a new microVM per request.</p>
+<h2 id="answers">Two answers to one question</h2>
+<p>Cloudflare&#8217;s post asks how to give every agent its own browser. Kitesurf answers with a new engine built as several Workers components, each in its own V8 isolate: the Engine, which holds the CDP session and fetches the page&#8217;s document and scripts; PageScript, one isolate per navigation, which runs the page&#8217;s script; PageRenderer, which paints; and SandboxOutbound, the only path to the network. Where it can, it uses native Rust compiled to WebAssembly, with parts of Blitz and Stylo for HTML and CSS. fcvm keeps the engine and moves the isolation boundary out to a microVM, so that each page gets its own kernel under an unmodified Chromium.</p>
+<figure class="diagram" aria-labelledby="d-answers">
+<figcaption id="d-answers"><span class="ct">From an untrusted page to the network, in each design</span><span class="cs">Kitesurf&#8217;s path follows the isolation figure and component descriptions in Cloudflare&#8217;s post, and the <a href="https://developers.cloudflare.com/workers/reference/security-model/">Workers security model</a> for the isolate boundary. PageRenderer, which paints and has no network access, is left out. The dashed box is each design&#8217;s isolation boundary.</span></figcaption>
+<div class="duo">
+<div class="lane"><h3>Kitesurf<small>Cloudflare; Rust compiled to WebAssembly, on Workers</small></h3>
+<div class="box"><b>Untrusted page</b><span>HTML, CSS and script from the site</span></div>
+<div class="down">&nbsp;</div>
+<div class="box"><b>Engine</b><span>holds the session; fetches the main document and scripts through SandboxOutbound</span></div>
+<div class="down">starts one isolate per navigation</div>
+<div class="box"><b>PageScript</b><span>DOM in WebAssembly; page script in V8, eval in Boa</span></div>
+<div class="down">&nbsp;</div>
+<div class="box edge"><b>Workers isolate boundary</b><span>V8 isolates that can share a runtime process; runtime processes run in a namespace and seccomp sandbox</span></div>
+<div class="down">&nbsp;</div>
+<div class="box"><b>SandboxOutbound</b><span>the only path to the network: CORS, headers, cookies</span></div>
+<div class="down">&nbsp;</div>
+<div class="box"><b>The internet</b><span>live origins</span></div>
+</div>
+<div class="lane"><h3>fcvm<small>unmodified Chromium in a Firecracker microVM per request</small></h3>
+<div class="box"><b>Untrusted page</b><span>HTML, CSS and script from the site</span></div>
+<div class="down">one microVM per request</div>
+<div class="box"><b>Chromium, restored</b><span>a copy-on-write clone of a warm browser, discarded after one page</span></div>
+<div class="down">&nbsp;</div>
+<div class="box edge"><b>KVM boundary: Firecracker microVM</b><span>its own guest kernel, vCPUs, memory and disk</span></div>
+<div class="down">&nbsp;</div>
+<div class="box"><b>pasta</b><span>user-mode networking in the clone&#8217;s own network namespace</span></div>
+<div class="down">&nbsp;</div>
+<div class="box"><b>The internet</b><span>in this benchmark, a replay server on the host</span></div>
+</div>
+</div>
+</figure>
+<p>The two designs pay for isolation in different places. Kitesurf rebuilds the engine as Workers components, and Cloudflare&#8217;s post lists what it cannot do yet: play video, render WebGL, negotiate a bot-challenge handshake with real TLS fingerprints, or start a ten-minute authenticated session that requires persistent state. It implements a subset of CDP. fcvm keeps the whole engine and restores a VM for each request instead of booting one. At 4 guest vCPUs the recorded port-accept and target-wait stages sum to a median of 197.7 ms. The driver&#8217;s setup between them is not timed and the harness polls every 50 ms, so the moment the restored Chromium was ready is not recorded. It is a time, not a cost: what a restore costs in CPU and memory is not measured. For scale only, Cloudflare&#8217;s later benchmark leaves out the launch of a fresh Chrome, a median of 215 ms across its pages, on hardware it does not state. Cloudflare publishes no spin-up time for a Kitesurf isolate.</p>
+<h2 id="cloudflare">The same corpus</h2>
+<p>Cloudflare&#8217;s post reports &#8220;the medians of five Browser Run quick-action runs across a 14-URL corpus&#8221;, Kitesurf against Chromium in a warm pool. The corpus file, <code>kitesurf.cloudflare.app/<wbr>corpus.txt</code>, is no longer served; the Wayback Machine holds identical copies from <a href="https://web.archive.org/web/20260807231955/https://kitesurf.cloudflare.app/corpus.txt">2026-08-07</a> and 2026-08-14. We captured those 14 URLs and replayed them to a new microVM per request.</p>
 <figure class="chart" aria-labelledby="c-cf">
-<figcaption id="c-cf"><span class="ct">Median time per screenshot, 14-URL corpus</span><span class="cs">Medians from different setups, grouped by system. The setups differ as listed below, so the bars are not a controlled ranking. Each fcvm bar is one run; our one repeated configuration, 2 vCPUs, moved 57.7 ms between two runs.</span></figcaption>
+<figcaption id="c-cf"><span class="ct">Published screenshot wall time (Cloudflare) and request median (fcvm), 14-URL corpus</span><span class="cs">Figures from different setups and different statistics, grouped by system. The setups differ as listed below, so the bars are not a controlled ranking. Each fcvm bar is one run; our one repeated configuration, 2 vCPUs, moved 57.7 ms between two runs.</span></figcaption>
 <ul class="legend"><li><span class="sw s2"></span>Cloudflare Kitesurf, isolated per request</li><li><span class="sw s3"></span>Cloudflare Chromium, warm pool</li><li><span class="sw s1"></span>fcvm, new microVM per request</li></ul>
 <div class="rows">
 <div class="grp"><span class="gl">Cloudflare, published medians</span>
@@ -281,17 +405,18 @@ table.records td:first-child { white-space: nowrap; }
 </div>
 <p class="src">fcvm bars: from launching the VM to the screenshot returned, teardown excluded (Latency, under Setup). The 4 and 8 vCPU runs are from 2026-09-02.</p>
 </figure>
-<p>These are medians side by side, not a controlled comparison. The setups differ:</p>
+<p>These figures sit side by side; they are not a controlled comparison. The setups differ:</p>
 <ul>
-<li><strong>Network.</strong> Cloudflare loaded the live pages over the internet. Our corpus is replayed from the same host, so our numbers contain no internet round trips.</li>
+<li><strong>Statistic and timer.</strong> Cloudflare&#8217;s figures are &#8220;the medians of five Browser Run quick-action runs&#8221;; the post does not say how each run combines its 14 URLs or what its timer covers. Ours is the median of 202 requests, from launch to the screenshot returned. Our mean at 4 vCPUs is 822.8 ms.</li>
+<li><strong>Network.</strong> Cloudflare&#8217;s corpus names live public URLs, and the post does not state how benchmark traffic was controlled. Our corpus is replayed from the same host, so our numbers contain no internet round trips.</li>
 <li><strong>Uncaptured requests.</strong> The replay answers an uncaptured GET, HEAD or POST with an empty 404: 1,261 of them in the 4 vCPU run, median 0.2 ms at the server, longest 341 ms. A live load would fetch those resources and whatever they trigger. Which way this moves our times is not measured.</li>
-<li><strong>Browser state.</strong> Their Chromium column reuses one browser across requests. Each of our requests gets its own clone and discards it afterwards, so no browser state carries from one request to the next, as in their Kitesurf column. Unlike Kitesurf, each clone starts from a Chromium that was booted and warmed on an unrelated local page before the snapshot: neither a cold engine nor a browser that has seen the measured pages.</li>
-<li><strong>Feature scope.</strong> Cloudflare&#8217;s post says Kitesurf cannot yet play video, render WebGL, negotiate a bot-challenge handshake with real TLS fingerprints, or hold a long-running authenticated session. We run unmodified Chromium.</li>
+<li><strong>Browser state.</strong> Their Chromium column is a warm pool; Cloudflare&#8217;s later benchmark page describes that arm as &#8220;Chrome reused between pages&#8221;. Each of our requests gets its own clone and discards it afterwards, so no browser state carries from one request to the next, as in their Kitesurf column. Unlike Kitesurf, each clone starts from a Chromium that was booted and warmed on an unrelated local page before the snapshot: neither a cold engine nor a browser that has seen the measured pages.</li>
+<li><strong>Feature scope.</strong> Cloudflare&#8217;s post says Kitesurf cannot yet play video, render WebGL, negotiate a bot-challenge handshake with real TLS fingerprints, or start a ten-minute authenticated session that requires persistent state. We run unmodified Chromium.</li>
 <li><strong>Hardware.</strong> Cloudflare does not state theirs. Ours is in <a href="#setup">Setup</a>.</li>
 </ul>
-<p>As numbers, our median is below their Kitesurf median at every vCPU count we ran, and below their warm Chromium median at 4 and 8 vCPUs but not at 2. Our only repeated configuration moved 57.7 ms between two runs, while the gap to their Chromium median is 56.8 ms at 8 vCPUs and 87.6 ms at 4. None of the differences above is priced, so these orderings do not rank the systems.</p>
+<p>As numbers, our median is below their Kitesurf median at every vCPU count we ran, and below their warm Chromium median at 4 and 8 vCPUs but not at 2. Our means, 1,035.1, 822.8 and 844.7 ms at 2, 4 and 8 vCPUs, are above their warm Chromium figure at every count. Which of our statistics matches theirs is not known, and none of the differences above is priced, so neither ordering ranks the systems.</p>
 <p>Cloudflare&#8217;s own table is a trade between cost and time. By their relative column, against their warm Chromium, Kitesurf uses 3.1 and 3.8 times less CPU and 4.7 and 7.0 times less memory, and is 1.8 and 1.7 times slower on wall time. The chart above shows only time, the axis on which Kitesurf is the slower of their two engines. We have no CPU or memory figure to set against the other rows.</p>
-<p class="tbl-title">Every row Cloudflare published</p>
+<p class="tbl-title">Cloudflare&#8217;s published table, with fcvm&#8217;s figures</p>
 <div class="table-wrap"><table class="stack">
 <thead><tr><th>Metric</th><th>Kitesurf</th><th>Cloudflare Chromium</th><th>Kitesurf, relative</th><th>fcvm</th><th>Notes</th></tr></thead>
 <tbody>
@@ -301,18 +426,52 @@ table.records td:first-child { white-space: nowrap; }
 <tr><td data-label="Metric">Memory, HTML extraction</td><td data-label="Kitesurf">39.4 MiB</td><td data-label="Cloudflare Chromium">273.7 MiB</td><td data-label="Kitesurf, relative">7.0x less memory</td><td data-label="fcvm">not measured</td><td data-label="Notes">not measured: no run performs this operation.</td></tr>
 <tr><td data-label="Metric">Wall, screenshot</td><td data-label="Kitesurf">1,148 ms</td><td data-label="Cloudflare Chromium">637 ms</td><td data-label="Kitesurf, relative">1.8x slower</td><td data-label="fcvm">549.4 ms at 4 vCPU</td><td data-label="Notes">770.3 and 712.6 ms in two runs at 2 vCPU, 580.2 ms at 8. From launching the VM to the screenshot returned, teardown excluded; the record&#8217;s <code>wall_ms</code>, which includes teardown, is 623.1 ms at 4 vCPU. Source: <code>arms.<wbr>cdp.<wbr>blocking_ms</code> in <code>results/reqbench-20260902-025115-corpus-c4/analysis.json</code>.</td></tr>
 <tr><td data-label="Metric">Wall, HTML extraction</td><td data-label="Kitesurf">820 ms</td><td data-label="Cloudflare Chromium">472 ms</td><td data-label="Kitesurf, relative">1.7x slower</td><td data-label="fcvm">not measured</td><td data-label="Notes">not measured: the harness has an HTML branch, and no run selects it.</td></tr>
-<tr><td data-label="Metric">Web-platform tests</td><td data-label="Kitesurf">215,000+ passing</td><td data-label="Cloudflare Chromium">full engine</td><td data-label="Kitesurf, relative">not published</td><td data-label="fcvm">full engine</td><td data-label="Notes">Kitesurf&#8217;s count is from the post&#8217;s section <a href="https://blog.cloudflare.com/kitesurf/#kitesurf-passes-215000-wpt-tests-and-growing">&#8220;Kitesurf passes 215,000+ WPT tests and growing&#8221;</a>. We run unmodified Chromium. Trackers count tests and subtests differently, so no Chromium count is quoted.</td></tr>
+<tr><td data-label="Metric">Web-platform tests</td><td data-label="Kitesurf">215,000+ (the post&#8217;s heading); 731,247 of 762,891 subtests passing (kitesurf.dev, 2026-09-26)</td><td data-label="Cloudflare Chromium">full engine</td><td data-label="Kitesurf, relative">not published</td><td data-label="fcvm">full engine</td><td data-label="Notes">Kitesurf&#8217;s count is from the post&#8217;s section <a href="https://blog.cloudflare.com/kitesurf/#kitesurf-passes-215000-wpt-tests-and-growing">&#8220;Kitesurf passes 215,000+ WPT tests and growing&#8221;</a>. Cloudflare&#8217;s docs say over 235,000 subtests, and <a href="https://kitesurf.dev/wpt">kitesurf.dev/wpt</a> reports 731,247 of 762,891 on a pinned corpus. The sources do not explain the different totals. This row is not part of Cloudflare&#8217;s table. We run unmodified Chromium, and no Chromium count is quoted.</td></tr>
 </tbody></table></div>
-<p class="src">Cloudflare&#8217;s rows: verified on 2026-08-30 against <a href="https://developers.cloudflare.com/browser-run/kitesurf/">developers.cloudflare.com/browser-run/kitesurf</a>, which carries the same table as <a href="https://blog.cloudflare.com/kitesurf/">blog.cloudflare.com/kitesurf</a>. Their figures are medians of five runs each.</p>
+<p class="src">Cloudflare&#8217;s rows: verified on 2026-08-30 against <a href="https://developers.cloudflare.com/browser-run/kitesurf/">developers.cloudflare.com/browser-run/kitesurf</a>, which carries the same table as <a href="https://blog.cloudflare.com/kitesurf/">blog.cloudflare.com/kitesurf</a>. Their figures are medians of five Browser Run quick-action runs. The web-platform row and the later benchmark below use the sources cited beside them.</p>
+<p><strong>Cloudflare&#8217;s later benchmark.</strong> Cloudflare&#8217;s benchmark page, <a href="https://kitesurf.dev/benchmarks">kitesurf.dev/benchmarks</a>, read on 2026-09-26, reports its latest run at 2026-09-25 01:17 UTC and states its method: 38 entries (the 14 corpus URLs and 24 more, one of which, relic.so/changelog, appears twice), 15 recorded renders attempted for each after two warm-ups, and three arms. For a screenshot of a typical page it reports a median wall time of 1.18 s for Kitesurf, 654 ms for Browser Run (Chrome reused between pages) and 1.09 s for Chrome (cold start), a fresh Chrome for every render whose launch is left out of the timer; in that run&#8217;s raw data the launch has a median of 215 ms across the pages&#8217; screenshot medians. fcvm&#8217;s figures include the restore. That page sums Kitesurf&#8217;s CPU and memory across its Worker components, measures the Chrome arms&#8217; memory as PSS across Chrome&#8217;s processes and Browser Run&#8217;s CPU at container level, and adds the Node driver to the cold Chrome&#8217;s CPU. No corpus run here measures CPU or memory for fcvm.</p>
 <h2 id="request">What one request does</h2>
 <ol class="flow">
 <li><strong>Golden, once.</strong> A VM boots Chromium, warms it on a local page, navigates to <code>about:blank</code> and is snapshotted. Every request restores this snapshot.</li>
-<li><strong>Restore.</strong> A new Firecracker process restores a copy-on-write clone of the golden. Guest RAM is filled on first touch from the shared in-memory copy of the snapshot; pages earlier clones used are prefetched.</li>
+<li><strong>Restore.</strong> A new Firecracker process restores a copy-on-write clone of the golden. Guest RAM is filled on first touch from the shared in-memory copy of the snapshot, and pages recorded from earlier clones start being mapped in after the handshake, before the VM resumes.</li>
 <li><strong>Wait for the target.</strong> The harness polls Chromium&#8217;s <code>/json/list</code> every 50 ms until a page target appears.</li>
 <li><strong>Connect and navigate.</strong> WebSocket upgrade and <code>Page.enable</code>, then <code>Page.navigate</code> and a wait for <code>Page.<wbr>loadEventFired</code>. The records do not split this into fetch, script and layout.</li>
 <li><strong>Screenshot.</strong> <code>Page.<wbr>captureScreenshot</code>, JPEG quality 80. The clock stops when the driver returns, after it decodes the JPEG, reads the navigation timing and closes the connection.</li>
 <li class="untimed"><strong>Destroy, not timed.</strong> The clone and everything it wrote are discarded after the answer (median 63.7 ms at 4 vCPUs).</li>
 </ol>
+<figure class="diagram" aria-labelledby="d-seq">
+<figcaption id="d-seq"><span class="ct">The life of one request</span><span class="cs">Order of events in fcvm&#8217;s restore path and the harness&#8217;s driver. The harness starts polling after step 4, which can come before the snapshot is loaded, so its polls can overlap steps 5 to 9; the records do not show how much. Replay (step 8) can continue after the resume (step 9). Demand faults (step 10) continue for the rest of the request. The clock runs from step 1 to step 13.</span></figcaption>
+<div class="seq"><div class="seq-lanes" aria-hidden="true"><span>Harness</span><span>fcvm and pasta</span><span>Memory server</span><span>Clone VM</span></div><div class="seq-body" role="list">
+<div class="msg rt hot" role="listitem" style="--l:12.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Harness &#8594; fcvm and pasta</span><span class="n">1</span><code>fcvm snapshot run</code>: the clock starts</span></div>
+<div class="msg self" role="listitem" style="--l:26%;--w:23%"><span class="ln"></span><span class="ml"><span class="who">fcvm and pasta</span><span class="n">2</span>CoW disk and network namespace</span></div>
+<div class="msg rt" role="listitem" style="--l:37.5%;--w:50%"><span class="ln"></span><span class="ml"><span class="who">fcvm and pasta &#8594; Clone VM</span><span class="n">3</span>start Firecracker; start pasta, whose port listens from here</span></div>
+<div class="msg rt" role="listitem" style="--l:12.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Harness &#8594; fcvm and pasta</span><span class="n">4</span>TCP connect to the forwarded port: pasta accepts</span></div>
+<div class="msg rt" role="listitem" style="--l:37.5%;--w:50%"><span class="ln"></span><span class="ml"><span class="who">fcvm and pasta &#8594; Clone VM</span><span class="n">5</span>load the snapshot, not resumed</span></div>
+<div class="msg rt" role="listitem" style="--l:62.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Memory server &#8594; Clone VM</span><span class="n">6</span>once Firecracker connects: the shared memfd</span></div>
+<div class="msg lt" role="listitem" style="--l:62.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Clone VM &#8594; Memory server</span><span class="n">7</span>Firecracker&#8217;s memory mappings and userfaultfd</span></div>
+<div class="msg rt" role="listitem" style="--l:62.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Memory server &#8594; Clone VM</span><span class="n">8</span>start replaying recorded pages in chunks of up to 2 MiB</span></div>
+<div class="msg rt" role="listitem" style="--l:37.5%;--w:50%"><span class="ln"></span><span class="ml"><span class="who">fcvm and pasta &#8594; Clone VM</span><span class="n">9</span>patch the disk; resume the VM</span></div>
+<div class="msg lt" role="listitem" style="--l:62.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Clone VM &#8594; Memory server</span><span class="n">10</span>demand faults, from resume on, served before each replay chunk</span></div>
+<div class="msg rt" role="listitem" style="--l:12.5%;--w:75%"><span class="ln"></span><span class="ml"><span class="who">Harness &#8594; Clone VM</span><span class="n">11</span>after step 4, poll <code>/json/list</code> every 50 ms until a page target is listed; then <code>Page.navigate</code></span></div>
+<div class="msg lt" role="listitem" style="--l:12.5%;--w:75%"><span class="ln"></span><span class="ml"><span class="who">Clone VM &#8594; Harness</span><span class="n">12</span>load event; screenshot JPEG</span></div>
+<div class="msg self hot" role="listitem" style="--l:1%;--w:23%"><span class="ln"></span><span class="ml"><span class="who">Harness</span><span class="n">13</span>decode and check the JPEG, read navigation timing, close CDP: the clock stops</span></div>
+<div class="msg rt" role="listitem" style="--l:12.5%;--w:25%"><span class="ln"></span><span class="ml"><span class="who">Harness &#8594; fcvm and pasta</span><span class="n">14</span>destroy the clone (not timed)</span></div>
+</div></div>
+</figure>
+<figure class="diagram" aria-labelledby="d-split">
+<figcaption id="d-split"><span class="ct">Where the time goes, mean request at 4 vCPUs</span><span class="cs">Means over the 202 requests, which add up per request (the stages sum to 822.3 of the 822.8 ms mean). The median request is 549.4 ms; the slow news sites pull the mean up, mostly through navigate.</span></figcaption>
+<div class="split" role="img" aria-label="Port accepts 45.4 ms; Wait for target 152.9 ms; Connect 5.5 ms; Navigate 537.7 ms; Screenshot 76.3 ms; After the JPEG 4.5 ms"><span class="restore" style="width:calc(5.51% - 2px)" title="Port accepts: 45.4 ms"></span><span class="restore" style="width:calc(18.59% - 2px)" title="Wait for target: 152.9 ms"></span><span class="render" style="width:calc(0.67% - 2px)" title="Connect: 5.5 ms"></span><span class="render" style="width:calc(65.35% - 2px)" title="Navigate: 537.7 ms"></span><span class="render" style="width:calc(9.27% - 2px)" title="Screenshot: 76.3 ms"></span><span class="other" style="width:calc(0.55% - 2px)" title="After the JPEG: 4.5 ms"></span></div>
+<div class="split-after"><i style="width:10.2%"></i>then teardown, after the answer and not timed: 84.0 ms mean</div>
+<dl class="parts">
+<div><dt><span class="sw s2"></span>Port accepts</dt><dd class="d">launch to the first TCP connect on the forwarded DevTools port</dd><dd class="v">45.4 ms</dd></div>
+<div><dt><span class="sw s2"></span>Wait for target</dt><dd class="d">the rest of the restore (snapshot load, memory handshake, disk patch, resume) and Chromium listing a page target, polled every 50 ms</dd><dd class="v">152.9 ms</dd></div>
+<div><dt><span class="sw s1"></span>Connect</dt><dd class="d">TCP connect, WebSocket upgrade, Page.enable</dd><dd class="v">5.5 ms</dd></div>
+<div><dt><span class="sw s1"></span>Navigate</dt><dd class="d">Page.navigate until the load event</dd><dd class="v">537.7 ms</dd></div>
+<div><dt><span class="sw s1"></span>Screenshot</dt><dd class="d">Page.captureScreenshot, JPEG quality 80</dd><dd class="v">76.3 ms</dd></div>
+<div><dt><span class="sw ref"></span>After the JPEG</dt><dd class="d">decode and check the JPEG, read the navigation timing</dd><dd class="v">4.5 ms</dd></div>
+</dl>
+<p class="src">Record: <code>results/reqbench-20260902-025115-corpus-c4/reqbench.jsonl</code>, the 202 measured <code>cdp</code> requests. The request is <code>blocking_ms</code> and port accepts is <code>spawn_to_port_ms</code>. The other parts are fields of <code>render.stages</code>: <code>resolve_ms</code>; <code>tcp_ms</code>, <code>upgrade_ms</code> and <code>enable_ms</code>; <code>navigate_ms</code>; <code>screenshot_ms</code>; <code>decode_ms</code>, <code>nav_timing_ms</code> and <code>idle_ms</code>. Teardown is <code>teardown.teardown_total_ms</code>.</p>
+</figure>
 <figure class="chart" aria-labelledby="c-st">
 <figcaption id="c-st"><span class="ct">Stage medians at 4 vCPUs, in request order</span><span class="cs">Each stage&#8217;s median over the 202 requests. Medians of separate stages do not add up to the request median.</span></figcaption>
 <div class="rows">
@@ -327,6 +486,71 @@ table.records td:first-child { white-space: nowrap; }
 <p>The first stage ends 44.7 ms after the harness launches the VM, at its first successful TCP connect to the forwarded DevTools port. That port is pasta&#8217;s host-side listener, which starts before the snapshot is loaded and accepts without the guest, so this stage does not show that the guest has restored. Any restore work left after that connect, and Chromium answering <code>/json/list</code>, fall in the next stage, the 153.1 ms wait for the target. The records do not mark when the restore completes.</p>
 <p>The harness polls every 50 ms, so the wait moves in 50 ms steps. At 4 vCPUs, 18 requests found a target on the third poll, 172 on the fourth and 12 on the fifth: in the median request the first three polls, the last about 100 ms after the port accepted, got no page target. The records do not say whether a poll failed to connect or found no page. At most one 50 ms step is poll granularity; per request, the stage less its 50 ms sleeps has a median of 3.2 ms. A readiness notification in place of the poll would save at most one step per request. That change has not been measured.</p>
 <p>Navigate, 301.0 ms, is the largest stage median.</p>
+<h2 id="sharing">One snapshot, many clones</h2>
+<p>Two mechanisms shape what a VM per request costs. The first is memory sharing: in minor mode, which the corpus runs used, the pages a clone only reads are a read-only view of one copy of the snapshot. The second is profiling and replay: the memory server records which pages clones fault and starts mapping that set into each new clone after the handshake, before it resumes.</p>
+<figure class="diagram" aria-labelledby="d-mem">
+<figcaption id="d-mem"><span class="ct">Memory in minor mode</span><span class="cs">Schematic, not to scale. From <code>src/uffd/server.rs</code> and the Firecracker fork&#8217;s restore backend.</span></figcaption>
+<div class="box"><b>memory.bin</b><span>the golden&#8217;s guest memory, on disk</span></div>
+<div class="down">copied once when the memory server starts; with 4 KiB pages, all-zero pages stay holes</div>
+<div class="box shared"><b>One sealed memfd per memory server</b><span>read-only, held while that server runs, shared by all its clones</span></div>
+<div class="down tall">each clone maps it privately; a fault installs a read-only mapping of the shared page</div>
+<div class="clones">
+<div class="clone"><b>Clone 1</b><div class="pg"><i class="sh"></i>pages it reads: the shared copy</div><div class="pg"><i class="pv"></i>pages it writes: its own copy</div><div class="pg">own vCPUs, disk and network</div></div>
+<div class="clone"><b>Clone 2</b><div class="pg"><i class="sh"></i>pages it reads: the shared copy</div><div class="pg"><i class="pv"></i>pages it writes: its own copy</div><div class="pg">own vCPUs, disk and network</div></div>
+<div class="clone"><b>Clone 3</b><div class="pg"><i class="sh"></i>pages it reads: the shared copy</div><div class="pg"><i class="pv"></i>pages it writes: its own copy</div><div class="pg">own vCPUs, disk and network</div></div>
+<div class="clone"><b>Clone N</b><div class="pg"><i class="sh"></i>pages it reads: the shared copy</div><div class="pg"><i class="pv"></i>pages it writes: its own copy</div><div class="pg">own vCPUs, disk and network</div></div>
+</div>
+</figure>
+<p>A page one clone reads costs no memory in the others: every clone maps the same physical page. A page a clone writes is copied into that clone on its first write and discarded with it. The snapshot never changes. In copy mode, the default for <code>fcvm snapshot serve</code>, each clone instead gets its own copy of every page it touches.</p>
+<figure class="diagram" aria-labelledby="d-replay">
+<figcaption id="d-replay"><span class="ct">Profiling and replay</span><span class="cs">How the memory server learns which pages clones touch. From <code>src/uffd/working_set.rs</code> and <code>src/uffd/prefetch.rs</code>.</span></figcaption>
+<ol class="cycle">
+<li><b>A clone runs.</b> Each demand fault in its first 300 s (the default window; for these requests, the whole render) marks every 4 KiB granule the faulting page covers in the clone&#8217;s bitmap.</li>
+<li><b>The clone ends.</b> Its bitmap is ORed into the server&#8217;s in-memory record of every clone so far. A background writer tries to save the grown record beside the snapshot as <code>memory.<wbr>bin.<wbr>working-set</code>; it can merge or skip saves, and the in-memory record serves the next clone either way.</li>
+<li><b>The next clone restores.</b> After the handshake the server maps the recorded pages in chunks of up to 2 MiB, serving any page the guest is waiting on before each chunk. The VM resumes without waiting, so replay can overlap the guest running; when it does, the guest&#8217;s own faults are served before each chunk.</li>
+</ol>
+<p class="cycle-note">A record only says which pages to map; the bytes always come from the snapshot being served, so a stale record wastes work and cannot corrupt a guest. A new snapshot or a changed config starts an empty record.</p>
+</figure>
+<p>Replay is measured once. On the synthetic page, in copy mode on one golden, the run with replay had a request median of 477.9 ms and the run without it 762.6 ms, with navigate at 184.1 against 390.6 ms (<a href="#synthetic">details and provenance</a>). The corpus campaign turns replay on by default; the run records do not store the value, and no run compares replay on and off in minor mode or on the corpus.</p>
+<h2 id="amortize">On a large host</h2>
+<p>Every corpus run on this page sent one request at a time. The three ladder runs used for the arithmetic below ran on an AWS c8g.metal-48xl with 192 vCPUs and 377 GiB. None of the runs holds many clones at once, so none measures how many renders the host sustains or how latency holds up while it does. What the records do give is the host and the time each request held a clone, from launch through teardown. The chart below is arithmetic from those two, not a measurement.</p>
+<figure class="chart" aria-labelledby="c-cap">
+<figcaption id="c-cap"><span class="ct">If every guest vCPU had a host vCPU to itself (arithmetic)</span><span class="cs">Clones in flight: 192 host vCPUs divided by guest vCPUs. Requests per second: clones in flight divided by the mean time a request held its clone, launch to teardown, in the serial runs. Hatched to mark arithmetic.</span></figcaption>
+<ul class="legend"><li><span class="sw arith"></span>arithmetic from the records, not measured</li></ul>
+<div class="rows">
+<div class="r" title="2 guest vCPUs: 96 clones in flight, 1,113.8 ms mean per request, 86.2 requests per second"><span class="l">2 vCPU: 96 in flight</span><span class="t" style="--w:62.06%;--end:62.06%"><span class="b arith"></span><span class="v">86.2 req/s</span></span></div>
+<div class="r" title="4 guest vCPUs: 48 clones in flight, 911.4 ms mean per request, 52.7 requests per second"><span class="l">4 vCPU: 48 in flight</span><span class="t" style="--w:37.92%;--end:37.92%"><span class="b arith"></span><span class="v">52.7 req/s</span></span></div>
+<div class="r" title="8 guest vCPUs: 24 clones in flight, 936.7 ms mean per request, 25.6 requests per second"><span class="l">8 vCPU: 24 in flight</span><span class="t" style="--w:18.45%;--end:18.45%"><span class="b arith"></span><span class="v">25.6 req/s</span></span></div>
+</div>
+<p class="src">Records: mean <code>wall_ms</code> of the measured <code>cdp</code> requests in <code>results/reqbench-20260902-023115-corpus-c2/reqbench.jsonl</code>, <code>results/reqbench-20260902-025115-corpus-c4/reqbench.jsonl</code>, <code>results/reqbench-20260902-031115-corpus-c8/reqbench.jsonl</code> (1,113.8, 911.4, 936.7 ms); host vCPUs are <code>nproc</code> in <code>results/reqbench-20260902-025115-corpus-c4/hostinfo.json</code>.</p>
+</figure>
+<p>The arithmetic assumes two things no corpus record checks: that a clone uses no more host CPU than its guest vCPUs, although the host also runs an fcvm process and a pasta for each clone and one memory server that serves all of them, and that a request takes as long with 96 clones in flight as it did alone. The one sustained-load run of minor mode (2026-08-08, synthetic page, 2-vCPU guests on a 64-vCPU host; <code>results/20260808-corrected/corrected.json</code>, <code>sustained</code>) saw the median of completed requests rise from 956.7 ms at a 1 request-per-second target to 1,223.6 ms at an 8 request-per-second target; the 8 request-per-second cell launched 459 requests and completed 458. In this arithmetic, 8 guest vCPUs halve the CPU slots from 48 to 24, and they did not shorten the request median in these runs; no record establishes how many clones the host can hold.</p>
+<figure class="chart" aria-labelledby="c-dens">
+<figcaption id="c-dens"><span class="ct">Memory per additional concurrent clone, synthetic page</span><span class="cs">fcvm: slope of cgroup <code>memory.current</code> over 1 to 16 clones held at once, each idle after one render of <code>medium.html</code>; 2 GiB guests with 2 vCPUs on a 64-vCPU host, 2026-08-08, before replay existed. The memory server sat outside the clones&#8217; cgroups, so the shared snapshot is not in these figures. Warm containers: slope over 2 to 16 containers on the host, each idle after its start-up render of a warm-up page; they did not render <code>medium.html</code>. Each &#177; is the standard error of a least-squares fit over 15 clone counts per fcvm mode, or 12 container counts.</span></figcaption>
+<ul class="legend"><li><span class="sw s1"></span>fcvm, one clone per request</li><li><span class="sw ref"></span>warm Chromium containers on the host</li></ul>
+<div class="rows">
+<div class="r"><span class="l">minor mode</span><span class="t" style="--w:28.05%;--end:28.05%"><span class="b s1"></span><span class="v">132.5 &#177; 1.0 MiB</span></span></div>
+<div class="r"><span class="l">file-backed</span><span class="t" style="--w:30.40%;--end:30.40%"><span class="b s1"></span><span class="v">143.5 &#177; 0.4 MiB</span></span></div>
+<div class="r"><span class="l">copy mode</span><span class="t" style="--w:54.60%;--end:54.60%"><span class="b s1"></span><span class="v">257.8 &#177; 1.1 MiB</span></span></div>
+<div class="r"><span class="l">warm container pool</span><span class="t" style="--w:33.14%;--end:33.14%"><span class="b ref"></span><span class="v">156.5 &#177; 5.0 MiB</span></span></div>
+</div>
+<p class="tbl-title">Fitted cgroup memory, intercept + N &#215; slope, and clones or containers per GiB of it</p>
+<div class="table-wrap"><table class="stack">
+<thead><tr><th>Setup</th><th>Intercept</th><th>Fitted at N = 16</th><th>Density at N = 16</th></tr></thead>
+<tbody>
+<tr><td>Minor mode</td><td class="n" data-label="Intercept">35.0 &#177; 7.8 MiB</td><td class="n" data-label="Fitted at N = 16">2,154 MiB</td><td class="n" data-label="Density at N = 16">7.6 per GiB</td></tr>
+<tr><td>File-backed</td><td class="n" data-label="Intercept">17.3 &#177; 3.4 MiB</td><td class="n" data-label="Fitted at N = 16">2,314 MiB</td><td class="n" data-label="Density at N = 16">7.1 per GiB</td></tr>
+<tr><td>Copy mode</td><td class="n" data-label="Intercept">29.5 &#177; 9.1 MiB</td><td class="n" data-label="Fitted at N = 16">4,155 MiB</td><td class="n" data-label="Density at N = 16">3.9 per GiB</td></tr>
+<tr><td>Warm container pool</td><td class="n" data-label="Intercept">249.8 &#177; 46.2 MiB</td><td class="n" data-label="Fitted at N = 16">2,754 MiB</td><td class="n" data-label="Density at N = 16">5.9 per GiB</td></tr>
+</tbody></table></div>
+<p class="src">Record: <code>results/20260808-corrected/corrected.json</code>, <code>density</code> and <code>host_pool</code> fits. <code>bench/chromium/REVIEW.md</code> keeps its 2 MB hugepage cell out of use, because that basis cannot see the guest&#8217;s hugepages.</p>
+</figure>
+<p>On the synthetic page, sharing is what separates the modes: a minor-mode clone added 132.5 MiB, about half of copy mode&#8217;s 257.8 MiB, and less than one more warm Chromium container at 156.5 MiB, which had rendered only its warm-up page. These are guests of a different size, on a different host, before replay, so they do not carry over to the corpus. What would settle the question on the corpus, with targets that exist today:</p>
+<ul>
+<li><strong>CPU per request.</strong> <code>make bench-chromium-corpus</code> with its default arms. Its fast-teardown arm records each child process&#8217;s CPU time; the published runs left that arm out. About 25 minutes per vCPU count.</li>
+<li><strong>Memory with many clones at once.</strong> <code>make bench-chromium-corpus-extra PHASES=memory MEM_NS=2,16,48,96</code>, which interleaves N clones against N warm containers and reports shared and private memory on two bases. About one to two hours.</li>
+<li><strong>Throughput under load.</strong> No target drives the corpus at a fixed arrival rate yet; <code>make bench-chromium-scale</code> does it for the synthetic page only.</li>
+</ul>
 <h2 id="vcpu">Guest vCPU count</h2>
 <p>The vCPU count is fixed in the golden, so each rung of the ladder has its own golden. The three rungs ran back to back on one host with one build.</p>
 <figure class="chart" aria-labelledby="c-vc">
@@ -513,7 +737,7 @@ table.records td:first-child { white-space: nowrap; }
 </ul>
 <p>Restored guests need their monotonic clock to continue from the snapshot instant, or every armed timer fires at once. On these plain-EL1 guests the host kernel handles it: since the <a href="https://lore.kernel.org/all/20230330174800.2677007-1-maz@kernel.org/">March 2023 arm64 KVM counter-offset series</a>, KVM recomputes the VM-wide counter offset when a restore replays the saved counter registers. The timer storm fcvm fixed for nested virtualization (<a href="https://github.com/ejc3/fcvm/issues/630">#630</a>) needs a virtual-EL2 guest and does not apply to either build.</p>
 <h2 id="records">Records</h2>
-<p>Every fcvm figure on this page comes from a committed record under <code>bench/chromium/results/</code>, except where a statement names another source: the bridged-network refusal, the replay equivalence result, the prefetch and port-probe settings taken from commit messages, the hugepage setting taken from raw captures, and the Firecracker commits, which no record stores. The reqbench runs record content hashes of the harness and of the runtime bundle holding fcvm and fc-agent, the snapshot generation and its config digest. HC records its configuration and host kernel in <code>run.json</code>; FB records its configuration and guest size only, with no host, kernel or prefetch setting. Cloudflare&#8217;s figures are quoted from their post.</p>
+<p>Every fcvm figure on this page comes from a committed record under <code>bench/chromium/results/</code>, except where a statement names another source: the bridged-network refusal, the replay equivalence result, the prefetch and port-probe settings taken from commit messages, the hugepage setting taken from raw captures, and the Firecracker commits, which no record stores. The reqbench runs record content hashes of the harness and of the runtime bundle holding fcvm and fc-agent, the snapshot generation and its config digest. HC records its configuration and host kernel in <code>run.json</code>; FB records its configuration and guest size only, with no host, kernel or prefetch setting. Cloudflare&#8217;s benchmark rows are quoted from their post; the web-platform and later-benchmark figures come from Cloudflare&#8217;s docs and kitesurf.dev, cited where they appear, and the Chrome launch median is computed from kitesurf.dev&#8217;s raw data.</p>
 <div class="table-wrap"><table class="stack records">
 <thead><tr><th>Id</th><th>What</th><th>Record</th></tr></thead>
 <tbody>
