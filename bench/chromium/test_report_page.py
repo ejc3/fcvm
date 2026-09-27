@@ -441,27 +441,61 @@ class ReportContent(unittest.TestCase):
             fit["slope"] = fit.get("slope_mib_per_clone", fit.get("slope_mib_per_container"))
         return fits
 
+    # The row label each fit is printed under, in the chart and in the table.
+    DENSITY_LABELS = {"uffd-4k-minor": "minor mode", "file-4k": "file-backed",
+                      "uffd-4k-copy": "copy mode", "host_pool": "warm container pool"}
+
+    def density_rows(self):
+        """{fit key: (chart row text, table row text)}, each row found by its label."""
+        fig = self.figure("c-dens")
+        chart = {plain(label).lower(): plain(rest) for label, rest in
+                 re.findall(r'<div class="r"[^>]*><span class="l">(.*?)</span>(.*?)</div>', fig, re.S)}
+        table = {plain(label).lower(): plain(rest) for label, rest in
+                 re.findall(r"<tr><td>(.*?)</td>(.*?)</tr>", fig, re.S)}
+        rows = {}
+        for key, label in self.DENSITY_LABELS.items():
+            self.assertIn(label, chart, f"no chart row labelled {label!r}")
+            self.assertIn(label, table, f"no table row labelled {label!r}")
+            rows[key] = (chart[label], table[label])
+        return rows
+
     def test_the_density_slopes_carry_their_standard_errors(self):
         """RED BEFORE THE FIX: #c-dens printed the fitted slopes as bare
         values (132.5, 143.5, 257.8 and 156.5 MiB) although the record gives
         their standard errors, 0.4 to 5.0 MiB. bench/chromium/AGENTS.md:
-        quote uncertainty."""
-        fig = plain(self.figure("c-dens"))
+        quote uncertainty. Each value is checked in its own labelled row, so
+        two rows' values cannot trade places."""
+        rows = self.density_rows()
         for key, fit in self.density_fits().items():
-            self.assertIn(f"{fit['slope']:.1f} ± {fit['slope_se']:.1f} MiB", fig, key)
+            self.assertEqual(rows[key][0], f"{fit['slope']:.1f} ± {fit['slope_se']:.1f} MiB", key)
 
     def test_the_density_figure_gives_intercepts_and_the_total_at_16(self):
         """RED BEFORE THE FIX: #c-dens showed slopes only. The fits'
         intercepts run from 17.3 to 249.8 MiB, so memory at a given count is
         intercept + N x slope and the slopes alone cannot give it.
         bench/chromium/AGENTS.md: slope and intercept with uncertainty, and a
-        value at a concrete N inside the measured range."""
-        fig = plain(self.figure("c-dens"))
+        value at a concrete N inside the measured range. Checked per
+        labelled row."""
+        rows = self.density_rows()
         for key, fit in self.density_fits().items():
-            self.assertIn(f"{fit['intercept_mib']:.1f} ± {fit['intercept_se']:.1f} MiB", fig, key)
             total = fit["intercept_mib"] + 16 * fit["slope"]
-            self.assertIn(f"{total:,.0f} MiB", fig, key)
-            self.assertIn(f"{fit['reqs_per_gib_at_n']['16']:.1f} per GiB", fig, key)
+            want = (f"{fit['intercept_mib']:.1f} ± {fit['intercept_se']:.1f} MiB {total:,.0f} MiB "
+                    f"{fit['reqs_per_gib_at_n']['16']:.1f} per GiB")
+            self.assertEqual(rows[key][1], want, key)
+
+    def test_the_sequence_shows_replay_can_outlast_the_resume(self):
+        """RED BEFORE THE FIX: step 8 read "replay recorded pages in chunks
+        of up to 2 MiB" above step 9's resume, and the caption named only the
+        harness's polls as overlapping steps 5 to 9, so the diagram showed
+        replay finishing before the VM resumes. The VM resumes without
+        waiting for replay (src/uffd/prefetch.rs), as #d-replay states."""
+        fig = self.figure("d-seq")
+        steps = {int(n): plain(text) for n, text in
+                 re.findall(r'<span class="n">(\d+)</span>(.*?)</span></div>', fig, re.S)}
+        self.assertTrue(steps[8].startswith("start replaying"), steps[8])
+        self.assertIn("resume the VM", steps[9])
+        caption = plain(re.search(r"<figcaption.*?</figcaption>", fig, re.S).group(0))
+        self.assertIn("Replay (step 8) can continue after the resume (step 9)", caption)
 
 
 class PhoneLayout(unittest.TestCase):
