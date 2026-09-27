@@ -137,6 +137,48 @@ class WrappedReport(unittest.TestCase):
         )
         self.assertRegex(workflow, r"path: *_site\b", "the site directory is what is uploaded")
 
+    def test_the_site_is_assembled_without_deploy_credentials(self):
+        """RED BEFORE THE FIX (#1014): pages.yml ran one job that held
+        pages: write and id-token: write and also executed
+        bench/chromium/report/wrap_page.py from the checked-out ref, so any
+        change to the wrapper that reached a deployable ref ran with the
+        deployment identity.
+
+        The workflow triggers only on push to main and manual dispatch, grants
+        nothing by default, and has exactly two jobs. build holds contents: read
+        and does the checkout, assembly and upload. deploy needs build, runs
+        only on refs/heads/main, holds exactly pages: write and id-token: write,
+        and runs only the two Pages actions."""
+        workflow = read(PAGES_WORKFLOW)
+        on = workflow[workflow.index("\non:\n") + len("\non:\n"):workflow.index("\npermissions:")]
+        self.assertEqual(re.findall(r"(?m)^  ([\w-]+):", on), ["push", "workflow_dispatch"],
+                         "only push and manual dispatch may start a deploy")
+        self.assertRegex(on, r"(?m)^    branches: *\[main\] *$")
+        self.assertRegex(workflow, r"(?m)^permissions: *\{\}\s*$",
+                         "the workflow grants nothing by default; each job asks for its own")
+        body = workflow[workflow.index("\njobs:\n") + len("\njobs:\n"):]
+        jobs = dict(re.findall(r"(?ms)^  ([\w-]+):\n(.*?)(?=^  [\w-]+:\n|\Z)", body))
+        self.assertEqual(sorted(jobs), ["build", "deploy"])
+
+        def permissions(job):
+            block = re.search(r"(?m)^    permissions:\n((?:      .*\n)+)", job)
+            self.assertTrue(block, "every job declares its permissions")
+            return sorted(line.strip() for line in block.group(1).splitlines())
+
+        build, deploy = jobs["build"], jobs["deploy"]
+        self.assertEqual(permissions(build), ["contents: read"])
+        self.assertEqual(permissions(deploy), ["id-token: write", "pages: write"])
+        self.assertRegex(deploy, r"(?m)^    needs: *build *$")
+        self.assertRegex(deploy, r"(?m)^    if: *github\.ref *== *'refs/heads/main' *$",
+                         "only a run on main deploys")
+        self.assertNotRegex(deploy, r"(?m)^ +(?:- )?run:", "the deploy job runs no shell steps")
+        used = [u.split("@")[0] for u in re.findall(r"(?m)^ +(?:- )?uses: *([^\s]+)", deploy)]
+        self.assertEqual(used, ["actions/configure-pages", "actions/deploy-pages"],
+                         "the deploy job runs only the Pages actions")
+        self.assertIn("actions/checkout", build)
+        self.assertIn("wrap_page.py", build)
+        self.assertIn("actions/upload-pages-artifact", build)
+
     def test_the_deliverable_contract_names_github_pages(self):
         """Codex on #1012: AGENTS.md required publishing through the Artifact tool,
         which this PR retires. The contract names the Pages path instead.
