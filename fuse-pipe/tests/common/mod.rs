@@ -199,6 +199,9 @@ impl FuseMount {
 
         // Create shutdown channel for clean server termination
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        // Sent once the server listens. The socket file appears at bind(), before listen(), so a
+        // client that connects as soon as the file exists can be refused.
+        let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<()>();
 
         // Start server in dedicated thread with its own runtime
         let server_data_path = data_path.to_path_buf();
@@ -218,7 +221,7 @@ impl FuseMount {
                 info!(target: TARGET, "Server calling serve_unix");
                 // Use select to allow clean shutdown via channel
                 tokio::select! {
-                    result = server.serve_unix(&server_socket) => {
+                    result = server.serve_unix_with_ready_signal(&server_socket, Some(ready_tx)) => {
                         if let Err(e) = result {
                             // Server exits when client disconnects - this is expected
                             debug!(target: TARGET, error = %e, "Server exited");
@@ -239,13 +242,10 @@ impl FuseMount {
             socket,
         };
 
-        // Wait for server to be ready (socket exists)
-        for i in 0..100 {
-            if Path::new(&socket_path).exists() {
-                debug!(target: TARGET, iterations = i, "Socket ready");
-                break;
-            }
-            thread::sleep(Duration::from_millis(10));
+        // Wait for the server to listen. An error means the server thread ended without listening.
+        if ready_rx.blocking_recv().is_err() {
+            drop(server_guard);
+            panic!("the fuse-pipe server stopped before listening on {socket_path}");
         }
 
         // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
