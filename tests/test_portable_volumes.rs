@@ -721,52 +721,64 @@ async fn held_open_file_across_snapshot(prefix: &str) -> Result<()> {
     tokio::fs::create_dir_all(&host_dir).await?;
     tokio::fs::write(format!("{}/big", host_dir), vec![b'A'; BIG_FILE_MIB << 20]).await?;
 
-    let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
-    common::poll_health_by_pid(pid, 180).await?;
-    start_held_open_reader(pid).await?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while reader_log(pid).await?.len() < 5 {
+    // Every fcvm process started below, killed after the body whether or not it succeeded.
+    let mut started: Vec<u32> = Vec::new();
+    let result = async {
+        let (_child, pid) = start_portable_vm(&vm_name, &host_dir, "/mnt/test", true).await?;
+        started.push(pid);
+        common::poll_health_by_pid(pid, 180).await?;
+        start_held_open_reader(pid).await?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while reader_log(pid).await?.len() < 5 {
+            anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "reader did not start in the baseline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+
+        common::create_snapshot_by_pid(pid, &snap_name).await?;
+        let at_snapshot = reader_log(pid).await?.len();
+        common::kill_process(pid).await;
+        started.retain(|p| *p != pid);
+
+        let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
+        started.push(serve_pid);
+        let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+        started.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 180).await?;
+
+        // Give the reader 10 s of clone time, then read its log.
+        tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        let log = reader_log(clone_pid).await?;
+        let after: Vec<_> = log
+            .iter()
+            .filter(|(n, _)| *n as usize >= at_snapshot)
+            .collect();
+
         anyhow::ensure!(
-            std::time::Instant::now() < deadline,
-            "reader did not start in the baseline"
+            after.len() >= 10,
+            "the reader held open across the snapshot read {} blocks in 10 s of the clone (at the \
+             snapshot it had read {}); the clone's volume server did not serve its handle",
+            after.len(),
+            at_snapshot
         );
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let wrong: Vec<_> = after.iter().filter(|(_, c)| c != "A").collect();
+        anyhow::ensure!(
+            wrong.is_empty(),
+            "the reader held open across the snapshot read something other than its file: {:?}",
+            &wrong[..wrong.len().min(5)]
+        );
+        Ok(())
     }
+    .await;
 
-    common::create_snapshot_by_pid(pid, &snap_name).await?;
-    let at_snapshot = reader_log(pid).await?.len();
-    common::kill_process(pid).await;
-
-    let (_serve, serve_pid) = common::start_memory_server(&snap_name).await?;
-    let (_clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
-    common::poll_health_by_pid(clone_pid, 180).await?;
-
-    // Give the reader 10 s of clone time, then read its log.
-    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-    let log = reader_log(clone_pid).await?;
-    let after: Vec<_> = log
-        .iter()
-        .filter(|(n, _)| *n as usize >= at_snapshot)
-        .collect();
-
-    common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
+    // Clone first, then the memory server it pages from, then the baseline.
+    for pid in started.iter().rev() {
+        common::kill_process(*pid).await;
+    }
     tokio::fs::remove_dir_all(&host_dir).await.ok();
-
-    anyhow::ensure!(
-        after.len() >= 10,
-        "the reader held open across the snapshot read {} blocks in 10 s of the clone (at the snapshot \
-         it had read {}); the clone's volume server did not serve its handle",
-        after.len(),
-        at_snapshot
-    );
-    let wrong: Vec<_> = after.iter().filter(|(_, c)| c != "A").collect();
-    anyhow::ensure!(
-        wrong.is_empty(),
-        "the reader held open across the snapshot read something other than its file: {:?}",
-        &wrong[..wrong.len().min(5)]
-    );
-    Ok(())
+    result
 }
 
 /// A handle opened before `fcvm snapshot create` keeps reading its file in the clone.

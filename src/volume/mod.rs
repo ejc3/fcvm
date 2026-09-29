@@ -251,6 +251,7 @@ fn spawn_inode_table_server(
     socket_path: PathBuf,
     remaps: Vec<(u32, Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>)>,
 ) -> Result<JoinHandle<()>> {
+    let remaps = Arc::new(remaps);
     let _ = std::fs::remove_file(&socket_path);
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding inode table socket {}", socket_path.display()))?;
@@ -264,10 +265,23 @@ fn spawn_inode_table_server(
                     continue;
                 }
             };
-            let files: Vec<(String, String)> = inode_table_files(&remaps)
-                .into_iter()
-                .map(|(name, json)| (name, String::from_utf8(json).unwrap_or_default()))
-                .collect();
+            // Serializing waits for any rename in flight (RemapFs::serialize_table), which may
+            // be a host rename, so it runs off the async workers.
+            let tables = Arc::clone(&remaps);
+            let files: Vec<(String, String)> = match tokio::task::spawn_blocking(move || {
+                inode_table_files(&tables)
+                    .into_iter()
+                    .map(|(name, json)| (name, String::from_utf8(json).unwrap_or_default()))
+                    .collect()
+            })
+            .await
+            {
+                Ok(files) => files,
+                Err(e) => {
+                    error!(socket = %socket_path.display(), error = %e, "serializing inode tables failed");
+                    continue;
+                }
+            };
             let body = serde_json::to_vec(&files).unwrap_or_default();
             if let Err(e) = stream.write_all(&body).await {
                 error!(socket = %socket_path.display(), error = %e, "writing inode tables failed");

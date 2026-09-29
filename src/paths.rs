@@ -141,7 +141,7 @@ const SUN_PATH_MAX: usize = 107;
 /// Checked rather than assumed: if a longer name is added later, the budget
 /// below silently stops covering it, so this constant and the check move
 /// together.
-const LONGEST_SOCKET_NAME: &str = "firecracker.socket";
+const LONGEST_SOCKET_NAME: &str = "vsock.sock_inode_tables";
 
 /// Fail early when this VM's data directory leaves no room for its sockets.
 ///
@@ -206,8 +206,14 @@ mod tests {
         let error = check_socket_path_budget_under(too_deep, VM_ID)
             .expect_err("a 128 byte socket path must be refused, not bound");
         let text = error.to_string();
+        // 128 bytes for the incident's firecracker.socket; the reserved name is longer now.
+        let length = format!(
+            "{}/vm-disks/{VM_ID}/{LONGEST_SOCKET_NAME}",
+            too_deep.display()
+        )
+        .len();
         assert!(
-            text.contains("sun_path") && text.contains("128"),
+            text.contains("sun_path") && text.contains(&format!("{length} bytes")),
             "the error must name the limit AND the measured length, or the operator \
              is left with the same unattributable symptom this replaces: {text}"
         );
@@ -226,6 +232,18 @@ mod tests {
     fn the_default_data_dir_fits() {
         check_socket_path_budget_under(Path::new("/mnt/fcvm-btrfs"), VM_ID)
             .expect("the default data dir must leave room for VM sockets");
+    }
+
+    /// Every socket fcvm binds in a VM's runtime directory must fit the name the budget reserves.
+    /// The portable-volume inode table socket (`vsock.sock_inode_tables`) is the longest.
+    #[test]
+    fn the_budget_covers_the_inode_table_socket() {
+        let name = crate::volume::inode_table_socket_path(Path::new("vsock.sock"));
+        assert!(
+            name.as_os_str().len() <= LONGEST_SOCKET_NAME.len(),
+            "{} is longer than the {LONGEST_SOCKET_NAME} the budget reserves",
+            name.display()
+        );
     }
 
     /// Exactly at the limit is allowed; one byte over is not. Pins the
