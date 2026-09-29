@@ -4619,3 +4619,232 @@ async fn snapshot_leaves_the_source_network_untouched() -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+/// Reproducer for the KVM async #PF / NMI race, built on the host and run in the guest. See its header.
+#[cfg(target_arch = "x86_64")]
+const ASYNC_PF_NMI_SOURCE: &str = include_str!("data/async_pf_nmi.c");
+
+/// ASYNC #PF INSIDE AN NMI. A clone restored through a copy-mode serve with prefetch off takes a KVM
+/// async page fault for every page it touches. If a perf sampling NMI lands after one is delivered and
+/// before its handler reads the reason flags, and the NMI's user call-chain walk faults, the pinned
+/// 6.18.50 kernel lets that nested fault take the flags and panics with "Host injected async #PF in
+/// interrupt disabled region".
+/// kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch
+/// fixes it. The guest program fills memory before the snapshot and reads it back in the clone while
+/// sampling hardware cycles with call chains and with its frame pointer aimed at an unmapped page.
+/// Without the fix the clone panicked within seconds in every run, after about 19,000 of the 262,144
+/// page faults 1 GiB takes.
+///
+/// The NMIs come from the guest's PMU, and only an AMD host gives a Firecracker guest one: the Intel
+/// CPUID normalization (`update_performance_monitoring_entry`) zeroes leaf 0xA, so an Intel guest has
+/// no hardware events and cannot take this panic from perf. On Intel the test therefore asserts that
+/// precondition instead, so a Firecracker change that starts exposing the PMU there turns it red.
+#[cfg(target_arch = "x86_64")]
+#[tokio::test]
+async fn test_async_pf_inside_nmi_does_not_panic_a_restored_guest() -> Result<()> {
+    const FILL_MIB: u32 = 1024;
+    const THREADS: u32 = 4;
+    const READ_SECS: u64 = 20;
+    let host_is_intel = std::fs::read_to_string("/proc/cpuinfo")
+        .context("reading /proc/cpuinfo")?
+        .lines()
+        .find(|line| line.starts_with("vendor_id"))
+        .context("no vendor_id in /proc/cpuinfo")?
+        .ends_with("GenuineIntel");
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("apfnmi");
+    let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let mut baseline: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut clone: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_cleanup_needed = false;
+
+    let build_dir = tempfile::tempdir().context("creating the reproducer build directory")?;
+    let source = build_dir.path().join("apfnmi.c");
+    std::fs::write(&source, ASYNC_PF_NMI_SOURCE)?;
+    let binary = build_dir.path().join("apfnmi");
+    let compiled = std::process::Command::new("cc")
+        .args(["-O2", "-pthread", "-o"])
+        .arg(&binary)
+        .arg(&source)
+        .output()
+        .context("running cc for the async #PF reproducer")?;
+    anyhow::ensure!(
+        compiled.status.success(),
+        "compiling the async #PF reproducer failed: {}",
+        String::from_utf8_lossy(&compiled.stderr)
+    );
+    // Map a directory named by the binary's hash, not the per-run build directory: the map path is part
+    // of the pre-start snapshot cache key, so a fresh path every run would miss the cache every run.
+    let digest = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(std::fs::read(&binary)?))
+    };
+    let map_dir = std::env::temp_dir().join(format!("fcvm-apfnmi-{}", &digest[..16]));
+    std::fs::create_dir_all(&map_dir)?;
+    let mapped = map_dir.join("apfnmi");
+    if !mapped.exists() {
+        // Unique name, then rename: concurrent runs never see a half-written binary.
+        let staged = map_dir.join(format!("apfnmi.{}.tmp", std::process::id()));
+        std::fs::copy(&binary, &staged)?;
+        std::fs::rename(&staged, &mapped)?;
+    }
+    let map = format!("{}:/apfnmi:ro", map_dir.display());
+
+    let verdict = async {
+        let cpus = THREADS.to_string();
+        let (child, pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman", "run", "--name", &baseline_name, "--network", "rootless", "--cpu", &cpus,
+                "--mem", "2048", "--map", &map, common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning baseline VM")?;
+        baseline = Some((child, pid));
+        common::poll_health_by_pid(pid, 300).await?;
+
+        // Run from the guest's own disk: a binary on a mapped volume can lose its text pages across a restore.
+        common::exec_in_vm(
+            pid,
+            &[&format!(
+                "cp /apfnmi/apfnmi /tmp/apfnmi && sysctl -qw kernel.perf_event_paranoid=-1 \
+                 kernel.perf_event_max_sample_rate=1000000 kernel.perf_cpu_time_max_percent=0 && \
+                 (nohup /tmp/apfnmi {FILL_MIB} {THREADS} {READ_SECS} > /tmp/apfnmi.out 2>&1 &)"
+            )],
+        )
+        .await
+        .context("starting the reproducer in the baseline")?;
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let out = common::exec_in_vm(pid, &["cat /tmp/apfnmi.out"]).await.unwrap_or_default();
+            if out.contains("filled") {
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the reproducer never filled its memory: {out:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        snapshot_cleanup_needed = true;
+        common::create_snapshot_by_pid(pid, &snapshot_name).await?;
+        if let Some((mut child, pid)) = baseline.take() {
+            let status = terminate_and_reap(&mut child, pid, "baseline VM").await?;
+            require_successful_working_set_exit(status, "baseline VM")?;
+        }
+
+        // Prefetch off: nothing is replayed, so every page the clone reads is missing on the host.
+        let (child, serve_pid, serve_log) = common::spawn_fcvm_with_log_path(
+            &["snapshot", "serve", &snapshot_name, "--uffd-mode", "copy", "--uffd-prefetch", "off"],
+            "uffd-serve-apfnmi",
+        )
+        .await
+        .context("spawning memory server")?;
+        serve = Some((child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+        let serve_arg = serve_pid.to_string();
+        let (child, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+            &["snapshot", "run", "--pid", &serve_arg, "--name", &clone_name],
+            &clone_name,
+        )
+        .await
+        .context("spawning the clone")?;
+        clone = Some((child, clone_pid));
+        common::poll_health_by_pid(clone_pid, 150).await?;
+
+        common::exec_in_vm(clone_pid, &["touch /tmp/apfnmi-go"]).await?;
+        let deadline = Instant::now() + Duration::from_secs(READ_SECS + 120);
+        loop {
+            let exited = match clone.as_mut() {
+                Some((child, _)) => child.try_wait()?.is_some(),
+                None => true,
+            };
+            if exited {
+                let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+                let panic = log
+                    .lines()
+                    .find(|line| line.contains("Kernel panic"))
+                    .unwrap_or("no panic line in the clone log");
+                anyhow::bail!("the restored guest died while reading under call-chain sampling: {panic}");
+            }
+            let out = common::exec_in_vm(clone_pid, &["cat /tmp/apfnmi.out"]).await.unwrap_or_default();
+            if out.contains("survived") {
+                if host_is_intel {
+                    // An Intel guest has no PMU (see the doc comment), so the race is unreachable.
+                    anyhow::ensure!(
+                        out.contains("perf_event_open: No such file or directory")
+                            && out.contains(&format!("sampling events opened: 0 of {THREADS}")),
+                        "an Intel guest opened hardware sampling events, so Firecracker now \
+                         exposes the PMU there and this host must run the full check: {out:?}"
+                    );
+                    println!("  ✓ Intel guest has no hardware PMU, so perf cannot raise the NMIs");
+                } else {
+                    // Without sampling events the reads prove nothing: the race needs the NMIs.
+                    anyhow::ensure!(
+                        out.contains(&format!("sampling events opened: {THREADS} of {THREADS}")),
+                        "the reproducer could not open a hardware sampling event on every \
+                         thread: {out:?}"
+                    );
+                    println!(
+                        "  ✓ clone survived {READ_SECS} s of async page faults under call-chain sampling"
+                    );
+                }
+                break;
+            }
+            anyhow::ensure!(Instant::now() < deadline, "the reproducer never finished: {out:?}");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+        // The race needs pages that are missing on the host. The memory server logs how many it
+        // served on demand once the clone exits.
+        if let Some((mut child, pid)) = clone.take() {
+            let status = terminate_and_reap(&mut child, pid, "clone").await?;
+            require_successful_working_set_exit(status, "clone")?;
+        }
+        let log = serve_log_until(&serve_log, 60, "the clone's fault count", |log| {
+            !faults_by_vm(log).is_empty()
+        })
+        .await?;
+        let faults = faults_by_vm(&log)[0].1;
+        anyhow::ensure!(
+            faults >= 10_000,
+            "the clone took only {faults} demand faults, too few to exercise async page faults"
+        );
+        println!("  ✓ the clone took {faults} demand faults");
+        anyhow::Ok(())
+    }
+    .await;
+
+    let mut cleanup_errors = Vec::new();
+    for (slot, role) in [
+        (&mut clone, "clone"),
+        (&mut serve, "memory server"),
+        (&mut baseline, "baseline VM"),
+    ] {
+        if let Some((mut child, pid)) = slot.take() {
+            let result = terminate_and_reap(&mut child, pid, role).await;
+            if role == "clone" {
+                // Only a failed run leaves the clone here, and its crash is the verdict.
+                if let Err(error) = result {
+                    cleanup_errors.push(format!("{role} {pid}: {error:#}"));
+                }
+            } else {
+                record_working_set_cleanup_result(&mut cleanup_errors, role, pid, result);
+            }
+        }
+    }
+    if snapshot_cleanup_needed && snapshot_path.exists() {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    match (verdict, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => anyhow::bail!("test cleanup failed: {}", cleanup_errors.join("; ")),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(error.context(format!(
+            "cleanup also failed: {}",
+            cleanup_errors.join("; ")
+        ))),
+    }
+}
