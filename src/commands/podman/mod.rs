@@ -597,7 +597,7 @@ async fn verify_prepared_snapshot_in(
     // generation before its atomic rename (see create_podman_snapshot). A clone that
     // finds no table renumbers inodes, which is exactly the glitch the table prevents.
     for volume in config.metadata.volumes.iter().filter(|v| v.portable) {
-        let path = snapshot_dir.join(format!("volume-{}-inode-table.json", volume.vsock_port));
+        let path = snapshot_dir.join(crate::volume::inode_table_file_name(volume.vsock_port));
         let metadata = tokio::fs::metadata(&path).await.with_context(|| {
             format!(
                 "reading prepared snapshot {} portable volume {} inode table {}",

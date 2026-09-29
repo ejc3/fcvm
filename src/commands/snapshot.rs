@@ -908,13 +908,22 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             crate::hypervisor::Backend::Firecracker => {
                 use crate::firecracker::FirecrackerClient;
                 let client = FirecrackerClient::new(socket_path.clone())?;
+                // The VM's own fcvm process holds the portable volumes' inode tables; without
+                // them every inode the guest held at the snapshot answers EIO in a clone.
+                let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
+                let table_vsock = vsock_socket_path.clone();
+                let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
                 super::common::create_snapshot_core(
                     &client,
                     snapshot_config.clone(),
                     &vm_disk_path,
                     &vsock_socket_path,
                     parent_dir.as_deref(),
-                    None,
+                    if has_portable {
+                        Some(&fetch_tables)
+                    } else {
+                        None
+                    },
                     super::common::SnapshotSourceDisposition::Resume,
                 )
                 .await?;
@@ -1782,10 +1791,17 @@ async fn cmd_snapshot_run_inner(
     let mut inode_tables: Vec<Option<String>> = Vec::with_capacity(volume_configs.len());
     for vol in &snapshot_config.metadata.volumes {
         if vol.portable {
-            let table_path = snap_dir.join(format!("volume-{}-inode-table.json", vol.vsock_port));
+            let table_path = snap_dir.join(crate::volume::inode_table_file_name(vol.vsock_port));
             let table = tokio::fs::read_to_string(&table_path).await.ok();
             if table.is_some() {
                 info!(port = vol.vsock_port, "loaded inode table from snapshot");
+            } else {
+                warn!(
+                    port = vol.vsock_port,
+                    path = %table_path.display(),
+                    "snapshot has no inode table for this portable volume; files the guest held open \
+                     at the snapshot will answer EIO in this clone"
+                );
             }
             inode_tables.push(table);
         } else {

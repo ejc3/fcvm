@@ -29,6 +29,10 @@ pub struct RemapFs<T: FilesystemHandler> {
     paths: DashMap<u64, String>,
     /// old_fh → new_fh (stale handles lazily reopened after snapshot restore)
     handle_remap: DashMap<u64, u64>,
+    /// Held for writing across a rename, from the host rename through the path updates of the
+    /// renamed entry and its descendants, and for reading by `serialize_table`, so a snapshot
+    /// never records a rename half applied.
+    rename_lock: std::sync::RwLock<()>,
 }
 
 impl<T: FilesystemHandler> RemapFs<T> {
@@ -51,6 +55,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             stable_to_inner,
             paths,
             handle_remap: DashMap::new(),
+            rename_lock: std::sync::RwLock::new(()),
         }
     }
 
@@ -521,6 +526,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// Returns a JSON object mapping stable_ino (as string key) to path.
     /// Used for portable snapshot restore.
     pub fn serialize_table(&self) -> String {
+        let _no_rename_in_flight = self.rename_lock.read().unwrap_or_else(|e| e.into_inner());
         let map: std::collections::BTreeMap<u64, String> = self
             .paths
             .iter()
@@ -611,6 +617,7 @@ impl<T: FilesystemHandler> RemapFs<T> {
             stable_to_inner,
             paths,
             handle_remap: DashMap::new(),
+            rename_lock: std::sync::RwLock::new(()),
         }
     }
 
@@ -708,6 +715,10 @@ impl<T: FilesystemHandler> FilesystemHandler for RemapFs<T> {
                 remapped = remapped.with_fh(*new_fh);
             }
         }
+
+        // A rename's host rename and path updates must look like one step to `serialize_table`.
+        let _rename_guard = matches!(request, VolumeRequest::Rename { .. })
+            .then(|| self.rename_lock.write().unwrap_or_else(|e| e.into_inner()));
 
         // Delegate to inner handler
         let response = self
@@ -1472,6 +1483,111 @@ mod tests {
             remap.paths.get(&child_stable).unwrap().value(),
             "newdir/child.txt",
             "descendant path should be updated after directory rename"
+        );
+    }
+
+    /// A snapshot may serialize the table while the guest renames a directory. The host rename and
+    /// the path updates for the directory and each descendant are separate steps, so a table read
+    /// between them names paths that no longer exist on the host, and a clone restored from it
+    /// answers EIO for those inodes. The mock parks the rename inside the host rename.
+    #[test]
+    fn serialize_table_never_sees_a_rename_half_applied() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        struct GatedRenameFs {
+            next_response: Mutex<Option<VolumeResponse>>,
+            entered: Mutex<mpsc::Sender<()>>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl FilesystemHandler for GatedRenameFs {
+            fn handle_request_with_groups(
+                &self,
+                request: &VolumeRequest,
+                _groups: &[u32],
+            ) -> VolumeResponse {
+                if matches!(request, VolumeRequest::Rename { .. }) {
+                    self.entered.lock().unwrap().send(()).unwrap();
+                    self.release.lock().unwrap().recv().unwrap();
+                    return VolumeResponse::Ok;
+                }
+                self.next_response
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or(VolumeResponse::Ok)
+            }
+        }
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let remap = std::sync::Arc::new(RemapFs::new(GatedRenameFs {
+            next_response: Mutex::new(None),
+            entered: Mutex::new(entered_tx),
+            release: Mutex::new(release_rx),
+        }));
+        let lookup = |parent: u64, name: &[u8], attr: FileAttr| {
+            *remap.inner.next_response.lock().unwrap() = Some(VolumeResponse::Entry {
+                attr,
+                generation: 0,
+                ttl_secs: 1,
+            });
+            remap.handle_request_with_groups(
+                &VolumeRequest::Lookup {
+                    parent,
+                    name: name.to_vec(),
+                    uid: 0,
+                    gid: 0,
+                    pid: 0,
+                },
+                &[],
+            );
+        };
+        let mut dir_attr = make_attr(10);
+        dir_attr.mode = libc::S_IFDIR | 0o755;
+        lookup(1, b"dir", dir_attr);
+        let dir_stable = remap.to_stable(10).unwrap();
+        lookup(dir_stable, b"child.txt", make_attr(20));
+
+        let renamer = {
+            let remap = std::sync::Arc::clone(&remap);
+            std::thread::spawn(move || {
+                remap.handle_request_with_groups(
+                    &VolumeRequest::Rename {
+                        parent: 1,
+                        name: b"dir".to_vec(),
+                        newparent: 1,
+                        newname: b"newdir".to_vec(),
+                        flags: 0,
+                        uid: 0,
+                        gid: 0,
+                        pid: 0,
+                    },
+                    &[],
+                )
+            })
+        };
+        entered_rx.recv().unwrap();
+
+        let (table_tx, table_rx) = mpsc::channel();
+        let serializer = {
+            let remap = std::sync::Arc::clone(&remap);
+            std::thread::spawn(move || table_tx.send(remap.serialize_table()).unwrap())
+        };
+        // A serialization that does not wait for the rename returns at once.
+        let early = table_rx.recv_timeout(Duration::from_millis(500)).ok();
+        release_tx.send(()).unwrap();
+        renamer.join().unwrap();
+        let table = early.unwrap_or_else(|| table_rx.recv().unwrap());
+        serializer.join().unwrap();
+
+        let paths: std::collections::BTreeMap<u64, String> = serde_json::from_str(&table).unwrap();
+        let mut names: Vec<&str> = paths.values().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            ["", "newdir", "newdir/child.txt"],
+            "the table was read while the rename was half applied"
         );
     }
 

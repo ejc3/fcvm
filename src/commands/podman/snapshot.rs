@@ -218,24 +218,20 @@ pub async fn create_podman_snapshot(
     // by create_snapshot_core BEFORE the atomic rename, so a finalized snapshot can never
     // exist without them. They are loaded by clone VolumeServers via restore_from_table()
     // to preserve inode numbering across snapshot/restore — eliminating the TTL glitch window.
-    let extra_files = || -> Vec<(String, Vec<u8>)> {
-        let mut files = Vec::new();
-        for (idx, remap_ref) in remap_refs.iter().enumerate() {
-            if let Some(remap) = remap_ref {
-                let port = volume_configs.get(idx).map(|c| c.port).unwrap_or(0);
-                let json = remap.serialize_table();
-                tracing::info!(
-                    port,
-                    bytes = json.len(),
-                    "serialized inode table for snapshot"
-                );
-                files.push((
-                    format!("volume-{}-inode-table.json", port),
-                    json.into_bytes(),
-                ));
-            }
-        }
-        files
+    let portable: Vec<_> = remap_refs
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, remap)| {
+            remap.as_ref().map(|r| {
+                (
+                    volume_configs.get(idx).map(|c| c.port).unwrap_or(0),
+                    std::sync::Arc::clone(r),
+                )
+            })
+        })
+        .collect();
+    let extra_files = || -> anyhow::Result<Vec<(String, Vec<u8>)>> {
+        Ok(crate::volume::inode_table_files(&portable))
     };
 
     // Use shared core function for snapshot creation
