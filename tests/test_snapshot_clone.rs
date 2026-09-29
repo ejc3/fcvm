@@ -4628,16 +4628,29 @@ const ASYNC_PF_NMI_SOURCE: &str = include_str!("data/async_pf_nmi.c");
 /// async page fault for every page it touches. If a perf sampling NMI lands after one is delivered and
 /// before its handler reads the reason flags, and the NMI's user call-chain walk faults, the pinned
 /// 6.18.50 kernel lets that nested fault take the flags and panics with "Host injected async #PF in
-/// interrupt disabled region". kernel/patches-default/0002 fixes it. The guest program fills memory
-/// before the snapshot and reads it back in the clone while sampling hardware cycles with call chains
-/// and with its frame pointer aimed at an unmapped page. Without the fix the clone panicked within
-/// seconds in every run, after about 19,000 of the 262,144 page faults 1 GiB takes.
+/// interrupt disabled region".
+/// kernel/patches-default-x86/0002-x86-kvm-leave-the-async-pf-reason-for-the-fault-it-belongs-to.patch
+/// fixes it. The guest program fills memory before the snapshot and reads it back in the clone while
+/// sampling hardware cycles with call chains and with its frame pointer aimed at an unmapped page.
+/// Without the fix the clone panicked within seconds in every run, after about 19,000 of the 262,144
+/// page faults 1 GiB takes.
+///
+/// The NMIs come from the guest's PMU, and only an AMD host gives a Firecracker guest one: the Intel
+/// CPUID normalization (`update_performance_monitoring_entry`) zeroes leaf 0xA, so an Intel guest has
+/// no hardware events and cannot take this panic from perf. On Intel the test therefore asserts that
+/// precondition instead, so a Firecracker change that starts exposing the PMU there turns it red.
 #[cfg(target_arch = "x86_64")]
 #[tokio::test]
 async fn test_async_pf_inside_nmi_does_not_panic_a_restored_guest() -> Result<()> {
     const FILL_MIB: u32 = 1024;
     const THREADS: u32 = 4;
     const READ_SECS: u64 = 20;
+    let host_is_intel = std::fs::read_to_string("/proc/cpuinfo")
+        .context("reading /proc/cpuinfo")?
+        .lines()
+        .find(|line| line.starts_with("vendor_id"))
+        .context("no vendor_id in /proc/cpuinfo")?
+        .ends_with("GenuineIntel");
     let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("apfnmi");
     let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
     let mut baseline: Option<(tokio::process::Child, u32)> = None;
@@ -4756,13 +4769,26 @@ async fn test_async_pf_inside_nmi_does_not_panic_a_restored_guest() -> Result<()
             }
             let out = common::exec_in_vm(clone_pid, &["cat /tmp/apfnmi.out"]).await.unwrap_or_default();
             if out.contains("survived") {
-                // Without sampling events the reads prove nothing: the race needs the NMIs.
-                anyhow::ensure!(
-                    out.contains(&format!("sampling events opened: {THREADS} of {THREADS}")),
-                    "the reproducer could not open a hardware sampling event on every thread: \
-                     {out:?}"
-                );
-                println!("  ✓ clone survived {READ_SECS} s of async page faults under call-chain sampling");
+                if host_is_intel {
+                    // An Intel guest has no PMU (see the doc comment), so the race is unreachable.
+                    anyhow::ensure!(
+                        out.contains("perf_event_open: No such file or directory")
+                            && out.contains(&format!("sampling events opened: 0 of {THREADS}")),
+                        "an Intel guest opened hardware sampling events, so Firecracker now \
+                         exposes the PMU there and this host must run the full check: {out:?}"
+                    );
+                    println!("  ✓ Intel guest has no hardware PMU, so perf cannot raise the NMIs");
+                } else {
+                    // Without sampling events the reads prove nothing: the race needs the NMIs.
+                    anyhow::ensure!(
+                        out.contains(&format!("sampling events opened: {THREADS} of {THREADS}")),
+                        "the reproducer could not open a hardware sampling event on every \
+                         thread: {out:?}"
+                    );
+                    println!(
+                        "  ✓ clone survived {READ_SECS} s of async page faults under call-chain sampling"
+                    );
+                }
                 break;
             }
             anyhow::ensure!(Instant::now() < deadline, "the reproducer never finished: {out:?}");
