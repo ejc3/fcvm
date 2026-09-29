@@ -251,35 +251,49 @@ fn spawn_inode_table_server(
     socket_path: PathBuf,
     remaps: Vec<(u32, Arc<fuse_pipe::RemapFs<fuse_pipe::PassthroughFs>>)>,
 ) -> Result<JoinHandle<()>> {
-    let remaps = Arc::new(remaps);
     let _ = std::fs::remove_file(&socket_path);
     let listener = tokio::net::UnixListener::bind(&socket_path)
         .with_context(|| format!("binding inode table socket {}", socket_path.display()))?;
-    Ok(tokio::spawn(async move {
-        use tokio::io::AsyncWriteExt;
-        loop {
-            let mut stream = match listener.accept().await {
-                Ok((stream, _)) => stream,
-                Err(e) => {
-                    error!(socket = %socket_path.display(), error = %e, "inode table socket accept failed");
-                    continue;
-                }
-            };
-            // Serializing waits for any rename in flight (RemapFs::serialize_table), which may
-            // be a host rename, so it runs off the async workers.
-            let tables = Arc::clone(&remaps);
-            let files: Vec<(String, String)> = match tokio::task::spawn_blocking(move || {
-                inode_table_files(&tables)
-                    .into_iter()
-                    .map(|(name, json)| (name, String::from_utf8(json).unwrap_or_default()))
-                    .collect()
-            })
-            .await
+    Ok(tokio::spawn(serve_inode_tables(
+        listener,
+        socket_path,
+        move || {
+            inode_table_files(&remaps)
+                .into_iter()
+                .map(|(name, json)| (name, String::from_utf8(json).unwrap_or_default()))
+                .collect()
+        },
+    )))
+}
+
+/// Accept loop of [`spawn_inode_table_server`], with the tables produced by `tables`.
+async fn serve_inode_tables<F>(listener: tokio::net::UnixListener, socket_path: PathBuf, tables: F)
+where
+    F: Fn() -> Vec<(String, String)> + Send + Sync + 'static,
+{
+    use tokio::io::AsyncWriteExt;
+    let tables = Arc::new(tables);
+    loop {
+        let mut stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            Err(e) => {
+                error!(socket = %socket_path.display(), error = %e, "inode table socket accept failed");
+                continue;
+            }
+        };
+        // Each connection gets its own task, so a client that never reads cannot hold up the next
+        // one. Serializing waits for any rename in flight (RemapFs::serialize_table), which may be
+        // a host rename, so it runs off the async workers.
+        let tables = Arc::clone(&tables);
+        let socket_path = socket_path.clone();
+        tokio::spawn(async move {
+            let files: Vec<(String, String)> = match tokio::task::spawn_blocking(move || tables())
+                .await
             {
                 Ok(files) => files,
                 Err(e) => {
                     error!(socket = %socket_path.display(), error = %e, "serializing inode tables failed");
-                    continue;
+                    return;
                 }
             };
             let body = serde_json::to_vec(&files).unwrap_or_default();
@@ -287,8 +301,8 @@ fn spawn_inode_table_server(
                 error!(socket = %socket_path.display(), error = %e, "writing inode tables failed");
             }
             let _ = stream.shutdown().await;
-        }
-    }))
+        });
+    }
 }
 
 /// Fetch the inode tables of the VM whose volume servers listen beside `vsock_socket_path`.
@@ -478,6 +492,36 @@ pub async fn spawn_volume_servers_with_tables(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that connects and never reads must not hold up the next `snapshot create`. The
+    /// table here is larger than a Unix socket's buffer, so writing it to the idle client blocks.
+    #[tokio::test]
+    async fn an_idle_client_does_not_block_the_inode_table_server() {
+        use tokio::io::AsyncReadExt;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("vsock.sock_inode_tables");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let big = "x".repeat(4 << 20);
+        let server = tokio::spawn(serve_inode_tables(listener, socket.clone(), move || {
+            vec![("volume-5000-inode-table.json".to_string(), big.clone())]
+        }));
+
+        let _idle = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut reader = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let mut body = Vec::new();
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            reader.read_to_end(&mut body),
+        )
+        .await;
+        server.abort();
+        assert!(
+            read.is_ok(),
+            "the second client got {} bytes in 5 s while the first connection sat unread",
+            body.len()
+        );
+        assert!(body.len() > 4 << 20, "short table: {} bytes", body.len());
+    }
 
     /// `fcvm snapshot create` gets exactly the tables the VM's RemapFs holds, under the file names the
     /// restore path reads.
