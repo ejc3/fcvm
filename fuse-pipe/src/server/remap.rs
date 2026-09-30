@@ -46,6 +46,11 @@ pub struct RemapFs<T: FilesystemHandler> {
 /// so every handle such a guest holds is far below this.
 const LEGACY_HANDLE_BASE: u64 = 1 << 32;
 
+/// Largest handle base a table may carry. A server's own handles count up from 1, so a real base is
+/// far below this; a larger one can only come from a corrupt table, and would leave too little room
+/// above it for the handles this server gives out.
+const MAX_HANDLE_BASE: u64 = 1 << 62;
+
 impl<T: FilesystemHandler> RemapFs<T> {
     /// Create a new RemapFs wrapping the given handler.
     ///
@@ -577,6 +582,13 @@ impl<T: FilesystemHandler> RemapFs<T> {
             ),
             None => (LEGACY_HANDLE_BASE, value),
         };
+        if handle_base > MAX_HANDLE_BASE {
+            error!(
+                handle_base,
+                "inode table carries an impossible handle base, starting with empty table"
+            );
+            return (LEGACY_HANDLE_BASE, std::collections::BTreeMap::new());
+        }
         match serde_json::from_value(paths) {
             Ok(paths) => (handle_base, paths),
             Err(e) => {
@@ -703,7 +715,20 @@ impl<T: FilesystemHandler> RemapFs<T> {
             | VolumeResponse::Created { fh, .. } => fh,
             _ => return response,
         };
-        *fh += self.handle_base;
+        // A base above MAX_HANDLE_BASE is refused when the table is read, so this cannot fail for a
+        // handle the inner server gives out; if it does, the open fails rather than handing the guest
+        // a wrapped number the server would take for a stale handle.
+        *fh = match fh.checked_add(self.handle_base) {
+            Some(guest_fh) => guest_fh,
+            None => {
+                error!(
+                    fh = *fh,
+                    handle_base = self.handle_base,
+                    "guest handle would overflow"
+                );
+                return VolumeResponse::io_error();
+            }
+        };
         self.max_guest_handle
             .fetch_max(*fh, std::sync::atomic::Ordering::SeqCst);
         response
@@ -911,6 +936,43 @@ mod tests {
             RemapFs::<MockFs>::parse_table(r#"{"handle_base":7,"paths":{"42":"data.txt"}}"#);
         assert_eq!(base, 7);
         assert_eq!(paths.get(&42).map(String::as_str), Some("data.txt"));
+    }
+
+    /// A handle base comes from a table on disk, so a corrupt one can hold any number. Adding a base
+    /// near u64::MAX to a new handle would wrap it to a number at or below the base, and the server
+    /// would then treat the guest's new handle as stale. Such a table is refused like any malformed
+    /// one, and a handle that would still wrap fails the open instead.
+    #[test]
+    fn a_handle_base_that_could_wrap_a_handle_is_refused() {
+        let (base, paths) = RemapFs::<MockFs>::parse_table(&format!(
+            r#"{{"handle_base":{},"paths":{{"42":"data.txt"}}}}"#,
+            u64::MAX - 1
+        ));
+        assert_eq!(base, LEGACY_HANDLE_BASE);
+        assert!(
+            paths.is_empty(),
+            "a table with an impossible base kept its paths: {paths:?}"
+        );
+
+        let mut remap = RemapFs::new(MockFs::new());
+        remap.handle_base = u64::MAX - 1;
+        remap
+            .inner
+            .set_response(VolumeResponse::Opened { fh: 5, flags: 0 });
+        let response = remap.handle_request_with_groups(
+            &VolumeRequest::Open {
+                ino: 1,
+                flags: 0,
+                uid: 0,
+                gid: 0,
+                pid: 0,
+            },
+            &[],
+        );
+        assert!(
+            !matches!(response, VolumeResponse::Opened { .. }),
+            "an open whose handle wrapped succeeded: {response:?}"
+        );
     }
 
     /// A handle from before the restore on a file the server may only read still reads: the reopen
