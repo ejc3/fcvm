@@ -208,7 +208,7 @@ pub struct SnapshotMetadata {
     /// Published port mappings inherited by clones
     #[serde(default)]
     pub port_mappings: Vec<crate::network::PortMapping>,
-    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost),
+    /// Guest localhost ports forwarded to the host's loopback (--forward-localhost),
     /// inherited by clones so routed mode re-establishes the host-side relay on restore
     #[serde(default)]
     pub forward_localhost: Vec<u16>,

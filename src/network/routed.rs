@@ -15,7 +15,8 @@ const GUEST_GATEWAY: &str = "10.0.2.1";
 /// Host loopback alias for `--forward-localhost`. fc-agent's guest-side relay
 /// connects to this address (pasta maps it to host loopback in rootless mode).
 /// In routed mode nothing owns it by default, so setup assigns it to the bridge
-/// and listens there, relaying to the host's 127.0.0.1.
+/// and listens there, relaying to the host's loopback (127.0.0.1, or ::1 when
+/// nothing accepts on 127.0.0.1).
 const HOST_LOOPBACK_ALIAS: &str = "10.0.2.2";
 
 /// Bridge device name
@@ -49,7 +50,7 @@ pub struct RoutedNetwork {
     /// Explicit routable prefix (CIDR or bare 4-group /64 shorthand).
     /// Skips auto-detect and MASQUERADE.
     ipv6_prefix: Option<String>,
-    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
+    /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     forward_localhost: Vec<u16>,
     /// The IPv6 resolver the launch's resolv.conf snapshot selected, threaded
     /// in by the caller. None means the snapshot named no IPv6 server.
@@ -89,7 +90,7 @@ impl RoutedNetwork {
         self
     }
 
-    /// Set guest localhost ports to forward to the host's 127.0.0.1 (--forward-localhost).
+    /// Set guest localhost ports to forward to the host's loopback (--forward-localhost).
     ///
     /// fc-agent relays guest 127.0.0.1:<port> to 10.0.2.2:<port>; setup() makes the
     /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
@@ -801,7 +802,8 @@ impl NetworkManager for RoutedNetwork {
         //     connects to 10.0.2.2:<port> (the pasta-style host gateway). Nothing
         //     owns 10.0.2.2 in routed mode, so assign it to the bridge and listen
         //     there inside the namespace, relaying each connection to the host's
-        //     127.0.0.1:<port> from the host namespace.
+        //     loopback from the host namespace: 127.0.0.1:<port>, or [::1]:<port>
+        //     when nothing accepts on 127.0.0.1.
         if !self.forward_localhost.is_empty() {
             let alias_cidr = format!("{}/32", HOST_LOOPBACK_ALIAS);
             namespace::exec_in_namespace_checked(

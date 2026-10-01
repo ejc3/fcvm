@@ -407,7 +407,7 @@ struct RoutedNetwork {
     vm_id: String,
     tap_device: String,
     port_mappings: Vec<PortMapping>,
-    forward_localhost: Vec<u16>,       // guest 127.0.0.1:<port> -> host 127.0.0.1:<port> relays
+    forward_localhost: Vec<u16>,       // guest localhost:<port> -> host loopback:<port> relays (127.0.0.1, else ::1)
     loopback_ip: Option<String>,
     namespace_id: Option<String>,
     host_veth: Option<String>,

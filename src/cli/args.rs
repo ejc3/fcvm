@@ -309,6 +309,10 @@ pub struct RunArgs {
 
     /// Forward specific localhost ports to the host gateway via TCP proxy.
     /// Enables containers to reach host-only services via localhost, on 127.0.0.1 and ::1.
+    /// The port is opened to the guest on both of the host's loopback addresses: with
+    /// routed networking the host side dials 127.0.0.1, and ::1 when that is refused, so
+    /// a host service bound to either is reached. Rootless networking reaches 127.0.0.1
+    /// only.
     /// Supported with rootless and routed networking (not bridged).
     /// Comma-separated port list, e.g., --forward-localhost 1421,9099
     #[arg(long, value_delimiter = ',')]
