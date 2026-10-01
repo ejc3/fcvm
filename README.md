@@ -105,6 +105,31 @@ Snapshot a running VM and restore clones from it. Two modes: UFFD (memory server
 ./fcvm snapshot run --pid <serve_pid> --exec "curl localhost"
 ```
 
+A clone inherits the snapshot's port mappings, host address included. An address and
+port belong to one VM at a time, so a clone of a VM published on a host address fails
+to start with "Address already in use" while its source or another clone runs.
+`snapshot run --publish` replaces the mappings with the ones given, in the grammar of
+`podman run --publish`:
+
+```bash
+# The baseline publishes guest port 80
+./fcvm podman run --name web --publish 8080:80 nginx:alpine
+./fcvm snapshot create web --tag web-warm
+
+# Inherits 8080:80, on the clone's own per-VM IP
+./fcvm snapshot run --snapshot web-warm --name clone1
+# Publishes guest port 80 on 127.0.0.1:9090 and nowhere else
+./fcvm snapshot run --snapshot web-warm --name clone2 --publish 127.0.0.1:9090:80
+```
+
+Each mapping's guest port and protocol must be one the snapshot published, because a
+guest restored from memory keeps the port setup it booted with. Anything else is refused
+before the clone starts, with the snapshot's guest ports in the error. A bridged clone
+listens on its veth address and ignores an IPv4 HOSTIP, as `podman run` does. `fcvm ls --json` shows the
+mappings a clone uses in `config.port_mappings`. The flag is in no snapshot key: with
+`--network routed`, one snapshot serves a clone on `--publish '[::]:80:80'` (port 80 on
+every host address) and clones on their per-VM IPs.
+
 ### Building a Snapshot Without Leaving a VM Behind
 
 `podman prepare` takes the same arguments as `podman run`, boots one disposable VM,
@@ -327,7 +352,8 @@ brackets, quoted for the shell. `config.port_mappings[].host_ip` records the add
   address and the mapping is refused. A routed VM whose mappings all name an address has
   no `loopback_ip`.
 - **Bridged** always listens on the VM's veth address: it ignores an IPv4 HOSTIP and
-  rejects an IPv6 one.
+  rejects an IPv6 one. Two mappings with the same host port and protocol are one socket
+  there whatever their HOSTIPs, and are refused.
 - A listener on routed `[::]` or on `0.0.0.0` holds its port on every 127.x.y.z address
   too. While it runs, a VM that publishes the same port on its per-VM IP fails to start
   with "Address already in use", and the reverse.
@@ -394,7 +420,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm ls` | List running VMs (`--json` for JSON) |
 | `fcvm snapshot create` | Snapshot a running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
-| `fcvm snapshot run` | Clone from snapshot |
+| `fcvm snapshot run` | Clone from snapshot (`--publish` chooses where its ports listen) |
 | `fcvm serve` | Start HTTP API server |
 
 **Key `podman run` flags:**

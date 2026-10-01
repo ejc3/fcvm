@@ -1034,6 +1034,56 @@ fn ensure_not_disk_only(kind: crate::storage::SnapshotKind, command: &str) -> Re
     Ok(())
 }
 
+/// The port mappings a clone publishes.
+///
+/// Without `--publish` they are the snapshot's. With it they are exactly the requested
+/// ones: a clone chooses the host side of a mapping, its address and port, but the guest
+/// port and protocol must be among the snapshot's. A guest restored from memory set its
+/// published ports up when it booted (fc-agent's DNAT to loopback, the
+/// --forward-localhost collision check) and the restore does not run that again. A
+/// disk-only clone boots, and a UDP mapping has no guest-side setup, so the rule is wider
+/// than those two need: it is one rule for every clone.
+fn clone_port_mappings(
+    snapshot: &[crate::network::PortMapping],
+    requested: &[String],
+) -> Result<Vec<crate::network::PortMapping>> {
+    if requested.is_empty() {
+        return Ok(snapshot.to_vec());
+    }
+    let mut mappings = Vec::with_capacity(requested.len());
+    for spec in requested {
+        let mapping = crate::network::PortMapping::parse(spec)?;
+        let published_by_snapshot = snapshot
+            .iter()
+            .any(|m| m.guest_port == mapping.guest_port && m.proto == mapping.proto);
+        if !published_by_snapshot {
+            let published: std::collections::BTreeSet<(u16, String)> = snapshot
+                .iter()
+                .map(|m| (m.guest_port, m.proto.to_string()))
+                .collect();
+            let published = if published.is_empty() {
+                "it published no ports".to_string()
+            } else {
+                let ports: Vec<String> = published
+                    .iter()
+                    .map(|(port, proto)| format!("{port}/{proto}"))
+                    .collect();
+                format!("it published {}", ports.join(", "))
+            };
+            bail!(
+                "--publish {spec}: the snapshot did not publish guest port {}/{} ({published}). \
+                 --publish moves where a port the snapshot published listens on the host. \
+                 It cannot add a guest port.",
+                mapping.guest_port,
+                mapping.proto
+            );
+        }
+        mappings.push(mapping);
+    }
+    crate::network::PortMapping::require_distinct_host_sockets(&mappings)?;
+    Ok(mappings)
+}
+
 /// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
 /// path fails loud instead of silently dropping them.
 fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
@@ -1569,6 +1619,11 @@ async fn cmd_snapshot_run_inner(
         .context("loading snapshot configuration")?;
     *attempted_generation = Some(snapshot_generation);
 
+    // Where this clone publishes its ports, settled before anything is allocated: a
+    // --publish the snapshot cannot serve fails here with nothing to clean up.
+    let port_mappings =
+        clone_port_mappings(&snapshot_config.metadata.port_mappings, &args.publish)?;
+
     // Construct signal streams synchronously before either restore path can
     // allocate clone state.  Installing them inside a spawned task leaves the
     // process's default SIGTERM disposition live until that task first polls.
@@ -1599,6 +1654,7 @@ async fn cmd_snapshot_run_inner(
             snapshot_name,
             snapshot_config,
             args,
+            port_mappings,
             snapshot_shared_lock,
             lifecycle_gate,
         )
@@ -1896,7 +1952,6 @@ async fn cmd_snapshot_run_inner(
     // Bridged and routed re-derive this from the namespace they reserve (see
     // network::names); read the settled name back from network_config.
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
-    let port_mappings = snapshot_config.metadata.port_mappings.clone();
 
     // Extract guest_ip from snapshot metadata for network config reuse
     let saved_network = &snapshot_config.metadata.network_config;
@@ -2026,7 +2081,7 @@ async fn cmd_snapshot_run_inner(
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
     vm_state.config.user = snapshot_config.metadata.user.clone();
-    vm_state.config.port_mappings = port_mappings;
+    vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = snapshot_config.metadata.forward_localhost.clone();
     vm_state.config.network_mode = network_mode;
     vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
@@ -3000,6 +3055,7 @@ async fn cmd_snapshot_run_inner(
                         } else {
                             match build_clone_reboot_plan(
                                 &snapshot_config.metadata,
+                                &port_mappings,
                                 &vm_name,
                                 args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
                                 args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
@@ -3351,6 +3407,7 @@ fn vmm_exit_failure(status: &Result<std::process::ExitStatus>) -> Option<String>
 #[allow(clippy::too_many_arguments)]
 async fn build_clone_reboot_plan(
     meta: &crate::storage::SnapshotMetadata,
+    port_mappings: &[crate::network::PortMapping],
     vm_name: &str,
     cpu: u8,
     mem: u32,
@@ -3376,6 +3433,7 @@ async fn build_clone_reboot_plan(
 
     let synth_args = run_args_from_snapshot_metadata(
         meta,
+        port_mappings,
         vm_name.to_string(),
         cpu,
         mem,
@@ -3442,8 +3500,13 @@ async fn build_clone_reboot_plan(
 ///
 /// Container-internal config (command, env, privileged) lives in the captured
 /// container, which fc-agent `podman start`s — so it doesn't flow through RunArgs.
+///
+/// `port_mappings` are the clone's own (`clone_port_mappings`), not `meta`'s. They are
+/// written back as `--publish` specs with their host address, because the disk-only
+/// dispatcher sets the clone's network up from them.
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
+    port_mappings: &[crate::network::PortMapping],
     name: String,
     cpu: u8,
     mem: u32,
@@ -3459,7 +3522,7 @@ fn run_args_from_snapshot_metadata(
         FcNetworkMode::Routed => CliNetworkMode::Routed,
     };
 
-    let publish: Vec<String> = meta.port_mappings.iter().map(ToString::to_string).collect();
+    let publish: Vec<String> = port_mappings.iter().map(ToString::to_string).collect();
     let map: Vec<String> = meta
         .volumes
         .iter()
@@ -3565,6 +3628,7 @@ async fn cmd_snapshot_run_disk_only(
     snapshot_name: String,
     snapshot_config: crate::storage::SnapshotConfig,
     args: SnapshotRunArgs,
+    port_mappings: Vec<crate::network::PortMapping>,
     dir_lock: std::fs::File,
     lifecycle_gate: super::common::LifecycleReadyGate,
 ) -> Result<()> {
@@ -3601,6 +3665,7 @@ async fn cmd_snapshot_run_disk_only(
 
     let run_args = run_args_from_snapshot_metadata(
         meta,
+        &port_mappings,
         vm_name,
         args.cpu.unwrap_or(meta.vcpu),
         args.mem.unwrap_or(meta.memory_mib),
@@ -3759,7 +3824,7 @@ mod tests {
             firecracker_bin: None,
         };
         let args =
-            run_args_from_snapshot_metadata(&meta, "clone".to_string(), 2, 1024, false, None);
+            run_args_from_snapshot_metadata(&meta, &[], "clone".to_string(), 2, 1024, false, None);
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
         assert_eq!(
@@ -3773,7 +3838,8 @@ mod tests {
         let mut meta2 = meta.clone();
         meta2.user = None;
         meta2.username = None;
-        let args2 = run_args_from_snapshot_metadata(&meta2, "c".to_string(), 1, 512, false, None);
+        let args2 =
+            run_args_from_snapshot_metadata(&meta2, &[], "c".to_string(), 1, 512, false, None);
         assert!(args2.env.is_empty());
 
         // The captured resolver must survive into a cold boot: fc-agent
@@ -3783,20 +3849,19 @@ mod tests {
         let mut meta_dns = meta.clone();
         meta_dns.network_config.dns_server = Some("192.0.2.53".to_string());
         let args_dns =
-            run_args_from_snapshot_metadata(&meta_dns, "c".to_string(), 1, 512, false, None);
+            run_args_from_snapshot_metadata(&meta_dns, &[], "c".to_string(), 1, 512, false, None);
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
-        // The recorded port mappings come back out of the specs written here, host
-        // address included: a disk-only clone sets its network up from them.
-        let mut meta_ports = meta.clone();
-        meta_ports.port_mappings = vec![
+        // The clone's own port mappings come back out of the specs written here,
+        // host address included: a disk-only clone sets its network up from them.
+        let own = [
             crate::network::PortMapping::parse("[::]:80:80").unwrap(),
             crate::network::PortMapping::parse("127.0.0.1:5300:53/udp").unwrap(),
         ];
-        let args_ports =
-            run_args_from_snapshot_metadata(&meta_ports, "c".to_string(), 1, 512, false, None);
+        let args_own =
+            run_args_from_snapshot_metadata(&meta, &own, "c".to_string(), 1, 512, false, None);
         assert_eq!(
-            args_ports.publish,
+            args_own.publish,
             vec![
                 "[::]:80:80/tcp".to_string(),
                 "127.0.0.1:5300:53/udp".to_string()
@@ -3818,7 +3883,8 @@ mod tests {
                 read_only: false,
             },
         ];
-        let args3 = run_args_from_snapshot_metadata(&meta3, "c".to_string(), 1, 512, false, None);
+        let args3 =
+            run_args_from_snapshot_metadata(&meta3, &[], "c".to_string(), 1, 512, false, None);
         assert_eq!(
             args3.nfs,
             vec![
@@ -3859,7 +3925,8 @@ mod tests {
             hypervisor: crate::hypervisor::Backend::CloudHypervisor,
             firecracker_bin: None,
         };
-        let args = run_args_from_snapshot_metadata(&base, "c".to_string(), 1, 512, false, None);
+        let args =
+            run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, false, None);
         assert_eq!(
             args.hypervisor,
             crate::cli::args::Hypervisor::CloudHypervisor
@@ -3867,11 +3934,85 @@ mod tests {
 
         let mut fc = base.clone();
         fc.hypervisor = crate::hypervisor::Backend::Firecracker;
-        let args_fc = run_args_from_snapshot_metadata(&fc, "c".to_string(), 1, 512, false, None);
+        let args_fc =
+            run_args_from_snapshot_metadata(&fc, &[], "c".to_string(), 1, 512, false, None);
         assert_eq!(
             args_fc.hypervisor,
             crate::cli::args::Hypervisor::Firecracker
         );
+    }
+
+    fn published(specs: &[&str]) -> Vec<crate::network::PortMapping> {
+        specs
+            .iter()
+            .map(|spec| crate::network::PortMapping::parse(spec).unwrap())
+            .collect()
+    }
+
+    fn requested(specs: &[&str]) -> Vec<String> {
+        specs.iter().map(|spec| spec.to_string()).collect()
+    }
+
+    /// Without --publish a clone has the snapshot's mappings. With it the clone has the
+    /// requested ones and nothing else, on the host addresses and ports they name.
+    #[test]
+    fn a_clone_inherits_the_snapshots_mappings_or_uses_exactly_the_requested_ones() {
+        let snapshot = published(&["127.0.0.1:8080:80", "8443:443", "5300:53/udp"]);
+        assert_eq!(clone_port_mappings(&snapshot, &[]).unwrap(), snapshot);
+        assert!(clone_port_mappings(&[], &[]).unwrap().is_empty());
+
+        // Guest port 80 twice on different host sockets, 53/udp moved, 443 dropped.
+        let chosen = clone_port_mappings(
+            &snapshot,
+            &requested(&["[::]:80:80", "127.0.0.1:8081:80/tcp", "53:53/udp"]),
+        )
+        .unwrap();
+        assert_eq!(
+            chosen,
+            published(&["[::]:80:80", "127.0.0.1:8081:80", "53:53/udp"])
+        );
+    }
+
+    /// The guest only has what was published when it booted, so a clone cannot publish
+    /// another guest port or the same port under another protocol.
+    #[test]
+    fn a_clone_cannot_publish_a_guest_port_the_snapshot_did_not() {
+        let snapshot = published(&["8080:80", "8443:443", "5300:53/udp"]);
+        let refusal = |specs: &[&str]| {
+            clone_port_mappings(&snapshot, &requested(specs))
+                .expect_err("must be refused")
+                .to_string()
+        };
+
+        let error = refusal(&["8080:80", "9090:81"]);
+        assert!(
+            error.contains("9090:81") && error.contains("guest port 81/tcp"),
+            "{error}"
+        );
+        assert!(error.contains("53/udp, 80/tcp, 443/tcp"), "{error}");
+
+        // The same port number under the other protocol.
+        let error = refusal(&["8080:80/udp"]);
+        assert!(error.contains("guest port 80/udp"), "{error}");
+        let error = refusal(&["5300:53"]);
+        assert!(error.contains("guest port 53/tcp"), "{error}");
+
+        // A spec that does not parse is reported by name.
+        let error = refusal(&["[::]:80"]);
+        assert!(error.contains("[::]:80"), "{error}");
+
+        // One host address and port cannot go to two guest ports.
+        let error = refusal(&["8080:80", "8080:443"]);
+        assert!(
+            error.contains("8080:80/tcp") && error.contains("8080:443/tcp"),
+            "{error}"
+        );
+
+        // A snapshot that published nothing has nothing a clone could publish.
+        let error = clone_port_mappings(&[], &requested(&["8080:80"]))
+            .expect_err("must be refused")
+            .to_string();
+        assert!(error.contains("published no ports"), "{error}");
     }
 
     #[test]
@@ -3969,6 +4110,7 @@ mod tests {
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
+            publish: vec![],
         };
 
         let (runtime, choice) = snapshot_restore_runtime_config_with(
@@ -4009,6 +4151,7 @@ mod tests {
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
+            publish: vec![],
         }
     }
 

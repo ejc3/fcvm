@@ -695,6 +695,36 @@ fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     )
 }
 
+/// The `snapshot run` arguments that restore this run from a cached snapshot.
+///
+/// `publish` is this run's own `--publish`, so the clone listens where this run asked,
+/// and a spec the cache key's lenient parse skipped is refused here as it is on a cache
+/// miss. The key hashes the mappings, so today they equal the snapshot's.
+fn snapshot_restore_args(
+    args: &RunArgs,
+    snapshot_key: &str,
+    startup_snapshot_base_key: Option<String>,
+    (firecracker_bin, firecracker_args): (Option<String>, Option<String>),
+) -> crate::cli::SnapshotRunArgs {
+    crate::cli::SnapshotRunArgs {
+        pid: None,
+        snapshot: Some(snapshot_key.to_string()),
+        name: Some(args.name.clone()),
+        exec: None,
+        no_dirty_tracking: false, // podman needs dirty tracking for later snapshots
+        no_swap: false,
+        vsock_dir: args.vsock_dir.clone(),
+        publish: args.publish.clone(),
+        startup_snapshot_base_key,
+        cpu: Some(args.cpu),
+        mem: Some(args.mem),
+        firecracker_bin,
+        firecracker_args,
+        hugepages: Some(args.hugepages),
+        non_blocking_output: args.non_blocking_output,
+    }
+}
+
 /// True when an error chain ends at Firecracker's `PUT /snapshot/load` step —
 /// i.e. the cached snapshot artifact itself is unusable (most commonly: it was
 /// created by an incompatible Firecracker version and no longer deserializes).
@@ -1246,26 +1276,14 @@ async fn prepare_vm_for_lifecycle(
                 image = %args.image,
                 "Startup snapshot hit! Restoring from fully-initialized snapshot"
             );
-            let (firecracker_bin, firecracker_args) =
-                snapshot_run_firecracker_overrides(&runtime_config);
             // Call snapshot run directly with startup snapshot
             // No need to create startup snapshot again since we're restoring from one
-            let snapshot_args = crate::cli::SnapshotRunArgs {
-                pid: None,
-                snapshot: Some(startup_key.clone()),
-                name: Some(args.name.clone()),
-                exec: None,
-                no_dirty_tracking: false, // podman needs dirty tracking for future snapshots
-                no_swap: false,
-                vsock_dir: args.vsock_dir.clone(),
-                startup_snapshot_base_key: None, // Already using startup snapshot
-                cpu: Some(args.cpu),
-                mem: Some(args.mem),
-                firecracker_bin,
-                firecracker_args,
-                hugepages: Some(args.hugepages),
-                non_blocking_output: args.non_blocking_output,
-            };
+            let snapshot_args = snapshot_restore_args(
+                &args,
+                &startup_key,
+                None, // Already using startup snapshot
+                snapshot_run_firecracker_overrides(&runtime_config),
+            );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
                 Ok(()) => return Ok(VmPreparation::RunCompleted),
@@ -1285,27 +1303,15 @@ async fn prepare_vm_for_lifecycle(
                 image = %args.image,
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
-            let (firecracker_bin, firecracker_args) =
-                snapshot_run_firecracker_overrides(&runtime_config);
             // Call snapshot run with startup snapshot creation enabled
             // (if health_check_url is set)
-            let snapshot_args = crate::cli::SnapshotRunArgs {
-                pid: None,
-                snapshot: Some(key.clone()),
-                name: Some(args.name.clone()),
-                exec: None,
-                no_dirty_tracking: false, // podman needs dirty tracking for startup snapshot
-                no_swap: false,
-                vsock_dir: args.vsock_dir.clone(),
+            let snapshot_args = snapshot_restore_args(
+                &args,
+                &key,
                 // Create startup snapshot if this config has a health check URL
-                startup_snapshot_base_key: args.health_check.as_ref().map(|_| key.clone()),
-                cpu: Some(args.cpu),
-                mem: Some(args.mem),
-                firecracker_bin,
-                firecracker_args,
-                hugepages: Some(args.hugepages),
-                non_blocking_output: args.non_blocking_output,
-            };
+                args.health_check.as_ref().map(|_| key.clone()),
+                snapshot_run_firecracker_overrides(&runtime_config),
+            );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
             match attempt.result {
                 Ok(()) => return Ok(VmPreparation::RunCompleted),
@@ -2779,21 +2785,13 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
     // Run the VM loop, then always clean up — even when the loop reports an error.
     let result = run_vm_loop(&mut ctx, cancel.clone()).await;
     let restore_key = ctx.restore_from_cache.take();
-    let restore_args = restore_key.as_ref().map(|key| crate::cli::SnapshotRunArgs {
-        pid: None,
-        snapshot: Some(key.clone()),
-        name: Some(ctx.args.name.clone()),
-        exec: None,
-        no_dirty_tracking: false,
-        no_swap: false,
-        vsock_dir: ctx.args.vsock_dir.clone(),
-        startup_snapshot_base_key: ctx.args.health_check.as_ref().map(|_| key.clone()),
-        cpu: Some(ctx.args.cpu),
-        mem: Some(ctx.args.mem),
-        firecracker_bin: None,
-        firecracker_args: None,
-        hugepages: Some(ctx.args.hugepages),
-        non_blocking_output: ctx.args.non_blocking_output,
+    let restore_args = restore_key.as_ref().map(|key| {
+        snapshot_restore_args(
+            &ctx.args,
+            key,
+            ctx.args.health_check.as_ref().map(|_| key.clone()),
+            (None, None),
+        )
     });
     cleanup_vm_context(ctx).await;
 
@@ -2930,6 +2928,41 @@ mod tests {
             rootfs_override: None,
             image_disk_override: None,
         }
+    }
+
+    /// A cache hit restores through `snapshot run`, where a clone chooses where it
+    /// publishes. The restore has to publish where THIS run asked.
+    #[test]
+    fn a_cache_restore_publishes_where_this_run_asked() {
+        let mut args = test_args();
+        args.publish = vec!["[::]:80:80".to_string(), "127.0.0.1:8443:443".to_string()];
+        args.vsock_dir = Some("/run/vsock".to_string());
+        let restore = snapshot_restore_args(
+            &args,
+            "0123456789ab",
+            Some("0123456789ab".to_string()),
+            (Some("/opt/firecracker".to_string()), None),
+        );
+        assert_eq!(restore.publish, args.publish);
+
+        // The other fields every cache restore carries.
+        assert_eq!(restore.pid, None);
+        assert_eq!(restore.snapshot.as_deref(), Some("0123456789ab"));
+        assert_eq!(restore.name.as_deref(), Some("test"));
+        assert_eq!(restore.vsock_dir.as_deref(), Some("/run/vsock"));
+        assert_eq!(
+            restore.startup_snapshot_base_key.as_deref(),
+            Some("0123456789ab")
+        );
+        assert_eq!((restore.cpu, restore.mem), (Some(2), Some(2048)));
+        assert_eq!(restore.firecracker_bin.as_deref(), Some("/opt/firecracker"));
+        assert_eq!(restore.firecracker_args, None);
+        assert_eq!(restore.hugepages, Some(false));
+        assert!(!restore.no_dirty_tracking && !restore.no_swap && restore.exec.is_none());
+
+        // A run that publishes nothing asks for nothing, and the clone inherits.
+        let plain = snapshot_restore_args(&test_args(), "k", None, (None, None));
+        assert!(plain.publish.is_empty());
     }
 
     /// Guest-visible launch inputs must change the snapshot key. --dns is

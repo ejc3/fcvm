@@ -1545,10 +1545,26 @@ fcvm snapshot run --snapshot <NAME> [OPTIONS]
                           (Either --pid or --snapshot is required; mutually exclusive)
 --name <NAME>             Clone VM name (auto-generated if not provided)
 --exec <CMD>              Execute command in container after clone is healthy
+--publish <SPEC>          [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated.
+                          The clone publishes these mappings instead of the snapshot's
 ```
 
-Network mode, port mappings, TTY, interactive flags, and `--ipv6-prefix` are inherited from the snapshot
-metadata automatically — no need to re-specify them on clone.
+Network mode, TTY, interactive flags, and `--ipv6-prefix` are inherited from the snapshot
+metadata, and so are the port mappings unless `--publish` is given.
+
+`--publish` moves the host side of a mapping (address and port). Its guest port and
+protocol must be one the snapshot published: a guest restored from memory set up its
+published ports when it booted (fc-agent's DNAT to loopback), and the restore does not
+run that again. The rule is the same for a disk-only clone and for UDP, which would not
+need it. A bridged clone listens on its veth address whatever HOSTIP says. A snapshot
+taken of a clone records that clone's mappings, so a guest port the clone dropped is not
+offered to clones of the new snapshot. The
+choice is one function, `clone_port_mappings` in `src/commands/snapshot.rs`, which runs
+right after the snapshot's config is loaded, so a refused mapping fails before a VM id,
+state file, or network exists. The clone's state (`config.port_mappings`) records the
+mappings it uses, a disk-only clone sets its network up from the same list, and no
+snapshot key includes the flag. `fcvm podman run` restoring from its snapshot cache
+passes its own `--publish` through the same path.
 
 **Examples**:
 ```bash

@@ -136,6 +136,28 @@ fn route_get_names_dev(route_get_output: &str, veth_name: &str) -> bool {
         .any(|w| w[0] == "dev" && w[1] == veth_name)
 }
 
+/// Refuse two mappings that bridged forwarding would make one socket.
+///
+/// `setup` forwards every published port from the host address of the VM's veth,
+/// whatever HOSTIP a mapping names (step 8). Two mappings with one host port and
+/// protocol are then two DNAT rules for one destination: the first takes all the
+/// traffic, and the second mapping's guest port is never reached. The check on the
+/// mappings as given (`PortMapping::require_distinct_host_sockets`) compares HOSTIP too,
+/// so it lets through two that differ only there.
+fn require_distinct_host_ports(mappings: &[PortMapping]) -> Result<()> {
+    let same_port = |earlier: &PortMapping, mapping: &PortMapping| {
+        earlier.host_port == mapping.host_port && earlier.proto == mapping.proto
+    };
+    if let Some((earlier, mapping)) = PortMapping::first_on_one_socket(mappings, same_port) {
+        anyhow::bail!(
+            "port mappings {earlier} and {mapping} claim the same host port: bridged \
+             networking listens on the VM's veth address whatever HOSTIP says, so they \
+             would be one address and port. Use different host ports."
+        );
+    }
+    Ok(())
+}
+
 /// Bridged networking using network namespace isolation with veth pairs
 ///
 /// This mode requires sudo/root for network namespace and iptables setup.
@@ -249,8 +271,10 @@ impl NetworkManager for BridgedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
         // Checked on the mappings as given, before anything is created: step 8
         // rescopes every mapping to the veth's host address, which would hide an
-        // IPv6 HOSTIP instead of refusing it.
+        // IPv6 HOSTIP instead of refusing it, and make one socket of two mappings
+        // that share a host port.
         portmap::require_ipv4_host_addresses(&self.port_mappings)?;
+        require_distinct_host_ports(&self.port_mappings)?;
 
         info!(vm_id = %self.vm_id, is_clone = %self.is_clone, "setting up network namespace");
 
@@ -718,6 +742,75 @@ mod tests {
             .expect_err("an IPv6 host address must be refused")
             .to_string();
         assert!(error.contains("[::]:8080"), "{error}");
+    }
+
+    fn mappings(specs: &[&str]) -> Vec<PortMapping> {
+        specs
+            .iter()
+            .map(|spec| PortMapping::parse(spec).unwrap())
+            .collect()
+    }
+
+    /// The error `setup()` refuses `specs` with, before it has created anything.
+    async fn refusal_before_any_setup(vm_id: &str, specs: &[&str]) -> String {
+        let mut network =
+            BridgedNetwork::new(vm_id.into(), format!("tap-{vm_id}"), mappings(specs));
+        let result = network.setup().await;
+        if result.is_ok() {
+            // Reachable only as root with the refusal gone: do not leave the
+            // namespace behind.
+            let _ = network.cleanup().await;
+        }
+        let error = result.expect_err("the mappings must be refused");
+        format!("{error:#}")
+    }
+
+    /// Bridged forwarding listens on the VM's veth address whatever HOSTIP says, so two
+    /// mappings with one host port and protocol are one socket there even when their
+    /// HOSTIPs differ. setup() refuses them before it creates anything, and names both
+    /// as they were given.
+    #[tokio::test]
+    async fn two_host_addresses_on_one_host_port_are_refused_before_any_setup() {
+        let error = refusal_before_any_setup(
+            "vm-one-port-two-ips",
+            &["127.0.0.1:8080:80", "127.0.0.2:8080:443"],
+        )
+        .await;
+        assert!(
+            error.contains("127.0.0.1:8080:80/tcp and 127.0.0.2:8080:443/tcp")
+                && error.contains("veth address")
+                && error.contains("HOSTIP"),
+            "{error}"
+        );
+    }
+
+    /// The same when one mapping names a HOSTIP and the other names none.
+    #[tokio::test]
+    async fn a_host_address_and_none_on_one_host_port_are_refused_before_any_setup() {
+        let error =
+            refusal_before_any_setup("vm-one-port-one-ip", &["8080:80", "127.0.0.1:8080:443"])
+                .await;
+        assert!(
+            error.contains("mappings 8080:80/tcp and 127.0.0.1:8080:443/tcp")
+                && error.contains("veth address")
+                && error.contains("HOSTIP"),
+            "{error}"
+        );
+    }
+
+    /// Another host port, or another protocol on the same port, is another socket on the
+    /// veth address. The check lets those through, with a HOSTIP or without one.
+    #[test]
+    fn mappings_on_different_host_ports_or_protocols_are_not_refused() {
+        for specs in [
+            &["8080:80", "8081:80"][..],
+            &["127.0.0.1:8080:80", "127.0.0.1:8081:443"][..],
+            &["8080:80", "8080:80/udp"][..],
+            &["127.0.0.1:53:53", "127.0.0.2:53:53/udp"][..],
+        ] {
+            require_distinct_host_ports(&mappings(specs))
+                .unwrap_or_else(|e| panic!("{specs:?}: {e}"));
+        }
     }
 
     /// The #820 collision as the kernel reports it, verbatim from the box

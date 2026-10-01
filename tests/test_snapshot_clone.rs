@@ -2502,7 +2502,9 @@ async fn test_clone_port_forward_rootless() -> Result<()> {
 
 /// Test port forwarding on clones with routed networking
 ///
-/// Routed mode uses TCP proxy + unique loopback IPs (like rootless).
+/// Routed mode uses TCP proxy + unique loopback IPs (like rootless). A second clone
+/// moves the published port with `snapshot run --publish`, and a guest port the
+/// snapshot did not publish is refused.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_clone_port_forward_routed() -> Result<()> {
@@ -2630,10 +2632,122 @@ async fn test_clone_port_forward_routed() -> Result<()> {
         println!("    Loopback access: ✗ FAIL ({})", loopback_check.error);
     }
 
+    // Step 6: a second clone chooses where it publishes. Guest port 80 is one the
+    // snapshot published, so this clone may put it on an address and port of its own.
+    let moved_port = loop {
+        let port = common::find_available_high_port().context("finding available port")?;
+        if port != host_port {
+            break port;
+        }
+    };
+    let moved_ip = common::private_loopback_ip();
+    let moved_publish = format!("{}:{}:80", moved_ip, moved_port);
+    let moved_name = format!("{}-moved", clone_name);
+    println!(
+        "\nStep 6: Spawning a clone with --publish {}...",
+        moved_publish
+    );
+    let (_moved_child, moved_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &moved_name,
+            "--publish",
+            &moved_publish,
+        ],
+        &moved_name,
+    )
+    .await
+    .context("spawning clone with --publish")?;
+    common::poll_health_by_pid(moved_pid, 120).await?;
+    println!("  ✓ Clone with --publish is healthy (PID: {})", moved_pid);
+
+    let moved_check =
+        common::curl_check_with_diag(&moved_ip, moved_port, 10, Some(moved_pid)).await;
+    let moved_works = moved_check.success && moved_check.body_len > 0;
+    println!(
+        "    Access via {}:{}: {}",
+        moved_ip,
+        moved_port,
+        if moved_works { "✓ OK" } else { "✗ FAIL" }
+    );
+
+    // The clone's state records the mapping it uses, not the snapshot's, and no
+    // loopback IP: nothing of this clone listens on one.
+    let listed = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &moved_pid.to_string()])
+        .output()
+        .await
+        .context("running fcvm ls for the clone with --publish")?;
+    let listed: Vec<serde_json::Value> =
+        serde_json::from_slice(&listed.stdout).context("parsing fcvm ls --json")?;
+    let moved_state = listed.first().cloned().unwrap_or_default();
+    let recorded_mappings = moved_state.pointer("/config/port_mappings").cloned();
+    let expected_mappings = serde_json::json!([{
+        "host_ip": moved_ip,
+        "host_port": moved_port,
+        "guest_port": 80,
+        "proto": "tcp",
+    }]);
+    let recorded_loopback = moved_state.pointer("/config/network/loopback_ip").cloned();
+    let moved_recorded = recorded_mappings.as_ref() == Some(&expected_mappings)
+        && recorded_loopback.as_ref().is_none_or(|ip| ip.is_null());
+    println!(
+        "    State: port_mappings={:?} loopback_ip={:?}",
+        recorded_mappings, recorded_loopback
+    );
+
+    // Step 7: a guest port the snapshot did not publish is refused, and the error
+    // names it and lists what the snapshot published.
+    println!("\nStep 7: --publish with a guest port the snapshot did not publish...");
+    let refused_name = format!("{}-refused", clone_name);
+    let mut refused_command = tokio::process::Command::new(&fcvm_path);
+    refused_command
+        .args([
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &refused_name,
+            "--publish",
+            "18081:81",
+        ])
+        .kill_on_drop(true);
+    common::set_test_pdeathsig(&mut refused_command);
+    // A refusal exits at once. Were the clone to start instead, the wait ends here and
+    // the drop kills it, so the failure is this error and not a hung test.
+    let refused =
+        tokio::time::timeout(std::time::Duration::from_secs(60), refused_command.output())
+            .await
+            .context("snapshot run with an unpublished guest port did not exit within 60 s")?
+            .context("running snapshot run with an unpublished guest port")?;
+    let refused_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stdout),
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    let refused_cleanly = !refused.status.success()
+        && refused_output.contains("guest port 81/tcp")
+        && refused_output.contains("it published 80/tcp");
+    println!(
+        "    Refused: {} (exit {:?})",
+        if refused_cleanly {
+            "✓ OK"
+        } else {
+            "✗ FAIL"
+        },
+        refused.status.code()
+    );
+
     // Cleanup
     println!("\nCleaning up...");
+    common::kill_process(moved_pid).await;
     common::kill_process(clone_pid).await;
-    println!("  Killed clone");
+    println!("  Killed clones");
     common::kill_process(serve_pid).await;
     println!("  Killed memory server");
 
@@ -2651,12 +2765,31 @@ async fn test_clone_port_forward_routed() -> Result<()> {
     );
     println!("╚═══════════════════════════════════════════════════════════════╝");
 
-    if loopback_works {
-        println!("\n✅ ROUTED CLONE PORT FORWARDING TEST PASSED!");
-        Ok(())
-    } else {
-        anyhow::bail!("Routed clone port forwarding test failed")
-    }
+    anyhow::ensure!(loopback_works, "Routed clone port forwarding test failed");
+    anyhow::ensure!(
+        moved_works,
+        "a clone run with --publish {} did not answer on {}:{}: {}",
+        moved_publish,
+        moved_ip,
+        moved_port,
+        moved_check.error
+    );
+    anyhow::ensure!(
+        moved_recorded,
+        "the clone's state must record the mapping it uses and no loopback IP: \
+         port_mappings={:?} loopback_ip={:?}",
+        recorded_mappings,
+        recorded_loopback
+    );
+    anyhow::ensure!(
+        refused_cleanly,
+        "--publish 18081:81 must be refused with the unpublished guest port and the \
+         snapshot's ports in the error (exit {:?}): {}",
+        refused.status.code(),
+        refused_output
+    );
+    println!("\n✅ ROUTED CLONE PORT FORWARDING TEST PASSED!");
+    Ok(())
 }
 
 /// Test direct file-based snapshot run (--snapshot flag) with rootless networking
