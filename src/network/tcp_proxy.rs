@@ -339,59 +339,46 @@ fn tries_ipv6_loopback(v4_error: &std::io::Error) -> bool {
 /// reaching a service on the host's loopback: 127.0.0.1:<port>, or [::1]:<port>
 /// when nothing accepts on 127.0.0.1 (`connect_host_loopback`).
 ///
-/// Returns a `Relay` per port, for `stop_relays`.
+/// Either every port is listening when this returns, or it returns an error and none
+/// is. Returns a `Relay` per port, for `stop_relays`.
 pub async fn start_localhost_forwards(
     ns_name: &str,
     listen_ip: &str,
     ports: &[u16],
 ) -> Result<Vec<Relay>> {
-    let mut handles: Vec<Relay> = Vec::new();
-
-    // Helper: abort all started relays on error.
-    let abort_all = |handles: &[Relay]| {
-        for h in handles {
-            h.task.abort();
-        }
-    };
-
+    // Bind every port before a relay takes any of them, as `bind_port_forwards` does.
+    // The listeners are plain values until then, so an error drops, and with that
+    // closes, the ones already bound before it is returned.
+    let mut listeners = Vec::with_capacity(ports.len());
     for &port in ports {
-        let bind_addr: SocketAddr = match format!("{}:{}", listen_ip, port).parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(anyhow::anyhow!(e)).with_context(|| {
-                    format!(
-                        "invalid localhost forward bind address {}:{}",
-                        listen_ip, port
-                    )
-                });
-            }
-        };
-
-        let listener = match bind_in_namespace(ns_name, bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(e).with_context(|| format!("binding localhost forward on {bind_addr}"));
-            }
-        };
-
+        let bind_addr: SocketAddr =
+            format!("{}:{}", listen_ip, port).parse().with_context(|| {
+                format!(
+                    "invalid localhost forward bind address {}:{}",
+                    listen_ip, port
+                )
+            })?;
+        let listener = bind_in_namespace(ns_name, bind_addr)
+            .await
+            .with_context(|| format!("binding localhost forward on {bind_addr}"))?;
         info!(
             port,
             bind = %bind_addr,
             "localhost forwarding via TCP proxy"
         );
-
-        let handle = spawn_relay_loop(
-            listener,
-            move || connect_host_loopback(port),
-            "localhost forward",
-        );
-
-        handles.push(handle);
+        listeners.push((port, listener));
     }
 
-    Ok(handles)
+    Ok(listeners
+        .into_iter()
+        .map(|(port, listener)| {
+            spawn_relay_loop(
+                listener,
+                move || connect_host_loopback(port),
+                "localhost forward",
+            )
+        })
+        .collect())
 }
 
 /// Start a reverse proxy relay: listen inside namespace, connect to host proxy.
@@ -1180,6 +1167,40 @@ mod tests {
         server_handle.abort();
         result?;
         println!("test_localhost_forward_relay PASSED");
+        Ok(())
+    }
+
+    /// A port that cannot be bound fails the start, and the listeners bound before it are
+    /// closed by the time the error is returned.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn test_localhost_forward_bind_failure_leaves_no_listener() -> Result<()> {
+        // Namespace is deleted by TestNetns::drop, even if an assertion panics.
+        let ns = TestNetns::create(format!("test-lfb-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
+        let loopback = |port: u16| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+
+        // `taken` is held by a listener in the namespace. `free` was bound a moment ago
+        // and released, and nothing else binds in this namespace.
+        let squatter = bind_in_namespace(&ns_name, loopback(0)).await?;
+        let taken = squatter.local_addr()?.port();
+        let free = bind_in_namespace(&ns_name, loopback(0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let error = start_localhost_forwards(&ns_name, "127.0.0.1", &[free, taken])
+            .await
+            .expect_err("the second port is in use");
+        let error = format!("{error:#}");
+        assert!(error.contains(&format!("127.0.0.1:{taken}")), "{error}");
+
+        // Nothing is awaited between the error and this bind. A listener still owned by
+        // an aborted relay task would stay open until the runtime ran again.
+        let ns_path = format!("/var/run/netns/{ns_name}");
+        run_in_namespace(&ns_path, || std::net::TcpListener::bind(loopback(free)))
+            .expect("the first port must be free again once the start has failed");
+        println!("test_localhost_forward_bind_failure_leaves_no_listener PASSED");
         Ok(())
     }
 }
