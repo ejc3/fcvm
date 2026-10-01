@@ -124,7 +124,7 @@ async fn test_forward_localhost() -> Result<()> {
 /// Test --forward-localhost with routed networking.
 ///
 /// Routed mode has no pasta gateway mapping: fcvm assigns 10.0.2.2 to the
-/// namespace bridge and relays connections to the host's 127.0.0.1 via the
+/// namespace bridge and relays connections to the host's loopback via the
 /// built-in TCP proxy. Requires root (network namespaces, veth pairs).
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]

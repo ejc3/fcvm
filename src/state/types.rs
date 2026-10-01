@@ -172,7 +172,7 @@ pub struct VmConfig {
     /// Published port mappings (host:guest)
     #[serde(default)]
     pub port_mappings: Vec<PortMapping>,
-    /// Guest localhost ports forwarded to the host's 127.0.0.1 (--forward-localhost).
+    /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     /// Routed mode needs these to set up the host-side relay; clones inherit them
     /// from snapshots so forwarding is re-established after restore.
     #[serde(default)]

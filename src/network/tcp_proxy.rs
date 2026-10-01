@@ -297,72 +297,88 @@ pub async fn start_port_forwards(
         .collect())
 }
 
+/// Connect to a service on the host's loopback, for `--forward-localhost`.
+///
+/// The flag forwards the host's `localhost`, which is 127.0.0.1 and ::1. The guest's
+/// relay accepts on both and does not carry over which one its client dialled, so the
+/// host side cannot mirror the address family: it dials 127.0.0.1, and ::1 when
+/// 127.0.0.1 refuses the connection. A refusal is the one error that says nothing
+/// listens there. Any other error is of a service that is there, and is returned.
+async fn connect_host_loopback(port: u16) -> Result<tokio::net::TcpStream> {
+    let v4 = SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+    let v4_error = match tokio::net::TcpStream::connect(v4).await {
+        Ok(stream) => return Ok(stream),
+        Err(e) if tries_ipv6_loopback(&e) => e,
+        Err(e) => {
+            anyhow::bail!("connecting to the host's loopback port {port}: {v4} gave {e}")
+        }
+    };
+    let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port));
+    // One message with both outcomes: the relay logs an error's own text, not its chain.
+    tokio::net::TcpStream::connect(v6)
+        .await
+        .map_err(|v6_error| {
+            anyhow::anyhow!(
+                "connecting to the host's loopback port {port}: \
+             {v4} gave {v4_error}, then {v6} gave {v6_error}"
+            )
+        })
+}
+
+/// Whether a failed dial of 127.0.0.1 is followed by one of ::1: only when it was refused.
+fn tries_ipv6_loopback(v4_error: &std::io::Error) -> bool {
+    v4_error.kind() == std::io::ErrorKind::ConnectionRefused
+}
+
 /// Start localhost forwarding: listen inside the namespace, relay to host loopback.
 ///
 /// Used for `--forward-localhost` in routed mode. fc-agent's guest-side relay
 /// connects to `<listen_ip>:<port>` (the pasta-style host gateway 10.0.2.2) for
 /// traffic destined to the host's loopback. The listener runs inside the VM's
 /// network namespace; the upstream connect happens in the host namespace,
-/// reaching services bound to 127.0.0.1:<port> on the host.
+/// reaching a service on the host's loopback: 127.0.0.1:<port>, or [::1]:<port>
+/// when nothing accepts on 127.0.0.1 (`connect_host_loopback`).
 ///
-/// Returns a `Relay` per port, for `stop_relays`.
+/// Either every port is listening when this returns, or it returns an error and none
+/// is. Returns a `Relay` per port, for `stop_relays`.
 pub async fn start_localhost_forwards(
     ns_name: &str,
     listen_ip: &str,
     ports: &[u16],
 ) -> Result<Vec<Relay>> {
-    let mut handles: Vec<Relay> = Vec::new();
-
-    // Helper: abort all started relays on error.
-    let abort_all = |handles: &[Relay]| {
-        for h in handles {
-            h.task.abort();
-        }
-    };
-
+    // Bind every port before a relay takes any of them, as `bind_port_forwards` does.
+    // The listeners are plain values until then, so an error drops, and with that
+    // closes, the ones already bound before it is returned.
+    let mut listeners = Vec::with_capacity(ports.len());
     for &port in ports {
-        let bind_addr: SocketAddr = match format!("{}:{}", listen_ip, port).parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(anyhow::anyhow!(e)).with_context(|| {
-                    format!(
-                        "invalid localhost forward bind address {}:{}",
-                        listen_ip, port
-                    )
-                });
-            }
-        };
-
-        let listener = match bind_in_namespace(ns_name, bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(e).with_context(|| format!("binding localhost forward on {bind_addr}"));
-            }
-        };
-
+        let bind_addr: SocketAddr =
+            format!("{}:{}", listen_ip, port).parse().with_context(|| {
+                format!(
+                    "invalid localhost forward bind address {}:{}",
+                    listen_ip, port
+                )
+            })?;
+        let listener = bind_in_namespace(ns_name, bind_addr)
+            .await
+            .with_context(|| format!("binding localhost forward on {bind_addr}"))?;
         info!(
             port,
             bind = %bind_addr,
             "localhost forwarding via TCP proxy"
         );
-
-        let host_addr = SocketAddr::from(([127, 0, 0, 1], port));
-        let handle = spawn_relay_loop(
-            listener,
-            move || async move {
-                tokio::net::TcpStream::connect(host_addr)
-                    .await
-                    .context("connecting to host loopback")
-            },
-            "localhost forward",
-        );
-
-        handles.push(handle);
+        listeners.push((port, listener));
     }
 
-    Ok(handles)
+    Ok(listeners
+        .into_iter()
+        .map(|(port, listener)| {
+            spawn_relay_loop(
+                listener,
+                move || connect_host_loopback(port),
+                "localhost forward",
+            )
+        })
+        .collect())
 }
 
 /// Start a reverse proxy relay: listen inside namespace, connect to host proxy.
@@ -784,6 +800,125 @@ mod tests {
         }
     }
 
+    /// A socket bound to `addr` that does not listen: connections to it are refused, and
+    /// no other process can take the port, so "nothing listens here" holds for as long as
+    /// the test keeps the socket.
+    fn hold_without_listening(addr: SocketAddr) -> std::io::Result<tokio::net::TcpSocket> {
+        let socket = match addr {
+            SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+            SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+        };
+        socket.bind(addr)?;
+        Ok(socket)
+    }
+
+    /// `hold_without_listening`, or `None` when another socket has the address. Any other
+    /// error is the test's environment (no IPv6 loopback, no descriptors) and fails the
+    /// test by name, where a retry loop would spin on it.
+    fn hold_if_free(addr: SocketAddr) -> Option<tokio::net::TcpSocket> {
+        match hold_without_listening(addr) {
+            Ok(socket) => Some(socket),
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => None,
+            Err(e) => panic!("binding {addr}: {e}"),
+        }
+    }
+
+    const V4_LOOPBACK: IpAddr = IpAddr::V4(std::net::Ipv4Addr::LOCALHOST);
+    const V6_LOOPBACK: IpAddr = IpAddr::V6(std::net::Ipv6Addr::LOCALHOST);
+
+    /// A host service that listens only on ::1 is reached. 127.0.0.1 at the same port is
+    /// held without a listener, so the first dial is refused whatever else runs here.
+    #[tokio::test]
+    async fn a_host_service_on_ipv6_loopback_only_is_reached() {
+        let (service, _refusing) = loop {
+            let service = std::net::TcpListener::bind((V6_LOOPBACK, 0))
+                .expect("binding [::1]:0, which this test needs");
+            let port = service.local_addr().unwrap().port();
+            // The port number is free on ::1 only; take another when 127.0.0.1 has it.
+            if let Some(held) = hold_if_free(SocketAddr::new(V4_LOOPBACK, port)) {
+                break (service, held);
+            }
+        };
+        let port = service.local_addr().unwrap().port();
+
+        let stream = connect_host_loopback(port)
+            .await
+            .expect("the service on ::1 accepts");
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            SocketAddr::new(V6_LOOPBACK, port)
+        );
+    }
+
+    /// A service on 127.0.0.1 is still the one dialled, also when ::1 listens too.
+    #[tokio::test]
+    async fn a_host_service_on_ipv4_loopback_is_dialled_first() {
+        let (v4, _v6) = loop {
+            let v4 = std::net::TcpListener::bind((V4_LOOPBACK, 0)).unwrap();
+            let port = v4.local_addr().unwrap().port();
+            match std::net::TcpListener::bind((V6_LOOPBACK, port)) {
+                Ok(v6) => break (v4, v6),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {}
+                Err(e) => panic!("binding [::1]:{port}: {e}"),
+            }
+        };
+        let port = v4.local_addr().unwrap().port();
+
+        let stream = connect_host_loopback(port).await.unwrap();
+        assert_eq!(
+            stream.peer_addr().unwrap(),
+            SocketAddr::new(V4_LOOPBACK, port)
+        );
+    }
+
+    /// With no service on either address the error names the port and the outcome of
+    /// both dials.
+    #[tokio::test]
+    async fn no_host_service_is_an_error_naming_both_loopback_addresses() {
+        let (held_v4, _held_v6) = loop {
+            let held_v4 = hold_without_listening(SocketAddr::new(V4_LOOPBACK, 0)).unwrap();
+            let port = held_v4.local_addr().unwrap().port();
+            if let Some(held_v6) = hold_if_free(SocketAddr::new(V6_LOOPBACK, port)) {
+                break (held_v4, held_v6);
+            }
+        };
+        let port = held_v4.local_addr().unwrap().port();
+
+        let error = connect_host_loopback(port)
+            .await
+            .expect_err("nothing listens on either loopback address");
+        // The relay logs an error's own text, not its chain, so both outcomes are in it.
+        let error = error.to_string();
+        assert!(
+            error.contains(&format!("127.0.0.1:{port} gave"))
+                && error.contains(&format!("[::1]:{port} gave")),
+            "{error}"
+        );
+    }
+
+    /// Only a refusal on 127.0.0.1 is followed by a dial of ::1. A timeout, or no local
+    /// port left to dial from, is the error of a service that is there: sending that
+    /// connection to whatever listens on ::1 would reach another service.
+    #[test]
+    fn only_a_refusal_on_ipv4_loopback_is_followed_by_ipv6_loopback() {
+        use std::io::{Error, ErrorKind};
+        assert!(tries_ipv6_loopback(&Error::from(
+            ErrorKind::ConnectionRefused
+        )));
+        assert!(tries_ipv6_loopback(&Error::from_raw_os_error(
+            libc::ECONNREFUSED
+        )));
+        for errno in [
+            libc::ETIMEDOUT,
+            libc::EADDRNOTAVAIL,
+            libc::ECONNRESET,
+            libc::EMFILE,
+        ] {
+            let error = Error::from_raw_os_error(errno);
+            assert!(!tries_ipv6_loopback(&error), "{error}");
+        }
+    }
+
     /// RAII network namespace for privileged tests.
     ///
     /// `ip netns add` is checked (a leftover same-named namespace fails the
@@ -932,6 +1067,56 @@ mod tests {
         Ok(())
     }
 
+    /// The relay reaches a host service that listens only on ::1.
+    ///
+    /// The path of `test_localhost_forward_relay`, with the host service on the other
+    /// loopback address and 127.0.0.1 at that port held without a listener.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn test_localhost_forward_relay_reaches_ipv6_loopback() -> Result<()> {
+        // Namespace is deleted by TestNetns::drop, even if the assertion panics.
+        let ns = TestNetns::create(format!("test-lf6-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
+
+        let (host_listener, _refusing) = loop {
+            let listener = tokio::net::TcpListener::bind((V6_LOOPBACK, 0)).await?;
+            let port = listener.local_addr()?.port();
+            if let Some(held) = hold_if_free(SocketAddr::new(V4_LOOPBACK, port)) {
+                break (listener, held);
+            }
+        };
+        let host_port = host_listener.local_addr()?.port();
+        let server_handle = tokio::spawn(async move {
+            if let Ok((mut stream, _)) = host_listener.accept().await {
+                use tokio::io::AsyncWriteExt;
+                let _ = stream.write_all(b"HELLO_FROM_HOST_V6").await;
+            }
+        });
+
+        let result: Result<()> = async {
+            let handles = start_localhost_forwards(&ns_name, "127.0.0.1", &[host_port]).await?;
+            let listen_addr = SocketAddr::new(V4_LOOPBACK, host_port);
+            let mut client = connect_in_namespace(&ns_name, listen_addr).await?;
+
+            use tokio::io::AsyncReadExt;
+            let mut buf = Vec::new();
+            client.read_to_end(&mut buf).await?;
+            assert_eq!(
+                buf, b"HELLO_FROM_HOST_V6",
+                "the relay should reach the host's ::1"
+            );
+
+            stop_relays(handles).await;
+            Ok(())
+        }
+        .await;
+
+        server_handle.abort();
+        result?;
+        println!("test_localhost_forward_relay_reaches_ipv6_loopback PASSED");
+        Ok(())
+    }
+
     /// Test the localhost-forward relay path without a VM.
     ///
     /// Creates a namespace with the forward listener inside it (the guest side),
@@ -982,6 +1167,40 @@ mod tests {
         server_handle.abort();
         result?;
         println!("test_localhost_forward_relay PASSED");
+        Ok(())
+    }
+
+    /// A port that cannot be bound fails the start, and the listeners bound before it are
+    /// closed by the time the error is returned.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn test_localhost_forward_bind_failure_leaves_no_listener() -> Result<()> {
+        // Namespace is deleted by TestNetns::drop, even if an assertion panics.
+        let ns = TestNetns::create(format!("test-lfb-{}", std::process::id())).await?;
+        let ns_name = ns.name.clone();
+        let loopback = |port: u16| SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+
+        // `taken` is held by a listener in the namespace. `free` was bound a moment ago
+        // and released, and nothing else binds in this namespace.
+        let squatter = bind_in_namespace(&ns_name, loopback(0)).await?;
+        let taken = squatter.local_addr()?.port();
+        let free = bind_in_namespace(&ns_name, loopback(0))
+            .await?
+            .local_addr()?
+            .port();
+
+        let error = start_localhost_forwards(&ns_name, "127.0.0.1", &[free, taken])
+            .await
+            .expect_err("the second port is in use");
+        let error = format!("{error:#}");
+        assert!(error.contains(&format!("127.0.0.1:{taken}")), "{error}");
+
+        // Nothing is awaited between the error and this bind. A listener still owned by
+        // an aborted relay task would stay open until the runtime ran again.
+        let ns_path = format!("/var/run/netns/{ns_name}");
+        run_in_namespace(&ns_path, || std::net::TcpListener::bind(loopback(free)))
+            .expect("the first port must be free again once the start has failed");
+        println!("test_localhost_forward_bind_failure_leaves_no_listener PASSED");
         Ok(())
     }
 }
