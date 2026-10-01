@@ -414,33 +414,81 @@ pub(crate) async fn run_status_listener(
 /// JSON (the MMDS `latest` object: `{ "container-plan": {...}, "host-time": "..." }`) to
 /// each connecting guest, then close so the guest's `read_to_end` sees EOF.
 ///
-/// Serialization and bind happen SYNCHRONOUSLY so a failure is surfaced to the caller
-/// (returns `Err`) instead of being swallowed in a detached task — otherwise the guest
-/// would loop forever waiting for a plan that is never served. The returned task runs for
-/// the VM's lifetime (the guest may reconnect for clock sync); the caller aborts it on
-/// cleanup or on any later boot-config failure.
+/// The serve loop sets "host-time" itself, at every accept, to the host clock in whole
+/// epoch seconds, replacing any value the caller put in `plan`. The guest sets its clock
+/// from the document it reads, and it can read it long after the caller built it: a
+/// snapshot restore binds this listener before the VMM is restored, and the guest
+/// connects only once it is running again.
+///
+/// Checking the plan, serializing it once and binding the socket happen SYNCHRONOUSLY,
+/// so a failure is surfaced to the caller (returns `Err`) instead of being swallowed in
+/// a detached task while the guest loops forever waiting for a plan that is never
+/// served. The returned task runs for the VM's lifetime (the guest may reconnect for
+/// clock sync); the caller aborts it on cleanup or on any later boot-config failure.
 pub(crate) fn spawn_bootplan_listener(
     socket_path: &str,
     plan: &serde_json::Value,
 ) -> Result<tokio::task::JoinHandle<()>> {
     use tokio::net::UnixListener;
 
-    let payload = serde_json::to_vec(plan).context("serializing boot plan")?;
+    // The loop sets a key on the plan, so anything but a JSON object is refused here,
+    // before the bind.
+    let plan = plan
+        .as_object()
+        .cloned()
+        .context("boot plan is not a JSON object, so host-time cannot be set on it")?;
+    // The loop serializes at every accept with only the "host-time" string changed, so a
+    // plan that serializes here serializes there.
+    let bytes = serde_json::to_vec(&plan)
+        .context("serializing boot plan")?
+        .len();
     let _ = std::fs::remove_file(socket_path);
     let listener = UnixListener::bind(socket_path)
         .with_context(|| format!("binding boot-plan listener to {socket_path}"))?;
-    info!(socket = %socket_path, bytes = payload.len(), "Boot-plan listener started (vsock)");
+    info!(socket = %socket_path, bytes, "Boot-plan listener started (vsock)");
 
-    Ok(tokio::spawn(serve_bootplan(listener, payload)))
+    Ok(tokio::spawn(serve_bootplan(
+        listener,
+        plan,
+        host_epoch_seconds,
+    )))
 }
 
-/// Accept loop for the boot-plan listener: write the plan to each connecting guest and
-/// close the write side so the guest's `read_to_end` observes EOF.
-async fn serve_bootplan(listener: tokio::net::UnixListener, payload: Vec<u8>) {
+/// The host clock in whole seconds since the Unix epoch, which is what "host-time"
+/// holds. fc-agent parses it as a decimal integer and rejects a fraction
+/// (`parse_epoch_seconds`, fc-agent/src/bootplan.rs). The agent that reads it after a
+/// restore is the one frozen in the snapshot, so the format stays what agents already
+/// in snapshots accept.
+fn host_epoch_seconds() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Accept loop for the boot-plan listener: set "host-time" from `now`, write the plan to
+/// the connecting guest, and close the write side so the guest's `read_to_end` observes
+/// EOF.
+///
+/// `now` returns whole epoch seconds. It is called once per connection, after the accept,
+/// and is a parameter so a test can supply the clock.
+async fn serve_bootplan(
+    listener: tokio::net::UnixListener,
+    mut plan: serde_json::Map<String, serde_json::Value>,
+    now: impl Fn() -> i64,
+) {
     use tokio::io::AsyncWriteExt;
     loop {
         match listener.accept().await {
             Ok((mut stream, _)) => {
+                plan.insert(
+                    "host-time".to_string(),
+                    serde_json::Value::String(now().to_string()),
+                );
+                let payload = match serde_json::to_vec(&plan) {
+                    Ok(payload) => payload,
+                    Err(e) => {
+                        warn!(error = %e, "boot-plan listener: serializing the plan failed");
+                        continue;
+                    }
+                };
                 if let Err(e) = stream.write_all(&payload).await {
                     debug!(error = %e, "boot-plan listener: write failed");
                     continue;
@@ -1636,5 +1684,196 @@ mod tests {
         let answer = ask_and_read(&socket_path, std::time::Duration::from_millis(500)).await;
         assert_eq!(answer, None, "no verdict may be invented for a dying VM");
         task.abort();
+    }
+
+    // -----------------------------------------------------------------------
+    // Boot-plan listener: "host-time" is the host clock at each accept, in
+    // whole epoch seconds, whatever the caller put in the plan.
+    // -----------------------------------------------------------------------
+
+    /// The second the injected clock starts at: a fixed second in the past, which neither
+    /// a caller's stamp in these tests nor the real clock produces.
+    const INJECTED_EPOCH: i64 = 1_786_000_000;
+
+    /// Bind `socket_path` and serve `plan` on it with a clock the test owns.
+    fn serve_bootplan_with_clock(
+        socket_path: &std::path::Path,
+        plan: serde_json::Value,
+        clock: Arc<std::sync::atomic::AtomicI64>,
+    ) -> tokio::task::JoinHandle<()> {
+        let listener = tokio::net::UnixListener::bind(socket_path).unwrap();
+        let plan = plan
+            .as_object()
+            .expect("a test plan is a JSON object")
+            .clone();
+        tokio::spawn(serve_bootplan(listener, plan, move || {
+            clock.load(std::sync::atomic::Ordering::SeqCst)
+        }))
+    }
+
+    /// Connect as the guest does, read the one document to EOF within the 10 s fc-agent
+    /// allows that read, and parse it.
+    async fn fetch_bootplan(socket_path: &std::path::Path) -> serde_json::Value {
+        use tokio::io::AsyncReadExt;
+        let mut stream = tokio::net::UnixStream::connect(socket_path).await.unwrap();
+        let mut bytes = Vec::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            stream.read_to_end(&mut bytes),
+        )
+        .await
+        .expect("the listener must close the connection after writing the plan")
+        .unwrap();
+        serde_json::from_slice(&bytes).expect("the listener serves one JSON document")
+    }
+
+    /// Take "host-time" out of a served document and return it as epoch seconds, read the
+    /// way fc-agent reads it: a JSON string holding a decimal integer.
+    fn take_host_time(document: &mut serde_json::Value) -> i64 {
+        let removed = document
+            .as_object_mut()
+            .expect("the served document is a JSON object")
+            .remove("host-time");
+        let text = match &removed {
+            Some(serde_json::Value::String(text)) => text,
+            other => panic!(
+                "the served document must carry host-time as a string, found {other:?} \
+                 beside {document}"
+            ),
+        };
+        text.parse().unwrap_or_else(|error| {
+            panic!("host-time {text:?} is not whole epoch seconds: {error}")
+        })
+    }
+
+    /// The cold-boot plan arrives carrying the host-time its builder stamped. The guest
+    /// reads the plan later, so the listener replaces that value with the clock at the
+    /// accept.
+    #[tokio::test]
+    async fn bootplan_listener_replaces_a_callers_host_time_with_the_clock_at_the_accept() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("bootplan.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(INJECTED_EPOCH));
+        let task = serve_bootplan_with_clock(
+            &socket_path,
+            serde_json::json!({
+                "container-plan": { "image": "alpine:latest" },
+                "host-time": "0",
+            }),
+            clock,
+        );
+
+        let mut served = fetch_bootplan(&socket_path).await;
+        task.abort();
+
+        assert_eq!(
+            take_host_time(&mut served),
+            INJECTED_EPOCH,
+            "host-time must be the clock at the accept, not the value the plan arrived with"
+        );
+        assert_eq!(
+            served,
+            serde_json::json!({ "container-plan": { "image": "alpine:latest" } }),
+            "the rest of the plan must be served as given"
+        );
+    }
+
+    /// Every connection gets the clock at its own accept. The listener outlives the first
+    /// read (a restored guest connects once it runs again, and a guest reconnects to sync
+    /// its clock), so a stamp taken once would reach every later connection stale.
+    #[tokio::test]
+    async fn bootplan_connections_thirty_seconds_apart_get_host_times_thirty_seconds_apart() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("bootplan.sock");
+        let clock = Arc::new(std::sync::atomic::AtomicI64::new(INJECTED_EPOCH));
+        // What a caller would have stamped 68 s before the first connection.
+        let callers_stamp = (INJECTED_EPOCH - 68).to_string();
+        let task = serve_bootplan_with_clock(
+            &socket_path,
+            serde_json::json!({
+                "host-time": callers_stamp,
+                "restore-epoch": "epoch-1",
+                "clone-ipv6": "fd00::2",
+            }),
+            clock.clone(),
+        );
+
+        let mut first = fetch_bootplan(&socket_path).await;
+        clock.fetch_add(30, std::sync::atomic::Ordering::SeqCst);
+        let mut second = fetch_bootplan(&socket_path).await;
+        task.abort();
+
+        let first_time = take_host_time(&mut first);
+        let second_time = take_host_time(&mut second);
+        assert_eq!(
+            second_time - first_time,
+            30,
+            "the clock moved 30 s between the two connections, so their host-times must be \
+             30 s apart: first={first_time} second={second_time}"
+        );
+        assert_eq!(
+            first, second,
+            "two connections may differ in host-time and in nothing else"
+        );
+        assert_eq!(
+            first,
+            serde_json::json!({ "restore-epoch": "epoch-1", "clone-ipv6": "fd00::2" }),
+            "every other key must be served as given"
+        );
+    }
+
+    /// A snapshot restore hands over a document with no host-time and relies on the
+    /// listener for it: fc-agent refuses metadata without the key. This goes through the
+    /// entry point both callers use, so it also covers the clock that entry point supplies.
+    #[tokio::test]
+    async fn spawned_bootplan_listener_stamps_a_plan_that_carries_no_host_time() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("bootplan.sock");
+        let task = spawn_bootplan_listener(
+            &socket_path.to_string_lossy(),
+            &serde_json::json!({ "restore-epoch": "epoch-1" }),
+        )
+        .unwrap();
+
+        let before = chrono::Utc::now().timestamp();
+        let mut served = fetch_bootplan(&socket_path).await;
+        let after = chrono::Utc::now().timestamp();
+        task.abort();
+
+        let host_time = take_host_time(&mut served);
+        assert!(
+            (before..=after).contains(&host_time),
+            "host-time {host_time} must be the host clock at the accept, which fell between \
+             {before} and {after}"
+        );
+        assert_eq!(
+            served,
+            serde_json::json!({ "restore-epoch": "epoch-1" }),
+            "the rest of the document must be served as given"
+        );
+    }
+
+    /// The serve loop sets a key on the plan, so a plan that is not a JSON object cannot be
+    /// served. The spawn has to say so: a listener that fails inside its task leaves the
+    /// guest asking for a plan that never comes.
+    #[tokio::test]
+    async fn spawn_bootplan_listener_refuses_a_plan_that_is_not_a_json_object() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let socket_path = temp_dir.path().join("bootplan.sock");
+
+        let error = spawn_bootplan_listener(
+            &socket_path.to_string_lossy(),
+            &serde_json::json!(["container-plan", "host-time"]),
+        )
+        .expect_err("a boot plan that is not a JSON object must be refused at spawn");
+
+        assert!(
+            format!("{error:#}").contains("not a JSON object"),
+            "the refusal must say what is wrong with the plan: {error:#}"
+        );
+        assert!(
+            !socket_path.exists(),
+            "a refused plan must not leave a bound socket behind"
+        );
     }
 }

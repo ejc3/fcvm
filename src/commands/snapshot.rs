@@ -2333,9 +2333,13 @@ async fn cmd_snapshot_run_inner(
     // cannot be the trigger that performs cookie cleanup and raises the link.
     // Bind before VMM resume and use the same epoch for Firecracker's later
     // MMDS mirror so the transport handoff cannot trigger cleanup twice.
+    //
+    // The document carries no "host-time". The listener sets it when the guest
+    // connects, which is after the restore below has resumed it. The guest
+    // steps its clock to the value it reads, so a stamp taken here would leave
+    // that clock behind by however long the restore takes.
     let restore_epoch = super::common::new_restore_epoch();
     let mut restore_latest = serde_json::json!({
-        "host-time": chrono::Utc::now().timestamp().to_string(),
         "restore-epoch": restore_epoch,
     });
     if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
