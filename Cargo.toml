@@ -46,7 +46,7 @@ hex = "0.4"
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-which = "6"
+which = "8"
 uuid = { version = "1", features = ["v4", "serde"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
