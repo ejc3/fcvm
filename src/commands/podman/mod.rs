@@ -965,6 +965,52 @@ async fn export_localhost_image_disk(
     Ok(disk_path)
 }
 
+/// The `--publish` mappings of a run, parsed before anything else reads the specs.
+///
+/// A malformed spec fails the run here, before the kernel, the rootfs and the image are
+/// looked up. So do two mappings that claim one host address and port: left to network
+/// setup, routed and rootless networking fail the second bind after the VM's network
+/// exists, and bridged networking installs both DNAT rules and delivers only the first.
+fn publish_mappings(args: &RunArgs) -> Result<Vec<PortMapping>> {
+    let port_mappings: Vec<PortMapping> = args
+        .publish
+        .iter()
+        .map(|s| PortMapping::parse(s))
+        .collect::<Result<Vec<_>>>()
+        .context("parsing port mappings")?;
+
+    // --publish now DNATs each published guest port to 127.0.0.1 inside the guest,
+    // and --forward-localhost BINDS 127.0.0.1:<port> there as a relay to the host.
+    // Overlap turns the published port into a reflector: an external client reaches
+    // the HOST's service on that port and never touches the guest. It returns a
+    // successful response from the wrong machine rather than an error, so it cannot
+    // be left to be discovered at runtime. The overlap is on the GUEST port, which
+    // is the second field of --publish.
+    let forwarded: std::collections::HashSet<u16> =
+        args.forward_localhost.iter().copied().collect();
+    for (spec, pm) in args.publish.iter().zip(&port_mappings) {
+        // TCP only: published_guest_ports carries TCP mappings alone, and the
+        // --forward-localhost relay is a TCP listener, so `--publish H:G/udp`
+        // alongside `--forward-localhost G` shares a port NUMBER without ever
+        // sharing a socket. Rejecting it would regress a valid combination.
+        if pm.proto == crate::network::Protocol::Tcp && forwarded.contains(&pm.guest_port) {
+            bail!(
+                "--publish {spec} and --forward-localhost {} both claim guest port {}. \
+                 --publish makes that port reach the guest's 127.0.0.1:{}, which is exactly \
+                 where --forward-localhost binds its relay to the host — so the published \
+                 port would answer with the HOST's service instead of the guest's. \
+                 Use different ports.",
+                pm.guest_port,
+                pm.guest_port,
+                pm.guest_port
+            );
+        }
+    }
+    PortMapping::require_distinct_host_sockets(&port_mappings)?;
+
+    Ok(port_mappings)
+}
+
 async fn prepare_vm_for_lifecycle(
     mut args: RunArgs,
     lifecycle: PodmanLifecycle,
@@ -1001,38 +1047,7 @@ async fn prepare_vm_for_lifecycle(
         );
     }
 
-    // --publish now DNATs each published guest port to 127.0.0.1 inside the guest,
-    // and --forward-localhost BINDS 127.0.0.1:<port> there as a relay to the host.
-    // Overlap turns the published port into a reflector: an external client reaches
-    // the HOST's service on that port and never touches the guest. It returns a
-    // successful response from the wrong machine rather than an error, so it cannot
-    // be left to be discovered at runtime. The overlap is on the GUEST port, which
-    // is the second field of --publish.
-    {
-        let forwarded: std::collections::HashSet<u16> =
-            args.forward_localhost.iter().copied().collect();
-        for spec in &args.publish {
-            let Ok(pm) = crate::network::PortMapping::parse(spec) else {
-                continue; // invalid specs are reported by the parser itself
-            };
-            // TCP only: published_guest_ports carries TCP mappings alone, and the
-            // --forward-localhost relay is a TCP listener, so `--publish H:G/udp`
-            // alongside `--forward-localhost G` shares a port NUMBER without ever
-            // sharing a socket. Rejecting it would regress a valid combination.
-            if pm.proto == crate::network::Protocol::Tcp && forwarded.contains(&pm.guest_port) {
-                bail!(
-                    "--publish {spec} and --forward-localhost {} both claim guest port {}. \
-                     --publish makes that port reach the guest's 127.0.0.1:{}, which is exactly \
-                     where --forward-localhost binds its relay to the host — so the published \
-                     port would answer with the HOST's service instead of the guest's. \
-                     Use different ports.",
-                    pm.guest_port,
-                    pm.guest_port,
-                    pm.guest_port
-                );
-            }
-        }
-    }
+    let port_mappings = publish_mappings(&args)?;
 
     // Disallow --setup when running as root
     // Root users should run `fcvm setup` explicitly
@@ -1344,14 +1359,6 @@ async fn prepare_vm_for_lifecycle(
     // Generate VM ID
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
-
-    // Parse port mappings
-    let port_mappings: Vec<PortMapping> = args
-        .publish
-        .iter()
-        .map(|s| PortMapping::parse(s))
-        .collect::<Result<Vec<_>>>()
-        .context("parsing port mappings")?;
 
     // Parse volume mappings (HOST:GUEST[:ro])
     let volume_mappings: Vec<VolumeMapping> = args
@@ -2928,6 +2935,37 @@ mod tests {
             rootfs_override: None,
             image_disk_override: None,
         }
+    }
+
+    /// A malformed --publish fails the run by name, and so does a published guest port
+    /// that --forward-localhost also claims.
+    #[test]
+    fn publish_specs_are_parsed_strictly_for_a_run() {
+        let mut args = test_args();
+        args.publish = vec!["8080:80".to_string(), "[::1:9090:90".to_string()];
+        let error = format!("{:#}", publish_mappings(&args).unwrap_err());
+        assert!(error.contains("[::1:9090:90"), "{error}");
+
+        args.publish = vec!["8080:80".to_string(), "127.0.0.1:5300:53/udp".to_string()];
+        let written: Vec<String> = publish_mappings(&args)
+            .unwrap()
+            .iter()
+            .map(|mapping| mapping.to_string())
+            .collect();
+        assert_eq!(written, ["8080:80/tcp", "127.0.0.1:5300:53/udp"]);
+
+        args.forward_localhost = vec![80];
+        let error = format!("{:#}", publish_mappings(&args).unwrap_err());
+        assert!(error.contains("--forward-localhost 80"), "{error}");
+
+        // One host address and port cannot go to two guest ports.
+        args.forward_localhost = vec![];
+        args.publish = vec!["8080:80".to_string(), "8080:443".to_string()];
+        let error = format!("{:#}", publish_mappings(&args).unwrap_err());
+        assert!(
+            error.contains("8080:80/tcp") && error.contains("8080:443/tcp"),
+            "{error}"
+        );
     }
 
     /// A cache hit restores through `snapshot run`, where a clone chooses where it
