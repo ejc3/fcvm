@@ -3,7 +3,7 @@
 //! Replaces socat with built-in Rust TCP relay. Uses `setns(2)` to create
 //! sockets inside network namespaces, then relays data with tokio.
 
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::os::fd::AsFd;
 use std::sync::Arc;
 
@@ -134,7 +134,72 @@ where
     })
 }
 
-/// Start port forwarding: listen on host loopback, relay to guest inside namespace.
+/// Backlog for a port forward's listener: as long as the kernel allows, which caps it at
+/// net.core.somaxconn. `tokio::net::TcpListener::bind` asks for the same.
+const PORT_FORWARD_BACKLOG: u32 = i32::MAX as u32;
+
+/// Where a published port's host-side listener binds: the address the mapping's HOSTIP
+/// names, or the VM's own loopback address when it names none.
+fn port_forward_bind_addr(mapping: &PortMapping, loopback_ip: &str) -> Result<SocketAddr> {
+    let host = mapping.host_ip.as_deref().unwrap_or(loopback_ip);
+    let ip: IpAddr = host.parse().map_err(|_| {
+        anyhow::anyhow!(
+            "port forward host address {host} (host port {}) is not an IP address",
+            mapping.host_port
+        )
+    })?;
+    Ok(SocketAddr::new(ip, mapping.host_port))
+}
+
+/// Listen on `addr` for a port forward.
+///
+/// This is the socket `tokio::net::TcpListener::bind` makes (SO_REUSEADDR, kernel-capped
+/// backlog) with one option set explicitly: an IPv6 listener clears IPV6_V6ONLY. tokio
+/// leaves that option at the kernel default, the `net.ipv6.bindv6only` sysctl, and with
+/// the sysctl at 1 a `[::]` listener refuses IPv4 clients. Cleared, `[::]` accepts IPv4
+/// and IPv6 clients on every host.
+fn listen_for_port_forward(addr: SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => {
+            let socket = tokio::net::TcpSocket::new_v6()?;
+            nix::sys::socket::setsockopt(&socket, nix::sys::socket::sockopt::Ipv6V6Only, &false)?;
+            socket
+        }
+    };
+    socket.set_reuseaddr(true)?;
+    socket.bind(addr)?;
+    socket.listen(PORT_FORWARD_BACKLOG)
+}
+
+/// Bind the host-side listener of every mapping, or of none.
+///
+/// The listeners are plain values until a relay task takes them, so an error drops, and
+/// with that closes, the ones already bound before it is returned.
+fn bind_port_forwards(
+    loopback_ip: &str,
+    mappings: &[PortMapping],
+) -> Result<Vec<tokio::net::TcpListener>> {
+    let mut listeners = Vec::with_capacity(mappings.len());
+    for mapping in mappings {
+        let addr = port_forward_bind_addr(mapping, loopback_ip)?;
+        let listener = listen_for_port_forward(addr)
+            .with_context(|| format!("binding port forward on {addr}"))?;
+        info!(
+            listen = %addr,
+            guest_port = mapping.guest_port,
+            "port forwarding via TCP proxy"
+        );
+        listeners.push(listener);
+    }
+    Ok(listeners)
+}
+
+/// Start port forwarding: listen on the host, relay to the guest inside the namespace.
+///
+/// A mapping listens on the host address its HOSTIP names, or on `loopback_ip` (the VM's
+/// own loopback address) when it names none. Either every mapping is listening when this
+/// returns, or it returns an error and none is.
 ///
 /// Returns a `JoinHandle` per port mapping. Abort all handles on cleanup.
 pub async fn start_port_forwards(
@@ -143,66 +208,28 @@ pub async fn start_port_forwards(
     ns_name: &str,
     guest_ip: &str,
 ) -> Result<Vec<JoinHandle<()>>> {
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let guest_ip: IpAddr = guest_ip
+        .parse()
+        .with_context(|| format!("invalid guest address {guest_ip}"))?;
+    let listeners = bind_port_forwards(loopback_ip, mappings)?;
+    let ns_name: Arc<str> = ns_name.into();
 
-    // Helper: abort all started handles on error.
-    let abort_all = |handles: &[JoinHandle<()>]| {
-        for h in handles {
-            h.abort();
-        }
-    };
-
-    for mapping in mappings {
-        let bind_addr: SocketAddr = match format!("{}:{}", loopback_ip, mapping.host_port).parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(anyhow::anyhow!(e)).with_context(|| {
-                    format!("invalid bind address {}:{}", loopback_ip, mapping.host_port)
-                });
-            }
-        };
-
-        let listener = match tokio::net::TcpListener::bind(bind_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(anyhow::anyhow!(e))
-                    .with_context(|| format!("binding port forward on {bind_addr}"));
-            }
-        };
-
-        info!(
-            host_port = mapping.host_port,
-            guest_port = mapping.guest_port,
-            bind = %loopback_ip,
-            "port forwarding via TCP proxy"
-        );
-
-        let ns_name: Arc<str> = ns_name.into();
-        let guest_addr: SocketAddr = match format!("{}:{}", guest_ip, mapping.guest_port).parse() {
-            Ok(addr) => addr,
-            Err(e) => {
-                abort_all(&handles);
-                return Err(anyhow::anyhow!(e)).with_context(|| {
-                    format!("invalid guest address {}:{}", guest_ip, mapping.guest_port)
-                });
-            }
-        };
-
-        let handle = spawn_relay_loop(
-            listener,
-            move || {
-                let ns = Arc::clone(&ns_name);
-                async move { connect_in_namespace(&ns, guest_addr).await }
-            },
-            "port forward",
-        );
-
-        handles.push(handle);
-    }
-
-    Ok(handles)
+    Ok(listeners
+        .into_iter()
+        .zip(mappings)
+        .map(|(listener, mapping)| {
+            let ns_name = Arc::clone(&ns_name);
+            let guest_addr = SocketAddr::new(guest_ip, mapping.guest_port);
+            spawn_relay_loop(
+                listener,
+                move || {
+                    let ns = Arc::clone(&ns_name);
+                    async move { connect_in_namespace(&ns, guest_addr).await }
+                },
+                "port forward",
+            )
+        })
+        .collect())
 }
 
 /// Start localhost forwarding: listen inside the namespace, relay to host loopback.
@@ -378,6 +405,147 @@ mod tests {
     fn test_parse_proxy_addr_ipv6() {
         let addr = parse_proxy_addr("http://[::1]:8080").unwrap();
         assert_eq!(addr.port(), 8080);
+    }
+
+    fn mapping(host_ip: Option<&str>, host_port: u16) -> PortMapping {
+        PortMapping {
+            host_ip: host_ip.map(str::to_string),
+            host_port,
+            guest_port: 80,
+            proto: super::super::types::Protocol::Tcp,
+        }
+    }
+
+    /// A loopback address for one test to bind. All of 127/8 is local on Linux. VMs take
+    /// theirs upward from 127.0.0.2, and the slot (one per address per test) plus the
+    /// process id keep this one away from every other test thread and test process.
+    fn test_ip(slot: u8) -> std::net::Ipv4Addr {
+        let pid = std::process::id();
+        std::net::Ipv4Addr::new(127, 128 | slot, (pid >> 8) as u8, pid as u8)
+    }
+
+    #[test]
+    fn a_mapping_binds_its_own_host_address_or_the_vm_loopback() {
+        let bind = |host_ip, host_port| {
+            port_forward_bind_addr(&mapping(host_ip, host_port), "127.0.0.5")
+                .map(|addr| addr.to_string())
+                .map_err(|e| e.to_string())
+        };
+        assert_eq!(bind(None, 8080), Ok("127.0.0.5:8080".to_string()));
+        assert_eq!(
+            bind(Some("127.0.0.1"), 8080),
+            Ok("127.0.0.1:8080".to_string())
+        );
+        assert_eq!(bind(Some("0.0.0.0"), 80), Ok("0.0.0.0:80".to_string()));
+        assert_eq!(bind(Some("::"), 80), Ok("[::]:80".to_string()));
+        assert_eq!(bind(Some("::1"), 443), Ok("[::1]:443".to_string()));
+
+        let error = bind(Some("localhost"), 8080).unwrap_err();
+        assert!(
+            error.contains("localhost") && error.contains("8080"),
+            "{error}"
+        );
+        // The VM's loopback address is taken as given, so a bad one is reported too.
+        let error = port_forward_bind_addr(&mapping(None, 8080), "not-an-address")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("not-an-address"), "{error}");
+    }
+
+    /// The listener is on the address the mapping names: a client connecting there is
+    /// accepted, and one connecting to the VM's loopback address on that port is refused.
+    /// A mapping that names no address still listens on the VM's loopback address.
+    #[tokio::test]
+    async fn a_mapping_listens_on_its_host_address_and_not_on_the_vm_loopback() {
+        let (loopback, host_ip) = (test_ip(1), test_ip(2));
+        let listeners = bind_port_forwards(
+            &loopback.to_string(),
+            &[mapping(Some(&host_ip.to_string()), 0), mapping(None, 0)],
+        )
+        .unwrap();
+        let (named, unnamed) = (
+            listeners[0].local_addr().unwrap(),
+            listeners[1].local_addr().unwrap(),
+        );
+        assert_eq!(named.ip(), IpAddr::V4(host_ip));
+        assert_eq!(unnamed.ip(), IpAddr::V4(loopback));
+
+        tokio::net::TcpStream::connect(named)
+            .await
+            .expect("the mapping's own address accepts");
+        let refused = tokio::net::TcpStream::connect((loopback, named.port()))
+            .await
+            .expect_err("nothing listens on the VM's loopback address at that port");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{refused}"
+        );
+    }
+
+    /// `[::]` is every address of the host, IPv4 included, so http://localhost/ reaches
+    /// the listener whether the client resolves localhost to 127.0.0.1 or to ::1.
+    #[tokio::test]
+    async fn a_listener_on_the_ipv6_wildcard_accepts_ipv4_and_ipv6_clients() {
+        let listeners = bind_port_forwards("127.0.0.1", &[mapping(Some("::"), 0)]).unwrap();
+        let listening = listeners[0].local_addr().unwrap();
+        assert_eq!(listening.ip(), IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED));
+        let v6only =
+            nix::sys::socket::getsockopt(&listeners[0], nix::sys::socket::sockopt::Ipv6V6Only)
+                .unwrap();
+        assert!(
+            !v6only,
+            "IPV6_V6ONLY must be cleared whatever net.ipv6.bindv6only says"
+        );
+
+        for client in [
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ] {
+            tokio::net::TcpStream::connect((client, listening.port()))
+                .await
+                .unwrap_or_else(|e| panic!("a client connecting to {client} is refused: {e}"));
+        }
+    }
+
+    /// A mapping whose address cannot be bound fails the start with an error naming that
+    /// address and port, and the listeners bound before it are closed by the time the
+    /// error is returned.
+    #[tokio::test]
+    async fn a_bind_failure_names_the_address_and_leaves_no_listener_behind() {
+        let (loopback, free, taken) = (test_ip(3), test_ip(4), test_ip(5));
+        // Another listener holds `taken:port`. The same port on `free` can still be
+        // bound: a listener on one specific address does not claim the others.
+        let squatter = std::net::TcpListener::bind((taken, 0)).unwrap();
+        let port = squatter.local_addr().unwrap().port();
+
+        let mappings = [
+            mapping(Some(&free.to_string()), port),
+            mapping(Some(&taken.to_string()), port),
+        ];
+        // No relay starts, so the namespace is never entered.
+        let error = start_port_forwards(&loopback.to_string(), &mappings, "unused", "10.0.2.100")
+            .await
+            .expect_err("the second mapping's address is in use");
+        let error = format!("{error:#}");
+        assert!(error.contains(&format!("{taken}:{port}")), "{error}");
+
+        let refused = tokio::net::TcpStream::connect((free, port))
+            .await
+            .expect_err("the first mapping's listener must be closed");
+        assert_eq!(
+            refused.kind(),
+            std::io::ErrorKind::ConnectionRefused,
+            "{refused}"
+        );
+
+        // 192.0.2.1 is TEST-NET-1, an address no host has.
+        let absent = [mapping(Some("192.0.2.1"), port)];
+        let error = start_port_forwards(&loopback.to_string(), &absent, "unused", "10.0.2.100")
+            .await
+            .expect_err("192.0.2.1 is not an address of this host");
+        let error = format!("{error:#}");
+        assert!(error.contains(&format!("192.0.2.1:{port}")), "{error}");
     }
 
     /// RAII network namespace for privileged tests.

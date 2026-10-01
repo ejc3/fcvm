@@ -1497,7 +1497,7 @@ async fn prepare_vm_for_lifecycle(
             }
             net.preflight_check()
                 .context("routed mode preflight check failed")?;
-            if !port_mappings.is_empty() {
+            if net.needs_loopback_ip() {
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
                     .await

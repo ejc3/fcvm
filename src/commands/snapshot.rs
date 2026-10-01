@@ -1952,7 +1952,7 @@ async fn cmd_snapshot_run_inner(
             setup_try!(net
                 .preflight_check()
                 .context("routed mode preflight check failed"));
-            if !port_mappings.is_empty() {
+            if net.needs_loopback_ip() {
                 let loopback_ip = setup_try!(state_manager
                     .allocate_loopback_ip(&mut vm_state)
                     .await
@@ -3459,11 +3459,7 @@ fn run_args_from_snapshot_metadata(
         FcNetworkMode::Routed => CliNetworkMode::Routed,
     };
 
-    let publish: Vec<String> = meta
-        .port_mappings
-        .iter()
-        .map(|pm| format!("{}:{}/{}", pm.host_port, pm.guest_port, pm.proto))
-        .collect();
+    let publish: Vec<String> = meta.port_mappings.iter().map(ToString::to_string).collect();
     let map: Vec<String> = meta
         .volumes
         .iter()
@@ -3789,6 +3785,23 @@ mod tests {
         let args_dns =
             run_args_from_snapshot_metadata(&meta_dns, "c".to_string(), 1, 512, false, None);
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
+
+        // The recorded port mappings come back out of the specs written here, host
+        // address included: a disk-only clone sets its network up from them.
+        let mut meta_ports = meta.clone();
+        meta_ports.port_mappings = vec![
+            crate::network::PortMapping::parse("[::]:80:80").unwrap(),
+            crate::network::PortMapping::parse("127.0.0.1:5300:53/udp").unwrap(),
+        ];
+        let args_ports =
+            run_args_from_snapshot_metadata(&meta_ports, "c".to_string(), 1, 512, false, None);
+        assert_eq!(
+            args_ports.publish,
+            vec![
+                "[::]:80:80/tcp".to_string(),
+                "127.0.0.1:5300:53/udp".to_string()
+            ]
+        );
 
         // Recorded NFS shares must survive into the cold-boot RunArgs (a
         // disk-only clone of an NFS VM used to silently lose its shares).

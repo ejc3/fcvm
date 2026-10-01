@@ -247,6 +247,11 @@ impl BridgedNetwork {
 #[async_trait::async_trait]
 impl NetworkManager for BridgedNetwork {
     async fn setup(&mut self) -> Result<NetworkConfig> {
+        // Checked on the mappings as given, before anything is created: step 8
+        // rescopes every mapping to the veth's host address, which would hide an
+        // IPv6 HOSTIP instead of refusing it.
+        portmap::require_ipv4_host_addresses(&self.port_mappings)?;
+
         info!(vm_id = %self.vm_id, is_clone = %self.is_clone, "setting up network namespace");
 
         use std::collections::hash_map::DefaultHasher;
@@ -688,6 +693,32 @@ impl NetworkManager for BridgedNetwork {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bridged forwarding is IPv4 DNAT scoped to the veth address, so it cannot honour
+    /// an IPv6 HOSTIP. setup() says so before it creates anything.
+    #[tokio::test]
+    async fn an_ipv6_host_address_is_refused_before_any_setup() {
+        let mut network = BridgedNetwork::new(
+            "vm-ipv6-publish".into(),
+            "tap-ipv6-publish".into(),
+            vec![PortMapping {
+                host_ip: Some("::".into()),
+                host_port: 8080,
+                guest_port: 80,
+                proto: crate::network::Protocol::Tcp,
+            }],
+        );
+        let result = network.setup().await;
+        if result.is_ok() {
+            // Reachable only as root with the refusal gone: do not leave the
+            // namespace behind.
+            let _ = network.cleanup().await;
+        }
+        let error = result
+            .expect_err("an IPv6 host address must be refused")
+            .to_string();
+        assert!(error.contains("[::]:8080"), "{error}");
+    }
 
     /// The #820 collision as the kernel reports it, verbatim from the box
     /// that hit it: with the veth's 10.0.0.1/30 assigned, `ip route get

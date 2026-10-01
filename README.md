@@ -318,6 +318,20 @@ fcvm auto-forwards `http_proxy`/`https_proxy` from host to VM as part of the boo
 - **Bridged**: `config.network.host_ip` (e.g., `curl 172.30.0.1:8080`)
 - **Routed**: `config.network.loopback_ip` (same as rootless)
 
+A mapping can name the host address to listen on instead: `--publish 127.0.0.1:8080:80`,
+or `--publish '[::]:80:80'` for every address of the host. An IPv6 address goes in
+brackets, quoted for the shell. `config.port_mappings[].host_ip` records the address.
+- **Rootless** and **Routed** listen on that address. In routed mode `[::]` accepts IPv4
+  and IPv6 clients; in rootless mode pasta's IPv6 listeners accept IPv6 only, and an IPv6
+  HOSTIP needs a global IPv6 address on the host: without one the guest has no IPv6
+  address and the mapping is refused. A routed VM whose mappings all name an address has
+  no `loopback_ip`.
+- **Bridged** always listens on the VM's veth address: it ignores an IPv4 HOSTIP and
+  rejects an IPv6 one.
+- A listener on routed `[::]` or on `0.0.0.0` holds its port on every 127.x.y.z address
+  too. While it runs, a VM that publishes the same port on its per-VM IP fails to start
+  with "Address already in use", and the reverse.
+
 ---
 
 ## Prerequisites
@@ -387,7 +401,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 ```
 --name <NAME>         VM name (required)
 --network <MODE>      rootless (default), bridged, or routed
---publish <H:G>       Port forward (e.g., 8080:80)
+--publish <[IP:]H:G>  Port forward (e.g., 8080:80, '[::]:80:80')
 --map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro)
 --env <K=V>           Environment variable
 -i / -t / -it         Interactive / TTY / both
