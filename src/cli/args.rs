@@ -280,6 +280,7 @@ pub struct RunArgs {
     /// prefix is directly routable). When not set, a /64 is auto-detected
     /// from host interfaces. Also read from FCVM_IPV6_PREFIX, for a host whose
     /// own addresses are not a routable /64: every routed run there needs it.
+    /// The other network modes ignore it, and their snapshot keys do not include it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
