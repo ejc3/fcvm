@@ -413,7 +413,7 @@ struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    proxy_handles: Vec<JoinHandle<()>>,
+    proxy_handles: Vec<Relay>,
     ipv6_prefix: Option<String>,       // explicit /64 prefix (skips auto-detect + MASQUERADE)
 }
 
@@ -914,7 +914,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Proxy NDP advertises the VM's IPv6 on the host's physical interface
 
 **Cleanup** (on VM exit):
-1. Abort TCP proxy tasks (in-process, no external PIDs)
+1. Stop TCP proxy relays and wait for them, which closes their listeners and ends their connections (in-process, no external PIDs)
 2. Remove ip6tables MASQUERADE rule (scoped to vm_ipv6/128)
 3. Remove proxy NDP entry
 4. Remove host route (uses `dev` qualifier for parallel safety)

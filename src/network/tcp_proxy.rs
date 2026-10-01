@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use super::PortMapping;
@@ -75,25 +76,57 @@ async fn bind_in_namespace(ns_name: &str, addr: SocketAddr) -> Result<tokio::net
     Ok(tokio::net::TcpListener::from_std(std_listener)?)
 }
 
+/// A running relay: the task that accepts on one listener, and the signal that stops it.
+///
+/// `stop_relays` stops relays and waits until they are gone. A `Relay` that is dropped
+/// without it is ended too, by aborting its task. Dropping does not wait: the listener
+/// and the connections close when the runtime drops the aborted tasks.
+#[derive(Debug)]
+pub struct Relay {
+    stop: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+impl Drop for Relay {
+    fn drop(&mut self) {
+        // Nothing to abort in a relay `stop_relays` has waited for: its task has finished.
+        self.task.abort();
+    }
+}
+
 /// Accept connections on `listener` and relay each to an upstream via `connect`.
 ///
-/// Shared relay loop used by both port forwarding and proxy relay.
+/// Shared relay loop used by both port forwarding and proxy relay. The relay's task owns
+/// the listener and every connection it accepted. Once stopped (`stop_relays`) it closes
+/// the listener, ends the connections and finishes only when their tasks have.
 fn spawn_relay_loop<F, Fut>(
     listener: tokio::net::TcpListener,
     connect: F,
     label: &'static str,
-) -> JoinHandle<()>
+) -> Relay
 where
     F: Fn() -> Fut + Send + Sync + 'static,
     Fut: std::future::Future<Output = Result<tokio::net::TcpStream>> + Send,
 {
     let connect = Arc::new(connect);
-    tokio::spawn(async move {
+    let stop = CancellationToken::new();
+    let stopped = stop.clone();
+    let task = tokio::spawn(async move {
+        // The connections live in this set and not in detached tasks, so they end with
+        // the relay: a stopped relay shuts the set down below, and aborting this task
+        // drops the set, which aborts each of them.
+        let mut connections = tokio::task::JoinSet::new();
         loop {
-            match listener.accept().await {
+            let accepted = tokio::select! {
+                _ = stopped.cancelled() => break,
+                accepted = listener.accept() => accepted,
+                // A finished connection leaves the set, so the set holds only live ones.
+                Some(_) = connections.join_next() => continue,
+            };
+            match accepted {
                 Ok((client, peer)) => {
                     let connect = Arc::clone(&connect);
-                    tokio::spawn(async move {
+                    connections.spawn(async move {
                         match connect().await {
                             Ok(mut upstream) => {
                                 let mut client = client;
@@ -131,7 +164,39 @@ where
                 }
             }
         }
-    })
+        // Stopped. The listener closes first, so a client that connects from here on is
+        // refused. `shutdown` aborts every connection and returns when their tasks have
+        // finished, and a finished task has dropped the streams it held.
+        drop(listener);
+        connections.shutdown().await;
+    });
+    Relay { stop, task }
+}
+
+/// Stop relays and wait until they are gone.
+///
+/// Every relay is told to stop before any is waited for. A stopped relay closes its
+/// listener, aborts the connections it had accepted and waits until their tasks have
+/// finished. So when this returns the listeners are closed, and the same address and
+/// port can be bound again at once: on a snapshot miss an NV2 guest is torn down and
+/// restored from its snapshot in one process. No connection task is left either. Each
+/// has dropped its client and upstream streams, so a client is disconnected instead of
+/// staying attached to a VM that is gone.
+///
+/// A dial of the guest that is still in progress is not waited for. It runs on the
+/// blocking pool (`connect_in_namespace`), ends by itself, and its socket closes then.
+pub async fn stop_relays(relays: impl IntoIterator<Item = Relay>) {
+    let mut relays: Vec<Relay> = relays.into_iter().collect();
+    for relay in &relays {
+        relay.stop.cancel();
+    }
+    for relay in &mut relays {
+        // A stopped relay's task ends by itself. An error is a panic in the relay loop,
+        // which drops its connections without waiting for them.
+        if let Err(e) = (&mut relay.task).await {
+            warn!(error = %e, "relay task did not stop cleanly");
+        }
+    }
 }
 
 /// Backlog for a port forward's listener: as long as the kernel allows, which caps it at
@@ -201,13 +266,13 @@ fn bind_port_forwards(
 /// own loopback address) when it names none. Either every mapping is listening when this
 /// returns, or it returns an error and none is.
 ///
-/// Returns a `JoinHandle` per port mapping. Abort all handles on cleanup.
+/// Returns a `Relay` per port mapping, for `stop_relays`.
 pub async fn start_port_forwards(
     loopback_ip: &str,
     mappings: &[PortMapping],
     ns_name: &str,
     guest_ip: &str,
-) -> Result<Vec<JoinHandle<()>>> {
+) -> Result<Vec<Relay>> {
     let guest_ip: IpAddr = guest_ip
         .parse()
         .with_context(|| format!("invalid guest address {guest_ip}"))?;
@@ -240,18 +305,18 @@ pub async fn start_port_forwards(
 /// network namespace; the upstream connect happens in the host namespace,
 /// reaching services bound to 127.0.0.1:<port> on the host.
 ///
-/// Returns a `JoinHandle` per port. Abort all handles on cleanup.
+/// Returns a `Relay` per port, for `stop_relays`.
 pub async fn start_localhost_forwards(
     ns_name: &str,
     listen_ip: &str,
     ports: &[u16],
-) -> Result<Vec<JoinHandle<()>>> {
-    let mut handles: Vec<JoinHandle<()>> = Vec::new();
+) -> Result<Vec<Relay>> {
+    let mut handles: Vec<Relay> = Vec::new();
 
-    // Helper: abort all started handles on error.
-    let abort_all = |handles: &[JoinHandle<()>]| {
+    // Helper: abort all started relays on error.
+    let abort_all = |handles: &[Relay]| {
         for h in handles {
-            h.abort();
+            h.task.abort();
         }
     };
 
@@ -304,12 +369,13 @@ pub async fn start_localhost_forwards(
 ///
 /// Used when host-side BPF programs intercept connect() for proxy auth.
 /// The relay listens in the namespace (reachable from the VM via gateway IP)
-/// and connects to the real proxy from the host namespace.
+/// and connects to the real proxy from the host namespace. Returns the `Relay`, for
+/// `stop_relays`.
 pub async fn start_proxy_relay(
     ns_name: &str,
     gateway_ip: &str,
     proxy_addr: SocketAddr,
-) -> Result<JoinHandle<()>> {
+) -> Result<Relay> {
     let bind_addr: SocketAddr = format!("{}:{}", gateway_ip, PROXY_RELAY_PORT)
         .parse()
         .with_context(|| {
@@ -329,7 +395,7 @@ pub async fn start_proxy_relay(
         "reverse proxy relay via TCP proxy"
     );
 
-    let handle = spawn_relay_loop(
+    let relay = spawn_relay_loop(
         listener,
         move || async move {
             tokio::net::TcpStream::connect(proxy_addr)
@@ -339,7 +405,7 @@ pub async fn start_proxy_relay(
         "proxy",
     );
 
-    Ok(handle)
+    Ok(relay)
 }
 
 /// Parse a proxy URL like "http://host:port" or "host:port" into a SocketAddr.
@@ -548,6 +614,176 @@ mod tests {
         assert!(error.contains(&format!("192.0.2.1:{port}")), "{error}");
     }
 
+    /// A connection belongs to its relay: stopping the relay ends it on both sides. A
+    /// detached connection task would keep the client attached, and the upstream socket
+    /// open inside the VM's namespace, for as long as the client stayed.
+    #[tokio::test]
+    async fn stopped_relays_have_closed_their_connections() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let upstream = tokio::net::TcpListener::bind((test_ip(7), 0))
+            .await
+            .unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let listeners = bind_port_forwards(&test_ip(8).to_string(), &[mapping(None, 0)]).unwrap();
+        let listening = listeners[0].local_addr().unwrap();
+        let relays: Vec<Relay> = listeners
+            .into_iter()
+            .map(|listener| {
+                spawn_relay_loop(
+                    listener,
+                    move || async move { Ok(tokio::net::TcpStream::connect(upstream_addr).await?) },
+                    "test",
+                )
+            })
+            .collect();
+
+        // One connection through the relay, shown end to end by a byte each way.
+        let mut client = tokio::net::TcpStream::connect(listening).await.unwrap();
+        let (mut served, _) = upstream.accept().await.unwrap();
+        let mut byte = [0u8; 1];
+        client.write_all(b"a").await.unwrap();
+        served.read_exact(&mut byte).await.unwrap();
+        served.write_all(b"b").await.unwrap();
+        client.read_exact(&mut byte).await.unwrap();
+
+        stop_relays(relays).await;
+
+        // Each end sees the connection end. A read still pending at the deadline is a
+        // connection that outlived its relay.
+        for (side, stream) in [("client", &mut client), ("upstream", &mut served)] {
+            let ended =
+                tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut byte))
+                    .await;
+            match ended {
+                Ok(Ok(0)) | Ok(Err(_)) => {}
+                Ok(Ok(n)) => panic!("{side} read {n} bytes after the relay stopped"),
+                Err(_) => panic!("{side} is still connected 5 s after the relay stopped"),
+            }
+        }
+    }
+
+    /// A relay task owns its listener. Stopping the relays must not return before the
+    /// task has closed it.
+    #[tokio::test]
+    async fn stopped_relays_have_closed_their_listeners() {
+        let listeners = bind_port_forwards(&test_ip(6).to_string(), &[mapping(None, 0)]).unwrap();
+        let listening = listeners[0].local_addr().unwrap();
+        let relays: Vec<Relay> = listeners
+            .into_iter()
+            .map(|listener| {
+                spawn_relay_loop(
+                    listener,
+                    || async { anyhow::bail!("this test connects no client") },
+                    "test",
+                )
+            })
+            .collect();
+
+        stop_relays(relays).await;
+
+        std::net::TcpListener::bind(listening)
+            .expect("the address must be free again once the relays are stopped");
+    }
+
+    /// Sets its flag when it is dropped.
+    struct SetOnDrop(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for SetOnDrop {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// When `stop_relays` returns, the connection tasks have finished: none is still
+    /// running with its sockets open. Asking for their cancellation is not that. The
+    /// connection task here is inside a poll that blocks its worker thread for 500 ms
+    /// when the relay is stopped, and it holds a guard until it finishes. A stop that
+    /// only asks for cancellation returns at once, with the guard still held.
+    ///
+    /// The client seeing its connection end within some seconds does not show this: it
+    /// sees that after a stop that waits for nothing, too.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stopped_relays_have_finished_their_connection_tasks() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let finished = Arc::new(AtomicBool::new(false));
+        let (entered, entered_rx) = std::sync::mpsc::channel::<()>();
+        let listeners = bind_port_forwards(&test_ip(9).to_string(), &[mapping(None, 0)]).unwrap();
+        let listening = listeners[0].local_addr().unwrap();
+        let relays: Vec<_> = listeners
+            .into_iter()
+            .map(|listener| {
+                let (finished, entered) = (Arc::clone(&finished), entered.clone());
+                spawn_relay_loop(
+                    listener,
+                    move || {
+                        let (guard, entered) = (SetOnDrop(Arc::clone(&finished)), entered.clone());
+                        async move {
+                            let _held_until_the_task_finishes = guard;
+                            entered.send(()).expect("the test waits for this");
+                            std::thread::sleep(std::time::Duration::from_millis(500));
+                            anyhow::bail!("this test has no upstream")
+                        }
+                    },
+                    "test",
+                )
+            })
+            .collect();
+
+        // One client, so one connection task. Once it has said so, it is inside its
+        // blocking poll. The client connects without the runtime: an async connect
+        // completes through the I/O driver, and the worker thread that drives it can be
+        // the one the connection task blocks.
+        let _client = std::net::TcpStream::connect(listening).unwrap();
+        entered_rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the relay starts a connection task for the client");
+
+        stop_relays(relays).await;
+
+        assert!(
+            finished.load(Ordering::SeqCst),
+            "stop_relays returned while a connection task was still running"
+        );
+    }
+
+    /// A relay that is dropped without `stop_relays` is ended too, so it does not hold
+    /// its port for the life of the process. Dropping does not wait: the address is free
+    /// once the runtime has dropped the task, which is soon after and not at once.
+    #[tokio::test]
+    async fn a_dropped_relay_releases_its_listener() {
+        let listeners = bind_port_forwards(&test_ip(10).to_string(), &[mapping(None, 0)]).unwrap();
+        let listening = listeners[0].local_addr().unwrap();
+        let relays: Vec<_> = listeners
+            .into_iter()
+            .map(|listener| {
+                spawn_relay_loop(
+                    listener,
+                    || async { anyhow::bail!("this test connects no client") },
+                    "test",
+                )
+            })
+            .collect();
+
+        drop(relays);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            match std::net::TcpListener::bind(listening) {
+                Ok(_) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "a dropped relay still listens on {listening} after 5 s"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                Err(e) => panic!("binding {listening}: {e}"),
+            }
+        }
+    }
+
     /// RAII network namespace for privileged tests.
     ///
     /// `ip netns add` is checked (a leftover same-named namespace fails the
@@ -690,9 +926,7 @@ mod tests {
         assert_eq!(buf, b"test data 12345", "echo data should match");
 
         // Cleanup (namespace deleted by TestNetns::drop)
-        for h in handles {
-            h.abort();
-        }
+        stop_relays(handles).await;
         echo_handle.abort();
         println!("test_port_forward_relay PASSED");
         Ok(())
@@ -740,9 +974,7 @@ mod tests {
             client.read_to_end(&mut buf).await?;
             assert_eq!(buf, b"HELLO_FROM_HOST", "relay should reach host loopback");
 
-            for h in handles {
-                h.abort();
-            }
+            stop_relays(handles).await;
             Ok(())
         }
         .await;

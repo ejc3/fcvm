@@ -60,7 +60,7 @@ pub struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    proxy_handles: Vec<tokio::task::JoinHandle<()>>,
+    proxy_handles: Vec<tcp_proxy::Relay>,
 }
 
 impl RoutedNetwork {
@@ -890,10 +890,10 @@ impl NetworkManager for RoutedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up routed network resources");
 
-        // Abort TCP proxy tasks (port forwarders + proxy relay)
-        for handle in self.proxy_handles.drain(..) {
-            handle.abort();
-        }
+        // Stop the TCP proxy relays (port forwards, localhost forwards, proxy relay).
+        // When this returns their listeners are closed and their connection tasks have
+        // finished.
+        tcp_proxy::stop_relays(self.proxy_handles.drain(..)).await;
 
         // Remove IPv6 MASQUERADE and proxy NDP
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
