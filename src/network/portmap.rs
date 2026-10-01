@@ -4,6 +4,28 @@ use tracing::{debug, info, warn};
 
 use super::types::{PortMapping, Protocol};
 
+/// Refuse a mapping whose HOSTIP is an IPv6 address.
+///
+/// Bridged port forwarding is IPv4 DNAT through `iptables`, which has no rule for an
+/// IPv6 destination. Without this the mapping fails as an iptables parse error, or is
+/// rescoped to the veth address and carries on as if no address had been named.
+pub fn require_ipv4_host_addresses(mappings: &[PortMapping]) -> Result<()> {
+    for mapping in mappings {
+        let Some(host_ip) = mapping.host_ip.as_deref() else {
+            continue;
+        };
+        if host_ip.parse::<std::net::Ipv6Addr>().is_ok() {
+            anyhow::bail!(
+                "bridged networking cannot publish on the IPv6 host address [{host_ip}]:{}: \
+                 its port forwarding is IPv4 iptables DNAT. Use --network routed or \
+                 --network rootless for an IPv6 host address.",
+                mapping.host_port
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Sets up port mapping rules for a VM
 ///
 /// Creates iptables DNAT rules to forward traffic from host ports to guest ports.
@@ -522,6 +544,32 @@ mod tests {
     fn output_without_a_device_still_reports_what_it_saw() {
         let error = parse_default_interface("default via 10.0.0.1\n").expect_err("no dev");
         assert!(format!("{error:#}").contains("10.0.0.1"));
+    }
+
+    fn mapping(host_ip: Option<&str>) -> PortMapping {
+        PortMapping {
+            host_ip: host_ip.map(str::to_string),
+            host_port: 8080,
+            guest_port: 80,
+            proto: Protocol::Tcp,
+        }
+    }
+
+    #[test]
+    fn an_ipv6_host_address_is_refused_by_name() {
+        let ipv4 = [
+            mapping(None),
+            mapping(Some("127.0.0.1")),
+            mapping(Some("0.0.0.0")),
+        ];
+        require_ipv4_host_addresses(&ipv4).unwrap();
+
+        for host_ip in ["::", "::1", "2001:db8::1"] {
+            let error = require_ipv4_host_addresses(&[mapping(None), mapping(Some(host_ip))])
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(&format!("[{host_ip}]:8080")), "{error}");
+        }
     }
 
     #[test]

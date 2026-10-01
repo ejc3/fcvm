@@ -398,7 +398,7 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
 - Each VM gets a unique IPv6 derived from the host's /64 prefix
-- Port forwarding via built-in TCP proxy (`setns` + tokio relay) on loopback IP (same as rootless)
+- Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
 **Implementation**:
@@ -413,7 +413,7 @@ struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    proxy_handles: Vec<JoinHandle<()>>,
+    proxy_handles: Vec<Relay>,
     ipv6_prefix: Option<String>,       // explicit /64 prefix (skips auto-detect + MASQUERADE)
 }
 
@@ -433,7 +433,7 @@ async fn setup() -> Result<NetworkConfig> {
     // Host: /128 route to VM IPv6 via host veth
     // Proxy NDP on default interface
     // ip6tables MASQUERADE for outbound (skipped if --ipv6-prefix is set)
-    // TCP proxy port forwarding on loopback IP (setns + tokio relay)
+    // TCP proxy port forwarding (setns + tokio relay): each mapping on its HOSTIP, else on the loopback IP
     // --forward-localhost: 10.0.2.2/32 alias on bridge + TCP relays to host loopback ports
 }
 ```
@@ -868,14 +868,24 @@ curl http://172.30.x.1:8080
 13. Host: route `vm_ipv6/128` via host veth
 14. Proxy NDP for vm_ipv6 on default interface (so network fabric routes to this host)
 15. ip6tables MASQUERADE on outbound interface (required for AWS source/dest check)
-16. TCP proxy port forwarding on unique loopback IP (127.x.y.z)
+16. TCP proxy port forwarding: each mapping on its HOSTIP, or on the VM's unique loopback IP (127.x.y.z) when it names none
 
-**Port Forwarding** (built-in TCP proxy + loopback IP, same as rootless):
+**Port Forwarding** (built-in TCP proxy):
 ```
-# Rust TCP proxy: bind on host loopback, connect inside namespace via setns(2)
+# Rust TCP proxy: bind on the host, connect inside namespace via setns(2)
+# --publish 8080:80        listens on the VM's loopback IP (same allocation as rootless)
 Host 127.0.0.2:8080 → tcp_proxy → setns(namespace) → connect 10.0.2.100:80
+# --publish '[::]:80:80'   listens on the address the mapping names
+Host [::]:80        → tcp_proxy → setns(namespace) → connect 10.0.2.100:80
 # Bidirectional relay via tokio::io::copy_bidirectional
 ```
+
+An IPv6 listener is created with `IPV6_V6ONLY` off, so `[::]` accepts IPv4 and IPv6
+clients whatever `net.ipv6.bindv6only` says. Every listener is bound before any relay
+starts: a bind failure (address in use, address not on this host) fails the VM start with
+the address and port in the error, and closes the listeners already bound. The loopback
+IP is allocated, and reported as `config.network.loopback_ip`, only when a mapping names
+no HOSTIP.
 
 **Traffic Flow** (VM to Internet, IPv6):
 ```
@@ -904,7 +914,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Proxy NDP advertises the VM's IPv6 on the host's physical interface
 
 **Cleanup** (on VM exit):
-1. Abort TCP proxy tasks (in-process, no external PIDs)
+1. Stop TCP proxy relays and wait for them, which closes their listeners and ends their connections (in-process, no external PIDs)
 2. Remove ip6tables MASQUERADE rule (scoped to vm_ipv6/128)
 3. Remove proxy NDP entry
 4. Remove host route (uses `dev` qualifier for parallel safety)
@@ -916,7 +926,7 @@ ip netns exec curl → br0 (10.0.2.1) → L2 forward → TAP → Guest (10.0.2.1
 - Kernel line-rate IPv6 (no userspace proxy for traffic forwarding)
 - Each VM gets unique /128 IPv6 — parallel clones route correctly without NAT
 - IPv4 internal only (10.0.2.x for health checks, no external IPv4 routing)
-- Port forwarding via built-in TCP proxy + loopback IP (same model as rootless)
+- Port forwarding via built-in TCP proxy, on the mapping's HOSTIP or on the VM's loopback IP
 - All resources per-VM: no shared state, clean parallel operation
 
 ---

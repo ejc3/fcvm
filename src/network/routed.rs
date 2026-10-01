@@ -60,7 +60,7 @@ pub struct RoutedNetwork {
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
     default_iface: Option<String>,
-    proxy_handles: Vec<tokio::task::JoinHandle<()>>,
+    proxy_handles: Vec<tcp_proxy::Relay>,
 }
 
 impl RoutedNetwork {
@@ -201,6 +201,14 @@ impl RoutedNetwork {
     pub fn with_loopback_ip(mut self, loopback_ip: String) -> Self {
         self.loopback_ip = Some(loopback_ip);
         self
+    }
+
+    /// Whether a port forward listens on this VM's loopback address: a mapping that
+    /// names no host address does. The caller allocates the address only then and
+    /// `setup` reports it only then, so `loopback_ip` in the VM's state is always an
+    /// address a published port answers on.
+    pub fn needs_loopback_ip(&self) -> bool {
+        self.port_mappings.iter().any(|m| m.host_ip.is_none())
     }
 
     /// Validate that the host meets requirements for routed networking.
@@ -766,11 +774,13 @@ impl NetworkManager for RoutedNetwork {
             info!(iface = %default_iface, "added IPv6 MASQUERADE for outbound traffic");
         }
 
-        // 14. Port forwarding: TCP proxy listens on host loopback, connects to VM
-        //     inside the namespace via setns(2). The veth is a bridge member so
-        //     host-side IPv4 routing to 10.0.2.100 doesn't work — the connect side
-        //     must run inside the namespace where the bridge is directly reachable.
-        //     Loopback IP is allocated by StateManager with lock-based coordination.
+        // 14. Port forwarding: TCP proxy listens on the host and connects to the VM
+        //     inside the namespace via setns(2). A mapping listens on the host
+        //     address its HOSTIP names, or on this VM's loopback IP when it names
+        //     none. The veth is a bridge member so host-side IPv4 routing to
+        //     10.0.2.100 doesn't work, and the connect side must run inside the
+        //     namespace where the bridge is directly reachable. Loopback IP is
+        //     allocated by StateManager with lock-based coordination.
         let loopback_ip = self
             .loopback_ip
             .clone()
@@ -847,11 +857,7 @@ impl NetworkManager for RoutedNetwork {
             guest_ip: Some(guest_ip),
             host_ip: Some(GUEST_GATEWAY.to_string()),
             host_veth: self.host_veth.clone(),
-            loopback_ip: if self.port_mappings.is_empty() {
-                None
-            } else {
-                Some(loopback_ip)
-            },
+            loopback_ip: self.needs_loopback_ip().then_some(loopback_ip),
             // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
             // Detect an IPv6 DNS server reachable via native routed IPv6.
             dns_server: detect_ipv6_dns(self.ipv6_dns.clone()).await,
@@ -884,10 +890,10 @@ impl NetworkManager for RoutedNetwork {
     async fn cleanup(&mut self) -> Result<()> {
         info!(vm_id = %self.vm_id, "cleaning up routed network resources");
 
-        // Abort TCP proxy tasks (port forwarders + proxy relay)
-        for handle in self.proxy_handles.drain(..) {
-            handle.abort();
-        }
+        // Stop the TCP proxy relays (port forwards, localhost forwards, proxy relay).
+        // When this returns their listeners are closed and their connection tasks have
+        // finished.
+        tcp_proxy::stop_relays(self.proxy_handles.drain(..)).await;
 
         // Remove IPv6 MASQUERADE and proxy NDP
         if let Some(ref vm_ipv6) = self.vm_ipv6 {
@@ -1211,6 +1217,27 @@ mod tests {
 
     const NET_2600: u128 = 0x2600_1f1c_0494_0201 << 64;
     const NET_2803: u128 = 0x2803_6084_7058_46f6 << 64;
+
+    #[test]
+    fn a_loopback_address_is_needed_only_by_a_mapping_without_a_host_address() {
+        let needs = |host_ips: &[Option<&str>]| {
+            let mappings = host_ips
+                .iter()
+                .map(|host_ip| PortMapping {
+                    host_ip: host_ip.map(str::to_string),
+                    host_port: 8080,
+                    guest_port: 80,
+                    proto: Protocol::Tcp,
+                })
+                .collect();
+            RoutedNetwork::new("vm-test".into(), "tap-test".into(), mappings).needs_loopback_ip()
+        };
+        assert!(!needs(&[]));
+        assert!(needs(&[None]));
+        assert!(!needs(&[Some("::")]));
+        assert!(!needs(&[Some("127.0.0.1"), Some("::1")]));
+        assert!(needs(&[Some("::"), None]));
+    }
 
     // --- parse_ipv6_prefix tests ---
 

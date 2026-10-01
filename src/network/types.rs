@@ -40,7 +40,7 @@ pub struct NetworkConfig {
     pub http_proxy: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PortMapping {
     pub host_ip: Option<String>,
     pub host_port: u16,
@@ -64,6 +64,18 @@ impl std::fmt::Display for Protocol {
     }
 }
 
+/// The `--publish` spec that parses back to this mapping.
+impl std::fmt::Display for PortMapping {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.host_ip.as_deref() {
+            Some(ip) if ip.contains(':') => write!(f, "[{ip}]:")?,
+            Some(ip) => write!(f, "{ip}:")?,
+            None => {}
+        }
+        write!(f, "{}:{}/{}", self.host_port, self.guest_port, self.proto)
+    }
+}
+
 impl PortMapping {
     /// Parse port mappings leniently, skipping invalid values with a warning.
     /// Used for cache key computation where invalid mappings are caught
@@ -82,34 +94,61 @@ impl PortMapping {
     }
 
     /// Parse port mapping from string: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]
+    ///
+    /// An IPv6 HOSTIP goes in brackets (`[::]:80:80`, `[::1]:8080:80/tcp`), because its
+    /// own colons would read as field separators. `host_ip` holds the address in its
+    /// canonical text form, without the brackets.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
-        let parts: Vec<&str> = s.split(':').collect();
+        const GRAMMAR: &str =
+            "expected [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], with an IPv6 HOSTIP in brackets";
 
-        let (host_ip, host_port_str, guest_port_str) = match parts.len() {
-            2 => (None, parts[0], parts[1]),
-            3 => (Some(parts[0].to_string()), parts[1], parts[2]),
-            _ => anyhow::bail!("invalid port mapping format: {}", s),
+        let (host_ip, ports): (Option<String>, Vec<&str>) = match s.strip_prefix('[') {
+            Some(rest) => {
+                let Some((addr, ports)) = rest.split_once("]:") else {
+                    anyhow::bail!("invalid port mapping {s}: {GRAMMAR}");
+                };
+                let Ok(addr) = addr.parse::<std::net::Ipv6Addr>() else {
+                    anyhow::bail!("invalid port mapping {s}: [{addr}] is not an IPv6 address");
+                };
+                (Some(addr.to_string()), ports.split(':').collect())
+            }
+            None => {
+                let mut parts: Vec<&str> = s.split(':').collect();
+                let host_ip = if parts.len() == 3 {
+                    let addr = parts.remove(0);
+                    let Ok(addr) = addr.parse::<std::net::Ipv4Addr>() else {
+                        anyhow::bail!(
+                            "invalid port mapping {s}: HOSTIP {addr:?} is not an IPv4 address \
+                             (an IPv6 address goes in brackets)"
+                        );
+                    };
+                    Some(addr.to_string())
+                } else {
+                    None
+                };
+                (host_ip, parts)
+            }
+        };
+        let &[host_port_str, guest_port_str] = ports.as_slice() else {
+            anyhow::bail!("invalid port mapping {s}: {GRAMMAR}");
         };
 
-        // Parse protocol suffix from guest_port
-        let (guest_port_str, proto) = if let Some(idx) = guest_port_str.find('/') {
-            let (port, proto_str) = guest_port_str.split_at(idx);
-            let proto = match &proto_str[1..] {
-                "tcp" => Protocol::Tcp,
-                "udp" => Protocol::Udp,
-                _ => anyhow::bail!("invalid protocol: {}", &proto_str[1..]),
-            };
-            (port, proto)
-        } else {
-            (guest_port_str, Protocol::Tcp) // default to TCP
+        // Protocol suffix on the guest port; TCP when there is none.
+        let (guest_port_str, proto) = match guest_port_str.split_once('/') {
+            None => (guest_port_str, Protocol::Tcp),
+            Some((port, "tcp")) => (port, Protocol::Tcp),
+            Some((port, "udp")) => (port, Protocol::Udp),
+            Some((_, other)) => {
+                anyhow::bail!("invalid port mapping {s}: invalid protocol {other}")
+            }
         };
 
-        let host_port = host_port_str
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid host port: {}", host_port_str))?;
-        let guest_port = guest_port_str
-            .parse()
-            .map_err(|_| anyhow::anyhow!("invalid guest port: {}", guest_port_str))?;
+        let host_port = host_port_str.parse().map_err(|_| {
+            anyhow::anyhow!("invalid port mapping {s}: invalid host port {host_port_str}")
+        })?;
+        let guest_port = guest_port_str.parse().map_err(|_| {
+            anyhow::anyhow!("invalid port mapping {s}: invalid guest port {guest_port_str}")
+        })?;
 
         Ok(Self {
             host_ip,
@@ -141,25 +180,104 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_parse_port_mapping() {
-        let pm = PortMapping::parse("8080:80").unwrap();
-        assert_eq!(pm.host_port, 8080);
-        assert_eq!(pm.guest_port, 80);
-        assert_eq!(pm.proto, Protocol::Tcp);
-        assert!(pm.host_ip.is_none());
+    fn parse_accepts_every_form_of_the_grammar() {
+        // (spec, host_ip, host_port, guest_port, proto)
+        let cases = [
+            ("8080:80", None, 8080, 80, Protocol::Tcp),
+            ("8080:80/tcp", None, 8080, 80, Protocol::Tcp),
+            ("8080:80/udp", None, 8080, 80, Protocol::Udp),
+            (
+                "127.0.0.1:8080:80",
+                Some("127.0.0.1"),
+                8080,
+                80,
+                Protocol::Tcp,
+            ),
+            ("0.0.0.0:53:53/udp", Some("0.0.0.0"), 53, 53, Protocol::Udp),
+            ("[::]:80:80", Some("::"), 80, 80, Protocol::Tcp),
+            ("[::1]:8080:80/tcp", Some("::1"), 8080, 80, Protocol::Tcp),
+            (
+                "[2001:db8::1]:53:53/udp",
+                Some("2001:db8::1"),
+                53,
+                53,
+                Protocol::Udp,
+            ),
+            // An IPv6 address is stored in its canonical text form.
+            (
+                "[0:0:0:0:0:0:0:1]:8080:80",
+                Some("::1"),
+                8080,
+                80,
+                Protocol::Tcp,
+            ),
+            (
+                "[2001:DB8::1]:53:53",
+                Some("2001:db8::1"),
+                53,
+                53,
+                Protocol::Tcp,
+            ),
+        ];
+        for (spec, host_ip, host_port, guest_port, proto) in cases {
+            let parsed = PortMapping::parse(spec).unwrap_or_else(|e| panic!("{spec}: {e}"));
+            let expected = PortMapping {
+                host_ip: host_ip.map(str::to_string),
+                host_port,
+                guest_port,
+                proto,
+            };
+            assert_eq!(parsed, expected, "{spec}");
+        }
+    }
 
-        let pm = PortMapping::parse("127.0.0.1:8080:80").unwrap();
-        assert_eq!(pm.host_ip, Some("127.0.0.1".to_string()));
-        assert_eq!(pm.host_port, 8080);
-        assert_eq!(pm.guest_port, 80);
+    #[test]
+    fn a_mapping_is_written_as_the_spec_that_parses_back_to_it() {
+        for (spec, written) in [
+            ("8080:80", "8080:80/tcp"),
+            ("8080:80/udp", "8080:80/udp"),
+            ("127.0.0.1:8080:80", "127.0.0.1:8080:80/tcp"),
+            ("[::]:80:80", "[::]:80:80/tcp"),
+            ("[2001:db8::1]:53:53/udp", "[2001:db8::1]:53:53/udp"),
+        ] {
+            let mapping = PortMapping::parse(spec).unwrap();
+            assert_eq!(mapping.to_string(), written, "{spec}");
+            assert_eq!(PortMapping::parse(written).unwrap(), mapping, "{spec}");
+        }
+    }
 
-        let pm = PortMapping::parse("8080:80/udp").unwrap();
-        assert_eq!(pm.proto, Protocol::Udp);
-
-        let pm = PortMapping::parse("0.0.0.0:53:53/udp").unwrap();
-        assert_eq!(pm.host_ip, Some("0.0.0.0".to_string()));
-        assert_eq!(pm.host_port, 53);
-        assert_eq!(pm.guest_port, 53);
-        assert_eq!(pm.proto, Protocol::Udp);
+    /// Every rejection names the spec it rejected, so one bad entry in a
+    /// comma-separated --publish can be found.
+    #[test]
+    fn parse_rejects_malformed_specs_and_names_them() {
+        let cases = [
+            "8080",                // one field
+            "1:2:3:4",             // too many fields
+            "::1:8080:80",         // IPv6 without brackets
+            "[::1:8080:80",        // no closing bracket
+            "::1]:8080:80",        // no opening bracket
+            "[::1]8080:80",        // no ':' after the bracket
+            "[]:8080:80",          // nothing in the brackets
+            "[127.0.0.1]:8080:80", // brackets around an IPv4 address
+            "[::g]:8080:80",       // not an address
+            "[[::1]]:8080:80",     // doubled brackets
+            "[::1]:8080",          // one port after the address
+            "[::1]:8080:80:90",    // three ports after the address
+            "[::1]:8080:80]",      // stray bracket in a port
+            "8080:80/sctp",        // unknown protocol
+            "http:80",             // host port is not a number
+            "8080:http",           // guest port is not a number
+            "65536:80",            // host port out of range
+            "localhost:8080:80",   // HOSTIP is a host name
+            ":8080:80",            // HOSTIP is empty
+            "127.1:8080:80",       // HOSTIP is not a whole IPv4 address
+            "256.0.0.1:8080:80",   // HOSTIP is out of range
+        ];
+        for spec in cases {
+            match PortMapping::parse(spec) {
+                Ok(parsed) => panic!("{spec} must be rejected, parsed as {parsed:?}"),
+                Err(e) => assert!(e.to_string().contains(spec), "{spec}: {e}"),
+            }
+        }
     }
 }

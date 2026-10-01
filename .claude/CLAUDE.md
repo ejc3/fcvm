@@ -2324,7 +2324,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 |------|------|---------------|-------------|-----------------|
 | Rootless (default) | `--network rootless` | No | Good | pasta CLI flags (-t/-u) |
 | Bridged | `--network bridged` | Yes | Better | iptables DNAT |
-| Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | TCP proxy + loopback IP |
+| Routed | `--network routed` | Yes (+ IPv6 host) | Best (kernel line rate) | TCP proxy on the mapping's HOSTIP, else loopback IP |
 
 **Rootless Architecture:**
 - Holder process starts with `unshare --user --net`, UID/GID mappings written externally
@@ -2341,7 +2341,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Network namespace with bridge (br0) connecting TAP and veth for L2 forwarding
 - Proxy NDP on default interface makes VM IPv6 routable from network fabric
 - ip6tables MASQUERADE for AWS VPC source/dest checks (skipped when `--ipv6-prefix` is set)
-- Port forwarding via built-in TCP proxy (setns + tokio relay) on unique loopback IP (same allocation as rootless)
+- Port forwarding via built-in TCP proxy (setns + tokio relay). A mapping with a HOSTIP (`--publish '[::]:80:80'`) listens on that address, and `[::]` accepts IPv4 and IPv6 clients. A mapping without one listens on the VM's unique loopback IP (same allocation as rootless), which is allocated only when a mapping needs it
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
 - `--ipv6-prefix` is also read from `FCVM_IPV6_PREFIX`. On a host whose own addresses are not a routable /64, set it to the host's delegated subnet: the routed tests pass no prefix, so without it they stop at "routed mode preflight check failed" before a VM boots

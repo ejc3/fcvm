@@ -256,7 +256,12 @@ pub struct RunArgs {
     pub cmd: Option<String>,
 
     /// Publish host ports to guest
-    /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated
+    /// Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated.
+    /// An IPv6 HOSTIP goes in brackets: [::]:80:80 listens on every host address.
+    /// Rootless and routed networking listen on HOSTIP, or on the VM's own loopback
+    /// address (config.network.loopback_ip in `fcvm ls --json`) when there is none.
+    /// Bridged networking always listens on the VM's veth address and rejects an
+    /// IPv6 HOSTIP.
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 

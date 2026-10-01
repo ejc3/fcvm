@@ -322,7 +322,8 @@ fn test_port_forward_rootless() -> Result<()> {
 /// Test port forwarding with routed networking
 ///
 /// Routed mode uses TCP proxy + unique loopback IPs (like rootless),
-/// so the test follows the same pattern.
+/// so the test follows the same pattern. A second mapping names its host
+/// address: it must answer there and not on the loopback IP.
 #[cfg(feature = "privileged-tests")]
 #[test]
 fn test_port_forward_routed() -> Result<()> {
@@ -334,6 +335,16 @@ fn test_port_forward_routed() -> Result<()> {
     // Use dynamic port to avoid conflicts with system services
     let host_port = common::find_available_high_port().context("finding available port")?;
     let publish_arg = format!("{}:80", host_port);
+    // A different port for the mapping that names its host address, so a listener on
+    // the loopback IP at that port could only be this mapping's.
+    let addressed_port = loop {
+        let port = common::find_available_high_port().context("finding available port")?;
+        if port != host_port {
+            break port;
+        }
+    };
+    let addressed_ip = common::private_loopback_ip();
+    let addressed_publish_arg = format!("{}:{}:80", addressed_ip, addressed_port);
 
     // Start VM with routed networking and port forwarding
     // Routed uses TCP proxy + unique loopback IPs (like rootless)
@@ -347,6 +358,8 @@ fn test_port_forward_routed() -> Result<()> {
         "routed",
         "--publish",
         &publish_arg,
+        "--publish",
+        &addressed_publish_arg,
         "--health-check",
         "http://localhost/",
         common::TEST_IMAGE,
@@ -437,6 +450,46 @@ fn test_port_forward_routed() -> Result<()> {
         println!("Loopback access: FAIL (timed out after 30s)");
     }
 
+    // Test: the mapping that names a host address answers on it
+    println!("Testing access via {}:{}...", addressed_ip, addressed_port);
+    let mut addressed_works = false;
+    let retry_start = std::time::Instant::now();
+    while retry_start.elapsed() < Duration::from_secs(30) {
+        let output = Command::new("curl")
+            .args([
+                "-s",
+                "--max-time",
+                "5",
+                &format!("http://{}:{}", addressed_ip, addressed_port),
+            ])
+            .output()
+            .context("curl to the mapping's host address")?;
+
+        if output.status.success() && !output.stdout.is_empty() {
+            addressed_works = true;
+            println!("Host address access: OK");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Test: nothing listens for that mapping on the VM's loopback IP. curl exits 7
+    // when the connection is refused.
+    let stray = Command::new("curl")
+        .args([
+            "-s",
+            "--max-time",
+            "5",
+            &format!("http://{}:{}", loopback_ip, addressed_port),
+        ])
+        .output()
+        .context("curl to the loopback IP at the host-addressed port")?;
+    let stray_exit = stray.status.code();
+    println!(
+        "Loopback IP at the host-addressed port: curl exit {:?}",
+        stray_exit
+    );
+
     // Cleanup
     println!("Cleaning up...");
     let _ = Command::new("kill")
@@ -450,6 +503,16 @@ fn test_port_forward_routed() -> Result<()> {
     assert!(
         loopback_works,
         "Routed port forwarding via loopback IP should work"
+    );
+    assert!(
+        addressed_works,
+        "Routed port forwarding on the host address a mapping names should work"
+    );
+    assert_eq!(
+        stray_exit,
+        Some(7),
+        "a mapping that names a host address must not also listen on the VM's loopback IP {}",
+        loopback_ip
     );
 
     println!("test_port_forward_routed PASSED");

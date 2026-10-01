@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::cli::LsArgs;
+use crate::firecracker::FcNetworkMode;
 use crate::paths;
 use crate::state::{truncate_id, StateManager, VmState};
 
@@ -15,6 +16,24 @@ struct VmInfoDisplay {
     #[serde(flatten)]
     vm: VmState,
     stale: bool,
+}
+
+/// HOST_ADDR: the host address a published port answers on when its mapping names none.
+///
+/// That is the VM's loopback IP in rootless and routed mode, and the veth's host address
+/// in bridged mode. A routed VM's `host_ip` is the gateway inside its namespace, which
+/// nothing on the host reaches, so a routed VM without a loopback IP shows none.
+fn host_addr(vm: &VmState) -> &str {
+    let network = &vm.config.network;
+    let veth_address = match vm.config.network_mode {
+        FcNetworkMode::Bridged => network.host_ip.as_deref(),
+        FcNetworkMode::Rootless | FcNetworkMode::Routed => None,
+    };
+    network
+        .loopback_ip
+        .as_deref()
+        .or(veth_address)
+        .unwrap_or("-")
 }
 
 pub async fn cmd_ls(args: LsArgs) -> Result<()> {
@@ -76,14 +95,7 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
                 .name
                 .as_deref()
                 .unwrap_or_else(|| truncate_id(&vm.vm_id, 8));
-            // HOST_ADDR: loopback_ip for rootless, host_ip for bridged
-            let host_addr = vm
-                .config
-                .network
-                .loopback_ip
-                .as_deref()
-                .or(vm.config.network.host_ip.as_deref())
-                .unwrap_or("-");
+            let host_addr = host_addr(vm);
             let guest_ip = vm.config.network.guest_ip.as_deref().unwrap_or("-");
             let image = vm
                 .config
@@ -110,4 +122,40 @@ pub async fn cmd_ls(args: LsArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn vm(mode: FcNetworkMode, loopback_ip: Option<&str>, host_ip: Option<&str>) -> VmState {
+        let mut vm = VmState::new("vm-ls".to_string(), "alpine".to_string(), 1, 128);
+        vm.config.network_mode = mode;
+        vm.config.network.loopback_ip = loopback_ip.map(str::to_string);
+        vm.config.network.host_ip = host_ip.map(str::to_string);
+        vm
+    }
+
+    /// HOST_ADDR is an address the host can reach. A routed VM whose mappings all name
+    /// their own address has no loopback IP, and its `host_ip` is the gateway inside its
+    /// namespace, so it shows none.
+    #[test]
+    fn host_addr_is_an_address_on_the_host() {
+        use FcNetworkMode::{Bridged, Rootless, Routed};
+        let gateway = Some("10.0.2.2");
+        assert_eq!(
+            host_addr(&vm(Rootless, Some("127.0.0.2"), gateway)),
+            "127.0.0.2"
+        );
+        assert_eq!(
+            host_addr(&vm(Routed, Some("127.0.0.3"), gateway)),
+            "127.0.0.3"
+        );
+        assert_eq!(host_addr(&vm(Routed, None, gateway)), "-");
+        assert_eq!(
+            host_addr(&vm(Bridged, None, Some("172.30.0.1"))),
+            "172.30.0.1"
+        );
+        assert_eq!(host_addr(&vm(Bridged, None, None)), "-");
+    }
 }

@@ -1889,6 +1889,21 @@ pub fn find_available_high_port() -> anyhow::Result<u16> {
     find_available_port(10000 + offset, 50000 - offset)
 }
 
+/// A loopback address for one test process to publish on by name.
+///
+/// 127.0.0.1 is shared with every other test, so a port probed free there can be taken
+/// before fcvm binds it. All of 127/8 is local on Linux, VM loopback IPs are allocated
+/// upward from 127.0.0.2, and the process id keeps concurrent test processes apart.
+pub fn private_loopback_ip() -> String {
+    let pid = std::process::id();
+    format!(
+        "127.{}.{}.{}",
+        192 | ((pid >> 16) as u8 & 0x3f),
+        (pid >> 8) as u8,
+        pid as u8
+    )
+}
+
 /// Read a string field out of a VM's `config.network` (from `fcvm ls --json`).
 ///
 /// e.g. `loopback_ip` (rootless), `host_veth` / `namespace_name` (routed).

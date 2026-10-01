@@ -1243,6 +1243,31 @@ impl PastaNetwork {
             .any(|gw| gw == addr)
     }
 
+    /// Refuse an IPv6 HOSTIP when pasta will run with `--ipv4-only`.
+    ///
+    /// Without a global IPv6 address on the host the guest has no IPv6 address, and
+    /// pasta exits on such a forward ("IPv6 forward, but IPv6 not enabled") with
+    /// nothing that names the mapping.
+    fn require_forwardable_host_addresses(&self, host_ipv6: Option<&str>) -> Result<()> {
+        if host_ipv6.is_some() {
+            return Ok(());
+        }
+        for mapping in &self.port_mappings {
+            let Some(host_ip) = mapping.host_ip.as_deref() else {
+                continue;
+            };
+            if host_ip.parse::<std::net::Ipv6Addr>().is_ok() {
+                anyhow::bail!(
+                    "rootless networking cannot publish on the IPv6 host address \
+                     [{host_ip}]:{}: this host has no global IPv6 address, so the guest has \
+                     no IPv6 address to forward to. Publish on an IPv4 address.",
+                    mapping.host_port
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// The complete pasta argument vector for this launch, in invocation order.
     ///
     /// Split out from the spawn so a unit test can assert the wiring: these
@@ -1360,9 +1385,12 @@ impl PastaNetwork {
                     Protocol::Udp => udp_specs.push(spec),
                 }
 
+                // The address and port are separate fields: joined with ':' an IPv6
+                // address and its port cannot be told apart.
                 info!(
                     proto = ?mapping.proto,
-                    host = %format!("{}:{}", bind_addr, mapping.host_port),
+                    host_ip = %bind_addr,
+                    host_port = mapping.host_port,
                     guest = %format!("{}:{}", self.guest_ip, mapping.guest_port),
                     "adding port forward"
                 );
@@ -1442,6 +1470,7 @@ impl PastaNetwork {
         }
 
         let host_ipv6 = Self::detect_host_ipv6();
+        self.require_forwardable_host_addresses(host_ipv6.as_deref())?;
 
         info!(
             namespace_pid = namespace_pid,
@@ -2395,6 +2424,34 @@ mod tests {
             contains_run(&args, &["-u", "127.0.0.9/5300:53"]),
             "{args:?}"
         );
+    }
+
+    /// Without a global IPv6 address on the host pasta runs with --ipv4-only and exits
+    /// on an IPv6 forward. The mapping is refused by name before pasta starts.
+    #[test]
+    fn an_ipv6_host_address_is_refused_when_pasta_runs_ipv4_only() {
+        let mapping = |host_ip: Option<&str>| PortMapping {
+            host_ip: host_ip.map(str::to_string),
+            host_port: 8080,
+            guest_port: 80,
+            proto: Protocol::Tcp,
+        };
+        let network = |mappings| PastaNetwork::new("args-v6".into(), "tap0".into(), mappings);
+
+        let error = network(vec![mapping(None), mapping(Some("::1"))])
+            .require_forwardable_host_addresses(None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("[::1]:8080"), "{error}");
+
+        // With IPv6 on the host the same mapping is pasta's to bind, and an IPv4 address
+        // or none is forwarded either way.
+        network(vec![mapping(Some("::1"))])
+            .require_forwardable_host_addresses(Some("2001:db8::2"))
+            .unwrap();
+        network(vec![mapping(None), mapping(Some("127.0.0.1"))])
+            .require_forwardable_host_addresses(None)
+            .unwrap();
     }
 
     /// pasta reads the HOST's /etc/resolv.conf, and when its first nameserver
