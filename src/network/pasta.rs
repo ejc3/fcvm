@@ -169,8 +169,19 @@ fn describe_silent_probe(code: Option<i32>, stderr: &str) -> String {
 /// The child leads its own process group (`process_group(0)`, so pgid == pid),
 /// which makes the whole subtree addressable with one `killpg`.
 async fn run_probe_bounded(
-    mut command: Command,
+    command: Command,
     budget: std::time::Duration,
+    what: &str,
+) -> Result<std::process::Output> {
+    run_probe_until(command, tokio::time::sleep(budget), what).await
+}
+
+/// [`run_probe_bounded`] with the expiry as a future: the probe runs until it exits or
+/// `abandon` completes, whichever comes first. A test passes the condition it waits for,
+/// so its child has no duration to beat.
+async fn run_probe_until(
+    mut command: Command,
+    abandon: impl std::future::Future<Output = ()>,
     what: &str,
 ) -> Result<std::process::Output> {
     command.process_group(0);
@@ -203,9 +214,11 @@ async fn run_probe_bounded(
             stderr: err,
         })
     };
-    match tokio::time::timeout(budget, wait).await {
-        Ok(result) => result.with_context(|| format!("running {what}")),
-        Err(_elapsed) => {
+    tokio::select! {
+        // The probe's own exit wins when both are ready, as with `tokio::time::timeout`.
+        biased;
+        result = wait => result.with_context(|| format!("running {what}")),
+        () = abandon => {
             // SAFETY: pgid came from this child, which leads its own group.
             // Killing a group we created cannot reach an unrelated process:
             // the pid is not reused while we hold the un-reaped child.
@@ -3547,23 +3560,31 @@ mod tests {
             ),
         ]);
 
-        let result = run_probe_bounded(
-            command,
-            std::time::Duration::from_millis(400),
-            "a group-kill probe",
+        // The probe is abandoned once the grandchild's pid is on disk. A fixed budget
+        // has to outlast bash starting, and 400 ms did not on a loaded host.
+        let recorded_pid = || {
+            std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        };
+        let recorded = async {
+            while recorded_pid().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(60),
+            run_probe_until(command, recorded, "a group-kill probe"),
         )
-        .await;
+        .await
+        .expect("bash records its child's pid well within 60 s");
         assert!(
             result.is_err(),
-            "the probe must time out to exercise the kill"
+            "the probe must be abandoned to exercise the kill"
         );
 
         // The grandchild wrote its pid before sleeping; it must now be gone.
-        let pid: i32 = std::fs::read_to_string(&marker)
-            .expect("the probe child must have recorded its grandchild's pid")
-            .trim()
-            .parse()
-            .expect("pid file must hold a number");
+        let pid = recorded_pid().expect("the pid file holds the grandchild's pid");
         let _ = std::fs::remove_file(&marker);
 
         let mut alive = true;
