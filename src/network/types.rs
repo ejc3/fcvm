@@ -78,8 +78,8 @@ impl std::fmt::Display for PortMapping {
 
 impl PortMapping {
     /// Parse port mappings leniently, skipping invalid values with a warning.
-    /// Used for cache key computation where invalid mappings are caught
-    /// later during actual network setup in `podman/mod.rs`.
+    /// Used for cache key computation. `podman run` has parsed the same specs strictly
+    /// by then (`publish_mappings` in `podman/mod.rs`), so nothing is skipped there.
     pub fn parse_all_lenient(specs: &[String]) -> Vec<Self> {
         specs
             .iter()
