@@ -93,11 +93,44 @@ impl PortMapping {
             .collect()
     }
 
+    /// The first two mappings, in the order given, that `same_socket` says are one socket.
+    pub(crate) fn first_on_one_socket(
+        mappings: &[Self],
+        same_socket: impl Fn(&Self, &Self) -> bool,
+    ) -> Option<(&Self, &Self)> {
+        mappings.iter().enumerate().find_map(|(i, mapping)| {
+            let earlier = mappings[..i]
+                .iter()
+                .find(|earlier| same_socket(earlier, mapping))?;
+            Some((earlier, mapping))
+        })
+    }
+
+    /// Refuse two mappings that claim the same host address and port for one protocol.
+    ///
+    /// Left to network setup, routed and rootless networking fail the second bind after
+    /// the VM's network exists, and bridged networking installs both DNAT rules and
+    /// delivers only the first.
+    pub fn require_distinct_host_sockets(mappings: &[Self]) -> anyhow::Result<()> {
+        let same_socket = |earlier: &Self, mapping: &Self| {
+            earlier.host_ip == mapping.host_ip
+                && earlier.host_port == mapping.host_port
+                && earlier.proto == mapping.proto
+        };
+        if let Some((earlier, mapping)) = Self::first_on_one_socket(mappings, same_socket) {
+            anyhow::bail!(
+                "port mappings {earlier} and {mapping} claim the same host address and port"
+            );
+        }
+        Ok(())
+    }
+
     /// Parse port mapping from string: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO]
     ///
-    /// An IPv6 HOSTIP goes in brackets (`[::]:80:80`, `[::1]:8080:80/tcp`), because its
-    /// own colons would read as field separators. `host_ip` holds the address in its
-    /// canonical text form, without the brackets.
+    /// HOSTIP is an IP address, never a host name. An IPv6 one goes in brackets
+    /// (`[::]:80:80`, `[::1]:8080:80/tcp`), because its own colons would read as field
+    /// separators. `host_ip` holds the address in its canonical text form, without the
+    /// brackets.
     pub fn parse(s: &str) -> anyhow::Result<Self> {
         const GRAMMAR: &str =
             "expected [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], with an IPv6 HOSTIP in brackets";
@@ -243,6 +276,43 @@ mod tests {
             let mapping = PortMapping::parse(spec).unwrap();
             assert_eq!(mapping.to_string(), written, "{spec}");
             assert_eq!(PortMapping::parse(written).unwrap(), mapping, "{spec}");
+        }
+    }
+
+    /// One host address and port, for one protocol, goes to one guest port.
+    #[test]
+    fn two_mappings_cannot_claim_one_host_socket() {
+        let mappings = |specs: &[&str]| -> Vec<PortMapping> {
+            specs
+                .iter()
+                .map(|spec| PortMapping::parse(spec).unwrap())
+                .collect()
+        };
+        for specs in [
+            &["8080:80", "8443:443", "8080:443"][..],
+            &["[::]:80:80", "[::]:80:8080"][..],
+            &["127.0.0.1:53:53/udp", "127.0.0.1:53:5353/udp"][..],
+        ] {
+            let error = PortMapping::require_distinct_host_sockets(&mappings(specs))
+                .expect_err("one host socket is claimed twice")
+                .to_string();
+            let (first, last) = (
+                mappings(specs)[0].to_string(),
+                mappings(specs)[specs.len() - 1].to_string(),
+            );
+            assert!(
+                error.contains(&first) && error.contains(&last),
+                "{specs:?}: {error}"
+            );
+        }
+        // Another protocol, another port or another address is another socket.
+        for specs in [
+            &["8080:80", "8080:80/udp"][..],
+            &["8080:80", "8081:80"][..],
+            &["127.0.0.1:8080:80", "8080:80", "[::1]:8080:80"][..],
+        ] {
+            PortMapping::require_distinct_host_sockets(&mappings(specs))
+                .unwrap_or_else(|e| panic!("{specs:?}: {e}"));
         }
     }
 

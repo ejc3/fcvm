@@ -547,6 +547,15 @@ pub struct SnapshotRunArgs {
     #[arg(long)]
     pub vsock_dir: Option<String>,
 
+    /// Publish the clone's ports on these host addresses and ports instead of the
+    /// snapshot's. Grammar: [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or
+    /// repeated, as for `podman run --publish`. Each GUESTPORT/PROTO must be one the
+    /// snapshot published. Bridged networking listens on the clone's veth address
+    /// whatever HOSTIP says. Without this flag the clone inherits the snapshot's
+    /// mappings.
+    #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
+    pub publish: Vec<String>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
@@ -987,6 +996,35 @@ mod tests {
         ]);
         assert_eq!(run.publish, vec!["8080:80", "8443:443"]);
         assert_eq!(run.forward_localhost, vec![1421u16, 9099]);
+    }
+
+    /// Parse a `fcvm snapshot run` command line and return the SnapshotRunArgs.
+    fn parse_snapshot_run(extra: &[&str]) -> SnapshotRunArgs {
+        let mut argv = vec!["fcvm", "snapshot", "run", "--snapshot", "golden"];
+        argv.extend_from_slice(extra);
+        let cli = Cli::try_parse_from(argv).expect("CLI should parse");
+        let Commands::Snapshot(snapshot) = cli.cmd else {
+            panic!("expected snapshot command");
+        };
+        let SnapshotCommands::Run(run) = snapshot.cmd else {
+            panic!("expected `snapshot run` command");
+        };
+        run
+    }
+
+    #[test]
+    fn snapshot_run_publish_takes_the_podman_run_grammar() {
+        let run = parse_snapshot_run(&[
+            "--publish",
+            "[::]:80:80,[::]:443:443",
+            "--publish",
+            "127.0.0.1:8080:80/tcp",
+        ]);
+        assert_eq!(
+            run.publish,
+            vec!["[::]:80:80", "[::]:443:443", "127.0.0.1:8080:80/tcp"]
+        );
+        assert!(parse_snapshot_run(&[]).publish.is_empty());
     }
 
     #[test]
