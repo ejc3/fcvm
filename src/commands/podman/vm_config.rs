@@ -1227,7 +1227,7 @@ pub(crate) fn build_launch_config(
         health_check_url: args.health_check.clone(),
         user: args.user.clone(),
         forward_localhost: args.forward_localhost.clone(),
-        ipv6_prefix: args.ipv6_prefix.clone(),
+        ipv6_prefix: super::launch_ipv6_prefix(args),
         portable_volumes: args.portable_volumes,
         image_mode: super::resolve_image_mode(args),
         rootfs_type: super::resolve_rootfs_type(args),

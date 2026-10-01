@@ -401,7 +401,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --rootfs-size <SIZE>  Minimum free space on rootfs (default: 10G)
 --no-snapshot         Disable automatic snapshot creation
 --hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)
---ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE)
+--ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE; also read from FCVM_IPV6_PREFIX)
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.

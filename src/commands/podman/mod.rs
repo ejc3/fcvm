@@ -2861,6 +2861,18 @@ pub async fn cmd_podman_prepare(args: crate::cli::PrepareArgs) -> Result<()> {
     }
 }
 
+/// The IPv6 prefix a run's launch configuration carries: the run's own for routed
+/// networking, and none for the other modes, which never read it. The configuration feeds
+/// the snapshot key, and FCVM_IPV6_PREFIX puts a prefix on every run, so one that reached
+/// a rootless or bridged run would give the same VM a second key.
+pub(crate) fn launch_ipv6_prefix(args: &RunArgs) -> Option<String> {
+    use crate::cli::args::NetworkMode;
+    match args.network {
+        NetworkMode::Routed => args.ipv6_prefix.clone(),
+        NetworkMode::Bridged | NetworkMode::Rootless => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2978,6 +2990,31 @@ mod tests {
             key(&base, None),
             key(&base, Some("arm64.nv2".to_string())),
             "extra boot args must change the key"
+        );
+    }
+
+    /// Only routed networking reads the IPv6 prefix, and FCVM_IPV6_PREFIX puts one on every
+    /// run. A rootless or bridged run has to keep the key it has without a prefix, or
+    /// exporting the variable costs it the snapshot it already has.
+    #[test]
+    fn ipv6_prefix_changes_the_snapshot_key_of_a_routed_run_only() {
+        let key = |network: NetworkMode, prefix: Option<&str>| {
+            let mut args = test_args();
+            args.network = network;
+            args.ipv6_prefix = prefix.map(str::to_string);
+            key_for(&args, GuestBootInputs::default())
+        };
+        for network in [NetworkMode::Rootless, NetworkMode::Bridged] {
+            assert_eq!(
+                key(network, None),
+                key(network, Some("2001:db8:0:1")),
+                "{network:?} never reads the prefix"
+            );
+        }
+        assert_ne!(
+            key(NetworkMode::Routed, None),
+            key(NetworkMode::Routed, Some("2001:db8:0:1")),
+            "a routed guest's addresses come from the prefix"
         );
     }
 
