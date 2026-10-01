@@ -5,6 +5,7 @@
 //! request handling over vsock.
 
 use fuse_pipe::transport::HOST_CID;
+use fuse_pipe::MountSettings;
 
 /// Default number of FUSE reader threads for parallel I/O.
 ///
@@ -102,7 +103,9 @@ fn get_max_write() -> u32 {
     0
 }
 
-/// Check if writeback cache should be disabled.
+/// Check the VM-wide switch that mounts read-write volumes without the
+/// writeback cache. A read-only volume never gets that cache, whatever this
+/// returns (`MountSettings::for_volume`).
 /// Checks (in order):
 /// 1. FCVM_NO_WRITEBACK_CACHE environment variable (any value)
 /// 2. no_writeback_cache=1 kernel boot parameter (from /proc/cmdline)
@@ -135,14 +138,29 @@ fn no_writeback_cache_from_cmdline() -> bool {
 /// Works for both baseline VMs (same VolumeServer) and clones (new
 /// VolumeServer). For clones, FUSE TTL expiry during boot ensures fresh
 /// LOOKUPs that correctly resolve on the new server.
-pub fn mount_vsock_reconnectable(port: u32, mount_point: &str) -> anyhow::Result<()> {
+///
+/// `read_only` is the volume's own flag from the boot plan. Together with the
+/// VM-wide writeback switch it decides how the volume is mounted
+/// (`MountSettings::for_volume`): a read-only volume is mounted read-only and
+/// without the writeback cache, so the guest follows the host's files.
+pub fn mount_vsock_reconnectable(
+    port: u32,
+    mount_point: &str,
+    read_only: bool,
+) -> anyhow::Result<()> {
     let num_readers = get_num_readers();
     let trace_rate = get_trace_rate();
     let max_write = get_max_write();
-    let no_writeback_cache = no_writeback_cache_from_cmdline();
+    let settings = MountSettings::for_volume(read_only, no_writeback_cache_from_cmdline());
     eprintln!(
-        "[fc-agent] mounting FUSE volume at {} via vsock port {} (reconnectable, {} readers, trace_rate={}, max_write={}, no_writeback_cache={})",
-        mount_point, port, num_readers, trace_rate, max_write, no_writeback_cache
+        "[fc-agent] mounting FUSE volume at {} via vsock port {} (reconnectable, {} readers, trace_rate={}, max_write={}, read_only={}, writeback_cache={})",
+        mount_point,
+        port,
+        num_readers,
+        trace_rate,
+        max_write,
+        settings.read_only(),
+        settings.writeback_cache()
     );
     fuse_pipe::mount_vsock_with_reconnect(
         HOST_CID,
@@ -151,6 +169,6 @@ pub fn mount_vsock_reconnectable(port: u32, mount_point: &str) -> anyhow::Result
         num_readers,
         trace_rate,
         max_write,
-        no_writeback_cache,
+        settings,
     )
 }

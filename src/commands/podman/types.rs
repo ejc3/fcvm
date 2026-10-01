@@ -1,5 +1,5 @@
 use anyhow::{bail, Result};
-use std::path::PathBuf;
+use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -307,5 +307,235 @@ impl VolumeMapping {
             guest_path,
             read_only,
         })
+    }
+}
+
+/// The guest path of a `HOST:GUEST[:ro]` disk or NFS spec, when it has one.
+fn guest_path_of_spec(spec: &str) -> Option<&str> {
+    spec.strip_suffix(":ro")
+        .unwrap_or(spec)
+        .split_once(':')
+        .map(|(_, guest)| guest)
+}
+
+/// Every guest path fc-agent mounts something at for this run, each with the
+/// argument that asked for it.
+pub(crate) fn guest_mount_points(args: &RunArgs, maps: &[VolumeMapping]) -> Vec<(String, String)> {
+    let maps = args
+        .map
+        .iter()
+        .zip(maps)
+        .map(|(spec, map)| (format!("--map {spec}"), map.guest_path.clone()));
+    let others = [
+        ("--disk", &args.disk),
+        ("--disk-dir", &args.disk_dir),
+        ("--nfs", &args.nfs),
+    ]
+    .into_iter()
+    .flat_map(|(flag, specs)| {
+        specs.iter().filter_map(move |spec| {
+            Some((
+                format!("{flag} {spec}"),
+                guest_path_of_spec(spec)?.to_string(),
+            ))
+        })
+    });
+    maps.chain(others).collect()
+}
+
+/// Refuse a mount point that fc-agent would have to create inside a read-only
+/// map.
+///
+/// fc-agent mounts a read-only map read-only, so a mount point that lies
+/// inside one cannot be created in the guest: it has to be a directory of the
+/// map's host directory already. The innermost map around a mount point is the
+/// filesystem the mount point is created in, so that is the one checked.
+///
+/// A symlink on the way is left to the guest, which resolves it in its own
+/// namespace.
+pub(crate) fn check_mount_points_inside_read_only_maps(
+    maps: &[VolumeMapping],
+    mount_points: &[(String, String)],
+) -> Result<()> {
+    for (argument, guest_path) in mount_points {
+        let guest_path = Path::new(guest_path);
+        let enclosing = maps
+            .iter()
+            .filter(|map| {
+                let outer = Path::new(&map.guest_path);
+                guest_path != outer && guest_path.starts_with(outer)
+            })
+            .max_by_key(|map| Path::new(&map.guest_path).components().count());
+        let Some(outer) = enclosing.filter(|map| map.read_only) else {
+            continue;
+        };
+        let inside = guest_path
+            .strip_prefix(&outer.guest_path)
+            .expect("the map's guest path is a prefix of the mount point");
+        let mut on_host = outer.host_path.clone();
+        for component in inside.components() {
+            let Component::Normal(name) = component else {
+                break;
+            };
+            on_host.push(name);
+            let found = std::fs::symlink_metadata(&on_host);
+            match &found {
+                Ok(meta) if meta.is_dir() => continue,
+                Ok(meta) if meta.file_type().is_symlink() => break,
+                _ => {}
+            }
+            let detail = found.err().map(|e| format!(" ({e})")).unwrap_or_default();
+            bail!(
+                "{argument}: {} is inside the read-only map --map {}:{}:ro, which is mounted \
+                 read-only in the guest, so the mount point cannot be created there, and {} is \
+                 not a directory on the host{detail}. Create that directory on the host, or map \
+                 {} without :ro.",
+                guest_path.display(),
+                outer.host_path.display(),
+                outer.guest_path,
+                on_host.display(),
+                outer.guest_path
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn map(host: &Path, guest: &str, read_only: bool) -> VolumeMapping {
+        VolumeMapping {
+            host_path: host.to_path_buf(),
+            guest_path: guest.to_string(),
+            read_only,
+        }
+    }
+
+    fn mount_point(argument: &str, guest: &str) -> (String, String) {
+        (argument.to_string(), guest.to_string())
+    }
+
+    /// A map inside a read-only map whose mount point the host directory does
+    /// not have fails before boot, and the error names both maps and the
+    /// directory to create. With that directory on the host the same maps pass.
+    ///
+    /// RED BEFORE THE FIX: nothing was checked. The VM booted and fc-agent
+    /// created the mount point on the host through the outer map, which the
+    /// guest had mounted read-write.
+    #[test]
+    fn a_mount_point_missing_from_a_read_only_map_fails_and_names_both_maps() {
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+        let maps = [
+            map(outer.path(), "/data", true),
+            map(inner.path(), "/data/cache", false),
+        ];
+        let mount_points = [
+            mount_point("--map outer:/data:ro", "/data"),
+            mount_point("--map inner:/data/cache", "/data/cache"),
+        ];
+
+        let error = check_mount_points_inside_read_only_maps(&maps, &mount_points)
+            .expect_err("a mount point the read-only outer map does not have was accepted")
+            .to_string();
+        let missing = outer.path().join("cache");
+        for named in [
+            "--map inner:/data/cache".to_string(),
+            format!("--map {}:/data:ro", outer.path().display()),
+            missing.display().to_string(),
+        ] {
+            assert!(
+                error.contains(&named),
+                "the error does not name {named}: {error}"
+            );
+        }
+
+        std::fs::create_dir(&missing).unwrap();
+        check_mount_points_inside_read_only_maps(&maps, &mount_points)
+            .expect("the mount point is a directory of the outer map's host directory");
+    }
+
+    /// What decides: the innermost map around the mount point, whether that
+    /// map is read-only, and what its host directory has at the mount point.
+    #[test]
+    fn only_a_read_only_innermost_map_needs_the_mount_point_on_the_host() {
+        let outer = tempfile::tempdir().unwrap();
+        let middle = tempfile::tempdir().unwrap();
+        std::fs::create_dir(outer.path().join("middle")).unwrap();
+        std::fs::write(outer.path().join("file"), "not a directory").unwrap();
+        std::os::unix::fs::symlink("/somewhere/in/the/guest", outer.path().join("link")).unwrap();
+
+        let read_only = [map(outer.path(), "/a", true)];
+        let read_write = [map(outer.path(), "/a", false)];
+        let nested = [
+            map(outer.path(), "/a", true),
+            map(middle.path(), "/a/middle", false),
+        ];
+
+        let (read_only, read_write, nested) = (
+            read_only.as_slice(),
+            read_write.as_slice(),
+            nested.as_slice(),
+        );
+        // (maps, mount point, whether the run is refused)
+        let cases: Vec<(&[VolumeMapping], (String, String), bool)> = vec![
+            // A read-write outer map: fc-agent creates the mount point through it.
+            (read_write, mount_point("--map x:/a/new", "/a/new"), false),
+            // Compared by path component: /ab is not inside /a.
+            (read_only, mount_point("--map x:/ab", "/ab"), false),
+            // A map is not inside itself.
+            (read_only, mount_point("--map x:/a:ro", "/a"), false),
+            // Disks and NFS shares are mounted by fc-agent too.
+            (
+                read_only,
+                mount_point("--disk-dir x:/a/disk", "/a/disk"),
+                true,
+            ),
+            (
+                read_only,
+                mount_point("--nfs x:/a/middle", "/a/middle"),
+                false,
+            ),
+            // The parent is missing as well.
+            (
+                read_only,
+                mount_point("--map x:/a/new/deep", "/a/new/deep"),
+                true,
+            ),
+            // Something other than a directory is in the way.
+            (read_only, mount_point("--map x:/a/file", "/a/file"), true),
+            // The guest resolves a symlink in its own namespace.
+            (
+                read_only,
+                mount_point("--map x:/a/link/sub", "/a/link/sub"),
+                false,
+            ),
+            // The innermost map is read-write, so its mount point is created in it.
+            (
+                nested,
+                mount_point("--map x:/a/middle/new", "/a/middle/new"),
+                false,
+            ),
+        ];
+        for (maps, point, refused) in cases {
+            let result =
+                check_mount_points_inside_read_only_maps(maps, std::slice::from_ref(&point));
+            assert_eq!(
+                result.is_err(),
+                refused,
+                "{} with {} map(s): {result:?}",
+                point.0,
+                maps.len()
+            );
+            if let Err(error) = result {
+                assert!(
+                    error.to_string().starts_with(&point.0),
+                    "the error does not start with the argument {}: {error}",
+                    point.0
+                );
+            }
+        }
     }
 }

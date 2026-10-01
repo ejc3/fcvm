@@ -15,72 +15,115 @@ fn is_fuse_mounted(path: &str) -> bool {
     })
 }
 
+/// Whether `inner` lies inside `outer`, compared path component by component.
+fn is_inside(inner: &str, outer: &str) -> bool {
+    let (inner, outer) = (std::path::Path::new(inner), std::path::Path::new(outer));
+    inner != outer && inner.starts_with(outer)
+}
+
+/// The order to mount `volumes` in: groups of indexes into `volumes`, each
+/// group mounted and ready before the next one starts.
+///
+/// A volume whose guest path lies inside another volume's comes in a later
+/// group than that volume. Its mount point is a directory of the outer
+/// volume, so the outer one has to be mounted first: mounted second, it would
+/// cover the inner mount. Volumes in one group do not contain each other and
+/// are mounted together.
+fn mount_levels(volumes: &[VolumeMount]) -> Vec<Vec<usize>> {
+    let mut levels: Vec<Vec<usize>> = Vec::new();
+    for (index, volume) in volumes.iter().enumerate() {
+        let depth = volumes
+            .iter()
+            .filter(|outer| is_inside(&volume.guest_path, &outer.guest_path))
+            .count();
+        if levels.len() <= depth {
+            levels.resize_with(depth + 1, Vec::new);
+        }
+        levels[depth].push(index);
+    }
+    levels.retain(|level| !level.is_empty());
+    levels
+}
+
 /// Mount FUSE volumes from host via vsock. Returns list of mounted paths.
 ///
 /// Uses reconnectable mounts: when vsock connections die (e.g., after
 /// snapshot), the multiplexer automatically reconnects and re-sends
 /// pending requests. The kernel FUSE session stays alive — no remount needed.
+///
+/// A read-only volume is mounted read-only, so a mount point inside one cannot
+/// be created here. fcvm refuses such a plan before it boots the VM unless the
+/// mount point is already a directory of that volume
+/// (check_mount_points_inside_read_only_maps).
 pub fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
     let mut mounted_paths = Vec::new();
 
-    for vol in volumes {
-        eprintln!(
-            "[fc-agent] mounting FUSE volume at {} via vsock port {}",
-            vol.guest_path, vol.vsock_port
-        );
+    for level in mount_levels(volumes) {
+        for &index in &level {
+            let vol = &volumes[index];
+            eprintln!(
+                "[fc-agent] mounting FUSE volume at {} via vsock port {}",
+                vol.guest_path, vol.vsock_port
+            );
 
-        let mount_path = std::path::Path::new(&vol.guest_path);
-        if mount_path.exists() {
-            eprintln!("[fc-agent] mount point exists, attempting to unmount stale mount...");
-            let _ = std::process::Command::new("umount")
-                .arg("-l")
-                .arg(&vol.guest_path)
-                .output();
+            let mount_path = std::path::Path::new(&vol.guest_path);
+            if mount_path.exists() {
+                eprintln!("[fc-agent] mount point exists, attempting to unmount stale mount...");
+                let _ = std::process::Command::new("umount")
+                    .arg("-l")
+                    .arg(&vol.guest_path)
+                    .output();
+            }
+
+            if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
+                if e.kind() != std::io::ErrorKind::AlreadyExists {
+                    return Err(e)
+                        .with_context(|| format!("creating mount point: {}", vol.guest_path));
+                }
+            }
+
+            let path = vol.guest_path.clone();
+            let port = vol.vsock_port;
+            let read_only = vol.read_only;
+
+            thread::spawn(move || {
+                eprintln!("[fc-agent] fuse: starting reconnectable mount at {}", path);
+                if let Err(e) = crate::fuse::mount_vsock_reconnectable(port, &path, read_only) {
+                    eprintln!("[fc-agent] FUSE mount error at {}: {}", path, e);
+                }
+                eprintln!("[fc-agent] fuse: mount at {} exited", path);
+            });
+
+            mounted_paths.push(vol.guest_path.clone());
         }
 
-        if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {
-            if e.kind() != std::io::ErrorKind::AlreadyExists {
-                return Err(e).with_context(|| format!("creating mount point: {}", vol.guest_path));
+        // Wait for each FUSE mount of this group to become accessible (up to
+        // 30s per mount) before the next group creates its mount points
+        // inside them.
+        for &index in &level {
+            let vol = &volumes[index];
+            let path = std::path::Path::new(&vol.guest_path);
+            let mut ready = false;
+            for attempt in 1..=60 {
+                // Check both read_dir (mount is functional) AND mountinfo (mount is FUSE,
+                // not just an empty directory after a failed mount attempt)
+                if is_fuse_mounted(&vol.guest_path) && std::fs::read_dir(path).is_ok() {
+                    eprintln!(
+                        "[fc-agent] mount {} ready ({}ms)",
+                        vol.guest_path,
+                        (attempt - 1) * 500
+                    );
+                    ready = true;
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-        }
-
-        let path = vol.guest_path.clone();
-        let port = vol.vsock_port;
-
-        thread::spawn(move || {
-            eprintln!("[fc-agent] fuse: starting reconnectable mount at {}", path);
-            if let Err(e) = crate::fuse::mount_vsock_reconnectable(port, &path) {
-                eprintln!("[fc-agent] FUSE mount error at {}: {}", path, e);
+            if !ready {
+                return Err(anyhow::anyhow!(
+                    "mount {} not accessible after 30s",
+                    vol.guest_path
+                ));
             }
-            eprintln!("[fc-agent] fuse: mount at {} exited", path);
-        });
-
-        mounted_paths.push(vol.guest_path.clone());
-    }
-
-    // Wait for each FUSE mount to become accessible (up to 30s per mount)
-    for vol in volumes {
-        let path = std::path::Path::new(&vol.guest_path);
-        let mut ready = false;
-        for attempt in 1..=60 {
-            // Check both read_dir (mount is functional) AND mountinfo (mount is FUSE,
-            // not just an empty directory after a failed mount attempt)
-            if is_fuse_mounted(&vol.guest_path) && std::fs::read_dir(path).is_ok() {
-                eprintln!(
-                    "[fc-agent] mount {} ready ({}ms)",
-                    vol.guest_path,
-                    (attempt - 1) * 500
-                );
-                ready = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-        if !ready {
-            return Err(anyhow::anyhow!(
-                "mount {} not accessible after 30s",
-                vol.guest_path
-            ));
         }
     }
 
@@ -267,6 +310,53 @@ pub fn unmount_disks(paths: &[String]) {
             Err(e) => {
                 eprintln!("[fc-agent] umount {} error: {}", path, e);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn volumes(guest_paths: &[&str]) -> Vec<VolumeMount> {
+        guest_paths
+            .iter()
+            .enumerate()
+            .map(|(index, guest_path)| VolumeMount {
+                guest_path: guest_path.to_string(),
+                vsock_port: 5000 + index as u32,
+                read_only: false,
+            })
+            .collect()
+    }
+
+    /// The outer volume is mounted, and ready, before a volume inside it,
+    /// whatever order the plan lists them in.
+    ///
+    /// RED BEFORE THE FIX: every volume was started at once in plan order.
+    /// Which of two nested mounts landed first was a race between their
+    /// threads, and when the outer one landed second it covered the inner one.
+    #[test]
+    fn a_volume_inside_another_is_mounted_after_it() {
+        let cases: Vec<(Vec<&str>, Vec<Vec<usize>>)> = vec![
+            (vec!["/a", "/b"], vec![vec![0, 1]]),
+            (vec!["/a", "/a/b"], vec![vec![0], vec![1]]),
+            (vec!["/a/b", "/a"], vec![vec![1], vec![0]]),
+            (
+                vec!["/a/b/c", "/x", "/a/b", "/a"],
+                vec![vec![1, 3], vec![2], vec![0]],
+            ),
+            // Compared by path component: /ab is not inside /a, and a trailing
+            // slash changes nothing.
+            (vec!["/a", "/ab"], vec![vec![0, 1]]),
+            (vec!["/a/b/", "/a/"], vec![vec![1], vec![0]]),
+        ];
+        for (guest_paths, want) in cases {
+            assert_eq!(
+                mount_levels(&volumes(&guest_paths)),
+                want,
+                "the groups {guest_paths:?} are mounted in"
+            );
         }
     }
 }

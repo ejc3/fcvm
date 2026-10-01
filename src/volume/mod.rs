@@ -116,8 +116,11 @@ impl VolumeServer {
         // Create fuse-pipe's passthrough filesystem
         let fs = fuse_pipe::PassthroughFs::new(&self.host_path);
 
-        // Note: read_only enforcement is handled at the PassthroughFs level
-        // TODO: Add read_only support to PassthroughFs if needed
+        // read_only is not enforced here: this server accepts writes on every
+        // volume. fc-agent mounts a read-only volume read-only, so the guest
+        // kernel refuses a write before it becomes a request. A guest that
+        // remounts the volume read-write can still write to the host
+        // directory (#1042).
 
         let serve_err = || {
             format!(

@@ -2228,7 +2228,15 @@ After changing the config, run `fcvm setup` to rebuild the rootfs with the new S
 
 ### FUSE Volume Cache Coherency
 
-`--map` volumes use FUSE-over-vsock with `WRITEBACK_CACHE` and `AUTO_INVAL_DATA`. When a host process modifies a file in a mapped directory, the guest sees the change on its next read — but only after the kernel detects the mtime change (up to ~1 second granularity). Writes within the same second may not be visible immediately.
+`--map` volumes are FUSE over vsock with `AUTO_INVAL_DATA`. Nothing tells the guest that the host changed a file. The guest finds out when it asks the server again, which it does once its 1 second attribute and entry timeouts have run out. What it does with the answer depends on how the map is mounted.
+
+**Read-only maps (`--map HOST:GUEST:ro`)** are mounted read-only in the guest and without `FUSE_WRITEBACK_CACHE`. `/proc/self/mountinfo` in the guest shows the mount as `ro`, and a write from the guest OS or from the container fails with EROFS. Without the writeback cache the guest takes the size and mtime the server reports and drops its cached pages when either changed. A file the host rewrites in place, longer or shorter, or replaces by rename is read whole, with its new size and mtime, after the attribute timeout. That holds in a running VM and in a clone restored from a snapshot taken before the host changed the file.
+
+The guest's kernel is what refuses the write. The host's VolumeServer does not check `read_only` and accepts writes on every volume, so a guest that remounts the volume read-write can write to the host directory (#1042).
+
+A mount point inside a read-only map (another `--map`, or a `--disk`, `--disk-dir` or `--nfs` whose guest path lies under it) cannot be created by the guest, so it has to be a directory of the map's host directory already. `fcvm podman run` fails before boot when it is not, and the error names both arguments. fc-agent mounts an outer map before a map inside it, whatever order the arguments are in.
+
+**Read-write maps** keep `FUSE_WRITEBACK_CACHE` unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`. With that cache the guest's kernel owns the size and mtime of a regular file it has cached and ignores the server's, because it may hold writes the server has not seen yet. The host must not change a file under a read-write map while a guest has it cached, unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`: a file the host rewrites longer is read cut off at the old length and keeps its old mtime, in the running VM and in clones restored from its snapshots (#1041).
 
 Directory changes (new files, deletions) are subject to the kernel's directory entry cache TTL. A new file created on the host may not appear in guest `readdir()` until the cache expires.
 
@@ -2242,7 +2250,9 @@ ARM64 FEAT_NV2 has architectural issues with cache coherency under double Stage 
 
 ### Snapshot + FUSE Volumes
 
-Snapshots are disabled when `--map` volumes are present because the FUSE-over-vsock connection state may not survive the pause/resume cycle cleanly. This means VMs with volume mounts always do a fresh boot. Block device mounts (`--disk`, `--disk-dir`) do not have this limitation.
+A snapshot of a VM with `--map` volumes holds the guest's FUSE mounts in its memory. A clone gets its own VolumeServers, and the guest's mounts reconnect to them over vsock without being mounted again. Each mount keeps the settings fc-agent made it with: read-only or read-write, with or without the writeback cache.
+
+A snapshot made by an fc-agent from before read-only maps were mounted read-only keeps read-write, writeback-cached mounts for them in every clone, until the snapshot is made again. The automatic snapshot cache does that by itself: its key covers the path of the fc-agent initrd, which is named after the hash of the fc-agent binary, so a new fc-agent never restores an older one's snapshot. A snapshot made with `fcvm snapshot create` or `fcvm podman prepare --tag` has to be made again by hand.
 
 ### Disk-Only Clone / Reboot Edge Cases
 

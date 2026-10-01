@@ -47,9 +47,80 @@ const SESSION_NEW_MAX_RETRIES: u32 = 5;
 /// Delay between Session::new retries.
 const SESSION_NEW_RETRY_DELAY: Duration = Duration::from_millis(50);
 
+/// How one FUSE mount is made: whether the kernel refuses writes, and whether
+/// the kernel or the server owns the size and mtime of a file it has cached.
+///
+/// [`MountSettings::for_volume`] is the only way to build one, so every mount
+/// this crate makes, over a Unix socket or over vsock, takes both settings
+/// from the same decision.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MountSettings {
+    read_only: bool,
+    writeback_cache: bool,
+}
+
+impl MountSettings {
+    /// The settings for a volume that is `read_only` or not, on a machine
+    /// whose `no_writeback_cache` switch is set or not.
+    ///
+    /// A read-only volume is mounted read-only and without the writeback
+    /// cache, whatever the switch says. With FUSE_WRITEBACK_CACHE the kernel
+    /// keeps the size and mtime it has cached for a regular file and drops the
+    /// ones the server sends, which is right only while this mount is the
+    /// file's one writer. A read-only mount writes nothing, so every change to
+    /// a file comes from the server's side, and the kernel sees it only by
+    /// taking the server's size and mtime.
+    ///
+    /// A read-write volume gets the writeback cache unless the switch turns
+    /// it off.
+    pub const fn for_volume(read_only: bool, no_writeback_cache: bool) -> Self {
+        Self {
+            read_only,
+            writeback_cache: !read_only && !no_writeback_cache,
+        }
+    }
+
+    /// Whether the filesystem is mounted with MS_RDONLY. The kernel then
+    /// refuses every write with EROFS before it reaches FUSE.
+    pub const fn read_only(self) -> bool {
+        self.read_only
+    }
+
+    /// Whether INIT asks the kernel for FUSE_WRITEBACK_CACHE.
+    pub const fn writeback_cache(self) -> bool {
+        self.writeback_cache
+    }
+
+    /// The mount options for these settings.
+    ///
+    /// - Suid: let SUID and SGID bits take effect (fusermount mounts nosuid
+    ///   by default). Needs root.
+    /// - Dev: allow device nodes (fusermount mounts nodev by default). Needs
+    ///   root.
+    /// - DefaultPermissions: the kernel does the POSIX permission checks
+    ///   (path traversal, owner and mode) before it sends an operation to
+    ///   FUSE. Without it a passthrough filesystem that resolves cached inodes
+    ///   would skip the parent directory's search permission.
+    /// - RO, for a read-only volume only.
+    fn mount_options(self) -> Vec<fuser::MountOption> {
+        let mut options = vec![
+            fuser::MountOption::FSName("fuse-pipe".to_string()),
+            fuser::MountOption::Suid,
+            fuser::MountOption::Dev,
+            fuser::MountOption::DefaultPermissions,
+        ];
+        if self.read_only {
+            options.push(fuser::MountOption::RO);
+        }
+        options
+    }
+}
+
 /// Configuration for FUSE mount.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct MountConfig {
+    /// What the mount may do, and who owns a cached file's size and mtime.
+    pub settings: MountSettings,
     /// Number of FUSE reader threads (default: 1).
     pub num_readers: usize,
     /// Trace every Nth request for telemetry (0 = disabled).
@@ -59,9 +130,10 @@ pub struct MountConfig {
 }
 
 impl MountConfig {
-    /// Create a new mount config with defaults (1 reader, no tracing).
-    pub fn new() -> Self {
+    /// Create a mount config with the given settings (1 reader, no tracing).
+    pub fn new(settings: MountSettings) -> Self {
         Self {
+            settings,
             num_readers: 1,
             trace_rate: 0,
             collector: None,
@@ -146,10 +218,11 @@ impl MountHandle {
 /// # Example
 ///
 /// ```ignore
-/// use fuse_pipe::{mount, MountConfig};
+/// use fuse_pipe::{mount, MountConfig, MountSettings};
 ///
-/// // Mount with 256 readers (blocks until Ctrl+C or fusermount -u)
-/// mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+/// // A read-write mount with 256 readers (blocks until Ctrl+C or fusermount -u)
+/// let settings = MountSettings::for_volume(false, false);
+/// mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new(settings).readers(256))?;
 /// ```
 pub fn mount<P: AsRef<Path>>(
     socket_path: &str,
@@ -159,6 +232,7 @@ pub fn mount<P: AsRef<Path>>(
     mount_internal(
         socket_path,
         mount_point,
+        config.settings,
         config.num_readers.max(1),
         config.trace_rate,
         config.collector,
@@ -174,9 +248,10 @@ pub fn mount<P: AsRef<Path>>(
 /// # Example
 ///
 /// ```ignore
-/// use fuse_pipe::{mount_spawn, MountConfig};
+/// use fuse_pipe::{mount_spawn, MountConfig, MountSettings};
 ///
-/// let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+/// let settings = MountSettings::for_volume(false, false);
+/// let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new(settings).readers(256))?;
 ///
 /// // Do work with the mounted filesystem...
 ///
@@ -190,6 +265,7 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
 ) -> anyhow::Result<MountHandle> {
     let (tx, rx) = std::sync::mpsc::channel();
     let socket_path = socket_path.to_string();
+    let settings = config.settings;
     let num_readers = config.num_readers.max(1);
     let trace_rate = config.trace_rate;
     let collector = config.collector;
@@ -201,6 +277,7 @@ pub fn mount_spawn<P: AsRef<Path> + Send + 'static>(
         mount_internal(
             &socket_path,
             mount_point,
+            settings,
             num_readers,
             trace_rate,
             collector,
@@ -285,10 +362,11 @@ fn force_unmount(path: &Path) {
     }
 }
 
-/// Internal mount implementation with optional unmounter channel.
+/// Connect to the server on a Unix socket and run the mount until it is unmounted.
 fn mount_internal<P: AsRef<Path>>(
     socket_path: &str,
     mount_point: P,
+    settings: MountSettings,
     num_readers: usize,
     trace_rate: u64,
     collector: Option<SpanCollector>,
@@ -306,111 +384,15 @@ fn mount_internal<P: AsRef<Path>>(
     let mux = Multiplexer::with_collector(socket, num_readers, trace_rate, collector)?;
     debug!(target: "fuse-pipe::client", num_readers, "multiplexer started");
 
-    // Mount options:
-    // - AllowOther: Allow non-root users to access the mount (requires user_allow_other in /etc/fuse.conf or running as root)
-    // - Suid: Allow SUID/SGID bits to take effect (fusermount uses nosuid by default). Requires root.
-    // - Dev: Allow device nodes (fusermount uses nodev by default). Requires root.
-    // - DefaultPermissions: Let the kernel perform standard POSIX permission checks (path traversal,
-    //   owner/mode checks) before sending operations to FUSE. This is required for correct behavior
-    //   like "can't access file if parent dir has no search permission". Without this, a passthrough
-    //   fs using cached inodes would bypass parent directory permission checks.
-    //
-    // Note: We intentionally do NOT use DefaultPermissions because it causes ftruncate on
-    // already-opened file handles to fail with EACCES if the file mode is restrictive. The
-    // kernel with DefaultPermissions checks inode permissions before sending SETATTR to FUSE,
-    // but ftruncate on a valid fd should use the fd's access rights, not the current file mode.
-    //
-    // Instead, we rely on set_creds() in fuse-backend-rs to switch to the caller's uid/gid
-    // before filesystem operations. This ensures:
-    // - Path traversal checks work (lookup calls openat which checks parent dir permissions)
-    // - File operations use caller's credentials
-    // - fd-based operations (ftruncate on open handle) work correctly
-    //
-    // default_permissions: Let the kernel check basic file permissions (rwx) before
-    // calling FUSE. This handles parent directory permission checking correctly and
-    // reduces round-trips to the FUSE server for operations that would fail anyway.
-    // Build mount options.
-    let options = vec![
-        fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::Suid,
-        fuser::MountOption::Dev,
-        fuser::MountOption::DefaultPermissions,
-    ];
-
-    // AllowOther (SessionACL::All) lets other users access the mount. It's needed when:
-    // - Tests switch to different uids (pjdfstest)
-    // - Multiple users need to access the filesystem
-    // Root can always use it; non-root needs user_allow_other in /etc/fuse.conf
-    let is_root = unsafe { libc::geteuid() } == 0;
-    let fuse_conf_allows = std::fs::read_to_string("/etc/fuse.conf")
-        .map(|s| fuse_conf_allows_other(&s))
-        .unwrap_or(false);
-
-    let acl = if is_root || fuse_conf_allows {
-        debug!(target: "fuse-pipe::client", is_root, fuse_conf_allows, "using SessionACL::All (allow_other)");
-        fuser::SessionACL::All
-    } else {
-        debug!(target: "fuse-pipe::client", "using SessionACL::Owner (not root and user_allow_other not in /etc/fuse.conf)");
-        fuser::SessionACL::Owner
-    };
-    info!(target: "fuse-pipe::client", ?options, "using mount options");
-    let mut config = fuser::Config::default();
-    config.mount_options = options;
-    config.acl = acl;
-    // Use fuser's built-in multi-threading with clone_fd for true parallel request processing
-    config.n_threads = Some(num_readers);
-    config.clone_fd = true; // Opt-in to FUSE_DEV_IOC_CLONE for parallel requests
-
-    // Shared flag set by FuseClient::destroy() when kernel sends FUSE_DESTROY.
-    let destroyed = Arc::new(AtomicBool::new(false));
-
-    // Retry Session::new if kernel hasn't released resources from previous mount
-    let mut session = None;
-    let mut last_error = None;
-    for attempt in 0..=SESSION_NEW_MAX_RETRIES {
-        // Note: We need to clone fs for each attempt since Session::new consumes it on failure
-        let fs_attempt = FuseClient::with_destroyed_flag(Arc::clone(&mux), Arc::clone(&destroyed));
-        match fuser::Session::new(fs_attempt, mount_point.as_ref(), &config) {
-            Ok(s) => {
-                if attempt > 0 {
-                    info!(target: "fuse-pipe::client", attempt, "Session::new succeeded after retry");
-                }
-                session = Some(s);
-                break;
-            }
-            Err(e) => {
-                if attempt < SESSION_NEW_MAX_RETRIES {
-                    debug!(target: "fuse-pipe::client", attempt, max_retries = SESSION_NEW_MAX_RETRIES, error = %e, "Session::new failed, retrying");
-                    thread::sleep(SESSION_NEW_RETRY_DELAY);
-                }
-                last_error = Some(e);
-            }
-        }
-    }
-    let mut session = session.ok_or_else(|| last_error.unwrap())?;
-    info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, "mounted");
-
-    // Send unmounter before blocking on run()
-    if let Some(tx) = unmounter_tx {
-        let _ = tx.send(session.unmount_callable());
-    }
-
-    debug!(target: "fuse-pipe::client", num_readers, "FUSE session starting with n_threads");
-    // spawn() handles all threading internally with clone_fd, join() waits for completion
-    let bg_session = session.spawn()?;
-    let join_result = bg_session.join();
-
-    if let Err(e) = join_result {
-        let destroyed_flag = destroyed.load(Ordering::SeqCst);
-        if destroyed_flag {
-            debug!(target: "fuse-pipe::client", "FUSE session exited (clean shutdown)");
-        } else {
-            error!(target: "fuse-pipe::client", error = %e, "FUSE session error");
-        }
-    }
-
-    debug!(target: "fuse-pipe::client", "FUSE session exited");
-    Ok(())
+    mount_fuse_session(
+        mux,
+        mount_point,
+        num_readers,
+        0,
+        settings,
+        "unix",
+        unmounter_tx,
+    )
 }
 
 /// Mount a FUSE filesystem using a vsock connection.
@@ -423,19 +405,27 @@ fn mount_internal<P: AsRef<Path>>(
 /// * `cid` - The context ID (use `HOST_CID` to connect to host from guest)
 /// * `port` - The vsock port number
 /// * `mount_point` - Directory where the FUSE filesystem will be mounted
+/// * `settings` - How the mount is made (see [`MountSettings::for_volume`])
 ///
 /// # Example
 ///
 /// ```rust,ignore
 /// use fuse_pipe::client::mount_vsock;
 /// use fuse_pipe::transport::HOST_CID;
+/// use fuse_pipe::MountSettings;
 ///
 /// // Connect from guest to host on port 5000
-/// mount_vsock(HOST_CID, 5000, "/mnt/volume")?;
+/// let settings = MountSettings::for_volume(false, false);
+/// mount_vsock(HOST_CID, 5000, "/mnt/volume", settings)?;
 /// ```
 #[cfg(target_os = "linux")]
-pub fn mount_vsock<P: AsRef<Path>>(cid: u32, port: u32, mount_point: P) -> anyhow::Result<()> {
-    mount_vsock_with_options(cid, port, mount_point, 1, 0, 0, false)
+pub fn mount_vsock<P: AsRef<Path>>(
+    cid: u32,
+    port: u32,
+    mount_point: P,
+    settings: MountSettings,
+) -> anyhow::Result<()> {
+    mount_vsock_with_options(cid, port, mount_point, 1, 0, 0, settings)
 }
 
 /// Mount a FUSE filesystem via vsock with transparent reconnection.
@@ -455,7 +445,7 @@ pub fn mount_vsock_with_reconnect<P: AsRef<Path>>(
     num_readers: usize,
     trace_rate: u64,
     max_write: u32,
-    no_writeback_cache: bool,
+    settings: MountSettings,
 ) -> anyhow::Result<()> {
     info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock (reconnectable)");
 
@@ -492,8 +482,9 @@ pub fn mount_vsock_with_reconnect<P: AsRef<Path>>(
         mount_point,
         num_readers,
         max_write,
-        no_writeback_cache,
+        settings,
         "reconnectable",
+        None,
     )
 }
 
@@ -504,8 +495,9 @@ pub fn mount_vsock_with_readers<P: AsRef<Path>>(
     port: u32,
     mount_point: P,
     num_readers: usize,
+    settings: MountSettings,
 ) -> anyhow::Result<()> {
-    mount_vsock_with_options(cid, port, mount_point, num_readers, 0, 0, false)
+    mount_vsock_with_options(cid, port, mount_point, num_readers, 0, 0, settings)
 }
 
 /// Mount a FUSE filesystem via vsock with full configuration.
@@ -518,7 +510,7 @@ pub fn mount_vsock_with_readers<P: AsRef<Path>>(
 /// * `num_readers` - Number of FUSE reader threads (1-8 recommended)
 /// * `trace_rate` - Trace every Nth request (0 = disabled)
 /// * `max_write` - Maximum write size in bytes (0 = unbounded, use kernel default)
-/// * `no_writeback_cache` - Disable FUSE writeback cache (for ctime accuracy)
+/// * `settings` - How the mount is made (see [`MountSettings::for_volume`])
 #[cfg(target_os = "linux")]
 pub fn mount_vsock_with_options<P: AsRef<Path>>(
     cid: u32,
@@ -527,7 +519,7 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
     num_readers: usize,
     trace_rate: u64,
     max_write: u32,
-    no_writeback_cache: bool,
+    settings: MountSettings,
 ) -> anyhow::Result<()> {
     info!(target: "fuse-pipe::client", cid, port, num_readers, "connecting via vsock");
 
@@ -556,26 +548,25 @@ pub fn mount_vsock_with_options<P: AsRef<Path>>(
         mount_point,
         num_readers,
         max_write,
-        no_writeback_cache,
+        settings,
         "vsock",
+        None,
     )
 }
 
-/// Shared FUSE session setup: configure mount options, create session, run until unmount.
+/// Shared FUSE session setup for every transport: mount with `settings`, create
+/// the session, run until unmount. `unmounter_tx`, when given, receives the
+/// handle that unmounts the session.
 fn mount_fuse_session<P: AsRef<Path>>(
     mux: Arc<Multiplexer>,
     mount_point: P,
     num_readers: usize,
     max_write: u32,
-    no_writeback_cache: bool,
+    settings: MountSettings,
     mode_label: &str,
+    unmounter_tx: Option<std::sync::mpsc::Sender<SessionUnmounter>>,
 ) -> anyhow::Result<()> {
-    let options = vec![
-        fuser::MountOption::FSName("fuse-pipe".to_string()),
-        fuser::MountOption::Suid,
-        fuser::MountOption::Dev,
-        fuser::MountOption::DefaultPermissions,
-    ];
+    let options = settings.mount_options();
 
     // AllowOther (SessionACL::All) lets other users access the mount. It's needed when:
     // - Tests switch to different uids (pjdfstest)
@@ -593,6 +584,7 @@ fn mount_fuse_session<P: AsRef<Path>>(
         debug!(target: "fuse-pipe::client", "using SessionACL::Owner (not root and user_allow_other not in /etc/fuse.conf)");
         fuser::SessionACL::Owner
     };
+    info!(target: "fuse-pipe::client", ?options, ?settings, "using mount options");
     let mut config = fuser::Config::default();
     config.mount_options = options;
     config.acl = acl;
@@ -607,11 +599,12 @@ fn mount_fuse_session<P: AsRef<Path>>(
     let mut session = None;
     let mut last_error = None;
     for attempt in 0..=SESSION_NEW_MAX_RETRIES {
+        // Session::new consumes the client, so each attempt gets its own.
         let fs = FuseClient::with_options(
             Arc::clone(&mux),
             Arc::clone(&destroyed),
             max_write,
-            no_writeback_cache,
+            settings,
         );
         match fuser::Session::new(fs, mount_point.as_ref(), &config) {
             Ok(s) => {
@@ -630,8 +623,13 @@ fn mount_fuse_session<P: AsRef<Path>>(
             }
         }
     }
-    let session = session.ok_or_else(|| last_error.unwrap())?;
+    let mut session = session.ok_or_else(|| last_error.unwrap())?;
     info!(target: "fuse-pipe::client", mount_point = ?mount_point.as_ref(), num_readers, mode_label, "mounted");
+
+    // Send unmounter before blocking on run()
+    if let Some(tx) = unmounter_tx {
+        let _ = tx.send(session.unmount_callable());
+    }
 
     // spawn() handles all threading internally with clone_fd, join() waits for completion
     let bg_session = session.spawn()?;
@@ -650,7 +648,7 @@ fn mount_fuse_session<P: AsRef<Path>>(
 
 #[cfg(test)]
 mod tests {
-    use super::fuse_conf_allows_other;
+    use super::{fuse_conf_allows_other, MountSettings};
 
     /// The fresh-box quickstart tells a reader to add user_allow_other to
     /// /etc/fuse.conf when a grep says it is absent, and names `make
@@ -737,5 +735,58 @@ mod tests {
                 },
             );
         }
+    }
+
+    /// The whole decision, row by row: a volume's own read-only flag and the
+    /// VM-wide writeback switch on the left, what the mount gets on the right.
+    ///
+    /// RED BEFORE THE FIX: only the VM-wide switch decided, so a read-only
+    /// volume was mounted read-write with the writeback cache. The two
+    /// read-only rows failed; the assertion reports the first.
+    #[test]
+    fn a_read_only_volume_is_mounted_read_only_and_without_the_writeback_cache() {
+        // (volume read_only, VM-wide no_writeback_cache) -> (read-only mount, writeback cache)
+        let table = [
+            ((false, false), (false, true)),
+            ((false, true), (false, false)),
+            ((true, false), (true, false)),
+            ((true, true), (true, false)),
+        ];
+        for ((read_only, no_writeback_cache), want) in table {
+            let settings = MountSettings::for_volume(read_only, no_writeback_cache);
+            assert_eq!(
+                (settings.read_only(), settings.writeback_cache()),
+                want,
+                "volume read_only={read_only}, VM-wide no_writeback_cache={no_writeback_cache}: \
+                 (read-only mount, writeback cache)"
+            );
+        }
+    }
+
+    /// A read-write volume is mounted with the options every volume had before
+    /// read-only volumes got their own, and a read-only volume adds `ro` to them.
+    #[test]
+    fn only_a_read_only_volume_adds_the_ro_mount_option() {
+        use fuser::MountOption::{DefaultPermissions, Dev, FSName, Suid, RO};
+        let read_write = vec![
+            FSName("fuse-pipe".to_string()),
+            Suid,
+            Dev,
+            DefaultPermissions,
+        ];
+        assert_eq!(
+            MountSettings::for_volume(false, false).mount_options(),
+            read_write
+        );
+        assert_eq!(
+            MountSettings::for_volume(false, true).mount_options(),
+            read_write
+        );
+        let mut read_only = read_write;
+        read_only.push(RO);
+        assert_eq!(
+            MountSettings::for_volume(true, false).mount_options(),
+            read_only
+        );
     }
 }

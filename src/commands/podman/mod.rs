@@ -1367,6 +1367,10 @@ async fn prepare_vm_for_lifecycle(
         .map(|s| VolumeMapping::parse(s))
         .collect::<Result<Vec<_>>>()
         .context("parsing volume mappings")?;
+    types::check_mount_points_inside_read_only_maps(
+        &volume_mappings,
+        &types::guest_mount_points(&args, &volume_mappings),
+    )?;
 
     if !volume_mappings.is_empty() {
         info!(
