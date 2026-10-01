@@ -278,8 +278,9 @@ pub struct RunArgs {
     /// shorthand (e.g. 2803:6084:7058:46f6). Each VM gets a unique address
     /// inside the subnet via NDP proxy. When set, MASQUERADE is skipped (the
     /// prefix is directly routable). When not set, a /64 is auto-detected
-    /// from host interfaces.
-    #[arg(long)]
+    /// from host interfaces. Also read from FCVM_IPV6_PREFIX, for a host whose
+    /// own addresses are not a routable /64: every routed run there needs it.
+    #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
@@ -916,6 +917,32 @@ mod tests {
         assert!(args.force);
         assert_eq!(args.run.image, "localhost/chromium-bench");
         assert_eq!(args.run.command_args, vec!["sh", "-c", "entry.sh"]);
+    }
+
+    /// --ipv6-prefix is bound to FCVM_IPV6_PREFIX on both commands that take it. The
+    /// binding is read off the command definition: this crate's tests do not set
+    /// variables in their own process (`test_env`).
+    #[test]
+    fn ipv6_prefix_is_bound_to_an_environment_variable() {
+        use clap::CommandFactory;
+        let cli = Cli::command();
+        let podman = cli
+            .find_subcommand("podman")
+            .expect("the podman command exists");
+        for name in ["run", "prepare"] {
+            let command = podman
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("podman {name} exists"));
+            let prefix = command
+                .get_arguments()
+                .find(|arg| arg.get_id() == "ipv6_prefix")
+                .unwrap_or_else(|| panic!("podman {name} takes --ipv6-prefix"));
+            assert_eq!(
+                prefix.get_env(),
+                Some(std::ffi::OsStr::new("FCVM_IPV6_PREFIX")),
+                "podman {name}"
+            );
+        }
     }
 
     #[test]

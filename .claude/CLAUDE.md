@@ -2344,6 +2344,7 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - Port forwarding via built-in TCP proxy (setns + tokio relay) on unique loopback IP (same allocation as rootless)
 - IPv4 stays internal to namespace (health checks only); all external traffic uses IPv6
 - Egress proxy is NOT used — IPv6 goes natively through the kernel stack
+- `--ipv6-prefix` is also read from `FCVM_IPV6_PREFIX`. On a host whose own addresses are not a routable /64, set it to the host's delegated subnet: the routed tests pass no prefix, so without it they stop at "routed mode preflight check failed" before a VM boots
 
 **Loopback IP Allocation** (`src/state/manager.rs`):
 - Sequential allocation: 127.0.0.2, 127.0.0.3, ..., 127.0.0.254, then 127.0.1.2, etc.
