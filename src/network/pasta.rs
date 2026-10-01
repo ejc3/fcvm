@@ -176,9 +176,30 @@ async fn run_probe_bounded(
     run_probe_until(command, tokio::time::sleep(budget), what).await
 }
 
+/// Kills a probe's process group when dropped, unless the probe ran to completion first.
+///
+/// The kill is in a guard, not in the branch that sees the expiry, because that branch does
+/// not run when the caller stops polling first. The readiness loop wraps each attempt in its
+/// own `tokio::time::timeout` of the same length, whose timer starts before the probe's and
+/// can fire one timer tick earlier, and a cancelled task drops the probe the same way.
+struct ProbeGroup(Option<i32>);
+
+impl Drop for ProbeGroup {
+    fn drop(&mut self) {
+        if let Some(pgid) = self.0 {
+            // SAFETY: pgid came from the probe's child, which leads its own group.
+            // Killing a group we created cannot reach an unrelated process: this
+            // guard is declared after the child handle, so it is dropped first, and
+            // the pid is not reused while the un-reaped child is held.
+            unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        }
+    }
+}
+
 /// [`run_probe_bounded`] with the expiry as a future: the probe runs until it exits or
 /// `abandon` completes, whichever comes first. A test passes the condition it waits for,
-/// so its child has no duration to beat.
+/// so its child has no duration to beat. Dropping the returned future abandons the probe
+/// too ([`ProbeGroup`]).
 async fn run_probe_until(
     mut command: Command,
     abandon: impl std::future::Future<Output = ()>,
@@ -195,7 +216,7 @@ async fn run_probe_until(
     let mut child = command
         .spawn()
         .with_context(|| format!("spawning {what}"))?;
-    let pgid = child.id().map(|id| id as i32);
+    let mut group = ProbeGroup(child.id().map(|id| id as i32));
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let wait = async {
@@ -217,16 +238,14 @@ async fn run_probe_until(
     tokio::select! {
         // The probe's own exit wins when both are ready, as with `tokio::time::timeout`.
         biased;
-        result = wait => result.with_context(|| format!("running {what}")),
-        () = abandon => {
-            // SAFETY: pgid came from this child, which leads its own group.
-            // Killing a group we created cannot reach an unrelated process:
-            // the pid is not reused while we hold the un-reaped child.
-            if let Some(pgid) = pgid {
-                unsafe { libc::killpg(pgid, libc::SIGKILL) };
+        result = wait => {
+            // The child has exited and been reaped, so its pid can be reused from here on.
+            if result.is_ok() {
+                group.0 = None;
             }
-            anyhow::bail!("{what} exceeded pasta's readiness deadline")
+            result.with_context(|| format!("running {what}"))
         }
+        () = abandon => anyhow::bail!("{what} exceeded pasta's readiness deadline"),
     }
 }
 
@@ -3586,25 +3605,80 @@ mod tests {
         // The grandchild wrote its pid before sleeping; it must now be gone.
         let pid = recorded_pid().expect("the pid file holds the grandchild's pid");
         let _ = std::fs::remove_file(&marker);
-
-        let mut alive = true;
-        for _ in 0..50 {
-            // SAFETY: signal 0 only tests for existence.
-            if unsafe { libc::kill(pid, 0) } != 0 {
-                alive = false;
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        if alive {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
-        }
         assert!(
-            !alive,
+            gone_within_a_second(pid).await,
             "grandchild {pid} survived the abandoned attempt. It ignores SIGTERM, so \
              only a process-group kill ends it; without one, every retry strands a \
              process holding the VM's network namespace."
         );
+    }
+
+    /// A probe that is dropped is killed as a group too. The readiness loop's own timeout
+    /// around an attempt drops the probe without its expiry branch ever running, and so does
+    /// a cancelled task. The expiry here never comes, so only the drop can end the child.
+    #[tokio::test]
+    async fn a_dropped_probe_kills_its_whole_process_group() {
+        let marker = std::env::temp_dir().join(format!("fcvm-probe-drop-{}", std::process::id()));
+        let _ = std::fs::remove_file(&marker);
+
+        let mut command = Command::new("bash");
+        command.args([
+            "-c",
+            &format!(
+                "trap '' TERM; sleep 300 & echo $! > {}; wait",
+                marker.display()
+            ),
+        ]);
+        let recorded_pid = || {
+            std::fs::read_to_string(&marker)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok())
+        };
+
+        // Poll the probe until the grandchild's pid is on disk, then drop it mid-flight.
+        // If the pid never appears, the panic drops the probe as well.
+        let mut probe = Box::pin(run_probe_until(
+            command,
+            std::future::pending(),
+            "a dropped probe",
+        ));
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            loop {
+                tokio::select! {
+                    biased;
+                    result = &mut probe => panic!("the probe ended by itself: {result:?}"),
+                    () = tokio::time::sleep(std::time::Duration::from_millis(5)) => {}
+                }
+                if let Some(pid) = recorded_pid() {
+                    break pid;
+                }
+            }
+        })
+        .await
+        .expect("bash records its child's pid well within 60 s");
+        drop(probe);
+        let _ = std::fs::remove_file(&marker);
+
+        assert!(
+            gone_within_a_second(pid).await,
+            "grandchild {pid} survived its probe being dropped. Nothing else kills it: \
+             the expiry branch never ran, and it ignores SIGTERM."
+        );
+    }
+
+    /// Whether `pid` stops existing within a second. A process still there is killed, so a
+    /// failing test leaves nothing behind.
+    async fn gone_within_a_second(pid: i32) -> bool {
+        for _ in 0..50 {
+            // SAFETY: signal 0 only tests for existence.
+            if unsafe { libc::kill(pid, 0) } != 0 {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        // SAFETY: the pid is the test's own grandchild, still alive.
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+        false
     }
 
     /// Any port; the scripted guest ignores it.
