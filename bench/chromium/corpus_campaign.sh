@@ -77,9 +77,35 @@ done
 # DIAG_ONLY=1 ends the campaign after golden, verify and diag: no measured
 # run, no analysis. For the throwaway golden round.
 DIAG_ONLY="${DIAG_ONLY:-0}"
+# MEASURE=scale replaces the serial reqbench run with the open-loop throughput
+# benchmark (make bench-chromium-scale) over the same corpus, inside the same
+# golden, verify and DNS-evidence bracket. Its rates, bursts, seed, gates and
+# control Chromium come from the caller's SCALE_* variables; the corpus URLs,
+# tag, memory-server mode and output directory come from this campaign. The
+# host control renders SCALE_CONTROL_URL (default: the corpus's first URL)
+# with every name mapped to this host's replay server.
+MEASURE="${MEASURE:-reqbench}"
+case "$MEASURE" in
+    reqbench) ;;
+    scale)
+        [ "${ENGINE:-chromium}" = chromium ] \
+            || { echo "BLOCKED: MEASURE=scale drives Chromium only (ENGINE=$ENGINE)" >&2; exit 2; }
+        [ "$BACKEND" = uffd ] \
+            || { echo "BLOCKED: MEASURE=scale pairs FILE and UFFD restores itself; BACKEND=$BACKEND has no meaning there" >&2; exit 2; }
+        ;;
+    *) echo "BLOCKED: MEASURE must be reqbench or scale (got '$MEASURE')" >&2; exit 2 ;;
+esac
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULTS="${RESULTS:-$REPO/bench/chromium/results/reqbench-$STAMP-corpus}"
 LOGDIR="${LOGDIR:-/tmp/corpus-campaign-$STAMP}"
+# The analysis the DNS evidence names its run from: the serial run's own, or
+# the scale run's first analysis (the one that may publish comes after the
+# evidence exists).
+if [ "$MEASURE" = scale ]; then
+    ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"
+else
+    ANALYSIS_JSON="$RESULTS/analysis.json"
+fi
 mkdir -p "$LOGDIR"
 # Created here, not left to reqbench: the replay server's logs and the resolver
 # evidence below are written into it before any reqbench phase runs.
@@ -484,6 +510,7 @@ write_dns_evidence() {
     # of this box names nothing; campaign_summary resolves each name beside
     # the record, and verify_file_sha256 is keyed by the same names.
     local verdict="$1" reason="${2:-}" owner_log="dns-owner.log"
+    local ANALYSIS_JSON="${ANALYSIS_JSON:-$RESULTS/analysis.json}"
     local log="$RESULTS/$owner_log" out="$RESULTS/dns-evidence.json"
     local samples=0 first_mismatch="" before=false after=false after_state f
     local sampler_alive=false load_stats load_samples=0 load_max=null
@@ -496,13 +523,13 @@ write_dns_evidence() {
     # ago; reqbench.py stamps that id into every record, so it survives a
     # re-analysis, which a hash of analysis.json would not.
     local run_id=""
-    if [ -f "$RESULTS/analysis.json" ]; then
+    if [ -f "$ANALYSIS_JSON" ]; then
         run_id=$(jq -r 'select((.run_id | type) == "string" and (.run_id | length) > 0)
-                        | .run_id' "$RESULTS/analysis.json" 2>/dev/null) || run_id=""
+                        | .run_id' "$ANALYSIS_JSON" 2>/dev/null) || run_id=""
     fi
     if [ -z "$run_id" ]; then
         verdict=unclean
-        reason="${reason:-$RESULTS/analysis.json names no run_id, so this evidence is bound to no measured run}"
+        reason="${reason:-$ANALYSIS_JSON names no run_id, so this evidence is bound to no measured run}"
     fi
     [ "$DNSMASQ_WAS_ACTIVE" = yes ] && before=true
     [ "$SAMPLER_ALIVE_AT_STOP" = yes ] && sampler_alive=true
@@ -915,14 +942,33 @@ say "box quiet (1-min load $load1)"
 run_verify before-run || campaign_fail "verify (before-run) failed after the settle wait"
 
 # --- measured run ----------------------------------------------------------
-say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
-start_dns_sampler
 run_rc=0
-TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
-    UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
-    STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
-    make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
-stop_dns_sampler
+if [ "$MEASURE" = scale ]; then
+    say "measured run: open-loop scale over the corpus, rates ${SCALE_RATES:-unset}, $UFFD_MODE prefetch=$UFFD_PREFETCH"
+    start_dns_sampler
+    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$RESULTS/scale" \
+        SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
+        SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
+        SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
+        make -C "$REPO" bench-chromium-scale 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
+    stop_dns_sampler
+    # The analyzer writes the run id the DNS evidence below binds to, and
+    # withholds publication until that evidence exists beside the run, so it
+    # runs once here and once more after the evidence is written.
+    if [ "$run_rc" -eq 0 ]; then
+        make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$RESULTS/scale" \
+            SCALE_ANALYSIS_JSON="$ANALYSIS_JSON" 2>&1 | tee "$LOGDIR/analyze.log" \
+            || run_rc=$?
+    fi
+else
+    say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
+    start_dns_sampler
+    TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
+        UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
+        STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
+        make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
+    stop_dns_sampler
+fi
 
 # The run's own exit is not the verdict: a run that measured cleanly against
 # the wrong resolver is worse than one that failed, so the after-run bracket
@@ -936,6 +982,17 @@ say "dns evidence: verdict=$verdict ($RESULTS/dns-evidence.json)"
 if [ "$run_rc" -ne 0 ] || [ "$after_rc" -ne 0 ] || [ "$verdict" != clean ]; then
     echo "FAILED: measured run exit $run_rc, after-run verify exit $after_rc, dns verdict $verdict" >&2
     exit 1
+fi
+if [ "$MEASURE" = scale ]; then
+    make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$RESULTS/scale" \
+        SCALE_ANALYSIS_JSON="$RESULTS/scale/analysis.json" 2>&1 \
+        | tee -a "$LOGDIR/analyze.log" \
+        || { echo "FAILED: the scale analysis after the DNS evidence did not run" >&2; exit 1; }
+    jq -e '.publishable == true' "$RESULTS/scale/analysis.json" >/dev/null || {
+        echo "FAILED: scale analysis not publishable: $(jq -r '.publication_blocked_by' "$RESULTS/scale/analysis.json" 2>&1)" >&2
+        exit 1
+    }
+    say "scale analysis: $RESULTS/scale/analysis.json (publishable)"
 fi
 
 say "records: $RESULTS"

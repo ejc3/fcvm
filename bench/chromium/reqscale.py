@@ -31,6 +31,7 @@ session, so visualization stays a separate, later step.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import dataclasses
 import datetime as dt
 import fcntl
@@ -270,6 +271,8 @@ class ScheduleConfig:
     score_seconds: float = SCORE_SECONDS
     trace_rate: Optional[float] = None
     trace_pairs: int = 0
+    # The pages requests render, cycled by pair index (request_url()).
+    urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -371,6 +374,8 @@ def _validate_schedule_config(config: ScheduleConfig) -> None:
         raise ValueError("scored bursts must use exactly a 15s ramp and 60s score")
     if not config.rates:
         raise ValueError("at least one target rate is required")
+    if not config.urls or not all(isinstance(url, str) and url for url in config.urls):
+        raise ValueError("the schedule needs the page or pages requests render")
     if len(set(config.rates)) != len(config.rates):
         raise ValueError("target rates must be unique")
     for rate in config.rates:
@@ -382,6 +387,14 @@ def _validate_schedule_config(config: ScheduleConfig) -> None:
             raise ValueError(
                 f"rate {rate:g} supplies fewer than 200 scored requests per backend "
                 f"across {config.scored_bursts} bursts"
+            )
+        # A corpus is only the same workload at every rate when each scored
+        # window renders every page equally often: whole cycles of the list.
+        score_pairs = _planned_count(rate, config.score_seconds)
+        if len(config.urls) > 1 and score_pairs % len(config.urls):
+            raise ValueError(
+                f"rate {rate:g} gives {score_pairs} scored pairs per burst, not a whole "
+                f"number of cycles of the {len(config.urls)}-page corpus"
             )
     criteria = dataclasses.asdict(config.criteria)
     for field in (
@@ -570,6 +583,8 @@ def build_schedule(config: ScheduleConfig, run_id: str) -> dict:
         "run_id": run_id,
         "seed": config.seed,
         "rates": list(config.rates),
+        "urls": list(config.urls),
+        "url_selection": "urls[pair_index % len(urls)]; both halves of a pair render the same page",
         "cells": [
             {
                 "cell_id": f"{backend}:r{format(rate, '.12g')}",
@@ -2420,6 +2435,37 @@ def quiet_host_snapshot(
     }
 
 
+def require_serve_mode(effective: str, requested: str) -> None:
+    """The memory server must run the mode the run asked for; fcvm coerces
+    minor to copy for NV2 snapshots, which would mislabel every UFFD cell."""
+    if effective != requested:
+        raise MeasurementInvalid(
+            f"the memory server runs {effective} mode, not the requested {requested}")
+
+
+def file_restore_refusal(snapshot_config: dict, environ) -> Optional[str]:
+    """Why this run's FILE arm would not be a file-backed restore, or None.
+
+    `fcvm snapshot run` without a memory server serves a hugepage snapshot, an
+    NV2 snapshot, or any restore under FCVM_FORCE_UFFD through an implicit
+    in-process UFFD server (src/commands/snapshot.rs direct_restore_memory),
+    so the FILE-versus-UFFD comparison would be UFFD against UFFD. NV2 comes
+    from the snapshot's kernel profile; any recorded profile is refused rather
+    than resolving whether it enables NV2.
+    """
+    metadata = snapshot_config.get("metadata")
+    if not isinstance(metadata, dict):
+        return "the snapshot config has no metadata to check its restore path against"
+    if metadata.get("hugepages"):
+        return "the snapshot uses hugepages, which fcvm restores through an implicit UFFD server"
+    if metadata.get("kernel_profile"):
+        return (f"the snapshot records kernel profile {metadata['kernel_profile']!r}, "
+                "which can restore through an implicit UFFD server (NV2)")
+    if "FCVM_FORCE_UFFD" in environ:
+        return "FCVM_FORCE_UFFD is set, which restores through an implicit UFFD server"
+    return None
+
+
 def snapshot_identity(data_root: str, snapshot_tag: str) -> dict:
     """Durable identity of the exact snapshot generation and runtime shape."""
     snapshots_root = os.path.realpath(os.path.join(data_root, "snapshots"))
@@ -2556,7 +2602,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             quiet,
         )
     return {
-        "schema": "fcvm.chromium.reqscale.provenance.v1",
+        "schema": "fcvm.chromium.reqscale.provenance.v2",
         "run_id": schedule["run_id"],
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "argv": list(sys.argv),
@@ -2573,6 +2619,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             "chromium_sha256": sha256_file(args.control_chromium),
             "chromium_version": _command([args.control_chromium, "--version"]),
             "url": args.control_url,
+            "resolve_all_to": args.control_resolve_all_to or None,
             "interval_seconds": CONTROL_INTERVAL_SECONDS,
             "timeout_seconds": args.control_timeout,
         },
@@ -2805,6 +2852,14 @@ class UffdServe:
         self.state = None
         self.record = None
 
+    def command(self) -> list[str]:
+        """The memory server's argv, in the requested fault mode."""
+        return [
+            self.args.fcvm, "snapshot", "serve", self.args.snapshot_tag,
+            "--uffd-mode", getattr(self.args, "uffd_mode", "copy"),
+            "--uffd-prefetch", getattr(self.args, "uffd_prefetch", "on"),
+        ]
+
     def start(self) -> int:
         watch = reqbench.DirWatch(self.args.state_dir)
         try:
@@ -2815,10 +2870,7 @@ class UffdServe:
             }
             self.log_stream = open(self.log_path, "xb")
             self.proc = subprocess.Popen(
-                guarded_command(
-                    self.cgroup_path,
-                    [self.args.fcvm, "snapshot", "serve", self.args.snapshot_tag],
-                ),
+                guarded_command(self.cgroup_path, self.command()),
                 stdout=self.log_stream,
                 stderr=self.log_stream,
                 stdin=subprocess.DEVNULL,
@@ -2862,6 +2914,8 @@ class UffdServe:
                                 )
                             if config.get("uffd_mode") not in ("copy", "minor"):
                                 raise MeasurementInvalid(f"serve state {path} has invalid UFFD mode")
+                            require_serve_mode(
+                                config["uffd_mode"], getattr(self.args, "uffd_mode", "copy"))
                             self.state_path, self.state = path, state
                             self.record = {
                                 "schema": RECORD_SCHEMA,
@@ -3006,6 +3060,34 @@ class NativeChromiumControl:
             raise MeasurementInvalid("host control Chromium is not running")
         return cdpdrive.drive(self._drive_args(self.args.control_timeout))
 
+    def command(self) -> list[str]:
+        """The control Chromium's argv; profile_dir must already exist."""
+        return [
+            self.args.control_chromium,
+            "--headless=new",
+            "--no-sandbox",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--remote-allow-origins=*",
+            "--ignore-certificate-errors",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--window-size=1280,800",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-breakpad",
+            "--disable-component-update",
+            *(
+                [f"--host-resolver-rules=MAP * {self.args.control_resolve_all_to}"]
+                if self.args.control_resolve_all_to else []
+            ),
+            f"--user-data-dir={self.profile_dir}",
+            "about:blank",
+        ]
+
     def start(self) -> dict:
         self.profile_dir = tempfile.mkdtemp(
             prefix=f"fcvm-reqscale-control-{self.args.run_id}-",
@@ -3015,29 +3097,8 @@ class NativeChromiumControl:
         pidfd = None
         try:
             self.log_stream = open(self.log_path, "xb")
-            command = [
-                self.args.control_chromium,
-                "--headless=new",
-                "--no-sandbox",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0",
-                "--remote-allow-origins=*",
-                "--ignore-certificate-errors",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--window-size=1280,800",
-                "--hide-scrollbars",
-                "--mute-audio",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-networking",
-                "--disable-breakpad",
-                "--disable-component-update",
-                f"--user-data-dir={self.profile_dir}",
-                "about:blank",
-            ]
             self.proc = subprocess.Popen(
-                supervised_command(self.cgroup_path, command),
+                supervised_command(self.cgroup_path, self.command()),
                 stdout=self.log_stream,
                 stderr=self.log_stream,
                 stdin=subprocess.DEVNULL,
@@ -3318,13 +3379,20 @@ class ControlScheduler:
         }
 
 
+def request_url(args, context: RequestContext) -> str:
+    """The page a request renders: the URL list cycled by pair, so the FILE and
+    UFFD halves of a pair always render the same page."""
+    urls = getattr(args, "urls", None) or [args.url]
+    return urls[context.pair_index % len(urls)]
+
+
 def _request_args(
     args, context: RequestContext, serve_pid: int, log_dir: str, probe,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         serve_pid=serve_pid if context.backend == "uffd" else 0,
         snapshot_tag=args.snapshot_tag if context.backend == "file" else "",
-        url=args.url,
+        url=request_url(args, context),
         format=args.format,
         quality=args.quality,
         cdp_port=args.cdp_port,
@@ -3355,6 +3423,7 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         record.pop("serve_cpu_before", None)
         record.pop("serve_cpu_after", None)
         record.update(
+            url=request_url(args, context),
             schema=RECORD_SCHEMA,
             kind="request",
             run_id=args.run_id,
@@ -3722,7 +3791,16 @@ def main() -> int:
     parser.add_argument("--state-dir", default="")
     parser.add_argument("--cgroup-root", default="/sys/fs/cgroup")
     parser.add_argument("--control-chromium", default="chromium")
-    parser.add_argument("--control-url", default="")
+    parser.add_argument("--uffd-mode", choices=("copy", "minor"), default="copy",
+                        help="the memory server's fault mode for the UFFD backend")
+    parser.add_argument("--uffd-prefetch", choices=("on", "off"), default="on",
+                        help="the memory server's working-set replay")
+    parser.add_argument("--control-url", default="",
+                        help="the one page the host control Chromium renders; "
+                             "required when --url is a list")
+    parser.add_argument("--control-resolve-all-to", default="",
+                        help="map every host name the control Chromium resolves to "
+                             "this IPv4 address, e.g. a corpus replay server")
     parser.add_argument("--control-timeout", type=float, default=8.0)
     parser.add_argument("--control-tmp-root", default="/tmp")
     parser.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
@@ -3750,7 +3828,18 @@ def main() -> int:
     args.data_root = os.path.abspath(args.data_root)
     args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
     args.out_dir = os.path.abspath(args.out_dir)
+    args.urls = reqbench.parse_urls(args.url)
+    if len(args.urls) > 1 and not args.control_url:
+        parser.error("--control-url is required with a URL list: the host control "
+                     "renders one fixed page")
+    if len(reqbench.parse_urls(args.control_url or args.url)) != 1:
+        parser.error("--control-url must name exactly one URL")
     args.control_url = args.control_url or args.url
+    if args.control_resolve_all_to:
+        try:
+            ipaddress.IPv4Address(args.control_resolve_all_to)
+        except ValueError:
+            parser.error("--control-resolve-all-to must be an IPv4 address")
     args.control_tmp_root = os.path.abspath(args.control_tmp_root)
     try:
         _validate_snapshot_tag(args.snapshot_tag)
@@ -3773,6 +3862,7 @@ def main() -> int:
         parser.error("trace options require --trace-faults")
 
     config = ScheduleConfig(
+        urls=tuple(args.urls),
         rates=args.rates,
         scored_bursts=args.bursts,
         seed=args.seed,
@@ -3815,6 +3905,13 @@ def main() -> int:
         with SnapshotGenerationLease(args.data_root, args.snapshot_tag) as lease:
             args.snapshot_generation_lease = lease
             args.snapshot_identity = dict(lease.identity)
+            config_path = os.path.join(
+                args.data_root, "snapshots", args.snapshot_tag, "config.json")
+            with open(config_path, "rb") as stream:
+                refusal = file_restore_refusal(
+                    strict_json_loads(stream.read(), config_path), os.environ)
+            if refusal:
+                raise MeasurementInvalid(f"refusing a FILE arm that is not one: {refusal}")
             provenance = collect_provenance(args, schedule, args.snapshot_identity)
             with TerminationFence():
                 return execute(args, schedule, provenance)

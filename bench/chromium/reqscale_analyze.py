@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -132,6 +133,39 @@ def _canonical_generation(value) -> str:
     return canonical
 
 
+def _null_or_ipv4(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return isinstance(value, str) and str(ipaddress.IPv4Address(value)) == value
+    except ValueError:
+        return False
+
+
+def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
+    """None when publication needs no resolver evidence or has it, else why not.
+
+    A corpus run renders real host names, so whether each clone resolved them
+    through the replay server is recorded only by the corpus campaign's DNS
+    evidence beside this run directory. Without a clean bundle that names this
+    run, a run against the wrong resolver is indistinguishable from a good one.
+    """
+    corpus = len(schedule["urls"]) > 1 or provenance["host_control"].get("resolve_all_to")
+    if not corpus:
+        return None
+    path = os.path.join(os.path.dirname(os.path.abspath(run_dir)), "dns-evidence.json")
+    try:
+        with open(path) as handle:
+            evidence = json.load(handle)
+    except (OSError, ValueError) as error:
+        return f"corpus run without the campaign's DNS evidence ({path}: {error})"
+    if not isinstance(evidence, dict) or evidence.get("verdict") != "clean":
+        return f"the campaign's DNS evidence is not clean ({path})"
+    if evidence.get("run_id") != schedule["run_id"]:
+        return f"the campaign's DNS evidence names run {evidence.get('run_id')!r}, not this one"
+    return None
+
+
 def _validate_schedule(schedule: dict) -> reqscale.ScheduleConfig:
     if not isinstance(schedule, dict):
         raise AnalysisInvalid("schedule is not an object")
@@ -162,6 +196,7 @@ def _validate_schedule(schedule: dict) -> reqscale.ScheduleConfig:
             score_seconds=schedule["score_seconds"],
             trace_rate=schedule["trace_rate"],
             trace_pairs=schedule["trace_pairs"],
+            urls=tuple(schedule["urls"]),
         )
         rebuilt = reqscale.build_schedule(config, schedule["run_id"])
     except (
@@ -516,6 +551,7 @@ def _validate_requests(
                 "backend": planned.backend,
                 "segment": planned.segment,
                 "pair_index": planned.pair_index,
+                "url": schedule["urls"][planned.pair_index % len(schedule["urls"])],
                 "request_seed": planned.seed,
                 "population": spec.population,
                 "target_rps": spec.target_rps,
@@ -1201,7 +1237,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
     }
     if not isinstance(provenance, dict) or set(provenance) != required:
         raise AnalysisInvalid("provenance fields are incomplete or unknown")
-    if provenance.get("schema") != "fcvm.chromium.reqscale.provenance.v1":
+    if provenance.get("schema") != "fcvm.chromium.reqscale.provenance.v2":
         raise AnalysisInvalid("unsupported provenance schema")
     if provenance.get("run_id") != schedule["run_id"]:
         raise AnalysisInvalid("run identity differs between schedule and provenance")
@@ -1269,7 +1305,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         not isinstance(host_control, dict)
         or set(host_control) != {
             "chromium_path", "chromium_sha256", "chromium_version", "url",
-            "interval_seconds", "timeout_seconds",
+            "resolve_all_to", "interval_seconds", "timeout_seconds",
         }
         or host_control.get("interval_seconds") != reqscale.CONTROL_INTERVAL_SECONDS
         or not isinstance(host_control.get("chromium_path"), str)
@@ -1278,6 +1314,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         or not host_control["chromium_version"]
         or not isinstance(host_control.get("url"), str)
         or not host_control["url"]
+        or not _null_or_ipv4(host_control.get("resolve_all_to"))
         or not 0 < _finite_number(
             host_control.get("timeout_seconds"), "host-control timeout", minimum=0,
         ) < reqscale.CONTROL_INTERVAL_SECONDS
@@ -1916,11 +1953,14 @@ def analyze(run_dir: str) -> dict:
     else:
         trace_gate = {"enabled": False}
 
+    dns_block = corpus_dns_gate(run_dir, schedule, provenance)
     return {
         "schema": ANALYSIS_SCHEMA,
         "run_id": run_id,
         "snapshot_generation_id": generation_id,
-        "publishable": True,
+        "publishable": dns_block is None,
+        "publication_blocked_by": dns_block,
+        "corpus": list(schedule["urls"]),
         # The report is the publication document, so the numbers that describe HOW the
         # run was scheduled, and on WHAT, have to come from the validated artifacts
         # rather than from prose written when the defaults happened to be these.
