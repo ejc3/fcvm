@@ -390,20 +390,11 @@ fn guest_mount_points(
     maps.chain(others).chain(image_store).collect()
 }
 
-/// `path` with its `.` and `..` components folded, without looking at any
-/// filesystem. `..` at the root stays at the root.
-fn lexically_normal(path: &Path) -> PathBuf {
-    let mut normal = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::ParentDir => {
-                normal.pop();
-            }
-            Component::CurDir => {}
-            other => normal.push(other.as_os_str()),
-        }
-    }
-    normal
+/// Whether the guest path `path` has a `..` component.
+fn has_parent_component(path: &str) -> bool {
+    Path::new(path)
+        .components()
+        .any(|component| component == Component::ParentDir)
 }
 
 /// Refuse a mount point that fc-agent would have to create inside a read-only
@@ -415,24 +406,46 @@ fn lexically_normal(path: &Path) -> PathBuf {
 /// filesystem the mount point is created in, so that is the one checked.
 ///
 /// A symlink on the way is left to the guest, which resolves it in its own
-/// namespace. `.` and `..` in a guest path are folded first, as the guest's
-/// kernel walks them when no symlink is on the way.
+/// namespace. Where a `..` leads depends on those symlinks, so a run with a
+/// read-only map refuses a guest path that has one: it cannot be placed inside
+/// or outside the map before boot.
 fn check_mount_points_inside_read_only_maps(
     maps: &[VolumeMapping],
     mount_points: &[(String, String)],
 ) -> Result<()> {
+    if maps.iter().any(|map| map.read_only) {
+        let of_maps = maps.iter().map(|map| {
+            (
+                format!("--map {}:{}", map.host_path.display(), map.guest_path),
+                map.guest_path.as_str(),
+            )
+        });
+        let of_mount_points = mount_points
+            .iter()
+            .map(|(argument, guest_path)| (argument.clone(), guest_path.as_str()));
+        for (argument, guest_path) in of_mount_points.chain(of_maps) {
+            if has_parent_component(guest_path) {
+                bail!(
+                    "{argument}: the guest path {guest_path} has a `..` in it, and this run \
+                     has a read-only map. Where `..` leads depends on the symlinks in the \
+                     guest, so fcvm cannot tell before boot whether that path is inside the \
+                     read-only map. Write the path without `..`."
+                );
+            }
+        }
+    }
     for (argument, guest_path) in mount_points {
-        let guest_path = lexically_normal(Path::new(guest_path));
+        let guest_path = Path::new(guest_path);
         let enclosing = maps
             .iter()
-            .map(|map| (map, lexically_normal(Path::new(&map.guest_path))))
+            .map(|map| (map, Path::new(&map.guest_path)))
             .filter(|(_, outer)| guest_path != *outer && guest_path.starts_with(outer))
             .max_by_key(|(_, outer)| outer.components().count());
         let Some((outer, outer_guest_path)) = enclosing.filter(|(map, _)| map.read_only) else {
             continue;
         };
         let inside = guest_path
-            .strip_prefix(&outer_guest_path)
+            .strip_prefix(outer_guest_path)
             .expect("the map's guest path is a prefix of the mount point");
         let mut on_host = outer.host_path.clone();
         for component in inside.components() {
@@ -601,44 +614,59 @@ mod tests {
         }
     }
 
-    /// A mount point written with `.` or `..` is checked where the guest's
-    /// kernel resolves it.
+    /// A guest path with `..` in it is refused when the run has a read-only
+    /// map, because where `..` leads depends on the symlinks before it in the
+    /// guest: with /var/run a link to /run, /var/run/../actual/inner is
+    /// /actual/inner.
     ///
-    /// RED BEFORE THE FIX: the walk stopped at the first `..`, so
-    /// /data/../data/cache passed with no cache directory in the read-only
-    /// map at /data, and /other/../data/cache was not seen as inside it.
+    /// RED BEFORE THE FIX: `..` was folded without the guest's filesystem, so
+    /// that path read as /var/actual/inner, outside the read-only map at
+    /// /actual, and passed with no inner directory in the map.
     #[test]
-    fn a_mount_point_written_with_parent_components_is_checked_where_it_resolves() {
+    fn a_guest_path_with_a_parent_component_is_refused_beside_a_read_only_map() {
         let outer = tempfile::tempdir().unwrap();
-        let missing = outer.path().join("cache").display().to_string();
-        let maps = [map(outer.path(), "/data", true)];
+        let maps = [map(outer.path(), "/actual", true)];
         for guest in [
-            "/data/../data/cache",
-            "/other/../data/cache",
-            "/data/./cache",
+            "/var/run/../actual/inner",
+            "/actual/../actual/inner",
+            "/actual/inner/..",
         ] {
             let point = mount_point("--map inner:GUEST", guest);
             let error =
                 check_mount_points_inside_read_only_maps(&maps, std::slice::from_ref(&point))
-                    .expect_err(&format!(
-                        "{guest} was accepted with no cache directory in the map"
-                    ))
+                    .expect_err(&format!("{guest} was accepted beside a read-only map"))
                     .to_string();
-            assert!(error.contains(&missing), "{guest}: {error}");
+            assert!(
+                error.contains(guest) && error.contains("`..`"),
+                "{guest}: {error}"
+            );
         }
-        // A path that leaves the map again is not inside it.
-        check_mount_points_inside_read_only_maps(
-            &maps,
-            &[mount_point("--map x:GUEST", "/data/../elsewhere")],
+        // The read-only map's own guest path is refused the same way.
+        let written_with_parent = [map(outer.path(), "/mnt/../actual", true)];
+        let error = check_mount_points_inside_read_only_maps(
+            &written_with_parent,
+            &[mount_point("--map x:GUEST", "/elsewhere")],
         )
-        .expect("/data/../elsewhere is outside the map");
-        // The map's own guest path may be written that way too.
-        let maps = [map(outer.path(), "/mnt/../data", true)];
-        check_mount_points_inside_read_only_maps(
+        .expect_err("a read-only map at /mnt/../actual was accepted")
+        .to_string();
+        assert!(error.contains("/mnt/../actual"), "{error}");
+        // `.` needs no filesystem: /actual/./inner is /actual/inner.
+        let missing = outer.path().join("inner").display().to_string();
+        let error = check_mount_points_inside_read_only_maps(
             &maps,
-            &[mount_point("--map x:GUEST", "/data/cache")],
+            &[mount_point("--map inner:GUEST", "/actual/./inner")],
         )
-        .expect_err("a map at /mnt/../data is a map at /data");
+        .expect_err("/actual/./inner was accepted with no inner directory in the map")
+        .to_string();
+        assert!(error.contains(&missing), "{error}");
+        // With no read-only map nothing is compared, and the guest resolves
+        // the path.
+        let read_write = [map(outer.path(), "/actual", false)];
+        check_mount_points_inside_read_only_maps(
+            &read_write,
+            &[mount_point("--map x:GUEST", "/var/run/../actual/inner")],
+        )
+        .expect("no map is read-only");
     }
 
     /// The RunArgs of `fcvm podman run --name test <extra>`, parsed by clap.
