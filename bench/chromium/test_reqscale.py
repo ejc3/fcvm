@@ -1672,6 +1672,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "chromium_version": "Chromium fixture",
                 "chromium_sha256": "4" * 64,
                 "url": "http://127.0.0.1/fixture",
+                "resolve_all_to": None,
                 "timeout_seconds": 8.0,
             },
             "fault_trace": {
@@ -2295,12 +2296,44 @@ class PlanOnlyCli(unittest.TestCase):
             self.assertIn("max-trace-perturbation-pct", result.stderr)
             self.assertFalse(os.path.exists(os.path.join(d, "out")))
 
+    def _plan(self, *extra):
+        with tempfile.TemporaryDirectory() as d:
+            return subprocess.run(
+                [
+                    sys.executable, self.SCRIPT,
+                    "--snapshot-tag", "not-opened-in-plan-mode",
+                    "--rates", "2", "--bursts", "5",
+                    "--seed", "776", "--run-id", RUN_ID,
+                    "--out-dir", os.path.join(d, "plan"), "--plan-only",
+                    *self.criteria_args(), *extra,
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+
+    def test_a_url_list_needs_a_single_control_url(self):
+        """Red before URL lists: the list became the control's one URL."""
+        corpus = "https://a.example/,https://b.example/"
+        result = self._plan("--url", corpus)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--control-url is required", result.stderr)
+        result = self._plan("--url", corpus, "--control-url", corpus)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exactly one URL", result.stderr)
+        result = self._plan("--url", corpus, "--control-url", "https://a.example/",
+                            "--control-resolve-all-to", "127.0.0.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_resolver_rule_must_be_an_ipv4_address(self):
+        result = self._plan("--url", "http://x/", "--control-resolve-all-to", "replay")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("IPv4", result.stderr)
+
 
 
 class ConcurrentRequestRecords(unittest.TestCase):
-    def _record(self, cdp_record):
+    def _record(self, cdp_record, urls=None, pair_index=0):
         args = SimpleNamespace(
-            url="http://x/", format="jpeg", quality=80, cdp_port=9222, ws_url="",
+            url="http://x/", urls=urls, format="jpeg", quality=80, cdp_port=9222, ws_url="",
             fcvm="fcvm", data_root="/d", state_dir="/s", timeout=10.0,
             teardown_timeout=5.0, rust_log="off", run_id="r", snapshot_tag="t",
             cgroup_paths={"uffd": "/sys/fs/cgroup/x/uffd", "file": "/sys/fs/cgroup/x/file"},
@@ -2310,14 +2343,21 @@ class ConcurrentRequestRecords(unittest.TestCase):
                                population="score", traced=False, trace_pair_id=None)
         context = reqscale.RequestContext(
             run_id="r", burst_id="b", population="score", segment="score",
-            backend="uffd", target_rps=2.0, request_index=0, pair_index=0,
+            backend="uffd", target_rps=2.0, request_index=0, pair_index=pair_index,
             request_id="r:b:0", scheduled_ns=0, actual_launch_ns=1, request_seed=7,
         )
         request = reqscale._make_request_fn(
             args, spec, 1234, "/logs", {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
-        with mock.patch.object(reqscale.reqbench, "run_cdp_request",
-                               return_value=dict(cdp_record)):
-            return request(context)
+        seen = []
+
+        def run(request_args, rep, fast):
+            seen.append(request_args.url)
+            return dict(cdp_record)
+
+        with mock.patch.object(reqscale.reqbench, "run_cdp_request", side_effect=run):
+            record = request(context)
+        self.assertEqual(seen, [record["url"]], "the record names the page it rendered")
+        return record
 
     def test_the_memory_server_cpu_is_not_charged_to_overlapping_requests(self):
         """Red without the pop: run_cdp_request's memory-server samples,
@@ -2328,6 +2368,62 @@ class ConcurrentRequestRecords(unittest.TestCase):
                                "serve_cpu_after": sample})
         self.assertNotIn("serve_cpu_before", record)
         self.assertNotIn("serve_cpu_after", record)
+
+    def test_a_corpus_request_renders_its_pairs_url_and_says_so(self):
+        """Red before URL lists: every request rendered args.url, the whole
+        comma-separated spec, and no record named its page."""
+        urls = [f"https://site{i}.example/" for i in range(14)]
+        record = self._record({"ok": True}, urls=urls, pair_index=15)
+        self.assertEqual(record["url"], urls[1])
+
+
+class CorpusPairing(unittest.TestCase):
+    def test_both_halves_of_a_pair_render_the_same_page_and_pairs_cycle(self):
+        """Red before URL lists: there was no per-request URL to choose."""
+        urls = ["https://a/", "https://b/", "https://c/"]
+        args = SimpleNamespace(url=",".join(urls), urls=urls)
+        plan = reqscale._build_request_plan(2.0, 3.0, 6.0, 776)
+        by_pair = {}
+        for planned in plan:
+            context = SimpleNamespace(pair_index=planned.pair_index)
+            by_pair.setdefault(planned.pair_index, set()).add(
+                reqscale.request_url(args, context))
+        self.assertTrue(all(len(pages) == 1 for pages in by_pair.values()), by_pair)
+        self.assertEqual([by_pair[i].pop() for i in range(6)], urls * 2)
+
+    def test_a_single_url_is_unchanged(self):
+        args = SimpleNamespace(url="http://x/", urls=None)
+        self.assertEqual(reqscale.request_url(args, SimpleNamespace(pair_index=9)), "http://x/")
+
+
+class ServeMode(unittest.TestCase):
+    def test_the_memory_server_runs_in_the_requested_mode(self):
+        """Red before the flags: reqscale always served in copy mode with
+        prefetch on, whatever the corpus headline's minor mode was."""
+        serve = reqscale.UffdServe.__new__(reqscale.UffdServe)
+        serve.args = SimpleNamespace(fcvm="/f", snapshot_tag="cb-req-corpus",
+                                     uffd_mode="minor", uffd_prefetch="off")
+        self.assertEqual(serve.command(), [
+            "/f", "snapshot", "serve", "cb-req-corpus",
+            "--uffd-mode", "minor", "--uffd-prefetch", "off"])
+
+
+class ControlResolverRule(unittest.TestCase):
+    def _control(self, resolve_all_to):
+        args = SimpleNamespace(control_chromium="/usr/bin/chromium",
+                               control_resolve_all_to=resolve_all_to)
+        control = reqscale.NativeChromiumControl.__new__(reqscale.NativeChromiumControl)
+        control.args = args
+        control.profile_dir = "/tmp/p"
+        return control.command()
+
+    def test_the_rule_maps_every_name_to_the_replay_server(self):
+        """Red before the knob: the control Chromium resolved corpus names on
+        the live internet while the clones rendered the replay."""
+        self.assertIn("--host-resolver-rules=MAP * 127.0.0.1", self._control("127.0.0.1"))
+
+    def test_no_rule_without_the_knob(self):
+        self.assertFalse(any("host-resolver-rules" in a for a in self._control("")))
 
 
 if __name__ == "__main__":

@@ -1140,6 +1140,40 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-run", handle.read())
 
+    def test_measure_scale_runs_the_open_loop_benchmark_over_the_corpus(self):
+        """MEASURE=scale replaces the serial run with bench-chromium-scale over
+        the same corpus, in the campaign's memory-server mode, with the host
+        control mapped to the replay server.
+
+        RED BEFORE THE FIX: there was no MEASURE knob and no scale branch.
+        """
+        body = campaign()
+        block = re.search(r'(if \[ "\$MEASURE" = scale \]; then\n.*?\nfi\n)', body, re.S)
+        self.assertIsNotNone(block, "the campaign has no MEASURE=scale branch")
+        self.assertRegex(body, r'(?m)^MEASURE="\$\{MEASURE:-reqbench\}"$')
+        with tempfile.TemporaryDirectory() as tmp:
+            env, results = self._fakes(tmp)
+            script = ('set -euo pipefail\nsay() { :; }\n'
+                      f'URLS="{self._urls()}"\nBACKEND=uffd\nUFFD_MODE=minor\n'
+                      'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
+                      'STALL_MAX_MS=15000\nMEASURE=scale\nTAG=cb-req-corpus\n'
+                      f'{self._helpers()}\nrun_rc=0\n'
+                      f'{block.group(1)}\necho "run_rc=$run_rc"\n')
+            result = self._run(script, env)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            seen = self._make_env(env)
+            self.assertEqual(seen.get("SCALE_URL"), self._urls())
+            self.assertEqual(seen.get("SCALE_TAG"), "cb-req-corpus")
+            self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale"))
+            self.assertEqual(seen.get("SCALE_UFFD_MODE"), "minor")
+            self.assertEqual(seen.get("SCALE_UFFD_PREFETCH"), "on")
+            self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
+            self.assertEqual(seen.get("SCALE_CONTROL_RESOLVE_ALL_TO"), "127.0.0.1")
+            with open(env["MAKE_ARGV"]) as handle:
+                argv = handle.read()
+            self.assertIn("bench-chromium-scale", argv)
+            self.assertNotIn("bench-chromium-request-run", argv)
+
     # From `mkdir -p "$RESULTS"` to the end of the rm, which may continue over
     # backslash-newlines, plus the lock release that closes the block. The
     # whole thing runs, so the lock the removal takes runs with it.

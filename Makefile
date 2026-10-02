@@ -1184,6 +1184,14 @@ test-chromium-fault:
 #
 # Every cell and every publication gate is required: an accidental benchmark is
 # worse than no benchmark, so there are no defaults to fall back on.
+# The memory server's mode for the UFFD backend, and the host control's page.
+# SCALE_URL may be a comma-separated list (the corpus); then SCALE_CONTROL_URL
+# names the one page the control renders, and SCALE_CONTROL_RESOLVE_ALL_TO maps
+# the control's names to a replay server.
+SCALE_UFFD_MODE ?= copy
+SCALE_UFFD_PREFETCH ?= on
+SCALE_CONTROL_URL ?=
+SCALE_CONTROL_RESOLVE_ALL_TO ?=
 bench-chromium-scale: private SHELL := $(TARGET_LEASE_SHELL)
 bench-chromium-scale: build
 	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
@@ -1209,6 +1217,9 @@ bench-chromium-scale: build
 		--max-p95-launch-lag-ms "$(SCALE_MAX_LAUNCH_LAG_MS)" \
 		--max-control-median-drift-pct "$(SCALE_MAX_CONTROL_DRIFT_PCT)" \
 		--seed "$(SCALE_SEED)" \
+		--uffd-mode "$(SCALE_UFFD_MODE)" --uffd-prefetch "$(SCALE_UFFD_PREFETCH)" \
+		$(if $(SCALE_CONTROL_URL),--control-url "$(SCALE_CONTROL_URL)") \
+		$(if $(SCALE_CONTROL_RESOLVE_ALL_TO),--control-resolve-all-to "$(SCALE_CONTROL_RESOLVE_ALL_TO)") \
 		--out-dir "$(SCALE_OUT)" $(SCALE_TRACE_ARGS)
 
 analyze-chromium-scale:

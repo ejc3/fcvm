@@ -77,6 +77,24 @@ done
 # DIAG_ONLY=1 ends the campaign after golden, verify and diag: no measured
 # run, no analysis. For the throwaway golden round.
 DIAG_ONLY="${DIAG_ONLY:-0}"
+# MEASURE=scale replaces the serial reqbench run with the open-loop throughput
+# benchmark (make bench-chromium-scale) over the same corpus, inside the same
+# golden, verify and DNS-evidence bracket. Its rates, bursts, seed, gates and
+# control Chromium come from the caller's SCALE_* variables; the corpus URLs,
+# tag, memory-server mode and output directory come from this campaign. The
+# host control renders SCALE_CONTROL_URL (default: the corpus's first URL)
+# with every name mapped to this host's replay server.
+MEASURE="${MEASURE:-reqbench}"
+case "$MEASURE" in
+    reqbench) ;;
+    scale)
+        [ "${ENGINE:-chromium}" = chromium ] \
+            || { echo "BLOCKED: MEASURE=scale drives Chromium only (ENGINE=$ENGINE)" >&2; exit 2; }
+        [ "$BACKEND" = uffd ] \
+            || { echo "BLOCKED: MEASURE=scale pairs FILE and UFFD restores itself; BACKEND=$BACKEND has no meaning there" >&2; exit 2; }
+        ;;
+    *) echo "BLOCKED: MEASURE must be reqbench or scale (got '$MEASURE')" >&2; exit 2 ;;
+esac
 STAMP="$(date +%Y%m%d-%H%M%S)"
 RESULTS="${RESULTS:-$REPO/bench/chromium/results/reqbench-$STAMP-corpus}"
 LOGDIR="${LOGDIR:-/tmp/corpus-campaign-$STAMP}"
@@ -915,14 +933,25 @@ say "box quiet (1-min load $load1)"
 run_verify before-run || campaign_fail "verify (before-run) failed after the settle wait"
 
 # --- measured run ----------------------------------------------------------
-say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
-start_dns_sampler
 run_rc=0
-TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
-    UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
-    STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
-    make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
-stop_dns_sampler
+if [ "$MEASURE" = scale ]; then
+    say "measured run: open-loop scale over the corpus, rates ${SCALE_RATES:-unset}, $UFFD_MODE prefetch=$UFFD_PREFETCH"
+    start_dns_sampler
+    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$RESULTS/scale" \
+        SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
+        SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
+        SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
+        make -C "$REPO" bench-chromium-scale 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
+    stop_dns_sampler
+else
+    say "measured run: $REPS reps/arm, warmup $WARMUP, arms $ARMS, $BACKEND/$UFFD_MODE prefetch=$UFFD_PREFETCH"
+    start_dns_sampler
+    TAG="$TAG" URL="$URLS" BACKEND="$BACKEND" UFFD_MODE="$UFFD_MODE" \
+        UFFD_PREFETCH="$UFFD_PREFETCH" ARMS="$ARMS" REPS="$REPS" WARMUP="$WARMUP" \
+        STALL_MAX_MS="$STALL_MAX_MS" RESULTS="$RESULTS" ENGINE="$ENGINE" \
+        make -C "$REPO" "$(engine_target run)" 2>&1 | tee "$LOGDIR/run.log" || run_rc=$?
+    stop_dns_sampler
+fi
 
 # The run's own exit is not the verdict: a run that measured cleanly against
 # the wrong resolver is worse than one that failed, so the after-run bracket

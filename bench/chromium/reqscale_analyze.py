@@ -1269,7 +1269,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         not isinstance(host_control, dict)
         or set(host_control) != {
             "chromium_path", "chromium_sha256", "chromium_version", "url",
-            "interval_seconds", "timeout_seconds",
+            "resolve_all_to", "interval_seconds", "timeout_seconds",
         }
         or host_control.get("interval_seconds") != reqscale.CONTROL_INTERVAL_SECONDS
         or not isinstance(host_control.get("chromium_path"), str)

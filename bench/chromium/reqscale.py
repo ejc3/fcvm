@@ -31,6 +31,7 @@ session, so visualization stays a separate, later step.
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import dataclasses
 import datetime as dt
 import fcntl
@@ -2573,6 +2574,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             "chromium_sha256": sha256_file(args.control_chromium),
             "chromium_version": _command([args.control_chromium, "--version"]),
             "url": args.control_url,
+            "resolve_all_to": args.control_resolve_all_to or None,
             "interval_seconds": CONTROL_INTERVAL_SECONDS,
             "timeout_seconds": args.control_timeout,
         },
@@ -2805,6 +2807,14 @@ class UffdServe:
         self.state = None
         self.record = None
 
+    def command(self) -> list[str]:
+        """The memory server's argv, in the requested fault mode."""
+        return [
+            self.args.fcvm, "snapshot", "serve", self.args.snapshot_tag,
+            "--uffd-mode", getattr(self.args, "uffd_mode", "copy"),
+            "--uffd-prefetch", getattr(self.args, "uffd_prefetch", "on"),
+        ]
+
     def start(self) -> int:
         watch = reqbench.DirWatch(self.args.state_dir)
         try:
@@ -2815,10 +2825,7 @@ class UffdServe:
             }
             self.log_stream = open(self.log_path, "xb")
             self.proc = subprocess.Popen(
-                guarded_command(
-                    self.cgroup_path,
-                    [self.args.fcvm, "snapshot", "serve", self.args.snapshot_tag],
-                ),
+                guarded_command(self.cgroup_path, self.command()),
                 stdout=self.log_stream,
                 stderr=self.log_stream,
                 stdin=subprocess.DEVNULL,
@@ -3006,6 +3013,34 @@ class NativeChromiumControl:
             raise MeasurementInvalid("host control Chromium is not running")
         return cdpdrive.drive(self._drive_args(self.args.control_timeout))
 
+    def command(self) -> list[str]:
+        """The control Chromium's argv; profile_dir must already exist."""
+        return [
+            self.args.control_chromium,
+            "--headless=new",
+            "--no-sandbox",
+            "--remote-debugging-address=127.0.0.1",
+            "--remote-debugging-port=0",
+            "--remote-allow-origins=*",
+            "--ignore-certificate-errors",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--window-size=1280,800",
+            "--hide-scrollbars",
+            "--mute-audio",
+            "--no-first-run",
+            "--no-default-browser-check",
+            "--disable-background-networking",
+            "--disable-breakpad",
+            "--disable-component-update",
+            *(
+                [f"--host-resolver-rules=MAP * {self.args.control_resolve_all_to}"]
+                if self.args.control_resolve_all_to else []
+            ),
+            f"--user-data-dir={self.profile_dir}",
+            "about:blank",
+        ]
+
     def start(self) -> dict:
         self.profile_dir = tempfile.mkdtemp(
             prefix=f"fcvm-reqscale-control-{self.args.run_id}-",
@@ -3015,29 +3050,8 @@ class NativeChromiumControl:
         pidfd = None
         try:
             self.log_stream = open(self.log_path, "xb")
-            command = [
-                self.args.control_chromium,
-                "--headless=new",
-                "--no-sandbox",
-                "--remote-debugging-address=127.0.0.1",
-                "--remote-debugging-port=0",
-                "--remote-allow-origins=*",
-                "--ignore-certificate-errors",
-                "--disable-gpu",
-                "--disable-dev-shm-usage",
-                "--window-size=1280,800",
-                "--hide-scrollbars",
-                "--mute-audio",
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-background-networking",
-                "--disable-breakpad",
-                "--disable-component-update",
-                f"--user-data-dir={self.profile_dir}",
-                "about:blank",
-            ]
             self.proc = subprocess.Popen(
-                supervised_command(self.cgroup_path, command),
+                supervised_command(self.cgroup_path, self.command()),
                 stdout=self.log_stream,
                 stderr=self.log_stream,
                 stdin=subprocess.DEVNULL,
@@ -3318,13 +3332,20 @@ class ControlScheduler:
         }
 
 
+def request_url(args, context: RequestContext) -> str:
+    """The page a request renders: the URL list cycled by pair, so the FILE and
+    UFFD halves of a pair always render the same page."""
+    urls = getattr(args, "urls", None) or [args.url]
+    return urls[context.pair_index % len(urls)]
+
+
 def _request_args(
     args, context: RequestContext, serve_pid: int, log_dir: str, probe,
 ) -> argparse.Namespace:
     return argparse.Namespace(
         serve_pid=serve_pid if context.backend == "uffd" else 0,
         snapshot_tag=args.snapshot_tag if context.backend == "file" else "",
-        url=args.url,
+        url=request_url(args, context),
         format=args.format,
         quality=args.quality,
         cdp_port=args.cdp_port,
@@ -3355,6 +3376,7 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         record.pop("serve_cpu_before", None)
         record.pop("serve_cpu_after", None)
         record.update(
+            url=request_url(args, context),
             schema=RECORD_SCHEMA,
             kind="request",
             run_id=args.run_id,
@@ -3722,7 +3744,16 @@ def main() -> int:
     parser.add_argument("--state-dir", default="")
     parser.add_argument("--cgroup-root", default="/sys/fs/cgroup")
     parser.add_argument("--control-chromium", default="chromium")
-    parser.add_argument("--control-url", default="")
+    parser.add_argument("--uffd-mode", choices=("copy", "minor"), default="copy",
+                        help="the memory server's fault mode for the UFFD backend")
+    parser.add_argument("--uffd-prefetch", choices=("on", "off"), default="on",
+                        help="the memory server's working-set replay")
+    parser.add_argument("--control-url", default="",
+                        help="the one page the host control Chromium renders; "
+                             "required when --url is a list")
+    parser.add_argument("--control-resolve-all-to", default="",
+                        help="map every host name the control Chromium resolves to "
+                             "this IPv4 address, e.g. a corpus replay server")
     parser.add_argument("--control-timeout", type=float, default=8.0)
     parser.add_argument("--control-tmp-root", default="/tmp")
     parser.add_argument("--format", choices=("png", "jpeg"), default="jpeg")
@@ -3750,7 +3781,18 @@ def main() -> int:
     args.data_root = os.path.abspath(args.data_root)
     args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
     args.out_dir = os.path.abspath(args.out_dir)
+    args.urls = reqbench.parse_urls(args.url)
+    if len(args.urls) > 1 and not args.control_url:
+        parser.error("--control-url is required with a URL list: the host control "
+                     "renders one fixed page")
+    if len(reqbench.parse_urls(args.control_url or args.url)) != 1:
+        parser.error("--control-url must name exactly one URL")
     args.control_url = args.control_url or args.url
+    if args.control_resolve_all_to:
+        try:
+            ipaddress.IPv4Address(args.control_resolve_all_to)
+        except ValueError:
+            parser.error("--control-resolve-all-to must be an IPv4 address")
     args.control_tmp_root = os.path.abspath(args.control_tmp_root)
     try:
         _validate_snapshot_tag(args.snapshot_tag)
