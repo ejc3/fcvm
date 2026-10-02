@@ -2315,7 +2315,11 @@ def run_comparison(
             "harness_sha256": meta["harness_sha256"],
             "runtime_bundle_sha256": meta["runtime_bundle_sha256"],
             "hostcdp_sha256": meta["hostcdp_sha256"],
-            "driver": meta["driver"], "network": meta["network"],
+            "driver": meta["driver"],
+            # Records before hostcdp.sh drove reps in-process carry no field;
+            # their wall_ms includes two interpreter start-ups per rep.
+            "driver_process": meta.get("driver_process", "per-rep subprocess"),
+            "network": meta["network"],
             "image_id": meta.get("image_id"), "resolve_all_to": meta.get("resolve_all_to"),
             "reps": counts["measured"], "warmup": counts["warmup"],
             "total_reps": counts["total"], "count_convention": counts["convention"],

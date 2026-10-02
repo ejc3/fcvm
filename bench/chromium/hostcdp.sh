@@ -1132,17 +1132,24 @@ with open(out_path, "a") as out:
             net_trace_drain_ms=5000.0, render_module=render_module,
         )
         started = time.monotonic_ns()
+        interrupted = None
         try:
             result = cdpdrive.drive(args)
-        except Exception as error:
+        except BaseException as error:
+            # An interrupt still leaves this rep's row behind before it ends
+            # the run, as the per-rep wrapper process used to.
+            if not isinstance(error, Exception):
+                interrupted = error
             result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
         wall_ms = round((time.monotonic_ns() - started) / 1_000_000, 1)
+        if not isinstance(result, dict):
+            result = {"ok": False, "error": f"drive() returned {type(result).__name__}"}
         ok = result.get("ok") is True and "net_trace_error" not in result
         # Per-rep 1-minute load, the same field reqbench.py puts on every record
         # (rec["loadavg1"]). The start-of-run reading in run.json cannot show
         # contention that arrived mid-run.
         load, load_raw, load_status = read_load()
-        driver_text = json.dumps(result, separators=(",", ":"))
+        driver_text = json.dumps(result, separators=(",", ":"), default=repr)
         out.write(json.dumps({
             "run_json_sha256": run_json_sha256, "rep": rep, "ok": ok,
             "warmup": rep < warmup, "wall_ms": wall_ms, "loadavg1": load,
@@ -1151,6 +1158,9 @@ with open(out_path, "a") as out:
             "driver": driver_text,
         }) + "\n")
         out.flush()
+        if interrupted is not None:
+            log(f"REFUSING: rep {rep} interrupted ({type(interrupted).__name__})")
+            raise interrupted
         if load is None:
             log(f"REFUSING: rep {rep} has no numeric 1-minute load from {loadavg_file} "
                 f"(status={load_status} raw={load_raw[:200]})")
