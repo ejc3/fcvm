@@ -2302,6 +2302,71 @@ def analyze_backend(
                             .get(cname, {}).get("complete") is not True)
                     ])
 
+        # CPU PER REQUEST, launch to the end of teardown, from three readings:
+        # each pinned child's utime+stime at the kill (the VM lives one
+        # request, so firecracker's figure includes the guest's vCPUs), what
+        # each child then spent being reaped, and the shared memory server's
+        # share, which reqbench reads around the request because requests run
+        # one at a time. Only the fast-teardown path takes the first two, so a
+        # record without them contributes nothing, and a UFFD record whose
+        # server reading failed contributes nothing to the total.
+        def request_cpu_parts(r):
+            t = r.get("teardown") or {}
+            life = t.get("lifetime_cpu_ms_by_child")
+            if not life:
+                return None
+            reclaim = [c.get("reclaim_cpu_ms") for c in (t.get("per_child_cpu") or {}).values()]
+            if any(v is None for v in reclaim):
+                return None
+            serve = r.get("serve_cpu")
+            if not isinstance(serve, dict):
+                return None
+            if serve.get("applicable"):
+                if serve.get("ms") is None:
+                    return None
+                serve_ms = serve["ms"]
+            else:
+                serve_ms = 0.0
+            return {"children": sum(life.values()), "reclaim": sum(reclaim), "serve": serve_ms}
+
+        if any(request_cpu_parts(r) for r in by[a]):
+            parts = lambda key: lambda r: (request_cpu_parts(r) or {}).get(key)
+            total = lambda r: (
+                sum(request_cpu_parts(r).values()) if request_cpu_parts(r) else None)
+            counted = [r for r in by[a] if request_cpu_parts(r)]
+            names = sorted({
+                n for r in counted
+                for n in r["teardown"]["lifetime_cpu_ms_by_child"]
+            })
+            # A reaping reading the reaper raced is a lower bound (see the
+            # per-child block above), and so is any total that includes one.
+            lower_bound = sum(
+                1 for r in counted
+                if any(c.get("complete") is not True
+                       for c in (r["teardown"].get("per_child_cpu") or {}).values()))
+            block = {
+                "total": metric_summary(by[a], total),
+                "children_at_kill": metric_summary(by[a], parts("children")),
+                "reclaim": metric_summary(by[a], parts("reclaim")),
+                "memory_server": metric_summary(by[a], parts("serve")),
+                "by_child_at_kill": {
+                    n: metric_summary(by[a], lambda r, n=n: (
+                        ((r.get("teardown") or {}).get("lifetime_cpu_ms_by_child") or {}).get(n)
+                        if request_cpu_parts(r) else None))
+                    for n in names
+                },
+                "records_with_lower_bound_reaping": lower_bound,
+            }
+            out["arms"][a]["request_cpu_ms"] = block
+            print("    request CPU, launch to end of teardown "
+                  "(children at kill + reaping + memory server); "
+                  f"{lower_bound}/{len(counted)} totals include a lower-bound reaping")
+            for key in ("total", "children_at_kill", "reclaim", "memory_server"):
+                s = block[key]
+                print(f"      {key:20s} {fmt(s['median'], s['lo'], s['hi'], s['n'])}")
+            for n, s in block["by_child_at_kill"].items():
+                print(f"      {'  ' + n:20s} {fmt(s['median'], s['lo'], s['hi'], s['n'])}")
+
         # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning
         # gate while `len(ag)` drove the denominator, so a null or an absent
         # `all_gone` landed in the denominator and OUT of the gate: 27 confirmed
