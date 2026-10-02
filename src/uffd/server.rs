@@ -1693,8 +1693,109 @@ impl ParkedFaults {
     }
 }
 
+/// Threads per clone that read source pages which are not in the page cache.
+const SOURCE_READERS: usize = 16;
+
+/// A fault whose source page was not in the page cache when it arrived.
+struct SourceWait {
+    page: usize,
+    offset: usize,
+    trace_t0: u64,
+}
+
+/// Reads of uncached source pages, taken off the thread that serves a clone's faults.
+///
+/// A copy whose source page is not in the page cache waits for a disk read, and the handler
+/// answers one fault at a time, so every other waiting vCPU stood behind that read. A fault
+/// like that is handed to one of these threads instead. The thread touches the page, which
+/// is the read, and hands the fault back; the handler then copies a page that is cached.
+/// Reads for different vCPUs overlap, and faults whose page is cached are not held up.
+struct SourceReaders {
+    jobs: std::sync::mpsc::Sender<SourceWait>,
+    ready: tokio::sync::mpsc::UnboundedReceiver<SourceWait>,
+    /// Faults handed to a reader thread.
+    waits: u64,
+}
+
+impl SourceReaders {
+    /// Start the reader threads for one copy-mode clone. `None` in minor mode, where there
+    /// is no source read, and when a thread cannot be started.
+    fn start(source: &Arc<PageSource>, vm_id: &str) -> Option<Self> {
+        if !matches!(**source, PageSource::Copy { .. }) {
+            return None;
+        }
+        let (jobs, job_queue) = std::sync::mpsc::channel::<SourceWait>();
+        let job_queue = Arc::new(std::sync::Mutex::new(job_queue));
+        let (ready_tx, ready) = tokio::sync::mpsc::unbounded_channel();
+        for reader in 0..SOURCE_READERS {
+            let source = Arc::clone(source);
+            let job_queue = Arc::clone(&job_queue);
+            let ready_tx = ready_tx.clone();
+            let spawned = std::thread::Builder::new()
+                .name(format!("fcvm-src-{reader}"))
+                .spawn(move || loop {
+                    // The lock is held while waiting: one thread waits for a job and the
+                    // rest wait for the lock. It is released before the read.
+                    let job = {
+                        let queue = job_queue.lock().unwrap_or_else(|e| e.into_inner());
+                        queue.recv()
+                    };
+                    // The sender is gone once the clone's handler has returned.
+                    let Ok(job) = job else { return };
+                    if let PageSource::Copy { mmap, .. } = &*source {
+                        if let Some(byte) = mmap.get(job.offset) {
+                            // SAFETY: `byte` is a readable byte of the mapping `source` owns.
+                            unsafe { std::ptr::read_volatile(byte as *const u8) };
+                        }
+                    }
+                    if ready_tx.send(job).is_err() {
+                        return;
+                    }
+                });
+            if let Err(error) = spawned {
+                warn!(
+                    target: "uffd",
+                    vm_id = %vm_id,
+                    error = %error,
+                    "could not start a source reader thread - source reads stay on the fault handler"
+                );
+                return None;
+            }
+        }
+        Some(Self {
+            jobs,
+            ready,
+            waits: 0,
+        })
+    }
+}
+
+/// Whether the page of `mmap` at `offset` is in the page cache. An answer the kernel does
+/// not give counts as cached, which leaves the fault on the ordinary path.
+fn source_is_cached(mmap: &[u8], offset: usize) -> bool {
+    let Some(byte) = mmap.get(offset) else {
+        return true;
+    };
+    let mut resident = [0u8; 1];
+    // SAFETY: `byte` is inside the mapping, `offset` is page-aligned, and `resident` holds
+    // the one byte the kernel writes for one page.
+    let rc = unsafe {
+        libc::mincore(
+            byte as *const u8 as *mut libc::c_void,
+            1,
+            resident.as_mut_ptr() as *mut _,
+        )
+    };
+    rc != 0 || resident[0] & 1 == 1
+}
+
 struct VmState {
     fault_count: u64,
+    /// Set once working-set replay is over. Replay does not wait on the reader threads, so
+    /// a fault is only handed to them after it.
+    replay_done: bool,
+    /// `Some` for a copy-mode clone whose reader threads started.
+    source_readers: Option<SourceReaders>,
     /// What fault-around populated beyond the demanded pages.
     fault_around: FaultAroundStats,
     parked_faults: ParkedFaults,
@@ -1878,6 +1979,10 @@ async fn handle_vm_page_faults(
     let started = std::time::Instant::now();
     let mut state = VmState {
         fault_count: 0,
+        replay_done: false,
+        source_readers: (page_size == 4096)
+            .then(|| SourceReaders::start(&source, &vm_id))
+            .flatten(),
         fault_around: FaultAroundStats::default(),
         parked_faults: ParkedFaults::default(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
@@ -1955,7 +2060,33 @@ async fn replay_then_serve(
         }
     }
 
+    state.replay_done = true;
     serve_faults(ctx, async_uffd, async_peer_pidfd, peer_pid, state).await
+}
+
+/// Copy the page of a fault whose source a reader thread has just read. Returns `false`
+/// when the clone's address space is gone.
+fn finish_source_wait(
+    uffd: &Uffd,
+    ctx: &VmContext<'_>,
+    state: &mut VmState,
+    wait: SourceWait,
+) -> Result<bool> {
+    match resolve_fault(uffd, ctx, wait.page, wait.offset)? {
+        FaultOutcome::Resolved | FaultOutcome::AlreadyPresent => {
+            if let Some(t) = state.trace.as_mut() {
+                let t1 = t.now_ns();
+                t.record(wait.offset as u64, wait.trace_t0, t1);
+            }
+            Ok(true)
+        }
+        FaultOutcome::VmGone => Ok(false),
+        FaultOutcome::Retry => {
+            let trace_t0 = state.trace.is_some().then_some(wait.trace_t0);
+            state.parked_faults.park(wait.page, wait.offset, trace_t0);
+            Ok(true)
+        }
+    }
 }
 
 async fn replay_working_set(
@@ -2093,6 +2224,31 @@ async fn serve_faults(
                 }
             }
 
+            read = async {
+                match state.source_readers.as_mut() {
+                    Some(readers) => readers.ready.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let mut next = Some(read.ok_or_else(|| {
+                    anyhow!("the source reader threads of vm {} are gone", ctx.vm_id)
+                })?);
+                let mut finished = 0usize;
+                while let Some(wait) = next.take() {
+                    if !finish_source_wait(async_uffd.get_ref(), ctx, state, wait)? {
+                        log_clone_finished(ctx, state, "clone exited while a source page was read");
+                        return Ok(());
+                    }
+                    finished += 1;
+                    if finished < MAX_EVENTS_PER_BATCH {
+                        next = state
+                            .source_readers
+                            .as_mut()
+                            .and_then(|readers| readers.ready.try_recv().ok());
+                    }
+                }
+            }
+
             _ = retry_due => {}
         }
 
@@ -2124,6 +2280,15 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             extra_mib = stats.extra_bytes / (1024 * 1024),
             refused_granules = stats.refused,
             "fault-around populated pages beyond the demanded ones"
+        );
+    }
+    if let Some(readers) = state.source_readers.as_ref() {
+        info!(
+            target: "uffd",
+            vm_id = %ctx.vm_id,
+            faults = readers.waits,
+            reader_threads = SOURCE_READERS,
+            "source reads taken off the fault handler"
         );
     }
     info!(
@@ -2425,6 +2590,28 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                             }
                         }
                         PageSource::Copy { .. } => {}
+                    }
+
+                    // A source page that is not cached is read by a reader thread, and the
+                    // fault is answered when it hands the fault back.
+                    if state.replay_done {
+                        if let (PageSource::Copy { mmap, .. }, Some(readers)) =
+                            (source, state.source_readers.as_mut())
+                        {
+                            if !source_is_cached(mmap, offset_in_file)
+                                && readers
+                                    .jobs
+                                    .send(SourceWait {
+                                        page: fault_page,
+                                        offset: offset_in_file,
+                                        trace_t0,
+                                    })
+                                    .is_ok()
+                            {
+                                readers.waits += 1;
+                                continue;
+                            }
+                        }
                     }
 
                     match resolve_fault(uffd, ctx, fault_page, offset_in_file)? {
@@ -3081,6 +3268,8 @@ mod tests {
         let origin = std::time::Instant::now();
         let mut state = VmState {
             fault_count: 0,
+            replay_done: true,
+            source_readers: None,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: None,
@@ -3275,6 +3464,8 @@ mod tests {
 
         let mut past_window = VmState {
             fault_count: 0,
+            replay_done: true,
+            source_readers: None,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
@@ -3295,6 +3486,8 @@ mod tests {
         // above cannot pass by never recording anything.
         let mut in_window = VmState {
             fault_count: 0,
+            replay_done: true,
+            source_readers: None,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(PageSet::empty(mem_len)),
@@ -3333,6 +3526,8 @@ mod tests {
         let fault_time = started + Duration::from_secs(1);
         let clone_state = |window: Duration| VmState {
             fault_count: 0,
+            replay_done: true,
+            source_readers: None,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
             recorded: Some(store.recorder()),
@@ -5171,6 +5366,8 @@ mod tests {
         fn state() -> VmState {
             VmState {
                 fault_count: 0,
+                replay_done: true,
+                source_readers: None,
                 fault_around: FaultAroundStats::default(),
                 parked_faults: ParkedFaults::default(),
                 recorded: None,
@@ -5995,6 +6192,8 @@ mod tests {
         fn state(&self) -> VmState {
             VmState {
                 fault_count: 0,
+                replay_done: true,
+                source_readers: None,
                 fault_around: FaultAroundStats::default(),
                 parked_faults: ParkedFaults::default(),
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
