@@ -8,8 +8,9 @@ writes it into run.json as `resolve_all_to` (null when unset), so a reader of
 the record can tell which resolver rule the baseline ran under.
 
 Driven with a stub podman on PATH that records the `run` argv NUL-separated,
-and a python3 shim that answers for cdpdrive.py only, so the script runs to
-its summary with no container and no browser. ALLOW_BUSY=1 passes the
+and test_hostcdp_corpus.write_python_shim, which hands the in-process driver a
+stub cdpdrive module, so the script runs to its summary with no container and
+no browser. ALLOW_BUSY=1 passes the
 quiet-box gate.
 
 Watched red 2026-08-28 against hostcdp.sh at 13cb9543; the failure text is
@@ -22,9 +23,10 @@ import hashlib
 import json
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
+
+from test_hostcdp_corpus import write_python_shim
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH = os.path.join(HERE, "hostcdp.sh")
@@ -80,12 +82,7 @@ case "$1" in
 esac
 exit 0
 ''')
-        write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
-case "${{1:-}}" in
-  *cdpdrive.py) echo '{{"stub": true}}'; exit 0 ;;
-esac
-exec {sys.executable} "$@"
-''')
+        write_python_shim(binx, d)
         env = dict(os.environ)
         env.pop("BENCH_RESOLVE_ALL_TO", None)
         env.pop("CPUS", None)
