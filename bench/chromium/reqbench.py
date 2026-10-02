@@ -230,6 +230,43 @@ def proc_stat_fields(pid: int):
         return None
 
 
+def proc_cpu_ticks(pid: int):
+    """(utime, stime, cutime, cstime, starttime) ticks, or None if the pid is gone.
+
+    cutime and cstime hold the CPU of children the process has already
+    reaped, such as fcvm's short-lived `cp --reflink`, `nsenter` and `ip`
+    helpers, which are gone before any per-process reading can see them.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        f = raw.rsplit(") ", 1)[1].split()
+        return int(f[11]), int(f[12]), int(f[13]), int(f[14]), int(f[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def serve_cpu_sample(serve_pid: int) -> dict:
+    """The memory server's cumulative CPU, its own and its reaped children's.
+
+    A per-request delta of this counter is not the request's: the server
+    finishes some work after a clone exits (working-set publication, copy-mode
+    cache warming), and it is read in CLK_TCK steps. The analyzer instead
+    divides the counter's growth over a whole single-arm run by the request
+    count, which counts that work and averages the quantization away.
+    """
+    if not serve_pid:
+        return {"applicable": False}
+    ticks = proc_cpu_ticks(serve_pid)
+    if ticks is None:
+        return {"applicable": True, "error": "memory server not readable"}
+    return {"applicable": True, "ms": sum(ticks[:4]) * 1000.0 / CLK_TCK,
+            "starttime": ticks[4]}
+
+
 def machine_cpu_ms() -> float:
     """Non-idle CPU milliseconds from /proc/stat's aggregate line."""
     with open("/proc/stat") as f:
@@ -1717,6 +1754,7 @@ def measure_fast_reap(
         # entirely rather than making it small.
         pre_memory = {name: proc_private_dirty_kb(pid) for name, pid in tracked.items()}
         pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
+        pre_ticks = {name: proc_cpu_ticks(pid) for name, pid in tracked.items()}
         missing_pre = [name for name, fields in pre.items() if fields is None]
         if missing_pre:
             raise RuntimeError(
@@ -1805,6 +1843,7 @@ def measure_fast_reap(
             "machine_window_ms": machine_window_ms,
             "parent_live": parent_live,
             "pre": pre,
+            "pre_ticks": pre_ticks,
             "pre_memory": pre_memory,
             "reclaim_cpu": reclaim_cpu,
             "sample_period_s": sample_period_s,
@@ -1920,6 +1959,13 @@ def teardown_fast(
         name: (fields[1] + fields[2]) * 1000.0 / CLK_TCK
         for name, fields in pre.items()
         if fields is not None
+    }
+    # What each pinned process's already-reaped children used: fcvm's setup
+    # helpers in particular. Not part of the per-child figures above.
+    out["reaped_children_cpu_ms_by_child"] = {
+        name: (ticks[2] + ticks[3]) * 1000.0 / CLK_TCK
+        for name, ticks in measured.get("pre_ticks", {}).items()
+        if ticks is not None
     }
     reclaim_cpu = measured["reclaim_cpu"]
     sample_period_s = measured["sample_period_s"]
@@ -3185,6 +3231,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
+    serve_pid = getattr(args, "serve_pid", 0) or 0
+    serve_before = serve_cpu_sample(serve_pid)
     t_spawn = time.monotonic()
     interrupted = None
     fcvm_start_time = None
@@ -3416,6 +3464,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             e.record = rec
             raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    rec["serve_cpu_before"] = serve_before
+    rec["serve_cpu_after"] = serve_cpu_sample(serve_pid)
     rec["log"] = log
     if interrupted is not None:
         raise interrupted

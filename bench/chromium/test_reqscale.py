@@ -2296,5 +2296,39 @@ class PlanOnlyCli(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "out")))
 
 
+
+class ConcurrentRequestRecords(unittest.TestCase):
+    def _record(self, cdp_record):
+        args = SimpleNamespace(
+            url="http://x/", format="jpeg", quality=80, cdp_port=9222, ws_url="",
+            fcvm="fcvm", data_root="/d", state_dir="/s", timeout=10.0,
+            teardown_timeout=5.0, rust_log="off", run_id="r", snapshot_tag="t",
+            cgroup_paths={"uffd": "/sys/fs/cgroup/x/uffd", "file": "/sys/fs/cgroup/x/file"},
+            snapshot_identity={"generation_id": "g", "config_sha256": "c"},
+        )
+        spec = SimpleNamespace(burst_id="b", block_id=0, target_rps=2.0,
+                               population="score", traced=False, trace_pair_id=None)
+        context = reqscale.RequestContext(
+            run_id="r", burst_id="b", population="score", segment="score",
+            backend="uffd", target_rps=2.0, request_index=0, pair_index=0,
+            request_id="r:b:0", scheduled_ns=0, actual_launch_ns=1, request_seed=7,
+        )
+        request = reqscale._make_request_fn(
+            args, spec, 1234, "/logs", {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
+        with mock.patch.object(reqscale.reqbench, "run_cdp_request",
+                               return_value=dict(cdp_record)):
+            return request(context)
+
+    def test_the_memory_server_cpu_is_not_charged_to_overlapping_requests(self):
+        """Red without the pop: run_cdp_request's memory-server samples,
+        taken around a request that overlapped others served by the same
+        server, survived into its record."""
+        sample = {"applicable": True, "ms": 25.0, "starttime": 7}
+        record = self._record({"ok": True, "serve_cpu_before": sample,
+                               "serve_cpu_after": sample})
+        self.assertNotIn("serve_cpu_before", record)
+        self.assertNotIn("serve_cpu_after", record)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

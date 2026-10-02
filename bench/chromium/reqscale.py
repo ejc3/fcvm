@@ -3349,6 +3349,11 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         request_args = _request_args(args, context, serve_pid, log_dir, probe)
         rep = global_base + context.request_index
         record = reqbench.run_cdp_request(request_args, rep, fast=True)
+        # The memory server's counters bracket overlapping requests here, so
+        # they say nothing about this one; reqscale_analyze has its own
+        # whole-run cgroup accounting.
+        record.pop("serve_cpu_before", None)
+        record.pop("serve_cpu_after", None)
         record.update(
             schema=RECORD_SCHEMA,
             kind="request",

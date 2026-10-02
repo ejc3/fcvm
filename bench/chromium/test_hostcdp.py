@@ -26,7 +26,7 @@ import subprocess
 import tempfile
 import unittest
 
-from test_hostcdp_corpus import write_python_shim
+from test_hostcdp_corpus import cgroup_fixture, write_python_shim
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SH = os.path.join(HERE, "hostcdp.sh")
@@ -72,6 +72,8 @@ case "$1" in
     case "$*" in
       *'.Image'*) echo sha256:{"a" * 64} ;;
       *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
+      *'.State.CgroupPath'*) echo "${{TEST_CGROUP_PATH-/fake-container.scope}}" ;;
+      *'.State.Pid'*) echo 4242 ;;
     esac
     ;;
   container)
@@ -103,6 +105,7 @@ exit 0
             REQBENCH_RUNTIME_MANIFEST=manifest,
             REQBENCH_RUNTIME_BUNDLE_SHA256=runtime_identity,
         )
+        env.update(cgroup_fixture(d))
         if resolve_all_to is not None:
             env["BENCH_RESOLVE_ALL_TO"] = resolve_all_to
         result = subprocess.run(["bash", SH], env=env, capture_output=True,

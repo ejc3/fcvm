@@ -81,9 +81,22 @@ def write_python_shim(binx, directory, seen=None):
     stub = os.path.join(directory, "stub_cdpdrive.py")
     with open(stub, "w") as handle:
         handle.write(f'''SEEN = {seen!r}
+import os as _os
+
+
+def _bump_cpu():
+    """Advance the fixture cgroup's usage_usec by 2.5 ms, as a render would."""
+    path = _os.environ.get("TEST_CPU_STAT")
+    if not path or not _os.path.exists(path):
+        return
+    with open(path) as handle:
+        usage = int(handle.read().split()[1])
+    with open(path, "w") as handle:
+        handle.write(f"usage_usec {{usage + 2500}}\\nuser_usec 0\\nsystem_usec 0\\n")
 
 
 def drive(args):
+    _bump_cpu()
     import os
     action = os.environ.get("TEST_DRIVE_ACTION", "")
     if action == "interrupt":
@@ -110,6 +123,21 @@ exec {sys.executable} "$@"
     return calls
 
 
+def cgroup_fixture(directory):
+    """A CGROUP_ROOT whose /fake-container.scope/cpu.stat the stub driver
+    advances by 2.5 ms per drive(). Returns the env entries hostcdp.sh needs."""
+    scope = os.path.join(directory, "cgroup", "fake-container.scope")
+    os.makedirs(scope)
+    cpu_stat = os.path.join(scope, "cpu.stat")
+    with open(cpu_stat, "w") as handle:
+        handle.write("usage_usec 1000000\nuser_usec 0\nsystem_usec 0\n")
+    # Podman puts the container's processes one level down.
+    os.makedirs(os.path.join(scope, "container"))
+    with open(os.path.join(scope, "container", "cgroup.procs"), "w") as handle:
+        handle.write("4242\n")
+    return {"CGROUP_ROOT": os.path.join(directory, "cgroup"), "TEST_CPU_STAT": cpu_stat}
+
+
 def write_podman_stub(path, run_argv=None):
     present = path + ".container-present"
     record_argv = ""
@@ -130,6 +158,8 @@ case "$1" in
     case "$*" in
       *'.Image'*) echo sha256:{"a" * 64} ;;
       *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
+      *'.State.CgroupPath'*) echo "${{TEST_CGROUP_PATH-/fake-container.scope}}" ;;
+      *'.State.Pid'*) echo 4242 ;;
     esac
     ;;
   container)
@@ -176,6 +206,7 @@ class HostCdpCorpusSchedule(unittest.TestCase):
             "REQBENCH_RUNTIME_MANIFEST": manifest,
             "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
         })
+        env.update(cgroup_fixture(d))
         if existing_results:
             os.makedirs(env["RESULTS"])
             with open(os.path.join(env["RESULTS"], "summary.json"), "w") as handle:
@@ -383,6 +414,120 @@ class HostCdpDriverFailures(unittest.TestCase):
         self.assertIn("returned str", rows[0]["driver"])
 
 
+class HostCdpContainerCpu(unittest.TestCase):
+    """The host control records the container's CPU per request.
+
+    A clone's CPU is all of its one-request life, so the comparable container
+    figure counts the warm container's CPU across the whole run, between
+    requests included, divided by the measured count. The stub driver
+    advances the fixture cgroup's usage_usec by 2.5 ms per drive().
+    """
+
+    def test_each_rep_carries_the_counters_and_the_summary_reduces_them(self):
+        """Red on #1046: no container_cpu_usec_* fields, no container_cpu_ms."""
+        proc, _, _, d = HostCdpCorpusSchedule._run(self, URLS[0], 4, 1)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        with open(os.path.join(d, "results", "hostcdp.jsonl")) as handle:
+            rows = [json.loads(line) for line in handle]
+        deltas = [r["container_cpu_usec_after"] - r["container_cpu_usec_before"] for r in rows]
+        self.assertEqual(deltas, [2500] * 5)
+        with open(os.path.join(d, "results", "summary.json")) as handle:
+            cpu = json.load(handle)["container_cpu_ms"]
+        self.assertEqual(cpu, {"window_p50_ms": 2.5, "window_mean_ms": 2.5,
+                               "run_average_ms": 2.5, "n": 4})
+
+    def test_a_container_without_a_cpu_counter_is_refused(self):
+        """Red on #1046: the run had no CPU reading to refuse on."""
+        d = tempfile.mkdtemp(prefix="hostcdp-cpu-")
+        self.addCleanup(lambda: subprocess.run(["rm", "-rf", d], check=True))
+        real = HostCdpCorpusSchedule._run.__get__(self)
+        original = cgroup_fixture
+
+        def broken(directory):
+            env = original(directory)
+            os.remove(env["TEST_CPU_STAT"])
+            return env
+
+        globals()["cgroup_fixture"] = broken
+        try:
+            proc, _, _, _ = real(URLS[0], 2, 1)
+        finally:
+            globals()["cgroup_fixture"] = original
+        self.assertEqual(proc.returncode, 5, proc.stderr[-2000:])
+        self.assertIn("no usage_usec", proc.stderr)
+
+
+class HostCdpContainerCgroup(unittest.TestCase):
+    """The CPU counter must be the container's own cgroup, not the machine's."""
+
+    def _run_with(self, cgroup_path, make_dir=None):
+        os.environ["TEST_CGROUP_PATH"] = cgroup_path
+        try:
+            proc, _, _, d = HostCdpCorpusSchedule._run(self, URLS[0], 2, 1)
+        finally:
+            del os.environ["TEST_CGROUP_PATH"]
+        return proc
+
+    def test_the_root_cgroup_is_refused(self):
+        """Red on e9691729: "/" made CPU_STAT the root cgroup's cpu.stat,
+        whose usage_usec is every process on the machine."""
+        for path in ("/", ""):
+            proc = self._run_with(path)
+            self.assertEqual(proc.returncode, 5, (path, proc.stderr[-2000:]))
+            self.assertIn("not a cgroup below the root", proc.stderr)
+
+    def test_a_climbing_path_is_refused(self):
+        proc = self._run_with("/fake-container.scope/../..")
+        self.assertEqual(proc.returncode, 5, proc.stderr[-2000:])
+        self.assertIn("not canonical", proc.stderr)
+
+    def test_a_cgroup_without_the_container_is_refused(self):
+        """Red on e9691729: any cgroup with a cpu.stat was accepted."""
+        proc = self._run_with("/fake-container.scope/other")
+        self.assertEqual(proc.returncode, 5, proc.stderr[-2000:])
+        self.assertIn("is not in", proc.stderr)
+
+
+class HostCdpCpuSummary(unittest.TestCase):
+    """hostcdp.sh's summary step, run on records with chosen counters."""
+
+    def test_the_run_average_counts_cpu_between_requests(self):
+        """Red if the run average were the mean of the drive() windows: each
+        window is 2 ms, the container spends 3 ms between requests, so the
+        run average from the first measured start to the last measured end is
+        (3 windows + 2 gaps) / 3. The warmup row is outside the window."""
+        with open(SH) as handle:
+            body = handle.read()
+        import re
+        block = re.search(r"^python3 - \"\$OUT\" \"\$WARMUP\" \"\$RESULTS/\.summary\.pending\" <<'PY'\n(.*?)\nPY\n",
+                          body, re.S | re.M)
+        self.assertIsNotNone(block, "summary step not found")
+        rows = []
+        counter = 0
+        for rep in range(4):
+            before = counter
+            counter += 2000
+            rows.append({"rep": rep, "warmup": rep == 0, "wall_ms": 10.0 + rep,
+                         "loadavg1": 0.5, "url": URLS[0],
+                         "container_cpu_usec_before": before,
+                         "container_cpu_usec_after": counter})
+            counter += 3000
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "hostcdp.jsonl")
+            with open(out, "w") as handle:
+                handle.writelines(json.dumps(r) + "\n" for r in rows)
+            pending = os.path.join(d, "summary.pending")
+            proc = subprocess.run([sys.executable, "-", out, "1", pending],
+                                  input=block.group(1), text=True, capture_output=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(pending) as handle:
+                cpu = json.load(handle)["container_cpu_ms"]
+        self.assertEqual(cpu["window_p50_ms"], 2.0)
+        self.assertEqual(cpu["window_mean_ms"], 2.0)
+        self.assertEqual(cpu["run_average_ms"], round((3 * 2.0 + 2 * 3.0) / 3, 1))
+        self.assertEqual(cpu["n"], 3)
+
+
 class HostCdpCpuBudget(unittest.TestCase):
     """The host control's CPU budget has to be settable and recorded.
 
@@ -419,6 +564,7 @@ class HostCdpCpuBudget(unittest.TestCase):
             "REQBENCH_RUNTIME_MANIFEST": manifest,
             "REQBENCH_RUNTIME_BUNDLE_SHA256": runtime_identity,
         })
+        env.update(cgroup_fixture(d))
         if cpus is not None:
             env["CPUS"] = cpus
         proc = subprocess.run(["bash", SH], env=env, capture_output=True, text=True)

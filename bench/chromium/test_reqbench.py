@@ -570,10 +570,44 @@ class TeardownFastReapGuard(unittest.TestCase):
             out = reqbench.teardown_fast(p.pid, d, state, data, 5.0)
             p.wait(timeout=5)
             self.assertTrue(out["all_gone"])
+            self.assertEqual(set(out["reaped_children_cpu_ms_by_child"]),
+                             set(out["lifetime_cpu_ms_by_child"]))
             self.assertFalse(os.path.exists(state))
             self.assertFalse(os.path.exists(state + ".lock"), "the .json.lock must go too")
             self.assertFalse(os.path.isdir(data))
 
+
+    def test_a_reaped_helpers_cpu_is_recorded(self):
+        """RED BEFORE THE FIX: utime+stime at the kill missed a child that had
+        already run and been reaped, the shape of fcvm's cp/nsenter/ip setup
+        helpers. Here the pinned child burns CPU in a helper, reaps it, and
+        execs sleep; cutime survives the exec."""
+        burn = ("import time\nt = time.process_time()\n"
+                "while time.process_time() - t < 0.3: pass\n")
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            with open(state, "w") as f:
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
+            with open(state + ".lock", "w") as f:
+                f.write("")
+            os.makedirs(data)
+            p = spawn_pdeathsig_parent(
+                ["bash", "-c", f"{sys.executable} -c '{burn}'; exec sleep 300"])
+            wait_for_child(p.pid)
+            deadline = time.monotonic() + 10
+            child = None
+            while time.monotonic() < deadline:
+                kids = open(f"/proc/{p.pid}/task/{p.pid}/children").read().split()
+                child = int(kids[0]) if kids else None
+                if child and reqbench.proc_comm(child) == "sleep":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(reqbench.proc_comm(child), "sleep")
+            out = reqbench.teardown_fast(p.pid, d, state, data, 5.0)
+            p.wait(timeout=5)
+        self.assertGreaterEqual(out["reaped_children_cpu_ms_by_child"]["sleep"], 250.0)
+        self.assertLess(out["lifetime_cpu_ms_by_child"]["sleep"], 250.0)
 
     def test_failed_rmtree_aborts_the_run(self):
         """A reap that could not remove the data dir must STOP the schedule.
@@ -890,6 +924,12 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertIn("WsClosed", rec.get("error", ""))
             self.assertEqual(rec.get("failure_class"), "transport")
             self.assertEqual(rec.get("failure_stage"), "navigate")
+            # serve_pid names a live process, so the request carries the
+            # memory server's cumulative CPU from before and after it.
+            for key in ("serve_cpu_before", "serve_cpu_after"):
+                self.assertIs(rec[key]["applicable"], True, key)
+                self.assertIsInstance(rec[key]["ms"], float, key)
+                self.assertEqual(rec[key]["starttime"], reqbench.proc_stat_fields(1)[3])
 
     def test_cdp_response_waits_for_lifecycle_ready_before_fast_teardown(self):
         """A serving port is not yet permission to tear down clone setup."""
@@ -3817,6 +3857,125 @@ class AnalyzerAvailability(unittest.TestCase):
                 "a sub-tick child must print as a bound, never as an exact zero",
             )
             self.assertIn("below /proc tick resolution", text)
+
+    def _cpu_fixture(self, d, mutate=None):
+        src = os.path.join(d, "r.jsonl")
+        dst = os.path.join(d, "r.json")
+        self._write_clean_backend(src, "uffd", 6, 372.0)
+        with open(src) as source:
+            rows = [json.loads(line) for line in source]
+        fast = [row for row in rows if row.get("arm") == "cdp-fast"]
+        measured = [row for row in fast if row.get("warmup") is False]
+        self.assertGreater(len(measured), 2)
+        for record in fast:
+            record["teardown"]["lifetime_cpu_ms_by_child"] = {
+                "fcvm": 40.0, "firecracker": 600.0, "pasta": 30.0}
+            record["teardown"]["reaped_children_cpu_ms_by_child"] = {
+                "fcvm": 5.0, "firecracker": 0.0, "pasta": 0.0}
+            record["teardown"]["per_child_cpu"] = {
+                "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
+                "pasta": {"reclaim_cpu_ms": 0.0, "complete": True},
+            }
+        measured[1]["teardown"]["per_child_cpu"]["firecracker"]["complete"] = False
+        if mutate:
+            mutate(measured)
+        with open(src, "w") as target:
+            for row in rows:
+                target.write(json.dumps(row) + "\n")
+        with redirect_stdout(io.StringIO()):
+            self._run_gate_fixture(["--json-out", dst, src])
+        with open(dst) as result_file:
+            return json.load(result_file)["arms"]["cdp-fast"]["request_cpu_ms"], measured
+
+    def test_request_cpu_counts_reaped_helpers_and_measured_lower_bounds(self):
+        """RED BEFORE THE FIX: no reduction read the per-child CPU, fcvm's
+        reaped setup helpers (cutime/cstime) were read nowhere, and the old
+        test's lower-bound row was a warmup, so it could never count one."""
+        with tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d)
+        self.assertTrue(block["complete"])
+        self.assertEqual(block["clone_mean_ms"]["mean"], 670.0 + 5.0 + 110.0)
+        self.assertEqual(block["clone_mean_ms"]["n"], len(measured))
+        self.assertEqual(block["clone_parts_mean_ms"]["reaped_children"], 5.0)
+        self.assertEqual(block["records_with_lower_bound_reaping"], 1)
+        # Four arms shared the memory server, so it is not this arm's.
+        self.assertFalse(block["memory_server"]["available"])
+        self.assertNotIn("total_mean_ms", block)
+
+    def test_one_incomplete_request_withholds_every_cpu_figure(self):
+        """RED BEFORE THE FIX: a request without a reading was dropped and
+        the rest published under a smaller n."""
+        def drop(measured):
+            del measured[0]["teardown"]["reaped_children_cpu_ms_by_child"]
+        with tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, drop)
+        self.assertFalse(block["complete"])
+        self.assertEqual(block["missing_records"], 1)
+        self.assertNotIn("clone_mean_ms", block)
+
+
+
+class ServeCpuSample(unittest.TestCase):
+    """The memory server's cumulative CPU, its own and its reaped children's."""
+
+    def test_a_live_server_reads_all_four_counters(self):
+        ticks = reqbench.proc_cpu_ticks(os.getpid())
+        got = reqbench.serve_cpu_sample(os.getpid())
+        self.assertEqual(got["starttime"], ticks[4])
+        self.assertGreaterEqual(got["ms"], sum(ticks[:4]) * 1000.0 / reqbench.CLK_TCK)
+
+    def test_a_server_that_is_gone_is_an_error_not_zero(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        got = reqbench.serve_cpu_sample(p.pid)
+        self.assertNotIn("ms", got)
+        self.assertIn("not readable", got["error"])
+
+    def test_a_file_backed_restore_has_no_server(self):
+        self.assertEqual(reqbench.serve_cpu_sample(0), {"applicable": False})
+
+
+class MemoryServerAverage(unittest.TestCase):
+    """The memory server's CPU per request, over a single-arm run."""
+
+    @staticmethod
+    def records(befores, afters, starttime=7, arm="cdp-fast"):
+        return [{"arm": arm, "rep": i,
+                 "serve_cpu_before": {"applicable": True, "ms": b, "starttime": starttime},
+                 "serve_cpu_after": {"applicable": True, "ms": a, "starttime": starttime}}
+                for i, (b, a) in enumerate(zip(befores, afters))]
+
+    def test_growth_over_the_run_counts_work_finished_between_requests(self):
+        """Red with per-request deltas: the 30 ms the server did between
+        requests (here 100->110 and 130->150) belonged to no request."""
+        recs = self.records([100.0, 110.0, 150.0], [100.0, 130.0, 160.0])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"])
+        self.assertTrue(got["available"])
+        self.assertEqual(got["mean_ms"], 60.0 / 3)
+
+    def test_a_server_shared_with_other_arms_is_not_attributed(self):
+        recs = self.records([0.0, 10.0, 20.0], [10.0, 20.0, 30.0])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"])
+        self.assertFalse(got["available"])
+        self.assertIn("noop", got["reason"])
+
+    def test_a_restarted_server_is_not_attributed(self):
+        recs = self.records([0.0, 10.0], [10.0, 20.0])
+        recs[1]["serve_cpu_after"]["starttime"] = 8
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"])
+        self.assertFalse(got["available"])
+        self.assertIn("restarted", got["reason"])
+
+    def test_a_missing_sample_is_not_attributed(self):
+        recs = self.records([0.0, 10.0], [10.0, 20.0])
+        recs[0]["serve_cpu_before"] = {"applicable": True, "error": "memory server not readable"}
+        self.assertFalse(reqanalyze.memory_server_average(recs, ["cdp-fast"])["available"])
+
+    def test_a_file_backed_run_has_no_server_cost(self):
+        recs = [{"arm": "cdp-fast", "rep": 0, "serve_cpu_before": {"applicable": False},
+                 "serve_cpu_after": {"applicable": False}}]
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"])
+        self.assertEqual((got["available"], got["mean_ms"]), (True, 0.0))
 
 
 class ProcStateReadOnce(unittest.TestCase):
