@@ -8431,6 +8431,8 @@ sys.stdin.read(1)
             rec = json.load(handle)
         self.assertEqual(rec["hosts"]["host"]["wall_ms"]["n"], 3)
         self.assertEqual(rec["hosts"]["host"]["driver_total_ms"]["n"], 3)
+        # The fixture predates in-process driving, and the output says so.
+        self.assertEqual(rec["hosts"]["host"]["driver_process"], "per-rep subprocess")
         identities = rec["input_identity"]
         self.assertEqual(
             identities["reqbench_jsonl"]["sha256"],

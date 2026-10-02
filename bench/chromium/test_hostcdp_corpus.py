@@ -84,6 +84,12 @@ def write_python_shim(binx, directory, seen=None):
 
 
 def drive(args):
+    import os
+    action = os.environ.get("TEST_DRIVE_ACTION", "")
+    if action == "interrupt":
+        raise KeyboardInterrupt
+    if action == "nondict":
+        return "not a result"
     if SEEN:
         with open(SEEN, "a") as handle:
             handle.write(args.url + "\\n")
@@ -342,6 +348,39 @@ class HostCdpDrivesInProcess(unittest.TestCase):
         self.assertEqual(len(many), len(few),
                          f"python3 starts grew with the rep count: {len(few)} at 2 reps, "
                          f"{len(many)} at 6")
+
+
+class HostCdpDriverFailures(unittest.TestCase):
+    """A rep that ends the run still leaves its row, as the per-rep wrapper
+    process did when its child crashed."""
+
+    def _run(self, action):
+        os.environ["TEST_DRIVE_ACTION"] = action
+        try:
+            proc, _, _, d = HostCdpCorpusSchedule._run(self, URLS[0], 2, 1)
+        finally:
+            del os.environ["TEST_DRIVE_ACTION"]
+        with open(os.path.join(d, "results", "hostcdp.jsonl")) as handle:
+            rows = [json.loads(line) for line in handle]
+        return proc, rows
+
+    def test_an_interrupt_writes_the_row_and_refuses(self):
+        """Red on 8b2778aa: KeyboardInterrupt escaped before out.write(), so
+        the interrupted rep left no row."""
+        proc, rows = self._run("interrupt")
+        self.assertEqual(proc.returncode, 5, proc.stderr[-2000:])
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0]["ok"], False)
+        self.assertIn("KeyboardInterrupt", rows[0]["driver"])
+
+    def test_a_result_that_is_not_a_dict_is_a_failed_rep(self):
+        """Red on 8b2778aa: result.get() raised AttributeError outside the
+        handler, so the rep left no row and the run refused instead of failing."""
+        proc, rows = self._run("nondict")
+        self.assertEqual(proc.returncode, 4, proc.stderr[-2000:])
+        self.assertEqual(len(rows), 1)
+        self.assertIs(rows[0]["ok"], False)
+        self.assertIn("returned str", rows[0]["driver"])
 
 
 class HostCdpCpuBudget(unittest.TestCase):
