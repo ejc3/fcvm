@@ -495,6 +495,9 @@ class DnsBrackets(unittest.TestCase):
     FAKE_MAKE = """#!/bin/bash
 env > "$MAKE_ENV_DUMP"
 echo "$*" > "$MAKE_ARGV"
+for a in "$@"; do case "$a" in ""|-*|*=*|*/*) ;; *) target=$a; break ;; esac; done
+env > "$MAKE_ENV_DUMP.${target:-none}"
+echo "$*" >> "$MAKE_ARGV.all"
 [ -z "${MAKE_VERIFY_JSON:-}" ] || printf '%s\\n' "$MAKE_VERIFY_JSON" > "$RESULTS/verify-dns.json"
 [ -z "${MAKE_DIAG_JSON:-}" ] || { mkdir -p "$RESULTS/diag"; printf '%s\\n' "$MAKE_DIAG_JSON" > "$RESULTS/diag/summary.json"; }
 for qname in ${MAKE_DNS_QNAMES:-}; do
@@ -1148,7 +1151,8 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         RED BEFORE THE FIX: there was no MEASURE knob and no scale branch.
         """
         body = campaign()
-        block = re.search(r'(if \[ "\$MEASURE" = scale \]; then\n.*?\nfi\n)', body, re.S)
+        block = re.search(r'(if \[ "\$MEASURE" = scale \]; then\n    say "measured run: open-loop.*?\nfi\n)',
+                          body, re.S)
         self.assertIsNotNone(block, "the campaign has no MEASURE=scale branch")
         self.assertRegex(body, r'(?m)^MEASURE="\$\{MEASURE:-reqbench\}"$')
         with tempfile.TemporaryDirectory() as tmp:
@@ -1157,11 +1161,13 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       f'URLS="{self._urls()}"\nBACKEND=uffd\nUFFD_MODE=minor\n'
                       'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
                       'STALL_MAX_MS=15000\nMEASURE=scale\nTAG=cb-req-corpus\n'
+                      'ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"\n'
                       f'{self._helpers()}\nrun_rc=0\n'
                       f'{block.group(1)}\necho "run_rc=$run_rc"\n')
             result = self._run(script, env)
             self.assertEqual(result.returncode, 0, result.stderr)
-            seen = self._make_env(env)
+            seen = self._make_env(dict(env, MAKE_ENV_DUMP=env["MAKE_ENV_DUMP"]
+                                       + ".bench-chromium-scale"))
             self.assertEqual(seen.get("SCALE_URL"), self._urls())
             self.assertEqual(seen.get("SCALE_TAG"), "cb-req-corpus")
             self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale"))
@@ -1169,10 +1175,29 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             self.assertEqual(seen.get("SCALE_UFFD_PREFETCH"), "on")
             self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
             self.assertEqual(seen.get("SCALE_CONTROL_RESOLVE_ALL_TO"), "127.0.0.1")
-            with open(env["MAKE_ARGV"]) as handle:
-                argv = handle.read()
-            self.assertIn("bench-chromium-scale", argv)
-            self.assertNotIn("bench-chromium-request-run", argv)
+            with open(env["MAKE_ARGV"] + ".all") as handle:
+                calls = handle.read().splitlines()
+            self.assertIn("bench-chromium-scale", calls[0])
+            self.assertFalse(any("bench-chromium-request-run" in c for c in calls))
+            # The run is analyzed before the DNS evidence, into the file the
+            # evidence names its run from (red before: the evidence read
+            # $RESULTS/analysis.json, which a scale run never writes).
+            self.assertEqual(len(calls), 2, calls)
+            self.assertIn("analyze-chromium-scale", calls[1])
+            self.assertIn(f"SCALE_RUN_DIR={results}/scale", calls[1])
+            self.assertIn("SCALE_ANALYSIS_JSON=$ANALYSIS_JSON".replace(
+                "$ANALYSIS_JSON", os.path.join(results, "scale", "analysis-pre-evidence.json")),
+                calls[1])
+        self.assertIn('ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"', body)
+        evidence = body[body.index("write_dns_evidence() {"):]
+        evidence = evidence[:evidence.index("\n}\n")]
+        self.assertIn('"$ANALYSIS_JSON"', evidence)
+        self.assertNotIn("$RESULTS/analysis.json", evidence.replace(
+            '${ANALYSIS_JSON:-$RESULTS/analysis.json}', ""))
+        # After a clean verdict the run is analyzed again into the analysis
+        # that may publish, and the campaign fails unless it does.
+        self.assertRegex(body, r'SCALE_ANALYSIS_JSON="\$RESULTS/scale/analysis\.json"')
+        self.assertIn("jq -e '.publishable == true' \"$RESULTS/scale/analysis.json\"", body)
 
     # From `mkdir -p "$RESULTS"` to the end of the rm, which may continue over
     # backslash-newlines, plus the lock release that closes the block. The

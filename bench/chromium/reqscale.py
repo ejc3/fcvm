@@ -271,6 +271,8 @@ class ScheduleConfig:
     score_seconds: float = SCORE_SECONDS
     trace_rate: Optional[float] = None
     trace_pairs: int = 0
+    # The pages requests render, cycled by pair index (request_url()).
+    urls: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -372,6 +374,8 @@ def _validate_schedule_config(config: ScheduleConfig) -> None:
         raise ValueError("scored bursts must use exactly a 15s ramp and 60s score")
     if not config.rates:
         raise ValueError("at least one target rate is required")
+    if not config.urls or not all(isinstance(url, str) and url for url in config.urls):
+        raise ValueError("the schedule needs the page or pages requests render")
     if len(set(config.rates)) != len(config.rates):
         raise ValueError("target rates must be unique")
     for rate in config.rates:
@@ -383,6 +387,14 @@ def _validate_schedule_config(config: ScheduleConfig) -> None:
             raise ValueError(
                 f"rate {rate:g} supplies fewer than 200 scored requests per backend "
                 f"across {config.scored_bursts} bursts"
+            )
+        # A corpus is only the same workload at every rate when each scored
+        # window renders every page equally often: whole cycles of the list.
+        score_pairs = _planned_count(rate, config.score_seconds)
+        if len(config.urls) > 1 and score_pairs % len(config.urls):
+            raise ValueError(
+                f"rate {rate:g} gives {score_pairs} scored pairs per burst, not a whole "
+                f"number of cycles of the {len(config.urls)}-page corpus"
             )
     criteria = dataclasses.asdict(config.criteria)
     for field in (
@@ -571,6 +583,8 @@ def build_schedule(config: ScheduleConfig, run_id: str) -> dict:
         "run_id": run_id,
         "seed": config.seed,
         "rates": list(config.rates),
+        "urls": list(config.urls),
+        "url_selection": "urls[pair_index % len(urls)]; both halves of a pair render the same page",
         "cells": [
             {
                 "cell_id": f"{backend}:r{format(rate, '.12g')}",
@@ -2421,6 +2435,37 @@ def quiet_host_snapshot(
     }
 
 
+def require_serve_mode(effective: str, requested: str) -> None:
+    """The memory server must run the mode the run asked for; fcvm coerces
+    minor to copy for NV2 snapshots, which would mislabel every UFFD cell."""
+    if effective != requested:
+        raise MeasurementInvalid(
+            f"the memory server runs {effective} mode, not the requested {requested}")
+
+
+def file_restore_refusal(snapshot_config: dict, environ) -> Optional[str]:
+    """Why this run's FILE arm would not be a file-backed restore, or None.
+
+    `fcvm snapshot run` without a memory server serves a hugepage snapshot, an
+    NV2 snapshot, or any restore under FCVM_FORCE_UFFD through an implicit
+    in-process UFFD server (src/commands/snapshot.rs direct_restore_memory),
+    so the FILE-versus-UFFD comparison would be UFFD against UFFD. NV2 comes
+    from the snapshot's kernel profile; any recorded profile is refused rather
+    than resolving whether it enables NV2.
+    """
+    metadata = snapshot_config.get("metadata")
+    if not isinstance(metadata, dict):
+        return "the snapshot config has no metadata to check its restore path against"
+    if metadata.get("hugepages"):
+        return "the snapshot uses hugepages, which fcvm restores through an implicit UFFD server"
+    if metadata.get("kernel_profile"):
+        return (f"the snapshot records kernel profile {metadata['kernel_profile']!r}, "
+                "which can restore through an implicit UFFD server (NV2)")
+    if "FCVM_FORCE_UFFD" in environ:
+        return "FCVM_FORCE_UFFD is set, which restores through an implicit UFFD server"
+    return None
+
+
 def snapshot_identity(data_root: str, snapshot_tag: str) -> dict:
     """Durable identity of the exact snapshot generation and runtime shape."""
     snapshots_root = os.path.realpath(os.path.join(data_root, "snapshots"))
@@ -2557,7 +2602,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             quiet,
         )
     return {
-        "schema": "fcvm.chromium.reqscale.provenance.v1",
+        "schema": "fcvm.chromium.reqscale.provenance.v2",
         "run_id": schedule["run_id"],
         "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
         "argv": list(sys.argv),
@@ -2869,6 +2914,8 @@ class UffdServe:
                                 )
                             if config.get("uffd_mode") not in ("copy", "minor"):
                                 raise MeasurementInvalid(f"serve state {path} has invalid UFFD mode")
+                            require_serve_mode(
+                                config["uffd_mode"], getattr(self.args, "uffd_mode", "copy"))
                             self.state_path, self.state = path, state
                             self.record = {
                                 "schema": RECORD_SCHEMA,
@@ -3813,6 +3860,7 @@ def main() -> int:
         parser.error("trace options require --trace-faults")
 
     config = ScheduleConfig(
+        urls=tuple(args.urls),
         rates=args.rates,
         scored_bursts=args.bursts,
         seed=args.seed,
@@ -3855,6 +3903,13 @@ def main() -> int:
         with SnapshotGenerationLease(args.data_root, args.snapshot_tag) as lease:
             args.snapshot_generation_lease = lease
             args.snapshot_identity = dict(lease.identity)
+            config_path = os.path.join(
+                args.data_root, "snapshots", args.snapshot_tag, "config.json")
+            with open(config_path, "rb") as stream:
+                refusal = file_restore_refusal(
+                    strict_json_loads(stream.read(), config_path), os.environ)
+            if refusal:
+                raise MeasurementInvalid(f"refusing a FILE arm that is not one: {refusal}")
             provenance = collect_provenance(args, schedule, args.snapshot_identity)
             with TerminationFence():
                 return execute(args, schedule, provenance)
