@@ -1030,6 +1030,10 @@ record = {
     "cpus": json.loads(cpus_json),
     "cpu_budget": cpu_budget,
     "driver": "cdpdrive.py",
+    # One interpreter imports cdpdrive and drives every rep, so wall_ms holds
+    # no interpreter start-up. Records without this field started a
+    # timing wrapper and a cdpdrive.py process for each rep.
+    "driver_process": "in-process",
     "network": "host (no VM, no DNAT)",
     "resolve_all_to": json.loads(resolve_json),
     "host_boot_id": host_boot_id,
@@ -1074,81 +1078,92 @@ run_json_sha256=$(sha256sum "$RESULTS/run.json" | cut -d' ' -f1)
 OUT="$RESULTS/hostcdp.jsonl"
 : > "$OUT"
 TOTAL_REPS=$((WARMUP + REPS))
-python3_command=$(command -v python3)
-for rep in $(seq 0 $((TOTAL_REPS - 1))); do
-    rep_url="${URLS[$((rep % ${#URLS[@]}))]}"
-    rep_tmp=$(mktemp -d "$RESULTS/.rep-${rep}.XXXXXX") \
-        || { log "REFUSING: cannot create timing workspace for rep $rep"; exit 5; }
-    if python3 - "$python3_command" "$HERE/cdpdrive.py" \
-            "127.0.0.1:$CDP_PORT" "$rep_url" \
-            "$rep_tmp/output" "$rep_tmp/wall_ms" <<'PY'
-import subprocess
+# One process drives every rep, as reqbench.py drives the VM arm: cdpdrive is
+# imported once and each request times one drive() call, so no rep pays for
+# starting an interpreter. Each record is written before its rep is judged, so
+# a refused run keeps the row that refused it.
+drive_status=0
+python3 - "$HERE/cdpdrive.py" "$HERE/render.py" "127.0.0.1:$CDP_PORT" "$OUT" \
+        "$LOADAVG_FILE" "$run_json_sha256" "$WARMUP" "$TOTAL_REPS" "${URLS[@]}" \
+        <<'PY' || drive_status=$?
+import argparse
+import importlib.util
+import json
+import re
 import sys
 import time
 
-(python_executable, driver, address, url,
- output_path, elapsed_path) = sys.argv[1:]
-started = time.monotonic_ns()
-result = subprocess.run(
-    [python_executable, driver, address, url, "--format", "jpeg", "--nav-timing"],
-    stdout=subprocess.PIPE,
-    stderr=subprocess.STDOUT,
-)
-elapsed_ms = (time.monotonic_ns() - started) / 1_000_000
-with open(output_path, "wb") as output:
-    output.write(result.stdout)
-with open(elapsed_path, "w") as timing:
-    timing.write(f"{elapsed_ms:.1f}\n")
-raise SystemExit(result.returncode)
+(driver_path, render_module, address, out_path, loadavg_file, run_json_sha256,
+ warmup, total) = sys.argv[1:9]
+urls = sys.argv[9:]
+warmup, total = int(warmup), int(total)
+
+
+def log(message):
+    print(f"{time.strftime('%H:%M:%S')} {message}", file=sys.stderr, flush=True)
+
+
+spec = importlib.util.spec_from_file_location("cdpdrive", driver_path)
+cdpdrive = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(cdpdrive)
+
+
+def read_load():
+    """The first field of LOADAVG_FILE, as `cut -d' ' -f1` read it before."""
+    try:
+        with open(loadavg_file) as handle:
+            raw = handle.readline().rstrip("\n").split(" ")[0]
+    except OSError as error:
+        return None, str(error), 1
+    if re.fullmatch(r"[0-9]+([.][0-9]+)?", raw):
+        return float(raw), raw, 0
+    return None, raw, 0
+
+
+with open(out_path, "a") as out:
+    for rep in range(total):
+        url = urls[rep % len(urls)]
+        # The same arguments `cdpdrive.py ADDRESS URL --format jpeg --nav-timing`
+        # parsed to; a field drive() grows has to be added here too.
+        args = argparse.Namespace(
+            cdp_host=address, url=url, format="jpeg", quality=80, timeout=30.0,
+            idle_wait_ms=0.0, out_prefix="", ws_url="", connect_retries=200,
+            nav_timing=True, print_target=False, host_header="", net_trace=None,
+            net_trace_drain_ms=5000.0, render_module=render_module,
+        )
+        started = time.monotonic_ns()
+        try:
+            result = cdpdrive.drive(args)
+        except Exception as error:
+            result = {"ok": False, "error": f"{type(error).__name__}: {error}"}
+        wall_ms = round((time.monotonic_ns() - started) / 1_000_000, 1)
+        ok = result.get("ok") is True and "net_trace_error" not in result
+        # Per-rep 1-minute load, the same field reqbench.py puts on every record
+        # (rec["loadavg1"]). The start-of-run reading in run.json cannot show
+        # contention that arrived mid-run.
+        load, load_raw, load_status = read_load()
+        driver_text = json.dumps(result, separators=(",", ":"))
+        out.write(json.dumps({
+            "run_json_sha256": run_json_sha256, "rep": rep, "ok": ok,
+            "warmup": rep < warmup, "wall_ms": wall_ms, "loadavg1": load,
+            "loadavg1_raw": load_raw[-2000:], "loadavg1_read_status": load_status,
+            "measurement_valid": load is not None, "url": url,
+            "driver": driver_text,
+        }) + "\n")
+        out.flush()
+        if load is None:
+            log(f"REFUSING: rep {rep} has no numeric 1-minute load from {loadavg_file} "
+                f"(status={load_status} raw={load_raw[:200]})")
+            sys.exit(5)
+        if not ok:
+            log(f"rep {rep} FAILED ({url}): {driver_text[-2000:]}")
+            sys.exit(4)
 PY
-    then
-        ok=true
-    else
-        ok=false
-    fi
-    if [ ! -f "$rep_tmp/output" ] || [ ! -f "$rep_tmp/wall_ms" ]; then
-        rm -rf -- "$rep_tmp"
-        log "REFUSING: monotonic timing wrapper produced no record for rep $rep"
-        exit 5
-    fi
-    out=$(<"$rep_tmp/output")
-    wall_ms=$(<"$rep_tmp/wall_ms")
-    rm -rf -- "$rep_tmp"
-    [[ "$wall_ms" =~ ^[0-9]+([.][0-9]+)?$ ]] \
-        || { log "REFUSING: monotonic timing wrapper produced invalid elapsed time: $wall_ms"; exit 5; }
-    warm=$([ "$rep" -lt "$WARMUP" ] && echo true || echo false)
-    # Per-rep 1-minute load, the same field reqbench.py puts on every record
-    # (rec["loadavg1"]) and reqanalyze reports as min/median/max "during run".
-    # The start-of-run reading in run.json cannot show contention that arrived
-    # mid-run, which is the contention that would move these numbers. Preserve
-    # the raw read and its status even when invalid, then refuse the run without
-    # publishing a summary.
-    if la_rep_raw=$(cut -d' ' -f1 "$LOADAVG_FILE" 2>&1); then
-        la_rep_status=0
-    else
-        la_rep_status=$?
-    fi
-    if [ "$la_rep_status" -eq 0 ] \
-            && [[ "$la_rep_raw" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-        la_rep=$(python3 -c 'import json,sys; print(json.dumps(float(sys.argv[1])))' \
-            "$la_rep_raw")
-        measurement_valid=true
-    else
-        la_rep=null
-        measurement_valid=false
-    fi
-    printf '{"run_json_sha256": "%s", "rep": %d, "ok": %s, "warmup": %s, "wall_ms": %s, "loadavg1": %s, "loadavg1_raw": %s, "loadavg1_read_status": %d, "measurement_valid": %s, "url": %s, "driver": %s}\n' \
-        "$run_json_sha256" "$rep" "$ok" "$warm" "$wall_ms" "$la_rep" \
-        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$la_rep_raw")" \
-        "$la_rep_status" "$measurement_valid" \
-        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$rep_url")" \
-        "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1][-2000:]))' "$out")" >> "$OUT"
-    if [ "$measurement_valid" != true ]; then
-        log "REFUSING: rep $rep has no numeric 1-minute load from $LOADAVG_FILE (status=$la_rep_status raw=${la_rep_raw:0:200})"
-        exit 5
-    fi
-    [ "$ok" = true ] || { log "rep $rep FAILED ($rep_url): $out"; exit 4; }
-done
+case "$drive_status" in
+    0) ;;
+    4) exit 4 ;;
+    *) log "REFUSING: the request driver exited $drive_status"; exit 5 ;;
+esac
 
 if [ -n "$SOURCE_REVISION" ]; then
     source_revision_after="$SOURCE_REVISION"

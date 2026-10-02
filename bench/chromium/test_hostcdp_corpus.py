@@ -12,9 +12,10 @@ metadata from one run cannot be placed beside samples from another.
 The results directory is claimed exactly once; reuse is refused before an old
 summary or record can be overwritten.
 
-Driven with a stub podman and a python3 shim that answers for cdpdrive.py and
-appends the URL it was handed, so the schedule is checked with no container and
-no browser. ALLOW_BUSY=1 passes the quiet-box gate.
+Driven with a stub podman and a python3 shim (write_python_shim) that hands
+hostcdp.sh's in-process driver a stub cdpdrive module, which appends the URL it
+was handed, so the schedule is checked with no container and no browser.
+ALLOW_BUSY=1 passes the quiet-box gate.
 
 The same script gained a CPUS budget knob, covered by HostCdpCpuBudget below,
 because a host baseline on every core compared against a 2-vCPU VM arm is two
@@ -66,6 +67,43 @@ def staged_runtime(directory):
     return manifest, identity
 
 
+def write_python_shim(binx, directory, seen=None):
+    """A python3 on PATH that logs every start to <directory>/python3-calls.
+
+    hostcdp.sh drives every rep from one `python3 - <cdpdrive.py> ...`
+    process; the shim swaps that cdpdrive.py for a stub module whose drive()
+    succeeds and, given `seen`, appends the URL it was handed. The old form, a
+    rep running `python3 cdpdrive.py` as its own program, is still answered so
+    a regression shows up in python3-calls and not as a connection failure.
+    Returns the path of the call log.
+    """
+    calls = os.path.join(directory, "python3-calls")
+    stub = os.path.join(directory, "stub_cdpdrive.py")
+    with open(stub, "w") as handle:
+        handle.write(f'''SEEN = {seen!r}
+
+
+def drive(args):
+    if SEEN:
+        with open(SEEN, "a") as handle:
+            handle.write(args.url + "\\n")
+    return {{"ok": True, "stub": True, "url": args.url}}
+''')
+    # The old form's argv is `cdpdrive.py ADDRESS URL ...`, so the URL is $3.
+    record_url = f'printf "%s\\n" "$3" >> {seen}; ' if seen else ""
+    write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
+printf '%s\\n' "$*" >> {calls}
+case "${{1:-}}" in
+  *cdpdrive.py) {record_url}echo '{{"ok":true,"stub":true}}'; exit 0 ;;
+esac
+if [ "${{1:-}}" = - ] && [[ "${{2:-}}" == *cdpdrive.py ]]; then
+  set -- - {stub} "${{@:3}}"
+fi
+exec {sys.executable} "$@"
+''')
+    return calls
+
+
 def write_podman_stub(path, run_argv=None):
     present = path + ".container-present"
     record_argv = ""
@@ -108,12 +146,7 @@ class HostCdpCorpusSchedule(unittest.TestCase):
         os.makedirs(binx)
         seen = os.path.join(d, "cdpdrive-urls")
         write_podman_stub(os.path.join(binx, "podman"))
-        write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
-case "${{1:-}}" in
-  *cdpdrive.py) printf '%s\\n' "$3" >> {seen}; echo '{{"stub": true}}'; exit 0 ;;
-esac
-exec {sys.executable} "$@"
-''')
+        write_python_shim(binx, d, seen)
         loadavg = os.path.join(d, "loadavg")
         with open(loadavg, "w") as handle:
             handle.write("1.23 0.50 0.40 1/100 999\n")
@@ -285,6 +318,32 @@ class HostCdpSummaryProvenance(unittest.TestCase):
                          {"n": 4, "min": 1.23, "median": 1.23, "max": 1.23})
 
 
+class HostCdpDrivesInProcess(unittest.TestCase):
+    """The host control drives every rep from one process, as the VM arm does.
+
+    reqbench.py imports cdpdrive once and times each drive() call. hostcdp.sh
+    started a timing wrapper and a `python3 cdpdrive.py` for every rep, so each
+    host wall_ms carried two interpreter start-ups the VM arm never paid; the
+    report charged 60.7 ms of the host container's wall time to that wrapper.
+    """
+
+    def _calls(self, reps):
+        proc, _, _, d = HostCdpCorpusSchedule._run(self, URLS[0], reps, 1)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        with open(os.path.join(d, "python3-calls")) as handle:
+            return handle.read().splitlines()
+
+    def test_no_rep_starts_an_interpreter(self):
+        """Red on main: every rep ran `python3 <wrapper>` and then
+        `python3 cdpdrive.py ...`, and the starts grew with REPS."""
+        few, many = self._calls(2), self._calls(6)
+        programs = [call for call in many if call.split(" ")[0].endswith("cdpdrive.py")]
+        self.assertEqual(programs, [], "a rep ran cdpdrive.py as its own program")
+        self.assertEqual(len(many), len(few),
+                         f"python3 starts grew with the rep count: {len(few)} at 2 reps, "
+                         f"{len(many)} at 6")
+
+
 class HostCdpCpuBudget(unittest.TestCase):
     """The host control's CPU budget has to be settable and recorded.
 
@@ -301,12 +360,7 @@ class HostCdpCpuBudget(unittest.TestCase):
         os.makedirs(binx)
         run_argv = os.path.join(d, "podman-run-argv")
         write_podman_stub(os.path.join(binx, "podman"), run_argv)
-        write_exec(os.path.join(binx, "python3"), f'''#!/bin/bash
-case "${{1:-}}" in
-  *cdpdrive.py) echo '{{"stub": true}}'; exit 0 ;;
-esac
-exec {sys.executable} "$@"
-''')
+        write_python_shim(binx, d)
         env = dict(os.environ)
         env.pop("CPUS", None)
         env.pop("CORPUS_EXTRA_RUNTIME_MANIFEST", None)
