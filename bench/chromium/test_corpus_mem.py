@@ -1622,7 +1622,8 @@ case "$cmd" in
       *'Config.Labels'*)
         printf '%s|%s\n' '{self.CONTAINER_ID}' "$(cat "$PODMAN_TEST_STATE.owner")"
         ;;
-      *'.State.CgroupPath'*) echo /fake-container.scope ;;
+      *'.State.CgroupPath'*) echo "${{TEST_CGROUP_PATH-/fake-container.scope}}" ;;
+      *'.State.Pid'*) echo 4242 ;;
       *) exit 64 ;;
     esac
     ;;
@@ -1823,6 +1824,8 @@ exec {real_date!r} "$@"
         os.makedirs(scope)
         with open(os.path.join(scope, "cpu.stat"), "w") as handle:
             handle.write("usage_usec 1000000\nuser_usec 0\nsystem_usec 0\n")
+        with open(os.path.join(scope, "cgroup.procs"), "w") as handle:
+            handle.write("4242\n")
         env.update(CGROUP_ROOT=os.path.join(tmp, "cgroup"),
                    TEST_CPU_STAT=os.path.join(scope, "cpu.stat"))
         env.pop("CPUS", None)

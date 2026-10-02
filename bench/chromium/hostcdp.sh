@@ -1086,7 +1086,25 @@ TOTAL_REPS=$((WARMUP + REPS))
 # covers every process in it (Chromium and the page server alike).
 container_cgroup=$(podman inspect --format '{{.State.CgroupPath}}' "$CONTAINER_ID") \
     || { log "REFUSING: cannot read the cgroup of container $CONTAINER_ID"; exit 5; }
-CPU_STAT="${CGROUP_ROOT:-/sys/fs/cgroup}${container_cgroup}/cpu.stat"
+container_pid=$(podman inspect --format '{{.State.Pid}}' "$CONTAINER_ID") \
+    || { log "REFUSING: cannot read the main pid of container $CONTAINER_ID"; exit 5; }
+# An empty path, "/" or one that climbs would make the counter the whole
+# machine's (the root cgroup's cpu.stat is valid and readable).
+case "$container_cgroup" in
+    /?*) ;;
+    *) log "REFUSING: container cgroup '$container_cgroup' is not a cgroup below the root"; exit 5 ;;
+esac
+case "$container_cgroup/" in
+    */../*|*/./*|*//*) log "REFUSING: container cgroup '$container_cgroup' is not canonical"; exit 5 ;;
+esac
+[[ "$container_pid" =~ ^[1-9][0-9]*$ ]] \
+    || { log "REFUSING: container main pid '$container_pid' is not a pid"; exit 5; }
+CGROUP_DIR="${CGROUP_ROOT:-/sys/fs/cgroup}${container_cgroup}"
+# The container's own main process must be in that cgroup or below it, or the
+# counter belongs to something else.
+grep -rqx --include=cgroup.procs -- "$container_pid" "$CGROUP_DIR" 2>/dev/null \
+    || { log "REFUSING: container main pid $container_pid is not in $CGROUP_DIR"; exit 5; }
+CPU_STAT="$CGROUP_DIR/cpu.stat"
 grep -q '^usage_usec ' "$CPU_STAT" 2>/dev/null \
     || { log "REFUSING: no usage_usec in $CPU_STAT"; exit 5; }
 drive_status=0

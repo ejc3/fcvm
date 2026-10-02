@@ -2320,11 +2320,14 @@ class ConcurrentRequestRecords(unittest.TestCase):
             return request(context)
 
     def test_the_memory_server_cpu_is_not_charged_to_overlapping_requests(self):
-        """Red without the pop: run_cdp_request's serve_cpu, the memory
-        server's CPU from launch to teardown, survived into a record whose
-        request overlapped others served by the same server."""
-        record = self._record({"ok": True, "serve_cpu": {"applicable": True, "ms": 25.0}})
-        self.assertNotIn("serve_cpu", record)
+        """Red without the pop: run_cdp_request's memory-server samples,
+        taken around a request that overlapped others served by the same
+        server, survived into its record."""
+        sample = {"applicable": True, "ms": 25.0, "starttime": 7}
+        record = self._record({"ok": True, "serve_cpu_before": sample,
+                               "serve_cpu_after": sample})
+        self.assertNotIn("serve_cpu_before", record)
+        self.assertNotIn("serve_cpu_after", record)
 
 
 if __name__ == "__main__":

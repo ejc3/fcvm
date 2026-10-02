@@ -149,6 +149,51 @@ def median_ci(xs, iters=20000, conf=0.95, seed=12345):
     return med, lo, hi, n
 
 
+def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
+    """Mean with a percentile-bootstrap CI. Returns (mean, lo, hi, n)."""
+    xs = [float(x) for x in xs if x is not None and not math.isnan(float(x))]
+    n = len(xs)
+    if n == 0:
+        return None, None, None, 0
+    mean = statistics.fmean(xs)
+    if n < 3:
+        return mean, min(xs), max(xs), n
+    rng = random.Random(seed)
+    boots = sorted(statistics.fmean(xs[rng.randrange(n)] for _ in range(n))
+                   for _ in range(iters))
+    return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1], n
+
+
+def memory_server_average(records, arms):
+    """The memory server's CPU per request over a single-arm run.
+
+    Each record carries the server's cumulative CPU sampled at its launch
+    (serve_cpu_before) and after its teardown (serve_cpu_after). The growth
+    from the first measured request's sample to the last one's, divided by
+    the measured count, is the server's CPU per request, including the work
+    it finishes after a clone exits. A run with other arms shared the server,
+    so its growth is not this arm's.
+    """
+    before = [r.get("serve_cpu_before") for r in records]
+    after = [r.get("serve_cpu_after") for r in records]
+    if any(not isinstance(s, dict) for s in before + after):
+        return {"available": False, "reason": "a request has no memory-server sample"}
+    if not any(s.get("applicable") for s in before + after):
+        return {"available": True, "mean_ms": 0.0, "note": "file-backed: no memory server"}
+    if len(arms) != 1:
+        return {"available": False,
+                "reason": f"the memory server also served arm(s) {sorted(set(arms) - set([records[0].get('arm')]))}"}
+    samples = before + after
+    if any(s.get("error") or not s.get("applicable") for s in samples):
+        return {"available": False, "reason": "a memory-server sample failed"}
+    if len({s["starttime"] for s in samples}) != 1:
+        return {"available": False, "reason": "the memory server restarted during the run"}
+    ordered = sorted(records, key=lambda r: r.get("rep", 0))
+    growth = ordered[-1]["serve_cpu_after"]["ms"] - ordered[0]["serve_cpu_before"]["ms"]
+    return {"available": True, "mean_ms": growth / len(records), "n": len(records),
+            "window_ms": growth}
+
+
 def fmt(med, lo, hi, n=None, unit="ms"):
     """Round the estimate to the precision its own CI can support (defect 6)."""
     if med is None:
@@ -2302,70 +2347,88 @@ def analyze_backend(
                             .get(cname, {}).get("complete") is not True)
                     ])
 
-        # CPU PER REQUEST, launch to the end of teardown, from three readings:
-        # each pinned child's utime+stime at the kill (the VM lives one
-        # request, so firecracker's figure includes the guest's vCPUs), what
-        # each child then spent being reaped, and the shared memory server's
-        # share, which reqbench reads around the request because requests run
-        # one at a time. Only the fast-teardown path takes the first two, so a
-        # record without them contributes nothing, and a UFFD record whose
-        # server reading failed contributes nothing to the total.
-        def request_cpu_parts(r):
-            t = r.get("teardown") or {}
-            life = t.get("lifetime_cpu_ms_by_child")
-            if not life:
-                return None
-            reclaim = [c.get("reclaim_cpu_ms") for c in (t.get("per_child_cpu") or {}).values()]
-            if any(v is None for v in reclaim):
-                return None
-            serve = r.get("serve_cpu")
-            if not isinstance(serve, dict):
-                return None
-            if serve.get("applicable"):
-                if serve.get("ms") is None:
+        # CPU PER REQUEST. Two figures, both arithmetic means so they add and
+        # compare with the host control's run average:
+        #   clone   each fast-teardown request's own process tree: every
+        #           pinned child's utime+stime at the kill (firecracker's
+        #           includes the guest's vCPUs), what their already-reaped
+        #           children used (fcvm's cp/nsenter/ip helpers), and what
+        #           each spent being reaped after the kill.
+        #   server  the shared memory server's cumulative CPU growth from the
+        #           first measured request's launch to the last one's
+        #           teardown, divided by the measured count. Detached work it
+        #           does after a clone exits is inside that window, and the
+        #           CLK_TCK steps average out. It is only this arm's when the
+        #           run had no other arm.
+        # Fail closed: one measured request without a complete reading
+        # withholds every figure, rather than shrinking n to the readable
+        # ones.
+        fast_records = [
+            r for r in measured_attempted[a]
+            if (r.get("teardown") or {}).get("mode") == "fast"
+        ]
+        if fast_records:
+            def clone_cpu(r):
+                t = r.get("teardown") or {}
+                life = t.get("lifetime_cpu_ms_by_child") or {}
+                reaped = t.get("reaped_children_cpu_ms_by_child") or {}
+                per_child = t.get("per_child_cpu") or {}
+                if ("firecracker" not in life or "fcvm" not in life
+                        or set(reaped) != set(life) or not per_child
+                        or any(c.get("reclaim_cpu_ms") is None for c in per_child.values())):
                     return None
-                serve_ms = serve["ms"]
-            else:
-                serve_ms = 0.0
-            return {"children": sum(life.values()), "reclaim": sum(reclaim), "serve": serve_ms}
+                return {
+                    "children_at_kill": sum(life.values()),
+                    "reaped_children": sum(reaped.values()),
+                    "reclaim": sum(c["reclaim_cpu_ms"] for c in per_child.values()),
+                    "lower_bound": any(c.get("complete") is not True
+                                       for c in per_child.values()),
+                    "by_child": life,
+                }
 
-        if any(request_cpu_parts(r) for r in by[a]):
-            parts = lambda key: lambda r: (request_cpu_parts(r) or {}).get(key)
-            total = lambda r: (
-                sum(request_cpu_parts(r).values()) if request_cpu_parts(r) else None)
-            counted = [r for r in by[a] if request_cpu_parts(r)]
-            names = sorted({
-                n for r in counted
-                for n in r["teardown"]["lifetime_cpu_ms_by_child"]
-            })
-            # A reaping reading the reaper raced is a lower bound (see the
-            # per-child block above), and so is any total that includes one.
-            lower_bound = sum(
-                1 for r in counted
-                if any(c.get("complete") is not True
-                       for c in (r["teardown"].get("per_child_cpu") or {}).values()))
-            block = {
-                "total": metric_summary(by[a], total),
-                "children_at_kill": metric_summary(by[a], parts("children")),
-                "reclaim": metric_summary(by[a], parts("reclaim")),
-                "memory_server": metric_summary(by[a], parts("serve")),
-                "by_child_at_kill": {
-                    n: metric_summary(by[a], lambda r, n=n: (
-                        ((r.get("teardown") or {}).get("lifetime_cpu_ms_by_child") or {}).get(n)
-                        if request_cpu_parts(r) else None))
-                    for n in names
-                },
-                "records_with_lower_bound_reaping": lower_bound,
-            }
+            readings = [clone_cpu(r) for r in fast_records]
+            missing = sum(1 for x in readings if x is None)
+            block = {"n": len(fast_records), "missing_records": missing,
+                     "complete": missing == 0}
+            if missing == 0:
+                totals = [x["children_at_kill"] + x["reaped_children"] + x["reclaim"]
+                          for x in readings]
+                m, lo, hi, n = mean_ci(totals)
+                block["clone_mean_ms"] = {"mean": m, "lo": lo, "hi": hi, "n": n,
+                                          "provenance": provenance(fast_records)}
+                block["clone_median_ms"] = dict(zip(("median", "lo", "hi", "n"),
+                                                    median_ci(totals)))
+                block["clone_parts_mean_ms"] = {
+                    key: statistics.fmean(x[key] for x in readings)
+                    for key in ("children_at_kill", "reaped_children", "reclaim")
+                }
+                names = sorted({name for x in readings for name in x["by_child"]})
+                block["by_child_at_kill_mean_ms"] = {
+                    name: statistics.fmean(x["by_child"].get(name, 0.0) for x in readings)
+                    for name in names
+                }
+                block["records_with_lower_bound_reaping"] = sum(
+                    1 for x in readings if x["lower_bound"])
+                block["memory_server"] = memory_server_average(fast_records, arms)
+                if block["memory_server"].get("available"):
+                    block["total_mean_ms"] = m + block["memory_server"]["mean_ms"]
             out["arms"][a]["request_cpu_ms"] = block
-            print("    request CPU, launch to end of teardown "
-                  "(children at kill + reaping + memory server); "
-                  f"{lower_bound}/{len(counted)} totals include a lower-bound reaping")
-            for key in ("total", "children_at_kill", "reclaim", "memory_server"):
-                s = block[key]
-                print(f"      {key:20s} {fmt(s['median'], s['lo'], s['hi'], s['n'])}")
-            for n, s in block["by_child_at_kill"].items():
-                print(f"      {'  ' + n:20s} {fmt(s['median'], s['lo'], s['hi'], s['n'])}")
+            print(f"    request CPU: {len(fast_records) - missing}/{len(fast_records)} "
+                  "measured requests with a complete reading")
+            if missing:
+                print("      ** CPU figures withheld: incomplete readings **")
+            else:
+                c = block["clone_mean_ms"]
+                print(f"      clone mean          {c['mean']:.1f} ms "
+                      f"[{c['lo']:.1f}, {c['hi']:.1f}] n={c['n']}"
+                      + (f"  ({block['records_with_lower_bound_reaping']} lower-bound reapings)"
+                         if block["records_with_lower_bound_reaping"] else ""))
+                s = block["memory_server"]
+                print("      memory server mean  "
+                      + (f"{s['mean_ms']:.1f} ms" if s.get("available")
+                         else f"not attributable: {s['reason']}"))
+                if "total_mean_ms" in block:
+                    print(f"      total mean          {block['total_mean_ms']:.1f} ms")
 
         # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning
         # gate while `len(ag)` drove the denominator, so a null or an absent
