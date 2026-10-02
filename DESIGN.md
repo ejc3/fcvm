@@ -2228,7 +2228,23 @@ After changing the config, run `fcvm setup` to rebuild the rootfs with the new S
 
 ### FUSE Volume Cache Coherency
 
-`--map` volumes use FUSE-over-vsock with `WRITEBACK_CACHE` and `AUTO_INVAL_DATA`. When a host process modifies a file in a mapped directory, the guest sees the change on its next read — but only after the kernel detects the mtime change (up to ~1 second granularity). Writes within the same second may not be visible immediately.
+`--map` volumes are FUSE over vsock with `AUTO_INVAL_DATA`. Nothing tells the guest that the host changed a file. The guest finds out when it asks the server again, which it does once its 1 second attribute and entry timeouts have run out. What it does with the answer depends on how the map is mounted.
+
+**Read-only maps (`--map HOST:GUEST:ro`)** are mounted read-only in the guest and without `FUSE_WRITEBACK_CACHE`. `/proc/self/mountinfo` in the guest shows the mount as `ro`, and a write from the guest OS or from the container fails with EROFS. Without the writeback cache the guest takes the size and mtime the server reports and drops its cached pages when either changed. A file the host rewrites in place, longer or shorter, or replaces by rename is read whole, with its new size and mtime, after the attribute timeout. That holds in a running VM and in a clone restored from a snapshot taken before the host changed the file.
+
+The guest's kernel is what refuses the write. The host's VolumeServer does not check `read_only` and accepts writes on every volume, so a guest that remounts the volume read-write can write to the host directory (#1042).
+
+A mount point inside a read-only map cannot be created by the guest, so it has to be a directory of the map's host directory already. The mount points are those of another `--map`, of a `--disk`, `--disk-dir` or `--nfs` whose guest path lies under the map, and `/mnt/image-store`, where fc-agent mounts the image disk of a `localhost/` image in overlay image mode (the default mode). fcvm checks them on the host and fails with an error that names the map, what is mounted there and the directory the host lacks. The check runs:
+
+- in every `fcvm podman run` and `fcvm podman prepare`, before the kernel, the rootfs and the image are looked up and before the snapshot cache is consulted, so a refused run sets up nothing and a run that would have been a cache hit is checked too;
+- in `fcvm snapshot run` of a disk-only snapshot, which cold-boots through the same code;
+- before each relaunch after a guest reboot, because the new fc-agent mounts the volumes again. A `podman run` VM that fails it ends with the error. A restored clone that fails it logs the error and treats the reboot as the VM's exit.
+
+`fcvm snapshot run` of a memory snapshot is not checked: the mounts are in the guest's memory and nothing is created. The check does not follow a symlink on the way to a mount point, which the guest resolves in its own namespace, and it cannot see a directory removed after it ran. In those cases fc-agent fails to create the mount point, the container exits with code 1, and fcvm's log has the cause on one line: `[fc-agent] Error: mounting FUSE volumes: creating mount point: /mnt/outer/inner: Read-only file system (os error 30)`.
+
+fc-agent mounts an outer map before a map inside it, whatever order the arguments are in. That order is among maps: disks and NFS shares are mounted after every map, and one whose guest path is above a map's covers that map. While a guest runs, the host must not replace or remove a directory that another mount sits on (the mount point of an inner map, a disk or an NFS share inside a map). The guest's kernel drops a mount whose mount point fails revalidation, so within the 1 second entry timeout the inner mount is gone from the guest's mount table, for a read-write outer map as well, and its path shows the outer map's new directory.
+
+**Read-write maps** keep `FUSE_WRITEBACK_CACHE` unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`. With that cache the guest's kernel owns the size and mtime of a regular file it has cached and ignores the server's, because it may hold writes the server has not seen yet. The host must not change a file under a read-write map while a guest has it cached, unless the VM was booted with `FCVM_NO_WRITEBACK_CACHE=1`: a file the host rewrites longer is read cut off at the old length and keeps its old mtime, in the running VM and in clones restored from its snapshots (#1041).
 
 Directory changes (new files, deletions) are subject to the kernel's directory entry cache TTL. A new file created on the host may not appear in guest `readdir()` until the cache expires.
 
@@ -2242,7 +2258,9 @@ ARM64 FEAT_NV2 has architectural issues with cache coherency under double Stage 
 
 ### Snapshot + FUSE Volumes
 
-Snapshots are disabled when `--map` volumes are present because the FUSE-over-vsock connection state may not survive the pause/resume cycle cleanly. This means VMs with volume mounts always do a fresh boot. Block device mounts (`--disk`, `--disk-dir`) do not have this limitation.
+A snapshot of a VM with `--map` volumes holds the guest's FUSE mounts in its memory. A clone gets its own VolumeServers, and the guest's mounts reconnect to them over vsock without being mounted again. Each mount keeps the settings fc-agent made it with: read-only or read-write, with or without the writeback cache.
+
+A snapshot made by an fc-agent from before read-only maps were mounted read-only keeps read-write, writeback-cached mounts for them in every clone, until the snapshot is made again. The automatic snapshot cache does that by itself: its key covers the path of the fc-agent initrd, which is named after the hash of the fc-agent binary, so a new fc-agent never restores an older one's snapshot. A snapshot made with `fcvm snapshot create` or `fcvm podman prepare --tag` has to be made again by hand.
 
 ### Disk-Only Clone / Reboot Edge Cases
 

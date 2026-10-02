@@ -117,7 +117,7 @@ async fn main() {
     if let Err(e) = agent::run().await {
         eprintln!("[fc-agent] ==========================================");
         eprintln!("[fc-agent] FATAL ERROR: Container failed to start");
-        eprintln!("[fc-agent] Error: {:?}", e);
+        eprintln!("{}", fatal_error_line(&e));
         // Guest resources at the instant of failure. Without this the host sees
         // only podman's one-liner, and issue #841 showed where that leads: two
         // occurrences of `conmon bytes ""` with no way to tell an out-of-memory
@@ -131,5 +131,56 @@ async fn main() {
         eprintln!("[fc-agent] ==========================================");
         vsock::notify_container_exit(1);
         system::shutdown_vm(1).await;
+    }
+}
+
+/// The console line that says why the agent failed, with every cause on it.
+///
+/// fcvm logs a console line at INFO only when it carries the `[fc-agent]`
+/// prefix (console_line_is_important in src/utils.rs). anyhow's `{:?}` puts
+/// each cause on a line of its own under "Caused by:", without the prefix, so
+/// the host showed the outermost context and nothing of what went wrong.
+fn fatal_error_line(error: &anyhow::Error) -> String {
+    let chain = format!("{error:#}");
+    let chain: Vec<&str> = chain
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    format!("[fc-agent] Error: {}", chain.join(" "))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fatal_error_line;
+    use anyhow::Context;
+
+    /// The line names every cause, innermost last, and is one line even when
+    /// a cause is a command's multi-line stderr.
+    ///
+    /// RED BEFORE THE FIX: printed with `{:?}`, the prefixed line of the first
+    /// error below was "[fc-agent] Error: mounting FUSE volumes", and fcvm's
+    /// log at INFO had no line with the mount point or the errno.
+    #[test]
+    fn the_fatal_error_line_carries_the_whole_cause_chain() {
+        let error = Err::<(), _>(std::io::Error::from_raw_os_error(libc::EROFS))
+            .context("creating mount point: /mnt/outer/inner")
+            .context("mounting FUSE volumes")
+            .unwrap_err();
+        assert_eq!(
+            fatal_error_line(&error),
+            "[fc-agent] Error: mounting FUSE volumes: creating mount point: /mnt/outer/inner: \
+             Read-only file system (os error 30)"
+        );
+
+        let error = anyhow::anyhow!(
+            "Failed to mount /dev/vdb at /data: mount: wrong fs type,\n       bad superblock.\n"
+        )
+        .context("mounting extra disks");
+        assert_eq!(
+            fatal_error_line(&error),
+            "[fc-agent] Error: mounting extra disks: Failed to mount /dev/vdb at /data: mount: \
+             wrong fs type, bad superblock."
+        );
     }
 }

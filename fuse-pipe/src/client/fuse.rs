@@ -1,5 +1,6 @@
 //! fuser::Filesystem implementation for remote FUSE.
 
+use super::mount::MountSettings;
 use super::multiplexer::Multiplexer;
 use crate::protocol::{file_type, FileAttr, VolumeRequest, VolumeResponse};
 use fuser::{
@@ -60,37 +61,33 @@ pub struct FuseClient {
     destroyed: Arc<AtomicBool>,
     /// Maximum write size (0 = unbounded). Passed explicitly to avoid env var races.
     max_write: u32,
-    /// Disable FUSE writeback cache (passed explicitly to avoid set_var unsoundness).
-    no_writeback_cache: bool,
+    /// Ask the kernel for FUSE_WRITEBACK_CACHE at INIT, as the mount's settings say.
+    writeback_cache: bool,
 }
 
 impl FuseClient {
     /// Create a new client using shared multiplexer.
-    pub fn new(mux: Arc<Multiplexer>) -> Self {
-        Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0, false)
+    pub fn new(mux: Arc<Multiplexer>, settings: MountSettings) -> Self {
+        Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0, settings)
     }
 
-    /// Create a new client with a shared destroyed flag.
+    /// Create a new client with a shared destroyed flag, a max_write limit and
+    /// the mount's settings.
     ///
     /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
     /// Reader threads can check this flag to distinguish clean shutdown from errors.
-    pub fn with_destroyed_flag(mux: Arc<Multiplexer>, destroyed: Arc<AtomicBool>) -> Self {
-        Self::with_options(mux, destroyed, 0, false)
-    }
-
-    /// Create a new client with a shared destroyed flag and max_write limit.
     pub fn with_options(
         mux: Arc<Multiplexer>,
         destroyed: Arc<AtomicBool>,
         max_write: u32,
-        no_writeback_cache: bool,
+        settings: MountSettings,
     ) -> Self {
         Self {
             mux,
             init_callback: Mutex::new(None),
             destroyed,
             max_write,
-            no_writeback_cache,
+            writeback_cache: settings.writeback_cache(),
         }
     }
 
@@ -99,13 +96,14 @@ impl FuseClient {
         mux: Arc<Multiplexer>,
         callback: InitCallback,
         destroyed: Arc<AtomicBool>,
+        settings: MountSettings,
     ) -> Self {
         Self {
             mux,
             init_callback: Mutex::new(Some(callback)),
             destroyed,
             max_write: 0,
-            no_writeback_cache: false,
+            writeback_cache: settings.writeback_cache(),
         }
     }
 
@@ -225,12 +223,10 @@ fn protocol_file_type_to_fuser(ft: u8) -> FileType {
 
 impl Filesystem for FuseClient {
     fn init(&mut self, _req: &Request, config: &mut fuser::KernelConfig) -> Result<(), io::Error> {
-        // Enable writeback cache for better write performance (kernel batches writes).
-        // Disabled if no_writeback_cache field is set (propagated from caller) or
-        // FCVM_NO_WRITEBACK_CACHE env var is set (for standalone use).
-        let enable_writeback =
-            !self.no_writeback_cache && std::env::var("FCVM_NO_WRITEBACK_CACHE").is_err();
-        if enable_writeback {
+        // The writeback cache lets the kernel batch writes, and makes it the owner
+        // of a cached file's size and mtime. Whether this mount asks for it is
+        // decided in one place, MountSettings::for_volume.
+        if self.writeback_cache {
             if let Err(unsupported) = config.add_capabilities(InitFlags::FUSE_WRITEBACK_CACHE) {
                 tracing::warn!(
                     target: "fuse-pipe::client",
@@ -246,7 +242,7 @@ impl Filesystem for FuseClient {
         } else {
             tracing::debug!(
                 target: "fuse-pipe::client",
-                "FUSE_WRITEBACK_CACHE disabled via FCVM_NO_WRITEBACK_CACHE"
+                "FUSE_WRITEBACK_CACHE not requested for this mount"
             );
         }
 

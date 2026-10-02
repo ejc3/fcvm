@@ -78,6 +78,8 @@ sudo ./fcvm podman run --name web --network routed nginx:alpine
 ./fcvm ls --json
 ```
 
+A `--map` with `:ro` is mounted read-only in the guest, for the guest OS and the container alike, and follows the host: a file the host rewrites or replaces shows its new size, mtime and content in the guest about a second later, in a running VM and in a clone restored from a snapshot. A map without `:ro` is read-write, and the guest keeps the size and mtime of the files it has cached. [FUSE Volume Cache Coherency](DESIGN.md#fuse-volume-cache-coherency) says what the host may change under each.
+
 ---
 
 ## Snapshot & Clone Workflow
@@ -428,7 +430,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --name <NAME>         VM name (required)
 --network <MODE>      rootless (default), bridged, or routed
 --publish <[IP:]H:G>  Port forward (e.g., 8080:80, '[::]:80:80')
---map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro)
+--map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro); :ro is read-only in the guest and follows the host
 --env <K=V>           Environment variable
 -i / -t / -it         Interactive / TTY / both
 --setup               Auto-setup if assets missing (rootless only)
@@ -452,7 +454,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 |----------|---------|-------------|
 | `FCVM_DATA_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
-| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to disable FUSE writeback cache |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so the guest takes a file's size and mtime from the host. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |

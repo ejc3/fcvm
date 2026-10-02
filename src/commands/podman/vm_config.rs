@@ -1114,10 +1114,14 @@ impl GuestBootInputs {
     ///   (fc-agent/src/fuse/mod.rs), and mount_fuse_volumes runs only when
     ///   the boot plan carries volumes (fc-agent/src/agent.rs), so a
     ///   volume-free run boots identically under any of their values.
+    /// * no_writeback_cache reaches read-write volumes only: a read-only
+    ///   volume is mounted without the writeback cache whatever it says
+    ///   (fuse_pipe::MountSettings::for_volume), so a run with no read-write
+    ///   volume boots identically with and without it.
     pub(crate) fn for_launch(
         mut self,
         network_mode: crate::firecracker::FcNetworkMode,
-        has_fuse_volumes: bool,
+        fuse_volumes: &[VolumeMapping],
     ) -> Self {
         if matches!(network_mode, crate::firecracker::FcNetworkMode::Bridged) {
             // Bridged forwards exactly one resolver: network_config.dns_server
@@ -1154,10 +1158,12 @@ impl GuestBootInputs {
                 None => crate::network::search_narrowed_to_sole_aws_vpc_zone(groups),
             };
         }
-        if !has_fuse_volumes {
+        if fuse_volumes.is_empty() {
             self.fuse_readers = None;
             self.fuse_trace_rate = None;
             self.fuse_max_write = None;
+        }
+        if fuse_volumes.iter().all(|volume| volume.read_only) {
             self.no_writeback_cache = false;
         }
         self
@@ -1170,6 +1176,7 @@ impl GuestBootInputs {
 ///   * initial `fcvm podman run` (run_vm_setup_inner, cache miss)
 ///   * the snapshot-restore path's up-front reboot plan (a rebooted restored clone
 ///     cold-boots from its current provisioned disk — disk-only-clone semantics)
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn build_launch_config(
     args: &RunArgs,
     rootfs_path: &std::path::Path,
@@ -1178,10 +1185,11 @@ pub(crate) fn build_launch_config(
     cmd_args: &Option<Vec<String>>,
     runtime_config: &crate::commands::common::RuntimeConfig,
     boot_inputs: GuestBootInputs,
+    volume_mappings: &[VolumeMapping],
 ) -> crate::firecracker::FirecrackerConfig {
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
     let network_mode: FcNetworkMode = args.network.into();
-    let boot_inputs = boot_inputs.for_launch(network_mode, !args.map.is_empty());
+    let boot_inputs = boot_inputs.for_launch(network_mode, volume_mappings);
     // Collect extra disk specifications
     let mut extra_disks: Vec<String> = Vec::new();
     extra_disks.extend(args.disk.iter().cloned());
@@ -1649,6 +1657,7 @@ async fn run_vm_setup_inner(
                 &cmd_args,
                 runtime_config,
                 boot_inputs,
+                volume_mappings,
             )
         });
 
@@ -2110,7 +2119,7 @@ mod tests {
     #[test]
     fn bridged_forwards_only_the_search_domains_of_the_resolver_it_selects() {
         let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
-            .for_launch(crate::firecracker::FcNetworkMode::Bridged, false);
+            .for_launch(crate::firecracker::FcNetworkMode::Bridged, &[]);
 
         assert_eq!(
             inputs.host_dns(),
@@ -2164,7 +2173,7 @@ mod tests {
         ];
 
         let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs())
-            .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+            .for_launch(crate::firecracker::FcNetworkMode::Routed, &[]);
 
         assert_eq!(
             inputs.host_dns(),
@@ -2214,7 +2223,7 @@ mod tests {
     #[test]
     fn routed_on_the_probe_path_forwards_only_the_suffixes_the_probed_resolver_serves() {
         let inputs = GuestBootInputs::from_sources(None, &ec2_host(), &no_runtime_knobs())
-            .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+            .for_launch(crate::firecracker::FcNetworkMode::Routed, &[]);
 
         assert_eq!(
             inputs.dns_search(),
@@ -2259,7 +2268,7 @@ mod tests {
     #[test]
     fn a_mode_that_forwards_every_resolver_keeps_every_search_domain() {
         let inputs = GuestBootInputs::from_sources(None, &two_source_host(), &no_runtime_knobs())
-            .for_launch(crate::firecracker::FcNetworkMode::Rootless, false);
+            .for_launch(crate::firecracker::FcNetworkMode::Rootless, &[]);
 
         assert_eq!(inputs.host_dns(), vec!["10.1.0.2", "192.0.2.53"]);
         assert_eq!(inputs.dns_search(), vec!["corp.example", "lab.example"]);
@@ -2299,7 +2308,7 @@ mod tests {
             ec2_host_with_a_foreign_vpc_zone_first(),
         ] {
             let inputs = GuestBootInputs::from_sources(None, &sources, &no_runtime_knobs())
-                .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+                .for_launch(crate::firecracker::FcNetworkMode::Routed, &[]);
 
             assert!(
                 inputs.dns_search().is_empty(),
@@ -2336,7 +2345,7 @@ mod tests {
             &ec2_host_with_a_custom_compute_internal_domain(),
             &no_runtime_knobs(),
         )
-        .for_launch(crate::firecracker::FcNetworkMode::Routed, false);
+        .for_launch(crate::firecracker::FcNetworkMode::Routed, &[]);
 
         assert_eq!(
             inputs.dns_search(),
@@ -2374,7 +2383,7 @@ mod tests {
     #[test]
     fn the_probe_narrowing_does_not_reach_a_mode_that_forwards_every_resolver() {
         let inputs = GuestBootInputs::from_sources(None, &ec2_host(), &no_runtime_knobs())
-            .for_launch(crate::firecracker::FcNetworkMode::Rootless, false);
+            .for_launch(crate::firecracker::FcNetworkMode::Rootless, &[]);
 
         assert_eq!(inputs.host_dns(), vec!["10.0.0.2", "10.99.0.53"]);
         assert_eq!(

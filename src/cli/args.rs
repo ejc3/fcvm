@@ -208,7 +208,10 @@ pub struct RunArgs {
     #[arg(long)]
     pub dns: Option<String>,
 
-    /// Volume mapping(s): HOST:GUEST[:ro] (repeat for multiple)
+    /// Volume mapping(s): HOST:GUEST[:ro] (repeat for multiple).
+    /// With :ro the map is read-only in the guest OS and the container and
+    /// follows the host's files; without it the guest keeps the size and mtime
+    /// of files it has cached.
     #[arg(long, action = clap::ArgAction::Append)]
     pub map: Vec<String>,
 

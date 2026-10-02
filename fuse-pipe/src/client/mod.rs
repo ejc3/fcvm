@@ -25,21 +25,25 @@
 //! # Example
 //!
 //! ```rust,ignore
-//! use fuse_pipe::{mount, MountConfig};
+//! use fuse_pipe::{mount, MountConfig, MountSettings};
+//!
+//! // A read-write mount with the writeback cache
+//! let settings = MountSettings::for_volume(false, false);
 //!
 //! // Simple blocking mount
-//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new())?;
+//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new(settings))?;
 //!
 //! // Mount with 256 readers for parallelism
-//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+//! mount("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new(settings).readers(256))?;
 //! ```
 //!
 //! For non-blocking mount with automatic cleanup, use [`mount_spawn`]:
 //!
 //! ```rust,ignore
-//! use fuse_pipe::{mount_spawn, MountConfig};
+//! use fuse_pipe::{mount_spawn, MountConfig, MountSettings};
 //!
-//! let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new().readers(256))?;
+//! let settings = MountSettings::for_volume(false, false);
+//! let handle = mount_spawn("/tmp/fuse.sock", "/mnt/fuse", MountConfig::new(settings).readers(256))?;
 //! // ... do work ...
 //! // Unmount happens automatically when handle is dropped
 //! ```
@@ -53,7 +57,7 @@ mod mount;
 mod multiplexer;
 
 pub use fuse::FuseClient;
-pub use mount::{mount, mount_spawn, MountConfig, MountHandle};
+pub use mount::{mount, mount_spawn, MountConfig, MountHandle, MountSettings};
 #[cfg(target_os = "linux")]
 pub use mount::{
     mount_vsock, mount_vsock_with_options, mount_vsock_with_readers, mount_vsock_with_reconnect,

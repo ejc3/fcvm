@@ -78,7 +78,9 @@ pub use server::{AsyncServer, FilesystemHandler, PassthroughFs, ServerConfig};
 pub use telemetry::{SpanCollector, SpanSummary};
 
 // Re-export client types
-pub use client::{mount, mount_spawn, FuseClient, MountConfig, MountHandle, Multiplexer};
+pub use client::{
+    mount, mount_spawn, FuseClient, MountConfig, MountHandle, MountSettings, Multiplexer,
+};
 #[cfg(target_os = "linux")]
 pub use client::{
     mount_vsock, mount_vsock_with_options, mount_vsock_with_readers, mount_vsock_with_reconnect,

@@ -22,7 +22,9 @@ use std::sync::Once;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use fuse_pipe::{AsyncServer, MountConfig, MountHandle, PassthroughFs, ServerConfig};
+use fuse_pipe::{
+    AsyncServer, MountConfig, MountHandle, MountSettings, PassthroughFs, ServerConfig,
+};
 use tracing::{debug, info};
 
 /// Target name for fixture logs (consistent with library naming)
@@ -176,11 +178,30 @@ pub struct FuseMount {
 }
 
 impl FuseMount {
-    /// Create a new FUSE mount with default settings.
+    /// Create a new FUSE mount as a read-write volume gets it: writable, with
+    /// the writeback cache.
     ///
     /// # Panics
     /// Panics if mount setup fails (e.g., insufficient privileges).
     pub fn new(data_path: &Path, mount_path: &Path, num_readers: usize) -> Self {
+        Self::with_settings(
+            data_path,
+            mount_path,
+            num_readers,
+            MountSettings::for_volume(false, false),
+        )
+    }
+
+    /// Create a new FUSE mount made with `settings`.
+    ///
+    /// # Panics
+    /// Panics if mount setup fails (e.g., insufficient privileges).
+    pub fn with_settings(
+        data_path: &Path,
+        mount_path: &Path,
+        num_readers: usize,
+        settings: MountSettings,
+    ) -> Self {
         // Initialize tracing for debug logging
         init_tracing();
 
@@ -250,7 +271,7 @@ impl FuseMount {
 
         // Start FUSE client using mount_spawn (returns handle for RAII cleanup)
         info!(target: TARGET, socket = %socket_path, mount = ?mount_path, readers = num_readers, "Starting FUSE client");
-        let config = MountConfig::new().readers(num_readers);
+        let config = MountConfig::new(settings).readers(num_readers);
         let mount_handle =
             match fuse_pipe::mount_spawn(&socket_path, mount_path.to_path_buf(), config) {
                 Ok(handle) => {

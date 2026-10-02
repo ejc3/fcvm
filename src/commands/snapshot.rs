@@ -3445,6 +3445,12 @@ async fn build_clone_reboot_plan(
         None,
     );
 
+    // This runs when the guest reboots, and the relaunched fc-agent mounts the
+    // volumes again, so the maps are parsed and checked here, before anything
+    // of the relaunch exists.
+    let volume_mappings =
+        super::podman::checked_volume_mappings(&synth_args, meta.image_disk_path.is_some())?;
+
     // Same kernel/initrd the source booted with (no setup side effects). The
     // recorded profile matters: a btrfs-profile disk needs a btrfs-capable kernel.
     let kernel_profile = meta.kernel_profile.as_deref().unwrap_or("default");
@@ -3466,15 +3472,9 @@ async fn build_clone_reboot_plan(
         &None,
         runtime_config,
         super::podman::GuestBootInputs::resolve(synth_args.dns.as_deref(), runtime_config),
+        &volume_mappings,
     );
     let boot_args = super::podman::build_runtime_boot_args(network_config, &launch_config);
-
-    let volume_mappings = synth_args
-        .map
-        .iter()
-        .map(|s| super::podman::VolumeMapping::parse(s))
-        .collect::<Result<Vec<_>>>()
-        .context("parsing volume mappings for reboot plan")?;
 
     let plan = super::podman::RebootSpec {
         firecracker_bin,

@@ -2,7 +2,9 @@
 //!
 //! Provides FUSE mount setup and category execution for POSIX compliance tests.
 
-use fuse_pipe::{mount_spawn, AsyncServer, MountConfig, PassthroughFs, ServerConfig};
+use fuse_pipe::{
+    mount_spawn, AsyncServer, MountConfig, MountSettings, PassthroughFs, ServerConfig,
+};
 use std::fs;
 use std::path::Path;
 use std::process::{Command, Stdio};
@@ -255,7 +257,7 @@ pub fn run_single_category(category: &str, jobs: usize) -> (bool, usize, usize) 
     }
 
     // Mount FUSE
-    let config = MountConfig::new().readers(NUM_READERS);
+    let config = MountConfig::new(MountSettings::for_volume(false, false)).readers(NUM_READERS);
     let _mount_handle = match mount_spawn(socket.to_str().unwrap(), mount_dir.clone(), config) {
         Ok(handle) => handle,
         Err(e) => {
