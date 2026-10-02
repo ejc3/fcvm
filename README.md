@@ -454,7 +454,7 @@ Run `fcvm --help` or `fcvm <command> --help` for full options.
 |----------|---------|-------------|
 | `FCVM_DATA_DIR` | `/mnt/fcvm-btrfs` | Base directory for all data |
 | `FCVM_NO_SNAPSHOT` | unset | `1` to disable snapshot creation (same as `--no-snapshot`) |
-| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so the guest takes a file's size and mtime from the host. Read-only maps never use that cache |
+| `FCVM_NO_WRITEBACK_CACHE` | unset | `1` to mount read-write `--map` volumes without the FUSE writeback cache, so the guest takes a file's size and mtime from the host. Read-only maps never use that cache, and a run with no read-write map is the same run with or without it |
 | `FCVM_SNAPSHOT_CONCURRENCY` | `10` | Max concurrent snapshot creations |
 | `FCVM_UFFD_MAX_CLONES` | `256` | Clones one `fcvm snapshot serve` will accept. They share that server's failure and fairness domain, so raising it widens the blast radius. Running two serve processes with half the clones each halves what one crashed or overloaded handler takes down |
 | `FCVM_CLOUD_HYPERVISOR_BIN` | unset | Path to `cloud-hypervisor` binary (falls back to PATH) |

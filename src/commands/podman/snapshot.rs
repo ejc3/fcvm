@@ -310,6 +310,7 @@ pub(super) fn build_firecracker_config(
     image_disk_identity: Option<String>,
     extra_boot_args: Option<String>,
     boot_inputs: super::vm_config::GuestBootInputs,
+    volume_mappings: &[super::types::VolumeMapping],
 ) -> crate::firecracker::FirecrackerConfig {
     // image_identifier is the digest for localhost images (content-addressed cache key).
     // args.image is the original name (what the guest uses to find the image).
@@ -317,7 +318,7 @@ pub(super) fn build_firecracker_config(
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
 
     let network_mode: FcNetworkMode = args.network.into();
-    let boot_inputs = boot_inputs.for_launch(network_mode, !args.map.is_empty());
+    let boot_inputs = boot_inputs.for_launch(network_mode, volume_mappings);
 
     let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 

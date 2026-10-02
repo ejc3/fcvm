@@ -491,3 +491,164 @@ async fn test_map_inside_read_only_map_is_mounted_over_it() -> Result<()> {
     std::fs::remove_dir_all(&inner_host).ok();
     result
 }
+
+/// How long a refused run gets to exit. A refusal comes before anything is
+/// set up, so a run still going after this booted a VM.
+const REFUSAL_LIMIT: Duration = Duration::from_secs(240);
+
+/// Run `fcvm podman run --name <vm_name> --network rootless <maps> <image>`
+/// to its end and return its output. The run is killed, and this fails, when
+/// it is still going after `REFUSAL_LIMIT`.
+async fn run_to_its_end(
+    vm_name: &str,
+    maps: &[String],
+    image: &str,
+) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::new(common::find_fcvm_binary()?);
+    command.args(["podman", "run", "--name", vm_name, "--network", "rootless"]);
+    for map in maps {
+        command.args(["--map", map]);
+    }
+    command
+        .arg(image)
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    common::set_test_pdeathsig(&mut command);
+    tokio::time::timeout(REFUSAL_LIMIT, command.output())
+        .await
+        .with_context(|| {
+            format!("fcvm podman run --name {vm_name} was still running after {REFUSAL_LIMIT:?}")
+        })?
+        .context("running fcvm podman run")
+}
+
+/// What a refused run left behind that it should not have: a zero exit, an
+/// error that does not name what it has to, an entry in a host directory, or
+/// a VM in fcvm's state.
+async fn left_by_refused_run(
+    output: &std::process::Output,
+    vm_name: &str,
+    named: &[String],
+    host_dirs: &[(&Path, &[&str])],
+) -> Result<Vec<String>> {
+    let mut wrong: Vec<String> = Vec::new();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if output.status.success() {
+        wrong.push("fcvm exited 0".to_string());
+    }
+    for name in named {
+        if !stderr.contains(name.as_str()) {
+            wrong.push(format!("stderr does not name {name}"));
+        }
+    }
+    for (dir, expected) in host_dirs {
+        let mut entries: Vec<String> = std::fs::read_dir(dir)?
+            .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+            .collect::<Result<_>>()?;
+        entries.sort();
+        if entries != *expected {
+            wrong.push(format!(
+                "{} holds {entries:?} after the run, not {expected:?}",
+                dir.display()
+            ));
+        }
+    }
+    let states = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .list_vms()
+        .await?;
+    if states.iter().any(|vm| vm.name.as_deref() == Some(vm_name)) {
+        wrong.push(format!("fcvm's state has a VM named {vm_name}"));
+    }
+    if !wrong.is_empty() {
+        wrong.push(format!("exit status: {}\nstderr:\n{stderr}", output.status));
+    }
+    Ok(wrong)
+}
+
+/// A map whose mount point a read-only map around it does not have is refused
+/// by fcvm before any VM boots: the run exits non-zero, the error names both
+/// maps and the directory the host lacks, nothing is created in either host
+/// directory, and no VM is left in fcvm's state. The inner map is listed
+/// first.
+#[tokio::test]
+async fn test_mount_point_missing_from_read_only_map_is_refused_before_boot() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ro-refuse-map");
+    let outer_host = fresh_dir("ro-refuse-map-outer")?;
+    let inner_host = fresh_dir("ro-refuse-map-inner")?;
+
+    let result = async {
+        let inner = format!("{}:/mnt/outer/inner", inner_host.display());
+        let outer = format!("{}:/mnt/outer:ro", outer_host.display());
+        let output = run_to_its_end(
+            &vm_name,
+            &[inner.clone(), outer.clone()],
+            common::TEST_IMAGE,
+        )
+        .await?;
+        let wrong = left_by_refused_run(
+            &output,
+            &vm_name,
+            &[
+                format!("--map {inner}"),
+                format!("--map {outer}"),
+                outer_host.join("inner").display().to_string(),
+            ],
+            &[(&outer_host, &[]), (&inner_host, &[])],
+        )
+        .await?;
+        anyhow::ensure!(
+            wrong.is_empty(),
+            "a mount point missing from a read-only map was not refused before boot:\n{}",
+            wrong.join("\n")
+        );
+        Ok(())
+    }
+    .await;
+
+    std::fs::remove_dir_all(&outer_host).ok();
+    std::fs::remove_dir_all(&inner_host).ok();
+    result
+}
+
+/// A read-only map at /mnt whose host directory has no image-store is refused
+/// before any VM boots when the image is a localhost/ one in the default
+/// image mode: fc-agent mounts that image's store at /mnt/image-store. The
+/// error names the map, /mnt/image-store and the directory the host lacks.
+/// The image does not have to exist: the refusal comes before it is looked up.
+#[tokio::test]
+async fn test_read_only_map_around_image_store_is_refused_before_boot() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("ro-refuse-store");
+    let host_dir = fresh_dir("ro-refuse-store")?;
+    std::fs::write(host_dir.join("existing.txt"), "written by the host")?;
+
+    let result = async {
+        let map = format!("{}:/mnt:ro", host_dir.display());
+        let output = run_to_its_end(
+            &vm_name,
+            std::slice::from_ref(&map),
+            "localhost/fcvm-test-image-that-is-never-built:latest",
+        )
+        .await?;
+        let wrong = left_by_refused_run(
+            &output,
+            &vm_name,
+            &[
+                format!("--map {map}"),
+                "/mnt/image-store".to_string(),
+                host_dir.join("image-store").display().to_string(),
+            ],
+            &[(&host_dir, &["existing.txt"])],
+        )
+        .await?;
+        anyhow::ensure!(
+            wrong.is_empty(),
+            "a read-only map around the image store was not refused before boot:\n{}",
+            wrong.join("\n")
+        );
+        Ok(())
+    }
+    .await;
+
+    std::fs::remove_dir_all(&host_dir).ok();
+    result
+}

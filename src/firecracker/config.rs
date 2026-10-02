@@ -192,7 +192,9 @@ pub struct FirecrackerConfig {
     pub fuse_max_write: Option<String>,
     /// Whether the guest mounts its read-write volumes without the FUSE
     /// writeback cache (FCVM_NO_WRITEBACK_CACHE), forwarded as
-    /// `no_writeback_cache=1`. Read-only volumes never get that cache.
+    /// `no_writeback_cache=1`. Read-only volumes never get that cache, so
+    /// GuestBootInputs::for_launch leaves this false for a run with no
+    /// read-write volume.
     /// Guest-visible boot behavior baked into snapshots, so part of the cache
     /// key (#821). false (the default) is skip-serialized so existing keys
     /// are unchanged.

@@ -19,7 +19,7 @@ pub use types::{
 };
 // Re-exported for the snapshot restore path's up-front reboot plan (a rebooted VM
 // relaunches in place via the same shared primitive, on every lifecycle path).
-pub(crate) use types::{RebootSpec, VolumeMapping};
+pub(crate) use types::{checked_volume_mappings, RebootSpec, VolumeMapping};
 
 // Re-exported for the #598 regression test (export must pin immutable content by image
 // ID even when the tag is rebuilt mid-export).
@@ -92,6 +92,19 @@ fn resolve_image_mode(args: &RunArgs) -> crate::firecracker::ImageMode {
 
     // Default: overlay
     ImageMode::Overlay
+}
+
+/// Whether this run exports its `localhost/` image to a disk and attaches it.
+/// A disk-only clone has the image in its captured container storage and
+/// exports nothing.
+fn exports_localhost_image(args: &RunArgs) -> bool {
+    args.image.starts_with("localhost/") && args.rootfs_override.is_none()
+}
+
+/// Whether the guest of this run gets an image disk: one exported from a
+/// `localhost/` image, or the one a disk-only snapshot recorded.
+fn attaches_image_disk(args: &RunArgs) -> bool {
+    exports_localhost_image(args) || args.image_disk_override.is_some()
 }
 
 /// Build the VMM runtime configuration from the selected kernel profile.
@@ -1049,6 +1062,13 @@ async fn prepare_vm_for_lifecycle(
 
     let port_mappings = publish_mappings(&args)?;
 
+    // Parse the volume mappings (HOST:GUEST[:ro]) and refuse a mount point
+    // inside a read-only map that does not have it. Done before the kernel,
+    // the rootfs and the image are looked up and before the snapshot-cache
+    // branch, so every run is checked, cached or not, and a refusal sets up
+    // nothing.
+    let volume_mappings = types::checked_volume_mappings(&args, attaches_image_disk(&args))?;
+
     // Disallow --setup when running as root
     // Root users should run `fcvm setup` explicitly
     if args.setup && nix::unistd::geteuid().is_root() {
@@ -1183,9 +1203,7 @@ async fn prepare_vm_for_lifecycle(
     // lives in the captured container storage on the reflinked rootfs — so
     // skip export (and don't require the original host image tag to still
     // exist). None for registry-pulled images.
-    let image_disk_path: Option<PathBuf> = if args.image.starts_with("localhost/")
-        && args.rootfs_override.is_none()
-    {
+    let image_disk_path: Option<PathBuf> = if exports_localhost_image(&args) {
         let resolved_mode = resolve_image_mode(&args);
         let expected = expected_image_disk_path(&image_identifier, resolved_mode);
         if resolved_mode == crate::firecracker::ImageMode::Overlay && expected.exists() {
@@ -1256,6 +1274,7 @@ async fn prepare_vm_for_lifecycle(
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
             boot_inputs.clone(),
+            &volume_mappings,
         );
         let key = config.snapshot_key();
 
@@ -1359,18 +1378,6 @@ async fn prepare_vm_for_lifecycle(
     // Generate VM ID
     let vm_id = generate_vm_id();
     let vm_name = args.name.clone();
-
-    // Parse volume mappings (HOST:GUEST[:ro])
-    let volume_mappings: Vec<VolumeMapping> = args
-        .map
-        .iter()
-        .map(|s| VolumeMapping::parse(s))
-        .collect::<Result<Vec<_>>>()
-        .context("parsing volume mappings")?;
-    types::check_mount_points_inside_read_only_maps(
-        &volume_mappings,
-        &types::guest_mount_points(&args, &volume_mappings),
-    )?;
 
     if !volume_mappings.is_empty() {
         info!(
@@ -2260,17 +2267,16 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         extra_args: ctx.reboot_spec.fc_args.clone(),
                         ..Default::default()
                     };
+                    // The relaunched fc-agent mounts the volumes again, so the
+                    // maps are parsed and checked again, before the new VMM exists.
+                    let volume_mappings = types::checked_volume_mappings(
+                        &ctx.args,
+                        ctx.reboot_spec.image_disk_path.is_some(),
+                    )?;
                     ctx.vm_manager
                         .spawn(&relaunch_spec)
                         .await
                         .context("relaunching Firecracker after guest reboot")?;
-                    let volume_mappings: Vec<VolumeMapping> = ctx
-                        .args
-                        .map
-                        .iter()
-                        .map(|s| VolumeMapping::parse(s))
-                        .collect::<Result<Vec<_>>>()
-                        .context("parsing volume mappings for reboot relaunch")?;
                     // Reuse the original boot-plan transport; the relaunched guest's
                     // boot args still carry fcvm_bootplan=vsock when applicable.
                     let bootplan_over_vsock = ctx.reboot_spec.bootplan_over_vsock;
@@ -3040,6 +3046,7 @@ mod tests {
                 None,
                 extra,
                 GuestBootInputs::default(),
+                &[],
             )
             .snapshot_key()
         };
@@ -3102,6 +3109,7 @@ mod tests {
     /// and a cache hit silently served a guest built with the other value.
     fn key_for(args: &RunArgs, inputs: GuestBootInputs) -> String {
         use std::path::Path;
+        let volume_mappings = parsed_maps(args);
         build_firecracker_config(
             args,
             "sha256:test",
@@ -3114,8 +3122,33 @@ mod tests {
             None,
             None,
             inputs,
+            &volume_mappings,
         )
         .snapshot_key()
+    }
+
+    /// The `--map` arguments of `args`, parsed. Their host paths have to exist.
+    fn parsed_maps(args: &RunArgs) -> Vec<VolumeMapping> {
+        args.map
+            .iter()
+            .map(|spec| VolumeMapping::parse(spec).unwrap())
+            .collect()
+    }
+
+    /// The kernel command line a cold boot of `args` gets from fcvm.
+    fn boot_args_for(args: &RunArgs, inputs: GuestBootInputs) -> String {
+        use std::path::Path;
+        let launch_config = build_launch_config(
+            args,
+            Path::new("/rootfs"),
+            Path::new("/kernel"),
+            Path::new("/initrd"),
+            &None,
+            &RuntimeConfig::default(),
+            inputs,
+            &parsed_maps(args),
+        );
+        build_runtime_boot_args(&crate::network::NetworkConfig::default(), &launch_config)
     }
 
     fn boot_inputs_key(inputs: GuestBootInputs) -> String {
@@ -3241,7 +3274,7 @@ mod tests {
     /// guest's mount path when the run maps volumes.
     fn fuse_volume_args() -> RunArgs {
         let mut args = test_args();
-        args.map = vec!["/tmp/data:/data".to_string()];
+        args.map = vec!["/tmp:/data".to_string()];
         args
     }
 
@@ -3334,6 +3367,235 @@ mod tests {
                 }
             ),
             "no_writeback_cache must change the key of a run with volumes"
+        );
+    }
+
+    /// A read-only volume is never mounted with the writeback cache
+    /// (fuse_pipe::MountSettings::for_volume), so FCVM_NO_WRITEBACK_CACHE
+    /// changes nothing in a guest whose volumes are all read-only. Such a run
+    /// gets the same snapshot key and the same kernel command line with and
+    /// without it. One read-write volume among them and the switch counts.
+    ///
+    /// RED BEFORE THE FIX: for_launch dropped the switch only for a run with
+    /// no volume at all, so two runs that boot the same guest had two keys and
+    /// one of them carried a no_writeback_cache=1 that nothing acted on.
+    #[test]
+    fn no_writeback_cache_does_not_fragment_keys_of_runs_with_only_read_only_maps() {
+        let switch = || GuestBootInputs {
+            no_writeback_cache: true,
+            ..Default::default()
+        };
+        let run = |maps: &[&str]| {
+            let mut args = test_args();
+            args.map = maps.iter().map(|map| map.to_string()).collect();
+            args
+        };
+
+        let read_only = run(&["/tmp:/data:ro", "/tmp:/more:ro"]);
+        assert_eq!(
+            key_for(&read_only, GuestBootInputs::default()),
+            key_for(&read_only, switch()),
+            "the switch changed the key of a run whose maps are all read-only"
+        );
+        assert_eq!(
+            boot_args_for(&read_only, GuestBootInputs::default()),
+            boot_args_for(&read_only, switch()),
+            "the switch changed the kernel command line of a run whose maps are all read-only"
+        );
+
+        let mixed = run(&["/tmp:/data:ro", "/tmp:/more"]);
+        assert_ne!(
+            key_for(&mixed, GuestBootInputs::default()),
+            key_for(&mixed, switch()),
+            "the switch must change the key of a run with a read-write map"
+        );
+        let with_switch = boot_args_for(&mixed, switch());
+        assert!(
+            with_switch.contains("no_writeback_cache=1")
+                && !boot_args_for(&mixed, GuestBootInputs::default())
+                    .contains("no_writeback_cache"),
+            "the switch must reach a guest with a read-write map: {with_switch:?}"
+        );
+
+        // The other FUSE knobs shape a read-only mount too and still key it.
+        assert_ne!(
+            key_for(&read_only, GuestBootInputs::default()),
+            key_for(
+                &read_only,
+                GuestBootInputs {
+                    fuse_readers: Some("8".to_string()),
+                    ..Default::default()
+                }
+            ),
+            "fuse_readers must change the key of a run with read-only maps"
+        );
+    }
+
+    /// A read-only map around /mnt/image-store is refused when the run makes
+    /// fc-agent mount the image store there and the map's host directory has
+    /// no image-store, and only then.
+    ///
+    /// RED BEFORE THE FIX: the host check knew the mount points of the
+    /// arguments only. A localhost/ image with `--map DIR:/mnt:ro` booted and
+    /// fc-agent failed in the guest on mkdir /mnt/image-store with EROFS.
+    #[test]
+    fn a_read_only_map_around_the_image_store_is_refused_when_the_run_mounts_one() {
+        let host = tempfile::tempdir().unwrap();
+        let map = format!("{}:/mnt:ro", host.path().display());
+        let run = |image: &str, mode: Option<CliImageMode>| {
+            let mut args = test_args();
+            args.image = image.to_string();
+            args.image_mode = mode;
+            args.map = vec![map.clone()];
+            args
+        };
+        let check = |args: &RunArgs| {
+            types::checked_volume_mappings(args, attaches_image_disk(args)).map(|_| ())
+        };
+
+        let localhost = run("localhost/app:latest", None);
+        let error = check(&localhost)
+            .expect_err("a run that mounts the image store inside a read-only map was accepted")
+            .to_string();
+        let missing = host.path().join("image-store");
+        for named in [
+            "fcvm mounts the image store of localhost/app:latest in the guest: /mnt/image-store"
+                .to_string(),
+            format!("--map {map}"),
+            missing.display().to_string(),
+        ] {
+            assert!(
+                error.contains(&named),
+                "the error does not name {named}: {error}"
+            );
+        }
+
+        // A registry image is pulled in the guest: no image disk, no image store.
+        check(&run("nginx:alpine", None)).expect("a registry image mounts no image store");
+        // Btrfs and archive modes load the image from the disk and mount nothing there.
+        for mode in [CliImageMode::Btrfs, CliImageMode::Archive] {
+            check(&run("localhost/app:latest", Some(mode)))
+                .expect("only overlay mode mounts the image store");
+        }
+        // A disk-only clone mounts the image store when its snapshot recorded an image disk.
+        let mut clone = run("localhost/app:latest", None);
+        clone.rootfs_override = Some(PathBuf::from("disk.raw"));
+        check(&clone).expect("a clone without an image disk mounts no image store");
+        clone.image_disk_override = Some(PathBuf::from("store.img"));
+        check(&clone).expect_err("a clone with an image disk mounts the image store");
+
+        std::fs::create_dir(&missing).unwrap();
+        check(&localhost).expect("the map's host directory has image-store");
+    }
+
+    /// Every boot of a guest goes through configure_and_boot_vm, and each of
+    /// its three callers has the maps checked first: the first boot in
+    /// prepare_vm_for_lifecycle, before any asset, the snapshot cache or the VM
+    /// is touched, and each relaunch after a guest reboot before the new VMM
+    /// is spawned. No fake hypervisor drives these paths, so the wiring is
+    /// pinned by its source.
+    #[test]
+    fn every_boot_has_its_maps_checked_first() {
+        // Put together here so this test's own text is not a call site.
+        let boot = ["configure_and_boot_vm", "("].concat();
+        let check = "checked_volume_mappings(";
+        let source = |file: &str| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(file);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        let body_of = |text: &str, function: &str| -> String {
+            let from = text
+                .find(function)
+                .unwrap_or_else(|| panic!("no {function}"));
+            let body = &text[from..];
+            body[..body.find("\n}\n").unwrap()].to_string()
+        };
+        let position = |text: &str, needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in the function"))
+        };
+
+        // The call sites, by file. A definition is not one.
+        let mut call_sites: Vec<(String, usize)> = Vec::new();
+        let mut pending = vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap();
+                    let calls =
+                        text.matches(&boot).count() - text.matches(&format!("fn {boot}")).count();
+                    if calls > 0 {
+                        let file = path.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap();
+                        call_sites.push((file.display().to_string(), calls));
+                    }
+                }
+            }
+        }
+        call_sites.sort();
+        assert_eq!(
+            call_sites,
+            [
+                ("src/commands/podman/mod.rs".to_string(), 1),
+                ("src/commands/podman/vm_config.rs".to_string(), 1),
+                ("src/commands/snapshot.rs".to_string(), 1),
+            ],
+            "a new caller boots a guest: check its maps first and pin it here"
+        );
+
+        // First boot: run_vm_setup_inner boots, and the one way into it starts
+        // in prepare_vm_for_lifecycle, which checks before anything else.
+        let vm_config = source("src/commands/podman/vm_config.rs");
+        assert!(body_of(&vm_config, "async fn run_vm_setup_inner(").contains(&boot));
+        let podman = source("src/commands/podman/mod.rs");
+        // Without the tests, whose text names what it looks for.
+        let podman = &podman[..podman.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        assert_eq!(podman.matches("= run_vm_setup(").count(), 1);
+        let prepare = body_of(podman, "async fn prepare_vm_for_lifecycle(");
+        let checked = position(&prepare, check);
+        for later in [
+            "ensure_kernel(",
+            "ensure_rootfs(",
+            "get_image_cache_ref(",
+            "check_podman_snapshot(",
+            "generate_vm_id()",
+            "= run_vm_setup(",
+        ] {
+            assert!(
+                checked < position(&prepare, later),
+                "prepare_vm_for_lifecycle reaches {later} before it checks the maps"
+            );
+        }
+
+        // Relaunch of a podman run VM.
+        let run_loop = body_of(podman, "pub async fn run_vm_loop");
+        let relaunch = position(&run_loop, "guest rebooted — relaunching VM in place");
+        let checked = position(&run_loop, check);
+        let spawned = position(&run_loop, ".spawn(&relaunch_spec)");
+        assert!(
+            relaunch < checked && checked < spawned && spawned < position(&run_loop, &boot),
+            "the reboot relaunch does not check the maps before it spawns the VMM"
+        );
+
+        // Relaunch of a restored clone: its plan is built when the guest
+        // reboots, and building it checks the maps.
+        let snapshot = source("src/commands/snapshot.rs");
+        assert!(
+            body_of(&snapshot, "async fn build_clone_reboot_plan(").contains(check),
+            "build_clone_reboot_plan does not check the maps"
+        );
+        let planned = position(&snapshot, "match build_clone_reboot_plan(");
+        let booted = position(&snapshot, &boot);
+        assert!(
+            planned < booted
+                && snapshot[planned..booted]
+                    .matches("build_clone_reboot_plan(")
+                    .count()
+                    == 1
+                && snapshot[planned..booted].contains("reboot_plan.as_ref()"),
+            "the clone's relaunch does not boot from the plan it has just built"
         );
     }
 

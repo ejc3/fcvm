@@ -1,4 +1,4 @@
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
@@ -318,9 +318,50 @@ fn guest_path_of_spec(spec: &str) -> Option<&str> {
         .map(|(_, guest)| guest)
 }
 
-/// Every guest path fc-agent mounts something at for this run, each with the
-/// argument that asked for it.
-pub(crate) fn guest_mount_points(args: &RunArgs, maps: &[VolumeMapping]) -> Vec<(String, String)> {
+/// Where fc-agent mounts the image disk of a run in overlay image mode
+/// (`mount_overlay_image` in fc-agent/src/container.rs). fc-agent creates this
+/// directory after the volumes are mounted, so to a read-only map around it it
+/// is a mount point like any other.
+/// `the_image_store_is_the_only_other_mount_point_fc_agent_creates` reads the
+/// fc-agent source and fails when the two differ.
+pub(crate) const IMAGE_STORE_MOUNT_POINT: &str = "/mnt/image-store";
+
+/// The parsed `--map` arguments of a run, once no mount point of the run lies
+/// inside a read-only map that does not have it
+/// (`check_mount_points_inside_read_only_maps`).
+///
+/// Every path that boots a guest calls this first, because every boot runs an
+/// fc-agent that mounts the volumes again: `fcvm podman run` before it sets
+/// anything up, and each relaunch after a guest reboot.
+/// `attaches_image_disk` is whether that boot gives the guest an image disk.
+/// In overlay image mode fc-agent mounts it at `IMAGE_STORE_MOUNT_POINT`.
+pub(crate) fn checked_volume_mappings(
+    args: &RunArgs,
+    attaches_image_disk: bool,
+) -> Result<Vec<VolumeMapping>> {
+    let maps = args
+        .map
+        .iter()
+        .map(|s| VolumeMapping::parse(s))
+        .collect::<Result<Vec<_>>>()
+        .context("parsing volume mappings")?;
+    let mounts_image_store = attaches_image_disk
+        && super::resolve_image_mode(args) == crate::firecracker::ImageMode::Overlay;
+    check_mount_points_inside_read_only_maps(
+        &maps,
+        &guest_mount_points(args, &maps, mounts_image_store),
+    )?;
+    Ok(maps)
+}
+
+/// Every guest path fc-agent creates and mounts something at for this run,
+/// each with what asked for it: the `--map`, `--disk`, `--disk-dir` and
+/// `--nfs` arguments, and the image store when the run mounts one.
+fn guest_mount_points(
+    args: &RunArgs,
+    maps: &[VolumeMapping],
+    mounts_image_store: bool,
+) -> Vec<(String, String)> {
     let maps = args
         .map
         .iter()
@@ -340,7 +381,13 @@ pub(crate) fn guest_mount_points(args: &RunArgs, maps: &[VolumeMapping]) -> Vec<
             ))
         })
     });
-    maps.chain(others).collect()
+    let image_store = mounts_image_store.then(|| {
+        (
+            format!("fcvm mounts the image store of {} in the guest", args.image),
+            IMAGE_STORE_MOUNT_POINT.to_string(),
+        )
+    });
+    maps.chain(others).chain(image_store).collect()
 }
 
 /// Refuse a mount point that fc-agent would have to create inside a read-only
@@ -353,7 +400,7 @@ pub(crate) fn guest_mount_points(args: &RunArgs, maps: &[VolumeMapping]) -> Vec<
 ///
 /// A symlink on the way is left to the guest, which resolves it in its own
 /// namespace.
-pub(crate) fn check_mount_points_inside_read_only_maps(
+fn check_mount_points_inside_read_only_maps(
     maps: &[VolumeMapping],
     mount_points: &[(String, String)],
 ) -> Result<()> {
@@ -537,5 +584,148 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The RunArgs of `fcvm podman run --name test <extra>`, parsed by clap.
+    fn parse_run(extra: &[&str]) -> RunArgs {
+        use clap::Parser;
+        let mut argv = vec!["fcvm", "podman", "run", "--name", "test"];
+        argv.extend_from_slice(extra);
+        let cli = crate::cli::Cli::try_parse_from(argv).expect("the command line parses");
+        match cli.cmd {
+            crate::cli::Commands::Podman(podman) => match podman.cmd {
+                crate::cli::PodmanCommands::Run(run) => run,
+                crate::cli::PodmanCommands::Prepare(_) => panic!("expected podman run"),
+            },
+            _ => panic!("expected podman run"),
+        }
+    }
+
+    /// Every argument that makes fc-agent mount something is listed with its
+    /// guest path, with and without `:ro`, in the order maps, disks, disk
+    /// directories, NFS shares, and the image store last when the run mounts
+    /// one.
+    #[test]
+    fn every_mounting_argument_is_listed_with_its_guest_path() {
+        let host = tempfile::tempdir().unwrap();
+        let host = host.path().display().to_string();
+        let specs = [
+            ("--map", format!("{host}:/data")),
+            ("--map", format!("{host}:/data/ro:ro")),
+            ("--disk", "/images/a.raw:/disk".to_string()),
+            ("--disk", "/images/b.raw:/disk/ro:ro".to_string()),
+            ("--disk-dir", "/dirs/a:/disk-dir".to_string()),
+            ("--disk-dir", "/dirs/b:/disk-dir/ro:ro".to_string()),
+            ("--nfs", "/shares/a:/nfs".to_string()),
+            ("--nfs", "/shares/b:/nfs/ro:ro".to_string()),
+        ];
+        // Flags interleaved, so the order of the list is not the order typed.
+        let mut argv: Vec<&str> = Vec::new();
+        for (flag, spec) in specs.iter().rev() {
+            argv.extend([*flag, spec.as_str()]);
+        }
+        argv.push("localhost/app:latest");
+        let args = parse_run(&argv);
+        let maps: Vec<VolumeMapping> = args
+            .map
+            .iter()
+            .map(|spec| VolumeMapping::parse(spec).unwrap())
+            .collect();
+        assert_eq!(
+            maps.iter().map(|map| map.read_only).collect::<Vec<_>>(),
+            [true, false],
+            "the maps as parsed"
+        );
+
+        let listed = |argument: String, guest: &str| (argument, guest.to_string());
+        let mut want = vec![
+            listed(format!("--map {host}:/data/ro:ro"), "/data/ro"),
+            listed(format!("--map {host}:/data"), "/data"),
+            listed("--disk /images/b.raw:/disk/ro:ro".into(), "/disk/ro"),
+            listed("--disk /images/a.raw:/disk".into(), "/disk"),
+            listed("--disk-dir /dirs/b:/disk-dir/ro:ro".into(), "/disk-dir/ro"),
+            listed("--disk-dir /dirs/a:/disk-dir".into(), "/disk-dir"),
+            listed("--nfs /shares/b:/nfs/ro:ro".into(), "/nfs/ro"),
+            listed("--nfs /shares/a:/nfs".into(), "/nfs"),
+        ];
+        assert_eq!(guest_mount_points(&args, &maps, false), want);
+
+        want.push(listed(
+            "fcvm mounts the image store of localhost/app:latest in the guest".into(),
+            IMAGE_STORE_MOUNT_POINT,
+        ));
+        assert_eq!(guest_mount_points(&args, &maps, true), want);
+
+        assert_eq!(guest_path_of_spec("/images/a.raw"), None);
+    }
+
+    /// The host's list of mount points is fc-agent's. Besides the mount points
+    /// of the plan's volumes, disks and NFS shares (fc-agent/src/mounts.rs),
+    /// the one directory fc-agent creates with an error that fails the boot is
+    /// the image store, at the path this file checks, and it creates it after
+    /// the volumes are mounted.
+    #[test]
+    fn the_image_store_is_the_only_other_mount_point_fc_agent_creates() {
+        let read = |file: &str| {
+            let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("fc-agent/src")
+                .join(file);
+            std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
+        };
+        // Every create_dir_all whose failure is not thrown away, per file.
+        let fatal_creations = |file: &str| -> Vec<String> {
+            read(file)
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.contains("create_dir_all(") && !line.starts_with("let _ ="))
+                .map(str::to_string)
+                .collect()
+        };
+
+        let image_store = format!("let mount_path = \"{IMAGE_STORE_MOUNT_POINT}\";");
+        let container = read("container.rs");
+        let mount_overlay_image = &container[container
+            .find("pub fn mount_overlay_image(")
+            .expect("mount_overlay_image is in container.rs")..];
+        let mount_overlay_image =
+            &mount_overlay_image[..mount_overlay_image.find("\n}\n").unwrap()];
+        assert!(
+            mount_overlay_image.contains(&image_store),
+            "fc-agent does not mount the image store at {IMAGE_STORE_MOUNT_POINT}. Expected \
+             line in mount_overlay_image: {image_store}"
+        );
+        assert_eq!(
+            fatal_creations("container.rs"),
+            ["std::fs::create_dir_all(mount_path).context(\"creating image store mount point\")?;"],
+            "fc-agent/src/container.rs creates another directory whose failure fails the boot. \
+             If it does so after the volumes are mounted, add it to guest_mount_points"
+        );
+        assert_eq!(
+            fatal_creations("agent.rs"),
+            Vec::<String>::new(),
+            "fc-agent/src/agent.rs creates a directory whose failure fails the boot. If it \
+             does so after the volumes are mounted, add it to guest_mount_points"
+        );
+        assert_eq!(
+            fatal_creations("mounts.rs"),
+            [
+                "if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {",
+                "if let Err(e) = std::fs::create_dir_all(&disk.mount_path) {",
+                "if let Err(e) = std::fs::create_dir_all(&share.mount_path) {",
+            ],
+            "fc-agent/src/mounts.rs creates a mount point guest_mount_points does not know"
+        );
+
+        let agent = read("agent.rs");
+        let volumes = agent
+            .find("mounts::mount_fuse_volumes(")
+            .expect("agent.rs mounts the FUSE volumes");
+        let image = agent
+            .find("container::mount_overlay_image(")
+            .expect("agent.rs mounts the overlay image");
+        assert!(
+            volumes < image,
+            "fc-agent mounts the image store before the volumes, so a map can cover it"
+        );
     }
 }

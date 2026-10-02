@@ -71,20 +71,11 @@ impl FuseClient {
         Self::with_options(mux, Arc::new(AtomicBool::new(false)), 0, settings)
     }
 
-    /// Create a new client with a shared destroyed flag.
+    /// Create a new client with a shared destroyed flag, a max_write limit and
+    /// the mount's settings.
     ///
     /// The destroyed flag is set by `destroy()` when the filesystem is unmounted.
     /// Reader threads can check this flag to distinguish clean shutdown from errors.
-    pub fn with_destroyed_flag(
-        mux: Arc<Multiplexer>,
-        destroyed: Arc<AtomicBool>,
-        settings: MountSettings,
-    ) -> Self {
-        Self::with_options(mux, destroyed, 0, settings)
-    }
-
-    /// Create a new client with a shared destroyed flag, a max_write limit and
-    /// the mount's settings.
     pub fn with_options(
         mux: Arc<Multiplexer>,
         destroyed: Arc<AtomicBool>,
