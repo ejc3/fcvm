@@ -72,7 +72,8 @@ case "$1" in
     case "$*" in
       *'.Image'*) echo sha256:{"a" * 64} ;;
       *'Config.Labels'*) echo {CONTAINER_ID}'|'{CONTAINER_OWNER_TOKEN} ;;
-      *'.State.CgroupPath'*) echo /fake-container.scope ;;
+      *'.State.CgroupPath'*) echo "${{TEST_CGROUP_PATH-/fake-container.scope}}" ;;
+      *'.State.Pid'*) echo 4242 ;;
     esac
     ;;
   container)
