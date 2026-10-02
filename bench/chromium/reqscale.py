@@ -3349,6 +3349,9 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         request_args = _request_args(args, context, serve_pid, log_dir, probe)
         rep = global_base + context.request_index
         record = reqbench.run_cdp_request(request_args, rep, fast=True)
+        # The memory server's CPU is attributable to one request only when
+        # requests run one at a time; here they overlap, so it says nothing.
+        record.pop("serve_cpu", None)
         record.update(
             schema=RECORD_SCHEMA,
             kind="request",

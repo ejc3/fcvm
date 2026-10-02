@@ -890,6 +890,9 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertIn("WsClosed", rec.get("error", ""))
             self.assertEqual(rec.get("failure_class"), "transport")
             self.assertEqual(rec.get("failure_stage"), "navigate")
+            # serve_pid names a live process, so the request carries its CPU.
+            self.assertIs(rec["serve_cpu"]["applicable"], True)
+            self.assertIsInstance(rec["serve_cpu"]["ms"], float)
 
     def test_cdp_response_waits_for_lifecycle_ready_before_fast_teardown(self):
         """A serving port is not yet permission to tear down clone setup."""
@@ -3817,6 +3820,71 @@ class AnalyzerAvailability(unittest.TestCase):
                 "a sub-tick child must print as a bound, never as an exact zero",
             )
             self.assertIn("below /proc tick resolution", text)
+
+    def test_request_cpu_sums_children_reaping_and_the_memory_server(self):
+        """RED BEFORE THE FIX: no reduction read lifetime_cpu_ms_by_child, and
+        the memory server's CPU was recorded nowhere, so the fast-teardown arm
+        published no CPU per request at all."""
+        with tempfile.TemporaryDirectory() as d:
+            src = os.path.join(d, "r.jsonl")
+            dst = os.path.join(d, "r.json")
+            self._write_clean_backend(src, "uffd", 6, 372.0)
+            with open(src) as source:
+                rows = [json.loads(line) for line in source]
+            fast = [row for row in rows if row.get("arm") == "cdp-fast"]
+            self.assertTrue(fast)
+            for i, record in enumerate(fast):
+                record["teardown"]["lifetime_cpu_ms_by_child"] = {
+                    "fcvm": 40.0, "firecracker": 600.0, "pasta": 30.0, "holder": 0.0}
+                record["teardown"]["per_child_cpu"] = {
+                    "fcvm": {"reclaim_cpu_ms": 0.0, "complete": True},
+                    "firecracker": {"reclaim_cpu_ms": 110.0, "complete": i != 0},
+                    "pasta": {"reclaim_cpu_ms": 0.0, "complete": True},
+                    "holder": {"reclaim_cpu_ms": 0.0, "complete": True},
+                }
+                record["serve_cpu"] = {"applicable": True, "ms": 25.0}
+            # A server reading that failed keeps its record out of the total.
+            fast[-1]["serve_cpu"] = {"applicable": True, "ms": None, "error": "x"}
+            with open(src, "w") as target:
+                for row in rows:
+                    target.write(json.dumps(row) + "\n")
+            with redirect_stdout(io.StringIO()):
+                self._run_gate_fixture(["--json-out", dst, src])
+            with open(dst) as result_file:
+                block = json.load(result_file)["arms"]["cdp-fast"]["request_cpu_ms"]
+            measured = [r for r in fast if r.get("warmup") is False and r.get("ok")]
+            n = len(measured) - (1 if fast[-1] in measured else 0)
+            self.assertEqual(block["total"]["median"], 670.0 + 110.0 + 25.0)
+            self.assertEqual(block["total"]["n"], n)
+            self.assertEqual(block["children_at_kill"]["median"], 670.0)
+            self.assertEqual(block["reclaim"]["median"], 110.0)
+            self.assertEqual(block["memory_server"]["median"], 25.0)
+            self.assertEqual(block["by_child_at_kill"]["firecracker"]["median"], 600.0)
+            self.assertEqual(block["records_with_lower_bound_reaping"],
+                             1 if fast[0] in measured else 0)
+
+
+class ServeCpu(unittest.TestCase):
+    """The memory server's CPU over one request, from two /proc samples."""
+
+    def test_the_tick_delta_is_milliseconds(self):
+        before = ("S", 100, 50, 777)
+        after = ("S", 130, 60, 777)
+        got = reqbench.serve_cpu(42, before, after)
+        self.assertEqual(got, {"applicable": True, "ms": 40 * 1000.0 / reqbench.CLK_TCK})
+
+    def test_a_restarted_server_says_nothing_about_the_request(self):
+        got = reqbench.serve_cpu(42, ("S", 100, 50, 777), ("S", 1, 1, 778))
+        self.assertIsNone(got["ms"])
+        self.assertIn("start time changed", got["error"])
+
+    def test_an_unreadable_server_is_an_error_not_zero(self):
+        got = reqbench.serve_cpu(42, ("S", 100, 50, 777), None)
+        self.assertIsNone(got["ms"])
+        self.assertIn("not readable", got["error"])
+
+    def test_a_file_backed_restore_has_no_server(self):
+        self.assertEqual(reqbench.serve_cpu(0, None, None), {"applicable": False, "ms": None})
 
 
 class ProcStateReadOnce(unittest.TestCase):

@@ -230,6 +230,26 @@ def proc_stat_fields(pid: int):
         return None
 
 
+def serve_cpu(serve_pid: int, before, after) -> dict:
+    """The shared memory server's CPU over one request, from proc_stat_fields
+    samples taken before the clone's launch and after its teardown.
+
+    Requests run one at a time, so the server's utime+stime (summed over its
+    threads) in that window is this clone's share: the faults it served, the
+    working-set replay into it, and any working-set publication that lands in
+    the window. A server whose start time changed is a different process, and
+    its counters say nothing about this request.
+    """
+    if not serve_pid:
+        return {"applicable": False, "ms": None}
+    if before is None or after is None:
+        return {"applicable": True, "ms": None, "error": "memory server not readable"}
+    if before[3] != after[3]:
+        return {"applicable": True, "ms": None, "error": "memory server start time changed"}
+    ticks = (after[1] + after[2]) - (before[1] + before[2])
+    return {"applicable": True, "ms": ticks * 1000.0 / CLK_TCK}
+
+
 def machine_cpu_ms() -> float:
     """Non-idle CPU milliseconds from /proc/stat's aggregate line."""
     with open("/proc/stat") as f:
@@ -3185,6 +3205,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # Watch registered BEFORE the spawn: a watch created afterwards can miss the
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
+    serve_pid = getattr(args, "serve_pid", 0) or 0
+    serve_before = proc_stat_fields(serve_pid) if serve_pid else None
     t_spawn = time.monotonic()
     interrupted = None
     fcvm_start_time = None
@@ -3416,6 +3438,8 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             e.record = rec
             raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    rec["serve_cpu"] = serve_cpu(
+        serve_pid, serve_before, proc_stat_fields(serve_pid) if serve_pid else None)
     rec["log"] = log
     if interrupted is not None:
         raise interrupted
