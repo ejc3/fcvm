@@ -131,6 +131,19 @@ pub struct FirecrackerConfig {
     /// mode-derived DNS) is skip-serialized so existing keys are unchanged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_server: Option<String>,
+    /// Balloon device target in MiB, from --balloon. The device is attached
+    /// before boot and the saved VM state carries it with its target. A device
+    /// cannot be added to a restored VM, so a snapshot taken without the flag
+    /// restores a guest with no balloon, and the device's presence has to be
+    /// in the key. The target is in the key as well because no restore step
+    /// sets one today: a snapshot taken at another target restores at that
+    /// target. Setting the target at restore, so that the key need only say
+    /// whether a device exists, is #1053. Without this field a run with
+    /// --balloon cache-hits either snapshot and the flag is silently ignored.
+    /// None (the default, no device) is skip-serialized so existing keys are
+    /// unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub balloon_mib: Option<u32>,
     /// Whether fc-agent straces the container (fc_agent_strace=1 on the kernel
     /// cmdline, from --strace-agent). Guest-visible boot behavior baked into
     /// snapshots, so part of the cache key. false is skip-serialized so
@@ -232,6 +245,7 @@ impl Default for FirecrackerConfig {
             firecracker_bin: None,
             guest_failpoint: None,
             dns_server: None,
+            balloon_mib: None,
             agent_strace: false,
             extra_boot_args: None,
             image_disk_identity: None,

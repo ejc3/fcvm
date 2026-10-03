@@ -3100,6 +3100,51 @@ mod tests {
         );
     }
 
+    /// --balloon attaches a device before boot, and the saved VM state carries
+    /// the device and its target. No restore step adds a balloon device or sets
+    /// a target, so a run with --balloon must not share a snapshot with a run
+    /// without it, or with a run at another target. Before FirecrackerConfig
+    /// carried the flag the keys came out equal, and a cache hit gave the
+    /// caller a guest with no balloon device.
+    #[test]
+    fn balloon_changes_the_snapshot_key() {
+        let key = |balloon: Option<u32>| {
+            let mut args = test_args();
+            args.balloon = balloon;
+            key_for(&args, GuestBootInputs::default())
+        };
+        assert_ne!(
+            key(None),
+            key(Some(0)),
+            "a snapshot taken with no balloon device must not serve --balloon 0"
+        );
+        assert_ne!(
+            key(Some(0)),
+            key(Some(1024)),
+            "a snapshot taken at one balloon target must not serve another"
+        );
+    }
+
+    /// The device is attached from the launch config, so with snapshots off,
+    /// where no key config exists, the launch config has to carry --balloon.
+    #[test]
+    fn the_launch_config_carries_the_balloon() {
+        use std::path::Path;
+        let mut args = test_args();
+        args.balloon = Some(512);
+        let launch_config = build_launch_config(
+            &args,
+            Path::new("/rootfs"),
+            Path::new("/kernel"),
+            Path::new("/initrd"),
+            &None,
+            &RuntimeConfig::default(),
+            GuestBootInputs::default(),
+            &[],
+        );
+        assert_eq!(launch_config.balloon_mib, Some(512));
+    }
+
     /// #821 helper: snapshot key of a config built through the real
     /// constructor from the given guest boot inputs. The host-derived DNS
     /// values and the FUSE knobs are guest-visible boot inputs, baked into
