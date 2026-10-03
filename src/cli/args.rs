@@ -268,7 +268,9 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter=',')]
     pub publish: Vec<String>,
 
-    /// Balloon device target MiB. If not specified, no balloon device is configured
+    /// Balloon device target MiB. If not specified, no balloon device is configured.
+    /// Part of the snapshot key: a snapshot keeps the device and the target it
+    /// booted with, so a run with another value boots its own.
     #[arg(long)]
     pub balloon: Option<u32>,
 
