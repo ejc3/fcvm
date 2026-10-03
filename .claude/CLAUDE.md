@@ -2548,7 +2548,9 @@ had prefetch on). Fault-around (below) covers neighbouring pages and is measured
 separately.
 
 - **Record**: every demand fault within the clone's recording window marks its snapshot
-  file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). The window starts
+  file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). A fault that is
+  on a page the clone's balloon gave back when it is first read is the exception: it is
+  answered with zeros and not recorded. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
   served but not recorded. On handler exit the bitmap is unioned into the serve
@@ -2574,7 +2576,8 @@ separately.
   because a yield after every small copy cost more than the copy. Every recorded run is
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
   work is bounded by the image size, and no cap drops part of a large guest's set when it
-  fragments into millions of runs.
+  fragments into millions of runs. A recorded page the clone's balloon has given back
+  by the time replay reaches it is stepped over.
 - **Page cache warm-up (copy mode)**: replay and demand faults both read the image through the
   serve's mapping, so with a cold page cache every source page is a synchronous major fault in
   the serve, ahead of the guest. One detached thread (`fcvm-ws-warm`, `src/uffd/warmup.rs`)
@@ -2689,9 +2692,9 @@ with the granule.
   It then populates the rest of the granule that holds the page: the pages after it first,
   then the pages before it. The granule is `BYTES` aligned in snapshot file offsets and
   clipped to the memory region that took the fault. Pages that are already present are
-  stepped over.
-- **The trade is density**: every fault privately materialises its whole granule whether or
-  not the guest touches the rest of it. At 64 KiB that measured 14.5 extra pages per fault
+  stepped over, and so are pages the clone's balloon gave back.
+- **The trade is density**: every fault privately materialises the rest of its granule, bar
+  pages the balloon gave back, whether or not the guest touches it. At 64 KiB that measured 14.5 extra pages per fault
   right after a restore. Idle clones are unaffected, because a clone that does not fault
   populates nothing.
 - **When to use it**: as an experiment, on large guests whose clones do real work right after
@@ -2711,10 +2714,12 @@ with the granule.
   zero-progress `EAGAIN` while `mmap_changing` is raised, abandons that granule to demand
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
-  It stands down in two cases. While any fault is parked it serves demanded pages only: a
+  It stands down in three cases. While any fault is parked it serves demanded pages only: a
   parked fault is retried between batches and fails the clone if it is still refused after
   2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
-  already present it populates nothing, because another populator owns that range.
+  already present it populates nothing, because another populator owns that range. After a
+  fault on a page the clone's balloon gave back, which is answered with zeros, it populates
+  nothing either. And a page of the granule that the balloon gave back is stepped over.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working

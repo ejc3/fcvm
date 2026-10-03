@@ -472,8 +472,10 @@ pub struct SnapshotServeArgs {
     /// A clone takes one userfaultfd round trip for every page it touches outside the
     /// recorded working set. With a granule of `BYTES`, the faulting page is served first,
     /// exactly as without the option, and the rest of its aligned granule is populated right
-    /// after, so the neighbouring pages never fault. The cost is memory: every page of a
-    /// granule becomes a private copy in the clone whether or not the guest touches it.
+    /// after, so the neighbouring pages do not fault. A page the clone's balloon gave back is
+    /// stepped over, and the guest's own touch of it is answered with zeros. The cost is
+    /// memory: every page of a granule that the balloon has not given back becomes a private
+    /// copy in the clone whether or not the guest touches it.
     ///
     /// Measured once, on a 128 GiB guest at 65536 (64 KiB): the first real page after a
     /// restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and
