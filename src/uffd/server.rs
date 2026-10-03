@@ -574,8 +574,8 @@ pub const MAX_FAULT_AROUND: usize = prefetch::CHUNK_BYTES;
 /// set. Replay cannot help a clone that does fresh work right after restore, because the
 /// memory that work allocates lands on different pages in every clone.
 ///
-/// The memory is the cost. Every page of a granule becomes a private copy in the clone
-/// whether or not the guest ever touches it. Measured once, on a 128 GiB guest with 64 KiB
+/// The memory is the cost. Every page of a granule that the clone's balloon has not given
+/// back becomes a private copy in the clone whether or not the guest ever touches it. Measured once, on a 128 GiB guest with 64 KiB
 /// granules: the first real page after a restore went from 518.4 s to 336.2 s, restore to
 /// healthy went from 2m23s to 4m07s, and the populate installed 14.5 pages beyond each
 /// demanded one (17.5 million in all), because right after a restore almost every granule held one
@@ -1221,20 +1221,6 @@ async fn serve_clone(
     .await
 }
 
-/// Whether a UFFDIO_ZEROPAGE error only means the kernel stopped short, which is not fatal.
-///
-/// * `EEXIST`: the first page is already present. Remove (balloon) events and page faults are
-///   not ordered, so a fault served with UFFDIO_COPY before the Remove event is processed
-///   leaves pages present in the removed range.
-/// * `EAGAIN`: the kernel stopped. Either it zeroed a prefix and then reached a present page,
-///   or it zeroed nothing because `mmap_changing` is raised. The second is the usual case
-///   right after a REMOVE event is read, because the flag drops only when the thread inside
-///   `madvise` runs again. The crate discards the ioctl's byte count, so the two cannot be
-///   told apart here.
-fn zeropage_stopped_short(e: &userfaultfd::Error) -> bool {
-    matches!(prefetch::errno_of(e), Some(libc::EEXIST | libc::EAGAIN))
-}
-
 /// Whether a UFFDIO_CONTINUE error means the page is already mapped in the clone.
 ///
 /// Two threads in the guest can fault on the same page before the first `UFFDIO_CONTINUE`
@@ -1373,8 +1359,9 @@ fn continue_page(uffd: &Uffd, vm_id: &str, page: usize, page_size: usize) -> Res
     Ok(FaultOutcome::Resolved)
 }
 
-/// Resolve one MISSING fault by copying its granule (`page_size` bytes) out of the snapshot
-/// mapping with `UFFDIO_COPY`. `offset_in_file` is where the granule starts in `mmap`.
+/// Resolve one MISSING fault by copying its granule (`page_size` bytes) out of `mmap`, which
+/// is the snapshot mapping or the granule of zeros, with `UFFDIO_COPY`. `offset_in_file` is
+/// where the granule starts in `mmap`.
 ///
 /// The outcomes mirror [`continue_page`]'s:
 ///
@@ -1402,9 +1389,11 @@ fn copy_page(
     offset_in_file: usize,
     page_size: usize,
 ) -> Result<FaultOutcome> {
-    // `validate_mappings` admits only page-aligned regions that end inside the memory image,
-    // and `mmap` is that image, so every granule of a registered region is wholly inside it.
-    // Checked, not indexed: a broken invariant fails through the ordinary error path.
+    // `mmap` is the memory image, or the granule of zeros with offset 0 for a page the
+    // balloon gave back. `validate_mappings` admits only page-aligned regions that end
+    // inside the image, and no page size above 2 MiB is admitted, so the granule is wholly
+    // inside either source. Checked, not indexed: a broken invariant fails through the
+    // ordinary error path.
     let src = offset_in_file
         .checked_add(page_size)
         .and_then(|end| mmap.get(offset_in_file..end))
@@ -1460,7 +1449,7 @@ fn copy_page(
                 target: "uffd",
                 vm_id = %vm_id,
                 fault_addr = format!("0x{:x}", page),
-                offset_in_file,
+                source_offset = offset_in_file,
                 error = ?e,
                 "UFFD copy failed"
             );
@@ -1494,6 +1483,10 @@ async fn wait_for_peer_vmm_exit(
 /// triples when the handler exits. The offset is into the snapshot memory file, NOT a host
 /// virtual address: host addresses differ per clone, so only the file offset can be compared
 /// between clones of the same snapshot.
+///
+/// A fault on a page the clone's balloon gave back is recorded like any other. An offset
+/// that repeats in a trace is therefore either a second read of the snapshot or a zero
+/// fill, and the handler's exit line counts the zero fills (`zero_filled_pages`).
 ///
 /// This is what `bench/chromium/faultbench.py` collects and `faultanalyze.py` reduces; it is
 /// the instrument behind the fault-count, cross-clone Jaccard and sequentiality figures the
@@ -1693,11 +1686,178 @@ impl ParkedFaults {
     }
 }
 
+/// A granule of zeros to `UFFDIO_COPY` from, as large as the largest page fcvm serves.
+///
+/// It is an anonymous mapping that is only read, so it holds no memory of its own: a read of
+/// it maps the kernel's zero page. A `static` array of zeros would be 2 MiB of `.rodata` in
+/// the binary. It is mapped at the first fault on a given-back page, so a serve whose clones
+/// have no balloon never maps it.
+fn zero_granule() -> Result<&'static [u8]> {
+    static ZERO_GRANULE: std::sync::OnceLock<memmap2::Mmap> = std::sync::OnceLock::new();
+    if let Some(zeros) = ZERO_GRANULE.get() {
+        return Ok(&zeros[..]);
+    }
+    let zeros = MmapOptions::new()
+        .len(HUGE_PAGE_2M)
+        .map_anon()
+        .and_then(memmap2::MmapMut::make_read_only)
+        .context("mapping a granule of zeros")?;
+    Ok(&ZERO_GRANULE.get_or_init(|| zeros)[..])
+}
+
+/// The granules of a COPY clone's memory that its balloon has given back, by offset in the
+/// snapshot file.
+///
+/// A balloon gives pages back with `madvise(MADV_DONTNEED)`. The kernel reports the range in
+/// a REMOVE event and drops the pages once the event has been read. The guest keeps nothing
+/// in such a page, so when it touches one again the fault is answered with zeros and the
+/// snapshot is not read.
+///
+/// A granule never leaves the set. Once it has been given back the snapshot's bytes are no
+/// longer its contents, so every later fault on it is answered with zeros. Replay and
+/// fault-around ask the set before each chunk and step over a granule in it, so such a
+/// granule is filled only by the guest's own fault.
+///
+/// A fill does not end that. The thread inside `madvise` lowers `mmap_changing` once its
+/// REMOVE has been read and drops the pages after that, so a zero fill can land in between
+/// and be dropped with them. The handler sees no second REMOVE for that drop, and the fault
+/// that follows has to get zeros again.
+///
+/// One bit per granule of the memory image, allocated at the first REMOVE event, so a clone
+/// without a balloon pays nothing. A 128 GiB guest of 4 KiB pages takes 4 MiB.
+#[derive(Default)]
+struct RemovedPages {
+    bits: Vec<u64>,
+    /// Granules in the set.
+    marked: u64,
+}
+
+impl RemovedPages {
+    /// Add every granule that lies wholly inside `[file_offset, file_offset + len)`.
+    /// `mem_size` is the length of the memory image, which sizes the set the first time.
+    ///
+    /// A granule the range only partly covers is left out. The kernel removes whole pages,
+    /// so that is a range this server did not expect, and such a granule is then served
+    /// from the snapshot as it was before this set existed.
+    fn insert_range(&mut self, file_offset: usize, len: usize, page_size: usize, mem_size: usize) {
+        let Some(end) = file_offset.checked_add(len) else {
+            return;
+        };
+        let first = file_offset.div_ceil(page_size);
+        let past_last = end.min(mem_size) / page_size;
+        if first >= past_last {
+            return;
+        }
+        if self.bits.is_empty() {
+            self.bits = vec![0; mem_size.div_ceil(page_size).div_ceil(64)];
+        }
+        let mut granule = first;
+        while granule < past_last {
+            let Some(word) = self.bits.get_mut(granule / 64) else {
+                return;
+            };
+            // The bits of this word that the range covers, set in one step.
+            let from = granule % 64;
+            let upto = (past_last - granule + from).min(64);
+            let mask = (u64::MAX >> (64 - (upto - from))) << from;
+            self.marked += u64::from((mask & !*word).count_ones());
+            *word |= mask;
+            granule += upto - from;
+        }
+    }
+
+    fn has(&self, granule: usize) -> bool {
+        self.bits
+            .get(granule / 64)
+            .is_some_and(|word| word & (1u64 << (granule % 64)) != 0)
+    }
+
+    fn contains(&self, file_offset: usize, page_size: usize) -> bool {
+        self.has(file_offset / page_size)
+    }
+
+    /// Whether the granule at `file_offset` is in the set, and how many bytes from there, up
+    /// to `max_len`, get that same answer. Replay and fault-around ask this before each
+    /// chunk: they step over a run that is in the set, and populate no further than a run
+    /// that is not. A clone whose balloon gave nothing back gets `max_len` at once.
+    ///
+    /// Once anything is in the set an answer covers at most one chunk
+    /// ([`prefetch::CHUNK_BYTES`]). A populate call takes no more than that, and a longer
+    /// answer would be scanned again for every chunk of the run. `file_offset` is page
+    /// aligned and `max_len` is not zero.
+    fn run_at(&self, file_offset: usize, max_len: usize, page_size: usize) -> (bool, usize) {
+        if self.marked == 0 {
+            return (false, max_len);
+        }
+        let max_len = max_len.min(prefetch::CHUNK_BYTES);
+        let first = file_offset / page_size;
+        let inside = self.has(first);
+        let granules = max_len.div_ceil(page_size);
+        let mut run = 1usize;
+        while run < granules && self.has(first.saturating_add(run)) == inside {
+            run += 1;
+        }
+        (inside, run.saturating_mul(page_size).min(max_len))
+    }
+}
+
+/// What a clone's balloon gave back and what the handler did about it, logged when the
+/// handler exits.
+#[derive(Default)]
+struct GivenBackStats {
+    /// REMOVE events read.
+    events: u64,
+    /// Bytes those events covered inside the clone's regions. A range given back twice
+    /// counts twice.
+    bytes: u64,
+    /// Faults on a given-back granule that were answered with zeros.
+    zero_filled: u64,
+}
+
+/// Whether the granule at `file_offset` is one the clone's balloon gave back, so that a
+/// fault on it is answered with zeros. Only a COPY clone has such granules.
+fn given_back(ctx: &VmContext<'_>, removed: &RemovedPages, file_offset: usize) -> bool {
+    matches!(ctx.source, PageSource::Copy { .. }) && removed.contains(file_offset, ctx.page_size)
+}
+
+/// Remember `[start, end)` of the clone's address space as given back by its balloon.
+/// Returns the bytes of it that lie inside the clone's registered regions.
+fn remember_removed(
+    ctx: &VmContext<'_>,
+    removed: &mut RemovedPages,
+    start: usize,
+    end: usize,
+) -> usize {
+    let mut bytes = 0usize;
+    for mapping in ctx.mappings {
+        let base = mapping.base_host_virt_addr as usize;
+        let Some(region_end) = base.checked_add(mapping.size) else {
+            continue;
+        };
+        let (from, to) = (start.max(base), end.min(region_end));
+        if from >= to {
+            continue;
+        }
+        let Some(file_offset) = usize::try_from(mapping.offset)
+            .ok()
+            .and_then(|offset| offset.checked_add(from - base))
+        else {
+            continue;
+        };
+        removed.insert_range(file_offset, to - from, ctx.page_size, ctx.mem_size);
+        bytes += to - from;
+    }
+    bytes
+}
+
 struct VmState {
     fault_count: u64,
     /// What fault-around populated beyond the demanded pages.
     fault_around: FaultAroundStats,
     parked_faults: ParkedFaults,
+    /// What the clone's balloon has given back.
+    removed: RemovedPages,
+    given_back: GivenBackStats,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -1754,7 +1914,8 @@ fn replay_steps_after_drain(outcome: DrainOutcome) -> &'static [ReplayStep] {
 /// Replay drains the fault queue before every populate call, so a guest fault never waits behind
 /// more than one call of speculation. What it does once per batch is yield. A batch ends after
 /// [`prefetch::CHUNK_BYTES`] of population or [`ReplayPacer::MAX_POPULATES`] populate calls,
-/// whichever comes first. A fragmented recording needs the second bound: a 128 GiB guest's set
+/// whichever comes first. A populate the kernel refused and a step over a run the balloon
+/// gave back each count as a call. A fragmented recording needs the second bound: a 128 GiB guest's set
 /// is millions of runs a few pages long (six clones' recordings unioned to 9.4M pages in 3.09M
 /// runs), and a yield after every one of those small copies cost more than the copy.
 #[derive(Debug, Default)]
@@ -1880,6 +2041,8 @@ async fn handle_vm_page_faults(
         fault_count: 0,
         fault_around: FaultAroundStats::default(),
         parked_faults: ParkedFaults::default(),
+        removed: RemovedPages::default(),
+        given_back: GivenBackStats::default(),
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -2011,10 +2174,33 @@ async fn replay_working_set(
                 continue 'chunk;
             }
 
+            // A recorded page the balloon has given back since is the guest's free memory.
+            // Replay steps over it, and the guest's own touch of it is answered with zeros.
+            let Some(at) = usize::try_from(segment.file_offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(done))
+            else {
+                continue 'segments;
+            };
+            let (given_back, run) = state.removed.run_at(at, segment.len - done, ctx.page_size);
+            if given_back {
+                done += run;
+                // A step over counts towards the batch like a refused populate, so a
+                // stretch of given-back runs yields once per batch too.
+                if pacer.populated(0) {
+                    yields += 1;
+                    tokio::task::yield_now().await;
+                }
+                continue 'chunk;
+            }
+            let wanted = prefetch::Segment {
+                len: done + run,
+                ..segment
+            };
             match prefetch::populate_chunk(
                 async_uffd.get_ref(),
                 &source,
-                &segment,
+                &wanted,
                 done,
                 ctx.page_size,
                 ctx.vm_id,
@@ -2126,6 +2312,18 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             "fault-around populated pages beyond the demanded ones"
         );
     }
+    if state.given_back.events > 0 {
+        let stats = &state.given_back;
+        info!(
+            target: "uffd",
+            vm_id = %ctx.vm_id,
+            remove_events = stats.events,
+            given_back_mib = stats.bytes / (1024 * 1024),
+            zero_filled_pages = stats.zero_filled,
+            distinct_given_back_pages = state.removed.marked,
+            "the balloon gave pages back; faults on them were answered with zeros"
+        );
+    }
     info!(
         target: "uffd",
         vm_id = %ctx.vm_id,
@@ -2139,14 +2337,26 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
 
 /// One attempt at resolving the fault at `page`, with the ioctl this clone's page source
 /// calls for. A fault's first attempt and every retry of a parked one go through here.
+///
+/// `zeros` says the granule is one the clone's balloon gave back ([`given_back`]): a COPY
+/// clone then gets a granule of zeros and the snapshot is not read. It goes through
+/// [`copy_page`] like any other granule, so a refusal parks it and an `EEXIST` wakes its
+/// faulter. `UFFDIO_ZEROPAGE` is not used: it maps the kernel's zero page read-only, so the
+/// write that nearly always follows on reused free memory would fault a second time, and
+/// hugetlb memory refuses it.
 fn resolve_fault(
     uffd: &Uffd,
     ctx: &VmContext<'_>,
     page: usize,
     offset_in_file: usize,
+    zeros: bool,
 ) -> Result<FaultOutcome> {
     match ctx.source {
         PageSource::Minor { .. } => continue_page(uffd, ctx.vm_id, page, ctx.page_size),
+        PageSource::Copy { .. } if zeros => {
+            copy_page(uffd, ctx.vm_id, zero_granule()?, page, 0, ctx.page_size)
+                .with_context(|| format!("zero fill for file offset {offset_in_file}"))
+        }
         PageSource::Copy { mmap, .. } => {
             copy_page(uffd, ctx.vm_id, mmap, page, offset_in_file, ctx.page_size)
         }
@@ -2174,10 +2384,14 @@ fn resolve_fault(
 ///
 /// A fault that was parked and resolved by a later retry gets no fault-around. Parking needs
 /// a balloon REMOVE in flight, and the pages around it still fault on demand.
+///
+/// A page of the granule that the balloon gave back is stepped over. It is the guest's free
+/// memory, and the guest's own touch of it is answered with zeros.
 fn populate_around_fault(
     uffd: &Uffd,
     ctx: &VmContext<'_>,
     stats: &mut FaultAroundStats,
+    removed: &RemovedPages,
     mapping: &GuestRegionUffdMapping,
     fault_page: usize,
     offset_in_file: usize,
@@ -2195,10 +2409,25 @@ fn populate_around_fault(
     {
         let mut done = 0usize;
         while done < segment.len {
+            let Some(at) = usize::try_from(segment.file_offset)
+                .ok()
+                .and_then(|offset| offset.checked_add(done))
+            else {
+                break 'granule;
+            };
+            let (given_back, run) = removed.run_at(at, segment.len - done, ctx.page_size);
+            if given_back {
+                done += run;
+                continue;
+            }
+            let wanted = prefetch::Segment {
+                len: done + run,
+                ..segment
+            };
             match prefetch::populate_chunk_counted(
                 uffd,
                 &source,
-                &segment,
+                &wanted,
                 done,
                 ctx.page_size,
                 ctx.vm_id,
@@ -2282,8 +2511,14 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
     };
     let mut resolved = Vec::new();
     for (&page, parked) in &state.parked_faults.by_page {
-        match resolve_fault(uffd, ctx, page, parked.file_offset)? {
-            FaultOutcome::Resolved | FaultOutcome::AlreadyPresent => resolved.push(page),
+        // Asked at every retry: the REMOVE that covers this page may have been read after
+        // the fault was parked. A fill that lands before that REMOVE's zap is dropped by
+        // it. The granule stays in the set, so the page's next fault gets zeros again.
+        let zeros = given_back(ctx, &state.removed, parked.file_offset);
+        match resolve_fault(uffd, ctx, page, parked.file_offset, zeros)? {
+            outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
+                resolved.push((page, zeros, matches!(outcome, FaultOutcome::Resolved)))
+            }
             FaultOutcome::VmGone => return Ok(false),
             FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
                 return Err(anyhow!(
@@ -2296,10 +2531,13 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
             FaultOutcome::Retry => {}
         }
     }
-    for page in resolved {
+    for (page, zeros, filled) in resolved {
         let Some(parked) = state.parked_faults.by_page.remove(&page) else {
             continue;
         };
+        if zeros {
+            state.given_back.zero_filled += u64::from(filled);
+        }
         // Logged for every fault that does resolve, so a deadline that fires has a healthy
         // distribution to be compared with.
         debug!(
@@ -2390,11 +2628,20 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         .checked_add(offset_in_region)
                         .ok_or_else(|| anyhow!("mapping offset overflow"))?;
 
+                    // A granule the balloon gave back holds nothing the guest still wants.
+                    // The fault is answered with zeros and the snapshot is not read.
+                    let zeros = given_back(ctx, &state.removed, offset_in_file);
+
                     // Record demand, never replay: the set converges on what the guest
                     // actually requested rather than recursively recording its prediction.
                     // Recording stops at the clone's window deadline; serving does not.
-                    if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
-                        recorder.insert_range(offset_in_file as u64, page_size as u64);
+                    // A granule that is given back when its fault is first read is not
+                    // recorded: a later clone has no use for the snapshot's bytes there.
+                    // A fault parked before its REMOVE was read has been recorded already.
+                    if !zeros {
+                        if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
+                            recorder.insert_range(offset_in_file as u64, page_size as u64);
+                        }
                     }
 
                     // Stamped before the resolve so each trace record brackets exactly the
@@ -2427,29 +2674,37 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         PageSource::Copy { .. } => {}
                     }
 
-                    match resolve_fault(uffd, ctx, fault_page, offset_in_file)? {
+                    match resolve_fault(uffd, ctx, fault_page, offset_in_file, zeros)? {
                         outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
                             if let Some(t) = state.trace.as_mut() {
                                 let t1 = t.now_ns();
                                 t.record(offset_in_file as u64, trace_t0, t1);
                             }
+                            if zeros {
+                                state.given_back.zero_filled +=
+                                    u64::from(matches!(outcome, FaultOutcome::Resolved));
+                            }
                             // The vCPU is awake and its trace interval is closed. The rest
                             // of its granule is speculation and costs that fault nothing.
                             //
-                            // Speculation stands down in two cases. A parked fault is on a
+                            // Speculation stands down in three cases. A parked fault is on a
                             // deadline that ends in a killed clone, and it is retried only
                             // once this batch is over, so nothing optional may lengthen
                             // the batch while one is parked. And a copy that found its
                             // page present lost a race to another populator, which owns
                             // that range: populating it as well would be up to one EEXIST
-                            // ioctl for every page of the granule, for nothing.
+                            // ioctl for every page of the granule, for nothing. And a
+                            // fault answered with zeros was free memory the guest is using
+                            // again, so the snapshot's bytes around it are not wanted.
                             let speculate = matches!(outcome, FaultOutcome::Resolved)
-                                && state.parked_faults.is_empty();
+                                && state.parked_faults.is_empty()
+                                && !zeros;
                             if speculate
                                 && !populate_around_fault(
                                     uffd,
                                     ctx,
                                     &mut state.fault_around,
+                                    &state.removed,
                                     mapping,
                                     fault_page,
                                     offset_in_file,
@@ -2480,7 +2735,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                 }
                 Event::Remove { start, end } => {
                     state.parked_faults.a_remove_was_read();
-                    // Balloon device removed pages - zero them
+                    // The balloon gave these pages back.
                     // Validate bounds: end must be >= start and range must be reasonable
                     let start_addr = start as usize;
                     let end_addr = end as usize;
@@ -2496,7 +2751,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     }
                     let len = end_addr.saturating_sub(start_addr);
                     if len == 0 {
-                        continue; // Nothing to zero
+                        continue; // Nothing was removed
                     }
 
                     if matches!(source, PageSource::Minor { .. }) {
@@ -2531,63 +2786,23 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         continue;
                     }
 
-                    // Remove events and page faults for the same range arrive in either order,
-                    // so a page in this range may already have been filled by UFFDIO_COPY before
-                    // we see the Remove event, and UFFDIO_ZEROPAGE then fails with EEXIST. It
-                    // fails with EAGAIN when it stopped at such a page after zeroing a prefix,
-                    // and also when it zeroed nothing because `mmap_changing` is still raised,
-                    // which is the usual state this soon after the event was read (see
-                    // `zeropage_stopped_short`). Tolerate both by falling back to per-page
-                    // zeroing that skips whatever is refused.
-                    // Killing the handler here would close the uffd and silently corrupt the
-                    // still-running VM.
-                    let bulk_result = unsafe { uffd.zeropage(start, len, true) };
-                    if let Err(e) = bulk_result {
-                        if !zeropage_stopped_short(&e) {
-                            error!(
-                                target: "uffd",
-                                vm_id = %vm_id,
-                                start = format!("0x{:x}", start_addr),
-                                len,
-                                error = ?e,
-                                "UFFD zeropage failed for Remove event"
-                            );
-                            return Err(e.into());
-                        }
-                        debug!(
-                            target: "uffd",
-                            vm_id = %vm_id,
-                            start = format!("0x{:x}", start_addr),
-                            len,
-                            error = ?e,
-                            "bulk zeropage hit already-present pages, zeroing per page"
-                        );
-                        let mut page = start_addr;
-                        while page < end_addr {
-                            let page_result = unsafe {
-                                uffd.zeropage(page as *mut std::ffi::c_void, page_size, true)
-                            };
-                            if let Err(page_err) = page_result {
-                                if !zeropage_stopped_short(&page_err) {
-                                    error!(
-                                        target: "uffd",
-                                        vm_id = %vm_id,
-                                        page = format!("0x{:x}", page),
-                                        error = ?page_err,
-                                        "UFFD zeropage failed for Remove event"
-                                    );
-                                    return Err(page_err.into());
-                                }
-                                debug!(
-                                    target: "uffd",
-                                    vm_id = %vm_id,
-                                    page = format!("0x{:x}", page),
-                                    "zeropage skipped - page already present"
-                                );
-                            }
-                            page += page_size;
-                        }
-                    }
+                    // The range is remembered, and nothing is installed here. The kernel
+                    // drops these pages only after this event has been read, and it refuses
+                    // every populate ioctl until the thread inside `madvise` has run again
+                    // (`mmap_changing`), so a page installed now is refused or dropped a
+                    // moment later. The guest's next touch of a page in the range is a
+                    // fault on a remembered granule, answered with zeros.
+                    let bytes = remember_removed(ctx, &mut state.removed, start_addr, end_addr);
+                    state.given_back.events += 1;
+                    state.given_back.bytes += bytes as u64;
+                    debug!(
+                        target: "uffd",
+                        vm_id = %vm_id,
+                        start = format!("0x{:x}", start_addr),
+                        len,
+                        remembered = bytes,
+                        "balloon gave a range back"
+                    );
                 }
                 Event::Fork { .. } | Event::Remap { .. } | Event::Unmap { .. } => {
                     // Ignore these events
@@ -3083,6 +3298,8 @@ mod tests {
             fault_count: 0,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
             recorded: None,
             record_until: None,
             started: origin,
@@ -3277,6 +3494,8 @@ mod tests {
             fault_count: 0,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -3297,6 +3516,8 @@ mod tests {
             fault_count: 0,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -3335,6 +3556,8 @@ mod tests {
             fault_count: 0,
             fault_around: FaultAroundStats::default(),
             parked_faults: ParkedFaults::default(),
+            removed: RemovedPages::default(),
+            given_back: GivenBackStats::default(),
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -5173,6 +5396,8 @@ mod tests {
                 fault_count: 0,
                 fault_around: FaultAroundStats::default(),
                 parked_faults: ParkedFaults::default(),
+                removed: RemovedPages::default(),
+                given_back: GivenBackStats::default(),
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -5671,21 +5896,30 @@ mod tests {
             !body[chunk..drain].contains("if "),
             "nothing may gate the drain"
         );
-        let gates = ["if pacer.populated(progress) {", "if pacer.populated(0) {"];
-        for gate in gates {
-            assert_eq!(count(gate), 1, "`{gate}` appears once");
-            let after = &body[at(gate)..];
-            let to_yield = &after[..after.find("yield_now()").expect("a gated yield")];
-            assert!(
-                !to_yield.contains('}'),
-                "the yield after `{gate}` sits inside that branch"
-            );
+        // The zero-byte gate appears twice: after a refused populate, and after a step over a
+        // run the balloon gave back.
+        let gates = [
+            ("if pacer.populated(progress) {", 1),
+            ("if pacer.populated(0) {", 2),
+        ];
+        let mut gated = 0;
+        for (gate, times) in gates {
+            assert_eq!(count(gate), times, "`{gate}` appears {times} time(s)");
+            for (found, _) in body.match_indices(gate) {
+                let after = &body[found..];
+                let to_yield = &after[..after.find("yield_now()").expect("a gated yield")];
+                assert!(
+                    !to_yield.contains('}'),
+                    "the yield after `{gate}` sits inside that branch"
+                );
+                gated += 1;
+            }
         }
         assert_eq!(
             count("yield_now()"),
-            gates.len() + 1,
-            "one yield per ended batch in each populate arm, and the one that waits out a busy \
-             queue; any other yield runs after every populate call"
+            gated + 1,
+            "one yield per ended batch in each populate arm and after a step over, and the one \
+             that waits out a busy queue; any other yield runs after every populate call"
         );
     }
 
@@ -5997,6 +6231,8 @@ mod tests {
                 fault_count: 0,
                 fault_around: FaultAroundStats::default(),
                 parked_faults: ParkedFaults::default(),
+                removed: RemovedPages::default(),
+                given_back: GivenBackStats::default(),
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -6295,8 +6531,8 @@ mod tests {
         let (clone, uffd) =
             FaultAroundClone::with_features(4, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let mut state = clone.state();
-        // Pages 0..4 hold the balloon's page, whose residency depends on how the REMOVE was
-        // zeroed. Every assertion below is about the other three granules.
+        // Pages 0..4 hold the balloon's page, which the handler leaves unmapped. Every
+        // assertion below is about the other three granules.
         let resident = |clone: &FaultAroundClone| -> Vec<usize> {
             clone
                 .resident_region_pages()
@@ -6389,5 +6625,610 @@ mod tests {
         assert_eq!(state.fault_count, 1);
         assert_eq!(state.fault_around.granules, 0);
         clone.unmap();
+    }
+
+    // -------------------------------------------------------------------------
+    // Pages a balloon gave back.
+    // Against a real userfaultfd, through the production `drain_events` and
+    // `retry_parked_faults`.
+    // -------------------------------------------------------------------------
+
+    /// Returns once thread `tid` sleeps inside `madvise`, which it does only after it has
+    /// queued its REMOVE event.
+    fn wait_until_its_remove_is_queued(tid: libc::pid_t) {
+        let mut wchan = String::new();
+        for _ in 0..5000 {
+            wchan =
+                std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan")).unwrap_or_default();
+            if wchan.trim().starts_with("userfaultfd_") {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        panic!("balloon thread {tid} never slept on its REMOVE event within 5s (wchan {wchan:?})");
+    }
+
+    /// Minor page faults this thread has taken so far.
+    fn minor_faults_of_this_thread() -> libc::c_long {
+        // SAFETY: an all-zero rusage is a valid value for getrusage to overwrite.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: getrusage writes only the struct it is given.
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_THREAD, &mut usage) };
+        assert_eq!(rc, 0, "getrusage(RUSAGE_THREAD)");
+        usage.ru_minflt
+    }
+
+    /// The balloon gives `region_page` back, and `madvise` has returned by the time this
+    /// does, so the kernel has dropped the page.
+    ///
+    /// A second page, `blocker`, is given back by another thread at the same time, so
+    /// `mmap_changing` is still raised when the first REMOVE is read and nothing the handler
+    /// does then can put a page into the first range. One balloon thread cannot have two
+    /// REMOVEs outstanding, because each `madvise` sleeps until its own event is read. The
+    /// second thread stands in for the flag still being up right after a read, which on a
+    /// real clone lasts until the thread inside `madvise` is scheduled again, and it makes
+    /// what these tests see independent of scheduling.
+    fn give_back(
+        clone: &FaultAroundClone,
+        uffd: &Uffd,
+        state: &mut VmState,
+        region_page: usize,
+        blocker: usize,
+    ) {
+        let first = clone.inflate(uffd, region_page);
+        let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+        let addr = clone.region_addr(blocker);
+        let second = std::thread::spawn(move || {
+            // SAFETY: gettid on the current thread.
+            tid_tx.send(unsafe { libc::gettid() }).ok();
+            // SAFETY: advising this test's own live mapping.
+            unsafe {
+                libc::madvise(
+                    addr as *mut libc::c_void,
+                    FaultAroundClone::PAGE,
+                    libc::MADV_DONTNEED,
+                )
+            }
+        });
+        let tid = tid_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the second balloon thread's id");
+        wait_until_its_remove_is_queued(tid);
+
+        let outcome = drain_events(uffd, &clone.ctx(), state).expect("reading the REMOVE events");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(first.join().expect("balloon thread"), 0, "madvise");
+        assert_eq!(second.join().expect("balloon thread"), 0, "madvise");
+    }
+
+    /// A page the guest used, gave to its balloon, and uses again holds nothing the guest
+    /// kept, so the second fault is answered with zeros. Filling it from the snapshot reads
+    /// the file again for bytes nobody wants: on one 128 GiB clone whose balloon was raised
+    /// three times, 5,022,079 faults (19.2 GiB) were such reads.
+    #[test]
+    fn a_page_the_balloon_gave_back_reads_zero_when_the_guest_uses_it_again() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 1),
+            2,
+            "first use: the snapshot's page 1"
+        );
+        give_back(&clone, &uffd, &mut state, 1, 3);
+        assert!(
+            !clone.resident_region_pages().contains(&1),
+            "the kernel dropped the page the balloon gave back"
+        );
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 1),
+            0,
+            "a page the balloon gave back must come back as zeros, not as the snapshot's bytes"
+        );
+        assert!(clone.resident_region_pages().contains(&1));
+        clone.unmap();
+    }
+
+    /// A page given back before this clone ever fetched it is free memory too. Its first
+    /// fault is answered with zeros, and it is not recorded: a later clone has no use for the
+    /// snapshot's bytes there.
+    #[test]
+    fn a_page_given_back_before_it_was_fetched_reads_zero_and_is_not_recorded() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        give_back(&clone, &uffd, &mut state, 2, 3);
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 2),
+            0,
+            "zeros, not the snapshot's page 2"
+        );
+        assert_eq!(
+            state.recorded.as_ref().expect("this clone records").len(),
+            0,
+            "a fault answered with zeros must not enter the recorded working set"
+        );
+
+        // A page the balloon never had is still served from the snapshot, and recorded.
+        assert_eq!(clone.touch(&uffd, &mut state, 0), 1);
+        assert_eq!(
+            state.recorded.as_ref().expect("this clone records").len(),
+            1
+        );
+        clone.unmap();
+    }
+
+    /// A fault on a given-back page that is parked behind another REMOVE is still answered
+    /// with zeros when its retry goes through.
+    #[test]
+    fn a_parked_fault_on_a_given_back_page_is_answered_with_zeros() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        give_back(&clone, &uffd, &mut state, 2, 3);
+
+        // One more REMOVE, left unread: the kernel refuses every populate ioctl until the
+        // event is read and the thread inside madvise has run again.
+        let balloon = clone.inflate(&uffd, 0);
+        let vcpu = FaultingReader::spawn(clone.region_addr(2));
+        vcpu.wait_until_asleep();
+
+        let outcome = drain_events(&uffd, &ctx, &mut state).expect("a refused fault is parked");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(
+            state
+                .parked_faults
+                .by_page
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![clone.region_addr(2)],
+            "the fault is read ahead of the unread REMOVE, so its populate is refused"
+        );
+
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved after the REMOVE event was read"
+            );
+            assert!(
+                retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying the parked fault"),
+                "the clone is alive; a retry must not report it gone"
+            );
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its parked fault resolved");
+        assert_eq!(
+            got, 0,
+            "a parked fault on a given-back page gets zeros, not the snapshot's bytes"
+        );
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
+    /// The REMOVE that covers a page can be read after a fault on that page was parked. The
+    /// set is asked at every retry, so that fault is answered with zeros too.
+    #[test]
+    fn a_fault_parked_before_its_remove_was_read_is_answered_with_zeros() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+
+        // The balloon gives page 2 back while a vCPU reads it. The REMOVE is queued first
+        // and left unread, so the fault is read ahead of it and its populate is refused.
+        let balloon = clone.inflate(&uffd, 2);
+        let vcpu = FaultingReader::spawn(clone.region_addr(2));
+        vcpu.wait_until_asleep();
+
+        let outcome = drain_events(&uffd, &ctx, &mut state).expect("a refused fault is parked");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(
+            state
+                .parked_faults
+                .by_page
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![clone.region_addr(2)],
+            "the fault is read ahead of the unread REMOVE, so its populate is refused"
+        );
+        assert!(
+            given_back(&ctx, &state.removed, 2 * PAGE),
+            "the same drain read the REMOVE after it parked the fault"
+        );
+        assert_eq!(state.given_back.zero_filled, 0);
+
+        // madvise returns once the kernel has dropped the page. A fill accepted before that
+        // would be dropped with it.
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved after the REMOVE event was read"
+            );
+            assert!(
+                retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying the parked fault"),
+                "the clone is alive; a retry must not report it gone"
+            );
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its parked fault resolved");
+        assert_eq!(
+            got, 0,
+            "a fault parked before its REMOVE was read gets zeros, not the snapshot's bytes"
+        );
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert!(
+            given_back(&ctx, &state.removed, 2 * PAGE),
+            "a filled page stays in the set"
+        );
+        clone.unmap();
+    }
+
+    /// Fault-around steps over a page the balloon gave back. The page is the guest's free
+    /// memory, so it stays missing until the guest touches it, and that touch reads zeros.
+    #[test]
+    fn fault_around_steps_over_a_page_the_balloon_gave_back() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // Granules of four pages: pages 0..4 are one granule, and page 6 is in the next.
+        let (clone, uffd) =
+            FaultAroundClone::with_features(4, 0, 8, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        give_back(&clone, &uffd, &mut state, 2, 6);
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 0),
+            1,
+            "page 0 comes from the snapshot"
+        );
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![0, 1, 3],
+            "fault-around populates the granule around page 0 except the given-back page 2"
+        );
+        assert!(
+            given_back(&ctx, &state.removed, 2 * PAGE),
+            "page 2 is still given back"
+        );
+        assert_eq!(clone.byte(1), 2, "page 1 holds the snapshot's bytes");
+        assert_eq!(clone.byte(3), 4, "page 3 holds the snapshot's bytes");
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 2),
+            0,
+            "the guest's own touch of the given-back page reads zeros"
+        );
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert_eq!(clone.resident_guard_pages(), 0);
+        clone.unmap();
+    }
+
+    /// Replay steps over a recorded page the balloon has given back since the recording.
+    /// The guest threw its contents away, so the snapshot's bytes are not put back.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_steps_over_a_page_the_balloon_gave_back() {
+        const PAGE: usize = BalloonedCopyClone::PAGE;
+        let (clone, uffd) = BalloonedCopyClone::new(16);
+        let ctx = clone.ctx();
+        let mut state = BalloonedCopyClone::state();
+        // The balloon gave pages 5 and 6 back before replay reached them, and the whole of a
+        // second recorded run, pages 10 and 11.
+        remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(7));
+        remember_removed(&ctx, &mut state.removed, clone.page(10), clone.page(12));
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let mut recorded = PageSet::empty(clone.mem_size as u64);
+        recorded.insert_range((4 * PAGE) as u64, (4 * PAGE) as u64);
+        recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
+
+        let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+            .await
+            .expect("replay");
+        assert!(!exited, "no clone exit was reported");
+        assert_eq!(
+            resident_pages(clone.base, 16),
+            vec![4, 7],
+            "replay populates the recorded pages 4..8 except the given-back pages 5 and 6, and \
+             none of the recorded run 10..12, which is wholly given back"
+        );
+        // SAFETY: page 4 of this test's own mapping, which the line above showed resident.
+        let first = unsafe { std::ptr::read_volatile(clone.page(4) as *const u8) };
+        assert_eq!(first, 5, "page 4 holds the snapshot's bytes");
+        assert_eq!(
+            state.removed.marked, 4,
+            "replay takes nothing out of the set"
+        );
+    }
+
+    /// `run_at` answers for the granule at an offset and says how far that answer holds.
+    #[test]
+    fn the_removed_set_reports_runs_of_given_back_and_kept_granules() {
+        const PAGE: usize = 4096;
+        let mut removed = RemovedPages::default();
+        assert_eq!(
+            removed.run_at(0, 10 * PAGE, PAGE),
+            (false, 10 * PAGE),
+            "an empty set keeps everything"
+        );
+        removed.insert_range(2 * PAGE, 3 * PAGE, PAGE, 256 * PAGE);
+        assert_eq!(removed.run_at(0, 10 * PAGE, PAGE), (false, 2 * PAGE));
+        assert_eq!(removed.run_at(2 * PAGE, 8 * PAGE, PAGE), (true, 3 * PAGE));
+        assert_eq!(
+            removed.run_at(3 * PAGE, PAGE, PAGE),
+            (true, PAGE),
+            "no further than it was asked"
+        );
+        assert_eq!(removed.run_at(5 * PAGE, 5 * PAGE, PAGE), (false, 5 * PAGE));
+
+        // A run that crosses a word of the bitmap.
+        removed.insert_range(62 * PAGE, 4 * PAGE, PAGE, 256 * PAGE);
+        assert_eq!(
+            removed.run_at(60 * PAGE, 10 * PAGE, PAGE),
+            (false, 2 * PAGE)
+        );
+        assert_eq!(removed.run_at(62 * PAGE, 10 * PAGE, PAGE), (true, 4 * PAGE));
+        assert_eq!(removed.run_at(66 * PAGE, 4 * PAGE, PAGE), (false, 4 * PAGE));
+
+        // Once anything is in the set an answer covers at most one chunk. A populate call
+        // takes no more, and a longer answer is scanned again for every chunk of the run.
+        let mut far = RemovedPages::default();
+        far.insert_range(0, PAGE, PAGE, 1 << 30);
+        assert_eq!(
+            far.run_at(PAGE, (1 << 30) - PAGE, PAGE),
+            (false, prefetch::CHUNK_BYTES),
+            "a kept run is answered one chunk at a time"
+        );
+
+        let mut huge = RemovedPages::default();
+        huge.insert_range(HUGE_PAGE_2M, HUGE_PAGE_2M, HUGE_PAGE_2M, 8 * HUGE_PAGE_2M);
+        assert_eq!(
+            huge.run_at(0, 4 * HUGE_PAGE_2M, HUGE_PAGE_2M),
+            (false, HUGE_PAGE_2M)
+        );
+        assert_eq!(
+            huge.run_at(HUGE_PAGE_2M, 3 * HUGE_PAGE_2M, HUGE_PAGE_2M),
+            (true, HUGE_PAGE_2M)
+        );
+    }
+
+    /// A fault answered with zeros gets no fault-around: it was free memory the guest is
+    /// using again, and the snapshot's bytes around it are not wanted.
+    #[test]
+    fn a_fault_answered_with_zeros_gets_no_fault_around() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(4, 0, 8, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        // Page 5 is in the granule of pages 4 to 7. The blocker, page 1, is in the other one.
+        give_back(&clone, &uffd, &mut state, 5, 1);
+        assert_eq!(clone.touch(&uffd, &mut state, 5), 0);
+        let around: Vec<usize> = clone
+            .resident_region_pages()
+            .into_iter()
+            .filter(|page| (4..8).contains(page))
+            .collect();
+        assert_eq!(
+            around,
+            vec![5],
+            "nothing around a zero-filled page is populated from the snapshot"
+        );
+        assert_eq!(state.fault_around.granules, 0);
+        assert_eq!(clone.resident_guard_pages(), 0);
+        clone.unmap();
+    }
+
+    /// The thread inside `madvise` lowers `mmap_changing` once its REMOVE has been read and
+    /// drops the range's pages after that. A fault served in between gets its zero page,
+    /// and the drop then takes that page away again. The handler sees no second REMOVE for
+    /// it, so the page has to stay in the set after its fill, or its next fault is answered
+    /// from the snapshot.
+    ///
+    /// The second `madvise` below stands for that late drop: the test reads its REMOVE off
+    /// the userfaultfd itself, so the handler's state never sees it.
+    #[test]
+    fn a_given_back_page_dropped_again_after_its_fill_still_reads_zero() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 2, 6, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        give_back(&clone, &uffd, &mut state, 4, 0);
+        assert_eq!(clone.touch(&uffd, &mut state, 4), 0);
+        assert_eq!(clone.resident_region_pages(), vec![4]);
+
+        let late_drop = clone.inflate(&uffd, 4);
+        match uffd.read_event().expect("reading the stand-in REMOVE") {
+            Some(Event::Remove { .. }) => {}
+            other => panic!("expected a REMOVE event, got {other:?}"),
+        }
+        assert_eq!(late_drop.join().expect("balloon thread"), 0, "madvise");
+        assert_eq!(clone.resident_region_pages(), Vec::<usize>::new());
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 4),
+            0,
+            "a page the balloon gave back is not served from the snapshot again"
+        );
+        assert_eq!(state.given_back.zero_filled, 2);
+        clone.unmap();
+    }
+
+    /// After a give-back the pages are missing and stay missing until a fault. The range is
+    /// remembered by file offset, the exit line's counters see it, and a page stays in the
+    /// set after the fault that fills it.
+    #[test]
+    fn a_range_the_balloon_gave_back_stays_remembered_after_a_fault_fills_it() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // The region starts at file page 2, so region pages 0, 1, 4 and 5 are file pages 2, 3, 6 and 7.
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 2, 6, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+
+        give_back(&clone, &uffd, &mut state, 1, 0);
+        give_back(&clone, &uffd, &mut state, 4, 5);
+
+        assert_eq!(
+            clone.resident_region_pages(),
+            Vec::<usize>::new(),
+            "a given-back page stays missing until a fault fills it"
+        );
+        assert_eq!(state.given_back.events, 4);
+        assert_eq!(state.given_back.bytes, 4 * PAGE as u64);
+        assert_eq!(state.removed.marked, 4);
+        for file_page in [2, 3, 6, 7] {
+            assert!(
+                given_back(&ctx, &state.removed, file_page * PAGE),
+                "file page {file_page} was given back"
+            );
+        }
+        assert!(!given_back(&ctx, &state.removed, 4 * PAGE));
+        assert!(!given_back(&ctx, &state.removed, 5 * PAGE));
+        assert!(
+            !given_back(&ctx, &state.removed, PAGE),
+            "region page 1 is file page 3, not file page 1"
+        );
+
+        assert_eq!(clone.touch(&uffd, &mut state, 4), 0);
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert_eq!(state.removed.marked, 4, "a filled page stays in the set");
+        assert!(given_back(&ctx, &state.removed, 6 * PAGE));
+
+        // The page is the guest's again and it was mapped writable, so the write that
+        // follows takes no fault. A page of the kernel's zero page, which UFFDIO_ZEROPAGE
+        // maps, would take one minor fault here for the copy.
+        let before = minor_faults_of_this_thread();
+        // SAFETY: a resident page of this clone's live mapping.
+        unsafe { std::ptr::write_volatile(clone.region_addr(4) as *mut u8, 0x5A) };
+        let faults = minor_faults_of_this_thread() - before;
+        assert_eq!(faults, 0, "the write to a zero-filled page faulted");
+        assert_eq!(clone.byte(4), 0x5A);
+        clone.unmap();
+    }
+
+    /// The set holds whole granules inside the memory image, counts each once, and costs
+    /// nothing until a range is given back.
+    #[test]
+    fn the_removed_set_holds_whole_granules_inside_the_image() {
+        const K4: usize = 4096;
+        let mem = 16 * K4;
+        let mut set = RemovedPages::default();
+        assert!(!set.contains(0, K4));
+        assert!(set.bits.is_empty(), "an empty set allocates nothing");
+
+        set.insert_range(2 * K4, 3 * K4, K4, mem);
+        assert_eq!(set.marked, 3);
+        assert!(!set.contains(K4, K4));
+        assert!(set.contains(2 * K4, K4) && set.contains(4 * K4, K4));
+        assert!(!set.contains(5 * K4, K4));
+
+        // A granule given back twice is in the set once.
+        set.insert_range(4 * K4, 2 * K4, K4, mem);
+        assert_eq!(set.marked, 4);
+
+        // A range that runs past the image is clipped to it.
+        set.insert_range(14 * K4, 8 * K4, K4, mem);
+        assert_eq!(set.marked, 6);
+        assert!(!set.contains(16 * K4, K4));
+
+        // A range that covers several words of the set marks every granule of it once.
+        let mut wide = RemovedPages::default();
+        wide.insert_range(30 * K4, 200 * K4, K4, 1024 * K4);
+        assert_eq!(wide.marked, 200);
+        assert!(!wide.contains(29 * K4, K4) && wide.contains(30 * K4, K4));
+        assert!(wide.contains(229 * K4, K4) && !wide.contains(230 * K4, K4));
+        wide.insert_range(0, 64 * K4, K4, 1024 * K4);
+        assert_eq!(wide.marked, 230);
+
+        // A granule the range only partly covers is left out. With 2 MiB granules a 4 KiB
+        // range marks nothing, and a range from the middle of one granule to the end of the
+        // next marks only the second.
+        let image = 8 * HUGE_PAGE_2M;
+        let mut huge = RemovedPages::default();
+        huge.insert_range(HUGE_PAGE_2M + K4, K4, HUGE_PAGE_2M, image);
+        assert_eq!(huge.marked, 0);
+        huge.insert_range(
+            HUGE_PAGE_2M / 2,
+            HUGE_PAGE_2M + HUGE_PAGE_2M / 2,
+            HUGE_PAGE_2M,
+            image,
+        );
+        assert_eq!(huge.marked, 1);
+        assert!(huge.contains(HUGE_PAGE_2M, HUGE_PAGE_2M));
+        assert!(!huge.contains(0, HUGE_PAGE_2M));
+    }
+
+    /// A removed range is turned into file offsets region by region: two regions that are
+    /// neighbours in the clone's address space need not be neighbours in the file.
+    #[test]
+    fn a_removed_range_is_remembered_by_file_offset_in_every_region_it_crosses() {
+        const PAGE: usize = 4096;
+        const BASE: usize = 0x10_0000;
+        let mmap = memmap2::MmapMut::map_anon(64 * PAGE)
+            .expect("mapping a snapshot")
+            .make_read_only()
+            .expect("sealing the snapshot");
+        let source = PageSource::Copy {
+            mmap,
+            fault_around: 0,
+        };
+        // Region A is four pages that hold file pages 8 to 11. Region B follows it in the
+        // address space and holds file pages 40 to 43. Only the arithmetic is under test:
+        // nothing is mapped at these addresses.
+        let mappings = [
+            GuestRegionUffdMapping {
+                base_host_virt_addr: BASE as u64,
+                size: 4 * PAGE,
+                offset: (8 * PAGE) as u64,
+                page_size: PAGE,
+            },
+            GuestRegionUffdMapping {
+                base_host_virt_addr: (BASE + 4 * PAGE) as u64,
+                size: 4 * PAGE,
+                offset: (40 * PAGE) as u64,
+                page_size: PAGE,
+            },
+        ];
+        let ctx = VmContext {
+            vm_id: "two-regions",
+            mappings: &mappings,
+            source: &source,
+            page_size: PAGE,
+            page_mask: !(PAGE - 1),
+            mem_size: 64 * PAGE,
+        };
+        let mut removed = RemovedPages::default();
+
+        // The last two pages of A and the first page of B.
+        let bytes = remember_removed(&ctx, &mut removed, BASE + 2 * PAGE, BASE + 5 * PAGE);
+        assert_eq!(bytes, 3 * PAGE);
+        for file_page in [10, 11, 40] {
+            assert!(
+                given_back(&ctx, &removed, file_page * PAGE),
+                "file page {file_page} was given back"
+            );
+        }
+        for file_page in [2, 3, 9, 12, 41] {
+            assert!(
+                !given_back(&ctx, &removed, file_page * PAGE),
+                "file page {file_page} was not given back"
+            );
+        }
+        assert_eq!(removed.marked, 3);
+
+        // A range outside every region is remembered nowhere.
+        assert_eq!(
+            remember_removed(&ctx, &mut removed, BASE + 64 * PAGE, BASE + 65 * PAGE),
+            0
+        );
+        assert_eq!(removed.marked, 3);
     }
 }
