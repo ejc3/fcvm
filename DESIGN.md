@@ -1511,7 +1511,7 @@ The memory server:
 | Flag | Env var | Default | Effect |
 |------|---------|---------|--------|
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
-| `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises its whole granule, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
+| `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. A fault on a page the balloon gave back is answered with zeros and gets no fault-around. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises its whole granule, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
 | `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
 | `--uffd-prefetch-record-window SECS` | `FCVM_UFFD_PREFETCH_RECORD_WINDOW` | `300` | Seconds after a clone's UFFD handshake during which its demand faults are recorded into the working set. Later faults are served but not recorded. `0` records nothing; replay of an existing record is unaffected |
 
@@ -2498,6 +2498,13 @@ copies (205 MiB PSS measured after serving 4 clones). With a balloon, a REMOVE e
 `mmap_changing` raised until the thread inside `madvise` runs again, and `UFFDIO_COPY`
 returns `EAGAIN` with nothing copied until then. The handler parks such a fault and
 retries it, bounded, exactly as the MINOR handler below does for `UFFDIO_CONTINUE`.
+The handler installs nothing when it reads a REMOVE event: the kernel drops the pages only
+after the event is read, so zeroing the range at that point is refused or undone. It
+remembers the range, one bit per page, and the guest's next fault on a page of it is
+answered with a page of zeros and not with the snapshot's bytes. A fault that is on such a
+page when it is first read is not recorded into the working set, and it gets no
+fault-around. Replay and fault-around do not ask the set. They can install the snapshot's
+bytes into a given-back page they reach before the guest does.
 
 **KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
 with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.

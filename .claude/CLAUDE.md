@@ -2548,7 +2548,9 @@ had prefetch on). Fault-around (below) covers neighbouring pages and is measured
 separately.
 
 - **Record**: every demand fault within the clone's recording window marks its snapshot
-  file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). The window starts
+  file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). A fault that is
+  on a page the clone's balloon gave back when it is first read is the exception: it is
+  answered with zeros and not recorded. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
   served but not recorded. On handler exit the bitmap is unioned into the serve
@@ -2711,10 +2713,12 @@ with the granule.
   zero-progress `EAGAIN` while `mmap_changing` is raised, abandons that granule to demand
   paging. It never fails a clone. A vCPU that faults inside the granule meanwhile is woken by
   the populate itself, because `UFFDIO_COPY` wakes every sleeper in the range it installs.
-  It stands down in two cases. While any fault is parked it serves demanded pages only: a
+  It stands down in three cases. While any fault is parked it serves demanded pages only: a
   parked fault is retried between batches and fails the clone if it is still refused after
   2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
-  already present it populates nothing, because another populator owns that range.
+  already present it populates nothing, because another populator owns that range. After a
+  fault on a page the clone's balloon gave back, which is answered with zeros, it populates
+  nothing either.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working
