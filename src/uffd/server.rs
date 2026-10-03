@@ -1705,26 +1705,30 @@ fn zero_granule() -> Result<&'static [u8]> {
     Ok(&ZERO_GRANULE.get_or_init(|| zeros)[..])
 }
 
-/// The granules of a COPY clone's memory that its balloon gave back and that no fault has
-/// filled since, by offset in the snapshot file.
+/// The granules of a COPY clone's memory that its balloon has given back, by offset in the
+/// snapshot file.
 ///
 /// A balloon gives pages back with `madvise(MADV_DONTNEED)`. The kernel reports the range in
 /// a REMOVE event and drops the pages once the event has been read. The guest keeps nothing
 /// in such a page, so when it touches one again the fault is answered with zeros and the
 /// snapshot is not read.
 ///
-/// A granule leaves the set when a fault on it is resolved. Replay and fault-around ask the
-/// set before each chunk and step over a granule in it, so a granule in the set is filled
-/// only by the guest's own fault. A zero fill that lands before its REMOVE's zap takes the
-/// granule out of the set and is dropped by the zap. That page is then served from the
-/// snapshot, by its next fault or by speculation.
+/// A granule never leaves the set. Once it has been given back the snapshot's bytes are no
+/// longer its contents, so every later fault on it is answered with zeros. Replay and
+/// fault-around ask the set before each chunk and step over a granule in it, so such a
+/// granule is filled only by the guest's own fault.
+///
+/// A fill does not end that. The thread inside `madvise` lowers `mmap_changing` once its
+/// REMOVE has been read and drops the pages after that, so a zero fill can land in between
+/// and be dropped with them. The handler sees no second REMOVE for that drop, and the fault
+/// that follows has to get zeros again.
 ///
 /// One bit per granule of the memory image, allocated at the first REMOVE event, so a clone
 /// without a balloon pays nothing. A 128 GiB guest of 4 KiB pages takes 4 MiB.
 #[derive(Default)]
 struct RemovedPages {
     bits: Vec<u64>,
-    /// Granules in the set now.
+    /// Granules in the set.
     marked: u64,
 }
 
@@ -1795,18 +1799,6 @@ impl RemovedPages {
         }
         (inside, run.saturating_mul(page_size).min(max_len))
     }
-
-    /// Take the granule at `file_offset` out of the set.
-    fn remove(&mut self, file_offset: usize, page_size: usize) {
-        let granule = file_offset / page_size;
-        let bit = 1u64 << (granule % 64);
-        if let Some(word) = self.bits.get_mut(granule / 64) {
-            if *word & bit != 0 {
-                *word &= !bit;
-                self.marked -= 1;
-            }
-        }
-    }
 }
 
 /// What a clone's balloon gave back and what the handler did about it, logged when the
@@ -1863,7 +1855,7 @@ struct VmState {
     /// What fault-around populated beyond the demanded pages.
     fault_around: FaultAroundStats,
     parked_faults: ParkedFaults,
-    /// What the clone's balloon gave back and no fault has filled since.
+    /// What the clone's balloon has given back.
     removed: RemovedPages,
     given_back: GivenBackStats,
     recorded: Option<PageSet>,
@@ -2328,7 +2320,7 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
             remove_events = stats.events,
             given_back_mib = stats.bytes / (1024 * 1024),
             zero_filled_pages = stats.zero_filled,
-            still_given_back_pages = state.removed.marked,
+            distinct_given_back_pages = state.removed.marked,
             "the balloon gave pages back; faults on them were answered with zeros"
         );
     }
@@ -2521,8 +2513,7 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
     for (&page, parked) in &state.parked_faults.by_page {
         // Asked at every retry: the REMOVE that covers this page may have been read after
         // the fault was parked. A fill that lands before that REMOVE's zap is dropped by
-        // it, and the page's next fault is then served from the snapshot, as it was before
-        // the set existed.
+        // it. The granule stays in the set, so the page's next fault gets zeros again.
         let zeros = given_back(ctx, &state.removed, parked.file_offset);
         match resolve_fault(uffd, ctx, page, parked.file_offset, zeros)? {
             outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
@@ -2545,7 +2536,6 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
             continue;
         };
         if zeros {
-            state.removed.remove(parked.file_offset, ctx.page_size);
             state.given_back.zero_filled += u64::from(filled);
         }
         // Logged for every fault that does resolve, so a deadline that fires has a healthy
@@ -2691,7 +2681,6 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                                 t.record(offset_in_file as u64, trace_t0, t1);
                             }
                             if zeros {
-                                state.removed.remove(offset_in_file, page_size);
                                 state.given_back.zero_filled +=
                                     u64::from(matches!(outcome, FaultOutcome::Resolved));
                             }
@@ -6879,8 +6868,8 @@ mod tests {
         );
         assert_eq!(state.given_back.zero_filled, 1);
         assert!(
-            !given_back(&ctx, &state.removed, 2 * PAGE),
-            "the filled page left the set"
+            given_back(&ctx, &state.removed, 2 * PAGE),
+            "a filled page stays in the set"
         );
         clone.unmap();
     }
@@ -7037,11 +7026,46 @@ mod tests {
         clone.unmap();
     }
 
-    /// After a give-back the pages are missing and stay missing until a fault. The range is
-    /// remembered by file offset, the exit line's counters see it, and the fault that fills
-    /// a page takes it out of the set.
+    /// The thread inside `madvise` lowers `mmap_changing` once its REMOVE has been read and
+    /// drops the range's pages after that. A fault served in between gets its zero page,
+    /// and the drop then takes that page away again. The handler sees no second REMOVE for
+    /// it, so the page has to stay in the set after its fill, or its next fault is answered
+    /// from the snapshot.
+    ///
+    /// The second `madvise` below stands for that late drop: the test reads its REMOVE off
+    /// the userfaultfd itself, so the handler's state never sees it.
     #[test]
-    fn a_range_the_balloon_gave_back_is_remembered_until_a_fault_fills_it() {
+    fn a_given_back_page_dropped_again_after_its_fill_still_reads_zero() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 2, 6, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let mut state = clone.state();
+
+        give_back(&clone, &uffd, &mut state, 4, 0);
+        assert_eq!(clone.touch(&uffd, &mut state, 4), 0);
+        assert_eq!(clone.resident_region_pages(), vec![4]);
+
+        let late_drop = clone.inflate(&uffd, 4);
+        match uffd.read_event().expect("reading the stand-in REMOVE") {
+            Some(Event::Remove { .. }) => {}
+            other => panic!("expected a REMOVE event, got {other:?}"),
+        }
+        assert_eq!(late_drop.join().expect("balloon thread"), 0, "madvise");
+        assert_eq!(clone.resident_region_pages(), Vec::<usize>::new());
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 4),
+            0,
+            "a page the balloon gave back is not served from the snapshot again"
+        );
+        assert_eq!(state.given_back.zero_filled, 2);
+        clone.unmap();
+    }
+
+    /// After a give-back the pages are missing and stay missing until a fault. The range is
+    /// remembered by file offset, the exit line's counters see it, and a page stays in the
+    /// set after the fault that fills it.
+    #[test]
+    fn a_range_the_balloon_gave_back_stays_remembered_after_a_fault_fills_it() {
         const PAGE: usize = FaultAroundClone::PAGE;
         // The region starts at file page 2, so region pages 0, 1, 4 and 5 are file pages 2, 3, 6 and 7.
         let (clone, uffd) =
@@ -7075,8 +7099,8 @@ mod tests {
 
         assert_eq!(clone.touch(&uffd, &mut state, 4), 0);
         assert_eq!(state.given_back.zero_filled, 1);
-        assert_eq!(state.removed.marked, 3, "the filled page left the set");
-        assert!(!given_back(&ctx, &state.removed, 6 * PAGE));
+        assert_eq!(state.removed.marked, 4, "a filled page stays in the set");
+        assert!(given_back(&ctx, &state.removed, 6 * PAGE));
 
         // The page is the guest's again and it was mapped writable, so the write that
         // follows takes no fault. A page of the kernel's zero page, which UFFDIO_ZEROPAGE
@@ -7114,11 +7138,6 @@ mod tests {
         set.insert_range(14 * K4, 8 * K4, K4, mem);
         assert_eq!(set.marked, 6);
         assert!(!set.contains(16 * K4, K4));
-
-        set.remove(2 * K4, K4);
-        set.remove(2 * K4, K4);
-        assert_eq!(set.marked, 5);
-        assert!(!set.contains(2 * K4, K4));
 
         // A range that covers several words of the set marks every granule of it once.
         let mut wide = RemovedPages::default();
