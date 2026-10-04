@@ -17,26 +17,59 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PASST_PATCHES=(
     "$SCRIPT_DIR/passt-udp-sock-errs-null-flow.patch"
 )
-# Key the build dir on the tarball and patch contents so a cached build tree from
-# an older pin or patch set is rebuilt instead of silently reused.
+# Key the kept source on the tarball and patch contents so a tree from an older
+# pin or patch set is never picked up.
 BUILD_FINGERPRINT="$({ echo "$PASST_TARBALL_SHA256"; cat "${PASST_PATCHES[@]}"; } | sha256sum | cut -c1-12)"
 BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${BUILD_FINGERPRINT}}"
 
+# fill_build_dir <kept> <build> <url> <sha256> [patch...]
+#
+# Fill <build>, an empty directory only this run uses, with the verified and
+# patched source.
+#
+# <kept> holds that source between runs, so a later run needs no download. A tree
+# gets that name in one rename, after it has been verified, patched and marked,
+# and is never written to afterwards. A directory under that name that carries
+# the mark is therefore a finished tree. Anything else under it is neither
+# trusted nor touched. A run that is killed leaves directories under names of its
+# own, which no run looks up. When two runs fetch at once, both rename: the
+# second rename fails, because the name then holds a directory that is not empty,
+# and that run removes its copy. No lock is involved.
+#
+# Nothing is built in <kept>: two runs of make in one directory would each remove
+# and rewrite the binaries the other is about to install.
+fill_build_dir() {
+    local kept="$1" build="$2" url="$3" sha256="$4" complete=".fcvm-source-complete" stage p
+    shift 4
+    if [ -f "$kept/$complete" ]; then
+        cp -a "$kept/." "$build/"
+        return
+    fi
+    curl -fsSL -o "$build/passt.orig.tar.xz" "$url"
+    echo "$sha256  $build/passt.orig.tar.xz" | sha256sum -c -
+    tar -xJf "$build/passt.orig.tar.xz" -C "$build" --strip-components=1
+    for p in "$@"; do
+        patch -p1 -d "$build" < "$p"
+    done
+    touch "$build/$complete"
+    # Keeping the source saves the next run a download. A run that cannot keep it
+    # still builds.
+    stage="$(mktemp -d "$kept.stage.XXXXXXXX")"
+    if ! { cp -a "$build/." "$stage/" && mv -T "$stage" "$kept" 2>/dev/null; }; then
+        rm -rf "$stage"
+        [ -f "$kept/$complete" ] ||
+            echo "==> Not keeping the source: $kept is not a finished tree and is left alone" >&2
+    fi
+}
+
 echo "==> Building passt from upstream commit ${PASST_COMMIT}..."
 
-if [ ! -f "$BUILD_DIR/Makefile" ]; then
-    rm -rf "$BUILD_DIR"
-    mkdir -p "$BUILD_DIR"
-    curl -fsSL -o "$BUILD_DIR/passt.orig.tar.xz" "$PASST_TARBALL_URL"
-    echo "$PASST_TARBALL_SHA256  $BUILD_DIR/passt.orig.tar.xz" | sha256sum -c -
-    tar -xJf "$BUILD_DIR/passt.orig.tar.xz" -C "$BUILD_DIR" --strip-components=1
-    for p in "${PASST_PATCHES[@]}"; do
-        patch -p1 -d "$BUILD_DIR" < "$p"
-    done
-fi
+mkdir -p "$(dirname "$BUILD_DIR")"
+RUN_DIR="$(mktemp -d "${BUILD_DIR}.build.XXXXXXXX")"
+trap 'rm -rf "$RUN_DIR"' EXIT
+fill_build_dir "$BUILD_DIR" "$RUN_DIR" "$PASST_TARBALL_URL" "$PASST_TARBALL_SHA256" "${PASST_PATCHES[@]}"
 
-cd "$BUILD_DIR"
-make clean 2>/dev/null || true
+cd "$RUN_DIR"
 make -j"$(nproc)" VERSION="$PASST_COMMIT"
 
 # Install (atomic rename avoids ETXTBSY when pasta/passt are running)
