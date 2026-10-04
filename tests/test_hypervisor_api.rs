@@ -158,9 +158,9 @@ async fn firecracker_balloon_statistics_request_and_reply() {
 }
 
 /// `GET /vm/config` is where fcvm reads whether a VM has a balloon device, and at
-/// what target. Firecracker answers 200 with or without a device, so "no device" is
-/// the reply's null and nothing else: a refusal, or a reply that does not say, is a
-/// failure.
+/// what target. Firecracker answers 200 with or without a device. "No device" is the
+/// reply's null, which the Firecracker builds fcvm pins send, or a reply without the
+/// member. A refusal is a failure, and so is a device that does not say its target.
 #[tokio::test]
 async fn firecracker_vm_config_reports_the_balloon_device_or_none() {
     // Firecracker's reply has more members than fcvm reads.
@@ -177,11 +177,24 @@ async fn firecracker_vm_config_reports_the_balloon_device_or_none() {
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
     assert_eq!(client.balloon_target_mib().await.unwrap(), None);
 
-    // A reply that does not say is not "no device".
+    // A reply with no `balloon` member says the same.
     let server = ApiServer::start(Some((StatusCode::OK, r#"{"drives":[]}"#))).await;
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(
+        client.balloon_target_mib().await.unwrap(),
+        None,
+        "a reply with no `balloon` member"
+    );
+
+    // A device that does not say its target is a failure, not "no device".
+    let server = ApiServer::start(Some((
+        StatusCode::OK,
+        r#"{"balloon":{"deflate_on_oom":true},"drives":[]}"#,
+    )))
+    .await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
     let error = format!("{:#}", client.balloon_target_mib().await.unwrap_err());
-    assert!(error.contains("missing field `balloon`"), "{error}");
+    assert!(error.contains("missing field `amount_mib`"), "{error}");
 
     // Nor is a refusal.
     let server = ApiServer::start(Some((StatusCode::BAD_REQUEST, "not now"))).await;

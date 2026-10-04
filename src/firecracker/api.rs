@@ -203,7 +203,8 @@ impl FirecrackerClient {
     /// Target of the VM's balloon device in MiB, or None when the VM has no balloon
     /// device. Read from `GET /vm/config`, which answers 200 either way and reports
     /// the device as it is now: at the target it was restored with, or the one set
-    /// since.
+    /// since. No device is a null `balloon` member or none at all. A refusal is an
+    /// error, and so is a device that does not say its target.
     pub async fn balloon_target_mib(&self) -> Result<Option<u32>> {
         let config: VmConfig = self.get("/vm/config").await?;
         Ok(config.balloon.map(|balloon| balloon.amount_mib))
@@ -421,8 +422,10 @@ pub struct BalloonStats {
 /// The part of the `GET /vm/config` reply fcvm reads.
 #[derive(Debug, Deserialize)]
 struct VmConfig {
-    /// In every reply: the device's configuration, or null when the VM has none.
-    #[serde(deserialize_with = "Option::deserialize")]
+    /// The device's configuration. For a VM with no device the Firecracker builds
+    /// fcvm pins send null (their reply serializes an `Option` with no skip), and
+    /// a build that leaves the member out means the same: both read as None.
+    #[serde(default)]
     balloon: Option<VmConfigBalloon>,
 }
 
@@ -445,4 +448,37 @@ pub struct Vsock {
     pub guest_cid: u32,
     /// Path to Unix socket on host
     pub uds_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VM with no balloon device. The Firecracker builds fcvm pins send
+    /// `"balloon": null`: their config reply serializes the `Option` as it is. A
+    /// build that leaves the member out means the same, and both are "no device".
+    /// A device that does not say its target is still not a reply fcvm can use.
+    #[test]
+    fn a_vm_config_reply_with_the_balloon_absent_or_null_means_no_device() {
+        let target = |body: &str| {
+            serde_json::from_str::<VmConfig>(body)
+                .map(|config| config.balloon.map(|balloon| balloon.amount_mib))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(target(r#"{"drives":[]}"#), Ok(None), "the member is absent");
+        assert_eq!(
+            target(r#"{"balloon":null,"drives":[]}"#),
+            Ok(None),
+            "the member is null"
+        );
+        assert_eq!(
+            target(r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true},"drives":[]}"#),
+            Ok(Some(96))
+        );
+        let no_target = target(r#"{"balloon":{"deflate_on_oom":true},"drives":[]}"#);
+        assert!(
+            no_target.is_err(),
+            "a device that does not say its target was read as {no_target:?}"
+        );
+    }
 }
