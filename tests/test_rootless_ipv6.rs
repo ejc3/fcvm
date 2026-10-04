@@ -314,43 +314,58 @@ async fn test_ipv6_egress_to_host() -> Result<()> {
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
+    // exec_in_vm returns the command's standard output, which for `wget -O -` is the
+    // body and nothing else: wget's own line goes to standard error.
     let output = result.context("the guest could not fetch from the host's IPv6 server")?;
     anyhow::ensure!(
-        output.contains("TEST_SUCCESS"),
+        output == "TEST_SUCCESS\n",
         "the fetch did not return the host server's body: {output:?}"
     );
     println!("✓ IPv6 egress works! Server response:\n{}", output);
     Ok(())
 }
 
-/// The host's server stops when the test that started it returns before its cleanup.
+/// A host server stops when the test that started it returns before its cleanup.
+///
+/// What is watched is the server's own listening socket and not its port: a port that is
+/// free can be taken at once by another test's server, and a port that is taken would
+/// then read as a server that did not stop. The property is `LocalTestServer`'s whatever
+/// address it binds, so this binds IPv4 loopback and runs on a host with no IPv6.
 #[tokio::test]
 async fn host_http_server_stops_when_its_test_returns_early() -> Result<()> {
-    // Stand-in for a test body in which a step fails before the cleanup.
-    async fn fails_before_cleanup(port: &mut u16) -> Result<()> {
-        let server = start_host_http_server().await?;
-        *port = server.port;
+    type Listener = std::sync::Weak<tokio::net::TcpListener>;
+
+    // Stand-in for a test body in which a step fails before the cleanup. It leaves the
+    // server's listening socket and whether that was open while the body ran.
+    async fn fails_before_cleanup(seen: &mut Option<(Listener, bool)>) -> Result<()> {
+        let server = common::LocalTestServer::start_on_available_port("127.0.0.1")
+            .await
+            .context("starting the server")?;
+        let listener = server.listener();
+        let open = listener.strong_count() > 0;
+        *seen = Some((listener, open));
         anyhow::bail!("a step failed before the cleanup");
     }
 
-    let mut port = 0;
-    fails_before_cleanup(&mut port)
+    let mut seen = None;
+    fails_before_cleanup(&mut seen)
         .await
         .expect_err("the stand-in body returns an error");
-    assert_ne!(port, 0, "the stand-in body did not start its server");
+    let (listener, open_while_running) = seen.expect("the stand-in body did not start its server");
+    assert!(
+        open_while_running,
+        "the server's listening socket was not open while its test ran"
+    );
 
-    // Nothing may still listen on the port. Binding it is the probe: a connection would
-    // be a request to a server that is still there. The server's task closes its listener
-    // when it next runs, so the bind is retried, and the deadline only bounds a failure.
+    // The server's task closes its listening socket when it next runs, so the check is
+    // retried, and the deadline only bounds a failure.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        match std::net::TcpListener::bind(("::", port)) {
-            Ok(_) => return Ok(()),
-            Err(error) => anyhow::ensure!(
-                std::time::Instant::now() < deadline,
-                "a server still listens on port {port} 5s after its test returned: {error}"
-            ),
-        }
+    while listener.strong_count() > 0 {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "the server's listening socket is still open 5s after its test returned"
+        );
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
+    Ok(())
 }

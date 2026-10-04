@@ -2125,6 +2125,8 @@ pub async fn wait_for_tcp(addr: &str, timeout_ms: u64) -> anyhow::Result<()> {
 pub struct LocalTestServer {
     shutdown_tx: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    /// The listening socket, which the server's task owns.
+    listener: std::sync::Weak<tokio::net::TcpListener>,
     pub url: String,
     pub port: u16,
 }
@@ -2151,7 +2153,8 @@ impl LocalTestServer {
         };
 
         // Bind listener before spawning task to ensure port is available
-        let listener = tokio::net::TcpListener::bind(socket_addr).await?;
+        let listener = std::sync::Arc::new(tokio::net::TcpListener::bind(socket_addr).await?);
+        let listening = std::sync::Arc::downgrade(&listener);
         let actual_port = listener.local_addr()?.port();
         let url = if is_ipv6 {
             format!("http://[{}]:{}/", bind_addr, actual_port)
@@ -2186,6 +2189,7 @@ impl LocalTestServer {
         Ok(Self {
             shutdown_tx,
             task,
+            listener: listening,
             url,
             port: actual_port,
         })
@@ -2194,6 +2198,15 @@ impl LocalTestServer {
     /// Start on an automatically selected port.
     pub async fn start_on_available_port(bind_addr: &str) -> anyhow::Result<Self> {
         Self::start(bind_addr, 0).await
+    }
+
+    /// The server's listening socket, dead once the server has stopped and closed it.
+    ///
+    /// This is the server's own end. Its port says less: once the socket is closed any
+    /// process may bind the port, so a port that is taken does not show that this
+    /// server still runs.
+    pub fn listener(&self) -> std::sync::Weak<tokio::net::TcpListener> {
+        self.listener.clone()
     }
 
     /// Stop the server.
