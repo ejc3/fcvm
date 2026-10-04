@@ -1,0 +1,57 @@
+udp: guard flow-specific logging against a NULL flow in udp_sock_errs()
+
+udp_sock_errs() logs through flow_dbg(), flow_perror_ratelimit() and
+flow_err_ratelimit(). Those macros read the flow's state field before any
+level check, so they require a non-NULL flow. The caller udp_sock_fwd()
+passes FLOW_SIDX_NONE for a listening socket, so uflow is NULL there, and
+pasta dereferences NULL when such a socket reports an unqueued error, when
+SO_ERROR cannot be read, or when EPOLLERR fires with nothing to report.
+
+Fall back to the non-flow logging macros when there is no flow, matching
+udp_sock_recverr(), which already logs the no-flow cases with debug() and
+err().
+
+Carried by fcvm until upstream merges the same change. The diff is
+identical against upstream passt head cba357068dc5.
+
+diff --git a/udp.c b/udp.c
+index 505e554..a2acd0d 100644
+--- a/udp.c
++++ b/udp.c
+@@ -710,20 +710,31 @@ static int udp_sock_errs(const struct ctx *c, int s, flow_sidx_t sidx,
+ 	errlen = sizeof(err);
+ 	if (getsockopt(s, SOL_SOCKET, SO_ERROR, &err, &errlen) < 0 ||
+ 	    errlen != sizeof(err)) {
+-		flow_perror_ratelimit(uflow, now, "Error reading SO_ERROR");
++		if (uflow)
++			flow_perror_ratelimit(uflow, now,
++					      "Error reading SO_ERROR");
++		else
++			err_perror("Error reading SO_ERROR");
+ 		return -1;  /* error reading error, unrecoverable */
+ 	}
+ 
+ 	if (err) {
+-		flow_dbg(uflow, "Unqueued error on UDP socket: %s",
+-			 strerror_(err));
++		if (uflow)
++			flow_dbg(uflow, "Unqueued error on UDP socket: %s",
++				 strerror_(err));
++		else
++			debug("Unqueued error on UDP socket: %s",
++			      strerror_(err));
+ 		n_err++;
+ 	}
+ 
+ 	if (!n_err) {
+ 		/* EPOLLERR, but no errors to clear !? */
+-		flow_err_ratelimit(uflow, now,
+-				   "EPOLLERR event without reported errors");
++		if (uflow)
++			flow_err_ratelimit(uflow, now,
++					   "EPOLLERR event without reported errors");
++		else
++			err("EPOLLERR event without reported errors");
+ 		return -1; /* no way to clear, unrecoverable */
+ 	}
+ 

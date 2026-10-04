@@ -25,8 +25,10 @@ btrfs_size = "60G"
 # address, and took the packets the VM's namespace sent to the guest.
 # It also contains 3f57f0382f6a, the addr_seen fix for issue #661: overheard
 # bridge traffic must not retarget inbound port forwarding away from the guest.
-# `fcvm setup` builds it without local patches into a content-addressed binary.
-# Rootless VMs require that binary while this section is present.
+# `fcvm setup` builds it, plus the carried patch that guards udp_sock_errs()
+# against a NULL flow (scripts/passt-udp-sock-errs-null-flow.patch), into a
+# content-addressed binary. Rootless VMs require that binary while this section
+# is present.
 [pasta]
 repo = "https://passt.top/passt"
 commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"

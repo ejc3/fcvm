@@ -1,14 +1,25 @@
 #!/bin/bash
-# Build the same upstream commit as rootfs-config.toml, without local patches.
-# This commit includes the addr_seen fix for #661, the earlier netlink
-# neighbour-sync fix, and the fix that keeps -a, -g and -n on a host without
-# IPv4. The checksum verifies the immutable upstream archive.
+# Build the same upstream commit as rootfs-config.toml, plus the one local patch
+# fcvm carries. This commit includes the addr_seen fix for #661, the earlier
+# netlink neighbour-sync fix, and the fix that keeps -a, -g and -n on a host
+# without IPv4. The checksum verifies the immutable upstream archive.
+#
+# Local patch (passt-*.patch, kept next to this script) is applied on top:
+#   - passt-udp-sock-errs-null-flow.patch: guards udp_sock_errs() against a NULL
+#     flow, so a published UDP port's listening socket does not crash pasta on a
+#     socket error. Submitted upstream; drop it when the pin moves past the merge.
 set -euo pipefail
 
 PASST_COMMIT="4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 PASST_TARBALL_URL="https://passt.top/passt/snapshot/passt-${PASST_COMMIT}.tar.xz"
 PASST_TARBALL_SHA256="ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9"
-BUILD_FINGERPRINT="${PASST_TARBALL_SHA256:0:12}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PASST_PATCHES=(
+    "$SCRIPT_DIR/passt-udp-sock-errs-null-flow.patch"
+)
+# Key the build dir on the tarball and patch contents so a cached build tree from
+# an older pin or patch set is rebuilt instead of silently reused.
+BUILD_FINGERPRINT="$({ echo "$PASST_TARBALL_SHA256"; cat "${PASST_PATCHES[@]}"; } | sha256sum | cut -c1-12)"
 BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${BUILD_FINGERPRINT}}"
 
 echo "==> Building passt from upstream commit ${PASST_COMMIT}..."
@@ -19,6 +30,9 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     curl -fsSL -o "$BUILD_DIR/passt.orig.tar.xz" "$PASST_TARBALL_URL"
     echo "$PASST_TARBALL_SHA256  $BUILD_DIR/passt.orig.tar.xz" | sha256sum -c -
     tar -xJf "$BUILD_DIR/passt.orig.tar.xz" -C "$BUILD_DIR" --strip-components=1
+    for p in "${PASST_PATCHES[@]}"; do
+        patch -p1 -d "$BUILD_DIR" < "$p"
+    done
 fi
 
 cd "$BUILD_DIR"

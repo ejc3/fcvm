@@ -1,13 +1,20 @@
-//! Build pasta (passt) from a pinned upstream commit.
+//! Build pasta (passt) from a pinned upstream commit plus one carried patch.
 //!
 //! The pin contains the upstream addr_seen fix for issue #661, and the fix
-//! that keeps `-a`, `-g` and `-n` on a host without IPv4. fcvm builds
-//! pasta on demand into the content-addressed shared assets directory, so
-//! rootless networking does not depend on the host's distro pasta version.
+//! that keeps `-a`, `-g` and `-n` on a host without IPv4. On top of it fcvm
+//! carries one patch (see `PATCHES`) that guards `udp_sock_errs()` against a
+//! NULL flow, so a published UDP port's listening socket cannot crash pasta on
+//! a socket error; it is submitted upstream and dropped once the pin moves past
+//! the merge. fcvm builds pasta on demand into the content-addressed shared
+//! assets directory, so rootless networking does not depend on the host's
+//! distro pasta version.
 //!
 //! Build and publication rules:
 //! - The upstream ref is a PINNED COMMIT, not a branch: the binary path is
 //!   computable offline (no ls-remote, no network-failure fallback paths).
+//! - Patches are EMBEDDED in the fcvm binary (include_str!), not read from the
+//!   repo checkout: builds work from any working directory, and editing a patch
+//!   automatically produces a new content hash (and thus a rebuild).
 //! - Installs are atomic (temp file + rename) and serialized by an exclusive
 //!   flock, double-checked after acquisition.
 
@@ -20,13 +27,27 @@ use tracing::{debug, info};
 use crate::paths;
 use crate::setup::rootfs::PastaConfig;
 
-/// Content hash for the pasta binary: upstream repo + pinned commit +
-/// the host libc (dynamically linked binaries must not be
+/// Patches applied on top of the pinned upstream commit, in order.
+/// Embedded so the build is independent of the working directory and the
+/// content hash tracks patch edits automatically. The same file is applied by
+/// `scripts/build-passt.sh` (CI, AMI, runners), and both references are pinned
+/// together by `tests/test_pasta_pin.rs`.
+const PATCHES: &[(&str, &str)] = &[(
+    "passt-udp-sock-errs-null-flow.patch",
+    include_str!("../../scripts/passt-udp-sock-errs-null-flow.patch"),
+)];
+
+/// Content hash for the pasta binary: upstream repo + pinned commit + every
+/// carried patch + the host libc (dynamically linked binaries must not be
 /// shared across incompatible C libraries — same rule as firecracker).
 fn compute_pasta_sha(config: &PastaConfig) -> String {
     let mut hasher = Sha256::new();
     hasher.update(config.repo.as_bytes());
     hasher.update(config.commit.as_bytes());
+    for (name, content) in PATCHES {
+        hasher.update(name.as_bytes());
+        hasher.update(content.as_bytes());
+    }
     hasher.update(super::kernel::libc_version_tag().as_bytes());
     let result = hasher.finalize();
     hex::encode(&result[..6])
@@ -45,7 +66,7 @@ pub fn pasta_bin_path(config: &PastaConfig) -> PathBuf {
 ///
 /// With a `[pasta]` config section, the content-addressed build is REQUIRED:
 /// a missing binary is an error pointing at `fcvm setup`, not a silent
-/// fallback to a distro pasta without the upstream fix.
+/// fallback to a distro pasta without the upstream fix and the carried patch.
 /// Without the section, the system pasta from PATH is used unchanged.
 pub fn get_pasta_for_config(config: Option<&PastaConfig>) -> Result<PathBuf> {
     match config {
@@ -92,9 +113,10 @@ pub async fn ensure_pasta(config: Option<&PastaConfig>) -> Result<Option<PathBuf
 
     let sha = compute_pasta_sha(config);
     println!(
-        "  → Building pasta from {} @ {} (sha: {})...",
+        "  → Building pasta from {} @ {} ({} patch(es), sha: {})...",
         config.repo,
         &config.commit[..config.commit.len().min(12)],
+        PATCHES.len(),
         sha
     );
 
@@ -157,6 +179,29 @@ async fn build_pasta(
             config.commit,
             config.repo
         );
+    }
+
+    for (name, content) in PATCHES {
+        let patch_path = build_dir.join(name);
+        tokio::fs::write(&patch_path, content)
+            .await
+            .with_context(|| format!("writing carried patch {}", name))?;
+        let status = super::run_build_as_sudo_invoker(
+            Command::new("git")
+                .args(["apply", "--verbose", name])
+                .current_dir(build_dir),
+        )
+        .status()
+        .await
+        .with_context(|| format!("applying pasta patch {}", name))?;
+        if !status.success() {
+            bail!(
+                "pasta patch {} does not apply to {} @ {} — rebase the patch or move the pin",
+                name,
+                config.repo,
+                &config.commit[..config.commit.len().min(12)]
+            );
+        }
     }
 
     let status =

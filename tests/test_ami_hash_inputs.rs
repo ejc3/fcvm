@@ -372,6 +372,9 @@ fn make_fixture() -> tempfile::TempDir {
          kernel_version = \"6.18.3\"\n",
     );
     w("scripts/build-passt.sh", "#!/bin/sh\n");
+    // A carried passt patch: build-ami.sh folds scripts/passt-*.patch into the
+    // AMI cache key so a patch change rebuilds the image.
+    w("scripts/passt-udp-sock-errs-null-flow.patch", "passt\n");
     w("scripts/install-runner-disk-guard.sh", "#!/bin/sh\n");
     w(
         "scripts/build-ami.sh",
