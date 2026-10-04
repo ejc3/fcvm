@@ -366,6 +366,21 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     );
     println!("  ✓ Clone is healthy (PID: {})", clone_pid);
 
+    // Fill 8 MiB of the clone's memory after its restore, so these pages are in the diff the next snapshot
+    // merges, and keep their checksum.
+    let written = common::exec_in_container(
+        clone_pid,
+        &["dd if=/dev/urandom of=/dev/shm/merged bs=1M count=8 2>/dev/null && sha256sum /dev/shm/merged | cut -d' ' -f1"],
+    )
+    .await
+    .context("writing 8 MiB in the clone")?;
+    let written = written.trim().to_string();
+    assert_eq!(
+        written.len(),
+        64,
+        "expected a sha256 of the clone's 8 MiB, got {written:?}"
+    );
+
     // Step 4: Create user snapshot from clone (should use parent lineage)
     println!("\nStep 4: Creating user snapshot from clone (should use parent -> Diff)...");
     let output = tokio::process::Command::new(&fcvm_path)
@@ -387,6 +402,42 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
         anyhow::bail!("User snapshot from clone failed: {}", stderr);
     }
     println!("  ✓ User snapshot created: {}", snapshot2_name);
+    // What the merge did, for the log of this run.
+    if let Some(line) = stderr
+        .lines()
+        .find(|line| line.contains("diff merge complete"))
+    {
+        println!("  {}", line.trim());
+    }
+
+    // Step 5: a clone of the user snapshot runs on the merged memory file, and holds the pages the diff carried.
+    println!("\nStep 5: Restoring a clone from the user snapshot...");
+    let clone2_name = format!("{}-2", clone_name);
+    let (_clone2_child, clone2_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot2_name,
+            "--name",
+            &clone2_name,
+        ],
+        &clone2_name,
+    )
+    .await
+    .context("spawning a clone of the merged snapshot")?;
+    common::poll_health_by_pid(clone2_pid, 120).await?;
+    let read_back =
+        common::exec_in_container(clone2_pid, &["sha256sum /dev/shm/merged | cut -d' ' -f1"])
+            .await
+            .context("reading the 8 MiB back in a clone of the merged snapshot")?;
+    common::kill_process(clone2_pid).await;
+    assert_eq!(
+        read_back.trim(),
+        written,
+        "a clone of the merged snapshot does not hold the 8 MiB the first clone wrote before the snapshot"
+    );
+    println!("  ✓ A clone of the merged snapshot holds the first clone's 8 MiB");
 
     // Check if the snapshot was created as Diff (check stderr for logs)
     let created_diff =
@@ -404,6 +455,11 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     assert!(
         snapshot2_dir.join("memory.bin").exists(),
         "Second snapshot not found at {}",
+        snapshot2_dir.display()
+    );
+    assert!(
+        !snapshot2_dir.join("memory.diff").exists(),
+        "the merged diff was published with the snapshot at {}",
         snapshot2_dir.display()
     );
 
