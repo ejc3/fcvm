@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode};
@@ -101,6 +101,32 @@ impl FirecrackerClient {
         Ok(())
     }
 
+    /// Make a GET request and parse the JSON body of the reply
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let req = Request::builder()
+            .method(Method::GET)
+            .uri(self.uri(path))
+            .body(Full::new(Bytes::new()))?;
+
+        let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "Firecracker API GET {} timed out after {:?}",
+                    path,
+                    self.request_timeout
+                )
+            })??;
+        let status = resp.status();
+        let body_bytes = resp.into_body().collect().await?.to_bytes();
+        if status != StatusCode::OK {
+            let body_str = String::from_utf8_lossy(&body_bytes);
+            anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
+        }
+        serde_json::from_slice(&body_bytes)
+            .with_context(|| format!("parsing the reply to Firecracker API GET {path}"))
+    }
+
     /// Configure boot source (kernel + optional initrd)
     pub async fn set_boot_source(&self, config: BootSource) -> Result<()> {
         self.put("/boot-source", &config).await
@@ -174,6 +200,13 @@ impl FirecrackerClient {
     /// Update balloon statistics polling interval
     pub async fn update_balloon_stats(&self, config: BalloonStats) -> Result<()> {
         self.patch("/balloon/statistics", &config).await
+    }
+
+    /// Target and current size of the balloon device. Firecracker answers 400
+    /// when the VM has no balloon device, and when the device was attached with
+    /// statistics off (fcvm attaches it with statistics on).
+    pub async fn balloon_stats(&self) -> Result<BalloonStatistics> {
+        self.get("/balloon/statistics").await
     }
 
     /// Configure entropy device (virtio-rng)
@@ -334,6 +367,16 @@ pub struct Balloon {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BalloonStats {
     pub stats_polling_interval_s: u32,
+}
+
+/// The part of the `GET /balloon/statistics` reply fcvm reads. The reply also
+/// carries page counts and the guest's memory counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct BalloonStatistics {
+    /// Size the device was asked to reach, in MiB.
+    pub target_mib: u32,
+    /// Size the guest has inflated it to so far, in MiB.
+    pub actual_mib: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

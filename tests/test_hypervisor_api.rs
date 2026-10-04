@@ -3,6 +3,7 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::Router;
+use fcvm::firecracker::api::BalloonStatistics;
 use fcvm::firecracker::FirecrackerClient;
 use fcvm::hypervisor::cloud_hypervisor::api::ChClient;
 use serde_json::json;
@@ -114,6 +115,44 @@ async fn firecracker_unix_api_preserves_requests_responses_and_deadlines() {
     assert_eq!(
         client.patch_mmds(data).await.unwrap_err().to_string(),
         "Firecracker API PATCH /mmds timed out after 10ms"
+    );
+}
+
+#[tokio::test]
+async fn firecracker_balloon_statistics_request_and_reply() {
+    // Firecracker's reply has more members than fcvm reads.
+    let mut server = ApiServer::start(Some((
+        StatusCode::OK,
+        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024}"#,
+    )))
+    .await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(
+        client.balloon_stats().await.unwrap(),
+        BalloonStatistics {
+            target_mib: 64,
+            actual_mib: 32
+        }
+    );
+    server
+        .assert_request(Method::GET, "/balloon/statistics", None)
+        .await;
+
+    // A VM with no balloon device answers 400, and the caller gets the reason.
+    let server = ApiServer::start(Some((StatusCode::BAD_REQUEST, "no balloon device"))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(
+        client.balloon_stats().await.unwrap_err().to_string(),
+        "Firecracker API error: 400 Bad Request - no balloon device"
+    );
+
+    let server = ApiServer::start(None).await;
+    let client = FirecrackerClient::new(server.path.clone())
+        .unwrap()
+        .with_timeout(Duration::from_millis(10));
+    assert_eq!(
+        client.balloon_stats().await.unwrap_err().to_string(),
+        "Firecracker API GET /balloon/statistics timed out after 10ms"
     );
 }
 

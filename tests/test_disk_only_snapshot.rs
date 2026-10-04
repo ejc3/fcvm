@@ -209,3 +209,111 @@ async fn test_disk_only_clone_preserves_work_and_regenerates_identity() -> Resul
     let _ = std::fs::remove_dir_all(snapshot_dir().join(&snap));
     Ok(())
 }
+
+/// A disk-only clone of a `--balloon` VM cold-boots with a balloon device at the
+/// source's target. The boot synthesized from the snapshot used to attach none
+/// (#1052).
+#[tokio::test]
+async fn test_disk_only_clone_keeps_the_balloon() -> Result<()> {
+    const BALLOON_MIB: u32 = 64;
+    let balloon = BALLOON_MIB.to_string();
+    let (name, clone_name, snap, _serve) = common::unique_names("disk-only-balloon");
+
+    // --no-snapshot makes the source a cold boot, so what its state records comes
+    // from its own --balloon. A cache hit would copy the cached snapshot's record,
+    // and a snapshot written by an older build has none.
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--balloon",
+            &balloon,
+            "nginx:alpine",
+        ],
+        "disk-only-balloon-base",
+    )
+    .await?;
+    let captured = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        // Control for the instrument: the source reports the target it booted with.
+        let source = common::balloon_stats_by_pid(pid)
+            .await
+            .context("reading the source VM's balloon")?;
+        anyhow::ensure!(
+            source.target_mib == BALLOON_MIB,
+            "the source VM's balloon target is {} MiB, not the {BALLOON_MIB} it was started with",
+            source.target_mib
+        );
+        let output = tokio::process::Command::new(common::find_fcvm_binary()?)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &pid.to_string(),
+                "--tag",
+                &snap,
+                "--disk-only",
+            ])
+            .output()
+            .await
+            .context("running snapshot create --disk-only")?;
+        anyhow::ensure!(
+            output.status.success(),
+            "snapshot create --disk-only failed:\nstdout: {}\nstderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Ok(())
+    }
+    .await;
+    // The clone boots from the captured disk, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        captured?;
+        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap,
+                "--name",
+                &clone_name,
+            ],
+            "disk-only-balloon-c1",
+        )
+        .await?;
+        let checked = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            let clone = common::balloon_stats_by_pid(clone_pid)
+                .await
+                .context("reading the disk-only clone's balloon")?;
+            anyhow::ensure!(
+                clone.target_mib == BALLOON_MIB,
+                "the disk-only clone's balloon target is {} MiB, not the source's {BALLOON_MIB}",
+                clone.target_mib
+            );
+            let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+                .load_state_by_pid(clone_pid)
+                .await
+                .context("loading the disk-only clone's state")?;
+            anyhow::ensure!(
+                state.config.balloon_mib == Some(BALLOON_MIB),
+                "the clone's state records balloon target {:?}, not Some({BALLOON_MIB})",
+                state.config.balloon_mib
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+        checked
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(snapshot_dir().join(&snap));
+    result
+}
