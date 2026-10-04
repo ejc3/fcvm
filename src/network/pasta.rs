@@ -1303,6 +1303,9 @@ impl PastaNetwork {
         // -a must be the VM's actual IP (GUEST_IP), not the gateway. pasta uses -a
         // as the "guest address" and ignores ARP requests for it (don't resolve self).
         // If -a == gateway, pasta ignores ARP for the gateway and the VM can't route.
+        // On a host with no IPv4 interface pasta keeps -a, -n and -g only from
+        // passt 4e8aa70379a3 on; the pinned binary is checked there by
+        // `does_not_answer_arp_for_the_guest_address_in_local_mode`.
         push("--ns-ifname");
         push(&self.pasta_device);
         push("-a");
@@ -1317,10 +1320,13 @@ impl PastaNetwork {
         if let Some(ipv6) = host_ipv6 {
             // Add IPv6 guest address and gateway so pasta handles IPv6 L2↔L4 translation.
             // -a/-g can each be specified twice (once IPv4, once IPv6).
+            // Unlike ARP, pasta answers NDP for every address, the guest's included.
+            // Nothing in the namespace has an address or a route in the guest's IPv6
+            // prefix, so nothing there resolves the guest's IPv6 address.
             push("-a");
-            push(GUEST_IPV6); // Guest IPv6 address — pasta ignores NDP for this
+            push(GUEST_IPV6);
             push("-g");
-            push(GUEST_IPV6_GATEWAY); // IPv6 gateway — pasta responds to NDP for this
+            push(GUEST_IPV6_GATEWAY);
             push("-o");
             push(ipv6); // Outbound source address for IPv6
 
@@ -4204,5 +4210,315 @@ mod tests {
             format!("{error:#}").contains("pasta exited before it listened on"),
             "unexpected error: {error:#}"
         );
+    }
+
+    /// Checks that run the pasta binary `fcvm setup` built. They need setup to have
+    /// run, so they sit behind the feature that `make test-fast` and `make test-root`
+    /// enable and `make test-unit` does not.
+    #[cfg(feature = "integration-fast")]
+    mod pinned_pasta {
+        use super::super::{
+            PastaNetwork, GUEST_GATEWAY, GUEST_IP, NAMESPACE_IP, PASTA_DEVICE_NAME,
+        };
+        use crate::test_child::{die_with_the_spawning_thread, TestChild};
+        use std::io::BufRead;
+        use std::path::Path;
+        use std::process::{Child, Command, Output, Stdio};
+        use std::time::{Duration, Instant};
+
+        /// Spawn `command` as a child that cannot outlive the test.
+        fn spawn(command: &mut Command) -> TestChild<Child> {
+            die_with_the_spawning_thread(command);
+            let child = command
+                .spawn()
+                .unwrap_or_else(|e| panic!("spawning {command:?}: {e}"));
+            TestChild::new(child)
+        }
+
+        /// A process holding a fresh user and network namespace open, for five
+        /// minutes at most.
+        struct Holder {
+            _process: TestChild<Child>,
+            pid: u32,
+            /// Command prefix that runs a program inside these namespaces.
+            enter: Vec<String>,
+        }
+
+        impl Holder {
+            /// `parent` is the prefix that enters the namespaces the new pair is
+            /// created below. Empty creates the pair below the test's own.
+            fn start(parent: &[String]) -> Self {
+                let mut argv = parent.to_vec();
+                argv.extend(
+                    [
+                        "unshare",
+                        "--user",
+                        "--map-root-user",
+                        "--net",
+                        "--",
+                        "sh",
+                        "-c",
+                        "echo $$; exec sleep 300",
+                    ]
+                    .map(String::from),
+                );
+                let mut command = Command::new(&argv[0]);
+                command
+                    .args(&argv[1..])
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped());
+                let mut process = spawn(&mut command);
+                // The holder prints its PID once its namespaces exist.
+                let mut line = String::new();
+                std::io::BufReader::new(process.stdout.take().expect("holder stdout"))
+                    .read_line(&mut line)
+                    .expect("reading the holder's PID");
+                let pid: u32 = line.trim().parse().unwrap_or_else(|_| {
+                    panic!(
+                        "BLOCKED: {argv:?} did not create a user and network namespace \
+                         (it printed {line:?}). Rootless fcvm needs the same namespaces."
+                    )
+                });
+                // Dropping the guard has to end the holder, so the holder must be the
+                // spawned child itself and not a process that child forked.
+                assert_eq!(
+                    pid,
+                    process.id(),
+                    "{argv:?} forked on its way to the holder"
+                );
+                let mut enter = parent.to_vec();
+                enter.extend(
+                    ["nsenter", "--preserve-credentials", "-U", "-n", "-t"].map(String::from),
+                );
+                enter.push(pid.to_string());
+                enter.push("--".into());
+                Self {
+                    _process: process,
+                    pid,
+                    enter,
+                }
+            }
+
+            /// Run `argv` inside these namespaces and wait for it.
+            fn run(&self, argv: &[&str]) -> Output {
+                Command::new(&self.enter[0])
+                    .args(&self.enter[1..])
+                    .args(argv)
+                    .stdin(Stdio::null())
+                    .output()
+                    .unwrap_or_else(|e| panic!("running {argv:?} beside PID {}: {e}", self.pid))
+            }
+        }
+
+        /// What the neighbour table holds for `ip`: `None` without an entry,
+        /// `Some(None)` for an entry nobody has answered for, and otherwise the
+        /// link-layer address that answered.
+        fn neighbour(table: &serde_json::Value, ip: &str) -> Option<Option<String>> {
+            table
+                .as_array()?
+                .iter()
+                .find(|entry| entry["dst"] == ip)
+                .map(|entry| entry["lladdr"].as_str().map(str::to_owned))
+        }
+
+        /// Run `pasta_bin` with fcvm's arguments between two scratch namespaces, the
+        /// outer one without IPv4, and say who answered ARP for the guest's address.
+        /// `None` means nobody did. `host_ipv6` is the global address the outer
+        /// namespace holds, if it holds one.
+        fn who_answers_arp_for_the_guest(
+            pasta_bin: &Path,
+            host_ipv6: Option<&str>,
+        ) -> Option<String> {
+            let outer = Holder::start(&[]);
+            if let Some(address) = host_ipv6 {
+                // An interface that holds the global address and the default
+                // route. Both ends of the pair stay inside the namespace.
+                let made = outer.run(&[
+                    "sh",
+                    "-c",
+                    &format!(
+                        "ip link add veth0 type veth peer name veth1 \
+                         && ip -6 addr add {address}/64 dev veth0 nodad \
+                         && ip link set veth0 up && ip link set veth1 up \
+                         && ip -6 route add default via 2001:db8::2 dev veth0"
+                    ),
+                ]);
+                assert!(
+                    made.status.success(),
+                    "giving the outer namespace IPv6: {}",
+                    String::from_utf8_lossy(&made.stderr)
+                );
+            }
+            let inner = Holder::start(&outer.enter);
+
+            let dir = tempfile::tempdir().expect("creating tempdir");
+            let pid_file = dir.path().join("pasta.pid");
+            let stderr_path = dir.path().join("pasta.stderr");
+            let network = PastaNetwork::new("local-mode".into(), "tap0".into(), vec![]);
+            let args = network.build_pasta_args(
+                &pid_file,
+                inner.pid,
+                host_ipv6,
+                nix::unistd::geteuid().is_root(),
+            );
+            let mut command = Command::new(&outer.enter[0]);
+            command
+                .args(&outer.enter[1..])
+                .arg(pasta_bin)
+                .args(&args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(std::fs::File::create(&stderr_path).expect("creating pasta's stderr"));
+            let mut pasta = spawn(&mut command);
+            let launch = || {
+                format!(
+                    "{} {:?} printed {:?}",
+                    pasta_bin.display(),
+                    super::arg_strings(&args),
+                    std::fs::read_to_string(&stderr_path).unwrap_or_default()
+                )
+            };
+
+            // pasta creates its PID file empty while it reads its options and writes
+            // its PID into it once its device exists, so wait for the content.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !std::fs::metadata(&pid_file).is_ok_and(|file| file.len() > 0) {
+                if let Some(status) = pasta.try_wait().expect("polling pasta") {
+                    panic!("pasta left with {status} before it was ready: {}", launch());
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pasta wrote no PID file within 30 s: {}",
+                    launch()
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let up = inner.run(&[
+                "sh",
+                "-c",
+                &format!(
+                    "ip link set {PASTA_DEVICE_NAME} up \
+                     && ip addr add {NAMESPACE_IP}/24 dev {PASTA_DEVICE_NAME}"
+                ),
+            ]);
+            assert!(
+                up.status.success(),
+                "bringing {PASTA_DEVICE_NAME} up in the inner namespace: {}; {}",
+                String::from_utf8_lossy(&up.stderr),
+                launch()
+            );
+
+            // Each round asks for the guest first and the gateway second. Nothing
+            // listens on either address: the connections only make the namespace
+            // send ARP, and how they end is not the evidence. pasta takes frames
+            // from its device in order, so once it has answered for the gateway
+            // it has already dealt with the request for the guest. The gateway's
+            // answer is also what shows that pasta answers ARP on this link.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            let (table, pasta_mac) = loop {
+                let mut attempts = String::new();
+                for ip in [GUEST_IP, GUEST_GATEWAY] {
+                    let attempt = inner.run(&[
+                        "timeout",
+                        "1",
+                        "bash",
+                        "-c",
+                        &format!("exec 3<>/dev/tcp/{ip}/80"),
+                    ]);
+                    let said = String::from_utf8_lossy(&attempt.stderr);
+                    // 1 is a refused or unreachable connection and 124 is the timeout.
+                    // Anything else means `timeout` or `bash` did not run.
+                    assert!(
+                        matches!(attempt.status.code(), Some(0 | 1 | 124)),
+                        "the connection attempt to {ip} could not run ({}): {said}",
+                        attempt.status
+                    );
+                    attempts.push_str(&format!("{ip}: {} {}; ", attempt.status, said.trim()));
+                }
+                let listed =
+                    inner.run(&["ip", "-j", "-4", "neigh", "show", "dev", PASTA_DEVICE_NAME]);
+                assert!(
+                    listed.status.success(),
+                    "listing neighbours: {}",
+                    String::from_utf8_lossy(&listed.stderr)
+                );
+                let table: serde_json::Value =
+                    serde_json::from_slice(&listed.stdout).expect("`ip -j neigh` prints JSON");
+                if let Some(Some(mac)) = neighbour(&table, GUEST_GATEWAY) {
+                    break (table, mac);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "pasta did not answer ARP for its gateway {GUEST_GATEWAY} within 30 s, \
+                     so this run cannot say who answers for the guest. Neighbours: {table}. \
+                     Connection attempts: {attempts}pasta: {}",
+                    launch()
+                );
+            };
+            match neighbour(&table, GUEST_IP) {
+                Some(None) => None,
+                None => panic!(
+                    "the namespace holds no neighbour entry for {GUEST_IP}, so it sent no \
+                     ARP for the guest and this run proves nothing. Neighbours: {table}"
+                ),
+                Some(Some(mac)) => Some(format!(
+                    "ARP for the guest's address {GUEST_IP} was answered by {mac}, which is \
+                     {} the address pasta answers for the gateway with. pasta is the only \
+                     other station on this link, so the namespace would send it every \
+                     packet meant for the guest. Neighbours: {table}. pasta: {}",
+                    if mac == pasta_mac { "also" } else { "not" },
+                    launch()
+                )),
+            }
+        }
+
+        /// fcvm passes the guest's address to pasta as `-a`, and the namespace
+        /// reaches the guest across the bridge only because pasta leaves ARP for
+        /// that address unanswered. A pasta that answers takes every packet the
+        /// namespace sends the guest, so the HTTP health probe is refused by pasta
+        /// while the guest serves the same URL to itself.
+        ///
+        /// passt before commit 4e8aa70379a3 answered on a host with no IPv4
+        /// interface to copy its configuration from. It entered local mode there,
+        /// replaced `-a` and `-g` with 169.254.2.1 and 169.254.2.2, and so no
+        /// longer took 10.0.2.100 for the guest's address.
+        ///
+        /// Both namespaces here are scratch ones and the outer has no IPv4, so
+        /// pasta is in local mode on any host this runs on. No VM is started.
+        #[test]
+        fn does_not_answer_arp_for_the_guest_address_in_local_mode() {
+            // The binary a rootless launch runs, through the same two calls as
+            // `start_pasta`.
+            let (config, _, _) =
+                crate::setup::rootfs::load_config(None).expect("loading the fcvm config");
+            // That config is the one `./target/release/fcvm` last generated. It has
+            // to carry this tree's pin, or the binary it resolves is another
+            // commit's and the result says nothing about this tree.
+            let tree: toml::Value = toml::from_str(include_str!("../../rootfs-config.toml"))
+                .expect("parsing this tree's rootfs-config.toml");
+            let pinned = |key: &str| tree["pasta"][key].as_str().expect("the [pasta] pin");
+            assert_eq!(
+                config
+                    .pasta
+                    .as_ref()
+                    .map(|pasta| (pasta.repo.as_str(), pasta.commit.as_str())),
+                Some((pinned("repo"), pinned("commit"))),
+                "BLOCKED: the active fcvm config does not carry this tree's pasta pin, so \
+                 the pasta it resolves is not the one under test. Run `make build` and \
+                 `make setup-fcvm` in this checkout first."
+            );
+            let pasta_bin = crate::setup::get_pasta_for_config(config.pasta.as_ref())
+                .expect("resolving the pasta binary");
+            println!("pinned pasta: {}", pasta_bin.display());
+
+            // The two address shapes `build_pasta_args` has: a host without a
+            // global IPv6 address, and a host with one. Both run, so a failure
+            // names every shape pasta answers in.
+            let answered: Vec<String> = [None, Some("2001:db8::1")]
+                .into_iter()
+                .filter_map(|host_ipv6| who_answers_arp_for_the_guest(&pasta_bin, host_ipv6))
+                .collect();
+            assert!(answered.is_empty(), "{}", answered.join("\n\n"));
+        }
     }
 }
