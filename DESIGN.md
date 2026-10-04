@@ -1433,6 +1433,7 @@ One async session per connection:
 | `fcvm setup` | Download kernel, create rootfs (first-time setup, ~5-10 min) |
 | `fcvm podman run` | Launch container in a microVM (Firecracker by default, or Cloud Hypervisor via `--hypervisor cloud-hypervisor`) |
 | `fcvm exec` | Execute command in running VM/container |
+| `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
@@ -1624,6 +1625,78 @@ NAME           PID     STATUS    HEALTH    NETWORK   IMAGE
 my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
+
+#### `fcvm balloon`
+
+**Purpose**: Read or set the balloon target of a running VM.
+
+**Usage**:
+```bash
+fcvm balloon (--pid <PID> | --name <NAME>) [MIB]
+```
+
+It prints one JSON line, `{"target_mib":96,"actual_mib":64}`: the target the
+device was asked to reach, and the size the guest has given it so far. With MIB
+it sets the target first (`PATCH /balloon`) and prints right after, so the size
+is still on its way. Refused before any request: a Cloud Hypervisor VM (fcvm's
+client for it has no balloon call) and a target above the VM's memory. A VM
+booted without `--balloon` has no device and cannot get one; whether it has
+one is read from `GET /vm/config`. When Firecracker answers the set with a 400,
+the error says what it refuses (a device the guest never activated, as with a
+kernel that has no virtio balloon driver).
+
+A set holds the VM's snapshot lock from its device check to its report. Every
+snapshot of the VM holds that lock from its read of the balloon to its save, and
+a pause does not keep a `PATCH` out (Firecracker applies it to a paused VM), so
+without the lock a target could land in between and leave a snapshot whose
+record and saved device disagree. Two sets cannot interleave either, so each
+reports the target it set. A set waits up to 60 seconds for the lock, then fails
+and says the target was not set: a snapshot of a large VM holds the lock for
+minutes. A report without MIB changes nothing, takes no lock and does not wait.
+A `PATCH /balloon` sent to the API socket by anything else is outside the lock.
+
+A set while a workload initializes costs the run its startup snapshot. That
+snapshot is named for the target its workload initialized under
+(`<key>-balloon<MIB>-startup`), and a restore can set a target but cannot replay
+the initialization. When the run turns healthy and its device is no longer at
+the target the run started with, the workload initialized under a mix of two
+targets and is the startup state of neither. The run takes no startup snapshot,
+under either name, and logs why at info. The comparison runs under the per-VM
+snapshot lock and before the VM is paused, so a set cannot land between it and
+the save, and a VM whose snapshot is not taken is not disturbed. Later runs
+restore the shared pre-start snapshot and make their own startup snapshot.
+`podman prepare` fails instead, because the snapshot is what it was asked for.
+The pre-start snapshot needs no such check: it is taken before the workload
+starts and is shared between targets. A target that was changed and changed
+back before the run turned healthy is not seen.
+
+The command writes no state. What follows the new target, and what does not:
+
+- **The next snapshot of the VM does.** A memory snapshot and a disk-only
+  capture read the device from the VMM, so they record the new target. A
+  clone of that snapshot records it in its state, and its relaunch after a
+  guest reboot attaches the device at it. The exception is `podman run`'s own
+  startup snapshot, which is named for the target the run started with: a run
+  whose device is at another target when it turns healthy does not take it
+  (below).
+- **The VM's own state does not.** `config.balloon_mib` (`fcvm ls --json`)
+  keeps the target the VM booted with or, for a clone, the one its restore
+  read.
+- **The VM's own relaunch after a guest reboot does not.** A cold-booted VM
+  relaunches from its launch config and a restored clone from its state, both
+  of which hold the earlier target. Firecracker has exited by then, so there
+  is nothing to ask.
+
+`test_balloon_command_sets_and_reports_the_target` covers the report, the set,
+the unchanged state and the snapshot's record.
+`test_balloon_set_cannot_land_between_a_snapshots_read_and_its_save` and
+`test_two_balloon_sets_each_report_their_own_target` cover the lock, each with a
+failpoint that holds the other side where the set must not land.
+`test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed` covers
+the startup snapshot, in the `podman run` loop and in the restore loop, with a
+workload that starts only when the test lets it. `podman prepare`'s refusal is
+pinned by source, with the two loops' call sites, in
+`tests/test_balloon_call_sites.rs`.
 
 #### `fcvm snapshots`
 
@@ -2341,7 +2414,9 @@ still load):
   pre-start snapshot, sets its target, starts the workload under it and saves
   a startup snapshot for that target, so no cold boot is added.
   `podman prepare` installs a startup snapshot, and its content key carries
-  the target the same way. `test_startup_snapshot_is_per_balloon_target`
+  the target the same way. A run whose target `fcvm balloon` changed before it
+  turned healthy takes no startup snapshot (see `fcvm balloon`).
+  `test_startup_snapshot_is_per_balloon_target`
   covers the lookup and both places that save. One limit:
   - The guest has to have activated the device. Firecracker refuses a target
     for a device the guest never activated (a custom kernel without the

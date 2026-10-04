@@ -411,7 +411,7 @@ pub struct BalloonUpdate {
 
 /// The part of the `GET /balloon/statistics` reply fcvm reads. The reply also
 /// carries page counts and the guest's memory counters.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BalloonStats {
     /// Size the device was asked to reach, in MiB.
     pub target_mib: u32,

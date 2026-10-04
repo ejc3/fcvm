@@ -199,7 +199,7 @@ Use `--health-check` to snapshot the fully initialized application, not just the
 # Second run: restores with app already running
 ```
 
-With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot.
+With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot. A run whose target `fcvm balloon` changed before the app turned healthy saves no startup snapshot, and `podman prepare` fails.
 
 ---
 
@@ -421,6 +421,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 | `fcvm podman run` | Run container in a microVM (backend selected with `--hypervisor`, default `firecracker`) |
 | `fcvm podman prepare` | Build and verify a startup snapshot, then reap the VM that produced it (`--tag`, `--force`) |
 | `fcvm exec` | Execute command in running VM/container |
+| `fcvm balloon` | Print a VM's balloon target and size as one JSON line; with a MIB argument, set the target first |
 | `fcvm ls` | List running VMs (`--json` for JSON) |
 | `fcvm snapshot create` | Snapshot a running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |

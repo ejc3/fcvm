@@ -9,13 +9,21 @@
 //! test hand the restore its caller's target and make the records follow the VMM,
 //! whose target can be changed on its API socket without any record being written.
 //!
+//! A startup snapshot is named for the balloon target its workload initialized under,
+//! and `fcvm balloon` can change the target while the workload initializes. The
+//! statements in the third test ask for each startup snapshot at the target its run
+//! started with, so the creator declines it once the device is at another, and make
+//! `podman prepare` fail when it is declined.
+//!
 //! Dropping any one of them still compiles, and the unit tests of the functions on
 //! either side still pass, because each of those is given the value it then finds.
 //! Only VM tests see the difference, and they take minutes and need KVM:
 //! `test_restored_clone_reboot_keeps_its_balloon` and
 //! `test_disk_only_clone_keeps_the_balloon` (#1052),
-//! `test_balloon_target_honored_on_snapshot_cache_hit` (#1053) and
-//! `test_snapshot_and_restored_clone_record_the_balloon_the_vmm_has`.
+//! `test_balloon_target_honored_on_snapshot_cache_hit` (#1053),
+//! `test_snapshot_and_restored_clone_record_the_balloon_the_vmm_has` and
+//! `test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed`, which
+//! covers the two run loops and not `podman prepare`.
 
 use std::path::PathBuf;
 
@@ -127,6 +135,47 @@ fn every_statement_that_sets_or_reads_a_restored_vms_balloon_still_does() {
          or a VM's record differs from its device and its next cold boot attaches the \
          record. \
          If a statement was only rewritten, update its pin here.\n{}",
+        missing.len(),
+        pins.len(),
+        missing.join("\n")
+    );
+}
+
+#[test]
+fn every_startup_snapshot_is_asked_for_at_the_target_its_run_started_with() {
+    let pins = [
+        (
+            "src/commands/podman/mod.rs",
+            "the `podman run` loop asks for its startup snapshot at the run's --balloon",
+            "let snap = CreateSnapshotParams::cache_entry( fc_backend, &startup_key, \
+             BalloonRequirement::StartedAt(ctx.args.balloon),",
+        ),
+        (
+            "src/commands/snapshot.rs",
+            "the restore loop asks for its startup snapshot at the target the restore set",
+            "let snap = CreateSnapshotParams::cache_entry( fc_backend, &startup_key, \
+             BalloonRequirement::StartedAt(args.balloon),",
+        ),
+        (
+            "src/commands/podman/mod.rs",
+            "`podman prepare` asks for the snapshot it installs at the run's --balloon",
+            "existing: target.existing, balloon: BalloonRequirement::StartedAt(ctx.args.balloon),",
+        ),
+        (
+            "src/commands/podman/mod.rs",
+            "`podman prepare` fails when its snapshot was declined",
+            "SnapshotInstall::BalloonTargetChanged { started_at, now } => bail!(",
+        ),
+    ];
+
+    let missing = missing(&pins);
+    assert!(
+        missing.is_empty(),
+        "{} of {} statements that keep a startup snapshot to the balloon target its run \
+         started with are gone. Without one, a run whose target `fcvm balloon` changed \
+         while its workload initialized saves that workload under the name of the target \
+         it started with, and later runs at that target restore it. If a statement was \
+         only rewritten, update its pin here.\n{}",
         missing.len(),
         pins.len(),
         missing.join("\n")

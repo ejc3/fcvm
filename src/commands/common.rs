@@ -1647,19 +1647,49 @@ fn restored_vsock_source_path(
 /// says what was being done. A 400 also says what Firecracker refuses and how to
 /// run without the restore; a timeout or a dead VMM is neither of those causes.
 fn balloon_target_failure(error: anyhow::Error, target_mib: u32) -> anyhow::Error {
-    let refused = error
-        .downcast_ref::<crate::firecracker::api::ApiRefusal>()
-        .is_some_and(|refusal| refusal.is_bad_request());
     let doing = format!("setting the balloon target to {target_mib} MiB on the restored VM");
-    if refused {
+    if firecracker_refused(&error) {
         error.context(format!(
-            "{doing} (Firecracker refuses a target for a device the guest never activated, \
-             as with a kernel that has no virtio balloon driver, for a VM with no balloon \
-             device, and above the guest's memory; --no-snapshot cold-boots at the target \
+            "{doing} ({BALLOON_TARGET_REFUSALS}; --no-snapshot cold-boots at the target \
              instead of restoring)"
         ))
     } else {
         error.context(doing)
+    }
+}
+
+/// What Firecracker answers 400 to when it is asked to set a balloon target.
+pub(crate) const BALLOON_TARGET_REFUSALS: &str =
+    "Firecracker refuses a target for a device the guest never activated, as with a kernel \
+     that has no virtio balloon driver, for a VM with no balloon device, and above the \
+     guest's memory";
+
+/// Whether `error` is Firecracker answering 400: it understood the request and
+/// refused it. A timeout, a dead VMM and any other status are not that.
+pub(crate) fn firecracker_refused(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<crate::firecracker::api::ApiRefusal>()
+        .is_some_and(|refusal| refusal.is_bad_request())
+}
+
+/// The state of the VM a command names with `--pid` or `--name`.
+pub async fn load_vm_state(
+    state_manager: &StateManager,
+    pid: Option<u32>,
+    name: Option<&str>,
+) -> Result<VmState> {
+    if let Some(pid) = pid {
+        state_manager
+            .load_state_by_pid(pid)
+            .await
+            .with_context(|| format!("No VM found with PID {}", pid))
+    } else if let Some(name) = name {
+        state_manager
+            .load_state_by_name(name)
+            .await
+            .with_context(|| format!("No VM found with name '{}'", name))
+    } else {
+        bail!("Either --pid or name is required");
     }
 }
 
@@ -3248,7 +3278,31 @@ pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::Snapsh
 ///
 /// disk_path is like `.../vm-disks/{vm_id}/disks/rootfs.raw` — lock is placed
 /// in the vm_id directory.
+///
+/// A snapshot holds it from its read of the VM's balloon to its save, and
+/// `fcvm balloon` takes it to set a target, so the target cannot change in between.
 pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File> {
+    lock_vm_snapshots(disk_path, None)
+        .await?
+        .context("the wait for the per-VM snapshot lock ended without the lock")
+}
+
+/// The per-VM snapshot lock for a caller that must not wait out a long snapshot:
+/// None when another holder still has it after `wait`.
+///
+/// `fcvm balloon` takes it to set a target, and a snapshot of a large VM holds
+/// the lock for minutes.
+pub async fn acquire_vm_snapshot_lock_within(
+    disk_path: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<std::fs::File>> {
+    lock_vm_snapshots(disk_path, Some(std::time::Instant::now() + wait)).await
+}
+
+async fn lock_vm_snapshots(
+    disk_path: &Path,
+    give_up_at: Option<std::time::Instant>,
+) -> Result<Option<std::fs::File>> {
     let vm_dir = disk_path
         .parent()
         .and_then(|p| p.parent())
@@ -3261,6 +3315,9 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if give_up_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    return Ok(None);
+                }
                 debug!("waiting for per-VM snapshot lock");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -3270,7 +3327,7 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
         }
     }
     debug!(lock = %lock_path.display(), "acquired per-VM snapshot lock");
-    Ok(lock_file)
+    Ok(Some(lock_file))
 }
 
 /// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
@@ -4003,6 +4060,9 @@ pub async fn create_snapshot_core(
     let mut snapshot_result = match balloon_result {
         Ok(balloon_mib) => {
             snapshot_config.metadata.balloon_mib = balloon_mib;
+            // failpoint: hold between the read of the balloon and the save, where a
+            // target set by `fcvm balloon` must not land.
+            failpoint::hit_async("snapshot.post_balloon_read_pre_save").await;
             snapshot_client
                 .create_snapshot(SnapshotCreate {
                     snapshot_type: Some(snapshot_type.to_string()),

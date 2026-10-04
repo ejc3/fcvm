@@ -722,21 +722,8 @@ async fn exec(args: ExecArgs, quiet: bool) -> Result<()> {
     let state_manager = StateManager::new(paths::state_dir());
     state_manager.init().await?;
 
-    let vm_state = if let Some(pid) = args.pid {
-        // Look up by PID
-        state_manager
-            .load_state_by_pid(pid)
-            .await
-            .with_context(|| format!("No VM found with PID {}", pid))?
-    } else if let Some(name) = &args.name {
-        // Look up by name
-        state_manager
-            .load_state_by_name(name)
-            .await
-            .with_context(|| format!("No VM found with name '{}'", name))?
-    } else {
-        bail!("Either --pid or name is required");
-    };
+    let vm_state =
+        super::common::load_vm_state(&state_manager, args.pid, args.name.as_deref()).await?;
 
     // Use the exact persisted path. `--vsock-dir` deliberately places the
     // socket outside vm_runtime_dir, so reconstructing it breaks exec/health.
