@@ -1485,6 +1485,23 @@ fcvm snapshot create --pid 12345 --tag my-snapshot
 fcvm snapshot create my-vm --tag warm-nginx
 ```
 
+**A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
+writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
+`merge_diff_snapshot` (`src/commands/common.rs`) copies each data run of the diff to the same offset of that copy:
+
+- **Workers.** One for each 256 MiB or 4,096 writes (`MERGE_BYTES_PER_WORKER`, `MERGE_WRITES_PER_WORKER`), up to 16
+  (`MERGE_WORKERS`), because one reader waits for one read at a time: on a 128 GiB guest with 38.1 GiB touched in
+  2,328,992 runs, one worker took 1,646 s and 16 took 323 s. A first walk writes nothing and counts the runs. Each
+  worker then takes the next 8 MiB of the file nobody has taken (`MERGE_WINDOW`), so they stay busy wherever in
+  the file the diff's data lies. The calling thread is one of them, so a merge of at most 256 MiB in at most
+  4,096 writes starts no thread. A worker that fails stops the others before their next write.
+- **Flush and cleanup.** The merged file is flushed before the snapshot's `config.json` is written, and a failed
+  flush fails the snapshot. The diff is removed once it is merged. A failed merge removes the unfinished snapshot
+  directory.
+- `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the writes, the workers and
+  the duration.
+
+
 #### `fcvm snapshot serve`
 
 **Purpose**: Start a UFFD memory server for cloning.
@@ -2424,7 +2441,7 @@ writes tracked by KVM's Stage-2 page tables.
 
 **CI data showing the failure:**
 
-| Round | bytes_merged | data_regions | Result |
+| Round | bytes_merged | runs | Result |
 |-------|-------------|-------------|--------|
 | 07:54 | 37,834,752 | 2,824 | OK |
 | 08:34 | 43,225,088 | 3,648 | OK |
