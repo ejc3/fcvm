@@ -198,15 +198,26 @@ async fn test_ipv6_connectivity_in_vm() -> Result<()> {
     Ok(())
 }
 
-/// Test IPv6 egress from VM to an IPv6-only server on the host.
+/// HTTP server for a guest to fetch from, on the host's IPv6 wildcard address.
+///
+/// It is a task of the test process and not a child process, so it stops when its handle
+/// is dropped (an early return or a panic in the test) and it cannot outlive a test
+/// process that is killed. A child process needs its own teardown on each of those paths,
+/// and where `python3` is a launcher that runs the interpreter as its own child, neither
+/// killing the child nor a parent-death signal on it reaches the interpreter.
+async fn start_host_http_server() -> Result<common::LocalTestServer> {
+    common::LocalTestServer::start_on_available_port("::")
+        .await
+        .context("starting the host's IPv6 HTTP server")
+}
+
+/// Test IPv6 egress from VM to a server on the host's IPv6 address.
 ///
 /// This verifies that the VM can reach external IPv6 endpoints.
-/// We start a simple HTTP server on the host listening ONLY on IPv6,
-/// then have the VM try to connect to it.
+/// We start an HTTP server on the host's IPv6 wildcard address,
+/// then have the VM fetch from it at the host's global IPv6 address.
 #[tokio::test]
 async fn test_ipv6_egress_to_host() -> Result<()> {
-    use std::time::Duration;
-
     // Get host's global IPv6 address
     let ip_output = tokio::process::Command::new("ip")
         .args(["-6", "addr", "show", "scope", "global"])
@@ -241,46 +252,8 @@ async fn test_ipv6_egress_to_host() -> Result<()> {
 
     println!("Host IPv6 address: {}", host_ipv6);
 
-    // Find an available port for our IPv6-only server
-    let server_port = common::find_available_high_port().context("find port")?;
-    println!("Using port {} for IPv6-only server", server_port);
-
-    // Start a simple HTTP server listening ONLY on IPv6
-    // Using python3 since it's available and can bind to specific addresses
-    let mut server = tokio::process::Command::new("python3")
-        .args([
-            "-c",
-            &format!(
-                r#"
-import http.server
-import socketserver
-import socket
-
-class IPv6Server(socketserver.TCPServer):
-    address_family = socket.AF_INET6
-
-handler = http.server.SimpleHTTPRequestHandler
-with IPv6Server(('::', {}), handler) as httpd:
-    httpd.handle_request()  # Handle one request then exit
-"#,
-                server_port
-            ),
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .context("start IPv6 HTTP server")?;
-
-    // Give server time to start
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Verify server is listening on IPv6 only
-    let ss_output = tokio::process::Command::new("ss")
-        .args(["-tlnp"])
-        .output()
-        .await?;
-    let ss_stdout = String::from_utf8_lossy(&ss_output.stdout);
-    println!("Listening sockets:\n{}", ss_stdout);
+    let server = start_host_http_server().await?;
+    println!("HTTP server for the guest on port {}", server.port);
 
     // Start a VM
     let (vm_name, _, _, _) = common::unique_names("ipv6egress");
@@ -302,7 +275,7 @@ with IPv6Server(('::', {}), handler) as httpd:
 
     // Wait for VM to be healthy
     if let Err(e) = common::poll_health_by_pid(pid, 120).await {
-        server.kill().await.ok();
+        server.stop().await;
         common::kill_process(pid).await;
         let _ = child.wait().await;
         anyhow::bail!("VM never became healthy: {}", e);
@@ -310,8 +283,8 @@ with IPv6Server(('::', {}), handler) as httpd:
 
     println!("VM is healthy, testing IPv6 egress to host...");
 
-    // Fetch from the IPv6-only server with the guest's wget (GNU wget in the guest OS).
-    let url = format!("http://[{}]:{}/", host_ipv6, server_port);
+    // Fetch from the host's server with the guest's wget (GNU wget in the guest OS).
+    let url = format!("http://[{}]:{}/", host_ipv6, server.port);
     println!("Attempting to connect to: {}", url);
 
     // The request has to reach the server above, so wget must not hand it to a proxy.
@@ -337,11 +310,47 @@ with IPv6Server(('::', {}), handler) as httpd:
     .await;
 
     // Clean up
-    server.kill().await.ok();
+    server.stop().await;
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    let output = result.context("the guest could not fetch from the host's IPv6-only server")?;
+    let output = result.context("the guest could not fetch from the host's IPv6 server")?;
+    anyhow::ensure!(
+        output.contains("TEST_SUCCESS"),
+        "the fetch did not return the host server's body: {output:?}"
+    );
     println!("✓ IPv6 egress works! Server response:\n{}", output);
     Ok(())
+}
+
+/// The host's server stops when the test that started it returns before its cleanup.
+#[tokio::test]
+async fn host_http_server_stops_when_its_test_returns_early() -> Result<()> {
+    // Stand-in for a test body in which a step fails before the cleanup.
+    async fn fails_before_cleanup(port: &mut u16) -> Result<()> {
+        let server = start_host_http_server().await?;
+        *port = server.port;
+        anyhow::bail!("a step failed before the cleanup");
+    }
+
+    let mut port = 0;
+    fails_before_cleanup(&mut port)
+        .await
+        .expect_err("the stand-in body returns an error");
+    assert_ne!(port, 0, "the stand-in body did not start its server");
+
+    // Nothing may still listen on the port. Binding it is the probe: a connection would
+    // be a request to a server that is still there. The server's task closes its listener
+    // when it next runs, so the bind is retried, and the deadline only bounds a failure.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match std::net::TcpListener::bind(("::", port)) {
+            Ok(_) => return Ok(()),
+            Err(error) => anyhow::ensure!(
+                std::time::Instant::now() < deadline,
+                "a server still listens on port {port} 5s after its test returned: {error}"
+            ),
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
