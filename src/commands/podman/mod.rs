@@ -1294,8 +1294,10 @@ async fn prepare_vm_for_lifecycle(
         );
         let key = config.snapshot_key();
 
-        // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot
-        let startup_key = startup_snapshot_key(&key);
+        // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
+        // The startup snapshot is this run's balloon target's own; the pre-start one is
+        // shared between targets.
+        let startup_key = startup_snapshot_key(&key, args.balloon);
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -2450,7 +2452,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 ctx.startup_rx = None;
 
                 if let Some(ref key) = ctx.snapshot_key {
-                    let startup_key = startup_snapshot_key(key);
+                    let startup_key = startup_snapshot_key(key, ctx.args.balloon);
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3139,6 +3141,47 @@ mod tests {
             key(Some(0)),
             key(Some(1024)),
             "runs that differ only in the balloon target must share a snapshot"
+        );
+    }
+
+    /// A startup snapshot holds a workload that initialised under one balloon
+    /// target, and a restore cannot replay that. Two targets share the pre-start
+    /// snapshot and have a startup snapshot each. A run without --balloon keeps
+    /// both names it had.
+    #[test]
+    fn two_balloon_targets_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let names = |balloon: Option<u32>| {
+            let mut args = test_args();
+            args.balloon = balloon;
+            let key = key_for(&args, GuestBootInputs::default());
+            let startup = startup_snapshot_key(&key, args.balloon);
+            (key, startup)
+        };
+        let (key_64, startup_64) = names(Some(64));
+        let (key_96, startup_96) = names(Some(96));
+        assert_eq!(
+            key_64, key_96,
+            "runs that differ only in the balloon target share the pre-start snapshot"
+        );
+        assert_ne!(
+            startup_64, startup_96,
+            "a 96 MiB run must not find the startup snapshot a 64 MiB run left"
+        );
+        assert_eq!(startup_64, format!("{key_64}-balloon64-startup"));
+        assert_eq!(startup_96, format!("{key_64}-balloon96-startup"));
+        // A device at target 0 is a target like any other.
+        assert_eq!(names(Some(0)).1, format!("{key_64}-balloon0-startup"));
+
+        let (key_none, startup_none) = names(None);
+        assert_ne!(key_none, key_64);
+        assert_eq!(
+            startup_none,
+            format!("{key_none}-startup"),
+            "a run without --balloon keeps the startup name it had"
+        );
+        assert_eq!(
+            startup_snapshot_key("abc123def456", None),
+            "abc123def456-startup"
         );
     }
 

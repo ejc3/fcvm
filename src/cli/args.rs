@@ -273,6 +273,7 @@ pub struct RunArgs {
     /// a run restored from a snapshot has its own target set before the guest resumes.
     /// That needs a guest kernel with the virtio balloon driver; without one, use
     /// --no-snapshot.
+    /// A startup snapshot (--health-check) is kept per target.
     #[arg(long)]
     pub balloon: Option<u32>,
 
@@ -574,6 +575,7 @@ pub struct SnapshotRunArgs {
     // ========================================================================
     /// Base snapshot key for startup snapshot creation (internal use only).
     /// When set, a startup snapshot will be created after the VM becomes healthy.
+    /// Its name is made from this key and `balloon`.
     #[arg(skip)]
     pub startup_snapshot_base_key: Option<String>,
 

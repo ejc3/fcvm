@@ -1861,11 +1861,11 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
         .await
 }
 
-/// Get the startup snapshot key for a base key
+/// Get the startup snapshot key for a base key, for a run without `--balloon`
 ///
 /// Uses the same format as the production code: `{base_key}-startup`
 pub fn startup_snapshot_key(base_key: &str) -> String {
-    fcvm::commands::podman::startup_snapshot_key(base_key)
+    fcvm::commands::podman::startup_snapshot_key(base_key, None)
 }
 
 /// Find an available TCP port starting from a given port.

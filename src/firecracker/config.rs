@@ -135,9 +135,10 @@ pub struct FirecrackerConfig {
     /// balloon, and whether a device exists has to be in the key. Its target is
     /// not: `BalloonDevice` keeps it out of the JSON, and a restore sets the
     /// caller's target on the loaded VM before the guest resumes (#1053), so
-    /// runs that differ only in the target share a snapshot. None (the
-    /// default, no device) is skip-serialized so keys without --balloon are
-    /// unchanged.
+    /// runs that differ only in the target share the pre-start snapshot. The
+    /// startup snapshot's name carries the target (`startup_snapshot_key`).
+    /// None (the default, no device) is skip-serialized so keys without
+    /// --balloon are unchanged.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub balloon: Option<BalloonDevice>,
     /// Whether fc-agent straces the container (fc_agent_strace=1 on the kernel
@@ -612,7 +613,7 @@ mod tests {
     /// The key hashes this JSON. A config with no balloon has no `balloon` member,
     /// so its key is the one it had before the field existed. A config with one says
     /// that the device exists and not its target: the target is set on a restored VM,
-    /// so runs at different targets share a snapshot (#1053).
+    /// so runs at different targets share the pre-start snapshot (#1053).
     #[test]
     fn the_key_json_names_a_balloon_device_without_its_target() {
         let json = |balloon: Option<BalloonDevice>| {

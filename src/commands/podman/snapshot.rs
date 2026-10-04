@@ -20,12 +20,21 @@ pub async fn check_podman_snapshot(snapshot_key: &str) -> Option<SnapshotConfig>
     snapshot_manager.load_snapshot(snapshot_key).await.ok()
 }
 
-/// Generate the startup snapshot key from a base snapshot key.
+/// The startup snapshot's name, from the pre-start key and the run's `--balloon`.
 ///
 /// Startup snapshots capture VM state after the container reports healthy,
-/// enabling subsequent runs to skip application initialization time.
-pub fn startup_snapshot_key(base_key: &str) -> String {
-    format!("{}-startup", base_key)
+/// enabling subsequent runs to skip application initialization time. That
+/// initialization ran under the run's balloon target (the memory the guest had,
+/// which a workload sizes itself by), and a restore can set a target but cannot
+/// replay the initialization. So the name carries the target, and a run looks up
+/// and saves only its own target's startup snapshot. The pre-start snapshot is
+/// taken before the workload starts and is shared between targets. A run without
+/// `--balloon` keeps the name it always had.
+pub fn startup_snapshot_key(base_key: &str, balloon: Option<u32>) -> String {
+    match balloon {
+        None => format!("{base_key}-startup"),
+        Some(target_mib) => format!("{base_key}-balloon{target_mib}-startup"),
+    }
 }
 
 /// What to do when a generation is already installed at the target name.

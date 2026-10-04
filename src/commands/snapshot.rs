@@ -3196,7 +3196,7 @@ async fn cmd_snapshot_run_inner(
                     startup_rx = None;
 
                     if let Some(ref base_key) = args.startup_snapshot_base_key {
-                        let startup_key = startup_snapshot_key(base_key);
+                        let startup_key = startup_snapshot_key(base_key, args.balloon);
 
                         // Skip if startup snapshot already exists. The startup-snapshot cache
                         // path is Firecracker-specific (diff snapshots via create_snapshot_core)

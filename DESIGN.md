@@ -2304,16 +2304,28 @@ still load):
   the record.
 - **Balloon target on a snapshot cache hit**: the snapshot key says whether a
   balloon device exists and not its target, so `podman run` invocations that
-  differ only in the `--balloon` value share one snapshot. Whether the device
-  exists stays in the key because one cannot be added to a restored VM. A
-  cache hit sets its own target on the loaded, paused VM (`PATCH /balloon`)
-  before the guest resumes, and its state records that target. A target that
-  cannot be set ends the run, with no fallback to a cold boot. A target above
-  `--mem` is refused before the cache is looked up, so a hit and a miss refuse
-  alike. `fcvm snapshot run` has no flag for the target and restores the
-  device as it was saved.
+  differ only in the `--balloon` value share one pre-start snapshot. Whether
+  the device exists stays in the key because one cannot be added to a restored
+  VM. A cache hit sets its own target on the loaded, paused VM
+  (`PATCH /balloon`) before the guest resumes, and its state records that
+  target. A target that cannot be set ends the run, with no fallback to a cold
+  boot. A target above `--mem` is refused before the cache is looked up, so a
+  hit and a miss refuse alike. `fcvm snapshot run` has no flag for the target
+  and restores the device as it was saved.
   `test_balloon_target_honored_on_snapshot_cache_hit` covers it with one hit
-  above the snapshot's target and one below. Two limits:
+  above the snapshot's target and one below.
+  The startup snapshot (`--health-check`) is not shared between targets. It
+  holds a workload that initialised under the target of the run that made it
+  (the memory the guest had, which a workload sizes itself by), and a restore
+  can set a target but cannot replay that. So its name carries the target:
+  `<key>-balloon<MIB>-startup`, and `<key>-startup` for a run without
+  `--balloon`, as before. A run looks up and saves only its own target's
+  startup snapshot. A run at a target that has none restores the shared
+  pre-start snapshot, sets its target, starts the workload under it and saves
+  a startup snapshot for that target, so no cold boot is added.
+  `podman prepare` installs a startup snapshot, and its content key carries
+  the target the same way. `test_startup_snapshot_is_per_balloon_target`
+  covers the lookup and both places that save. One limit:
   - The guest has to have activated the device. Firecracker refuses a target
     for a device the guest never activated (a custom kernel without the
     virtio balloon driver), so the first run of such a configuration
@@ -2321,10 +2333,6 @@ still load):
     first run fails too: a miss there tears its cold-booted VM down and
     restores its own snapshot with the caller's target. `--no-snapshot` runs
     it.
-  - A startup-snapshot hit hands over a guest whose workload started under
-    the target of the run that made the snapshot, and reaches its own target
-    only after the restore. Refusing a target above `--mem` is the only
-    balloon behaviour that is the same on a hit and on a miss.
 - **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
   rejects sources with extra disks, and reboot-in-place is disabled for restored
   clones that have them (a relaunch would silently drop the data disks).
