@@ -1,3 +1,4 @@
+pub mod balloon;
 pub mod common;
 pub mod completions;
 pub mod exec;
@@ -10,6 +11,7 @@ pub mod snapshots;
 pub mod tty;
 
 // Re-export command functions
+pub use balloon::cmd_balloon;
 pub use completions::cmd_completions;
 pub use exec::cmd_exec;
 pub use ls::cmd_ls;

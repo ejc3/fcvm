@@ -28,6 +28,8 @@ pub enum Commands {
     Snapshots(SnapshotsArgs),
     /// Execute a command in a running VM
     Exec(ExecArgs),
+    /// Print a VM's balloon target and size as one JSON line; with MIB, set the target first
+    Balloon(BalloonArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
     /// Run HTTP/WebSocket API server for ComputeSDK integration
@@ -274,6 +276,7 @@ pub struct RunArgs {
     /// That needs a guest kernel with the virtio balloon driver; without one, use
     /// --no-snapshot.
     /// A startup snapshot (--health-check) is kept per target.
+    /// `fcvm balloon` reads and changes the target of a running VM.
     #[arg(long)]
     pub balloon: Option<u32>,
 
@@ -846,6 +849,26 @@ pub struct ExecArgs {
     pub command: Vec<String>,
 }
 
+// ============================================================================
+// Balloon Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct BalloonArgs {
+    /// PID of the fcvm process that runs the VM (mutually exclusive with --name)
+    #[arg(long, conflicts_with = "name", required_unless_present = "name")]
+    pub pid: Option<u32>,
+
+    /// Name of the VM (mutually exclusive with --pid)
+    #[arg(long, conflicts_with = "pid")]
+    pub name: Option<String>,
+
+    /// New balloon target in MiB. Without it the command only reports. The VM
+    /// needs a balloon device, which is attached only at boot with
+    /// `fcvm podman run --balloon`
+    pub mib: Option<u32>,
+}
+
 /// Parse --mem value: either an integer (MiB) or "unlimited" (all host memory).
 fn parse_mem(s: &str) -> Result<u32, String> {
     if s.eq_ignore_ascii_case("unlimited") {
@@ -1017,6 +1040,61 @@ mod tests {
         ]);
         assert_eq!(run.publish, vec!["8080:80", "8443:443"]);
         assert_eq!(run.forward_localhost, vec![1421u16, 9099]);
+    }
+
+    /// Parse a `fcvm balloon` command line.
+    fn parse_balloon(extra: &[&str]) -> Result<BalloonArgs, clap::Error> {
+        let mut argv = vec!["fcvm", "balloon"];
+        argv.extend_from_slice(extra);
+        Cli::try_parse_from(argv).map(|cli| match cli.cmd {
+            Commands::Balloon(args) => args,
+            _ => panic!("expected `balloon` command"),
+        })
+    }
+
+    /// `fcvm balloon` names exactly one VM, by --pid or by --name.
+    #[test]
+    fn balloon_names_one_vm_by_pid_or_by_name() {
+        let by_pid = parse_balloon(&["--pid", "4242"]).unwrap();
+        assert_eq!((by_pid.pid, by_pid.name.as_deref()), (Some(4242), None));
+        let by_name = parse_balloon(&["--name", "web"]).unwrap();
+        assert_eq!((by_name.pid, by_name.name.as_deref()), (None, Some("web")));
+
+        let both = parse_balloon(&["--pid", "4242", "--name", "web"])
+            .expect_err("--pid and --name were accepted together");
+        assert_eq!(
+            both.kind(),
+            clap::error::ErrorKind::ArgumentConflict,
+            "{both}"
+        );
+        let neither = parse_balloon(&[]).expect_err("a command that names no VM was accepted");
+        assert_eq!(
+            neither.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument,
+            "{neither}"
+        );
+    }
+
+    /// MIB is optional: without it the command reports, with it it sets first.
+    #[test]
+    fn balloon_mib_is_optional() {
+        let report = parse_balloon(&["--pid", "4242"]).expect("a report needs no MIB");
+        assert_eq!(report.mib, None);
+        assert_eq!(
+            parse_balloon(&["--name", "web", "96"]).unwrap().mib,
+            Some(96)
+        );
+        assert_eq!(
+            parse_balloon(&["96", "--pid", "4242"]).unwrap().mib,
+            Some(96)
+        );
+        let not_a_size = parse_balloon(&["--pid", "4242", "lots"])
+            .expect_err("a MIB that is not a number was accepted");
+        assert_eq!(
+            not_a_size.kind(),
+            clap::error::ErrorKind::ValueValidation,
+            "{not_a_size}"
+        );
     }
 
     /// Parse a `fcvm snapshot run` command line and return the SnapshotRunArgs.

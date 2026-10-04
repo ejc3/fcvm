@@ -1433,6 +1433,7 @@ One async session per connection:
 | `fcvm setup` | Download kernel, create rootfs (first-time setup, ~5-10 min) |
 | `fcvm podman run` | Launch container in a microVM (Firecracker by default, or Cloud Hypervisor via `--hypervisor cloud-hypervisor`) |
 | `fcvm exec` | Execute command in running VM/container |
+| `fcvm balloon` | Print a VM's balloon target and size; with MIB, set the target first |
 | `fcvm ls` | List running VMs |
 | `fcvm snapshot create` | Create snapshot from running VM |
 | `fcvm snapshot serve` | Start UFFD memory server for cloning |
@@ -1607,6 +1608,46 @@ NAME           PID     STATUS    HEALTH    NETWORK   IMAGE
 my-nginx       12345   running   healthy   bridged   nginx:alpine
 clone-1        12350   running   healthy   rootless  (clone)
 ```
+
+#### `fcvm balloon`
+
+**Purpose**: Read or set the balloon target of a running VM.
+
+**Usage**:
+```bash
+fcvm balloon (--pid <PID> | --name <NAME>) [MIB]
+```
+
+It prints one JSON line, `{"target_mib":96,"actual_mib":64}`: the target the
+device was asked to reach, and the size the guest has given it so far. With MIB
+it sets the target first (`PATCH /balloon`) and prints right after, so the size
+is still on its way. Refused before any request: a Cloud Hypervisor VM (fcvm's
+client for it has no balloon call) and a target above the VM's memory. A VM
+booted without `--balloon` has no device and cannot get one; whether it has
+one is read from `GET /vm/config`. When Firecracker answers the set with a 400,
+the error says what it refuses (a device the guest never activated, as with a
+kernel that has no virtio balloon driver).
+
+The command writes no state. What follows the new target, and what does not:
+
+- **The next snapshot of the VM does.** A memory snapshot and a disk-only
+  capture read the device from the VMM, so they record the new target. A
+  clone of that snapshot records it in its state, and its relaunch after a
+  guest reboot attaches the device at it. The name of `podman run`'s own
+  startup snapshot does not move: it carries the run's `--balloon`. A target
+  changed before the VM turns healthy is recorded in that snapshot, and a
+  later run at the same `--balloon` still restores it and sets its own
+  target.
+- **The VM's own state does not.** `config.balloon_mib` (`fcvm ls --json`)
+  keeps the target the VM booted with or, for a clone, the one its restore
+  read.
+- **The VM's own relaunch after a guest reboot does not.** A cold-booted VM
+  relaunches from its launch config and a restored clone from its state, both
+  of which hold the earlier target. Firecracker has exited by then, so there
+  is nothing to ask.
+
+`test_balloon_command_sets_and_reports_the_target` covers the report, the set,
+the unchanged state and the snapshot's record.
 
 #### `fcvm snapshots`
 
