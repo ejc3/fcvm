@@ -1120,6 +1120,68 @@ fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
 }
 
 /// Serve snapshot memory (foreground)
+/// The snapshots a live fcvm process names in its state: a memory server, a clone restored
+/// from one, or a VM that recorded the snapshot it started from.
+fn snapshots_in_use(
+    states: &[crate::state::VmState],
+    live: impl Fn(&crate::state::VmState) -> bool,
+) -> std::collections::HashSet<String> {
+    states
+        .iter()
+        .filter(|state| live(state))
+        .filter_map(|state| state.config.snapshot_name.clone())
+        .collect()
+}
+
+/// Whether the process a state names is still running: its PID is alive, and when the state
+/// recorded a start time, the process at that PID started then.
+fn state_process_is_live(state: &crate::state::VmState) -> bool {
+    match state.pid {
+        Some(pid) => {
+            crate::utils::is_process_alive(pid)
+                && state
+                    .pid_start_time
+                    .is_none_or(|recorded| crate::utils::process_start_time(pid) == Some(recorded))
+        }
+        None => false,
+    }
+}
+
+/// Before a memory server starts reading `serving`, release from the page cache the memory
+/// files of the snapshots no live fcvm process names (#1066, `uffd::release`).
+///
+/// The pass runs on a detached thread, like the page cache warm-up: nothing waits for it, so
+/// a slow filesystem cannot hold up the server. A pass that cannot run is logged and the
+/// restore goes on as it would have without it.
+async fn release_idle_snapshot_memory(serving: &str) {
+    let states = match crate::state::StateManager::new(paths::state_dir())
+        .list_vms()
+        .await
+    {
+        Ok(states) => states,
+        Err(error) => {
+            warn!(
+                error = %error,
+                "could not list fcvm's processes, so no idle snapshot is released from the page cache"
+            );
+            return;
+        }
+    };
+    let in_use = snapshots_in_use(&states, state_process_is_live);
+    let (snapshot_dir, serving) = (paths::snapshot_dir(), serving.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("fcvm-ws-release".to_string())
+        .spawn(move || {
+            crate::uffd::release_idle_snapshots(&snapshot_dir, &serving, &in_use);
+        });
+    if let Err(error) = spawned {
+        warn!(
+            error = %error,
+            "could not start the thread that releases idle snapshots from the page cache"
+        );
+    }
+}
+
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     validate_snapshot_name(&args.snapshot_name)?;
     info!(
@@ -1194,6 +1256,8 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // Copy mode only: how much of the snapshot each demand fault materialises around the
     // page that faulted (--uffd-fault-around / FCVM_UFFD_FAULT_AROUND). Off unless asked for.
     let fault_around = FaultAround::new(args.uffd_fault_around.unwrap_or(0))?;
+
+    release_idle_snapshot_memory(&args.snapshot_name).await;
 
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
@@ -2247,6 +2311,8 @@ async fn cmd_snapshot_run_inner(
                 fault_around_bytes = fault_around.bytes(),
                 "starting implicit UFFD server for snapshot restore"
             );
+
+            release_idle_snapshot_memory(&snapshot_name).await;
 
             // Just "implicit" — NOT the vm_id. This socket is created inside `data_dir`,
             // which IS this VM's own directory (`vm-disks/<vm_id>/`), so repeating the id in
@@ -3813,6 +3879,87 @@ async fn cmd_snapshot_ls() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A state that names `snapshot`, written by the process `pid`.
+    fn state_naming(snapshot: Option<&str>, pid: u32) -> crate::state::VmState {
+        let mut state =
+            crate::state::VmState::new("vm-unit".to_string(), "alpine:latest".to_string(), 1, 128);
+        state.pid = Some(pid);
+        state.config.snapshot_name = snapshot.map(str::to_string);
+        state
+    }
+
+    /// Only a live process keeps a snapshot's memory file in the page cache when another
+    /// snapshot's server starts (#1066): a state whose process is gone names nothing.
+    #[test]
+    fn only_snapshots_a_live_process_names_are_in_use() {
+        let states = [
+            state_naming(Some("served-by-a-live-server"), 1),
+            state_naming(Some("left-by-a-dead-clone"), 2),
+            state_naming(None, 1),
+            state_naming(Some("restored-by-a-live-clone"), 1),
+        ];
+        let in_use = snapshots_in_use(&states, |state| state.pid == Some(1));
+        assert_eq!(
+            in_use,
+            std::collections::HashSet::from([
+                "served-by-a-live-server".to_string(),
+                "restored-by-a-live-clone".to_string()
+            ])
+        );
+    }
+
+    /// A state is live only while the process that wrote it runs. This process is. A PID
+    /// whose process started at another time is not, and neither is a state with no PID.
+    #[test]
+    fn a_state_is_live_only_while_the_process_that_wrote_it_runs() {
+        let me = std::process::id();
+        let started = crate::utils::process_start_time(me);
+        assert!(started.is_some(), "control: this process has a start time");
+
+        let mut mine = state_naming(Some("x"), me);
+        mine.pid_start_time = started;
+        assert!(state_process_is_live(&mine));
+
+        let mut reused = state_naming(Some("x"), me);
+        reused.pid_start_time = started.map(|ticks| ticks + 1);
+        assert!(
+            !state_process_is_live(&reused),
+            "a PID that another process holds now was taken for the one that wrote the state"
+        );
+
+        let mut never_started = state_naming(Some("x"), me);
+        never_started.pid = None;
+        assert!(!state_process_is_live(&never_started));
+    }
+
+    /// Both places that build a memory server release idle snapshots first (#1066): the
+    /// `snapshot serve` command and the implicit server inside `snapshot run`.
+    #[test]
+    fn every_memory_server_is_built_after_idle_snapshots_were_released() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let servers: Vec<usize> = code
+            .match_indices("UffdServer::new(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            servers.len(),
+            2,
+            "this file builds a memory server in {} places, not the two this test knows",
+            servers.len()
+        );
+        let mut from = 0;
+        for at in servers {
+            assert!(
+                code[from..at].contains("release_idle_snapshot_memory(&"),
+                "a memory server is built with no release of idle snapshots before it: without \
+                 one, a restore that follows another snapshot's reads its recorded pages \
+                 several times over"
+            );
+            from = at;
+        }
+    }
     use crate::storage::snapshot::SnapshotVolumeConfig;
     use crate::storage::SnapshotKind;
 

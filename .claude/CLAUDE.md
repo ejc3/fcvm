@@ -2629,6 +2629,19 @@ separately.
   the warm-up is not paced, so on a cold cache another running clone's major fault waits
   behind its readahead, it can outrun replay when free page cache is smaller than the
   recorded set, and a minor-mode server starting on the same image drops what it loaded.
+- **Idle snapshots leave the page cache when a server starts** (`src/uffd/release.rs`, #1066):
+  a server that starts asks the kernel to drop the memory file of every other snapshot that
+  no live fcvm process names (`posix_fadvise(POSIX_FADV_DONTNEED)`, on a detached thread).
+  Without it, a restore that follows restores of another snapshot reads its recorded set
+  several times over: the kernel keeps the other snapshot's recently used pages and evicts
+  the ones the new restore has just read. Measured on a 236 GB host with two snapshots of a
+  128 GiB guest and recorded sets of 40 to 42 GiB: 180 s to guest ACK, 7m20s to healthy and
+  465 GiB read with the other snapshot's file cached, against 65 s, 2m02s and 112 GiB with
+  it dropped first. The reverse switch took 58 s, 4m20s and 254 GiB against 59 s, 1m51s and
+  87 GiB. A dropped memory file costs its own next restore about 40 s to guest ACK (60 s
+  cold against 24 s warm). A snapshot that a live server, clone or VM names in its state is
+  left alone. A `snapshot run --snapshot` restore through Firecracker's File backend starts
+  no server and releases nothing.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would
