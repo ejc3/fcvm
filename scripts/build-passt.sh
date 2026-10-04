@@ -1,12 +1,13 @@
 #!/bin/bash
 # Build the same upstream commit as rootfs-config.toml, without local patches.
-# This commit includes the addr_seen fix for #661 and the earlier netlink
-# neighbour-sync fix. The checksum verifies the immutable upstream archive.
+# This commit includes the addr_seen fix for #661, the earlier netlink
+# neighbour-sync fix, and the fix that keeps -a, -g and -n on a host without
+# IPv4. The checksum verifies the immutable upstream archive.
 set -euo pipefail
 
-PASST_COMMIT="3f57f0382f6a72c0b8ce0c5ff92248b5117ed9b6"
+PASST_COMMIT="4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 PASST_TARBALL_URL="https://passt.top/passt/snapshot/passt-${PASST_COMMIT}.tar.xz"
-PASST_TARBALL_SHA256="2d698e3f7a96408231aa11bb1b27775de6964e2de7b0fa29399847d012044e3a"
+PASST_TARBALL_SHA256="ef88ad2c6137b52286e6fcd10311d61f2ab329e5558abe097170e9e5851da8b9"
 BUILD_FINGERPRINT="${PASST_TARBALL_SHA256:0:12}"
 BUILD_DIR="${BUILD_DIR:-/tmp/passt-build-${BUILD_FINGERPRINT}}"
 

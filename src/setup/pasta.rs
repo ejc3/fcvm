@@ -1,6 +1,7 @@
 //! Build pasta (passt) from a pinned upstream commit.
 //!
-//! The pin contains the upstream addr_seen fix for issue #661. fcvm builds
+//! The pin contains the upstream addr_seen fix for issue #661, and the fix
+//! that keeps `-a`, `-g` and `-n` on a host without IPv4. fcvm builds
 //! pasta on demand into the content-addressed shared assets directory, so
 //! rootless networking does not depend on the host's distro pasta version.
 //!

@@ -159,6 +159,13 @@ threads-required = "num-test-threads"
 slow-timeout = { period = "600s", terminate-after = 1 }
 retries = 0
 
+# The local-mode ARP check on the pinned pasta (src/network/pasta.rs) reads
+# pasta's answer from the neighbour table, with no timing in the verdict. A pass
+# on a retry would be a defect in the check or in pasta, so it is never retried.
+[[profile.default.overrides]]
+filter = "package(fcvm) & test(=network::pasta::tests::pinned_pasta::does_not_answer_arp_for_the_guest_address_in_local_mode)"
+retries = 0
+
 # VM tests get 10 minute timeout (non-snapshot tests)
 [[profile.default.overrides]]
 filter = "package(fcvm) & test(/test_/) & !test(/stress_100/) & !test(/pjdfstest_vm/) & !test(/snapshot/) & !test(/clone/)"
