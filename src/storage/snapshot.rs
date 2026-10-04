@@ -259,6 +259,14 @@ pub struct SnapshotMetadata {
     /// field existed; those restore on the binary their kernel profile resolves to.
     #[serde(default)]
     pub firecracker_bin: Option<PathBuf>,
+    /// Balloon target in MiB the source VM booted with (--balloon). A memory
+    /// restore gets the device from the VMM state. The cold boots, which are a
+    /// disk-only clone and a restored clone's relaunch after a guest reboot,
+    /// attach the device at this target. None when the source had no balloon
+    /// device and for snapshots written before this field existed; those
+    /// cold-boot without one.
+    #[serde(default)]
+    pub balloon_mib: Option<u32>,
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -690,6 +698,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                balloon_mib: None,
             },
         };
 
@@ -887,6 +896,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                balloon_mib: None,
             },
         };
 
@@ -969,6 +979,7 @@ mod tests {
                     image_disk_identity: None,
                     hypervisor: Default::default(),
                     firecracker_bin: None,
+                    balloon_mib: None,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1038,6 +1049,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                balloon_mib: None,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1231,6 +1243,7 @@ mod tests {
                 image_disk_identity: None,
                 hypervisor: Default::default(),
                 firecracker_bin: None,
+                balloon_mib: None,
             },
         };
 
@@ -1318,6 +1331,25 @@ mod tests {
     }
 
     #[test]
+    fn balloon_target_survives_the_round_trip_and_older_snapshots_have_none() {
+        // A snapshot written before the field existed parses, with no balloon:
+        // its cold boots attach no device, as they did before.
+        let legacy = r#"{
+            "image": "x", "vcpu": 1, "memory_mib": 128,
+            "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" }
+        }"#;
+        let parsed: SnapshotMetadata = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.balloon_mib, None);
+        // `snapshot run` reads the target from config.json, so it has to be
+        // written there.
+        let mut meta = parsed;
+        meta.balloon_mib = Some(512);
+        let reparsed: SnapshotMetadata =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert_eq!(reparsed.balloon_mib, Some(512));
+    }
+
+    #[test]
     fn test_snapshot_metadata_ipv6_prefix_roundtrip() {
         let metadata = SnapshotMetadata {
             image: "nginx:alpine".to_string(),
@@ -1344,6 +1376,7 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            balloon_mib: None,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

@@ -2825,6 +2825,7 @@ pub fn build_snapshot_config(
             image_disk_identity: vm_state.config.image_disk_identity.clone(),
             hypervisor: vm_state.config.hypervisor,
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
+            balloon_mib: vm_state.config.balloon_mib,
         },
     })
 }
@@ -4763,6 +4764,27 @@ mod tests {
         assert_eq!(config.vm_id, "vm-CCC");
         assert_eq!(config.original_vsock_vm_id, Some("vm-AAA".to_string()));
         assert!(matches!(config.snapshot_type, SnapshotType::User));
+    }
+
+    /// A snapshot records the balloon target of the VM it was taken from. The
+    /// cold boots from that snapshot, a disk-only clone and a restored clone's
+    /// relaunch after a guest reboot, attach the device from this record. Without
+    /// it they came up with no balloon device (#1052).
+    #[test]
+    fn a_snapshot_records_its_vms_balloon() {
+        let mut state = make_vm_state("vm-AAA", None);
+        state.config.balloon_mib = Some(512);
+        let config = build_snapshot_config(
+            &state,
+            "key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.metadata.balloon_mib, Some(512));
     }
 
     #[test]

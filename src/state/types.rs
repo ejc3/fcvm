@@ -241,6 +241,12 @@ pub struct VmConfig {
     /// Hypervisor VMs and for state files written before this field existed.
     #[serde(default)]
     pub firecracker_bin: Option<std::path::PathBuf>,
+    /// Balloon target in MiB that a cold boot of this VM attaches the device at
+    /// (--balloon). Snapshots of the VM record it, so a disk-only clone and a
+    /// restored clone that reboots get the device back. None when the VM has no
+    /// balloon device and for state files written before this field existed.
+    #[serde(default)]
+    pub balloon_mib: Option<u32>,
 }
 
 impl VmState {
@@ -294,6 +300,7 @@ impl VmState {
                 image_disk_identity: None,
                 hypervisor: crate::hypervisor::Backend::default(),
                 firecracker_bin: None,
+                balloon_mib: None,
             },
         }
     }
@@ -394,6 +401,28 @@ mod tests {
         let roundtrip: VmState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.vsock_epoch, 7);
+    }
+
+    #[test]
+    fn balloon_target_survives_state_persistence_and_older_files_have_none() {
+        let mut state = VmState::new("vm-old".to_string(), "alpine:latest".to_string(), 1, 128);
+        assert_eq!(state.config.balloon_mib, None);
+
+        // A state file written before the field existed loads, with no balloon.
+        let mut json: serde_json::Value = serde_json::to_value(&state).unwrap();
+        json["config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("balloon_mib");
+        let loaded: VmState = serde_json::from_value(json).unwrap();
+        assert_eq!(loaded.config.balloon_mib, None);
+
+        // `snapshot create` runs in another process and reads the target from the
+        // state file, so it has to be written there.
+        state.config.balloon_mib = Some(512);
+        let roundtrip: VmState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert_eq!(roundtrip.config.balloon_mib, Some(512));
     }
 
     #[test]

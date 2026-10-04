@@ -351,3 +351,118 @@ async fn test_restored_clone_reboot_comes_back_healthy() -> Result<()> {
     );
     Ok(())
 }
+
+/// A clone restored from a snapshot of a `--balloon` VM keeps its balloon device
+/// across a guest reboot. The relaunch is a cold boot from the clone's disk, and it
+/// used to attach no balloon device whatever the source VM had (#1052).
+#[tokio::test]
+async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
+    const BALLOON_MIB: u32 = 64;
+    let balloon = BALLOON_MIB.to_string();
+    let (name, clone_name, snap, _serve) = common::unique_names("reboot-balloon");
+
+    // --no-snapshot makes the source a cold boot, so what its state records comes
+    // from its own --balloon. A cache hit would copy the cached snapshot's record,
+    // and a snapshot written by an older build has none.
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--balloon",
+            &balloon,
+            "nginx:alpine",
+        ],
+        "reboot-balloon-base",
+    )
+    .await?;
+    let token = format!("reboot-balloon-token-{}", std::process::id());
+    let snapshotted = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        // Control for the instrument: the source reports the target it booted with.
+        let source = common::balloon_stats_by_pid(pid)
+            .await
+            .context("reading the source VM's balloon")?;
+        anyhow::ensure!(
+            source.target_mib == BALLOON_MIB,
+            "the source VM's balloon target is {} MiB, not the {BALLOON_MIB} it was started with",
+            source.target_mib
+        );
+        // reboot_and_assert_relaunch looks for the marker in the clone.
+        write_work_marker(pid, &token).await?;
+        common::create_snapshot_by_pid(pid, &snap)
+            .await
+            .context("creating full snapshot")
+    }
+    .await;
+    // The clone restores from the snapshot files, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        snapshotted?;
+        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap,
+                "--name",
+                &clone_name,
+            ],
+            "reboot-balloon-c1",
+        )
+        .await?;
+        let checked = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            // Second control: the memory restore brings the device back from the
+            // VMM state, so the clone has it before the reboot.
+            let restored = common::balloon_stats_by_pid(clone_pid)
+                .await
+                .context("reading the restored clone's balloon before the reboot")?;
+            anyhow::ensure!(
+                restored.target_mib == BALLOON_MIB,
+                "the restored clone's balloon target is {} MiB before the reboot, not {BALLOON_MIB}",
+                restored.target_mib
+            );
+
+            // reboot_and_assert_relaunch reports a failed relaunch by panicking. It runs
+            // as its own task, so the panic comes back here as an error and the clone
+            // and the snapshot are still cleaned up below.
+            let relaunch_token = token.clone();
+            tokio::spawn(async move {
+                reboot_and_assert_relaunch(clone_pid, &relaunch_token).await
+            })
+            .await
+            .context("the relaunch check panicked")??;
+
+            let rebooted = common::balloon_stats_by_pid(clone_pid)
+                .await
+                .context("reading the clone's balloon after the reboot")?;
+            anyhow::ensure!(
+                rebooted.target_mib == BALLOON_MIB,
+                "the rebooted clone's balloon target is {} MiB, not the source's {BALLOON_MIB}",
+                rebooted.target_mib
+            );
+            let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+                .load_state_by_pid(clone_pid)
+                .await
+                .context("loading the clone's state")?;
+            anyhow::ensure!(
+                state.config.balloon_mib == Some(BALLOON_MIB),
+                "the clone's state records balloon target {:?}, not Some({BALLOON_MIB})",
+                state.config.balloon_mib
+            );
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+        checked
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
+    result
+}

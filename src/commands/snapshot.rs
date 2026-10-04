@@ -1712,6 +1712,9 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.portable_volumes = portable_volumes;
     // Same for the boot-plan fields: a snapshot taken FROM this clone must record
     // the original kernel profile / image device, or grand-clones lose them.
+    // The balloon target is one of them, and this clone's own relaunch after a
+    // guest reboot reads it from here.
+    vm_state.config.balloon_mib = snapshot_config.metadata.balloon_mib;
     vm_state.config.kernel_profile = snapshot_config.metadata.kernel_profile.clone();
     vm_state.config.image_mode = snapshot_config.metadata.image_mode.clone();
     vm_state.config.image_disk_path = snapshot_config.metadata.image_disk_path.clone();
@@ -3063,6 +3066,7 @@ async fn cmd_snapshot_run_inner(
                                 &vm_name,
                                 args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
                                 args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
+                                vm_state.config.balloon_mib,
                                 args.non_blocking_output,
                                 &network_config,
                                 &runtime_config,
@@ -3415,6 +3419,7 @@ async fn build_clone_reboot_plan(
     vm_name: &str,
     cpu: u8,
     mem: u32,
+    balloon: Option<u32>,
     non_blocking_output: bool,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
@@ -3441,6 +3446,7 @@ async fn build_clone_reboot_plan(
         vm_name.to_string(),
         cpu,
         mem,
+        balloon,
         non_blocking_output,
         None,
     );
@@ -3508,12 +3514,18 @@ async fn build_clone_reboot_plan(
 /// `port_mappings` are the clone's own (`clone_port_mappings`), not `meta`'s. They are
 /// written back as `--publish` specs with their host address, because the disk-only
 /// dispatcher sets the clone's network up from them.
+///
+/// `balloon` is the balloon target of the VM being booted: the one recorded in a
+/// rebooting clone's state, or the snapshot's for a disk-only clone. The cold boot
+/// attaches the device at it, and attaches none for None.
+#[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
     port_mappings: &[crate::network::PortMapping],
     name: String,
     cpu: u8,
     mem: u32,
+    balloon: Option<u32>,
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
 ) -> RunArgs {
@@ -3573,7 +3585,7 @@ fn run_args_from_snapshot_metadata(
         },
         cmd: None,
         publish,
-        balloon: None,
+        balloon,
         network,
         // Cold-boot the clone/reboot under the SAME backend that created the snapshot —
         // a CH disk-only/reboot clone must not be launched under Firecracker (and would
@@ -3673,6 +3685,7 @@ async fn cmd_snapshot_run_disk_only(
         vm_name,
         args.cpu.unwrap_or(meta.vcpu),
         args.mem.unwrap_or(meta.memory_mib),
+        meta.balloon_mib,
         args.non_blocking_output,
         Some(disk_path),
     );
@@ -3826,9 +3839,18 @@ mod tests {
             image_disk_identity: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
+            balloon_mib: None,
         };
-        let args =
-            run_args_from_snapshot_metadata(&meta, &[], "clone".to_string(), 2, 1024, false, None);
+        let args = run_args_from_snapshot_metadata(
+            &meta,
+            &[],
+            "clone".to_string(),
+            2,
+            1024,
+            None,
+            false,
+            None,
+        );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
         assert_eq!(
@@ -3842,8 +3864,16 @@ mod tests {
         let mut meta2 = meta.clone();
         meta2.user = None;
         meta2.username = None;
-        let args2 =
-            run_args_from_snapshot_metadata(&meta2, &[], "c".to_string(), 1, 512, false, None);
+        let args2 = run_args_from_snapshot_metadata(
+            &meta2,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+        );
         assert!(args2.env.is_empty());
 
         // The captured resolver must survive into a cold boot: fc-agent
@@ -3852,8 +3882,16 @@ mod tests {
         // baked in.
         let mut meta_dns = meta.clone();
         meta_dns.network_config.dns_server = Some("192.0.2.53".to_string());
-        let args_dns =
-            run_args_from_snapshot_metadata(&meta_dns, &[], "c".to_string(), 1, 512, false, None);
+        let args_dns = run_args_from_snapshot_metadata(
+            &meta_dns,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+        );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
         // The clone's own port mappings come back out of the specs written here,
@@ -3862,8 +3900,16 @@ mod tests {
             crate::network::PortMapping::parse("[::]:80:80").unwrap(),
             crate::network::PortMapping::parse("127.0.0.1:5300:53/udp").unwrap(),
         ];
-        let args_own =
-            run_args_from_snapshot_metadata(&meta, &own, "c".to_string(), 1, 512, false, None);
+        let args_own = run_args_from_snapshot_metadata(
+            &meta,
+            &own,
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+        );
         assert_eq!(
             args_own.publish,
             vec![
@@ -3887,8 +3933,16 @@ mod tests {
                 read_only: false,
             },
         ];
-        let args3 =
-            run_args_from_snapshot_metadata(&meta3, &[], "c".to_string(), 1, 512, false, None);
+        let args3 = run_args_from_snapshot_metadata(
+            &meta3,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+        );
         assert_eq!(
             args3.nfs,
             vec![
@@ -3928,9 +3982,10 @@ mod tests {
             image_disk_identity: None,
             hypervisor: crate::hypervisor::Backend::CloudHypervisor,
             firecracker_bin: None,
+            balloon_mib: None,
         };
         let args =
-            run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, false, None);
+            run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, None, false, None);
         assert_eq!(
             args.hypervisor,
             crate::cli::args::Hypervisor::CloudHypervisor
@@ -3939,11 +3994,38 @@ mod tests {
         let mut fc = base.clone();
         fc.hypervisor = crate::hypervisor::Backend::Firecracker;
         let args_fc =
-            run_args_from_snapshot_metadata(&fc, &[], "c".to_string(), 1, 512, false, None);
+            run_args_from_snapshot_metadata(&fc, &[], "c".to_string(), 1, 512, None, false, None);
         assert_eq!(
             args_fc.hypervisor,
             crate::cli::args::Hypervisor::Firecracker
         );
+    }
+
+    /// A cold boot attaches a balloon device only when its RunArgs name a target.
+    /// The synthesized args said None whatever the source VM had, so a disk-only
+    /// clone and a rebooted clone of a --balloon VM had no balloon device (#1052).
+    #[test]
+    fn run_args_from_metadata_carry_the_balloon() {
+        let meta: crate::storage::SnapshotMetadata = serde_json::from_str(
+            r#"{
+                "image": "x", "vcpu": 1, "memory_mib": 1024,
+                "network_config": { "tap_device": "t", "guest_mac": "AA:BB:CC:DD:EE:FF" }
+            }"#,
+        )
+        .unwrap();
+        for balloon in [Some(512), None] {
+            let args = run_args_from_snapshot_metadata(
+                &meta,
+                &[],
+                "c".to_string(),
+                1,
+                1024,
+                balloon,
+                false,
+                None,
+            );
+            assert_eq!(args.balloon, balloon);
+        }
     }
 
     fn published(specs: &[&str]) -> Vec<crate::network::PortMapping> {

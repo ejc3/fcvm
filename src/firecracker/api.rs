@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Bytes;
 use hyper::{Method, Request, StatusCode};
@@ -47,58 +47,70 @@ impl FirecrackerClient {
         UnixUri::new(&self.socket_path, path).into()
     }
 
-    /// Make a PUT request
-    async fn put<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let json = serde_json::to_string(body)?;
-        let req = Request::builder()
-            .method(Method::PUT)
-            .uri(self.uri(path))
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(json)))?;
+    /// Send one request and read the whole reply. The deadline covers the reply's
+    /// body as well as its head, so a VMM that sends the head and then stalls fails
+    /// the call at the deadline.
+    async fn request(
+        &self,
+        method: Method,
+        path: &str,
+        json: Option<String>,
+    ) -> Result<(StatusCode, Bytes)> {
+        let mut req = Request::builder()
+            .method(method.clone())
+            .uri(self.uri(path));
+        if json.is_some() {
+            req = req.header("Content-Type", "application/json");
+        }
+        let req = req.body(Full::new(Bytes::from(json.unwrap_or_default())))?;
 
-        let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Firecracker API PUT {} timed out after {:?}",
-                    path,
-                    self.request_timeout
-                )
-            })??;
-        if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
+        tokio::time::timeout(self.request_timeout, async {
+            let resp = self.client.request(req).await?;
             let status = resp.status();
-            let body_bytes = resp.into_body().collect().await?.to_bytes();
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
+            let body = resp.into_body().collect().await?.to_bytes();
+            anyhow::Ok((status, body))
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "Firecracker API {} {} timed out after {:?}",
+                method,
+                path,
+                self.request_timeout
+            )
+        })?
+    }
+
+    /// Send a JSON body. Firecracker answers 204 (or 200) when it accepts one.
+    async fn send_json<T: Serialize>(&self, method: Method, path: &str, body: &T) -> Result<()> {
+        let json = serde_json::to_string(body)?;
+        let (status, reply) = self.request(method, path, Some(json)).await?;
+        if status != StatusCode::NO_CONTENT && status != StatusCode::OK {
+            let reply = String::from_utf8_lossy(&reply);
+            anyhow::bail!("Firecracker API error: {} - {}", status, reply);
         }
         Ok(())
     }
 
+    /// Make a PUT request
+    async fn put<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
+        self.send_json(Method::PUT, path, body).await
+    }
+
     /// Make a PATCH request
     async fn patch<T: Serialize>(&self, path: &str, body: &T) -> Result<()> {
-        let json = serde_json::to_string(body)?;
-        let req = Request::builder()
-            .method(Method::PATCH)
-            .uri(self.uri(path))
-            .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from(json)))?;
+        self.send_json(Method::PATCH, path, body).await
+    }
 
-        let resp = tokio::time::timeout(self.request_timeout, self.client.request(req))
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!(
-                    "Firecracker API PATCH {} timed out after {:?}",
-                    path,
-                    self.request_timeout
-                )
-            })??;
-        if resp.status() != StatusCode::NO_CONTENT && resp.status() != StatusCode::OK {
-            let status = resp.status();
-            let body_bytes = resp.into_body().collect().await?.to_bytes();
-            let body_str = String::from_utf8_lossy(&body_bytes);
-            anyhow::bail!("Firecracker API error: {} - {}", status, body_str);
+    /// Make a GET request and parse the JSON body of the reply
+    async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
+        let (status, reply) = self.request(Method::GET, path, None).await?;
+        if status != StatusCode::OK {
+            let reply = String::from_utf8_lossy(&reply);
+            anyhow::bail!("Firecracker API error: {} - {}", status, reply);
         }
-        Ok(())
+        serde_json::from_slice(&reply)
+            .with_context(|| format!("parsing the reply to Firecracker API GET {path}"))
     }
 
     /// Configure boot source (kernel + optional initrd)
@@ -172,8 +184,15 @@ impl FirecrackerClient {
     }
 
     /// Update balloon statistics polling interval
-    pub async fn update_balloon_stats(&self, config: BalloonStats) -> Result<()> {
+    pub async fn update_balloon_stats(&self, config: BalloonStatsUpdate) -> Result<()> {
         self.patch("/balloon/statistics", &config).await
+    }
+
+    /// Target size of the balloon device. Firecracker answers 400
+    /// when the VM has no balloon device, and when the device was attached with
+    /// statistics off (fcvm attaches it with statistics on).
+    pub async fn balloon_stats(&self) -> Result<BalloonStats> {
+        self.get("/balloon/statistics").await
     }
 
     /// Configure entropy device (virtio-rng)
@@ -332,8 +351,16 @@ pub struct Balloon {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct BalloonStats {
+pub struct BalloonStatsUpdate {
     pub stats_polling_interval_s: u32,
+}
+
+/// The part of the `GET /balloon/statistics` reply fcvm reads. The reply also
+/// carries the size reached so far, page counts and the guest's memory counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct BalloonStats {
+    /// Size the device was asked to reach, in MiB.
+    pub target_mib: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

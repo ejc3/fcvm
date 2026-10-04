@@ -2264,8 +2264,9 @@ A snapshot made by an fc-agent from before read-only maps were mounted read-only
 
 ### Disk-Only Clone / Reboot Edge Cases
 
-Snapshot metadata records the source's `kernel_profile`, `image_mode`, and
-`image_disk_path` (all `#[serde(default)]`, so old snapshots still load):
+Snapshot metadata records the source's `kernel_profile`, `image_mode`,
+`image_disk_path`, and `balloon_mib` (all `#[serde(default)]`, so old snapshots
+still load):
 
 - **Custom kernel profiles**: cold-boot clones and reboot plans resolve the
   recorded profile, so a btrfs/nested-profile disk boots with a kernel that can
@@ -2274,6 +2275,23 @@ Snapshot metadata records the source's `kernel_profile`, `image_mode`, and
   (content-addressed cache file) is re-attached on cold-boot clones and reboot
   relaunches, and the MMDS plan carries the mode so fc-agent re-mounts the
   additionalImageStore on a provisioned boot. The image layers stay reachable.
+- **Balloon** (`--balloon`): a VM's balloon target is recorded in its state and
+  in every snapshot of it. A disk-only clone and a restored clone's relaunch
+  after a guest reboot are cold boots given that target, and attach the device
+  at it. A memory restore attaches nothing: the device comes back with the VMM
+  state. This is tested on Firecracker only:
+  `test_disk_only_clone_keeps_the_balloon` and
+  `test_restored_clone_reboot_keeps_its_balloon` read the target back from
+  Firecracker's `GET /balloon/statistics`. No Cloud Hypervisor VM was run with
+  a balloon. From the code, a disk-only clone of one cold-boots under Cloud
+  Hypervisor with the recorded target as the `balloon` size in the VM config
+  it is created from, and no test reads that device back. A restored Cloud
+  Hypervisor clone has no reboot relaunch (a guest reboot ends it). A snapshot
+  created before the field existed records no target, and cold boots from it
+  attach no balloon device. That covers cache snapshots too: a
+  `podman run --balloon` that restores from one runs with the device, but its
+  state and the snapshots taken of it record none. `fcvm snapshots prune`
+  removes the cache snapshots.
 - **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
   rejects sources with extra disks, and reboot-in-place is disabled for restored
   clones that have them (a relaunch would silently drop the data disks).

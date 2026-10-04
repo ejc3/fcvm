@@ -1424,6 +1424,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.hugepages = args.hugepages;
+    vm_state.config.balloon_mib = args.balloon;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = args.forward_localhost.clone();
