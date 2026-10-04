@@ -45,6 +45,16 @@ another what changed and why. Say that and stop.
 - Read it back as if a colleague sent it to you. If it reads like marketing or an essay,
   rewrite it.
 
+## SESSION VALUES STAY OUT OF THE REPOSITORY
+
+A value copied from a working session (a shell, an environment variable, a launch command or
+a transcript) is not useful to the repository and goes stale: profile names, account names,
+one-off paths, model names, local ports. Don't put one in a file, a comment, a commit
+message, or a pull request title, description or review comment. Use a variable or a made-up
+placeholder (`example-profile`, `example-name`). Where something specific has to be named,
+use its publicly documented identifier. Check the diff, the commit messages and the PR text
+before every push.
+
 ## SUSPENDING A VM DOES NOT DISTURB IT
 
 **`snapshot create` is a read of the source VM, not a reconfiguration of it.** A
