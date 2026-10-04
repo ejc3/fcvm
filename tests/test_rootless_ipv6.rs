@@ -310,19 +310,38 @@ with IPv6Server(('::', {}), handler) as httpd:
 
     println!("VM is healthy, testing IPv6 egress to host...");
 
-    // Try to reach the IPv6-only server from the VM
-    // Use wget since it's available in alpine (curl would need to be installed)
+    // Fetch from the IPv6-only server with the guest's wget (GNU wget in the guest OS).
     let url = format!("http://[{}]:{}/", host_ipv6, server_port);
     println!("Attempting to connect to: {}", url);
 
-    let result = common::exec_in_vm(pid, &["wget", "-q", "-O", "-", "--timeout=5", &url]).await;
+    // The request has to reach the server above, so wget must not hand it to a proxy.
+    // fcvm forwards the host's proxy variables to the guest and wget obeys http_proxy: on
+    // a host that exports one, the request goes to that proxy and no packet reaches the
+    // server (a proxy that refuses the host's address answers HTTP 403). --no-proxy keeps
+    // the connection direct. http_proxy names a port nothing listens on, so a fetch that
+    // does obey a proxy fails on every host and not only on one that exports a proxy.
+    // -nv keeps wget's one-line error in the failure, where -q left only an exit status.
+    let result = common::exec_in_vm(
+        pid,
+        &[
+            "http_proxy=http://[::1]:9/",
+            "wget",
+            "--no-proxy",
+            "-nv",
+            "-O",
+            "-",
+            "--timeout=5",
+            &url,
+        ],
+    )
+    .await;
 
     // Clean up
     server.kill().await.ok();
     common::kill_process(pid).await;
     let _ = child.wait().await;
 
-    let output = result.context("IPv6 egress failed - pasta should support native IPv6")?;
+    let output = result.context("the guest could not fetch from the host's IPv6-only server")?;
     println!("✓ IPv6 egress works! Server response:\n{}", output);
     Ok(())
 }
