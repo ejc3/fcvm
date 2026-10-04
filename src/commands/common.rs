@@ -1643,6 +1643,26 @@ fn restored_vsock_source_path(
         .unwrap_or_else(|| snapshot_source.to_path_buf())
 }
 
+/// What a failed `PATCH /balloon` on a restored VM is reported as. Every failure
+/// says what was being done. A 400 also says what Firecracker refuses and how to
+/// run without the restore; a timeout or a dead VMM is neither of those causes.
+fn balloon_target_failure(error: anyhow::Error, target_mib: u32) -> anyhow::Error {
+    let refused = error
+        .downcast_ref::<crate::firecracker::api::ApiRefusal>()
+        .is_some_and(|refusal| refusal.is_bad_request());
+    let doing = format!("setting the balloon target to {target_mib} MiB on the restored VM");
+    if refused {
+        error.context(format!(
+            "{doing} (Firecracker refuses a target for a device the guest never activated, \
+             as with a kernel that has no virtio balloon driver, for a VM with no balloon \
+             device, and above the guest's memory; --no-snapshot cold-boots at the target \
+             instead of restoring)"
+        ))
+    } else {
+        error.context(doing)
+    }
+}
+
 /// Parameters for snapshot restore, grouping the many read-only inputs.
 pub struct RestoreParams<'a> {
     pub vm_id: &'a str,
@@ -1670,6 +1690,11 @@ pub struct RestoreParams<'a> {
     pub track_dirty_pages: bool,
     /// Why `runtime_config` names the Firecracker binary it names.
     pub firecracker_choice: FirecrackerChoice,
+    /// Balloon target this run asked for, in MiB. A snapshot key says whether a
+    /// balloon device exists and not its target, so the loaded VM holds the target
+    /// of the run that made the snapshot. Some sets this one before the guest
+    /// resumes. None (a plain `snapshot run`) leaves the device as it was saved.
+    pub balloon_target_mib: Option<u32>,
 }
 
 /// Diagnostic helper (#608): the `vm-disks/<id>` directory ids whose **rootfs** path is
@@ -2307,6 +2332,7 @@ pub async fn restore_from_snapshot(
         clone_ipv6,
         track_dirty_pages,
         firecracker_choice,
+        balloon_target_mib,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -2406,7 +2432,8 @@ pub async fn restore_from_snapshot(
 
         // Load snapshot with configured memory backend and network override
         use crate::firecracker::api::{
-            DrivePatch, MemBackend, NetworkOverride, SnapshotLoad, VmState as ApiVmState,
+            BalloonUpdate, DrivePatch, MemBackend, NetworkOverride, SnapshotLoad,
+            VmState as ApiVmState,
         };
 
         let mem_backend = match &restore_config.memory_backend {
@@ -2487,6 +2514,40 @@ pub async fn restore_from_snapshot(
         info!(
             duration_ms = patch_duration.as_millis(),
             "disk patch completed"
+        );
+
+        // The balloon. A snapshot key says whether a device exists and not its
+        // target, so the loaded VM holds the target of the run that made the
+        // snapshot. A caller that named a target has it set here, while the guest
+        // is paused: Firecracker raises the device's config-change interrupt and
+        // the guest acts on it when it first runs, so it never runs at the other
+        // run's target. A target that cannot be set ends the run through the kill
+        // below. It is not a snapshot load failure, so a cache hit does not fall
+        // back to a cold boot.
+        // The VM's state then records what the VMM reports, whether or not a
+        // target was set. The VMM is the authority on its device: the target can
+        // be changed on the API socket after boot and nothing writes that to a
+        // state file, so the snapshot's record, copied from one, can differ from
+        // the device that was saved. The record is what this VM's cold boots
+        // attach, its relaunch after a guest reboot among them.
+        let balloon_start = std::time::Instant::now();
+        if let Some(target_mib) = balloon_target_mib {
+            client
+                .patch_balloon(BalloonUpdate {
+                    amount_mib: target_mib,
+                })
+                .await
+                .map_err(|error| balloon_target_failure(error, target_mib))?;
+        }
+        vm_state.config.balloon_mib = client
+            .balloon_target_mib()
+            .await
+            .context("reading the restored VM's balloon device")?;
+        info!(
+            duration_us = balloon_start.elapsed().as_micros(),
+            balloon_mib = ?vm_state.config.balloon_mib,
+            set_by_caller = balloon_target_mib.is_some(),
+            "balloon target settled on the restored VM"
         );
 
         // Failpoint: snapshot loaded and paused, network post-start done (pasta
@@ -2672,7 +2733,16 @@ pub async fn restore_from_snapshot_ch(
         clone_ipv6: _,         // delivered to the guest via the boot-plan restore-epoch (caller)
         track_dirty_pages: _,  // CH has no dirty-page tracking
         firecracker_choice: _, // CH restores run find_cloud_hypervisor's binary
+        balloon_target_mib,
     } = params;
+    // No Cloud Hypervisor call sets a balloon target on a restored VM, so a target
+    // named here would be dropped. `podman run` keeps this backend out of the
+    // snapshot cache and names none.
+    if let Some(target_mib) = balloon_target_mib {
+        bail!(
+            "a Cloud Hypervisor restore cannot set a balloon target (asked for {target_mib} MiB)"
+        );
+    }
     let vm_dir = data_dir.join("disks");
 
     // CH's own snapshot files live in the `ch/` subdir (written by create_snapshot_ch).
@@ -3920,14 +3990,30 @@ pub async fn create_snapshot_core(
 
     // VM is now paused — we MUST resume it before returning, no matter what.
     let mut use_diff = has_base;
-    let mut snapshot_result = snapshot_client
-        .create_snapshot(SnapshotCreate {
-            snapshot_type: Some(snapshot_type.to_string()),
-            snapshot_path: temp_vmstate_path.display().to_string(),
-            mem_file_path: temp_memory_path.display().to_string(),
-        })
+    // The snapshot's balloon record comes from the VMM, which is the authority on
+    // its device: the target can be changed on the API socket after boot and
+    // nothing writes that to the VM's state. Read here, with the VM paused and
+    // right before the save, it is the target the saved device holds, for every
+    // creator that comes through this function. A failed read skips the save and
+    // is reported through the recovery below, which resumes the VM.
+    let balloon_result = pause_client
+        .balloon_target_mib()
         .await
-        .context("creating Firecracker snapshot");
+        .context("reading the VM's balloon device for the snapshot");
+    let mut snapshot_result = match balloon_result {
+        Ok(balloon_mib) => {
+            snapshot_config.metadata.balloon_mib = balloon_mib;
+            snapshot_client
+                .create_snapshot(SnapshotCreate {
+                    snapshot_type: Some(snapshot_type.to_string()),
+                    snapshot_path: temp_vmstate_path.display().to_string(),
+                    mem_file_path: temp_memory_path.display().to_string(),
+                })
+                .await
+                .context("creating Firecracker snapshot")
+        }
+        Err(error) => Err(error),
+    };
 
     // Validate diff snapshot: detect KVM dirty page tracking failure.
     //
@@ -5051,6 +5137,145 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.metadata.balloon_mib, Some(512));
+    }
+
+    /// A cache hit sets its run's balloon target on the loaded, paused VM: after
+    /// the load, because the device comes back with the saved VM state, and before
+    /// the resume, so the guest never runs at the target of the run that made the
+    /// snapshot. The restore then reads the device back for the VM's state, after
+    /// the target is set, so the record is the device's. No fake VMM can drive the
+    /// restore, so the order is pinned by its source.
+    /// `test_balloon_target_honored_on_snapshot_cache_hit` is the VM test.
+    #[test]
+    fn the_restore_sets_the_balloon_target_between_load_and_resume() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn restore_from_snapshot(")
+            .expect("no Firecracker restore");
+        let end = source[start..]
+            .find("pub async fn restore_from_snapshot_ch(")
+            .expect("no Cloud Hypervisor restore after the Firecracker one");
+        let body = &source[start..start + end];
+        let steps = [
+            ".load_snapshot(",
+            ".patch_balloon(",
+            ".balloon_target_mib()",
+            "failpoint::hit_async(\"restore.post_network_pre_resume\")",
+            "state: \"Resumed\".to_string()",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("the Firecracker restore has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "the Firecracker restore does not run {steps:?} in that order: offsets {offsets:?}"
+        );
+    }
+
+    /// A failed PATCH of the balloon target always says what was being done. It
+    /// explains what Firecracker refuses, and names --no-snapshot, only when
+    /// Firecracker answered 400: a timeout or another status has other causes.
+    #[test]
+    fn a_failed_balloon_target_explains_a_refusal_and_nothing_else() {
+        use crate::firecracker::api::ApiRefusal;
+        let refusal = |status| {
+            anyhow::Error::new(ApiRefusal {
+                status,
+                reply: "the reason".to_string(),
+            })
+        };
+        let refused = format!(
+            "{:#}",
+            balloon_target_failure(refusal(hyper::StatusCode::BAD_REQUEST), 512)
+        );
+        assert!(
+            refused.contains("setting the balloon target to 512 MiB on the restored VM")
+                && refused.contains("never activated")
+                && refused.contains("--no-snapshot")
+                && refused.contains("400 Bad Request - the reason"),
+            "{refused}"
+        );
+        for other in [
+            refusal(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            anyhow::anyhow!("Firecracker API PATCH /balloon timed out after 30s"),
+        ] {
+            let message = format!("{:#}", balloon_target_failure(other, 512));
+            assert!(
+                message.contains("setting the balloon target to 512 MiB on the restored VM"),
+                "{message}"
+            );
+            assert!(
+                !message.contains("--no-snapshot") && !message.contains("never activated"),
+                "{message}"
+            );
+        }
+    }
+
+    /// A memory snapshot's balloon record is read from the VMM inside
+    /// `create_snapshot_core`: after the pause, so nothing can change the target
+    /// between the read and the save, and before the save, so the record is the
+    /// target the saved device holds. Every creator of a Firecracker memory
+    /// snapshot comes through that function and holds the per-VM snapshot lock.
+    /// No fake VMM can drive it, so the order is pinned by its source.
+    #[test]
+    fn a_memory_snapshot_reads_the_balloon_between_the_pause_and_the_save() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn create_snapshot_core(")
+            .expect("no create_snapshot_core");
+        // The function ends at the first closing brace in column one.
+        let end = source[start..]
+            .find("\n}\n")
+            .expect("create_snapshot_core has no end");
+        let body = &source[start..start + end];
+        let steps = [
+            "state: \"Paused\".to_string()",
+            ".balloon_target_mib()",
+            ".create_snapshot(SnapshotCreate {",
+        ];
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("create_snapshot_core has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "create_snapshot_core does not run {steps:?} in that order: offsets {offsets:?}"
+        );
+    }
+
+    /// Cloud Hypervisor has no call that sets a balloon target on a restored VM.
+    /// `podman run` keeps that backend out of the snapshot cache, so no caller
+    /// names a target today. One that did would have it dropped without a word, so
+    /// the restore refuses it, naming the target, before it prepares the clone's
+    /// network and disk. This shows the order of those two steps and nothing about
+    /// the checks that run before the refusal.
+    #[test]
+    fn a_cloud_hypervisor_restore_refuses_a_balloon_target_before_it_prepares_the_clone() {
+        let source = include_str!("common.rs");
+        let start = source
+            .find("pub async fn restore_from_snapshot_ch(")
+            .expect("no Cloud Hypervisor restore");
+        let end = source[start..]
+            .find("pub fn build_snapshot_config(")
+            .expect("build_snapshot_config no longer follows the Cloud Hypervisor restore");
+        let body = &source[start..start + end];
+        let refused = body
+            .find("(asked for {target_mib} MiB)")
+            .expect("the Cloud Hypervisor restore does not refuse a balloon target by its number");
+        let first_side_effect = body
+            .find("prepare_clone_substrate(")
+            .expect("the Cloud Hypervisor restore no longer prepares a clone substrate");
+        assert!(
+            refused < first_side_effect,
+            "the Cloud Hypervisor restore prepares the clone before it refuses a balloon target"
+        );
     }
 
     #[test]

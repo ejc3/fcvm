@@ -128,6 +128,12 @@ so nothing is built or booted twice when it doesn't have to be.
   bypassing the cache.** Example: `--vsock-dir` makes a cache hit place the clone's
   listener in the caller's directory (through the load's vsock override, or the restore
   mount redirect on Firecracker before 1.16.0); it does not force a cold boot.
+- **A value a restored VM can be given is set at restore time, not keyed.** Example:
+  `--balloon` puts only the device's existence in the snapshot key, because a device
+  cannot be added to a restored VM. A cache hit sets its own target on the loaded,
+  paused VM before the guest resumes, so runs at different targets share the pre-start
+  snapshot. The startup snapshot holds a workload that initialised under one target,
+  which a restore cannot replay, so its name carries the target.
 - **Never add per-caller data to the content key when restore can reconcile it.**
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this

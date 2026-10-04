@@ -3,7 +3,7 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::Router;
-use fcvm::firecracker::api::BalloonStats;
+use fcvm::firecracker::api::{ApiRefusal, BalloonStats, BalloonUpdate};
 use fcvm::firecracker::FirecrackerClient;
 use fcvm::hypervisor::cloud_hypervisor::api::ChClient;
 use serde_json::json;
@@ -124,13 +124,16 @@ async fn firecracker_balloon_statistics_request_and_reply() {
     // Firecracker's reply has more members than fcvm reads.
     let mut server = ApiServer::start(Some((
         StatusCode::OK,
-        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"free_memory":1024}"#,
+        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024}"#,
     )))
     .await;
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
     assert_eq!(
         client.balloon_stats().await.unwrap(),
-        BalloonStats { target_mib: 64 }
+        BalloonStats {
+            target_mib: 64,
+            actual_mib: 32
+        }
     );
     server
         .assert_request(Method::GET, "/balloon/statistics", None)
@@ -151,6 +154,88 @@ async fn firecracker_balloon_statistics_request_and_reply() {
     assert_eq!(
         client.balloon_stats().await.unwrap_err().to_string(),
         "Firecracker API GET /balloon/statistics timed out after 10ms"
+    );
+}
+
+/// `GET /vm/config` is where fcvm reads whether a VM has a balloon device, and at
+/// what target. Firecracker answers 200 with or without a device. "No device" is the
+/// reply's null, which the Firecracker builds fcvm pins send, or a reply without the
+/// member. A refusal is a failure, and so is a device that does not say its target.
+#[tokio::test]
+async fn firecracker_vm_config_reports_the_balloon_device_or_none() {
+    // Firecracker's reply has more members than fcvm reads.
+    let mut server = ApiServer::start(Some((
+        StatusCode::OK,
+        r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"stats_polling_interval_s":1,"free_page_hinting":false,"free_page_reporting":false},"drives":[],"machine-config":{"vcpu_count":2}}"#,
+    )))
+    .await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(client.balloon_target_mib().await.unwrap(), Some(96));
+    server.assert_request(Method::GET, "/vm/config", None).await;
+
+    let server = ApiServer::start(Some((StatusCode::OK, r#"{"balloon":null,"drives":[]}"#))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(client.balloon_target_mib().await.unwrap(), None);
+
+    // A reply with no `balloon` member says the same.
+    let server = ApiServer::start(Some((StatusCode::OK, r#"{"drives":[]}"#))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(
+        client.balloon_target_mib().await.unwrap(),
+        None,
+        "a reply with no `balloon` member"
+    );
+
+    // A device that does not say its target is a failure, not "no device".
+    let server = ApiServer::start(Some((
+        StatusCode::OK,
+        r#"{"balloon":{"deflate_on_oom":true},"drives":[]}"#,
+    )))
+    .await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    let error = format!("{:#}", client.balloon_target_mib().await.unwrap_err());
+    assert!(error.contains("missing field `amount_mib`"), "{error}");
+
+    // Nor is a refusal.
+    let server = ApiServer::start(Some((StatusCode::BAD_REQUEST, "not now"))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    assert_eq!(
+        client.balloon_target_mib().await.unwrap_err().to_string(),
+        "Firecracker API error: 400 Bad Request - not now"
+    );
+}
+
+/// `PATCH /balloon` carries the target and nothing else. Firecracker refuses a body
+/// with any other member, and the `Balloon` a device is attached with has two more.
+#[tokio::test]
+async fn firecracker_balloon_target_update_sends_the_target_alone() {
+    let mut server = ApiServer::start(Some((StatusCode::NO_CONTENT, ""))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    client
+        .patch_balloon(BalloonUpdate { amount_mib: 512 })
+        .await
+        .unwrap();
+    server
+        .assert_request(Method::PATCH, "/balloon", Some(json!({"amount_mib": 512})))
+        .await;
+
+    // A refusal reaches the caller with Firecracker's reason, and as a refusal: the
+    // restore explains a 400 and nothing else.
+    let server = ApiServer::start(Some((StatusCode::BAD_REQUEST, "no balloon device"))).await;
+    let client = FirecrackerClient::new(server.path.clone()).unwrap();
+    let error = client
+        .patch_balloon(BalloonUpdate { amount_mib: 512 })
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "Firecracker API error: 400 Bad Request - no balloon device"
+    );
+    assert!(
+        error
+            .downcast_ref::<ApiRefusal>()
+            .is_some_and(ApiRefusal::is_bad_request),
+        "a 400 is not recognisable as a refusal: {error:?}"
     );
 }
 

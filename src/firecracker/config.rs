@@ -15,7 +15,7 @@ use std::path::PathBuf;
 /// Complete Firecracker VM launch configuration.
 /// Serialize this to JSON for cache key computation.
 /// All fields here affect the cached VM state.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct FirecrackerConfig {
     /// Boot source configuration
     pub boot_source: BootSource,
@@ -41,80 +41,78 @@ pub struct FirecrackerConfig {
     /// Extra disk specifications (--disk, --disk-dir, --nfs).
     /// These add block devices that must match between cache create and restore.
     /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
     /// Environment variables passed to the container.
     /// Format: "KEY=value" - affects container behavior so must be in cache key.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub env_vars: Vec<String>,
     /// Volume mount specifications.
     /// Format: "host_path:guest_path[:ro]" - affects MMDS plan so must be in cache key.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub volume_mounts: Vec<String>,
     /// Whether container runs in privileged mode.
     /// Affects container capabilities and MMDS plan.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub privileged: bool,
     /// Whether to allocate a TTY for the container.
     /// Affects MMDS plan and container PTY allocation.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub tty: bool,
     /// Whether stdin is forwarded to the container.
     /// Affects MMDS plan and container stdin handling.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub interactive: bool,
     /// Non-blocking output: fc-agent drops container output when channel is full.
     /// Part of cache key because fc-agent reads this from the Plan at boot,
     /// and that value is baked into the snapshot memory.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub non_blocking_output: bool,
     /// Minimum free space on root filesystem (e.g., "10G").
     /// Affects disk size after CoW copy, so must be in cache key.
-    #[serde(default = "default_rootfs_size")]
     pub rootfs_size: String,
     /// Health check URL for the VM (e.g., "http://localhost/").
     /// Part of cache key because it's a property of the VM configuration —
     /// clones must inherit the same health check behavior.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub health_check_url: Option<String>,
     /// User specification (uid:gid) for rootless podman inside the VM.
     /// Triggers --userns=keep-id in fc-agent. Must be in cache key because
     /// it changes how podman sets up user namespaces and storage.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
     /// Published port mappings (host:guest forwarding).
     /// Part of VM identity — clones inherit these from snapshot metadata.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub port_mappings: Vec<crate::network::PortMapping>,
     /// Ports to forward from guest localhost to host localhost.
     /// Affects fc-agent's iptables setup, must be in cache key.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub forward_localhost: Vec<u16>,
     /// How localhost images are delivered to the guest.
     /// Affects whether guest mounts overlay store, btrfs store, or runs podman load.
-    #[serde(default = "default_image_mode")]
     pub image_mode: ImageMode,
     /// Root filesystem type ("ext4" or "btrfs").
     /// Different rootfs types produce different VM states and must not share snapshots.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
     /// IPv6 prefix for routed mode (--ipv6-prefix).
     /// Part of cache key so a run requesting a different prefix never silently
     /// reuses a snapshot recorded with another prefix (the restore path applies
     /// the prefix stored in snapshot metadata, not the CLI flag).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6_prefix: Option<String>,
     /// Portable FUSE volumes (--portable-volumes).
     /// Part of cache key because per-volume inode tables are baked into the
     /// snapshot at create time — a portable run must not reuse a non-portable
     /// snapshot (and vice versa).
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub portable_volumes: bool,
     /// Firecracker binary path used to create this snapshot.
     /// Content-addressed (e.g., firecracker-default-76c9e1236dab.bin), so changing
     /// the binary automatically invalidates the cache. Required because snapshots
     /// created by one FC version cannot be restored by another.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub firecracker_bin: Option<PathBuf>,
     /// Guest failpoint spec (FCVM_GUEST_FAILPOINT), forwarded to fc-agent on the
     /// kernel cmdline as `fcvm_failpoint=`. The runtime boot-args string is
@@ -122,40 +120,39 @@ pub struct FirecrackerConfig {
     /// key: a snapshot whose guest booted with failpoints armed must never be
     /// restored by a normal run (and vice versa) — fuzz VMs get their own cache
     /// entries. None (the default) is skip-serialized so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub guest_failpoint: Option<String>,
     /// DNS override from --dns. fc-agent writes it into the guest's resolv.conf
     /// at boot, so it is baked into any snapshot taken from the VM; without this
     /// field a run with a different --dns cache-hits a snapshot answering with
     /// the old resolver and the flag is silently ignored. None (the default,
     /// mode-derived DNS) is skip-serialized so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dns_server: Option<String>,
-    /// Balloon device target in MiB, from --balloon. The device is attached
-    /// before boot and the saved VM state carries it with its target. A device
-    /// cannot be added to a restored VM, so a snapshot taken without the flag
-    /// restores a guest with no balloon, and the device's presence has to be
-    /// in the key. The target is in the key as well because no restore step
-    /// sets one today: a snapshot taken at another target restores at that
-    /// target. Setting the target at restore, so that the key need only say
-    /// whether a device exists, is #1053. Without this field a run with
-    /// --balloon cache-hits either snapshot and the flag is silently ignored.
-    /// None (the default, no device) is skip-serialized so existing keys are
-    /// unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub balloon_mib: Option<u32>,
+    /// Balloon device, from --balloon. The device is attached before boot and
+    /// the saved VM state carries it. A device cannot be added to a restored
+    /// VM, so a snapshot taken without the flag restores a guest with no
+    /// balloon, and whether a device exists has to be in the key. Its target is
+    /// not: `BalloonDevice` keeps it out of the JSON, and a restore sets the
+    /// caller's target on the loaded VM before the guest resumes (#1053), so
+    /// runs that differ only in the target share the pre-start snapshot. The
+    /// startup snapshot's name carries the target (`startup_snapshot_key`).
+    /// None (the default, no device) is skip-serialized so keys without
+    /// --balloon are unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub balloon: Option<BalloonDevice>,
     /// Whether fc-agent straces the container (fc_agent_strace=1 on the kernel
     /// cmdline, from --strace-agent). Guest-visible boot behavior baked into
     /// snapshots, so part of the cache key. false is skip-serialized so
     /// existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub agent_strace: bool,
     /// Effective extra kernel boot args (RuntimeConfig.boot_args or
     /// FCVM_BOOT_ARGS). Appended to the runtime cmdline at launch and therefore
     /// baked into the guest, so part of the cache key — a profile with
     /// different boot args must never share a snapshot with one without them.
     /// None (the default) is skip-serialized so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_boot_args: Option<String>,
     /// Build identity (inode:size:mtime) of the attached image-delivery disk
     /// (overlay storage image or Docker archive). The disk's PATH is
@@ -166,7 +163,7 @@ pub struct FirecrackerConfig {
     /// directory", 2026-08-13). Keying on the build identity turns a rebuilt
     /// disk into a snapshot cache miss. None (registry-pulled images, no
     /// attached disk) is skip-serialized so those keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub image_disk_identity: Option<String>,
     /// Host-derived DNS fallback (the host's resolv.conf servers), used when
     /// --dns is absent. fc-agent writes these into the guest's resolv.conf at
@@ -176,32 +173,32 @@ pub struct FirecrackerConfig {
     /// then, and hashing it would fragment keys between hosts whose guests
     /// boot identically). Empty (the default) is skip-serialized so existing
     /// keys are unchanged.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub host_dns: Vec<String>,
     /// Host-derived DNS search domains (resolv.conf `search` line), forwarded
     /// as `fcvm_dns_search=` and written into the guest's resolv.conf at boot.
     /// Baked into snapshots, so part of the cache key (#821). Empty (the
     /// default) is skip-serialized so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub dns_search: Vec<String>,
     /// FUSE reader thread count (RuntimeConfig.fuse_readers or
     /// FCVM_FUSE_READERS), forwarded as `fuse_readers=`. Changes fc-agent's
     /// FUSE thread and memory shape captured in the snapshot, so part of the
     /// cache key (#821). None (the default) is skip-serialized so existing
     /// keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_readers: Option<String>,
     /// FUSE per-operation trace rate (FCVM_FUSE_TRACE_RATE), forwarded as
     /// `fuse_trace_rate=`. Guest-visible boot behavior baked into snapshots,
     /// so part of the cache key (#821). None (the default) is skip-serialized
     /// so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_trace_rate: Option<String>,
     /// FUSE max_write cap (FCVM_FUSE_MAX_WRITE), forwarded as
     /// `fuse_max_write=`. Guest-visible boot behavior baked into snapshots,
     /// so part of the cache key (#821). None (the default) is skip-serialized
     /// so existing keys are unchanged.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub fuse_max_write: Option<String>,
     /// Whether the guest mounts its read-write volumes without the FUSE
     /// writeback cache (FCVM_NO_WRITEBACK_CACHE), forwarded as
@@ -211,7 +208,7 @@ pub struct FirecrackerConfig {
     /// Guest-visible boot behavior baked into snapshots, so part of the cache
     /// key (#821). false (the default) is skip-serialized so existing keys
     /// are unchanged.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub no_writeback_cache: bool,
 }
 
@@ -245,7 +242,7 @@ impl Default for FirecrackerConfig {
             firecracker_bin: None,
             guest_failpoint: None,
             dns_server: None,
-            balloon_mib: None,
+            balloon: None,
             agent_strace: false,
             extra_boot_args: None,
             image_disk_identity: None,
@@ -259,12 +256,16 @@ impl Default for FirecrackerConfig {
     }
 }
 
-fn default_image_mode() -> ImageMode {
-    ImageMode::Overlay
-}
-
-fn default_rootfs_size() -> String {
-    "10G".to_string()
+/// A balloon device in the launch config. It serializes as `{}`: the snapshot key
+/// says that a device exists and nothing about its target. It is written and never
+/// read back, so it has no `Deserialize`: a reader would get target 0 for every
+/// device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub struct BalloonDevice {
+    /// Target in MiB a cold boot attaches the device at. Kept out of the JSON, and
+    /// so out of the snapshot key.
+    #[serde(skip)]
+    pub target_mib: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -292,7 +293,7 @@ pub struct MachineConfig {
     pub vcpu_count: u8,
     pub mem_size_mib: u32,
     /// 2MB hugepage backing ("2M" or None)
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub huge_pages: Option<String>,
 }
 
@@ -607,6 +608,37 @@ mod tests {
     #[test]
     fn test_snapshot_key_golden() {
         assert_eq!(test_config().snapshot_key(), "4278f265ad63");
+    }
+
+    /// The key hashes this JSON. A config with no balloon has no `balloon` member,
+    /// so its key is the one it had before the field existed. A config with one says
+    /// that the device exists and not its target: the target is set on a restored VM,
+    /// so runs at different targets share the pre-start snapshot (#1053).
+    #[test]
+    fn the_key_json_names_a_balloon_device_without_its_target() {
+        let json = |balloon: Option<BalloonDevice>| {
+            let mut config = test_config();
+            config.balloon = balloon;
+            serde_json::to_value(&config).unwrap()
+        };
+        assert_eq!(json(None).get("balloon"), None);
+        for target_mib in [0, 512] {
+            assert_eq!(
+                json(Some(BalloonDevice { target_mib })).get("balloon"),
+                Some(&serde_json::json!({})),
+                "a balloon device at {target_mib} MiB"
+            );
+        }
+    }
+
+    /// The launch config is the key config with the VM's own rootfs path, and the
+    /// cold boot attaches the device at the target it carries.
+    #[test]
+    fn the_launch_copy_of_a_key_config_keeps_the_balloon_target() {
+        let mut config = test_config();
+        config.balloon = Some(BalloonDevice { target_mib: 512 });
+        let launch = config.with_rootfs_path("/vm/rootfs.raw".into());
+        assert_eq!(launch.balloon, Some(BalloonDevice { target_mib: 512 }));
     }
 
     #[test]

@@ -319,6 +319,20 @@ fn validate_prepare_args(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Refuse a balloon target above the guest's memory. Firecracker refuses it too,
+/// when a cold boot attaches the device and when a restore sets the target, and
+/// by then the network and the VMM exist. Checked before either so a cache hit
+/// and a cold boot refuse the same run the same way.
+fn validate_balloon_target(balloon: Option<u32>, mem: u32) -> Result<()> {
+    if let Some(target) = balloon {
+        anyhow::ensure!(
+            target <= mem,
+            "--balloon {target} is above --mem {mem}: a balloon target cannot exceed the guest's memory"
+        );
+    }
+    Ok(())
+}
+
 fn should_arm_startup_snapshot(
     skip_snapshot_creation: bool,
     has_snapshot_key: bool,
@@ -731,6 +745,7 @@ fn snapshot_restore_args(
         startup_snapshot_base_key,
         cpu: Some(args.cpu),
         mem: Some(args.mem),
+        balloon: args.balloon,
         firecracker_bin,
         firecracker_args,
         hugepages: Some(args.hugepages),
@@ -1047,6 +1062,7 @@ async fn prepare_vm_for_lifecycle(
             args.mem
         );
     }
+    validate_balloon_target(args.balloon, args.mem)?;
 
     // Normalize --forward-localhost: a repeated port would otherwise fail the
     // host-side bind in routed mode. Bridged mode has no host-side relay for the
@@ -1278,8 +1294,10 @@ async fn prepare_vm_for_lifecycle(
         );
         let key = config.snapshot_key();
 
-        // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot
-        let startup_key = startup_snapshot_key(&key);
+        // Check if cached snapshot exists - prefer startup snapshot over pre-start snapshot.
+        // The startup snapshot is this run's balloon target's own; the pre-start one is
+        // shared between targets.
+        let startup_key = startup_snapshot_key(&key, args.balloon);
 
         let mut prepare_target = None;
         if let PodmanLifecycle::Prepare(options) = &lifecycle {
@@ -2434,7 +2452,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                 ctx.startup_rx = None;
 
                 if let Some(ref key) = ctx.snapshot_key {
-                    let startup_key = startup_snapshot_key(key);
+                    let startup_key = startup_snapshot_key(key, ctx.args.balloon);
 
                     // Skip if startup snapshot already exists
                     if check_podman_snapshot(&startup_key).await.is_some() {
@@ -3101,14 +3119,14 @@ mod tests {
         );
     }
 
-    /// --balloon attaches a device before boot, and the saved VM state carries
-    /// the device and its target. No restore step adds a balloon device or sets
-    /// a target, so a run with --balloon must not share a snapshot with a run
-    /// without it, or with a run at another target. Before FirecrackerConfig
-    /// carried the flag the keys came out equal, and a cache hit gave the
-    /// caller a guest with no balloon device.
+    /// The snapshot key says whether a balloon device exists, and not its target.
+    /// A device cannot be added to a restored VM, so a run with --balloon must not
+    /// share a snapshot with a run without it. The target can be set on a restored
+    /// VM, and the restore sets it, so runs that differ only in the target share
+    /// one. With the target in the key each of them cold-booted and kept a
+    /// snapshot of its own (#1053).
     #[test]
-    fn balloon_changes_the_snapshot_key() {
+    fn the_snapshot_key_says_whether_a_balloon_exists_not_its_target() {
         let key = |balloon: Option<u32>| {
             let mut args = test_args();
             args.balloon = balloon;
@@ -3119,20 +3137,65 @@ mod tests {
             key(Some(0)),
             "a snapshot taken with no balloon device must not serve --balloon 0"
         );
-        assert_ne!(
+        assert_eq!(
             key(Some(0)),
             key(Some(1024)),
-            "a snapshot taken at one balloon target must not serve another"
+            "runs that differ only in the balloon target must share a snapshot"
         );
     }
 
-    /// The device is attached from the launch config, so with snapshots off,
-    /// where no key config exists, the launch config has to carry --balloon.
+    /// A startup snapshot holds a workload that initialised under one balloon
+    /// target, and a restore cannot replay that. Two targets share the pre-start
+    /// snapshot and have a startup snapshot each. A run without --balloon keeps
+    /// both names it had.
+    #[test]
+    fn two_balloon_targets_share_the_pre_start_snapshot_and_not_the_startup_one() {
+        let names = |balloon: Option<u32>| {
+            let mut args = test_args();
+            args.balloon = balloon;
+            let key = key_for(&args, GuestBootInputs::default());
+            let startup = startup_snapshot_key(&key, args.balloon);
+            (key, startup)
+        };
+        let (key_64, startup_64) = names(Some(64));
+        let (key_96, startup_96) = names(Some(96));
+        assert_eq!(
+            key_64, key_96,
+            "runs that differ only in the balloon target share the pre-start snapshot"
+        );
+        assert_ne!(
+            startup_64, startup_96,
+            "a 96 MiB run must not find the startup snapshot a 64 MiB run left"
+        );
+        assert_eq!(startup_64, format!("{key_64}-balloon64-startup"));
+        assert_eq!(startup_96, format!("{key_64}-balloon96-startup"));
+        // A device at target 0 is a target like any other.
+        assert_eq!(names(Some(0)).1, format!("{key_64}-balloon0-startup"));
+
+        let (key_none, startup_none) = names(None);
+        assert_ne!(key_none, key_64);
+        assert_eq!(
+            startup_none,
+            format!("{key_none}-startup"),
+            "a run without --balloon keeps the startup name it had"
+        );
+        assert_eq!(
+            startup_snapshot_key("abc123def456", None),
+            "abc123def456-startup"
+        );
+    }
+
+    /// The device is attached from the launch config, at the target it carries.
+    /// With snapshots off that config is built on its own. With snapshots on it is
+    /// the key config, whose JSON leaves the target out. Both have to carry
+    /// --balloon.
     #[test]
     fn the_launch_config_carries_the_balloon() {
+        use crate::firecracker::BalloonDevice;
         use std::path::Path;
         let mut args = test_args();
         args.balloon = Some(512);
+        let device = Some(BalloonDevice { target_mib: 512 });
         let launch_config = build_launch_config(
             &args,
             Path::new("/rootfs"),
@@ -3143,7 +3206,74 @@ mod tests {
             GuestBootInputs::default(),
             &[],
         );
-        assert_eq!(launch_config.balloon_mib, Some(512));
+        assert_eq!(launch_config.balloon, device);
+        let key_config = build_firecracker_config(
+            &args,
+            "sha256:test",
+            Path::new("/kernel"),
+            Path::new("/rootfs"),
+            Path::new("/initrd"),
+            None,
+            ImageMode::Overlay,
+            None,
+            None,
+            None,
+            GuestBootInputs::default(),
+            &[],
+        );
+        assert_eq!(key_config.balloon, device);
+    }
+
+    /// A cache hit restores through `snapshot run`. The snapshot holds the balloon
+    /// target of the run that made it, so the restore has to be told THIS run's.
+    #[test]
+    fn a_cache_restore_asks_for_this_runs_balloon_target() {
+        let mut args = test_args();
+        args.balloon = Some(512);
+        let restore = snapshot_restore_args(&args, "k", None, (None, None));
+        assert_eq!(restore.balloon, Some(512));
+
+        // A run with no --balloon matched a snapshot with no device, and sets nothing.
+        let plain = snapshot_restore_args(&test_args(), "k", None, (None, None));
+        assert_eq!(plain.balloon, None);
+    }
+
+    /// A balloon target above the guest's memory is refused before the snapshot
+    /// cache is looked up, so the run fails the same way on a hit and on a miss.
+    /// Firecracker refuses it on both paths, but only once the network and the VMM
+    /// exist.
+    #[test]
+    fn a_balloon_target_above_the_guests_memory_is_refused() {
+        assert!(validate_balloon_target(None, 1024).is_ok());
+        assert!(validate_balloon_target(Some(0), 1024).is_ok());
+        assert!(validate_balloon_target(Some(1024), 1024).is_ok());
+        let error = validate_balloon_target(Some(1025), 1024)
+            .expect_err("a 1025 MiB balloon in a 1024 MiB guest was accepted")
+            .to_string();
+        assert!(
+            error.contains("--balloon 1025") && error.contains("--mem 1024"),
+            "{error}"
+        );
+
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("async fn prepare_vm_for_lifecycle(")
+            .expect("no prepare_vm_for_lifecycle");
+        // The function ends at the first closing brace in column one.
+        let end = source[start..]
+            .find("\n}\n")
+            .expect("prepare_vm_for_lifecycle has no end");
+        let prepare = &source[start..start + end];
+        let checked = prepare
+            .find("validate_balloon_target(args.balloon, args.mem)?;")
+            .expect("the balloon target is never checked");
+        let looked_up = prepare
+            .find("check_podman_snapshot(")
+            .expect("no snapshot cache lookup");
+        assert!(
+            checked < looked_up,
+            "prepare_vm_for_lifecycle looks the snapshot cache up before it checks the balloon target"
+        );
     }
 
     /// #821 helper: snapshot key of a config built through the real

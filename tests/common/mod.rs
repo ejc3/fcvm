@@ -1252,19 +1252,24 @@ pub async fn wait_for_nginx(pid: u32, limit: Duration) -> anyhow::Result<()> {
     }
 }
 
-/// Balloon target of a running Firecracker VM, read from its API socket. Errors when
-/// the VM has no balloon device (Firecracker answers 400).
-pub async fn balloon_stats_by_pid(
+/// Client for the API socket of a running Firecracker VM.
+pub async fn firecracker_client_by_pid(
     pid: u32,
-) -> anyhow::Result<fcvm::firecracker::api::BalloonStats> {
+) -> anyhow::Result<fcvm::firecracker::FirecrackerClient> {
     let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
         .load_state_by_pid(pid)
         .await
         .with_context(|| format!("loading the state of fcvm process {pid}"))?;
     let socket = fcvm::paths::vm_runtime_dir(&state.vm_id).join("firecracker.sock");
-    fcvm::firecracker::FirecrackerClient::new(socket)?
-        .balloon_stats()
-        .await
+    fcvm::firecracker::FirecrackerClient::new(socket)
+}
+
+/// Balloon target and current size of a running Firecracker VM, read from its API
+/// socket. Errors when the VM has no balloon device (Firecracker answers 400).
+pub async fn balloon_stats_by_pid(
+    pid: u32,
+) -> anyhow::Result<fcvm::firecracker::api::BalloonStats> {
+    firecracker_client_by_pid(pid).await?.balloon_stats().await
 }
 
 /// Create a snapshot from a running VM by PID
@@ -1856,11 +1861,11 @@ pub async fn delete_snapshot(snapshot_key: &str) -> anyhow::Result<()> {
         .await
 }
 
-/// Get the startup snapshot key for a base key
+/// Get the startup snapshot key for a base key, for a run without `--balloon`
 ///
 /// Uses the same format as the production code: `{base_key}-startup`
 pub fn startup_snapshot_key(base_key: &str) -> String {
-    fcvm::commands::podman::startup_snapshot_key(base_key)
+    fcvm::commands::podman::startup_snapshot_key(base_key, None)
 }
 
 /// Find an available TCP port starting from a given port.

@@ -86,8 +86,7 @@ impl FirecrackerClient {
         let json = serde_json::to_string(body)?;
         let (status, reply) = self.request(method, path, Some(json)).await?;
         if status != StatusCode::NO_CONTENT && status != StatusCode::OK {
-            let reply = String::from_utf8_lossy(&reply);
-            anyhow::bail!("Firecracker API error: {} - {}", status, reply);
+            return Err(ApiRefusal::new(status, &reply).into());
         }
         Ok(())
     }
@@ -106,8 +105,7 @@ impl FirecrackerClient {
     async fn get<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<T> {
         let (status, reply) = self.request(Method::GET, path, None).await?;
         if status != StatusCode::OK {
-            let reply = String::from_utf8_lossy(&reply);
-            anyhow::bail!("Firecracker API error: {} - {}", status, reply);
+            return Err(ApiRefusal::new(status, &reply).into());
         }
         serde_json::from_slice(&reply)
             .with_context(|| format!("parsing the reply to Firecracker API GET {path}"))
@@ -188,11 +186,28 @@ impl FirecrackerClient {
         self.patch("/balloon/statistics", &config).await
     }
 
-    /// Target size of the balloon device. Firecracker answers 400
-    /// when the VM has no balloon device, and when the device was attached with
-    /// statistics off (fcvm attaches it with statistics on).
+    /// Set the target size of the balloon device. Firecracker answers 400 when the
+    /// VM has no balloon device, when the guest never activated the device, and when
+    /// the target is above the guest's memory.
+    pub async fn patch_balloon(&self, update: BalloonUpdate) -> Result<()> {
+        self.patch("/balloon", &update).await
+    }
+
+    /// Target and current size of the balloon device. Firecracker answers 400 when
+    /// the VM has no balloon device, when the device was attached with statistics
+    /// off (fcvm attaches it with statistics on), and before the VM has booted.
     pub async fn balloon_stats(&self) -> Result<BalloonStats> {
         self.get("/balloon/statistics").await
+    }
+
+    /// Target of the VM's balloon device in MiB, or None when the VM has no balloon
+    /// device. Read from `GET /vm/config`, which answers 200 either way and reports
+    /// the device as it is now: at the target it was restored with, or the one set
+    /// since. No device is a null `balloon` member or none at all. A refusal is an
+    /// error, and so is a device that does not say its target.
+    pub async fn balloon_target_mib(&self) -> Result<Option<u32>> {
+        let config: VmConfig = self.get("/vm/config").await?;
+        Ok(config.balloon.map(|balloon| balloon.amount_mib))
     }
 
     /// Configure entropy device (virtio-rng)
@@ -205,6 +220,37 @@ impl FirecrackerClient {
         self.put("/vsock", &config).await
     }
 }
+
+/// A reply whose status says Firecracker did not do what was asked. A caller that
+/// treats a refusal differently from a timeout or a dead VMM finds it in the error
+/// chain.
+#[derive(Debug)]
+pub struct ApiRefusal {
+    pub status: StatusCode,
+    pub reply: String,
+}
+
+impl ApiRefusal {
+    fn new(status: StatusCode, reply: &[u8]) -> Self {
+        Self {
+            status,
+            reply: String::from_utf8_lossy(reply).into_owned(),
+        }
+    }
+
+    /// Whether Firecracker answered 400: it understood the request and refused it.
+    pub fn is_bad_request(&self) -> bool {
+        self.status == StatusCode::BAD_REQUEST
+    }
+}
+
+impl std::fmt::Display for ApiRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Firecracker API error: {} - {}", self.status, self.reply)
+    }
+}
+
+impl std::error::Error for ApiRefusal {}
 
 // API data structures
 
@@ -355,12 +401,39 @@ pub struct BalloonStatsUpdate {
     pub stats_polling_interval_s: u32,
 }
 
+/// Body of `PATCH /balloon`: the target and nothing else. Firecracker refuses a
+/// body with any other member, so the `Balloon` a device is attached with cannot be
+/// sent here.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct BalloonUpdate {
+    pub amount_mib: u32,
+}
+
 /// The part of the `GET /balloon/statistics` reply fcvm reads. The reply also
-/// carries the size reached so far, page counts and the guest's memory counters.
+/// carries page counts and the guest's memory counters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub struct BalloonStats {
     /// Size the device was asked to reach, in MiB.
     pub target_mib: u32,
+    /// Size the guest has given the device so far, in MiB.
+    pub actual_mib: u32,
+}
+
+/// The part of the `GET /vm/config` reply fcvm reads.
+#[derive(Debug, Deserialize)]
+struct VmConfig {
+    /// The device's configuration. For a VM with no device the Firecracker builds
+    /// fcvm pins send null (their reply serializes an `Option` with no skip), and
+    /// a build that leaves the member out means the same: both read as None.
+    #[serde(default)]
+    balloon: Option<VmConfigBalloon>,
+}
+
+/// A balloon device as `GET /vm/config` reports it.
+#[derive(Debug, Deserialize)]
+struct VmConfigBalloon {
+    /// Target size in MiB.
+    amount_mib: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -375,4 +448,37 @@ pub struct Vsock {
     pub guest_cid: u32,
     /// Path to Unix socket on host
     pub uds_path: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A VM with no balloon device. The Firecracker builds fcvm pins send
+    /// `"balloon": null`: their config reply serializes the `Option` as it is. A
+    /// build that leaves the member out means the same, and both are "no device".
+    /// A device that does not say its target is still not a reply fcvm can use.
+    #[test]
+    fn a_vm_config_reply_with_the_balloon_absent_or_null_means_no_device() {
+        let target = |body: &str| {
+            serde_json::from_str::<VmConfig>(body)
+                .map(|config| config.balloon.map(|balloon| balloon.amount_mib))
+                .map_err(|error| error.to_string())
+        };
+        assert_eq!(target(r#"{"drives":[]}"#), Ok(None), "the member is absent");
+        assert_eq!(
+            target(r#"{"balloon":null,"drives":[]}"#),
+            Ok(None),
+            "the member is null"
+        );
+        assert_eq!(
+            target(r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true},"drives":[]}"#),
+            Ok(Some(96))
+        );
+        let no_target = target(r#"{"balloon":{"deflate_on_oom":true},"drives":[]}"#);
+        assert!(
+            no_target.is_err(),
+            "a device that does not say its target was read as {no_target:?}"
+        );
+    }
 }
