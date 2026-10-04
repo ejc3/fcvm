@@ -4,6 +4,13 @@
 //! state. A snapshot taken afterwards records the new target, because snapshots
 //! read the device from the VMM. The VM's own state file, and its own relaunch
 //! after a guest reboot, keep the target the VM booted or was restored with.
+//!
+//! A set holds the VM's snapshot lock from its device check to its report, so it
+//! cannot land between a snapshot's read of the balloon and its save, and two sets
+//! cannot interleave. A report takes no lock.
+
+use std::path::Path;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
@@ -14,7 +21,13 @@ use crate::hypervisor::Backend;
 use crate::paths;
 use crate::state::{StateManager, VmState};
 
-use super::common::{firecracker_refused, load_vm_state, BALLOON_TARGET_REFUSALS};
+use super::common::{
+    acquire_vm_snapshot_lock_within, firecracker_refused, load_vm_state, BALLOON_TARGET_REFUSALS,
+};
+
+/// How long a set waits for the VM's snapshot lock. A snapshot of a large VM holds
+/// it for minutes; the command gives up and says so instead of waiting that out.
+const SNAPSHOT_LOCK_WAIT: Duration = Duration::from_secs(60);
 
 pub async fn cmd_balloon(args: BalloonArgs) -> Result<()> {
     let state_manager = StateManager::new(paths::state_dir());
@@ -24,6 +37,21 @@ pub async fn cmd_balloon(args: BalloonArgs) -> Result<()> {
 
     // What can be refused from the VM's state is refused before any request.
     check_request(&vm_state, args.mib)?;
+
+    // A set holds the per-VM snapshot lock from the device check to the report.
+    // Every snapshot holds that lock from its read of the balloon to its save, and
+    // Firecracker applies a PATCH to a paused VM, so without the lock a target
+    // could land in between and leave a snapshot whose record and saved device
+    // disagree. Two sets cannot interleave either, so each reports the target it
+    // set. A report alone changes nothing and takes no lock: it does not wait for
+    // a snapshot.
+    let _snapshot_lock = match args.mib {
+        Some(mib) => {
+            let disk = paths::vm_runtime_dir(&vm_state.vm_id).join("disks/rootfs.raw");
+            Some(lock_for_set(&disk, mib, &vm, SNAPSHOT_LOCK_WAIT).await?)
+        }
+        None => None,
+    };
 
     let socket = paths::vm_runtime_dir(&vm_state.vm_id).join("firecracker.sock");
     anyhow::ensure!(
@@ -46,6 +74,9 @@ pub async fn cmd_balloon(args: BalloonArgs) -> Result<()> {
             .patch_balloon(BalloonUpdate { amount_mib: mib })
             .await
             .map_err(|error| set_failure(error, mib, &vm))?;
+        // failpoint: hold between the set and the report, where another set must
+        // not land.
+        failpoint::hit_async("balloon.post_set_pre_report").await;
     }
 
     // Printed right after a set, the size is still on its way to the target.
@@ -55,6 +86,27 @@ pub async fn cmd_balloon(args: BalloonArgs) -> Result<()> {
         .with_context(|| format!("reading the balloon's target and size from VM {vm}"))?;
     println!("{}", report_line(&stats)?);
     Ok(())
+}
+
+/// The VM's snapshot lock for a set, or why the target was not set. `disk_path` is
+/// the VM's root disk, which is how the snapshot paths name the lock.
+async fn lock_for_set(
+    disk_path: &Path,
+    mib: u32,
+    vm: &str,
+    wait: Duration,
+) -> Result<std::fs::File> {
+    acquire_vm_snapshot_lock_within(disk_path, wait)
+        .await
+        .with_context(|| format!("taking the snapshot lock of VM {vm}"))?
+        .with_context(|| {
+            format!(
+                "the balloon target of VM {vm} was not set to {mib} MiB: a snapshot of the \
+                 VM, or another `fcvm balloon` that sets its target, still held the VM's \
+                 snapshot lock after {}s. Run the command again when it is done",
+                wait.as_secs()
+            )
+        })
 }
 
 /// How a VM is named in this command's errors.
@@ -234,5 +286,44 @@ mod tests {
         })
         .unwrap();
         assert_eq!(line, r#"{"target_mib":96,"actual_mib":64}"#);
+    }
+
+    /// A set waits for the VM's snapshot lock only so long. While a snapshot, or
+    /// another set, holds it past the wait, the set gives up and says the target
+    /// was not set. It gets the lock once the holder is done.
+    #[tokio::test]
+    async fn a_set_gives_up_while_the_snapshot_lock_stays_held_and_says_nothing_was_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let disk = dir.path().join("disks/rootfs.raw");
+        let holder = crate::commands::common::acquire_vm_snapshot_lock(&disk)
+            .await
+            .unwrap();
+
+        let wait = Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let refused = tokio::time::timeout(
+            Duration::from_secs(10),
+            lock_for_set(&disk, 96, "'web'", wait),
+        )
+        .await
+        .expect("a set with a 300 ms wait was still waiting for a held lock after 10s");
+        let error = format!(
+            "{:#}",
+            refused.expect_err("a set got a lock that another holder has")
+        );
+        assert!(
+            started.elapsed() >= wait,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+        assert!(
+            error.contains("the balloon target of VM 'web' was not set to 96 MiB"),
+            "{error}"
+        );
+
+        drop(holder);
+        lock_for_set(&disk, 96, "'web'", wait)
+            .await
+            .expect("the lock is free once its holder is done");
     }
 }

@@ -232,3 +232,276 @@ async fn test_balloon_command_sets_and_reports_the_target() -> Result<()> {
     let _ = common::delete_snapshot(&snap).await;
     result
 }
+
+/// One fcvm command that was started with a failpoint armed and has reached it.
+struct Held {
+    child: tokio::process::Child,
+    stdout: tokio::task::JoinHandle<String>,
+    stderr: tokio::task::JoinHandle<String>,
+}
+
+impl Held {
+    /// Wait for the command to end.
+    async fn finish(mut self, what: &str) -> Result<Ran> {
+        let status = tokio::time::timeout(Duration::from_secs(120), self.child.wait())
+            .await
+            .with_context(|| format!("{what} did not end within 120s"))?
+            .with_context(|| format!("waiting for {what}"))?;
+        Ok(Ran {
+            ok: status.success(),
+            stdout: self.stdout.await?,
+            stderr: self.stderr.await?,
+        })
+    }
+}
+
+/// Start `fcvm <args>` with `failpoint` armed to sleep `hold_ms`, and return once the
+/// command says it has reached it. Its output is read to the end either way.
+async fn start_and_hold(args: &[&str], failpoint: &str, hold_ms: u64) -> Result<Held> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+    let fcvm = common::find_fcvm_binary()?;
+    let mut child = tokio::process::Command::new(&fcvm)
+        .args(args)
+        .env("FCVM_FAILPOINT", format!("{failpoint}:sleep:{hold_ms}"))
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("starting fcvm {args:?}"))?;
+    let mut out = child.stdout.take().context("no stdout pipe")?;
+    let err = child.stderr.take().context("no stderr pipe")?;
+    let stdout = tokio::spawn(async move {
+        let mut text = String::new();
+        let _ = out.read_to_string(&mut text).await;
+        text
+    });
+    let marker = format!("FAILPOINT {failpoint} reached");
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let stderr = tokio::spawn(async move {
+        let mut reached_tx = Some(reached_tx);
+        let mut lines = BufReader::new(err).lines();
+        let mut text = String::new();
+        while let Ok(Some(line)) = lines.next_line().await {
+            if line.contains(&marker) {
+                if let Some(reached) = reached_tx.take() {
+                    let _ = reached.send(());
+                }
+            }
+            text.push_str(&line);
+            text.push('\n');
+        }
+        text
+    });
+    // The sender is dropped when the command's stderr ends without the marker.
+    match tokio::time::timeout(Duration::from_secs(120), reached_rx).await {
+        Ok(Ok(())) => Ok(Held {
+            child,
+            stdout,
+            stderr,
+        }),
+        _ => {
+            let _ = child.kill().await;
+            anyhow::bail!(
+                "fcvm {args:?} did not reach failpoint {failpoint}: {}",
+                stderr.await.unwrap_or_default().trim()
+            )
+        }
+    }
+}
+
+/// A target set by `fcvm balloon` cannot land between a snapshot's read of the
+/// balloon and its save. `snapshot create` is held there by a failpoint: the VM is
+/// paused and the snapshot's record, 64 MiB, is already read. `fcvm balloon --pid P
+/// 96` is started while it is held. The snapshot has to hold what it recorded: a
+/// clone restored from it gets the device as it was saved and has to come up at 64.
+/// The set is not lost: it waits for the snapshot, then sets 96 and reports 96.
+/// Without the lock the PATCH lands on the paused VM, and the snapshot records 64
+/// with a device saved at 96.
+#[tokio::test]
+async fn test_balloon_set_cannot_land_between_a_snapshots_read_and_its_save() -> Result<()> {
+    const BOOT_MIB: u32 = 64;
+    const SET_MIB: u32 = 96;
+    const FAILPOINT: &str = "snapshot.post_balloon_read_pre_save";
+    let (name, clone_name, snap, _) = common::unique_names("balloon-lock");
+    let (boot, set) = (BOOT_MIB.to_string(), SET_MIB.to_string());
+    let mut wrong: Vec<String> = Vec::new();
+
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--balloon",
+            &boot,
+            "nginx:alpine",
+        ],
+        "balloon-lock-vm",
+    )
+    .await?;
+    let pid_arg = pid.to_string();
+    let snapshotted = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        let snapshot = start_and_hold(
+            &["snapshot", "create", "--pid", &pid_arg, "--tag", &snap],
+            FAILPOINT,
+            8000,
+        )
+        .await?;
+        // The snapshot now sits between its read and its save, for 8 s.
+        let set_ran = fcvm_balloon(&["--pid", &pid_arg, &set]).await?;
+        let snapshot_ran = snapshot.finish("snapshot create").await?;
+        anyhow::ensure!(
+            snapshot_ran.ok,
+            "snapshot create failed: {}",
+            snapshot_ran.stderr.trim()
+        );
+        // The set is not lost.
+        match report(&set_ran, "fcvm balloon --pid P MIB during a snapshot") {
+            Ok(printed) if printed.target_mib == SET_MIB => {}
+            Ok(printed) => wrong.push(format!(
+                "the set asked for {SET_MIB} MiB during a snapshot and reported target {} MiB",
+                printed.target_mib
+            )),
+            Err(error) => wrong.push(format!("{error:#}")),
+        }
+        let source = common::balloon_stats_by_pid(pid)
+            .await
+            .context("reading the VM's balloon after the snapshot and the set")?;
+        if source.target_mib != SET_MIB {
+            wrong.push(format!(
+                "after the snapshot and the set, the VM's balloon target is {} MiB, not the \
+                 {SET_MIB} the set asked for",
+                source.target_mib
+            ));
+        }
+        anyhow::Ok(())
+    }
+    .await;
+    // The clone restores from the snapshot files, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        snapshotted?;
+        let recorded = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&snap)
+            .await?
+            .metadata
+            .balloon_mib;
+        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap,
+                "--name",
+                &clone_name,
+            ],
+            "balloon-lock-c1",
+        )
+        .await?;
+        let restored = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            common::balloon_stats_by_pid(clone_pid)
+                .await
+                .context("reading the restored clone's balloon")
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+        let restored = restored?;
+        if recorded != Some(restored.target_mib) {
+            wrong.push(format!(
+                "the snapshot records balloon {recorded:?} and the device it saved holds {} \
+                 MiB: a target was set between the snapshot's read and its save",
+                restored.target_mib
+            ));
+        }
+        if recorded != Some(BOOT_MIB) {
+            wrong.push(format!(
+                "the snapshot had read the balloon before the set started and records \
+                 {recorded:?}, not Some({BOOT_MIB})"
+            ));
+        }
+        anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+    .await;
+    let _ = common::delete_snapshot(&snap).await;
+    result
+}
+
+/// Two sets do not interleave: each reports the target it set. The first is held by
+/// a failpoint between its PATCH and its report, and a second, with another target,
+/// is started while it is held. The first has to report its own 96 and the second
+/// its own 80, and the VM ends at 80, the later of the two. Without the lock the
+/// second set's PATCH lands inside the first, which then reports 80.
+#[tokio::test]
+async fn test_two_balloon_sets_each_report_their_own_target() -> Result<()> {
+    const BOOT_MIB: u32 = 64;
+    const FIRST_MIB: u32 = 96;
+    const SECOND_MIB: u32 = 80;
+    const FAILPOINT: &str = "balloon.post_set_pre_report";
+    let (name, _, _, _) = common::unique_names("balloon-two");
+    let (boot, first_mib, second_mib) = (
+        BOOT_MIB.to_string(),
+        FIRST_MIB.to_string(),
+        SECOND_MIB.to_string(),
+    );
+
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--balloon",
+            &boot,
+            "nginx:alpine",
+        ],
+        "balloon-two-vm",
+    )
+    .await?;
+    let pid_arg = pid.to_string();
+    let result = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        let first =
+            start_and_hold(&["balloon", "--pid", &pid_arg, &first_mib], FAILPOINT, 5000).await?;
+        // The first set has sent its PATCH and not read its report yet, for 5 s.
+        let second = fcvm_balloon(&["--pid", &pid_arg, &second_mib]).await?;
+        let first = first.finish("the first set").await?;
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (which, ran, asked) in [
+            ("first", &first, FIRST_MIB),
+            ("second", &second, SECOND_MIB),
+        ] {
+            match report(ran, &format!("the {which} set")) {
+                Ok(printed) if printed.target_mib == asked => {}
+                Ok(printed) => wrong.push(format!(
+                    "the {which} set asked for {asked} MiB and reported target {} MiB",
+                    printed.target_mib
+                )),
+                Err(error) => wrong.push(format!("{error:#}")),
+            }
+        }
+        let end = common::balloon_stats_by_pid(pid)
+            .await
+            .context("reading the VM's balloon after both sets")?;
+        if end.target_mib != SECOND_MIB {
+            wrong.push(format!(
+                "the VM ends at target {} MiB, not the {SECOND_MIB} of the set that ran last",
+                end.target_mib
+            ));
+        }
+        anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+    result
+}

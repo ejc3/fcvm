@@ -1628,6 +1628,16 @@ one is read from `GET /vm/config`. When Firecracker answers the set with a 400,
 the error says what it refuses (a device the guest never activated, as with a
 kernel that has no virtio balloon driver).
 
+A set holds the VM's snapshot lock from its device check to its report. Every
+snapshot of the VM holds that lock from its read of the balloon to its save, and
+a pause does not keep a `PATCH` out (Firecracker applies it to a paused VM), so
+without the lock a target could land in between and leave a snapshot whose
+record and saved device disagree. Two sets cannot interleave either, so each
+reports the target it set. A set waits up to 60 seconds for the lock, then fails
+and says the target was not set: a snapshot of a large VM holds the lock for
+minutes. A report without MIB changes nothing, takes no lock and does not wait.
+A `PATCH /balloon` sent to the API socket by anything else is outside the lock.
+
 The command writes no state. What follows the new target, and what does not:
 
 - **The next snapshot of the VM does.** A memory snapshot and a disk-only
@@ -1648,6 +1658,9 @@ The command writes no state. What follows the new target, and what does not:
 
 `test_balloon_command_sets_and_reports_the_target` covers the report, the set,
 the unchanged state and the snapshot's record.
+`test_balloon_set_cannot_land_between_a_snapshots_read_and_its_save` and
+`test_two_balloon_sets_each_report_their_own_target` cover the lock, each with a
+failpoint that holds the other side where the set must not land.
 
 #### `fcvm snapshots`
 

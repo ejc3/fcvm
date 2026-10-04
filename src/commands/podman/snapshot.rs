@@ -420,6 +420,41 @@ mod tests {
 
     use super::*;
 
+    /// `podman run`'s own pre-start and startup snapshots, and `podman prepare`'s,
+    /// hold the per-VM snapshot lock from before the shared creator reads the VM's
+    /// balloon until it has saved the VM: the lock is bound for the rest of the
+    /// function, and taken before `create_snapshot_core`. `fcvm balloon` takes the
+    /// same lock to set a target, so a target cannot land between that read and
+    /// the save.
+    #[test]
+    fn podmans_own_snapshots_hold_the_vm_snapshot_lock_through_the_save() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let start = code
+            .find("pub async fn create_podman_snapshot(")
+            .expect("no create_podman_snapshot");
+        let body = &code[start..];
+        let bound = body.find("let (_generation_locks, _vm_lock, ").expect(
+            "create_podman_snapshot does not keep the per-VM snapshot lock for the rest of \
+             the function",
+        );
+        let taken = body
+            .find("acquire_vm_snapshot_lock(disk_path)")
+            .expect("create_podman_snapshot does not take the per-VM snapshot lock");
+        let saved = body
+            .find("create_snapshot_core(")
+            .expect("create_podman_snapshot does not call create_snapshot_core");
+        assert!(
+            bound < taken && taken < saved,
+            "the lock is not taken before the shared creator runs: bound at {bound}, taken \
+             at {taken}, creator at {saved}"
+        );
+        assert!(
+            !body.contains("drop(_vm_lock)"),
+            "create_podman_snapshot gives the per-VM snapshot lock back before it returns"
+        );
+    }
+
     #[test]
     fn test_snapshot_run_firecracker_overrides_preserve_runtime_config() {
         let runtime_config = crate::commands::common::RuntimeConfig {

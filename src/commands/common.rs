@@ -3034,7 +3034,31 @@ pub fn extra_disks_to_snapshot(vm_state: &VmState) -> Vec<crate::storage::Snapsh
 ///
 /// disk_path is like `.../vm-disks/{vm_id}/disks/rootfs.raw` — lock is placed
 /// in the vm_id directory.
+///
+/// A snapshot holds it from its read of the VM's balloon to its save, and
+/// `fcvm balloon` takes it to set a target, so the target cannot change in between.
 pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File> {
+    lock_vm_snapshots(disk_path, None)
+        .await?
+        .context("the wait for the per-VM snapshot lock ended without the lock")
+}
+
+/// The per-VM snapshot lock for a caller that must not wait out a long snapshot:
+/// None when another holder still has it after `wait`.
+///
+/// `fcvm balloon` takes it to set a target, and a snapshot of a large VM holds
+/// the lock for minutes.
+pub async fn acquire_vm_snapshot_lock_within(
+    disk_path: &Path,
+    wait: std::time::Duration,
+) -> Result<Option<std::fs::File>> {
+    lock_vm_snapshots(disk_path, Some(std::time::Instant::now() + wait)).await
+}
+
+async fn lock_vm_snapshots(
+    disk_path: &Path,
+    give_up_at: Option<std::time::Instant>,
+) -> Result<Option<std::fs::File>> {
     let vm_dir = disk_path
         .parent()
         .and_then(|p| p.parent())
@@ -3047,6 +3071,9 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if give_up_at.is_some_and(|at| std::time::Instant::now() >= at) {
+                    return Ok(None);
+                }
                 debug!("waiting for per-VM snapshot lock");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -3056,7 +3083,7 @@ pub async fn acquire_vm_snapshot_lock(disk_path: &Path) -> Result<std::fs::File>
         }
     }
     debug!(lock = %lock_path.display(), "acquired per-VM snapshot lock");
-    Ok(lock_file)
+    Ok(Some(lock_file))
 }
 
 /// Sibling path for a snapshot directory's auxiliary files (lock, .creating,
@@ -3789,6 +3816,9 @@ pub async fn create_snapshot_core(
     let mut snapshot_result = match balloon_result {
         Ok(balloon_mib) => {
             snapshot_config.metadata.balloon_mib = balloon_mib;
+            // failpoint: hold between the read of the balloon and the save, where a
+            // target set by `fcvm balloon` must not land.
+            failpoint::hit_async("snapshot.post_balloon_read_pre_save").await;
             snapshot_client
                 .create_snapshot(SnapshotCreate {
                     snapshot_type: Some(snapshot_type.to_string()),
