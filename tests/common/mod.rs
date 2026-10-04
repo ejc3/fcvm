@@ -1252,11 +1252,11 @@ pub async fn wait_for_nginx(pid: u32, limit: Duration) -> anyhow::Result<()> {
     }
 }
 
-/// Balloon target and current size of a running Firecracker VM, read from its API
-/// socket. Errors when the VM has no balloon device (Firecracker answers 400).
+/// Balloon target of a running Firecracker VM, read from its API socket. Errors when
+/// the VM has no balloon device (Firecracker answers 400).
 pub async fn balloon_stats_by_pid(
     pid: u32,
-) -> anyhow::Result<fcvm::firecracker::api::BalloonStatistics> {
+) -> anyhow::Result<fcvm::firecracker::api::BalloonStats> {
     let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
         .load_state_by_pid(pid)
         .await

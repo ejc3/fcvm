@@ -428,7 +428,15 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
                 restored.target_mib
             );
 
-            reboot_and_assert_relaunch(clone_pid, &token).await?;
+            // reboot_and_assert_relaunch reports a failed relaunch by panicking. It runs
+            // as its own task, so the panic comes back here as an error and the clone
+            // and the snapshot are still cleaned up below.
+            let relaunch_token = token.clone();
+            tokio::spawn(async move {
+                reboot_and_assert_relaunch(clone_pid, &relaunch_token).await
+            })
+            .await
+            .context("the relaunch check panicked")??;
 
             let rebooted = common::balloon_stats_by_pid(clone_pid)
                 .await
