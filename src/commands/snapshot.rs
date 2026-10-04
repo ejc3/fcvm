@@ -6,7 +6,7 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing::{debug, error, info, warn};
 
 use super::podman::{
-    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
+    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
     CreateSnapshotParams, SnapshotOutcome,
 };
 use crate::cli::args::RunArgs;
@@ -3220,6 +3220,7 @@ async fn cmd_snapshot_run_inner(
                             let snap = CreateSnapshotParams::cache_entry(
                                 fc_backend,
                                 &startup_key,
+                                BalloonRequirement::StartedAt(args.balloon),
                                 &vm_state,
                                 &disk_path,
                                 &volume_configs,
@@ -3249,6 +3250,10 @@ async fn cmd_snapshot_run_inner(
                                         }
                                         SnapshotOutcome::Failed(e) => {
                                             warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                        }
+                                        SnapshotOutcome::NotTaken => {
+                                            // The creator logged why. The clone keeps the pre-start
+                                            // snapshot as its parent and saves no startup snapshot.
                                         }
                                     }
                                 }

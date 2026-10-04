@@ -199,7 +199,7 @@ Use `--health-check` to snapshot the fully initialized application, not just the
 # Second run: restores with app already running
 ```
 
-With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot.
+With `--balloon`, the startup snapshot is kept per target, because the app initialized under that target. Runs that differ only in the target still share the pre-start snapshot. A run whose target `fcvm balloon` changed before the app turned healthy saves no startup snapshot, and `podman prepare` fails.
 
 ---
 

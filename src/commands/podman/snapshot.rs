@@ -49,6 +49,27 @@ pub enum ExistingGeneration {
     Replace,
 }
 
+/// Which balloon target a snapshot is good for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BalloonRequirement {
+    /// Any. A pre-start snapshot is taken before the workload starts and is shared
+    /// between targets: every run restored from it has its own target set.
+    Any,
+    /// Only the target the run started with (None: no balloon device). A startup
+    /// snapshot is named for the target its workload initialized under, and
+    /// `fcvm balloon` can change the target while the workload initializes. The
+    /// snapshot is taken only while the VM's device is still at this target.
+    StartedAt(Option<u32>),
+}
+
+/// A balloon target as an error or a log line names it.
+pub(super) fn balloon_text(target: Option<u32>) -> String {
+    match target {
+        Some(mib) => format!("{mib} MiB"),
+        None => "no balloon device".to_string(),
+    }
+}
+
 /// Parameters for cache snapshot creation.
 ///
 /// Uses VmState as the single source of truth for snapshot metadata,
@@ -64,6 +85,8 @@ pub struct CreateSnapshotParams<'a> {
     /// `User` for a caller-named artifact it must keep.
     pub snapshot_type: SnapshotType,
     pub existing: ExistingGeneration,
+    /// The balloon target the snapshot is taken at, if it is good for one only.
+    pub balloon: BalloonRequirement,
     pub vm_state: &'a VmState,
     pub disk_path: &'a Path,
     pub volume_configs: &'a [VolumeConfig],
@@ -78,6 +101,7 @@ impl CreateSnapshotParams<'_> {
     pub fn cache_entry<'a>(
         vm_manager: &'a FirecrackerBackend,
         snapshot_key: &'a str,
+        balloon: BalloonRequirement,
         vm_state: &'a VmState,
         disk_path: &'a Path,
         volume_configs: &'a [VolumeConfig],
@@ -89,6 +113,7 @@ impl CreateSnapshotParams<'_> {
             content_key: snapshot_key,
             snapshot_type: SnapshotType::System,
             existing: ExistingGeneration::Reuse,
+            balloon,
             vm_state,
             disk_path,
             volume_configs,
@@ -109,6 +134,12 @@ pub(crate) fn keeps_installed_generation(existing: ExistingGeneration, installed
 pub enum SnapshotInstall {
     Created,
     Existing,
+    /// Not taken, and the VM was not paused: a startup snapshot whose VM is no
+    /// longer at the balloon target its run started with.
+    BalloonTargetChanged {
+        started_at: Option<u32>,
+        now: Option<u32>,
+    },
 }
 
 /// Create a podman snapshot from a running VM.
@@ -133,6 +164,7 @@ pub async fn create_podman_snapshot(
         content_key,
         snapshot_type,
         existing,
+        balloon,
         vm_state,
         disk_path,
         volume_configs,
@@ -204,6 +236,32 @@ pub async fn create_podman_snapshot(
 
     // Get Firecracker client
     let client = vm_manager.client().context("VM not started")?;
+
+    // A startup snapshot is named for the balloon target its workload initialized
+    // under. `fcvm balloon` can change the target while the workload initializes,
+    // and then the workload is the startup state of neither target: not of the one
+    // in the snapshot's name, and not of the one the device holds now. So the
+    // snapshot is not taken, under either name. The comparison runs under the
+    // per-VM snapshot lock, which a set takes too, so the target cannot change
+    // between here and the save. It runs before the pause, so a VM whose snapshot
+    // is not taken is not disturbed.
+    if let BalloonRequirement::StartedAt(started_at) = *balloon {
+        let now = client
+            .balloon_target_mib()
+            .await
+            .context("reading the VM's balloon device before its startup snapshot")?;
+        if now != started_at {
+            info!(
+                snapshot_key = %snapshot_key,
+                started_at = %balloon_text(started_at),
+                now = %balloon_text(now),
+                "Not taking the startup snapshot: the VM's balloon target was changed \
+                 while its workload initialized, so the workload did not initialize under \
+                 the target the snapshot is named for"
+            );
+            return Ok(SnapshotInstall::BalloonTargetChanged { started_at, now });
+        }
+    }
 
     // Build snapshot config from VmState (single source of truth)
     let snapshot_volumes = crate::commands::common::volume_configs_to_snapshot(volume_configs);
@@ -285,10 +343,12 @@ pub async fn create_snapshot_interruptible(
 
     // Run snapshot to completion so its source disposition is always honored.
     match create_podman_snapshot(snap, source_disposition).await {
-        Ok(_) => {
+        Ok(install) => {
             if cancel.is_cancelled() {
                 // Snapshot succeeded but we're shutting down
                 SnapshotOutcome::Interrupted
+            } else if matches!(install, SnapshotInstall::BalloonTargetChanged { .. }) {
+                SnapshotOutcome::NotTaken
             } else {
                 SnapshotOutcome::Created
             }
@@ -452,6 +512,36 @@ mod tests {
         assert!(
             !body.contains("drop(_vm_lock)"),
             "create_podman_snapshot gives the per-VM snapshot lock back before it returns"
+        );
+    }
+
+    /// A startup snapshot is not taken once the VM's balloon target is no longer the
+    /// one its run started with. The creator compares the two after it has the
+    /// per-VM snapshot lock, which `fcvm balloon` takes to set a target, and before
+    /// the shared creator pauses and saves the VM. So a set cannot land between the
+    /// comparison and the save.
+    #[test]
+    fn a_startup_snapshot_compares_the_balloon_target_under_the_vm_snapshot_lock() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let start = code
+            .find("pub async fn create_podman_snapshot(")
+            .expect("no create_podman_snapshot");
+        let body = &code[start..];
+        let locked = body
+            .find("acquire_vm_snapshot_lock(disk_path)")
+            .expect("create_podman_snapshot does not take the per-VM snapshot lock");
+        let compared = body.find(".balloon_target_mib()").expect(
+            "create_podman_snapshot does not read the VM's balloon target before a startup \
+             snapshot",
+        );
+        let saved = body
+            .find("create_snapshot_core(")
+            .expect("create_podman_snapshot does not call create_snapshot_core");
+        assert!(
+            locked < compared && compared < saved,
+            "the balloon target is not compared between taking the lock and the save: lock \
+             at {locked}, comparison at {compared}, creator at {saved}"
         );
     }
 

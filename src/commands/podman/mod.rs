@@ -35,7 +35,7 @@ pub(crate) use listeners::{
 
 use snapshot::{build_firecracker_config, snapshot_run_firecracker_overrides};
 pub use snapshot::{
-    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key,
+    check_podman_snapshot, create_snapshot_interruptible, startup_snapshot_key, BalloonRequirement,
     CreateSnapshotParams, ExistingGeneration, SnapshotInstall,
 };
 pub(crate) use vm_config::{
@@ -2355,6 +2355,8 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     let snap = CreateSnapshotParams::cache_entry(
                         fc_backend,
                         key,
+                        // Taken before the workload starts and shared between targets.
+                        BalloonRequirement::Any,
                         &ctx.vm_state,
                         &ctx.disk_path,
                         &ctx.volume_configs,
@@ -2417,6 +2419,9 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
                         }
+                        SnapshotOutcome::NotTaken => {
+                            // Only a startup snapshot is declined. Continue cold like a failure.
+                        }
                     }
                     // Continue cold in this VM (snapshot kept alongside a
                     // resumed source, or creation failed). Recorded BEFORE the
@@ -2475,6 +2480,7 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                         let snap = CreateSnapshotParams::cache_entry(
                             fc_backend,
                             &startup_key,
+                            BalloonRequirement::StartedAt(ctx.args.balloon),
                             &ctx.vm_state,
                             &ctx.disk_path,
                             &ctx.volume_configs,
@@ -2505,6 +2511,10 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     }
                                     SnapshotOutcome::Failed(e) => {
                                         warn!(snapshot_key = %startup_key, error = %e, "Failed to create startup snapshot");
+                                    }
+                                    SnapshotOutcome::NotTaken => {
+                                        // The creator logged why. The run keeps the pre-start
+                                        // snapshot as its parent and saves no startup snapshot.
                                     }
                                 }
                             }
@@ -2611,6 +2621,8 @@ async fn run_prepare_loop(
         content_key: &target.content_key,
         snapshot_type: target.snapshot_type,
         existing: target.existing,
+        // What prepare installs is a startup snapshot.
+        balloon: BalloonRequirement::StartedAt(ctx.args.balloon),
         vm_state: &ctx.vm_state,
         disk_path: &ctx.disk_path,
         volume_configs: &ctx.volume_configs,
@@ -2629,6 +2641,13 @@ async fn run_prepare_loop(
     let cache = match install {
         SnapshotInstall::Created => PreparedCache::Created,
         SnapshotInstall::Existing => PreparedCache::Hit,
+        SnapshotInstall::BalloonTargetChanged { started_at, now } => bail!(
+            "the VM's balloon target was changed from {} to {} while it was being prepared, \
+             so its workload did not initialize under the target the prepared snapshot is \
+             named for; nothing was installed",
+            snapshot::balloon_text(started_at),
+            snapshot::balloon_text(now)
+        ),
     };
     let prepared = verify_prepared_snapshot(&target, cache)
         .await?

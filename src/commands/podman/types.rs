@@ -267,6 +267,9 @@ pub enum SnapshotOutcome {
     Failed(anyhow::Error),
     /// Signal received during creation (caller should break and shutdown)
     Interrupted,
+    /// Not taken, and the VM was not paused: a startup snapshot whose VM is no longer
+    /// at the balloon target its run started with. The creator has logged why.
+    NotTaken,
 }
 
 /// Parsed volume mapping from --map HOST:GUEST[:ro] specification.

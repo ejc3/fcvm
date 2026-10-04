@@ -505,3 +505,221 @@ async fn test_two_balloon_sets_each_report_their_own_target() -> Result<()> {
     let _ = child.kill().await;
     result
 }
+
+/// What one `podman run` decided about the snapshot cache, from the line it logs
+/// when it decides: which kind of start, and the snapshot key the line names.
+#[cfg(feature = "privileged-tests")]
+fn cache_choice(log: &std::path::Path) -> Option<(&'static str, String)> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines().find_map(|line| {
+        let which = if line.contains("Startup snapshot hit!") {
+            "startup snapshot"
+        } else if line.contains("Pre-start snapshot hit!") {
+            "pre-start snapshot"
+        } else if line.contains("Snapshot miss, will create snapshot") {
+            "cold boot"
+        } else {
+            return None;
+        };
+        let key = line
+            .split("snapshot_key=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?;
+        Some((which, key.to_string()))
+    })
+}
+
+/// nginx, started only once the test has made `/tmp/go` in the container. Until
+/// then the health check fails, so the run cannot reach its startup snapshot.
+#[cfg(feature = "privileged-tests")]
+const HELD_NGINX: &str =
+    "sh -c 'while [ ! -e /tmp/go ]; do sleep 0.2; done; exec nginx -g \"daemon off;\"'";
+
+/// One `podman run --balloon 64 --health-check` whose workload is held. Returns
+/// once its container is running, which is after its pre-start snapshot, with the
+/// run's cache choice.
+#[cfg(feature = "privileged-tests")]
+async fn held_startup_run(
+    run: &str,
+    name: &str,
+    env_unique: &str,
+    cleanup_pids: &mut Vec<u32>,
+) -> Result<(u32, (&'static str, String))> {
+    let (_child, pid, log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "run",
+            "--name",
+            name,
+            "--network",
+            "routed",
+            "--env",
+            env_unique,
+            "--balloon",
+            "64",
+            "--health-check",
+            "http://localhost/",
+            "--cmd",
+            HELD_NGINX,
+            "nginx:alpine",
+        ],
+        &[],
+    )
+    .await
+    .with_context(|| format!("spawning {run}"))?;
+    cleanup_pids.push(pid);
+    let deadline = Instant::now() + Duration::from_secs(300);
+    while common::exec_in_container(pid, &["true"]).await.is_err() {
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{run}'s container was not running 300s after the run was spawned"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    let choice = cache_choice(&log)
+        .with_context(|| format!("{run}'s log has no line that says how it started"))?;
+    Ok((pid, choice))
+}
+
+/// Set the held run's balloon target when `set_mib` is given, then let its workload
+/// start and wait for the run to turn healthy. The run takes or declines its startup
+/// snapshot before it reports healthy.
+#[cfg(feature = "privileged-tests")]
+async fn release_held_run(run: &str, pid: u32, set_mib: Option<u32>) -> Result<()> {
+    if let Some(mib) = set_mib {
+        let printed = report(
+            &fcvm_balloon(&["--pid", &pid.to_string(), &mib.to_string()]).await?,
+            &format!("fcvm balloon on {run}"),
+        )?;
+        anyhow::ensure!(
+            printed.target_mib == mib,
+            "control: the set on {run} reported target {} MiB, not {mib}",
+            printed.target_mib
+        );
+    }
+    // Control: the workload is still held, so the run has not turned healthy.
+    let health = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(pid)
+        .await?
+        .health_status;
+    anyhow::ensure!(
+        !matches!(health, fcvm::state::HealthStatus::Healthy),
+        "control: {run} is healthy before its workload was let go"
+    );
+    common::exec_in_container(pid, &["touch /tmp/go"])
+        .await
+        .with_context(|| format!("letting {run}'s workload start"))?;
+    common::poll_health_by_pid(pid, 300)
+        .await
+        .with_context(|| format!("{run} never turned healthy"))
+}
+
+/// A startup snapshot is named for the balloon target its workload initialized
+/// under. When `fcvm balloon` changes the target while the workload initializes, the
+/// run does not take its startup snapshot: the workload is the startup state of
+/// neither target, and a later run at the named target would restore it. Run 1
+/// cold-boots at 64 MiB with its workload held, is set to 96, and is then let go: it
+/// has to turn healthy with no startup snapshot, under either name. Run 2 is the
+/// same run again, so it restores the pre-start snapshot, and it is set to 96 the
+/// same way: that covers the save in the restore loop. Run 3 is the control: nobody
+/// changes its target, and it has to leave the 64 MiB startup snapshot.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed() -> Result<()> {
+    const START_MIB: u32 = 64;
+    const SET_MIB: u32 = 96;
+    let (name_1, name_2, _, _) = common::unique_names("balloon-init");
+    let name_3 = format!("{name_1}-untouched");
+    // The same unique --env on every run: one snapshot key, cold on the first run.
+    let env_unique = format!("BALLOONINIT_ID={name_1}");
+    let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+
+    let mut cleanup_pids = Vec::new();
+    let mut pre_start_key: Option<String> = None;
+    let result: Result<()> = async {
+        let (pid_1, (how_1, key)) =
+            held_startup_run("run 1", &name_1, &env_unique, &mut cleanup_pids).await?;
+        anyhow::ensure!(
+            how_1 == "cold boot",
+            "control: run 1 starts from a cold cache and started from a {how_1}"
+        );
+        pre_start_key = Some(key.clone());
+        let startup = fcvm::commands::podman::startup_snapshot_key(&key, Some(START_MIB));
+        let at_new_target = fcvm::commands::podman::startup_snapshot_key(&key, Some(SET_MIB));
+        let pre_start = ("pre-start snapshot", key.clone());
+
+        release_held_run("run 1", pid_1, Some(SET_MIB)).await?;
+        anyhow::ensure!(
+            !common::snapshot_exists(&startup),
+            "run 1's balloon target was changed from {START_MIB} to {SET_MIB} MiB before its \
+             workload initialized, and the run saved the startup snapshot {startup}, which \
+             later {START_MIB} MiB runs restore"
+        );
+        anyhow::ensure!(
+            !common::snapshot_exists(&at_new_target),
+            "run 1 saved a startup snapshot under the target it was set to, {at_new_target}"
+        );
+        let recorded = states.load_state_by_pid(pid_1).await?.config.snapshot_name;
+        anyhow::ensure!(
+            recorded.as_deref() == Some(key.as_str()),
+            "run 1's state names snapshot {recorded:?}, not its pre-start snapshot {key}"
+        );
+        common::kill_process(pid_1).await;
+
+        let (pid_2, choice_2) =
+            held_startup_run("run 2", &name_2, &env_unique, &mut cleanup_pids).await?;
+        anyhow::ensure!(
+            choice_2 == pre_start,
+            "run 2 has only the pre-start snapshot {key} to restore and started from {choice_2:?}"
+        );
+        release_held_run("run 2", pid_2, Some(SET_MIB)).await?;
+        anyhow::ensure!(
+            !common::snapshot_exists(&startup),
+            "run 2 restored the pre-start snapshot, its balloon target was changed from \
+             {START_MIB} to {SET_MIB} MiB before its workload initialized, and the run saved \
+             the startup snapshot {startup}"
+        );
+        anyhow::ensure!(
+            !common::snapshot_exists(&at_new_target),
+            "run 2 saved a startup snapshot under the target it was set to, {at_new_target}"
+        );
+        common::kill_process(pid_2).await;
+
+        let (pid_3, choice_3) =
+            held_startup_run("run 3", &name_3, &env_unique, &mut cleanup_pids).await?;
+        anyhow::ensure!(
+            choice_3 == pre_start,
+            "run 3 has only the pre-start snapshot {key} to restore and started from {choice_3:?}"
+        );
+        release_held_run("run 3", pid_3, None).await?;
+        anyhow::ensure!(
+            common::snapshot_exists(&startup),
+            "control: nobody changed run 3's balloon target, and it is healthy with no startup \
+             snapshot {startup}"
+        );
+        Ok(())
+    }
+    .await;
+
+    for pid in cleanup_pids.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    // Every snapshot of this test's runs is a directory named from run 1's pre-start
+    // key, which the unique --env makes this test's own.
+    if let Some(pre_start) = &pre_start_key {
+        let named_from_it = format!("{pre_start}-");
+        if let Ok(entries) = std::fs::read_dir(fcvm::paths::snapshot_dir()) {
+            for entry in entries.flatten() {
+                let is_dir = entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false);
+                let Ok(name) = entry.file_name().into_string() else {
+                    continue;
+                };
+                if is_dir && (&name == pre_start || name.starts_with(&named_from_it)) {
+                    let _ = common::delete_snapshot(&name).await;
+                }
+            }
+        }
+    }
+    result
+}
