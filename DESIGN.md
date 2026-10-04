@@ -2286,12 +2286,45 @@ still load):
   a balloon. From the code, a disk-only clone of one cold-boots under Cloud
   Hypervisor with the recorded target as the `balloon` size in the VM config
   it is created from, and no test reads that device back. A restored Cloud
-  Hypervisor clone has no reboot relaunch (a guest reboot ends it). A snapshot
-  created before the field existed records no target, and cold boots from it
-  attach no balloon device. That covers cache snapshots too: a
-  `podman run --balloon` that restores from one runs with the device, but its
-  state and the snapshots taken of it record none. `fcvm snapshots prune`
-  removes the cache snapshots.
+  Hypervisor clone has no reboot relaunch (a guest reboot ends it).
+  On Firecracker the record follows the VMM, which is the authority on its
+  device: the target can be changed on the VM's API socket after boot, and
+  nothing writes that to the VM's state. The device is read from
+  `GET /vm/config`. A memory snapshot reads it inside the shared creator, with
+  the VM paused and right before the save, so `snapshot create` and
+  `podman run`'s own pre-start and startup snapshots record the target the
+  saved device holds. A disk-only capture has no pause and reads it under the
+  per-VM snapshot lock. Every memory restore reads it before the resume, after
+  it has set the caller's target if there is one, and the clone's state
+  records what it reports
+  (`test_snapshot_and_restored_clone_record_the_balloon_the_vmm_has`). A
+  disk-only clone has no restored VM to ask. It cold-boots from the
+  snapshot's record, and attaches no balloon device when the snapshot has
+  none. Cloud Hypervisor has no call to ask, so its snapshots and clones copy
+  the record.
+- **Balloon target on a snapshot cache hit**: the snapshot key says whether a
+  balloon device exists and not its target, so `podman run` invocations that
+  differ only in the `--balloon` value share one snapshot. Whether the device
+  exists stays in the key because one cannot be added to a restored VM. A
+  cache hit sets its own target on the loaded, paused VM (`PATCH /balloon`)
+  before the guest resumes, and its state records that target. A target that
+  cannot be set ends the run, with no fallback to a cold boot. A target above
+  `--mem` is refused before the cache is looked up, so a hit and a miss refuse
+  alike. `fcvm snapshot run` has no flag for the target and restores the
+  device as it was saved.
+  `test_balloon_target_honored_on_snapshot_cache_hit` covers it with one hit
+  above the snapshot's target and one below. Two limits:
+  - The guest has to have activated the device. Firecracker refuses a target
+    for a device the guest never activated (a custom kernel without the
+    virtio balloon driver), so the first run of such a configuration
+    cold-boots and every later one, a cache hit, fails. On an NV2 profile the
+    first run fails too: a miss there tears its cold-booted VM down and
+    restores its own snapshot with the caller's target. `--no-snapshot` runs
+    it.
+  - A startup-snapshot hit hands over a guest whose workload started under
+    the target of the run that made the snapshot, and reaches its own target
+    only after the restore. Refusing a target above `--mem` is the only
+    balloon behaviour that is the same on a hit and on a miss.
 - **Extra disks** (`--disk-dir`): intentionally fail-fast — disk-only capture
   rejects sources with extra disks, and reboot-in-place is disabled for restored
   clones that have them (a relaunch would silently drop the data disks).

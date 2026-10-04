@@ -773,9 +773,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         anyhow::bail!("VM disk not found at {}", vm_disk_path.display());
     }
 
-    // The control client is created per-backend in the memory-snapshot branch below
-    // (FirecrackerClient vs ChClient on the same socket path). The disk-only path needs
-    // no control client (it quiesces the guest over vsock).
+    // Control clients are created where they are used, on the same socket path: a
+    // Firecracker VM's for a disk-only capture's balloon read and for the memory
+    // snapshot, Cloud Hypervisor's for its memory snapshot. The disk-only capture
+    // itself quiesces the guest over vsock.
 
     let snapshot_dir = paths::snapshot_dir().join(&snapshot_name);
 
@@ -894,6 +895,22 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                  cold-boot clones cannot re-attach them",
                 vm_state.config.extra_disks.len()
             );
+        }
+        // A disk-only capture has no pause and no save to read the balloon next to
+        // (a memory snapshot reads it inside `create_snapshot_core`). The record its
+        // cold-boot clones attach is read here from the VMM, under the per-VM
+        // snapshot lock: the target can be changed on the API socket after boot and
+        // nothing writes that to the VM's state. Cloud Hypervisor has no call to
+        // ask, so its snapshots copy the state.
+        if matches!(
+            vm_state.config.hypervisor,
+            crate::hypervisor::Backend::Firecracker
+        ) {
+            snapshot_config.metadata.balloon_mib =
+                crate::firecracker::FirecrackerClient::new(socket_path.clone())?
+                    .balloon_target_mib()
+                    .await
+                    .context("reading the VM's balloon device")?;
         }
         super::common::create_disk_only_snapshot_core(
             snapshot_config.clone(),
@@ -1712,8 +1729,9 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.portable_volumes = portable_volumes;
     // Same for the boot-plan fields: a snapshot taken FROM this clone must record
     // the original kernel profile / image device, or grand-clones lose them.
-    // The balloon target is one of them, and this clone's own relaunch after a
-    // guest reboot reads it from here.
+    // The balloon record is one of them for a Cloud Hypervisor clone: a snapshot
+    // taken of that clone copies it from here. A Firecracker restore replaces it
+    // with what its VMM reports.
     vm_state.config.balloon_mib = snapshot_config.metadata.balloon_mib;
     vm_state.config.kernel_profile = snapshot_config.metadata.kernel_profile.clone();
     vm_state.config.image_mode = snapshot_config.metadata.image_mode.clone();
@@ -2438,6 +2456,7 @@ async fn cmd_snapshot_run_inner(
         clone_ipv6: clone_ipv6_swap.as_ref().map(|(_, new)| new.clone()),
         track_dirty_pages: needs_dirty_tracking,
         firecracker_choice,
+        balloon_target_mib: args.balloon,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
@@ -4189,6 +4208,7 @@ mod tests {
             startup_snapshot_base_key: None,
             cpu: None,
             mem: None,
+            balloon: None,
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
@@ -4221,6 +4241,34 @@ mod tests {
         assert_eq!(runtime.firecracker_args, Some("--enable-nv2".to_string()));
     }
 
+    /// A disk-only `snapshot create` reads the VM's balloon from Firecracker once it
+    /// holds the per-VM snapshot lock. A memory snapshot of the same VM holds that
+    /// lock for as long as Firecracker writes the memory file, so a create waits for
+    /// its turn at the lock and sends the read when Firecracker is free to answer.
+    /// A memory snapshot reads the balloon inside `create_snapshot_core`, under the
+    /// same lock. The order is pinned by the source.
+    #[test]
+    fn snapshot_create_reads_the_balloon_under_the_vm_snapshot_lock() {
+        let source = include_str!("snapshot.rs");
+        let start = source
+            .find("async fn cmd_snapshot_create(")
+            .expect("no cmd_snapshot_create");
+        let end = source[start..]
+            .find("\nfn ensure_not_disk_only(")
+            .expect("ensure_not_disk_only no longer follows cmd_snapshot_create");
+        let body = &source[start..start + end];
+        let locked = body
+            .find("acquire_vm_snapshot_lock(")
+            .expect("snapshot create takes no per-VM snapshot lock");
+        let read = body
+            .find("snapshot_config.metadata.balloon_mib =")
+            .expect("snapshot create does not read the VM's balloon");
+        assert!(
+            locked < read,
+            "snapshot create reads the VM's balloon before it holds the per-VM snapshot lock"
+        );
+    }
+
     fn snapshot_runtime_args_without_overrides() -> SnapshotRunArgs {
         SnapshotRunArgs {
             pid: None,
@@ -4230,6 +4278,7 @@ mod tests {
             startup_snapshot_base_key: None,
             cpu: None,
             mem: None,
+            balloon: None,
             firecracker_bin: None,
             firecracker_args: None,
             hugepages: None,

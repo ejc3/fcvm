@@ -377,7 +377,9 @@ pub(super) fn build_firecracker_config(
         // forwarded to the guest by build_runtime_boot_args from the same env var.
         guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
         dns_server: args.dns.clone(),
-        balloon_mib: args.balloon,
+        balloon: args
+            .balloon
+            .map(|target_mib| crate::firecracker::BalloonDevice { target_mib }),
         agent_strace: args.strace_agent,
         extra_boot_args,
         image_disk_identity,

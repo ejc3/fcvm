@@ -1245,7 +1245,9 @@ pub(crate) fn build_launch_config(
         // forwarded to the guest by build_runtime_boot_args from the same env var.
         guest_failpoint: std::env::var("FCVM_GUEST_FAILPOINT").ok(),
         dns_server: args.dns.clone(),
-        balloon_mib: args.balloon,
+        balloon: args
+            .balloon
+            .map(|target_mib| crate::firecracker::BalloonDevice { target_mib }),
         agent_strace: args.strace_agent,
         extra_boot_args: effective_extra_boot_args(runtime_config),
         // Launch-only config: never hashed into a snapshot key, so the image
@@ -1447,10 +1449,10 @@ pub(crate) async fn configure_and_boot_vm(
     hv.add_entropy_device().await?;
 
     // Balloon (if specified). Read from the launch config. With snapshots on
-    // that is a copy of the config the snapshot key hashed, so the device
-    // attached is the device keyed.
-    if let Some(balloon_mib) = plan.launch_config.balloon_mib {
-        hv.add_balloon(balloon_mib).await?;
+    // that is a copy of the config the snapshot key hashed. The key says only
+    // that the device exists; the copy in memory still holds the target.
+    if let Some(device) = plan.launch_config.balloon {
+        hv.add_balloon(device.target_mib).await?;
     }
 
     // Start VM.

@@ -437,6 +437,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --health-check <URL>  Create startup snapshot after health passes
 --cpu <N> --mem <MB>  CPU count and memory
 --hugepages           Use 2MB hugepages (pre-allocate pool first)
+--balloon <MIB>       Balloon device target; runs that differ only in the target share a snapshot
 --privileged          Allow device access and mknod in container
 --image-mode <MODE>   overlay (default), btrfs, or archive
 --portable-volumes    Path-hash inodes for cross-machine snapshot/restore
