@@ -6,7 +6,7 @@ mod warmup;
 mod working_set;
 
 pub use handler::UffdHandler;
-pub use release::{release_idle_snapshots, Released};
+pub use release::{keep_in_use_until_exit, mark_in_use, release_idle_snapshots, Released};
 pub use server::{
     preflight_clone_hugepages, record_window_from_env, FaultAround, Prefetch, ServeShape,
     UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,

@@ -2631,7 +2631,7 @@ separately.
   recorded set, and a minor-mode server starting on the same image drops what it loaded.
 - **Idle snapshots leave the page cache when a server starts** (`src/uffd/release.rs`, #1066):
   a server that starts asks the kernel to drop the memory file of every other snapshot that
-  no live fcvm process names (`posix_fadvise(POSIX_FADV_DONTNEED)`, on a detached thread).
+  nothing is reading (`posix_fadvise(POSIX_FADV_DONTNEED)`, on a detached thread).
   Without it, a restore that follows restores of another snapshot reads its recorded set
   several times over: the kernel keeps the other snapshot's recently used pages and evicts
   the ones the new restore has just read. Measured on a 236 GB host with two snapshots of a
@@ -2639,9 +2639,14 @@ separately.
   465 GiB read with the other snapshot's file cached, against 65 s, 2m02s and 112 GiB with
   it dropped first. The reverse switch took 58 s, 4m20s and 254 GiB against 59 s, 1m51s and
   87 GiB. A dropped memory file costs its own next restore about 40 s to guest ACK (60 s
-  cold against 24 s warm). A snapshot that a live server, clone or VM names in its state is
-  left alone. A `snapshot run --snapshot` restore through Firecracker's File backend starts
-  no server and releases nothing.
+  cold against 24 s warm). In use is a shared `flock` on the memory file, held by a memory
+  server from before it maps the file and by a File-backed restore until its fcvm process
+  exits. A pass takes the lock exclusively, without waiting, around each drop, so two
+  servers that start together cannot drop each other's file, and the lock goes when its
+  holder dies. fcvm's state is not asked: a server writes its state after it has started
+  reading, and a running VM also names the snapshots it was created from. A
+  `snapshot run --snapshot` restore through Firecracker's File backend starts no server and
+  releases nothing.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would

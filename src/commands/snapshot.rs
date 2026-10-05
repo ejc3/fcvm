@@ -1119,60 +1119,19 @@ fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Serve snapshot memory (foreground)
-/// The snapshots a live fcvm process names in its state: a memory server, a clone restored
-/// from one, or a VM that recorded the snapshot it started from.
-fn snapshots_in_use(
-    states: &[crate::state::VmState],
-    live: impl Fn(&crate::state::VmState) -> bool,
-) -> std::collections::HashSet<String> {
-    states
-        .iter()
-        .filter(|state| live(state))
-        .filter_map(|state| state.config.snapshot_name.clone())
-        .collect()
-}
-
-/// Whether the process a state names is still running: its PID is alive, and when the state
-/// recorded a start time, the process at that PID started then.
-fn state_process_is_live(state: &crate::state::VmState) -> bool {
-    match state.pid {
-        Some(pid) => {
-            crate::utils::is_process_alive(pid)
-                && state
-                    .pid_start_time
-                    .is_none_or(|recorded| crate::utils::process_start_time(pid) == Some(recorded))
-        }
-        None => false,
-    }
-}
-
 /// Before a memory server starts reading `serving`, release from the page cache the memory
-/// files of the snapshots no live fcvm process names (#1066, `uffd::release`).
+/// files of the snapshots nothing is reading (#1066, `uffd::release`).
 ///
-/// The pass runs on a detached thread, like the page cache warm-up: nothing waits for it, so
-/// a slow filesystem cannot hold up the server. A pass that cannot run is logged and the
-/// restore goes on as it would have without it.
-async fn release_idle_snapshot_memory(serving: &str) {
-    let states = match crate::state::StateManager::new(paths::state_dir())
-        .list_vms()
-        .await
-    {
-        Ok(states) => states,
-        Err(error) => {
-            warn!(
-                error = %error,
-                "could not list fcvm's processes, so no idle snapshot is released from the page cache"
-            );
-            return;
-        }
-    };
-    let in_use = snapshots_in_use(&states, state_process_is_live);
+/// In use is a lock on the memory file that its reader holds, so this asks fcvm's state
+/// directory nothing. The pass runs on a detached thread, like the page cache warm-up:
+/// nothing waits for it, so a slow filesystem cannot hold up the server. A pass that cannot
+/// start is logged and the restore goes on as it would have without it.
+fn release_idle_snapshot_memory(serving: &str) {
     let (snapshot_dir, serving) = (paths::snapshot_dir(), serving.to_string());
     let spawned = std::thread::Builder::new()
         .name("fcvm-ws-release".to_string())
         .spawn(move || {
-            crate::uffd::release_idle_snapshots(&snapshot_dir, &serving, &in_use);
+            crate::uffd::release_idle_snapshots(&snapshot_dir, &serving);
         });
     if let Err(error) = spawned {
         warn!(
@@ -1182,6 +1141,7 @@ async fn release_idle_snapshot_memory(serving: &str) {
     }
 }
 
+/// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     validate_snapshot_name(&args.snapshot_name)?;
     info!(
@@ -1257,7 +1217,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // page that faulted (--uffd-fault-around / FCVM_UFFD_FAULT_AROUND). Off unless asked for.
     let fault_around = FaultAround::new(args.uffd_fault_around.unwrap_or(0))?;
 
-    release_idle_snapshot_memory(&args.snapshot_name).await;
+    release_idle_snapshot_memory(&args.snapshot_name);
 
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
@@ -2312,7 +2272,7 @@ async fn cmd_snapshot_run_inner(
                 "starting implicit UFFD server for snapshot restore"
             );
 
-            release_idle_snapshot_memory(&snapshot_name).await;
+            release_idle_snapshot_memory(&snapshot_name);
 
             // Just "implicit" — NOT the vm_id. This socket is created inside `data_dir`,
             // which IS this VM's own directory (`vm-disks/<vm_id>/`), so repeating the id in
@@ -3880,57 +3840,46 @@ async fn cmd_snapshot_ls() -> Result<()> {
 mod tests {
     use super::*;
 
-    /// A state that names `snapshot`, written by the process `pid`.
-    fn state_naming(snapshot: Option<&str>, pid: u32) -> crate::state::VmState {
-        let mut state =
-            crate::state::VmState::new("vm-unit".to_string(), "alpine:latest".to_string(), 1, 128);
-        state.pid = Some(pid);
-        state.config.snapshot_name = snapshot.map(str::to_string);
-        state
+    /// What counts as in use is the lock a reader holds on the memory file (#1067). The
+    /// pass used to ask fcvm's state directory, which names a snapshot a running VM was only
+    /// created from, and which a server writes to after it has started reading.
+    #[test]
+    fn in_use_is_decided_by_the_memory_files_lock_and_not_by_fcvms_states() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let from = code
+            .find("fn release_idle_snapshot_memory(")
+            .expect("the function that starts the release pass");
+        let body = &code[from..from + code[from..].find("\n}\n").expect("its end")];
+        assert!(body.contains("release_idle_snapshots(&snapshot_dir, &serving)"));
+        for asked in ["StateManager", "list_vms", "snapshot_name", "pid"] {
+            assert!(
+                !body.contains(asked),
+                "the release pass reads {asked} to decide what is in use: a server that has \
+                 not published its state yet, or a VM that only names a snapshot as its diff \
+                 base, is judged wrongly that way"
+            );
+        }
     }
 
-    /// Only a live process keeps a snapshot's memory file in the page cache when another
-    /// snapshot's server starts (#1066): a state whose process is gone names nothing.
+    /// A restore whose VMM maps the memory file itself has no memory server to hold the
+    /// file in use, so the restore marks it before it hands the path to the VMM.
     #[test]
-    fn only_snapshots_a_live_process_names_are_in_use() {
-        let states = [
-            state_naming(Some("served-by-a-live-server"), 1),
-            state_naming(Some("left-by-a-dead-clone"), 2),
-            state_naming(None, 1),
-            state_naming(Some("restored-by-a-live-clone"), 1),
-        ];
-        let in_use = snapshots_in_use(&states, |state| state.pid == Some(1));
-        assert_eq!(
-            in_use,
-            std::collections::HashSet::from([
-                "served-by-a-live-server".to_string(),
-                "restored-by-a-live-clone".to_string()
-            ])
-        );
-    }
-
-    /// A state is live only while the process that wrote it runs. This process is. A PID
-    /// whose process started at another time is not, and neither is a state with no PID.
-    #[test]
-    fn a_state_is_live_only_while_the_process_that_wrote_it_runs() {
-        let me = std::process::id();
-        let started = crate::utils::process_start_time(me);
-        assert!(started.is_some(), "control: this process has a start time");
-
-        let mut mine = state_naming(Some("x"), me);
-        mine.pid_start_time = started;
-        assert!(state_process_is_live(&mine));
-
-        let mut reused = state_naming(Some("x"), me);
-        reused.pid_start_time = started.map(|ticks| ticks + 1);
+    fn a_file_backed_restore_marks_its_memory_file_in_use_before_it_loads_it() {
+        let source = include_str!("common.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let arm = code
+            .find("MemoryBackend::File { memory_path } => {")
+            .expect("the file-backed arm of the restore");
+        let load = arm
+            + code[arm..]
+                .find("backend_type: \"File\".to_string()")
+                .expect("the backend the VMM is told to load");
         assert!(
-            !state_process_is_live(&reused),
-            "a PID that another process holds now was taken for the one that wrote the state"
+            code[arm..load].contains("crate::uffd::keep_in_use_until_exit(memory_path).await"),
+            "a file-backed restore does not mark its memory file in use: a server that starts \
+             for another snapshot would drop its cached pages"
         );
-
-        let mut never_started = state_naming(Some("x"), me);
-        never_started.pid = None;
-        assert!(!state_process_is_live(&never_started));
     }
 
     /// Both places that build a memory server release idle snapshots first (#1066): the
