@@ -1119,6 +1119,28 @@ fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Before a memory server starts reading `serving`, release from the page cache the memory
+/// files of the snapshots nothing is reading (#1066, `uffd::release`).
+///
+/// In use is a lock on the memory file that its reader holds, so this asks fcvm's state
+/// directory nothing. The pass runs on a detached thread, like the page cache warm-up:
+/// nothing waits for it, so a slow filesystem cannot hold up the server. A pass that cannot
+/// start is logged and the restore goes on as it would have without it.
+fn release_idle_snapshot_memory(serving: &str) {
+    let (snapshot_dir, serving) = (paths::snapshot_dir(), serving.to_string());
+    let spawned = std::thread::Builder::new()
+        .name("fcvm-ws-release".to_string())
+        .spawn(move || {
+            crate::uffd::release_idle_snapshots(&snapshot_dir, &serving);
+        });
+    if let Err(error) = spawned {
+        warn!(
+            error = %error,
+            "could not start the thread that releases idle snapshots from the page cache"
+        );
+    }
+}
+
 /// Serve snapshot memory (foreground)
 async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     validate_snapshot_name(&args.snapshot_name)?;
@@ -1194,6 +1216,8 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // Copy mode only: how much of the snapshot each demand fault materialises around the
     // page that faulted (--uffd-fault-around / FCVM_UFFD_FAULT_AROUND). Off unless asked for.
     let fault_around = FaultAround::new(args.uffd_fault_around.unwrap_or(0))?;
+
+    release_idle_snapshot_memory(&args.snapshot_name);
 
     // The server names its own socket after this process's (pid, start_time), so no two
     // live servers can collide on it. Clones rebuild the same name from the serve state
@@ -2247,6 +2271,8 @@ async fn cmd_snapshot_run_inner(
                 fault_around_bytes = fault_around.bytes(),
                 "starting implicit UFFD server for snapshot restore"
             );
+
+            release_idle_snapshot_memory(&snapshot_name);
 
             // Just "implicit" — NOT the vm_id. This socket is created inside `data_dir`,
             // which IS this VM's own directory (`vm-disks/<vm_id>/`), so repeating the id in
@@ -3813,6 +3839,56 @@ async fn cmd_snapshot_ls() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What counts as in use is the lock a reader holds on the memory file (#1067). The
+    /// pass used to ask fcvm's state directory, which names a snapshot a running VM was only
+    /// created from, and which a server writes to after it has started reading.
+    #[test]
+    fn in_use_is_decided_by_the_memory_files_lock_and_not_by_fcvms_states() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let from = code
+            .find("fn release_idle_snapshot_memory(")
+            .expect("the function that starts the release pass");
+        let body = &code[from..from + code[from..].find("\n}\n").expect("its end")];
+        assert!(body.contains("release_idle_snapshots(&snapshot_dir, &serving)"));
+        for asked in ["StateManager", "list_vms", "snapshot_name", "pid"] {
+            assert!(
+                !body.contains(asked),
+                "the release pass reads {asked} to decide what is in use: a server that has \
+                 not published its state yet, or a VM that only names a snapshot as its diff \
+                 base, is judged wrongly that way"
+            );
+        }
+    }
+
+    /// Both places that build a memory server release idle snapshots first (#1066): the
+    /// `snapshot serve` command and the implicit server inside `snapshot run`.
+    #[test]
+    fn every_memory_server_is_built_after_idle_snapshots_were_released() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let servers: Vec<usize> = code
+            .match_indices("UffdServer::new(")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(
+            servers.len(),
+            2,
+            "this file builds a memory server in {} places, not the two this test knows",
+            servers.len()
+        );
+        let mut from = 0;
+        for at in servers {
+            assert!(
+                code[from..at].contains("release_idle_snapshot_memory(&"),
+                "a memory server is built with no release of idle snapshots before it: without \
+                 one, a restore that follows another snapshot's reads its recorded pages \
+                 several times over"
+            );
+            from = at;
+        }
+    }
     use crate::storage::snapshot::SnapshotVolumeConfig;
     use crate::storage::SnapshotKind;
 

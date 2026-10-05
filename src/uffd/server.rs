@@ -683,6 +683,8 @@ pub struct UffdServer {
     /// prefetch on: minor mode reads the whole image into its memfd at startup, and prefetch
     /// off loads no recorded set. Cancelling or dropping the server stops a running one.
     warmer: Option<Warmer>,
+    /// The memory file, marked in use (`uffd::release`) until this server is dropped.
+    _in_use: Option<File>,
 }
 
 impl UffdServer {
@@ -769,6 +771,29 @@ impl UffdServer {
         // Open the memory snapshot file (shared across all VMs)
         let mem_file = File::open(mem_file_path).context("opening memory file")?;
         let mem_size = mem_file.metadata()?.len() as usize;
+
+        // Mark the memory file in use before any of it is read: a server that starts for
+        // another snapshot drops from the page cache every memory file nothing holds
+        // (`uffd::release`). The duplicate shares the open file description and with it the
+        // lock, so the mark lasts as long as this server, whichever mode keeps `mem_file`.
+        let in_use = async {
+            super::release::mark_in_use(&mem_file).await?;
+            mem_file.try_clone()
+        }
+        .await;
+        let in_use = match in_use {
+            Ok(file) => Some(file),
+            Err(error) => {
+                warn!(
+                    target: "uffd",
+                    snapshot = %snapshot_id,
+                    error = %error,
+                    "could not mark the memory file in use: a server that starts for another \
+                     snapshot may drop its cached pages"
+                );
+                None
+            }
+        };
 
         info!(
             target: "uffd",
@@ -886,6 +911,7 @@ impl UffdServer {
             working_set_persistence,
             record_window,
             warmer,
+            _in_use: in_use,
         };
         // Copy mode reads every page it serves through the mapping, so with a cold page
         // cache a restore replays from disk one major fault at a time. Start reading the
@@ -4035,6 +4061,30 @@ mod tests {
 
         assert!(server.warmer.is_some());
         assert_eq!(wait_until_resident(&mmap, &snapshot.recorded), Ok(()));
+    }
+
+    /// A server holds its memory file in use from `new()` until it is dropped, so the pass
+    /// another snapshot's server runs leaves the file alone for exactly that long (#1067).
+    #[tokio::test]
+    async fn a_server_holds_its_memory_file_in_use_until_it_is_dropped() {
+        let snapshot = RecordedSnapshot::new();
+        let pass = File::open(&snapshot.image).unwrap();
+        fs2::FileExt::try_lock_exclusive(&pass)
+            .expect("control: nothing holds the file before a server starts");
+        fs2::FileExt::unlock(&pass).unwrap();
+
+        let server = snapshot.serve(UffdBacking::Copy, Prefetch::Off).await;
+        assert_eq!(
+            fs2::FileExt::try_lock_exclusive(&pass)
+                .err()
+                .map(|error| error.kind()),
+            Some(std::io::ErrorKind::WouldBlock),
+            "a pass could take a running server's memory file to drop it"
+        );
+
+        drop(server);
+        fs2::FileExt::try_lock_exclusive(&pass)
+            .expect("a dropped server still holds its memory file in use");
     }
 
     /// `--uffd-prefetch off` stays inert: with a recorded set sitting beside the image, the
