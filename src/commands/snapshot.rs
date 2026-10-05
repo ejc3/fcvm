@@ -3078,6 +3078,9 @@ async fn cmd_snapshot_run_inner(
                     )
                     .await;
                     if guest_rebooted {
+                        // The restored VMM is gone, and whatever replaces it cold-boots from
+                        // the disk: nothing here reads the snapshot's memory file again.
+                        crate::uffd::end_in_use();
                         reboot_requested.store(false, std::sync::atomic::Ordering::Release);
                         // Clear racing pre-reboot exit signal/files (fresh lifecycle).
                         container_exit_seen.store(false, std::sync::atomic::Ordering::Release);
@@ -3876,9 +3879,30 @@ mod tests {
                 .find("backend_type: \"File\".to_string()")
                 .expect("the backend the VMM is told to load");
         assert!(
-            code[arm..load].contains("crate::uffd::keep_in_use_until_exit(memory_path).await"),
+            code[arm..load].contains("crate::uffd::keep_in_use(memory_path).await"),
             "a file-backed restore does not mark its memory file in use: a server that starts \
              for another snapshot would drop its cached pages"
+        );
+    }
+
+    /// A clone whose guest rebooted is relaunched as a cold boot in the same fcvm process,
+    /// which can then run for a long time. It stops holding the snapshot's memory file in
+    /// use as soon as the restored VMM is seen gone, before the relaunch is even planned.
+    #[test]
+    fn a_rebooted_clone_stops_holding_its_snapshots_memory_file_in_use() {
+        let source = include_str!("snapshot.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let rebooted = code
+            .find("if guest_rebooted {")
+            .expect("the branch that relaunches a rebooted clone");
+        let plan = rebooted
+            + code[rebooted..]
+                .find("build_clone_reboot_plan(")
+                .expect("the cold-boot plan of the relaunch");
+        assert!(
+            code[rebooted..plan].contains("crate::uffd::end_in_use();"),
+            "a rebooted clone keeps its snapshot's memory file marked in use: no server \
+             could release that file while the clone runs"
         );
     }
 

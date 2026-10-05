@@ -2472,10 +2472,10 @@ pub async fn restore_from_snapshot(
                     memory = %memory_path.display(),
                     "loading snapshot with File backend"
                 );
-                // The VMM maps the memory file itself, so this process marks it in use for
-                // the VM's life: a server that starts for another snapshot leaves its cached
-                // pages alone (`uffd::release`).
-                crate::uffd::keep_in_use_until_exit(memory_path).await;
+                // The VMM maps the memory file itself, so this process marks it in use until
+                // that VMM is gone: a server that starts for another snapshot leaves its
+                // cached pages alone (`uffd::release`).
+                crate::uffd::keep_in_use(memory_path).await;
                 MemBackend {
                     backend_type: "File".to_string(),
                     backend_path: memory_path.display().to_string(),

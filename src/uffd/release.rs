@@ -23,7 +23,7 @@
 //! **In use is a lock on the memory file, not a line in fcvm's state.** Whoever reads a
 //! snapshot's memory file for a VM holds a shared `flock` on it for as long as it reads: a
 //! memory server ([`mark_in_use`], taken before the server maps the file) and a restore whose
-//! VMM maps the file itself ([`keep_in_use_until_exit`]). A pass takes the lock exclusively,
+//! VMM maps the file itself ([`keep_in_use`], until that VMM is gone). A pass takes the lock exclusively,
 //! without waiting, around each drop. So a pass either finds a reader and leaves the file
 //! alone, or holds the file while it drops it and a reader that starts meanwhile waits those
 //! milliseconds and then reads. Two servers that start together cannot drop each other's
@@ -53,7 +53,7 @@ const MEMORY_FILE: &str = "memory.bin";
 /// How long a reader waits between attempts while a pass holds its memory file.
 const IN_USE_RETRY: Duration = Duration::from_millis(10);
 
-/// The memory files this process keeps in use until it exits.
+/// The memory files this process keeps in use for its restored VMM.
 static KEPT_IN_USE: Mutex<Vec<File>> = Mutex::new(Vec::new());
 
 /// Mark an open memory file in use for as long as `file`, or a duplicate of it, stays open.
@@ -74,13 +74,14 @@ pub async fn mark_in_use(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// Keep the memory file at `memory_path` in use until this process exits.
+/// Keep the memory file at `memory_path` in use until [`end_in_use`], or until this process
+/// exits.
 ///
-/// For a restore whose VMM maps the memory file itself: the fcvm process lives exactly as
-/// long as its VM, so the mark needs no owner to pass around. Best effort: a file that
-/// cannot be marked is logged, and the cost is that a server started for another snapshot
-/// may drop this one's cached pages.
-pub async fn keep_in_use_until_exit(memory_path: &Path) {
+/// For a restore whose VMM maps the memory file itself. The fcvm process has one VM, so the
+/// mark needs no owner to pass around: the restore sets it and the place that sees the
+/// restored VMM gone ends it. Best effort: a file that cannot be marked is logged, and the
+/// cost is that a server started for another snapshot may drop this one's cached pages.
+pub async fn keep_in_use(memory_path: &Path) {
     let marked = async {
         let file = File::open(memory_path)?;
         mark_in_use(&file).await?;
@@ -96,9 +97,20 @@ pub async fn keep_in_use_until_exit(memory_path: &Path) {
             target: "uffd",
             memory = %memory_path.display(),
             error = %error,
-            "could not mark the snapshot's memory file in use: a server that starts for              another snapshot may drop its cached pages"
+            "could not mark the snapshot's memory file in use: a server that starts for \
+             another snapshot may drop its cached pages"
         ),
     }
+}
+
+/// Stop keeping any memory file in use: the VMM that mapped it is gone. A clone whose guest
+/// rebooted is relaunched as a cold boot from its disk and reads no snapshot memory again,
+/// and it can run for a long time after that.
+pub fn end_in_use() {
+    KEPT_IN_USE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }
 
 /// What one pass over the snapshot directory did.
@@ -317,14 +329,15 @@ mod tests {
             .expect("the pass kept the file locked after it had moved on");
     }
 
-    /// A file kept in use until this process exits is in use to every pass after that.
+    /// A file a restore keeps in use is left alone by every pass until the restore's VMM is
+    /// gone, and is released by the next pass after that (#1067).
     #[tokio::test]
-    async fn a_file_kept_in_use_until_exit_is_never_dropped() {
+    async fn a_file_kept_in_use_is_left_alone_until_its_vmm_is_gone() {
         let root = tempfile::tempdir_in(disk_dir()).unwrap();
         let mapped = cached_snapshot(root.path(), "file-backed");
         let before = resident_pages(&mapped, 0, LEN);
 
-        keep_in_use_until_exit(&root.path().join("file-backed").join(MEMORY_FILE)).await;
+        keep_in_use(&root.path().join("file-backed").join(MEMORY_FILE)).await;
         let done = release_idle_snapshots(root.path(), "served");
 
         assert_eq!(
@@ -336,6 +349,20 @@ mod tests {
             }
         );
         assert_eq!(resident_pages(&mapped, 0, LEN), before);
+
+        end_in_use();
+        let done = release_idle_snapshots(root.path(), "served");
+
+        assert_eq!(
+            done,
+            Released {
+                released: 1,
+                in_use: 0,
+                failed: 0
+            },
+            "a file whose VMM is gone is still held in use"
+        );
+        assert_eq!(resident_pages(&mapped, 0, LEN), 0);
     }
 
     #[test]
