@@ -2640,13 +2640,14 @@ separately.
   it dropped first. The reverse switch took 58 s, 4m20s and 254 GiB against 59 s, 1m51s and
   87 GiB. A dropped memory file costs its own next restore about 40 s to guest ACK (60 s
   cold against 24 s warm). In use is a shared `flock` on the memory file, held by a memory
-  server from before it maps the file and by a File-backed restore until its VMM is gone
-  (a guest reboot relaunches the clone as a cold boot) or its fcvm process exits. A pass takes the lock exclusively, without waiting, around each drop, so two
-  servers that start together cannot drop each other's file, and the lock goes when its
-  holder dies. fcvm's state is not asked: a server writes its state after it has started
-  reading, and a running VM also names the snapshots it was created from. A
-  `snapshot run --snapshot` restore through Firecracker's File backend starts no server and
-  releases nothing.
+  server from before it maps the file until it is dropped. A pass takes the lock
+  exclusively, without waiting, around each drop, so two servers that start together cannot
+  drop each other's file, and the lock goes when its holder dies. fcvm's state is not asked:
+  a server writes its state after it has started reading, and a running VM also names the
+  snapshots it was created from. A directory a create is still writing (`<tag>.creating`) or
+  has just replaced (`<tag>.old`) is never touched. A `snapshot run --snapshot` restore
+  through Firecracker's File backend starts no server, releases nothing and holds no mark, so
+  a pass can drop the cached pages of its snapshot that its VMM has not touched yet.
 - **Invalidation**: keyed by the exact `config.json` digest plus the memory image's
   (`len, mtime, ino, dev`) identity, not a memory-image content hash — SHA-256 of a 2 GiB
   image measures 1.4 s at 1.5 GB/s here, which costs more than the mis-prefetch it would

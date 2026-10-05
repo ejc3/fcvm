@@ -20,17 +20,25 @@
 //! starts therefore asks the kernel to drop the memory file of every other snapshot that
 //! nothing is reading.
 //!
-//! **In use is a lock on the memory file, not a line in fcvm's state.** Whoever reads a
-//! snapshot's memory file for a VM holds a shared `flock` on it for as long as it reads: a
-//! memory server ([`mark_in_use`], taken before the server maps the file) and a restore whose
-//! VMM maps the file itself ([`keep_in_use`], until that VMM is gone). A pass takes the lock exclusively,
-//! without waiting, around each drop. So a pass either finds a reader and leaves the file
-//! alone, or holds the file while it drops it and a reader that starts meanwhile waits those
+//! **In use is a lock on the memory file, not a line in fcvm's state.** A memory server holds
+//! a shared `flock` on its snapshot's memory file for as long as it serves ([`mark_in_use`],
+//! taken before the server maps the file). A pass takes the lock exclusively, without
+//! waiting, around each drop. So a pass either finds a server and leaves the file alone, or
+//! holds the file while it drops it and a server that starts meanwhile waits those
 //! milliseconds and then reads. Two servers that start together cannot drop each other's
 //! file, which a scan of the state directory allowed: a server publishes its state after it
 //! has started reading. The kernel releases the lock when its holder dies, however it dies,
 //! and a snapshot that a running VM was only created from, or is the diff base of, has no
-//! reader and is released.
+//! server and is released.
+//!
+//! A restore whose VMM maps the memory file itself (the File backend) starts no server and
+//! holds no mark. A pass can drop the cached pages of that snapshot that the VMM has not
+//! touched yet, and that VM then reads them from disk. Pages the VMM has mapped stay.
+//!
+//! A directory a snapshot create is still writing (`<tag>.creating`), or has just replaced
+//! (`<tag>.old`), is not an installed snapshot and is never touched: its creator holds the
+//! tag's lock, not a lock on that file, and a drop there would make the create read its own
+//! output back from disk.
 //!
 //! `POSIX_FADV_DONTNEED` drops the clean pages of a file that no process has mapped. A
 //! snapshot in use is skipped whole all the same: the pages its server has read ahead and
@@ -43,18 +51,18 @@ use nix::fcntl::{posix_fadvise, PosixFadviseAdvice};
 use std::fs::File;
 use std::io::ErrorKind;
 use std::path::Path;
-use std::sync::Mutex;
 use std::time::Duration;
 use tracing::{info, warn};
 
 /// The memory file's name in a snapshot's directory.
 const MEMORY_FILE: &str = "memory.bin";
 
-/// How long a reader waits between attempts while a pass holds its memory file.
-const IN_USE_RETRY: Duration = Duration::from_millis(10);
+/// The endings of the directories a snapshot create works in beside the installed
+/// snapshots (`commands::common::snapshot_sibling`).
+const NOT_INSTALLED: [&str; 2] = [".creating", ".old"];
 
-/// The memory files this process keeps in use for its restored VMM.
-static KEPT_IN_USE: Mutex<Vec<File>> = Mutex::new(Vec::new());
+/// How long a server waits between attempts while a pass holds its memory file.
+const IN_USE_RETRY: Duration = Duration::from_millis(10);
 
 /// Mark an open memory file in use for as long as `file`, or a duplicate of it, stays open.
 ///
@@ -72,45 +80,6 @@ pub async fn mark_in_use(file: &File) -> std::io::Result<()> {
             Err(error) => return Err(error),
         }
     }
-}
-
-/// Keep the memory file at `memory_path` in use until [`end_in_use`], or until this process
-/// exits.
-///
-/// For a restore whose VMM maps the memory file itself. The fcvm process has one VM, so the
-/// mark needs no owner to pass around: the restore sets it and the place that sees the
-/// restored VMM gone ends it. Best effort: a file that cannot be marked is logged, and the
-/// cost is that a server started for another snapshot may drop this one's cached pages.
-pub async fn keep_in_use(memory_path: &Path) {
-    let marked = async {
-        let file = File::open(memory_path)?;
-        mark_in_use(&file).await?;
-        Ok::<File, std::io::Error>(file)
-    }
-    .await;
-    match marked {
-        Ok(file) => KEPT_IN_USE
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(file),
-        Err(error) => warn!(
-            target: "uffd",
-            memory = %memory_path.display(),
-            error = %error,
-            "could not mark the snapshot's memory file in use: a server that starts for \
-             another snapshot may drop its cached pages"
-        ),
-    }
-}
-
-/// Stop keeping any memory file in use: the VMM that mapped it is gone. A clone whose guest
-/// rebooted is relaunched as a cold boot from its disk and reads no snapshot memory again,
-/// and it can run for a long time after that.
-pub fn end_in_use() {
-    KEPT_IN_USE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
 }
 
 /// What one pass over the snapshot directory did.
@@ -162,7 +131,7 @@ fn release_with(
         let Ok(name) = entry.file_name().into_string() else {
             continue;
         };
-        if name == serving {
+        if name == serving || NOT_INSTALLED.iter().any(|ending| name.ends_with(ending)) {
             continue;
         }
         // Anything without a memory file is not one: a lock file beside the snapshots, a
@@ -329,28 +298,19 @@ mod tests {
             .expect("the pass kept the file locked after it had moved on");
     }
 
-    /// A file a restore keeps in use is left alone by every pass until the restore's VMM is
-    /// gone, and is released by the next pass after that (#1067).
-    #[tokio::test]
-    async fn a_file_kept_in_use_is_left_alone_until_its_vmm_is_gone() {
+    /// A snapshot that is still being written, and the one a create has just replaced, sit
+    /// beside the installed snapshots under other names. A pass leaves both alone (#1067).
+    #[test]
+    fn a_snapshot_that_is_being_written_or_was_just_replaced_is_left_alone() {
         let root = tempfile::tempdir_in(disk_dir()).unwrap();
-        let mapped = cached_snapshot(root.path(), "file-backed");
-        let before = resident_pages(&mapped, 0, LEN);
-
-        keep_in_use(&root.path().join("file-backed").join(MEMORY_FILE)).await;
-        let done = release_idle_snapshots(root.path(), "served");
-
-        assert_eq!(
-            done,
-            Released {
-                released: 0,
-                in_use: 1,
-                failed: 0
-            }
+        let writing = cached_snapshot(root.path(), "next.creating");
+        let replaced = cached_snapshot(root.path(), "next.old");
+        let idle = cached_snapshot(root.path(), "idle");
+        let before = (
+            resident_pages(&writing, 0, LEN),
+            resident_pages(&replaced, 0, LEN),
         );
-        assert_eq!(resident_pages(&mapped, 0, LEN), before);
 
-        end_in_use();
         let done = release_idle_snapshots(root.path(), "served");
 
         assert_eq!(
@@ -359,10 +319,17 @@ mod tests {
                 released: 1,
                 in_use: 0,
                 failed: 0
-            },
-            "a file whose VMM is gone is still held in use"
+            }
         );
-        assert_eq!(resident_pages(&mapped, 0, LEN), 0);
+        assert_eq!(resident_pages(&idle, 0, LEN), 0);
+        assert_eq!(
+            (
+                resident_pages(&writing, 0, LEN),
+                resident_pages(&replaced, 0, LEN)
+            ),
+            before,
+            "a pass dropped pages of a snapshot that a create is writing or has just replaced"
+        );
     }
 
     #[test]
