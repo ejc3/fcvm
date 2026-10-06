@@ -466,3 +466,200 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
     let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
     result
 }
+
+/// The document the host serves on a VM's boot-plan vsock port, or None when nothing
+/// listens there. A guest that connects to that port reads the same document, with
+/// the host time of its own connection.
+async fn served_boot_plan(pid: u32) -> Result<Option<serde_json::Value>> {
+    use tokio::io::AsyncReadExt;
+
+    let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+        .load_state_by_pid(pid)
+        .await
+        .with_context(|| format!("loading the state of fcvm process {pid}"))?;
+    let base = state
+        .config
+        .vsock_socket_path
+        .context("the VM's state records no vsock socket path")?;
+    let socket = format!(
+        "{}_{}",
+        base.display(),
+        fcvm::commands::common::VSOCK_BOOTPLAN_PORT
+    );
+    let mut stream = match tokio::net::UnixStream::connect(&socket).await {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error).with_context(|| format!("connecting to {socket}")),
+    };
+    let mut bytes = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut bytes))
+        .await
+        .with_context(|| format!("{socket} accepted and sent no complete document in 5s"))?
+        .with_context(|| format!("reading {socket}"))?;
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .with_context(|| format!("{socket} served something that is not JSON"))
+}
+
+/// A restored clone that rebooted keeps running after a snapshot of it, and that
+/// snapshot restores.
+///
+/// A restore serves its epoch to the guest on the boot-plan vsock port. The agent
+/// of a guest that then reboots has handled no epoch, and it reads that port
+/// whenever its snapshot boundary is armed, which a snapshot does. If the
+/// restore's listener were still up after the relaunch, a snapshot would hand the
+/// relaunched guest the old epoch: it would run the restore sequence on a VM that
+/// was not restored, fail, and shut down.
+#[tokio::test]
+async fn test_snapshot_of_a_relaunched_clone_leaves_it_running() -> Result<()> {
+    let (name, clone_name, snap, _serve) = common::unique_names("relaunch-snap");
+    let second_snap = format!("{snap}-b");
+    let second_clone_name = format!("{clone_name}-b");
+    let snapshots = fcvm::paths::snapshot_dir();
+    let token = format!("relaunch-snap-token-{}", std::process::id());
+
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &name, "nginx:alpine"],
+        "relaunch-snap-base",
+    )
+    .await?;
+    let snapshotted = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        // reboot_and_assert_relaunch looks for the marker in the clone.
+        write_work_marker(pid, &token).await?;
+        common::create_snapshot_by_pid(pid, &snap)
+            .await
+            .context("creating the source VM's snapshot")
+    }
+    .await;
+    // The clones restore from the snapshot files, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        snapshotted?;
+        let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap,
+                "--name",
+                &clone_name,
+            ],
+            "relaunch-snap-clone",
+        )
+        .await?;
+        let checked = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            // Control: the restored clone's port serves the restore's epoch, so a
+            // port that serves nothing after the relaunch is not a blind probe.
+            let served = served_boot_plan(clone_pid).await?;
+            anyhow::ensure!(
+                served
+                    .as_ref()
+                    .and_then(|document| document.get("restore-epoch"))
+                    .is_some_and(|epoch| epoch.is_string()),
+                "control: the restored clone's boot-plan port serves no restore-epoch: {served:?}"
+            );
+
+            // reboot_and_assert_relaunch reports a failed relaunch by panicking. It runs
+            // as its own task, so the panic comes back here as an error and the clone
+            // and the snapshots are still cleaned up below.
+            let relaunch_token = token.clone();
+            tokio::spawn(
+                async move { reboot_and_assert_relaunch(clone_pid, &relaunch_token).await },
+            )
+            .await
+            .context("the relaunch check panicked")??;
+
+            let mut wrong = Vec::new();
+            if let Some(document) = served_boot_plan(clone_pid).await? {
+                wrong.push(format!(
+                    "after the relaunch the host still serves the restore's document on the \
+                     boot-plan port: {document}"
+                ));
+            }
+            if let Err(error) = common::create_snapshot_by_pid(clone_pid, &second_snap).await {
+                wrong.push(format!(
+                    "creating a snapshot of the relaunched clone: {error:#}"
+                ));
+                return Ok((wrong, false));
+            }
+            let until = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < until {
+                if !process_alive(clone_pid) {
+                    wrong.push(
+                        "the clone's fcvm process exited within 5s of the snapshot of it"
+                            .to_string(),
+                    );
+                    break;
+                }
+                if let Err(error) = common::exec_in_vm(clone_pid, &["/usr/bin/true"]).await {
+                    wrong.push(format!(
+                        "the relaunched clone stopped answering exec within 5s of the snapshot \
+                         of it: {error:#}"
+                    ));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Ok((wrong, true))
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+        let (mut wrong, snapshotted): (Vec<String>, bool) = checked?;
+
+        // Without a snapshot of the relaunched clone there is nothing to restore.
+        if snapshotted {
+            let (mut second_child, second_pid) = common::spawn_fcvm_with_logs(
+                &[
+                    "snapshot",
+                    "run",
+                    "--snapshot",
+                    &second_snap,
+                    "--name",
+                    &second_clone_name,
+                ],
+                "relaunch-snap-clone-b",
+            )
+            .await?;
+            let restored = async {
+                common::poll_health_by_pid(second_pid, 120).await?;
+                let work = common::exec_in_container(second_pid, &["cat", "/work.txt"]).await?;
+                anyhow::ensure!(
+                    work.contains(&token),
+                    "it does not hold the marker file: {work}"
+                );
+                Ok(())
+            }
+            .await;
+            common::kill_process(second_pid).await;
+            let _ = second_child.kill().await;
+            if let Err(error) = restored {
+                wrong.push(format!(
+                    "a clone restored from the relaunched clone's snapshot: {error:#}"
+                ));
+            }
+        }
+        anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
+        Ok(())
+    }
+    .await;
+    for dir in [
+        snap.clone(),
+        second_snap.clone(),
+        format!("{second_snap}.creating"),
+    ] {
+        let _ = std::fs::remove_dir_all(snapshots.join(dir));
+    }
+    result
+}
