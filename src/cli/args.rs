@@ -280,6 +280,18 @@ pub struct RunArgs {
     #[arg(long)]
     pub balloon: Option<u32>,
 
+    /// Turn on free page reporting on the balloon device: the guest reports the
+    /// memory it has freed and the host takes it back, without the balloon target
+    /// changing. Needs --balloon (--balloon 0 attaches a device that holds no
+    /// memory) and Firecracker, and is not supported with --hugepages.
+    /// The guest has to accept the feature. One booted with init_on_free=1 or with
+    /// page poisoning does not, its balloon device then never comes up, and the run
+    /// fails.
+    /// Part of the snapshot key: a restored VM keeps the setting its device was
+    /// booted with, so runs with and without the flag do not share snapshots.
+    #[arg(long)]
+    pub free_page_reporting: bool,
+
     /// Network mode: bridged (requires sudo) or rootless (no sudo)
     #[arg(long, value_enum, default_value_t = NetworkMode::Rootless)]
     pub network: NetworkMode,

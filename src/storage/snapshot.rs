@@ -267,6 +267,32 @@ pub struct SnapshotMetadata {
     /// cold-boot without one.
     #[serde(default)]
     pub balloon_mib: Option<u32>,
+    /// Whether the source VM's balloon device offers free page reporting, as its
+    /// VMM reported it when the snapshot was taken. A memory restore gets the
+    /// setting back with the device, and nothing can change it there. The cold
+    /// boots attach the device with it. False when the source had no balloon
+    /// device.
+    #[serde(default)]
+    pub balloon_free_page_reporting: bool,
+}
+
+impl SnapshotMetadata {
+    /// The balloon device a cold boot from this snapshot attaches, or None when the
+    /// source had no device: the recorded target and free page reporting switch.
+    pub fn balloon_device(&self) -> Option<crate::firecracker::BalloonDevice> {
+        self.balloon_mib
+            .map(|target_mib| crate::firecracker::BalloonDevice {
+                target_mib,
+                free_page_reporting: self.balloon_free_page_reporting,
+            })
+    }
+
+    /// Record the balloon device the VMM reports, or that it has none: the target
+    /// and the free page reporting switch, both from one read.
+    pub fn record_balloon(&mut self, device: Option<crate::firecracker::BalloonDevice>) {
+        self.balloon_mib = device.map(|device| device.target_mib);
+        self.balloon_free_page_reporting = device.is_some_and(|device| device.free_page_reporting);
+    }
 }
 
 /// Extra disk configuration saved in snapshot metadata.
@@ -699,6 +725,7 @@ mod tests {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
 
@@ -897,6 +924,7 @@ mod tests {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
 
@@ -980,6 +1008,7 @@ mod tests {
                     hypervisor: Default::default(),
                     firecracker_bin: None,
                     balloon_mib: None,
+                    balloon_free_page_reporting: false,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1050,6 +1079,7 @@ mod tests {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1244,6 +1274,7 @@ mod tests {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
 
@@ -1347,6 +1378,24 @@ mod tests {
         let reparsed: SnapshotMetadata =
             serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
         assert_eq!(reparsed.balloon_mib, Some(512));
+
+        // What a snapshot reads from the VMM is recorded whole, written to
+        // config.json, and handed whole to the cold boot that attaches the device.
+        let device = crate::firecracker::BalloonDevice {
+            target_mib: 256,
+            free_page_reporting: true,
+        };
+        meta.record_balloon(Some(device));
+        let reparsed: SnapshotMetadata =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert!(reparsed.balloon_free_page_reporting);
+        assert_eq!(reparsed.balloon_device(), Some(device));
+
+        // A VMM with no device leaves no target and no switch behind.
+        meta.record_balloon(None);
+        assert_eq!(meta.balloon_mib, None);
+        assert!(!meta.balloon_free_page_reporting);
+        assert_eq!(meta.balloon_device(), None);
     }
 
     #[test]
@@ -1377,6 +1426,7 @@ mod tests {
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

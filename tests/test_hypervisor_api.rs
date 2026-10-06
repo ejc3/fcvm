@@ -3,8 +3,8 @@
 use axum::body::Bytes;
 use axum::http::{HeaderMap, Method, StatusCode, Uri};
 use axum::Router;
-use fcvm::firecracker::api::{ApiRefusal, BalloonStats, BalloonUpdate};
-use fcvm::firecracker::FirecrackerClient;
+use fcvm::firecracker::api::{ApiRefusal, Balloon, BalloonStats, BalloonUpdate};
+use fcvm::firecracker::{BalloonDevice, FirecrackerClient};
 use fcvm::hypervisor::cloud_hypervisor::api::ChClient;
 use serde_json::json;
 use std::path::PathBuf;
@@ -124,7 +124,7 @@ async fn firecracker_balloon_statistics_request_and_reply() {
     // Firecracker's reply has more members than fcvm reads.
     let mut server = ApiServer::start(Some((
         StatusCode::OK,
-        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024}"#,
+        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024,"total_memory":2048}"#,
     )))
     .await;
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
@@ -132,7 +132,8 @@ async fn firecracker_balloon_statistics_request_and_reply() {
         client.balloon_stats().await.unwrap(),
         BalloonStats {
             target_mib: 64,
-            actual_mib: 32
+            actual_mib: 32,
+            total_memory: Some(2048),
         }
     );
     server
@@ -173,6 +174,30 @@ async fn firecracker_vm_config_reports_the_balloon_device_or_none() {
     assert_eq!(client.balloon_target_mib().await.unwrap(), Some(96));
     server.assert_request(Method::GET, "/vm/config", None).await;
 
+    // The same call says whether the device offers free page reporting.
+    for (reply, free_page_reporting) in [
+        (
+            r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"free_page_reporting":true},"drives":[]}"#,
+            true,
+        ),
+        (
+            r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"free_page_reporting":false},"drives":[]}"#,
+            false,
+        ),
+    ] {
+        let mut server = ApiServer::start(Some((StatusCode::OK, reply))).await;
+        let client = FirecrackerClient::new(server.path.clone()).unwrap();
+        assert_eq!(
+            client.balloon_device().await.unwrap(),
+            Some(BalloonDevice {
+                target_mib: 96,
+                free_page_reporting,
+            }),
+            "the device in {reply}"
+        );
+        server.assert_request(Method::GET, "/vm/config", None).await;
+    }
+
     let server = ApiServer::start(Some((StatusCode::OK, r#"{"balloon":null,"drives":[]}"#))).await;
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
     assert_eq!(client.balloon_target_mib().await.unwrap(), None);
@@ -203,6 +228,43 @@ async fn firecracker_vm_config_reports_the_balloon_device_or_none() {
         client.balloon_target_mib().await.unwrap_err().to_string(),
         "Firecracker API error: 400 Bad Request - not now"
     );
+}
+
+/// The `PUT /balloon` that attaches a device before boot. A device without free
+/// page reporting is attached with three members: the target, deflate-on-oom and
+/// the statistics interval. A device with it adds the one member. The body is
+/// built by `Balloon::attach`, which is what the Firecracker backend sends, so a
+/// boot request that stopped carrying the switch fails here.
+#[tokio::test]
+async fn firecracker_balloon_attach_sends_free_page_reporting_only_when_it_is_on() {
+    for (free_page_reporting, body) in [
+        (
+            false,
+            json!({"amount_mib": 64, "deflate_on_oom": true, "stats_polling_interval_s": 1}),
+        ),
+        (
+            true,
+            json!({
+                "amount_mib": 64,
+                "deflate_on_oom": true,
+                "stats_polling_interval_s": 1,
+                "free_page_reporting": true,
+            }),
+        ),
+    ] {
+        let mut server = ApiServer::start(Some((StatusCode::NO_CONTENT, ""))).await;
+        let client = FirecrackerClient::new(server.path.clone()).unwrap();
+        client
+            .set_balloon(Balloon::attach(BalloonDevice {
+                target_mib: 64,
+                free_page_reporting,
+            }))
+            .await
+            .unwrap();
+        server
+            .assert_request(Method::PUT, "/balloon", Some(body))
+            .await;
+    }
 }
 
 /// `PATCH /balloon` carries the target and nothing else. Firecracker refuses a body

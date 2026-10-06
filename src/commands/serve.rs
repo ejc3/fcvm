@@ -312,6 +312,7 @@ async fn create_sandbox(
         cmd: Some("sh -c 'while :; do sleep 3600; done'".to_string()),
         publish: vec![],
         balloon: None,
+        free_page_reporting: false,
         network: crate::cli::NetworkMode::Rootless,
         hypervisor: crate::cli::args::Hypervisor::Firecracker,
         ipv6_prefix: None,

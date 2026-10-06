@@ -77,6 +77,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         },
     }
 }

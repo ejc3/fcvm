@@ -247,6 +247,31 @@ pub struct VmConfig {
     /// balloon device and for state files written before this field existed.
     #[serde(default)]
     pub balloon_mib: Option<u32>,
+    /// Whether a cold boot of this VM attaches its balloon device with free page
+    /// reporting (--free-page-reporting). A cold boot records what fcvm sent and a
+    /// restore what the VMM reports. It says what the device offers, not what the
+    /// guest accepted. False for a VM with no balloon device.
+    #[serde(default)]
+    pub balloon_free_page_reporting: bool,
+}
+
+impl VmConfig {
+    /// The balloon device a cold boot of this VM attaches, or None for a VM with
+    /// no device: the recorded target and free page reporting switch.
+    pub fn balloon_device(&self) -> Option<crate::firecracker::BalloonDevice> {
+        self.balloon_mib
+            .map(|target_mib| crate::firecracker::BalloonDevice {
+                target_mib,
+                free_page_reporting: self.balloon_free_page_reporting,
+            })
+    }
+
+    /// Record the balloon device the VMM reports, or that it has none: the target
+    /// and the free page reporting switch, both from one read.
+    pub fn record_balloon(&mut self, device: Option<crate::firecracker::BalloonDevice>) {
+        self.balloon_mib = device.map(|device| device.target_mib);
+        self.balloon_free_page_reporting = device.is_some_and(|device| device.free_page_reporting);
+    }
 }
 
 impl VmState {
@@ -301,6 +326,7 @@ impl VmState {
                 hypervisor: crate::hypervisor::Backend::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         }
     }
@@ -423,6 +449,24 @@ mod tests {
         let roundtrip: VmState =
             serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
         assert_eq!(roundtrip.config.balloon_mib, Some(512));
+
+        // What a restore reads from the VMM is recorded whole, written to the state
+        // file, and handed whole to the cold boot that attaches the device again.
+        let device = crate::firecracker::BalloonDevice {
+            target_mib: 256,
+            free_page_reporting: true,
+        };
+        state.config.record_balloon(Some(device));
+        let roundtrip: VmState =
+            serde_json::from_str(&serde_json::to_string(&state).unwrap()).unwrap();
+        assert!(roundtrip.config.balloon_free_page_reporting);
+        assert_eq!(roundtrip.config.balloon_device(), Some(device));
+
+        // A VMM with no device leaves no target and no switch behind.
+        state.config.record_balloon(None);
+        assert_eq!(state.config.balloon_mib, None);
+        assert!(!state.config.balloon_free_page_reporting);
+        assert_eq!(state.config.balloon_device(), None);
     }
 
     #[test]

@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::time::Duration;
 
+use super::config::BalloonDevice;
+
 /// Firecracker API client for managing VMs via HTTP over Unix socket
 #[derive(Debug, Clone)]
 pub struct FirecrackerClient {
@@ -200,14 +202,24 @@ impl FirecrackerClient {
         self.get("/balloon/statistics").await
     }
 
-    /// Target of the VM's balloon device in MiB, or None when the VM has no balloon
-    /// device. Read from `GET /vm/config`, which answers 200 either way and reports
-    /// the device as it is now: at the target it was restored with, or the one set
-    /// since. No device is a null `balloon` member or none at all. A refusal is an
-    /// error, and so is a device that does not say its target.
-    pub async fn balloon_target_mib(&self) -> Result<Option<u32>> {
+    /// The VM's balloon device, or None when the VM has none: its target and
+    /// whether it offers free page reporting, from one `GET /vm/config`. That call
+    /// answers 200 either way and reports the device as it is now: at the target it
+    /// was restored with, or the one set since. No device is a null `balloon` member
+    /// or none at all. A refusal is an error, and so is a device that does not say
+    /// its target.
+    pub async fn balloon_device(&self) -> Result<Option<BalloonDevice>> {
         let config: VmConfig = self.get("/vm/config").await?;
-        Ok(config.balloon.map(|balloon| balloon.amount_mib))
+        Ok(config.balloon.map(|balloon| BalloonDevice {
+            target_mib: balloon.amount_mib,
+            free_page_reporting: balloon.free_page_reporting,
+        }))
+    }
+
+    /// Target of the VM's balloon device in MiB, or None when the VM has no balloon
+    /// device. See `balloon_device`.
+    pub async fn balloon_target_mib(&self) -> Result<Option<u32>> {
+        Ok(self.balloon_device().await?.map(|device| device.target_mib))
     }
 
     /// Configure entropy device (virtio-rng)
@@ -394,6 +406,24 @@ pub struct Balloon {
     pub deflate_on_oom: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stats_polling_interval_s: Option<u32>,
+    /// Free page reporting. Sent only when it is on.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_page_reporting: Option<bool>,
+}
+
+impl Balloon {
+    /// The body of the `PUT /balloon` that attaches `device` before boot: at its
+    /// target, deflating when the guest runs out of memory, with statistics every
+    /// second (`GET /balloon/statistics` needs them on), and with free page
+    /// reporting when the device has it on.
+    pub fn attach(device: BalloonDevice) -> Self {
+        Self {
+            amount_mib: device.target_mib,
+            deflate_on_oom: true,
+            stats_polling_interval_s: Some(1),
+            free_page_reporting: device.free_page_reporting.then_some(true),
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -417,6 +447,11 @@ pub struct BalloonStats {
     pub target_mib: u32,
     /// Size the guest has given the device so far, in MiB.
     pub actual_mib: u32,
+    /// The guest's total memory in bytes, from the statistics its balloon driver
+    /// sends. Firecracker has it only once an active device has received
+    /// statistics from its guest. It is not part of what `fcvm balloon` prints.
+    #[serde(skip_serializing)]
+    pub total_memory: Option<u64>,
 }
 
 /// The part of the `GET /vm/config` reply fcvm reads.
@@ -434,6 +469,8 @@ struct VmConfig {
 struct VmConfigBalloon {
     /// Target size in MiB.
     amount_mib: u32,
+    /// Whether the device offers free page reporting.
+    free_page_reporting: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -472,7 +509,9 @@ mod tests {
             "the member is null"
         );
         assert_eq!(
-            target(r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true},"drives":[]}"#),
+            target(
+                r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"free_page_reporting":false},"drives":[]}"#
+            ),
             Ok(Some(96))
         );
         let no_target = target(r#"{"balloon":{"deflate_on_oom":true},"drives":[]}"#);

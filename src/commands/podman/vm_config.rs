@@ -1247,7 +1247,10 @@ pub(crate) fn build_launch_config(
         dns_server: args.dns.clone(),
         balloon: args
             .balloon
-            .map(|target_mib| crate::firecracker::BalloonDevice { target_mib }),
+            .map(|target_mib| crate::firecracker::BalloonDevice {
+                target_mib,
+                free_page_reporting: args.free_page_reporting,
+            }),
         agent_strace: args.strace_agent,
         extra_boot_args: effective_extra_boot_args(runtime_config),
         // Launch-only config: never hashed into a snapshot key, so the image
@@ -1449,10 +1452,11 @@ pub(crate) async fn configure_and_boot_vm(
     hv.add_entropy_device().await?;
 
     // Balloon (if specified). Read from the launch config. With snapshots on
-    // that is a copy of the config the snapshot key hashed. The key says only
-    // that the device exists; the copy in memory still holds the target.
+    // that is a copy of the config the snapshot key hashed. The key says that
+    // the device exists and whether it reports free pages; the copy in memory
+    // still holds the target.
     if let Some(device) = plan.launch_config.balloon {
-        hv.add_balloon(device.target_mib).await?;
+        hv.add_balloon(device).await?;
     }
 
     // Start VM.

@@ -261,6 +261,7 @@ mod tests {
         assert!(
             refused.contains("setting the balloon target of VM 'web' to 96 MiB")
                 && refused.contains("never activated")
+                && refused.contains("--free-page-reporting")
                 && refused.contains("400 Bad Request - the reason"),
             "{refused}"
         );
@@ -283,6 +284,7 @@ mod tests {
         let line = report_line(&BalloonStats {
             target_mib: 96,
             actual_mib: 64,
+            total_memory: Some(1 << 30),
         })
         .unwrap();
         assert_eq!(line, r#"{"target_mib":96,"actual_mib":64}"#);

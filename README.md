@@ -441,6 +441,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --cpu <N> --mem <MB>  CPU count and memory
 --hugepages           Use 2MB hugepages (pre-allocate pool first)
 --balloon <MIB>       Balloon device target; runs that differ only in the target share the pre-start snapshot
+--free-page-reporting Guest reports freed memory and the host takes it back (needs --balloon, Firecracker only, not with --hugepages; the run fails if the guest refuses it; in the snapshot key)
 --privileged          Allow device access and mknod in container
 --image-mode <MODE>   overlay (default), btrfs, or archive
 --portable-volumes    Path-hash inodes for cross-machine snapshot/restore
