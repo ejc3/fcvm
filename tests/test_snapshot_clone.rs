@@ -4295,6 +4295,449 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
     }
 }
 
+/// The feature bits of the guest's balloon device, one `0` or `1` per bit with bit 0
+/// first, as the guest's sysfs prints them. The balloon is the virtio device whose
+/// ID is 5. Empty when the guest has no such device.
+async fn guest_balloon_features(pid: u32) -> Result<String> {
+    let features = common::exec_in_vm(
+        pid,
+        &[r#"for d in /sys/bus/virtio/devices/virtio*; do if [ "$(/usr/bin/cat $d/device)" = 0x0005 ]; then /usr/bin/cat $d/features; fi; done"#],
+    )
+    .await
+    .context("reading the feature bits of the guest's balloon device")?;
+    Ok(features.trim().to_string())
+}
+
+/// Whether the guest and the device agreed on VIRTIO_BALLOON_F_REPORTING, bit 5.
+fn negotiated_free_page_reporting(features: &str) -> bool {
+    features.as_bytes().get(5) == Some(&b'1')
+}
+
+/// The guest's free memory in MiB, after its file cache is dropped so that the
+/// number is what a fill can take without the guest reclaiming anything.
+async fn guest_free_mib_after_dropping_caches(pid: u32) -> Result<u64> {
+    common::exec_in_vm(pid, &["/usr/bin/sync; echo 3 > /proc/sys/vm/drop_caches"])
+        .await
+        .context("dropping the guest's file cache")?;
+    let line = common::exec_in_vm(pid, &["/usr/bin/grep MemFree: /proc/meminfo"])
+        .await
+        .context("reading the guest's MemFree")?;
+    let kb: u64 = line
+        .split_whitespace()
+        .nth(1)
+        .and_then(|kb| kb.parse().ok())
+        .with_context(|| format!("the guest's MemFree line is {line:?}"))?;
+    Ok(kb / 1024)
+}
+
+/// Where the fill lives in the guest: a tmpfs, so the file is guest memory and
+/// deleting it frees that memory at once.
+const FPR_TMPFS: &str = "/mnt/fcvm-fpr";
+
+async fn fpr_mount(pid: u32, fill_mib: u64) -> Result<()> {
+    let size = fill_mib + 64;
+    common::exec_in_vm(
+        pid,
+        &[&format!(
+            "/usr/bin/mkdir -p {FPR_TMPFS} && /usr/bin/mount -t tmpfs -o size={size}m tmpfs {FPR_TMPFS}"
+        )],
+    )
+    .await
+    .context("mounting the fill's tmpfs in the guest")?;
+    Ok(())
+}
+
+/// Take `fill_mib` MiB of the guest's free memory.
+async fn fpr_fill(pid: u32, fill_mib: u64) -> Result<()> {
+    common::exec_in_vm(
+        pid,
+        &[&format!(
+            "/usr/bin/dd if=/dev/zero of={FPR_TMPFS}/fill bs=1M count={fill_mib} status=none"
+        )],
+    )
+    .await
+    .with_context(|| format!("writing {fill_mib} MiB into the guest's tmpfs"))?;
+    Ok(())
+}
+
+/// Free what `fpr_fill` took.
+async fn fpr_free(pid: u32) -> Result<()> {
+    common::exec_in_vm(pid, &[&format!("/usr/bin/rm -f {FPR_TMPFS}/fill")])
+        .await
+        .context("deleting the fill")?;
+    Ok(())
+}
+
+/// Bytes the memory server has remembered as given back, over every REMOVE event
+/// in its log so far.
+fn remembered_bytes(log: &str) -> u64 {
+    log.lines()
+        .filter(|line| line.contains("balloon gave a range back"))
+        .filter_map(|line| field(line, "remembered=")?.parse::<u64>().ok())
+        .sum()
+}
+
+/// `(remove_events, given_back_mib, zero_filled_pages)` from the line the memory
+/// server logs when a clone whose balloon gave pages back exits. It logs none for a
+/// clone with no REMOVE event.
+fn given_back_summary(log: &str) -> Option<(u64, u64, u64)> {
+    let line = log
+        .lines()
+        .find(|line| line.contains("the balloon gave pages back"))?;
+    Some((
+        field(line, "remove_events=")?.parse().ok()?,
+        field(line, "given_back_mib=")?.parse().ok()?,
+        field(line, "zero_filled_pages=")?.parse().ok()?,
+    ))
+}
+
+/// Anonymous resident memory of a process in MiB, from `/proc/<pid>/status`.
+fn rss_anon_mib(pid: u32) -> Result<u64> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .with_context(|| format!("reading /proc/{pid}/status"))?;
+    let kb: u64 = status
+        .lines()
+        .find_map(|line| line.strip_prefix("RssAnon:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kb| kb.parse().ok())
+        .with_context(|| format!("no RssAnon in /proc/{pid}/status"))?;
+    Ok(kb / 1024)
+}
+
+/// FREE PAGE REPORTING, END TO END. A VM booted with `--balloon 0
+/// --free-page-reporting` has a guest that negotiated the feature. In a copy-mode
+/// clone of its snapshot, memory the guest frees reaches the memory server as
+/// REMOVE events, and the guest's next use of that memory is answered with zeros
+/// and not with the snapshot's bytes. In a File-backed clone of the same snapshot,
+/// which is the transport a `podman run` cache hit uses, Firecracker discards the
+/// reported memory itself: its resident memory falls, the VM keeps answering, and
+/// memory the guest still holds is intact.
+///
+/// The sizes come from the guest. Each clone drops its file cache, reads MemFree,
+/// and fills a tmpfs with 70 percent of it. Deleting the file frees that memory,
+/// and the guest reports it over the next seconds. The copy-mode clone then waits
+/// until the memory server has heard of half the fill given back, counted from the
+/// delete, and fills the same amount again. The memory the clone has not given back
+/// is then at most MemFree less half the fill, which is less than the fill, so part
+/// of the second fill has to land on memory the clone gave back.
+///
+/// The source boots with `--no-snapshot`: the snapshot key does not cover the fcvm
+/// binary, so a cached source would hide a boot request that stopped carrying the
+/// switch. Everything after the controls is judged together at the end, so one run
+/// shows every part that is wrong.
+#[tokio::test]
+async fn test_snapshot_clone_free_page_reporting_reaches_the_page_server() -> Result<()> {
+    const MEM_MIB: &str = "2048";
+    // Below this much free memory the fill is too small to say anything.
+    const LEAST_FREE_MIB: u64 = 512;
+    let (source_name, clone_name, snapshot_name, _) = common::unique_names("fpr");
+    let file_clone_name = format!("{clone_name}-file");
+    let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let mut source: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut clone: Option<(tokio::process::Child, u32)> = None;
+    let mut file_clone: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_cleanup_needed = false;
+    let mut wrong: Vec<String> = Vec::new();
+
+    let verdict = async {
+        let (child, source_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &source_name,
+                "--no-snapshot",
+                "--mem",
+                MEM_MIB,
+                "--balloon",
+                "0",
+                "--free-page-reporting",
+                common::TEST_IMAGE,
+            ],
+            &source_name,
+        )
+        .await
+        .context("spawning the source VM")?;
+        source = Some((child, source_pid));
+        common::poll_health_by_pid(source_pid, 180).await?;
+
+        // What Firecracker was asked for, and what the guest agreed to.
+        let offered = common::firecracker_client_by_pid(source_pid)
+            .await?
+            .balloon_device()
+            .await
+            .context("reading the source VM's balloon device")?;
+        if !offered.is_some_and(|device| device.free_page_reporting) {
+            wrong.push(format!(
+                "the source VM's balloon device is {offered:?}: Firecracker was not asked for \
+                 free page reporting"
+            ));
+        }
+        let features = guest_balloon_features(source_pid).await?;
+        anyhow::ensure!(
+            !features.is_empty(),
+            "control: the source guest has no virtio balloon device"
+        );
+        if !negotiated_free_page_reporting(&features) {
+            wrong.push(format!(
+                "the source guest did not negotiate free page reporting: the feature bits of \
+                 its balloon are {features}, and bit 5 is not set"
+            ));
+        }
+
+        // A failed create may still have installed a partial generation, so cleanup
+        // owns this tag from before the create.
+        snapshot_cleanup_needed = true;
+        common::create_snapshot_by_pid(source_pid, &snapshot_name)
+            .await
+            .context("creating the snapshot")?;
+
+        // Copy mode: the clone's memory is anonymous, so each block the guest
+        // reports is one REMOVE event at the memory server.
+        let serve_args = ["snapshot", "serve", &snapshot_name, "--uffd-mode", "copy"];
+        let (child, serve_pid, serve_log) =
+            common::spawn_fcvm_with_log_path(&serve_args, "uffd-serve-fpr")
+                .await
+                .context("spawning the memory server")?;
+        serve = Some((child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+
+        let serve_pid_arg = serve_pid.to_string();
+        let (child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_arg,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning the copy-mode clone")?;
+        clone = Some((child, clone_pid));
+        common::poll_health_by_pid(clone_pid, 150)
+            .await
+            .context("the copy-mode clone never became healthy")?;
+
+        let free_mib = guest_free_mib_after_dropping_caches(clone_pid).await?;
+        anyhow::ensure!(
+            free_mib >= LEAST_FREE_MIB,
+            "control: the copy-mode clone has {free_mib} MiB free of {MEM_MIB}"
+        );
+        let fill_mib = free_mib * 7 / 10;
+        let half_fill_mib = fill_mib / 2;
+        fpr_mount(clone_pid, fill_mib).await?;
+        fpr_fill(clone_pid, fill_mib)
+            .await
+            .context("the first fill")?;
+        // Counted from here. A block the guest reported before the fill and the
+        // fill then took is in use again, and is not free memory given back.
+        let before_free = remembered_bytes(
+            &tokio::fs::read_to_string(&serve_log)
+                .await
+                .unwrap_or_default(),
+        );
+        fpr_free(clone_pid).await?;
+        let given_back_since =
+            |log: &str| remembered_bytes(log).saturating_sub(before_free) / (1024 * 1024);
+        if let Err(error) = serve_log_until(
+            &serve_log,
+            90,
+            "the guest to report half of the memory it freed",
+            |log| given_back_since(log) >= half_fill_mib,
+        )
+        .await
+        {
+            let heard = given_back_since(
+                &tokio::fs::read_to_string(&serve_log)
+                    .await
+                    .unwrap_or_default(),
+            );
+            wrong.push(format!(
+                "the memory server heard of {heard} MiB given back after the clone freed \
+                 {fill_mib} MiB, not the {half_fill_mib} MiB that is half of it: {error:#}"
+            ));
+        }
+        fpr_fill(clone_pid, fill_mib)
+            .await
+            .context("the second fill")?;
+
+        // The memory server logs a clone's totals when the clone exits.
+        let (mut child, pid) = clone.take().context("the copy-mode clone is gone")?;
+        terminate_and_reap(&mut child, pid, "copy-mode clone")
+            .await
+            .context("stopping the copy-mode clone")?;
+        let log = serve_log_until(&serve_log, 60, "the clone's exit line", |log| {
+            !faults_by_vm(log).is_empty()
+        })
+        .await?;
+        match given_back_summary(&log) {
+            None => wrong.push(
+                "the memory server logged no 'the balloon gave pages back' line for the clone: \
+                 it read no REMOVE event"
+                    .to_string(),
+            ),
+            Some((remove_events, given_back_mib, zero_filled_pages)) => {
+                println!(
+                    "  copy-mode clone: fill {fill_mib} MiB, {remove_events} REMOVE events, \
+                     {given_back_mib} MiB given back, {zero_filled_pages} faults answered with \
+                     zeros"
+                );
+                if remove_events == 0 {
+                    wrong.push("the memory server read no REMOVE event".to_string());
+                }
+                if given_back_mib < half_fill_mib {
+                    wrong.push(format!(
+                        "the clone gave {given_back_mib} MiB back over its life, less than the \
+                         {half_fill_mib} MiB that is half of one {fill_mib} MiB fill"
+                    ));
+                }
+                if zero_filled_pages == 0 {
+                    wrong.push(format!(
+                        "no fault on given-back memory was answered with zeros, though the \
+                         second {fill_mib} MiB fill was larger than the memory the clone had \
+                         not given back"
+                    ));
+                }
+            }
+        }
+
+        // File-backed: no memory server, so the one above is stopped first and the
+        // two phases share nothing but the snapshot. Firecracker maps the snapshot's
+        // memory file privately and replaces each reported range with fresh
+        // anonymous memory.
+        let (mut child, pid) = serve.take().context("the memory server is gone")?;
+        terminate_and_reap(&mut child, pid, "memory server")
+            .await
+            .context("stopping the memory server")?;
+        let (child, file_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snapshot_name,
+                "--name",
+                &file_clone_name,
+            ],
+            &file_clone_name,
+        )
+        .await
+        .context("spawning the File-backed clone")?;
+        file_clone = Some((child, file_pid));
+        common::poll_health_by_pid(file_pid, 150)
+            .await
+            .context("the File-backed clone never became healthy")?;
+        let (vmm_pid, _) = find_firecracker_descendant(file_pid)
+            .context("control: no firecracker process under the File-backed clone")?;
+
+        // Memory the guest keeps across the discards, to be read back afterwards.
+        let keep_md5 = || async {
+            common::exec_in_vm(file_pid, &["/usr/bin/md5sum /dev/shm/fcvm-fpr-keep"])
+                .await
+                .map(|out| {
+                    out.split_whitespace()
+                        .next()
+                        .unwrap_or_default()
+                        .to_string()
+                })
+        };
+        common::exec_in_vm(
+            file_pid,
+            &["/usr/bin/head -c 8388608 /dev/urandom > /dev/shm/fcvm-fpr-keep"],
+        )
+        .await
+        .context("writing the file the guest keeps")?;
+        let kept = keep_md5().await.context("checksumming the kept file")?;
+        anyhow::ensure!(!kept.is_empty(), "control: the kept file has no checksum");
+
+        let free_mib = guest_free_mib_after_dropping_caches(file_pid).await?;
+        anyhow::ensure!(
+            free_mib >= LEAST_FREE_MIB,
+            "control: the File-backed clone has {free_mib} MiB free of {MEM_MIB}"
+        );
+        let fill_mib = free_mib * 7 / 10;
+        let half_fill_mib = fill_mib / 2;
+        fpr_mount(file_pid, fill_mib).await?;
+        fpr_fill(file_pid, fill_mib)
+            .await
+            .context("the File-backed clone's fill")?;
+        let filled = rss_anon_mib(vmm_pid)?;
+        fpr_free(file_pid).await?;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let fell_to = loop {
+            let now = rss_anon_mib(vmm_pid)?;
+            if filled.saturating_sub(now) >= half_fill_mib {
+                break Ok(now);
+            }
+            if Instant::now() >= deadline {
+                break Err(now);
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        match fell_to {
+            Ok(now) => println!(
+                "  File-backed clone: fill {fill_mib} MiB, Firecracker's anonymous memory \
+                 {filled} -> {now} MiB"
+            ),
+            Err(now) => wrong.push(format!(
+                "Firecracker's anonymous memory went from {filled} to {now} MiB in the 60s \
+                 after the File-backed clone freed {fill_mib} MiB: it did not fall by the \
+                 {half_fill_mib} MiB that is half of it"
+            )),
+        }
+        let kept_after = keep_md5()
+            .await
+            .context("the File-backed clone no longer answers after its memory was discarded")?;
+        if kept_after != kept {
+            wrong.push(format!(
+                "memory the File-backed clone still held changed while Firecracker discarded \
+                 what it freed: checksum {kept} became {kept_after}"
+            ));
+        }
+        anyhow::Ok(())
+    }
+    .await;
+
+    let verdict = match (verdict, wrong.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(anyhow::anyhow!(
+            "{} free page reporting checks failed:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        )),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(error.context(format!(
+            "stopped by the error below, after {} checks had already failed:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        ))),
+    };
+
+    // Clones first, then the server one of them depends on, then the source.
+    let mut cleanup_errors = Vec::new();
+    for (role, process) in [
+        ("File-backed clone", file_clone.take()),
+        ("copy-mode clone", clone.take()),
+        ("memory server", serve.take()),
+        ("source VM", source.take()),
+    ] {
+        if let Some((mut child, pid)) = process {
+            if let Err(error) = terminate_and_reap(&mut child, pid, role).await {
+                cleanup_errors.push(format!("{role} {pid}: {error:#}"));
+            }
+        }
+    }
+    if snapshot_cleanup_needed && snapshot_path.exists() {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    combine_with_cleanup(verdict, cleanup_errors)
+}
+
 async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("iso-{}", uffd_mode));
     let fcvm_path = common::find_fcvm_binary()?;
@@ -4603,7 +5046,6 @@ async fn a_clone_dies_when_its_memory_server_dies() -> Result<()> {
 
 /// comm, state, ppid, starttime (fields 2, 3, 4, 22) from `/proc/<pid>/stat`.
 /// comm may contain spaces and parens, so parse around the LAST `)`.
-#[cfg(feature = "privileged-tests")]
 fn proc_stat(pid: u32) -> Option<(String, char, u32, u64)> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let open = text.find('(')?;
@@ -4616,7 +5058,6 @@ fn proc_stat(pid: u32) -> Option<(String, char, u32, u64)> {
     Some((comm, state, ppid, starttime))
 }
 
-#[cfg(feature = "privileged-tests")]
 fn is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
     for _ in 0..32 {
         if pid == ancestor {
@@ -4636,7 +5077,6 @@ fn is_descendant_of(mut pid: u32, ancestor: u32) -> bool {
 /// The firecracker process under a given fcvm, as (pid, starttime). The
 /// starttime pins identity across the assertion window: a reused PID has a
 /// different starttime, so it can never masquerade as an unreaped VMM.
-#[cfg(feature = "privileged-tests")]
 fn find_firecracker_descendant(fcvm_pid: u32) -> Option<(u32, u64)> {
     for entry in std::fs::read_dir("/proc").ok()?.flatten() {
         let Ok(pid) = entry.file_name().to_string_lossy().parse::<u32>() else {

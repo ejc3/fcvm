@@ -1,13 +1,17 @@
 //! Source pins for the statements that carry a VM's balloon target.
 //!
-//! A cold boot attaches a balloon device only when its RunArgs name a target. A
-//! disk-only clone and a restored clone's relaunch after a guest reboot get theirs
-//! through the statements in the first test: the VM's state takes `--balloon`, a
-//! clone's state takes the snapshot's record, and each cold boot is handed the record
-//! of the VM it boots. A memory restore brings the device back with the VMM state, at
-//! the target of the run that made the snapshot, and the statements in the second
-//! test hand the restore its caller's target and make the records follow the VMM,
-//! whose target can be changed on its API socket without any record being written.
+//! A cold boot attaches a balloon device only when its RunArgs name a target, and
+//! one that reports free pages only when they name that too. A disk-only clone and
+//! a restored clone's relaunch after a guest reboot get theirs through the
+//! statements in the first test: the VM's state takes `--balloon` and
+//! `--free-page-reporting`, a clone's state takes the snapshot's record, each cold
+//! boot is handed the record of the VM it boots, target and switch together, and
+//! the boot request is built from the device it is handed. A memory restore brings
+//! the device back with the VMM state, at the target of the run that made the
+//! snapshot, and the statements in the second test hand the restore its caller's
+//! target and make the records follow the VMM, target and switch from one read.
+//! The VMM's target can be changed on its API socket without any record being
+//! written.
 //!
 //! A startup snapshot is named for the balloon target its workload initialized under,
 //! and `fcvm balloon` can change the target while the workload initializes. The
@@ -17,13 +21,16 @@
 //!
 //! Dropping any one of them still compiles, and the unit tests of the functions on
 //! either side still pass, because each of those is given the value it then finds.
-//! Only VM tests see the difference, and they take minutes and need KVM:
+//! VM tests see most of them, and they take minutes and need KVM:
 //! `test_restored_clone_reboot_keeps_its_balloon` and
 //! `test_disk_only_clone_keeps_the_balloon` (#1052),
 //! `test_balloon_target_honored_on_snapshot_cache_hit` (#1053),
-//! `test_snapshot_and_restored_clone_record_the_balloon_the_vmm_has` and
+//! `test_snapshot_and_restored_clone_record_the_balloon_the_vmm_has`,
 //! `test_startup_snapshot_is_not_taken_after_the_balloon_target_was_changed`, which
-//! covers the two run loops and not `podman prepare`.
+//! covers the two run loops and not `podman prepare`, and
+//! `test_snapshot_clone_free_page_reporting_reaches_the_page_server` for the boot
+//! request. Two keep a record truthful and are seen by their pin alone: the state
+//! line for `--free-page-reporting` and the switch in a memory snapshot's record.
 
 use std::path::PathBuf;
 
@@ -58,6 +65,16 @@ fn every_call_site_that_carries_the_balloon_still_does() {
             "vm_state.config.balloon_mib = args.balloon;",
         ),
         (
+            "src/commands/podman/mod.rs",
+            "a VM's state records its --free-page-reporting",
+            "vm_state.config.balloon_free_page_reporting = args.free_page_reporting;",
+        ),
+        (
+            "src/commands/podman/mod.rs",
+            "a cold boot with --free-page-reporting owes the check of the guest's balloon",
+            "let balloon_check_due = args.free_page_reporting;",
+        ),
+        (
             "src/commands/snapshot.rs",
             "a clone's state starts with the snapshot's balloon record (a Cloud Hypervisor clone \
              keeps it and its snapshots copy it; a Firecracker restore replaces it)",
@@ -65,11 +82,12 @@ fn every_call_site_that_carries_the_balloon_still_does() {
         ),
         (
             "src/commands/snapshot.rs",
-            "the relaunch after a guest reboot is planned with the balloon in the VM's state",
+            "the relaunch after a guest reboot is planned with the balloon in the VM's state, \
+             its target and its free page reporting switch",
             "match build_clone_reboot_plan( &snapshot_config.metadata, &port_mappings, &vm_name, \
              args.cpu.unwrap_or(snapshot_config.metadata.vcpu), \
              args.mem.unwrap_or(snapshot_config.metadata.memory_mib), \
-             vm_state.config.balloon_mib,",
+             vm_state.config.balloon_device(),",
         ),
         (
             "src/commands/snapshot.rs",
@@ -79,10 +97,16 @@ fn every_call_site_that_carries_the_balloon_still_does() {
         ),
         (
             "src/commands/snapshot.rs",
-            "a disk-only boot is given the snapshot's balloon record",
+            "a disk-only boot is given the snapshot's balloon record, its target and its free \
+             page reporting switch",
             "let run_args = run_args_from_snapshot_metadata( meta, &port_mappings, vm_name, \
              args.cpu.unwrap_or(meta.vcpu), args.mem.unwrap_or(meta.memory_mib), \
-             meta.balloon_mib,",
+             meta.balloon_device(),",
+        ),
+        (
+            "src/hypervisor/firecracker.rs",
+            "the boot request is built from the device the launch config holds",
+            ".set_balloon(api::Balloon::attach(device))",
         ),
     ];
 
@@ -91,8 +115,10 @@ fn every_call_site_that_carries_the_balloon_still_does() {
         missing.is_empty(),
         "{} of {} statements that carry a VM's balloon record are gone. Without one, a \
          rebooted clone or a disk-only clone of a --balloon VM boots with no balloon \
-         device, or a snapshot of a Cloud Hypervisor clone records none. If a statement \
-         was only rewritten, update its pin here.\n{}",
+         device or with one that does not report free pages, a VM booted with \
+         --free-page-reporting records or attaches a device without it, or a snapshot of \
+         a Cloud Hypervisor clone records none. If a statement was only rewritten, update \
+         its pin here.\n{}",
         missing.len(),
         pins.len(),
         missing.join("\n")
@@ -109,21 +135,23 @@ fn every_statement_that_sets_or_reads_a_restored_vms_balloon_still_does() {
         ),
         (
             "src/commands/common.rs",
-            "a restore records the device the VMM has",
-            "vm_state.config.balloon_mib = client .balloon_target_mib() .await \
-             .context(\"reading the restored VM's balloon device\")?;",
+            "a restore records the device the VMM has, target and switch from one read",
+            "let device = client .balloon_device() .await \
+             .context(\"reading the restored VM's balloon device\")?; \
+             vm_state.config.record_balloon(device);",
         ),
         (
             "src/commands/common.rs",
-            "a memory snapshot records the device the VMM has",
-            "Ok(balloon_mib) => { snapshot_config.metadata.balloon_mib = balloon_mib;",
+            "a memory snapshot records the device the VMM has, target and switch from one read",
+            "Ok(device) => { snapshot_config.metadata.record_balloon(device);",
         ),
         (
             "src/commands/snapshot.rs",
-            "a disk-only snapshot records the device the VMM has",
-            "snapshot_config.metadata.balloon_mib = \
-             crate::firecracker::FirecrackerClient::new(socket_path.clone())? \
-             .balloon_target_mib() .await .context(\"reading the VM's balloon device\")?;",
+            "a disk-only snapshot records the device the VMM has, target and switch from one \
+             read",
+            "let device = crate::firecracker::FirecrackerClient::new(socket_path.clone())? \
+             .balloon_device() .await .context(\"reading the VM's balloon device\")?; \
+             snapshot_config.metadata.record_balloon(device);",
         ),
     ];
 

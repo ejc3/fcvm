@@ -297,8 +297,9 @@ pub(crate) async fn run_status_listener(
                         }
                     } else {
                         // Pending with no cache channel. Our callers never
-                        // construct this (no-snapshot runs start at Continue,
-                        // the restore path at Restored), but a bare ack here
+                        // construct this (a no-snapshot run starts at Continue
+                        // unless it owes the balloon check, and then it has a
+                        // channel; the restore path at Restored), but a bare ack here
                         // preserved the historical fallback — keep it, loudly.
                         warn!(
                             vm_id = %vm_id,

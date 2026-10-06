@@ -261,6 +261,7 @@ mod tests {
         assert!(
             refused.contains("setting the balloon target of VM 'web' to 96 MiB")
                 && refused.contains("never activated")
+                && refused.contains("--free-page-reporting")
                 && refused.contains("400 Bad Request - the reason"),
             "{refused}"
         );

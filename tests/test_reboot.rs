@@ -354,7 +354,9 @@ async fn test_restored_clone_reboot_comes_back_healthy() -> Result<()> {
 
 /// A clone restored from a snapshot of a `--balloon` VM keeps its balloon device
 /// across a guest reboot. The relaunch is a cold boot from the clone's disk, and it
-/// used to attach no balloon device whatever the source VM had (#1052).
+/// used to attach no balloon device whatever the source VM had (#1052). The source
+/// here also has `--free-page-reporting`, and the relaunch has to attach the device
+/// with that switch too: Firecracker takes it only when the device is attached.
 #[tokio::test]
 async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
     const BALLOON_MIB: u32 = 64;
@@ -373,6 +375,7 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
             "--no-snapshot",
             "--balloon",
             &balloon,
+            "--free-page-reporting",
             "nginx:alpine",
         ],
         "reboot-balloon-base",
@@ -427,6 +430,18 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
                 "the restored clone's balloon target is {} MiB before the reboot, not {BALLOON_MIB}",
                 restored.target_mib
             );
+            // Third control: the restored device offers free page reporting, as the
+            // source's did, so what the relaunch attaches is the only thing in doubt.
+            let restored_device = common::firecracker_client_by_pid(clone_pid)
+                .await?
+                .balloon_device()
+                .await
+                .context("reading the restored clone's balloon device before the reboot")?;
+            anyhow::ensure!(
+                restored_device.is_some_and(|device| device.free_page_reporting),
+                "control: the restored clone's balloon device is {restored_device:?} before \
+                 the reboot, without the free page reporting its source was booted with"
+            );
 
             // reboot_and_assert_relaunch reports a failed relaunch by panicking. It runs
             // as its own task, so the panic comes back here as an error and the clone
@@ -446,6 +461,17 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
                 "the rebooted clone's balloon target is {} MiB, not the source's {BALLOON_MIB}",
                 rebooted.target_mib
             );
+            // Firecracker reports what the device it was asked to attach offers.
+            let relaunched = common::firecracker_client_by_pid(clone_pid)
+                .await?
+                .balloon_device()
+                .await
+                .context("reading the rebooted clone's balloon device")?;
+            anyhow::ensure!(
+                relaunched.is_some_and(|device| device.free_page_reporting),
+                "the rebooted clone's balloon device is {relaunched:?}: the relaunch dropped \
+                 the free page reporting its source was booted with"
+            );
             let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
                 .load_state_by_pid(clone_pid)
                 .await
@@ -464,6 +490,182 @@ async fn test_restored_clone_reboot_keeps_its_balloon() -> Result<()> {
     }
     .await;
     let _ = std::fs::remove_dir_all(fcvm::paths::snapshot_dir().join(&snap));
+    result
+}
+
+/// The status register of the guest's balloon device, as the guest's virtio bus
+/// shows it. The balloon is the virtio device whose ID is 5. A device its driver
+/// brought up reads 0x0f: ACKNOWLEDGE, DRIVER, DRIVER_OK and FEATURES_OK.
+/// Firecracker adds 0x40, DEVICE_NEEDS_RESET, to one it could not activate.
+async fn guest_balloon_status(pid: u32) -> Result<u32> {
+    let printed = common::exec_in_vm(
+        pid,
+        &[r#"for d in /sys/bus/virtio/devices/virtio*; do if [ "$(/usr/bin/cat $d/device)" = 0x0005 ]; then /usr/bin/cat $d/status; fi; done"#],
+    )
+    .await
+    .context("reading the status of the guest's balloon device")?;
+    let status = printed.trim();
+    u32::from_str_radix(status.trim_start_matches("0x"), 16).with_context(|| {
+        format!("the guest's balloon device status reads {status:?}, not one hex number")
+    })
+}
+
+/// A memory snapshot is refused for a VM whose guest left its reporting balloon
+/// inactive, whoever asks for it. Nothing fails such a VM early when it is a
+/// restored clone that relaunched after a guest reboot: the relaunch is a cold
+/// boot with the clone's free page reporting switch and with extra kernel
+/// arguments from the clone process's `FCVM_BOOT_ARGS`, and no balloon check
+/// follows it. Here that environment has `init_on_free=1`, which makes the guest
+/// refuse the feature, and Firecracker then leaves the device inactive.
+/// `fcvm snapshot create` on the relaunched clone has to fail with the error that
+/// names the flag and the cause, leave no snapshot directory, and leave the VM
+/// running. A snapshot of it would hand the inactive device to every run restored
+/// from it.
+#[tokio::test]
+async fn test_snapshot_of_a_vm_with_an_inactive_reporting_balloon_is_refused() -> Result<()> {
+    let (name, clone_name, snap, _serve) = common::unique_names("fpr-save-check");
+    let refused_snap = format!("{snap}-refused");
+    let snapshots = fcvm::paths::snapshot_dir();
+
+    // --no-snapshot makes the source a cold boot with the switch. Its kernel
+    // command line is the default one, so its guest brings the balloon up and its
+    // snapshot is taken.
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &name,
+            "--no-snapshot",
+            "--balloon",
+            "0",
+            "--free-page-reporting",
+            "nginx:alpine",
+        ],
+        "fpr-save-check-base",
+    )
+    .await?;
+    let token = format!("fpr-save-check-token-{}", std::process::id());
+    let snapshotted = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        // reboot_and_assert_relaunch looks for the marker in the clone.
+        write_work_marker(pid, &token).await?;
+        common::create_snapshot_by_pid(pid, &snap)
+            .await
+            .context("creating the source VM's snapshot")
+    }
+    .await;
+    // The clone restores from the snapshot files, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        snapshotted?;
+        // The clone process's environment is where its relaunch takes extra kernel
+        // arguments from. The restore itself boots no kernel.
+        let (mut clone_child, clone_pid, _log) = common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "snapshot",
+                "run",
+                "--snapshot",
+                &snap,
+                "--name",
+                &clone_name,
+            ],
+            &[("FCVM_BOOT_ARGS", "init_on_free=1")],
+        )
+        .await?;
+        let checked = async {
+            common::poll_health_by_pid(clone_pid, 120).await?;
+            // reboot_and_assert_relaunch reports a failed relaunch by panicking. It runs
+            // as its own task, so the panic comes back here as an error and the clone
+            // and the snapshots are still cleaned up below.
+            let relaunch_token = token.clone();
+            tokio::spawn(
+                async move { reboot_and_assert_relaunch(clone_pid, &relaunch_token).await },
+            )
+            .await
+            .context("the relaunch check panicked")??;
+
+            // Controls: the relaunched guest booted with the argument, and its
+            // balloon device is not one its driver brought up.
+            let cmdline = common::exec_in_vm(clone_pid, &["/usr/bin/cat /proc/cmdline"])
+                .await
+                .context("reading the relaunched guest's command line")?;
+            anyhow::ensure!(
+                cmdline.contains("init_on_free=1"),
+                "control: the relaunched guest's command line has no init_on_free=1: {}",
+                cmdline.trim()
+            );
+            let status = guest_balloon_status(clone_pid).await?;
+            anyhow::ensure!(
+                status != 0x0f,
+                "control: the relaunched guest's balloon device status is {status:#04x}: the \
+                 guest brought the device up, so this VM has no inactive balloon to refuse"
+            );
+
+            let mut wrong = Vec::new();
+            match common::create_snapshot_by_pid(clone_pid, &refused_snap).await {
+                Ok(()) => wrong.push(format!(
+                    "`fcvm snapshot create` saved a snapshot of a VM whose guest left its \
+                     balloon device inactive (device status {status:#04x})"
+                )),
+                Err(error) => {
+                    let message = format!("{error:#}");
+                    let named = message.lines().any(|line| {
+                        ["--free-page-reporting", "init_on_free"]
+                            .iter()
+                            .all(|part| line.contains(part))
+                    });
+                    if !named {
+                        wrong.push(format!(
+                            "the refused snapshot's error does not name --free-page-reporting \
+                             and init_on_free on one line: {message}"
+                        ));
+                    }
+                    let left: Vec<String> = std::fs::read_dir(&snapshots)
+                        .with_context(|| format!("listing {}", snapshots.display()))?
+                        .filter_map(|entry| entry.ok())
+                        .filter(|entry| entry.path().is_dir())
+                        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                        .filter(|entry| entry.starts_with(&refused_snap))
+                        .collect();
+                    if !left.is_empty() {
+                        wrong.push(format!(
+                            "the refused snapshot left {left:?} in {}",
+                            snapshots.display()
+                        ));
+                    }
+                }
+            }
+            // The refusal comes with the VM paused, and the VM is resumed after it.
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while let Err(error) = common::exec_in_vm(clone_pid, &["/usr/bin/true"]).await {
+                if Instant::now() >= deadline {
+                    wrong.push(format!(
+                        "the VM does not answer 30s after `fcvm snapshot create` returned: \
+                         {error:#}"
+                    ));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(500)).await;
+            }
+            anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
+            Ok(())
+        }
+        .await;
+        common::kill_process(clone_pid).await;
+        let _ = clone_child.kill().await;
+        checked
+    }
+    .await;
+    for dir in [
+        snap.clone(),
+        refused_snap.clone(),
+        format!("{refused_snap}.creating"),
+    ] {
+        let _ = std::fs::remove_dir_all(snapshots.join(dir));
+    }
     result
 }
 

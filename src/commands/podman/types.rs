@@ -95,6 +95,10 @@ pub struct VmContext {
     /// Startup-snapshot trigger from the health monitor. Carries the ack the
     /// snapshot path must send (or drop) before the monitor publishes Healthy.
     pub startup_rx: Option<oneshot::Receiver<crate::health::StartupSnapshotAck>>,
+    /// True from a cold boot with `--free-page-reporting` until the guest's balloon
+    /// device has been seen active (`settle_balloon_check`), which has to happen
+    /// before any snapshot of the VM is taken.
+    pub balloon_check_due: bool,
     pub snapshot_key: Option<String>,
     /// Set only for the `podman prepare` lifecycle: where its startup snapshot goes.
     pub prepare_target: Option<PreparedTarget>,
@@ -226,10 +230,11 @@ pub struct CacheRequest {
 /// from what it actually did:
 ///
 /// - the podman-run loop starts at `Pending` (or `Continue` when snapshots
-///   are disabled), moves to `Continue` once the snapshot decision is "keep
-///   running this VM" (created-and-resumed, creation failed, or no snapshot
-///   key), and to `Doomed` when the VM is being replaced by a restore of the
-///   snapshot it just produced (the NV2 miss path) or shut down mid-decision;
+///   are disabled and no balloon check is owed), moves to `Continue` once the
+///   snapshot decision is "keep running this VM" (created-and-resumed,
+///   creation failed, or no snapshot key), and to `Doomed` when the VM is
+///   being replaced by a restore of the snapshot it just produced (the NV2
+///   miss path) or shut down mid-decision;
 /// - the restore path binds its listener with `Restored` BEFORE resuming the
 ///   clone, so a restored guest's re-ask can never be told to start cold;
 /// - an in-place reboot resets to `Continue`: the rebooted guest cold-boots,

@@ -506,9 +506,191 @@ async fn test_two_balloon_sets_each_report_their_own_target() -> Result<()> {
     result
 }
 
+/// How one run of a guest that leaves its balloon inactive ended: the run's log,
+/// and each thing that was wrong with the way it ended.
+struct InactiveBalloonRun {
+    log_path: std::path::PathBuf,
+    wrong: Vec<String>,
+}
+
+/// One `podman run --balloon 0 --free-page-reporting` of a guest booted with
+/// `init_on_free=1`, with `extra` among its arguments. The run has to end by
+/// itself, with an error that names the flag and the known causes and carries
+/// what Firecracker answered. `FCVM_NO_SNAPSHOT` is taken out of the run's
+/// environment, so only a `--no-snapshot` in `extra` keeps the run out of the
+/// snapshot cache.
+async fn run_with_an_inactive_balloon(name: &str, extra: &[&str]) -> Result<InactiveBalloonRun> {
+    enum Ended {
+        Exited(std::process::ExitStatus),
+        Healthy,
+    }
+
+    let mut args = vec!["podman", "run", "--name", name];
+    args.extend_from_slice(extra);
+    args.extend_from_slice(&[
+        "--balloon",
+        "0",
+        "--free-page-reporting",
+        common::TEST_IMAGE,
+    ]);
+    let (mut child, pid, log_path) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &args,
+        &[("FCVM_BOOT_ARGS", "init_on_free=1")],
+    )
+    .await?;
+    let mut wrong = Vec::new();
+
+    // The run has to end by itself. One that reaches healthy was not checked. The
+    // health poll gives up when fcvm exits, and then the wait for the exit decides.
+    let ended = tokio::time::timeout(Duration::from_secs(300), async {
+        tokio::select! {
+            status = child.wait() => status.map(Ended::Exited).context("waiting for fcvm"),
+            Ok(()) = common::poll_health_by_pid(pid, 240) => Ok(Ended::Healthy),
+        }
+    })
+    .await;
+    let failed = match ended {
+        Ok(Ok(Ended::Exited(status))) => {
+            if status.success() {
+                wrong.push(format!(
+                    "the run of a VM whose guest left the balloon inactive exited with {status}"
+                ));
+            }
+            !status.success()
+        }
+        Ok(Ok(Ended::Healthy)) => {
+            // Said with the failure: whether the guest did boot with the argument.
+            let cmdline = common::exec_in_vm(pid, &["/usr/bin/cat /proc/cmdline"])
+                .await
+                .unwrap_or_else(|error| format!("(not read: {error:#})"));
+            common::kill_process(pid).await;
+            let _ = child.kill().await;
+            wrong.push(format!(
+                "the run became healthy: fcvm did not check that the guest brought up its \
+                 balloon device. The guest's command line {} init_on_free=1: {}",
+                if cmdline.contains("init_on_free=1") {
+                    "has"
+                } else {
+                    "does not have"
+                },
+                cmdline.trim()
+            ));
+            false
+        }
+        Ok(Err(error)) => {
+            common::kill_process(pid).await;
+            let _ = child.kill().await;
+            return Err(error);
+        }
+        Err(_) => {
+            common::kill_process(pid).await;
+            let _ = child.kill().await;
+            anyhow::bail!("the run neither ended nor became healthy within 300s");
+        }
+    };
+
+    if let Err(error) = common::wait_for_log_eof(&log_path, Duration::from_secs(30)).await {
+        wrong.push(format!("the run's log did not end: {error:#}"));
+    }
+    if failed {
+        // The harness writes the command line and the environment into the same
+        // file, so the flag and `init_on_free` are looked for on the line that
+        // carries Firecracker's refusal, which only the error has.
+        let log = std::fs::read_to_string(&log_path)
+            .with_context(|| format!("reading {}", log_path.display()))?;
+        let refusals: Vec<&str> = log
+            .lines()
+            .filter(|line| line.contains("Device not activated yet"))
+            .collect();
+        if refusals.is_empty() {
+            wrong.push(format!(
+                "the failed run's output ({}) does not carry Firecracker's refusal, 'Device \
+                 not activated yet'",
+                log_path.display()
+            ));
+        } else if !refusals.iter().any(|line| {
+            ["--free-page-reporting", "init_on_free", "page poisoning"]
+                .iter()
+                .all(|part| line.contains(part))
+        }) {
+            wrong.push(format!(
+                "the failed run's error does not name --free-page-reporting, init_on_free and \
+                 page poisoning beside Firecracker's refusal: {refusals:?}"
+            ));
+        }
+    }
+    Ok(InactiveBalloonRun { log_path, wrong })
+}
+
+/// A guest that does not accept free page reporting leaves Firecracker's whole
+/// balloon device inactive: the device has a queue for the reports, the guest never
+/// sets it up, and Firecracker then activates nothing. `init_on_free=1` on the
+/// kernel command line is one way a guest refuses the feature. A VM booted that way
+/// with `--free-page-reporting` must not go on with a dead balloon, because a
+/// snapshot of it hands that device to every run restored from it. So the run
+/// fails, and its error names the flag and the known causes and carries what
+/// Firecracker answered. Two runs are judged together. The first has
+/// `--no-snapshot`: a cold boot whatever the snapshot cache holds, and the case
+/// where fcvm takes no snapshot of its own to check before. The second would take
+/// a pre-start snapshot: it has to fail before it starts one, and install none.
+/// Its `--env` is this test run's own, so its snapshot key is too, and no other
+/// run can have left it a snapshot to restore.
+#[tokio::test]
+async fn test_free_page_reporting_run_fails_when_the_guest_leaves_the_balloon_inactive(
+) -> Result<()> {
+    let (name, cached_name, _snap, _serve) = common::unique_names("fpr-inactive");
+    let mut wrong = Vec::new();
+
+    let cold = run_with_an_inactive_balloon(&name, &["--no-snapshot"]).await?;
+    wrong.extend(
+        cold.wrong
+            .iter()
+            .map(|what| format!("the --no-snapshot run: {what}")),
+    );
+
+    let env_unique = format!("FPR_INACTIVE_ID={cached_name}");
+    let cached = run_with_an_inactive_balloon(&cached_name, &["--env", &env_unique]).await?;
+    wrong.extend(
+        cached
+            .wrong
+            .iter()
+            .map(|what| format!("the run that takes snapshots: {what}")),
+    );
+    match cache_choice(&cached.log_path) {
+        Some(("cold boot", key)) => {
+            if common::snapshot_exists(&key) {
+                wrong.push(format!(
+                    "the run that takes snapshots installed the snapshot {key} of a VM whose \
+                     guest left the balloon inactive"
+                ));
+                if let Err(error) = common::delete_snapshot(&key).await {
+                    wrong.push(format!("the snapshot {key} was not deleted: {error:#}"));
+                }
+            }
+        }
+        other => wrong.push(format!(
+            "control: the run that takes snapshots was to start as a cold boot on its way to \
+             a pre-start snapshot, and its log says {other:?}"
+        )),
+    }
+    let log = std::fs::read_to_string(&cached.log_path)
+        .with_context(|| format!("reading {}", cached.log_path.display()))?;
+    if log
+        .lines()
+        .any(|line| line.contains("Creating pre-start snapshot"))
+    {
+        wrong.push(
+            "the run that takes snapshots logged `Creating pre-start snapshot`: it got to \
+             its pre-start snapshot before the balloon check stopped it"
+                .to_string(),
+        );
+    }
+    anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
+    Ok(())
+}
+
 /// What one `podman run` decided about the snapshot cache, from the line it logs
 /// when it decides: which kind of start, and the snapshot key the line names.
-#[cfg(feature = "privileged-tests")]
 fn cache_choice(log: &std::path::Path) -> Option<(&'static str, String)> {
     let text = std::fs::read_to_string(log).ok()?;
     text.lines().find_map(|line| {

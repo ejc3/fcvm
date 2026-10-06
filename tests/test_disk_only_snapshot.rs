@@ -212,7 +212,8 @@ async fn test_disk_only_clone_preserves_work_and_regenerates_identity() -> Resul
 
 /// A disk-only clone of a `--balloon` VM cold-boots with a balloon device at the
 /// source's target. The boot synthesized from the snapshot used to attach none
-/// (#1052).
+/// (#1052). The source here also has `--free-page-reporting`, which the snapshot
+/// records from the source's VMM and the clone's boot has to attach the device with.
 #[tokio::test]
 async fn test_disk_only_clone_keeps_the_balloon() -> Result<()> {
     const BALLOON_MIB: u32 = 64;
@@ -231,6 +232,7 @@ async fn test_disk_only_clone_keeps_the_balloon() -> Result<()> {
             "--no-snapshot",
             "--balloon",
             &balloon,
+            "--free-page-reporting",
             "nginx:alpine",
         ],
         "disk-only-balloon-base",
@@ -246,6 +248,18 @@ async fn test_disk_only_clone_keeps_the_balloon() -> Result<()> {
             source.target_mib == BALLOON_MIB,
             "the source VM's balloon target is {} MiB, not the {BALLOON_MIB} it was started with",
             source.target_mib
+        );
+        // Second control: the source's device offers free page reporting, so what
+        // the snapshot records and the clone attaches is the only thing in doubt.
+        let source_device = common::firecracker_client_by_pid(pid)
+            .await?
+            .balloon_device()
+            .await
+            .context("reading the source VM's balloon device")?;
+        anyhow::ensure!(
+            source_device.is_some_and(|device| device.free_page_reporting),
+            "control: the source VM's balloon device is {source_device:?}, without the free \
+             page reporting it was started with"
         );
         let output = tokio::process::Command::new(common::find_fcvm_binary()?)
             .args([
@@ -296,6 +310,17 @@ async fn test_disk_only_clone_keeps_the_balloon() -> Result<()> {
                 clone.target_mib == BALLOON_MIB,
                 "the disk-only clone's balloon target is {} MiB, not the source's {BALLOON_MIB}",
                 clone.target_mib
+            );
+            // Firecracker reports what the device it was asked to attach offers.
+            let attached = common::firecracker_client_by_pid(clone_pid)
+                .await?
+                .balloon_device()
+                .await
+                .context("reading the disk-only clone's balloon device")?;
+            anyhow::ensure!(
+                attached.is_some_and(|device| device.free_page_reporting),
+                "the disk-only clone's balloon device is {attached:?}: its boot dropped the \
+                 free page reporting its source was booted with"
             );
             let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
                 .load_state_by_pid(clone_pid)

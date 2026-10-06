@@ -17,7 +17,7 @@ use std::process::ExitStatus;
 use tokio::sync::mpsc;
 
 use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, ProcessSpec};
-use crate::firecracker::{api, FirecrackerClient, FirecrackerConfig, VmManager};
+use crate::firecracker::{api, BalloonDevice, FirecrackerClient, FirecrackerConfig, VmManager};
 
 /// Guest CID for the host↔guest vsock device (host is always CID 2).
 const GUEST_CID: u32 = 3;
@@ -207,14 +207,10 @@ impl Hypervisor for FirecrackerBackend {
             .await
     }
 
-    async fn add_balloon(&mut self, amount_mib: u32) -> Result<()> {
+    async fn add_balloon(&mut self, device: BalloonDevice) -> Result<()> {
         self.vm
             .client()?
-            .set_balloon(api::Balloon {
-                amount_mib,
-                deflate_on_oom: true,
-                stats_polling_interval_s: Some(1),
-            })
+            .set_balloon(api::Balloon::attach(device))
             .await
     }
 

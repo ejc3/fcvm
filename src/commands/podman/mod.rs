@@ -722,6 +722,64 @@ fn nv2_profile(kernel_profile: &Option<String>) -> bool {
     )
 }
 
+/// Refuse `--free-page-reporting` where fcvm cannot turn it on: with no balloon
+/// device to carry it, with hugepages, and on Cloud Hypervisor. Checked with the
+/// balloon target, before the snapshot cache is looked up, so a cache hit and a
+/// cold boot refuse the same run the same way. It is checked here and not by clap
+/// so that RunArgs clap never parsed (the serve API, a cold boot from a snapshot, a
+/// library caller) are checked too.
+fn validate_free_page_reporting(args: &RunArgs) -> Result<()> {
+    if !args.free_page_reporting {
+        return Ok(());
+    }
+    anyhow::ensure!(
+        args.balloon.is_some(),
+        "--free-page-reporting needs --balloon: free page reporting is a feature of the \
+         balloon device, and a VM has one only with --balloon (--balloon 0 attaches one that \
+         holds no memory)"
+    );
+    anyhow::ensure!(
+        !args.hugepages,
+        "--free-page-reporting is not supported with --hugepages: fcvm supports it only when \
+         guest memory is not backed by huge pages"
+    );
+    anyhow::ensure!(
+        args.hypervisor == crate::cli::args::Hypervisor::Firecracker,
+        "--free-page-reporting is not supported with --hypervisor cloud-hypervisor: fcvm turns \
+         it on only on a Firecracker balloon"
+    );
+    Ok(())
+}
+
+/// Whether the guest agent's first "cache-ready" ask is handed to the run loop:
+/// when the run may take a pre-start snapshot, and when a cold boot
+/// with `--free-page-reporting` owes the check of its balloon
+/// (`settle_balloon_check`), which runs at that ask. `podman prepare` has no run
+/// loop to hand it to, and checks after its health wait.
+fn ask_reaches_run_loop(
+    skip_snapshot_creation: bool,
+    balloon_check_due: bool,
+    lifecycle: &PodmanLifecycle,
+) -> bool {
+    (!skip_snapshot_creation || balloon_check_due) && !lifecycle.is_prepare()
+}
+
+/// Run the check a cold boot with `--free-page-reporting` owes, once: that the
+/// guest brought its balloon device up (`require_active_balloon`, which says why
+/// that can fail and why it matters). Callers run it when the guest's agent is up
+/// and before a snapshot of the VM is taken. A VM that owes no check, and one
+/// already checked, return at once.
+async fn settle_balloon_check(ctx: &mut VmContext) -> Result<()> {
+    if !ctx.balloon_check_due {
+        return Ok(());
+    }
+    let client = crate::firecracker::FirecrackerClient::new(ctx.data_dir.join("firecracker.sock"))?;
+    crate::commands::common::require_active_balloon(&client, &ctx.disk_path).await?;
+    ctx.balloon_check_due = false;
+    info!("the guest brought up its balloon device with free page reporting");
+    Ok(())
+}
+
 /// The `snapshot run` arguments that restore this run from a cached snapshot.
 ///
 /// `publish` is this run's own `--publish`, so the clone listens where this run asked,
@@ -1063,6 +1121,7 @@ async fn prepare_vm_for_lifecycle(
         );
     }
     validate_balloon_target(args.balloon, args.mem)?;
+    validate_free_page_reporting(&args)?;
 
     // Normalize --forward-localhost: a repeated port would otherwise fail the
     // host-side bind in routed mode. Bridged mode has no host-side relay for the
@@ -1443,6 +1502,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.health_check_timeout = args.health_check_timeout;
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
+    vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
     vm_state.config.portable_volumes = args.portable_volumes;
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = args.forward_localhost.clone();
@@ -1675,10 +1735,14 @@ async fn prepare_vm_for_lifecycle(
     // - --no-snapshot flag or FCVM_NO_SNAPSHOT env var is set
     // Note: FUSE volumes survive snapshot/restore — fc-agent remounts them on clone restore
     let skip_snapshot_creation = no_snapshot;
+    // This is a cold boot. With --free-page-reporting it owes a check that the
+    // guest brought its balloon up, before any snapshot of the VM is taken.
+    let balloon_check_due = args.free_page_reporting;
+    let forward_ask = ask_reaches_run_loop(skip_snapshot_creation, balloon_check_due, &lifecycle);
     let (cache_tx, cache_rx): (
         Option<mpsc::Sender<CacheRequest>>,
         Option<mpsc::Receiver<CacheRequest>>,
-    ) = if !skip_snapshot_creation && !lifecycle.is_prepare() {
+    ) = if forward_ask {
         let (tx, rx) = mpsc::channel(1);
         (Some(tx), Some(rx))
     } else {
@@ -1687,9 +1751,10 @@ async fn prepare_vm_for_lifecycle(
 
     // What this process knows the guest to be, for answering (re-)asked
     // "cache-ready" messages. With snapshots disabled no boundary can sever
-    // the handshake and no snapshot decision exists — the verdict is Continue
-    // from the start; otherwise it is Pending until the run loop decides.
-    let cache_verdict = shared_cache_verdict(if skip_snapshot_creation {
+    // the handshake and no snapshot decision exists, so the verdict is Continue
+    // from the start, unless the run loop has the balloon check to run at the
+    // guest's first ask. Otherwise it is Pending until the run loop decides.
+    let cache_verdict = shared_cache_verdict(if skip_snapshot_creation && !forward_ask {
         CacheVerdict::Continue
     } else {
         CacheVerdict::Pending
@@ -1914,6 +1979,7 @@ async fn prepare_vm_for_lifecycle(
         egress_proxy_handle,
         cache_rx,
         startup_rx,
+        balloon_check_due,
         snapshot_key,
         prepare_target,
         volume_configs,
@@ -2256,6 +2322,12 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     // startup snapshot. The Continue verdict set below makes the
                     // relaunched fc-agent's cache-ready resolve to a cold start,
                     // so it proceeds straight to the container.
+                    // The balloon check of a --free-page-reporting VM is not run
+                    // after a relaunch. The relaunch replays the launch config the
+                    // first boot used (`ctx.reboot_spec`), so a guest that passed the
+                    // check brings its balloon up again. A guest that reboots before
+                    // its first ask is not checked by this run. A memory snapshot of
+                    // it still makes the test (`snapshot_balloon_device`).
                     ctx.cache_rx = None;
                     ctx.startup_rx = None;
                     // The relaunched fc-agent re-sends cache-ready; a rebooted
@@ -2344,6 +2416,15 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                     None => std::future::pending().await,
                 }
             } => {
+                // The guest's agent is up, so its kernel has probed its devices. A
+                // cold boot with --free-page-reporting is checked here: before the
+                // pre-start snapshot below, and before the guest is told to go on.
+                if let Err(error) = settle_balloon_check(ctx).await {
+                    // The request is dropped unanswered, and that must not read as
+                    // "start the container": this VM is about to be torn down.
+                    *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
+                    return Err(error);
+                }
                 if let Some(ref key) = ctx.snapshot_key {
                     info!(snapshot_key = %key, digest = %cache_request.digest, "Creating pre-start snapshot");
 
@@ -2455,6 +2536,11 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
             } => {
                 // Oneshot channel - prevent further attempts
                 ctx.startup_rx = None;
+
+                // The balloon check normally ran at the agent's first ask. It runs
+                // here if that ask never came (fc-agent skips it when it cannot
+                // quiesce the console), so the startup snapshot is behind it too.
+                settle_balloon_check(ctx).await?;
 
                 if let Some(ref key) = ctx.snapshot_key {
                     let startup_key = startup_snapshot_key(key, ctx.args.balloon);
@@ -2596,6 +2682,10 @@ async fn run_prepare_loop(
         PodmanLifecycle::Run => PREPARE_HEALTH_BUDGET,
     };
     let startup_ack = await_prepare_healthy(startup_rx, cancel, budget, vm_exited).await?;
+
+    // The container is healthy, so the guest's agent is up. A cold boot with
+    // --free-page-reporting is checked before the snapshot below is taken.
+    settle_balloon_check(ctx).await?;
 
     // Resolved before the boot, so the generation this installs is the one the pre-boot
     // cache check looked for.
@@ -2967,6 +3057,7 @@ mod tests {
             cmd: None,
             publish: vec![],
             balloon: None,
+            free_page_reporting: false,
             network: NetworkMode::Rootless,
             hypervisor: crate::cli::args::Hypervisor::Firecracker,
             health_check: None,
@@ -3212,35 +3303,41 @@ mod tests {
     fn the_launch_config_carries_the_balloon() {
         use crate::firecracker::BalloonDevice;
         use std::path::Path;
-        let mut args = test_args();
-        args.balloon = Some(512);
-        let device = Some(BalloonDevice { target_mib: 512 });
-        let launch_config = build_launch_config(
-            &args,
-            Path::new("/rootfs"),
-            Path::new("/kernel"),
-            Path::new("/initrd"),
-            &None,
-            &RuntimeConfig::default(),
-            GuestBootInputs::default(),
-            &[],
-        );
-        assert_eq!(launch_config.balloon, device);
-        let key_config = build_firecracker_config(
-            &args,
-            "sha256:test",
-            Path::new("/kernel"),
-            Path::new("/rootfs"),
-            Path::new("/initrd"),
-            None,
-            ImageMode::Overlay,
-            None,
-            None,
-            None,
-            GuestBootInputs::default(),
-            &[],
-        );
-        assert_eq!(key_config.balloon, device);
+        for free_page_reporting in [false, true] {
+            let mut args = test_args();
+            args.balloon = Some(512);
+            args.free_page_reporting = free_page_reporting;
+            let device = Some(BalloonDevice {
+                target_mib: 512,
+                free_page_reporting,
+            });
+            let launch_config = build_launch_config(
+                &args,
+                Path::new("/rootfs"),
+                Path::new("/kernel"),
+                Path::new("/initrd"),
+                &None,
+                &RuntimeConfig::default(),
+                GuestBootInputs::default(),
+                &[],
+            );
+            assert_eq!(launch_config.balloon, device);
+            let key_config = build_firecracker_config(
+                &args,
+                "sha256:test",
+                Path::new("/kernel"),
+                Path::new("/rootfs"),
+                Path::new("/initrd"),
+                None,
+                ImageMode::Overlay,
+                None,
+                None,
+                None,
+                GuestBootInputs::default(),
+                &[],
+            );
+            assert_eq!(key_config.balloon, device);
+        }
     }
 
     /// A cache hit restores through `snapshot run`. The snapshot holds the balloon
@@ -3293,6 +3390,129 @@ mod tests {
             checked < looked_up,
             "prepare_vm_for_lifecycle looks the snapshot cache up before it checks the balloon target"
         );
+        let switch_checked = prepare
+            .find("validate_free_page_reporting(&args)?;")
+            .expect("--free-page-reporting is never checked");
+        assert!(
+            switch_checked < looked_up,
+            "prepare_vm_for_lifecycle looks the snapshot cache up before it checks --free-page-reporting"
+        );
+    }
+
+    /// `--free-page-reporting` is refused by name where fcvm cannot turn it on: with
+    /// no balloon device, with hugepages and on Cloud Hypervisor. The refusal runs
+    /// before the snapshot cache is looked up (pinned in the test above), so a hit
+    /// and a miss refuse alike, and it covers RunArgs that clap never parsed.
+    #[test]
+    fn free_page_reporting_is_refused_without_a_balloon_with_hugepages_and_on_cloud_hypervisor() {
+        type Change = fn(&mut RunArgs);
+        let with = |change: Change| {
+            let mut args = test_args();
+            args.balloon = Some(0);
+            args.free_page_reporting = true;
+            change(&mut args);
+            args
+        };
+        validate_free_page_reporting(&with(|_| {}))
+            .expect("a Firecracker VM with a balloon device takes the switch");
+
+        let refusals: [(Change, &str); 3] = [
+            (|args| args.balloon = None, "--balloon"),
+            (|args| args.hugepages = true, "--hugepages"),
+            (
+                |args| args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor,
+                "cloud-hypervisor",
+            ),
+        ];
+        for (change, names) in refusals {
+            let error = validate_free_page_reporting(&with(change))
+                .expect_err(&format!("the switch was accepted with {names}"))
+                .to_string();
+            assert!(
+                error.contains("--free-page-reporting") && error.contains(names),
+                "{names}: {error}"
+            );
+
+            // Without the switch the same run is none of this function's business.
+            let mut plain = with(change);
+            plain.free_page_reporting = false;
+            validate_free_page_reporting(&plain).expect("a run without the switch");
+        }
+    }
+
+    /// A VM cold-booted with --free-page-reporting has its balloon checked before
+    /// this process takes a snapshot of it: when the guest's agent first asks for
+    /// its cache verdict, which is before the pre-start snapshot, again before the
+    /// startup snapshot in case that ask never came, and in `podman prepare` between
+    /// its health wait and its snapshot. A --no-snapshot run takes no snapshot of
+    /// its own, but `fcvm snapshot create` can, so its agent's ask reaches the run
+    /// loop too. No fake VMM drives these loops, so the order is pinned by source.
+    #[test]
+    fn a_cold_boot_with_free_page_reporting_checks_the_balloon_before_any_snapshot() {
+        let source = include_str!("mod.rs");
+        let code = &source[..source.find("\n#[cfg(test)]\nmod tests {").unwrap()];
+        let body_of = |function: &str| {
+            let from = code
+                .find(function)
+                .unwrap_or_else(|| panic!("no {function}"));
+            let body = &code[from..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        let position = |body: &str, needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("no {needle:?} in the function"))
+        };
+        let check = "settle_balloon_check(ctx).await";
+
+        let run_loop = body_of("pub async fn run_vm_loop");
+        let checks: Vec<usize> = run_loop.match_indices(check).map(|(at, _)| at).collect();
+        assert_eq!(
+            checks.len(),
+            2,
+            "run_vm_loop checks the balloon at {checks:?}, not once at the agent's ask and \
+             once before the startup snapshot"
+        );
+        let asked = position(run_loop, "Some(cache_request) = async {");
+        let pre_start = position(run_loop, "\"Creating pre-start snapshot\"");
+        let healthy = position(run_loop, "Ok(startup_ack) = async {");
+        let startup = position(run_loop, "\"Creating startup snapshot (VM healthy)\"");
+        assert!(
+            asked < checks[0] && checks[0] < pre_start,
+            "the pre-start snapshot is not behind the check: ask at {asked}, check at {}, \
+             snapshot at {pre_start}",
+            checks[0]
+        );
+        assert!(
+            healthy < checks[1] && checks[1] < startup,
+            "the startup snapshot is not behind the check: healthy at {healthy}, check at {}, \
+             snapshot at {startup}",
+            checks[1]
+        );
+
+        let prepare = body_of("async fn run_prepare_loop(");
+        let waited = position(prepare, "await_prepare_healthy(");
+        let checked = position(prepare, check);
+        let saved = position(prepare, "create_podman_snapshot(");
+        assert!(
+            waited < checked && checked < saved,
+            "podman prepare's snapshot is not behind the check: health wait at {waited}, check \
+             at {checked}, snapshot at {saved}"
+        );
+
+        // The ask reaches the run loop whenever a snapshot may be taken,
+        // and on a run that takes none when the check is due. `podman prepare` has
+        // no run loop to hand it to.
+        let run = PodmanLifecycle::Run;
+        let prepare = PodmanLifecycle::Prepare(PrepareOptions::default());
+        assert!(ask_reaches_run_loop(false, false, &run));
+        assert!(ask_reaches_run_loop(false, true, &run));
+        assert!(!ask_reaches_run_loop(true, false, &run));
+        assert!(
+            ask_reaches_run_loop(true, true, &run),
+            "a --no-snapshot run with --free-page-reporting never hears that its guest is up"
+        );
+        assert!(!ask_reaches_run_loop(false, true, &prepare));
+        assert!(!ask_reaches_run_loop(true, true, &prepare));
     }
 
     /// #821 helper: snapshot key of a config built through the real

@@ -578,8 +578,13 @@ impl Hypervisor for CloudHypervisorBackend {
         Ok(())
     }
 
-    async fn add_balloon(&mut self, amount_mib: u32) -> Result<()> {
-        self.pending.balloon_mib = Some(amount_mib);
+    async fn add_balloon(&mut self, device: crate::firecracker::BalloonDevice) -> Result<()> {
+        anyhow::ensure!(
+            !device.free_page_reporting,
+            "--free-page-reporting needs Firecracker: fcvm's Cloud Hypervisor backend attaches \
+             a balloon without free page reporting"
+        );
+        self.pending.balloon_mib = Some(device.target_mib);
         Ok(())
     }
 
@@ -801,6 +806,36 @@ mod tests {
             PathBuf::from("/tmp/ch-test.sock"),
             None,
         )
+    }
+
+    /// fcvm turns free page reporting on only on a Firecracker balloon. `podman run`
+    /// refuses the switch for Cloud Hypervisor before anything is set up. This is
+    /// the same refusal for any other caller of the trait, so a device that asks
+    /// for reporting is never attached without it.
+    #[tokio::test]
+    async fn a_balloon_with_free_page_reporting_is_refused() {
+        use crate::firecracker::BalloonDevice;
+        let mut be = backend();
+        be.add_balloon(BalloonDevice {
+            target_mib: 64,
+            free_page_reporting: false,
+        })
+        .await
+        .expect("a balloon without free page reporting");
+        assert_eq!(be.pending.balloon_mib, Some(64));
+
+        let error = be
+            .add_balloon(BalloonDevice {
+                target_mib: 64,
+                free_page_reporting: true,
+            })
+            .await
+            .expect_err("a balloon with free page reporting was accepted")
+            .to_string();
+        assert!(
+            error.contains("--free-page-reporting") && error.contains("Cloud Hypervisor"),
+            "{error}"
+        );
     }
 
     /// CH madvises guest RAM MADV_HUGEPAGE unless the request says `thp: false`, so an

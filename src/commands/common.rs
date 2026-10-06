@@ -1658,11 +1658,127 @@ fn balloon_target_failure(error: anyhow::Error, target_mib: u32) -> anyhow::Erro
     }
 }
 
+/// Check that the guest of a VM cold-booted with `--free-page-reporting` brought
+/// its balloon device up.
+///
+/// With the switch on, Firecracker gives the device one more queue, for the guest's
+/// reports. A guest that does not accept the feature never sets that queue up, and
+/// Firecracker then does not activate the device at all: the VM has a balloon that
+/// takes no target, where the same guest without the switch has a working one. A
+/// snapshot of that VM hands the dead device to every run restored from it, so
+/// `podman run` makes this check before it takes one, and every memory snapshot
+/// repeats the test with the VM paused (`snapshot_balloon_device`). The caller
+/// runs this one once the guest's agent is up, because the guest's kernel has
+/// probed its devices by then.
+///
+/// The test is `reporting_balloon_must_be_active`: a balloon that holds memory is
+/// sent nothing, and one that holds none is sent the target it already has, which
+/// Firecracker refuses for a device that is not active. This function holds the
+/// per-VM snapshot lock from its read of the target to that PATCH. `fcvm balloon`
+/// takes that lock to set a target, so the check cannot put back a target another
+/// process has just changed.
+pub(crate) async fn require_active_balloon(
+    client: &crate::firecracker::FirecrackerClient,
+    disk_path: &Path,
+) -> Result<()> {
+    let _snapshot_lock = acquire_vm_snapshot_lock(disk_path).await?;
+    let device = client
+        .balloon_device()
+        .await
+        .context("reading the VM's balloon device to check that the guest brought it up")?
+        .context("the VM was booted with --free-page-reporting and has no balloon device")?;
+    reporting_balloon_must_be_active(client, &device).await
+}
+
+/// Test that the guest activated a balloon device that has free page reporting,
+/// sending the guest as little as that takes.
+///
+/// A balloon that holds memory was inflated by the guest's driver, so its device
+/// is active. `GET /balloon/statistics` answers for an active and an inactive
+/// device alike, and the guest's Linux driver writes a size above 0 only after an
+/// inflate the device answered. Such a device is sent nothing.
+///
+/// A balloon that holds nothing proves nothing, so the device is sent the target
+/// it already has, and Firecracker refuses that `PATCH /balloon` for a device that
+/// is not active. An accepted PATCH has an effect in the guest: Firecracker raises
+/// a config interrupt for every one, and the guest's driver answers it by moving
+/// its balloon to the target. With a target of 0 nothing moves. With a target
+/// above 0, a balloon the guest had deflated all the way to 0 when it ran out of
+/// memory is inflated again. Leaving that guest alone needs Firecracker to say in
+/// a read whether the device is active.
+///
+/// The caller holds the per-VM snapshot lock, which `fcvm balloon` takes to set a
+/// target, so the target sent is still the one read.
+async fn reporting_balloon_must_be_active(
+    client: &crate::firecracker::FirecrackerClient,
+    device: &crate::firecracker::BalloonDevice,
+) -> Result<()> {
+    let stats = client.balloon_stats().await.context(
+        "reading the size of the VM's balloon to check that the guest brought the device up",
+    )?;
+    if stats.actual_mib > 0 {
+        return Ok(());
+    }
+    client
+        .patch_balloon(crate::firecracker::api::BalloonUpdate {
+            amount_mib: device.target_mib,
+        })
+        .await
+        .map_err(inactive_balloon_failure)
+}
+
+/// What a failed check of the guest's balloon device is reported as. Every failure
+/// says what was being checked and for which flag. A 400 is Firecracker saying the
+/// device is not active, and gets the known causes. A timeout or a dead VMM is
+/// none of them.
+fn inactive_balloon_failure(error: anyhow::Error) -> anyhow::Error {
+    let doing = "checking that the guest brought up the balloon device it was given with \
+                 --free-page-reporting";
+    if firecracker_refused(&error) {
+        error.context(format!(
+            "{doing}: it did not, so the VM has no working balloon, and no snapshot of it is \
+             taken. A guest does not accept free page reporting when it boots with \
+             init_on_free=1 or with page poisoning (page_poison=1), set in the kernel \
+             profile's boot_args or in FCVM_BOOT_ARGS, or when its virtio balloon driver has \
+             no free page reporting, and Firecracker then leaves the whole device inactive. A \
+             kernel with no virtio balloon driver leaves it inactive with or without the \
+             flag. Remove the cause, or run without --free-page-reporting"
+        ))
+    } else {
+        error.context(doing)
+    }
+}
+
+/// The balloon device a memory snapshot records, read from the VMM with the VM
+/// paused: its target and its free page reporting switch from one
+/// `GET /vm/config`, or None for a VM with no device.
+///
+/// A device with free page reporting is then tested for a guest that never
+/// activated it (`reporting_balloon_must_be_active`; `require_active_balloon` says
+/// how a guest leaves it so). A snapshot of such a VM would hand the inactive
+/// device to every run restored from it. The refusal is returned as the error of
+/// `inactive_balloon_failure`, and the caller takes no snapshot. `podman run`
+/// makes the same test earlier, to fail the run. This one covers every creator of
+/// a memory snapshot and every boot, the ones no run checked included. The caller
+/// holds the per-VM snapshot lock, which the test needs.
+async fn snapshot_balloon_device(
+    client: &crate::firecracker::FirecrackerClient,
+) -> Result<Option<crate::firecracker::BalloonDevice>> {
+    let device = client
+        .balloon_device()
+        .await
+        .context("reading the VM's balloon device for the snapshot")?;
+    if let Some(device) = device.filter(|device| device.free_page_reporting) {
+        reporting_balloon_must_be_active(client, &device).await?;
+    }
+    Ok(device)
+}
+
 /// What Firecracker answers 400 to when it is asked to set a balloon target.
 pub(crate) const BALLOON_TARGET_REFUSALS: &str =
     "Firecracker refuses a target for a device the guest never activated, as with a kernel \
-     that has no virtio balloon driver, for a VM with no balloon device, and above the \
-     guest's memory";
+     that has no virtio balloon driver or a guest that did not accept --free-page-reporting, \
+     for a VM with no balloon device, and above the guest's memory";
 
 /// Whether `error` is Firecracker answering 400: it understood the request and
 /// refused it. A timeout, a dead VMM and any other status are not that.
@@ -2559,7 +2675,9 @@ pub async fn restore_from_snapshot(
         // be changed on the API socket after boot and nothing writes that to a
         // state file, so the snapshot's record, copied from one, can differ from
         // the device that was saved. The record is what this VM's cold boots
-        // attach, its relaunch after a guest reboot among them.
+        // attach, its relaunch after a guest reboot among them. The same read
+        // gives the free page reporting switch, which is the saved device's:
+        // nothing sets it on a restored VM.
         let balloon_start = std::time::Instant::now();
         if let Some(target_mib) = balloon_target_mib {
             client
@@ -2569,13 +2687,15 @@ pub async fn restore_from_snapshot(
                 .await
                 .map_err(|error| balloon_target_failure(error, target_mib))?;
         }
-        vm_state.config.balloon_mib = client
-            .balloon_target_mib()
+        let device = client
+            .balloon_device()
             .await
             .context("reading the restored VM's balloon device")?;
+        vm_state.config.record_balloon(device);
         info!(
             duration_us = balloon_start.elapsed().as_micros(),
             balloon_mib = ?vm_state.config.balloon_mib,
+            free_page_reporting = vm_state.config.balloon_free_page_reporting,
             set_by_caller = balloon_target_mib.is_some(),
             "balloon target settled on the restored VM"
         );
@@ -3170,6 +3290,7 @@ pub fn build_snapshot_config(
             hypervisor: vm_state.config.hypervisor,
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
             balloon_mib: vm_state.config.balloon_mib,
+            balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
         },
     })
 }
@@ -4051,15 +4172,15 @@ pub async fn create_snapshot_core(
     // its device: the target can be changed on the API socket after boot and
     // nothing writes that to the VM's state. Read here, with the VM paused and
     // right before the save, it is the target the saved device holds, for every
-    // creator that comes through this function. A failed read skips the save and
-    // is reported through the recovery below, which resumes the VM.
-    let balloon_result = pause_client
-        .balloon_target_mib()
-        .await
-        .context("reading the VM's balloon device for the snapshot");
+    // creator that comes through this function. The free page reporting switch
+    // comes from the same GET, and a device that has it is tested for a guest that
+    // left it inactive (`snapshot_balloon_device`). A failed read and an inactive
+    // device both skip the save and are reported through the recovery below, which
+    // resumes the VM.
+    let balloon_result = snapshot_balloon_device(&pause_client).await;
     let mut snapshot_result = match balloon_result {
-        Ok(balloon_mib) => {
-            snapshot_config.metadata.balloon_mib = balloon_mib;
+        Ok(device) => {
+            snapshot_config.metadata.record_balloon(device);
             // failpoint: hold between the read of the balloon and the save, where a
             // target set by `fcvm balloon` must not land.
             failpoint::hit_async("snapshot.post_balloon_read_pre_save").await;
@@ -5186,6 +5307,7 @@ mod tests {
     fn a_snapshot_records_its_vms_balloon() {
         let mut state = make_vm_state("vm-AAA", None);
         state.config.balloon_mib = Some(512);
+        state.config.balloon_free_page_reporting = true;
         let config = build_snapshot_config(
             &state,
             "key",
@@ -5197,6 +5319,47 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.metadata.balloon_mib, Some(512));
+        assert!(
+            config.metadata.balloon_free_page_reporting,
+            "the snapshot of a VM whose balloon reports free pages records that it does not"
+        );
+    }
+
+    /// A VM cold-booted with --free-page-reporting whose guest never brought the
+    /// balloon up fails its run. The error names the flag and the known causes, and
+    /// carries Firecracker's own message. A timeout and a dead VMM are none of those
+    /// causes, and are not explained as one.
+    #[test]
+    fn an_inactive_balloon_is_explained_by_the_flag_and_its_known_causes() {
+        let refusal = |status| {
+            anyhow::Error::new(crate::firecracker::api::ApiRefusal {
+                status,
+                reply:
+                    r#"{"fault_message":"Balloon update error: Balloon: Device not activated yet."}"#
+                        .to_string(),
+            })
+        };
+        let refused = format!(
+            "{:#}",
+            inactive_balloon_failure(refusal(hyper::StatusCode::BAD_REQUEST))
+        );
+        for part in [
+            "--free-page-reporting",
+            "init_on_free",
+            "page poisoning",
+            "balloon driver",
+            "Device not activated yet",
+        ] {
+            assert!(refused.contains(part), "no `{part}` in: {refused}");
+        }
+        for other in [
+            refusal(hyper::StatusCode::INTERNAL_SERVER_ERROR),
+            anyhow::anyhow!("Firecracker API PATCH /balloon timed out after 30s"),
+        ] {
+            let message = format!("{:#}", inactive_balloon_failure(other));
+            assert!(message.contains("--free-page-reporting"), "{message}");
+            assert!(!message.contains("init_on_free"), "{message}");
+        }
     }
 
     /// A cache hit sets its run's balloon target on the loaded, paused VM: after
@@ -5219,7 +5382,7 @@ mod tests {
         let steps = [
             ".load_snapshot(",
             ".patch_balloon(",
-            ".balloon_target_mib()",
+            ".balloon_device()",
             "failpoint::hit_async(\"restore.post_network_pre_resume\")",
             "state: \"Resumed\".to_string()",
         ];
@@ -5278,36 +5441,188 @@ mod tests {
     /// A memory snapshot's balloon record is read from the VMM inside
     /// `create_snapshot_core`: after the pause, so nothing can change the target
     /// between the read and the save, and before the save, so the record is the
-    /// target the saved device holds. Every creator of a Firecracker memory
+    /// target the saved device holds. The read is `snapshot_balloon_device`, which
+    /// also sends a device with free page reporting the target it has, and so
+    /// refuses a device the guest left inactive. The save comes after it, so no
+    /// snapshot holds such a device. Every creator of a Firecracker memory
     /// snapshot comes through that function and holds the per-VM snapshot lock.
     /// No fake VMM can drive it, so the order is pinned by its source.
     #[test]
     fn a_memory_snapshot_reads_the_balloon_between_the_pause_and_the_save() {
+        // A function's source, from its signature to the first closing brace in
+        // column one.
+        fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+            let start = source
+                .find(signature)
+                .unwrap_or_else(|| panic!("no `{signature}`"));
+            let end = source[start..]
+                .find("\n}\n")
+                .unwrap_or_else(|| panic!("`{signature}` has no end"));
+            &source[start..start + end]
+        }
+        fn assert_in_order(name: &str, body: &str, steps: &[&str]) {
+            let offsets: Vec<usize> = steps
+                .iter()
+                .map(|step| {
+                    body.find(step)
+                        .unwrap_or_else(|| panic!("{name} has no `{step}`"))
+                })
+                .collect();
+            assert!(
+                offsets.windows(2).all(|pair| pair[0] < pair[1]),
+                "{name} does not run {steps:?} in that order: offsets {offsets:?}"
+            );
+        }
         let source = include_str!("common.rs");
-        let start = source
-            .find("pub async fn create_snapshot_core(")
-            .expect("no create_snapshot_core");
-        // The function ends at the first closing brace in column one.
-        let end = source[start..]
-            .find("\n}\n")
-            .expect("create_snapshot_core has no end");
-        let body = &source[start..start + end];
-        let steps = [
-            "state: \"Paused\".to_string()",
-            ".balloon_target_mib()",
-            ".create_snapshot(SnapshotCreate {",
-        ];
-        let offsets: Vec<usize> = steps
-            .iter()
-            .map(|step| {
-                body.find(step)
-                    .unwrap_or_else(|| panic!("create_snapshot_core has no `{step}`"))
-            })
-            .collect();
-        assert!(
-            offsets.windows(2).all(|pair| pair[0] < pair[1]),
-            "create_snapshot_core does not run {steps:?} in that order: offsets {offsets:?}"
+        assert_in_order(
+            "create_snapshot_core",
+            body_of(source, "pub async fn create_snapshot_core("),
+            &[
+                "state: \"Paused\".to_string()",
+                "snapshot_balloon_device(&pause_client)",
+                ".create_snapshot(SnapshotCreate {",
+            ],
         );
+        assert_in_order(
+            "snapshot_balloon_device",
+            body_of(source, "async fn snapshot_balloon_device("),
+            &[".balloon_device()", "reporting_balloon_must_be_active("],
+        );
+        assert_in_order(
+            "reporting_balloon_must_be_active",
+            body_of(source, "async fn reporting_balloon_must_be_active("),
+            &[".balloon_stats()", ".patch_balloon("],
+        );
+        // The check a cold boot makes goes through the same test, under the lock.
+        assert_in_order(
+            "require_active_balloon",
+            body_of(source, "pub(crate) async fn require_active_balloon("),
+            &[
+                "acquire_vm_snapshot_lock(",
+                ".balloon_device()",
+                "reporting_balloon_must_be_active(",
+            ],
+        );
+    }
+
+    /// A memory snapshot is not taken of a VM whose guest left its balloon device
+    /// inactive. `snapshot_balloon_device` is the read `create_snapshot_core` makes
+    /// with the VM paused. It reads the size of a device with free page reporting
+    /// and sends one that holds nothing the target just read. Firecracker's refusal
+    /// of that comes back as the error that names the flag and the known causes, so
+    /// the caller skips the save. A device that holds memory is sent nothing. A
+    /// device the guest brought up is returned for the record. A device without
+    /// free page reporting is sent nothing: a guest's refusal of the feature cannot
+    /// have left it inactive.
+    #[tokio::test]
+    async fn a_memory_snapshot_refuses_a_reporting_balloon_the_guest_left_inactive() {
+        use crate::firecracker::BalloonDevice;
+        const REPORTING: &str = r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"free_page_reporting":true},"drives":[]}"#;
+        const PLAIN: &str = r#"{"balloon":{"amount_mib":96,"deflate_on_oom":true,"free_page_reporting":false},"drives":[]}"#;
+        const INACTIVE: (hyper::StatusCode, &str) = (
+            hyper::StatusCode::BAD_REQUEST,
+            r#"{"fault_message":"Balloon update error: Balloon: Device not activated yet."}"#,
+        );
+        const ACTIVE: (hyper::StatusCode, &str) = (hyper::StatusCode::NO_CONTENT, "");
+        // The statistics of a balloon that holds nothing, and of one the guest has
+        // inflated to 64 MiB.
+        const EMPTY: &str =
+            r#"{"target_pages":24576,"actual_pages":0,"target_mib":96,"actual_mib":0}"#;
+        const HELD: &str =
+            r#"{"target_pages":24576,"actual_pages":16384,"target_mib":96,"actual_mib":64}"#;
+        // The three requests as the fake VMM below writes them down.
+        const READ: &str = "GET /vm/config ";
+        const SIZE: &str = "GET /balloon/statistics ";
+        const TEST: &str = r#"PATCH /balloon {"amount_mib":96}"#;
+
+        // What `snapshot_balloon_device` returns from a VMM that answers
+        // `PATCH /balloon` with `patch`, `GET /balloon/statistics` with `stats` and
+        // everything else with `config`, and the requests that VMM saw: method,
+        // path and body.
+        async fn asked(
+            config: &'static str,
+            stats: &'static str,
+            patch: (hyper::StatusCode, &'static str),
+        ) -> (Result<Option<BalloonDevice>>, Vec<String>) {
+            let dir = tempfile::tempdir().unwrap();
+            let socket = dir.path().join("api.sock");
+            let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+            let (seen, mut requests) = tokio::sync::mpsc::unbounded_channel();
+            let app = axum::Router::new().fallback(
+                move |method: axum::http::Method, uri: axum::http::Uri, body: String| {
+                    let seen = seen.clone();
+                    async move {
+                        seen.send(format!("{method} {} {body}", uri.path()))
+                            .unwrap();
+                        if method == axum::http::Method::PATCH && uri.path() == "/balloon" {
+                            patch
+                        } else if uri.path() == "/balloon/statistics" {
+                            (hyper::StatusCode::OK, stats)
+                        } else {
+                            (hyper::StatusCode::OK, config)
+                        }
+                    }
+                },
+            );
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = crate::firecracker::FirecrackerClient::new(socket).unwrap();
+            let device = snapshot_balloon_device(&client).await;
+            server.abort();
+            let mut saw = Vec::new();
+            while let Ok(request) = requests.try_recv() {
+                saw.push(request);
+            }
+            (device, saw)
+        }
+
+        let (device, saw) = asked(REPORTING, EMPTY, INACTIVE).await;
+        let refused = match device {
+            Err(error) => format!("{error:#}"),
+            Ok(device) => panic!(
+                "a snapshot of a VM whose guest left its reporting balloon inactive is not \
+                 refused: the read returned {device:?} after the requests {saw:?}"
+            ),
+        };
+        for part in [
+            "--free-page-reporting",
+            "init_on_free",
+            "Device not activated yet",
+        ] {
+            assert!(refused.contains(part), "no `{part}` in: {refused}");
+        }
+        assert_eq!(saw, [READ, SIZE, TEST], "an inactive reporting device");
+
+        let (device, saw) = asked(REPORTING, EMPTY, ACTIVE).await;
+        assert_eq!(
+            device.unwrap(),
+            Some(BalloonDevice {
+                target_mib: 96,
+                free_page_reporting: true,
+            })
+        );
+        assert_eq!(saw, [READ, SIZE, TEST], "an active reporting device");
+
+        // A balloon that holds memory was inflated by the guest's driver, so the
+        // device is active and it is sent nothing. This VMM would refuse a PATCH.
+        let (device, saw) = asked(REPORTING, HELD, INACTIVE).await;
+        assert_eq!(
+            device.unwrap(),
+            Some(BalloonDevice {
+                target_mib: 96,
+                free_page_reporting: true,
+            })
+        );
+        assert_eq!(saw, [READ, SIZE], "a reporting device that holds memory");
+
+        let (device, saw) = asked(PLAIN, EMPTY, INACTIVE).await;
+        assert_eq!(
+            device.unwrap(),
+            Some(BalloonDevice {
+                target_mib: 96,
+                free_page_reporting: false,
+            })
+        );
+        assert_eq!(saw, [READ], "a device without free page reporting");
     }
 
     /// Cloud Hypervisor has no call that sets a balloon target on a restored VM.

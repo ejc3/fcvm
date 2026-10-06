@@ -132,7 +132,9 @@ pub struct FirecrackerConfig {
     /// Balloon device, from --balloon. The device is attached before boot and
     /// the saved VM state carries it. A device cannot be added to a restored
     /// VM, so a snapshot taken without the flag restores a guest with no
-    /// balloon, and whether a device exists has to be in the key. Its target is
+    /// balloon, and whether a device exists has to be in the key. So does
+    /// whether it reports free pages, which a restore cannot change either
+    /// (`BalloonDevice::free_page_reporting`). Its target is
     /// not: `BalloonDevice` keeps it out of the JSON, and a restore sets the
     /// caller's target on the loaded VM before the guest resumes (#1053), so
     /// runs that differ only in the target share the pre-start snapshot. The
@@ -256,16 +258,25 @@ impl Default for FirecrackerConfig {
     }
 }
 
-/// A balloon device in the launch config. It serializes as `{}`: the snapshot key
-/// says that a device exists and nothing about its target. It is written and never
-/// read back, so it has no `Deserialize`: a reader would get target 0 for every
-/// device.
+/// A balloon device in the launch config. It serializes as `{}`, or as
+/// `{"free_page_reporting":true}` for a device that reports free pages: the
+/// snapshot key says that a device exists and whether it reports free pages, and
+/// nothing about its target. It is written and never read back, so it has no
+/// `Deserialize`: a reader would get target 0 for every device.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BalloonDevice {
     /// Target in MiB a cold boot attaches the device at. Kept out of the JSON, and
     /// so out of the snapshot key.
     #[serde(skip)]
     pub target_mib: u32,
+    /// Whether the device offers free page reporting (--free-page-reporting). In
+    /// the JSON, and so in the snapshot key, because a restore cannot reconcile
+    /// it: Firecracker takes the setting only when the device is attached before
+    /// boot, and a restored device comes back with the feature bits it was saved
+    /// with. A snapshot booted without it never answers a run that asks for it,
+    /// nor the reverse.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub free_page_reporting: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -624,7 +635,11 @@ mod tests {
         assert_eq!(json(None).get("balloon"), None);
         for target_mib in [0, 512] {
             assert_eq!(
-                json(Some(BalloonDevice { target_mib })).get("balloon"),
+                json(Some(BalloonDevice {
+                    target_mib,
+                    free_page_reporting: false,
+                }))
+                .get("balloon"),
                 Some(&serde_json::json!({})),
                 "a balloon device at {target_mib} MiB"
             );
@@ -635,10 +650,46 @@ mod tests {
     /// cold boot attaches the device at the target it carries.
     #[test]
     fn the_launch_copy_of_a_key_config_keeps_the_balloon_target() {
+        let device = BalloonDevice {
+            target_mib: 512,
+            free_page_reporting: true,
+        };
         let mut config = test_config();
-        config.balloon = Some(BalloonDevice { target_mib: 512 });
+        config.balloon = Some(device);
         let launch = config.with_rootfs_path("/vm/rootfs.raw".into());
-        assert_eq!(launch.balloon, Some(BalloonDevice { target_mib: 512 }));
+        assert_eq!(launch.balloon, Some(device));
+    }
+
+    /// Free page reporting is part of the key. A restored VM keeps the setting its
+    /// device was booted with and no call changes it, so a snapshot booted without
+    /// it must not answer a run that asks for it, nor the reverse. A device with
+    /// reporting off serializes as `{}`.
+    #[test]
+    fn the_key_says_whether_the_balloon_reports_free_pages() {
+        let config = |free_page_reporting: bool| {
+            let mut config = test_config();
+            config.balloon = Some(BalloonDevice {
+                target_mib: 0,
+                free_page_reporting,
+            });
+            config
+        };
+        assert_ne!(
+            config(true).snapshot_key(),
+            config(false).snapshot_key(),
+            "a snapshot booted without free page reporting must not serve a run that asks for it"
+        );
+        let balloon = |free_page_reporting: bool| {
+            serde_json::to_value(config(free_page_reporting))
+                .unwrap()
+                .get("balloon")
+                .cloned()
+        };
+        assert_eq!(balloon(false), Some(serde_json::json!({})));
+        assert_eq!(
+            balloon(true),
+            Some(serde_json::json!({"free_page_reporting": true}))
+        );
     }
 
     #[test]

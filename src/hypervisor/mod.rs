@@ -243,8 +243,10 @@ pub trait Hypervisor: Send {
     /// Attach a virtio-rng entropy device.
     async fn add_entropy_device(&mut self) -> Result<()>;
 
-    /// Attach a memory balloon device (`amount_mib`, deflate-on-oom).
-    async fn add_balloon(&mut self, amount_mib: u32) -> Result<()>;
+    /// Attach a memory balloon device at the device's target, deflating when the
+    /// guest runs out of memory, and with free page reporting when the device has
+    /// it on. A backend that cannot turn reporting on refuses such a device.
+    async fn add_balloon(&mut self, device: crate::firecracker::BalloonDevice) -> Result<()>;
 
     /// Start the guest. Firecracker: `InstanceStart`. Batch-API backends (CH) perform
     /// the buffered `vm.create` then `vm.boot` here.

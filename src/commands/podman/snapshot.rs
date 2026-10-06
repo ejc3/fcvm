@@ -448,7 +448,10 @@ pub(super) fn build_firecracker_config(
         dns_server: args.dns.clone(),
         balloon: args
             .balloon
-            .map(|target_mib| crate::firecracker::BalloonDevice { target_mib }),
+            .map(|target_mib| crate::firecracker::BalloonDevice {
+                target_mib,
+                free_page_reporting: args.free_page_reporting,
+            }),
         agent_strace: args.strace_agent,
         extra_boot_args,
         image_disk_identity,

@@ -76,6 +76,7 @@ async fn test_state_persistence() {
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         },
     };
 
@@ -167,6 +168,7 @@ async fn test_list_vms() {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -242,6 +244,7 @@ async fn test_load_state_by_name_duplicate_detection() {
                 hypervisor: Default::default(),
                 firecracker_bin: None,
                 balloon_mib: None,
+                balloon_free_page_reporting: false,
             },
         };
         manager.save_state(&state).await.unwrap();
@@ -311,6 +314,7 @@ async fn test_load_state_by_name_duplicate_detection() {
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         },
     };
     manager.save_state(&state).await.unwrap();
@@ -369,6 +373,7 @@ fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         },
     }
 }

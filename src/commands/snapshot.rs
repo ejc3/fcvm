@@ -906,11 +906,11 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             vm_state.config.hypervisor,
             crate::hypervisor::Backend::Firecracker
         ) {
-            snapshot_config.metadata.balloon_mib =
-                crate::firecracker::FirecrackerClient::new(socket_path.clone())?
-                    .balloon_target_mib()
-                    .await
-                    .context("reading the VM's balloon device")?;
+            let device = crate::firecracker::FirecrackerClient::new(socket_path.clone())?
+                .balloon_device()
+                .await
+                .context("reading the VM's balloon device")?;
+            snapshot_config.metadata.record_balloon(device);
         }
         super::common::create_disk_only_snapshot_core(
             snapshot_config.clone(),
@@ -1755,7 +1755,9 @@ async fn cmd_snapshot_run_inner(
     // the original kernel profile / image device, or grand-clones lose them.
     // The balloon record is one of them for a Cloud Hypervisor clone: a snapshot
     // taken of that clone copies it from here. A Firecracker restore replaces it
-    // with what its VMM reports.
+    // with what its VMM reports. The free page reporting switch has no line here:
+    // Cloud Hypervisor is refused the switch, so off, which the state starts
+    // with, is right for the only clone that keeps this copy.
     vm_state.config.balloon_mib = snapshot_config.metadata.balloon_mib;
     vm_state.config.kernel_profile = snapshot_config.metadata.kernel_profile.clone();
     vm_state.config.image_mode = snapshot_config.metadata.image_mode.clone();
@@ -3112,7 +3114,7 @@ async fn cmd_snapshot_run_inner(
                                 &vm_name,
                                 args.cpu.unwrap_or(snapshot_config.metadata.vcpu),
                                 args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
-                                vm_state.config.balloon_mib,
+                                vm_state.config.balloon_device(),
                                 args.non_blocking_output,
                                 &network_config,
                                 &runtime_config,
@@ -3147,6 +3149,17 @@ async fn cmd_snapshot_run_inner(
                                 let _ = handle.await;
                             }
                             let _ = tokio::fs::remove_file(&bootplan_socket).await;
+                            // This cold boot attaches the balloon with the clone's
+                            // free page reporting switch (the plan's args). It is not
+                            // followed by the check `podman run` makes of the guest's
+                            // balloon (`settle_balloon_check`): the status listener
+                            // here hands no ask to this loop. The plan boots the
+                            // kernel profile the snapshot's source booted, with extra
+                            // kernel arguments from this process's FCVM_BOOT_ARGS
+                            // only, so this boot can differ from the one that passed
+                            // the check and can come up with an inactive balloon. A
+                            // memory snapshot of it is then refused
+                            // (`snapshot_balloon_device`).
                             let relaunch_result = async {
                                 // The backend's VmManager still holds the restore-time
                                 // namespace fields; a minimal spec reuses them.
@@ -3484,7 +3497,7 @@ async fn build_clone_reboot_plan(
     vm_name: &str,
     cpu: u8,
     mem: u32,
-    balloon: Option<u32>,
+    balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
@@ -3580,9 +3593,10 @@ async fn build_clone_reboot_plan(
 /// written back as `--publish` specs with their host address, because the disk-only
 /// dispatcher sets the clone's network up from them.
 ///
-/// `balloon` is the balloon target of the VM being booted: the one recorded in a
-/// rebooting clone's state, or the snapshot's for a disk-only clone. The cold boot
-/// attaches the device at it, and attaches none for None.
+/// `balloon` is the balloon device of the VM being booted, its target and its free
+/// page reporting switch: the one recorded in a rebooting clone's state, or the
+/// snapshot's for a disk-only clone. The cold boot attaches that device, and
+/// attaches none for None.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -3590,7 +3604,7 @@ fn run_args_from_snapshot_metadata(
     name: String,
     cpu: u8,
     mem: u32,
-    balloon: Option<u32>,
+    balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
 ) -> RunArgs {
@@ -3650,7 +3664,8 @@ fn run_args_from_snapshot_metadata(
         },
         cmd: None,
         publish,
-        balloon,
+        balloon: balloon.map(|device| device.target_mib),
+        free_page_reporting: balloon.is_some_and(|device| device.free_page_reporting),
         network,
         // Cold-boot the clone/reboot under the SAME backend that created the snapshot —
         // a CH disk-only/reboot clone must not be launched under Firecracker (and would
@@ -3750,7 +3765,7 @@ async fn cmd_snapshot_run_disk_only(
         vm_name,
         args.cpu.unwrap_or(meta.vcpu),
         args.mem.unwrap_or(meta.memory_mib),
-        meta.balloon_mib,
+        meta.balloon_device(),
         args.non_blocking_output,
         Some(disk_path),
     );
@@ -3955,6 +3970,7 @@ mod tests {
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         };
         let args = run_args_from_snapshot_metadata(
             &meta,
@@ -4098,6 +4114,7 @@ mod tests {
             hypervisor: crate::hypervisor::Backend::CloudHypervisor,
             firecracker_bin: None,
             balloon_mib: None,
+            balloon_free_page_reporting: false,
         };
         let args =
             run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, None, false, None);
@@ -4128,7 +4145,18 @@ mod tests {
             }"#,
         )
         .unwrap();
-        for balloon in [Some(512), None] {
+        use crate::firecracker::BalloonDevice;
+        let device = |free_page_reporting| {
+            Some(BalloonDevice {
+                target_mib: 512,
+                free_page_reporting,
+            })
+        };
+        for (balloon, target, reporting) in [
+            (device(true), Some(512), true),
+            (device(false), Some(512), false),
+            (None, None, false),
+        ] {
             let args = run_args_from_snapshot_metadata(
                 &meta,
                 &[],
@@ -4139,7 +4167,8 @@ mod tests {
                 false,
                 None,
             );
-            assert_eq!(args.balloon, balloon);
+            assert_eq!(args.balloon, target, "{balloon:?}");
+            assert_eq!(args.free_page_reporting, reporting, "{balloon:?}");
         }
     }
 
@@ -4357,7 +4386,7 @@ mod tests {
             .find("acquire_vm_snapshot_lock(")
             .expect("snapshot create takes no per-VM snapshot lock");
         let read = body
-            .find("snapshot_config.metadata.balloon_mib =")
+            .find("snapshot_config.metadata.record_balloon(")
             .expect("snapshot create does not read the VM's balloon");
         assert!(
             locked < read,

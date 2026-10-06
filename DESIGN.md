@@ -2392,11 +2392,67 @@ still load):
   snapshot's record, and attaches no balloon device when the snapshot has
   none. Cloud Hypervisor has no call to ask, so its snapshots and clones copy
   the record.
+- **Free page reporting** (`--free-page-reporting`): the switch on the balloon
+  device that makes the guest report the memory it has freed, which the VMM
+  then discards. It needs `--balloon` and Firecracker and is refused with
+  `--hugepages`, all before the snapshot cache is looked up. It is recorded
+  beside the target (`balloon_free_page_reporting` in the VM's state and in
+  snapshot metadata) and travels with it. A cold boot records what fcvm sent.
+  A restore and every snapshot record what `GET /vm/config` reports, from the
+  same read that gives the target. A disk-only clone and a restored clone's
+  relaunch after a guest reboot attach the device with the recorded switch
+  (`test_disk_only_clone_keeps_the_balloon`,
+  `test_restored_clone_reboot_keeps_its_balloon`), and a cold-booted VM's own
+  relaunch attaches it from its launch config. The record says what the
+  device offers, not what the guest negotiated. A memory restore cannot
+  change the switch: Firecracker accepts it only when the device is attached
+  before boot, and rebuilds a restored device from its saved feature bits.
+  A guest that does not accept the feature leaves the whole balloon device
+  inactive in Firecracker, where the same guest without the switch has a
+  working balloon. That happens with `init_on_free=1`, with page poisoning,
+  and with a balloon driver that has no free page reporting. A snapshot of
+  such a VM would hand the dead device to every run restored from it, so the
+  first cold boot of a VM with the switch checks that the guest brought the
+  device up and fails the run if it did not
+  (`test_free_page_reporting_run_fails_when_the_guest_leaves_the_balloon_inactive`).
+  The check reads the balloon's size first. A balloon that holds memory was
+  inflated by the guest's driver, so its device is active and is sent
+  nothing. One that holds nothing is sent, under the per-VM snapshot lock,
+  a `PATCH /balloon` with the target it already has, which Firecracker
+  refuses for an inactive device. An accepted PATCH makes the guest's
+  driver move its balloon to the target, so a balloon with a target above 0
+  that the guest had deflated to 0 when it ran out of memory is inflated
+  again by the check.
+  `podman run` makes it when the guest's agent first reports
+  in, which is before the pre-start snapshot, and on `--no-snapshot` runs
+  too. It makes it again before a startup snapshot if the agent's ask never
+  came. `podman prepare` makes it after its health wait and before its
+  snapshot. Every memory snapshot repeats the test with the VM paused, so no
+  snapshot holds an inactive device
+  (`test_snapshot_of_a_vm_with_an_inactive_reporting_balloon_is_refused`).
+  Three boots are not failed early: one whose agent's ask never reaches fcvm
+  (the agent could not quiet the console, could not read the image digest,
+  or could not send the ask) and that arms no startup snapshot, a cold-booted
+  VM that reboots before its first ask, and a restored clone's relaunch after
+  a guest reboot, which takes extra kernel arguments from its own process's
+  `FCVM_BOOT_ARGS` only and not from the kernel profile. Such a VM runs with
+  an inactive balloon, `fcvm balloon` refuses a target for it, and a memory
+  snapshot of it fails. A limit of the switch: Firecracker discards every
+  range the guest reports, including memory the host holds, so memory the
+  guest frees and uses again costs a first touch again. Measured in two runs
+  on a host that is itself a virtual machine: writing 2 GiB for the first
+  time took 22.0 s and 22.5 s, rewriting it right after freeing it took
+  2.3 s and 1.1 s, and rewriting it once the guest had reported it took
+  18.7 s and 19.4 s. Use the switch where giving memory back matters more
+  than that.
 - **Balloon target on a snapshot cache hit**: the snapshot key says whether a
   balloon device exists and not its target, so `podman run` invocations that
   differ only in the `--balloon` value share one pre-start snapshot. Whether
   the device exists stays in the key because one cannot be added to a restored
-  VM. A cache hit sets its own target on the loaded, paused VM
+  VM. Whether it reports free pages (`--free-page-reporting`) is in the key
+  for the same reason: a restore can turn it neither on nor off, so a run
+  with the switch never restores a snapshot booted without it, nor the
+  reverse. A cache hit sets its own target on the loaded, paused VM
   (`PATCH /balloon`) before the guest resumes, and its state records that
   target. A target that cannot be set ends the run, with no fallback to a cold
   boot. A target above `--mem` is refused before the cache is looked up, so a
@@ -2656,6 +2712,25 @@ answered with a page of zeros and not with the snapshot's bytes. A fault that is
 page when it is first read is not recorded into the working set, and it gets no
 fault-around. Replay and fault-around ask the set before each chunk and step over a page
 in it, so a page in the set is filled only by the guest's own fault.
+
+**Free page reporting on each transport** (`--free-page-reporting`). In a copy-mode clone
+each block the guest reports is one `MADV_DONTNEED` in Firecracker and one REMOVE event in
+the handler, remembered as above
+(`test_snapshot_clone_free_page_reporting_reaches_the_page_server`). Two limits follow from
+the paragraph above. While a REMOVE is unread the kernel refuses populate calls for that
+clone, so demand faults are parked, and one still refused after 2 s stops the clone. Replay
+treats a refused chunk as speculation lost and leaves the rest of that recorded run to
+demand faults, so reports that arrive while replay runs cost replay coverage, not data.
+On the File backend, which every `podman run` cache hit uses except an NV2 guest and a run
+with `FCVM_FORCE_UFFD` set, and in minor mode, Firecracker replaces each reported range
+with fresh anonymous memory, the kernel zero-fills later touches, and the page server
+hears nothing. Each isolated range adds mappings to the VMM. The worst case is guest
+memory divided by the reported block size: 512 mappings per GiB at the guest's default of
+2 MiB blocks. The block size can be lowered with `page_reporting.page_reporting_order=` in
+the boot arguments or by a write inside the guest, and at single pages the worst case is
+262,144 mappings per GiB. Past `vm.max_map_count` (65,530 by kernel default, 1,048,576 on
+Ubuntu 24.04) the replacement mapping fails and Firecracker panics. fcvm does not set the
+block size.
 
 **KSM**: Disabled (`/sys/kernel/mm/ksm/run=0`). Firecracker doesn't mark guest memory
 with `MADV_MERGEABLE`. Even if enabled, KSM is after-the-fact dedup with scanning overhead.
