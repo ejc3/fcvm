@@ -3150,15 +3150,6 @@ async fn cmd_snapshot_run_inner(
                                 let _ = handle.await;
                             }
                             let _ = tokio::fs::remove_file(&bootplan_socket).await;
-                            // The restored VM is gone, so from here the clone is not
-                            // its server's. A serve shutdown finds its clones by this
-                            // field and stops them, and one that lands during the
-                            // relaunch must leave this clone alone.
-                            let _ = state_manager
-                                .update_state(&vm_id, |state| {
-                                    state.config.serve_pid = None;
-                                })
-                                .await;
                             let relaunch_result = async {
                                 // The backend's VmManager still holds the restore-time
                                 // namespace fields; a minimal spec reuses them.
