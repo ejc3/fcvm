@@ -663,3 +663,106 @@ async fn test_snapshot_of_a_relaunched_clone_leaves_it_running() -> Result<()> {
     }
     result
 }
+
+/// A clone restored through a memory server stops depending on that server once
+/// its guest has rebooted: the relaunch is a cold boot from the clone's disk. The
+/// server's exit must leave it running.
+///
+/// The clone's process watches its server, so that a clone with unserved pages is
+/// failed and not left frozen. If that watch outlived the relaunch, the server's
+/// exit would fail a VM that has no page left for the server to serve.
+#[tokio::test]
+async fn test_memory_server_clone_outlives_its_server_after_a_reboot() -> Result<()> {
+    let (name, clone_name, snap, _serve) = common::unique_names("reboot-served");
+    let snapshots = fcvm::paths::snapshot_dir();
+    let token = format!("reboot-served-token-{}", std::process::id());
+
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &["podman", "run", "--name", &name, "nginx:alpine"],
+        "reboot-served-base",
+    )
+    .await?;
+    let snapshotted = async {
+        common::poll_health_by_pid(pid, 120).await?;
+        // reboot_and_assert_relaunch looks for the marker in the clone.
+        write_work_marker(pid, &token).await?;
+        common::create_snapshot_by_pid(pid, &snap)
+            .await
+            .context("creating the source VM's snapshot")
+    }
+    .await;
+    // The clone restores from the snapshot files, with the source gone.
+    common::kill_process(pid).await;
+    let _ = child.kill().await;
+
+    let result = async {
+        snapshotted?;
+        let (mut serve_child, serve_pid) = common::start_memory_server(&snap).await?;
+        let served = async {
+            let (mut clone_child, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let checked = async {
+                common::poll_health_by_pid(clone_pid, 120).await?;
+                // Control: before the reboot the clone belongs to the server.
+                let state = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+                    .load_state_by_pid(clone_pid)
+                    .await
+                    .context("loading the clone's state")?;
+                anyhow::ensure!(
+                    state.config.serve_pid == Some(serve_pid),
+                    "control: the clone's state names memory server {:?}, not {serve_pid}",
+                    state.config.serve_pid
+                );
+
+                // reboot_and_assert_relaunch reports a failed relaunch by panicking. It
+                // runs as its own task, so the panic comes back here as an error and
+                // the clone, the server and the snapshot are still cleaned up below.
+                let relaunch_token = token.clone();
+                tokio::spawn(async move {
+                    reboot_and_assert_relaunch(clone_pid, &relaunch_token).await
+                })
+                .await
+                .context("the relaunch check panicked")??;
+
+                // The server stops. Its shutdown leaves this clone alone: the relaunch
+                // took the clone out of the server's list.
+                common::kill_process(serve_pid).await;
+                let deadline = Instant::now() + Duration::from_secs(20);
+                while process_alive(serve_pid) {
+                    anyhow::ensure!(
+                        Instant::now() < deadline,
+                        "the memory server (pid {serve_pid}) is still running 20s after it was \
+                         told to stop"
+                    );
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                }
+
+                let until = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < until {
+                    anyhow::ensure!(
+                        process_alive(clone_pid),
+                        "the clone's fcvm process exited within 5s of its memory server's exit"
+                    );
+                    common::exec_in_vm(clone_pid, &["/usr/bin/true"])
+                        .await
+                        .context(
+                            "the relaunched clone stopped answering exec within 5s of its \
+                             memory server's exit",
+                        )?;
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(())
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone_child.kill().await;
+            checked
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve_child.kill().await;
+        served
+    }
+    .await;
+    let _ = std::fs::remove_dir_all(snapshots.join(&snap));
+    result
+}

@@ -2950,7 +2950,9 @@ async fn cmd_snapshot_run_inner(
         // Get disk path for startup snapshot creation
         let disk_path = data_dir.join("disks/rootfs.raw");
 
-        // Watch the memory server for this clone's whole life, not just at connect time.
+        // Watch the memory server for as long as this clone runs on restored memory,
+        // not just at connect time. A guest reboot ends that, and the relaunch drops
+        // the watch.
         //
         // A UFFD-restored clone's guest RAM is served by that process. If it dies, the
         // clone does not crash and does not read zeroes — it FREEZES. Firecracker keeps
@@ -3032,8 +3034,9 @@ async fn cmd_snapshot_run_inner(
                     }
                     watchdog_killed = true;
                 }
-                // `serve_watch` is None for file-backed restores, so this branch is
-                // disabled entirely there rather than firing on a dummy future.
+                // `serve_watch` is None for file-backed restores and after a relaunch, so
+                // this branch is disabled entirely then rather than firing on a dummy
+                // future.
                 Some(()) = async {
                     match serve_watch.as_mut() {
                         Some(w) => { w.exited().await; Some(()) }
@@ -3186,6 +3189,11 @@ async fn cmd_snapshot_run_inner(
                                     // belongs to) its serve process — a serve
                                     // shutdown must not SIGTERM it.
                                     vm_state.config.serve_pid = None;
+                                    // The watch on that server ends with the
+                                    // dependence. Left armed, the server's exit would
+                                    // fail a VM that booted from its disk and has no
+                                    // page left for the server to serve.
+                                    serve_watch = None;
                                     let _ = state_manager
                                         .update_state(&vm_id, |state| {
                                             state.config.snapshot_name = None;
