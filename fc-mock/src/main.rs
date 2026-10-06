@@ -16,7 +16,9 @@ fn main() -> Result<()> {
     // Handle --version before anything else (no args parsing needed)
     let args: Vec<String> = std::env::args().collect();
     if args.iter().any(|a| a == "--version") {
-        println!("Firecracker v1.14.0-mock");
+        // A suffix makes this a pre-release, and fcvm refuses a pre-release of its
+        // minimum version (1.14.0), so the mock reports the next patch release.
+        println!("Firecracker v1.14.1-mock");
         return Ok(());
     }
 

@@ -34,7 +34,8 @@ fn find_fc_mock_binary() -> Option<PathBuf> {
 
 /// Verify fc-mock --version outputs a valid Firecracker version string.
 ///
-/// fcvm requires version >= 1.13.1 (parse_firecracker_version in common.rs:357).
+/// fcvm requires a release at or above 1.14.0 (`MIN_FIRECRACKER_VERSION` in
+/// src/commands/common.rs), and treats a suffixed version as a pre-release.
 /// The version must match the pattern `v?(\d+)\.(\d+)\.(\d+)`.
 #[tokio::test]
 async fn test_fc_mock_version() -> Result<()> {
@@ -67,10 +68,10 @@ async fn test_fc_mock_version() -> Result<()> {
         version
     );
 
-    // Must contain version pattern vX.Y.Z where major >= 1 and minor >= 13
+    // The mock's version carries a suffix, so it has to be above 1.14.0, not at it.
     assert!(
-        version.contains("v1.14.") || version.contains("v1.13.") || version.contains("v2."),
-        "version should be >= v1.13.1, got: {}",
+        version.contains("v1.14.1-mock"),
+        "version should be v1.14.1-mock, a pre-release above the minimum 1.14.0, got: {}",
         version
     );
 

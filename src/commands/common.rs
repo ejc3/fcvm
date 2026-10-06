@@ -73,8 +73,12 @@ pub const VSOCK_BOOTPLAN_PORT: u32 = 4995;
 /// Must match `fc-agent::vsock::RESTORE_COMPLETE_PORT`.
 pub const VSOCK_RESTORE_COMPLETE_PORT: u32 = 4994;
 
-/// Minimum required Firecracker version for network_overrides support
-const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 13, 1);
+/// Minimum required Firecracker version. 1.14.0 is the first whose balloon has
+/// free page reporting: its `PUT /balloon` takes the switch, and its
+/// `GET /vm/config` reply says whether a device has it, which every snapshot and
+/// restore of a VM with a balloon reads. Snapshot cloning's network overrides
+/// need 1.13.1, which this covers.
+const MIN_FIRECRACKER_VERSION: (u32, u32, u32) = (1, 14, 0);
 
 /// Timeout for namespace holder creation retries
 pub const HOLDER_RETRY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -746,7 +750,7 @@ pub(crate) fn find_firecracker_with_version(
 
     if !version.at_least(MIN_FIRECRACKER_VERSION) {
         anyhow::bail!(
-            "Firecracker version {}.{}.{}{} is too old. Minimum required: {}.{}.{} (for network_overrides support in snapshot cloning)",
+            "Firecracker version {}.{}.{}{} is too old. Minimum required: {}.{}.{} (the first whose balloon configuration says whether it reports free pages, which snapshots and restores read)",
             version.release.0, version.release.1, version.release.2,
             if version.prerelease { " (pre-release)" } else { "" },
             MIN_FIRECRACKER_VERSION.0, MIN_FIRECRACKER_VERSION.1, MIN_FIRECRACKER_VERSION.2
@@ -5814,6 +5818,58 @@ mod tests {
         assert!(
             reporting("newer", &format!("{major}.{}.0", minor + 1)).is_ok(),
             "a newer release must pass"
+        );
+    }
+
+    /// The minimum Firecracker is the first whose balloon has free page reporting.
+    /// Its `GET /vm/config` reply says whether the device reports free pages, and
+    /// every snapshot and restore of a VM with a balloon reads that member. An
+    /// older build's reply has none and its `PUT /balloon` refuses the switch, so
+    /// it is refused here, before any VM runs on it.
+    #[test]
+    fn firecracker_before_free_page_reporting_is_too_old() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let reporting = |name: &str, version: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("#!/bin/sh\necho 'Firecracker v{version}'\n")).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            find_firecracker_with_version(&RuntimeConfig {
+                firecracker_bin: Some(path),
+                ..Default::default()
+            })
+        };
+        let refused = match reporting("before", "1.13.1") {
+            Err(error) => format!("{error:#}"),
+            Ok((_, version)) => panic!(
+                "Firecracker 1.13.1, whose balloon has no free page reporting, is accepted: \
+                 {version:?}"
+            ),
+        };
+        for part in ["1.13.1 is too old", "Minimum required: 1.14.0"] {
+            assert!(refused.contains(part), "no `{part}` in: {refused}");
+        }
+        assert!(
+            reporting("first", "1.14.0").is_ok(),
+            "1.14.0, the first release with free page reporting, must pass"
+        );
+    }
+
+    /// The mock Firecracker's version has to pass the minimum check: CI's fc-mock
+    /// job runs fcvm with the mock as its Firecracker. The mock is another crate,
+    /// so this reads the line of its source that prints the version.
+    #[test]
+    fn the_mock_firecracker_reports_a_version_fcvm_accepts() {
+        let source = include_str!("../../fc-mock/src/main.rs");
+        let printed = source
+            .lines()
+            .find(|line| line.contains("\"Firecracker v"))
+            .expect("fc-mock/src/main.rs prints no Firecracker version");
+        let version = parse_firecracker_version(printed).unwrap();
+        assert!(
+            version.at_least(MIN_FIRECRACKER_VERSION),
+            "the mock prints {printed:?}, which fcvm refuses: its minimum is {MIN_FIRECRACKER_VERSION:?} \
+             and a suffixed version is a pre-release"
         );
     }
 

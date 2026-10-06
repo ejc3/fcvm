@@ -2407,6 +2407,8 @@ still load):
   device offers, not what the guest negotiated. A memory restore cannot
   change the switch: Firecracker accepts it only when the device is attached
   before boot, and rebuilds a restored device from its saved feature bits.
+  fcvm's minimum Firecracker is 1.14.0, the first whose balloon has the
+  switch and whose `GET /vm/config` reply says whether a device has it.
   A guest that does not accept the feature leaves the whole balloon device
   inactive in Firecracker, where the same guest without the switch has a
   working balloon. That happens with `init_on_free=1`, with page poisoning,
