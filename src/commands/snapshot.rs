@@ -3066,7 +3066,8 @@ async fn cmd_snapshot_run_inner(
 
                     // Guest reboot? Relaunch in place as a cold boot from the
                     // provisioned disk (disk-only-clone semantics): same fcvm
-                    // process, network, holder, listeners, and health monitor.
+                    // process, network, holder, status and output listeners, and health
+                    // monitor. The restore's boot-plan listener is stopped below.
                     // Authoritative (drain-handshake backed) answer to "did the GUEST ask
                     // for this?". A reboot is an orderly guest action even when this clone
                     // shape cannot be relaunched in place, so it must not be classified as
@@ -3132,6 +3133,20 @@ async fn cmd_snapshot_run_inner(
                         };
                         if let Some((plan, synth_args, volume_mappings)) = reboot_plan.as_ref() {
                             info!("guest rebooted — relaunching restored clone in place (cold boot)");
+                            // The restore's control plane ends with the restored guest.
+                            // The boot-plan listener still serves this restore's epoch,
+                            // and the agent of the guest booting now has handled none. It
+                            // reads that listener whenever its snapshot boundary is armed,
+                            // so with the listener left up, the next snapshot of this VM
+                            // hands it the old epoch: it runs the restore sequence on a VM
+                            // that was not restored, the sequence fails, and the guest
+                            // shuts down. Awaiting the aborted task drops the listener
+                            // before the new guest runs.
+                            if let Some(handle) = bootplan_handle.take() {
+                                handle.abort();
+                                let _ = handle.await;
+                            }
+                            let _ = tokio::fs::remove_file(&bootplan_socket).await;
                             let relaunch_result = async {
                                 // The backend's VmManager still holds the restore-time
                                 // namespace fields; a minimal spec reuses them.
