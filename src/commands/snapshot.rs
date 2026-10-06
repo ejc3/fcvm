@@ -2950,7 +2950,9 @@ async fn cmd_snapshot_run_inner(
         // Get disk path for startup snapshot creation
         let disk_path = data_dir.join("disks/rootfs.raw");
 
-        // Watch the memory server for this clone's whole life, not just at connect time.
+        // Watch the memory server for as long as this clone runs on restored memory,
+        // not just at connect time. A guest reboot ends that, and the relaunch drops
+        // the watch.
         //
         // A UFFD-restored clone's guest RAM is served by that process. If it dies, the
         // clone does not crash and does not read zeroes — it FREEZES. Firecracker keeps
@@ -3032,8 +3034,9 @@ async fn cmd_snapshot_run_inner(
                     }
                     watchdog_killed = true;
                 }
-                // `serve_watch` is None for file-backed restores, so this branch is
-                // disabled entirely there rather than firing on a dummy future.
+                // `serve_watch` is None for file-backed restores and after a relaunch, so
+                // this branch is disabled entirely then rather than firing on a dummy
+                // future.
                 Some(()) = async {
                     match serve_watch.as_mut() {
                         Some(w) => { w.exited().await; Some(()) }
@@ -3147,6 +3150,15 @@ async fn cmd_snapshot_run_inner(
                                 let _ = handle.await;
                             }
                             let _ = tokio::fs::remove_file(&bootplan_socket).await;
+                            // The restored VM is gone, so from here the clone is not
+                            // its server's. A serve shutdown finds its clones by this
+                            // field and stops them, and one that lands during the
+                            // relaunch must leave this clone alone.
+                            let _ = state_manager
+                                .update_state(&vm_id, |state| {
+                                    state.config.serve_pid = None;
+                                })
+                                .await;
                             let relaunch_result = async {
                                 // The backend's VmManager still holds the restore-time
                                 // namespace fields; a minimal spec reuses them.
@@ -3186,6 +3198,11 @@ async fn cmd_snapshot_run_inner(
                                     // belongs to) its serve process — a serve
                                     // shutdown must not SIGTERM it.
                                     vm_state.config.serve_pid = None;
+                                    // The watch on that server ends with the
+                                    // dependence. Left armed, the server's exit would
+                                    // fail a VM that booted from its disk and has no
+                                    // page left for the server to serve.
+                                    serve_watch = None;
                                     let _ = state_manager
                                         .update_state(&vm_id, |state| {
                                             state.config.snapshot_name = None;
