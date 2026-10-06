@@ -447,6 +447,11 @@ pub struct BalloonStats {
     pub target_mib: u32,
     /// Size the guest has given the device so far, in MiB.
     pub actual_mib: u32,
+    /// The guest's total memory in bytes, from the statistics its balloon driver
+    /// sends. Firecracker has it only once an active device has received
+    /// statistics from its guest. It is not part of what `fcvm balloon` prints.
+    #[serde(skip_serializing)]
+    pub total_memory: Option<u64>,
 }
 
 /// The part of the `GET /vm/config` reply fcvm reads.

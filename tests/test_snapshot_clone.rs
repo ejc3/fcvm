@@ -4493,6 +4493,37 @@ async fn test_snapshot_clone_free_page_reporting_reaches_the_page_server() -> Re
             .await
             .context("creating the snapshot")?;
 
+        // The cold boot's check and the snapshot's check both looked at this
+        // balloon. Its guest is up and sends statistics, so neither had to send
+        // the device anything: a snapshot reads its source and changes nothing in
+        // it. Firecracker logs each request that changes something, so its log
+        // shows the PUT that attached the device and would show a PATCH.
+        let source_vm_id = fcvm::state::StateManager::new(fcvm::paths::state_dir())
+            .load_state_by_pid(source_pid)
+            .await
+            .context("loading the source VM's state")?
+            .vm_id;
+        let vmm_log_path = fcvm::paths::vm_runtime_dir(&source_vm_id).join("firecracker.log");
+        let vmm_log = std::fs::read_to_string(&vmm_log_path)
+            .with_context(|| format!("reading {}", vmm_log_path.display()))?;
+        anyhow::ensure!(
+            vmm_log.contains(r#"Put request on "/balloon""#),
+            "control: Firecracker's log at {} does not show the request that attached the \
+             balloon, so it cannot show what the checks sent the device",
+            vmm_log_path.display()
+        );
+        let patches: Vec<&str> = vmm_log
+            .lines()
+            .filter(|line| line.contains(r#"Patch request on "/balloon""#))
+            .collect();
+        if let Some(first) = patches.first() {
+            wrong.push(format!(
+                "the checks sent the source VM's active balloon {} PATCH request(s), the first: \
+                 {first}",
+                patches.len()
+            ));
+        }
+
         // Copy mode: the clone's memory is anonymous, so each block the guest
         // reports is one REMOVE event at the memory server.
         let serve_args = ["snapshot", "serve", &snapshot_name, "--uffd-mode", "copy"];

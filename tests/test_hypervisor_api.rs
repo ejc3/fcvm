@@ -124,7 +124,7 @@ async fn firecracker_balloon_statistics_request_and_reply() {
     // Firecracker's reply has more members than fcvm reads.
     let mut server = ApiServer::start(Some((
         StatusCode::OK,
-        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024}"#,
+        r#"{"target_pages":16384,"actual_pages":8192,"target_mib":64,"actual_mib":32,"free_memory":1024,"total_memory":2048}"#,
     )))
     .await;
     let client = FirecrackerClient::new(server.path.clone()).unwrap();
@@ -132,7 +132,8 @@ async fn firecracker_balloon_statistics_request_and_reply() {
         client.balloon_stats().await.unwrap(),
         BalloonStats {
             target_mib: 64,
-            actual_mib: 32
+            actual_mib: 32,
+            total_memory: Some(2048),
         }
     );
     server

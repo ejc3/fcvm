@@ -284,6 +284,7 @@ mod tests {
         let line = report_line(&BalloonStats {
             target_mib: 96,
             actual_mib: 64,
+            total_memory: Some(1 << 30),
         })
         .unwrap();
         assert_eq!(line, r#"{"target_mib":96,"actual_mib":64}"#);

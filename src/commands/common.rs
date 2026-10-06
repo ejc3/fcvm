@@ -1671,12 +1671,12 @@ fn balloon_target_failure(error: anyhow::Error, target_mib: u32) -> anyhow::Erro
 /// runs this one once the guest's agent is up, because the guest's kernel has
 /// probed its devices by then.
 ///
-/// The test is `reporting_balloon_must_be_active`: a balloon that holds memory is
-/// sent nothing, and one that holds none is sent the target it already has, which
-/// Firecracker refuses for a device that is not active. This function holds the
-/// per-VM snapshot lock from its read of the target to that PATCH. `fcvm balloon`
-/// takes that lock to set a target, so the check cannot put back a target another
-/// process has just changed.
+/// The test is `reporting_balloon_must_be_active`: a device its statistics show
+/// to be active is sent nothing, and any other is sent the target it already has,
+/// which Firecracker refuses for a device that is not active. This function holds
+/// the per-VM snapshot lock from its read of the target to that PATCH. `fcvm
+/// balloon` takes that lock to set a target, so the check cannot put back a target
+/// another process has just changed.
 pub(crate) async fn require_active_balloon(
     client: &crate::firecracker::FirecrackerClient,
     disk_path: &Path,
@@ -1693,19 +1693,22 @@ pub(crate) async fn require_active_balloon(
 /// Test that the guest activated a balloon device that has free page reporting,
 /// sending the guest as little as that takes.
 ///
-/// A balloon that holds memory was inflated by the guest's driver, so its device
-/// is active. `GET /balloon/statistics` answers for an active and an inactive
-/// device alike, and the guest's Linux driver writes a size above 0 only after an
-/// inflate the device answered. Such a device is sent nothing.
+/// One `GET /balloon/statistics`, which answers for an active and an inactive
+/// device alike, shows an active device in two ways. A balloon that holds memory
+/// was inflated by the guest's driver: the Linux driver writes a size above 0 only
+/// after an inflate the device answered. And a reply with the guest's memory
+/// counters comes from a device that served its statistics queue: Firecracker
+/// fills them only from the queue of an active device. fcvm attaches every balloon
+/// with statistics every second, so an active device has the counters about a
+/// second after its guest's driver came up, and keeps them through a snapshot.
+/// Such a device is sent nothing, so the check leaves a running guest's balloon as
+/// it is, including one the guest deflated when it ran out of memory.
 ///
-/// A balloon that holds nothing proves nothing, so the device is sent the target
-/// it already has, and Firecracker refuses that `PATCH /balloon` for a device that
-/// is not active. An accepted PATCH has an effect in the guest: Firecracker raises
-/// a config interrupt for every one, and the guest's driver answers it by moving
-/// its balloon to the target. With a target of 0 nothing moves. With a target
-/// above 0, a balloon the guest had deflated all the way to 0 when it ran out of
-/// memory is inflated again. Leaving that guest alone needs Firecracker to say in
-/// a read whether the device is active.
+/// A device that shows neither is sent the target it already has, and Firecracker
+/// refuses that `PATCH /balloon` for a device that is not active. An accepted
+/// PATCH makes the guest's driver move its balloon to the target. It can reach an
+/// active device only in the first second after its driver came up, before its
+/// first statistics, when the balloon is on its way to the target anyway.
 ///
 /// The caller holds the per-VM snapshot lock, which `fcvm balloon` takes to set a
 /// target, so the target sent is still the one read.
@@ -1716,7 +1719,7 @@ async fn reporting_balloon_must_be_active(
     let stats = client.balloon_stats().await.context(
         "reading the size of the VM's balloon to check that the guest brought the device up",
     )?;
-    if stats.actual_mib > 0 {
+    if stats.actual_mib > 0 || stats.total_memory.is_some() {
         return Ok(());
     }
     client
@@ -5507,13 +5510,14 @@ mod tests {
 
     /// A memory snapshot is not taken of a VM whose guest left its balloon device
     /// inactive. `snapshot_balloon_device` is the read `create_snapshot_core` makes
-    /// with the VM paused. It reads the size of a device with free page reporting
-    /// and sends one that holds nothing the target just read. Firecracker's refusal
-    /// of that comes back as the error that names the flag and the known causes, so
-    /// the caller skips the save. A device that holds memory is sent nothing. A
-    /// device the guest brought up is returned for the record. A device without
-    /// free page reporting is sent nothing: a guest's refusal of the feature cannot
-    /// have left it inactive.
+    /// with the VM paused. It reads the statistics of a device with free page
+    /// reporting. A device that holds memory, or whose guest has sent statistics,
+    /// is active and is sent nothing. Any other is sent the target just read, and
+    /// Firecracker's refusal of that comes back as the error that names the flag
+    /// and the known causes, so the caller skips the save. A device the guest
+    /// brought up is returned for the record. A device without free page reporting
+    /// is sent nothing: a guest's refusal of the feature cannot have left it
+    /// inactive.
     #[tokio::test]
     async fn a_memory_snapshot_refuses_a_reporting_balloon_the_guest_left_inactive() {
         use crate::firecracker::BalloonDevice;
@@ -5530,6 +5534,8 @@ mod tests {
             r#"{"target_pages":24576,"actual_pages":0,"target_mib":96,"actual_mib":0}"#;
         const HELD: &str =
             r#"{"target_pages":24576,"actual_pages":16384,"target_mib":96,"actual_mib":64}"#;
+        // A balloon that holds nothing, whose guest has sent its memory counters.
+        const HEARD: &str = r#"{"target_pages":24576,"actual_pages":0,"target_mib":96,"actual_mib":0,"free_memory":536870912,"total_memory":1073741824}"#;
         // The three requests as the fake VMM below writes them down.
         const READ: &str = "GET /vm/config ";
         const SIZE: &str = "GET /balloon/statistics ";
@@ -5613,6 +5619,24 @@ mod tests {
             })
         );
         assert_eq!(saw, [READ, SIZE], "a reporting device that holds memory");
+
+        // A device whose guest has sent statistics has served a queue, so it is
+        // active whatever its balloon holds, and it is sent nothing. A balloon
+        // deflated to nothing under memory pressure is this case: a PATCH would
+        // make its guest inflate it again.
+        let (device, saw) = asked(REPORTING, HEARD, INACTIVE).await;
+        assert_eq!(
+            device.unwrap(),
+            Some(BalloonDevice {
+                target_mib: 96,
+                free_page_reporting: true,
+            })
+        );
+        assert_eq!(
+            saw,
+            [READ, SIZE],
+            "a reporting device that holds nothing and whose guest has sent statistics"
+        );
 
         let (device, saw) = asked(PLAIN, EMPTY, INACTIVE).await;
         assert_eq!(

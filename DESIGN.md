@@ -2415,14 +2415,17 @@ still load):
   first cold boot of a VM with the switch checks that the guest brought the
   device up and fails the run if it did not
   (`test_free_page_reporting_run_fails_when_the_guest_leaves_the_balloon_inactive`).
-  The check reads the balloon's size first. A balloon that holds memory was
-  inflated by the guest's driver, so its device is active and is sent
-  nothing. One that holds nothing is sent, under the per-VM snapshot lock,
-  a `PATCH /balloon` with the target it already has, which Firecracker
-  refuses for an inactive device. An accepted PATCH makes the guest's
-  driver move its balloon to the target, so a balloon with a target above 0
-  that the guest had deflated to 0 when it ran out of memory is inflated
-  again by the check.
+  The check reads the balloon's statistics first. A balloon that holds
+  memory was inflated by the guest's driver, and a device whose guest has
+  sent its memory counters has served its statistics queue. Either shows an
+  active device, which is sent nothing. A device with neither is sent,
+  under the per-VM snapshot lock, a `PATCH /balloon` with the target it
+  already has, which Firecracker refuses for an inactive device. fcvm
+  attaches every balloon with statistics every second, so an active device
+  is past that state about a second after its guest's driver came up, and
+  the check changes nothing in a running guest's balloon
+  (`test_snapshot_clone_free_page_reporting_reaches_the_page_server` reads
+  the requests the source's Firecracker received).
   `podman run` makes it when the guest's agent first reports
   in, which is before the pre-start snapshot, and on `--no-snapshot` runs
   too. It makes it again before a startup snapshot if the agent's ask never
