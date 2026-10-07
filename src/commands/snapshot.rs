@@ -1568,6 +1568,20 @@ pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotR
     SnapshotRunAttempt { result, generation }
 }
 
+/// The prefix a routed clone's address is derived from: the one this restore was given,
+/// or else the one the snapshot was created under (#1079). Other network modes keep what
+/// the snapshot recorded, so a FCVM_IPV6_PREFIX set for routed runs changes nothing there.
+fn restore_ipv6_prefix(
+    network_mode: FcNetworkMode,
+    given: Option<&String>,
+    recorded: Option<&String>,
+) -> Option<String> {
+    match network_mode {
+        FcNetworkMode::Routed => given.or(recorded).cloned(),
+        FcNetworkMode::Bridged | FcNetworkMode::Rootless => recorded.cloned(),
+    }
+}
+
 async fn cmd_snapshot_run_inner(
     args: SnapshotRunArgs,
     attempted_generation: &mut Option<SnapshotGeneration>,
@@ -2044,8 +2058,12 @@ async fn cmd_snapshot_run_inner(
         FcNetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-            if let Some(ref prefix) = snapshot_config.metadata.ipv6_prefix {
-                net = net.with_ipv6_prefix(prefix.clone());
+            if let Some(prefix) = restore_ipv6_prefix(
+                network_mode,
+                args.ipv6_prefix.as_ref(),
+                snapshot_config.metadata.ipv6_prefix.as_ref(),
+            ) {
+                net = net.with_ipv6_prefix(prefix);
             }
             if !snapshot_config.metadata.forward_localhost.is_empty() {
                 net =
@@ -2131,7 +2149,11 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = snapshot_config.metadata.forward_localhost.clone();
     vm_state.config.network_mode = network_mode;
-    vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
+    vm_state.config.ipv6_prefix = restore_ipv6_prefix(
+        network_mode,
+        args.ipv6_prefix.as_ref(),
+        snapshot_config.metadata.ipv6_prefix.as_ref(),
+    );
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
 
@@ -3535,6 +3557,7 @@ async fn build_clone_reboot_plan(
         balloon,
         non_blocking_output,
         None,
+        None,
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -3605,6 +3628,10 @@ async fn build_clone_reboot_plan(
 /// page reporting switch: the one recorded in a rebooting clone's state, or the
 /// snapshot's for a disk-only clone. The cold boot attaches that device, and
 /// attaches none for None.
+///
+/// `ipv6_prefix` is the one `snapshot run --ipv6-prefix` gave a disk-only clone; a routed
+/// clone takes it in place of the recorded one (#1079). The reboot plan passes None,
+/// because a rebooting clone keeps the network it already has.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -3615,6 +3642,7 @@ fn run_args_from_snapshot_metadata(
     balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
+    ipv6_prefix: Option<&String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -3708,7 +3736,7 @@ fn run_args_from_snapshot_metadata(
         rootfs_type: None,
         non_blocking_output,
         label: vec![],
-        ipv6_prefix: meta.ipv6_prefix.clone(),
+        ipv6_prefix: restore_ipv6_prefix(meta.network_mode, ipv6_prefix, meta.ipv6_prefix.as_ref()),
         image: meta.image.clone(),
         command_args: vec![],
         rootfs_override,
@@ -3776,6 +3804,7 @@ async fn cmd_snapshot_run_disk_only(
         meta.balloon_device(),
         args.non_blocking_output,
         Some(disk_path),
+        args.ipv6_prefix.as_ref(),
     );
 
     info!(
@@ -3945,6 +3974,74 @@ mod tests {
         );
     }
 
+    /// #1079: a disk-only routed clone boots under the prefix `snapshot run` was given,
+    /// and under the recorded one without it. A rootless clone has none either way.
+    #[test]
+    fn run_args_from_metadata_take_the_restore_prefix() {
+        let recorded = "2001:db8:aaaa:1::/112".to_string();
+        let given = "2001:db8:bbbb:2::/112".to_string();
+        let routed = crate::storage::SnapshotMetadata {
+            image: "localhost/app:latest".to_string(),
+            vcpu: 1,
+            memory_mib: 512,
+            network_config: crate::network::NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            username: None,
+            user: None,
+            port_mappings: vec![],
+            forward_localhost: vec![],
+            network_mode: crate::firecracker::FcNetworkMode::Routed,
+            ipv6_prefix: Some(recorded.clone()),
+            tty: false,
+            interactive: false,
+            kernel_profile: None,
+            image_mode: None,
+            image_disk_path: None,
+            image_disk_identity: None,
+            hypervisor: Default::default(),
+            firecracker_bin: None,
+            balloon_mib: None,
+            balloon_free_page_reporting: false,
+        };
+        let boot = |meta: &crate::storage::SnapshotMetadata, given: Option<&String>| {
+            run_args_from_snapshot_metadata(
+                meta,
+                &[],
+                "c".to_string(),
+                1,
+                512,
+                None,
+                false,
+                None,
+                given,
+            )
+            .ipv6_prefix
+        };
+        assert_eq!(
+            boot(&routed, Some(&given)),
+            Some(given.clone()),
+            "the given prefix replaces the recorded one"
+        );
+        assert_eq!(
+            boot(&routed, None),
+            Some(recorded),
+            "without one the recorded prefix stays"
+        );
+        let mut rootless = routed.clone();
+        rootless.network_mode = crate::firecracker::FcNetworkMode::Rootless;
+        rootless.ipv6_prefix = None;
+        assert_eq!(
+            boot(&rootless, Some(&given)),
+            None,
+            "a rootless clone ignores the flag"
+        );
+    }
+
     /// The synthesized RunArgs must carry the recorded boot-plan metadata:
     /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
     /// (overlay layers live on a separate read-only disk), and the USER env
@@ -3989,6 +4086,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -4012,6 +4110,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -4030,6 +4129,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -4047,6 +4147,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -4080,6 +4181,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -4124,8 +4226,17 @@ mod tests {
             balloon_mib: None,
             balloon_free_page_reporting: false,
         };
-        let args =
-            run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, None, false, None);
+        let args = run_args_from_snapshot_metadata(
+            &base,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+            None,
+        );
         assert_eq!(
             args.hypervisor,
             crate::cli::args::Hypervisor::CloudHypervisor
@@ -4133,8 +4244,17 @@ mod tests {
 
         let mut fc = base.clone();
         fc.hypervisor = crate::hypervisor::Backend::Firecracker;
-        let args_fc =
-            run_args_from_snapshot_metadata(&fc, &[], "c".to_string(), 1, 512, None, false, None);
+        let args_fc = run_args_from_snapshot_metadata(
+            &fc,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+            None,
+        );
         assert_eq!(
             args_fc.hypervisor,
             crate::cli::args::Hypervisor::Firecracker
@@ -4173,6 +4293,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
             );
             assert_eq!(args.balloon, target, "{balloon:?}");
@@ -4350,6 +4471,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            ipv6_prefix: None,
         };
 
         let (runtime, choice) = snapshot_restore_runtime_config_with(
@@ -4420,6 +4542,38 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            ipv6_prefix: None,
+        }
+    }
+
+    /// #1079: a routed restore derives the clone's address from the prefix it is given, so
+    /// a re-addressed host or another host gets an address its network routes. Without
+    /// one it keeps the snapshot's prefix, and other network modes ignore the flag.
+    #[test]
+    fn a_routed_restore_takes_the_prefix_it_is_given() {
+        let recorded = "2001:db8:aaaa:1::/112".to_string();
+        let given = "2001:db8:bbbb:2::/112".to_string();
+        assert_eq!(
+            restore_ipv6_prefix(FcNetworkMode::Routed, None, Some(&recorded)).as_deref(),
+            Some("2001:db8:aaaa:1::/112"),
+            "without --ipv6-prefix the snapshot's prefix stays"
+        );
+        assert_eq!(
+            restore_ipv6_prefix(FcNetworkMode::Routed, Some(&given), Some(&recorded)).as_deref(),
+            Some("2001:db8:bbbb:2::/112"),
+            "the given prefix replaces the recorded one"
+        );
+        assert_eq!(
+            restore_ipv6_prefix(FcNetworkMode::Routed, Some(&given), None).as_deref(),
+            Some("2001:db8:bbbb:2::/112"),
+            "a snapshot that recorded none still takes the given one"
+        );
+        for mode in [FcNetworkMode::Bridged, FcNetworkMode::Rootless] {
+            assert_eq!(
+                restore_ipv6_prefix(mode, Some(&given), None),
+                None,
+                "{mode:?} ignores --ipv6-prefix"
+            );
         }
     }
 
