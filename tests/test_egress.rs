@@ -303,36 +303,44 @@ done"#,
     Ok(())
 }
 
+/// A private (ULA) prefix no test host routes to itself. A clone restored under it
+/// needs no traffic beyond this host: it restores with its container running, and its
+/// egress check talks to a server on the host.
+#[cfg(feature = "privileged-tests")]
+const RESTORE_PREFIX: &str = "fd5a:fc7a:1079::/112";
+
+/// Whether `addr` lies inside the CIDR `prefix`.
+#[cfg(feature = "privileged-tests")]
+fn inside_prefix(addr: &str, prefix: &str) -> Result<bool> {
+    let (net, len) = prefix
+        .split_once('/')
+        .with_context(|| format!("{prefix} has no length"))?;
+    let len: u32 = len.parse().with_context(|| format!("length of {prefix}"))?;
+    anyhow::ensure!((1..=128).contains(&len), "length of {prefix} out of range");
+    let net = u128::from(net.parse::<std::net::Ipv6Addr>()?);
+    let bits = u128::from(
+        addr.parse::<std::net::Ipv6Addr>()
+            .with_context(|| format!("parsing {addr}"))?,
+    );
+    Ok(bits >> (128 - len) == net >> (128 - len))
+}
+
 /// #1079: a routed clone restored with `--ipv6-prefix` takes its address from that
-/// prefix, not from the one the snapshot was created under. Without it, a host whose
+/// prefix, not from the one its snapshot was created under. Without it, a host whose
 /// routed prefix changed since the snapshot, or another host, gives the clone an
 /// address its network does not route back to the host.
 ///
-/// The snapshot is created under one half of a base prefix and restored under the
-/// other half. The clone's egress goes to a server on this host, so it works either
-/// way; the clone's address, as fcvm records it, as the host routes and proxies it, and
-/// as the guest holds it on eth0, is what tells them apart.
+/// The baseline runs under the host's own routed setup (FCVM_IPV6_PREFIX, or the /64
+/// routed mode detects), and the clone is restored under RESTORE_PREFIX, which holds
+/// none of the host's addresses. A restore that ignored the given prefix would put the
+/// clone back inside the host's prefix, outside RESTORE_PREFIX. The clone's address is
+/// checked as fcvm records it, as the host routes and proxies it, and as the guest holds
+/// it on eth0; its egress goes to a server on this host.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
-    use std::net::Ipv6Addr;
     let (baseline_name, clone_name, snapshot_name, _) =
         common::unique_names("egress-routed-prefix");
-
-    let (base, len) = routed_base_prefix().await?;
-    let half_len = len + 1;
-    let snapshot_net = base;
-    let restore_net = base | (1u128 << (127 - len));
-    let snapshot_prefix = format!("{}/{}", Ipv6Addr::from(snapshot_net), half_len);
-    let restore_prefix = format!("{}/{}", Ipv6Addr::from(restore_net), half_len);
-    let inside = |addr: &str, net: u128| -> Result<bool> {
-        let bits = u128::from(
-            addr.parse::<Ipv6Addr>()
-                .with_context(|| format!("parsing {addr}"))?,
-        );
-        Ok(bits >> (128 - half_len) == net >> (128 - half_len))
-    };
-    println!("  snapshot prefix {snapshot_prefix}, restore prefix {restore_prefix}");
 
     let test_server = common::LocalTestServer::start_on_available_port("::")
         .await
@@ -351,8 +359,6 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
                 &baseline_name,
                 "--network",
                 "routed",
-                "--ipv6-prefix",
-                &snapshot_prefix,
                 common::TEST_IMAGE,
             ],
             &baseline_name,
@@ -364,6 +370,10 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
             .await
             .context("baseline VM failed to become healthy")?;
         let baseline_ipv6 = guest_ipv6(baseline_pid).await?;
+        anyhow::ensure!(
+            !inside_prefix(&baseline_ipv6, RESTORE_PREFIX)?,
+            "control: the baseline's address {baseline_ipv6} is already inside {RESTORE_PREFIX}"
+        );
         let snap = tokio::process::Command::new(&fcvm_path)
             .args([
                 "snapshot",
@@ -401,7 +411,7 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
                 "--name",
                 &clone_name,
                 "--ipv6-prefix",
-                &restore_prefix,
+                RESTORE_PREFIX,
             ],
             &clone_name,
         )
@@ -411,15 +421,13 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
         common::poll_health_by_pid(clone_pid, 120).await?;
 
         let clone_ipv6 = guest_ipv6(clone_pid).await?;
-        println!("  baseline address {baseline_ipv6}, clone address {clone_ipv6}");
-        anyhow::ensure!(
-            inside(&baseline_ipv6, snapshot_net)?,
-            "the baseline's address {baseline_ipv6} is outside {snapshot_prefix}, the prefix it ran under"
+        println!(
+            "  baseline address {baseline_ipv6}, clone address {clone_ipv6}, restore prefix {RESTORE_PREFIX}"
         );
         anyhow::ensure!(
-            inside(&clone_ipv6, restore_net)?,
-            "the clone's address {clone_ipv6} is outside {restore_prefix}, the prefix it was restored \
-             under (the snapshot's prefix was {snapshot_prefix})"
+            inside_prefix(&clone_ipv6, RESTORE_PREFIX)?,
+            "the clone's address {clone_ipv6} is outside {RESTORE_PREFIX}, the prefix it was \
+             restored under (the baseline ran at {baseline_ipv6})"
         );
         let clone_veth = common::get_network_field(clone_pid, "host_veth")
             .await
@@ -460,32 +468,6 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
     }
     test_server.stop().await;
     result
-}
-
-/// The prefix the restore-prefix test splits in two: FCVM_IPV6_PREFIX when it is set
-/// and not empty (CIDR, or the bare four-group form of a /64), else the /64 of the
-/// host's global address, the one routed mode detects without a prefix.
-#[cfg(feature = "privileged-tests")]
-async fn routed_base_prefix() -> Result<(u128, u8)> {
-    let given = std::env::var("FCVM_IPV6_PREFIX")
-        .ok()
-        .filter(|prefix| !prefix.trim().is_empty());
-    let (addr, len) = match given {
-        Some(prefix) => match prefix.split_once('/') {
-            Some((addr, len)) => (
-                addr.to_string(),
-                len.parse::<u8>().context("FCVM_IPV6_PREFIX length")?,
-            ),
-            None => (format!("{prefix}::"), 64),
-        },
-        None => (common::get_host_ipv6().await?, 64),
-    };
-    anyhow::ensure!(len < 120, "base prefix /{len} is too long to split in two");
-    let bits = u128::from(
-        addr.parse::<std::net::Ipv6Addr>()
-            .with_context(|| format!("parsing {addr}"))?,
-    );
-    Ok((bits & !(u128::MAX >> len), len))
 }
 
 /// Output of `ip ARGS` on the host.
