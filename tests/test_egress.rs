@@ -309,9 +309,9 @@ done"#,
 /// address its network does not route back to the host.
 ///
 /// The snapshot is created under one half of a base prefix and restored under the
-/// other half. Both halves reach this host, so egress works either way; the clone's
-/// address, as fcvm records it and as the guest holds it on eth0, is what tells
-/// them apart.
+/// other half. The clone's egress goes to a server on this host, so it works either
+/// way; the clone's address, as fcvm records it and as the guest holds it on eth0, is
+/// what tells them apart.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
@@ -320,7 +320,6 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
         common::unique_names("egress-routed-prefix");
 
     let (base, len) = routed_base_prefix().await?;
-    anyhow::ensure!(len < 120, "base prefix /{len} is too long to split in two");
     let half_len = len + 1;
     let snapshot_net = base;
     let restore_net = base | (1u128 << (127 - len));
@@ -338,83 +337,86 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
     let test_server = common::LocalTestServer::start_on_available_port("::")
         .await
         .context("starting local test server")?;
-    let egress_url = get_egress_url("routed", test_server.port).await?;
-    let fcvm_path = common::find_fcvm_binary()?;
-
-    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "podman",
-            "run",
-            "--name",
+    // Every VM process still running when the body returns, killed afterwards whatever
+    // the outcome.
+    let mut running: Vec<u32> = Vec::new();
+    let result = async {
+        let egress_url = get_egress_url("routed", test_server.port).await?;
+        let fcvm_path = common::find_fcvm_binary()?;
+        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "routed",
+                "--ipv6-prefix",
+                &snapshot_prefix,
+                common::TEST_IMAGE,
+            ],
             &baseline_name,
-            "--network",
-            "routed",
-            "--ipv6-prefix",
-            &snapshot_prefix,
-            common::TEST_IMAGE,
-        ],
-        &baseline_name,
-    )
-    .await
-    .context("spawning baseline VM")?;
-    if let Err(e) = common::poll_health_by_pid(baseline_pid, 300).await {
-        test_server.stop().await;
-        common::kill_process(baseline_pid).await;
-        return Err(e.context("baseline VM failed to become healthy"));
-    }
-    let baseline_ipv6 = guest_ipv6(baseline_pid).await?;
-
-    let snap = tokio::process::Command::new(&fcvm_path)
-        .args([
-            "snapshot",
-            "create",
-            "--pid",
-            &baseline_pid.to_string(),
-            "--tag",
-            &snapshot_name,
-        ])
-        .output()
+        )
         .await
-        .context("running snapshot create")?;
-    common::kill_process(baseline_pid).await;
-    if !snap.status.success() {
-        test_server.stop().await;
-        anyhow::bail!(
+        .context("spawning baseline VM")?;
+        running.push(baseline_pid);
+        common::poll_health_by_pid(baseline_pid, 300)
+            .await
+            .context("baseline VM failed to become healthy")?;
+        let baseline_ipv6 = guest_ipv6(baseline_pid).await?;
+        let snap = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .output()
+            .await
+            .context("running snapshot create")?;
+        anyhow::ensure!(
+            snap.status.success(),
             "snapshot creation failed: {}",
             String::from_utf8_lossy(&snap.stderr)
         );
-    }
+        common::kill_process(baseline_pid).await;
+        running.retain(|pid| *pid != baseline_pid);
 
-    let (_serve_child, serve_pid) =
-        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server-prefix")
-            .await
-            .context("spawning memory server")?;
-    common::poll_serve_state_by_pid(serve_pid, 30).await?;
-    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
-        &[
-            "snapshot",
-            "run",
-            "--pid",
-            &serve_pid.to_string(),
-            "--name",
+        let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+            &["snapshot", "serve", &snapshot_name],
+            "uffd-server-prefix",
+        )
+        .await
+        .context("spawning memory server")?;
+        running.push(serve_pid);
+        common::poll_serve_state_by_pid(serve_pid, 30).await?;
+        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+                "--ipv6-prefix",
+                &restore_prefix,
+            ],
             &clone_name,
-            "--ipv6-prefix",
-            &restore_prefix,
-        ],
-        &clone_name,
-    )
-    .await
-    .context("spawning clone")?;
-
-    let result = async {
+        )
+        .await
+        .context("spawning clone")?;
+        running.push(clone_pid);
         common::poll_health_by_pid(clone_pid, 120).await?;
+
         let clone_ipv6 = guest_ipv6(clone_pid).await?;
         println!("  baseline address {baseline_ipv6}, clone address {clone_ipv6}");
-        assert!(
+        anyhow::ensure!(
             inside(&baseline_ipv6, snapshot_net)?,
             "the baseline's address {baseline_ipv6} is outside {snapshot_prefix}, the prefix it ran under"
         );
-        assert!(
+        anyhow::ensure!(
             inside(&clone_ipv6, restore_net)?,
             "the clone's address {clone_ipv6} is outside {restore_prefix}, the prefix it was restored \
              under (the snapshot's prefix was {snapshot_prefix})"
@@ -425,11 +427,11 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
         )
         .await
         .context("reading the guest's eth0 addresses")?;
-        assert!(
+        anyhow::ensure!(
             eth0.contains(&format!("inet6 {clone_ipv6}/")),
             "the guest's eth0 does not hold the clone's address {clone_ipv6}:\n{eth0}"
         );
-        assert!(
+        anyhow::ensure!(
             !eth0.contains(&format!("inet6 {baseline_ipv6}/")),
             "the guest's eth0 still holds the snapshot's address {baseline_ipv6}:\n{eth0}"
         );
@@ -437,27 +439,32 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
     }
     .await;
 
-    common::kill_process(clone_pid).await;
-    common::kill_process(serve_pid).await;
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
     test_server.stop().await;
     result
 }
 
 /// The prefix the restore-prefix test splits in two: FCVM_IPV6_PREFIX when it is set
-/// (CIDR, or the bare four-group form of a /64), else the /64 of the host's global
-/// address, the one routed mode detects without a prefix.
+/// and not empty (CIDR, or the bare four-group form of a /64), else the /64 of the
+/// host's global address, the one routed mode detects without a prefix.
 #[cfg(feature = "privileged-tests")]
 async fn routed_base_prefix() -> Result<(u128, u8)> {
-    let (addr, len) = match std::env::var("FCVM_IPV6_PREFIX") {
-        Ok(prefix) => match prefix.split_once('/') {
+    let given = std::env::var("FCVM_IPV6_PREFIX")
+        .ok()
+        .filter(|prefix| !prefix.trim().is_empty());
+    let (addr, len) = match given {
+        Some(prefix) => match prefix.split_once('/') {
             Some((addr, len)) => (
                 addr.to_string(),
                 len.parse::<u8>().context("FCVM_IPV6_PREFIX length")?,
             ),
             None => (format!("{prefix}::"), 64),
         },
-        Err(_) => (common::get_host_ipv6().await?, 64),
+        None => (common::get_host_ipv6().await?, 64),
     };
+    anyhow::ensure!(len < 120, "base prefix /{len} is too long to split in two");
     let bits = u128::from(
         addr.parse::<std::net::Ipv6Addr>()
             .with_context(|| format!("parsing {addr}"))?,

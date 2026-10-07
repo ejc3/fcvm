@@ -1509,7 +1509,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
     vm_state.config.hypervisor = args.hypervisor.into();
-    vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
+    vm_state.config.ipv6_prefix = launch_ipv6_prefix(&args);
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();

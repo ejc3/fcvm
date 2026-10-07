@@ -586,10 +586,10 @@ pub struct SnapshotRunArgs {
     pub publish: Vec<String>,
 
     /// Routable IPv6 prefix to derive a routed clone's address from, in the forms
-    /// `podman run --ipv6-prefix` takes. Without it the clone uses the prefix the
-    /// snapshot was created under. That is wrong after a restore on another host, or on
-    /// a host whose routed prefix changed: the clone gets an address the network no
-    /// longer routes to this host. Also read from FCVM_IPV6_PREFIX. Other network modes
+    /// `podman run --ipv6-prefix` takes. Without it the clone's address comes from the
+    /// host's own /64, as for `podman run`. The prefix the snapshot was created under is
+    /// never used: on another host, or after the host's routed prefix changed, the network
+    /// no longer routes it here. Also read from FCVM_IPV6_PREFIX. Other network modes
     /// ignore it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
