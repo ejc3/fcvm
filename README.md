@@ -132,6 +132,13 @@ mappings a clone uses in `config.port_mappings`. The flag is in no snapshot key:
 `--network routed`, one snapshot serves a clone on `--publish '[::]:80:80'` (port 80 on
 every host address) and clones on their per-VM IPs.
 
+A routed clone's IPv6 address comes from the host that runs it, as for `podman run`:
+from `snapshot run --ipv6-prefix` (also read from `FCVM_IPV6_PREFIX`), in the forms
+`podman run --ipv6-prefix` takes, and otherwise from the host's own /64. The prefix the
+snapshot was created under is never used, so a clone on another host, or on a host whose
+routed prefix changed, gets an address the network routes to it. On a host with no
+routable /64 of its own, set the variable. Other network modes ignore it.
+
 ### Building a Snapshot Without Leaving a VM Behind
 
 `podman prepare` takes the same arguments as `podman run`, boots one disposable VM,

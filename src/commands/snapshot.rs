@@ -1568,6 +1568,18 @@ pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotR
     SnapshotRunAttempt { result, generation }
 }
 
+/// The prefix a routed clone's address is derived from: the one this run was given
+/// (`--ipv6-prefix` or FCVM_IPV6_PREFIX). Without one, routed networking detects the
+/// host's own /64, as a fresh `podman run` does. The prefix belongs to the host that runs
+/// the clone, so the one the snapshot was created under is never used (#1079). Other
+/// network modes have none.
+fn restore_ipv6_prefix(network_mode: FcNetworkMode, given: Option<&String>) -> Option<String> {
+    match network_mode {
+        FcNetworkMode::Routed => given.cloned(),
+        FcNetworkMode::Bridged | FcNetworkMode::Rootless => None,
+    }
+}
+
 async fn cmd_snapshot_run_inner(
     args: SnapshotRunArgs,
     attempted_generation: &mut Option<SnapshotGeneration>,
@@ -2021,6 +2033,7 @@ async fn cmd_snapshot_run_inner(
         );
     }
 
+    let restore_prefix = restore_ipv6_prefix(network_mode, args.ipv6_prefix.as_ref());
     // Setup networking based on mode - reuse guest_ip from snapshot if available
     let network: Box<dyn NetworkManager> = match network_mode {
         FcNetworkMode::Bridged => {
@@ -2044,8 +2057,8 @@ async fn cmd_snapshot_run_inner(
         FcNetworkMode::Routed => {
             let mut net =
                 RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-            if let Some(ref prefix) = snapshot_config.metadata.ipv6_prefix {
-                net = net.with_ipv6_prefix(prefix.clone());
+            if let Some(prefix) = restore_prefix.clone() {
+                net = net.with_ipv6_prefix(prefix);
             }
             if !snapshot_config.metadata.forward_localhost.is_empty() {
                 net =
@@ -2131,7 +2144,7 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.port_mappings = port_mappings.clone();
     vm_state.config.forward_localhost = snapshot_config.metadata.forward_localhost.clone();
     vm_state.config.network_mode = network_mode;
-    vm_state.config.ipv6_prefix = snapshot_config.metadata.ipv6_prefix.clone();
+    vm_state.config.ipv6_prefix = restore_prefix;
     vm_state.config.tty = tty_mode;
     vm_state.config.interactive = interactive;
 
@@ -3119,6 +3132,7 @@ async fn cmd_snapshot_run_inner(
                                 args.mem.unwrap_or(snapshot_config.metadata.memory_mib),
                                 vm_state.config.balloon_device(),
                                 args.non_blocking_output,
+                                vm_state.config.ipv6_prefix.as_ref(),
                                 &network_config,
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
@@ -3507,6 +3521,7 @@ async fn build_clone_reboot_plan(
     mem: u32,
     balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
+    ipv6_prefix: Option<&String>,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
@@ -3535,6 +3550,7 @@ async fn build_clone_reboot_plan(
         balloon,
         non_blocking_output,
         None,
+        ipv6_prefix,
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -3605,6 +3621,10 @@ async fn build_clone_reboot_plan(
 /// page reporting switch: the one recorded in a rebooting clone's state, or the
 /// snapshot's for a disk-only clone. The cold boot attaches that device, and
 /// attaches none for None.
+///
+/// `ipv6_prefix` is the prefix the run gives the clone: the one `snapshot run --ipv6-prefix`
+/// was given, for a disk-only clone, and the clone's own, for the reboot plan. The prefix
+/// the snapshot recorded is never used (#1079).
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -3615,6 +3635,7 @@ fn run_args_from_snapshot_metadata(
     balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
+    ipv6_prefix: Option<&String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -3708,7 +3729,7 @@ fn run_args_from_snapshot_metadata(
         rootfs_type: None,
         non_blocking_output,
         label: vec![],
-        ipv6_prefix: meta.ipv6_prefix.clone(),
+        ipv6_prefix: restore_ipv6_prefix(meta.network_mode, ipv6_prefix),
         image: meta.image.clone(),
         command_args: vec![],
         rootfs_override,
@@ -3776,6 +3797,7 @@ async fn cmd_snapshot_run_disk_only(
         meta.balloon_device(),
         args.non_blocking_output,
         Some(disk_path),
+        args.ipv6_prefix.as_ref(),
     );
 
     info!(
@@ -3945,6 +3967,74 @@ mod tests {
         );
     }
 
+    /// #1079: a disk-only routed clone boots under the prefix `snapshot run` was given, and
+    /// without one detects the host's /64 as `podman run` does. The prefix the snapshot
+    /// recorded is never used. A rootless clone has none.
+    #[test]
+    fn run_args_from_metadata_take_the_restore_prefix() {
+        let recorded = "2001:db8:aaaa:1::/112".to_string();
+        let given = "2001:db8:bbbb:2::/112".to_string();
+        let routed = crate::storage::SnapshotMetadata {
+            image: "localhost/app:latest".to_string(),
+            vcpu: 1,
+            memory_mib: 512,
+            network_config: crate::network::NetworkConfig::default(),
+            volumes: vec![],
+            health_check_url: None,
+            health_check_timeout: 5,
+            hugepages: false,
+            extra_disks: vec![],
+            nfs_shares: vec![],
+            username: None,
+            user: None,
+            port_mappings: vec![],
+            forward_localhost: vec![],
+            network_mode: crate::firecracker::FcNetworkMode::Routed,
+            ipv6_prefix: Some(recorded),
+            tty: false,
+            interactive: false,
+            kernel_profile: None,
+            image_mode: None,
+            image_disk_path: None,
+            image_disk_identity: None,
+            hypervisor: Default::default(),
+            firecracker_bin: None,
+            balloon_mib: None,
+            balloon_free_page_reporting: false,
+        };
+        let boot = |meta: &crate::storage::SnapshotMetadata, given: Option<&String>| {
+            run_args_from_snapshot_metadata(
+                meta,
+                &[],
+                "c".to_string(),
+                1,
+                512,
+                None,
+                false,
+                None,
+                given,
+            )
+            .ipv6_prefix
+        };
+        assert_eq!(
+            boot(&routed, Some(&given)),
+            Some(given.clone()),
+            "a routed clone takes the given prefix"
+        );
+        assert_eq!(
+            boot(&routed, None),
+            None,
+            "without one the host's own /64 is detected, never the snapshot's prefix"
+        );
+        let mut rootless = routed.clone();
+        rootless.network_mode = crate::firecracker::FcNetworkMode::Rootless;
+        assert_eq!(
+            boot(&rootless, Some(&given)),
+            None,
+            "a rootless clone has no prefix, whatever the snapshot recorded"
+        );
+    }
+
     /// The synthesized RunArgs must carry the recorded boot-plan metadata:
     /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
     /// (overlay layers live on a separate read-only disk), and the USER env
@@ -3989,6 +4079,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -4012,6 +4103,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -4030,6 +4122,7 @@ mod tests {
             None,
             false,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -4047,6 +4140,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -4080,6 +4174,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
         );
         assert_eq!(
@@ -4124,8 +4219,17 @@ mod tests {
             balloon_mib: None,
             balloon_free_page_reporting: false,
         };
-        let args =
-            run_args_from_snapshot_metadata(&base, &[], "c".to_string(), 1, 512, None, false, None);
+        let args = run_args_from_snapshot_metadata(
+            &base,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+            None,
+        );
         assert_eq!(
             args.hypervisor,
             crate::cli::args::Hypervisor::CloudHypervisor
@@ -4133,8 +4237,17 @@ mod tests {
 
         let mut fc = base.clone();
         fc.hypervisor = crate::hypervisor::Backend::Firecracker;
-        let args_fc =
-            run_args_from_snapshot_metadata(&fc, &[], "c".to_string(), 1, 512, None, false, None);
+        let args_fc = run_args_from_snapshot_metadata(
+            &fc,
+            &[],
+            "c".to_string(),
+            1,
+            512,
+            None,
+            false,
+            None,
+            None,
+        );
         assert_eq!(
             args_fc.hypervisor,
             crate::cli::args::Hypervisor::Firecracker
@@ -4173,6 +4286,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
             );
             assert_eq!(args.balloon, target, "{balloon:?}");
@@ -4350,6 +4464,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            ipv6_prefix: None,
         };
 
         let (runtime, choice) = snapshot_restore_runtime_config_with(
@@ -4420,6 +4535,31 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            ipv6_prefix: None,
+        }
+    }
+
+    /// #1079: a routed restore takes the prefix it is given, and without one detects the
+    /// host's /64 as `podman run` does. Other network modes have none.
+    #[test]
+    fn a_routed_restore_takes_the_prefix_it_is_given() {
+        let given = "2001:db8:bbbb:2::/112".to_string();
+        assert_eq!(
+            restore_ipv6_prefix(FcNetworkMode::Routed, Some(&given)).as_deref(),
+            Some("2001:db8:bbbb:2::/112"),
+            "the given prefix"
+        );
+        assert_eq!(
+            restore_ipv6_prefix(FcNetworkMode::Routed, None),
+            None,
+            "without one the host's /64 is detected"
+        );
+        for mode in [FcNetworkMode::Bridged, FcNetworkMode::Rootless] {
+            assert_eq!(
+                restore_ipv6_prefix(mode, Some(&given)),
+                None,
+                "{mode:?} has no prefix"
+            );
         }
     }
 

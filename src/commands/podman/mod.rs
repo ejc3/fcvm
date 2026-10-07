@@ -800,6 +800,7 @@ fn snapshot_restore_args(
         no_swap: false,
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
+        ipv6_prefix: launch_ipv6_prefix(args),
         startup_snapshot_base_key,
         cpu: Some(args.cpu),
         mem: Some(args.mem),
@@ -1508,7 +1509,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.forward_localhost = args.forward_localhost.clone();
     vm_state.config.network_mode = args.network.into();
     vm_state.config.hypervisor = args.hypervisor.into();
-    vm_state.config.ipv6_prefix = args.ipv6_prefix.clone();
+    vm_state.config.ipv6_prefix = launch_ipv6_prefix(&args);
     vm_state.config.tty = args.tty;
     vm_state.config.interactive = args.interactive;
     vm_state.config.user = args.user.clone();
@@ -3202,6 +3203,23 @@ mod tests {
             key(&base, Some("arm64.nv2".to_string())),
             "extra boot args must change the key"
         );
+    }
+
+    /// #1079: a cache hit restores under this run's prefix; a run in another network mode
+    /// passes none.
+    #[test]
+    fn a_cache_hit_restores_under_the_runs_own_prefix() {
+        let mut args = test_args();
+        args.network = NetworkMode::Routed;
+        args.ipv6_prefix = Some("2001:db8:bbbb:2::/112".to_string());
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(
+            restore.ipv6_prefix.as_deref(),
+            Some("2001:db8:bbbb:2::/112")
+        );
+        args.network = NetworkMode::Rootless;
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.ipv6_prefix, None);
     }
 
     /// Only routed networking reads the IPv6 prefix, and FCVM_IPV6_PREFIX puts one on every

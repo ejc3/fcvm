@@ -303,6 +303,196 @@ done"#,
     Ok(())
 }
 
+/// A private (ULA) prefix no test host routes to itself. A clone restored under it
+/// needs no traffic beyond this host: it restores with its container running, and its
+/// egress check talks to a server on the host.
+#[cfg(feature = "privileged-tests")]
+const RESTORE_PREFIX: &str = "fd5a:fc7a:1079::/112";
+
+/// Whether `addr` lies inside the CIDR `prefix`.
+#[cfg(feature = "privileged-tests")]
+fn inside_prefix(addr: &str, prefix: &str) -> Result<bool> {
+    let (net, len) = prefix
+        .split_once('/')
+        .with_context(|| format!("{prefix} has no length"))?;
+    let len: u32 = len.parse().with_context(|| format!("length of {prefix}"))?;
+    anyhow::ensure!((1..=128).contains(&len), "length of {prefix} out of range");
+    let net = u128::from(net.parse::<std::net::Ipv6Addr>()?);
+    let bits = u128::from(
+        addr.parse::<std::net::Ipv6Addr>()
+            .with_context(|| format!("parsing {addr}"))?,
+    );
+    Ok(bits >> (128 - len) == net >> (128 - len))
+}
+
+/// #1079: a routed clone restored with `--ipv6-prefix` takes its address from that
+/// prefix, not from the one its snapshot was created under. Without it, a host whose
+/// routed prefix changed since the snapshot, or another host, gives the clone an
+/// address its network does not route back to the host.
+///
+/// The baseline runs under the host's own routed setup (FCVM_IPV6_PREFIX, or the /64
+/// routed mode detects), and the clone is restored under RESTORE_PREFIX, which holds
+/// none of the host's addresses. A restore that ignored the given prefix would put the
+/// clone back inside the host's prefix, outside RESTORE_PREFIX. The clone's address is
+/// checked as fcvm records it, as the host routes and proxies it, and as the guest holds
+/// it on eth0; its egress goes to a server on this host.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) =
+        common::unique_names("egress-routed-prefix");
+
+    let test_server = common::LocalTestServer::start_on_available_port("::")
+        .await
+        .context("starting local test server")?;
+    // Every VM process still running when the body returns, killed afterwards whatever
+    // the outcome.
+    let mut running: Vec<u32> = Vec::new();
+    let result = async {
+        let egress_url = get_egress_url("routed", test_server.port).await?;
+        let fcvm_path = common::find_fcvm_binary()?;
+        let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "routed",
+                common::TEST_IMAGE,
+            ],
+            &baseline_name,
+        )
+        .await
+        .context("spawning baseline VM")?;
+        running.push(baseline_pid);
+        common::poll_health_by_pid(baseline_pid, 300)
+            .await
+            .context("baseline VM failed to become healthy")?;
+        let baseline_ipv6 = guest_ipv6(baseline_pid).await?;
+        anyhow::ensure!(
+            !inside_prefix(&baseline_ipv6, RESTORE_PREFIX)?,
+            "control: the baseline's address {baseline_ipv6} is already inside {RESTORE_PREFIX}"
+        );
+        let snap = tokio::process::Command::new(&fcvm_path)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &baseline_pid.to_string(),
+                "--tag",
+                &snapshot_name,
+            ])
+            .output()
+            .await
+            .context("running snapshot create")?;
+        anyhow::ensure!(
+            snap.status.success(),
+            "snapshot creation failed: {}",
+            String::from_utf8_lossy(&snap.stderr)
+        );
+        common::kill_process(baseline_pid).await;
+        running.retain(|pid| *pid != baseline_pid);
+
+        let (_serve_child, serve_pid) = common::spawn_fcvm_with_logs(
+            &["snapshot", "serve", &snapshot_name],
+            "uffd-server-prefix",
+        )
+        .await
+        .context("spawning memory server")?;
+        running.push(serve_pid);
+        common::poll_serve_state_by_pid(serve_pid, 30).await?;
+        let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid.to_string(),
+                "--name",
+                &clone_name,
+                "--ipv6-prefix",
+                RESTORE_PREFIX,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning clone")?;
+        running.push(clone_pid);
+        common::poll_health_by_pid(clone_pid, 120).await?;
+
+        let clone_ipv6 = guest_ipv6(clone_pid).await?;
+        println!(
+            "  baseline address {baseline_ipv6}, clone address {clone_ipv6}, restore prefix {RESTORE_PREFIX}"
+        );
+        anyhow::ensure!(
+            inside_prefix(&clone_ipv6, RESTORE_PREFIX)?,
+            "the clone's address {clone_ipv6} is outside {RESTORE_PREFIX}, the prefix it was \
+             restored under (the baseline ran at {baseline_ipv6})"
+        );
+        let clone_veth = common::get_network_field(clone_pid, "host_veth")
+            .await
+            .context("the routed clone recorded no host_veth")?;
+        let route = host_ip(&["-6", "route", "show", &format!("{clone_ipv6}/128")]).await?;
+        anyhow::ensure!(
+            route.split_whitespace().any(|word| word == clone_veth),
+            "the host does not route the clone's address {clone_ipv6} through its veth {clone_veth}: {}",
+            route.trim()
+        );
+        let proxy = host_ip(&["-6", "neigh", "show", "proxy"]).await?;
+        anyhow::ensure!(
+            proxy
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(clone_ipv6.as_str())),
+            "the host has no proxy-NDP entry for the clone's address {clone_ipv6}:\n{proxy}"
+        );
+        let eth0 = common::exec_in_vm(
+            clone_pid,
+            &["PATH=/usr/sbin:/usr/bin:/sbin:/bin ip -6 addr show dev eth0 scope global"],
+        )
+        .await
+        .context("reading the guest's eth0 addresses")?;
+        anyhow::ensure!(
+            eth0.contains(&format!("inet6 {clone_ipv6}/")),
+            "the guest's eth0 does not hold the clone's address {clone_ipv6}:\n{eth0}"
+        );
+        anyhow::ensure!(
+            !eth0.contains(&format!("inet6 {baseline_ipv6}/")),
+            "the guest's eth0 still holds the snapshot's address {baseline_ipv6}:\n{eth0}"
+        );
+        test_egress(&fcvm_path, clone_pid, &egress_url).await
+    }
+    .await;
+
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    test_server.stop().await;
+    result
+}
+
+/// Output of `ip ARGS` on the host.
+#[cfg(feature = "privileged-tests")]
+async fn host_ip(args: &[&str]) -> Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running ip {args:?}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ip {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// The guest IPv6 address fcvm recorded for a routed VM, without its /128.
+#[cfg(feature = "privileged-tests")]
+async fn guest_ipv6(pid: u32) -> Result<String> {
+    let recorded = common::get_network_field(pid, "guest_ipv6").await?;
+    Ok(recorded.split('/').next().unwrap_or_default().to_string())
+}
+
 /// Compute the EUI-64 link-local for an interface from its MAC, independently of
 /// fcvm's own computation, so the nexthop assertion cross-checks fcvm's result.
 #[cfg(feature = "privileged-tests")]

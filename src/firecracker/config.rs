@@ -96,10 +96,8 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
-    /// IPv6 prefix for routed mode (--ipv6-prefix).
-    /// Part of cache key so a run requesting a different prefix never silently
-    /// reuses a snapshot recorded with another prefix (the restore path applies
-    /// the prefix stored in snapshot metadata, not the CLI flag).
+    /// IPv6 prefix for routed mode (--ipv6-prefix). Part of the cache key, so runs
+    /// under different prefixes keep separate snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ipv6_prefix: Option<String>,
     /// Portable FUSE volumes (--portable-volumes).

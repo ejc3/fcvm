@@ -585,6 +585,15 @@ pub struct SnapshotRunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
     pub publish: Vec<String>,
 
+    /// Routable IPv6 prefix to derive a routed clone's address from, in the forms
+    /// `podman run --ipv6-prefix` takes. Without it the clone's address comes from the
+    /// host's own /64, as for `podman run`. The prefix the snapshot was created under is
+    /// never used: on another host, or after the host's routed prefix changed, the network
+    /// no longer routes it here. Also read from FCVM_IPV6_PREFIX. Other network modes
+    /// ignore it.
+    #[arg(long, env = "FCVM_IPV6_PREFIX")]
+    pub ipv6_prefix: Option<String>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
@@ -990,7 +999,7 @@ mod tests {
         assert_eq!(args.run.command_args, vec!["sh", "-c", "entry.sh"]);
     }
 
-    /// --ipv6-prefix is bound to FCVM_IPV6_PREFIX on both commands that take it. The
+    /// --ipv6-prefix is bound to FCVM_IPV6_PREFIX on every command that takes it. The
     /// binding is read off the command definition: this crate's tests do not set
     /// variables in their own process (`test_env`).
     #[test]
@@ -1014,6 +1023,19 @@ mod tests {
                 "podman {name}"
             );
         }
+        let run = cli
+            .find_subcommand("snapshot")
+            .and_then(|snapshot| snapshot.find_subcommand("run"))
+            .expect("snapshot run exists");
+        let prefix = run
+            .get_arguments()
+            .find(|arg| arg.get_id() == "ipv6_prefix")
+            .expect("snapshot run takes --ipv6-prefix");
+        assert_eq!(
+            prefix.get_env(),
+            Some(std::ffi::OsStr::new("FCVM_IPV6_PREFIX")),
+            "snapshot run"
+        );
     }
 
     #[test]
@@ -1136,6 +1158,13 @@ mod tests {
             vec!["[::]:80:80", "[::]:443:443", "127.0.0.1:8080:80/tcp"]
         );
         assert!(parse_snapshot_run(&[]).publish.is_empty());
+    }
+
+    /// #1079: `snapshot run` takes the prefix a routed clone's address is derived from.
+    #[test]
+    fn snapshot_run_takes_an_ipv6_prefix() {
+        let run = parse_snapshot_run(&["--ipv6-prefix", "2001:db8:bbbb:2::/112"]);
+        assert_eq!(run.ipv6_prefix.as_deref(), Some("2001:db8:bbbb:2::/112"));
     }
 
     #[test]
