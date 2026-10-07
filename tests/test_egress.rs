@@ -470,6 +470,154 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
     result
 }
 
+/// Wait until a run's log says how it used the snapshot cache, so a cold boot shows in
+/// seconds rather than after a health timeout.
+#[cfg(feature = "privileged-tests")]
+async fn wait_for_cache_choice(
+    log: &std::path::Path,
+    limit: Duration,
+) -> Result<(&'static str, String)> {
+    let deadline = std::time::Instant::now() + limit;
+    loop {
+        if let Some(choice) = common::cache_choice(log) {
+            return Ok(choice);
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "{} names no cache choice after {limit:?}",
+            log.display()
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// #1079: a routed run under a new IPv6 prefix reuses the snapshot a run under the
+/// host's own prefix left, and its VM takes its address from the new prefix. The prefix
+/// is in no snapshot key because the restore takes the run's prefix.
+///
+/// The second run uses RESTORE_PREFIX, which holds none of the host's addresses, so it
+/// works only as a restore: a cold boot under it could not pull its image.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_routed_run_under_a_new_prefix_reuses_its_snapshot() -> Result<()> {
+    let (first_name, second_name, _, _) = common::unique_names("routed-prefix-cache");
+    let env_unique = format!("PREFIXCACHE_ID={first_name}");
+    let test_server = common::LocalTestServer::start_on_available_port("::")
+        .await
+        .context("starting local test server")?;
+    // VM processes still running and snapshot keys made, cleaned up whatever the outcome.
+    let mut running: Vec<u32> = Vec::new();
+    let mut keys: Vec<String> = Vec::new();
+    let result = async {
+        let egress_url = get_egress_url("routed", test_server.port).await?;
+        let fcvm_path = common::find_fcvm_binary()?;
+
+        let (_first_child, first_pid, first_log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &first_name,
+                    "--network",
+                    "routed",
+                    "--env",
+                    &env_unique,
+                    common::TEST_IMAGE,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning the first run")?;
+        running.push(first_pid);
+        common::poll_health_by_pid(first_pid, 300)
+            .await
+            .context("the first run never turned healthy")?;
+        common::kill_process(first_pid).await;
+        running.retain(|pid| *pid != first_pid);
+        let (first_how, first_key) = common::cache_choice(&first_log)
+            .context("the first run's log has no line that says how it started")?;
+        keys.push(first_key.clone());
+        anyhow::ensure!(
+            first_how == "cold boot",
+            "control: the first run starts from a cold cache and started from a {first_how}"
+        );
+
+        let (_second_child, second_pid, second_log) =
+            common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+                &[
+                    "podman",
+                    "run",
+                    "--name",
+                    &second_name,
+                    "--network",
+                    "routed",
+                    "--ipv6-prefix",
+                    RESTORE_PREFIX,
+                    "--env",
+                    &env_unique,
+                    common::TEST_IMAGE,
+                ],
+                &[],
+            )
+            .await
+            .context("spawning the second run")?;
+        running.push(second_pid);
+        let (second_how, second_key) =
+            wait_for_cache_choice(&second_log, Duration::from_secs(60)).await?;
+        if second_key != first_key {
+            keys.push(second_key.clone());
+        }
+        anyhow::ensure!(
+            second_how != "cold boot",
+            "the run under {RESTORE_PREFIX} cold-booted instead of reusing the snapshot of the run \
+             under the host's own prefix"
+        );
+        anyhow::ensure!(
+            second_key == first_key,
+            "the two runs keyed their snapshots differently: {first_key} and {second_key}"
+        );
+        common::poll_health_by_pid(second_pid, 300)
+            .await
+            .context("the second run never turned healthy")?;
+        let address = guest_ipv6(second_pid).await?;
+        anyhow::ensure!(
+            inside_prefix(&address, RESTORE_PREFIX)?,
+            "the second run's address {address} is outside {RESTORE_PREFIX}, the prefix it ran under"
+        );
+        let eth0 = common::exec_in_vm(
+            second_pid,
+            &["PATH=/usr/sbin:/usr/bin:/sbin:/bin ip -6 addr show dev eth0 scope global"],
+        )
+        .await
+        .context("reading the guest's eth0 addresses")?;
+        anyhow::ensure!(
+            eth0.contains(&format!("inet6 {address}/")),
+            "the guest's eth0 does not hold {address}:\n{eth0}"
+        );
+        test_egress(&fcvm_path, second_pid, &egress_url).await
+    }
+    .await;
+
+    for pid in running.into_iter().rev() {
+        common::kill_process(pid).await;
+    }
+    test_server.stop().await;
+    for key in keys {
+        for snapshot in [
+            fcvm::commands::podman::startup_snapshot_key(&key, None),
+            key.clone(),
+        ] {
+            if common::snapshot_exists(&snapshot) {
+                if let Err(error) = common::delete_snapshot(&snapshot).await {
+                    println!("  could not delete snapshot {snapshot}: {error:#}");
+                }
+            }
+        }
+    }
+    result
+}
+
 /// Output of `ip ARGS` on the host.
 #[cfg(feature = "privileged-tests")]
 async fn host_ip(args: &[&str]) -> Result<String> {
