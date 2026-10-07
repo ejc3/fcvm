@@ -13,6 +13,9 @@ pub struct Plan {
     pub extra_disks: Vec<ExtraDiskMount>,
     #[serde(default)]
     pub nfs_mounts: Vec<NfsMount>,
+    /// Read-only virtio-pmem images, mounted with DAX
+    #[serde(default)]
+    pub pmem_mounts: Vec<PmemMount>,
     /// Device path for localhost image (e.g., "/dev/vdb")
     #[serde(default)]
     pub image_device: Option<String>,
@@ -78,6 +81,13 @@ pub struct ExtraDiskMount {
     pub read_only: bool,
 }
 
+/// A read-only virtio-pmem device (`/dev/pmemN`) holding an ext4 image.
+#[derive(Debug, Clone, Deserialize)]
+pub struct PmemMount {
+    pub device: String,
+    pub mount_path: String,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct NfsMount {
     pub host_ip: String,
@@ -135,6 +145,21 @@ mod tests {
         assert!(!plan.volumes[0].read_only);
         assert!(plan.tty);
         assert!(plan.privileged);
+    }
+
+    #[test]
+    fn test_plan_pmem_mounts() {
+        let plan: Plan = serde_json::from_str(
+            r#"{"image": "alpine:latest",
+                "pmem_mounts": [{"device": "/dev/pmem0", "mount_path": "/mnt/cache"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.pmem_mounts.len(), 1);
+        assert_eq!(plan.pmem_mounts[0].device, "/dev/pmem0");
+        assert_eq!(plan.pmem_mounts[0].mount_path, "/mnt/cache");
+
+        let bare: Plan = serde_json::from_str(r#"{"image": "alpine:latest"}"#).unwrap();
+        assert!(bare.pmem_mounts.is_empty());
     }
 
     /// The NTP list rides in the boot plan because nothing mounts the host's /etc

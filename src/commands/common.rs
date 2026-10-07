@@ -2649,6 +2649,10 @@ pub async fn restore_from_snapshot(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
         );
+        // Firecracker holds the pmem images now. One rewritten between the check before
+        // load and the load would pair the guest's cached view of its filesystem with new
+        // contents; the same check again here catches it, as a snapshot-load failure.
+        crate::storage::pmem::check_snapshot_pmem_images(&vm_state.config.pmem_devices)?;
 
         // Timing instrumentation: measure disk patch operation
         let patch_start = std::time::Instant::now();
@@ -3281,6 +3285,7 @@ pub fn build_snapshot_config(
             health_check_timeout: vm_state.config.health_check_timeout,
             hugepages: vm_state.config.hugepages,
             extra_disks,
+            pmem_devices: vm_state.config.pmem_devices.clone(),
             nfs_shares: vm_state.config.nfs_shares.clone(),
             username: vm_state.config.username.clone(),
             user: vm_state.config.user.clone(),
@@ -5220,6 +5225,30 @@ mod tests {
                 .lifecycle_ready,
             "cancellation that wins the lifecycle gate must leave persisted readiness false"
         );
+    }
+
+    /// A snapshot of a clone carries the clone's pmem devices, so a clone of that
+    /// snapshot attaches the same images and checks them against the same identity.
+    #[test]
+    fn test_build_snapshot_config_carries_pmem_devices() {
+        let mut state = make_vm_state("vm-CCC", Some("vm-AAA"));
+        let device = crate::state::types::PmemDevice {
+            path: "/images/cache.ext4".to_string(),
+            mount_path: "/mnt/cache".to_string(),
+            identity: "12:134217728:1700000000.000000000".to_string(),
+        };
+        state.config.pmem_devices = vec![device.clone()];
+        let config = build_snapshot_config(
+            &state,
+            "test-key",
+            SnapshotType::System,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.metadata.pmem_devices, vec![device]);
     }
 
     #[test]

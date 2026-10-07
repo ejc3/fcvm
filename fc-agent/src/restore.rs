@@ -359,7 +359,8 @@ pub async fn handle_clone_restore(
                 .output()
                 .await;
         }
-        if let Err(e) = crate::mounts::mount_nfs_shares(&signals.nfs_mounts) {
+        // No mount record: the boot's check passed the mounts this restore reproduces.
+        if let Err(e) = crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None) {
             eprintln!(
                 "[fc-agent] WARNING: NFS remount after restore failed: {:?}",
                 e

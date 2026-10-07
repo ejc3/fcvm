@@ -43,6 +43,12 @@ pub struct FirecrackerConfig {
     /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
+    /// Read-only virtio-pmem image specs (--pmem), in device order. The device is
+    /// recorded in the snapshot, so a snapshot answers only runs with the same
+    /// specs. Kept apart from extra_disks so a --pmem and a --disk with the same
+    /// text get different keys.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub pmem: Vec<String>,
     /// Environment variables passed to the container.
     /// Format: "KEY=value" - affects container behavior so must be in cache key.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -220,6 +226,7 @@ impl Default for FirecrackerConfig {
             network_mode: NetworkMode::default(),
             data_dir: PathBuf::new(),
             extra_disks: Vec::new(),
+            pmem: Vec::new(),
             env_vars: Vec::new(),
             volume_mounts: Vec::new(),
             privileged: false,
@@ -501,6 +508,7 @@ impl FirecrackerConfig {
                     "volumes": runtime.volumes,
                     "extra_disks": runtime.extra_disks,
                     "nfs_mounts": runtime.nfs_mounts,
+                    "pmem_mounts": runtime.pmem_mounts,
                     "image_device": runtime.image_device,
                     "image_mode": runtime.image_device.as_ref().map(|_| self.image_mode.to_string()),
                     "privileged": self.privileged,
@@ -539,6 +547,8 @@ pub struct MmdsRuntime {
     pub extra_disks: Vec<serde_json::Value>,
     /// NFS mount details with host IP
     pub nfs_mounts: Vec<serde_json::Value>,
+    /// virtio-pmem mounts ({device: /dev/pmemN, mount_path})
+    pub pmem_mounts: Vec<serde_json::Value>,
     /// Device path for localhost image (e.g., "/dev/vdb"), used by all image modes
     pub image_device: Option<String>,
     /// Resolved HTTP proxy URL (IP, not hostname)
@@ -683,6 +693,22 @@ mod tests {
             balloon(true),
             Some(serde_json::json!({"free_page_reporting": true}))
         );
+    }
+
+    /// A pmem device is recorded in the snapshot, so --pmem is part of the key, and
+    /// a --pmem spec does not collide with a --disk of the same text.
+    #[test]
+    fn test_snapshot_key_changes_with_pmem() {
+        let none = test_config();
+        let mut pmem = test_config();
+        pmem.pmem = vec!["/images/cache.ext4:/mnt/cache:ro".to_string()];
+        let mut other = test_config();
+        other.pmem = vec!["/images/other.ext4:/mnt/cache:ro".to_string()];
+        let mut disk = test_config();
+        disk.extra_disks = vec!["/images/cache.ext4:/mnt/cache:ro".to_string()];
+        assert_ne!(none.snapshot_key(), pmem.snapshot_key());
+        assert_ne!(pmem.snapshot_key(), other.snapshot_key());
+        assert_ne!(pmem.snapshot_key(), disk.snapshot_key());
     }
 
     #[test]
@@ -956,6 +982,7 @@ mod tests {
             volumes: vec![],
             extra_disks: vec![],
             nfs_mounts: vec![],
+            pmem_mounts: vec![],
             image_device: None,
             http_proxy: None,
             https_proxy: None,

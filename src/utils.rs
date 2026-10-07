@@ -1196,15 +1196,20 @@ pub fn ensure_sbin_on_path() {
 /// inode, so this triple distinguishes builds cheaply (one stat) without
 /// hashing multi-hundred-MB files.
 pub fn file_identity(path: &std::path::Path) -> anyhow::Result<String> {
+    Ok(metadata_identity(&std::fs::metadata(path)?))
+}
+
+/// `file_identity` of metadata already read, for a caller that checks other fields
+/// of the same stat.
+pub fn metadata_identity(md: &std::fs::Metadata) -> String {
     use std::os::unix::fs::MetadataExt;
-    let md = std::fs::metadata(path)?;
-    Ok(format!(
+    format!(
         "{}:{}:{}.{:09}",
         md.ino(),
         md.size(),
         md.mtime(),
         md.mtime_nsec()
-    ))
+    )
 }
 
 /// Whether an image-delivery disk is an overlay STORAGE image (as opposed to a

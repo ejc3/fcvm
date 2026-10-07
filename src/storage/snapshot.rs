@@ -194,6 +194,11 @@ pub struct SnapshotMetadata {
     /// Extra disk images from the baseline VM (for clone disk-dir support)
     #[serde(default)]
     pub extra_disks: Vec<SnapshotExtraDisk>,
+    /// Read-only virtio-pmem images from the baseline VM, in device order.
+    /// Firecracker records each path and reopens it on restore; restore refuses an
+    /// image that is gone or whose inode, length or modification time changed.
+    #[serde(default)]
+    pub pmem_devices: Vec<crate::state::types::PmemDevice>,
     /// NFS shares from the baseline VM. The restore path re-exports these for
     /// the new VM (the baseline's /etc/exports.d entry dies with the baseline)
     /// and fc-agent remounts them in the guest after the transport reset.
@@ -709,6 +714,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                pmem_devices: vec![],
                 nfs_shares: vec![],
                 username: None,
                 user: None,
@@ -908,6 +914,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                pmem_devices: vec![],
                 nfs_shares: vec![],
                 username: None,
                 user: None,
@@ -992,6 +999,7 @@ mod tests {
                     health_check_timeout: 5,
                     hugepages: false,
                     extra_disks: vec![],
+                    pmem_devices: vec![],
                     nfs_shares: vec![],
                     username: None,
                     user: None,
@@ -1063,6 +1071,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                pmem_devices: vec![],
                 nfs_shares: vec![],
                 username: None,
                 user: None,
@@ -1258,6 +1267,7 @@ mod tests {
                 health_check_timeout: 5,
                 hugepages: false,
                 extra_disks: vec![],
+                pmem_devices: vec![],
                 nfs_shares: vec![],
                 username: None,
                 user: None,
@@ -1410,6 +1420,7 @@ mod tests {
             health_check_timeout: 5,
             hugepages: false,
             extra_disks: vec![],
+            pmem_devices: vec![],
             nfs_shares: vec![],
             username: None,
             user: None,

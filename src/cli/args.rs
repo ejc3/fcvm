@@ -239,6 +239,20 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub disk_dir: Vec<String>,
 
+    /// Read-only host image over virtio-pmem with DAX: HOST_IMAGE:GUEST_MOUNT:ro
+    /// (repeat for multiple). Devices appear as /dev/pmem0, /dev/pmem1, ... in order
+    /// and are mounted at GUEST_MOUNT in both VM and container with -o ro,noload,dax=always.
+    /// The image's file data stays out of guest RAM and the memory snapshot, and
+    /// clones share it through the host page cache. The image must be an ext4
+    /// filesystem with 4 KiB blocks (mkfs.ext4 -b 4096), and its length a multiple
+    /// of 2 MiB. Restores reopen it at the same path, so it must not change while a
+    /// snapshot that uses it exists: a restore refuses an image whose inode, length or
+    /// modification time changed, and a `podman run` cache hit then boots fresh.
+    /// Firecracker only.
+    /// Example: --pmem /data/cache.ext4:/mnt/cache:ro
+    #[arg(long, action = clap::ArgAction::Append)]
+    pub pmem: Vec<String>,
+
     /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
     /// Starts NFS server on host, VM mounts via network.
     /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).

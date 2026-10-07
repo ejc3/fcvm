@@ -283,6 +283,7 @@ async fn create_sandbox(
         map: vec![],
         disk: vec![],
         disk_dir: vec![],
+        pmem: vec![],
         nfs: vec![],
         env: {
             let env_map = req.env.unwrap_or_default();
