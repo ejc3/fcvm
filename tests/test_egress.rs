@@ -310,8 +310,8 @@ done"#,
 ///
 /// The snapshot is created under one half of a base prefix and restored under the
 /// other half. The clone's egress goes to a server on this host, so it works either
-/// way; the clone's address, as fcvm records it and as the guest holds it on eth0, is
-/// what tells them apart.
+/// way; the clone's address, as fcvm records it, as the host routes and proxies it, and
+/// as the guest holds it on eth0, is what tells them apart.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
@@ -421,6 +421,22 @@ async fn test_egress_clone_routed_takes_the_restore_prefix() -> Result<()> {
             "the clone's address {clone_ipv6} is outside {restore_prefix}, the prefix it was restored \
              under (the snapshot's prefix was {snapshot_prefix})"
         );
+        let clone_veth = common::get_network_field(clone_pid, "host_veth")
+            .await
+            .context("the routed clone recorded no host_veth")?;
+        let route = host_ip(&["-6", "route", "show", &format!("{clone_ipv6}/128")]).await?;
+        anyhow::ensure!(
+            route.split_whitespace().any(|word| word == clone_veth),
+            "the host does not route the clone's address {clone_ipv6} through its veth {clone_veth}: {}",
+            route.trim()
+        );
+        let proxy = host_ip(&["-6", "neigh", "show", "proxy"]).await?;
+        anyhow::ensure!(
+            proxy
+                .lines()
+                .any(|line| line.split_whitespace().next() == Some(clone_ipv6.as_str())),
+            "the host has no proxy-NDP entry for the clone's address {clone_ipv6}:\n{proxy}"
+        );
         let eth0 = common::exec_in_vm(
             clone_pid,
             &["PATH=/usr/sbin:/usr/bin:/sbin:/bin ip -6 addr show dev eth0 scope global"],
@@ -470,6 +486,22 @@ async fn routed_base_prefix() -> Result<(u128, u8)> {
             .with_context(|| format!("parsing {addr}"))?,
     );
     Ok((bits & !(u128::MAX >> len), len))
+}
+
+/// Output of `ip ARGS` on the host.
+#[cfg(feature = "privileged-tests")]
+async fn host_ip(args: &[&str]) -> Result<String> {
+    let output = tokio::process::Command::new("ip")
+        .args(args)
+        .output()
+        .await
+        .with_context(|| format!("running ip {args:?}"))?;
+    anyhow::ensure!(
+        output.status.success(),
+        "ip {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
 /// The guest IPv6 address fcvm recorded for a routed VM, without its /128.
