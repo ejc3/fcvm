@@ -439,7 +439,6 @@ pub(super) fn build_firecracker_config(
         image_mode,
         non_blocking_output: args.non_blocking_output,
         rootfs_type: super::resolve_rootfs_type(args),
-        ipv6_prefix: super::launch_ipv6_prefix(args),
         portable_volumes: args.portable_volumes,
         firecracker_bin: firecracker_bin.map(|p| p.to_path_buf()),
         // Cache-key isolation for guest failpoints (see field docs): the spec is

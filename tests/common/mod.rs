@@ -2594,6 +2594,29 @@ pub async fn get_host_primary_ip() -> anyhow::Result<String> {
     anyhow::bail!("Could not determine host primary IP from: {}", stdout)
 }
 
+/// What one `podman run` decided about the snapshot cache, from the line it logs
+/// when it decides: which kind of start, and the snapshot key the line names.
+pub fn cache_choice(log: &std::path::Path) -> Option<(&'static str, String)> {
+    let text = std::fs::read_to_string(log).ok()?;
+    text.lines().find_map(|line| {
+        let which = if line.contains("Startup snapshot hit!") {
+            "startup snapshot"
+        } else if line.contains("Pre-start snapshot hit!") {
+            "pre-start snapshot"
+        } else if line.contains("Snapshot miss, will create snapshot") {
+            "cold boot"
+        } else {
+            return None;
+        };
+        let key = line
+            .split("snapshot_key=")
+            .nth(1)?
+            .split_whitespace()
+            .next()?;
+        Some((which, key.to_string()))
+    })
+}
+
 /// Get the host's global IPv6 address.
 /// Uses `ip -6 addr show scope global` and returns the first non-link-local address.
 pub async fn get_host_ipv6() -> anyhow::Result<String> {

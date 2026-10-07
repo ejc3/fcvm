@@ -656,7 +656,7 @@ async fn test_free_page_reporting_run_fails_when_the_guest_leaves_the_balloon_in
             .iter()
             .map(|what| format!("the run that takes snapshots: {what}")),
     );
-    match cache_choice(&cached.log_path) {
+    match common::cache_choice(&cached.log_path) {
         Some(("cold boot", key)) => {
             if common::snapshot_exists(&key) {
                 wrong.push(format!(
@@ -687,29 +687,6 @@ async fn test_free_page_reporting_run_fails_when_the_guest_leaves_the_balloon_in
     }
     anyhow::ensure!(wrong.is_empty(), "{}", wrong.join("\n"));
     Ok(())
-}
-
-/// What one `podman run` decided about the snapshot cache, from the line it logs
-/// when it decides: which kind of start, and the snapshot key the line names.
-fn cache_choice(log: &std::path::Path) -> Option<(&'static str, String)> {
-    let text = std::fs::read_to_string(log).ok()?;
-    text.lines().find_map(|line| {
-        let which = if line.contains("Startup snapshot hit!") {
-            "startup snapshot"
-        } else if line.contains("Pre-start snapshot hit!") {
-            "pre-start snapshot"
-        } else if line.contains("Snapshot miss, will create snapshot") {
-            "cold boot"
-        } else {
-            return None;
-        };
-        let key = line
-            .split("snapshot_key=")
-            .nth(1)?
-            .split_whitespace()
-            .next()?;
-        Some((which, key.to_string()))
-    })
 }
 
 /// nginx, started only once the test has made `/tmp/go` in the container. Until
@@ -759,7 +736,7 @@ async fn held_startup_run(
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
-    let choice = cache_choice(&log)
+    let choice = common::cache_choice(&log)
         .with_context(|| format!("{run}'s log has no line that says how it started"))?;
     Ok((pid, choice))
 }

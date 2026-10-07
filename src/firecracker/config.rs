@@ -96,10 +96,6 @@ pub struct FirecrackerConfig {
     /// Different rootfs types produce different VM states and must not share snapshots.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rootfs_type: Option<String>,
-    /// IPv6 prefix for routed mode (--ipv6-prefix). Part of the cache key, so runs
-    /// under different prefixes keep separate snapshots.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ipv6_prefix: Option<String>,
     /// Portable FUSE volumes (--portable-volumes).
     /// Part of cache key because per-volume inode tables are baked into the
     /// snapshot at create time — a portable run must not reuse a non-portable
@@ -237,7 +233,6 @@ impl Default for FirecrackerConfig {
             forward_localhost: Vec::new(),
             image_mode: ImageMode::Overlay,
             rootfs_type: None,
-            ipv6_prefix: None,
             portable_volumes: false,
             firecracker_bin: None,
             guest_failpoint: None,
@@ -896,14 +891,6 @@ mod tests {
         let config1 = test_config();
         let mut config2 = test_config();
         config2.rootfs_type = Some("btrfs".to_string());
-        assert_ne!(config1.snapshot_key(), config2.snapshot_key());
-    }
-
-    #[test]
-    fn test_snapshot_key_changes_with_ipv6_prefix() {
-        let config1 = test_config();
-        let mut config2 = test_config();
-        config2.ipv6_prefix = Some("2001:db8::/64".to_string());
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
     }
 
