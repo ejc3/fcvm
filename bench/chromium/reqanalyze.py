@@ -164,7 +164,7 @@ def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
     return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1], n
 
 
-def memory_server_average(records, arms):
+def memory_server_average(records, arms, tick_ms):
     """The memory server's CPU per request over a single-arm run.
 
     Each record carries the server's cumulative CPU sampled at its launch
@@ -173,13 +173,19 @@ def memory_server_average(records, arms):
     the measured count, is the server's CPU per request, including the work
     it finishes after a clone exits. A run with other arms shared the server,
     so its growth is not this arm's.
+
+    Each sample is four /proc counters (utime, stime, cutime, cstime), each
+    truncated to tick_ms, so it reads up to four ticks low and the growth is
+    known to within four ticks either way; quantization_ms is that interval
+    spread over the requests.
     """
     before = [r.get("serve_cpu_before") for r in records]
     after = [r.get("serve_cpu_after") for r in records]
     if any(not isinstance(s, dict) for s in before + after):
         return {"available": False, "reason": "a request has no memory-server sample"}
     if not any(s.get("applicable") for s in before + after):
-        return {"available": True, "mean_ms": 0.0, "note": "file-backed: no memory server"}
+        return {"available": True, "mean_ms": 0.0, "quantization_ms": {"lo": 0.0, "hi": 0.0},
+                "note": "file-backed: no memory server"}
     if len(arms) != 1:
         return {"available": False,
                 "reason": f"the memory server also served arm(s) {sorted(set(arms) - set([records[0].get('arm')]))}"}
@@ -190,8 +196,9 @@ def memory_server_average(records, arms):
         return {"available": False, "reason": "the memory server restarted during the run"}
     ordered = sorted(records, key=lambda r: r.get("rep", 0))
     growth = ordered[-1]["serve_cpu_after"]["ms"] - ordered[0]["serve_cpu_before"]["ms"]
+    bound = 4 * tick_ms / len(records)
     return {"available": True, "mean_ms": growth / len(records), "n": len(records),
-            "window_ms": growth}
+            "window_ms": growth, "quantization_ms": {"lo": -bound, "hi": bound}}
 
 
 def fmt(med, lo, hi, n=None, unit="ms"):
@@ -2360,6 +2367,10 @@ def analyze_backend(
         #           does after a clone exits is inside that window, and the
         #           CLK_TCK steps average out. It is only this arm's when the
         #           run had no other arm.
+        # Every reading is /proc counters truncated to the tick, so each
+        # figure carries quantization_ms: the interval, before sampling error,
+        # in which the mean of the untruncated counters lies around it. The
+        # bootstrap CI does not cover it, because truncation always reads low.
         # Fail closed: one measured request without a complete reading
         # withholds every figure, rather than shrinking n to the readable
         # ones.
@@ -2373,11 +2384,21 @@ def analyze_backend(
                 life = t.get("lifetime_cpu_ms_by_child") or {}
                 reaped = t.get("reaped_children_cpu_ms_by_child") or {}
                 per_child = t.get("per_child_cpu") or {}
+                tick = t.get("tick_ms")
                 if ("firecracker" not in life or "fcvm" not in life
                         or set(reaped) != set(life) or not per_child
-                        or any(c.get("reclaim_cpu_ms") is None for c in per_child.values())):
+                        or any(c.get("reclaim_cpu_ms") is None for c in per_child.values())
+                        or isinstance(tick, bool) or not isinstance(tick, (int, float))
+                        or not math.isfinite(tick) or tick <= 0):
                     return None
+                # Each reading is two counters (utime+stime, or cutime+cstime)
+                # truncated to the tick, so up to two ticks low. A child's
+                # reclaim is its final reading minus its reading at the kill,
+                # so the two cancel and the child carries one reading.
+                readings = len(set(life) | set(per_child)) + len(reaped)
                 return {
+                    "quantization_hi": 2 * tick * readings,
+                    "tick_ms": tick,
                     "children_at_kill": sum(life.values()),
                     "reaped_children": sum(reaped.values()),
                     "reclaim": sum(c["reclaim_cpu_ms"] for c in per_child.values()),
@@ -2394,7 +2415,11 @@ def analyze_backend(
                 totals = [x["children_at_kill"] + x["reaped_children"] + x["reclaim"]
                           for x in readings]
                 m, lo, hi, n = mean_ci(totals)
+                tick = max(x["tick_ms"] for x in readings)
+                clone_q_hi = statistics.fmean(x["quantization_hi"] for x in readings)
                 block["clone_mean_ms"] = {"mean": m, "lo": lo, "hi": hi, "n": n,
+                                          "quantization_ms": {"lo": 0.0, "hi": clone_q_hi,
+                                                              "tick_ms": tick},
                                           "provenance": provenance(fast_records)}
                 block["clone_median_ms"] = dict(zip(("median", "lo", "hi", "n"),
                                                     median_ci(totals)))
@@ -2409,9 +2434,12 @@ def analyze_backend(
                 }
                 block["records_with_lower_bound_reaping"] = sum(
                     1 for x in readings if x["lower_bound"])
-                block["memory_server"] = memory_server_average(fast_records, arms)
+                block["memory_server"] = memory_server_average(fast_records, arms, tick)
                 if block["memory_server"].get("available"):
                     block["total_mean_ms"] = m + block["memory_server"]["mean_ms"]
+                    server_q = block["memory_server"]["quantization_ms"]
+                    block["total_quantization_ms"] = {"lo": server_q["lo"],
+                                                      "hi": clone_q_hi + server_q["hi"]}
             out["arms"][a]["request_cpu_ms"] = block
             print(f"    request CPU: {len(fast_records) - missing}/{len(fast_records)} "
                   "measured requests with a complete reading")
@@ -2423,12 +2451,17 @@ def analyze_backend(
                       f"[{c['lo']:.1f}, {c['hi']:.1f}] n={c['n']}"
                       + (f"  ({block['records_with_lower_bound_reaping']} lower-bound reapings)"
                          if block["records_with_lower_bound_reaping"] else ""))
+                q = c["quantization_ms"]
+                print(f"        /proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms "
+                      f"({q['tick_ms']:.0f} ms tick)")
                 s = block["memory_server"]
                 print("      memory server mean  "
                       + (f"{s['mean_ms']:.1f} ms" if s.get("available")
                          else f"not attributable: {s['reason']}"))
                 if "total_mean_ms" in block:
-                    print(f"      total mean          {block['total_mean_ms']:.1f} ms")
+                    q = block["total_quantization_ms"]
+                    print(f"      total mean          {block['total_mean_ms']:.1f} ms "
+                          f"(/proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms)")
 
         # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning
         # gate while `len(ag)` drove the denominator, so a null or an absent

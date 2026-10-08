@@ -125,9 +125,13 @@ exec {sys.executable} "$@"
 
 def cgroup_fixture(directory):
     """A CGROUP_ROOT whose /fake-container.scope/cpu.stat the stub driver
-    advances by 2.5 ms per drive(). Returns the env entries hostcdp.sh needs."""
+    advances by 2.5 ms per drive(). Returns the env entries hostcdp.sh needs.
+    The root has its own readable cpu.stat, as the real root cgroup does, so a
+    path that resolves to the root reads a valid counter unless refused."""
     scope = os.path.join(directory, "cgroup", "fake-container.scope")
     os.makedirs(scope)
+    with open(os.path.join(directory, "cgroup", "cpu.stat"), "w") as handle:
+        handle.write("usage_usec 9000000000\nuser_usec 0\nsystem_usec 0\n")
     cpu_stat = os.path.join(scope, "cpu.stat")
     with open(cpu_stat, "w") as handle:
         handle.write("usage_usec 1000000\nuser_usec 0\nsystem_usec 0\n")

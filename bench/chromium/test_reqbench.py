@@ -3876,6 +3876,7 @@ class AnalyzerAvailability(unittest.TestCase):
                 "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
                 "pasta": {"reclaim_cpu_ms": 0.0, "complete": True},
             }
+            record["teardown"]["tick_ms"] = 10.0
         measured[1]["teardown"]["per_child_cpu"]["firecracker"]["complete"] = False
         if mutate:
             mutate(measured)
@@ -3911,6 +3912,37 @@ class AnalyzerAvailability(unittest.TestCase):
             block, measured = self._cpu_fixture(d, drop)
         self.assertFalse(block["complete"])
         self.assertEqual(block["missing_records"], 1)
+        self.assertNotIn("clone_mean_ms", block)
+
+    def test_request_cpu_carries_the_proc_tick_quantization(self):
+        """RED BEFORE THE FIX: every part of the clone figure is a sum of
+        /proc counters truncated to the tick, and only a bootstrap CI was
+        published, so a mean read in 10 ms steps claimed precision below
+        them. Each of the three children's final utime+stime and its reaped
+        cutime+cstime are two truncated counters, so each record reads up to
+        6 x 2 x 10 ms low. The memory server's growth is two readings of four
+        counters, +/-40 ms over the run."""
+        def no_server(measured):
+            for record in measured:
+                record["serve_cpu_before"] = {"applicable": False}
+                record["serve_cpu_after"] = {"applicable": False}
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d)
+        self.assertEqual(block["clone_mean_ms"]["quantization_ms"],
+                         {"lo": 0.0, "hi": 120.0, "tick_ms": 10.0})
+        self.assertNotIn("total_quantization_ms", block)
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, no_server)
+        self.assertEqual(block["memory_server"]["quantization_ms"], {"lo": 0.0, "hi": 0.0})
+        self.assertEqual(block["total_quantization_ms"], {"lo": 0.0, "hi": 120.0})
+
+    def test_a_request_without_its_tick_withholds_every_cpu_figure(self):
+        """Without the tick the readings' quantization cannot be stated."""
+        def drop(measured):
+            del measured[0]["teardown"]["tick_ms"]
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, drop)
+        self.assertFalse(block["complete"])
         self.assertNotIn("clone_mean_ms", block)
 
 
@@ -3949,32 +3981,35 @@ class MemoryServerAverage(unittest.TestCase):
         """Red with per-request deltas: the 30 ms the server did between
         requests (here 100->110 and 130->150) belonged to no request."""
         recs = self.records([100.0, 110.0, 150.0], [100.0, 130.0, 160.0])
-        got = reqanalyze.memory_server_average(recs, ["cdp-fast"])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
         self.assertTrue(got["available"])
         self.assertEqual(got["mean_ms"], 60.0 / 3)
+        # Two readings of four truncated counters bound the growth to
+        # +/-40 ms, spread over the three requests.
+        self.assertEqual(got["quantization_ms"], {"lo": -40.0 / 3, "hi": 40.0 / 3})
 
     def test_a_server_shared_with_other_arms_is_not_attributed(self):
         recs = self.records([0.0, 10.0, 20.0], [10.0, 20.0, 30.0])
-        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"], 10.0)
         self.assertFalse(got["available"])
         self.assertIn("noop", got["reason"])
 
     def test_a_restarted_server_is_not_attributed(self):
         recs = self.records([0.0, 10.0], [10.0, 20.0])
         recs[1]["serve_cpu_after"]["starttime"] = 8
-        got = reqanalyze.memory_server_average(recs, ["cdp-fast"])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
         self.assertFalse(got["available"])
         self.assertIn("restarted", got["reason"])
 
     def test_a_missing_sample_is_not_attributed(self):
         recs = self.records([0.0, 10.0], [10.0, 20.0])
         recs[0]["serve_cpu_before"] = {"applicable": True, "error": "memory server not readable"}
-        self.assertFalse(reqanalyze.memory_server_average(recs, ["cdp-fast"])["available"])
+        self.assertFalse(reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)["available"])
 
     def test_a_file_backed_run_has_no_server_cost(self):
         recs = [{"arm": "cdp-fast", "rep": 0, "serve_cpu_before": {"applicable": False},
                  "serve_cpu_after": {"applicable": False}}]
-        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"])
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"], 10.0)
         self.assertEqual((got["available"], got["mean_ms"]), (True, 0.0))
 
 

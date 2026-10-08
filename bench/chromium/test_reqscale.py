@@ -2298,7 +2298,8 @@ class PlanOnlyCli(unittest.TestCase):
 
 
 class ConcurrentRequestRecords(unittest.TestCase):
-    def _record(self, cdp_record):
+    @staticmethod
+    def _inputs():
         args = SimpleNamespace(
             url="http://x/", format="jpeg", quality=80, cdp_port=9222, ws_url="",
             fcvm="fcvm", data_root="/d", state_dir="/s", timeout=10.0,
@@ -2313,22 +2314,35 @@ class ConcurrentRequestRecords(unittest.TestCase):
             backend="uffd", target_rps=2.0, request_index=0, pair_index=0,
             request_id="r:b:0", scheduled_ns=0, actual_launch_ns=1, request_seed=7,
         )
-        request = reqscale._make_request_fn(
-            args, spec, 1234, "/logs", {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
-        with mock.patch.object(reqscale.reqbench, "run_cdp_request",
-                               return_value=dict(cdp_record)):
-            return request(context)
+        return args, spec, context
 
-    def test_the_memory_server_cpu_is_not_charged_to_overlapping_requests(self):
-        """Red without the pop: run_cdp_request's memory-server samples,
-        taken around a request that overlapped others served by the same
-        server, survived into its record."""
-        sample = {"applicable": True, "ms": 25.0, "starttime": 7}
-        record = self._record({"ok": True, "serve_cpu_before": sample,
-                               "serve_cpu_after": sample})
-        self.assertNotIn("serve_cpu_before", record)
-        self.assertNotIn("serve_cpu_after", record)
+    def test_a_concurrent_request_never_reads_the_memory_server(self):
+        """Red while reqscale only dropped the samples from the record:
+        run_cdp_request had already read the shared server's /proc/<pid>/stat
+        before each UFFD clone's launch (and again after its teardown), which
+        no FILE request does, so the UFFD arm alone carried that work."""
+        args, spec, context = self._inputs()
+        reads = []
 
+        class Stop(Exception):
+            pass
+
+        def sample(pid):
+            reads.append(pid)
+            return {"applicable": True, "ms": 0.0, "starttime": 1}
+
+        with tempfile.TemporaryDirectory() as state_dir:
+            args.state_dir = state_dir
+            request = reqscale._make_request_fn(
+                args, spec, 1234, state_dir,
+                {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
+            # The clone launch is stopped right after the point where the
+            # request would have sampled the server before it.
+            with mock.patch.object(reqscale.reqbench, "serve_cpu_sample", side_effect=sample), \
+                    mock.patch.object(reqscale.reqbench, "state_path_baseline", side_effect=Stop):
+                with self.assertRaises(Stop):
+                    request(context)
+        self.assertEqual(reads, [], "a concurrent UFFD request read the memory server")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

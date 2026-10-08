@@ -3214,7 +3214,8 @@ def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
     return session
 
 
-def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
+def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot",
+                    sample_serve_cpu: bool = True) -> dict:
     import cdpdrive
 
     arm_name = "html" if op == "html" else ("cdp-fast" if fast else "cdp")
@@ -3232,7 +3233,10 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     # state file's creation and then block waiting for an event already past.
     watch = DirWatch(args.state_dir)
     serve_pid = getattr(args, "serve_pid", 0) or 0
-    serve_before = serve_cpu_sample(serve_pid)
+    # A caller whose requests overlap (reqscale) passes sample_serve_cpu=False:
+    # the server's counters would bracket other requests too, and reading them
+    # would add work to UFFD requests that FILE requests do not do.
+    serve_before = serve_cpu_sample(serve_pid) if sample_serve_cpu else None
     t_spawn = time.monotonic()
     interrupted = None
     fcvm_start_time = None
@@ -3464,8 +3468,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             e.record = rec
             raise e from interrupted
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
-    rec["serve_cpu_before"] = serve_before
-    rec["serve_cpu_after"] = serve_cpu_sample(serve_pid)
+    if sample_serve_cpu:
+        rec["serve_cpu_before"] = serve_before
+        rec["serve_cpu_after"] = serve_cpu_sample(serve_pid)
     rec["log"] = log
     if interrupted is not None:
         raise interrupted

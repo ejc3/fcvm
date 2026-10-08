@@ -3348,12 +3348,10 @@ def _make_request_fn(args, spec, serve_pid, log_dir, audits, tracer, global_base
         probe = FirecrackerFaultProbe(ProcReader(), audits[context.backend], marker)
         request_args = _request_args(args, context, serve_pid, log_dir, probe)
         rep = global_base + context.request_index
-        record = reqbench.run_cdp_request(request_args, rep, fast=True)
-        # The memory server's counters bracket overlapping requests here, so
-        # they say nothing about this one; reqscale_analyze has its own
+        # The memory server's counters would bracket overlapping requests
+        # here, so no request reads them; reqscale_analyze has its own
         # whole-run cgroup accounting.
-        record.pop("serve_cpu_before", None)
-        record.pop("serve_cpu_after", None)
+        record = reqbench.run_cdp_request(request_args, rep, fast=True, sample_serve_cpu=False)
         record.update(
             schema=RECORD_SCHEMA,
             kind="request",
