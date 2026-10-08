@@ -103,15 +103,18 @@ pub struct ExtraDisk {
 /// `pmem_devices` is `/dev/pmemN` in the guest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PmemDevice {
-    /// Canonical host path of the image. Firecracker records it in the snapshot and
-    /// reopens it at this path on restore.
+    /// The pmem store entry Firecracker maps (`<data_dir>/pmem/<hex>.img`, canonical), a
+    /// read-only copy of `source`. Firecracker records it in the snapshot and reopens it
+    /// at this path on restore.
     pub path: String,
+    /// Canonical host path of the image the entry was copied from, which is what
+    /// `--pmem` named. Used in messages and listings; nothing maps it.
+    pub source: String,
     /// Mount path inside the guest and the container
     pub mount_path: String,
-    /// Inode, length, modification time and change time when the device was attached
-    /// (`storage::pmem::image_identity`). A restore refuses an image whose identity changed,
-    /// which catches an image rewritten in place at the same length, even with its
-    /// modification time put back.
+    /// The entry's inode, length and modification time when the device was attached
+    /// (`storage::pmem::entry_identity`). An entry is never rewritten, so a restore that
+    /// finds another identity refuses an entry that is missing or was replaced.
     pub identity: String,
 }
 

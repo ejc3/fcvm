@@ -93,20 +93,204 @@ pub const NSENTER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from
 /// Retry interval between holder creation attempts (only used when holder dies)
 pub const HOLDER_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
+/// First host id of the subordinate range the extended mapping gives namespace ids
+/// 1-65535; /etc/subuid and /etc/subgid must grant it to the caller.
+const SUBORDINATE_HOST_FIRST: u32 = 100000;
+/// Number of namespace ids, from 1, the extended mapping gives the subordinate range.
+const SUBORDINATE_COUNT: u32 = 65535;
+/// Namespace id of the sudo invoker in a root run's holder namespace: past both layouts
+/// (0 alone, or 0 and 1-65535), so it collides with neither.
+const INVOKER_NAMESPACE_ID: u32 = 65536;
+
+/// One line of a uid_map or gid_map: namespace id, host id, count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IdMapLine {
+    inside: u32,
+    outside: u32,
+    count: u32,
+}
+
+/// The lines of one id map of a holder namespace: `own` (the caller's uid or gid) at 0,
+/// the subordinate range at 1-65535 when `extended`, and `invoker` at 65536 unless a line
+/// already maps it.
+///
+/// `invoker` is the sudo invoker's uid or gid in a root run. The pmem store hands its
+/// entries to that user with mode 0400, and Firecracker runs inside this namespace,
+/// where the capability that overrides file permissions applies only to a file whose
+/// owner and group are both mapped. Without the line Firecracker gets EACCES opening an
+/// entry, and so does a root run opening one a rootless run of the same user published.
+fn holder_id_map(own: u32, extended: bool, invoker: Option<u32>) -> Vec<IdMapLine> {
+    let mut lines = vec![IdMapLine {
+        inside: 0,
+        outside: own,
+        count: 1,
+    }];
+    if extended {
+        lines.push(IdMapLine {
+            inside: 1,
+            outside: SUBORDINATE_HOST_FIRST,
+            count: SUBORDINATE_COUNT,
+        });
+    }
+    if let Some(invoker) = invoker {
+        let mapped = lines
+            .iter()
+            .any(|line| (line.outside..line.outside + line.count).contains(&invoker));
+        if !mapped {
+            lines.push(IdMapLine {
+                inside: INVOKER_NAMESPACE_ID,
+                outside: invoker,
+                count: 1,
+            });
+        }
+    }
+    lines
+}
+
+/// Whether the holder namespace of a run whose real uid or gid is `own`, with the sudo
+/// invoker's uid or gid `invoker`, maps the host id `id`, read from the single layout of
+/// `holder_id_map`. The extended layout maps every id the single one does, so this holds for
+/// every holder. The pmem store asks it which entries Firecracker can open there
+/// (`storage::pmem_store::entry_owner_is_mapped`).
+pub(crate) fn holder_maps_id(own: u32, invoker: Option<u32>, id: u32) -> bool {
+    holder_id_map(own, false, invoker).iter().any(|line| {
+        id.checked_sub(line.outside)
+            .is_some_and(|offset| offset < line.count)
+    })
+}
+
+/// `lines` as newuidmap and newgidmap take them after the pid.
+fn id_map_args(lines: &[IdMapLine]) -> Vec<String> {
+    lines
+        .iter()
+        .flat_map(|line| [line.inside, line.outside, line.count])
+        .map(|id| id.to_string())
+        .collect()
+}
+
+/// `lines` as /proc/<pid>/uid_map and gid_map take them, in one write.
+fn id_map_text(lines: &[IdMapLine]) -> String {
+    lines
+        .iter()
+        .map(|line| format!("{} {} {}\n", line.inside, line.outside, line.count))
+        .collect()
+}
+
+/// Whether `text`, the contents of /etc/subuid or /etc/subgid, grants root the whole host
+/// range the extended layout maps, [SUBORDINATE_HOST_FIRST, SUBORDINATE_HOST_FIRST +
+/// SUBORDINATE_COUNT), in one `owner:start:count` entry whose owner is `root` or `0`.
+///
+/// Stricter than newuidmap and newgidmap (shadow 4.9), which also accept the owner as
+/// another user name with uid 0, a range that several entries cover together, numbers in
+/// octal or hex, and a `subid` source in nsswitch.conf in place of the files. Where the
+/// two disagree, a root run gets the single layout. Numbers here are decimal with no
+/// leading zero, so an entry shadow reads as octal is never read here as decimal.
+fn subordinate_range_granted_to_root(text: &str) -> bool {
+    let first = u64::from(SUBORDINATE_HOST_FIRST);
+    let end = first + u64::from(SUBORDINATE_COUNT);
+    let decimal = |field: &str| {
+        let digits = !field.is_empty() && field.bytes().all(|b| b.is_ascii_digit());
+        let leading_zero = field.len() > 1 && field.starts_with('0');
+        if digits && !leading_zero {
+            field.parse::<u64>().ok()
+        } else {
+            None
+        }
+    };
+    // Lines end at '\n' alone, as shadow reads them: a trailing '\r' spoils the count.
+    text.split('\n').any(|line| {
+        let fields: Vec<&str> = line.split(':').collect();
+        let [owner, start, count] = fields[..] else {
+            return false;
+        };
+        let (Some(start), Some(count)) = (decimal(start), decimal(count)) else {
+            return false;
+        };
+        matches!(owner, "root" | "0") && start <= first && start.saturating_add(count) >= end
+    })
+}
+
+/// The layout `write_id_map_with_invoker` wrote, and why.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InvokerIdMap {
+    /// The extended layout, which the subordinate id file grants root.
+    Extended,
+    /// The single layout: the subordinate id file does not grant root the range, or it
+    /// could not be read.
+    NotGranted,
+    /// The single layout: the file grants root the range, and the kernel refused the
+    /// extended layout with EPERM.
+    Refused,
+}
+
+impl InvokerIdMap {
+    /// The log line's description of this outcome for the map that `file` authorizes.
+    fn describe(self, file: &str) -> String {
+        let first = SUBORDINATE_HOST_FIRST;
+        let last = SUBORDINATE_HOST_FIRST + SUBORDINATE_COUNT - 1;
+        match self {
+            Self::Extended => format!("extended layout ({file} grants root {first}-{last})"),
+            Self::NotGranted => format!(
+                "single layout, extended layout not written ({file} does not grant root \
+                 {first}-{last})"
+            ),
+            Self::Refused => {
+                "single layout, extended layout refused by the kernel (EPERM)".to_string()
+            }
+        }
+    }
+}
+
+/// Write one id map of a root run's holder namespace with the sudo invoker in it, through
+/// `write`. `subordinate_file` is the text of /etc/subuid for uid_map or /etc/subgid for
+/// gid_map, or `None` when it could not be read. Unless that file grants root the extended
+/// layout's host range (`subordinate_range_granted_to_root`), the single layout is the
+/// first and only write. When it does, the extended layout is written, and if the kernel
+/// refuses it with EPERM because the parent namespace does not map the range (as inside a
+/// rootless container), the single layout follows: a refused write leaves the map unset,
+/// so the second write is allowed.
+fn write_id_map_with_invoker(
+    own: u32,
+    invoker: u32,
+    subordinate_file: Option<&str>,
+    mut write: impl FnMut(&str) -> std::io::Result<()>,
+) -> std::io::Result<InvokerIdMap> {
+    let single = id_map_text(&holder_id_map(own, false, Some(invoker)));
+    if !subordinate_file.is_some_and(subordinate_range_granted_to_root) {
+        write(&single)?;
+        return Ok(InvokerIdMap::NotGranted);
+    }
+    match write(&id_map_text(&holder_id_map(own, true, Some(invoker)))) {
+        Ok(()) => Ok(InvokerIdMap::Extended),
+        Err(error) if error.raw_os_error() == Some(libc::EPERM) => {
+            write(&single)?;
+            Ok(InvokerIdMap::Refused)
+        }
+        Err(error) => Err(error),
+    }
+}
+
 /// Set up UID/GID mappings for a process in a new user namespace.
 ///
 /// Tries extended mappings (UIDs 0-65535) via newuidmap/newgidmap first, which
 /// enables OCI runtimes (crun) to mount devpts inside containers (needed by fc-mock).
 /// Falls back to single-UID mapping (like --map-root-user) when the helpers aren't
 /// available or lack permissions (e.g., inside containers).
+///
+/// A root run started with sudo writes both maps itself, with the invoking user's uid and
+/// gid at 65536 (`holder_id_map`, `write_id_map_with_invoker`): newuidmap has no exception
+/// for root, so it would refuse the invoker's line. Writing the maps directly skips the
+/// check newuidmap and newgidmap make against /etc/subuid and /etc/subgid, so the run makes
+/// it: each map gets the extended layout only when its file grants root host ids
+/// 100000-165534 (`subordinate_range_granted_to_root`), and the single layout otherwise.
+/// Without that check, a file the container creates as one of its ids 1-65535 would be
+/// owned on the host by whichever user those files give 100000-165534.
 async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
     let uid = nix::unistd::getuid().as_raw();
     let gid = nix::unistd::getgid().as_raw();
     let pid_s = pid.to_string();
-    let uid_s = uid.to_string();
-    let gid_s = gid.to_string();
 
     // Wait for unshare(2) to create the new user namespace.
     // The namespace exists once /proc/PID/ns/user has a different inode than ours.
@@ -127,17 +311,50 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
 
+    // Only a root run has a sudo invoker (`sudo_invoker` is None otherwise).
+    let invoker = crate::setup::sudo_invoker().map(|user| (user.uid.as_raw(), user.gid.as_raw()));
+    if let (0, Some((invoker_uid, invoker_gid))) = (uid, invoker) {
+        let read = |path: &str| match std::fs::read_to_string(path) {
+            Ok(text) => Some(text),
+            Err(error) => {
+                debug!(path, %error, "cannot read the subordinate id file; it grants root nothing");
+                None
+            }
+        };
+        let uid_map =
+            write_id_map_with_invoker(uid, invoker_uid, read("/etc/subuid").as_deref(), |text| {
+                std::fs::write(format!("/proc/{pid}/uid_map"), text)
+            })
+            .context("writing uid_map")?;
+        let gid_map =
+            write_id_map_with_invoker(gid, invoker_gid, read("/etc/subgid").as_deref(), |text| {
+                std::fs::write(format!("/proc/{pid}/gid_map"), text)
+            })
+            .context("writing gid_map")?;
+        info!(
+            pid,
+            ?invoker,
+            "UID/GID mappings written by root with the sudo invoker at 65536: uid_map {}, \
+             gid_map {}",
+            uid_map.describe("/etc/subuid"),
+            gid_map.describe("/etc/subgid"),
+        );
+        return Ok(());
+    }
+
     // Try extended mappings (0-65535) via newuidmap/newgidmap (setuid helpers).
     // These read /etc/subuid and /etc/subgid to authorize the mapping range.
     let uid_ok = tokio::process::Command::new("newuidmap")
-        .args([&pid_s, "0", &uid_s, "1", "1", "100000", "65535"])
+        .arg(&pid_s)
+        .args(id_map_args(&holder_id_map(uid, true, None)))
         .output()
         .await
         .map(|o| o.status.success())
         .unwrap_or(false);
     let gid_ok = uid_ok
         && tokio::process::Command::new("newgidmap")
-            .args([&pid_s, "0", &gid_s, "1", "1", "100000", "65535"])
+            .arg(&pid_s)
+            .args(id_map_args(&holder_id_map(gid, true, None)))
             .output()
             .await
             .map(|o| o.status.success())
@@ -155,11 +372,17 @@ async fn setup_namespace_mappings(pid: u32) -> anyhow::Result<()> {
         std::fs::write(format!("/proc/{pid}/setgroups"), "deny").context("denying setgroups")?;
     }
     if !uid_ok {
-        std::fs::write(format!("/proc/{pid}/uid_map"), format!("0 {uid} 1\n"))
-            .context("writing uid_map")?;
+        std::fs::write(
+            format!("/proc/{pid}/uid_map"),
+            id_map_text(&holder_id_map(uid, false, None)),
+        )
+        .context("writing uid_map")?;
     }
-    std::fs::write(format!("/proc/{pid}/gid_map"), format!("0 {gid} 1\n"))
-        .context("writing gid_map")?;
+    std::fs::write(
+        format!("/proc/{pid}/gid_map"),
+        id_map_text(&holder_id_map(gid, false, None)),
+    )
+    .context("writing gid_map")?;
     info!(pid, "single UID/GID mapping (fallback)");
 
     Ok(())
@@ -2883,11 +3106,6 @@ pub async fn restore_from_snapshot(
             duration_ms = load_duration.as_millis(),
             track_dirty_pages, "snapshot load completed"
         );
-        // Firecracker holds the pmem images now. One rewritten between the check before
-        // load and the load would pair the guest's cached view of its filesystem with new
-        // contents; the same check again here catches it, as a snapshot-load failure.
-        crate::storage::pmem::check_snapshot_pmem_images(&vm_state.config.pmem_devices)?;
-
         // Timing instrumentation: measure disk patch operation
         let patch_start = std::time::Instant::now();
         client
@@ -5563,13 +5781,209 @@ mod tests {
         );
     }
 
+    /// The holder namespace's id maps: unchanged without a sudo invoker, and with one, the
+    /// invoker's id at 65536 in both layouts unless a line already maps it.
+    #[test]
+    fn holder_id_maps_add_the_sudo_invoker_outside_both_layouts() {
+        let line = |inside, outside, count| IdMapLine {
+            inside,
+            outside,
+            count,
+        };
+        // A rootless run: no invoker.
+        assert_eq!(
+            holder_id_map(1000, true, None),
+            [line(0, 1000, 1), line(1, 100000, 65535)]
+        );
+        assert_eq!(holder_id_map(1000, false, None), [line(0, 1000, 1)]);
+        // A root run started with sudo by uid 2000.
+        assert_eq!(
+            holder_id_map(0, true, Some(2000)),
+            [line(0, 0, 1), line(1, 100000, 65535), line(65536, 2000, 1)]
+        );
+        let single = holder_id_map(0, false, Some(2000));
+        assert_eq!(single, [line(0, 0, 1), line(65536, 2000, 1)]);
+        assert_eq!(id_map_text(&single), "0 0 1\n65536 2000 1\n");
+        assert_eq!(id_map_args(&single), ["0", "0", "1", "65536", "2000", "1"]);
+        // An invoker a line already maps gets no second line: the kernel refuses a map
+        // whose host ranges overlap.
+        assert_eq!(holder_id_map(0, false, Some(0)), [line(0, 0, 1)]);
+        assert_eq!(
+            holder_id_map(0, true, Some(100500)),
+            [line(0, 0, 1), line(1, 100000, 65535)]
+        );
+        assert_eq!(
+            holder_id_map(0, false, Some(100500)),
+            [line(0, 0, 1), line(65536, 100500, 1)]
+        );
+    }
+
+    /// The pmem store uses an entry of an owner other than the run's own uid only when the
+    /// entry's uid is in the holder's uid map and its gid in its gid map, in either layout, so
+    /// the store's rule and the maps cannot drift apart. The uids tried are the run's, the
+    /// invoker's and one neither maps, and the gids the same; entries only ever belong to the
+    /// first two.
+    #[test]
+    fn the_pmem_store_owner_rule_matches_the_holder_maps() {
+        use crate::storage::pmem_store::entry_owner_is_mapped;
+        let maps = |lines: &[IdMapLine], id: u32| {
+            lines.iter().any(|line| {
+                (u64::from(line.outside)..u64::from(line.outside) + u64::from(line.count))
+                    .contains(&u64::from(id))
+            })
+        };
+        const UNMAPPED: u32 = 3000;
+        for (own, invoker) in [
+            ((1000, 1000), None),
+            ((0, 0), None),
+            ((0, 0), Some((1000, 1001))),
+            ((0, 0), Some((100500, 100501))),
+        ] {
+            let uids = [Some(own.0), invoker.map(|(uid, _)| uid), Some(UNMAPPED)];
+            let gids = [Some(own.1), invoker.map(|(_, gid)| gid), Some(UNMAPPED)];
+            for extended in [false, true] {
+                let uid_map = holder_id_map(own.0, extended, invoker.map(|(uid, _)| uid));
+                let gid_map = holder_id_map(own.1, extended, invoker.map(|(_, gid)| gid));
+                for uid in uids.into_iter().flatten() {
+                    for gid in gids.into_iter().flatten() {
+                        let in_maps = maps(&uid_map, uid) && maps(&gid_map, gid);
+                        assert_eq!(
+                            entry_owner_is_mapped((uid, gid), own, invoker),
+                            uid == own.0 || in_maps,
+                            "own {own:?}, invoker {invoker:?}, extended {extended}: an entry of \
+                             uid {uid}, gid {gid}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// /etc/subuid on a host that gives 100000-165535 to another user and nothing to root.
+    const SUBUID_WITHOUT_ROOT: &str = "alice:100000:65536\nbob:165536:65536\n";
+    /// What root writes to a map with the sudo invoker 2000, in each layout.
+    const EXTENDED_WITH_INVOKER: &str = "0 0 1\n1 100000 65535\n65536 2000 1\n";
+    const SINGLE_WITH_INVOKER: &str = "0 0 1\n65536 2000 1\n";
+
+    /// Root's writes to one map with the sudo invoker 2000, given the subordinate id file's
+    /// text, through a writer that refuses the first write with `refuse` when it is set.
+    /// Returns the outcome and every text the writer was given.
+    fn root_id_map_writes(
+        subordinate_file: Option<&str>,
+        refuse: Option<i32>,
+    ) -> (Result<InvokerIdMap, Option<i32>>, Vec<String>) {
+        let mut writes = Vec::new();
+        let result = write_id_map_with_invoker(0, 2000, subordinate_file, |text| {
+            writes.push(text.to_string());
+            match refuse {
+                Some(errno) if writes.len() == 1 => Err(std::io::Error::from_raw_os_error(errno)),
+                _ => Ok(()),
+            }
+        });
+        (result.map_err(|error| error.raw_os_error()), writes)
+    }
+
+    /// Only an entry for root, named `root` or `0`, that covers 100000-165534 on its own
+    /// grants the extended layout's host range.
+    #[test]
+    fn subordinate_range_is_granted_only_by_a_root_entry_covering_it() {
+        let cases = [
+            ("root entry covering the range", "root:100000:65536\n", true),
+            ("root entry of exactly the range", "root:100000:65535", true),
+            ("root entry starting earlier", "root:1:200000\n", true),
+            ("uid form 0:", "0:100000:65536\n", true),
+            (
+                "root entry after another user's",
+                "alice:200000:65536\nroot:100000:65536\n",
+                true,
+            ),
+            (
+                "comments and blank lines",
+                "# subordinate ids\n\nroot:100000:65536\n\n# end\n",
+                true,
+            ),
+            ("root entry covering only part", "root:100000:1000\n", false),
+            ("root entry starting inside", "root:100001:65536\n", false),
+            (
+                "two root entries covering it together",
+                "root:100000:30000\nroot:130000:35535\n",
+                false,
+            ),
+            (
+                "another user's entry over the range",
+                SUBUID_WITHOUT_ROOT,
+                false,
+            ),
+            ("commented-out root entry", "#root:100000:65536\n", false),
+            ("blank lines only", "\n\n", false),
+            ("empty file", "", false),
+            ("start shadow reads as octal", "root:0100000:65536\n", false),
+            (
+                "line ending in a carriage return",
+                "root:100000:65536\r\n",
+                false,
+            ),
+            ("a fourth field", "root:100000:65536:1\n", false),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter(|(_, text, granted)| subordinate_range_granted_to_root(text) != *granted)
+            .map(|(name, _, granted)| format!("{name}: expected {granted}"))
+            .collect();
+        assert!(wrong.is_empty(), "wrong grant decisions: {wrong:#?}");
+    }
+
+    /// Root writes a map with the sudo invoker in the extended layout when the file grants
+    /// root the range, and in the single layout only after the kernel refuses the extended
+    /// one with EPERM; any other error is returned without a second write.
+    #[test]
+    fn root_writes_the_extended_map_and_falls_back_only_on_eperm() {
+        let granted = Some("root:100000:65536\n");
+        let extended = EXTENDED_WITH_INVOKER.to_string();
+        let single = SINGLE_WITH_INVOKER.to_string();
+        assert_eq!(
+            root_id_map_writes(granted, None),
+            (Ok(InvokerIdMap::Extended), vec![extended.clone()])
+        );
+        assert_eq!(
+            root_id_map_writes(granted, Some(libc::EPERM)),
+            (Ok(InvokerIdMap::Refused), vec![extended.clone(), single])
+        );
+        assert_eq!(
+            root_id_map_writes(granted, Some(libc::EACCES)),
+            (Err(Some(libc::EACCES)), vec![extended])
+        );
+    }
+
+    /// A file that does not grant root the range, or one that could not be read, makes the
+    /// single layout with the invoker the first and only write, and an error from that write
+    /// is returned without another.
+    #[test]
+    fn root_writes_only_the_single_map_when_the_range_is_not_granted() {
+        let single = SINGLE_WITH_INVOKER.to_string();
+        for file in [Some(SUBUID_WITHOUT_ROOT), Some("root:100000:1000\n"), None] {
+            assert_eq!(
+                root_id_map_writes(file, None),
+                (Ok(InvokerIdMap::NotGranted), vec![single.clone()]),
+                "subordinate file {file:?}"
+            );
+            assert_eq!(
+                root_id_map_writes(file, Some(libc::EPERM)),
+                (Err(Some(libc::EPERM)), vec![single.clone()]),
+                "subordinate file {file:?}"
+            );
+        }
+    }
+
     /// A snapshot of a clone carries the clone's pmem devices, so a clone of that
     /// snapshot attaches the same images and checks them against the same identity.
     #[test]
     fn test_build_snapshot_config_carries_pmem_devices() {
         let mut state = make_vm_state("vm-CCC", Some("vm-AAA"));
         let device = crate::state::types::PmemDevice {
-            path: "/images/cache.ext4".to_string(),
+            path: "/mnt/fcvm-btrfs/pmem/0000000000000000000000000000000000000000000000000000000000000000.img"
+                .to_string(),
+            source: "/images/cache.ext4".to_string(),
             mount_path: "/mnt/cache".to_string(),
             identity: "12:134217728:1700000000.000000000".to_string(),
         };

@@ -339,6 +339,7 @@ async fn create_sandbox(
         command_args: vec![],
         rootfs_override: None,
         image_disk_override: None,
+        pmem_devices: vec![],
     };
 
     info!(name = %name, "Creating sandbox");

@@ -489,7 +489,7 @@ async fn verify_prepared_snapshot(
     target: &PreparedTarget,
     cache: PreparedCache,
 ) -> Result<Option<PreparedSnapshot>> {
-    verify_prepared_snapshot_in(&paths::snapshot_dir(), target, cache).await
+    verify_prepared_snapshot_in(&paths::data_dir(), &paths::snapshot_dir(), target, cache).await
 }
 
 /// Verify the generation installed at `target.name`.
@@ -500,6 +500,7 @@ async fn verify_prepared_snapshot(
 /// would not help: it is truncated, points outside itself, or sits at the
 /// content-addressed key while describing different content.
 async fn verify_prepared_snapshot_in(
+    data_dir: &std::path::Path,
     snapshot_root: &std::path::Path,
     target: &PreparedTarget,
     cache: PreparedCache,
@@ -647,7 +648,7 @@ async fn verify_prepared_snapshot_in(
     // restored. Remove that exact generation, as the run path does, and rebuild: a rebuild
     // under the content key would otherwise reuse the installed generation it replaces.
     if let Err(error) =
-        crate::storage::pmem::check_snapshot_pmem_images(&config.metadata.pmem_devices)
+        crate::storage::pmem::check_snapshot_pmem_images(data_dir, &config.metadata.pmem_devices)
     {
         if !is_snapshot_load_failure(&error) {
             return Err(error.context(format!("checking prepared snapshot {snapshot_key}")));
@@ -1125,6 +1126,18 @@ fn publish_mappings(args: &RunArgs) -> Result<Vec<PortMapping>> {
     Ok(port_mappings)
 }
 
+/// Replace the `--pmem` specs with the specs of the pmem store entries they resolve to,
+/// and record those devices, with the image each was copied from, in `pmem_devices`.
+/// Copies an image whose generation is not in the store yet, so it blocks for as long as
+/// that copy takes.
+fn resolve_pmem_into_store(args: &mut RunArgs, data_dir: &Path) -> Result<()> {
+    let store = crate::storage::pmem_store::PmemStore::open(data_dir)?;
+    args.pmem_devices =
+        crate::storage::pmem::resolve_pmem_devices(&store, &args.pmem, &args.pmem_devices)?;
+    args.pmem = args.pmem_devices.iter().map(|d| d.spec()).collect();
+    Ok(())
+}
+
 async fn prepare_vm_for_lifecycle(
     mut args: RunArgs,
     lifecycle: PodmanLifecycle,
@@ -1160,9 +1173,6 @@ async fn prepare_vm_for_lifecycle(
     {
         bail!("--pmem is not supported with --hypervisor cloud-hypervisor");
     }
-    // Resolve each image once: the snapshot key and the attach both read these canonical
-    // specs, so a symlink repointed while the run starts cannot make them name different files.
-    args.pmem = crate::storage::pmem::resolve_pmem_specs(&args.pmem)?;
 
     // Normalize --forward-localhost: a repeated port would otherwise fail the
     // host-side bind in routed mode. Bridged mode has no host-side relay for the
@@ -1356,6 +1366,20 @@ async fn prepare_vm_for_lifecycle(
                 .with_context(|| format!("stat image disk {} for snapshot key", p.display()))
         })
         .transpose()?;
+
+    // Copy each image into the pmem store, or find its generation there, once. This comes
+    // after the arguments are checked and the kernel, rootfs, initrd and container image
+    // are found, so a run refused by any of those copies nothing. The snapshot key and the
+    // attach both read the resulting entry specs, so they name the same generation, and no
+    // VM maps the file the user named.
+    if !args.pmem.is_empty() {
+        let data_dir = paths::data_dir();
+        args = tokio::task::spawn_blocking(move || {
+            resolve_pmem_into_store(&mut args, &data_dir).map(|()| args)
+        })
+        .await
+        .context("resolving --pmem images")??;
+    }
 
     // Check for snapshot cache (unless the invocation opts out — see
     // snapshot_cache_opt_out for the full list and rationale).
@@ -3126,6 +3150,7 @@ mod tests {
             command_args: vec![],
             rootfs_override: None,
             image_disk_override: None,
+            pmem_devices: vec![],
         }
     }
 
@@ -3577,63 +3602,70 @@ mod tests {
         assert!(!ask_reaches_run_loop(true, true, &prepare));
     }
 
-    /// `podman run` resolves the --pmem specs once, before the snapshot key or the attach
-    /// reads them, so both name the same file even if a symlink in a typed path is
-    /// repointed while the run starts.
+    /// `podman run` resolves the --pmem specs into the store once, after every check that
+    /// can refuse the run and before the snapshot key or the attach reads them, so a
+    /// refused run copies nothing and the key and the attach name the same generation.
     #[test]
     fn podman_run_resolves_the_pmem_specs_once() {
         let source = include_str!("mod.rs");
         let body = &source[..source
             .find("\n#[cfg(test)]\nmod tests {")
             .expect("mod.rs has no test module")];
+        let call = "resolve_pmem_into_store(&mut args, &data_dir)";
         assert_eq!(
-            body.matches("args.pmem = crate::storage::pmem::resolve_pmem_specs(&args.pmem)?;")
-                .count(),
+            body.matches(call).count(),
             1,
-            "podman run no longer replaces its --pmem specs with resolved ones"
+            "podman run no longer replaces its --pmem specs with store entries"
         );
-    }
-
-    /// The pmem identity is checked again after the instance starts: Firecracker maps the
-    /// images then, so an image replaced after the attach would otherwise run unnoticed.
-    #[test]
-    fn the_pmem_identity_is_checked_after_the_instance_starts() {
-        let source = include_str!("vm_config.rs");
-        let boot = source
-            .find("hv.boot().await?;")
-            .expect("vm_config.rs no longer boots the VM");
-        let check = source
-            .find(
-                "crate::storage::pmem::check_attached_pmem_images(&vm_state.config.pmem_devices)?;",
-            )
-            .expect("the boot path no longer checks the pmem images");
+        let at = body.find(call).unwrap();
+        for check in [
+            "\"--setup is not allowed when running as root",
+            "\"invalid --user format",
+            "get_kernel_profile(effective_profile_name)?",
+            "\"Custom kernel not found",
+            "get_image_cache_ref(&args.image).await?",
+        ] {
+            assert_eq!(body.matches(check).count(), 1, "{check}");
+            assert!(
+                body.find(check).unwrap() < at,
+                "the --pmem images are copied before {check} can refuse the run"
+            );
+        }
+        let config = body
+            .find("let config = build_firecracker_config(")
+            .expect("podman run no longer builds the snapshot key's config");
         assert!(
-            check > boot,
-            "the pmem images are checked before the instance starts"
+            at < config,
+            "the snapshot key is built before the --pmem specs name store entries"
         );
     }
 
-    /// The snapshot key names the image a --pmem spec resolves to, not the text typed:
-    /// a symlink and its target share a key, and repointing the symlink to another
-    /// image changes it, so a cache hit never restores over a different image.
+    /// The snapshot key names the image generation a --pmem spec resolves to: a symlink
+    /// and its target share a key, a rewrite of the image changes it, and so does
+    /// repointing the symlink to another image, so a cache hit never restores a snapshot
+    /// of another generation.
     #[test]
-    fn pmem_key_names_the_image_the_spec_resolves_to() {
-        let dir = tempfile::tempdir().unwrap();
+    fn the_snapshot_key_names_the_pmem_image_generation() {
+        let dir = tempfile::tempdir_in(crate::storage::pmem_store::test_image_dir()).unwrap();
+        let data = tempfile::tempdir().unwrap();
         let (a, b, link) = (
             dir.path().join("a.ext4"),
             dir.path().join("b.ext4"),
             dir.path().join("current.ext4"),
         );
         for image in [&a, &b] {
-            std::fs::File::create(image)
-                .unwrap()
-                .set_len(2 << 20)
+            let file = std::fs::File::create(image).unwrap();
+            file.set_len(2 << 20).unwrap();
+            // A modification time long past, so the rewrite below gives the image another
+            // identity at any timestamp granularity.
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1 << 30))
                 .unwrap();
         }
         std::os::unix::fs::symlink(&a, &link).unwrap();
         let key = |image: &std::path::Path| {
             let mut args = test_args();
             args.pmem = vec![format!("{}:/mnt/cache:ro", image.display())];
+            resolve_pmem_into_store(&mut args, data.path()).unwrap();
             key_for(&args, GuestBootInputs::default())
         };
         let through_link = key(&link);
@@ -3642,13 +3674,16 @@ mod tests {
             key(&a),
             "a symlink and its target are one image"
         );
+        std::fs::write(&a, vec![7u8; 2 << 20]).unwrap();
+        let rewritten = key(&a);
+        assert_ne!(
+            rewritten, through_link,
+            "the key did not change with the image generation"
+        );
+        assert_eq!(key(&link), rewritten, "the same generation has one key");
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&b, &link).unwrap();
-        assert_ne!(
-            key(&link),
-            through_link,
-            "the symlink names another image now"
-        );
+        assert_ne!(key(&link), rewritten, "the symlink names another image now");
     }
 
     /// A mount point at or under a --pmem mount point is refused before boot: the pmem
@@ -4507,16 +4542,17 @@ mod tests {
         );
     }
 
-    /// A prepared snapshot whose pmem image changed cannot be restored: the memory snapshot
-    /// holds the guest's view of the image as it was. `prepare` must rebuild it, not report
-    /// a hit the next run would refuse.
+    /// A prepared snapshot whose pmem store entry is gone cannot be restored: Firecracker
+    /// reopens the recorded entry. `prepare` must rebuild it, not report a hit the next run
+    /// would refuse.
     #[tokio::test]
-    async fn a_prepared_snapshot_whose_pmem_image_changed_is_a_miss() {
+    async fn a_prepared_snapshot_whose_pmem_entry_is_gone_is_a_miss() {
         let temp = tempfile::tempdir().unwrap();
         let snapshot_key = "0123456789ab-startup";
         let snapshot_dir = temp.path().join(snapshot_key);
         tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
-        let image = temp.path().join("cache.ext4");
+        let images = tempfile::tempdir_in(crate::storage::pmem_store::test_image_dir()).unwrap();
+        let image = images.path().join("cache.ext4");
         std::fs::File::create(&image)
             .unwrap()
             .set_len(2 * 1024 * 1024)
@@ -4530,11 +4566,14 @@ mod tests {
         );
         vm_state.config.source_vsock_socket_path =
             Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
-        vm_state.config.pmem_devices = vec![crate::storage::pmem::parse_pmem_spec(&format!(
-            "{}:/mnt/cache:ro",
-            image.display()
-        ))
-        .unwrap()];
+        let data = tempfile::tempdir().unwrap();
+        let store = crate::storage::pmem_store::PmemStore::open(data.path()).unwrap();
+        vm_state.config.pmem_devices = crate::storage::pmem::resolve_pmem_devices(
+            &store,
+            &[format!("{}:/mnt/cache:ro", image.display())],
+            &[],
+        )
+        .unwrap();
         let mut config = super::super::common::build_snapshot_config(
             &vm_state,
             snapshot_key,
@@ -4558,28 +4597,23 @@ mod tests {
 
         let target = prepare_install_target(&PrepareOptions::default(), snapshot_key).unwrap();
         assert!(
-            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+            verify_prepared_snapshot_in(data.path(), temp.path(), &target, PreparedCache::Hit)
                 .await
                 .unwrap()
                 .is_some(),
-            "a generation whose pmem image is unchanged is a hit"
+            "a generation whose pmem entry is present is a hit"
         );
-        std::fs::File::options()
-            .write(true)
-            .open(&image)
-            .unwrap()
-            .set_len(4 * 1024 * 1024)
-            .unwrap();
+        std::fs::remove_file(&vm_state.config.pmem_devices[0].path).unwrap();
         assert!(
-            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+            verify_prepared_snapshot_in(data.path(), temp.path(), &target, PreparedCache::Hit)
                 .await
                 .unwrap()
                 .is_none(),
-            "a generation whose pmem image changed was reported as prepared"
+            "a generation whose pmem entry is gone was reported as prepared"
         );
         assert!(
             !snapshot_dir.join("config.json").exists(),
-            "the generation whose pmem image changed is still installed, so a rebuild under              the content key would reuse it"
+            "the generation whose pmem entry is gone is still installed, so a rebuild under              the content key would reuse it"
         );
     }
 
@@ -4620,10 +4654,11 @@ mod tests {
         .unwrap();
 
         let target = prepare_install_target(&PrepareOptions::default(), snapshot_key).unwrap();
-        let prepared = verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Created)
-            .await
-            .unwrap()
-            .expect("complete installed generation should verify");
+        let prepared =
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &target, PreparedCache::Created)
+                .await
+                .unwrap()
+                .expect("complete installed generation should verify");
         assert_eq!(prepared.output.status, "prepared");
         assert_eq!(prepared.output.cache, PreparedCache::Created);
         assert_eq!(prepared.output.snapshot_key, snapshot_key);
@@ -4652,11 +4687,17 @@ mod tests {
         drop(exclusive);
 
         tokio::fs::remove_file(&config.disk_path).await.unwrap();
-        let error =
-            match verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit).await {
-                Ok(_) => panic!("missing disk artifact must fail verification"),
-                Err(error) => error,
-            };
+        let error = match verify_prepared_snapshot_in(
+            temp.path(),
+            temp.path(),
+            &target,
+            PreparedCache::Hit,
+        )
+        .await
+        {
+            Ok(_) => panic!("missing disk artifact must fail verification"),
+            Err(error) => error,
+        };
         assert!(
             format!("{error:#}").contains("disk artifact"),
             "unexpected verification error: {error:#}"
@@ -4755,10 +4796,11 @@ mod tests {
         .await;
 
         let matching = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
-        let hit = verify_prepared_snapshot_in(temp.path(), &matching, PreparedCache::Hit)
-            .await
-            .unwrap()
-            .expect("a tag holding this content is a hit");
+        let hit =
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &matching, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .expect("a tag holding this content is a hit");
         assert_eq!(hit.output.snapshot_key, "cb-req-golden");
         assert_eq!(hit.output.content_key, CONTENT_KEY);
         assert_eq!(hit.output.snapshot_type, "user");
@@ -4768,10 +4810,15 @@ mod tests {
         let other_content =
             prepare_install_target(&tagged("cb-req-golden"), "ffffffffffff-startup").unwrap();
         assert!(
-            verify_prepared_snapshot_in(temp.path(), &other_content, PreparedCache::Hit)
-                .await
-                .unwrap()
-                .is_none(),
+            verify_prepared_snapshot_in(
+                temp.path(),
+                temp.path(),
+                &other_content,
+                PreparedCache::Hit
+            )
+            .await
+            .unwrap()
+            .is_none(),
             "a tag holding other content must be a miss so prepare rebuilds it"
         );
     }
@@ -4798,11 +4845,17 @@ mod tests {
         .unwrap();
 
         let target = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
-        let error =
-            match verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit).await {
-                Ok(_) => panic!("a disk-only generation at the cache key cannot be published"),
-                Err(error) => error,
-            };
+        let error = match verify_prepared_snapshot_in(
+            temp.path(),
+            temp.path(),
+            &target,
+            PreparedCache::Hit,
+        )
+        .await
+        {
+            Ok(_) => panic!("a disk-only generation at the cache key cannot be published"),
+            Err(error) => error,
+        };
         assert_eq!(
             format!("{error:#}"),
             format!("prepared snapshot {CONTENT_KEY} is a disk-only snapshot, not a full one")
@@ -4823,10 +4876,11 @@ mod tests {
         .await;
 
         let target = prepare_install_target(&PrepareOptions::default(), CONTENT_KEY).unwrap();
-        let hit = verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
-            .await
-            .unwrap()
-            .expect("a pre-existing cache entry named by its key must still hit");
+        let hit =
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &target, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .expect("a pre-existing cache entry named by its key must still hit");
         assert_eq!(hit.output.content_key, CONTENT_KEY);
     }
 
@@ -4927,7 +4981,7 @@ mod tests {
             // The lease is released with the returned value; these cases only ask
             // whether the generation verified at all.
             Ok(
-                verify_prepared_snapshot_in(temp, &target, PreparedCache::Hit)
+                verify_prepared_snapshot_in(temp, temp, &target, PreparedCache::Hit)
                     .await?
                     .is_some(),
             )
@@ -5041,7 +5095,7 @@ mod tests {
 
         let target = prepare_install_target(&tagged("cb-req-golden"), CONTENT_KEY).unwrap();
         assert!(
-            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+            verify_prepared_snapshot_in(temp.path(), temp.path(), &target, PreparedCache::Hit)
                 .await
                 .unwrap()
                 .is_none()

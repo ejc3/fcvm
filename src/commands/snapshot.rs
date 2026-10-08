@@ -1801,11 +1801,14 @@ async fn cmd_snapshot_run_inner(
     ) {
         crate::utils::verify_image_disk_identity(disk, expected)?;
     }
-    // Firecracker reopens each pmem image at its recorded path on load, and the
-    // guest's cached view of each filesystem is in the memory image. Refuse an
-    // image that is gone, resized or rewritten before any side effects; the podman hit
-    // path classifies this as unusable and falls back to a fresh boot.
-    crate::storage::pmem::check_snapshot_pmem_images(&snapshot_config.metadata.pmem_devices)?;
+    // Firecracker reopens each pmem store entry at its recorded path on load, and the
+    // guest's cached view of each filesystem is in the memory image. Refuse an entry
+    // that is gone or was replaced before any side effects; the podman hit path
+    // classifies this as unusable and falls back to a fresh boot.
+    crate::storage::pmem::check_snapshot_pmem_images(
+        &paths::data_dir(),
+        &snapshot_config.metadata.pmem_devices,
+    )?;
     vm_state.config.pmem_devices = snapshot_config.metadata.pmem_devices.clone();
     // The clone runs the same VMM that created the snapshot (the memory image format is
     // VMM-specific). Recorded so `fcvm ls` and any later snapshot of the clone are correct.
@@ -3706,8 +3709,8 @@ fn run_args_from_snapshot_metadata(
         map,
         disk: vec![],
         disk_dir: vec![],
-        // pmem images live at stable host paths outside the VM directory, so a
-        // cold boot attaches the recorded ones again as they are.
+        // The recorded pmem store entries, which are never rewritten, so a cold boot
+        // attaches them again as they are and keeps the images they were copied from.
         pmem: meta.pmem_devices.iter().map(|d| d.spec()).collect(),
         nfs,
         // fc-agent derives the rootless username from env USER; without it a --user
@@ -3759,6 +3762,7 @@ fn run_args_from_snapshot_metadata(
         command_args: vec![],
         rootfs_override,
         image_disk_override: meta.image_disk_path.clone(),
+        pmem_devices: meta.pmem_devices.clone(),
     }
 }
 

@@ -1,6 +1,6 @@
 use std::net::ToSocketAddrs;
 
-use anyhow::{Context, Result};
+use anyhow::{ensure, Context, Result};
 use tracing::{debug, info, warn};
 use url::Url;
 
@@ -327,30 +327,43 @@ pub(crate) fn build_runtime_boot_args(
     boot_args
 }
 
-/// Attach the read-only virtio-pmem images (--pmem) in order, so device N is
-/// /dev/pmemN in the guest. Each spec is validated again here: the image is opened
-/// by the VMM now, not when the run started.
+/// Attach the read-only virtio-pmem devices (--pmem) in order, so device N is
+/// /dev/pmemN in the guest. Firecracker is given each device's pmem store entry, never
+/// the image the user named: `PmemStore::attach_path` refuses any other path.
 pub(super) async fn attach_pmem_devices(
     args: &RunArgs,
     hv: &mut dyn crate::hypervisor::Hypervisor,
 ) -> Result<Vec<crate::state::types::PmemDevice>> {
-    let mut devices = Vec::with_capacity(args.pmem.len());
-    for (i, spec) in args.pmem.iter().enumerate() {
-        let device = crate::storage::pmem::parse_pmem_spec(spec)?;
+    let resolved: Vec<String> = args.pmem_devices.iter().map(|d| d.spec()).collect();
+    ensure!(
+        resolved == args.pmem,
+        "the --pmem specs {:?} were not resolved into the pmem store (resolved: {resolved:?})",
+        args.pmem
+    );
+    if args.pmem_devices.is_empty() {
+        return Ok(Vec::new());
+    }
+    let store = crate::storage::pmem_store::PmemStore::open(&crate::paths::data_dir())?;
+    for (i, device) in args.pmem_devices.iter().enumerate() {
+        let path_on_host = store.attach_path(device)?;
         info!(
-            "Adding pmem device: {} -> /dev/pmem{} -> {} (ro, dax)",
-            device.path, i, device.mount_path
+            "Adding pmem device: {} (store copy {}) -> /dev/pmem{} -> {} (ro, dax)",
+            device.source, device.path, i, device.mount_path
         );
         hv.add_pmem(&crate::hypervisor::PmemSpec {
             id: format!("pmem{i}"),
-            path_on_host: std::path::PathBuf::from(&device.path),
+            path_on_host,
             is_read_only: true,
         })
         .await
-        .with_context(|| format!("attaching pmem device {}", device.path))?;
-        devices.push(device);
+        .with_context(|| {
+            format!(
+                "attaching pmem device {} (copy of {})",
+                device.path, device.source
+            )
+        })?;
     }
-    Ok(devices)
+    Ok(args.pmem_devices.clone())
 }
 
 /// Attach extra disks (--disk, --disk-dir, image archive) to the VM.
@@ -1267,7 +1280,7 @@ pub(crate) fn build_launch_config(
         network_mode,
         data_dir: crate::paths::data_dir(),
         extra_disks,
-        pmem: crate::storage::pmem::pmem_key_specs(&args.pmem),
+        pmem: args.pmem.clone(),
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
@@ -1504,9 +1517,6 @@ pub(crate) async fn configure_and_boot_vm(
 
     // Start VM.
     hv.boot().await?;
-    // Firecracker maps each pmem image when the instance starts, not when it is attached,
-    // so check now that the file it holds is the one whose identity was recorded.
-    crate::storage::pmem::check_attached_pmem_images(&vm_state.config.pmem_devices)?;
 
     Ok(bootplan_guard.disarm())
 }
