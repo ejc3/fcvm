@@ -38,7 +38,9 @@ commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 # Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
 # 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend,
 # and a Full snapshot written to a new memory file leaves all-zero 4 KiB pages
-# as holes. nested.arm64 builds nv2-on-main, which writes every page.
+# as holes, and with dirty tracking on a diff holds the pages a discard emptied
+# (balloon, free page reporting) as zeros. nested.arm64 builds nv2-on-main,
+# which has neither change.
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
@@ -55,8 +57,8 @@ commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 # Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0-zero-holes"
-commit = "6347691fed3e63f92abf1c2a802921861a403cf7"
+branch = "agent/uffd-minor-v1.17.0-discard-dirty"
+commit = "8819f112ad79ad3efb1b4717c1175229fd21b3cb"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).

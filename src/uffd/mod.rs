@@ -15,3 +15,4 @@ pub use server::{
 };
 /// Exported so integration tests can read back what a real restore recorded.
 pub use working_set::WorkingSetStore;
+pub(crate) use working_set::GRANULE;
