@@ -2797,6 +2797,19 @@ Two kernel facts shape the implementation:
   only adds to the page cache when `VM_MAYSHARE`, so a hugetlb hole would become a private
   anon huge page per clone — hugetlb backings are therefore populated in full.
 
+`UFFDIO_CONTINUE` refuses a hole, because the memfd has no page there to map, and a refused
+populate gives up the rest of its run. The server keeps a map of the pages it left unwritten
+(`src/uffd/holes.rs`), and each page in it is a candidate: the first clone to touch a hole
+fills it in the memfd with no fault reaching the server. For a recorded run the map
+marks, replay runs `mincore` over a read-only view of the memfd, maps the pages that are in
+its page cache now, and steps over the rest. One `mincore` call answers a chunk, and replay
+reuses the answer while it walks inside that chunk. A page that leaves the page cache (the
+host swaps a filled page out, and `UFFDIO_CONTINUE` swaps it back in), or is filled after the
+query, costs one demand fault. A MINOR fault on a filled hole is recorded like any other.
+`lseek(SEEK_DATA)` on a private reopen of the memfd would answer the same question, but
+`shmem_file_llseek` takes the inode lock exclusively, so every clone's queries would wait on
+one another, while `mincore` needs only the view and the server's mm read lock.
+
 ### Measured (2026-08-07, N=4 concurrent alpine/nginx clones, 1 GiB guest, aarch64)
 
 Matched accounting basis: **PSS/RSS summed over every process belonging to a clone** — the

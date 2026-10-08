@@ -2594,7 +2594,13 @@ separately.
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
   work is bounded by the image size, and no cap drops part of a large guest's set when it
   fragments into millions of runs. A recorded page the clone's balloon has given back
-  by the time replay reaches it is stepped over.
+  by the time replay reaches it is stepped over. In minor mode on shmem the backing memfd
+  leaves the snapshot's all-zero pages unwritten (a hugetlb backing is written in full), and
+  each stays a hole until a clone touches it, which fills it in the memfd with no fault
+  reaching the server. `UFFDIO_CONTINUE` refuses a hole, and a refusal would give up the rest
+  of the run, so for a recorded run of those pages replay asks the memfd (`mincore`) which are
+  filled now, maps them, and steps over the rest. A later clone's MINOR fault on a filled hole
+  is recorded like any other fault.
 - **Page cache warm-up (copy mode)**: replay and demand faults both read the image through the
   serve's mapping, so with a cold page cache every source page is a synchronous major fault in
   the serve, ahead of the guest. One detached thread (`fcvm-ws-warm`, `src/uffd/warmup.rs`)
@@ -2663,7 +2669,8 @@ separately.
 - **Measuring it**: the memory server logs `replayed recorded working set` with
   `prefetched_pages`, and `VM exited` with `fault_count`. Compare a recording clone against a
   replaying one; `--uffd-prefetch off` (or `FCVM_UFFD_PREFETCH=off`) gives an inert baseline
-  arm — no recording, no replay, no files.
+  arm — no recording, no replay, no files. In minor mode the replay line's
+  `filled_holes_mapped` counts the pages replay mapped at holes earlier clones filled.
 - **Replay trades memory for latency.** A replaying clone materialises the recorded set at
   restore instead of faulting it in as it runs. Commit 86a05b9a reports, from a Chromium run
   that is not committed, that 98% of faults arrived within 750 ms. The set is a union over
