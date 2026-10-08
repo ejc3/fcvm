@@ -296,7 +296,7 @@ pub(crate) fn build_runtime_boot_args(
 
     // Pass guest failpoints to fc-agent via kernel command line (test-only
     // deterministic-interleaving instrumentation — see the failpoint crate).
-    // Validated up front: guest specs are sleep-only and whitespace-free, and a
+    // Validated up front: guest specs are sleep or burn only and whitespace-free, and a
     // bad spec must fail the run before a VM boots, not silently un-arm a test.
     if let Some(ref spec) = launch_config.guest_failpoint {
         if let Err(e) = failpoint::validate_guest_spec(spec) {

@@ -414,9 +414,7 @@ async fn apply_restore_epoch(
             crate::system::shutdown_vm(1).await
         }
     };
-    if let Err(error) =
-        crate::vsock::notify_restore_complete(current, &phases.to_frame_json()).await
-    {
+    if let Err(error) = crate::vsock::notify_restore_complete(current, &phases).await {
         signals.restore_status.fail();
         eprintln!(
             "[fc-agent] FATAL: restore-completion ACK failed closed \

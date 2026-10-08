@@ -155,7 +155,7 @@ pub struct RestoreSignals {
 /// the restore-completion ACK frame so every clone's critical path is
 /// attributed in the host's own logs (guest serial output is not reliably
 /// captured for clones).
-#[derive(Debug, Default, serde::Serialize)]
+#[derive(Debug, Default, Clone, serde::Serialize)]
 pub struct RestorePhases {
     pub clock_ms: f64,
     pub ipv6_ms: f64,
@@ -180,6 +180,9 @@ pub struct RestorePhases {
     pub exec_wait_ms: f64,
     pub egress_wait_ms: f64,
     pub total_ms: f64,
+    /// How long the host took to answer the connection the ACK is sent on (#1080). Set by
+    /// `vsock::notify_restore_complete` once the connection is answered.
+    pub ack_connect_ms: f64,
 }
 
 impl RestorePhases {
@@ -601,6 +604,39 @@ mod restore_side_job_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The ACK telemetry, with every phase at a large value and the ACK connect time, still
+    /// fits the frame budget beside a UUID epoch, so `restore_complete_frame` keeps it.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn the_ack_telemetry_fits_the_frame_budget() {
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = 99_999.999;
+        phases.ipv6_ms = 99_999.999;
+        phases.tcp_cleanup_ms = 99_999.999;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = 99_999.999;
+        phases.tcp_reassert_ms = 99_999.999;
+        phases.tcp_destroy_ms = 99_999.999;
+        phases.tcp_reopen_ms = 99_999.999;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.neighbor_ms = 99_999.999;
+        phases.nfs_ms = 99_999.999;
+        phases.exec_wait_ms = 99_999.999;
+        phases.egress_wait_ms = 99_999.999;
+        phases.total_ms = 99_999.999;
+        phases.ack_connect_ms = 99_999.999;
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"ack_connect_ms\":99999.999"),
+            "the ACK telemetry was dropped from the frame: {frame}"
+        );
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn exec_rebind_timeout_is_a_restore_readiness_error() {

@@ -23,7 +23,13 @@ use exec_proto::{
     RESTORE_COMPLETE_MAX_FRAME_BYTES as RESTORE_COMPLETION_MAX_FRAME_BYTES,
     RESTORE_COMPLETE_PREFIX as RESTORE_COMPLETION_PREFIX,
 };
-const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// How long the host reads the ACK after it accepts the connection. Firecracker connects
+/// the host's listener when it sees the guest's request, before the guest's connect
+/// returns, so this has to cover the guest's whole connect and write deadlines (#1080).
+const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration =
+    exec_proto::RESTORE_COMPLETE_CONNECT_TIMEOUT
+        .saturating_add(exec_proto::RESTORE_COMPLETE_WRITE_TIMEOUT)
+        .saturating_add(std::time::Duration::from_secs(5));
 
 /// Listen for fc-agent status messages on the status vsock port.
 ///
@@ -507,13 +513,16 @@ async fn serve_bootplan(
 /// phase-timing telemetry on success, the protocol failure otherwise.
 pub(crate) type RestoreCompletionReceiver = tokio::sync::oneshot::Receiver<Result<Option<String>>>;
 
-/// Bind the one-shot restored-guest completion listener before the VMM resumes.
+/// Bind the restored-guest completion listener before the VMM resumes.
 ///
 /// The output, TTY, and exec sockets are workload transports, not proof that the
 /// restore handler finished. This dedicated channel carries one exact restore UUID
 /// after fc-agent has completed cleanup, exec/egress rebind, and its Succeeded
-/// transition. Bind is synchronous so a missing correctness oracle fails setup
-/// instead of becoming a detached guest/host race.
+/// transition. The listener resolves the restore exactly once, but it may accept
+/// several connections to do it: an interrupted connect leaves a closed one behind the
+/// retry that carries the frame (see [`receive_restore_completion`]). Bind is synchronous
+/// so a missing correctness oracle fails setup instead of becoming a detached guest/host
+/// race.
 pub(crate) fn spawn_restore_completion_listener(
     socket_path: &str,
     expected_epoch: &str,
@@ -535,7 +544,9 @@ pub(crate) fn spawn_restore_completion_listener(
     );
 
     let handle = tokio::spawn(async move {
-        let result = receive_restore_completion(listener, &expected_epoch).await;
+        let result =
+            receive_restore_completion(listener, &expected_epoch, RESTORE_COMPLETION_READ_TIMEOUT)
+                .await;
         if completion_tx.send(result).is_err() {
             debug!(
                 expected_epoch = %expected_epoch,
@@ -546,41 +557,95 @@ pub(crate) fn spawn_restore_completion_listener(
     Ok((handle, completion_rx))
 }
 
+/// Read the restore-completion ACK, accepting connections until one is decisive or the
+/// budget elapses.
+///
+/// Firecracker connects the host's listener as soon as it sees the guest's connect request,
+/// before the guest's own connect returns. If the guest then gives up (its connect timed out
+/// or a signal interrupted it) and retries on a new socket, the host is left a first
+/// connection that closes with no frame and a second that carries the real one. A single
+/// accept would fail the restore on that first empty connection and never read the retry
+/// (#1080). So the host keeps accepting: a connection that closes
+/// without sending a byte is abandoned (logged as a warning) and the next is accepted, up to one
+/// overall `budget` measured from the first accept. Any connection that sends bytes is
+/// decisive and ends the wait: a valid frame for `expected_epoch` is returned, and a
+/// malformed, oversized, wrong-generation, or timed-out frame still fails the restore. If
+/// the budget passes with every connection having closed empty, the closed-connection error
+/// is returned.
+///
+/// One task owns the listener and the loop is bounded by `budget`, so there is no unbounded
+/// accept loop and no second reader of the socket.
 async fn receive_restore_completion(
     listener: tokio::net::UnixListener,
     expected_epoch: &str,
+    budget: std::time::Duration,
 ) -> Result<Option<String>> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt};
 
-    let (stream, _) = listener.accept().await.with_context(|| {
+    // The first accept is un-timed: a guest that never connects at all is bounded by the
+    // outer restore-completion gate, not here. The budget starts once a connection exists.
+    let (first, _) = listener.accept().await.with_context(|| {
         format!(
             "restore-completion protocol failed (phase=accept expected_epoch={expected_epoch} observed_epoch=<none>)"
         )
     })?;
-    let mut frame = Vec::with_capacity(RESTORE_COMPLETION_MAX_FRAME_BYTES);
-    let mut limited =
-        tokio::io::BufReader::new(stream).take((RESTORE_COMPLETION_MAX_FRAME_BYTES + 1) as u64);
-    match tokio::time::timeout(
-        RESTORE_COMPLETION_READ_TIMEOUT,
-        limited.read_until(b'\n', &mut frame),
-    )
-    .await
-    {
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => {
-            return Err(error).with_context(|| {
-                format!(
-                    "restore-completion protocol failed (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<io-error>)"
-                )
-            });
+    let deadline = tokio::time::Instant::now() + budget;
+    let mut stream = first;
+    let mut abandoned: u64 = 0;
+    loop {
+        let mut frame = Vec::with_capacity(RESTORE_COMPLETION_MAX_FRAME_BYTES);
+        let mut limited =
+            tokio::io::BufReader::new(stream).take((RESTORE_COMPLETION_MAX_FRAME_BYTES + 1) as u64);
+        match tokio::time::timeout_at(deadline, limited.read_until(b'\n', &mut frame)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "restore-completion protocol failed (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<io-error>)"
+                    )
+                });
+            }
+            Err(_) => {
+                anyhow::bail!(
+                    "restore-completion protocol timed out (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<incomplete> timeout={budget:?})"
+                );
+            }
         }
-        Err(_) => {
-            anyhow::bail!(
-                "restore-completion protocol timed out (phase=read-frame expected_epoch={expected_epoch} observed_epoch=<incomplete> timeout={RESTORE_COMPLETION_READ_TIMEOUT:?})"
+
+        if frame.is_empty() {
+            // The connection closed without sending a byte: the guest gave up connecting, or
+            // the VMM closed it. A retry on a new socket may still carry the frame, so keep
+            // accepting until the budget.
+            abandoned += 1;
+            warn!(
+                expected_epoch = %expected_epoch,
+                abandoned,
+                "restore-completion: a connection closed without a frame; waiting for another within the budget"
             );
+            match tokio::time::timeout_at(deadline, listener.accept()).await {
+                Ok(Ok((next, _))) => {
+                    stream = next;
+                    continue;
+                }
+                Ok(Err(error)) => {
+                    return Err(error).with_context(|| {
+                        format!(
+                            "restore-completion protocol failed (phase=accept expected_epoch={expected_epoch} observed_epoch=<none>)"
+                        )
+                    });
+                }
+                Err(_) => {
+                    // The budget passed with no decisive connection. Report the empty-frame
+                    // case that every connection presented.
+                    return validate_restore_completion_frame(&frame, expected_epoch);
+                }
+            }
         }
+
+        // A connection that sent bytes is decisive: validate it (a valid frame is returned,
+        // anything else fails the restore), without accepting any further connection.
+        return validate_restore_completion_frame(&frame, expected_epoch);
     }
-    validate_restore_completion_frame(&frame, expected_epoch)
 }
 
 /// Validate one ACK frame against the expected restore generation.
@@ -594,6 +659,12 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
         anyhow::bail!(
             "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<oversized> bytes={})",
             frame.len()
+        );
+    }
+
+    if frame.is_empty() {
+        anyhow::bail!(
+            "restore-completion protocol failed (phase=validate-frame expected_epoch={expected_epoch} observed_epoch=<none>): the acknowledgement connection closed without a frame (the guest gave up connecting, or the VMM closed it)"
         );
     }
 
@@ -901,6 +972,136 @@ mod tests {
         assert!(
             format!("{error:#}").contains("<malformed>"),
             "unexpected diagnostic: {error:#}"
+        );
+    }
+
+    /// The host reads the ACK for longer than the guest may take to connect and write it:
+    /// the host's timer starts when Firecracker connects its listener, before the guest's
+    /// connect returns (#1080).
+    #[test]
+    fn the_host_reads_the_ack_for_longer_than_the_guest_may_take_to_send_it() {
+        assert!(
+            RESTORE_COMPLETION_READ_TIMEOUT
+                > exec_proto::RESTORE_COMPLETE_CONNECT_TIMEOUT
+                    + exec_proto::RESTORE_COMPLETE_WRITE_TIMEOUT,
+            "the read timeout {RESTORE_COMPLETION_READ_TIMEOUT:?} does not cover the guest's connect and write"
+        );
+    }
+
+    /// A guest that gives up on the acknowledgement leaves the host a connection with no
+    /// frame (#1080). The error names that case instead of calling an empty frame malformed.
+    #[test]
+    fn an_empty_acknowledgement_frame_names_the_closed_connection() {
+        let error = validate_restore_completion_frame(b"", "epoch-1")
+            .expect_err("an empty frame must fail closed");
+        assert!(
+            format!("{error:#}").contains("the acknowledgement connection closed without a frame"),
+            "unexpected diagnostic: {error:#}"
+        );
+    }
+
+    // A real UnixListener in a temp dir, so the accept loop is exercised end to end. The
+    // budget is injected small so a test does not wait the production 25 s.
+    fn restore_ack_listener() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        tokio::net::UnixListener,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("restore-ack.sock");
+        let listener = tokio::net::UnixListener::bind(&sock).unwrap();
+        (dir, sock, listener)
+    }
+
+    /// A connection that closes without sending a byte does not end the wait: the host keeps
+    /// accepting, so a guest that retried the ACK on a new socket is still answered (#1080).
+    /// It fails if the receiver stops at the first connection, which would fail the restore
+    /// on the empty connection and never read the valid frame behind it.
+    ///
+    /// Both connections are queued into the listener backlog before the receiver runs, so
+    /// the accept order is fixed and the receiver never races a client connect.
+    #[tokio::test]
+    async fn restore_completion_waits_past_an_empty_connection_for_a_valid_frame() {
+        let (_dir, sock, listener) = restore_ack_listener();
+
+        // First connection: connect, then close without writing anything.
+        drop(tokio::net::UnixStream::connect(&sock).await.unwrap());
+        // Second connection: a valid frame with telemetry. Kept alive so its bytes stay
+        // readable until the receiver accepts it.
+        let mut c2 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        c2.write_all(b"restore-complete:epoch-1 {\"total_ms\":7.0}\n")
+            .await
+            .unwrap();
+        c2.flush().await.unwrap();
+
+        let telemetry =
+            receive_restore_completion(listener, "epoch-1", std::time::Duration::from_secs(5))
+                .await
+                .expect("a valid frame behind an empty connection must be accepted");
+        assert_eq!(telemetry.as_deref(), Some("{\"total_ms\":7.0}"));
+    }
+
+    /// Any connection that sends bytes is decisive: a wrong-generation frame fails the
+    /// restore at once, even with a connection that would send a valid frame queued behind
+    /// it. It fails if the receiver stops at the first connection, which would report the
+    /// empty connection in front and never reach the wrong-generation frame.
+    #[tokio::test]
+    async fn restore_completion_fails_on_the_first_decisive_frame_behind_an_empty_connection() {
+        let (_dir, sock, listener) = restore_ack_listener();
+
+        // Queue, in order: an empty connection, a wrong-generation frame, and a valid frame
+        // that must never be reached.
+        drop(tokio::net::UnixStream::connect(&sock).await.unwrap());
+        let mut c2 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        c2.write_all(b"restore-complete:other-generation\n")
+            .await
+            .unwrap();
+        c2.flush().await.unwrap();
+        let mut c3 = tokio::net::UnixStream::connect(&sock).await.unwrap();
+        c3.write_all(b"restore-complete:epoch-1\n").await.unwrap();
+        c3.flush().await.unwrap();
+
+        let error =
+            receive_restore_completion(listener, "epoch-1", std::time::Duration::from_secs(5))
+                .await
+                .expect_err("a wrong-generation frame must fail the restore");
+        let diagnostic = format!("{error:#}");
+        assert!(
+            diagnostic.contains("phase=validate-epoch"),
+            "the decisive frame's rejection must name its phase: {diagnostic}"
+        );
+        assert!(
+            diagnostic.contains("observed_epoch=other-generation"),
+            "the decisive frame's rejection must name the wrong generation: {diagnostic}"
+        );
+    }
+
+    /// A run of connections that all close without a frame waits the whole budget, then
+    /// fails with the closed-connection error. It fails if the receiver gives up on the first
+    /// empty connection, which returns far sooner than the budget.
+    #[tokio::test]
+    async fn restore_completion_waits_the_budget_then_reports_the_closed_connection() {
+        let (_dir, sock, listener) = restore_ack_listener();
+        let budget = std::time::Duration::from_millis(700);
+
+        // Four connections, each closing without a byte, queued before the receiver runs.
+        for _ in 0..4 {
+            drop(tokio::net::UnixStream::connect(&sock).await.unwrap());
+        }
+
+        let started = std::time::Instant::now();
+        let error = receive_restore_completion(listener, "epoch-1", budget)
+            .await
+            .expect_err("a run of empty connections must fail closed");
+        let waited = started.elapsed();
+        assert!(
+            format!("{error:#}").contains("the acknowledgement connection closed without a frame"),
+            "unexpected diagnostic: {error:#}"
+        );
+        assert!(
+            waited >= std::time::Duration::from_millis(500),
+            "the host must keep accepting until the budget elapses, not give up on the first \
+             empty connection (waited {waited:?}, budget {budget:?})"
         );
     }
 

@@ -94,10 +94,80 @@ macro_rules! impl_async_write {
     };
 }
 
-/// Connect a blocking vsock socket. The connect itself is instant for
-/// same-machine vsock, so it is safe to call from async code.
+/// `SO_VM_SOCKETS_CONNECT_TIMEOUT` from linux/vm_sockets.h, which libc does not define.
+/// Its value is a struct timeval: 6 is the header's `SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD`, whose
+/// timeval is two longs on the 64-bit targets fc-agent builds for.
+const SO_VM_SOCKETS_CONNECT_TIMEOUT: libc::c_int = 6;
+const _: () = assert!(
+    std::mem::size_of::<libc::timeval>() == 2 * std::mem::size_of::<libc::c_long>(),
+    "SO_VM_SOCKETS_CONNECT_TIMEOUT_OLD takes a timeval of two longs"
+);
+
+/// Connect a blocking vsock socket. A blocking vsock connect waits for the host's answer
+/// (Firecracker connects to the host's listener, then answers the guest) for at most
+/// Linux's default of 2 s, and blocks the calling thread meanwhile. Every other fc-agent
+/// connection keeps that default. The restore ACK, which fails closed, uses
+/// [`connect_blocking_within`] on a blocking thread instead (#1080).
 pub fn connect_blocking(cid: u32, port: u32) -> Result<OwnedFd> {
-    use nix::sys::socket::{connect, socket, AddressFamily, SockFlag, SockType, VsockAddr};
+    let fd = vsock_socket(None)?;
+    connect_vsock(&fd, cid, port).context("connecting vsock")?;
+    Ok(fd)
+}
+
+/// Connect a blocking vsock socket, waiting up to `timeout` for the host's answer, and
+/// return it with how long its connect syscalls blocked. Blocks the calling thread for up
+/// to that long, so call it from a blocking task. A signal that interrupts the wait closes
+/// the socket (Linux does not restart a vsock connect that has a finite timeout), so the
+/// connect starts over on a new socket with the time left. The retry is meaningful for the
+/// restore ACK: the host keeps accepting connections, so the first (closed) socket is
+/// abandoned and the retry's socket is the one it reads (`receive_restore_completion`,
+/// src/commands/podman/listeners.rs).
+///
+/// The syscall time is measured around each connect syscall on this thread, so it leaves
+/// out the wait for a thread to run this and for the caller to be scheduled again. A failed
+/// connect's error carries it too.
+pub fn connect_blocking_within(
+    cid: u32,
+    port: u32,
+    timeout: std::time::Duration,
+) -> Result<(OwnedFd, std::time::Duration)> {
+    anyhow::ensure!(
+        !timeout.is_zero(),
+        "a vsock connect timeout must be longer than zero"
+    );
+    let deadline = std::time::Instant::now() + timeout;
+    let mut blocked = std::time::Duration::ZERO;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        anyhow::ensure!(
+            !left.is_zero(),
+            "connecting vsock: interrupted by signals until the {timeout:?} deadline passed \
+             (connect syscall time {} ms)",
+            blocked.as_millis()
+        );
+        let fd = vsock_socket(Some(left))?;
+        let attempt = std::time::Instant::now();
+        let connected = connect_vsock(&fd, cid, port);
+        blocked += attempt.elapsed();
+        match connected {
+            Ok(()) => return Ok((fd, blocked)),
+            Err(nix::errno::Errno::EINTR) => continue,
+            Err(errno) => {
+                return Err(errno).with_context(|| {
+                    format!(
+                        "connecting vsock (connect syscall time {} ms)",
+                        blocked.as_millis()
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// A blocking vsock socket. With `connect_timeout`, its connect waits that long for the
+/// host's answer instead of Linux's 2 s default.
+fn vsock_socket(connect_timeout: Option<std::time::Duration>) -> Result<OwnedFd> {
+    use nix::sys::socket::{socket, AddressFamily, SockFlag, SockType};
 
     let fd = socket(
         AddressFamily::Vsock,
@@ -106,8 +176,33 @@ pub fn connect_blocking(cid: u32, port: u32) -> Result<OwnedFd> {
         None,
     )
     .context("creating vsock socket")?;
-    connect(fd.as_raw_fd(), &VsockAddr::new(cid, port)).context("connecting vsock")?;
+    if let Some(timeout) = connect_timeout {
+        let value = libc::timeval {
+            tv_sec: timeout.as_secs().try_into().unwrap_or(libc::c_long::MAX),
+            tv_usec: timeout.subsec_micros() as _,
+        };
+        // SAFETY: `fd` is an open socket, and `value` is a timeval that outlives the call.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.as_raw_fd(),
+                libc::AF_VSOCK,
+                SO_VM_SOCKETS_CONNECT_TIMEOUT,
+                (&value as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("setting the vsock connect timeout");
+        }
+    }
     Ok(fd)
+}
+
+fn connect_vsock(fd: &OwnedFd, cid: u32, port: u32) -> nix::Result<()> {
+    use nix::sys::socket::{connect, VsockAddr};
+
+    connect(fd.as_raw_fd(), &VsockAddr::new(cid, port))
 }
 
 /// Async vsock stream — wraps an OwnedFd in Arc<AsyncFd> for non-blocking I/O.
@@ -123,11 +218,15 @@ pub struct VsockStream {
 impl VsockStream {
     /// Connect to the host on the given vsock port.
     ///
-    /// Creates a blocking socket, connects (instant for vsock), then sets
-    /// non-blocking for use with tokio's AsyncFd.
+    /// Creates a blocking socket and connects, waiting up to Linux's 2 s default for the
+    /// host's response ([`connect_blocking`]), then sets non-blocking for use with tokio's
+    /// AsyncFd.
     pub fn connect(cid: u32, port: u32) -> Result<Self> {
-        let fd = connect_blocking(cid, port)?;
+        Self::from_connected(connect_blocking(cid, port)?)
+    }
 
+    /// Wrap a connected blocking vsock socket for async I/O.
+    pub fn from_connected(fd: OwnedFd) -> Result<Self> {
         // Set non-blocking for AsyncFd
         nix::fcntl::fcntl(
             &fd,
@@ -395,40 +494,81 @@ pub fn send_status(message: &[u8]) -> bool {
 /// and the shared Succeeded transition have completed.
 ///
 /// This deliberately uses its own connection rather than the output or status
-/// transports: the host binds the matching one-shot listener before resume, and
-/// treats any missing/malformed/wrong-generation frame as a restore failure.
+/// transports: the host binds the matching listener before resume. The host keeps
+/// accepting until a connection sends a frame, so a connect that is interrupted and
+/// retried on a new socket is still answered (see [`connect_blocking_within`]); it treats
+/// any malformed/wrong-generation frame, and a budget with only empty connections, as a
+/// restore failure.
 ///
-/// `telemetry` rides after the epoch, separated by one space: the per-phase
-/// restore timings as compact JSON. The host logs it verbatim so every clone's
-/// restore critical path is attributed without guest console capture. It is
-/// telemetry, never identity; the host validates only the epoch, and
-/// [`exec_proto::restore_complete_frame`] drops telemetry that would overflow
-/// the shared frame budget so advisory data can never cost the clone its ACK.
-pub async fn notify_restore_complete(restore_epoch: &str, telemetry: &str) -> Result<()> {
-    /// Deadline for writing the (small) ACK frame to a host that has already
-    /// accepted the connection.
-    const RESTORE_COMPLETE_ACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// `phases` rides after the epoch, separated by one space, as compact JSON: the per-phase
+/// restore timings and how long the ACK's connection took to be answered. The host logs it
+/// verbatim so every clone's restore critical path is attributed without guest console
+/// capture. It is telemetry, never identity; the host validates only the epoch, and
+/// [`exec_proto::restore_complete_frame`] drops telemetry that would overflow the shared
+/// frame budget so advisory data can never cost the clone its ACK.
+///
+/// The connect and write deadlines are shared with the host, whose read of the ACK has to
+/// outlast both (#1080).
+pub async fn notify_restore_complete(
+    restore_epoch: &str,
+    phases: &crate::restore::RestorePhases,
+) -> Result<()> {
+    use exec_proto::{RESTORE_COMPLETE_CONNECT_TIMEOUT, RESTORE_COMPLETE_WRITE_TIMEOUT};
 
-    let stream = VsockStream::connect(HOST_CID, RESTORE_COMPLETE_PORT).with_context(|| {
+    let started = std::time::Instant::now();
+    let (fd, connect_syscall) = tokio::task::spawn_blocking(|| {
+        // Test-only: a `burn` guest failpoint here keeps every SCHED_OTHER task, the kernel
+        // worker that processes this connect's RESPONSE included, off every CPU, so the
+        // connect cannot complete until the burn ends. That is how a VM test measures a
+        // vsock connect completing above Linux's 2 s default (#1080). It is zero-cost
+        // unless armed. The burn raises this blocking thread above its burners so it can
+        // issue the connect, and ends at its deadline. The guard drops at the end of this
+        // closure, on this thread, and waits for that deadline before restoring what the
+        // burn changed. Nothing may allocate or print between the hit and the connect (see
+        // `failpoint::hit_scoped`), and `connect_blocking_within` does neither before its
+        // connect syscall returns, unless creating or configuring the socket fails.
+        let _burn = failpoint::hit_scoped("restore.pre_ack_connect");
+        connect_blocking_within(HOST_CID, RESTORE_COMPLETE_PORT, RESTORE_COMPLETE_CONNECT_TIMEOUT)
+    })
+    .await
+    .context("joining the restore-completion ACK connect")?
+    .with_context(|| {
         format!(
-            "restore-completion ACK failed (phase=connect expected_epoch={restore_epoch} observed_epoch=<none>)"
+            "restore-completion ACK failed (phase=connect expected_epoch={restore_epoch} observed_epoch=<none> waited_ms={})",
+            started.elapsed().as_millis()
         )
     })?;
-    let frame = exec_proto::restore_complete_frame(restore_epoch, telemetry);
+    let connect_ms = started.elapsed().as_secs_f64() * 1000.0;
+    // Logged on success too, so the connect's duration under restore load is measured. The
+    // syscall time is the connect alone, timed on the connecting thread; `connect_ms` also
+    // holds the wait for a blocking thread and for this task to be polled again. The
+    // telemetry carries `connect_ms`, where a host log filter on guest console lines cannot
+    // drop it.
+    eprintln!(
+        "[fc-agent] restore-completion ACK connect syscall took {:.0} ms",
+        connect_syscall.as_secs_f64() * 1000.0
+    );
+    eprintln!("[fc-agent] restore-completion ACK connected in {connect_ms:.0} ms");
+    let stream = VsockStream::from_connected(fd).with_context(|| {
+        format!("restore-completion ACK failed (phase=wrap-socket expected_epoch={restore_epoch})")
+    })?;
+    let mut phases = phases.clone();
+    phases.ack_connect_ms = connect_ms;
+    let frame = exec_proto::restore_complete_frame(restore_epoch, &phases.to_frame_json());
     // Bounded: a host that accepts and then stops reading (or a wedged
     // transport) would otherwise block this write forever, leaving the clone
     // alive, unpublished and silent. The caller treats an ACK error as fatal
     // and shuts the clone down, so a deadline converts a silent hang into a
     // diagnosable failure. The frame is a few hundred bytes at most.
     tokio::time::timeout(
-        RESTORE_COMPLETE_ACK_TIMEOUT,
+        RESTORE_COMPLETE_WRITE_TIMEOUT,
         stream.write_all(frame.as_bytes()),
     )
     .await
     .map_err(|_| {
         anyhow::anyhow!(
             "restore-completion ACK failed (phase=write-frame expected_epoch={restore_epoch} reason=timed out after {:?})",
-            RESTORE_COMPLETE_ACK_TIMEOUT
+            RESTORE_COMPLETE_WRITE_TIMEOUT
         )
     })?
     .with_context(|| {
@@ -481,7 +621,7 @@ pub fn notify_container_exit(exit_code: i32) {
 /// cold boot (storage preserved, captured container restarted, identity regenerated).
 ///
 /// Best-effort with a few retries: the hook runs late in shutdown, so the send must
-/// be fast and must never block (vsock connect is local/instant).
+/// be fast: each connect waits at most Linux's 2 s vsock default.
 pub fn notify_reboot() -> bool {
     const MAX_ATTEMPTS: u32 = 3;
     const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
@@ -504,5 +644,116 @@ pub fn notify_container_started() {
         eprintln!("[fc-agent] container started, notified host via vsock");
     } else {
         eprintln!("[fc-agent] WARNING: failed to send ready status to host");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A vsock socket made with a connect timeout reports that timeout back. Linux's
+    /// default is 2 s (#1080), so a socket that skipped the option would read 2 s here.
+    /// Needs AF_VSOCK on the build host (CI runs privileged) and fails loudly without it.
+    #[test]
+    fn a_vsock_socket_takes_the_connect_timeout_it_is_given() {
+        let fd = vsock_socket(Some(std::time::Duration::from_secs(10)))
+            .expect("creating a vsock socket with a connect timeout");
+        let mut value = libc::timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+        };
+        let mut len = std::mem::size_of::<libc::timeval>() as libc::socklen_t;
+        // SAFETY: `fd` is an open socket; `value` and `len` outlive the call.
+        let rc = unsafe {
+            libc::getsockopt(
+                fd.as_raw_fd(),
+                libc::AF_VSOCK,
+                SO_VM_SOCKETS_CONNECT_TIMEOUT,
+                (&mut value as *mut libc::timeval).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+        assert_eq!((value.tv_sec, value.tv_usec), (10, 0));
+    }
+
+    /// A zero timeout would leave the kernel's default in place, so it is refused.
+    #[test]
+    fn a_zero_connect_timeout_is_refused() {
+        let error =
+            connect_blocking_within(HOST_CID, RESTORE_COMPLETE_PORT, std::time::Duration::ZERO)
+                .expect_err("a zero connect timeout was accepted");
+        assert!(
+            format!("{error:#}").contains("longer than zero"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    /// A failed connect says how long its connect syscall blocked, measured on the
+    /// connecting thread, which a restore that timed out reports beside the end-to-end wait
+    /// (#1080). The test holds a socket bound, not listening, on a local port the kernel
+    /// picked, so no other test or process can listen there and the kernel resets the
+    /// connect at once. Without vsock loopback nothing can listen on the local CID, so the
+    /// test connects to a fixed port instead.
+    #[test]
+    fn a_failed_connect_reports_its_connect_syscall_time() {
+        use nix::sys::socket::{bind, getsockname, VsockAddr};
+
+        // Bound until the test returns. Meanwhile the kernel refuses any other bind of this
+        // port on VMADDR_CID_LOCAL or VMADDR_CID_ANY, the only bindings a connect to the
+        // local CID can reach. Without vsock loopback the bind fails with EADDRNOTAVAIL
+        // (__vsock_bind accepts VMADDR_CID_LOCAL only with the loopback transport), and then
+        // nothing can listen on the local CID at all, so any port is refused.
+        let reserved = vsock_socket(None).expect("creating a vsock socket");
+        let port = match bind(
+            reserved.as_raw_fd(),
+            &VsockAddr::new(libc::VMADDR_CID_LOCAL, libc::VMADDR_PORT_ANY),
+        ) {
+            Ok(()) => getsockname::<VsockAddr>(reserved.as_raw_fd())
+                .expect("reading back the reserved vsock port")
+                .port(),
+            Err(nix::errno::Errno::EADDRNOTAVAIL) => 0x7fff_fff0,
+            Err(errno) => panic!("binding a local vsock port: {errno}"),
+        };
+
+        let error = connect_blocking_within(
+            libc::VMADDR_CID_LOCAL,
+            port,
+            std::time::Duration::from_secs(1),
+        )
+        .expect_err("a connect to a bound port that does not listen succeeded");
+        assert!(
+            format!("{error:#}").contains("connect syscall time"),
+            "the connect error does not carry the connect syscall time: {error:#}"
+        );
+    }
+
+    /// The restore-completion ACK connects and writes within the deadlines it shares with
+    /// the host, not Linux's 2 s connect default. Only the code above the test module is
+    /// searched, and comments are skipped, so neither this test's own text nor a comment
+    /// can satisfy it.
+    #[test]
+    fn the_restore_ack_uses_the_shared_deadlines() {
+        let source = include_str!("vsock.rs");
+        let code = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("vsock.rs has no test module")];
+        let start = code
+            .find("pub async fn notify_restore_complete(")
+            .expect("notify_restore_complete is gone");
+        let end = code[start..]
+            .find("\n}\n")
+            .expect("notify_restore_complete has no end");
+        let squeezed: String = code[start..start + end]
+            .lines()
+            .filter(|line| !line.trim_start().starts_with("//"))
+            .flat_map(|line| line.split_whitespace())
+            .collect();
+        for call in [
+            "connect_blocking_within(HOST_CID,RESTORE_COMPLETE_PORT,RESTORE_COMPLETE_CONNECT_TIMEOUT)",
+            "tokio::time::timeout(RESTORE_COMPLETE_WRITE_TIMEOUT,",
+        ] {
+            assert!(squeezed.contains(call), "notify_restore_complete no longer calls {call}");
+        }
     }
 }
