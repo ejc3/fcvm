@@ -99,6 +99,29 @@ pub struct ExtraDisk {
     pub read_only: bool,
 }
 
+/// A read-only host image attached through virtio-pmem (`--pmem`). Device N in
+/// `pmem_devices` is `/dev/pmemN` in the guest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PmemDevice {
+    /// Canonical host path of the image. Firecracker records it in the snapshot and
+    /// reopens it at this path on restore.
+    pub path: String,
+    /// Mount path inside the guest and the container
+    pub mount_path: String,
+    /// Inode, length, modification time and change time when the device was attached
+    /// (`storage::pmem::image_identity`). A restore refuses an image whose identity changed,
+    /// which catches an image rewritten in place at the same length, even with its
+    /// modification time put back.
+    pub identity: String,
+}
+
+impl PmemDevice {
+    /// The `--pmem` spec that attaches this device again.
+    pub fn spec(&self) -> String {
+        format!("{}:{}:ro", self.path, self.mount_path)
+    }
+}
+
 /// NFS share configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NfsShare {
@@ -126,6 +149,9 @@ pub struct VmConfig {
     /// Extra block devices (paths to raw disk images)
     #[serde(default)]
     pub extra_disks: Vec<ExtraDisk>,
+    /// Read-only virtio-pmem images, in device order (/dev/pmem0, /dev/pmem1, ...)
+    #[serde(default)]
+    pub pmem_devices: Vec<PmemDevice>,
     /// NFS shares to mount in guest
     #[serde(default)]
     pub nfs_shares: Vec<NfsShare>,
@@ -298,6 +324,7 @@ impl VmState {
                 network: NetworkConfig::default(),
                 volumes: Vec::new(),
                 extra_disks: Vec::new(),
+                pmem_devices: Vec::new(),
                 nfs_shares: Vec::new(),
                 health_check_url: None,
                 health_check_timeout: 5,

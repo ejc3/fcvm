@@ -33,7 +33,7 @@ use self::api::{
     BalloonConfig, ChClient, ConsoleConfig, CpusConfig, DiskConfig, MemoryConfig, NetConfig,
     PayloadConfig, RngConfig, VmConfig, VsockConfig,
 };
-use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, ProcessSpec};
+use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, PmemSpec, ProcessSpec};
 use crate::utils::{install_namespace_pre_exec, spawn_streaming, NamespaceParams};
 
 /// Guest CID for the host↔guest vsock device (host is always CID 2).
@@ -541,6 +541,15 @@ impl Hypervisor for CloudHypervisorBackend {
             image_type: "Raw".to_string(),
         });
         Ok(())
+    }
+
+    async fn add_pmem(&mut self, pmem: &PmemSpec) -> Result<()> {
+        anyhow::bail!(
+            "--pmem is not supported with --hypervisor cloud-hypervisor (device {} for {}); \
+             use the Firecracker backend",
+            pmem.id,
+            pmem.path_on_host.display()
+        )
     }
 
     async fn add_network_interface(&mut self, iface: &NetIfaceSpec) -> Result<()> {

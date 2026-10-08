@@ -1,4 +1,5 @@
 pub mod disk;
+pub mod pmem;
 pub mod snapshot;
 pub mod volume;
 

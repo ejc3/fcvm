@@ -128,6 +128,11 @@ impl FirecrackerClient {
         self.put(&format!("/drives/{}", drive_id), &config).await
     }
 
+    /// Attach a virtio-pmem device backed by a host file (PUT /pmem/{id})
+    pub async fn put_pmem(&self, config: Pmem) -> Result<()> {
+        self.put(&format!("/pmem/{}", config.id), &config).await
+    }
+
     /// Update an existing drive configuration (e.g., host path) after snapshot load
     pub async fn patch_drive(&self, drive_id: &str, patch: DrivePatch) -> Result<()> {
         self.patch(&format!("/drives/{}", drive_id), &patch).await
@@ -298,6 +303,18 @@ pub struct Drive {
     pub is_read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub partuuid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limiter: Option<RateLimiter>,
+}
+
+/// Body of `PUT /pmem/{id}`. Firecracker's PmemConfig is `deny_unknown_fields`, so
+/// this carries exactly its members; `id` must equal the id in the path.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Pmem {
+    pub id: String,
+    pub path_on_host: String,
+    pub root_device: bool,
+    pub read_only: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limiter: Option<RateLimiter>,
 }
@@ -490,6 +507,29 @@ pub struct Vsock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pmem body holds only members Firecracker's PmemConfig accepts: it is
+    /// `deny_unknown_fields`, so any other member fails the whole PUT.
+    #[test]
+    fn put_pmem_body_carries_only_the_fields_firecracker_accepts() {
+        let body = serde_json::to_value(Pmem {
+            id: "pmem0".to_string(),
+            path_on_host: "/mnt/fcvm-btrfs/pmem/cache.ext4".to_string(),
+            root_device: false,
+            read_only: true,
+            rate_limiter: None,
+        })
+        .unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "id": "pmem0",
+                "path_on_host": "/mnt/fcvm-btrfs/pmem/cache.ext4",
+                "root_device": false,
+                "read_only": true,
+            })
+        );
+    }
 
     /// A VM with no balloon device. The Firecracker builds fcvm pins send
     /// `"balloon": null`: their config reply serializes the `Option` as it is. A

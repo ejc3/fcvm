@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::thread;
 
-use crate::types::{ExtraDiskMount, NfsMount, VolumeMount};
+use crate::types::{ExtraDiskMount, NfsMount, PmemMount, VolumeMount};
 
 /// Check if a path has an active FUSE mount by examining /proc/self/mountinfo.
 fn is_fuse_mounted(path: &str) -> bool {
@@ -55,8 +55,17 @@ fn mount_levels(volumes: &[VolumeMount]) -> Vec<Vec<usize>> {
 /// be created here. fcvm refuses such a plan before it boots the VM unless the
 /// mount point is already a directory of that volume
 /// (checked_volume_mappings in src/commands/podman/types.rs).
-pub fn mount_fuse_volumes(volumes: &[VolumeMount]) -> Result<Vec<String>> {
-    mount_in_levels(volumes, start_fuse_mount, wait_for_fuse_mount)
+///
+/// Each volume goes into `record` once its mount is ready, which is after every volume
+/// of its level has started, so a later volume of the same level can already cover it.
+pub fn mount_fuse_volumes(
+    volumes: &[VolumeMount],
+    record: &mut MountRecord,
+) -> Result<Vec<String>> {
+    mount_in_levels(volumes, start_fuse_mount, |volume| {
+        wait_for_fuse_mount(volume)?;
+        record.record("FUSE volume", &volume.guest_path)
+    })
 }
 
 /// Start the mounts of `volumes` one group of `mount_levels` at a time, and
@@ -139,8 +148,332 @@ fn wait_for_fuse_mount(vol: &VolumeMount) -> Result<()> {
     ))
 }
 
-/// Mount extra block devices. Returns list of mounted paths.
-pub fn mount_extra_disks(disks: &[ExtraDiskMount]) -> Result<Vec<String>> {
+/// Wait about 5 s (10 checks, 500 ms apart) for a device node to appear.
+fn wait_for_device(device: &str) -> Result<()> {
+    let device_path = std::path::Path::new(device);
+    for attempt in 1..=10 {
+        if device_path.exists() {
+            return Ok(());
+        }
+        if attempt == 10 {
+            break;
+        }
+        eprintln!(
+            "[fc-agent] waiting for device {} (attempt {}/10)",
+            device, attempt
+        );
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    anyhow::bail!("Device {} not found after 10 attempts", device)
+}
+
+/// Mount options for a pmem device. `noload` keeps ext4 from replaying a journal
+/// on a device the host mapped read-only: on aarch64 a guest write to it stops the
+/// VM. `dax=always` maps file data straight from the device, so it never enters the
+/// guest page cache.
+const PMEM_MOUNT_OPTIONS: &str = "ro,noload,dax=always";
+
+/// Arguments to `mount` for one pmem device.
+fn pmem_mount_args(pmem: &PmemMount) -> Vec<String> {
+    vec![
+        "-t".to_string(),
+        "ext4".to_string(),
+        "-o".to_string(),
+        PMEM_MOUNT_OPTIONS.to_string(),
+        pmem.device.clone(),
+        pmem.mount_path.clone(),
+    ]
+}
+
+/// Undo the octal escapes /proc/mounts uses for space, tab, newline and backslash.
+fn unescape_mount_field(field: &str) -> String {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let octal = (bytes[i] == b'\\'
+            && i + 3 < bytes.len()
+            && bytes[i + 1..i + 4]
+                .iter()
+                .all(|b| (b'0'..=b'7').contains(b)))
+        .then(|| {
+            u8::try_from(
+                bytes[i + 1..i + 4]
+                    .iter()
+                    .fold(0u32, |value, digit| value * 8 + u32::from(digit - b'0')),
+            )
+            .ok()
+        })
+        .flatten();
+        if let Some(byte) = octal {
+            out.push(byte);
+            i += 4;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Fail unless the mount at `mount_path` in a /proc/mounts listing has DAX on.
+/// Without DAX, file pages land in guest RAM and the memory snapshot, which is
+/// what --pmem exists to avoid, so a mount that does not show it is an error
+/// whatever the reason. The last entry for the path is the one in effect.
+fn check_dax_mount(proc_mounts: &str, mount_path: &str) -> Result<()> {
+    // /proc/mounts records the target with symlinks resolved, so compare the resolved
+    // path; a path that does not resolve is compared as given.
+    let resolved =
+        std::fs::canonicalize(mount_path).unwrap_or_else(|_| std::path::PathBuf::from(mount_path));
+    let wanted = resolved.as_path();
+    let options = proc_mounts
+        .lines()
+        .rev()
+        .find_map(|line| {
+            let mut fields = line.split_whitespace();
+            let _source = fields.next()?;
+            let target = unescape_mount_field(fields.next()?);
+            let _fstype = fields.next()?;
+            let options = fields.next()?;
+            (std::path::Path::new(&target) == wanted).then(|| options.to_string())
+        })
+        .with_context(|| format!("{mount_path} is not in /proc/mounts"))?;
+    anyhow::ensure!(
+        options.split(',').any(|o| o == "dax" || o == "dax=always"),
+        "pmem mount {mount_path} does not have DAX on (options: {options}); the image \
+         must be ext4 with 4 KiB blocks (mkfs.ext4 -b 4096)"
+    );
+    Ok(())
+}
+
+/// The mounts fc-agent makes before the container starts, each with the mount its path
+/// reaches when it is recorded. A FUSE volume is recorded once its mount is ready, after
+/// every volume of its level has started; every other mount is recorded right after it
+/// is made. `check_none_covered` runs after the last one and consumes the record.
+#[derive(Debug, Default)]
+pub struct MountRecord {
+    mounts: Vec<RecordedMount>,
+}
+
+/// One mount fc-agent made.
+#[derive(Debug)]
+struct RecordedMount {
+    /// What was mounted, as an error names it, such as "pmem /dev/pmem0".
+    what: String,
+    path: String,
+    /// The ID of the mount `path` reached when it was recorded, which is the first
+    /// field of that mount's line in /proc/self/mountinfo.
+    mount_id: u64,
+    /// The O_PATH descriptor `mount_id` was read from. It holds the mount, so the kernel
+    /// cannot give its ID to another mount before the check, and a plain umount of it
+    /// fails with EBUSY until the check drops the record.
+    _pin: std::fs::File,
+}
+
+impl MountRecord {
+    /// Record the mount fc-agent made at `path`. `what` names it in an error.
+    pub fn record(&mut self, what: impl Into<String>, path: &str) -> Result<()> {
+        let pinned = open_path(path).and_then(|file| file_mount_id(&file).map(|id| (file, id)));
+        let (pin, mount_id) =
+            pinned.with_context(|| format!("reading which mount {path} reaches"))?;
+        self.mounts.push(RecordedMount {
+            what: what.into(),
+            path: path.to_string(),
+            mount_id,
+            _pin: pin,
+        });
+        Ok(())
+    }
+
+    /// Fail if a mount fc-agent made is covered or gone. A symlink in the guest, such as
+    /// Ubuntu's /var/run -> /run, lets two guest paths that differ as text name one
+    /// directory, which the host's check of the guest paths cannot see. Consuming the
+    /// record closes the descriptors that hold its mounts, so the plain umount of the
+    /// extra disks at shutdown does not fail with EBUSY.
+    pub fn check_none_covered(self) -> Result<()> {
+        mounts_visible(&self.mounts, path_mount_id, || {
+            std::fs::read_to_string("/proc/self/mountinfo")
+        })
+    }
+}
+
+/// The ID of the mount `path` reaches. It follows symlinks, as the mount and the
+/// container's bind mount of the path do. A mount ID names one mount, while st_dev names
+/// a filesystem, which several mounts can show. It is read from the mnt_id line of
+/// /proc/self/fdinfo for an O_PATH descriptor, because the libc crate does not expose
+/// statx to the musl build.
+fn path_mount_id(path: &str) -> std::io::Result<u64> {
+    file_mount_id(&open_path(path)?)
+}
+
+/// An O_PATH descriptor for `path`, following symlinks. While it is open it holds the
+/// mount it reaches.
+fn open_path(path: &str) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(path)
+}
+
+/// The ID of the mount `file` is on, from the mnt_id line of its /proc/self/fdinfo entry.
+fn file_mount_id(file: &std::fs::File) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:")?.trim().parse().ok())
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "fdinfo has no mnt_id line")
+        })
+}
+
+/// Fail if two records reached one mount when they were recorded, or a recorded path no
+/// longer reaches the mount it reached then, or can no longer be read. `mount_of` reads
+/// the ID of the mount a path reaches, and `mountinfo` reads /proc/self/mountinfo, which
+/// names a mount by its ID.
+fn mounts_visible(
+    mounts: &[RecordedMount],
+    mount_of: impl Fn(&str) -> std::io::Result<u64>,
+    mountinfo: impl Fn() -> std::io::Result<String>,
+) -> Result<()> {
+    // Mount `id` as an error names it.
+    let describe = |id: u64| match mountinfo() {
+        Ok(listing) => mountinfo_entry(&listing, id)
+            .unwrap_or_else(|| format!("mount {id}, which /proc/self/mountinfo does not list")),
+        Err(error) => format!("mount {id} (/proc/self/mountinfo cannot be read: {error})"),
+    };
+    // Each mount fc-agent makes is a new mount, so two records on one mount mean that one
+    // of them is covered or was never mounted.
+    for (at, first) in mounts.iter().enumerate() {
+        if let Some(second) = mounts[at + 1..]
+            .iter()
+            .find(|later| later.mount_id == first.mount_id)
+        {
+            anyhow::bail!(
+                "{} at {} and {} at {} both reached {} when fc-agent recorded them, so one \
+                 of them is covered or was never mounted. Two mounts at one guest path, or \
+                 at two paths a symlink in the guest joins, cannot both be reached. Mount \
+                 one of them somewhere else.",
+                first.what,
+                first.path,
+                second.what,
+                second.path,
+                describe(first.mount_id)
+            );
+        }
+    }
+    for mount in mounts {
+        let now = match mount_of(&mount.path) {
+            Ok(id) if id == mount.mount_id => continue,
+            Ok(id) => id,
+            Err(error) => anyhow::bail!(
+                "{} at {} cannot be read after fc-agent's last mount: {error}. A mount made \
+                 after it may cover a directory on the way to it, possibly through a symlink \
+                 in the guest such as Ubuntu's /var/run -> /run.",
+                mount.what,
+                mount.path
+            ),
+        };
+        let reached = describe(now);
+        let gone =
+            mountinfo().is_ok_and(|listing| mountinfo_entry(&listing, mount.mount_id).is_none());
+        if gone {
+            anyhow::bail!(
+                "{} at {} is no longer mounted: /proc/self/mountinfo no longer lists mount \
+                 {}, and the path now reaches {reached}.",
+                mount.what,
+                mount.path,
+                mount.mount_id
+            );
+        }
+        anyhow::bail!(
+            "{} at {}: a later mount now covers it: the path reaches {reached}. A mount \
+             made after this one is at or above this path, possibly through a symlink in \
+             the guest such as Ubuntu's /var/run -> /run. Mount one of them somewhere else.",
+            mount.what,
+            mount.path
+        );
+    }
+    Ok(())
+}
+
+/// The filesystem type, source and mount point of mount `id` in a /proc/self/mountinfo
+/// listing, as "ext4 /dev/pmem1 at /run/cache".
+fn mountinfo_entry(mountinfo: &str, id: u64) -> Option<String> {
+    mountinfo.lines().find_map(|line| {
+        // The mount ID, parent ID, major:minor, root, mount point, options and optional
+        // fields, then "-", the filesystem type, the source and the superblock options.
+        let (mount, filesystem) = line.split_once(" - ")?;
+        let mut fields = mount.split_whitespace();
+        if fields.next()?.parse::<u64>().ok()? != id {
+            return None;
+        }
+        let mount_point = unescape_mount_field(fields.nth(3)?);
+        let mut filesystem = filesystem.split_whitespace();
+        let fstype = filesystem.next()?;
+        let source = unescape_mount_field(filesystem.next()?);
+        Some(format!("{fstype} {source} at {mount_point}"))
+    })
+}
+
+/// Mount read-only pmem devices with DAX and check /proc/mounts shows it. Returns
+/// the mounted paths. Each device goes into `record` once it is mounted.
+pub fn mount_pmem_devices(devices: &[PmemMount], record: &mut MountRecord) -> Result<Vec<String>> {
+    let mut mounted_paths = Vec::new();
+    for pmem in devices {
+        if let Err(error) = mount_pmem_device(pmem, &mut mounted_paths, record) {
+            // The boot fails; leave none of the devices mounted so far behind.
+            unmount_paths(&mounted_paths, "pmem device");
+            return Err(error);
+        }
+    }
+    Ok(mounted_paths)
+}
+
+/// Mount one pmem device with DAX and check /proc/mounts shows it. The path is
+/// recorded as soon as the device is mounted, so a failed check unmounts it too.
+fn mount_pmem_device(
+    pmem: &PmemMount,
+    mounted_paths: &mut Vec<String>,
+    record: &mut MountRecord,
+) -> Result<()> {
+    eprintln!(
+        "[fc-agent] mounting pmem {} at {} ({PMEM_MOUNT_OPTIONS})",
+        pmem.device, pmem.mount_path
+    );
+    std::fs::create_dir_all(&pmem.mount_path)
+        .with_context(|| format!("creating mount point: {}", pmem.mount_path))?;
+    wait_for_device(&pmem.device)?;
+    let output = std::process::Command::new("mount")
+        .args(pmem_mount_args(pmem))
+        .output()
+        .with_context(|| format!("mounting {} at {}", pmem.device, pmem.mount_path))?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "Failed to mount {} at {}: {}",
+            pmem.device,
+            pmem.mount_path,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    mounted_paths.push(pmem.mount_path.clone());
+    let proc_mounts = std::fs::read_to_string("/proc/mounts").context("reading /proc/mounts")?;
+    check_dax_mount(&proc_mounts, &pmem.mount_path)?;
+    record.record(format!("pmem {}", pmem.device), &pmem.mount_path)?;
+    eprintln!(
+        "[fc-agent] pmem {} mounted at {} with DAX",
+        pmem.device, pmem.mount_path
+    );
+    Ok(())
+}
+
+/// Mount extra block devices. Returns list of mounted paths. Each disk goes into
+/// `record` once it is mounted.
+pub fn mount_extra_disks(
+    disks: &[ExtraDiskMount],
+    record: &mut MountRecord,
+) -> Result<Vec<String>> {
     let mut mounted_paths = Vec::new();
 
     for disk in disks {
@@ -158,20 +491,7 @@ pub fn mount_extra_disks(disks: &[ExtraDiskMount]) -> Result<Vec<String>> {
             }
         }
 
-        let device_path = std::path::Path::new(&disk.device);
-        for attempt in 1..=10 {
-            if device_path.exists() {
-                break;
-            }
-            if attempt == 10 {
-                anyhow::bail!("Device {} not found after 10 attempts", disk.device);
-            }
-            eprintln!(
-                "[fc-agent] waiting for device {} (attempt {}/10)",
-                disk.device, attempt
-            );
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
+        wait_for_device(&disk.device)?;
 
         let mut mount_cmd = std::process::Command::new("mount");
         if disk.read_only {
@@ -198,13 +518,19 @@ pub fn mount_extra_disks(disks: &[ExtraDiskMount]) -> Result<Vec<String>> {
             disk.device, disk.mount_path
         );
         mounted_paths.push(disk.mount_path.clone());
+        record.record(format!("extra disk {}", disk.device), &disk.mount_path)?;
     }
 
     Ok(mounted_paths)
 }
 
-/// Mount NFS shares from host. Returns list of mounted paths.
-pub fn mount_nfs_shares(shares: &[NfsMount]) -> Result<Vec<String>> {
+/// Mount NFS shares from host. Returns list of mounted paths. On a boot each share goes
+/// into `record` once it is mounted. A restore remounts the shares with no record: it
+/// reproduces the mounts the boot's check passed.
+pub fn mount_nfs_shares(
+    shares: &[NfsMount],
+    mut record: Option<&mut MountRecord>,
+) -> Result<Vec<String>> {
     let mut mounted_paths = Vec::new();
 
     for share in shares {
@@ -253,6 +579,9 @@ pub fn mount_nfs_shares(shares: &[NfsMount]) -> Result<Vec<String>> {
             nfs_source, share.mount_path
         );
         mounted_paths.push(share.mount_path.clone());
+        if let Some(record) = record.as_deref_mut() {
+            record.record(format!("NFS share {nfs_source}"), &share.mount_path)?;
+        }
     }
 
     Ok(mounted_paths)
@@ -326,6 +655,272 @@ pub fn unmount_disks(paths: &[String]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pmem_mount_args_are_read_only_ext4_with_dax() {
+        let args = pmem_mount_args(&PmemMount {
+            device: "/dev/pmem1".to_string(),
+            mount_path: "/mnt/cache".to_string(),
+        });
+        assert_eq!(
+            args,
+            [
+                "-t",
+                "ext4",
+                "-o",
+                "ro,noload,dax=always",
+                "/dev/pmem1",
+                "/mnt/cache"
+            ]
+        );
+    }
+
+    /// /proc/mounts records a mount target with symlinks resolved, so a mount path through
+    /// a symlinked directory (Ubuntu's /var/run is /run) has to match its resolved form.
+    #[test]
+    fn pmem_dax_check_follows_a_symlinked_mount_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mounts = format!(
+            "/dev/pmem0 {} ext4 ro,relatime,dax=always 0 0\n",
+            real.canonicalize().unwrap().display()
+        );
+        check_dax_mount(&mounts, link.to_str().unwrap()).unwrap();
+    }
+
+    /// Lines from a guest's /proc/mounts: the DAX pmem mount, the same image
+    /// mounted without DAX, and a mount point with a space in it.
+    #[test]
+    fn pmem_dax_check_reads_the_mount_options() {
+        let mounts = "\
+/dev/vda / ext4 rw,relatime 0 0
+/dev/pmem0 /mnt/cache ext4 ro,relatime,norecovery,dax=always 0 0
+/dev/pmem1 /mnt/plain ext4 ro,relatime,norecovery 0 0
+/dev/pmem2 /mnt/never ext4 ro,relatime,dax=never 0 0
+/dev/pmem3 /mnt/with\\040space ext4 ro,relatime,dax=always 0 0
+";
+        check_dax_mount(mounts, "/mnt/cache").unwrap();
+        check_dax_mount(mounts, "/mnt/cache/").unwrap();
+        check_dax_mount(mounts, "/mnt/with space").unwrap();
+        for path in ["/mnt/plain", "/mnt/never"] {
+            let error = format!("{:#}", check_dax_mount(mounts, path).unwrap_err());
+            assert!(error.contains("does not have DAX on"), "{path}: {error}");
+        }
+        let error = format!("{:#}", check_dax_mount(mounts, "/mnt/absent").unwrap_err());
+        assert!(error.contains("not in /proc/mounts"), "{error}");
+
+        // A later mount over the same path is the one in effect.
+        let covered = format!("{mounts}tmpfs /mnt/cache tmpfs rw 0 0\n");
+        assert!(check_dax_mount(&covered, "/mnt/cache").is_err());
+    }
+
+    fn recorded(what: &str, path: &str, mount_id: u64) -> RecordedMount {
+        RecordedMount {
+            what: what.to_string(),
+            path: path.to_string(),
+            mount_id,
+            // Any descriptor: these records are checked against made-up mount IDs.
+            _pin: std::fs::File::open("/").unwrap(),
+        }
+    }
+
+    /// The mounts the tests below name, as /proc/self/mountinfo lists them.
+    const MOUNTINFO: &str = "\
+1 0 254:0 / / rw,relatime shared:1 - ext4 /dev/vda rw
+30 1 254:16 / /run/data ro,relatime shared:5 - ext4 /dev/vdb ro
+31 30 259:0 / /run/data ro,relatime shared:6 - ext4 /dev/pmem0 ro,dax=always
+32 1 259:1 / /mnt/tools ro,relatime shared:7 - ext4 /dev/pmem1 ro,dax=always
+40 1 0:45 / /run/cache rw,relatime - nfs4 10.0.2.2:/srv/my\\040share rw
+50 1 0:52 / /data rw,nosuid,nodev,relatime - fuse fuse-pipe rw,user_id=0,group_id=0
+";
+
+    /// Run the check with each recorded path reaching the mount `now` gives it, or its
+    /// recorded mount when `now` does not name the path: `Some(id)` reaches mount `id`,
+    /// `None` cannot be read.
+    fn check_with(mounts: &[RecordedMount], now: &[(&str, Option<u64>)]) -> Result<()> {
+        mounts_visible(
+            mounts,
+            |path| match now.iter().find(|(changed, _)| *changed == path) {
+                Some((_, Some(id))) => Ok(*id),
+                Some((_, None)) => Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+                None => Ok(mounts
+                    .iter()
+                    .find(|mount| mount.path == path)
+                    .expect("the check reads only recorded paths")
+                    .mount_id),
+            },
+            || Ok(MOUNTINFO.to_string()),
+        )
+    }
+
+    fn assert_names(error: &str, wanted: &[&str]) {
+        for wanted in wanted {
+            assert!(
+                error.contains(wanted),
+                "{wanted:?} is missing from: {error}"
+            );
+        }
+    }
+
+    /// A recorded path that reaches another mount after fc-agent's last mount is covered
+    /// by a later one. The error names what was covered, its path, and the filesystem
+    /// type, source and mount point that cover it. A path that cannot be read is reported
+    /// as that, and a recorded mount that /proc/self/mountinfo no longer lists as gone,
+    /// not as covered.
+    #[test]
+    fn a_mount_covered_by_a_later_mount_fails_the_boot() {
+        let mounted = [
+            recorded("pmem /dev/pmem0", "/var/run/cache", 31),
+            recorded("pmem /dev/pmem1", "/mnt/tools", 32),
+        ];
+        check_with(&mounted, &[]).expect("no later mount covers either device");
+
+        // An NFS share mounted at /run/cache reaches /var/run/cache through Ubuntu's
+        // /var/run -> /run symlink and covers the pmem device there.
+        let error = format!(
+            "{:#}",
+            check_with(&mounted, &[("/var/run/cache", Some(40))]).unwrap_err()
+        );
+        assert_names(
+            &error,
+            &[
+                "pmem /dev/pmem0 at /var/run/cache: a later mount now covers it",
+                "nfs4 10.0.2.2:/srv/my share at /run/cache",
+            ],
+        );
+
+        let error = format!(
+            "{:#}",
+            check_with(&mounted, &[("/mnt/tools", Some(99))]).unwrap_err()
+        );
+        assert_names(
+            &error,
+            &[
+                "pmem /dev/pmem1 at /mnt/tools: a later mount now covers it",
+                "mount 99, which /proc/self/mountinfo does not list",
+            ],
+        );
+
+        let error = format!(
+            "{:#}",
+            check_with(&mounted, &[("/mnt/tools", None)]).unwrap_err()
+        );
+        assert_names(&error, &["pmem /dev/pmem1 at /mnt/tools cannot be read"]);
+        assert!(!error.contains("now covers it"), "{error}");
+
+        // Mount 35 is unmounted and the path falls through to the root filesystem.
+        let gone = [recorded("extra disk /dev/vdc", "/srv/scratch", 35)];
+        let error = format!(
+            "{:#}",
+            check_with(&gone, &[("/srv/scratch", Some(1))]).unwrap_err()
+        );
+        assert_names(
+            &error,
+            &[
+                "extra disk /dev/vdc at /srv/scratch is no longer mounted",
+                "no longer lists mount 35",
+                "the path now reaches ext4 /dev/vda at /",
+            ],
+        );
+        assert!(!error.contains("covers it"), "{error}");
+
+        mounts_visible(
+            &[],
+            |path| panic!("read {path} with nothing mounted"),
+            || panic!("read /proc/self/mountinfo with nothing mounted"),
+        )
+        .expect("with nothing mounted there is nothing to check");
+    }
+
+    /// fc-agent mounts extra disks before pmem devices, so a pmem device at /var/run/data
+    /// covers a disk at /run/data through the symlink, while /var/run/data itself still
+    /// reaches the pmem device. Only the disk's own path shows it.
+    #[test]
+    fn an_earlier_disk_covered_by_a_later_pmem_device_fails_the_boot() {
+        let mounted = [
+            recorded("extra disk /dev/vdb", "/run/data", 30),
+            recorded("pmem /dev/pmem0", "/var/run/data", 31),
+        ];
+        let error = format!(
+            "{:#}",
+            check_with(&mounted, &[("/run/data", Some(31))]).unwrap_err()
+        );
+        assert_names(
+            &error,
+            &[
+                "extra disk /dev/vdb at /run/data: a later mount now covers it",
+                "ext4 /dev/pmem0 at /run/data",
+            ],
+        );
+    }
+
+    /// A mount inside an earlier one covers nothing: with a disk at /data and a pmem
+    /// device at /data/cache, /data still reaches the disk, and the boot goes on.
+    #[test]
+    fn a_mount_inside_an_earlier_one_still_boots() {
+        let mounted = [
+            recorded("extra disk /dev/vdb", "/data", 30),
+            recorded("pmem /dev/pmem0", "/data/cache", 31),
+        ];
+        check_with(&mounted, &[]).expect("a pmem device inside a disk covers nothing");
+    }
+
+    /// Two mounts fc-agent made never reach one mount. Two FUSE volumes at /data start in
+    /// one level and are recorded once both have started, so both can record the second
+    /// one's mount while the first is covered or detached, and every path still reaches
+    /// what it recorded.
+    #[test]
+    fn two_records_on_one_mount_fail_the_boot() {
+        let mounted = [
+            recorded("FUSE volume", "/data", 50),
+            recorded("FUSE volume", "/data", 50),
+        ];
+        let error = format!("{:#}", check_with(&mounted, &[]).unwrap_err());
+        assert_names(
+            &error,
+            &["FUSE volume at /data and FUSE volume at /data both reached fuse fuse-pipe at /data"],
+        );
+    }
+
+    /// The check reads a recorded path through its symlinks, as the container's bind
+    /// mount does, so a path whose symlink now leads to another mount is covered, and
+    /// the error names that mount from the real /proc/self/mountinfo.
+    #[test]
+    fn the_check_reads_a_recorded_path_through_its_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link = link.to_str().unwrap();
+        assert_ne!(
+            path_mount_id("/proc").unwrap(),
+            path_mount_id(real.to_str().unwrap()).unwrap(),
+            "the test needs /proc on another mount than the temporary directory"
+        );
+
+        let mut record = MountRecord::default();
+        record.record("pmem /dev/pmem0", link).unwrap();
+        record
+            .check_none_covered()
+            .expect("the path still reaches the same mount");
+
+        let mut record = MountRecord::default();
+        record.record("pmem /dev/pmem0", link).unwrap();
+        std::fs::remove_file(link).unwrap();
+        std::os::unix::fs::symlink("/proc", link).unwrap();
+        let error = format!("{:#}", record.check_none_covered().unwrap_err());
+        assert_names(
+            &error,
+            &[
+                "a later mount now covers it",
+                "the path reaches proc proc at /proc",
+            ],
+        );
+    }
 
     fn volumes(guest_paths: &[&str]) -> Vec<VolumeMount> {
         guest_paths

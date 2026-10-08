@@ -25,6 +25,7 @@ fn test_run_args(name: &str) -> RunArgs {
         map: vec![],
         disk: vec![],
         disk_dir: vec![],
+        pmem: vec![],
         nfs: vec![],
         env: vec![],
         cmd: None,

@@ -327,6 +327,32 @@ pub(crate) fn build_runtime_boot_args(
     boot_args
 }
 
+/// Attach the read-only virtio-pmem images (--pmem) in order, so device N is
+/// /dev/pmemN in the guest. Each spec is validated again here: the image is opened
+/// by the VMM now, not when the run started.
+pub(super) async fn attach_pmem_devices(
+    args: &RunArgs,
+    hv: &mut dyn crate::hypervisor::Hypervisor,
+) -> Result<Vec<crate::state::types::PmemDevice>> {
+    let mut devices = Vec::with_capacity(args.pmem.len());
+    for (i, spec) in args.pmem.iter().enumerate() {
+        let device = crate::storage::pmem::parse_pmem_spec(spec)?;
+        info!(
+            "Adding pmem device: {} -> /dev/pmem{} -> {} (ro, dax)",
+            device.path, i, device.mount_path
+        );
+        hv.add_pmem(&crate::hypervisor::PmemSpec {
+            id: format!("pmem{i}"),
+            path_on_host: std::path::PathBuf::from(&device.path),
+            is_read_only: true,
+        })
+        .await
+        .with_context(|| format!("attaching pmem device {}", device.path))?;
+        devices.push(device);
+    }
+    Ok(devices)
+}
+
 /// Attach extra disks (--disk, --disk-dir, image archive) to the VM.
 ///
 /// Returns the list of extra disks and optionally the image archive device path.
@@ -668,6 +694,21 @@ pub(super) fn build_boot_plan_json(
         })
         .collect();
 
+    // virtio-pmem mounts, always read-only with DAX. Devices are added in this
+    // order, so device N is /dev/pmemN.
+    let pmem_mounts: Vec<serde_json::Value> = vm_state
+        .config
+        .pmem_devices
+        .iter()
+        .enumerate()
+        .map(|(idx, device)| {
+            serde_json::json!({
+                "device": format!("/dev/pmem{idx}"),
+                "mount_path": &device.mount_path,
+            })
+        })
+        .collect();
+
     // NFS mounts for guest
     // Format: { host_ip, host_path, mount_path, read_only }
     let nfs_mounts: Vec<serde_json::Value> = vm_state
@@ -715,6 +756,7 @@ pub(super) fn build_boot_plan_json(
         volumes,
         extra_disks,
         nfs_mounts,
+        pmem_mounts,
         image_device,
         http_proxy,
         https_proxy,
@@ -1225,6 +1267,7 @@ pub(crate) fn build_launch_config(
         network_mode,
         data_dir: crate::paths::data_dir(),
         extra_disks,
+        pmem: crate::storage::pmem::pmem_key_specs(&args.pmem),
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
@@ -1318,6 +1361,7 @@ pub(crate) async fn configure_and_boot_vm(
     )
     .await?;
     vm_state.config.extra_disks = extra_disks;
+    vm_state.config.pmem_devices = attach_pmem_devices(args, hv).await?;
 
     // Host-once-only steps — skipped on an in-place reboot relaunch (network=None).
     if let Some(network) = network {
@@ -1460,6 +1504,9 @@ pub(crate) async fn configure_and_boot_vm(
 
     // Start VM.
     hv.boot().await?;
+    // Firecracker maps each pmem image when the instance starts, not when it is attached,
+    // so check now that the file it holds is the one whose identity was recorded.
+    crate::storage::pmem::check_attached_pmem_images(&vm_state.config.pmem_devices)?;
 
     Ok(bootplan_guard.disarm())
 }

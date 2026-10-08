@@ -132,6 +132,15 @@ pub struct DriveSpec {
     pub is_read_only: bool,
 }
 
+/// A virtio-pmem device backed by a host file, VMM-neutral. Devices appear in the
+/// guest as /dev/pmem0, /dev/pmem1, ... in the order they are added.
+#[derive(Debug, Clone)]
+pub struct PmemSpec {
+    pub id: String,
+    pub path_on_host: PathBuf,
+    pub is_read_only: bool,
+}
+
 /// A network interface to attach, VMM-neutral.
 #[derive(Debug, Clone)]
 pub struct NetIfaceSpec {
@@ -147,7 +156,7 @@ pub struct NetIfaceSpec {
 /// guest. [`Self::pid`]/[`Self::wait`]/[`Self::kill`] manage the process.
 ///
 /// Method ordering for cold boot mirrors the Firecracker API sequence exactly:
-/// `apply_launch_config` → `add_drive`* → `add_network_interface` →
+/// `apply_launch_config` → `add_drive`* → `add_pmem`* → `add_network_interface` →
 /// `configure_metadata_service` → `set_vsock` → `publish_boot_plan` →
 /// `add_entropy_device` → (`add_balloon`) → `boot`.
 #[async_trait::async_trait]
@@ -224,6 +233,9 @@ pub trait Hypervisor: Send {
 
     /// Attach one extra block device.
     async fn add_drive(&mut self, drive: &DriveSpec) -> Result<()>;
+
+    /// Attach one virtio-pmem device. A backend without pmem support refuses.
+    async fn add_pmem(&mut self, pmem: &PmemSpec) -> Result<()>;
 
     /// Attach the guest network interface (eth0).
     async fn add_network_interface(&mut self, iface: &NetIfaceSpec) -> Result<()>;

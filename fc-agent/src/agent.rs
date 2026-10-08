@@ -186,9 +186,16 @@ pub async fn run() -> Result<()> {
     // start with a plain empty directory bind-mounted where the volume should be,
     // write into the ephemeral rootfs, and the VM would still report healthy.
     // Propagating the error makes main() report container exit 1 and shut down.
+    //
+    // Every mount fc-agent makes before the container starts goes into this record: a
+    // FUSE volume once its mount is ready, after every volume of its level has started,
+    // and every other mount right after it is made. The record is checked after the
+    // last one.
+    let mut mount_record = mounts::MountRecord::default();
     let mounted_fuse_paths = if !plan.volumes.is_empty() {
         eprintln!("[fc-agent] mounting {} FUSE volume(s)", plan.volumes.len());
-        let paths = mounts::mount_fuse_volumes(&plan.volumes).context("mounting FUSE volumes")?;
+        let paths = mounts::mount_fuse_volumes(&plan.volumes, &mut mount_record)
+            .context("mounting FUSE volumes")?;
         eprintln!("[fc-agent] FUSE volumes mounted successfully");
         paths
     } else {
@@ -215,8 +222,24 @@ pub async fn run() -> Result<()> {
             "[fc-agent] mounting {} extra disk(s)",
             plan.extra_disks.len()
         );
-        let paths = mounts::mount_extra_disks(&plan.extra_disks).context("mounting extra disks")?;
+        let paths = mounts::mount_extra_disks(&plan.extra_disks, &mut mount_record)
+            .context("mounting extra disks")?;
         eprintln!("[fc-agent] extra disks mounted successfully");
+        paths
+    } else {
+        Vec::new()
+    };
+
+    // pmem mounts are guest kernel state carried in the snapshot, as extra disks
+    // are, so a restore does not mount them again.
+    let mounted_pmem_paths = if !plan.pmem_mounts.is_empty() {
+        eprintln!(
+            "[fc-agent] mounting {} pmem device(s)",
+            plan.pmem_mounts.len()
+        );
+        let paths = mounts::mount_pmem_devices(&plan.pmem_mounts, &mut mount_record)
+            .context("mounting pmem devices")?;
+        eprintln!("[fc-agent] pmem devices mounted with DAX");
         paths
     } else {
         Vec::new()
@@ -224,7 +247,8 @@ pub async fn run() -> Result<()> {
 
     if !plan.nfs_mounts.is_empty() {
         eprintln!("[fc-agent] mounting {} NFS share(s)", plan.nfs_mounts.len());
-        mounts::mount_nfs_shares(&plan.nfs_mounts).context("mounting NFS shares")?;
+        mounts::mount_nfs_shares(&plan.nfs_mounts, Some(&mut mount_record))
+            .context("mounting NFS shares")?;
         eprintln!("[fc-agent] NFS shares mounted successfully");
     }
 
@@ -261,7 +285,7 @@ pub async fn run() -> Result<()> {
         _ => {
             // Btrfs, archive, and pull modes all use btrfs loopback on rootfs.
             // The btrfs kernel module must be available (CONFIG_BTRFS_FS=y in btrfs profile).
-            container::setup_btrfs_storage_if_available()
+            container::setup_btrfs_storage_if_available(&mut mount_record)
                 .context("setting up container storage")?;
         }
     }
@@ -345,7 +369,7 @@ pub async fn run() -> Result<()> {
         if let (Some("overlay"), Some(device)) = (plan.image_mode.as_deref(), &plan.image_device) {
             eprintln!("[fc-agent] re-mounting overlay image store (provisioned re-boot)");
             let username = user_info.as_ref().map(|(name, _)| name.as_str());
-            container::mount_overlay_image(device, &plan.image, username)?
+            container::mount_overlay_image(device, &plan.image, username, &mut mount_record)?
         } else {
             eprintln!("[fc-agent] skipping image import (clone — image already in storage)");
             plan.image.clone()
@@ -354,7 +378,7 @@ pub async fn run() -> Result<()> {
         let image_ref = match (plan.image_mode.as_deref(), &plan.image_device) {
             (Some("overlay"), Some(device)) => {
                 let username = user_info.as_ref().map(|(name, _)| name.as_str());
-                container::mount_overlay_image(device, &plan.image, username)?
+                container::mount_overlay_image(device, &plan.image, username, &mut mount_record)?
             }
             (Some("btrfs"), Some(device)) => {
                 // Btrfs loopback was created in Phase 1 (setup_btrfs_storage_if_available).
@@ -384,6 +408,18 @@ pub async fn run() -> Result<()> {
         container::write_provisioned_marker();
         image_ref
     };
+
+    // fc-agent mounts nothing more before the container starts. A mount can cover one
+    // made before it through a symlink in the guest, such as Ubuntu's /var/run -> /run,
+    // which the host's check of the guest paths compares as text and cannot see: a pmem
+    // device over an extra disk, or an NFS share over a pmem device. Checked before the
+    // cache-ready handshake so no snapshot captures a covered mount. A restored clone
+    // remounts its NFS shares after this check by design: the restore reproduces the
+    // mounts this check passed. The check consumes the record, closing the descriptors
+    // that hold its mounts, so the plain umount of the extra disks at shutdown works.
+    mount_record
+        .check_none_covered()
+        .context("checking that no mount fc-agent made covers an earlier one")?;
 
     // Notify host for cache snapshot. notify_cache_ready_and_wait logs the
     // digest itself, then quiesces the console BEFORE the notification so the
@@ -564,6 +600,8 @@ pub async fn run() -> Result<()> {
     if !mounted_fuse_paths.is_empty() {
         sleep(Duration::from_millis(100)).await;
     }
+    // The pmem devices mounted after the extra disks, so they unmount before them.
+    mounts::unmount_paths(&mounted_pmem_paths, "pmem device");
     mounts::unmount_disks(&mounted_disk_paths);
     if let Some("overlay") = plan.image_mode.as_deref() {
         mounts::unmount_paths(&["/mnt/image-store".to_string()], "image store");
@@ -930,7 +968,7 @@ mod tests {
             .expect("fc-agent no longer starts the exec server");
         for step in [
             "container::write_early_storage_conf()",
-            "container::setup_btrfs_storage_if_available()",
+            "container::setup_btrfs_storage_if_available(",
             "container::create_vm_user(",
             "container::set_podman_cmd_prefix(",
         ] {
@@ -944,5 +982,235 @@ mod tests {
                  finished."
             );
         }
+    }
+
+    /// Shutdown unmounts in reverse mount order. pmem devices mount after the extra
+    /// disks, so a pmem mount point inside a disk has to go first, or the disk's
+    /// unmount fails busy and a read-write disk can be left dirty.
+    #[test]
+    fn pmem_devices_unmount_before_the_extra_disks() {
+        let source = include_str!("agent.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("agent.rs has no test module")];
+        let pmem = body
+            .find("mounts::unmount_paths(&mounted_pmem_paths")
+            .expect("fc-agent no longer unmounts pmem devices");
+        let disks = body
+            .find("mounts::unmount_disks(&mounted_disk_paths)")
+            .expect("fc-agent no longer unmounts extra disks");
+        assert!(
+            pmem < disks,
+            "fc-agent unmounts the extra disks before the pmem devices mounted after them"
+        );
+    }
+
+    /// Every mount fc-agent makes before the container starts goes into the boot's mount
+    /// record, and the record is checked after the last one and before the cache-ready
+    /// handshake, so a pre-start snapshot never captures a covered mount.
+    ///
+    /// The test reads every file under fc-agent/src for code that mounts: running
+    /// mount(8), a mount.<type> helper or fusermount, a mount system call through libc or
+    /// nix, or a FUSE mount through a fuse_pipe:: or fuser:: path. Each function that does
+    /// is listed below with the call in agent.rs that reaches it, so a new one fails this
+    /// test until it is listed. Every listed call in agent.rs must pass the mount record
+    /// and come before the check. Calls from other files are not checked: restore.rs
+    /// remounts a restored clone's NFS shares after the check by design, because the
+    /// restore reproduces the mounts the check passed.
+    ///
+    /// Each line that mounts must be followed by a .record( call in its function before
+    /// the next line that mounts, where a function ends at the next fn line of its file.
+    /// The FUSE mount in mount_vsock_reconnectable blocks for as long as the volume is
+    /// mounted, so mount_fuse_volumes must record the volume after waiting for it
+    /// instead. The scan cannot see a mount through an aliased import, a program name
+    /// held in a constant (Command::new(CONST)), or a shell that runs mount (sh -c), and
+    /// it cannot tell whether a record call is on the path a successful mount takes.
+    #[test]
+    fn mounts_are_checked_after_the_last_mount() {
+        fn without_tests(source: &str) -> &str {
+            &source[..source
+                .find("\n#[cfg(test)]\nmod tests {")
+                .unwrap_or(source.len())]
+        }
+        /// The name of the function a source line declares.
+        fn function_name(line: &str) -> Option<&str> {
+            let mut rest = line.trim_start();
+            loop {
+                let before = rest;
+                for prefix in [
+                    "pub(crate) ",
+                    "pub(super) ",
+                    "pub ",
+                    "async ",
+                    "unsafe ",
+                    "const ",
+                ] {
+                    rest = rest.strip_prefix(prefix).unwrap_or(rest);
+                }
+                if rest == before {
+                    break;
+                }
+            }
+            rest.strip_prefix("fn ")?.split(['(', '<']).next()
+        }
+        /// Whether a source line mounts something.
+        fn mounts_something(line: &str) -> bool {
+            let program = line
+                .split("Command::new(\"")
+                .nth(1)
+                .and_then(|rest| rest.split('"').next())
+                .map(|program| program.rsplit('/').next().unwrap_or(program));
+            program.is_some_and(|program| {
+                program == "mount"
+                    || program.starts_with("mount.")
+                    || program.starts_with("fusermount")
+            }) || [
+                "libc::mount(",
+                "libc::fsmount(",
+                "libc::move_mount(",
+                "SYS_mount",
+                "SYS_fsmount",
+                "SYS_move_mount",
+                "nix::mount",
+                "fuse_pipe::mount",
+                "fuser::mount",
+                "fuser::spawn_mount",
+            ]
+            .iter()
+            .any(|call| line.contains(call))
+        }
+        /// The arguments of a call, from the text after its opening parenthesis.
+        fn arguments(after_paren: &str) -> &str {
+            let mut depth = 1;
+            for (at, c) in after_paren.char_indices() {
+                match c {
+                    '(' => depth += 1,
+                    ')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return &after_paren[..at];
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            after_paren
+        }
+
+        let mut mounting = Vec::new();
+        // Each line that mounts with no record call after it in its function before the
+        // next line that mounts, as "function at file:line".
+        let mut unrecorded = Vec::new();
+        let mut pending = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src")];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|ext| ext != "rs") {
+                    continue;
+                }
+                let source = std::fs::read_to_string(&path).unwrap();
+                let mut function = None;
+                // The last line that mounts in this function with no record call after it.
+                let mut awaiting = None;
+                for (index, line) in without_tests(&source).lines().enumerate() {
+                    if let Some(name) = function_name(line) {
+                        unrecorded.extend(awaiting.take());
+                        function = Some(name.to_string());
+                    }
+                    if line.trim_start().starts_with("//") {
+                        continue;
+                    }
+                    if mounts_something(line) {
+                        let name = function.clone().unwrap_or_else(|| {
+                            panic!("a mount outside any function in {}", path.display())
+                        });
+                        unrecorded.extend(awaiting.take());
+                        // This FUSE mount blocks on the thread start_fuse_mount starts for
+                        // as long as the volume is mounted, so mount_fuse_volumes records
+                        // the volume once it is ready (checked below).
+                        if name != "mount_vsock_reconnectable" {
+                            awaiting = Some(format!("{name} at {}:{}", path.display(), index + 1));
+                        }
+                        mounting.push(name);
+                    } else if line.contains(".record(") {
+                        awaiting = None;
+                    }
+                }
+                unrecorded.extend(awaiting);
+            }
+        }
+        assert!(
+            unrecorded.is_empty(),
+            "no .record( call follows these mounts in their function before the next mount, \
+             so the check after the last mount cannot see them: {unrecorded:?}"
+        );
+        let fuse = include_str!("mounts.rs");
+        let fuse = &fuse[fuse
+            .find("pub fn mount_fuse_volumes(")
+            .expect("mounts.rs no longer has mount_fuse_volumes")..];
+        let fuse = &fuse[..fuse.find("\n}\n").expect("mount_fuse_volumes has no end")];
+        let ready = fuse
+            .find("wait_for_fuse_mount(")
+            .expect("mount_fuse_volumes no longer waits for each volume's mount");
+        assert!(
+            fuse[ready..].contains(".record("),
+            "mount_fuse_volumes does not record a FUSE volume once its mount is ready"
+        );
+        mounting.sort();
+        mounting.dedup();
+
+        // Each function that mounts, and the call in agent.rs that reaches it.
+        let reached_by = [
+            ("mount_extra_disks", "mounts::mount_extra_disks("),
+            ("mount_nfs_shares", "mounts::mount_nfs_shares("),
+            ("mount_overlay_image", "container::mount_overlay_image("),
+            // mount_pmem_device runs inside mount_pmem_devices.
+            ("mount_pmem_device", "mounts::mount_pmem_devices("),
+            // In fuse/mod.rs, run on the thread start_fuse_mount starts for each volume.
+            ("mount_vsock_reconnectable", "mounts::mount_fuse_volumes("),
+            (
+                "setup_btrfs_storage_if_available",
+                "container::setup_btrfs_storage_if_available(",
+            ),
+        ];
+        assert_eq!(
+            mounting,
+            reached_by.map(|(function, _)| function),
+            "the functions that mount changed: list each with the agent.rs call that reaches it"
+        );
+
+        let body = without_tests(include_str!("agent.rs"));
+        let check = body
+            .find(".check_none_covered()")
+            .expect("fc-agent no longer checks that no mount covers an earlier one");
+        for (_, call) in reached_by {
+            let calls: Vec<usize> = body.match_indices(call).map(|(at, _)| at).collect();
+            assert!(!calls.is_empty(), "agent.rs does not call {call}");
+            for at in calls {
+                assert!(
+                    arguments(&body[at + call.len()..]).contains("&mut mount_record"),
+                    "agent.rs calls {call} without the mount record, so the check after the \
+                     last mount cannot see what it mounts"
+                );
+                assert!(
+                    at < check,
+                    "agent.rs calls {call} after it checks that no mount covers an earlier \
+                     one, so that mount can cover one unseen"
+                );
+            }
+        }
+
+        let handshake = body
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("fc-agent no longer sends the cache-ready handshake");
+        assert!(
+            check < handshake,
+            "fc-agent checks the mounts after the cache-ready handshake, so the pre-start \
+             snapshot can capture a covered mount"
+        );
     }
 }

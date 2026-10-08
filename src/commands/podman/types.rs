@@ -318,6 +318,15 @@ impl VolumeMapping {
     }
 }
 
+/// The guest path of a `--pmem` spec. Its image path can hold ':' and its mount path
+/// cannot, so the split is at the last one (`storage::pmem::parse_pmem_spec`).
+fn pmem_guest_path(spec: &str) -> Option<&str> {
+    spec.strip_suffix(":ro")
+        .unwrap_or(spec)
+        .rsplit_once(':')
+        .map(|(_, guest)| guest)
+}
+
 /// The guest path of a `HOST:GUEST[:ro]` disk or NFS spec, when it has one.
 fn guest_path_of_spec(spec: &str) -> Option<&str> {
     spec.strip_suffix(":ro")
@@ -355,16 +364,15 @@ pub(crate) fn checked_volume_mappings(
         .context("parsing volume mappings")?;
     let mounts_image_store = attaches_image_disk
         && super::resolve_image_mode(args) == crate::firecracker::ImageMode::Overlay;
-    check_mount_points_inside_read_only_maps(
-        &maps,
-        &guest_mount_points(args, &maps, mounts_image_store),
-    )?;
+    let mount_points = guest_mount_points(args, &maps, mounts_image_store);
+    check_mount_points_inside_read_only_maps(&maps, &mount_points)?;
+    check_pmem_mount_points(&mount_points)?;
     Ok(maps)
 }
 
 /// Every guest path fc-agent creates and mounts something at for this run,
-/// each with what asked for it: the `--map`, `--disk`, `--disk-dir` and
-/// `--nfs` arguments, and the image store when the run mounts one.
+/// each with what asked for it: the `--map`, `--disk`, `--disk-dir`, `--pmem`
+/// and `--nfs` arguments, and the image store when the run mounts one.
 fn guest_mount_points(
     args: &RunArgs,
     maps: &[VolumeMapping],
@@ -378,15 +386,18 @@ fn guest_mount_points(
     let others = [
         ("--disk", &args.disk),
         ("--disk-dir", &args.disk_dir),
+        ("--pmem", &args.pmem),
         ("--nfs", &args.nfs),
     ]
     .into_iter()
     .flat_map(|(flag, specs)| {
         specs.iter().filter_map(move |spec| {
-            Some((
-                format!("{flag} {spec}"),
-                guest_path_of_spec(spec)?.to_string(),
-            ))
+            let guest = if flag == "--pmem" {
+                pmem_guest_path(spec)
+            } else {
+                guest_path_of_spec(spec)
+            }?;
+            Some((format!("{flag} {spec}"), guest.to_string()))
         })
     });
     let image_store = mounts_image_store.then(|| {
@@ -396,6 +407,61 @@ fn guest_mount_points(
         )
     });
     maps.chain(others).chain(image_store).collect()
+}
+
+/// Refuse a mount point at or under a `--pmem` mount point, and an NFS share or the image
+/// store at or above one. fc-agent mounts the pmem devices after the volumes and extra
+/// disks and before the NFS shares and the image store. Each image is a read-only
+/// filesystem, so a mount point under one is either hidden by it or cannot be created on
+/// it, and a share or image store mounted later at or above it hides it. The comparisons
+/// are lexical, so with a pmem device a guest path with a `..` component is refused first:
+/// the guest resolves it, and it could land at or above a pmem mount point.
+fn check_pmem_mount_points(mount_points: &[(String, String)]) -> Result<()> {
+    if mount_points
+        .iter()
+        .any(|(argument, _)| argument.starts_with("--pmem "))
+    {
+        if let Some((argument, guest_path)) = mount_points
+            .iter()
+            .find(|(_, guest_path)| has_parent_component(guest_path))
+        {
+            bail!(
+                "{argument}: the guest path {guest_path} has a '..' component. With --pmem, \
+                 guest paths are compared as written, and the guest could resolve this one at \
+                 or above a pmem mount point. Write the path without '..'."
+            );
+        }
+    }
+    for (i, (pmem_argument, pmem_path)) in mount_points.iter().enumerate() {
+        if !pmem_argument.starts_with("--pmem ") {
+            continue;
+        }
+        for (j, (argument, guest_path)) in mount_points.iter().enumerate() {
+            if i == j {
+                continue;
+            }
+            if Path::new(guest_path).starts_with(pmem_path) {
+                bail!(
+                    "{argument}: the guest path {guest_path} is at or under {pmem_path}, where \
+                     {pmem_argument} mounts a read-only image. Mount it somewhere else."
+                );
+            }
+            if mounted_after_pmem(argument) && Path::new(pmem_path).starts_with(guest_path) {
+                bail!(
+                    "{argument}: the guest path {guest_path} is at or above {pmem_path}, and it is \
+                     mounted after {pmem_argument}, so it would hide that read-only image. Mount \
+                     one of them somewhere else."
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether fc-agent mounts what `argument` names after the pmem devices: the NFS shares
+/// and the image store (`guest_mount_points` names both this way).
+fn mounted_after_pmem(argument: &str) -> bool {
+    argument.starts_with("--nfs ") || argument.starts_with("fcvm mounts the image store ")
 }
 
 /// Whether the guest path `path` has a `..` component.
@@ -692,10 +758,53 @@ mod tests {
         }
     }
 
+    /// fc-agent mounts the image store after the pmem devices, so a pmem mount point under
+    /// it would be hidden. A disk there is mounted before the pmem devices.
+    #[test]
+    fn a_pmem_mount_point_under_the_image_store_is_refused() {
+        let pmem = (
+            "--pmem /images/c.ext4:/mnt/image-store/cache:ro".to_string(),
+            "/mnt/image-store/cache".to_string(),
+        );
+        let store = (
+            "fcvm mounts the image store of localhost/app:latest in the guest".to_string(),
+            IMAGE_STORE_MOUNT_POINT.to_string(),
+        );
+        let error = check_pmem_mount_points(&[pmem.clone(), store])
+            .expect_err("a pmem mount point under the image store was accepted")
+            .to_string();
+        assert!(error.contains("image store"), "{error}");
+        let disk = (
+            "--disk /images/d.raw:/mnt/image-store".to_string(),
+            IMAGE_STORE_MOUNT_POINT.to_string(),
+        );
+        check_pmem_mount_points(&[pmem, disk]).expect("a disk is mounted before the pmem devices");
+    }
+
+    /// The prefix comparisons are lexical, so a `..` could put a share or a disk at or above
+    /// a pmem mount point once the guest resolves it. With a pmem device, a `..` in any guest
+    /// path is refused; without one this check refuses nothing.
+    #[test]
+    fn a_parent_component_in_any_mount_path_is_refused_with_pmem() {
+        let pmem = (
+            "--pmem /images/c.ext4:/mnt/cache:ro".to_string(),
+            "/mnt/cache".to_string(),
+        );
+        let nfs = (
+            "--nfs host:/mnt/other/..".to_string(),
+            "/mnt/other/..".to_string(),
+        );
+        let error = check_pmem_mount_points(&[pmem, nfs.clone()])
+            .expect_err("an NFS share at /mnt/other/.. was accepted beside a pmem device")
+            .to_string();
+        assert!(error.contains("'..'"), "{error}");
+        check_pmem_mount_points(&[nfs]).expect("without a pmem device this check refuses nothing");
+    }
+
     /// Every argument that makes fc-agent mount something is listed with its
     /// guest path, with and without `:ro`, in the order maps, disks, disk
     /// directories, NFS shares, and the image store last when the run mounts
-    /// one.
+    /// one. A `--pmem` image path can hold ':', which its mount path cannot.
     #[test]
     fn every_mounting_argument_is_listed_with_its_guest_path() {
         let host = tempfile::tempdir().unwrap();
@@ -707,6 +816,11 @@ mod tests {
             ("--disk", "/images/b.raw:/disk/ro:ro".to_string()),
             ("--disk-dir", "/dirs/a:/disk-dir".to_string()),
             ("--disk-dir", "/dirs/b:/disk-dir/ro:ro".to_string()),
+            ("--pmem", "/images/c.ext4:/pmem:ro".to_string()),
+            (
+                "--pmem",
+                "/images/2026-10-07T12:00/d.ext4:/pmem2:ro".to_string(),
+            ),
             ("--nfs", "/shares/a:/nfs".to_string()),
             ("--nfs", "/shares/b:/nfs/ro:ro".to_string()),
         ];
@@ -736,6 +850,11 @@ mod tests {
             listed("--disk /images/a.raw:/disk".into(), "/disk"),
             listed("--disk-dir /dirs/b:/disk-dir/ro:ro".into(), "/disk-dir/ro"),
             listed("--disk-dir /dirs/a:/disk-dir".into(), "/disk-dir"),
+            listed(
+                "--pmem /images/2026-10-07T12:00/d.ext4:/pmem2:ro".into(),
+                "/pmem2",
+            ),
+            listed("--pmem /images/c.ext4:/pmem:ro".into(), "/pmem"),
             listed("--nfs /shares/b:/nfs/ro:ro".into(), "/nfs/ro"),
             listed("--nfs /shares/a:/nfs".into(), "/nfs"),
         ];
@@ -801,6 +920,7 @@ mod tests {
             fatal_creations("mounts.rs"),
             [
                 "if let Err(e) = std::fs::create_dir_all(&vol.guest_path) {",
+                "std::fs::create_dir_all(&pmem.mount_path)",
                 "if let Err(e) = std::fs::create_dir_all(&disk.mount_path) {",
                 "if let Err(e) = std::fs::create_dir_all(&share.mount_path) {",
             ],

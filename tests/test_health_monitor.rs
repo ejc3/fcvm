@@ -49,6 +49,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             network,
             volumes: vec![],
             extra_disks: vec![],
+            pmem_devices: vec![],
             nfs_shares: vec![],
             health_check_url: Some(health_check_url.to_string()),
             snapshot_name: None,

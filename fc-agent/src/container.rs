@@ -15,11 +15,12 @@ use crate::vsock;
 ///
 /// The storage image is an ext4 filesystem containing a podman overlay storage tree
 /// (overlay/, overlay-images/, overlay-layers/). It is mounted read-only and podman
-/// finds the image there without needing `podman load`.
+/// finds the image there without needing `podman load`. The mount goes into `record`.
 pub fn mount_overlay_image(
     device: &str,
     image_name: &str,
     username: Option<&str>,
+    record: &mut crate::mounts::MountRecord,
 ) -> Result<String> {
     eprintln!("[fc-agent] mounting overlay storage image: {}", device);
 
@@ -43,6 +44,7 @@ pub fn mount_overlay_image(
             stderr
         );
     }
+    record.record(format!("image store {device}"), mount_path)?;
 
     // Configure podman to use this as an additional image store.
     let (conf_path, runroot, graphroot) = storage_paths(username);
@@ -265,11 +267,15 @@ fn get_filesystem_size_bytes(path: &str) -> Option<u64> {
 /// Creates a sparse loopback btrfs filesystem sized to the root disk capacity
 /// and configures podman to use it.
 /// This avoids overlay's idmap issues that cause expensive chown-copy on rootless podman.
-/// Errors only when a PROVISIONED disk's existing storage loopback fails to mount —
+/// Errors when a PROVISIONED disk's existing storage loopback fails to mount —
 /// continuing would silently detach the captured container (the boot would fall back
 /// to an empty store and `podman run` a fresh container). Fresh-boot setup problems
-/// remain best-effort warnings (the VM can still run with the default driver).
-pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
+/// before the loopback is mounted remain best-effort warnings (the VM can still run
+/// with the default driver). A loopback it mounts goes into `record`, and failing to
+/// record it is an error on either path.
+pub fn setup_btrfs_storage_if_available(
+    record: &mut crate::mounts::MountRecord,
+) -> anyhow::Result<()> {
     // Check if kernel has btrfs support via /proc/filesystems.
     // Note: /sys/fs/btrfs only appears after a btrfs filesystem is mounted,
     // so it can't detect built-in (CONFIG_BTRFS_FS=y) support before first mount.
@@ -350,6 +356,7 @@ pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
             .output()
         {
             Ok(o) if o.status.success() => {
+                record.record(format!("container storage {loopback_path}"), storage_dir)?;
                 use std::os::unix::fs::PermissionsExt;
                 if let Some(parent) = std::path::Path::new(storage_dir).parent() {
                     let _ =
@@ -430,7 +437,9 @@ pub fn setup_btrfs_storage_if_available() -> anyhow::Result<()> {
         .args(["-o", "loop", loopback_path, storage_dir])
         .output();
     match mount {
-        Ok(o) if o.status.success() => {}
+        Ok(o) if o.status.success() => {
+            record.record(format!("container storage {loopback_path}"), storage_dir)?;
+        }
         Ok(o) => {
             eprintln!(
                 "[fc-agent] WARNING: mount btrfs failed: {}",
@@ -1400,6 +1409,10 @@ pub fn build_podman_args(
         args.push("-v".to_string());
         args.push(spec);
     }
+    for pmem in &plan.pmem_mounts {
+        args.push("-v".to_string());
+        args.push(format!("{}:{}:ro", pmem.mount_path, pmem.mount_path));
+    }
     for share in &plan.nfs_mounts {
         let spec = if share.read_only {
             format!("{}:{}:ro", share.mount_path, share.mount_path)
@@ -1740,6 +1753,23 @@ pub async fn run_async(
 #[cfg(test)]
 mod tests {
     use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};
+
+    /// A pmem mount reaches the container read-only at the same path, as a
+    /// read-only --disk does.
+    #[test]
+    fn pmem_mounts_are_bind_mounted_into_the_container_read_only() {
+        let plan: crate::types::Plan = serde_json::from_str(
+            r#"{"image": "alpine",
+                "pmem_mounts": [{"device": "/dev/pmem0", "mount_path": "/mnt/cache"}]}"#,
+        )
+        .unwrap();
+        let args = super::build_podman_args(&plan, "alpine", None);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair[0] == "-v" && pair[1] == "/mnt/cache:/mnt/cache:ro"),
+            "{args:?}"
+        );
+    }
 
     fn buf_with(data: &[u8]) -> ([u8; 64], usize) {
         let mut buf = [0u8; 64];

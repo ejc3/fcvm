@@ -642,6 +642,29 @@ async fn verify_prepared_snapshot_in(
         );
     }
 
+    // The memory snapshot holds the guest's view of each pmem image as it was, and Firecracker
+    // reopens the recorded path at restore, so a generation whose image changed can never be
+    // restored. Remove that exact generation, as the run path does, and rebuild: a rebuild
+    // under the content key would otherwise reuse the installed generation it replaces.
+    if let Err(error) =
+        crate::storage::pmem::check_snapshot_pmem_images(&config.metadata.pmem_devices)
+    {
+        if !is_snapshot_load_failure(&error) {
+            return Err(error.context(format!("checking prepared snapshot {snapshot_key}")));
+        }
+        info!(
+            snapshot_key = %snapshot_key,
+            reason = %format!("{error:#}"),
+            "installed snapshot's pmem image changed; removing it and rebuilding"
+        );
+        drop(generation_lock);
+        manager
+            .delete_snapshot_if_generation(snapshot_key, &generation)
+            .await
+            .with_context(|| format!("removing prepared snapshot {snapshot_key}"))?;
+        return Ok(None);
+    }
+
     // `prepare` is a durability boundary, not merely a namespace rename. Flush every file
     // in the installed generation, then the generation and snapshot-root directories, while
     // the shared generation lease prevents replacement. Success therefore survives a host
@@ -824,7 +847,11 @@ fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
     // snapshot references a disk build that no longer exists at that path, so
     // it is permanently unusable — invalidate it and fall back to a fresh
     // boot, which re-stats the disk and provisions coherently.
-    rendered.contains("Load snapshot error") || rendered.contains("image disk build changed")
+    // "snapshot pmem image changed" is check_snapshot_pmem_images' marker, for
+    // the same reason: Firecracker reopens the recorded image path on restore.
+    rendered.contains("Load snapshot error")
+        || rendered.contains("image disk build changed")
+        || rendered.contains("snapshot pmem image changed")
 }
 
 /// Delete a cached snapshot that failed to load so the run can fall back to a
@@ -1123,6 +1150,19 @@ async fn prepare_vm_for_lifecycle(
     }
     validate_balloon_target(args.balloon, args.mem)?;
     validate_free_page_reporting(&args)?;
+    // Refuse a bad --pmem before the snapshot cache is looked up, so a cache hit
+    // and a cold boot refuse it the same way.
+    if !args.pmem.is_empty()
+        && matches!(
+            args.hypervisor,
+            crate::cli::args::Hypervisor::CloudHypervisor
+        )
+    {
+        bail!("--pmem is not supported with --hypervisor cloud-hypervisor");
+    }
+    // Resolve each image once: the snapshot key and the attach both read these canonical
+    // specs, so a symlink repointed while the run starts cannot make them name different files.
+    args.pmem = crate::storage::pmem::resolve_pmem_specs(&args.pmem)?;
 
     // Normalize --forward-localhost: a repeated port would otherwise fail the
     // host-side bind in routed mode. Bridged mode has no host-side relay for the
@@ -3052,6 +3092,7 @@ mod tests {
             map: vec![],
             disk: vec![],
             disk_dir: vec![],
+            pmem: vec![],
             nfs: vec![],
             env: vec![],
             cmd: None,
@@ -3534,6 +3575,134 @@ mod tests {
         );
         assert!(!ask_reaches_run_loop(false, true, &prepare));
         assert!(!ask_reaches_run_loop(true, true, &prepare));
+    }
+
+    /// `podman run` resolves the --pmem specs once, before the snapshot key or the attach
+    /// reads them, so both name the same file even if a symlink in a typed path is
+    /// repointed while the run starts.
+    #[test]
+    fn podman_run_resolves_the_pmem_specs_once() {
+        let source = include_str!("mod.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("mod.rs has no test module")];
+        assert_eq!(
+            body.matches("args.pmem = crate::storage::pmem::resolve_pmem_specs(&args.pmem)?;")
+                .count(),
+            1,
+            "podman run no longer replaces its --pmem specs with resolved ones"
+        );
+    }
+
+    /// The pmem identity is checked again after the instance starts: Firecracker maps the
+    /// images then, so an image replaced after the attach would otherwise run unnoticed.
+    #[test]
+    fn the_pmem_identity_is_checked_after_the_instance_starts() {
+        let source = include_str!("vm_config.rs");
+        let boot = source
+            .find("hv.boot().await?;")
+            .expect("vm_config.rs no longer boots the VM");
+        let check = source
+            .find(
+                "crate::storage::pmem::check_attached_pmem_images(&vm_state.config.pmem_devices)?;",
+            )
+            .expect("the boot path no longer checks the pmem images");
+        assert!(
+            check > boot,
+            "the pmem images are checked before the instance starts"
+        );
+    }
+
+    /// The snapshot key names the image a --pmem spec resolves to, not the text typed:
+    /// a symlink and its target share a key, and repointing the symlink to another
+    /// image changes it, so a cache hit never restores over a different image.
+    #[test]
+    fn pmem_key_names_the_image_the_spec_resolves_to() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b, link) = (
+            dir.path().join("a.ext4"),
+            dir.path().join("b.ext4"),
+            dir.path().join("current.ext4"),
+        );
+        for image in [&a, &b] {
+            std::fs::File::create(image)
+                .unwrap()
+                .set_len(2 << 20)
+                .unwrap();
+        }
+        std::os::unix::fs::symlink(&a, &link).unwrap();
+        let key = |image: &std::path::Path| {
+            let mut args = test_args();
+            args.pmem = vec![format!("{}:/mnt/cache:ro", image.display())];
+            key_for(&args, GuestBootInputs::default())
+        };
+        let through_link = key(&link);
+        assert_eq!(
+            through_link,
+            key(&a),
+            "a symlink and its target are one image"
+        );
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&b, &link).unwrap();
+        assert_ne!(
+            key(&link),
+            through_link,
+            "the symlink names another image now"
+        );
+    }
+
+    /// A mount point at or under a --pmem mount point is refused before boot: the pmem
+    /// image is a read-only filesystem mounted after the extra disks, so it would hide
+    /// the disk, or the mount point could not be created on it. A sibling path is not
+    /// under it.
+    #[test]
+    fn a_mount_point_under_a_pmem_mount_point_is_refused() {
+        let mut args = test_args();
+        args.pmem = vec!["/images/cache.ext4:/mnt/cache:ro".to_string()];
+        args.disk = vec!["/images/scratch.raw:/mnt/cache/scratch".to_string()];
+        let error = checked_volume_mappings(&args, false)
+            .err()
+            .expect("a disk under a pmem mount point was accepted")
+            .to_string();
+        for named in [
+            "--disk /images/scratch.raw:/mnt/cache/scratch",
+            "--pmem /images/cache.ext4:/mnt/cache:ro",
+        ] {
+            assert!(
+                error.contains(named),
+                "the error does not name {named}: {error}"
+            );
+        }
+        args.disk = vec!["/images/scratch.raw:/mnt/cachex".to_string()];
+        checked_volume_mappings(&args, false)
+            .expect("a sibling of the pmem mount point is not under it");
+    }
+
+    /// fc-agent mounts the NFS shares after the pmem devices, so a share at or above a pmem
+    /// mount point would hide the image. A disk there is mounted before the image and is
+    /// not refused.
+    #[test]
+    fn an_nfs_share_above_a_pmem_mount_point_is_refused() {
+        let mut args = test_args();
+        args.pmem = vec!["/images/cache.ext4:/mnt/data:ro".to_string()];
+        args.nfs = vec!["/shares/a:/mnt".to_string()];
+        let error = checked_volume_mappings(&args, false)
+            .err()
+            .expect("an NFS share above a pmem mount point was accepted")
+            .to_string();
+        for named in [
+            "--nfs /shares/a:/mnt",
+            "--pmem /images/cache.ext4:/mnt/data:ro",
+        ] {
+            assert!(
+                error.contains(named),
+                "the error does not name {named}: {error}"
+            );
+        }
+        args.nfs.clear();
+        args.disk = vec!["/images/scratch.raw:/mnt".to_string()];
+        checked_volume_mappings(&args, false)
+            .expect("a disk above a pmem mount point is mounted before it");
     }
 
     /// #821 helper: snapshot key of a config built through the real
@@ -4338,6 +4507,82 @@ mod tests {
         );
     }
 
+    /// A prepared snapshot whose pmem image changed cannot be restored: the memory snapshot
+    /// holds the guest's view of the image as it was. `prepare` must rebuild it, not report
+    /// a hit the next run would refuse.
+    #[tokio::test]
+    async fn a_prepared_snapshot_whose_pmem_image_changed_is_a_miss() {
+        let temp = tempfile::tempdir().unwrap();
+        let snapshot_key = "0123456789ab-startup";
+        let snapshot_dir = temp.path().join(snapshot_key);
+        tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+        let image = temp.path().join("cache.ext4");
+        std::fs::File::create(&image)
+            .unwrap()
+            .set_len(2 * 1024 * 1024)
+            .unwrap();
+
+        let mut vm_state = VmState::new(
+            "vm-prepare-pmem".to_string(),
+            "alpine:latest".to_string(),
+            1,
+            512,
+        );
+        vm_state.config.source_vsock_socket_path =
+            Some(std::path::PathBuf::from("/run/test-vsock/vsock.sock"));
+        vm_state.config.pmem_devices = vec![crate::storage::pmem::parse_pmem_spec(&format!(
+            "{}:/mnt/cache:ro",
+            image.display()
+        ))
+        .unwrap()];
+        let mut config = super::super::common::build_snapshot_config(
+            &vm_state,
+            snapshot_key,
+            crate::storage::SnapshotType::System,
+            &snapshot_dir,
+            Vec::new(),
+            Vec::new(),
+            None,
+        )
+        .unwrap();
+        config.content_key = Some(snapshot_key.to_string());
+        for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::write(path, b"durable-artifact").await.unwrap();
+        }
+        tokio::fs::write(
+            snapshot_dir.join("config.json"),
+            serde_json::to_vec_pretty(&config).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let target = prepare_install_target(&PrepareOptions::default(), snapshot_key).unwrap();
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_some(),
+            "a generation whose pmem image is unchanged is a hit"
+        );
+        std::fs::File::options()
+            .write(true)
+            .open(&image)
+            .unwrap()
+            .set_len(4 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            verify_prepared_snapshot_in(temp.path(), &target, PreparedCache::Hit)
+                .await
+                .unwrap()
+                .is_none(),
+            "a generation whose pmem image changed was reported as prepared"
+        );
+        assert!(
+            !snapshot_dir.join("config.json").exists(),
+            "the generation whose pmem image changed is still installed, so a rebuild under              the content key would reuse it"
+        );
+    }
+
     #[tokio::test]
     async fn prepared_snapshot_verification_pins_exact_complete_generation() {
         let temp = tempfile::tempdir().unwrap();
@@ -4934,6 +5179,8 @@ mod image_disk_identity_classifier_tests {
             "image disk build changed during launch: /x is now a, snapshot/key was computed against b"
         );
         assert!(super::is_snapshot_load_failure(&err));
+        let pmem = anyhow::anyhow!("snapshot pmem image changed: /x (mounted at /m) is missing");
+        assert!(super::is_snapshot_load_failure(&pmem));
         let unrelated = anyhow::anyhow!("some other failure");
         assert!(!super::is_snapshot_load_failure(&unrelated));
     }

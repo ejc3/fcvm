@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use tokio::sync::mpsc;
 
-use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, ProcessSpec};
+use super::{Backend, Capabilities, DriveSpec, Hypervisor, NetIfaceSpec, PmemSpec, ProcessSpec};
 use crate::firecracker::{api, BalloonDevice, FirecrackerClient, FirecrackerConfig, VmManager};
 
 /// Guest CID for the host↔guest vsock device (host is always CID 2).
@@ -150,6 +150,19 @@ impl Hypervisor for FirecrackerBackend {
                     rate_limiter: None,
                 },
             )
+            .await
+    }
+
+    async fn add_pmem(&mut self, pmem: &PmemSpec) -> Result<()> {
+        self.vm
+            .client()?
+            .put_pmem(api::Pmem {
+                id: pmem.id.clone(),
+                path_on_host: pmem.path_on_host.display().to_string(),
+                root_device: false,
+                read_only: pmem.is_read_only,
+                rate_limiter: None,
+            })
             .await
     }
 

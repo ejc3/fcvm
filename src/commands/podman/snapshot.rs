@@ -426,6 +426,7 @@ pub(super) fn build_firecracker_config(
         network_mode,
         data_dir: crate::paths::data_dir(),
         extra_disks,
+        pmem: crate::storage::pmem::pmem_key_specs(&args.pmem),
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
