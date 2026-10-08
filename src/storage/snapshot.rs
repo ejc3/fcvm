@@ -194,9 +194,10 @@ pub struct SnapshotMetadata {
     /// Extra disk images from the baseline VM (for clone disk-dir support)
     #[serde(default)]
     pub extra_disks: Vec<SnapshotExtraDisk>,
-    /// Read-only virtio-pmem images from the baseline VM, in device order.
-    /// Firecracker records each path and reopens it on restore; restore refuses an
-    /// image that is gone or whose inode, length or modification time changed.
+    /// Read-only virtio-pmem images from the baseline VM, in device order. Each path
+    /// is a pmem store entry; Firecracker records it and reopens it on restore, and
+    /// restore refuses an entry that is gone or whose inode, length or modification
+    /// time changed.
     #[serde(default)]
     pub pmem_devices: Vec<crate::state::types::PmemDevice>,
     /// NFS shares from the baseline VM. The restore path re-exports these for

@@ -2922,6 +2922,7 @@ assets_dir (default: /mnt/fcvm-btrfs)
 data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── vm-disks/{vm_id}/disks/       # CoW reflink copies per VM
 ├── state/{vm_id}.json            # VM state files
+├── pmem/{sha}.img                # --pmem copies, one per image version, read-only
 └── snapshots/{name}/             # Firecracker snapshots
 ```
 

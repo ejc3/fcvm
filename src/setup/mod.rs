@@ -77,9 +77,9 @@ pub(crate) fn give_store_entry_to_invoker(path: &Path) {
 /// directly, because this crate's tests never set `SUDO_USER` (see
 /// `test_env`).
 pub(crate) fn give_store_entry_to(path: &Path, user: Option<&nix::unistd::User>) {
-    let Some(user) = user else {
+    if user.is_none() {
         return;
-    };
+    }
     let fd = match open_store_entry_nofollow(path) {
         Ok(fd) => fd,
         Err(err) => {
@@ -91,7 +91,20 @@ pub(crate) fn give_store_entry_to(path: &Path, user: Option<&nix::unistd::User>)
             return;
         }
     };
-    if let Err(err) = nix::unistd::fchown(&fd, Some(user.uid), Some(user.gid)) {
+    give_store_fd_to(&fd, path, user);
+}
+
+/// [`give_store_entry_to`] for an entry already open, which the pmem store hands to the
+/// invoker it was opened for before it publishes the entry. `path` names it in the log.
+pub(crate) fn give_store_fd_to(
+    fd: &impl std::os::fd::AsFd,
+    path: &Path,
+    user: Option<&nix::unistd::User>,
+) {
+    let Some(user) = user else {
+        return;
+    };
+    if let Err(err) = nix::unistd::fchown(fd, Some(user.uid), Some(user.gid)) {
         warn!(
             path = %path.display(),
             invoker = %user.name,

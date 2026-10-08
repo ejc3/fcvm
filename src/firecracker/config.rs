@@ -43,10 +43,11 @@ pub struct FirecrackerConfig {
     /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
-    /// Read-only virtio-pmem image specs (--pmem), in device order. The device is
-    /// recorded in the snapshot, so a snapshot answers only runs with the same
-    /// specs. Kept apart from extra_disks so a --pmem and a --disk with the same
-    /// text get different keys.
+    /// Read-only virtio-pmem specs (--pmem), in device order, each naming the image's
+    /// pmem store entry, so the key names the image generation: Firecracker reopens
+    /// the recorded entry on restore and the memory snapshot holds the guest's view
+    /// of it. Kept apart from extra_disks so a --pmem and a --disk with the same text
+    /// get different keys.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pmem: Vec<String>,
     /// Environment variables passed to the container.

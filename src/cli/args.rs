@@ -244,10 +244,19 @@ pub struct RunArgs {
     /// and are mounted at GUEST_MOUNT in both VM and container with -o ro,noload,dax=always.
     /// The image's file data stays out of guest RAM and the memory snapshot, and
     /// clones share it through the host page cache. The image must be an ext4
-    /// filesystem with 4 KiB blocks (mkfs.ext4 -b 4096), and its length a multiple
-    /// of 2 MiB. Restores reopen it at the same path, so it must not change while a
-    /// snapshot that uses it exists: a restore refuses an image whose inode, length or
-    /// modification time changed, and a `podman run` cache hit then boots fresh.
+    /// filesystem with 4 KiB blocks (mkfs.ext4 -b 4096), its length a multiple of
+    /// 2 MiB, and it cannot be on tmpfs, ramfs, hugetlbfs, FUSE, NFS, SMB or 9p, where
+    /// fcvm cannot see a write to it, or on overlayfs, which hides the filesystem that
+    /// holds it.
+    /// fcvm copies each version of the image (its inode, length, modification and
+    /// change time) into <data_dir>/pmem once: a reflink when that directory is on the
+    /// image's filesystem and the filesystem shares extents (btrfs, XFS with reflink),
+    /// otherwise a copy of the image's non-zero blocks that keeps it sparse. VMs,
+    /// snapshots and clones map the copy: writes to HOST_IMAGE after a run starts never
+    /// reach them, and the next run copies the new version. A run is refused if the
+    /// image changes while it is copied. On a kernel or filesystem without multigrain
+    /// timestamps, a write within one timestamp tick of the image's previous change
+    /// keeps its version, so neither check sees it. Copies are not deleted yet.
     /// Firecracker only.
     /// Example: --pmem /data/cache.ext4:/mnt/cache:ro
     #[arg(long, action = clap::ArgAction::Append)]
@@ -438,6 +447,13 @@ pub struct RunArgs {
     /// container's image layers stay reachable.
     #[arg(skip)]
     pub image_disk_override: Option<std::path::PathBuf>,
+
+    /// Internal (not a CLI flag): the devices `pmem` names once each image is in the
+    /// pmem store, with the image each was copied from. podman run sets it when it
+    /// resolves `pmem`, and the disk-only clone and reboot dispatchers set it from
+    /// snapshot metadata; `pmem` then holds exactly these devices' specs.
+    #[arg(skip)]
+    pub pmem_devices: Vec<crate::state::types::PmemDevice>,
 }
 
 // ============================================================================
