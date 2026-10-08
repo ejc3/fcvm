@@ -678,6 +678,428 @@ async fn test_full_snapshot_stores_zero_pages_as_holes() -> Result<()> {
     Ok(())
 }
 
+/// The bytes the memory server logged as given back by the guest's balloon, over every
+/// REMOVE event in its log so far.
+fn given_back_bytes(log: &str) -> u64 {
+    log.lines()
+        .filter(|line| line.contains("balloon gave a range back"))
+        .filter_map(|line| log_number(line, " remembered="))
+        .sum()
+}
+
+/// The number after `key` in a log line.
+fn log_number(line: &str, key: &str) -> Option<u64> {
+    let rest = &line[line.find(key)? + key.len()..];
+    rest.split_whitespace().next()?.parse().ok()
+}
+
+/// Bounds each step of a test by its own limit and by what is left of the test's budget,
+/// and prints how long each step took. A step that runs out of time is dropped, which kills
+/// a child it spawned with `kill_on_drop`.
+struct Steps {
+    started: std::time::Instant,
+    budget: Duration,
+}
+
+impl Steps {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: std::time::Instant::now(),
+            budget,
+        }
+    }
+
+    async fn run<T>(
+        &self,
+        name: &str,
+        bound: Duration,
+        step: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let limit = bound.min(self.budget.saturating_sub(self.started.elapsed()));
+        let began = std::time::Instant::now();
+        let outcome = tokio::time::timeout(limit, step).await;
+        println!(
+            "  step {name}: {:.1} s of its {} s, {:.0} s of the test's {} s spent",
+            began.elapsed().as_secs_f64(),
+            limit.as_secs(),
+            self.started.elapsed().as_secs_f64(),
+            self.budget.as_secs()
+        );
+        match outcome {
+            Ok(result) => result.with_context(|| format!("step {name}")),
+            Err(_) => anyhow::bail!("step {name} did not finish in {} s", limit.as_secs()),
+        }
+    }
+}
+
+/// `fcvm snapshot create` of the VM at `pid` under `tag`. Dropping the future, as a step
+/// that runs out of time does, kills the process.
+async fn snapshot_create(
+    fcvm_path: &std::path::Path,
+    pid: u32,
+    tag: &str,
+) -> Result<std::process::Output> {
+    let mut command = tokio::process::Command::new(fcvm_path);
+    command
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            tag,
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true);
+    common::set_test_pdeathsig(&mut command);
+    command
+        .spawn()
+        .context("spawning snapshot create")?
+        .wait_with_output()
+        .await
+        .context("waiting for snapshot create")
+}
+
+/// Kill a process the test started and reap it, in at most about 16 s.
+async fn stop(pid: u32, child: &mut tokio::process::Child) {
+    common::kill_process(pid).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), child.wait()).await;
+}
+
+/// A snapshot of a clone stores the memory its guest freed and gave back as holes.
+///
+/// The source boots cold with `--no-snapshot --balloon 0 --free-page-reporting`, fills a
+/// tmpfs with random bytes, and takes a Full snapshot, so the fill is data in the parent's
+/// memory.bin. A copy-mode clone of that snapshot deletes the fill without touching it. Its
+/// guest reports the freed memory to the balloon, Firecracker discards it, and the memory
+/// server logs each range as a REMOVE event. A snapshot of the clone is a Diff over the parent.
+///
+/// The clone never writes the fill's pages, so KVM's dirty log does not hold them. They reach
+/// the Diff only from a Firecracker that marks each range it discards as dirty, and the Diff
+/// then holds them as zeros. The merge punches each run of the Diff's all-zero pages at least
+/// `MERGE_MIN_PUNCH` long as a hole. With both, the child's memory.bin gains holes where the
+/// guest gave memory back, and the test asks for holes over at least half of the fill beyond
+/// the parent's. A Firecracker that does not mark discards leaves the parent's random bytes
+/// there, and a merge that writes zero pages as data leaves the zeros as data.
+///
+/// A clone of the child reads back a file the source wrote beside the fill, so a punch of
+/// memory the guest still holds fails the test. Holes are counted from SEEK_DATA and
+/// SEEK_HOLE runs, which say nothing about disk use.
+///
+/// nextest kills a snapshot test at 600 s. Each step has its own bound, and together they
+/// stop at `BUDGET`, which leaves room for the four bounded stops between them.
+#[tokio::test]
+async fn test_snapshot_of_a_clone_stores_the_memory_its_guest_gave_back_as_holes() -> Result<()> {
+    const MEM_MIB: &str = "2048";
+    const FILL_DIR: &str = "/mnt/fcvm-merge-holes";
+    const KEEP_FILE: &str = "/dev/shm/fcvm-merge-holes-keep";
+    const BUDGET: Duration = Duration::from_secs(420);
+    let secs = Duration::from_secs;
+    let steps = Steps::new(BUDGET);
+    let (vm_name, clone_name, tag, _) = common::unique_names("merge-holes");
+    let child_tag = format!("{tag}-child");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let snapshot = snapshot_dir().join(&tag);
+    let child_snapshot = snapshot_dir().join(&child_tag);
+    let _remove_snapshot = RemoveSnapshotOnDrop(snapshot.clone());
+    let _remove_child_snapshot = RemoveSnapshotOnDrop(child_snapshot.clone());
+
+    // The source fills a tmpfs with 60 percent of its free memory and writes the file a
+    // restore of the child reads back.
+    let (mut source, source_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--no-snapshot",
+            "--mem",
+            MEM_MIB,
+            "--balloon",
+            "0",
+            "--free-page-reporting",
+            "--health-check",
+            HEALTH_CHECK_URL,
+            TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning the source VM")?;
+    let filled = async {
+        steps
+            .run(
+                "the source turns healthy",
+                secs(180),
+                common::poll_health_by_pid(source_pid, 180),
+            )
+            .await?;
+        steps
+            .run(
+                "dropping the source's file cache",
+                secs(30),
+                common::exec_in_vm(
+                    source_pid,
+                    &["/usr/bin/sync; echo 3 > /proc/sys/vm/drop_caches"],
+                ),
+            )
+            .await?;
+        let meminfo = steps
+            .run(
+                "reading the source's meminfo",
+                secs(30),
+                common::exec_in_vm(source_pid, &["/usr/bin/cat /proc/meminfo"]),
+            )
+            .await?;
+        let fill_mib = (meminfo_bytes(&meminfo, "MemFree")? * 6 / 10) >> 20;
+        anyhow::ensure!(
+            fill_mib >= 256,
+            "control: 60 percent of the source's free memory is {fill_mib} MiB, too little to measure"
+        );
+        let keep = steps
+            .run(
+                "filling the source's tmpfs",
+                secs(120),
+                common::exec_in_vm(
+                    source_pid,
+                    &[&format!(
+                        "/usr/bin/mkdir -p {FILL_DIR} && \
+                         /usr/bin/mount -t tmpfs -o size={}m tmpfs {FILL_DIR} && \
+                         /usr/bin/head -c {} /dev/urandom > {FILL_DIR}/fill && \
+                         /usr/bin/head -c 8388608 /dev/urandom > {KEEP_FILE} && \
+                         /usr/bin/sha256sum {KEEP_FILE}",
+                        fill_mib + 64,
+                        fill_mib << 20
+                    )],
+                ),
+            )
+            .await?;
+        let keep_sum = keep.split_whitespace().next().unwrap_or_default().to_string();
+        anyhow::ensure!(keep_sum.len() == 64, "control: sha256sum printed {keep:?}");
+        let output = steps
+            .run(
+                "snapshot create of the source",
+                secs(120),
+                snapshot_create(&fcvm_path, source_pid, &tag),
+            )
+            .await?;
+        anyhow::Ok((fill_mib << 20, keep_sum, output))
+    }
+    .await;
+    stop(source_pid, &mut source).await;
+    let (fill_bytes, keep_sum, output) = filled?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(output.status.success(), "snapshot create failed: {stderr}");
+    assert!(
+        stderr.contains("creating full snapshot"),
+        "a VM booted with --no-snapshot has no parent, so its snapshot must be Full: {stderr}"
+    );
+    let memory = std::fs::File::open(snapshot.join("memory.bin")).context("opening memory.bin")?;
+    let len = memory.metadata()?.len();
+    let data = fcvm::commands::common::data_run_bytes(&memory)?;
+    let holes = len - data;
+    println!(
+        "  memory.bin: {} MiB long, {} MiB data, {} MiB holes; fill {} MiB",
+        len >> 20,
+        data >> 20,
+        holes >> 20,
+        fill_bytes >> 20
+    );
+    anyhow::ensure!(
+        data >= fill_bytes,
+        "control: memory.bin holds {data} bytes of data, less than the {fill_bytes}-byte fill"
+    );
+
+    // A copy-mode clone frees the fill, and the test waits until the memory server has heard
+    // of three quarters of it given back and then of nothing more for 3 s.
+    let (mut serve, serve_pid, serve_log) = common::spawn_fcvm_with_log_path(
+        &["snapshot", "serve", &tag, "--uffd-mode", "copy"],
+        "uffd-serve-merge-holes",
+    )
+    .await
+    .context("spawning the memory server")?;
+    let serve_pid_arg = serve_pid.to_string();
+    let mut clone: Option<(tokio::process::Child, u32)> = None;
+    let given_back = async {
+        steps
+            .run(
+                "the memory server is ready",
+                secs(60),
+                common::poll_serve_ready(&tag, serve_pid, 60),
+            )
+            .await?;
+        let (child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_arg,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning the copy-mode clone")?;
+        clone = Some((child, clone_pid));
+        steps
+            .run(
+                "the copy-mode clone turns healthy",
+                secs(120),
+                common::poll_health_by_pid(clone_pid, 120),
+            )
+            .await?;
+        let read_log = || std::fs::read_to_string(&serve_log).unwrap_or_default();
+        let before = given_back_bytes(&read_log());
+        let heard = || given_back_bytes(&read_log()).saturating_sub(before);
+        steps
+            .run(
+                "deleting the fill in the clone",
+                secs(30),
+                common::exec_in_vm(clone_pid, &[&format!("/usr/bin/rm -f {FILL_DIR}/fill")]),
+            )
+            .await?;
+        // Every REMOVE after `before` counts, the guest's other frees included, so the total
+        // can cross the threshold before the last of the fill is given back.
+        let threshold = fill_bytes / 4 * 3;
+        let last_heard = std::cell::Cell::new(0u64);
+        let (at_threshold, settled) = steps
+            .run("the guest gives the fill back", secs(120), async {
+                let at_threshold = loop {
+                    last_heard.set(heard());
+                    if last_heard.get() >= threshold {
+                        break last_heard.get();
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                };
+                let mut grew = std::time::Instant::now();
+                let mut settled = at_threshold;
+                while grew.elapsed() < Duration::from_secs(3) {
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    last_heard.set(heard());
+                    if last_heard.get() != settled {
+                        settled = last_heard.get();
+                        grew = std::time::Instant::now();
+                    }
+                }
+                anyhow::Ok((at_threshold, settled))
+            })
+            .await
+            .with_context(|| {
+                format!(
+                    "control: after the clone deleted its {fill_bytes}-byte fill, the memory \
+                     server had heard of {} bytes given back, against a threshold of {threshold}",
+                    last_heard.get()
+                )
+            })?;
+        println!(
+            "  given back: {} MiB when the total crossed three quarters of the fill, {} MiB once \
+             it had not grown for 3 s",
+            at_threshold >> 20,
+            settled >> 20
+        );
+        let output = steps
+            .run(
+                "snapshot create of the clone",
+                secs(120),
+                snapshot_create(&fcvm_path, clone_pid, &child_tag),
+            )
+            .await?;
+        anyhow::Ok((settled, output))
+    }
+    .await;
+    if let Some((mut child, clone_pid)) = clone.take() {
+        stop(clone_pid, &mut child).await;
+    }
+    stop(serve_pid, &mut serve).await;
+    let (heard, output) = given_back?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create on the clone failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("creating diff snapshot"),
+        "a snapshot of a restored clone must be a Diff over its parent: {stderr}"
+    );
+    let merge_line = stderr
+        .lines()
+        .find(|line| line.contains("diff merge complete"))
+        .with_context(|| format!("snapshot create on the clone logged no merge: {stderr}"))?;
+    println!("  {}", merge_line.trim());
+    let zero_bytes = log_number(merge_line, " zero_bytes=")
+        .with_context(|| format!("the merge line has no zero_bytes: {merge_line}"))?;
+
+    let child_memory = std::fs::File::open(child_snapshot.join("memory.bin"))
+        .context("opening the child's memory.bin")?;
+    let child_len = child_memory.metadata()?.len();
+    let child_holes = child_len - fcvm::commands::common::data_run_bytes(&child_memory)?;
+    let gained = child_holes.saturating_sub(holes);
+    println!(
+        "  child memory.bin: {} MiB holes, {} MiB more than its parent's; the server heard of \
+         {} MiB given back; the merge punched {} MiB",
+        child_holes >> 20,
+        gained >> 20,
+        heard >> 20,
+        zero_bytes >> 20
+    );
+
+    // A clone of the child reads back the file the source kept.
+    let clone2_name = format!("{clone_name}-child");
+    let (mut clone2, clone2_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &child_tag,
+            "--name",
+            &clone2_name,
+        ],
+        &clone2_name,
+    )
+    .await
+    .context("spawning a clone of the child")?;
+    let read_back = async {
+        steps
+            .run(
+                "a clone of the child turns healthy",
+                secs(120),
+                common::poll_health_by_pid(clone2_pid, 120),
+            )
+            .await?;
+        steps
+            .run(
+                "reading the kept file in a clone of the child",
+                secs(30),
+                common::exec_in_vm(clone2_pid, &[&format!("/usr/bin/sha256sum {KEEP_FILE}")]),
+            )
+            .await
+    }
+    .await;
+    stop(clone2_pid, &mut clone2).await;
+    let read_back = read_back?;
+    assert_eq!(
+        read_back.split_whitespace().next().unwrap_or_default(),
+        keep_sum,
+        "a clone of the child does not hold the file the source kept beside the fill"
+    );
+
+    assert!(
+        gained >= fill_bytes / 2,
+        "the child's memory.bin has {gained} bytes of holes more than its parent's, less than \
+         half of the {fill_bytes}-byte fill its guest gave back ({heard} bytes heard by the \
+         memory server): the Diff did not carry the given-back pages as zeros, or the merge \
+         wrote them as data"
+    );
+    assert!(
+        zero_bytes >= fill_bytes / 2,
+        "the merge punched {zero_bytes} bytes of zero pages, less than half of the \
+         {fill_bytes}-byte fill the guest gave back"
+    );
+    Ok(())
+}
+
 /// Test that clones inherit the baseline VM's health check setting (or lack thereof).
 ///
 /// When a baseline VM is started WITHOUT --health-check, clones should also have

@@ -14,6 +14,7 @@ use tracing::{debug, error, info, warn};
 
 use std::path::PathBuf;
 
+use crate::uffd::GRANULE;
 use crate::{
     firecracker::VmManager,
     hypervisor::{firecracker::FirecrackerBackend, Hypervisor},
@@ -276,12 +277,23 @@ pub async fn spawn_namespace_holder(
     }
 }
 
-/// What one merge did: the data found in the diff, in how many runs, and the writes that put it on the base.
+/// What one merge did: the data found in the diff, in how many runs, the pieces that put it on the base, and the
+/// diff's runs of all-zero pages that the base gets as holes.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MergeStats {
     pub diff_bytes: u64,
     pub runs: u64,
+    /// Pieces of the diff's runs, each read once. A piece reaches the base in one write for each stretch of data and
+    /// one punch for each hole (`piece_runs`), so it can take several system calls.
     pub writes: u64,
+    /// Holes punched, one fallocate call each.
+    pub punches: u64,
+    /// Bytes the punches covered: runs of all-zero granules at least `MERGE_MIN_PUNCH` long. They are holes on a
+    /// filesystem of 4 KiB blocks, as on the btrfs fcvm keeps snapshots on. A filesystem of larger blocks zeroes in
+    /// place the part of a block a punch does not cover whole, so there some of these bytes stay allocated.
+    pub zero_bytes: u64,
+    /// Bytes of zero runs long enough to punch that were written as zeros, because the filesystem refused the punch.
+    pub unpunched_zero_bytes: u64,
     /// Workers the writes were made with.
     pub workers: u64,
 }
@@ -292,11 +304,15 @@ impl MergeStats {
         self.diff_bytes += other.diff_bytes;
         self.runs += other.runs;
         self.writes += other.writes;
+        self.punches += other.punches;
+        self.zero_bytes += other.zero_bytes;
+        self.unpunched_zero_bytes += other.unpunched_zero_bytes;
     }
 }
 
 /// The stretch of the file a worker takes at a time, and the most one write holds. A run that crosses a multiple
-/// of it is written in pieces, so the writes of a merge do not depend on which worker makes them.
+/// of it is written in pieces, so the writes of a merge do not depend on which worker makes them. It is a multiple
+/// of [`GRANULE`], so each granule lies in one window and one worker alone writes or punches it.
 const MERGE_WINDOW: u64 = 8 * 1024 * 1024;
 
 /// The most workers one merge runs. One worker waits for one read at a time. Measured on a 128 GiB guest whose
@@ -307,9 +323,17 @@ const MERGE_WORKERS: u64 = 16;
 /// One worker for each this many bytes a merge writes, up to `MERGE_WORKERS`.
 const MERGE_BYTES_PER_WORKER: u64 = 256 * 1024 * 1024;
 
-/// One worker for each this many writes a merge makes, up to `MERGE_WORKERS`: a merge of many single pages is
-/// slow by its writes, not by its bytes.
+/// One worker for each this many pieces a merge writes (`MergeStats::writes`), up to `MERGE_WORKERS`: a merge of
+/// many single pages is slow by its pieces, not by its bytes.
 const MERGE_WRITES_PER_WORKER: u64 = 4096;
+
+/// The shortest run of all-zero granules a merge punches as a hole, measured within the run's merge window
+/// (`piece_runs`). A shorter run is written with the data beside it. Measured on btrfs with compress-force=zstd,
+/// merging 1 GiB of a diff with 4 workers: alternating 4 KiB pages of data and zeros took 4.3 s with every zero page
+/// punched, 1.3 s with each zero page written by its own call, and 0.80 s with the zeros written in one call with the
+/// data beside them, as this minimum does. Runs of 2 MiB took 0.48 s punched and 0.76 s written in one call per piece.
+/// The holes never took more disk than written zeros.
+const MERGE_MIN_PUNCH: u64 = 128 * 1024;
 
 /// The numbers a merge is cut by. fcvm merges with `MERGE_TUNING`; tests pass smaller ones.
 #[derive(Debug, Clone, Copy)]
@@ -318,6 +342,7 @@ struct MergeTuning {
     workers: u64,
     bytes_per_worker: u64,
     writes_per_worker: u64,
+    min_punch: u64,
 }
 
 const MERGE_TUNING: MergeTuning = MergeTuning {
@@ -325,6 +350,7 @@ const MERGE_TUNING: MergeTuning = MergeTuning {
     workers: MERGE_WORKERS,
     bytes_per_worker: MERGE_BYTES_PER_WORKER,
     writes_per_worker: MERGE_WRITES_PER_WORKER,
+    min_punch: MERGE_MIN_PUNCH,
 };
 
 /// How a merge reaches the base: what makes one write, and what flushes the file when the last is made. fcvm
@@ -335,9 +361,41 @@ struct MergeIo<'a> {
     flush: MergeFlusher<'a>,
 }
 
-/// What makes one write of a merge: the write, the base, the diff, and a buffer the worker keeps between writes.
-type MergeWriter<'a> =
-    &'a (dyn Fn(&MergeWrite, &std::fs::File, &std::fs::File, &mut Vec<u8>) -> Result<()> + Sync);
+/// What makes one write of a merge: the write, the base, the diff, what the merge's workers share, and a buffer the
+/// worker keeps between writes. It returns what it adds to the merge's counts: its punches and the zero runs it
+/// punched or wrote.
+type MergeWriter<'a> = &'a (dyn Fn(
+    &MergeWrite,
+    &std::fs::File,
+    &std::fs::File,
+    &MergeShared,
+    &mut Vec<u8>,
+) -> Result<MergeStats>
+         + Sync);
+
+/// What punches a hole of `len` bytes at `offset` of the base: the file, the offset and the length.
+type MergePuncher<'a> = &'a dyn Fn(&std::fs::File, u64, u64) -> nix::Result<()>;
+
+/// What the workers of one merge share.
+struct MergeShared {
+    /// The shortest zero run the merge punches.
+    min_punch: u64,
+    /// Raised by a worker that fails. Every worker reads it before each piece and before each run of a piece.
+    stop: std::sync::atomic::AtomicBool,
+    /// Raised when the filesystem refuses a punch with EOPNOTSUPP. Every later zero run of the merge is then written
+    /// without asking.
+    cannot_punch: std::sync::atomic::AtomicBool,
+}
+
+impl MergeShared {
+    fn new(min_punch: u64) -> Self {
+        Self {
+            min_punch,
+            stop: std::sync::atomic::AtomicBool::new(false),
+            cannot_punch: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+}
 
 /// What flushes the merged base.
 type MergeFlusher<'a> = &'a (dyn Fn(&std::fs::File) -> std::io::Result<()> + Sync);
@@ -351,7 +409,12 @@ const MERGE_IO: MergeIo<'static> = MergeIo {
 ///
 /// Diff snapshots are sparse files where:
 /// - Holes = unchanged memory (skip)
-/// - Data blocks = dirty pages (copy to base at same offset)
+/// - Data blocks = dirty pages (copy to base at same offset, except long runs of all-zero pages, which become holes)
+///
+/// A run of the diff's all-zero pages, whole [`GRANULE`]s at multiples of it, at least `MERGE_MIN_PUNCH` long, is
+/// punched as a hole in the base instead of written, so it costs the merged file nothing. A page the guest gave back
+/// reads as zeros, so memory a guest gave back in runs that long becomes holes. A shorter zero run is written with
+/// the data beside it, and a filesystem that cannot punch holes gets the zeros written.
 ///
 /// Uses SEEK_DATA/SEEK_HOLE to find the data without reading the whole file. Each data run is copied to the base
 /// at its own offset, by up to `MERGE_WORKERS` workers that each take the next `MERGE_WINDOW` of the file nobody
@@ -395,9 +458,31 @@ impl MergeWrite {
         &self,
         base: &std::fs::File,
         diff: &std::fs::File,
+        shared: &MergeShared,
         buffer: &mut Vec<u8>,
-    ) -> Result<()> {
+    ) -> Result<MergeStats> {
+        self.apply_with(base, diff, shared, buffer, &punch_hole)
+    }
+
+    /// Copy the piece from the diff to the same offset of the base, except its runs of all-zero granules at least
+    /// `shared.min_punch` long, which `punch` makes holes of. The piece is read once, and its runs are told apart in
+    /// the buffer (`piece_runs`).
+    ///
+    /// A granule the piece holds only part of, at an edge that is not a multiple of [`GRANULE`], is written: the
+    /// rest of it is another piece's or keeps the base's bytes. No run is written or punched once a worker has
+    /// raised `shared.stop`. Where the filesystem refuses a punch with EOPNOTSUPP, the zeros are written instead and
+    /// counted apart, and `shared.cannot_punch` has every later zero run of the merge written without asking. Any
+    /// other refusal fails the write.
+    fn apply_with(
+        &self,
+        base: &std::fs::File,
+        diff: &std::fs::File,
+        shared: &MergeShared,
+        buffer: &mut Vec<u8>,
+        punch: MergePuncher<'_>,
+    ) -> Result<MergeStats> {
         use std::os::unix::fs::FileExt;
+        use std::sync::atomic::Ordering;
 
         let len = self.bytes() as usize;
         if buffer.len() < len {
@@ -406,10 +491,124 @@ impl MergeWrite {
         let buffer = &mut buffer[..len];
         diff.read_exact_at(buffer, self.start)
             .with_context(|| format!("reading from diff at offset {}", self.start))?;
-        base.write_all_at(buffer, self.start)
-            .with_context(|| format!("writing to base at offset {}", self.start))?;
-        Ok(())
+        let buffer = &buffer[..];
+        let mut stats = MergeStats::default();
+        for (run, hole) in piece_runs(self.start, buffer, shared.min_punch) {
+            if shared.stop.load(Ordering::SeqCst) {
+                break;
+            }
+            let offset = self.start + run.start as u64;
+            let bytes = &buffer[run];
+            let run_len = bytes.len() as u64;
+            if hole && !shared.cannot_punch.load(Ordering::SeqCst) {
+                match punch(base, offset, run_len) {
+                    Ok(()) => {
+                        stats.punches += 1;
+                        stats.zero_bytes += run_len;
+                        continue;
+                    }
+                    Err(nix::errno::Errno::EOPNOTSUPP) => {
+                        shared.cannot_punch.store(true, Ordering::SeqCst)
+                    }
+                    Err(e) => bail!(
+                        "punching a hole of {} bytes at offset {} of the base: {}",
+                        run_len,
+                        offset,
+                        e
+                    ),
+                }
+            }
+            if hole {
+                stats.unpunched_zero_bytes += run_len;
+            }
+            base.write_all_at(bytes, offset)
+                .with_context(|| format!("writing to base at offset {offset}"))?;
+        }
+        Ok(stats)
     }
+}
+
+/// A granule of zeros, to compare the diff's granules with.
+static ZERO_GRANULE: [u8; GRANULE as usize] = [0; GRANULE as usize];
+
+/// The runs of `data`, which is the file from offset `start` on, each as a range of `data` and whether it is all-zero
+/// granules. Runs are cut at multiples of [`GRANULE`] in the file and joined while they agree. A granule `data` holds
+/// only part of, at either end, is not a zero granule.
+fn granule_runs(
+    start: u64,
+    data: &[u8],
+) -> impl Iterator<Item = (std::ops::Range<usize>, bool)> + '_ {
+    let granule = GRANULE as usize;
+    // The granule that begins at `at`: where it ends in `data`, and whether it is a whole granule of zeros.
+    let granule_at = move |at: usize| {
+        let end = data
+            .len()
+            .min(at + granule - ((start + at as u64) % GRANULE) as usize);
+        (
+            end,
+            end - at == granule && data[at..end] == ZERO_GRANULE[..],
+        )
+    };
+    let mut at = 0;
+    // The granule at `at`, when the run before measured it and found it of the other kind.
+    let mut measured = None;
+    std::iter::from_fn(move || {
+        if at >= data.len() {
+            return None;
+        }
+        let (mut end, zero) = measured.take().unwrap_or_else(|| granule_at(at));
+        while end < data.len() {
+            let next = granule_at(end);
+            if next.1 != zero {
+                measured = Some(next);
+                break;
+            }
+            end = next.0;
+        }
+        let run = at..end;
+        at = end;
+        Some((run, zero))
+    })
+}
+
+/// The runs of a piece as the merge puts them on the base, each as a range of `data` and whether it is punched as a
+/// hole: every run of all-zero granules at least `min_punch` long is, and the bytes between them are written, a
+/// shorter zero run with the data beside it. A run is measured inside its piece, so a window boundary cuts one in
+/// two.
+fn piece_runs(
+    start: u64,
+    data: &[u8],
+    min_punch: u64,
+) -> impl Iterator<Item = (std::ops::Range<usize>, bool)> + '_ {
+    let mut runs = granule_runs(start, data)
+        .map(move |(run, zero)| {
+            let hole = zero && run.len() as u64 >= min_punch;
+            (run, hole)
+        })
+        .peekable();
+    std::iter::from_fn(move || {
+        let (mut run, hole) = runs.next()?;
+        if !hole {
+            while let Some((next, _)) = runs.next_if(|(_, next_hole)| !next_hole) {
+                run.end = next.end;
+            }
+        }
+        Some((run, hole))
+    })
+}
+
+/// Punch a hole of `len` bytes at `offset` of `file`, keeping its length.
+fn punch_hole(file: &std::fs::File, offset: u64, len: u64) -> nix::Result<()> {
+    use nix::fcntl::{fallocate, FallocateFlags};
+
+    let offset = libc::off_t::try_from(offset).map_err(|_| nix::errno::Errno::EOVERFLOW)?;
+    let len = libc::off_t::try_from(len).map_err(|_| nix::errno::Errno::EOVERFLOW)?;
+    fallocate(
+        file,
+        FallocateFlags::FALLOC_FL_PUNCH_HOLE | FallocateFlags::FALLOC_FL_KEEP_SIZE,
+        offset,
+        len,
+    )
 }
 
 /// Whether the byte at `offset` of the diff is data.
@@ -486,7 +685,8 @@ fn window_writes(
     Ok(writes)
 }
 
-/// One worker's share of a pass: it takes the next window nobody has taken until none is left or `stop` is raised.
+/// One worker's share of a pass: it takes the next window nobody has taken until none is left or `shared.stop` is
+/// raised.
 /// With `io` it makes each window's writes; without, it only counts them.
 fn merge_windows(
     base_path: &Path,
@@ -494,7 +694,7 @@ fn merge_windows(
     size: u64,
     window: u64,
     next: &std::sync::atomic::AtomicU64,
-    stop: &std::sync::atomic::AtomicBool,
+    shared: &MergeShared,
     io: Option<MergeIo<'_>>,
 ) -> Result<MergeStats> {
     use std::sync::atomic::Ordering;
@@ -516,7 +716,7 @@ fn merge_windows(
     let windows = size.div_ceil(window);
     let mut stats = MergeStats::default();
     let mut buffer: Vec<u8> = Vec::new();
-    while !stop.load(Ordering::SeqCst) {
+    while !shared.stop.load(Ordering::SeqCst) {
         let index = next.fetch_add(1, Ordering::SeqCst);
         if index >= windows {
             break;
@@ -524,10 +724,16 @@ fn merge_windows(
         let writes = window_writes(&diff_file, index, size, window, &mut stats)?;
         if let (Some(io), Some(base_file)) = (io, base_file.as_ref()) {
             for write in &writes {
-                if stop.load(Ordering::SeqCst) {
+                if shared.stop.load(Ordering::SeqCst) {
                     return Ok(stats);
                 }
-                (io.write)(write, base_file, &diff_file, &mut buffer)?;
+                stats.add(&(io.write)(
+                    write,
+                    base_file,
+                    &diff_file,
+                    shared,
+                    &mut buffer,
+                )?);
             }
         }
     }
@@ -537,15 +743,15 @@ fn merge_windows(
 /// One pass over every window of the file with up to `workers` workers. The calling thread is one of them, so a
 /// pass with one worker starts no thread, and a host that refuses a thread still merges with the workers it got.
 ///
-/// A worker that fails or panics raises `stop`, and the others return before their next write: the file is no
-/// longer wanted, and on a full disk every write they add is taken from whatever else is writing there.
+/// A worker that fails or panics raises `shared.stop`, and the others make no further write or punch, inside a
+/// piece or after it: the file is no longer wanted, and on a full disk every write they add is taken from whatever else is writing there.
 fn merge_pass(
     base_path: &Path,
     diff_path: &Path,
     size: u64,
     window: u64,
     workers: u64,
-    stop: &std::sync::atomic::AtomicBool,
+    shared: &MergeShared,
     io: Option<MergeIo<'_>>,
 ) -> Result<MergeStats> {
     use std::sync::atomic::Ordering;
@@ -553,11 +759,11 @@ fn merge_pass(
     let next = std::sync::atomic::AtomicU64::new(0);
     let work = || -> Result<MergeStats> {
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            merge_windows(base_path, diff_path, size, window, &next, stop, io)
+            merge_windows(base_path, diff_path, size, window, &next, shared, io)
         }))
         .unwrap_or_else(|_| Err(anyhow::anyhow!("a merge worker panicked")));
         if result.is_err() {
-            stop.store(true, Ordering::SeqCst);
+            shared.stop.store(true, Ordering::SeqCst);
         }
         result
     };
@@ -605,6 +811,12 @@ fn merge_with(
             && tuning.writes_per_worker > 0,
         "a merge needs a window of at least one byte and at least one worker"
     );
+    anyhow::ensure!(
+        tuning.window.is_multiple_of(GRANULE),
+        "a merge window of {} bytes is not a multiple of the {}-byte granule, so two workers could share one",
+        tuning.window,
+        GRANULE
+    );
     let diff_meta = std::fs::metadata(diff_path)
         .with_context(|| format!("getting diff file metadata: {}", diff_path.display()))?;
     let size = diff_meta.len();
@@ -618,7 +830,7 @@ fn merge_with(
         size
     );
 
-    let stop = std::sync::atomic::AtomicBool::new(false);
+    let shared = MergeShared::new(tuning.min_punch);
     // The walk that counts only seeks, and what it has to cover is known before it starts from the blocks the
     // diff has allocated. A small diff is walked on the calling thread.
     let planners = (diff_meta.blocks() * 512)
@@ -630,7 +842,7 @@ fn merge_with(
         size,
         tuning.window,
         planners,
-        &stop,
+        &shared,
         None,
     )?;
     let workers = plan
@@ -645,9 +857,17 @@ fn merge_with(
         size,
         tuning.window,
         workers,
-        &stop,
+        &shared,
         Some(io),
     )?;
+    // A filesystem that cannot punch holes refuses every punch alike, so the merge says it once.
+    if stats.unpunched_zero_bytes > 0 {
+        warn!(
+            base = %base_path.display(),
+            unpunched_zero_bytes = stats.unpunched_zero_bytes,
+            "the filesystem cannot punch holes (EOPNOTSUPP), so the zero runs the merge would have punched were written as zeros"
+        );
+    }
 
     // The caller names this file in the snapshot's config.json next, so its bytes have to be on disk first, and an
     // error the kernel met writing them back has to fail the snapshot.
@@ -4006,8 +4226,9 @@ impl PublishedMemoryFile {
     /// Log the memory file's length and how many of its bytes are data. Its data runs
     /// are the guest memory the snapshot stores: the default Firecracker build leaves a
     /// Full snapshot's all-zero pages as holes, and a Diff keeps its base's, because on
-    /// btrfs the base copy (copy_file_range) clones. A failed measurement is logged and
-    /// does not fail the snapshot.
+    /// btrfs the base copy (copy_file_range) clones, and gains one for each run of its
+    /// diff's all-zero pages at least `MERGE_MIN_PUNCH` long, which the merge punches. A
+    /// failed measurement is logged and does not fail the snapshot.
     ///
     /// The walk runs on a blocking thread. It is quick only because the file is synced:
     /// Firecracker syncs the memory file it writes, and merge_diff_snapshot syncs a merged
@@ -4508,6 +4729,9 @@ pub async fn create_snapshot_core(
             bytes_merged = merged.diff_bytes,
             runs = merged.runs,
             writes = merged.writes,
+            punches = merged.punches,
+            zero_bytes = merged.zero_bytes,
+            unpunched_zero_bytes = merged.unpunched_zero_bytes,
             workers = merged.workers,
             merge_ms = merge_started.elapsed().as_millis() as u64,
             "diff merge complete, building atomic update"
@@ -6415,18 +6639,33 @@ mod tests {
     }
 
     /// A base of `len` bytes of 0xAA, a sparse diff of the same length that holds `runs` of (offset, length, byte),
-    /// and the bytes the merged base should hold.
+    /// and the bytes the merged base should hold, in the system's temporary directory.
     fn merge_fixture(
+        len: u64,
+        runs: &[(u64, usize, u8)],
+    ) -> (tempfile::NamedTempFile, tempfile::NamedTempFile, Vec<u8>) {
+        merge_fixture_in(&std::env::temp_dir(), len, runs)
+    }
+
+    /// Where the tests that assert a merged file's holes keep their files: the btrfs fcvm keeps snapshots on, which
+    /// every environment the tests run in mounts, and whose 4 KiB blocks hold a 4 KiB hole.
+    fn snapshot_fs_dir() -> &'static Path {
+        Path::new("/mnt/fcvm-btrfs")
+    }
+
+    /// `merge_fixture` with its files in `dir`.
+    fn merge_fixture_in(
+        dir: &Path,
         len: u64,
         runs: &[(u64, usize, u8)],
     ) -> (tempfile::NamedTempFile, tempfile::NamedTempFile, Vec<u8>) {
         use std::io::Write;
         use std::os::unix::fs::FileExt;
 
-        let mut base = tempfile::NamedTempFile::new().unwrap();
+        let mut base = tempfile::NamedTempFile::new_in(dir).unwrap();
         base.write_all(&vec![0xAAu8; len as usize]).unwrap();
         base.flush().unwrap();
-        let diff = tempfile::NamedTempFile::new().unwrap();
+        let diff = tempfile::NamedTempFile::new_in(dir).unwrap();
         diff.as_file().set_len(len).unwrap();
         let mut expected = vec![0xAAu8; len as usize];
         for &(offset, run_len, byte) in runs {
@@ -6439,14 +6678,352 @@ mod tests {
         (base, diff, expected)
     }
 
-    /// A tuning for the tests of how writes are cut: this window, and every worker it is allowed.
+    /// A tuning for the tests of how writes are cut: this window, every worker it is allowed, and every run of zero
+    /// granules punched.
     fn cut_by(window: u64, workers: u64) -> MergeTuning {
         MergeTuning {
             window,
             workers,
             bytes_per_worker: 1,
             writes_per_worker: 1,
+            min_punch: GRANULE,
         }
+    }
+
+    /// fcvm's tuning, but with every run of zero granules punched, for the tests of single zero pages.
+    const EVERY_ZERO_RUN: MergeTuning = MergeTuning {
+        min_punch: GRANULE,
+        ..MERGE_TUNING
+    };
+
+    /// Which 4 KiB pages of the file at `path` are holes, from its SEEK_DATA and SEEK_HOLE runs.
+    ///
+    /// The merge punches 4 KiB granules, which a filesystem holds as holes only when its block is 4 KiB, as on the
+    /// btrfs fcvm keeps snapshots on. A larger block keeps a punched granule as zeros in an allocated block. The
+    /// tests keep the files it reads in `snapshot_fs_dir`.
+    fn hole_pages(path: &Path) -> Vec<bool> {
+        use std::os::unix::fs::MetadataExt;
+
+        let file = std::fs::File::open(path).unwrap();
+        let meta = file.metadata().unwrap();
+        assert_eq!(
+            meta.blksize(),
+            GRANULE,
+            "control: {} is on a filesystem of {}-byte blocks, which cannot hold a 4 KiB hole",
+            path.display(),
+            meta.blksize()
+        );
+        let mut holes = vec![true; meta.len().div_ceil(GRANULE) as usize];
+        crate::uffd::for_each_data_run(&file, meta.len(), |start, end| {
+            for page in start / GRANULE..end.div_ceil(GRANULE) {
+                holes[page as usize] = false;
+            }
+        })
+        .unwrap();
+        holes
+    }
+
+    /// Which 4 KiB pages of `bytes` are all zero.
+    fn zero_pages(bytes: &[u8]) -> Vec<bool> {
+        bytes
+            .chunks(GRANULE as usize)
+            .map(|page| page.iter().all(|&byte| byte == 0))
+            .collect()
+    }
+
+    /// A base of 32 pages of 0xAA and a diff whose data holds all-zero pages beside pages of bytes, alone and inside
+    /// runs that hold both, with the bytes and the holes the merged base should have.
+    fn zero_page_fixture() -> (
+        tempfile::NamedTempFile,
+        tempfile::NamedTempFile,
+        Vec<u8>,
+        Vec<bool>,
+    ) {
+        const P: u64 = 4096;
+        const PAGE: usize = 4096;
+        let (base, diff, expected) = merge_fixture_in(
+            snapshot_fs_dir(),
+            32 * P,
+            &[
+                // A run of two zero pages.
+                (P, 2 * PAGE, 0x00),
+                // A page of bytes alone.
+                (4 * P, PAGE, 0xBB),
+                // One run of pages 6 to 9: zeros, bytes, zeros, zeros.
+                (6 * P, PAGE, 0x00),
+                (7 * P, PAGE, 0xCC),
+                (8 * P, 2 * PAGE, 0x00),
+                // One run of pages 12 to 15 with a zero page inside.
+                (12 * P, 2 * PAGE, 0xDD),
+                (14 * P, PAGE, 0x00),
+                (15 * P, PAGE, 0xEE),
+                // Pages 20 and 21 are zeros but for the last byte of 21, which is therefore data.
+                (20 * P, 2 * PAGE, 0x00),
+                (22 * P - 1, 1, 0x01),
+                // The last page of the file.
+                (31 * P, PAGE, 0x00),
+            ],
+        );
+        let mut holes = vec![false; 32];
+        for page in [1, 2, 6, 8, 9, 14, 20, 31] {
+            holes[page] = true;
+        }
+        (base, diff, expected, holes)
+    }
+
+    #[test]
+    fn a_merge_punches_the_diffs_zero_pages_and_writes_the_rest() {
+        let (base, diff, expected, holes) = zero_page_fixture();
+        assert_eq!(
+            hole_pages(base.path()),
+            vec![false; 32],
+            "control: the base starts with no holes"
+        );
+        let stats = merge_with(base.path(), diff.path(), &EVERY_ZERO_RUN, MERGE_IO).unwrap();
+        assert_eq!(
+            hole_pages(base.path()),
+            holes,
+            "hole layout: the merged base's holes, page by page, are not the diff's all-zero pages"
+        );
+        assert!(
+            std::fs::read(base.path()).unwrap() == expected,
+            "the merged base differs from the expected bytes"
+        );
+        assert_eq!(stats.diff_bytes, 14 * GRANULE);
+        assert_eq!(
+            (stats.punches, stats.zero_bytes, stats.unpunched_zero_bytes),
+            (6, 8 * GRANULE, 0),
+            "the eight zero pages, in six runs, should be punched and counted in zero_bytes"
+        );
+    }
+
+    #[test]
+    fn a_merge_writes_zeros_where_the_filesystem_refuses_to_punch() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let asked = AtomicU64::new(0);
+        let refuse = |_: &std::fs::File, _: u64, _: u64| -> nix::Result<()> {
+            asked.fetch_add(1, Ordering::SeqCst);
+            Err(nix::errno::Errno::EOPNOTSUPP)
+        };
+        let write = |write: &MergeWrite,
+                     base: &std::fs::File,
+                     diff: &std::fs::File,
+                     shared: &MergeShared,
+                     buffer: &mut Vec<u8>|
+         -> Result<MergeStats> {
+            write.apply_with(base, diff, shared, buffer, &refuse)
+        };
+        let io = MergeIo {
+            write: &write,
+            ..MERGE_IO
+        };
+        let (base, diff, expected, _holes) = zero_page_fixture();
+        let stats = merge_with(base.path(), diff.path(), &EVERY_ZERO_RUN, io).unwrap();
+        assert!(
+            std::fs::read(base.path()).unwrap() == expected,
+            "the merged base differs from the expected bytes"
+        );
+        assert_eq!(
+            (stats.punches, stats.zero_bytes, stats.unpunched_zero_bytes),
+            (0, 0, 8 * GRANULE),
+            "the eight zero pages the filesystem refused to punch should be counted as written"
+        );
+        assert_eq!(
+            hole_pages(base.path()),
+            vec![false; 32],
+            "a merge whose punches were all refused left holes"
+        );
+        // One worker meets the six zero runs, and the first refusal holds for the rest of the merge.
+        assert_eq!(
+            (stats.workers, asked.load(Ordering::SeqCst)),
+            (1, 1),
+            "after one EOPNOTSUPP the merge asked the filesystem to punch again"
+        );
+
+        // Four workers, each with zero runs in its window: each can be inside a punch before any refusal is known,
+        // and none asks after one.
+        asked.store(0, Ordering::SeqCst);
+        let (base, diff, expected, _holes) = zero_page_fixture();
+        let stats = merge_with(base.path(), diff.path(), &cut_by(8 * GRANULE, 4), io).unwrap();
+        assert!(
+            std::fs::read(base.path()).unwrap() == expected,
+            "the merged base differs from the expected bytes"
+        );
+        assert_eq!(stats.unpunched_zero_bytes, 8 * GRANULE);
+        assert!(
+            stats.workers == 4 && asked.load(Ordering::SeqCst) <= 4,
+            "{} workers asked for {} punches: a worker asked again after a refusal",
+            stats.workers,
+            asked.load(Ordering::SeqCst)
+        );
+
+        // Any other refusal fails the merge.
+        let fail =
+            |_: &std::fs::File, _: u64, _: u64| -> nix::Result<()> { Err(nix::errno::Errno::EIO) };
+        let write = |write: &MergeWrite,
+                     base: &std::fs::File,
+                     diff: &std::fs::File,
+                     shared: &MergeShared,
+                     buffer: &mut Vec<u8>|
+         -> Result<MergeStats> {
+            write.apply_with(base, diff, shared, buffer, &fail)
+        };
+        let io = MergeIo {
+            write: &write,
+            ..MERGE_IO
+        };
+        let (base, diff, _expected, _holes) = zero_page_fixture();
+        let error = merge_with(base.path(), diff.path(), &EVERY_ZERO_RUN, io)
+            .expect_err("a merge whose punch failed with EIO is not a merge");
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("punching a hole") && error.contains("EIO"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn granule_runs_write_a_granule_a_piece_holds_only_part_of() {
+        // A piece from 100 bytes before a granule boundary to 50 bytes past the next, all zeros: the two partial
+        // granules are written and the whole one between them is punched.
+        let start = 7 * GRANULE - 100;
+        let data = vec![0u8; 100 + GRANULE as usize + 50];
+        let runs: Vec<_> = granule_runs(start, &data).collect();
+        assert_eq!(
+            runs,
+            vec![(0..100, false), (100..4196, true), (4196..4246, false)]
+        );
+
+        // One nonzero byte makes its granule data, and runs of the same kind are joined.
+        let mut data = vec![0u8; 4 * GRANULE as usize];
+        data[2 * GRANULE as usize + 7] = 1;
+        let runs: Vec<_> = granule_runs(3 * GRANULE, &data).collect();
+        assert_eq!(
+            runs,
+            vec![(0..8192, true), (8192..12288, false), (12288..16384, true)]
+        );
+    }
+
+    #[test]
+    fn piece_runs_write_a_zero_run_shorter_than_the_minimum_with_the_data_beside_it() {
+        let g = GRANULE as usize;
+        // Granules: zero, data, zero, zero, zero, data, zero.
+        let mut data = vec![0u8; 7 * g];
+        data[g] = 1;
+        data[5 * g] = 1;
+        let runs: Vec<_> = piece_runs(0, &data, 3 * GRANULE).collect();
+        assert_eq!(
+            runs,
+            vec![
+                (0..2 * g, false),
+                (2 * g..5 * g, true),
+                (5 * g..7 * g, false)
+            ]
+        );
+        // With every zero run punched, the single zero granules are holes too.
+        let runs: Vec<_> = piece_runs(0, &data, GRANULE).collect();
+        assert_eq!(
+            runs,
+            vec![
+                (0..g, true),
+                (g..2 * g, false),
+                (2 * g..5 * g, true),
+                (5 * g..6 * g, false),
+                (6 * g..7 * g, true)
+            ]
+        );
+    }
+
+    #[test]
+    fn a_merge_punches_a_zero_run_of_the_minimum_length_and_writes_a_shorter_one() {
+        let min = MERGE_MIN_PUNCH;
+        // A zero run one granule short of the minimum, a page of bytes, and a zero run of the minimum.
+        let (base, diff, expected) = merge_fixture_in(
+            snapshot_fs_dir(),
+            4 * min,
+            &[
+                (0, (min - GRANULE) as usize, 0x00),
+                (min, GRANULE as usize, 0x5A),
+                (2 * min, min as usize, 0x00),
+            ],
+        );
+        let stats = merge_diff_snapshot(base.path(), diff.path()).unwrap();
+        assert!(
+            std::fs::read(base.path()).unwrap() == expected,
+            "the merged base differs from the expected bytes"
+        );
+        let mut holes = vec![false; (4 * min / GRANULE) as usize];
+        holes[(2 * min / GRANULE) as usize..(3 * min / GRANULE) as usize].fill(true);
+        assert_eq!(
+            hole_pages(base.path()),
+            holes,
+            "hole layout: only the zero run of MERGE_MIN_PUNCH bytes should be a hole"
+        );
+        assert_eq!(
+            (stats.punches, stats.zero_bytes, stats.unpunched_zero_bytes),
+            (1, min, 0)
+        );
+    }
+
+    #[test]
+    fn a_piece_makes_no_write_or_punch_once_the_stop_is_raised() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        // One piece of 64 granules that alternate zero and bytes, so 64 runs, the first of them zero.
+        let runs: Vec<(u64, usize, u8)> = (0..64u64)
+            .map(|granule| {
+                let byte = if granule % 2 == 0 { 0 } else { 0xB7 };
+                (granule * GRANULE, GRANULE as usize, byte)
+            })
+            .collect();
+        let (base, diff, _expected) = merge_fixture(64 * GRANULE, &runs);
+        let shared = MergeShared::new(GRANULE);
+        let punches = AtomicU64::new(0);
+        // Another worker fails while this one punches the piece's first run.
+        let punch = |_: &std::fs::File, _: u64, _: u64| -> nix::Result<()> {
+            punches.fetch_add(1, Ordering::SeqCst);
+            shared.stop.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+        let piece = MergeWrite {
+            start: 0,
+            end: 64 * GRANULE,
+        };
+        let stats = piece
+            .apply_with(
+                base.as_file(),
+                diff.as_file(),
+                &shared,
+                &mut Vec::new(),
+                &punch,
+            )
+            .unwrap();
+        assert_eq!(
+            punches.load(Ordering::SeqCst),
+            1,
+            "the piece asked for another punch after the stop was raised"
+        );
+        assert!(
+            std::fs::read(base.path())
+                .unwrap()
+                .iter()
+                .all(|&byte| byte == 0xAA),
+            "the piece wrote to the base after the stop was raised"
+        );
+        assert_eq!((stats.punches, stats.zero_bytes), (1, GRANULE));
+    }
+
+    #[test]
+    fn a_merge_refuses_a_window_that_splits_a_granule() {
+        // Two workers would each hold part of one granule, and a zero granule split that way could not be punched.
+        let (base, diff, _expected) = merge_fixture(64 * 1024, &[(4096, 4096, 0xD3)]);
+        let error = merge_with(base.path(), diff.path(), &cut_by(6000, 1), MERGE_IO)
+            .expect_err("a window of 6000 bytes is not a whole number of granules");
+        assert!(
+            format!("{error:#}").contains("not a multiple of"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -6467,21 +7044,24 @@ mod tests {
             let offset = next() % (len / 4096) * 4096;
             let pages = [1u64, 1, 1, 2, 5, 40][(next() % 6) as usize];
             let run_len = (pages * 4096).min(len - offset) as usize;
-            runs.push((offset, run_len, (i % 200) as u8 + 1));
+            // Every fifth run is zeros, which the base should get as holes wherever no later run lands on them.
+            let byte = if i % 5 == 0 { 0 } else { (i % 200) as u8 + 1 };
+            runs.push((offset, run_len, byte));
         }
         let mut found = None;
         for window in [4096u64, 16384, 65536, 1024 * 1024, 8 * 1024 * 1024] {
             let mut with_one_worker = None;
             for workers in [1u64, 3, 16] {
-                let (base, diff, expected) = merge_fixture(len, &runs);
+                let (base, diff, expected) = merge_fixture_in(snapshot_fs_dir(), len, &runs);
                 let applied = AtomicU64::new(0);
                 let write = |write: &MergeWrite,
                              base: &std::fs::File,
                              diff: &std::fs::File,
+                             shared: &MergeShared,
                              buffer: &mut Vec<u8>|
-                 -> Result<()> {
+                 -> Result<MergeStats> {
                     applied.fetch_add(write.bytes(), Ordering::SeqCst);
-                    write.apply(base, diff, buffer)
+                    write.apply(base, diff, shared, buffer)
                 };
                 let io = MergeIo {
                     write: &write,
@@ -6494,14 +7074,28 @@ mod tests {
                     std::fs::read(base.path()).unwrap() == expected,
                     "{case}: the merged base differs from the expected bytes"
                 );
+                // The base is 0xAA, so a zero page of the merged base is a zero page of the diff.
+                let zero = zero_pages(&expected);
+                let holes = hole_pages(base.path());
+                assert!(
+                    holes == zero,
+                    "{case}: page {:?} of the merged base is a hole where the diff's page is not all zero, or the \
+                     other way round",
+                    holes.iter().zip(&zero).position(|(hole, zero)| hole != zero)
+                );
+                assert_eq!(
+                    stats.zero_bytes,
+                    zero.iter().filter(|&&page| page).count() as u64 * GRANULE,
+                    "{case}: zero_bytes is not the bytes of the diff's all-zero pages"
+                );
                 assert_eq!(
                     applied.load(Ordering::SeqCst),
                     stats.diff_bytes,
                     "{case}: the bytes the writes held are not the diff's bytes"
                 );
                 assert_eq!(
-                    *found.get_or_insert((stats.diff_bytes, stats.runs)),
-                    (stats.diff_bytes, stats.runs),
+                    *found.get_or_insert((stats.diff_bytes, stats.runs, stats.zero_bytes)),
+                    (stats.diff_bytes, stats.runs, stats.zero_bytes),
                     "{case}: the same diff holds the same data in the same runs however it is merged"
                 );
                 assert_eq!(stats.workers, workers, "{case}");
@@ -6534,6 +7128,9 @@ mod tests {
                 // Counted once, in the window it begins in.
                 runs: 1,
                 writes: 6,
+                punches: 0,
+                zero_bytes: 0,
+                unpunched_zero_bytes: 0,
                 workers: 1,
             }
         );
@@ -6576,6 +7173,7 @@ mod tests {
             workers: 16,
             bytes_per_worker: 64 * K,
             writes_per_worker: 4,
+            min_punch: GRANULE,
         };
         // Three pages across the file are 12 KiB in three writes: one worker.
         let (base, diff, expected) = merge_fixture(
@@ -6615,7 +7213,7 @@ mod tests {
 
     #[test]
     fn a_failed_write_stops_the_other_workers_before_their_next_write() {
-        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        use std::sync::atomic::{AtomicU64, Ordering};
         use std::time::{Duration, Instant};
 
         const K: u64 = 1024;
@@ -6631,7 +7229,7 @@ mod tests {
             }
         }
         let (base, diff, _expected) = merge_fixture(256 * K, &runs);
-        let stop = AtomicBool::new(false);
+        let shared = MergeShared::new(GRANULE);
         let entered = AtomicU64::new(0);
         let applied = AtomicU64::new(0);
         let wait_for = |what: &str, done: &dyn Fn() -> bool| {
@@ -6647,8 +7245,9 @@ mod tests {
         let write = |write: &MergeWrite,
                      base: &std::fs::File,
                      diff: &std::fs::File,
+                     shared: &MergeShared,
                      buffer: &mut Vec<u8>|
-         -> Result<()> {
+         -> Result<MergeStats> {
             if write.start < 64 * K {
                 wait_for("the other three workers to begin a write", &|| {
                     entered.load(Ordering::SeqCst) == 3
@@ -6657,10 +7256,10 @@ mod tests {
             }
             entered.fetch_add(1, Ordering::SeqCst);
             wait_for("the failed worker to raise the stop", &|| {
-                stop.load(Ordering::SeqCst)
+                shared.stop.load(Ordering::SeqCst)
             });
             applied.fetch_add(1, Ordering::SeqCst);
-            write.apply(base, diff, buffer)
+            write.apply(base, diff, shared, buffer)
         };
         let io = MergeIo {
             write: &write,
@@ -6672,7 +7271,7 @@ mod tests {
             256 * K,
             64 * K,
             4,
-            &stop,
+            &shared,
             Some(io),
         )
         .expect_err("a merge with a failed write is not a merge");
@@ -6704,11 +7303,12 @@ mod tests {
         let write = |write: &MergeWrite,
                      base: &std::fs::File,
                      diff: &std::fs::File,
+                     shared: &MergeShared,
                      buffer: &mut Vec<u8>|
-         -> Result<()> {
-            write.apply(base, diff, buffer)?;
+         -> Result<MergeStats> {
+            let stats = write.apply(base, diff, shared, buffer)?;
             written.fetch_add(1, Ordering::SeqCst);
-            Ok(())
+            Ok(stats)
         };
         let flush = |file: &std::fs::File| -> std::io::Result<()> {
             flushes.fetch_add(1, Ordering::SeqCst);

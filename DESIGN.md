@@ -1489,9 +1489,14 @@ fcvm snapshot create my-vm --tag warm-nginx
 **Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
 kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves every
 all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero pages and
-a hole reads back as zeros. The `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page.
-A diff still writes every page the VM touched, zeros included. Its merge base is a copy of the parent's `memory.bin`
-made with `copy_file_range`, which on btrfs clones the parent's extents, so a child keeps its parent's holes.
+a hole reads back as zeros. With dirty tracking on, a diff from that build also holds the pages a discard emptied
+(balloon inflation, free page reporting) as zeros: a discard is not a guest write, so KVM's dirty log never records it,
+and the fork marks each discarded range itself. A diff writes every page the VM touched or a discard emptied, zeros
+included, and its merge punches each run of its all-zero pages at least `MERGE_MIN_PUNCH` long, measured within its 8
+MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in its snapshot. The
+`nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full snapshot and leaves
+discarded pages out of a diff. A diff's merge base is a copy of the parent's `memory.bin` made with `copy_file_range`,
+which on btrfs clones the parent's extents, so a child keeps its parent's holes.
 
 **A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
 writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
@@ -1503,11 +1508,27 @@ writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the bas
   worker then takes the next 8 MiB of the file nobody has taken (`MERGE_WINDOW`), so they stay busy wherever in
   the file the diff's data lies. The calling thread is one of them, so a merge of at most 256 MiB in at most
   4,096 writes starts no thread. A worker that fails stops the others before their next write.
+- **Zero pages.** A worker reads each piece of a run once. Each run of its all-zero 4 KiB pages (`GRANULE`) at least
+  `MERGE_MIN_PUNCH` (128 KiB) long is punched as a hole (`FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`), and the rest is
+  written: the data, a shorter zero run with the data beside it, and a page the piece holds only part of. A run is
+  measured inside its piece's window, so a zero run of 128 to 248 KiB that straddles a window boundary can be cut into
+  two shorter runs and written. A short zero run costs more to punch than to write: on btrfs with compress-force=zstd, a
+  merge of 1 GiB of alternating 4 KiB pages of data and zeros took 4.3 s with every zero page punched, 1.3 s with each
+  zero page written by its own call, and 0.80 s with the zeros written in one call with the data beside them, which is
+  what a run shorter than the minimum gets and what the merge did before it punched anything. Runs of 2 MiB took 0.48 s
+  punched, against 0.76 s written in one call per piece. The holes never took more disk than the written zeros. The
+  window is a multiple of the granule, so one worker alone writes or punches each page. A worker that fails stops the
+  others between the runs of a piece as well as between pieces. A filesystem that refuses a punch with EOPNOTSUPP gets
+  the zeros written, counted apart and logged once per merge, and is not asked again during that merge. Any other punch
+  error fails the merge. `zero_bytes` counts the bytes of the punches that succeeded. They are holes on a filesystem of
+  4 KiB blocks, as btrfs is. A filesystem of larger blocks zeroes in place the part of a block a punch does not cover
+  whole, so there some of them stay allocated.
 - **Flush and cleanup.** The merged file is flushed before the snapshot's `config.json` is written, and a failed
   flush fails the snapshot. The diff is removed once it is merged. A failed merge removes the unfinished snapshot
   directory.
-- `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the writes, the workers and
-  the duration.
+- `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the pieces written (`writes`), the
+  holes punched (`punches`), the bytes they covered (`zero_bytes`), the bytes of zero runs written after a refusal
+  (`unpunched_zero_bytes`), the workers and the duration.
 
 
 #### `fcvm snapshot serve`
