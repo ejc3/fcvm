@@ -155,12 +155,16 @@ def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     verify bracket and replay log against the sha256 recorded at the verdict,
     and brackets that covered exactly this run's pages. The scale schedule
     records no guest resolver, so the brackets are held to the one the first
-    of them names.
+    of them names. A WITHDRAWN marker in the campaign directory, the results
+    directory the withdrawal rule in AGENTS.md governs, withdraws the run too.
     """
     corpus = len(schedule["urls"]) > 1 or provenance["host_control"].get("resolve_all_to")
     if not corpus:
         return None
     campaign_dir = os.path.dirname(os.path.abspath(run_dir))
+    withdrawn = campaign_summary.withdrawal_errors([campaign_dir])
+    if withdrawn:
+        return f"the campaign is withdrawn: {withdrawn[0]}"
     path = os.path.join(campaign_dir, "dns-evidence.json")
     if not os.path.isfile(path):
         return f"corpus run without the campaign's DNS evidence ({path})"
@@ -1962,13 +1966,15 @@ def analyze(run_dir: str) -> dict:
     else:
         trace_gate = {"enabled": False}
 
-    dns_block = corpus_dns_gate(run_dir, schedule, provenance)
+    # A WITHDRAWN marker withdraws a scale run wherever it was measured.
+    withdrawn = campaign_summary.withdrawal_errors([run_dir])
+    block = withdrawn[0] if withdrawn else corpus_dns_gate(run_dir, schedule, provenance)
     return {
         "schema": ANALYSIS_SCHEMA,
         "run_id": run_id,
         "snapshot_generation_id": generation_id,
-        "publishable": dns_block is None,
-        "publication_blocked_by": dns_block,
+        "publishable": block is None,
+        "publication_blocked_by": block,
         "corpus": list(schedule["urls"]),
         # The report is the publication document, so the numbers that describe HOW the
         # run was scheduled, and on WHAT, have to come from the validated artifacts
@@ -2014,6 +2020,13 @@ def _format_seconds(value):
 
 
 def markdown_report(analysis: dict) -> str:
+    # The report says the run passed its checks, so an analysis that withholds
+    # publication gets none.
+    if analysis.get("publishable") is not True:
+        raise AnalysisInvalid(
+            "no report for an unpublishable analysis: "
+            f"{analysis.get('publication_blocked_by')}"
+        )
     sched = analysis["schedule"]
     prov = analysis["provenance"]
     warmup = sched["warmup_bursts"]
@@ -2125,33 +2138,47 @@ def main() -> int:
     args = parser.parse_args()
     if not args.json_out and not args.markdown_out:
         parser.error("at least one of --json-out or --markdown-out is required")
-    try:
-        analysis = analyze(os.path.abspath(args.run_dir))
-        if args.json_out:
-            reqscale.write_json_exclusive(os.path.abspath(args.json_out), analysis)
-        if args.markdown_out:
-            report_path = os.path.abspath(args.markdown_out)
-            directory = os.path.dirname(report_path)
-            os.makedirs(directory, exist_ok=True)
-            temp = os.path.join(
-                directory, f".{os.path.basename(report_path)}.{uuid.uuid4().hex}.tmp"
-            )
-            try:
-                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                with os.fdopen(fd, "w") as stream:
-                    stream.write(markdown_report(analysis))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.link(temp, report_path)
-                reqscale._fsync_directory(directory)
-            finally:
+    run_dir = os.path.abspath(args.run_dir)
+    # The reader side of the WITHDRAWN protocol in AGENTS.md: shared locks on
+    # the run directory and the directory holding it (for a corpus run, the
+    # campaign whose marker and DNS evidence authorize it) from the first read
+    # until the outputs are installed. A withdrawal writer's exclusive lock
+    # then lands wholly before this analysis, which reads its marker, or after.
+    with campaign_summary.shared_run_directory_locks(
+            [run_dir, os.path.dirname(run_dir)]) as lock_errors:
+        try:
+            if lock_errors:
+                raise AnalysisInvalid("; ".join(lock_errors))
+            analysis = analyze(run_dir)
+            report = markdown_report(analysis) if args.markdown_out else None
+            moved = campaign_summary.locked_run_directory_errors(lock_errors.run_dirs)
+            if moved:
+                raise AnalysisInvalid("; ".join(moved))
+            if args.json_out:
+                reqscale.write_json_exclusive(os.path.abspath(args.json_out), analysis)
+            if report is not None:
+                report_path = os.path.abspath(args.markdown_out)
+                directory = os.path.dirname(report_path)
+                os.makedirs(directory, exist_ok=True)
+                temp = os.path.join(
+                    directory, f".{os.path.basename(report_path)}.{uuid.uuid4().hex}.tmp"
+                )
                 try:
-                    os.unlink(temp)
-                except FileNotFoundError:
-                    pass
-    except (AnalysisInvalid, reqscale.MeasurementInvalid, OSError, ValueError) as error:
-        print(f"{type(error).__name__}: {error}", file=sys.stderr)
-        return 4
+                    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    with os.fdopen(fd, "w") as stream:
+                        stream.write(report)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.link(temp, report_path)
+                    reqscale._fsync_directory(directory)
+                finally:
+                    try:
+                        os.unlink(temp)
+                    except FileNotFoundError:
+                        pass
+        except (AnalysisInvalid, reqscale.MeasurementInvalid, OSError, ValueError) as error:
+            print(f"{type(error).__name__}: {error}", file=sys.stderr)
+            return 4
     return 0
 
 

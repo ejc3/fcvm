@@ -1552,7 +1552,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         }
 
     @classmethod
-    def build_run(cls, directory):
+    def build_run(cls, directory, url="http://127.0.0.1/fixture",
+                  resolve_all_to=None):
         criteria = reqscale.CapacityCriteria(
             max_offered_rps_error_pct=1.0,
             min_departure_ratio=0.95,
@@ -1563,7 +1564,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         schedule = reqscale.build_schedule(
             reqscale.ScheduleConfig(
                 rates=(0.8,), scored_bursts=5, seed=776, criteria=criteria,
-                urls=("http://127.0.0.1/fixture",),
+                urls=(url,),
             ),
             RUN_ID,
         )
@@ -1577,7 +1578,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             clock.now_ns = next_start
             burst_rows, summary = reqscale.run_open_loop_burst(
                 RUN_ID, spec, lambda context: {"backend": context.backend,
-                                       "url": "http://127.0.0.1/fixture"},
+                                       "url": url},
                 clock, DeferredLauncher(),
             )
             for row in burst_rows:
@@ -1677,8 +1678,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "chromium_path": "/usr/bin/chromium",
                 "chromium_version": "Chromium fixture",
                 "chromium_sha256": "4" * 64,
-                "url": "http://127.0.0.1/fixture",
-                "resolve_all_to": None,
+                "url": url,
+                "resolve_all_to": resolve_all_to,
                 "timeout_seconds": 8.0,
             },
             "fault_trace": {
@@ -2513,6 +2514,117 @@ class AnalyzerHoldsTheCorpus(unittest.TestCase):
             self.assertTrue(reqscale_analyze._null_or_ipv4(good), good)
         for bad in ("", "replay", "127.0.0.01", 7):
             self.assertFalse(reqscale_analyze._null_or_ipv4(bad), bad)
+
+
+class ScaleOutputHonoursThePublicationGate(unittest.TestCase):
+    """main() is what the campaign and `make report-chromium-scale` run."""
+
+    @staticmethod
+    def _corpus_run(d, evidence=True):
+        from test_campaign_summary import write_run
+
+        run_dir = os.path.join(d, "scale")
+        os.mkdir(run_dir)
+        CompleteAnalyzerFixture.build_run(
+            run_dir, url="https://example.com/", resolve_all_to="127.0.0.1")
+        if evidence:
+            write_run(d, analysis_overrides={"run_id": RUN_ID})
+        return run_dir
+
+    @staticmethod
+    def _main(*argv):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["reqscale_analyze.py", *argv]), \
+                mock.patch.object(reqscale_analyze, "BOOTSTRAP_DRAWS", 1000), \
+                redirect_stderr(err):
+            return reqscale_analyze.main(), err.getvalue()
+
+    @staticmethod
+    def _load(path):
+        with open(path) as stream:
+            return json.load(stream)
+
+    def test_an_unpublishable_analysis_gets_json_but_no_report(self):
+        """RED BEFORE THE FIX: with the campaign's DNS evidence absent the
+        analysis said publishable false, and --markdown-out still wrote a
+        report saying the run passed its checks, at exit 0. The JSON-only
+        analysis still exits 0, because the campaign writes it before the
+        evidence exists to bind the run id the evidence names."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir = self._corpus_run(d, evidence=False)
+            report = os.path.join(out, "report.md")
+            rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+            self.assertNotEqual(rc, 0, "a report was written for an unpublishable analysis")
+            self.assertFalse(os.path.lexists(report))
+            self.assertIn("DNS evidence", err)
+            pre = os.path.join(out, "analysis-pre-evidence.json")
+            rc, err = self._main("--run-dir", run_dir, "--json-out", pre)
+            self.assertEqual(rc, 0, err)
+            self.assertFalse(self._load(pre)["publishable"])
+
+    def test_a_withdrawn_run_or_campaign_is_not_publishable(self):
+        """RED BEFORE THE FIX: the scale analyzer read no WITHDRAWN marker, so
+        re-analysing a withdrawn campaign whose clean DNS evidence stayed in
+        place said publishable, and its report was written."""
+        for where in ("campaign", "run"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as d, \
+                    tempfile.TemporaryDirectory() as out:
+                run_dir = self._corpus_run(d)
+                before = os.path.join(out, "before.json")
+                rc, err = self._main("--run-dir", run_dir, "--json-out", before)
+                self.assertEqual(rc, 0, err)
+                self.assertTrue(self._load(before)["publishable"])
+                marked = d if where == "campaign" else run_dir
+                with open(os.path.join(marked, "WITHDRAWN"), "w") as marker:
+                    marker.write("resolver was ambient\n")
+                after = os.path.join(out, "after.json")
+                rc, err = self._main("--run-dir", run_dir, "--json-out", after)
+                self.assertEqual(rc, 0, err)
+                analysis = self._load(after)
+                self.assertFalse(analysis["publishable"], f"a withdrawn {where} stayed publishable")
+                self.assertIn("withdrawn: resolver was ambient",
+                              analysis["publication_blocked_by"])
+                report = os.path.join(out, "report.md")
+                rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+                self.assertNotEqual(rc, 0, err)
+                self.assertFalse(os.path.lexists(report))
+
+    def test_the_run_and_its_campaign_stay_locked_while_the_analysis_reads_them(self):
+        """RED BEFORE THE FIX: the analyzer held no lock, so a withdrawal
+        writer following AGENTS.md (exclusive flock on the directory, then the
+        marker) took either directory in the middle of validation, and the
+        analysis published from the state before its marker."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir = self._corpus_run(d)
+            report = os.path.join(out, "report.md")
+            real_analyze = reqscale_analyze.analyze
+            writers = []
+
+            def analyze_beside_a_writer(path):
+                for directory in (run_dir, d):
+                    writers.append(subprocess.run(
+                        ["flock", "-n", "-x", directory, "sh", "-c",
+                         'printf "late\\n" > "$1"', "sh",
+                         os.path.join(directory, "WITHDRAWN")],
+                        capture_output=True, text=True, timeout=10,
+                    ).returncode)
+                return real_analyze(path)
+
+            with mock.patch.object(reqscale_analyze, "analyze",
+                                   side_effect=analyze_beside_a_writer):
+                rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+            self.assertEqual(writers, [1, 1],
+                             "a withdrawal writer locked a directory mid-analysis")
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(report))
+            for directory in (run_dir, d):
+                self.assertFalse(os.path.lexists(os.path.join(directory, "WITHDRAWN")))
+                released = subprocess.run(
+                    ["flock", "-n", "-x", directory, "true"],
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(released.returncode, 0,
+                                 f"{directory}: the analysis kept its lock")
 
 
 class RestorePathIsWhatItSays(unittest.TestCase):
