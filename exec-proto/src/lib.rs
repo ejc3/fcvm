@@ -444,6 +444,15 @@ pub const RESTORE_COMPLETE_PREFIX: &str = "restore-complete:";
 /// float-valued phases render near 450 bytes).
 pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 1024;
 
+/// How long fc-agent waits for the host to answer the connection it sends the ACK on. A
+/// blocking vsock connect otherwise waits only Linux's default of 2 s, which a guest busy
+/// right after a restore has exceeded (#1080).
+pub const RESTORE_COMPLETE_CONNECT_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(10);
+
+/// How long fc-agent waits to write the ACK frame once its connection is answered.
+pub const RESTORE_COMPLETE_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build the restore-completion ACK frame.
 ///
 /// Telemetry is advisory and must never cost a healthy clone its ACK: when it

@@ -3542,6 +3542,169 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     }
 }
 
+/// The guest-armed burn every test VM boots with in `a_slow_ack_connect_still_completes_the_restore`.
+const SLOW_ACK_BURN: &str = "restore.pre_ack_connect:burn:4000";
+
+/// How long the restore ACK's connect syscall blocked, as the guest timed it on the
+/// connecting thread ("restore-completion ACK connect syscall took N ms").
+fn ack_connect_syscall_ms(log: &str) -> Option<u64> {
+    const MARKER: &str = "restore-completion ACK connect syscall took ";
+    let tail = &log[log.find(MARKER)? + MARKER.len()..];
+    let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+    digits.parse().ok()
+}
+
+/// The burn's and the restore ACK's lines in a VM log, so a failure names its cause.
+fn burn_and_ack_lines(log: &str) -> String {
+    log.lines()
+        .filter(|line| line.contains("FAILPOINT") || line.contains("restore-completion ACK"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A restore whose ACK vsock connect takes longer than Linux's 2 s default still succeeds,
+/// because fc-agent gives that connect its own 10 s deadline (#1080, PR 1085).
+///
+/// The golden boots with the guest failpoint `restore.pre_ack_connect:burn:4000` armed. It
+/// cold-boots, and the failpoint is on the restore path only, so the golden never reaches
+/// it. fc-agent armed it at boot, so the snapshot carries it, and the clone's restore hits
+/// it right before the ACK connect. The burn keeps every SCHED_OTHER task off every guest
+/// CPU for 4 s, the kernel worker that processes the host's connect RESPONSE included, so
+/// the connect syscall blocks until the burn ends and then completes. The test requires the
+/// clone's log to show the burn starting and never aborting, the connect syscall blocking
+/// more than 2000 ms, the burn's restore line naming RT throttling and the hitting thread's
+/// policy, and the clone healthy.
+///
+/// The golden runs off the snapshot cache (`FCVM_NO_SNAPSHOT=1`) for two reasons. Restored
+/// from a pre-start snapshot, it would burn in its own restore, so under the red below the
+/// failure would land on the golden instead of the clone. And that pre-start snapshot,
+/// keyed by the armed `guest_failpoint`, would stay in the runner's snapshot cache.
+///
+/// # Seeing the red
+///
+/// Set `RESTORE_COMPLETE_CONNECT_TIMEOUT` in exec-proto/src/lib.rs to Linux's default
+/// (`std::time::Duration::from_secs(2)`), rebuild, set up, and rerun. The clone's log then
+/// shows the burn starting and the connect failing with `ETIMEDOUT` after a 2000 ms connect
+/// syscall (not `EINTR`, so the retry does not fire). fc-agent fails the ACK closed and
+/// shuts the clone down, fcvm exits, and `poll_health_by_pid` fails as soon as it sees the
+/// process gone.
+///
+/// Run it (integration-slow tests run under `make test-all`, rootless, no sudo):
+/// `make test-all FILTER="-E 'test(/a_slow_ack_connect_still_completes_the_restore/)'"`.
+#[tokio::test]
+async fn a_slow_ack_connect_still_completes_the_restore() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("slow-ack-connect");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (mut baseline_child, baseline_pid, _baseline_log) =
+        common::spawn_fcvm_with_env_and_log_path(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &baseline_name,
+                "--network",
+                "rootless",
+                common::TEST_IMAGE,
+            ],
+            &[
+                ("FCVM_GUEST_FAILPOINT", SLOW_ACK_BURN),
+                // Cold boot only, no pre-start snapshot (see the doc comment).
+                ("FCVM_NO_SNAPSHOT", "1"),
+            ],
+        )
+        .await
+        .context("spawning golden VM with the ACK-connect burn armed")?;
+
+    common::poll_health_by_pid(baseline_pid, 120)
+        .await
+        .context("golden VM did not become healthy")?;
+
+    // Snapshot, then drop the golden; the restore runs from the snapshot files alone.
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "snapshot create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    common::kill_process(baseline_pid).await;
+    let _ = baseline_child.wait().await;
+
+    let (mut clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning restored clone")?;
+
+    let health = common::poll_health_by_pid(clone_pid, 120).await;
+
+    // The guest's console lines reach the log asynchronously; wait briefly for the burn to
+    // be reported ended and the connect syscall line to arrive.
+    let mut log = String::new();
+    for _ in 0..40 {
+        log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+        if ack_connect_syscall_ms(&log).is_some() && log.contains("BURN restored") {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let _ = common::delete_snapshot(&snapshot_name).await;
+
+    let lines = burn_and_ack_lines(&log);
+    println!("clone burn and ACK lines:\n{lines}");
+    health.with_context(|| {
+        format!("the restored clone did not become healthy; its burn and ACK lines:\n{lines}")
+    })?;
+    assert!(
+        log.contains("BURN started"),
+        "the burn never started, so nothing stalled the connect:\n{lines}"
+    );
+    assert!(
+        !log.contains("BURN ABORTED") && !log.contains("BURN RESTORE FAILED"),
+        "the burn aborted or failed to restore:\n{lines}"
+    );
+    let restored = log
+        .lines()
+        .find(|line| line.contains("BURN restored"))
+        .with_context(|| format!("the burn never reported its restore:\n{lines}"))?;
+    assert!(
+        restored.contains("sched_rt_runtime_us") && restored.contains("hitting thread policy"),
+        "the burn's restore line must name RT throttling and the hitting thread's policy:\n{lines}"
+    );
+    let syscall_ms = ack_connect_syscall_ms(&log).with_context(|| {
+        format!("the clone never logged its ACK connect syscall time:\n{lines}")
+    })?;
+    assert!(
+        syscall_ms > 2000,
+        "the ACK connect syscall must block longer than Linux's 2 s default to show the 10 s \
+         deadline at work (it blocked {syscall_ms} ms):\n{lines}"
+    );
+    Ok(())
+}
+
 /// Test snapshot run --exec with bridged networking
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]

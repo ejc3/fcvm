@@ -7,6 +7,9 @@ description = "Deterministic failpoints for lifecycle interleaving tests (FCVM_F
 
 [dependencies]
 tokio = { version = "1", features = ["time", "fs"] }
+# The `burn` guest action: per-thread scheduling syscalls, CPU pinning, and the debugfs mount
+# that reaches the fair server.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }

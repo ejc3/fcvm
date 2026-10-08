@@ -103,8 +103,8 @@ async fn main() {
 
     // Arm guest failpoints from the kernel cmdline: fcvm forwards the host env
     // FCVM_GUEST_FAILPOINT as `fcvm_failpoint=<spec>` (the fuse_trace_rate
-    // pattern) because fc-agent cannot read host env. Sleep actions only in the
-    // guest — block_until_file is host-only, rejected by fcvm before boot.
+    // pattern) because fc-agent cannot read host env. Guest specs take sleep and
+    // burn; block_until_file is host-only, rejected by fcvm before boot.
     if let Ok(cmdline) = std::fs::read_to_string("/proc/cmdline") {
         if let Some(spec) = cmdline
             .split_whitespace()

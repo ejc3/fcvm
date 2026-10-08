@@ -27,7 +27,9 @@
 //!
 //! "reached" is printed before the action starts, "released" after it completes;
 //! a harness that sees "reached" knows the code path is parked inside the window
-//! and may act. A `block_until_file` point that hits its 60s hard cap prints a
+//! and may act. A `burn` hit with [`hit_scoped`] completes when the returned
+//! guard is dropped, so its hitting thread runs its next operation between the
+//! two markers. A `block_until_file` point that hits its 300 s hard cap prints a
 //! loud `RELEASED BY TIMEOUT` line first — a wedged harness must not wedge the
 //! VM forever. Arming prints `FAILPOINT armed spec=<spec>` once.
 //!
@@ -42,16 +44,23 @@
 //! A spec is comma-separated entries, each `<name>:<action>:<arg>`:
 //!
 //! * `<name>:sleep:<ms>` — hold for `<ms>` milliseconds.
+//! * `<name>:burn:<ms>`: keep every SCHED_OTHER task in the guest, kernel workers
+//!   included, off every CPU for `<ms>` milliseconds, so an operation that needs a
+//!   kernel worker to complete (a vsock connect) cannot complete until the burn ends.
+//!   Hit it with [`hit_scoped`] so the hitting thread's next operation runs during the
+//!   burn; [`hit`] waits the burn out. Capped at 15 s. Guest-only and root-only
+//!   (failpoint/src/burn.rs).
 //! * `<name>:block_until_file:<path>` — poll every 10ms until `<path>` exists,
-//!   hard-capped at 60s. Host-only (see below). `<path>` may contain `:`.
+//!   hard-capped at 300 s. Host-only (see below). `<path>` may contain `:`.
 //!
 //! # Arming
 //!
-//! * Host: `fcvm` calls [`arm_from_env`] once at startup; set `FCVM_FAILPOINT`.
+//! * Host: `fcvm` calls [`arm_from_env`] once at startup; set `FCVM_FAILPOINT`. A host
+//!   spec cannot hold `burn`, which would starve every CPU of the host.
 //! * Guest: fc-agent cannot read host env. `fcvm` forwards `FCVM_GUEST_FAILPOINT`
 //!   onto the kernel cmdline as `fcvm_failpoint=<spec>` (the `fuse_trace_rate`
 //!   pattern); fc-agent parses `/proc/cmdline` at startup and calls
-//!   [`arm_from_str`]. Guest specs are sleep-only and whitespace-free —
+//!   [`arm_from_str`]. Guest specs take `sleep` and `burn` only and are whitespace-free:
 //!   `block_until_file` is host-only (the harness cannot create files inside the
 //!   guest, and a file-blocked guest holds VM-global state for the full cap) —
 //!   enforced host-side by [`validate_guest_spec`] before the VM boots.
@@ -71,8 +80,11 @@
 //! create and restore their own entries — and normal runs can never restore a
 //! snapshot with failpoints armed.
 
+mod burn;
+
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -87,6 +99,10 @@ const BLOCK_POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// exactly the race the hold was supposed to remove.
 const BLOCK_CAP: Duration = Duration::from_secs(300);
 
+/// Cap on `burn`: above the restore ACK's 10 s connect deadline, the longest wait a burn
+/// exists to outlast, and short enough that a typo cannot hold every guest CPU for minutes.
+const BURN_CAP: Duration = Duration::from_secs(15);
+
 /// What an armed failpoint does when hit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Action {
@@ -95,6 +111,9 @@ enum Action {
     /// Poll every [`BLOCK_POLL_INTERVAL`] until the file exists, capped at
     /// [`BLOCK_CAP`]. Host-only (see crate docs).
     BlockUntilFile(PathBuf),
+    /// Keep every SCHED_OTHER task off every CPU for the given duration. Guest-only and
+    /// root-only (see the crate docs and the `burn` module).
+    Burn(Duration),
 }
 
 impl fmt::Display for Action {
@@ -102,6 +121,7 @@ impl fmt::Display for Action {
         match self {
             Action::Sleep(d) => write!(f, "sleep:{}ms", d.as_millis()),
             Action::BlockUntilFile(p) => write!(f, "block_until_file:{}", p.display()),
+            Action::Burn(d) => write!(f, "burn:{}ms", d.as_millis()),
         }
     }
 }
@@ -144,6 +164,19 @@ fn parse_spec(spec: &str) -> Result<HashMap<String, Action>, String> {
                 }
                 Action::Sleep(Duration::from_millis(ms))
             }
+            (Some("burn"), Some(ms)) => {
+                let ms: u64 = ms
+                    .parse()
+                    .map_err(|e| format!("entry {entry:?}: bad burn milliseconds: {e}"))?;
+                // Reject, don't clamp, as for sleep.
+                if Duration::from_millis(ms) > BURN_CAP {
+                    return Err(format!(
+                        "entry {entry:?}: burn exceeds the {}s cap",
+                        BURN_CAP.as_secs()
+                    ));
+                }
+                Action::Burn(Duration::from_millis(ms))
+            }
             (Some("block_until_file"), Some(path)) if !path.is_empty() => {
                 Action::BlockUntilFile(PathBuf::from(path))
             }
@@ -152,7 +185,7 @@ fn parse_spec(spec: &str) -> Result<HashMap<String, Action>, String> {
             }
             (Some(other), _) => {
                 return Err(format!(
-                    "entry {entry:?}: unknown action {other:?} (expected sleep or block_until_file)"
+                    "entry {entry:?}: unknown action {other:?} (expected sleep, burn, or block_until_file)"
                 ));
             }
             (None, _) => {
@@ -166,23 +199,46 @@ fn parse_spec(spec: &str) -> Result<HashMap<String, Action>, String> {
     Ok(map)
 }
 
-/// Arm failpoints from the `FCVM_FAILPOINT` env var. Unset arms nothing (and
-/// keeps the fast path). Called once at process startup; panics on a malformed
-/// spec (see crate docs) or if failpoints are already armed.
+/// Arm failpoints from the `FCVM_FAILPOINT` env var (the host path). Unset arms
+/// nothing (and keeps the fast path). Called once at process startup; panics on a
+/// malformed spec (see crate docs), on a `burn` entry, or if failpoints are already
+/// armed.
 pub fn arm_from_env() {
     match std::env::var("FCVM_FAILPOINT") {
-        Ok(spec) => arm_from_str(&spec),
+        Ok(spec) => arm_host(&spec),
         Err(_) => {
             let _ = ARMED.set(None);
         }
     }
 }
 
+/// [`arm_from_str`] for the host: a `burn` entry is refused like a malformed one, because
+/// a burn armed in fcvm would starve every CPU of the host.
+fn arm_host(spec: &str) {
+    let map = parse_spec(spec).and_then(|map| {
+        let burn = map
+            .iter()
+            .find_map(|(name, action)| matches!(action, Action::Burn(_)).then_some(name));
+        match burn {
+            Some(name) => Err(format!(
+                "failpoint {name:?}: burn is guest-only (FCVM_GUEST_FAILPOINT); armed in fcvm \
+                 it would starve every CPU of the host"
+            )),
+            None => Ok(map),
+        }
+    });
+    arm(spec, map);
+}
+
 /// Arm failpoints from a spec string (the guest path: fc-agent passes the
 /// `fcvm_failpoint=` kernel cmdline value). Panics on a malformed spec (see
 /// crate docs) or if failpoints are already armed.
 pub fn arm_from_str(spec: &str) {
-    let map = parse_spec(spec).unwrap_or_else(|e| panic!("invalid failpoint spec {spec:?}: {e}"));
+    arm(spec, parse_spec(spec));
+}
+
+fn arm(spec: &str, map: Result<HashMap<String, Action>, String>) {
+    let map = map.unwrap_or_else(|e| panic!("invalid failpoint spec {spec:?}: {e}"));
     if ARMED.set(Some(map)).is_err() {
         panic!("failpoints already armed (arm_from_env/arm_from_str called twice)");
     }
@@ -190,7 +246,7 @@ pub fn arm_from_str(spec: &str) {
 }
 
 /// Validate a spec for forwarding to the guest kernel cmdline: parseable,
-/// whitespace-free (the cmdline is space-delimited), and sleep-only
+/// whitespace-free (the cmdline is space-delimited), and `sleep` or `burn` only
 /// (`block_until_file` is host-only — see crate docs).
 pub fn validate_guest_spec(spec: &str) -> Result<(), String> {
     if spec.chars().any(|c| c.is_whitespace()) {
@@ -202,7 +258,7 @@ pub fn validate_guest_spec(spec: &str) -> Result<(), String> {
     for (name, action) in parse_spec(spec)? {
         if matches!(action, Action::BlockUntilFile(_)) {
             return Err(format!(
-                "failpoint {name:?}: block_until_file is host-only; guest failpoints support sleep only"
+                "failpoint {name:?}: block_until_file is host-only; guest failpoints support sleep and burn only"
             ));
         }
     }
@@ -211,10 +267,55 @@ pub fn validate_guest_spec(spec: &str) -> Result<(), String> {
 
 /// Hit a failpoint from a sync context (plain threads, `spawn_blocking`).
 /// Zero-cost when unarmed. When armed for `name`: print the "reached" marker,
-/// perform the action (blocking this thread), print "released".
+/// perform the action (blocking this thread), print "released". A burn holds this
+/// thread until it ends.
 pub fn hit(name: &str) {
     if let Some(action) = armed_action(name) {
         perform_sync(name, action, BLOCK_CAP);
+    }
+}
+
+/// Hit a failpoint from a sync context and keep a burn running after the return.
+///
+/// Every other action is performed as by [`hit`] before this returns, and its "released"
+/// marker is printed when the guard drops. A burn is only
+/// started: the hitting thread runs its next operation while the burn keeps SCHED_OTHER
+/// work off every CPU, and dropping the returned guard waits for the burn's deadline,
+/// restores what it changed (including this thread's raised priority), and prints
+/// "released". The guard cannot leave the thread, because the priority it restores is
+/// that thread's own.
+///
+/// The burners start spinning as this returns, so between the return and the operation
+/// the caller must not allocate, print, or take a lock: none of those locks has priority
+/// inheritance, and a starved SCHED_OTHER thread holding one would keep this thread asleep
+/// through the burn.
+#[must_use = "the burn ends when the guard is dropped, so the operation to stall must run while it is held"]
+pub fn hit_scoped(name: &str) -> Hold {
+    match armed_action(name) {
+        Some(action) => begin_sync(name, action, BLOCK_CAP),
+        None => Hold {
+            name: None,
+            burn: None,
+            _thread: PhantomData,
+        },
+    }
+}
+
+/// Returned by [`hit_scoped`]: ends a running burn and prints "released" when dropped.
+pub struct Hold {
+    /// The armed failpoint, if any; `None` when the hit was unarmed.
+    name: Option<String>,
+    burn: Option<burn::Burn>,
+    /// Not Send: dropping the guard restores the hitting thread's own scheduling policy.
+    _thread: PhantomData<*const ()>,
+}
+
+impl Drop for Hold {
+    fn drop(&mut self) {
+        drop(self.burn.take());
+        if let Some(name) = &self.name {
+            eprintln!("FAILPOINT {name} released");
+        }
     }
 }
 
@@ -227,7 +328,14 @@ pub async fn hit_async(name: &str) {
 }
 
 fn perform_sync(name: &str, action: &Action, cap: Duration) {
+    drop(begin_sync(name, action, cap));
+}
+
+/// Print "reached" and perform `action`, except that a burn is only started. The returned
+/// guard ends the burn and prints "released" when dropped.
+fn begin_sync(name: &str, action: &Action, cap: Duration) -> Hold {
     eprintln!("FAILPOINT {name} reached action={action}");
+    let mut burn = None;
     match action {
         Action::Sleep(d) => std::thread::sleep(*d),
         Action::BlockUntilFile(path) => {
@@ -243,8 +351,19 @@ fn perform_sync(name: &str, action: &Action, cap: Duration) {
                 std::thread::sleep(BLOCK_POLL_INTERVAL);
             }
         }
+        Action::Burn(d) => burn = burn::start(name, *d),
     }
-    eprintln!("FAILPOINT {name} released");
+    let hold = Hold {
+        name: Some(name.to_string()),
+        burn,
+        _thread: PhantomData,
+    };
+    // Last act before the return: everything above may allocate and print, which nothing
+    // may do once the burners spin.
+    if let Some(burn) = &hold.burn {
+        burn.release();
+    }
+    hold
 }
 
 async fn perform_async(name: &str, action: &Action, cap: Duration) {
@@ -264,6 +383,12 @@ async fn perform_async(name: &str, action: &Action, cap: Duration) {
                 tokio::time::sleep(BLOCK_POLL_INTERVAL).await;
             }
         }
+        // A burn raises the hitting thread above its burners, and an async task does not
+        // own its thread, so it is refused here instead of raising a runtime worker.
+        Action::Burn(_) => eprintln!(
+            "FAILPOINT {name} BURN ABORTED: a burn raises the thread that hits it, so it needs \
+             failpoint::hit or failpoint::hit_scoped on a blocking thread, not hit_async"
+        ),
     }
     eprintln!("FAILPOINT {name} released");
 }
@@ -316,6 +441,8 @@ mod tests {
         assert!(parse_spec("x:sleep").is_err()); // missing ms
         assert!(parse_spec("x:sleep:abc").is_err()); // non-numeric ms
         assert!(parse_spec("x:explode:1").is_err()); // unknown action
+        assert!(parse_spec("x:burn").is_err()); // missing ms
+        assert!(parse_spec("x:burn:abc").is_err()); // non-numeric ms
         assert!(parse_spec("x:block_until_file:").is_err()); // empty path
         assert!(parse_spec("x:sleep:1,x:sleep:2").is_err()); // duplicate name
         assert!(parse_spec(":sleep:1").is_err()); // empty name with action
@@ -324,9 +451,37 @@ mod tests {
     #[test]
     fn test_validate_guest_spec() {
         assert!(validate_guest_spec("a:sleep:5,b:sleep:10").is_ok());
+        assert!(validate_guest_spec("a:burn:4000").is_ok()); // burn is a guest action
+        assert!(validate_guest_spec("a:sleep:5,b:burn:4000").is_ok());
         assert!(validate_guest_spec("a:block_until_file:/tmp/x").is_err()); // host-only
         assert!(validate_guest_spec("a:sleep:5 b:sleep:10").is_err()); // whitespace
         assert!(validate_guest_spec("garbage").is_err()); // unparseable
+    }
+
+    /// A burn is capped at 15 s, enough to outlast the restore ACK's 10 s connect
+    /// deadline, so a typo cannot hold every guest CPU for minutes.
+    #[test]
+    fn test_burn_has_its_own_cap() {
+        assert!(parse_spec("x:burn:15000").is_ok());
+        assert!(parse_spec("x:burn:15001").is_err());
+    }
+
+    /// The host arming path refuses a burn: armed in fcvm (FCVM_FAILPOINT) it would starve
+    /// every CPU of the host. It panics before arming, like any malformed spec.
+    #[test]
+    #[should_panic(expected = "burn is guest-only")]
+    fn test_host_arming_refuses_burn() {
+        arm_host("exec.post_connect_pre_send:burn:3000");
+    }
+
+    #[test]
+    fn test_parse_burn() {
+        let map = parse_spec("restore.pre_ack_connect:burn:4000").unwrap();
+        assert_eq!(
+            map["restore.pre_ack_connect"],
+            Action::Burn(Duration::from_millis(4000))
+        );
+        assert_eq!(format!("{}", map["restore.pre_ack_connect"]), "burn:4000ms");
     }
 
     /// The one test allowed to arm the process-global map (OnceLock arms once
