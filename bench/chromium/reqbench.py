@@ -76,7 +76,8 @@ the task into a zombie. A `/proc/<pid>/stat` read taken while the task is in
 state `Z` therefore already includes all of the reclaim. The sampler records
 whether it caught the `Z` state (`zombie_seen`); when it did, the CPU figure is
 COMPLETE, and when it did not (the parent's reaper won the race) the figure is a
-LOWER BOUND and is labelled as one. Never averaged together.
+LOWER BOUND and is labelled as one. A lower bound is averaged only into a
+figure that is itself labelled a lower bound.
 
 Whole-machine `/proc/stat` busy-jiffy deltas are recorded over a window that
 encloses the reclaim, then compared with an adjacent post-terminal ambient
@@ -696,7 +697,8 @@ def sample_all_until_gone(
     `exit_notify()`, so the reclaim is already in the counters by the time state
     `Z` is reachable, and MISSING the `Z` only downgrades that child's figure to a
     labelled LOWER BOUND — a state the record already models (`complete`, and
-    reqanalyze prints the two populations separately, never averaged).
+    reqanalyze prints the two populations separately, and averages a lower
+    bound only into a figure labelled as one).
     """
     live = dict(pids)
     last: dict = dict(initial_stats)

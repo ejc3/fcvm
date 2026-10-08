@@ -2373,7 +2373,17 @@ def analyze_backend(
         # bootstrap CI does not cover it, because truncation always reads low.
         # Fail closed: one measured request without a complete reading
         # withholds every figure, rather than shrinking n to the readable
-        # ones.
+        # ones. A child that exited before its terminal sample has a reclaim
+        # that is only a lower bound, possibly by all of it (its last reading
+        # can be the one at the kill), which quantization_ms does not cover.
+        # One such request withholds the complete figures (clone_mean_ms, its
+        # median and parts, total_mean_ms), and the block publishes
+        # clone_at_least_mean_ms and total_at_least_mean_ms instead: the mean
+        # over every measured request, lower-bound readings included, with
+        # only the lower end of its bootstrap CI. Those readings can only read
+        # low, so the true mean is at least that figure up to sampling error,
+        # and an upper end would bound nothing. The per-child section above
+        # still prints the complete and lower-bound populations apart.
         fast_records = [
             r for r in measured_attempted[a]
             if (r.get("teardown") or {}).get("mode") == "fast"
@@ -2409,48 +2419,77 @@ def analyze_backend(
 
             readings = [clone_cpu(r) for r in fast_records]
             missing = sum(1 for x in readings if x is None)
+            lower = sum(1 for x in readings if x is not None and x["lower_bound"])
             block = {"n": len(fast_records), "missing_records": missing,
-                     "complete": missing == 0}
-            if missing == 0:
+                     "records_with_lower_bound_reaping": lower,
+                     "complete": missing == 0 and lower == 0}
+            if missing:
+                block["withheld_because"] = "; ".join(reason for reason in (
+                    f"{missing} measured requests without a complete reading",
+                    f"{lower} measured requests with a lower-bound reaping (a child "
+                    "exited before its terminal CPU sample)" if lower else "",
+                ) if reason)
+            else:
                 totals = [x["children_at_kill"] + x["reaped_children"] + x["reclaim"]
                           for x in readings]
                 m, lo, hi, n = mean_ci(totals)
                 tick = max(x["tick_ms"] for x in readings)
                 clone_q_hi = statistics.fmean(x["quantization_hi"] for x in readings)
-                block["clone_mean_ms"] = {"mean": m, "lo": lo, "hi": hi, "n": n,
-                                          "quantization_ms": {"lo": 0.0, "hi": clone_q_hi,
-                                                              "tick_ms": tick},
-                                          "provenance": provenance(fast_records)}
-                block["clone_median_ms"] = dict(zip(("median", "lo", "hi", "n"),
-                                                    median_ci(totals)))
-                block["clone_parts_mean_ms"] = {
-                    key: statistics.fmean(x[key] for x in readings)
-                    for key in ("children_at_kill", "reaped_children", "reclaim")
-                }
-                names = sorted({name for x in readings for name in x["by_child"]})
-                block["by_child_at_kill_mean_ms"] = {
-                    name: statistics.fmean(x["by_child"].get(name, 0.0) for x in readings)
-                    for name in names
-                }
-                block["records_with_lower_bound_reaping"] = sum(
-                    1 for x in readings if x["lower_bound"])
-                block["memory_server"] = memory_server_average(fast_records, arms, tick)
-                if block["memory_server"].get("available"):
-                    block["total_mean_ms"] = m + block["memory_server"]["mean_ms"]
-                    server_q = block["memory_server"]["quantization_ms"]
-                    block["total_quantization_ms"] = {"lo": server_q["lo"],
-                                                      "hi": clone_q_hi + server_q["hi"]}
+                clone_q = {"lo": 0.0, "hi": clone_q_hi, "tick_ms": tick}
+                server = memory_server_average(fast_records, arms, tick)
+                total_q = ({"lo": server["quantization_ms"]["lo"],
+                            "hi": clone_q_hi + server["quantization_ms"]["hi"]}
+                           if server.get("available") else None)
+                if lower:
+                    block["withheld_because"] = (
+                        f"{lower} measured requests with a lower-bound reaping (a child "
+                        "exited before its terminal CPU sample, so its reclaim reads low "
+                        "by an unknown amount); only at-least figures are published")
+                    block["clone_at_least_mean_ms"] = {
+                        "at_least": m, "ci_lo": lo, "n": n, "quantization_ms": clone_q,
+                        "provenance": provenance(fast_records)}
+                    block["memory_server"] = server
+                    if total_q is not None:
+                        block["total_at_least_mean_ms"] = {
+                            "at_least": m + server["mean_ms"] + server["quantization_ms"]["lo"],
+                            "ci_lo": lo + server["mean_ms"] + server["quantization_ms"]["lo"], "n": n,
+                            "quantization_ms": total_q}
+                else:
+                    block["clone_mean_ms"] = {"mean": m, "lo": lo, "hi": hi, "n": n,
+                                              "quantization_ms": clone_q,
+                                              "provenance": provenance(fast_records)}
+                    block["clone_median_ms"] = dict(zip(("median", "lo", "hi", "n"),
+                                                        median_ci(totals)))
+                    block["clone_parts_mean_ms"] = {
+                        key: statistics.fmean(x[key] for x in readings)
+                        for key in ("children_at_kill", "reaped_children", "reclaim")
+                    }
+                    names = sorted({name for x in readings for name in x["by_child"]})
+                    block["by_child_at_kill_mean_ms"] = {
+                        name: statistics.fmean(x["by_child"].get(name, 0.0) for x in readings)
+                        for name in names
+                    }
+                    block["memory_server"] = server
+                    if total_q is not None:
+                        block["total_mean_ms"] = m + server["mean_ms"]
+                        block["total_quantization_ms"] = total_q
             out["arms"][a]["request_cpu_ms"] = block
-            print(f"    request CPU: {len(fast_records) - missing}/{len(fast_records)} "
-                  "measured requests with a complete reading")
+            print(f"    request CPU: {len(fast_records) - missing - lower}/{len(fast_records)} "
+                  "measured requests with a complete reading"
+                  + (f", {lower} with a lower-bound reaping" if lower else ""))
             if missing:
-                print("      ** CPU figures withheld: incomplete readings **")
+                print(f"      ** CPU figures withheld: {block['withheld_because']} **")
             else:
-                c = block["clone_mean_ms"]
-                print(f"      clone mean          {c['mean']:.1f} ms "
-                      f"[{c['lo']:.1f}, {c['hi']:.1f}] n={c['n']}"
-                      + (f"  ({block['records_with_lower_bound_reaping']} lower-bound reapings)"
-                         if block["records_with_lower_bound_reaping"] else ""))
+                if lower:
+                    print("      ** complete CPU figures withheld: "
+                          f"{block['withheld_because']} **")
+                    c = block["clone_at_least_mean_ms"]
+                    print(f"      clone AT LEAST      {c['at_least']:.1f} ms "
+                          f"(95% CI lower end {c['ci_lo']:.1f}) n={c['n']}   LOWER BOUND")
+                else:
+                    c = block["clone_mean_ms"]
+                    print(f"      clone mean          {c['mean']:.1f} ms "
+                          f"[{c['lo']:.1f}, {c['hi']:.1f}] n={c['n']}")
                 q = c["quantization_ms"]
                 print(f"        /proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms "
                       f"({q['tick_ms']:.0f} ms tick)")
@@ -2461,6 +2500,12 @@ def analyze_backend(
                 if "total_mean_ms" in block:
                     q = block["total_quantization_ms"]
                     print(f"      total mean          {block['total_mean_ms']:.1f} ms "
+                          f"(/proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms)")
+                if "total_at_least_mean_ms" in block:
+                    t = block["total_at_least_mean_ms"]
+                    q = t["quantization_ms"]
+                    print(f"      total AT LEAST      {t['at_least']:.1f} ms "
+                          f"(95% CI lower end {t['ci_lo']:.1f})   LOWER BOUND "
                           f"(/proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms)")
 
         # CLASSIFY ON True, NOT ON False. `ag.count(False)` drove the warning

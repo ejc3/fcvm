@@ -3877,42 +3877,107 @@ class AnalyzerAvailability(unittest.TestCase):
                 "pasta": {"reclaim_cpu_ms": 0.0, "complete": True},
             }
             record["teardown"]["tick_ms"] = 10.0
-        measured[1]["teardown"]["per_child_cpu"]["firecracker"]["complete"] = False
         if mutate:
             mutate(measured)
         with open(src, "w") as target:
             for row in rows:
                 target.write(json.dumps(row) + "\n")
-        with redirect_stdout(io.StringIO()):
+        printout = io.StringIO()
+        with redirect_stdout(printout):
             self._run_gate_fixture(["--json-out", dst, src])
+        self.cpu_printout = printout.getvalue()
         with open(dst) as result_file:
             return json.load(result_file)["arms"]["cdp-fast"]["request_cpu_ms"], measured
 
-    def test_request_cpu_counts_reaped_helpers_and_measured_lower_bounds(self):
-        """RED BEFORE THE FIX: no reduction read the per-child CPU, fcvm's
-        reaped setup helpers (cutime/cstime) were read nowhere, and the old
-        test's lower-bound row was a warmup, so it could never count one."""
+    def test_request_cpu_counts_reaped_helpers(self):
+        """RED BEFORE THE FIX: no reduction read the per-child CPU, and fcvm's
+        reaped setup helpers (cutime/cstime) were read nowhere."""
         with tempfile.TemporaryDirectory() as d:
             block, measured = self._cpu_fixture(d)
         self.assertTrue(block["complete"])
         self.assertEqual(block["clone_mean_ms"]["mean"], 670.0 + 5.0 + 110.0)
         self.assertEqual(block["clone_mean_ms"]["n"], len(measured))
         self.assertEqual(block["clone_parts_mean_ms"]["reaped_children"], 5.0)
-        self.assertEqual(block["records_with_lower_bound_reaping"], 1)
+        self.assertEqual(block["records_with_lower_bound_reaping"], 0)
+        self.assertNotIn("clone_at_least_mean_ms", block)
         # Four arms shared the memory server, so it is not this arm's.
         self.assertFalse(block["memory_server"]["available"])
         self.assertNotIn("total_mean_ms", block)
 
+    def test_a_lower_bound_reaping_publishes_only_at_least_figures(self):
+        """RED BEFORE THE FIX: a measured request whose child exited before
+        its terminal sample carries a reclaim that is only a lower bound,
+        possibly by all of it, and it was averaged into a mean marked
+        complete. Withholding every figure instead would publish nothing for
+        a real run, where most requests carry one. The complete figures stay
+        withheld and the means are published labelled as lower bounds."""
+        def reaper_won(complete, file_backed=False):
+            def mutate(measured):
+                # Its last reading was the one taken at the kill.
+                child = measured[1]["teardown"]["per_child_cpu"]["firecracker"]
+                child["reclaim_cpu_ms"] = 0.0
+                child["complete"] = complete
+                if file_backed:
+                    for record in measured:
+                        record["serve_cpu_before"] = {"applicable": False}
+                        record["serve_cpu_after"] = {"applicable": False}
+            return mutate
+        with tempfile.TemporaryDirectory() as d:
+            as_complete, _ = self._cpu_fixture(d, reaper_won(True))
+        with tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, reaper_won(False))
+        printout = self.cpu_printout
+        self.assertFalse(block["complete"],
+                         "a lower-bound reaping was averaged into a complete mean")
+        self.assertEqual(block["missing_records"], 0)
+        self.assertEqual(block["records_with_lower_bound_reaping"], 1)
+        self.assertIn("1 measured requests with a lower-bound reaping",
+                      block["withheld_because"])
+        for figure in ("clone_mean_ms", "clone_median_ms", "clone_parts_mean_ms",
+                       "by_child_at_kill_mean_ms", "total_mean_ms", "total_quantization_ms"):
+            self.assertNotIn(figure, block)
+        self.assertIn("clone_at_least_mean_ms", block,
+                      "a lower-bound reaping withheld the at-least figures too")
+        at_least = block["clone_at_least_mean_ms"]
+        self.assertEqual(sorted(at_least),
+                         ["at_least", "ci_lo", "n", "provenance", "quantization_ms"])
+        self.assertLessEqual(at_least["at_least"], as_complete["clone_mean_ms"]["mean"],
+                             "the at-least mean left out the lower-bound reading")
+        self.assertLessEqual(at_least["ci_lo"], as_complete["clone_mean_ms"]["lo"])
+        self.assertEqual(at_least["n"], len(measured))
+        self.assertEqual(at_least["quantization_ms"],
+                         as_complete["clone_mean_ms"]["quantization_ms"])
+        self.assertRegex(printout, r"clone AT LEAST .* LOWER BOUND")
+        self.assertNotIn("clone mean ", printout)
+        # Four arms shared the memory server, so there is no total.
+        self.assertFalse(block["memory_server"]["available"])
+        self.assertNotIn("total_at_least_mean_ms", block)
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, reaper_won(False, file_backed=True))
+        self.assertEqual(block["total_at_least_mean_ms"]["at_least"],
+                         block["clone_at_least_mean_ms"]["at_least"])
+        self.assertEqual(block["total_at_least_mean_ms"]["quantization_ms"],
+                         {"lo": 0.0, "hi": 120.0})
+        self.assertRegex(self.cpu_printout, r"total AT LEAST .* LOWER BOUND")
+
     def test_one_incomplete_request_withholds_every_cpu_figure(self):
         """RED BEFORE THE FIX: a request without a reading was dropped and
-        the rest published under a smaller n."""
+        the rest published under a smaller n. A missing reading bounds
+        nothing, so no at-least figure is published either."""
         def drop(measured):
             del measured[0]["teardown"]["reaped_children_cpu_ms_by_child"]
-        with tempfile.TemporaryDirectory() as d:
-            block, measured = self._cpu_fixture(d, drop)
-        self.assertFalse(block["complete"])
-        self.assertEqual(block["missing_records"], 1)
-        self.assertNotIn("clone_mean_ms", block)
+
+        def drop_and_reaper_won(measured):
+            drop(measured)
+            measured[1]["teardown"]["per_child_cpu"]["firecracker"]["complete"] = False
+        for mutate in (drop, drop_and_reaper_won):
+            with self.subTest(mutate.__name__), tempfile.TemporaryDirectory() as d:
+                block, _ = self._cpu_fixture(d, mutate)
+                self.assertFalse(block["complete"])
+                self.assertEqual(block["missing_records"], 1)
+                for figure in ("clone_mean_ms", "clone_at_least_mean_ms", "memory_server",
+                               "total_mean_ms", "total_at_least_mean_ms"):
+                    self.assertNotIn(figure, block)
 
     def test_request_cpu_carries_the_proc_tick_quantization(self):
         """RED BEFORE THE FIX: every part of the clone figure is a sum of
