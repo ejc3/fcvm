@@ -18,6 +18,7 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import campaign_summary  # noqa: E402
 import reqscale  # noqa: E402
 
 
@@ -149,20 +150,28 @@ def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     through the replay server is recorded only by the corpus campaign's DNS
     evidence beside this run directory. Without a clean bundle that names this
     run, a run against the wrong resolver is indistinguishable from a good one.
+    The bundle is held to campaign_summary's check, the one the index applies:
+    the run id, the :53 owner samples, the replay server's exit status, every
+    verify bracket and replay log against the sha256 recorded at the verdict,
+    and brackets that covered exactly this run's pages. The scale schedule
+    records no guest resolver, so the brackets are held to the one the first
+    of them names.
     """
     corpus = len(schedule["urls"]) > 1 or provenance["host_control"].get("resolve_all_to")
     if not corpus:
         return None
-    path = os.path.join(os.path.dirname(os.path.abspath(run_dir)), "dns-evidence.json")
+    campaign_dir = os.path.dirname(os.path.abspath(run_dir))
+    path = os.path.join(campaign_dir, "dns-evidence.json")
+    if not os.path.isfile(path):
+        return f"corpus run without the campaign's DNS evidence ({path})"
+    sources = campaign_summary.Sources(campaign_dir)
     try:
-        with open(path) as handle:
-            evidence = json.load(handle)
-    except (OSError, ValueError) as error:
-        return f"corpus run without the campaign's DNS evidence ({path}: {error})"
-    if not isinstance(evidence, dict) or evidence.get("verdict") != "clean":
-        return f"the campaign's DNS evidence is not clean ({path})"
-    if evidence.get("run_id") != schedule["run_id"]:
-        return f"the campaign's DNS evidence names run {evidence.get('run_id')!r}, not this one"
+        evidence = sources.read_json(path)
+        campaign_summary.check_evidence(
+            campaign_dir, evidence, sources, None, list(schedule["urls"]), schedule["run_id"]
+        )
+    except campaign_summary.RunError as error:
+        return f"the campaign's DNS evidence does not hold: {error}"
     return None
 
 

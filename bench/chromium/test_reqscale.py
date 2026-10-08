@@ -2476,9 +2476,32 @@ class AnalyzerHoldsTheCorpus(unittest.TestCase):
         """Red before the gate: a corpus run's analysis said publishable with
         no evidence that its clones resolved through the replay server."""
         self.assertIn("without the campaign's DNS evidence", self._gate(None))
-        self.assertIn("not clean", self._gate({"verdict": "unclean", "run_id": RUN_ID}))
-        self.assertIn("names run", self._gate({"verdict": "clean", "run_id": "other"}))
-        self.assertIsNone(self._gate({"verdict": "clean", "run_id": RUN_ID}))
+        self.assertIn("not 'clean'", self._gate({"verdict": "unclean", "run_id": RUN_ID}))
+        self.assertIn("records run_id='other'",
+                      self._gate({"verdict": "clean", "run_id": "other"}))
+
+    def test_the_dns_evidence_is_held_to_every_file_it_pins(self):
+        """Red while the gate read only verdict and run_id: an object holding
+        just those two fields, or a bundle whose replay log changed after the
+        verdict, left a corpus run publishable. The gate is campaign_summary's
+        check, so a bundle the index would refuse is refused here too."""
+        from test_campaign_summary import write_run
+
+        bare = self._gate({"verdict": "clean", "run_id": RUN_ID})
+        self.assertIsNotNone(bare, "two fields passed as a whole DNS evidence bundle")
+        self.assertIn("samples", bare)
+        schedule = {"run_id": RUN_ID, "urls": ["https://example.com/"]}
+        provenance = {"host_control": {"resolve_all_to": "127.0.0.1"}}
+        with tempfile.TemporaryDirectory() as d:
+            write_run(d, analysis_overrides={"run_id": RUN_ID})
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            self.assertIsNone(reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance))
+            with open(os.path.join(d, "corpus-dns.log"), "a") as handle:
+                handle.write("{}\n")
+            refused = reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance)
+        self.assertIsNotNone(refused, "a replay log changed after the verdict passed")
+        self.assertIn("corpus-dns.log sha256", refused)
 
     def test_a_single_page_run_needs_no_resolver_evidence(self):
         self.assertIsNone(reqscale_analyze.corpus_dns_gate(
