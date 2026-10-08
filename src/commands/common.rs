@@ -365,6 +365,40 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<MergeSt
     merge_with(base_path, diff_path, &MERGE_TUNING, MERGE_IO)
 }
 
+/// The bytes of `file` that are data, summed over its SEEK_DATA and SEEK_HOLE
+/// runs. A hole reads as zeros and stores nothing.
+///
+/// This is the file's layout, not its disk use. st_blocks is no disk measure
+/// either: on btrfs it counts uncompressed bytes (16 MiB of zstd-compressible
+/// data showed 16 MiB of st_blocks and 512 KiB on disk in compsize), so a claim
+/// about disk space has to come from compsize.
+pub fn data_run_bytes(file: &std::fs::File) -> Result<u64> {
+    let len = file.metadata().context("reading the file's length")?.len();
+    let mut total = 0;
+    let mut offset = 0;
+    while offset < len {
+        let data_start = match lseek(file, offset as i64, Whence::SeekData) {
+            Ok(pos) => pos as u64,
+            // ENXIO means no more data after this offset
+            Err(nix::errno::Errno::ENXIO) => break,
+            Err(e) => bail!("SEEK_DATA failed at offset {}: {}", offset, e),
+        };
+        let data_end = lseek(file, data_start as i64, Whence::SeekHole)
+            .map_err(|e| anyhow::anyhow!("SEEK_HOLE failed at offset {}: {}", data_start, e))?
+            as u64;
+        anyhow::ensure!(
+            data_end > data_start && data_end <= len,
+            "the data run at offset {} ends at {} in a file of {} bytes",
+            data_start,
+            data_end,
+            len
+        );
+        total += data_end - data_start;
+        offset = data_end;
+    }
+    Ok(total)
+}
+
 /// One write of a merge: the piece `[start, end)` of one of the diff's runs.
 struct MergeWrite {
     start: u64,
@@ -3182,7 +3216,8 @@ async fn atomic_replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
 
 /// Limit concurrent snapshot creation to prevent dirty_ratio writeback throttling.
 ///
-/// Each full snapshot writes the VM's entire configured memory (default 1GB) to page cache.
+/// Each full snapshot writes the VM's memory to page cache, up to its configured size (default
+/// 1 GiB). The default Firecracker build leaves all-zero pages as holes and writes only the rest.
 /// The Linux kernel throttles ALL writers when dirty pages exceed `dirty_ratio` (typically
 /// 20% of RAM). On a 125GB machine with default dirty_ratio=20%, that's 25GB.
 /// When 150 VMs snapshot simultaneously (CI SnapshotEnabled mode), total dirty pages
@@ -3945,23 +3980,85 @@ async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &s
 /// order. Cleanup failures must never replace the operation that made cleanup
 /// necessary, and a successful snapshot is still an error if either recovery
 /// step failed.
-fn combine_snapshot_boundary_results(
-    operation_result: Result<()>,
+fn combine_snapshot_boundary_results<T>(
+    operation_result: Result<T>,
     hypervisor_resume_result: Result<()>,
     guest_network_resume_result: Result<()>,
-) -> Result<()> {
-    let mut combined = operation_result.err();
+) -> Result<T> {
+    let mut combined = operation_result;
     for recovery_result in [hypervisor_resume_result, guest_network_resume_result] {
         if let Err(recovery_error) = recovery_result {
-            combined = Some(match combined {
-                Some(existing) => {
+            combined = Err(match combined {
+                Ok(_) => recovery_error,
+                Err(existing) => {
                     anyhow::anyhow!("{existing:#}; additionally: {recovery_error:#}")
                 }
-                None => recovery_error,
             });
         }
     }
-    combined.map_or(Ok(()), Err)
+    combined
+}
+
+/// The memory file a Firecracker snapshot create published, opened by its final path
+/// after the atomic rename.
+///
+/// Measuring the file walks its data runs with two lseek calls per run, and a 128 GiB
+/// guest whose 4 KiB pages alternate between zero and nonzero has about 16.8 million
+/// runs. So `create_snapshot_core` does not measure it: it returns this, which gives back
+/// the global snapshot permit, and its caller calls [`PublishedMemoryFile::log_data_runs`]
+/// once it has given back the generation locks and the per-VM snapshot lock. The file is
+/// opened while the target's generation lock is still held, so a create that replaces the
+/// snapshot afterwards cannot change which file is measured.
+#[must_use = "measure it with log_data_runs once the snapshot locks are given back"]
+pub struct PublishedMemoryFile {
+    snapshot: String,
+    file: Result<std::fs::File>,
+}
+
+impl PublishedMemoryFile {
+    fn open(snapshot: &str, path: &Path) -> Self {
+        Self {
+            snapshot: snapshot.to_string(),
+            file: std::fs::File::open(path).with_context(|| format!("opening {}", path.display())),
+        }
+    }
+
+    /// Log the memory file's length and how many of its bytes are data. Its data runs
+    /// are the guest memory the snapshot stores: the default Firecracker build leaves a
+    /// Full snapshot's all-zero pages as holes, and a Diff keeps its base's, because on
+    /// btrfs the base copy (copy_file_range) clones. A failed measurement is logged and
+    /// does not fail the snapshot.
+    ///
+    /// The walk runs on a blocking thread. It is quick only because the file is synced:
+    /// Firecracker syncs the memory file it writes, and merge_diff_snapshot syncs a merged
+    /// one. On a btrfs file with dirty pages the same walk measured about 1,000 times
+    /// slower (13 to 70 s for 8k to 32k runs).
+    pub async fn log_data_runs(self) {
+        let Self { snapshot, file } = self;
+        let measured = match file {
+            Ok(file) => tokio::task::spawn_blocking(move || -> Result<(u64, u64)> {
+                let len = file.metadata().context("reading its length")?.len();
+                Ok((len, data_run_bytes(&file)?))
+            })
+            .await
+            .context("memory file measurement task panicked")
+            .and_then(|measured| measured),
+            Err(e) => Err(e),
+        };
+        match measured {
+            Ok((memory_len, memory_data_bytes)) => info!(
+                snapshot = %snapshot,
+                memory_len,
+                memory_data_bytes,
+                "measured the snapshot's memory file"
+            ),
+            Err(e) => warn!(
+                snapshot = %snapshot,
+                error = %format!("{e:#}"),
+                "could not measure the memory file's data runs"
+            ),
+        }
+    }
 }
 
 /// Create a snapshot of the running VM.
@@ -3971,7 +4068,8 @@ fn combine_snapshot_boundary_results(
 /// before calling this function.
 ///
 /// # Returns
-/// Ok(()) on success, Err on failure. A normal source is resumed regardless of
+/// The published memory file on success, for the caller to measure once it has given
+/// back its locks, and Err on failure. A normal source is resumed regardless of
 /// success/failure after a successful pause. A disposable source remains paused on every
 /// post-pause return so it cannot mutate after its prepared startup point.
 pub async fn create_snapshot_core(
@@ -3982,7 +4080,7 @@ pub async fn create_snapshot_core(
     parent_snapshot_dir: Option<&Path>,
     extra_files: SnapshotExtraFiles<'_>,
     source_disposition: SnapshotSourceDisposition,
-) -> Result<()> {
+) -> Result<PublishedMemoryFile> {
     use crate::firecracker::api::{SnapshotCreate, VmState as ApiVmState};
 
     // Acquire snapshot concurrency permit BEFORE pausing the VM.
@@ -4040,11 +4138,13 @@ pub async fn create_snapshot_core(
     let snapshot_type = if has_base { "Diff" } else { "Full" };
 
     // Check available disk space before attempting snapshot.
-    // A full snapshot dumps all VM memory; a diff snapshot is smaller but still needs space.
+    // A full snapshot writes at most all VM memory (the default Firecracker build leaves
+    // all-zero pages as holes), so memory_mib is an upper bound and the check errs toward
+    // refusing. A diff snapshot is smaller but still needs space.
     // Failing ENOSPC mid-snapshot corrupts the VM (Firecracker can't resume properly).
     {
         let memory_bytes = (snapshot_config.metadata.memory_mib as u64) * 1024 * 1024;
-        // For full snapshots, need ~memory_mib. For diff, need ~10% as buffer.
+        // For full snapshots, need at most memory_mib. For diff, need ~10% as buffer.
         let required_bytes = if has_base {
             memory_bytes / 10
         } else {
@@ -4478,7 +4578,12 @@ pub async fn create_snapshot_core(
         "snapshot created successfully"
     );
 
-    Ok(())
+    // Measured by the caller, after this function gives back the snapshot permit and
+    // the caller gives back its locks.
+    Ok(PublishedMemoryFile::open(
+        &snapshot_config.name,
+        &snapshot_dir.join("memory.bin"),
+    ))
 }
 
 /// Subdirectory inside a snapshot directory holding Cloud Hypervisor's own snapshot files
@@ -4705,6 +4810,33 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn data_run_bytes_counts_data_runs_and_not_holes() {
+        use std::os::unix::fs::FileExt;
+
+        // 64 KiB blocks, so the layout is exact on any filesystem whose block is
+        // no larger, including 64 KiB-page hosts.
+        const BLOCK: u64 = 64 * 1024;
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(16 * BLOCK).unwrap();
+        assert_eq!(
+            data_run_bytes(&file).unwrap(),
+            0,
+            "a file that is all hole holds no data"
+        );
+
+        // Data at the start, a hole, two blocks of data, then a trailing hole.
+        file.write_all_at(&vec![0xa5; BLOCK as usize], 0).unwrap();
+        file.write_all_at(&vec![0x5a; 2 * BLOCK as usize], 5 * BLOCK)
+            .unwrap();
+        assert_eq!(data_run_bytes(&file).unwrap(), 3 * BLOCK);
+
+        // A file that ends in data.
+        file.write_all_at(&vec![0x3c; BLOCK as usize], 15 * BLOCK)
+            .unwrap();
+        assert_eq!(data_run_bytes(&file).unwrap(), 4 * BLOCK);
+    }
+
+    #[test]
     fn verified_cleanup_reports_every_failure_after_all_attempts() {
         let mut failures = CleanupFailures::default();
         failures.record(
@@ -4728,7 +4860,7 @@ mod tests {
 
     #[test]
     fn snapshot_boundary_error_preserves_operation_and_both_recovery_failures() {
-        let error = combine_snapshot_boundary_results(
+        let error = combine_snapshot_boundary_results::<()>(
             Err(anyhow::anyhow!("snapshot save failed")),
             Err(anyhow::anyhow!("hypervisor resume failed")),
             Err(anyhow::anyhow!("guest network reopen failed")),
@@ -5474,6 +5606,33 @@ mod tests {
         }
     }
 
+    /// A function's source, from its signature to the first closing brace in
+    /// column one.
+    fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
+        let start = source
+            .find(signature)
+            .unwrap_or_else(|| panic!("no `{signature}`"));
+        let end = source[start..]
+            .find("\n}\n")
+            .unwrap_or_else(|| panic!("`{signature}` has no end"));
+        &source[start..start + end]
+    }
+
+    /// Fail unless each of `steps` appears in `body`, in that order.
+    fn assert_in_order(name: &str, body: &str, steps: &[&str]) {
+        let offsets: Vec<usize> = steps
+            .iter()
+            .map(|step| {
+                body.find(step)
+                    .unwrap_or_else(|| panic!("{name} has no `{step}`"))
+            })
+            .collect();
+        assert!(
+            offsets.windows(2).all(|pair| pair[0] < pair[1]),
+            "{name} does not run {steps:?} in that order: offsets {offsets:?}"
+        );
+    }
+
     /// A memory snapshot's balloon record is read from the VMM inside
     /// `create_snapshot_core`: after the pause, so nothing can change the target
     /// between the read and the save, and before the save, so the record is the
@@ -5485,30 +5644,6 @@ mod tests {
     /// No fake VMM can drive it, so the order is pinned by its source.
     #[test]
     fn a_memory_snapshot_reads_the_balloon_between_the_pause_and_the_save() {
-        // A function's source, from its signature to the first closing brace in
-        // column one.
-        fn body_of<'a>(source: &'a str, signature: &str) -> &'a str {
-            let start = source
-                .find(signature)
-                .unwrap_or_else(|| panic!("no `{signature}`"));
-            let end = source[start..]
-                .find("\n}\n")
-                .unwrap_or_else(|| panic!("`{signature}` has no end"));
-            &source[start..start + end]
-        }
-        fn assert_in_order(name: &str, body: &str, steps: &[&str]) {
-            let offsets: Vec<usize> = steps
-                .iter()
-                .map(|step| {
-                    body.find(step)
-                        .unwrap_or_else(|| panic!("{name} has no `{step}`"))
-                })
-                .collect();
-            assert!(
-                offsets.windows(2).all(|pair| pair[0] < pair[1]),
-                "{name} does not run {steps:?} in that order: offsets {offsets:?}"
-            );
-        }
         let source = include_str!("common.rs");
         assert_in_order(
             "create_snapshot_core",
@@ -5539,6 +5674,63 @@ mod tests {
                 "reporting_balloon_must_be_active(",
             ],
         );
+    }
+
+    /// Measuring a published memory file walks its data runs with two lseek calls
+    /// per run, and a 128 GiB guest whose 4 KiB pages alternate between zero and
+    /// nonzero has about 16.8 million runs. Nothing may wait on that walk.
+    /// `create_snapshot_core` holds the global snapshot permit for its whole body,
+    /// so it does not walk: it opens the memory file once the atomic rename has
+    /// published it and returns it unmeasured. Each caller holds the snapshot's
+    /// generation locks and the per-VM snapshot lock, and gives them back before
+    /// it walks the file. No fake VMM can drive these functions, so the order is
+    /// pinned by their source.
+    #[test]
+    fn a_snapshot_create_walks_its_memory_file_after_publishing_and_unlocking() {
+        let source = include_str!("common.rs");
+        let core = body_of(source, "pub async fn create_snapshot_core(");
+        assert!(
+            !core.contains("data_run_bytes(") && !core.contains(".log_data_runs()"),
+            "create_snapshot_core walks the memory file's data runs, so the walk holds the \
+             snapshot permit and the caller's generation locks"
+        );
+        assert_in_order(
+            "create_snapshot_core",
+            core,
+            &[
+                "let _permit = snapshot_semaphore()",
+                "atomic_replace_dir(&temp_snapshot_dir, snapshot_dir)",
+                "PublishedMemoryFile::open(",
+            ],
+        );
+        assert_in_order(
+            "PublishedMemoryFile::log_data_runs",
+            body_of(source, "pub async fn log_data_runs("),
+            &["spawn_blocking(", "data_run_bytes("],
+        );
+        for (name, source, signature) in [
+            (
+                "cmd_snapshot_create",
+                include_str!("snapshot.rs"),
+                "async fn cmd_snapshot_create(",
+            ),
+            (
+                "create_podman_snapshot",
+                include_str!("podman/snapshot.rs"),
+                "pub async fn create_podman_snapshot(",
+            ),
+        ] {
+            assert_in_order(
+                name,
+                body_of(source, signature),
+                &[
+                    "create_snapshot_core(",
+                    "drop(_vm_lock)",
+                    "drop(_generation_locks)",
+                    ".log_data_runs()",
+                ],
+            );
+        }
     }
 
     /// A memory snapshot is not taken of a VM whose guest left its balloon device

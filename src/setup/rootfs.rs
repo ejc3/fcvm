@@ -88,9 +88,10 @@ pub struct FirecrackerConfig {
     /// Branch or lightweight tag to build from (default: "main")
     #[serde(default = "default_branch")]
     pub branch: String,
-    /// Exact full commit required at `branch`.
-    #[serde(default)]
-    pub commit: Option<String>,
+    /// Exact full commit to build, fetched by its hash; it need not be the tip
+    /// of `branch`. Required, so the default build is always one known commit
+    /// and launch resolves it without the network.
+    pub commit: String,
 }
 
 /// Cloud Hypervisor build configuration (#632).
@@ -191,7 +192,8 @@ pub struct KernelProfile {
     #[serde(default)]
     pub firecracker_branch: Option<String>,
 
-    /// Exact full commit required at `firecracker_branch`
+    /// Exact full commit to build, fetched by its hash; it need not be the tip
+    /// of `firecracker_branch`
     #[serde(default)]
     pub firecracker_commit: Option<String>,
 
@@ -1112,7 +1114,7 @@ fn apply_default_firecracker_config(plan: &mut Plan) {
         if profile.firecracker_repo.is_none() {
             profile.firecracker_repo = Some(firecracker.repo.clone());
             profile.firecracker_branch = Some(firecracker.branch.clone());
-            profile.firecracker_commit = firecracker.commit.clone();
+            profile.firecracker_commit = Some(firecracker.commit.clone());
         }
     }
 }
@@ -2632,6 +2634,52 @@ mod tests {
     use super::*;
 
     #[test]
+    fn global_firecracker_config_without_a_commit_is_refused() {
+        let error = toml::from_str::<FirecrackerConfig>(
+            r#"
+repo = "ejc3/firecracker"
+branch = "agent/nv2"
+"#,
+        )
+        .expect_err("a [firecracker] section must pin the commit it builds");
+        assert!(error.to_string().contains("commit"), "{error}");
+    }
+
+    /// Every Firecracker the embedded config builds is pinned, so setup keeps a
+    /// built binary without the network and launch resolves it offline.
+    #[test]
+    fn embedded_config_pins_every_firecracker_it_builds() {
+        let mut plan: Plan = toml::from_str(EMBEDDED_CONFIG).unwrap();
+        apply_default_firecracker_config(&mut plan);
+        let mut built = 0;
+        for (name, arches) in &plan.kernel_profiles {
+            for (arch, profile) in arches {
+                if profile.firecracker_repo.is_none() {
+                    continue;
+                }
+                built += 1;
+                let commit = profile.firecracker_commit.as_deref().unwrap_or_else(|| {
+                    panic!("{name}.{arch} builds Firecracker with no pinned commit")
+                });
+                assert!(
+                    commit.len() == 40
+                        && commit
+                            .bytes()
+                            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                    "{name}.{arch} pins {commit:?}, which is not a full lowercase commit"
+                );
+            }
+        }
+        assert!(
+            plan.kernel_profiles["default"]
+                .values()
+                .all(|profile| profile.firecracker_repo.is_some()),
+            "the default profiles must build the [firecracker] fork"
+        );
+        assert!(built > 2, "only {built} profiles build Firecracker");
+    }
+
+    #[test]
     fn firecracker_commit_pins_deserialize_for_global_and_profile_configs() {
         let global: FirecrackerConfig = toml::from_str(
             r#"
@@ -2641,10 +2689,7 @@ commit = "27305f49ab3a5d862dc56b5108713b6536d2baa7"
 "#,
         )
         .unwrap();
-        assert_eq!(
-            global.commit.as_deref(),
-            Some("27305f49ab3a5d862dc56b5108713b6536d2baa7")
-        );
+        assert_eq!(global.commit, "27305f49ab3a5d862dc56b5108713b6536d2baa7");
 
         let profile: KernelProfile = toml::from_str(
             r#"

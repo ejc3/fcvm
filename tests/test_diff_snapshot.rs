@@ -479,60 +479,202 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     Ok(())
 }
 
-/// Test that memory.bin size is reasonable after diff merge
-///
-/// After diff is merged onto base, memory.bin should contain all data.
-/// This test verifies the merge doesn't corrupt the file by checking that
-/// the startup snapshot (which uses diff merge) has the same size as the
-/// pre-start snapshot (which is full).
-#[tokio::test]
-async fn test_diff_snapshot_memory_size_valid() -> Result<()> {
-    println!("\nDiff Snapshot: Memory Size Validation");
-    println!("======================================");
+/// The bytes of one `/proc/meminfo` field, which the kernel prints in KiB.
+fn meminfo_bytes(meminfo: &str, field: &str) -> Result<u64> {
+    let line = meminfo
+        .lines()
+        .find(|line| line.split(':').next() == Some(field))
+        .with_context(|| format!("no {field} in meminfo:\n{meminfo}"))?;
+    let mut words = line.split_whitespace().skip(1);
+    let kib: u64 = words
+        .next()
+        .with_context(|| format!("no value in {line:?}"))?
+        .parse()
+        .with_context(|| format!("parsing {line:?}"))?;
+    anyhow::ensure!(words.next() == Some("kB"), "{line:?} is not in kB");
+    Ok(kib * 1024)
+}
 
-    // Use unique env var to get unique snapshot key
-    let test_id = format!("TEST_ID=diff-size-{}", std::process::id());
+/// Removes a snapshot directory when dropped, so a failed test does not leave
+/// its memory file behind. Create it before `snapshot create`, which can
+/// publish the snapshot and still exit non-zero; removing a directory that
+/// does not exist does nothing.
+struct RemoveSnapshotOnDrop(std::path::PathBuf);
 
-    // First boot: creates pre-start (Full) and startup (Diff, merged)
-    let (vm_name, _, _, _) = common::unique_names("diff-size");
-
-    println!("Starting VM with health check...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman",
-        "run",
-        "--name",
-        &vm_name,
-        "--env",
-        &test_id,
-        "--health-check",
-        HEALTH_CHECK_URL,
-        TEST_IMAGE,
-    ])
-    .await
-    .context("spawning fcvm")?;
-
-    // Wait for healthy
-    let health_result = tokio::time::timeout(
-        Duration::from_secs(300),
-        common::poll_health_by_pid(fcvm_pid, 300),
-    )
-    .await;
-
-    // Wait for snapshot creation
-    tokio::time::sleep(Duration::from_secs(5)).await;
-
-    // Cleanup
-    common::kill_process(fcvm_pid).await;
-    let _ = child.wait().await;
-
-    if health_result.is_err() || health_result.as_ref().unwrap().is_err() {
-        anyhow::bail!("VM did not become healthy");
+impl Drop for RemoveSnapshotOnDrop {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
+}
 
-    // The workflow completed - that's the main verification
-    // The diff merge happening is verified by logs in other tests
-    println!("\n✅ MEMORY SIZE VALIDATION TEST PASSED!");
-    println!("  Diff snapshot created and merged successfully");
+/// A Full snapshot leaves the guest's all-zero pages as holes in memory.bin, and
+/// a restore from that file is healthy.
+///
+/// The source boots cold with `--no-snapshot`, so it has no parent snapshot and
+/// `snapshot create` writes a Full one. MemFree is the memory the guest's
+/// allocator holds free. Most of it has not been touched since boot and reads as
+/// zeros, so it becomes holes. The rest was used and freed during boot (the
+/// initrd, early allocations) and still holds its bytes, so it is written as
+/// data. The test therefore asks for holes covering at least half of MemFree,
+/// read just before the snapshot. A Firecracker that writes zero pages as data
+/// leaves no holes at all.
+///
+/// A snapshot of a clone restored from it is a Diff whose merge base is a copy of
+/// this memory.bin, made with copy_file_range. On btrfs that clones the extents,
+/// so the child keeps the parent's holes. When btrfs refuses the clone (the two
+/// files' NODATACOW flags differ, or the data dir is not btrfs) the kernel falls
+/// back to a byte copy and every hole becomes data, so the test also bounds the
+/// child's holes.
+///
+/// The data is counted from SEEK_DATA and SEEK_HOLE runs, which is what the
+/// snapshot wrote. That is not disk use: on btrfs with compression neither the
+/// runs nor st_blocks give the disk, and only compsize does.
+#[tokio::test]
+async fn test_full_snapshot_stores_zero_pages_as_holes() -> Result<()> {
+    let (vm_name, clone_name, tag, _) = common::unique_names("zero-holes");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--no-snapshot",
+            "--health-check",
+            HEALTH_CHECK_URL,
+            TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await
+    .context("spawning the source VM")?;
+    common::poll_health_by_pid(pid, 300).await?;
+
+    let meminfo = common::exec_in_vm(pid, &["cat /proc/meminfo"])
+        .await
+        .context("reading the guest's meminfo")?;
+    let mem_free = meminfo_bytes(&meminfo, "MemFree")?;
+
+    let snapshot = snapshot_dir().join(&tag);
+    let _remove_snapshot = RemoveSnapshotOnDrop(snapshot.clone());
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &pid.to_string(),
+            "--tag",
+            &tag,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(output.status.success(), "snapshot create failed: {stderr}");
+    for line in stderr.lines().filter(|line| {
+        line.contains("snapshot created successfully")
+            || line.contains("measured the snapshot's memory file")
+    }) {
+        println!("  {}", line.trim());
+    }
+    assert!(
+        stderr.contains("creating full snapshot"),
+        "a VM booted with --no-snapshot has no parent, so its snapshot must be Full: {stderr}"
+    );
+    assert!(
+        stderr.contains("memory_data_bytes="),
+        "snapshot create did not log the memory file's data: {stderr}"
+    );
+
+    let memory = std::fs::File::open(snapshot.join("memory.bin")).context("opening memory.bin")?;
+    let len = memory.metadata()?.len();
+    let data = fcvm::commands::common::data_run_bytes(&memory)?;
+    let holes = len - data;
+    println!(
+        "  memory.bin: {} MiB long, {} MiB data, {} MiB holes; guest MemFree {} MiB",
+        len >> 20,
+        data >> 20,
+        holes >> 20,
+        mem_free >> 20
+    );
+    assert!(data > 0, "memory.bin holds no data at all");
+    assert!(
+        holes >= mem_free / 2,
+        "memory.bin has {holes} bytes of holes, less than half of the guest's {mem_free} bytes \
+         of free memory: zero pages were written as data"
+    );
+
+    let child_tag = format!("{tag}-child");
+    let child_snapshot = snapshot_dir().join(&child_tag);
+    let _remove_child_snapshot = RemoveSnapshotOnDrop(child_snapshot.clone());
+    let (mut clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "run", "--snapshot", &tag, "--name", &clone_name],
+        &clone_name,
+    )
+    .await
+    .context("spawning a clone of the snapshot")?;
+    let clone_snapshot = async {
+        common::poll_health_by_pid(clone_pid, 120)
+            .await
+            .context("a clone restored from a memory file with holes did not turn healthy")?;
+        tokio::process::Command::new(&fcvm_path)
+            .args([
+                "snapshot",
+                "create",
+                "--pid",
+                &clone_pid.to_string(),
+                "--tag",
+                &child_tag,
+            ])
+            .output()
+            .await
+            .context("running snapshot create on the clone")
+    }
+    .await;
+    common::kill_process(clone_pid).await;
+    let _ = clone_child.wait().await;
+    let output = clone_snapshot?;
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create on the clone failed: {stderr}"
+    );
+    for line in stderr.lines().filter(|line| {
+        line.contains("snapshot created successfully")
+            || line.contains("measured the snapshot's memory file")
+    }) {
+        println!("  {}", line.trim());
+    }
+    assert!(
+        stderr.contains("creating diff snapshot"),
+        "a snapshot of a restored clone must be a Diff over its parent: {stderr}"
+    );
+
+    let child_memory = std::fs::File::open(child_snapshot.join("memory.bin"))
+        .context("opening the child's memory.bin")?;
+    let child_len = child_memory.metadata()?.len();
+    let child_data = fcvm::commands::common::data_run_bytes(&child_memory)?;
+    let child_holes = child_len - child_data;
+    println!(
+        "  child memory.bin: {} MiB long, {} MiB data, {} MiB holes",
+        child_len >> 20,
+        child_data >> 20,
+        child_holes >> 20
+    );
+    // The clone's diff writes every page it touched since the restore, zeros
+    // included, so the child gains some data: 1.1 MiB on this 1 GiB guest, and
+    // 4 to 8 MiB for the startup diffs of the other tests in this binary. A
+    // merge base that writes the parent's holes out (about 630 MiB) leaves the
+    // child none. Half the parent's holes allows about 40 times the largest
+    // gain measured and still fails that copy.
+    assert!(
+        child_holes >= holes / 2,
+        "the child's memory.bin has {child_holes} bytes of holes against its parent's {holes}: \
+         the merge base copy wrote the parent's holes out as data"
+    );
     Ok(())
 }
 

@@ -1522,23 +1522,6 @@ async fn fetch_remote_firecracker_commit(repo: &str, branch: &str) -> Result<Str
     parse_firecracker_remote_commit(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Select the source commit after resolving the configured remote ref.
-fn select_firecracker_commit(pinned_commit: Option<&str>, resolved_commit: &str) -> Result<String> {
-    validate_full_git_commit(resolved_commit, "resolved firecracker ref")?;
-    if let Some(pinned_commit) = pinned_commit {
-        validate_full_git_commit(pinned_commit, "configured firecracker commit")?;
-        if pinned_commit != resolved_commit {
-            bail!(
-                "configured firecracker commit {} does not match resolved ref commit {}",
-                pinned_commit,
-                resolved_commit
-            );
-        }
-        return Ok(pinned_commit.to_string());
-    }
-    Ok(resolved_commit.to_string())
-}
-
 /// Verify that the clone used for a build has the source identity we selected.
 fn verify_firecracker_checkout_commit(expected: &str, actual: &str) -> Result<()> {
     validate_full_git_commit(expected, "selected firecracker commit")?;
@@ -1572,30 +1555,6 @@ fn validate_full_git_commit(commit: &str, source: &str) -> Result<()> {
 ///
 /// Repo, ref, full commit, architecture, and libc all affect the executable;
 /// every one is part of the cache identity.
-fn compute_profile_firecracker_sha_with_commit(
-    profile: &KernelProfile,
-    commit_hash: &str,
-) -> String {
-    compute_profile_firecracker_sha_for(
-        profile,
-        commit_hash,
-        std::env::consts::ARCH,
-        &libc_version_tag(),
-    )
-}
-
-fn compute_profile_firecracker_sha_for(
-    profile: &KernelProfile,
-    commit_hash: &str,
-    arch: &str,
-    libc_tag: &str,
-) -> String {
-    let repo = profile.firecracker_repo.as_deref().unwrap_or("");
-    let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
-
-    compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag)
-}
-
 fn compute_firecracker_sha_for_fields(
     repo: &str,
     branch: &str,
@@ -1636,10 +1595,13 @@ fn firecracker_install_temp_path(bin_path: &Path, nonce: uuid::Uuid) -> PathBuf 
     bin_path.with_file_name(format!(".{name}.{nonce}.tmp"))
 }
 
-fn firecracker_build_dir(profile_name: &str, sha: &str, nonce: uuid::Uuid) -> PathBuf {
-    PathBuf::from(format!(
-        "/tmp/firecracker-build-{profile_name}-{sha}-{nonce}"
-    ))
+/// A checkout directory for one build of the binary installed at `bin_path`.
+fn firecracker_build_dir(bin_path: &Path, nonce: uuid::Uuid) -> PathBuf {
+    let stem = bin_path
+        .file_stem()
+        .map(|stem| stem.to_string_lossy())
+        .unwrap_or_else(|| "firecracker".into());
+    PathBuf::from(format!("/tmp/{stem}-build-{nonce}"))
 }
 
 /// Return a string identifying the C library (e.g. "glibc-2.39" or "musl-1.2.4").
@@ -2104,7 +2066,8 @@ fn resolve_cargo(
 ///
 /// When `firecracker_commit` is set, its exact content-addressed path is
 /// computed locally. Launch never contacts the network and never falls back to
-/// another cached build. Setup verifies both the remote ref and cloned HEAD.
+/// another cached build. Setup fetches that commit by its hash and checks the
+/// checkout's HEAD.
 ///
 /// Without a commit pin, resolution order is:
 ///
@@ -2120,11 +2083,12 @@ fn resolve_cargo(
 /// setting it to `0` forces a remote refresh on every call.
 ///
 /// **A rebuild must never leave a launcher on a stale binary.**
-/// [`ensure_profile_firecracker`] — the `fcvm setup` path, including
-/// `--build-kernels` / an explicit `--kernel-profile` — always performs the
-/// remote resolution and rewrites this cache with the binary it just
-/// installed. So `fcvm setup` is what makes an updated fork visible, and it
-/// takes effect immediately rather than after the TTL expires.
+/// For a profile without a pin, [`ensure_profile_firecracker`] (the
+/// `fcvm setup` path, including `--build-kernels` and an explicit
+/// `--kernel-profile`) always performs the remote resolution and rewrites
+/// this cache with the binary it just installed. So `fcvm setup` is what
+/// makes an updated fork visible, and it takes effect immediately rather than
+/// after the TTL expires.
 pub async fn get_profile_firecracker_path(
     profile: &KernelProfile,
     profile_name: &str,
@@ -2148,8 +2112,8 @@ async fn get_profile_firecracker_path_in(
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
     // An immutable pin makes the launch path fully offline and forbids falling
-    // back to a different cached build. `fcvm setup` already verified that the
-    // configured ref and cloned checkout both named this exact commit.
+    // back to a different cached build. `fcvm setup` fetched this exact commit
+    // and checked the checkout's HEAD.
     if let Some(commit_hash) = profile.firecracker_commit.as_deref() {
         validate_full_git_commit(commit_hash, "configured firecracker commit")?;
         let resolved = profile_firecracker_path_for_build(
@@ -2178,8 +2142,7 @@ async fn get_profile_firecracker_path_in(
 
     // Fetch latest commit hash to detect updates
     match fetch_remote_firecracker_commit(repo, branch).await {
-        Ok(resolved_commit) => {
-            let commit_hash = select_firecracker_commit(None, &resolved_commit)?;
+        Ok(commit_hash) => {
             let resolved = profile_firecracker_path_for_build(
                 firecracker_dir,
                 profile_name,
@@ -2292,17 +2255,6 @@ pub async fn get_configured_firecracker_for_profile(
         .with_context(|| format!("resolving configured Firecracker for profile '{profile_name}'"))
 }
 
-/// Ensure the firecracker binary for a kernel profile exists.
-///
-/// Uses content-addressed naming: firecracker-{profile}-{sha}.bin, where SHA
-/// covers repo + ref + full commit + architecture + libc. With a configured
-/// commit pin, setup fails closed unless both the remote ref and cloned HEAD
-/// equal that pin. Without a pin it detects and builds the current ref commit.
-///
-/// This is the `fcvm setup` path and it **always** performs the remote
-/// resolution (`git ls-remote`), then rewrites the launch-time resolution cache
-/// read by [`get_profile_firecracker_path`]. That is what makes an updated fork
-/// take effect for VM launches immediately rather than after the cache TTL —
 /// What setup should do after trying to resolve the remote firecracker commit.
 #[derive(Debug)]
 enum RemoteResolutionOutcome {
@@ -2332,7 +2284,213 @@ fn resolve_or_reuse_cached(
     }
 }
 
-/// `fcvm setup` is the sanctioned way to pick up a new firecracker build.
+/// Where `fcvm setup` takes a profile's Firecracker source from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FirecrackerSource {
+    /// The configured commit, fetched by its hash.
+    Pin,
+    /// The commit `git ls-remote` resolved the branch to, cloned from the branch.
+    BranchTip,
+}
+
+/// What `fcvm setup` does for a profile's Firecracker.
+///
+/// `record_resolution` says whether setup then records `commit` as where the
+/// branch points, the record an unpinned launch reads instead of asking the
+/// remote. Only a commit `git ls-remote` resolved the branch to is recorded: a
+/// pin says nothing about where the branch points.
+#[derive(Debug)]
+enum FirecrackerSetupStep {
+    /// `commit` is already built at `path`.
+    Installed {
+        commit: String,
+        path: PathBuf,
+        record_resolution: bool,
+    },
+    /// Build `commit` from `source` and install it at `path`.
+    Build {
+        commit: String,
+        path: PathBuf,
+        source: FirecrackerSource,
+        record_resolution: bool,
+    },
+    /// The remote did not answer, and the branch has a binary built before.
+    ReuseCached { path: PathBuf, error: anyhow::Error },
+}
+
+/// Decide what `fcvm setup` does for a profile's Firecracker.
+///
+/// A pinned commit that is already built is kept without the network. One that
+/// is not is built, and the build fetches that commit by its hash without
+/// resolving the branch. Without a pin, `remote_commit` (the `git ls-remote`
+/// of the branch, passed in so tests can count the calls) picks the commit,
+/// and when the remote cannot be reached the branch's recorded binary is kept.
+async fn plan_firecracker_setup<Fut>(
+    firecracker_dir: &Path,
+    profile_name: &str,
+    repo: &str,
+    branch: &str,
+    pinned_commit: Option<&str>,
+    remote_commit: impl FnOnce() -> Fut,
+) -> Result<FirecrackerSetupStep>
+where
+    Fut: std::future::Future<Output = Result<String>>,
+{
+    let arch = std::env::consts::ARCH;
+    let libc_tag = libc_version_tag();
+    let (commit, source) = match pinned_commit {
+        // A pin names its binary on its own, so a built one is kept and a
+        // missing one is built without asking where the branch points.
+        Some(commit) => {
+            validate_full_git_commit(commit, "configured firecracker commit")?;
+            (commit.to_string(), FirecrackerSource::Pin)
+        }
+        None => {
+            let fetched = remote_commit().await;
+            match resolve_or_reuse_cached(fetched, || {
+                offline_cached_firecracker_resolution_in(
+                    firecracker_dir,
+                    profile_name,
+                    repo,
+                    branch,
+                    arch,
+                    &libc_tag,
+                )
+            })? {
+                RemoteResolutionOutcome::Resolved(commit) => (commit, FirecrackerSource::BranchTip),
+                RemoteResolutionOutcome::ReuseCached { path, error } => {
+                    return Ok(FirecrackerSetupStep::ReuseCached { path, error });
+                }
+            }
+        }
+    };
+    let path = profile_firecracker_path_for_build(
+        firecracker_dir,
+        profile_name,
+        repo,
+        branch,
+        &commit,
+        arch,
+        &libc_tag,
+    );
+    let record_resolution = source == FirecrackerSource::BranchTip;
+    Ok(if path.exists() {
+        FirecrackerSetupStep::Installed {
+            commit,
+            path,
+            record_resolution,
+        }
+    } else {
+        FirecrackerSetupStep::Build {
+            commit,
+            path,
+            source,
+            record_resolution,
+        }
+    })
+}
+
+/// Run one git command as the sudo invoker, so the checkout is not root-owned.
+async fn git_as_invoker(args: &[&str], what: &str) -> Result<()> {
+    let mut cmd = Command::new("git");
+    cmd.args(args);
+    super::run_build_as_sudo_invoker(&mut cmd);
+    let status = cmd
+        .status()
+        .await
+        .with_context(|| format!("running git to {what}"))?;
+    if !status.success() {
+        bail!("git could not {what} ({status})");
+    }
+    Ok(())
+}
+
+/// Put the source of `commit` in `build_dir`, which must not exist yet, and
+/// check that the checkout's HEAD is `commit`.
+async fn checkout_firecracker_source(
+    url: &str,
+    branch: &str,
+    commit: &str,
+    source: FirecrackerSource,
+    build_dir: &Path,
+) -> Result<()> {
+    let dir = build_dir
+        .to_str()
+        .context("the firecracker build directory is not UTF-8")?;
+    match source {
+        // GitHub serves a commit that is reachable from its refs by its hash,
+        // so a pin need not be the branch tip. A remote without the commit
+        // fails the fetch.
+        FirecrackerSource::Pin => {
+            git_as_invoker(&["init", "-q", dir], "create the firecracker checkout").await?;
+            git_as_invoker(
+                &[
+                    "-C",
+                    dir,
+                    "fetch",
+                    "-q",
+                    "--depth=1",
+                    "--no-tags",
+                    url,
+                    commit,
+                ],
+                &format!("fetch firecracker commit {commit} from {url}"),
+            )
+            .await?;
+            git_as_invoker(
+                &["-C", dir, "checkout", "-q", "--detach", "FETCH_HEAD"],
+                &format!("check out firecracker commit {commit}"),
+            )
+            .await?;
+        }
+        FirecrackerSource::BranchTip => {
+            git_as_invoker(
+                &[
+                    "clone",
+                    "--depth=1",
+                    "--single-branch",
+                    "--no-tags",
+                    "-b",
+                    branch,
+                    url,
+                    dir,
+                ],
+                &format!("clone branch {branch} of {url}"),
+            )
+            .await?;
+        }
+    }
+
+    let checkout = Command::new("git")
+        .args(["-C", dir, "rev-parse", "HEAD"])
+        .output()
+        .await
+        .context("reading cloned firecracker HEAD")?;
+    if !checkout.status.success() {
+        bail!(
+            "git rev-parse failed: {}",
+            String::from_utf8_lossy(&checkout.stderr)
+        );
+    }
+    verify_firecracker_checkout_commit(commit, String::from_utf8_lossy(&checkout.stdout).trim())
+}
+
+/// Ensure the firecracker binary for a kernel profile exists.
+///
+/// Uses content-addressed naming: firecracker-{profile}-{sha}.bin, where SHA
+/// covers repo + ref + full commit + architecture + libc.
+///
+/// With a configured commit pin, a built binary for it is kept without
+/// contacting the remote. Otherwise setup fetches the pinned commit by its hash,
+/// whether or not it is the branch tip, and refuses a checkout whose HEAD is not
+/// the pin. A remote that does not have the commit fails the fetch.
+///
+/// Without a pin, setup always performs the remote resolution
+/// (`git ls-remote`), builds the commit the branch resolves to, and rewrites
+/// the launch-time resolution cache read by [`get_profile_firecracker_path`].
+/// That is what makes an updated fork take effect for VM launches immediately
+/// rather than after the cache TTL. `fcvm setup` is the sanctioned way to pick
+/// up a new firecracker build.
 pub async fn ensure_profile_firecracker(
     profile: &KernelProfile,
     profile_name: &str,
@@ -2348,27 +2506,41 @@ pub async fn ensure_profile_firecracker(
 
     let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
 
-    // Fetch latest commit hash to detect updates. A transient failure to
-    // reach the remote is not a reason to fail setup when this machine has
-    // already built and recorded a binary for this profile: setup exists to
-    // make the assets present, and they are. `get_firecracker_for_profile`
-    // has always degraded this way; the ensure path failing hard on the same
-    // blip took a CI job down with every asset already on disk (all 764 unit
-    // tests had passed; `git ls-remote` then could not reach GitHub).
-    let fetched = fetch_remote_firecracker_commit(repo, branch).await;
+    // A transient failure to reach the remote is not a reason to fail setup
+    // when this machine has already built and recorded a binary for this
+    // profile: setup exists to make the assets present, and they are.
+    // `get_firecracker_for_profile` has always degraded this way; the ensure
+    // path failing hard on the same blip took a CI job down with every asset
+    // already on disk (all 764 unit tests had passed; `git ls-remote` then
+    // could not reach GitHub).
     let firecracker_dir = paths::assets_dir().join("firecracker");
-    let resolved_commit = match resolve_or_reuse_cached(fetched, || {
-        offline_cached_firecracker_resolution_in(
-            &firecracker_dir,
-            profile_name,
-            repo,
-            branch,
-            std::env::consts::ARCH,
-            &libc_version_tag(),
-        )
-    })? {
-        RemoteResolutionOutcome::Resolved(commit) => commit,
-        RemoteResolutionOutcome::ReuseCached { path, error } => {
+    let step = plan_firecracker_setup(
+        &firecracker_dir,
+        profile_name,
+        repo,
+        branch,
+        profile.firecracker_commit.as_deref(),
+        || fetch_remote_firecracker_commit(repo, branch),
+    )
+    .await?;
+    let (commit_hash, bin_path, source, record_resolution) = match step {
+        FirecrackerSetupStep::Installed {
+            commit,
+            path,
+            record_resolution,
+        } => {
+            info!(
+                path = %path.display(),
+                profile = %profile_name,
+                commit = %commit,
+                "firecracker binary exists"
+            );
+            if record_resolution {
+                record_firecracker_resolution(profile_name, repo, branch, &commit, &path);
+            }
+            return Ok(Some(path));
+        }
+        FirecrackerSetupStep::ReuseCached { path, error } => {
             warn!(
                 profile = %profile_name,
                 %error,
@@ -2377,50 +2549,36 @@ pub async fn ensure_profile_firecracker(
             );
             return Ok(Some(path));
         }
+        FirecrackerSetupStep::Build {
+            commit,
+            path,
+            source,
+            record_resolution,
+        } => (commit, path, source, record_resolution),
     };
-    let commit_hash =
-        select_firecracker_commit(profile.firecracker_commit.as_deref(), &resolved_commit)?;
-    let sha = compute_profile_firecracker_sha_with_commit(profile, &commit_hash);
-
-    // Content-addressed path in assets dir (alongside kernels)
-    let firecracker_dir = paths::assets_dir().join("firecracker");
-    let filename = format!("firecracker-{}-{}.bin", profile_name, sha);
-    let bin_path = firecracker_dir.join(&filename);
-
-    // Already exists — use it
-    if bin_path.exists() {
-        info!(
-            path = %bin_path.display(),
-            profile = %profile_name,
-            sha = %sha,
-            "firecracker binary exists"
-        );
-        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
-        return Ok(Some(bin_path));
-    }
 
     // Resolve the build toolchain before creating anything: a missing cargo
     // must not cost a network clone or leave a fresh dir/lock behind.
     let cargo = cargo_program()?;
 
     // Create directory and acquire lock
-    let flock = super::lock_store_dir(
-        &firecracker_dir.join(format!("{}.lock", filename)),
-        "firecracker build",
-    )
-    .await?;
+    let mut lock_path = bin_path.clone().into_os_string();
+    lock_path.push(".lock");
+    let flock = super::lock_store_dir(Path::new(&lock_path), "firecracker build").await?;
 
     // Double-check after lock (another process may have built it)
     if bin_path.exists() {
         debug!(path = %bin_path.display(), "firecracker exists (built by another process)");
         flock.unlock().map_err(|(_, err)| err)?;
-        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+        if record_resolution {
+            record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+        }
         return Ok(Some(bin_path));
     }
 
     println!(
-        "  → Building firecracker from {} (branch: {}, sha: {})...",
-        repo, branch, sha
+        "  → Building firecracker from {} (branch: {}, commit: {})...",
+        repo, branch, commit_hash
     );
     println!("    This may take 5-10 minutes...");
 
@@ -2428,7 +2586,7 @@ pub async fn ensure_profile_firecracker(
     // fuse-pipe shared assets directory, where separate guest kernels do not
     // share flock state; unique paths keep those builders from deleting or
     // compiling inside one another's checkout.
-    let build_dir = firecracker_build_dir(profile_name, &sha, uuid::Uuid::new_v4());
+    let build_dir = firecracker_build_dir(&bin_path, uuid::Uuid::new_v4());
 
     // Clean up old build
     if build_dir.exists() {
@@ -2437,46 +2595,10 @@ pub async fn ensure_profile_firecracker(
             .context("removing old firecracker build directory")?;
     }
 
-    // Clone repo (as the sudo invoker, so the checkout is not root-owned)
     let clone_url = format!("https://github.com/{}", repo);
-    let mut clone_cmd = Command::new("git");
-    clone_cmd.args([
-        "clone",
-        "--depth=1",
-        "--single-branch",
-        "--no-tags",
-        "-b",
-        branch,
-        &clone_url,
-        build_dir.to_str().unwrap(),
-    ]);
-    super::run_build_as_sudo_invoker(&mut clone_cmd);
-    let status = clone_cmd
-        .status()
-        .await
-        .context("cloning firecracker repo")?;
-
-    if !status.success() {
-        flock.unlock().map_err(|(_, err)| err)?;
-        bail!("Failed to clone firecracker repo from {}", clone_url);
-    }
-
-    let checkout = Command::new("git")
-        .args(["-C", build_dir.to_str().unwrap(), "rev-parse", "HEAD"])
-        .output()
-        .await
-        .context("reading cloned firecracker HEAD")?;
-    if !checkout.status.success() {
-        flock.unlock().map_err(|(_, err)| err)?;
-        bail!(
-            "git rev-parse failed: {}",
-            String::from_utf8_lossy(&checkout.stderr)
-        );
-    }
-    if let Err(error) = verify_firecracker_checkout_commit(
-        &commit_hash,
-        String::from_utf8_lossy(&checkout.stdout).trim(),
-    ) {
+    if let Err(error) =
+        checkout_firecracker_source(&clone_url, branch, &commit_hash, source, &build_dir).await
+    {
         flock.unlock().map_err(|(_, err)| err)?;
         return Err(error);
     }
@@ -2535,12 +2657,14 @@ pub async fn ensure_profile_firecracker(
     info!(
         path = %bin_path.display(),
         profile = %profile_name,
-        sha = %sha,
+        commit = %commit_hash,
         "firecracker binary installed"
     );
     println!("  ✓ Firecracker ready: {}", bin_path.display());
 
-    record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+    if record_resolution {
+        record_firecracker_resolution(profile_name, repo, branch, &commit_hash, &bin_path);
+    }
 
     Ok(Some(bin_path))
 }
@@ -3152,19 +3276,6 @@ cp vmlinux arch/arm64/boot/Image
             format!("{PINNED_COMMIT}\trefs/heads/release\n{MOVED_COMMIT}\trefs/tags/release\n");
         assert!(parse_firecracker_remote_commit(&ambiguous).is_err());
         assert!(parse_firecracker_remote_commit("1234\trefs/heads/main\n").is_err());
-        assert!(
-            select_firecracker_commit(Some("ABCDEF"), PINNED_COMMIT).is_err(),
-            "a short or non-canonical pin must fail before any build"
-        );
-    }
-
-    #[test]
-    fn pinned_firecracker_ref_movement_is_rejected() {
-        let err = select_firecracker_commit(Some(PINNED_COMMIT), MOVED_COMMIT).unwrap_err();
-        assert!(
-            err.to_string().contains(PINNED_COMMIT) && err.to_string().contains(MOVED_COMMIT),
-            "the mismatch error must name both identities: {err:#}"
-        );
     }
 
     #[test]
@@ -3174,6 +3285,17 @@ cp vmlinux arch/arm64/boot/Image
             err.to_string().contains(PINNED_COMMIT) && err.to_string().contains(MOVED_COMMIT),
             "the mismatch error must name both identities: {err:#}"
         );
+    }
+
+    fn compute_profile_firecracker_sha_for(
+        profile: &KernelProfile,
+        commit_hash: &str,
+        arch: &str,
+        libc_tag: &str,
+    ) -> String {
+        let repo = profile.firecracker_repo.as_deref().unwrap_or("");
+        let branch = profile.firecracker_branch.as_deref().unwrap_or("main");
+        compute_firecracker_sha_for_fields(repo, branch, commit_hash, arch, libc_tag)
     }
 
     #[test]
@@ -3210,6 +3332,317 @@ cp vmlinux arch/arm64/boot/Image
             compute_profile_firecracker_sha_for(&second, PINNED_COMMIT, "aarch64", "glibc-2.39"),
             "adjacent cache-key fields must not admit boundary-shifting collisions"
         );
+    }
+
+    #[test]
+    fn firecracker_cache_key_includes_the_commit() {
+        let profile = KernelProfile {
+            firecracker_repo: Some(REPO.to_string()),
+            firecracker_branch: Some(BRANCH.to_string()),
+            ..Default::default()
+        };
+        assert_ne!(
+            compute_profile_firecracker_sha_for(&profile, PINNED_COMMIT, "aarch64", "glibc-2.39"),
+            compute_profile_firecracker_sha_for(&profile, MOVED_COMMIT, "aarch64", "glibc-2.39"),
+            "a new commit pin on the same repository and branch must name a new binary, \
+             so setup builds it instead of finding the old one"
+        );
+    }
+
+    /// A remote lookup that counts its calls and answers that the branch has
+    /// moved past the pin, the way a force-push leaves it.
+    fn moved_branch_remote(
+        calls: &std::cell::Cell<u32>,
+    ) -> impl FnOnce() -> std::future::Ready<Result<String>> + '_ {
+        move || {
+            calls.set(calls.get() + 1);
+            std::future::ready(Ok(MOVED_COMMIT.to_string()))
+        }
+    }
+
+    /// A built pin is kept without contacting the remote, so a branch that
+    /// moves cannot fail setup on a host that already has the binary.
+    #[tokio::test]
+    async fn setup_keeps_a_built_pin_without_asking_the_remote() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let pinned = resolution_fixture(dir, PINNED_COMMIT);
+        let calls = std::cell::Cell::new(0);
+
+        let step = plan_firecracker_setup(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            Some(PINNED_COMMIT),
+            moved_branch_remote(&calls),
+        )
+        .await
+        .expect("a pinned binary that is built must be kept");
+        assert_eq!(calls.get(), 0, "setup asked the remote about a built pin");
+        match step {
+            FirecrackerSetupStep::Installed {
+                commit,
+                path,
+                record_resolution,
+            } => {
+                assert_eq!((commit.as_str(), path), (PINNED_COMMIT, pinned));
+                assert!(
+                    !record_resolution,
+                    "setup would record a pin as where the branch points"
+                );
+            }
+            other => panic!("a built pin must be kept, got {other:?}"),
+        }
+    }
+
+    /// A pin that is not built yet is built from the pinned commit, whatever the
+    /// branch points at, and the binary another commit of the branch left behind
+    /// is not taken for it.
+    #[tokio::test]
+    async fn setup_builds_a_pin_the_branch_has_moved_past() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let moved = resolution_fixture(dir, MOVED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, MOVED_COMMIT, &moved);
+        let calls = std::cell::Cell::new(0);
+
+        let step = plan_firecracker_setup(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            Some(PINNED_COMMIT),
+            moved_branch_remote(&calls),
+        )
+        .await
+        .expect("a pin the branch has moved past must still build");
+        assert_eq!(calls.get(), 0, "setup asked the remote about a pin");
+        match step {
+            FirecrackerSetupStep::Build {
+                commit,
+                path,
+                source,
+                record_resolution,
+            } => {
+                assert_eq!(
+                    (commit.as_str(), path, source),
+                    (
+                        PINNED_COMMIT,
+                        current_build_path(dir, PINNED_COMMIT),
+                        FirecrackerSource::Pin
+                    )
+                );
+                assert!(
+                    !record_resolution,
+                    "setup would record a pin as where the branch points"
+                );
+            }
+            other => panic!("a pin that is not built must be built, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_short_pin_fails_before_the_remote_is_asked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let calls = std::cell::Cell::new(0);
+        let error = plan_firecracker_setup(
+            tmp.path(),
+            "default",
+            REPO,
+            BRANCH,
+            Some("ABCDEF"),
+            moved_branch_remote(&calls),
+        )
+        .await
+        .expect_err("a short or non-canonical pin must fail before any build");
+        assert!(format!("{error:#}").contains("ABCDEF"), "{error:#}");
+        assert_eq!(calls.get(), 0, "setup asked the remote about a bad pin");
+    }
+
+    /// Without a pin, setup keeps or builds what the branch resolves to and
+    /// records it, and keeps the branch's recorded binary when the remote cannot
+    /// be reached.
+    #[tokio::test]
+    async fn unpinned_setup_follows_the_branch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let moved = resolution_fixture(dir, MOVED_COMMIT);
+        record_firecracker_resolution_in(dir, "default", REPO, BRANCH, MOVED_COMMIT, &moved);
+
+        let calls = std::cell::Cell::new(0);
+        let step = plan_firecracker_setup(
+            dir,
+            "default",
+            REPO,
+            BRANCH,
+            None,
+            moved_branch_remote(&calls),
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.get(), 1);
+        match step {
+            FirecrackerSetupStep::Installed {
+                commit,
+                path,
+                record_resolution,
+            } => {
+                assert_eq!((commit.as_str(), &path), (MOVED_COMMIT, &moved));
+                assert!(
+                    record_resolution,
+                    "setup must record where the branch points"
+                );
+            }
+            other => panic!("the branch's built commit must be kept, got {other:?}"),
+        }
+
+        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, || {
+            std::future::ready(Ok(PINNED_COMMIT.to_string()))
+        })
+        .await
+        .unwrap();
+        match step {
+            FirecrackerSetupStep::Build {
+                commit,
+                path,
+                source,
+                record_resolution,
+            } => {
+                assert_eq!(
+                    (commit.as_str(), path, source),
+                    (
+                        PINNED_COMMIT,
+                        current_build_path(dir, PINNED_COMMIT),
+                        FirecrackerSource::BranchTip
+                    )
+                );
+                assert!(
+                    record_resolution,
+                    "setup must record where the branch points"
+                );
+            }
+            other => panic!("a branch commit that is not built must be built, got {other:?}"),
+        }
+
+        let step = plan_firecracker_setup(dir, "default", REPO, BRANCH, None, || {
+            std::future::ready(Err(anyhow::anyhow!(
+                "git ls-remote failed: could not resolve host"
+            )))
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&step, FirecrackerSetupStep::ReuseCached { path, .. } if *path == moved),
+            "{step:?}"
+        );
+    }
+
+    /// A local repository whose branch `br` holds two commits. Returns the
+    /// first commit and the tip.
+    fn two_commit_repo(dir: &Path) -> (String, String) {
+        std::fs::create_dir_all(dir).unwrap();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .arg("-C")
+                .arg(dir)
+                .args([
+                    "-c",
+                    "user.name=fcvm",
+                    "-c",
+                    "user.email=fcvm@localhost",
+                    "-c",
+                    "commit.gpgsign=false",
+                    "-c",
+                    "core.hooksPath=/dev/null",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap().trim().to_string()
+        };
+        git(&["init", "-q", "-b", "br"]);
+        for version in ["first", "second"] {
+            std::fs::write(dir.join("version"), version).unwrap();
+            git(&["add", "version"]);
+            git(&["commit", "-q", "-m", version]);
+        }
+        (git(&["rev-parse", "HEAD~1"]), git(&["rev-parse", "HEAD"]))
+    }
+
+    #[tokio::test]
+    async fn a_pinned_commit_behind_the_branch_tip_is_checked_out() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        let (first, _tip) = two_commit_repo(&remote);
+        let build_dir = tmp.path().join("build");
+
+        checkout_firecracker_source(
+            &format!("file://{}", remote.display()),
+            "br",
+            &first,
+            FirecrackerSource::Pin,
+            &build_dir,
+        )
+        .await
+        .expect("a pin behind the branch tip must be fetched by its hash");
+        assert_eq!(
+            std::fs::read_to_string(build_dir.join("version")).unwrap(),
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_branch_checkout_must_be_the_commit_the_branch_resolved_to() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        let (first, tip) = two_commit_repo(&remote);
+        let url = format!("file://{}", remote.display());
+
+        let at_tip = tmp.path().join("tip");
+        checkout_firecracker_source(&url, "br", &tip, FirecrackerSource::BranchTip, &at_tip)
+            .await
+            .expect("a clone of the branch checks out its tip");
+        assert_eq!(
+            std::fs::read_to_string(at_tip.join("version")).unwrap(),
+            "second"
+        );
+
+        // The branch moved after ls-remote resolved it to `first`.
+        let error = checkout_firecracker_source(
+            &url,
+            "br",
+            &first,
+            FirecrackerSource::BranchTip,
+            &tmp.path().join("behind"),
+        )
+        .await
+        .expect_err("a clone whose HEAD is not the resolved commit must not build");
+        let error = format!("{error:#}");
+        assert!(error.contains(&first) && error.contains(&tip), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_pin_the_remote_does_not_have_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let remote = tmp.path().join("remote");
+        two_commit_repo(&remote);
+
+        let error = checkout_firecracker_source(
+            &format!("file://{}", remote.display()),
+            "br",
+            MOVED_COMMIT,
+            FirecrackerSource::Pin,
+            &tmp.path().join("build"),
+        )
+        .await
+        .expect_err("a pin the remote does not have must not build");
+        assert!(format!("{error:#}").contains(MOVED_COMMIT), "{error:#}");
     }
 
     #[tokio::test]
@@ -3265,14 +3698,13 @@ cp vmlinux arch/arm64/boot/Image
 
     #[test]
     fn concurrent_firecracker_builds_use_unique_checkout_paths() {
+        let bin = Path::new("/assets/firecracker/firecracker-nested-deadbeef0000.bin");
         let first = firecracker_build_dir(
-            "nested",
-            "deadbeef0000",
+            bin,
             uuid::Uuid::from_u128(0x11111111111111111111111111111111),
         );
         let second = firecracker_build_dir(
-            "nested",
-            "deadbeef0000",
+            bin,
             uuid::Uuid::from_u128(0x22222222222222222222222222222222),
         );
         assert_ne!(
@@ -3281,10 +3713,9 @@ cp vmlinux arch/arm64/boot/Image
         );
     }
 
-    /// Create a stand-in binary at the exact current-build cache path.
-    fn resolution_fixture(dir: &Path, commit: &str) -> PathBuf {
-        std::fs::create_dir_all(dir).unwrap();
-        let bin = profile_firecracker_path_for_build(
+    /// The current build's cache path for `commit` of the fixtures' branch.
+    fn current_build_path(dir: &Path, commit: &str) -> PathBuf {
+        profile_firecracker_path_for_build(
             dir,
             "default",
             REPO,
@@ -3292,7 +3723,13 @@ cp vmlinux arch/arm64/boot/Image
             commit,
             std::env::consts::ARCH,
             &libc_version_tag(),
-        );
+        )
+    }
+
+    /// Create a stand-in binary at the exact current-build cache path.
+    fn resolution_fixture(dir: &Path, commit: &str) -> PathBuf {
+        std::fs::create_dir_all(dir).unwrap();
+        let bin = current_build_path(dir, commit);
         std::fs::write(&bin, b"fake firecracker").unwrap();
         bin
     }

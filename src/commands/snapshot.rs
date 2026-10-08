@@ -883,7 +883,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     };
 
-    if args.disk_only {
+    let published_memory = if args.disk_only {
         // Disk-only: no vCPU pause, no memory dump — fsfreeze the guest over the
         // exec vsock, reflink the disk, unfreeze. Cold-boot clones run from it.
         // Cold-boot clones can't re-attach extra disks yet, so a capture WITH them
@@ -918,6 +918,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             &vsock_socket_path,
         )
         .await?;
+        None
     } else {
         // Memory snapshot: drive the VM's actual control plane. Both backends listen on
         // the same `firecracker.sock` path; the client type + snapshot mechanism differ.
@@ -930,20 +931,22 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
                 let table_vsock = vsock_socket_path.clone();
                 let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
-                super::common::create_snapshot_core(
-                    &client,
-                    snapshot_config.clone(),
-                    &vm_disk_path,
-                    &vsock_socket_path,
-                    parent_dir.as_deref(),
-                    if has_portable {
-                        Some(&fetch_tables)
-                    } else {
-                        None
-                    },
-                    super::common::SnapshotSourceDisposition::Resume,
+                Some(
+                    super::common::create_snapshot_core(
+                        &client,
+                        snapshot_config.clone(),
+                        &vm_disk_path,
+                        &vsock_socket_path,
+                        parent_dir.as_deref(),
+                        if has_portable {
+                            Some(&fetch_tables)
+                        } else {
+                            None
+                        },
+                        super::common::SnapshotSourceDisposition::Resume,
+                    )
+                    .await?,
                 )
-                .await?;
             }
             crate::hypervisor::Backend::CloudHypervisor => {
                 let client =
@@ -955,9 +958,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                     &vsock_socket_path,
                 )
                 .await?;
+                None
             }
         }
-    }
+    };
 
     // Track this snapshot as the latest base for future diff snapshots.
     // Use a locked read-modify-write so we only change snapshot_name — this
@@ -985,6 +989,12 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             "VM state file no longer exists; snapshot base not recorded"
         );
     }
+
+    // The snapshot is published and recorded as the VM's diff base. Give the locks back
+    // before the memory file is measured, so no clone, create or balloon change waits on
+    // the walk.
+    drop(_vm_lock);
+    drop(_generation_locks);
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -1027,6 +1037,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             "\nOriginal VM '{}' has been resumed and is still running.",
             vm_name
         );
+    }
+
+    if let Some(published_memory) = published_memory {
+        published_memory.log_data_runs().await;
     }
 
     Ok(())
