@@ -1,8 +1,11 @@
-//! The holes of a snapshot memory image: the pages a MINOR-mode server left unwritten in its
-//! backing memfd, and which of them are still holes when a page server is about to map one.
+//! The holes of a snapshot memory image: the holes of the memory file a COPY-mode server maps,
+//! the pages a MINOR-mode server left unwritten in its backing memfd, and which of those are
+//! still holes when a page server is about to map one.
 
 use std::fs::File;
 
+use anyhow::{anyhow, bail, ensure, Result};
+use nix::unistd::{lseek, Whence};
 use tracing::warn;
 
 use super::prefetch::CHUNK_BYTES;
@@ -12,21 +15,24 @@ use super::working_set::GRANULE;
 /// [`GRANULE`] as a byte count in the server's address arithmetic.
 const GRANULE_BYTES: usize = GRANULE as usize;
 
-/// The granules of a snapshot memory image that a MINOR-mode server left unwritten in its
-/// backing memfd, one bit per [`GRANULE`] (4 KiB).
+/// The granules of a snapshot memory image that are holes, one bit per [`GRANULE`] (4 KiB).
 ///
-/// The server fills it while it populates the memfd, which leaves every all-zero 4 KiB page
-/// of the snapshot unwritten. Each marked granule is a candidate: a clone's first touch of
-/// one fills it in the memfd without telling the server. [`MemfdHoles`] asks the memfd which
-/// candidates are still holes.
+/// A COPY-mode server builds it from the memory file it maps ([`HoleMap::from_file`]). A hole
+/// there reads as zeros, so a fault on one is answered with zeros and the file is not read.
+///
+/// A MINOR-mode server fills it while it populates its backing memfd, which leaves every
+/// all-zero 4 KiB page of the snapshot unwritten. Each marked granule is then a candidate: a
+/// clone's first touch of one fills it in the memfd without telling the server.
+/// [`MemfdHoles`] asks the memfd which candidates are still holes.
 ///
 /// A marked granule is one the builder did not write. On a host whose base page is larger
 /// than 4 KiB, a granule beside written data in the same page is backed all the same, so a
 /// caller asks about a whole clone page with [`HoleMap::covers`], which is true only when
 /// every granule of the page is marked.
 ///
-/// The server builds the map before it binds its socket and never changes it after, so
-/// every clone task reads it without a lock.
+/// A COPY server builds the map on a thread of its own once it has bound its socket, and
+/// publishes it once, whole. A MINOR server builds it before it binds. Neither changes it
+/// after, so every clone task reads it without a lock.
 pub struct HoleMap {
     /// The length of the memory image in granules. A granule past it is never a hole.
     granules: usize,
@@ -45,6 +51,32 @@ impl HoleMap {
             bits: Vec::new(),
             marked: 0,
         }
+    }
+
+    /// The holes of the first `len` bytes of `file`: everything between its data runs
+    /// ([`for_each_data_run`]), so the build reads no data. A hole is rounded inward to whole
+    /// granules ([`HoleMap::insert`]), and a file with no holes gives a map that allocates
+    /// nothing.
+    ///
+    /// The kernel may report a hole as data, which only leaves that granule unmarked. It never
+    /// reports data as a hole. The walk moves the file offset of `file`, which a caller that
+    /// reads through the offset has to set again.
+    pub fn from_file(file: &File, len: usize) -> Result<Self> {
+        let mut map = Self::new(len);
+        let mut hole_start = 0usize;
+        for_each_data_run(file, len as u64, |start, end| {
+            // Both are inside `[hole_start, len]`, so they fit a usize and the hole before the
+            // run does not underflow.
+            map.insert(hole_start, start as usize - hole_start);
+            hole_start = end as usize;
+        })?;
+        map.insert(hole_start, len - hole_start);
+        Ok(map)
+    }
+
+    /// The bytes of the granules marked.
+    pub fn bytes(&self) -> usize {
+        self.marked.saturating_mul(GRANULE_BYTES)
     }
 
     /// Mark every granule that lies wholly inside `[offset, offset + len)`. A granule the
@@ -347,6 +379,66 @@ fn resident_run(
     Some((first, (run * page_size).min(len)))
 }
 
+/// Call `each(start, end)` for every data run of the first `len` bytes of `file`, in order,
+/// from `lseek(SEEK_DATA)` and `lseek(SEEK_HOLE)`, so no data is read. Everything between two
+/// runs is a hole, which reads as zeros and stores nothing. A run that ends past `len` is an
+/// error: the file is then longer than the caller believes, and its runs would not describe
+/// the bytes the caller asked about.
+///
+/// The kernel may report a hole as data, and never reports data as a hole. The calls move the
+/// file offset of `file`, which a caller that reads through the offset has to set again.
+pub fn for_each_data_run(file: &File, len: u64, mut each: impl FnMut(u64, u64)) -> Result<()> {
+    let mut offset = 0u64;
+    while offset < len {
+        let at = i64::try_from(offset)?;
+        let data_start = match lseek(file, at, Whence::SeekData) {
+            Ok(pos) => pos as u64,
+            // ENXIO: no data at or after `offset`.
+            Err(nix::errno::Errno::ENXIO) => break,
+            Err(e) => bail!("SEEK_DATA failed at offset {offset}: {e}"),
+        };
+        let data_end = lseek(file, i64::try_from(data_start)?, Whence::SeekHole)
+            .map_err(|e| anyhow!("SEEK_HOLE failed at offset {data_start}: {e}"))?
+            as u64;
+        ensure!(
+            data_start >= offset && data_end > data_start && data_end <= len,
+            "the data run at offset {data_start} ends at {data_end} in a file of {len} bytes"
+        );
+        each(data_start, data_end);
+        offset = data_end;
+    }
+    Ok(())
+}
+
+/// A memfd of `pages` host pages with `fill` written over each page in `written` and nothing
+/// anywhere else. shmem reports holes page by page, so its SEEK_HOLE layout is exactly the
+/// pages never written.
+#[cfg(test)]
+pub(super) fn memfd_with_pages(
+    name: &std::ffi::CStr,
+    pages: usize,
+    written: &[(usize, u8)],
+) -> File {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::FileExt;
+
+    let page = usize::try_from(host_page_size()).expect("a host page size");
+    // SAFETY: memfd_create with a valid name; a descriptor it returns is new and ours.
+    let fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
+    // SAFETY: `fd` was just returned and nothing else owns it.
+    let memfd = unsafe { File::from_raw_fd(fd) };
+    memfd
+        .set_len((pages * page) as u64)
+        .expect("sizing the memfd");
+    for &(index, fill) in written {
+        memfd
+            .write_at(&vec![fill; page], (index * page) as u64)
+            .expect("writing a page");
+    }
+    memfd
+}
+
 /// The word holding `granule`, the bits of that word from `granule` up to `past_last` (or to
 /// the end of the word), and how many granules those bits are.
 fn word_mask(granule: usize, past_last: usize) -> (usize, u64, usize) {
@@ -524,39 +616,26 @@ mod tests {
     /// Its answers must be the ones a fresh window at every call gives, page for page.
     #[test]
     fn a_reused_resident_window_answers_like_a_fresh_one() {
-        use std::os::fd::FromRawFd;
-        use std::os::unix::fs::FileExt;
-
         let page = usize::try_from(host_page_size()).expect("a host page size");
         let per_chunk = CHUNK_BYTES / page;
         // Four data pages, then candidates over two chunks and a bit, every other one filled.
+        // Writing a candidate makes shmem allocate its page, as a clone's touch does.
         let data = 4;
         let candidates = 2 * per_chunk + 7;
         let len = (data + candidates) * page;
-        // SAFETY: memfd_create with a valid name; a descriptor it returns is new and ours.
-        let fd = unsafe { libc::memfd_create(c"fcvm-holes-test".as_ptr(), libc::MFD_CLOEXEC) };
-        assert!(fd >= 0, "memfd_create: {}", std::io::Error::last_os_error());
-        // SAFETY: `fd` was just returned and nothing else owns it.
-        let memfd = unsafe { File::from_raw_fd(fd) };
-        memfd.set_len(len as u64).expect("sizing the memfd");
-        let mut want = Vec::new();
-        for index in 0..data {
-            memfd
-                .write_at(&[0xAB], (index * page) as u64)
-                .expect("writing a data page");
-            want.push('P');
-        }
-        for index in 0..candidates {
-            if index % 2 == 0 {
-                // Writing one byte makes shmem allocate the page, as a clone's touch does.
-                memfd
-                    .write_at(&[0], ((data + index) * page) as u64)
-                    .expect("filling a hole");
-                want.push('F');
-            } else {
-                want.push('H');
-            }
-        }
+        let filled = |candidate: usize| candidate.is_multiple_of(2);
+        let written: Vec<(usize, u8)> = (0..data)
+            .map(|index| (index, 0xAB))
+            .chain(
+                (0..candidates)
+                    .filter(|candidate| filled(*candidate))
+                    .map(|candidate| (data + candidate, 0)),
+            )
+            .collect();
+        let memfd = memfd_with_pages(c"fcvm-holes-test", data + candidates, &written);
+        let want: Vec<char> = std::iter::repeat_n('P', data)
+            .chain((0..candidates).map(|candidate| if filled(candidate) { 'F' } else { 'H' }))
+            .collect();
         let mut map = HoleMap::new(len);
         map.insert(data * page, candidates * page);
         let holes = MemfdHoles::new(map, &memfd);
@@ -597,6 +676,93 @@ mod tests {
             kept_queries,
             candidates.div_ceil(per_chunk),
             "a reused window costs one call per chunk"
+        );
+    }
+
+    /// Where `lseek` with `whence` lands from `offset` in `file`.
+    fn seek(file: &File, offset: usize, whence: libc::c_int) -> usize {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: lseek on a descriptor this test owns.
+        let at = unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) };
+        assert!(at >= 0, "lseek: {}", std::io::Error::last_os_error());
+        at as usize
+    }
+
+    /// A map built from a file is the file's SEEK_HOLE layout: every granule of every hole,
+    /// a hole at the start and one that runs to the end of the file included, and nothing
+    /// else. A page written with zeros is data, because the build reads no bytes. A file with
+    /// no holes gives a map that allocates nothing, so a fault asking it costs one branch.
+    #[test]
+    fn a_hole_map_from_a_file_is_its_seek_hole_layout() {
+        let page = usize::try_from(host_page_size()).expect("a host page size");
+        let per_page = page / PAGE;
+        // Holes at pages 0 and 1, 3 and 4, and 8 to 11. Page 6 is written with zeros.
+        let memfd = memfd_with_pages(
+            c"fcvm-holes-from-file",
+            12,
+            &[(2, 0xAB), (5, 0xCD), (6, 0), (7, 0xEF)],
+        );
+        // Control: the memfd reports exactly that layout.
+        assert_eq!(seek(&memfd, 0, libc::SEEK_DATA), 2 * page);
+        assert_eq!(seek(&memfd, 2 * page, libc::SEEK_HOLE), 3 * page);
+        assert_eq!(seek(&memfd, 3 * page, libc::SEEK_DATA), 5 * page);
+        assert_eq!(seek(&memfd, 5 * page, libc::SEEK_HOLE), 8 * page);
+
+        let map = HoleMap::from_file(&memfd, 12 * page).expect("mapping the memfd's holes");
+        let want: Vec<usize> = [0, 1, 3, 4, 8, 9, 10, 11]
+            .into_iter()
+            .flat_map(|index| index * per_page..(index + 1) * per_page)
+            .collect();
+        assert_eq!(
+            holes(&map, 12 * per_page),
+            want,
+            "the map must mark the granules of every hole and nothing else"
+        );
+        assert_eq!(map.bytes(), 8 * page);
+
+        let full = memfd_with_pages(c"fcvm-holes-none", 4, &[(0, 1), (1, 2), (2, 3), (3, 4)]);
+        assert_eq!(
+            seek(&full, 0, libc::SEEK_HOLE),
+            4 * page,
+            "control: no holes"
+        );
+        let map = HoleMap::from_file(&full, 4 * page).expect("mapping a file with no holes");
+        assert_eq!(map.marked, 0);
+        assert!(
+            map.bits.is_empty(),
+            "a file with no holes allocates no bitmap"
+        );
+        assert!(!map.covers(0, page));
+    }
+
+    /// A data run that ends past the length asked for is an error, for the hole map and for
+    /// `data_run_bytes` alike. The file is then longer than its caller believes, and neither
+    /// the map nor the byte count would describe it.
+    #[test]
+    fn a_data_run_past_the_length_is_an_error() {
+        let page = usize::try_from(host_page_size()).expect("a host page size");
+        let memfd = memfd_with_pages(
+            c"fcvm-holes-past-len",
+            4,
+            &[(1, 0xAB), (2, 0xAB), (3, 0xAB)],
+        );
+        let mut runs = Vec::new();
+        for_each_data_run(&memfd, (4 * page) as u64, |start, end| {
+            runs.push((start, end))
+        })
+        .expect("control: walking the whole file");
+        assert_eq!(runs, vec![(page as u64, (4 * page) as u64)]);
+
+        let error = for_each_data_run(&memfd, (2 * page) as u64, |_, _| {})
+            .expect_err("a data run that ends past the length must be an error, not clipped");
+        assert!(
+            format!("{error:#}").contains(&format!("ends at {} in a file of", 4 * page)),
+            "{error:#}"
+        );
+        assert!(
+            HoleMap::from_file(&memfd, 2 * page).is_err(),
+            "a hole map over a file longer than its length must not be built"
         );
     }
 }

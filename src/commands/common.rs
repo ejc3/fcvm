@@ -375,27 +375,7 @@ pub fn merge_diff_snapshot(base_path: &Path, diff_path: &Path) -> Result<MergeSt
 pub fn data_run_bytes(file: &std::fs::File) -> Result<u64> {
     let len = file.metadata().context("reading the file's length")?.len();
     let mut total = 0;
-    let mut offset = 0;
-    while offset < len {
-        let data_start = match lseek(file, offset as i64, Whence::SeekData) {
-            Ok(pos) => pos as u64,
-            // ENXIO means no more data after this offset
-            Err(nix::errno::Errno::ENXIO) => break,
-            Err(e) => bail!("SEEK_DATA failed at offset {}: {}", offset, e),
-        };
-        let data_end = lseek(file, data_start as i64, Whence::SeekHole)
-            .map_err(|e| anyhow::anyhow!("SEEK_HOLE failed at offset {}: {}", data_start, e))?
-            as u64;
-        anyhow::ensure!(
-            data_end > data_start && data_end <= len,
-            "the data run at offset {} ends at {} in a file of {} bytes",
-            data_start,
-            data_end,
-            len
-        );
-        total += data_end - data_start;
-        offset = data_end;
-    }
+    crate::uffd::for_each_data_run(file, len, |start, end| total += end - start)?;
     Ok(total)
 }
 

@@ -5006,6 +5006,341 @@ async fn test_snapshot_clone_free_page_reporting_reaches_the_page_server() -> Re
     combine_with_cleanup(verdict, cleanup_errors)
 }
 
+/// `hole_zero_filled` from the memory server's exit line for the clone `vm_id`: the faults on
+/// holes of the memory file that it answered with zeros. `None` when no exit line for that
+/// clone carries the field.
+fn hole_zero_fills_for(log: &str, vm_id: &str) -> Option<u64> {
+    log.lines()
+        .filter(|line| line.contains("VM exited"))
+        .filter(|line| field(line, "vm_id=").as_deref() == Some(vm_id))
+        .find_map(|line| field(line, "hole_zero_filled=")?.parse().ok())
+}
+
+/// The sha256 of each of `paths` inside the guest of the VM `pid`, in order.
+async fn guest_sha256s(pid: u32, paths: &[&str]) -> Result<Vec<String>> {
+    let out = common::exec_in_vm(pid, &[&format!("/usr/bin/sha256sum {}", paths.join(" "))])
+        .await
+        .with_context(|| format!("checksumming {paths:?} in VM {pid}"))?;
+    let sums: Vec<String> = out
+        .lines()
+        .zip(paths)
+        .filter(|(line, path)| line.trim_end().ends_with(*path))
+        .filter_map(|(line, _)| line.split_whitespace().next().map(str::to_string))
+        .collect();
+    anyhow::ensure!(
+        sums.len() == paths.len(),
+        "sha256sum in VM {pid} printed {out:?} for {paths:?}"
+    );
+    Ok(sums)
+}
+
+/// HOLES IN THE MEMORY FILE, END TO END. A Full snapshot stores the guest's all-zero pages
+/// as holes in memory.bin, and a copy-mode memory server answers a fault on a hole with the
+/// kernel's zero page without reading the file. The source writes a file of zeros and a
+/// control file of random bytes to /dev/shm before the snapshot. A copy-mode clone reads both
+/// back with the checksums the source took, and the server's exit line counts at least one
+/// fault answered from a hole for every page of the zero file.
+///
+/// Those faults are recorded. The serve records for an hour after each clone's handshake, so
+/// the first clone's reads, which come after it is healthy, fall inside the window however
+/// slowly it boots. A second clone replays them, so its replay fills at least the zero file's
+/// pages with zeros, it reads both files back with the same checksums, and it takes fewer
+/// faults on holes than the zero file has pages.
+///
+/// The source boots with `--no-snapshot`, so its user snapshot is Full. A snapshot over a
+/// cached parent is a Diff, whose dirty zero pages are written as data. This needs a
+/// Firecracker whose Full dump leaves all-zero pages as holes. With one that writes them as
+/// data, memory.bin has no holes and the count is zero.
+#[tokio::test]
+async fn test_snapshot_clone_serves_snapshot_holes_as_zeros() -> Result<()> {
+    const MEM_MIB: &str = "2048";
+    const ZERO_FILE: &str = "/dev/shm/fcvm-holes-zero";
+    const RANDOM_FILE: &str = "/dev/shm/fcvm-holes-random";
+    const ZERO_BYTES: u64 = 256 << 20;
+    const RANDOM_BYTES: u64 = 16 << 20;
+    // SAFETY: sysconf has no preconditions.
+    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .context("reading the host page size")?;
+    let (source_name, clone_name, snapshot_name, _) = common::unique_names("holes");
+    let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
+    let mut source: Option<(tokio::process::Child, u32)> = None;
+    let mut serve: Option<(tokio::process::Child, u32)> = None;
+    let mut clone: Option<(tokio::process::Child, u32)> = None;
+    let mut replay: Option<(tokio::process::Child, u32)> = None;
+    let mut snapshot_cleanup_needed = false;
+    let mut wrong: Vec<String> = Vec::new();
+
+    let verdict = async {
+        let (child, source_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "podman",
+                "run",
+                "--name",
+                &source_name,
+                "--no-snapshot",
+                "--mem",
+                MEM_MIB,
+                common::TEST_IMAGE,
+            ],
+            &source_name,
+        )
+        .await
+        .context("spawning the source VM")?;
+        source = Some((child, source_pid));
+        common::poll_health_by_pid(source_pid, 180).await?;
+
+        common::exec_in_vm(
+            source_pid,
+            &[&format!(
+                "/usr/bin/head -c {ZERO_BYTES} /dev/zero > {ZERO_FILE} && \
+                 /usr/bin/head -c {RANDOM_BYTES} /dev/urandom > {RANDOM_FILE}"
+            )],
+        )
+        .await
+        .context("writing the zero and random files in the source")?;
+        let source_sums = guest_sha256s(source_pid, &[ZERO_FILE, RANDOM_FILE]).await?;
+        let zeros_sum = {
+            use sha2::{Digest, Sha256};
+            let mut hasher = Sha256::new();
+            let chunk = vec![0u8; 1 << 20];
+            for _ in 0..ZERO_BYTES >> 20 {
+                hasher.update(&chunk);
+            }
+            format!("{:x}", hasher.finalize())
+        };
+        anyhow::ensure!(
+            source_sums[0] == zeros_sum,
+            "control: {ZERO_FILE} in the source is not {ZERO_BYTES} bytes of zeros"
+        );
+        anyhow::ensure!(
+            source_sums[1] != source_sums[0],
+            "control: {RANDOM_FILE} in the source has the zero file's checksum"
+        );
+
+        // A failed create may still have installed a partial generation, so cleanup
+        // owns this tag from before the create.
+        snapshot_cleanup_needed = true;
+        common::create_snapshot_by_pid(source_pid, &snapshot_name)
+            .await
+            .context("creating the snapshot")?;
+
+        let serve_args = [
+            "snapshot",
+            "serve",
+            &snapshot_name,
+            "--uffd-mode",
+            "copy",
+            "--uffd-prefetch-record-window",
+            "3600",
+        ];
+        let (child, serve_pid, serve_log) =
+            common::spawn_fcvm_with_log_path(&serve_args, "uffd-serve-holes")
+                .await
+                .context("spawning the memory server")?;
+        serve = Some((child, serve_pid));
+        common::poll_serve_ready(&snapshot_name, serve_pid, 60).await?;
+        // The server maps the holes of memory.bin once it has bound its socket, and serves
+        // every fault from the file until it publishes the map.
+        let published = serve_log_until(&serve_log, 60, "the hole map to be published", |log| {
+            log.contains("published the hole map of the memory file")
+        })
+        .await?;
+        if let Some(line) = published
+            .lines()
+            .find(|line| line.contains("published the hole map of the memory file"))
+        {
+            println!("  {line}");
+        }
+
+        let serve_pid_arg = serve_pid.to_string();
+        let (child, clone_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_arg,
+                "--name",
+                &clone_name,
+            ],
+            &clone_name,
+        )
+        .await
+        .context("spawning the copy-mode clone")?;
+        clone = Some((child, clone_pid));
+        common::poll_health_by_pid(clone_pid, 150)
+            .await
+            .context("the copy-mode clone never became healthy")?;
+
+        let clone_sums = guest_sha256s(clone_pid, &[ZERO_FILE, RANDOM_FILE]).await?;
+        for ((path, want), got) in [ZERO_FILE, RANDOM_FILE]
+            .iter()
+            .zip(&source_sums)
+            .zip(&clone_sums)
+        {
+            if got != want {
+                wrong.push(format!(
+                    "the clone read {path} with checksum {got}, not the source's {want}"
+                ));
+            }
+        }
+
+        // The memory server logs a clone's totals when the clone exits.
+        let (mut child, pid) = clone.take().context("the copy-mode clone is gone")?;
+        terminate_and_reap(&mut child, pid, "copy-mode clone")
+            .await
+            .context("stopping the copy-mode clone")?;
+        let log = serve_log_until(&serve_log, 60, "the clone's exit line", |log| {
+            !faults_by_vm(log).is_empty()
+        })
+        .await?;
+        let zero_pages = ZERO_BYTES / page;
+        let first_vm = faults_by_vm(&log)[0].0.clone();
+        match hole_zero_fills_for(&log, &first_vm) {
+            None => wrong.push(
+                "the memory server's exit line for the clone has no hole_zero_filled field"
+                    .to_string(),
+            ),
+            Some(fills) => {
+                println!(
+                    "  copy-mode clone: {fills} faults answered from holes; the zero file is \
+                     {zero_pages} pages"
+                );
+                if fills == 0 {
+                    wrong.push(
+                        "the memory server answered no fault from a hole: memory.bin stored the \
+                         guest's zero pages as data, or the server did not map its holes"
+                            .to_string(),
+                    );
+                } else if fills < zero_pages {
+                    wrong.push(format!(
+                        "the memory server answered {fills} faults from holes, fewer than the \
+                         {zero_pages} pages of the zero file the clone read, so part of that \
+                         file was served from memory.bin as data"
+                    ));
+                }
+            }
+        }
+
+        // The first clone's faults on the zero file's holes were recorded. Once they are
+        // merged into the working set, a second clone's replay fills those pages with zeros,
+        // so its reads of the zero file take no fault.
+        serve_log_until(
+            &serve_log,
+            60,
+            "the first clone's faults to be merged",
+            |log| log.contains("merged this clone's faults into the snapshot's working set"),
+        )
+        .await?;
+        let replay_name = format!("{clone_name}-replay");
+        let (child, replay_pid) = common::spawn_fcvm_with_logs(
+            &[
+                "snapshot",
+                "run",
+                "--pid",
+                &serve_pid_arg,
+                "--name",
+                &replay_name,
+            ],
+            &replay_name,
+        )
+        .await
+        .context("spawning the replaying clone")?;
+        replay = Some((child, replay_pid));
+        common::poll_health_by_pid(replay_pid, 150)
+            .await
+            .context("the replaying clone never became healthy")?;
+        let replay_sums = guest_sha256s(replay_pid, &[ZERO_FILE, RANDOM_FILE]).await?;
+        for ((path, want), got) in [ZERO_FILE, RANDOM_FILE]
+            .iter()
+            .zip(&source_sums)
+            .zip(&replay_sums)
+        {
+            if got != want {
+                wrong.push(format!(
+                    "the replaying clone read {path} with checksum {got}, not the source's {want}"
+                ));
+            }
+        }
+        let (mut child, pid) = replay.take().context("the replaying clone is gone")?;
+        terminate_and_reap(&mut child, pid, "replaying clone")
+            .await
+            .context("stopping the replaying clone")?;
+        let log = serve_log_until(&serve_log, 60, "both clones' exit lines", |log| {
+            faults_by_vm(log).len() >= 2
+        })
+        .await?;
+        let replay_vm = faults_by_vm(&log)[1].0.clone();
+        let replayed = replayed_by_vm(&log, "hole_zero_filled_pages=")
+            .into_iter()
+            .find_map(|(vm, pages)| (vm == replay_vm).then_some(pages));
+        let replay_fills = hole_zero_fills_for(&log, &replay_vm);
+        println!(
+            "  replaying clone: replay filled {replayed:?} pages of holes with zeros, and \
+             {replay_fills:?} faults were answered from holes"
+        );
+        match replayed {
+            None => wrong.push(
+                "the replaying clone has no replay line with hole_zero_filled_pages".to_string(),
+            ),
+            Some(pages) if pages < zero_pages => wrong.push(format!(
+                "replay filled {pages} pages of holes with zeros, fewer than the {zero_pages} \
+                 pages of the zero file the first clone read"
+            )),
+            Some(_) => {}
+        }
+        match replay_fills {
+            None => wrong.push(
+                "the memory server's exit line for the replaying clone has no hole_zero_filled \
+                 field"
+                    .to_string(),
+            ),
+            Some(fills) if fills >= zero_pages => wrong.push(format!(
+                "the replaying clone still took {fills} faults on holes, not fewer than the \
+                 {zero_pages} pages of the zero file its replay should have filled"
+            )),
+            Some(_) => {}
+        }
+        anyhow::Ok(())
+    }
+    .await;
+
+    let verdict = match (verdict, wrong.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Ok(()), false) => Err(anyhow::anyhow!(
+            "{} snapshot hole checks failed:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        )),
+        (Err(error), true) => Err(error),
+        (Err(error), false) => Err(error.context(format!(
+            "stopped by the error below, after {} checks had already failed:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        ))),
+    };
+
+    // The clones first, then the server they depend on, then the source.
+    let mut cleanup_errors = Vec::new();
+    for (role, process) in [
+        ("replaying clone", replay.take()),
+        ("copy-mode clone", clone.take()),
+        ("memory server", serve.take()),
+        ("source VM", source.take()),
+    ] {
+        if let Some((mut child, pid)) = process {
+            if let Err(error) = terminate_and_reap(&mut child, pid, role).await {
+                cleanup_errors.push(format!("{role} {pid}: {error:#}"));
+            }
+        }
+    }
+    if snapshot_cleanup_needed && snapshot_path.exists() {
+        if let Err(error) = common::delete_snapshot(&snapshot_name).await {
+            cleanup_errors.push(format!("snapshot {snapshot_name}: {error:#}"));
+        }
+    }
+    combine_with_cleanup(verdict, cleanup_errors)
+}
+
 async fn clone_isolation_impl(uffd_mode: &str) -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names(&format!("iso-{}", uffd_mode));
     let fcvm_path = common::find_fcvm_binary()?;

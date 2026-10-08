@@ -14,6 +14,8 @@
 //!   prefetch and leave the VM to fault on demand, which is exactly the behaviour of a
 //!   snapshot with no recording at all.
 
+use std::os::fd::AsRawFd;
+
 use tracing::debug;
 use userfaultfd::Uffd;
 
@@ -49,6 +51,7 @@ pub struct Segment {
 }
 
 /// Where prefetched bytes come from — the mode-specific half of [`populate`].
+#[derive(Clone, Copy)]
 pub enum Source<'a> {
     /// A read-only mapping of the snapshot memory file. Pages are copied out of it into the
     /// clone's private anonymous memory (`UFFDIO_COPY`).
@@ -56,6 +59,11 @@ pub enum Source<'a> {
     /// The clone already maps the shared snapshot memfd `MAP_PRIVATE`; the page only needs a
     /// (read-only) PTE (`UFFDIO_CONTINUE`). No bytes move.
     Minor,
+    /// The kernel's shared zero page, mapped read-only (`UFFDIO_ZEROPAGE`). No bytes move and
+    /// the clone holds no memory for the range until the guest writes it, and that write is
+    /// the kernel's own copy-on-write fault, which a clone registered for MISSING faults only
+    /// takes without the server.
+    ZeroPage,
 }
 
 /// Why a prefetch stopped short. Neither variant is an error the caller propagates: both mean
@@ -318,7 +326,7 @@ pub fn populate_chunk_counted(
     };
     let len = CHUNK_BYTES.min(remaining);
     let dst = host_addr as *mut std::ffi::c_void;
-    let result = match source {
+    let filled = match source {
         Source::Copy(mmap) => {
             // Checked, not indexed. `plan` bounds segments by the `mem_len` it was given,
             // which is a DIFFERENT value from this mapping's length (the caller passes
@@ -346,24 +354,23 @@ pub fn populate_chunk_counted(
             };
             // SAFETY: `chunk` is a `len`-byte slice of the snapshot mapping, and `dst` is a
             // page-aligned range inside a region the clone registered with this uffd.
-            unsafe { uffd.copy(chunk.as_ptr() as *const std::ffi::c_void, dst, len, true) }
+            ioctl_progress(unsafe {
+                uffd.copy(chunk.as_ptr() as *const std::ffi::c_void, dst, len, true)
+            })
         }
-        Source::Minor => uffd
-            .r#continue(dst, len, true)
-            .map(|mapped| mapped as usize),
+        Source::Minor => ioctl_progress(
+            uffd.r#continue(dst, len, true)
+                .map(|mapped| mapped as usize),
+        ),
+        Source::ZeroPage => zero_page_range(uffd, host_addr, len),
     };
 
-    match result {
+    match filled {
         Ok(copied) if copied > 0 => Ok(Progress::populated(copied)),
         // The kernel never reports zero-byte success; treat it as no progress rather than
         // spinning on the same address forever.
         Ok(_) => Ok(Progress::stepped_over(page_size.min(len))),
-        // The variant carries the ioctl's signed `copy` field. Only a positive one is a byte
-        // count; `errno_of` decodes the rest.
-        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied as isize > 0 => {
-            Ok(Progress::populated(copied))
-        }
-        Err(e) => match errno_of(&e) {
+        Err(errno) => match errno {
             Some(libc::EEXIST) => Ok(Progress::stepped_over(page_size.min(len))),
             Some(libc::ESRCH) => Err(Stop::VmGone),
             // Zero-progress EAGAIN: an event-generating operation is in flight
@@ -383,12 +390,71 @@ pub fn populate_chunk_counted(
                     target: "uffd",
                     vm_id = %vm_id,
                     addr = format!("0x{host_addr:x}"),
-                    error = ?e,
+                    errno = ?errno,
                     "prefetch chunk refused by kernel"
                 );
                 Err(Stop::Refused)
             }
         },
+    }
+}
+
+/// The bytes a populate ioctl of the `userfaultfd` crate populated, the prefix it populated
+/// when it stopped part way included, or the errno it failed with having populated nothing.
+fn ioctl_progress(result: userfaultfd::Result<usize>) -> Result<usize, Option<i32>> {
+    match result {
+        Ok(populated) => Ok(populated),
+        // The variant carries the ioctl's signed `copy` field. Only a positive one is a byte
+        // count; `errno_of` decodes the rest.
+        Err(userfaultfd::Error::PartiallyCopied(copied)) if copied as isize > 0 => Ok(copied),
+        Err(e) => Err(errno_of(&e)),
+    }
+}
+
+/// `UFFDIO_ZEROPAGE` over the `len` bytes at `dst`: the bytes it mapped, the prefix it mapped
+/// when it stopped part way included, or the errno it failed with having mapped nothing.
+///
+/// The kernel reports a fill that stopped part way, at a page already present for one, as
+/// `EAGAIN` with the bytes done in the struct's `zeropage` field. The `userfaultfd` crate's
+/// `zeropage` returns that as a bare `EAGAIN`, and replay advances by what was mapped, so this
+/// issues the ioctl itself.
+fn zero_page_range(uffd: &Uffd, dst: usize, len: usize) -> Result<usize, Option<i32>> {
+    /// `struct uffdio_zeropage` of `<linux/userfaultfd.h>`.
+    #[repr(C)]
+    struct UffdioZeropage {
+        start: u64,
+        len: u64,
+        mode: u64,
+        zeropage: i64,
+    }
+    const _: () = assert!(std::mem::size_of::<UffdioZeropage>() == 32);
+    /// `UFFDIO_ZEROPAGE`, `_IOWR(0xAA, 0x04, struct uffdio_zeropage)`. x86_64 and arm64 share
+    /// the generic ioctl encoding, so the number is the same on both.
+    const UFFDIO_ZEROPAGE: u32 = (3 << 30) | (32 << 16) | (0xAA << 8) | 0x04;
+
+    let mut zeropage = UffdioZeropage {
+        start: dst as u64,
+        len: len as u64,
+        // Wake the faulters in the range.
+        mode: 0,
+        zeropage: 0,
+    };
+    // SAFETY: an ioctl on a userfaultfd this process holds, with a pointer to a live struct of
+    // the layout the kernel reads and writes back.
+    let rc = unsafe {
+        libc::ioctl(
+            uffd.as_raw_fd(),
+            UFFDIO_ZEROPAGE as _,
+            &mut zeropage as *mut UffdioZeropage,
+        )
+    };
+    if rc == 0 {
+        return Ok(len);
+    }
+    let errno = std::io::Error::last_os_error().raw_os_error();
+    match usize::try_from(zeropage.zeropage) {
+        Ok(mapped) if mapped > 0 => Ok(mapped),
+        _ => Err(errno),
     }
 }
 

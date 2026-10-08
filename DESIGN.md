@@ -1536,7 +1536,7 @@ The memory server:
 | Flag | Env var | Default | Effect |
 |------|---------|---------|--------|
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
-| `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. A fault on a page the balloon gave back is answered with zeros and gets no fault-around, and a given-back page inside another fault's granule is stepped over. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises the rest of its granule, bar pages the balloon gave back, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
+| `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. A fault on a page the balloon gave back is answered with zeros and gets no fault-around. A fault on a hole in the memory file is answered with zeros and gets fault-around like any other. A given-back page or a hole inside a fault's granule is stepped over. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises the rest of its granule, bar pages the balloon gave back and holes, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
 | `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
 | `--uffd-prefetch-record-window SECS` | `FCVM_UFFD_PREFETCH_RECORD_WINDOW` | `300` | Seconds after a clone's UFFD handshake during which its demand faults are recorded into the working set. Later faults are served but not recorded. `0` records nothing; replay of an existing record is unaffected |
 
@@ -2720,10 +2720,41 @@ retries it, bounded, exactly as the MINOR handler below does for `UFFDIO_CONTINU
 The handler installs nothing when it reads a REMOVE event: the kernel drops the pages only
 after the event is read, so zeroing the range at that point is refused or undone. It
 remembers the range, one bit per page, and the guest's next fault on a page of it is
-answered with a page of zeros and not with the snapshot's bytes. A fault that is on such a
+answered with zeros and not with the snapshot's bytes. A fault that is on such a
 page when it is first read is not recorded into the working set, and it gets no
 fault-around. Replay and fault-around ask the set before each chunk and step over a page
 in it, so a page in the set is filled only by the guest's own fault.
+
+A hole in memory.bin is answered with zeros too. Once the server has bound its socket, it
+maps the file's holes with `SEEK_HOLE`/`SEEK_DATA` on a thread of its own, so the build
+reads no data and does not delay the bind (the walk costs about 1.7 us per data run on
+btrfs, about 3.9 s for a file of 2.3 million runs). It publishes the map once, whole,
+through a `OnceLock`: a fault sees either no map or all of it. Until then every fault is
+served from the file, which reads a hole as zeros, so only the saving waits. A file without
+holes costs one branch per fault. A memory file on FUSE is flushed with `fdatasync` before
+the walk: fuse-pipe forwards `SEEK_HOLE` to the host, so in a nested L1 with the writeback
+cache a page still dirty in the L1 would read as a hole. A local filesystem answers
+`SEEK_HOLE` from its page cache and is not flushed, which saves seconds on a file just
+written (3.27 s measured on btrfs). A fault on a hole is answered with zeros and recorded
+into the working set like any other fault. Replay maps a run of recorded holes to the
+kernel's zero page with one `UFFDIO_ZEROPAGE`, as a read fault on a hole is answered, and
+gives an NV2 clone and hugetlb memory private copies of zeros instead. Fault-around steps
+over holes, and still runs after a fault on one, since a page of zeros among data says
+nothing about its neighbours.
+
+The kind of zero answer depends on the fault. A read fault, on a hole or on a page the
+balloon gave back, gets `UFFDIO_ZEROPAGE`, which maps the kernel's shared zero page
+read-only: the read costs the clone no memory, and the guest's first write is a
+copy-on-write fault the kernel resolves without the server, since a copy clone registers
+MISSING faults only. A write fault (`UFFD_PAGEFAULT_FLAG_WRITE`, kept through a parked
+retry) gets a private copy of zeros, mapped writable, so the write does not fault a second
+time. Every fault of an NV2 clone gets a copy too: on arm64 the MMU-notifier invalidate of
+that copy-on-write reaches `kvm_nested_s2_unmap` and drops every nested stage-2 mapping,
+the cost that makes NV2 restores use UFFD. `snapshot serve` and the implicit server know a
+snapshot's clones are NV2 from the Firecracker arguments they run with (`--enable-nv2`).
+Hugetlb memory refuses `UFFDIO_ZEROPAGE` (EINVAL), so a clone whose page is larger than the
+host's base page gets copies, and a clone whose `UFFDIO_ZEROPAGE` fails with EINVAL anyway
+gets a copy for that fault and every later one.
 
 **Free page reporting on each transport** (`--free-page-reporting`). In a copy-mode clone
 each block the guest reports is one `MADV_DONTNEED` in Firecracker and one REMOVE event in
