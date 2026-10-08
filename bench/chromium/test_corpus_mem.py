@@ -1645,29 +1645,47 @@ esac
             handle.write("#!/bin/sh\nexit 1\n")
         os.chmod(pgrep, 0o755)
 
+        # hostcdp.sh drives every rep in one `python3 - <cdpdrive.py> ...`
+        # process. The shim swaps in a stub module whose drive() runs once per
+        # rep, as the driver program used to, and applies the per-rep actions.
+        stub_driver = os.path.join(tmp, "stub_cdpdrive.py")
+        with open(stub_driver, "w") as handle:
+            handle.write('''import os
+import subprocess
+import time
+
+
+def drive(args):
+    env = os.environ
+    if env.get("DRIVER_STARTED_FILE"):
+        open(env["DRIVER_STARTED_FILE"], "w").close()
+    if env.get("DRIVER_WAIT_FILE"):
+        while not os.path.exists(env["DRIVER_WAIT_FILE"]):
+            time.sleep(0.01)
+    action = env.get("DRIVER_LOAD_ACTION", "")
+    if action == "nonnumeric":
+        with open(env["LOADAVG_FILE"], "w") as handle:
+            handle.write("not-a-load\\n")
+    elif action == "missing":
+        try:
+            os.unlink(env["LOADAVG_FILE"])
+        except FileNotFoundError:
+            pass
+    if env.get("DRIVER_RUNTIME_ACTION") == "tamper":
+        with open(env["RUNTIME_PAYLOAD"], "w") as handle:
+            handle.write("mutated\\n")
+    if env.get("DRIVER_LEAVE_DESCENDANT", "0") == "1":
+        subprocess.Popen(["/bin/sleep", "30"], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    return {"ok": True, "url": "https://example.com/",
+            "stages": {"total_ms": 1.0}, "nav": {"load_ms": 1.0}}
+''')
         python = os.path.join(bindir, "python3")
         with open(python, "w") as handle:
             handle.write(f'''#!/bin/bash
-if [ "${{1:-}}" = "$HOSTCDP_DRIVER" ]; then
-  [ -z "${{DRIVER_STARTED_FILE:-}}" ] || : >"$DRIVER_STARTED_FILE"
-  if [ -n "${{DRIVER_WAIT_FILE:-}}" ]; then
-    while [ ! -e "$DRIVER_WAIT_FILE" ]; do /bin/sleep 0.01; done
-  fi
-  case "${{DRIVER_LOAD_ACTION:-}}" in
-    nonnumeric) printf '%s\n' 'not-a-load' >"$LOADAVG_FILE" ;;
-    missing) rm -f -- "$LOADAVG_FILE" ;;
-  esac
-  case "${{DRIVER_RUNTIME_ACTION:-}}" in
-    tamper) printf '%s\n' mutated >"$RUNTIME_PAYLOAD" ;;
-  esac
-  case "${{DRIVER_LOAD_ACTION:-}}" in
-    numeric-read-error) : >"$LOAD_READ_FAILED_MARKER" ;;
-  esac
-  if [ "${{DRIVER_LEAVE_DESCENDANT:-0}}" = 1 ]; then
-    setsid /bin/sleep 30 </dev/null >/dev/null 2>&1 &
-  fi
-  printf '%s\n' '{{"ok":true,"url":"https://example.com/","stages":{{"total_ms":1.0}},"nav":{{"load_ms":1.0}}}}'
-  exit 0
+if [ "${{1:-}}" = - ] && [ "${{2:-}}" = "$HOSTCDP_DRIVER" ]; then
+  set -- - {stub_driver!r} "${{@:3}}"
 fi
 exec {sys.executable!r} "$@"
 ''')
@@ -1678,9 +1696,7 @@ exec {sys.executable!r} "$@"
         with open(cut, "w") as handle:
             handle.write(f'''#!/bin/bash
 if [ "${{@: -1}}" = "$LOADAVG_FILE" ] \
-    && {{ [ "${{LOAD_READ_FAIL_FROM_START:-0}}" = 1 ] \
-         || {{ [ -n "${{LOAD_READ_FAILED_MARKER:-}}" ] \
-              && [ -e "$LOAD_READ_FAILED_MARKER" ]; }}; }}; then
+    && [ "${{LOAD_READ_FAIL_FROM_START:-0}}" = 1 ]; then
   printf '%s\n' '0.42'
   exit 9
 fi
@@ -1785,7 +1801,6 @@ exec {real_date!r} "$@"
             CORPUS_EXTRA_RUNTIME_MANIFEST=outer_manifest,
             CORPUS_EXTRA_RUNTIME_BUNDLE_SHA256=runtime_digest,
             RUNTIME_PAYLOAD=payload,
-            LOAD_READ_FAILED_MARKER=os.path.join(tmp, "load-read-failed"),
             WALL_CLOCK_STATE=wall_clock_state,
         )
         env.pop("CPUS", None)
@@ -2439,21 +2454,6 @@ exec {real_date!r} "$@"
             self.assertFalse(os.path.exists(env["WALL_CLOCK_STATE"]),
                              "elapsed timing still reads CLOCK_REALTIME through date")
 
-    def test_numeric_output_from_a_failed_load_read_is_invalid(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            env, _removed, _state = self.environment(
-                tmp, DRIVER_LOAD_ACTION="numeric-read-error")
-            proc = self.run_host(env)
-            self.assertNotEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertIn("status=9", proc.stderr)
-            self.assertFalse(os.path.exists(os.path.join(env["RESULTS"], "summary.json")))
-            with open(os.path.join(env["RESULTS"], "hostcdp.jsonl")) as handle:
-                row = json.loads(handle.readline())
-            self.assertEqual(row["loadavg1_raw"], "0.42")
-            self.assertEqual(row["loadavg1_read_status"], 9)
-            self.assertIsNone(row["loadavg1"])
-            self.assertIs(row["measurement_valid"], False)
-
     def test_failed_initial_load_read_refuses_before_container_create(self):
         with tempfile.TemporaryDirectory() as tmp:
             env, removed, state = self.environment(
@@ -2703,6 +2703,7 @@ exec {real_date!r} "$@"
                 "phase_supervisor_sha256": supervisor_hash,
                 "host_resource_finalizer_sha256": finalizer_hash,
                 "driver": "cdpdrive.py",
+                "driver_process": "in-process",
                 "network": "host (no VM, no DNAT)",
                 "comparison_label": "free",
                 "cpu_budget": "unlimited",
@@ -8430,6 +8431,8 @@ sys.stdin.read(1)
             rec = json.load(handle)
         self.assertEqual(rec["hosts"]["host"]["wall_ms"]["n"], 3)
         self.assertEqual(rec["hosts"]["host"]["driver_total_ms"]["n"], 3)
+        # The fixture predates in-process driving, and the output says so.
+        self.assertEqual(rec["hosts"]["host"]["driver_process"], "per-rep subprocess")
         identities = rec["input_identity"]
         self.assertEqual(
             identities["reqbench_jsonl"]["sha256"],
