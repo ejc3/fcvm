@@ -262,6 +262,7 @@ impl Progress {
 }
 
 /// [`populate_chunk_counted`], for a caller that only needs to know how far to advance.
+#[cfg(test)]
 pub fn populate_chunk(
     uffd: &Uffd,
     source: &Source<'_>,

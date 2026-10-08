@@ -3770,17 +3770,25 @@ fn faults_by_vm(log: &str) -> Vec<(String, u64)> {
         .collect()
 }
 
-/// `(vm_id, prefetched_pages)` for every clone that replayed a recorded working set.
-fn prefetched_by_vm(log: &str) -> Vec<(String, u64)> {
+/// `(vm_id, count)` for every clone that replayed a recorded working set, where `count` is the
+/// replay line's `key=` field, e.g. `replayed_by_vm(log, "prefetched_pages=")`.
+fn replayed_by_vm(log: &str, key: &str) -> Vec<(String, u64)> {
     log.lines()
         .filter(|line| line.contains("replayed recorded working set"))
-        .filter_map(|line| {
-            Some((
-                field(line, "vm_id=")?,
-                field(line, "prefetched_pages=")?.parse().ok()?,
-            ))
-        })
+        .filter_map(|line| Some((field(line, "vm_id=")?, field(line, key)?.parse().ok()?)))
         .collect()
+}
+
+/// `(vm_id, prefetched_pages)` for every clone that replayed a recorded working set.
+fn prefetched_by_vm(log: &str) -> Vec<(String, u64)> {
+    replayed_by_vm(log, "prefetched_pages=")
+}
+
+/// `(vm_id, filled_holes_mapped)` for every clone that replayed a recorded working set: the
+/// pages its replay mapped at holes of a MINOR server's backing memfd that earlier clones
+/// filled.
+fn filled_holes_by_vm(log: &str) -> Vec<(String, u64)> {
+    replayed_by_vm(log, "filled_holes_mapped=")
 }
 
 /// Prefetched page count for one exact clone. A serve log can contain entries for several
@@ -3835,13 +3843,13 @@ async fn sha256_of(path: &std::path::Path) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn working_set_serve_args(snapshot_name: &str) -> Vec<&str> {
+fn working_set_serve_args<'a>(snapshot_name: &'a str, uffd_mode: &'a str) -> Vec<&'a str> {
     vec![
         "snapshot",
         "serve",
         snapshot_name,
         "--uffd-mode",
-        "copy",
+        uffd_mode,
         "--uffd-prefetch",
         "on",
     ]
@@ -3882,19 +3890,21 @@ async fn finish_working_set_isolation_phase(
 
 #[test]
 fn working_set_replay_test_pins_its_server_modes() {
-    assert_eq!(
-        working_set_serve_args("snapshot-under-test"),
-        [
-            "snapshot",
-            "serve",
-            "snapshot-under-test",
-            "--uffd-mode",
-            "copy",
-            "--uffd-prefetch",
-            "on",
-        ],
-        "ambient FCVM_UFFD_MODE/PREFETCH must not change which replay path the E2E covers"
-    );
+    for mode in ["copy", "minor"] {
+        assert_eq!(
+            working_set_serve_args("snapshot-under-test", mode),
+            [
+                "snapshot",
+                "serve",
+                "snapshot-under-test",
+                "--uffd-mode",
+                mode,
+                "--uffd-prefetch",
+                "on",
+            ],
+            "ambient FCVM_UFFD_MODE/PREFETCH must not change which replay path the E2E covers"
+        );
+    }
 }
 
 #[test]
@@ -4058,8 +4068,23 @@ async fn run_working_set_clone(serve_pid: u32, name: &str) -> Result<String> {
 ///
 /// The fault counts are the evidence: the recording clone pays full demand paging, the
 /// replaying clones pay a small fraction of it for the same workload.
+///
+/// It runs against both server modes: COPY replays with `UFFDIO_COPY` into each clone's
+/// private memory, MINOR with `UFFDIO_CONTINUE` onto the shared backing memfd.
 #[tokio::test]
 async fn test_snapshot_clone_working_set_replay() -> Result<()> {
+    working_set_replay_impl("copy").await
+}
+
+/// [`test_snapshot_clone_working_set_replay`] against a MINOR-mode server. It also checks the
+/// holes of the server's backing memfd: a clone that replays after another clone's faults on
+/// filled holes were merged must map those holes.
+#[tokio::test]
+async fn test_snapshot_clone_working_set_replay_uffd_minor() -> Result<()> {
+    working_set_replay_impl("minor").await
+}
+
+async fn working_set_replay_impl(uffd_mode: &str) -> Result<()> {
     let (baseline_name, _, snapshot_name, _) = common::unique_names("wsreplay");
     let snapshot_path = fcvm::paths::snapshot_dir().join(&snapshot_name);
     let mut baseline: Option<(tokio::process::Child, u32)> = None;
@@ -4067,7 +4092,7 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
     let mut iso_clones: Vec<(tokio::process::Child, u32)> = Vec::new();
     let mut snapshot_cleanup_needed = false;
 
-    println!("\n=== Working-set replay test ===");
+    println!("\n=== Working-set replay test (uffd-mode={uffd_mode}) ===");
 
     let verdict = async {
         // Every owned process is stored immediately after spawn, before the first fallible
@@ -4115,9 +4140,10 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
             working_set_path.display()
         );
 
-        let serve_args = working_set_serve_args(&snapshot_name);
+        let serve_args = working_set_serve_args(&snapshot_name, uffd_mode);
+        let serve_log_name = format!("uffd-serve-wsreplay-{uffd_mode}");
         let (serve_child, serve_pid, serve_log) =
-            common::spawn_fcvm_with_log_path(&serve_args, "uffd-serve-wsreplay")
+            common::spawn_fcvm_with_log_path(&serve_args, &serve_log_name)
                 .await
                 .context("spawning memory server")?;
         serve = Some((serve_child, serve_pid));
@@ -4206,10 +4232,58 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
             100.0 - (replay_faults as f64 / recorder_faults as f64) * 100.0
         );
 
+        // MINOR only. Clone 1 filled every hole it touched without a fault, so its recording
+        // holds no hole and clone 2's replay maps none. Clone 2's touches of those filled
+        // holes were MINOR faults, which it recorded, so once its faults are merged the next
+        // clone's replay asks the memfd about them and maps them.
+        let minor = uffd_mode == "minor";
+        if minor {
+            let replay_filled = filled_holes_by_vm(&log)
+                .into_iter()
+                .find_map(|(vm, pages)| (vm == *replay_vm_id).then_some(pages));
+            anyhow::ensure!(
+                replay_filled == Some(0),
+                "clone 2 replays clone 1's recording, which holds no hole clone 1 filled, yet \
+                 its replay reported filled_holes_mapped={replay_filled:?}"
+            );
+            serve_log_until(&serve_log, 60, "clone 2's faults to be merged", |log| {
+                log.lines().any(|line| {
+                    line.contains("merged this clone's faults into the snapshot's working set")
+                        && field(line, "vm_id=").as_deref() == Some(replay_vm_id.as_str())
+                })
+            })
+            .await?;
+        }
+
         // Isolation, with two live clones that both replayed.
         let b_name = format!("{}-b", snapshot_name);
         let (b_child, b) = spawn_working_set_clone(serve_pid, &b_name).await?;
         iso_clones.push((b_child, b));
+        if minor {
+            // Clones 1 and 2 have exited and clone C has not started, so the one replay line
+            // from any other clone is clone B's.
+            let measured = [faults[0].0.as_str(), faults[1].0.as_str()];
+            let log = serve_log_until(&serve_log, 60, "clone B's replay", |log| {
+                filled_holes_by_vm(log)
+                    .iter()
+                    .any(|(vm, _)| !measured.contains(&vm.as_str()))
+            })
+            .await?;
+            let b_filled: Vec<u64> = filled_holes_by_vm(&log)
+                .into_iter()
+                .filter(|(vm, _)| !measured.contains(&vm.as_str()))
+                .map(|(_, pages)| pages)
+                .collect();
+            anyhow::ensure!(
+                b_filled.len() == 1 && b_filled[0] > 0,
+                "HOLE REPLAY DID NOT WORK: clone B replayed after clone 2's faults on filled \
+                 holes were merged, yet mapped no filled hole: filled_holes_mapped={b_filled:?}"
+            );
+            println!(
+                "  ✓ clone B's replay mapped {} pages at holes earlier clones filled",
+                b_filled[0]
+            );
+        }
         let c_name = format!("{}-c", snapshot_name);
         let (c_child, c) = spawn_working_set_clone(serve_pid, &c_name).await?;
         iso_clones.push((c_child, c));
@@ -4284,7 +4358,7 @@ async fn test_snapshot_clone_working_set_replay() -> Result<()> {
 
     if cleanup_errors.is_empty() {
         verdict?;
-        println!("✅ WORKING-SET REPLAY TEST PASSED");
+        println!("✅ WORKING-SET REPLAY TEST PASSED (uffd-mode={uffd_mode})");
         Ok(())
     } else {
         let cleanup = cleanup_errors.join("; ");

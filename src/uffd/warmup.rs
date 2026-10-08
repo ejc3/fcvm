@@ -215,7 +215,7 @@ fn warm(
 }
 
 /// The host's page size, or [`GRANULE`] if `sysconf` has no usable answer.
-fn host_page_size() -> u64 {
+pub(super) fn host_page_size() -> u64 {
     // SAFETY: sysconf(3) has no preconditions.
     let raw = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     u64::try_from(raw)

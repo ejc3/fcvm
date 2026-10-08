@@ -14,6 +14,7 @@ use memmap2::MmapOptions;
 use userfaultfd::{Event, FaultKind, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
+use crate::uffd::holes::{HoleMap, MemfdHoles, MemfdRun, ResidentWindow};
 use crate::uffd::prefetch;
 use crate::uffd::warmup::Warmer;
 use crate::uffd::working_set::{PageSet, WorkingSetPersistence, WorkingSetStore};
@@ -481,8 +482,21 @@ enum PageSource {
         fault_around: usize,
     },
     /// A memfd holding the whole snapshot image. Handed to each Firecracker over
-    /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`.
-    Minor { backing: File },
+    /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`. `holes` lists the
+    /// all-zero pages [`create_backing_memfd`] left unwritten in it and asks the memfd which
+    /// of them a clone has filled since.
+    Minor { backing: File, holes: MemfdHoles },
+}
+
+impl PageSource {
+    /// The holes of the image this source serves, where it has any. A MINOR source's backing
+    /// memfd starts with a hole at each all-zero page.
+    fn holes(&self) -> Option<&MemfdHoles> {
+        match self {
+            Self::Minor { holes, .. } => Some(holes),
+            Self::Copy { .. } => None,
+        }
+    }
 }
 
 /// Whether a server records each clone's restore working set and replays it into later clones.
@@ -822,15 +836,17 @@ impl UffdServer {
                 )
             }
             UffdBacking::Minor { hugepages } => {
-                let backing_file = tokio::task::spawn_blocking({
+                let (backing_file, holes) = tokio::task::spawn_blocking({
                     let id = snapshot_id.clone();
                     move || create_backing_memfd(&id, mem_file, mem_size, hugepages)
                 })
                 .await
                 .context("joining memfd population task")??;
+                let holes = MemfdHoles::new(holes, &backing_file);
                 (
                     PageSource::Minor {
                         backing: backing_file,
+                        holes,
                     },
                     None,
                 )
@@ -1940,10 +1956,11 @@ fn replay_steps_after_drain(outcome: DrainOutcome) -> &'static [ReplayStep] {
 /// Replay drains the fault queue before every populate call, so a guest fault never waits behind
 /// more than one call of speculation. What it does once per batch is yield. A batch ends after
 /// [`prefetch::CHUNK_BYTES`] of population or [`ReplayPacer::MAX_POPULATES`] populate calls,
-/// whichever comes first. A populate the kernel refused and a step over a run the balloon
-/// gave back each count as a call. A fragmented recording needs the second bound: a 128 GiB guest's set
-/// is millions of runs a few pages long (six clones' recordings unioned to 9.4M pages in 3.09M
-/// runs), and a yield after every one of those small copies cost more than the copy.
+/// whichever comes first. A populate the kernel refused and a step over a run that is given
+/// back or a hole each count as a call. A fragmented recording needs the second bound: a
+/// 128 GiB guest's set is millions of runs a few pages long (six clones' recordings unioned to
+/// 9.4M pages in 3.09M runs), and a yield after every one of those small copies cost more than
+/// the copy.
 #[derive(Debug, Default)]
 struct ReplayPacer {
     populates: u32,
@@ -2138,7 +2155,9 @@ async fn replay_then_serve(
 ) -> Result<()> {
     if let Some(store) = working_set {
         let recorded = store.to_prefetch();
-        if !recorded.is_empty() && replay_working_set(ctx, async_uffd, &recorded, state).await? {
+        if !recorded.is_empty()
+            && replay_working_set(ctx, async_uffd, &recorded, state).await? == Replay::Exited
+        {
             log_clone_finished(ctx, state, "clone exited during working-set replay");
             return Ok(());
         }
@@ -2147,12 +2166,27 @@ async fn replay_then_serve(
     serve_faults(ctx, async_uffd, async_peer_pidfd, peer_pid, state).await
 }
 
+/// How a working-set replay ended.
+#[derive(Debug, PartialEq, Eq)]
+enum Replay {
+    /// The clone exited while replay ran.
+    Exited,
+    /// Replay went through every planned segment. The kernel refused a populate in
+    /// `refused_segments` of them, and what was left of each faults on demand.
+    /// `filled_holes_mapped` is the pages replay mapped at candidate holes of a MINOR clone's
+    /// backing memfd because an earlier clone had filled them.
+    Finished {
+        refused_segments: u64,
+        filled_holes_mapped: u64,
+    },
+}
+
 async fn replay_working_set(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
     recorded: &PageSet,
     state: &mut VmState,
-) -> Result<bool> {
+) -> Result<Replay> {
     let regions: Vec<prefetch::Region> = ctx
         .mappings
         .iter()
@@ -2166,8 +2200,13 @@ async fn replay_working_set(
         PageSource::Copy { mmap, .. } => prefetch::Source::Copy(&mmap[..]),
         PageSource::Minor { .. } => prefetch::Source::Minor,
     };
+    let holes = ctx.source.holes();
+    let mut resident = ResidentWindow::default();
     let started = std::time::Instant::now();
     let mut bytes = 0u64;
+    let mut filled_holes_mapped = 0u64;
+    let mut hole_skipped = 0u64;
+    let mut hole_queries_failed = 0u64;
     let mut refused = 0u64;
     let mut segments = 0u64;
     let mut yields = 0u64;
@@ -2180,10 +2219,10 @@ async fn replay_working_set(
         'chunk: while done < segment.len {
             for step in replay_steps_after_drain(drain_events(async_uffd.get_ref(), ctx, state)?) {
                 match step {
-                    ReplayStep::VmExited => return Ok(true),
+                    ReplayStep::VmExited => return Ok(Replay::Exited),
                     ReplayStep::RetryPending => {
                         if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
-                            return Ok(true);
+                            return Ok(Replay::Exited);
                         }
                     }
                     ReplayStep::Populate => {}
@@ -2209,10 +2248,31 @@ async fn replay_working_set(
                 continue 'segments;
             };
             let (given_back, run) = state.removed.run_at(at, segment.len - done, ctx.page_size);
-            if given_back {
+            // A recorded page that is a hole in a MINOR clone's backing memfd has no page for
+            // `UFFDIO_CONTINUE` to map. The kernel refuses it, which would give up the rest of
+            // the segment, and the guest's own touch fills the hole. Replay steps over it. A
+            // hole an earlier clone has filled is a page now, and replay maps and counts it.
+            let (hole, filled, run) = match holes {
+                Some(holes) if !given_back => {
+                    match holes.run_at(&mut resident, at, run, ctx.page_size) {
+                        MemfdRun::Pages(run) => (false, false, run),
+                        MemfdRun::Filled(run) => (false, true, run),
+                        MemfdRun::Holes(run) => (true, false, run),
+                        MemfdRun::Unknown(run) => {
+                            hole_queries_failed += 1;
+                            (true, false, run)
+                        }
+                    }
+                }
+                _ => (false, false, run),
+            };
+            if given_back || hole {
                 done += run;
+                if hole {
+                    hole_skipped += run as u64;
+                }
                 // A step over counts towards the batch like a refused populate, so a
-                // stretch of given-back runs yields once per batch too.
+                // stretch of runs stepped over yields once per batch too.
                 if pacer.populated(0) {
                     yields += 1;
                     tokio::task::yield_now().await;
@@ -2223,7 +2283,7 @@ async fn replay_working_set(
                 len: done + run,
                 ..segment
             };
-            match prefetch::populate_chunk(
+            match prefetch::populate_chunk_counted(
                 async_uffd.get_ref(),
                 &source,
                 &wanted,
@@ -2231,15 +2291,21 @@ async fn replay_working_set(
                 ctx.page_size,
                 ctx.vm_id,
             ) {
-                Ok(progress) => {
+                Ok(prefetch::Progress {
+                    advanced: progress,
+                    populated,
+                }) => {
                     done += progress;
                     bytes += progress as u64;
+                    if filled {
+                        filled_holes_mapped += (populated / ctx.page_size) as u64;
+                    }
                     if pacer.populated(progress) {
                         yields += 1;
                         tokio::task::yield_now().await;
                     }
                 }
-                Err(prefetch::Stop::VmGone) => return Ok(true),
+                Err(prefetch::Stop::VmGone) => return Ok(Replay::Exited),
                 Err(prefetch::Stop::Refused) => {
                     refused += 1;
                     if pacer.populated(0) {
@@ -2259,12 +2325,18 @@ async fn replay_working_set(
         prefetched_mib = bytes / (1024 * 1024),
         segments,
         refused_segments = refused,
+        filled_holes_mapped,
+        hole_skipped_mib = hole_skipped / (1024 * 1024),
+        hole_queries_failed,
         yields,
         prefetch_ms = started.elapsed().as_millis(),
         demand_faults_during_replay = state.fault_count,
         "replayed recorded working set"
     );
-    Ok(false)
+    Ok(Replay::Finished {
+        refused_segments: refused,
+        filled_holes_mapped,
+    })
 }
 
 async fn serve_faults(
@@ -3003,7 +3075,7 @@ async fn handshake(
     // Keep non-blocking — AsyncFd handles readiness
     let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
 
-    if let PageSource::Minor { backing } = source {
+    if let PageSource::Minor { backing, .. } = source {
         send_backing_fd(&async_stream, backing).await?;
     }
 
@@ -3090,7 +3162,10 @@ async fn send_backing_fd(
 ///   (`shmem_get_folio_gfp(..., SGP_CACHE, ...)`) regardless of `VM_SHARED`, so every later
 ///   clone finds it there and faults MINOR onto the same physical page. Sharing is preserved
 ///   and the resident cost drops to the snapshot's non-zero footprint (measured: 63% of a
-///   1 GiB idle alpine/nginx snapshot is zero pages).
+///   1 GiB idle alpine/nginx snapshot is zero pages). The returned [`HoleMap`] lists each of
+///   them. `UFFDIO_CONTINUE` refuses a page that is not in the memfd, and a clone's touch
+///   fills a hole without telling the server, so replay asks the memfd which of them are
+///   still holes ([`MemfdHoles`]).
 /// * **hugetlb is populated in full.** `hugetlb_no_page()` only calls
 ///   `hugetlb_add_to_page_cache()` when `vma->vm_flags & VM_MAYSHARE`; on our `MAP_PRIVATE`
 ///   VMA a hole fault allocates an *anonymous* huge page instead, one per clone. Leaving
@@ -3100,7 +3175,7 @@ fn create_backing_memfd(
     mut mem_file: File,
     mem_size: usize,
     hugepages: bool,
-) -> Result<File> {
+) -> Result<(File, HoleMap)> {
     use std::io::Read;
 
     let page_size = if hugepages { HUGE_PAGE_2M } else { 4096 };
@@ -3153,6 +3228,7 @@ fn create_backing_memfd(
     let mut offset = 0usize;
     let mut resident_pages = 0usize;
     let mut hole_pages = 0usize;
+    let mut holes = HoleMap::new(mem_size);
     while offset < mem_size {
         let end = (offset + chunk_len).min(mem_size);
         let len = end - offset;
@@ -3164,6 +3240,7 @@ fn create_backing_memfd(
             let plen = page_size.min(len - p);
             let src = &scratch[p..p + plen];
             if !hugepages && plen == page_size && src == &zero_page[..] {
+                holes.insert(offset + p, plen);
                 hole_pages += 1;
             } else {
                 dest[offset + p..offset + p + plen].copy_from_slice(src);
@@ -3217,7 +3294,7 @@ fn create_backing_memfd(
         "populated, sealed and reopened read-only the shared backing memfd for MINOR-mode restore"
     );
 
-    Ok(backing_ro)
+    Ok((backing_ro, holes))
 }
 
 /// Refuse an allocation the host hugepage pool cannot hold.
@@ -4431,7 +4508,7 @@ mod tests {
     fn test_backing_memfd_is_sealed_and_read_only() {
         let (path, mem_size) = write_test_snapshot();
         let mem_file = File::open(&path).unwrap();
-        let backing = create_backing_memfd("seal-test", mem_file, mem_size, false).unwrap();
+        let (backing, _) = create_backing_memfd("seal-test", mem_file, mem_size, false).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         // All four seals present.
@@ -4467,7 +4544,8 @@ mod tests {
     async fn test_backing_memfd_is_sealed_and_serves_minor_faults() {
         let (path, mem_size) = write_test_snapshot();
         let mem_file = File::open(&path).unwrap();
-        let backing = create_backing_memfd("seal-minor-test", mem_file, mem_size, false).unwrap();
+        let (backing, _) =
+            create_backing_memfd("seal-minor-test", mem_file, mem_size, false).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         // --- receive the fd exactly the way a clone's Firecracker does ---
@@ -4595,6 +4673,354 @@ mod tests {
         assert_eq!(
             pristine[8192], 0xCD,
             "clone write must not reach the snapshot"
+        );
+    }
+
+    // =========================================================================
+    // Holes in a MINOR clone's backing memfd: the all-zero pages the server
+    // leaves unwritten, which `UFFDIO_CONTINUE` has no page to map for.
+    // =========================================================================
+
+    /// A snapshot image file whose page `i` is filled with the byte `pages[i]`, so 0 makes an
+    /// all-zero page. Rewound, because `create_backing_memfd` reads from the file position.
+    fn image_file(pages: &[u8]) -> File {
+        use std::io::{Seek, Write};
+        let mut file = tempfile::tempfile().expect("creating a snapshot image");
+        for byte in pages {
+            file.write_all(&[*byte; 4096]).expect("writing the image");
+        }
+        file.rewind().expect("rewinding the image");
+        file
+    }
+
+    /// Indices of the pages in `[base, base + pages * 4096)` that have a page table entry, read
+    /// from `/proc/self/pagemap` (bit 63). `mincore` would not do here: for a file mapping it
+    /// answers for the page cache, which holds a memfd page whether or not this mapping has it
+    /// mapped.
+    fn present_pages(base: usize, pages: usize) -> Vec<usize> {
+        use std::os::unix::fs::FileExt;
+        let pagemap = File::open("/proc/self/pagemap").expect("opening /proc/self/pagemap");
+        let mut entries = vec![0u8; pages * 8];
+        pagemap
+            .read_exact_at(&mut entries, (base / 4096 * 8) as u64)
+            .expect("reading /proc/self/pagemap");
+        entries
+            .chunks_exact(8)
+            .enumerate()
+            .filter(|(_, entry)| {
+                u64::from_le_bytes((*entry).try_into().expect("an 8-byte entry")) & (1 << 63) != 0
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    /// A MINOR-mode clone as Firecracker sets one up: its guest memory is a MAP_PRIVATE
+    /// mapping of the backing memfd `create_backing_memfd` built from an image, registered
+    /// MINOR on the clone's own userfaultfd.
+    struct MinorClone {
+        guest: memmap2::MmapMut,
+        mem_size: usize,
+        source: PageSource,
+        mappings: [GuestRegionUffdMapping; 1],
+    }
+
+    impl MinorClone {
+        const PAGE: usize = 4096;
+
+        /// A clone of an image whose page `i` is filled with the byte `pages[i]`.
+        fn new(pages: &[u8]) -> (Self, Uffd) {
+            let mem_size = pages.len() * Self::PAGE;
+            let (backing, holes) =
+                create_backing_memfd("minor-clone", image_file(pages), mem_size, false)
+                    .expect("building the backing memfd");
+            // SAFETY: a private mapping of a sealed memfd this test owns.
+            let guest = unsafe { MmapOptions::new().map_copy(&backing) }
+                .expect("mapping the backing memfd MAP_PRIVATE");
+            let base = guest.as_ptr() as usize;
+            let uffd = userfaultfd::UffdBuilder::new()
+                .close_on_exec(true)
+                .non_blocking(true)
+                .user_mode_only(true)
+                .create()
+                .expect("creating userfaultfd (via /dev/userfaultfd)");
+            uffd.register_with_mode(
+                base as *mut libc::c_void,
+                mem_size,
+                userfaultfd::RegisterMode::MINOR,
+            )
+            .expect("MINOR registration on a MAP_PRIVATE mapping of the memfd");
+            let holes = MemfdHoles::new(holes, &backing);
+            let clone = Self {
+                guest,
+                mem_size,
+                source: PageSource::Minor { backing, holes },
+                mappings: [GuestRegionUffdMapping {
+                    base_host_virt_addr: base as u64,
+                    size: mem_size,
+                    offset: 0,
+                    page_size: Self::PAGE,
+                }],
+            };
+            (clone, uffd)
+        }
+
+        fn page(&self, index: usize) -> usize {
+            self.guest.as_ptr() as usize + index * Self::PAGE
+        }
+
+        fn ctx(&self) -> VmContext<'_> {
+            VmContext {
+                vm_id: "minor-clone",
+                mappings: &self.mappings,
+                source: &self.source,
+                page_size: Self::PAGE,
+                page_mask: !(Self::PAGE - 1),
+                mem_size: self.mem_size,
+            }
+        }
+
+        fn state(&self) -> VmState {
+            VmState {
+                fault_count: 0,
+                fault_around: FaultAroundStats::default(),
+                parked_faults: ParkedFaults::default(),
+                removed: RemovedPages::default(),
+                given_back: GivenBackStats::default(),
+                recorded: Some(PageSet::empty(self.mem_size as u64)),
+                record_until: None,
+                started: std::time::Instant::now(),
+                trace: None,
+            }
+        }
+
+        fn present_pages(&self) -> Vec<usize> {
+            present_pages(self.page(0), self.mem_size / Self::PAGE)
+        }
+
+        /// Touch `pages` the way another clone of the same snapshot would: through a private
+        /// mapping of the backing memfd that no userfaultfd covers. A touch of a hole fills it
+        /// in the memfd, and no event reaches any server.
+        fn touch_as_another_clone(&self, pages: &[usize]) {
+            let PageSource::Minor { backing, .. } = &self.source else {
+                unreachable!("a MinorClone is served in minor mode")
+            };
+            // SAFETY: a private read-only mapping of a sealed memfd this test owns.
+            let other = unsafe { MmapOptions::new().map_copy_read_only(backing) }
+                .expect("mapping the memfd for another clone");
+            for page in pages {
+                // SAFETY: a page inside the mapping made above.
+                unsafe { std::ptr::read_volatile(other.as_ptr().add(page * Self::PAGE)) };
+            }
+        }
+
+        /// The first byte of a page of this clone that [`Self::present_pages`] showed mapped.
+        /// A page that is not mapped would fault, and nothing serves this clone's faults.
+        fn read_mapped(&self, page: usize) -> u8 {
+            assert!(
+                self.present_pages().contains(&page),
+                "page {page} is not mapped"
+            );
+            // SAFETY: a mapped page of this clone's live mapping.
+            unsafe { std::ptr::read_volatile(self.page(page) as *const u8) }
+        }
+    }
+
+    /// `create_backing_memfd` returns a map of exactly the pages it left unwritten: every
+    /// all-zero page and nothing else. A page with one non-zero byte is data, and so is a
+    /// short last page, which is written whatever it holds. The memfd's own holes, as
+    /// `SEEK_DATA` reports them, are the same pages.
+    #[test]
+    fn create_backing_memfd_returns_exactly_the_zero_pages() {
+        use std::io::{Seek, Write};
+        const PAGE: usize = 4096;
+        let mut one_byte = [0u8; PAGE];
+        one_byte[PAGE - 1] = 1;
+        let mut image = tempfile::tempfile().expect("creating a snapshot image");
+        for page in [[0xAB; PAGE], [0; PAGE], one_byte, [0; PAGE], [0; PAGE]] {
+            image.write_all(&page).expect("writing the image");
+        }
+        image
+            .write_all(&[0u8; 100])
+            .expect("writing a short last page");
+        image.rewind().expect("rewinding the image");
+        let mem_size = 5 * PAGE + 100;
+
+        let (backing, holes) = create_backing_memfd("hole-map", image, mem_size, false)
+            .expect("building the backing memfd");
+
+        let marked: Vec<usize> = (0..8)
+            .filter(|page| holes.covers(page * PAGE, PAGE))
+            .collect();
+        assert_eq!(marked, vec![1, 3, 4], "the map marks the all-zero pages");
+        assert!(holes.covers(3 * PAGE, 2 * PAGE), "two holes in a row");
+        assert!(
+            !holes.covers(PAGE, 3 * PAGE),
+            "a range with a data page in it"
+        );
+
+        let memfd_holes: Vec<usize> = (0..6)
+            .filter(|page| {
+                let offset = (page * PAGE) as libc::off_t;
+                // SAFETY: lseek on a valid fd this test owns.
+                let data = unsafe { libc::lseek(backing.as_raw_fd(), offset, libc::SEEK_DATA) };
+                data != offset
+            })
+            .collect();
+        assert_eq!(memfd_holes, marked, "the map describes the memfd's holes");
+    }
+
+    /// Replay of a recorded set that includes a page the backing memfd left as a hole. The
+    /// kernel refuses `UFFDIO_CONTINUE` there (there is no page in the memfd to map), and a
+    /// refused populate gives up the rest of its segment. Replay steps over the hole and
+    /// maps every other recorded page.
+    #[tokio::test]
+    async fn minor_replay_steps_over_memfd_holes_and_finishes_the_run() {
+        const PAGE: usize = MinorClone::PAGE;
+        // Page 1 is all zeros, so the backing memfd leaves it unwritten.
+        let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0xA3, 0xA4]);
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        // An earlier clone recorded all four pages, the zero page among them.
+        let mut recorded = PageSet::empty(clone.mem_size as u64);
+        recorded.insert_range(0, (4 * PAGE) as u64);
+
+        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+            .await
+            .expect("replay");
+        assert_eq!(
+            replayed,
+            Replay::Finished {
+                refused_segments: 0,
+                filled_holes_mapped: 0,
+            },
+            "replay must not ask the kernel for the hole"
+        );
+        assert_eq!(
+            clone.present_pages(),
+            vec![0, 2, 3],
+            "replay maps every recorded page except the hole"
+        );
+        // SAFETY: pages of this clone's live mapping that the line above showed mapped.
+        let read = |page: usize| unsafe { std::ptr::read_volatile(clone.page(page) as *const u8) };
+        assert_eq!((read(0), read(2), read(3)), (0xA1, 0xA3, 0xA4));
+        assert_eq!(state.fault_count, 0, "nothing faulted");
+    }
+
+    /// A hole the backing memfd started with stops being one when a clone touches it: the
+    /// touch fills the hole in the memfd, with no event reaching the server. Replay for a
+    /// later clone must map that page like any other recorded page. A replay that still
+    /// stepped over it would cost every later clone a round trip for each filled hole.
+    #[tokio::test]
+    async fn minor_replay_maps_a_memfd_hole_another_clone_filled() {
+        const PAGE: usize = MinorClone::PAGE;
+        // Pages 1 and 2 are all zeros, so the backing memfd leaves them unwritten.
+        let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0, 0xA4]);
+        // An earlier clone touched page 1 and not page 2.
+        clone.touch_as_another_clone(&[1]);
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        let mut recorded = PageSet::empty(clone.mem_size as u64);
+        recorded.insert_range(0, (4 * PAGE) as u64);
+
+        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+            .await
+            .expect("replay");
+        assert_eq!(
+            replayed,
+            Replay::Finished {
+                refused_segments: 0,
+                filled_holes_mapped: 1,
+            },
+            "replay maps and counts the hole another clone filled, and does not ask the kernel \
+             for the hole no clone filled"
+        );
+        assert_eq!(
+            clone.present_pages(),
+            vec![0, 1, 3],
+            "replay maps the filled hole and steps over the other one"
+        );
+        assert_eq!(clone.read_mapped(1), 0, "a filled hole reads as zeros");
+        assert_eq!(state.fault_count, 0, "nothing faulted");
+    }
+
+    /// A MINOR fault on a page the backing memfd started without is recorded like any other.
+    /// Such a fault arrives only after another clone's touch filled the hole in the memfd,
+    /// and a later clone's replay maps the page while it stays in the memfd's page cache.
+    #[test]
+    fn a_minor_fault_on_a_filled_memfd_hole_is_recorded() {
+        let (clone, uffd) = MinorClone::new(&[0xB1, 0, 0xB3]);
+        // Another clone reads page 1. That fills the hole in the memfd, without an event, so
+        // this clone's touch of page 1 is a MINOR fault.
+        clone.touch_as_another_clone(&[1]);
+
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        for (page, want) in [(1, 0), (2, 0xB3)] {
+            let vcpu = FaultingReader::spawn(clone.page(page));
+            vcpu.wait_until_asleep();
+            let outcome = drain_events(&uffd, &ctx, &mut state).expect("serving the fault");
+            assert_eq!(outcome, DrainOutcome::QueueDrained);
+            let (got, _) = vcpu.finish("the vCPU is still asleep after its fault was served");
+            assert_eq!(got, want, "page {page}");
+        }
+        assert_eq!(state.fault_count, 2, "both touches faulted");
+        let mut faulted = PageSet::empty(clone.mem_size as u64);
+        faulted.insert_range(MinorClone::PAGE as u64, (2 * MinorClone::PAGE) as u64);
+        assert_eq!(
+            state.recorded,
+            Some(faulted),
+            "the filled hole is recorded with the data page"
+        );
+    }
+
+    /// Replay with a given-back set and holes together. A run that is given back is stepped
+    /// over whatever the memfd holds there, a filled hole included. A run that is not given
+    /// back is split at the holes no clone has filled, and replay maps the data pages and the
+    /// filled holes around them. The server fills the given-back set only for COPY clones, so
+    /// this sets it directly to pin the order the replay loop asks in.
+    #[tokio::test]
+    async fn minor_replay_steps_over_given_back_runs_and_splits_the_rest_at_holes() {
+        const PAGE: usize = MinorClone::PAGE;
+        // Pages 1, 2, 4, 6 and 7 are holes.
+        let (clone, uffd) = MinorClone::new(&[0xC0, 0, 0, 0xC3, 0, 0xC5, 0, 0]);
+        // Earlier clones filled pages 2 and 6.
+        clone.touch_as_another_clone(&[2, 6]);
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        // Pages 1 to 3 are given back: a hole, a filled hole and a data page.
+        state
+            .removed
+            .insert_range(PAGE, 3 * PAGE, PAGE, clone.mem_size);
+        let mut recorded = PageSet::empty(clone.mem_size as u64);
+        recorded.insert_range(0, (8 * PAGE) as u64);
+
+        let replayed = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+            .await
+            .expect("replay");
+        assert_eq!(
+            replayed,
+            Replay::Finished {
+                refused_segments: 0,
+                filled_holes_mapped: 1,
+            },
+            "replay counts the filled hole it maps, not the one that is given back, and does \
+             not ask the kernel for a hole no clone filled"
+        );
+        assert_eq!(
+            clone.present_pages(),
+            vec![0, 5, 6],
+            "pages 1 to 3 are given back, and pages 4 and 7 are holes"
+        );
+        assert_eq!(
+            (
+                clone.read_mapped(0),
+                clone.read_mapped(5),
+                clone.read_mapped(6)
+            ),
+            (0xC0, 0xC5, 0)
         );
     }
 
@@ -5773,7 +6199,7 @@ mod tests {
 
         for (round, (got, blocked, replayed)) in rounds.iter().enumerate() {
             assert!(
-                matches!(replayed, Ok(false)),
+                matches!(replayed, Ok(Replay::Finished { .. })),
                 "round {round}: replay must not fail the handler while a fault is parked \
                  behind a balloon that keeps inflating, because the fail-closed path kills \
                  the clone's VMM: {replayed:?}"
@@ -5936,7 +6362,7 @@ mod tests {
         );
         let chunk = at("'chunk: while done < segment.len {");
         let drain = at("drain_events(");
-        let populate = at("prefetch::populate_chunk(");
+        let populate = at("prefetch::populate_chunk_counted(");
         assert!(
             chunk < drain && drain < populate,
             "every populate call follows a drain"
@@ -5947,7 +6373,7 @@ mod tests {
             "nothing may gate the drain"
         );
         // The zero-byte gate appears twice: after a refused populate, and after a step over a
-        // run the balloon gave back.
+        // run that is given back or a hole.
         let gates = [
             ("if pacer.populated(progress) {", 1),
             ("if pacer.populated(0) {", 2),
@@ -6554,7 +6980,8 @@ mod tests {
             recorded.insert_range((9 * PAGE) as u64, PAGE as u64);
             let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
                 .await
-                .expect("replay");
+                .expect("replay")
+                == Replay::Exited;
             assert!(!exited, "the clone is alive");
             assert_eq!(
                 clone.resident_region_pages(),
@@ -6982,7 +7409,8 @@ mod tests {
 
         let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
             .await
-            .expect("replay");
+            .expect("replay")
+            == Replay::Exited;
         assert!(!exited, "no clone exit was reported");
         assert_eq!(
             resident_pages(clone.base, 16),
