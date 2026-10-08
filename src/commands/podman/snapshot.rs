@@ -306,7 +306,7 @@ pub async fn create_podman_snapshot(
     let parent_dir = parent_snapshot_key
         .as_deref()
         .map(|key| paths::snapshot_dir().join(key));
-    crate::commands::common::create_snapshot_core(
+    let published_memory = crate::commands::common::create_snapshot_core(
         client,
         snapshot_config,
         disk_path,
@@ -316,6 +316,12 @@ pub async fn create_podman_snapshot(
         source_disposition,
     )
     .await?;
+
+    // The VM is saved and the snapshot published. Give the locks back before the memory
+    // file is measured, so no clone, create or balloon change waits on the walk.
+    drop(_vm_lock);
+    drop(_generation_locks);
+    published_memory.log_data_runs().await;
 
     Ok(SnapshotInstall::Created)
 }
@@ -485,10 +491,10 @@ mod tests {
 
     /// `podman run`'s own pre-start and startup snapshots, and `podman prepare`'s,
     /// hold the per-VM snapshot lock from before the shared creator reads the VM's
-    /// balloon until it has saved the VM: the lock is bound for the rest of the
-    /// function, and taken before `create_snapshot_core`. `fcvm balloon` takes the
-    /// same lock to set a target, so a target cannot land between that read and
-    /// the save.
+    /// balloon until it has saved the VM: the lock is taken before
+    /// `create_snapshot_core` and given back only after it returns. `fcvm balloon`
+    /// takes the same lock to set a target, so a target cannot land between that
+    /// read and the save.
     #[test]
     fn podmans_own_snapshots_hold_the_vm_snapshot_lock_through_the_save() {
         let source = include_str!("snapshot.rs");
@@ -498,8 +504,7 @@ mod tests {
             .expect("no create_podman_snapshot");
         let body = &code[start..];
         let bound = body.find("let (_generation_locks, _vm_lock, ").expect(
-            "create_podman_snapshot does not keep the per-VM snapshot lock for the rest of \
-             the function",
+            "create_podman_snapshot does not keep the per-VM snapshot lock past its retry loop",
         );
         let taken = body
             .find("acquire_vm_snapshot_lock(disk_path)")
@@ -512,10 +517,13 @@ mod tests {
             "the lock is not taken before the shared creator runs: bound at {bound}, taken \
              at {taken}, creator at {saved}"
         );
-        assert!(
-            !body.contains("drop(_vm_lock)"),
-            "create_podman_snapshot gives the per-VM snapshot lock back before it returns"
-        );
+        if let Some(released) = body.find("drop(_vm_lock)") {
+            assert!(
+                saved < released,
+                "create_podman_snapshot gives the per-VM snapshot lock back before the shared \
+                 creator has saved the VM: released at {released}, creator at {saved}"
+            );
+        }
     }
 
     /// A startup snapshot is not taken once the VM's balloon target is no longer the

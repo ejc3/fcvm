@@ -1486,6 +1486,13 @@ fcvm snapshot create --pid 12345 --tag my-snapshot
 fcvm snapshot create my-vm --tag warm-nginx
 ```
 
+**Zero pages are holes**: with the default Firecracker build (`[firecracker]` in `rootfs-config.toml`, used by every
+kernel profile that does not set its own `firecracker_repo`), a Full snapshot written to a new memory file leaves every
+all-zero 4 KiB page as a hole. The fork tests each page as it dumps, so `memory.bin` stores only the non-zero pages and
+a hole reads back as zeros. The `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page.
+A diff still writes every page the VM touched, zeros included. Its merge base is a copy of the parent's `memory.bin`
+made with `copy_file_range`, which on btrfs clones the parent's extents, so a child keeps its parent's holes.
+
 **A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
 writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
 `merge_diff_snapshot` (`src/commands/common.rs`) copies each data run of the diff to the same offset of that copy:

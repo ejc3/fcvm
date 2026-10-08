@@ -33,19 +33,30 @@ btrfs_size = "60G"
 repo = "https://passt.top/passt"
 commit = "4e8aa70379a35ec9deb11d76513e7f6c4123b667"
 
-# Default Firecracker binary
+# Default Firecracker binary, for every kernel profile that does not set its
+# own firecracker_repo (all of them except nested.arm64).
 # Build from the fork's patch chain rebased onto upstream v1.17.0 (95f868c8e,
-# 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend.
+# 2026-09-04): vsock muxer capacity + the bounded UFFD-minor memory backend,
+# and a Full snapshot written to a new memory file leaves all-zero 4 KiB pages
+# as holes. nested.arm64 builds nv2-on-main, which writes every page.
 # v1.17.0 writes snapshot format 12 and refuses format 11, and the previous
 # build cannot restore format 12. A restore uses the binary the snapshot
 # recorded (SnapshotMetadata::firecracker_bin) while that file exists. A
 # snapshot that records none is loaded with this build, so a format 11 one
 # fails to load, and the error says to re-create it or pass --firecracker-bin.
 # `fcvm setup` builds this automatically; `find_firecracker()` uses it.
-# Kernel profiles can override with their own firecracker_repo/branch.
+# `commit` is required. Setup keeps a binary already built for it without
+# contacting the remote. Otherwise it fetches the commit by its hash, which
+# need not be the tip of `branch` but must still be on the remote (keep it on a
+# branch or tag), and checks the checkout's HEAD. `branch` is part of the
+# binary's name and is not checked against the commit. The commit is part of
+# the name too, so a new pin builds a new binary, and launch finds it without
+# the network.
+# Kernel profiles can override with their own firecracker_repo/branch/commit.
 [firecracker]
 repo = "ejc3/firecracker"
-branch = "agent/uffd-minor-v1.17.0"
+branch = "agent/uffd-minor-v1.17.0-zero-holes"
+commit = "6347691fed3e63f92abf1c2a802921861a403cf7"
 
 # Cloud Hypervisor backend (#632), optional VMM selected via --hypervisor cloud-hypervisor.
 # Built on demand with `fcvm setup --cloud-hypervisor` (content-addressed, like firecracker).
@@ -188,7 +199,7 @@ remove_dirs = [
 # Select via FCVM_KERNEL_PROFILE=<name> or auto-detected from kernel filename.
 #
 # Profile config is applied at runtime:
-# - firecracker_repo/branch: build firecracker from source (content-addressed in ~/.local/share/fcvm/firecracker/)
+# - firecracker_repo/branch/commit: build firecracker from source (content-addressed in <assets_dir>/firecracker/)
 # - firecracker_args: extra CLI args for firecracker
 # - boot_args: extra kernel boot parameters
 # - fuse_readers: override FUSE reader count
@@ -262,6 +273,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # PR: https://github.com/firecracker-microvm/firecracker/pull/5696
 firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "nv2-on-main"
+firecracker_commit = "865fcab0d237cea9bcb3faf79f0e6d654d5a33eb"
 firecracker_args = "--enable-nv2"
 
 # Boot args for nested KVM
