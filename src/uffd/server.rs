@@ -11,12 +11,13 @@ use tokio::task::JoinSet;
 use tracing::{debug, error, info, warn};
 
 use memmap2::MmapOptions;
-use userfaultfd::{Event, FaultKind, Uffd};
+use nix::sys::statfs::{fstatfs, FsType, FUSE_SUPER_MAGIC};
+use userfaultfd::{Event, FaultKind, ReadWrite, Uffd};
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
 
 use crate::uffd::holes::{HoleMap, MemfdHoles, MemfdRun, ResidentWindow};
 use crate::uffd::prefetch;
-use crate::uffd::warmup::Warmer;
+use crate::uffd::warmup::{host_page_size, Warmer};
 use crate::uffd::working_set::{PageSet, WorkingSetPersistence, WorkingSetStore};
 
 /// 2MiB — the only huge page size fcvm supports for guest memory.
@@ -476,10 +477,17 @@ impl UffdBacking {
 enum PageSource {
     /// Read-only mapping of the snapshot memory file; pages are `UFFDIO_COPY`'d out of it.
     /// `fault_around` is the [`FaultAround`] granule in bytes, zero when the option is off.
-    /// It lives here because this is the only mode that implements it.
+    /// It lives here because this is the only mode that implements it. `holes` are the holes
+    /// of the memory file, which read as zeros, once the server has mapped them
+    /// ([`FileHoles`]): a fault on one is answered with zeros ([`zero_answer`]), replay fills
+    /// a recorded one with zeros, and fault-around steps over them ([`skip_run_at`]). `nv2`
+    /// says the clones run with `--enable-nv2`, so every zero answer is a private copy of
+    /// zeros ([`VmContext::zero_fill`]).
     Copy {
         mmap: memmap2::Mmap,
         fault_around: usize,
+        holes: FileHoles,
+        nv2: bool,
     },
     /// A memfd holding the whole snapshot image. Handed to each Firecracker over
     /// `SCM_RIGHTS`; faults are resolved in place with `UFFDIO_CONTINUE`. `holes` lists the
@@ -489,12 +497,149 @@ enum PageSource {
 }
 
 impl PageSource {
-    /// The holes of the image this source serves, where it has any. A MINOR source's backing
-    /// memfd starts with a hole at each all-zero page.
-    fn holes(&self) -> Option<&MemfdHoles> {
+    /// The holes of a MINOR source's backing memfd, which starts with a hole at each all-zero
+    /// page. A COPY source's holes are those of the memory file it maps, which
+    /// [`zero_answer`] and [`skip_run_at`] read.
+    fn memfd_holes(&self) -> Option<&MemfdHoles> {
         match self {
             Self::Minor { holes, .. } => Some(holes),
             Self::Copy { .. } => None,
+        }
+    }
+}
+
+/// The holes of the memory file a COPY-mode server maps, once they are known.
+///
+/// The server builds the map on a thread of its own once it has bound its socket
+/// ([`UffdServer::run`], [`spawn_hole_map_build`]), so a memory file of millions of data runs
+/// does not delay the bind, and publishes it here whole. Until then every fault is served from
+/// the file, which reads a hole as zeros, so a fault is answered correctly either way and only
+/// the saving waits for the map. Faults, replay and fault-around read the map only through
+/// [`FileHoles::published`]. A `OnceLock` publishes it, so a reader sees either no map or the
+/// whole map, never part of one, and needs no lock.
+#[derive(Default)]
+struct FileHoles(std::sync::OnceLock<Option<HoleMap>>);
+
+impl FileHoles {
+    /// The map, once it is published. `None` while it is being built, and for good when it
+    /// could not be built.
+    fn published(&self) -> Option<&HoleMap> {
+        self.0.get()?.as_ref()
+    }
+
+    /// Publish the map built, or `None` for one that could not be built. The server builds
+    /// the map once, so a second call changes nothing.
+    fn publish(&self, map: Option<HoleMap>) {
+        let _ = self.0.set(map);
+    }
+
+    /// The map's state, for a log line.
+    fn state(&self) -> &'static str {
+        match self.0.get() {
+            None => "building",
+            Some(None) => "failed",
+            Some(Some(_)) => "published",
+        }
+    }
+}
+
+/// Whether the memory file has to be flushed before `SEEK_HOLE` describes it, on a
+/// filesystem of type `fs_type`. Only on FUSE: fuse-pipe forwards `SEEK_HOLE` to the host, so
+/// in a nested L1 whose data dir is on fuse-pipe with the writeback cache, a page still dirty
+/// in the L1's page cache would read as a hole and be served as zeros. A local filesystem
+/// answers `SEEK_HOLE` from its page cache, dirty pages included, and flushing a file just
+/// written costs seconds (`fdatasync` took 3.27 s for one on btrfs).
+fn flush_before_mapping_holes(fs_type: FsType) -> bool {
+    fs_type == FUSE_SUPER_MAGIC
+}
+
+/// The holes of the first `mem_size` bytes of `file`, after a flush where
+/// [`flush_before_mapping_holes`] calls for one. The walk moves the file offset, so `file` is
+/// a description of its own ([`open_for_hole_walk`]).
+fn build_file_holes(file: &File, mem_size: usize) -> Result<HoleMap> {
+    let fs_type = fstatfs(file)
+        .context("reading the memory file's filesystem type")?
+        .filesystem_type();
+    if flush_before_mapping_holes(fs_type) {
+        file.sync_data().context("flushing the memory file")?;
+    }
+    HoleMap::from_file(file, mem_size)
+}
+
+/// A read-only open file description of `file`, through `/proc/self/fd`, whose file offset
+/// nothing else uses. `SEEK_DATA` and `SEEK_HOLE` move the offset, and the hole walk runs
+/// while the server serves, so it does not use a duplicate of the served descriptor, which
+/// would share that descriptor's offset.
+fn open_for_hole_walk(file: &File) -> std::io::Result<File> {
+    File::open(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// Build the hole map of `file` on a thread of its own and publish it into `source`, a COPY
+/// page source, when it is whole. The source is weak, so the build keeps nothing alive: a
+/// server dropped before the build ends gets nothing published.
+fn spawn_hole_map_build(
+    snapshot_id: &str,
+    source: std::sync::Weak<PageSource>,
+    file: File,
+    mem_size: usize,
+) {
+    let snapshot = snapshot_id.to_string();
+    let on_failure = (snapshot.clone(), source.clone());
+    let spawned = std::thread::Builder::new()
+        .name("fcvm-holes".to_string())
+        .spawn(move || {
+            let started = std::time::Instant::now();
+            let map = build_file_holes(&file, mem_size);
+            drop(file);
+            publish_file_holes(&snapshot, &source, map, started.elapsed());
+        });
+    if let Err(error) = spawned {
+        let (snapshot, source) = on_failure;
+        publish_file_holes(
+            &snapshot,
+            &source,
+            Err(anyhow!(error).context("starting the hole map thread")),
+            Duration::ZERO,
+        );
+    }
+}
+
+/// Publish the outcome of a hole map build into `source` and log it: the map's size and how
+/// long the build took (`took`), or why there is no map. A map that could not be built is
+/// published as none, and every page is then served from the file.
+fn publish_file_holes(
+    snapshot: &str,
+    source: &std::sync::Weak<PageSource>,
+    map: Result<HoleMap>,
+    took: Duration,
+) {
+    let Some(source) = source.upgrade() else {
+        return;
+    };
+    let PageSource::Copy { holes, .. } = &*source else {
+        return;
+    };
+    match map {
+        Ok(map) => {
+            let hole_mib = map.bytes() / (1024 * 1024);
+            holes.publish(Some(map));
+            info!(
+                target: "uffd",
+                snapshot = %snapshot,
+                hole_mib,
+                build_ms = took.as_millis() as u64,
+                "published the hole map of the memory file; faults on its holes are answered \
+                 with zeros from now on"
+            );
+        }
+        Err(error) => {
+            holes.publish(None);
+            warn!(
+                target: "uffd",
+                snapshot = %snapshot,
+                error = %format!("{error:#}"),
+                "could not map the holes of the memory file; every page is served from the file"
+            );
         }
     }
 }
@@ -680,6 +825,10 @@ pub struct ServeShape {
     /// Copy mode only: how much of the snapshot each demand fault materialises around the
     /// page that faulted. See [`FaultAround`].
     pub fault_around: FaultAround,
+    /// The clones run with `--enable-nv2` (ARM64 NV2), which only copy mode serves. Every
+    /// fault answered with zeros then gets a private copy of zeros, never the kernel's zero
+    /// page. See [`VmContext::zero_fill`].
+    pub nv2: bool,
 }
 
 /// Async UFFD server that serves memory pages for multiple VMs from a single snapshot
@@ -699,6 +848,9 @@ pub struct UffdServer {
     warmer: Option<Warmer>,
     /// The memory file, marked in use (`uffd::release`) until this server is dropped.
     _in_use: Option<File>,
+    /// A COPY server's memory file, opened again for the walk that maps its holes, which
+    /// [`UffdServer::run`] starts once the socket is bound. Taken by that start.
+    hole_walk: std::sync::Mutex<Option<File>>,
 }
 
 impl UffdServer {
@@ -734,6 +886,7 @@ impl UffdServer {
             prefetch,
             record_window,
             fault_around,
+            nv2,
         } = shape;
 
         // Fault-around populates with UFFDIO_COPY. A minor clone's faults are resolved with
@@ -818,7 +971,7 @@ impl UffdServer {
 
         // Copy mode keeps the memory file open after mapping it: the page cache warm-up asks
         // the kernel for the recorded runs through this descriptor.
-        let (source, image_for_warming) = match backing {
+        let (source, image_for_warming, hole_walk) = match backing {
             UffdBacking::Copy => {
                 // Safety: We're mapping a read-only file for serving pages
                 let mmap = unsafe {
@@ -827,12 +980,32 @@ impl UffdServer {
                         .map(&mem_file)
                         .context("mmapping memory file")?
                 };
+                // The holes are mapped once `run` has bound the socket, from a description
+                // of the file of its own. Faults are served from the file until then.
+                let holes = FileHoles::default();
+                let hole_walk = match open_for_hole_walk(&mem_file) {
+                    Ok(file) => Some(file),
+                    Err(error) => {
+                        warn!(
+                            target: "uffd",
+                            snapshot = %snapshot_id,
+                            %error,
+                            "could not open the memory file to map its holes; every page is \
+                             served from the file"
+                        );
+                        holes.publish(None);
+                        None
+                    }
+                };
                 (
                     PageSource::Copy {
                         mmap,
                         fault_around: fault_around.bytes(),
+                        holes,
+                        nv2,
                     },
                     Some(mem_file),
+                    hole_walk,
                 )
             }
             UffdBacking::Minor { hugepages } => {
@@ -848,6 +1021,7 @@ impl UffdServer {
                         backing: backing_file,
                         holes,
                     },
+                    None,
                     None,
                 )
             }
@@ -928,6 +1102,7 @@ impl UffdServer {
             record_window,
             warmer,
             _in_use: in_use,
+            hole_walk: std::sync::Mutex::new(hole_walk),
         };
         // Copy mode reads every page it serves through the mapping, so with a cold page
         // cache a restore replays from disk one major fault at a time. Start reading the
@@ -978,6 +1153,23 @@ impl UffdServer {
 
         // Bind Unix socket
         let listener = UnixListener::bind(&self.socket_path).context("binding Unix socket")?;
+
+        // A COPY server's memory file can hold millions of data runs, so its holes are
+        // mapped on a thread of their own once clones can connect. Faults are served from
+        // the file until the map is published, which reads a hole as zeros all the same.
+        let hole_walk = self
+            .hole_walk
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        if let Some(file) = hole_walk {
+            spawn_hole_map_build(
+                &self.snapshot_id,
+                Arc::downgrade(&self.source),
+                file,
+                self.mem_size,
+            );
+        }
 
         info!(target: "uffd", "UFFD server listening, waiting for VM connections...");
 
@@ -1460,20 +1652,84 @@ fn copy_page(
     let Err(e) = result else {
         return Ok(FaultOutcome::Resolved);
     };
+    if let Some(outcome) = missing_fill_refused(uffd, vm_id, "UFFDIO_COPY", page, page_size, &e)? {
+        return Ok(outcome);
+    }
+    // Real error - log with Debug format to show errno
+    error!(
+        target: "uffd",
+        vm_id = %vm_id,
+        fault_addr = format!("0x{:x}", page),
+        source_offset = offset_in_file,
+        error = ?e,
+        "UFFD copy failed"
+    );
+    Err(e.into())
+}
 
-    match prefetch::errno_of(&e) {
+/// Resolve one MISSING fault with the kernel's shared zero page (`UFFDIO_ZEROPAGE`), mapped
+/// read-only. A read of the page then costs the clone no memory. The guest's first write to
+/// it is an ordinary copy-on-write fault, which the kernel resolves without the server,
+/// because a COPY clone registers MISSING faults only.
+///
+/// The outcomes are [`copy_page`]'s, handled by the same code, and `None` when the kernel
+/// refuses the ioctl with EINVAL, as hugetlb memory does. The caller then answers the fault
+/// with a copy of zeros ([`resolve_fault`]).
+fn zero_page(
+    uffd: &Uffd,
+    vm_id: &str,
+    page: usize,
+    page_size: usize,
+) -> Result<Option<FaultOutcome>> {
+    // SAFETY: `page` is a granule-aligned address inside a region the clone registered with
+    // this uffd.
+    let result = unsafe { uffd.zeropage(page as *mut std::ffi::c_void, page_size, true) };
+    let Err(e) = result else {
+        return Ok(Some(FaultOutcome::Resolved));
+    };
+    if let Some(outcome) =
+        missing_fill_refused(uffd, vm_id, "UFFDIO_ZEROPAGE", page, page_size, &e)?
+    {
+        return Ok(Some(outcome));
+    }
+    if prefetch::errno_of(&e) == Some(libc::EINVAL) {
+        return Ok(None);
+    }
+    error!(
+        target: "uffd",
+        vm_id = %vm_id,
+        fault_addr = format!("0x{:x}", page),
+        error = ?e,
+        "UFFD zero page failed"
+    );
+    Err(e.into())
+}
+
+/// The outcome of a MISSING-fault ioctl (`ioctl`) that failed with `e` and resolved nothing,
+/// for the errors [`copy_page`] documents: `EEXIST` wakes the faulter, `ESRCH` is the clone's
+/// exit and `EAGAIN` is a retry. `None` for any other error, which the caller logs and returns.
+fn missing_fill_refused(
+    uffd: &Uffd,
+    vm_id: &str,
+    ioctl: &str,
+    page: usize,
+    page_size: usize,
+    e: &userfaultfd::Error,
+) -> Result<Option<FaultOutcome>> {
+    match prefetch::errno_of(e) {
         Some(libc::EEXIST) => {
             debug!(
                 target: "uffd",
                 vm_id = %vm_id,
                 fault_addr = format!("0x{:x}", page),
-                "UFFD copy skipped - page already filled (EEXIST), waking waiters"
+                ioctl,
+                "page already filled (EEXIST), waking waiters"
             );
-            // See wake_eexist_waiters: the COPY backend has the same check-then-sleep
-            // window as CONTINUE, this fault event is already consumed, and Linux's uffd
-            // selftests wake after COPY EEXIST for exactly this reason.
+            // See wake_eexist_waiters: a MISSING fill has the same check-then-sleep window
+            // as CONTINUE, this fault event is already consumed, and Linux's uffd selftests
+            // wake after COPY EEXIST for exactly this reason.
             wake_eexist_waiters(uffd, page, page_size)?;
-            Ok(FaultOutcome::AlreadyPresent)
+            Ok(Some(FaultOutcome::AlreadyPresent))
         }
         Some(libc::ESRCH) => {
             info!(
@@ -1482,21 +1738,10 @@ fn copy_page(
                 fault_addr = format!("0x{:x}", page),
                 "VM exited while its fault was being served"
             );
-            Ok(FaultOutcome::VmGone)
+            Ok(Some(FaultOutcome::VmGone))
         }
-        Some(libc::EAGAIN) => Ok(FaultOutcome::Retry),
-        _ => {
-            // Real error - log with Debug format to show errno
-            error!(
-                target: "uffd",
-                vm_id = %vm_id,
-                fault_addr = format!("0x{:x}", page),
-                source_offset = offset_in_file,
-                error = ?e,
-                "UFFD copy failed"
-            );
-            Err(e.into())
-        }
+        Some(libc::EAGAIN) => Ok(Some(FaultOutcome::Retry)),
+        _ => Ok(None),
     }
 }
 
@@ -1526,9 +1771,11 @@ async fn wait_for_peer_vmm_exit(
 /// virtual address: host addresses differ per clone, so only the file offset can be compared
 /// between clones of the same snapshot.
 ///
-/// A fault on a page the clone's balloon gave back is recorded like any other. An offset
-/// that repeats in a trace is therefore either a second read of the snapshot or a zero
-/// fill, and the handler's exit line counts the zero fills (`zero_filled_pages`).
+/// A fault answered with zeros, on a page the clone's balloon gave back or on a hole of the
+/// memory file, is recorded like any other. Only a given-back page faults again after its
+/// fill, so an offset that repeats in a trace is either a second read of the snapshot or a
+/// zero fill of a given-back page, which the balloon line counts (`zero_filled_pages`). The
+/// faults on holes are counted on the exit line (`hole_zero_filled`).
 ///
 /// This is what `bench/chromium/faultbench.py` collects and `faultanalyze.py` reduces; it is
 /// the instrument behind the fault-count, cross-clone Jaccard and sequentiality figures the
@@ -1620,10 +1867,82 @@ impl<'a> VmContext<'a> {
     /// page is the largest granule there is.
     fn fault_around(&self) -> Option<(usize, &'a [u8])> {
         match self.source {
-            PageSource::Copy { mmap, fault_around } if *fault_around > self.page_size => {
-                Some((*fault_around, &mmap[..]))
-            }
+            PageSource::Copy {
+                mmap, fault_around, ..
+            } if *fault_around > self.page_size => Some((*fault_around, &mmap[..])),
             _ => None,
+        }
+    }
+}
+
+/// The ioctl that resolves a fault, and what it maps.
+enum Resolution<'a> {
+    /// `UFFDIO_CONTINUE` onto the page already in a MINOR clone's backing memfd.
+    Continue,
+    /// `UFFDIO_COPY` of the snapshot's bytes out of this mapping of the memory file.
+    CopySnapshot(&'a [u8]),
+    /// `UFFDIO_ZEROPAGE`, for a fault answered with the kernel's zero page
+    /// ([`ZeroFill::SharedZeroPage`]).
+    ZeroPage,
+    /// `UFFDIO_COPY` of a granule of zeros, for a fault answered with a private page of zeros
+    /// ([`ZeroFill::PrivateCopy`]).
+    CopyZeros,
+}
+
+impl Resolution<'_> {
+    fn ioctl(&self) -> &'static str {
+        match self {
+            Self::Continue => "UFFDIO_CONTINUE",
+            Self::CopySnapshot(_) | Self::CopyZeros => "UFFDIO_COPY",
+            Self::ZeroPage => "UFFDIO_ZEROPAGE",
+        }
+    }
+}
+
+/// How a fault answered with zeros ([`zero_answer`]) is filled.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroFill {
+    /// `UFFDIO_ZEROPAGE`: the kernel's shared zero page, mapped read-only. A read of it costs
+    /// the clone no memory. The guest's first write to it is the kernel's copy-on-write fault,
+    /// which the server never sees, because a COPY clone registers MISSING faults only.
+    SharedZeroPage,
+    /// `UFFDIO_COPY` of zeros: a private page, mapped writable, so a write to it takes no
+    /// further fault.
+    PrivateCopy,
+}
+
+impl<'a> VmContext<'a> {
+    /// How this clone fills a zero answer for a fault that is a `write`, or a read.
+    ///
+    /// A read fault gets the kernel's zero page. Everything else gets a private copy of zeros:
+    ///
+    /// * A write fault. On the zero page its write would fault again at once for the kernel's
+    ///   copy-on-write, an extra exit on x86.
+    /// * Every fault of an NV2 clone, whose guest writes the page sooner or later. On arm64 the
+    ///   MMU-notifier invalidate of that copy-on-write reaches `kvm_nested_s2_unmap` and drops
+    ///   every nested stage-2 mapping, which is why NV2 restores avoid the File backend.
+    /// * Hugetlb memory, which refuses `UFFDIO_ZEROPAGE` (EINVAL). A clone page larger than the
+    ///   host's base page is taken to be hugetlb memory.
+    /// * A clone whose `UFFDIO_ZEROPAGE` has been refused with EINVAL once
+    ///   (`zero_page_refused`), in case that inference is ever wrong.
+    fn zero_fill(&self, write: bool, zero_page_refused: bool) -> ZeroFill {
+        let nv2 = matches!(self.source, PageSource::Copy { nv2: true, .. });
+        let hugetlb = self.page_size as u64 > host_page_size();
+        if write || nv2 || hugetlb || zero_page_refused {
+            ZeroFill::PrivateCopy
+        } else {
+            ZeroFill::SharedZeroPage
+        }
+    }
+
+    /// How a fault on this clone is resolved. `zero` says it is answered with zeros
+    /// ([`zero_answer`]), filled as [`VmContext::zero_fill`] picked.
+    fn resolution(&self, zero: Option<ZeroFill>) -> Resolution<'a> {
+        match (self.source, zero) {
+            (PageSource::Minor { .. }, _) => Resolution::Continue,
+            (PageSource::Copy { mmap, .. }, None) => Resolution::CopySnapshot(&mmap[..]),
+            (PageSource::Copy { .. }, Some(ZeroFill::SharedZeroPage)) => Resolution::ZeroPage,
+            (PageSource::Copy { .. }, Some(ZeroFill::PrivateCopy)) => Resolution::CopyZeros,
         }
     }
 }
@@ -1648,6 +1967,9 @@ struct ParkedFault {
     /// Where the granule starts in the snapshot file. A COPY retry reads its bytes from
     /// there, and the fault's trace record is keyed by it.
     file_offset: usize,
+    /// Whether a fault on the page was a write. A retry answered with zeros fills the page as
+    /// that fault calls for ([`VmContext::zero_fill`]).
+    write: bool,
     /// `t0_ns` of the trace interval this fault opened, carried so the retry that actually
     /// releases the vCPU is what closes it. Closing it around the FAILED ioctl instead would
     /// report the EAGAIN as the fault's resolution cost, and `faultanalyze.py` reads these
@@ -1691,14 +2013,17 @@ impl ParkedFaults {
     /// A fault already parked keeps its original start: the vCPU has been blocked
     /// since that first attempt, and that is the cost the trace is measuring. It is also
     /// what [`MAX_PARKED_WAIT`] counts from, so a second fault on the page cannot extend
-    /// the wait.
-    fn park(&mut self, page: usize, file_offset: usize, trace_t0: Option<u64>) {
+    /// the wait. A second fault that is a write makes the parked fault a write, so the retry
+    /// fills the page writable for every faulter waiting on it.
+    fn park(&mut self, page: usize, file_offset: usize, write: bool, trace_t0: Option<u64>) {
         let now = std::time::Instant::now();
-        self.by_page.entry(page).or_insert(ParkedFault {
+        let parked = self.by_page.entry(page).or_insert(ParkedFault {
             parked_at: now,
             file_offset,
+            write,
             trace_t0,
         });
+        parked.write |= write;
         // The refusal means the flag is up, and the event behind it may already have been
         // read, in which case no REMOVE is left to start the burst.
         self.retry_without_sleeping_from(now);
@@ -1728,12 +2053,15 @@ impl ParkedFaults {
     }
 }
 
-/// A granule of zeros to `UFFDIO_COPY` from, as large as the largest page fcvm serves.
+/// A granule of zeros to `UFFDIO_COPY` from, as large as the largest page fcvm serves and as
+/// the longest run one populate call takes. It is the source of every private page of zeros:
+/// a zero answer [`VmContext::zero_fill`] makes a copy ([`Resolution::CopyZeros`]), and a
+/// recorded hole that replay fills for an NV2 clone or on hugetlb memory.
 ///
 /// It is an anonymous mapping that is only read, so it holds no memory of its own: a read of
 /// it maps the kernel's zero page. A `static` array of zeros would be 2 MiB of `.rodata` in
-/// the binary. It is mapped at the first fault on a given-back page, so a serve whose clones
-/// have no balloon never maps it.
+/// the binary. It is mapped at the first zero answer that needs it, so a serve that never
+/// gives one never maps it.
 fn zero_granule() -> Result<&'static [u8]> {
     static ZERO_GRANULE: std::sync::OnceLock<memmap2::Mmap> = std::sync::OnceLock::new();
     if let Some(zeros) = ZERO_GRANULE.get() {
@@ -1856,10 +2184,65 @@ struct GivenBackStats {
     zero_filled: u64,
 }
 
-/// Whether the granule at `file_offset` is one the clone's balloon gave back, so that a
-/// fault on it is answered with zeros. Only a COPY clone has such granules.
-fn given_back(ctx: &VmContext<'_>, removed: &RemovedPages, file_offset: usize) -> bool {
-    matches!(ctx.source, PageSource::Copy { .. }) && removed.contains(file_offset, ctx.page_size)
+/// Why a fault is answered with zeros and not with the snapshot's bytes. Only a COPY clone is
+/// answered this way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ZeroReason {
+    /// The clone's balloon gave the granule back, so the guest keeps nothing in it.
+    GivenBack,
+    /// The granule is a hole in the memory file, which reads as zeros.
+    Hole,
+}
+
+/// Whether a fault on the clone page at `file_offset` is answered with zeros, and why. The
+/// fault path and every retry of a parked fault ask this.
+fn zero_answer(
+    ctx: &VmContext<'_>,
+    removed: &RemovedPages,
+    file_offset: usize,
+) -> Option<ZeroReason> {
+    let PageSource::Copy { holes, .. } = ctx.source else {
+        return None;
+    };
+    if removed.contains(file_offset, ctx.page_size) {
+        Some(ZeroReason::GivenBack)
+    } else if holes
+        .published()
+        .is_some_and(|map| map.covers(file_offset, ctx.page_size))
+    {
+        Some(ZeroReason::Hole)
+    } else {
+        None
+    }
+}
+
+/// Whether the snapshot from `file_offset` is a run the balloon gave back, or a run of holes
+/// in a COPY source's memory file, and how many bytes from there, up to `max_len`, get the
+/// same answer. Replay steps over a given-back run and fills a run of holes with zeros.
+/// Fault-around steps over both. `file_offset` is page aligned and `max_len` is not zero.
+///
+/// A MINOR clone's given-back set stays empty, because its REMOVE events are ignored, and its
+/// holes are those of the backing memfd, which replay asks about separately.
+fn skip_run_at(
+    ctx: &VmContext<'_>,
+    removed: &RemovedPages,
+    file_offset: usize,
+    max_len: usize,
+) -> (Option<ZeroReason>, usize) {
+    let (given_back, run) = removed.run_at(file_offset, max_len, ctx.page_size);
+    if given_back {
+        return (Some(ZeroReason::GivenBack), run);
+    }
+    let Some(holes) = (match ctx.source {
+        PageSource::Copy { holes, .. } => holes.published(),
+        PageSource::Minor { .. } => None,
+    }) else {
+        return (None, run);
+    };
+    // Asked no further than the run that is not given back, so every byte of the answer gets
+    // the same one.
+    let (hole, run) = holes.run_at(file_offset, run, ctx.page_size);
+    (hole.then_some(ZeroReason::Hole), run)
 }
 
 /// Remember `[start, end)` of the clone's address space as given back by its balloon.
@@ -1900,6 +2283,11 @@ struct VmState {
     /// What the clone's balloon has given back.
     removed: RemovedPages,
     given_back: GivenBackStats,
+    /// Faults on a hole of the memory file that were answered with zeros.
+    hole_zero_filled: u64,
+    /// `UFFDIO_ZEROPAGE` failed with EINVAL once, so every later zero answer of this clone is
+    /// a private copy ([`VmContext::zero_fill`]).
+    zero_page_refused: bool,
     recorded: Option<PageSet>,
     /// When this clone's recording window closes. `None` means unbounded (a window too
     /// large for the clock to represent). Faults are always SERVED regardless; the deadline
@@ -1912,6 +2300,18 @@ struct VmState {
 }
 
 impl VmState {
+    /// Count a fault answered with zeros, under its reason, when this handler's ioctl
+    /// installed the page (`installed`). A page another populator installed first is not
+    /// counted.
+    fn count_zero_fill(&mut self, zero: Option<ZeroReason>, installed: bool) {
+        let counter = match zero {
+            Some(ZeroReason::GivenBack) => &mut self.given_back.zero_filled,
+            Some(ZeroReason::Hole) => &mut self.hole_zero_filled,
+            None => return,
+        };
+        *counter += u64::from(installed);
+    }
+
     /// Close a parked fault's trace interval at the retry that resolved it.
     fn close_parked_trace(&mut self, parked: &ParkedFault) {
         if let (Some(t0), Some(t)) = (parked.trace_t0, self.trace.as_mut()) {
@@ -2086,6 +2486,8 @@ async fn handle_vm_page_faults(
         parked_faults: ParkedFaults::default(),
         removed: RemovedPages::default(),
         given_back: GivenBackStats::default(),
+        hole_zero_filled: 0,
+        zero_page_refused: false,
         recorded: working_set.as_deref().map(WorkingSetStore::recorder),
         // Anchored here, right after the handshake: the window is measured from the
         // moment this clone could first fault, not from server startup. A window the
@@ -2200,12 +2602,20 @@ async fn replay_working_set(
         PageSource::Copy { mmap, .. } => prefetch::Source::Copy(&mmap[..]),
         PageSource::Minor { .. } => prefetch::Source::Minor,
     };
-    let holes = ctx.source.holes();
+    let holes = ctx.source.memfd_holes();
+    // A COPY clone's recorded holes are known only once the server has published its map of
+    // the memory file. Before that a recorded hole is replayed from the file, which reads it
+    // as zeros.
+    let hole_map_at_start = match ctx.source {
+        PageSource::Copy { holes, .. } => holes.state(),
+        PageSource::Minor { .. } => "none",
+    };
     let mut resident = ResidentWindow::default();
     let started = std::time::Instant::now();
     let mut bytes = 0u64;
     let mut filled_holes_mapped = 0u64;
     let mut hole_skipped = 0u64;
+    let mut hole_zero_filled = 0u64;
     let mut hole_queries_failed = 0u64;
     let mut refused = 0u64;
     let mut segments = 0u64;
@@ -2240,33 +2650,45 @@ async fn replay_working_set(
             }
 
             // A recorded page the balloon has given back since is the guest's free memory.
-            // Replay steps over it, and the guest's own touch of it is answered with zeros.
+            // Replay steps over it, and the guest's own touch is answered with zeros. A COPY
+            // clone's recorded page that is a hole in the memory file reads as zeros, and an
+            // earlier clone touched it, so replay fills it with zeros without reading the file.
             let Some(at) = usize::try_from(segment.file_offset)
                 .ok()
                 .and_then(|offset| offset.checked_add(done))
             else {
                 continue 'segments;
             };
-            let (given_back, run) = state.removed.run_at(at, segment.len - done, ctx.page_size);
+            let (zero, run) = skip_run_at(ctx, &state.removed, at, segment.len - done);
             // A recorded page that is a hole in a MINOR clone's backing memfd has no page for
             // `UFFDIO_CONTINUE` to map. The kernel refuses it, which would give up the rest of
             // the segment, and the guest's own touch fills the hole. Replay steps over it. A
             // hole an earlier clone has filled is a page now, and replay maps and counts it.
-            let (hole, filled, run) = match holes {
-                Some(holes) if !given_back => {
-                    match holes.run_at(&mut resident, at, run, ctx.page_size) {
-                        MemfdRun::Pages(run) => (false, false, run),
-                        MemfdRun::Filled(run) => (false, true, run),
-                        MemfdRun::Holes(run) => (true, false, run),
-                        MemfdRun::Unknown(run) => {
-                            hole_queries_failed += 1;
-                            (true, false, run)
-                        }
+            let (hole, filled, run) = match (zero, holes) {
+                (None, Some(holes)) => match holes.run_at(&mut resident, at, run, ctx.page_size) {
+                    MemfdRun::Pages(run) => (false, false, run),
+                    MemfdRun::Filled(run) => (false, true, run),
+                    MemfdRun::Holes(run) => (true, false, run),
+                    MemfdRun::Unknown(run) => {
+                        hole_queries_failed += 1;
+                        (true, false, run)
                     }
-                }
+                },
                 _ => (false, false, run),
             };
-            if given_back || hole {
+            // A run of holes is filled as a read fault on one is ([`VmContext::zero_fill`]):
+            // with the kernel's shared zero page, so the clone holds no memory for zeros it
+            // only reads and a later write is the kernel's own copy-on-write, or with private
+            // zeros copied from the zero granule for an NV2 clone and on hugetlb memory.
+            // Without a granule to copy from, the run is left to demand faults.
+            let zeros = match zero {
+                Some(ZeroReason::Hole) => match ctx.zero_fill(false, state.zero_page_refused) {
+                    ZeroFill::SharedZeroPage => Some(prefetch::Source::ZeroPage),
+                    ZeroFill::PrivateCopy => zero_granule().ok().map(prefetch::Source::Copy),
+                },
+                _ => None,
+            };
+            if (zero.is_some() && zeros.is_none()) || hole {
                 done += run;
                 if hole {
                     hole_skipped += run as u64;
@@ -2279,15 +2701,34 @@ async fn replay_working_set(
                 }
                 continue 'chunk;
             }
-            let wanted = prefetch::Segment {
-                len: done + run,
-                ..segment
+            // A run of holes is filled at where it sits in the clone, from the start of the
+            // zero granule when it is copied. Anything else is copied from where it sits in the
+            // snapshot.
+            let (from, wanted, done_in_wanted) = match zeros {
+                Some(zeros) => {
+                    let Some(host_addr) = segment.host_addr.checked_add(done) else {
+                        continue 'segments;
+                    };
+                    let run_of_zeros = prefetch::Segment {
+                        host_addr,
+                        file_offset: 0,
+                        len: run,
+                    };
+                    (zeros, run_of_zeros, 0)
+                }
+                None => {
+                    let wanted = prefetch::Segment {
+                        len: done + run,
+                        ..segment
+                    };
+                    (source, wanted, done)
+                }
             };
             match prefetch::populate_chunk_counted(
                 async_uffd.get_ref(),
-                &source,
+                &from,
                 &wanted,
-                done,
+                done_in_wanted,
                 ctx.page_size,
                 ctx.vm_id,
             ) {
@@ -2299,6 +2740,9 @@ async fn replay_working_set(
                     bytes += progress as u64;
                     if filled {
                         filled_holes_mapped += (populated / ctx.page_size) as u64;
+                    }
+                    if zeros.is_some() {
+                        hole_zero_filled += (populated / ctx.page_size) as u64;
                     }
                     if pacer.populated(progress) {
                         yields += 1;
@@ -2327,6 +2771,8 @@ async fn replay_working_set(
         refused_segments = refused,
         filled_holes_mapped,
         hole_skipped_mib = hole_skipped / (1024 * 1024),
+        hole_zero_filled_pages = hole_zero_filled,
+        hole_map_at_start,
         hole_queries_failed,
         yields,
         prefetch_ms = started.elapsed().as_millis(),
@@ -2426,6 +2872,7 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
         target: "uffd",
         vm_id = %ctx.vm_id,
         fault_count = state.fault_count,
+        hole_zero_filled = state.hole_zero_filled,
         elapsed_secs = format!("{:.1}", elapsed.as_secs_f64()),
         pages_per_sec = format!("{:.0}", rate),
         reason,
@@ -2433,31 +2880,51 @@ fn log_clone_finished(ctx: &VmContext<'_>, state: &VmState, reason: &str) {
     );
 }
 
-/// One attempt at resolving the fault at `page`, with the ioctl this clone's page source
-/// calls for. A fault's first attempt and every retry of a parked one go through here.
+/// One attempt at resolving the fault at `page`, with the ioctl [`VmContext::resolution`]
+/// picks. A fault's first attempt and every retry of a parked one go through here.
 ///
-/// `zeros` says the granule is one the clone's balloon gave back ([`given_back`]): a COPY
-/// clone then gets a granule of zeros and the snapshot is not read. It goes through
-/// [`copy_page`] like any other granule, so a refusal parks it and an `EEXIST` wakes its
-/// faulter. `UFFDIO_ZEROPAGE` is not used: it maps the kernel's zero page read-only, so the
-/// write that nearly always follows on reused free memory would fault a second time, and
-/// hugetlb memory refuses it.
+/// `zero` says the fault is answered with zeros ([`zero_answer`]): the balloon gave the
+/// granule back, or it is a hole in the memory file. The snapshot is not read, and the page
+/// is filled as [`VmContext::zero_fill`] picked: the kernel's zero page ([`zero_page`]) or a
+/// private granule of zeros through [`copy_page`]. Either way a refusal parks the fault and
+/// an `EEXIST` wakes its faulter. A `UFFDIO_ZEROPAGE` refused with EINVAL is answered with a
+/// copy of zeros instead, and sets `zero_page_refused`, so the clone's later zero answers are
+/// copies from the start.
 fn resolve_fault(
     uffd: &Uffd,
     ctx: &VmContext<'_>,
     page: usize,
     offset_in_file: usize,
-    zeros: bool,
+    zero: Option<ZeroFill>,
+    zero_page_refused: &mut bool,
 ) -> Result<FaultOutcome> {
-    match ctx.source {
-        PageSource::Minor { .. } => continue_page(uffd, ctx.vm_id, page, ctx.page_size),
-        PageSource::Copy { .. } if zeros => {
-            copy_page(uffd, ctx.vm_id, zero_granule()?, page, 0, ctx.page_size)
-                .with_context(|| format!("zero fill for file offset {offset_in_file}"))
-        }
-        PageSource::Copy { mmap, .. } => {
+    let copy_zeros = || {
+        copy_page(uffd, ctx.vm_id, zero_granule()?, page, 0, ctx.page_size)
+            .with_context(|| format!("zero fill for file offset {offset_in_file}"))
+    };
+    match ctx.resolution(zero) {
+        Resolution::Continue => continue_page(uffd, ctx.vm_id, page, ctx.page_size),
+        Resolution::CopySnapshot(mmap) => {
             copy_page(uffd, ctx.vm_id, mmap, page, offset_in_file, ctx.page_size)
         }
+        Resolution::ZeroPage => {
+            let answered = zero_page(uffd, ctx.vm_id, page, ctx.page_size)
+                .with_context(|| format!("zero page for file offset {offset_in_file}"))?;
+            if let Some(outcome) = answered {
+                return Ok(outcome);
+            }
+            warn!(
+                target: "uffd",
+                vm_id = %ctx.vm_id,
+                fault_addr = format!("0x{page:x}"),
+                page_size = ctx.page_size,
+                "UFFDIO_ZEROPAGE refused with EINVAL; this clone's zero answers are copies of \
+                 zeros from now on"
+            );
+            *zero_page_refused = true;
+            copy_zeros()
+        }
+        Resolution::CopyZeros => copy_zeros(),
     }
 }
 
@@ -2484,7 +2951,8 @@ fn resolve_fault(
 /// a balloon REMOVE in flight, and the pages around it still fault on demand.
 ///
 /// A page of the granule that the balloon gave back is stepped over. It is the guest's free
-/// memory, and the guest's own touch of it is answered with zeros.
+/// memory, and the guest's own touch of it is answered with zeros. So is a hole in the memory
+/// file, whose zeros the guest's own touch gets without the snapshot being read.
 fn populate_around_fault(
     uffd: &Uffd,
     ctx: &VmContext<'_>,
@@ -2513,8 +2981,8 @@ fn populate_around_fault(
             else {
                 break 'granule;
             };
-            let (given_back, run) = removed.run_at(at, segment.len - done, ctx.page_size);
-            if given_back {
+            let (zero, run) = skip_run_at(ctx, removed, at, segment.len - done);
+            if zero.is_some() {
                 done += run;
                 continue;
             }
@@ -2603,25 +3071,33 @@ fn granule_segments(
 /// the fail-closed path kills the VMM. The alternative is dropping the fault, which leaves
 /// its vCPU asleep for good.
 fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) -> Result<bool> {
-    let ioctl = match ctx.source {
-        PageSource::Minor { .. } => "UFFDIO_CONTINUE",
-        PageSource::Copy { .. } => "UFFDIO_COPY",
-    };
     let mut resolved = Vec::new();
     for (&page, parked) in &state.parked_faults.by_page {
         // Asked at every retry: the REMOVE that covers this page may have been read after
         // the fault was parked. A fill that lands before that REMOVE's zap is dropped by
         // it. The granule stays in the set, so the page's next fault gets zeros again.
-        let zeros = given_back(ctx, &state.removed, parked.file_offset);
-        match resolve_fault(uffd, ctx, page, parked.file_offset, zeros)? {
+        let zero = zero_answer(ctx, &state.removed, parked.file_offset);
+        let fill = zero.map(|_| ctx.zero_fill(parked.write, state.zero_page_refused));
+        match resolve_fault(
+            uffd,
+            ctx,
+            page,
+            parked.file_offset,
+            fill,
+            &mut state.zero_page_refused,
+        )? {
             outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
-                resolved.push((page, zeros, matches!(outcome, FaultOutcome::Resolved)))
+                resolved.push((page, zero, matches!(outcome, FaultOutcome::Resolved)))
             }
             FaultOutcome::VmGone => return Ok(false),
             FaultOutcome::Retry if parked.parked_at.elapsed() >= MAX_PARKED_WAIT => {
+                // Named after the attempt: a zero page refused with EINVAL in it was answered
+                // with a copy of zeros, and the copy is what is still refused.
+                let retried = zero.map(|_| ctx.zero_fill(parked.write, state.zero_page_refused));
                 return Err(anyhow!(
-                    "{ioctl} at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
+                    "{} at 0x{page:x} still EAGAIN after {:?}; refusing to drop \
                      a fault that would permanently hang a vCPU for vm {}",
+                    ctx.resolution(retried).ioctl(),
                     parked.parked_at.elapsed(),
                     ctx.vm_id
                 ));
@@ -2629,13 +3105,11 @@ fn retry_parked_faults(ctx: &VmContext<'_>, uffd: &Uffd, state: &mut VmState) ->
             FaultOutcome::Retry => {}
         }
     }
-    for (page, zeros, filled) in resolved {
+    for (page, zero, filled) in resolved {
         let Some(parked) = state.parked_faults.by_page.remove(&page) else {
             continue;
         };
-        if zeros {
-            state.given_back.zero_filled += u64::from(filled);
-        }
+        state.count_zero_fill(zero, filled);
         // Logged for every fault that does resolve, so a deadline that fires has a healthy
         // distribution to be compared with.
         debug!(
@@ -2697,8 +3171,9 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
             handled += 1;
 
             match event {
-                Event::Pagefault { addr, kind, .. } => {
+                Event::Pagefault { addr, kind, rw, .. } => {
                     state.fault_count += 1;
+                    let write = matches!(rw, ReadWrite::Write);
 
                     // Find which memory region this address belongs to
                     let fault_page = (addr as usize) & page_mask;
@@ -2726,17 +3201,19 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         .checked_add(offset_in_region)
                         .ok_or_else(|| anyhow!("mapping offset overflow"))?;
 
-                    // A granule the balloon gave back holds nothing the guest still wants.
-                    // The fault is answered with zeros and the snapshot is not read.
-                    let zeros = given_back(ctx, &state.removed, offset_in_file);
+                    // A granule the balloon gave back holds nothing the guest still wants, and
+                    // a hole in the memory file reads as zeros. Either way the fault is
+                    // answered with zeros and the snapshot is not read.
+                    let zero = zero_answer(ctx, &state.removed, offset_in_file);
 
                     // Record demand, never replay: the set converges on what the guest
                     // actually requested rather than recursively recording its prediction.
                     // Recording stops at the clone's window deadline; serving does not.
-                    // A granule that is given back when its fault is first read is not
-                    // recorded: a later clone has no use for the snapshot's bytes there.
-                    // A fault parked before its REMOVE was read has been recorded already.
-                    if !zeros {
+                    // A fault on a given-back granule when it is first read is not recorded:
+                    // a later clone has no use for the snapshot's bytes there. A fault on a
+                    // hole is recorded like any other, and replay fills it with zeros. A
+                    // fault parked before its REMOVE was read has been recorded already.
+                    if zero != Some(ZeroReason::GivenBack) {
                         if let Some(recorder) = state.fault_recorder(std::time::Instant::now()) {
                             recorder.insert_range(offset_in_file as u64, page_size as u64);
                         }
@@ -2772,16 +3249,21 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                         PageSource::Copy { .. } => {}
                     }
 
-                    match resolve_fault(uffd, ctx, fault_page, offset_in_file, zeros)? {
+                    let fill = zero.map(|_| ctx.zero_fill(write, state.zero_page_refused));
+                    match resolve_fault(
+                        uffd,
+                        ctx,
+                        fault_page,
+                        offset_in_file,
+                        fill,
+                        &mut state.zero_page_refused,
+                    )? {
                         outcome @ (FaultOutcome::Resolved | FaultOutcome::AlreadyPresent) => {
                             if let Some(t) = state.trace.as_mut() {
                                 let t1 = t.now_ns();
                                 t.record(offset_in_file as u64, trace_t0, t1);
                             }
-                            if zeros {
-                                state.given_back.zero_filled +=
-                                    u64::from(matches!(outcome, FaultOutcome::Resolved));
-                            }
+                            state.count_zero_fill(zero, matches!(outcome, FaultOutcome::Resolved));
                             // The vCPU is awake and its trace interval is closed. The rest
                             // of its granule is speculation and costs that fault nothing.
                             //
@@ -2792,11 +3274,14 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                             // page present lost a race to another populator, which owns
                             // that range: populating it as well would be up to one EEXIST
                             // ioctl for every page of the granule, for nothing. And a
-                            // fault answered with zeros was free memory the guest is using
-                            // again, so the snapshot's bytes around it are not wanted.
+                            // fault on a given-back page gets none: that is free memory the
+                            // guest is using again, so the snapshot's bytes around it are not
+                            // wanted. A fault on a hole gets fault-around like any other: a
+                            // page of zeros among data says nothing about its neighbours, and
+                            // fault-around steps over the holes of the granule.
                             let speculate = matches!(outcome, FaultOutcome::Resolved)
                                 && state.parked_faults.is_empty()
-                                && !zeros;
+                                && zero != Some(ZeroReason::GivenBack);
                             if speculate
                                 && !populate_around_fault(
                                     uffd,
@@ -2827,7 +3312,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                             let trace_t0 = state.trace.is_some().then_some(trace_t0);
                             state
                                 .parked_faults
-                                .park(fault_page, offset_in_file, trace_t0);
+                                .park(fault_page, offset_in_file, write, trace_t0);
                         }
                     }
                 }
@@ -3403,6 +3888,8 @@ mod tests {
             parked_faults: ParkedFaults::default(),
             removed: RemovedPages::default(),
             given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
             recorded: None,
             record_until: None,
             started: origin,
@@ -3414,7 +3901,9 @@ mod tests {
         };
 
         let t0 = state.trace.as_ref().expect("trace").now_ns();
-        state.parked_faults.park(PAGE, OFFSET as usize, Some(t0));
+        state
+            .parked_faults
+            .park(PAGE, OFFSET as usize, false, Some(t0));
         assert_eq!(
             state.trace.as_ref().expect("trace").records.len(),
             0,
@@ -3599,6 +4088,8 @@ mod tests {
             parked_faults: ParkedFaults::default(),
             removed: RemovedPages::default(),
             given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: Some(started), // zero-length window: closed before any fault
             started,
@@ -3621,6 +4112,8 @@ mod tests {
             parked_faults: ParkedFaults::default(),
             removed: RemovedPages::default(),
             given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
             recorded: Some(PageSet::empty(mem_len)),
             record_until: started.checked_add(DEFAULT_PREFETCH_RECORD_WINDOW),
             started,
@@ -3661,6 +4154,8 @@ mod tests {
             parked_faults: ParkedFaults::default(),
             removed: RemovedPages::default(),
             given_back: GivenBackStats::default(),
+            hole_zero_filled: 0,
+            zero_page_refused: false,
             recorded: Some(store.recorder()),
             record_until: started.checked_add(window),
             started,
@@ -4111,6 +4606,7 @@ mod tests {
                     prefetch,
                     record_window: DEFAULT_PREFETCH_RECORD_WINDOW,
                     fault_around: FaultAround::OFF,
+                    nv2: false,
                 },
             )
             .await
@@ -4786,6 +5282,8 @@ mod tests {
                 parked_faults: ParkedFaults::default(),
                 removed: RemovedPages::default(),
                 given_back: GivenBackStats::default(),
+                hole_zero_filled: 0,
+                zero_page_refused: false,
                 recorded: Some(PageSet::empty(self.mem_size as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -5315,6 +5813,8 @@ mod tests {
         let source = Arc::new(PageSource::Copy {
             mmap,
             fault_around: 0,
+            holes: FileHoles::default(),
+            nv2: false,
         });
         std::fs::remove_file(&snap_path).ok();
 
@@ -5404,6 +5904,8 @@ mod tests {
         let source = Arc::new(PageSource::Copy {
             mmap,
             fault_around: 0,
+            holes: FileHoles::default(),
+            nv2: false,
         });
         std::fs::remove_file(&snap_path).ok();
 
@@ -5495,30 +5997,36 @@ mod tests {
         panic!("faulter (tid {tid}) never parked in handle_userfault within 5s");
     }
 
-    /// A guest thread that reads one byte at `addr`. It faults, sleeps in the kernel until
-    /// the fault is resolved, and then reports what it read and how long the read was blocked.
-    struct FaultingReader {
+    /// A guest thread that makes one access, as a vCPU does. An access whose fault reaches the
+    /// server sleeps in the kernel until the server answers it, so an access that has not
+    /// returned is how a test sees that. `T` is what the access reports once it returns.
+    struct FaultingThread<T> {
         tid: libc::pid_t,
-        read: std::sync::mpsc::Receiver<(u8, Duration)>,
+        done: std::sync::mpsc::Receiver<T>,
         thread: std::thread::JoinHandle<()>,
     }
 
-    impl FaultingReader {
-        fn spawn(addr: usize) -> Self {
+    /// A [`FaultingThread`] that reads one byte, and reports what it read and how long the
+    /// read was blocked.
+    type FaultingReader = FaultingThread<(u8, Duration)>;
+
+    /// A [`FaultingThread`] that writes one byte, and reports the minor faults the write took
+    /// on its thread.
+    type FaultingWriter = FaultingThread<libc::c_long>;
+
+    impl<T: Send + 'static> FaultingThread<T> {
+        fn start(access: impl FnOnce() -> T + Send + 'static) -> Self {
             let (tid_tx, tid_rx) = std::sync::mpsc::channel();
-            let (read_tx, read) = std::sync::mpsc::channel();
+            let (done_tx, done) = std::sync::mpsc::channel();
             let thread = std::thread::spawn(move || {
                 // SAFETY: gettid on the current thread.
                 tid_tx.send(unsafe { libc::gettid() }).ok();
-                let blocked = std::time::Instant::now();
-                // SAFETY: `addr` is inside a mapping that outlives this thread.
-                let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
-                read_tx.send((got, blocked.elapsed())).ok();
+                done_tx.send(access()).ok();
             });
             let tid = tid_rx
                 .recv_timeout(Duration::from_secs(5))
-                .expect("reader tid");
-            Self { tid, read, thread }
+                .expect("the faulting thread's id");
+            Self { tid, done, thread }
         }
 
         /// Returns once the thread is asleep in its fault; see
@@ -5527,14 +6035,46 @@ mod tests {
             wait_parked_in_handle_userfault(self.tid);
         }
 
-        /// What the thread read and how long it was blocked, once its fault is resolved.
-        fn finish(self, why_it_must_wake: &str) -> (u8, Duration) {
-            let read = self
-                .read
-                .recv_timeout(Duration::from_secs(5))
-                .expect(why_it_must_wake);
-            self.thread.join().expect("reader thread");
-            read
+        /// What the access reported, once it returns within `timeout`. The thread itself when
+        /// it has not, so the test can answer its fault and finish it.
+        fn finish_within(self, timeout: Duration) -> std::result::Result<T, Self> {
+            match self.done.recv_timeout(timeout) {
+                Ok(report) => {
+                    self.thread.join().expect("faulting thread");
+                    Ok(report)
+                }
+                Err(_) => Err(self),
+            }
+        }
+
+        /// What the access reported, once it returns.
+        fn finish(self, why_it_must_return: &str) -> T {
+            match self.finish_within(Duration::from_secs(5)) {
+                Ok(report) => report,
+                Err(_) => panic!("{why_it_must_return}"),
+            }
+        }
+    }
+
+    impl FaultingReader {
+        fn spawn(addr: usize) -> Self {
+            Self::start(move || {
+                let blocked = std::time::Instant::now();
+                // SAFETY: `addr` is inside a mapping that outlives this thread.
+                let got = unsafe { std::ptr::read_volatile(addr as *const u8) };
+                (got, blocked.elapsed())
+            })
+        }
+    }
+
+    impl FaultingWriter {
+        fn spawn(addr: usize, value: u8) -> Self {
+            Self::start(move || {
+                let before = minor_faults_of_this_thread();
+                // SAFETY: `addr` is inside a mapping that outlives this thread.
+                unsafe { std::ptr::write_volatile(addr as *mut u8, value) };
+                minor_faults_of_this_thread() - before
+            })
         }
     }
 
@@ -5841,6 +6381,8 @@ mod tests {
                 source: PageSource::Copy {
                     mmap,
                     fault_around: 0,
+                    holes: FileHoles::default(),
+                    nv2: false,
                 },
                 mappings: [GuestRegionUffdMapping {
                     base_host_virt_addr: base as u64,
@@ -5874,6 +6416,8 @@ mod tests {
                 parked_faults: ParkedFaults::default(),
                 removed: RemovedPages::default(),
                 given_back: GivenBackStats::default(),
+                hole_zero_filled: 0,
+                zero_page_refused: false,
                 recorded: None,
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -5972,7 +6516,7 @@ mod tests {
             "the refused fault must stay parked; dropping it leaves its vCPU asleep for good"
         );
         assert!(
-            vcpu.read.try_recv().is_err(),
+            vcpu.done.try_recv().is_err(),
             "nothing has resolved the fault yet, so the vCPU must still be asleep"
         );
 
@@ -6014,7 +6558,7 @@ mod tests {
         let page = clone.page(2);
         state
             .parked_faults
-            .park(page, 2 * BalloonedCopyClone::PAGE, None);
+            .park(page, 2 * BalloonedCopyClone::PAGE, false, None);
         assert!(
             retry_parked_faults(&ctx, &uffd, &mut state)
                 .expect("a refusal inside the wait is not a failure"),
@@ -6109,7 +6653,7 @@ mod tests {
             "nothing says the flag is about to drop"
         );
 
-        parked.park(0x1000, 0, None);
+        parked.park(0x1000, 0, false, None);
         assert_eq!(
             parked.retry_pause(),
             ParkedRetryPause::Yield,
@@ -6473,6 +7017,7 @@ mod tests {
                     prefetch: Prefetch::Off,
                     record_window: Duration::ZERO,
                     fault_around: FaultAround::for_host_page(65536, 4096).unwrap(),
+                    nv2: false,
                 },
             )
         };
@@ -6580,6 +7125,8 @@ mod tests {
         let source = PageSource::Copy {
             mmap,
             fault_around: GRANULE,
+            holes: FileHoles::default(),
+            nv2: false,
         };
         let ctx = |page_size: usize| VmContext {
             vm_id: "fault-around-page-size",
@@ -6676,6 +7223,8 @@ mod tests {
                 source: PageSource::Copy {
                     mmap,
                     fault_around: granule_pages * Self::PAGE,
+                    holes: FileHoles::default(),
+                    nv2: false,
                 },
                 mappings: [GuestRegionUffdMapping {
                     base_host_virt_addr: (base + guard_pages * Self::PAGE) as u64,
@@ -6709,6 +7258,8 @@ mod tests {
                 parked_faults: ParkedFaults::default(),
                 removed: RemovedPages::default(),
                 given_back: GivenBackStats::default(),
+                hole_zero_filled: 0,
+                zero_page_refused: false,
                 recorded: Some(PageSet::empty((self.file_pages * Self::PAGE) as u64)),
                 record_until: None,
                 started: std::time::Instant::now(),
@@ -7317,7 +7868,7 @@ mod tests {
             "the fault is read ahead of the unread REMOVE, so its populate is refused"
         );
         assert!(
-            given_back(&ctx, &state.removed, 2 * PAGE),
+            zero_answer(&ctx, &state.removed, 2 * PAGE) == Some(ZeroReason::GivenBack),
             "the same drain read the REMOVE after it parked the fault"
         );
         assert_eq!(state.given_back.zero_filled, 0);
@@ -7345,7 +7896,7 @@ mod tests {
         );
         assert_eq!(state.given_back.zero_filled, 1);
         assert!(
-            given_back(&ctx, &state.removed, 2 * PAGE),
+            zero_answer(&ctx, &state.removed, 2 * PAGE) == Some(ZeroReason::GivenBack),
             "a filled page stays in the set"
         );
         clone.unmap();
@@ -7374,7 +7925,7 @@ mod tests {
             "fault-around populates the granule around page 0 except the given-back page 2"
         );
         assert!(
-            given_back(&ctx, &state.removed, 2 * PAGE),
+            zero_answer(&ctx, &state.removed, 2 * PAGE) == Some(ZeroReason::GivenBack),
             "page 2 is still given back"
         );
         assert_eq!(clone.byte(1), 2, "page 1 holds the snapshot's bytes");
@@ -7564,30 +8115,32 @@ mod tests {
         assert_eq!(state.removed.marked, 4);
         for file_page in [2, 3, 6, 7] {
             assert!(
-                given_back(&ctx, &state.removed, file_page * PAGE),
+                zero_answer(&ctx, &state.removed, file_page * PAGE) == Some(ZeroReason::GivenBack),
                 "file page {file_page} was given back"
             );
         }
-        assert!(!given_back(&ctx, &state.removed, 4 * PAGE));
-        assert!(!given_back(&ctx, &state.removed, 5 * PAGE));
+        assert!(zero_answer(&ctx, &state.removed, 4 * PAGE) != Some(ZeroReason::GivenBack));
+        assert!(zero_answer(&ctx, &state.removed, 5 * PAGE) != Some(ZeroReason::GivenBack));
         assert!(
-            !given_back(&ctx, &state.removed, PAGE),
+            zero_answer(&ctx, &state.removed, PAGE) != Some(ZeroReason::GivenBack),
             "region page 1 is file page 3, not file page 1"
         );
 
         assert_eq!(clone.touch(&uffd, &mut state, 4), 0);
         assert_eq!(state.given_back.zero_filled, 1);
         assert_eq!(state.removed.marked, 4, "a filled page stays in the set");
-        assert!(given_back(&ctx, &state.removed, 6 * PAGE));
+        assert!(zero_answer(&ctx, &state.removed, 6 * PAGE) == Some(ZeroReason::GivenBack));
 
-        // The page is the guest's again and it was mapped writable, so the write that
-        // follows takes no fault. A page of the kernel's zero page, which UFFDIO_ZEROPAGE
-        // maps, would take one minor fault here for the copy.
-        let before = minor_faults_of_this_thread();
-        // SAFETY: a resident page of this clone's live mapping.
-        unsafe { std::ptr::write_volatile(clone.region_addr(4) as *mut u8, 0x5A) };
-        let faults = minor_faults_of_this_thread() - before;
-        assert_eq!(faults, 0, "the write to a zero-filled page faulted");
+        // The page is the kernel's zero page, so the write that follows is the kernel's own
+        // copy-on-write fault and reaches no handler. It is made on another thread: a write
+        // whose fault reached the server would never return, as nothing serves it here.
+        let faults = FaultingWriter::spawn(clone.region_addr(4), 0x5A)
+            .finish_within(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("the write to the zero page reached the server"));
+        assert_eq!(
+            faults, 1,
+            "the write to the zero page is one copy-on-write fault"
+        );
         assert_eq!(clone.byte(4), 0x5A);
         clone.unmap();
     }
@@ -7657,6 +8210,8 @@ mod tests {
         let source = PageSource::Copy {
             mmap,
             fault_around: 0,
+            holes: FileHoles::default(),
+            nv2: false,
         };
         // Region A is four pages that hold file pages 8 to 11. Region B follows it in the
         // address space and holds file pages 40 to 43. Only the arithmetic is under test:
@@ -7690,13 +8245,13 @@ mod tests {
         assert_eq!(bytes, 3 * PAGE);
         for file_page in [10, 11, 40] {
             assert!(
-                given_back(&ctx, &removed, file_page * PAGE),
+                zero_answer(&ctx, &removed, file_page * PAGE) == Some(ZeroReason::GivenBack),
                 "file page {file_page} was given back"
             );
         }
         for file_page in [2, 3, 9, 12, 41] {
             assert!(
-                !given_back(&ctx, &removed, file_page * PAGE),
+                zero_answer(&ctx, &removed, file_page * PAGE) != Some(ZeroReason::GivenBack),
                 "file page {file_page} was not given back"
             );
         }
@@ -7708,5 +8263,888 @@ mod tests {
             0
         );
         assert_eq!(removed.marked, 3);
+    }
+
+    // -------------------------------------------------------------------------
+    // Holes in the memory file, in COPY mode.
+    // -------------------------------------------------------------------------
+
+    use crate::uffd::holes::memfd_with_pages;
+
+    /// Mark `file_pages` of a COPY source's memory file as holes in its published map, as the
+    /// server's map of a sparse file does, publishing an empty map first when there is none.
+    /// The test snapshots hold data there, so a fault served from the mapping instead of the
+    /// map reads that data and not zeros.
+    fn mark_holes(source: &mut PageSource, file_pages: &[usize]) {
+        const PAGE: usize = 4096;
+        let PageSource::Copy { mmap, holes, .. } = source else {
+            panic!("only a COPY source maps the holes of its memory file");
+        };
+        holes.publish(Some(HoleMap::new(mmap.len())));
+        let map = holes
+            .0
+            .get_mut()
+            .and_then(Option::as_mut)
+            .expect("a published map");
+        for page in file_pages {
+            map.insert(page * PAGE, PAGE);
+        }
+    }
+
+    /// Serve a COPY source as a server whose clones run with `--enable-nv2` does.
+    fn serve_as_nv2(source: &mut PageSource) {
+        let PageSource::Copy { nv2, .. } = source else {
+            panic!("only copy mode serves NV2 clones");
+        };
+        *nv2 = true;
+    }
+
+    /// Whether the page at `addr` is present, and whether it is exclusively mapped, from
+    /// `/proc/self/pagemap`. The kernel's zero page is present and never exclusive, because it
+    /// is no process's page. A private copy is both.
+    fn pagemap_flags(addr: usize) -> (bool, bool) {
+        use std::os::unix::fs::FileExt;
+        const PRESENT: u64 = 1 << 63;
+        const EXCLUSIVE: u64 = 1 << 56;
+        let mut entry = [0u8; 8];
+        File::open("/proc/self/pagemap")
+            .expect("opening /proc/self/pagemap")
+            .read_exact_at(&mut entry, (addr as u64 / host_page_size()) * 8)
+            .expect("reading a pagemap entry");
+        let entry = u64::from_le_bytes(entry);
+        (entry & PRESENT != 0, entry & EXCLUSIVE != 0)
+    }
+
+    /// The 4 KiB at `addr`. Only for a page the test has already shown to be resident:
+    /// reading a missing one faults with nothing left to serve it.
+    fn resident_bytes(addr: usize) -> Vec<u8> {
+        // SAFETY: a resident page of a live mapping this test owns.
+        unsafe { std::slice::from_raw_parts(addr as *const u8, 4096) }.to_vec()
+    }
+
+    /// A hole in the memory file reads as zeros, so a fault on one is answered with zeros and
+    /// not with whatever the mapping holds there. It is recorded like any other fault: a later
+    /// clone touches the same page, and its replay fills a recorded hole with zeros. A page
+    /// outside the holes is served from the snapshot and recorded as before.
+    #[test]
+    fn a_fault_on_a_snapshot_hole_reads_zero_and_is_recorded() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (mut clone, uffd) = FaultAroundClone::new(0, 0, 4);
+        mark_holes(&mut clone.source, &[2]);
+        let mut state = clone.state();
+        let recorded = |state: &VmState| -> Vec<(u64, u64)> {
+            state
+                .recorded
+                .as_ref()
+                .expect("this clone records")
+                .runs()
+                .map(|run| (run.offset, run.len))
+                .collect()
+        };
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 2),
+            0,
+            "a fault on a hole must read zeros, not the mapping's byte 3"
+        );
+        assert_eq!(
+            recorded(&state),
+            vec![(2 * PAGE as u64, PAGE as u64)],
+            "a fault on a hole must enter the recorded working set"
+        );
+        assert_eq!(state.hole_zero_filled, 1);
+        assert_eq!(
+            state.given_back.zero_filled, 0,
+            "a hole is not memory the balloon gave back"
+        );
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 0),
+            1,
+            "a page outside the holes comes from the snapshot"
+        );
+        assert_eq!(
+            recorded(&state),
+            vec![(0, PAGE as u64), (2 * PAGE as u64, PAGE as u64)]
+        );
+        assert_eq!(state.hole_zero_filled, 1);
+        clone.unmap();
+    }
+
+    /// A fault on a hole that is parked behind an unread REMOVE is still answered with zeros
+    /// when its retry goes through: the retry asks the same question the first attempt did.
+    #[test]
+    fn a_parked_fault_on_a_snapshot_hole_is_answered_with_zeros() {
+        let (mut clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        mark_holes(&mut clone.source, &[2]);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+
+        // A REMOVE left unread: the kernel refuses every populate ioctl until the event is
+        // read and the thread inside madvise has run again.
+        let balloon = clone.inflate(&uffd, 0);
+        let vcpu = FaultingReader::spawn(clone.region_addr(2));
+        vcpu.wait_until_asleep();
+
+        let outcome = drain_events(&uffd, &ctx, &mut state).expect("a refused fault is parked");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        assert_eq!(
+            state
+                .parked_faults
+                .by_page
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![clone.region_addr(2)],
+            "the fault is read ahead of the unread REMOVE, so its answer is refused"
+        );
+
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved after the REMOVE event was read"
+            );
+            assert!(
+                retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying the parked fault"),
+                "the clone is alive; a retry must not report it gone"
+            );
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let (got, _) = vcpu.finish("the vCPU is still asleep after its parked fault resolved");
+        assert_eq!(
+            got, 0,
+            "a parked fault on a hole gets zeros, not the snapshot's bytes"
+        );
+        assert_eq!(state.hole_zero_filled, 1);
+        assert_eq!(state.given_back.zero_filled, 0);
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+        clone.unmap();
+    }
+
+    /// Set by [`hold_until_released`] once a thread is inside it.
+    static HELD_IN_HANDLER: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    /// Lets the thread inside [`hold_until_released`] return.
+    static RELEASE_HANDLER: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A SIGUSR1 handler that keeps its thread inside it until [`RELEASE_HANDLER`] is set. A
+    /// thread asleep in a userfault that receives the signal leaves the fault, runs this, and
+    /// runs its faulting instruction again only once released.
+    extern "C" fn hold_until_released(_signal: libc::c_int) {
+        HELD_IN_HANDLER.store(true, std::sync::atomic::Ordering::SeqCst);
+        while !RELEASE_HANDLER.load(std::sync::atomic::Ordering::SeqCst) {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// A write fault on a hole is answered with a private page of zeros, mapped writable, and
+    /// not with the kernel's zero page. On the zero page the guest's write would fault again
+    /// at once for the kernel's copy-on-write. It holds for a fault that was parked and is
+    /// answered by a retry, which carries the fault's write flag.
+    ///
+    /// Once a write has run, a private page of zeros and the zero page plus its copy-on-write
+    /// both leave a private page, so the test looks before the write runs again. The fault is
+    /// parked behind an unread REMOVE, then the writer is taken out of its fault into a
+    /// SIGUSR1 handler that holds it, and the retry answers the fault while nothing waits on
+    /// it. The page is then exclusive only if the answer was a private copy. Released, the
+    /// writer stores again. Its fault count is not asserted: delivering the signal can fault
+    /// on the thread's fresh stack, so the count does not isolate the store.
+    #[test]
+    fn a_parked_write_fault_on_a_snapshot_hole_gets_a_private_page_of_zeros() {
+        // SAFETY: an all-zero sigaction is valid; the handler only touches atomics.
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = hold_until_released as extern "C" fn(libc::c_int) as usize;
+        // SAFETY: installing a handler for SIGUSR1, which nothing else in this test uses.
+        let rc = unsafe { libc::sigaction(libc::SIGUSR1, &action, std::ptr::null_mut()) };
+        assert_eq!(rc, 0, "sigaction: {}", std::io::Error::last_os_error());
+
+        let (mut clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        mark_holes(&mut clone.source, &[2]);
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+
+        let balloon = clone.inflate(&uffd, 0);
+        let writer = FaultingWriter::spawn(clone.region_addr(2), 0x5A);
+        writer.wait_until_asleep();
+        let outcome = drain_events(&uffd, &ctx, &mut state).expect("a refused fault is parked");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        let parked: Vec<(usize, bool)> = state
+            .parked_faults
+            .by_page
+            .iter()
+            .map(|(page, parked)| (*page, parked.write))
+            .collect();
+        assert_eq!(
+            parked,
+            vec![(clone.region_addr(2), true)],
+            "the write fault is parked behind the unread REMOVE, as a write"
+        );
+
+        // Out of its fault: the event is read, so the fault stays parked and unanswered.
+        // SAFETY: tgkill to a thread of this process.
+        let rc =
+            unsafe { libc::syscall(libc::SYS_tgkill, libc::getpid(), writer.tid, libc::SIGUSR1) };
+        assert_eq!(rc, 0, "tgkill: {}", std::io::Error::last_os_error());
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !HELD_IN_HANDLER.load(std::sync::atomic::Ordering::SeqCst) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the writer never left its fault for the signal handler"
+            );
+            std::thread::yield_now();
+        }
+
+        let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+        while !state.parked_faults.is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked fault never resolved after the REMOVE event was read"
+            );
+            assert!(
+                retry_parked_faults(&ctx, &uffd, &mut state).expect("retrying the parked fault"),
+                "the clone is alive; a retry must not report it gone"
+            );
+            std::thread::sleep(PARKED_RETRY_DELAY);
+        }
+        let answered = pagemap_flags(clone.region_addr(2));
+        let bytes = resident_bytes(clone.region_addr(2));
+
+        RELEASE_HANDLER.store(true, std::sync::atomic::Ordering::SeqCst);
+        writer.finish("the writer never returned from its signal handler");
+        assert_eq!(balloon.join().expect("balloon thread"), 0, "madvise");
+
+        assert_eq!(
+            answered,
+            (true, true),
+            "a parked write fault on a hole must get a private page of zeros, not the kernel's \
+             zero page its write would fault on again"
+        );
+        assert!(bytes.iter().all(|byte| *byte == 0), "the answer is zeros");
+        assert_eq!(clone.byte(2), 0x5A);
+        assert_eq!(state.hole_zero_filled, 1);
+        clone.unmap();
+    }
+
+    /// A write fault on a hole gets a private page of zeros, mapped writable, and a read fault
+    /// on a hole the kernel's shared zero page. Once the write has run, its end state cannot
+    /// tell a private copy from the zero page plus the kernel's copy-on-write, which leaves a
+    /// private page too: [`a_parked_write_fault_on_a_snapshot_hole_gets_a_private_page_of_zeros`]
+    /// looks at the page before the write runs again. This one runs the copy of zeros at the
+    /// host's base page on the direct path, and checks what it leaves.
+    #[test]
+    fn a_write_fault_on_a_snapshot_hole_gets_a_private_page_and_a_read_the_zero_page() {
+        let (mut clone, uffd) = FaultAroundClone::new(0, 0, 4);
+        mark_holes(&mut clone.source, &[1, 2]);
+        let mut state = clone.state();
+
+        assert_eq!(clone.touch(&uffd, &mut state, 1), 0, "page 1 is a hole");
+        assert_eq!(
+            pagemap_flags(clone.region_addr(1)),
+            (true, false),
+            "a read fault on a hole maps the kernel's zero page"
+        );
+
+        let writer = FaultingWriter::spawn(clone.region_addr(2), 0x5A);
+        writer.wait_until_asleep();
+        let outcome = drain_events(&uffd, &clone.ctx(), &mut state).expect("serving the fault");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        writer.finish("the writer is still asleep after its fault was served");
+        assert_eq!(
+            pagemap_flags(clone.region_addr(2)),
+            (true, true),
+            "the written page is the clone's own"
+        );
+        let bytes = resident_bytes(clone.region_addr(2));
+        assert_eq!(bytes[0], 0x5A, "the write landed");
+        assert!(
+            bytes[1..].iter().all(|byte| *byte == 0),
+            "the rest of the page is zeros, not the snapshot's byte 3"
+        );
+        assert_eq!(state.hole_zero_filled, 2);
+        clone.unmap();
+    }
+
+    /// An NV2 clone's guest writes the pages it reads sooner or later, and on arm64 the
+    /// copy-on-write of the kernel's zero page drops every nested stage-2 mapping. So every
+    /// zero answer of an NV2 clone is a private page of zeros, for a read fault on a hole and
+    /// on a page the balloon gave back alike, and the write that follows takes no fault.
+    #[test]
+    fn an_nv2_clone_answers_every_zero_fault_with_a_private_page() {
+        let (mut clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 4, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        mark_holes(&mut clone.source, &[2]);
+        serve_as_nv2(&mut clone.source);
+        let mut state = clone.state();
+        give_back(&clone, &uffd, &mut state, 1, 3);
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 1),
+            0,
+            "page 1 was given back"
+        );
+        assert_eq!(
+            pagemap_flags(clone.region_addr(1)),
+            (true, true),
+            "an NV2 clone's read fault on a given-back page must get a private page of zeros"
+        );
+        assert_eq!(clone.touch(&uffd, &mut state, 2), 0, "page 2 is a hole");
+        assert_eq!(
+            pagemap_flags(clone.region_addr(2)),
+            (true, true),
+            "an NV2 clone's read fault on a hole must get a private page of zeros"
+        );
+        assert!(resident_bytes(clone.region_addr(2))
+            .iter()
+            .all(|byte| *byte == 0));
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert_eq!(state.hole_zero_filled, 1);
+
+        let faults = FaultingWriter::spawn(clone.region_addr(2), 0x5A)
+            .finish("a write to a page this clone owns cannot reach the server");
+        assert_eq!(
+            faults, 0,
+            "the page is mapped writable, so its write takes no fault"
+        );
+        clone.unmap();
+    }
+
+    /// Replay fills a recorded page that is a hole in the memory file without reading the
+    /// file: an earlier clone touched it, so this one should not fault for it. On ordinary
+    /// memory it maps the kernel's shared zero page there, as a read fault on the hole would,
+    /// so a replaying clone holds no memory for zeros an earlier clone only read, and a later
+    /// write is the kernel's own copy-on-write. An NV2 clone gets private pages of zeros
+    /// ([`VmContext::zero_fill`]). A recorded page the balloon has given back is stepped over
+    /// as before. Here a given-back page and a hole meet, and a second recorded run is all
+    /// holes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replay_maps_recorded_snapshot_holes_to_the_zero_page_and_nv2_gets_private_zeros() {
+        const PAGE: usize = BalloonedCopyClone::PAGE;
+        for nv2 in [false, true] {
+            let (mut clone, uffd) = BalloonedCopyClone::new(16);
+            mark_holes(&mut clone.source, &[6, 10, 11]);
+            if nv2 {
+                serve_as_nv2(&mut clone.source);
+            }
+            let ctx = clone.ctx();
+            let mut state = BalloonedCopyClone::state();
+            remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(6));
+            let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+            let mut recorded = PageSet::empty(clone.mem_size as u64);
+            recorded.insert_range((4 * PAGE) as u64, (5 * PAGE) as u64);
+            recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
+
+            let outcome = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay");
+            assert_eq!(
+                outcome,
+                Replay::Finished {
+                    refused_segments: 0,
+                    filled_holes_mapped: 0,
+                },
+                "nv2={nv2}"
+            );
+            assert_eq!(
+                resident_pages(clone.base, 16),
+                vec![4, 6, 7, 8, 10, 11],
+                "nv2={nv2}: replay populates the recorded pages 4..9 except the given-back page \
+                 5, and the recorded run 10..12 of holes"
+            );
+            let (kind, want) = if nv2 {
+                ("a private page of zeros", (true, true))
+            } else {
+                ("the kernel's zero page", (true, false))
+            };
+            for page in [6, 10, 11] {
+                assert_eq!(
+                    pagemap_flags(clone.page(page)),
+                    want,
+                    "nv2={nv2}: replay must fill the recorded hole at page {page} with {kind}"
+                );
+                assert!(
+                    resident_bytes(clone.page(page))
+                        .iter()
+                        .all(|byte| *byte == 0),
+                    "nv2={nv2}: replay fills the hole at page {page} with zeros, not the \
+                     snapshot's bytes"
+                );
+            }
+            // SAFETY: pages of this test's own mapping, which the line above showed resident.
+            let bytes = unsafe {
+                [
+                    std::ptr::read_volatile(clone.page(4) as *const u8),
+                    std::ptr::read_volatile(clone.page(7) as *const u8),
+                    std::ptr::read_volatile(clone.page(8) as *const u8),
+                ]
+            };
+            assert_eq!(
+                bytes,
+                [5, 8, 9],
+                "nv2={nv2}: pages 4, 7 and 8 hold the snapshot's bytes"
+            );
+            assert_eq!(state.fault_count, 0, "nv2={nv2}: nothing faulted");
+
+            // A write to a replayed hole never reaches the server: on the zero page it is the
+            // kernel's copy-on-write, and an NV2 clone's page is its own already.
+            FaultingWriter::spawn(clone.page(10), 0x5A)
+                .finish("a write to a replayed hole reached the server, which nothing runs here");
+            // SAFETY: a resident page of this test's own mapping.
+            let written = unsafe { std::ptr::read_volatile(clone.page(10) as *const u8) };
+            assert_eq!(written, 0x5A, "nv2={nv2}");
+            drop(async_uffd);
+            clone.unmap();
+        }
+    }
+
+    /// Fault-around steps over a hole in the memory file inside another fault's granule. The
+    /// guest's own touch of the hole then reads zeros.
+    #[test]
+    fn fault_around_steps_over_snapshot_holes() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // Granules of four pages: pages 0..4 are one granule.
+        let (mut clone, uffd) = FaultAroundClone::new(4, 0, 8);
+        mark_holes(&mut clone.source, &[2]);
+        let mut state = clone.state();
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 0),
+            1,
+            "page 0 comes from the snapshot"
+        );
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![0, 1, 3],
+            "fault-around populates the granule around page 0 except the hole at page 2"
+        );
+        assert_eq!(state.fault_around.extra_bytes, 2 * PAGE as u64);
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 2),
+            0,
+            "the guest's own touch of the hole reads zeros"
+        );
+        assert_eq!(state.hole_zero_filled, 1);
+        assert_eq!(clone.resident_guard_pages(), 0);
+        clone.unmap();
+    }
+
+    /// A fault on a hole is answered with zeros, and fault-around then populates the rest of
+    /// its granule from the snapshot, as after any other demand fault. Only a page the balloon
+    /// gave back turns fault-around off for its fault, because the guest is reusing free
+    /// memory there. A hole among data is a page of zeros and says nothing about its
+    /// neighbours.
+    #[test]
+    fn fault_around_runs_after_a_fault_on_a_snapshot_hole() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // Granules of four pages: pages 0..4 are one granule.
+        let (mut clone, uffd) = FaultAroundClone::new(4, 0, 8);
+        mark_holes(&mut clone.source, &[2]);
+        let mut state = clone.state();
+
+        assert_eq!(clone.touch(&uffd, &mut state, 2), 0, "page 2 is a hole");
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![0, 1, 2, 3],
+            "fault-around populates the granule around the hole at page 2"
+        );
+        for page in [0, 1, 3] {
+            assert_eq!(
+                clone.byte(page),
+                page as u8 + 1,
+                "page {page} holds the snapshot's bytes"
+            );
+        }
+        assert_eq!(state.fault_around.extra_bytes, 3 * PAGE as u64);
+        assert_eq!(state.hole_zero_filled, 1);
+        assert_eq!(clone.resident_guard_pages(), 0);
+        clone.unmap();
+    }
+
+    /// On memory whose page is the host's base page, a read fault answered with zeros maps
+    /// the kernel's shared zero page, for a hole and for a page the balloon gave back alike,
+    /// so free memory the guest reads costs the clone none. The guest's first write to such a
+    /// page is the kernel's own copy-on-write fault: no event reaches the server, and the page
+    /// becomes the clone's.
+    #[test]
+    fn a_zero_answer_to_a_read_maps_the_kernels_zero_page() {
+        let (mut clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 5, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        mark_holes(&mut clone.source, &[2]);
+        let mut state = clone.state();
+        give_back(&clone, &uffd, &mut state, 1, 3);
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 0),
+            1,
+            "page 0 comes from the snapshot"
+        );
+        // Control: a private copy reads as exclusive, so the instrument tells the two apart.
+        assert_eq!(
+            pagemap_flags(clone.region_addr(0)),
+            (true, true),
+            "the snapshot's page is a private copy"
+        );
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 1),
+            0,
+            "page 1 was given back"
+        );
+        assert_eq!(
+            pagemap_flags(clone.region_addr(1)),
+            (true, false),
+            "the given-back page must map the kernel's zero page, not a private copy of zeros"
+        );
+        assert_eq!(clone.touch(&uffd, &mut state, 2), 0, "page 2 is a hole");
+        assert_eq!(
+            pagemap_flags(clone.region_addr(2)),
+            (true, false),
+            "the hole must map the kernel's zero page, not a private copy of zeros"
+        );
+        assert_eq!(state.given_back.zero_filled, 1);
+        assert_eq!(state.hole_zero_filled, 1);
+
+        // Control: a write whose fault reaches the server sleeps in the kernel until the server
+        // answers it, so a write that returns on its own never reached the server.
+        let blocked = FaultingWriter::spawn(clone.region_addr(4), 0x11);
+        blocked.wait_until_asleep();
+        let outcome = drain_events(&uffd, &clone.ctx(), &mut state).expect("serving the fault");
+        assert_eq!(outcome, DrainOutcome::QueueDrained);
+        blocked.finish("the write to page 4 is still blocked after its fault was served");
+
+        let faults = FaultingWriter::spawn(clone.region_addr(2), 0x5A)
+            .finish_within(Duration::from_secs(5))
+            .unwrap_or_else(|_| panic!("the write to the zero page reached the server"));
+        assert_eq!(
+            faults, 1,
+            "the write to the zero page is one copy-on-write fault in the kernel"
+        );
+        assert_eq!(clone.byte(2), 0x5A);
+        assert_eq!(
+            pagemap_flags(clone.region_addr(2)),
+            (true, true),
+            "after the write the page is the clone's own"
+        );
+        clone.unmap();
+    }
+
+    /// The context of a clone served from `source` whose page is `page_size`.
+    fn zero_fill_ctx(source: &PageSource, page_size: usize) -> VmContext<'_> {
+        VmContext {
+            vm_id: "zero-fill",
+            mappings: &[],
+            source,
+            page_size,
+            page_mask: !(page_size - 1),
+            mem_size: HUGE_PAGE_2M,
+        }
+    }
+
+    /// A zero answer is the kernel's zero page only for a read fault on ordinary memory. A
+    /// write fault, any fault of an NV2 clone, hugetlb memory, and a clone whose
+    /// `UFFDIO_ZEROPAGE` has been refused with EINVAL get a private copy of zeros. The harness
+    /// has no memory on which `UFFDIO_ZEROPAGE` fails with EINVAL and the copy that answers it
+    /// instead succeeds: hugetlb memory refuses both at a 4 KiB granule, and at its own page
+    /// size it never asks for the zero page. So this tests the decision.
+    #[test]
+    fn a_zero_answer_is_the_zero_page_only_for_a_read_on_ordinary_memory() {
+        let source = |nv2: bool| PageSource::Copy {
+            mmap: memmap2::MmapMut::map_anon(HUGE_PAGE_2M)
+                .expect("mapping a snapshot")
+                .make_read_only()
+                .expect("sealing the snapshot"),
+            fault_around: 0,
+            holes: FileHoles::default(),
+            nv2,
+        };
+        let (plain, nv2) = (source(false), source(true));
+        let base = usize::try_from(host_page_size()).expect("a host page size");
+
+        let cases = [
+            (
+                "a read on ordinary memory",
+                &plain,
+                base,
+                false,
+                false,
+                ZeroFill::SharedZeroPage,
+            ),
+            ("a write", &plain, base, true, false, ZeroFill::PrivateCopy),
+            (
+                "a read by an NV2 clone",
+                &nv2,
+                base,
+                false,
+                false,
+                ZeroFill::PrivateCopy,
+            ),
+            (
+                "a read on hugetlb memory",
+                &plain,
+                HUGE_PAGE_2M,
+                false,
+                false,
+                ZeroFill::PrivateCopy,
+            ),
+            (
+                "a read after a refused UFFDIO_ZEROPAGE",
+                &plain,
+                base,
+                false,
+                true,
+                ZeroFill::PrivateCopy,
+            ),
+        ];
+        for (case, source, page_size, write, refused, want) in cases {
+            assert_eq!(
+                zero_fill_ctx(source, page_size).zero_fill(write, refused),
+                want,
+                "{case}"
+            );
+        }
+
+        let ordinary = zero_fill_ctx(&plain, base);
+        assert!(matches!(
+            ordinary.resolution(Some(ZeroFill::SharedZeroPage)),
+            Resolution::ZeroPage
+        ));
+        assert!(matches!(
+            ordinary.resolution(Some(ZeroFill::PrivateCopy)),
+            Resolution::CopyZeros
+        ));
+        assert!(matches!(
+            ordinary.resolution(None),
+            Resolution::CopySnapshot(_)
+        ));
+        assert_eq!(
+            ordinary.resolution(Some(ZeroFill::SharedZeroPage)).ioctl(),
+            "UFFDIO_ZEROPAGE"
+        );
+        assert_eq!(
+            ordinary.resolution(Some(ZeroFill::PrivateCopy)).ioctl(),
+            "UFFDIO_COPY"
+        );
+    }
+
+    /// A memory file on FUSE is flushed before its holes are mapped, and one on a local
+    /// filesystem is not. fuse-pipe forwards SEEK_HOLE to the host, so in a nested L1 with the
+    /// writeback cache a page still dirty in the L1 would read as a hole. A local filesystem
+    /// answers SEEK_HOLE from its page cache, and a flush of a file just written costs seconds.
+    #[test]
+    fn the_memory_file_is_flushed_before_its_holes_are_mapped_only_on_fuse() {
+        use nix::sys::statfs::{BTRFS_SUPER_MAGIC, EXT4_SUPER_MAGIC, TMPFS_MAGIC, XFS_SUPER_MAGIC};
+        assert!(
+            flush_before_mapping_holes(FUSE_SUPER_MAGIC),
+            "a memory file on FUSE must be flushed: SEEK_HOLE there sees only what was written \
+             back"
+        );
+        for (name, local) in [
+            ("btrfs", BTRFS_SUPER_MAGIC),
+            ("ext4", EXT4_SUPER_MAGIC),
+            ("xfs", XFS_SUPER_MAGIC),
+            ("tmpfs", TMPFS_MAGIC),
+        ] {
+            assert!(
+                !flush_before_mapping_holes(local),
+                "a memory file on {name} must not be flushed: SEEK_HOLE there reads the page \
+                 cache, and a flush of a file just written costs seconds"
+            );
+        }
+        // Control: the decision is made on the type of the file served, and a memfd is tmpfs.
+        let memfd = memfd_with_pages(c"fcvm-holes-fs-type", 1, &[]);
+        assert_eq!(
+            fstatfs(&memfd)
+                .expect("fstatfs on a memfd")
+                .filesystem_type(),
+            TMPFS_MAGIC
+        );
+    }
+
+    /// The flush that a memory file on FUSE gets comes before the walk that maps its holes. No
+    /// fake filesystem misreports dirty pages to SEEK_HOLE, so the order is pinned by the
+    /// source.
+    #[test]
+    fn the_hole_map_is_built_after_a_flush_only_fuse_gets() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("fn build_file_holes(")
+            .expect("build_file_holes was renamed without updating this test");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("build_file_holes ends")];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("build_file_holes has no `{needle}`"))
+        };
+        assert!(
+            at("if flush_before_mapping_holes(") < at(".sync_data()"),
+            "the memory file is flushed only where flush_before_mapping_holes says so"
+        );
+        assert!(
+            at(".sync_data()") < at("HoleMap::from_file("),
+            "the memory file must be flushed before its holes are mapped"
+        );
+    }
+
+    /// The hole walk runs on an open file description of its own, so the served descriptor's
+    /// file offset stays where it was, however long the walk takes.
+    #[test]
+    fn the_hole_walk_leaves_the_served_file_offset_alone() {
+        let page = usize::try_from(host_page_size()).expect("a host page size");
+        let memfd = memfd_with_pages(c"fcvm-holes-offset", 8, &[(0, 0xAB), (3, 0xCD)]);
+        // SAFETY: lseek on a descriptor this test owns.
+        let set = unsafe { libc::lseek(memfd.as_raw_fd(), 5, libc::SEEK_SET) };
+        assert_eq!(set, 5, "control: the served descriptor's offset is set");
+        let walk = open_for_hole_walk(&memfd).expect("opening the memory file again");
+        let holes = build_file_holes(&walk, 8 * page).expect("mapping the holes");
+        assert_eq!(
+            holes.bytes(),
+            6 * page,
+            "control: the walk mapped the holes"
+        );
+        // SAFETY: lseek on a descriptor this test owns; SEEK_CUR with 0 moves nothing.
+        let offset = unsafe { libc::lseek(memfd.as_raw_fd(), 0, libc::SEEK_CUR) };
+        assert_eq!(
+            offset, 5,
+            "the walk must not move the served descriptor's file offset"
+        );
+    }
+
+    /// A COPY-mode server maps the holes of its memory file once `run` has bound its socket,
+    /// not in `new`, so a memory file of millions of data runs does not delay the bind, and
+    /// it publishes the map whole for its clones to share through the page source. The memory
+    /// file here is a memfd reached through /proc, whose holes are exactly the pages never
+    /// written, on any host filesystem.
+    #[tokio::test]
+    async fn a_copy_mode_server_maps_the_holes_of_its_memory_file_after_it_binds() {
+        let page = usize::try_from(host_page_size()).expect("a host page size");
+        let memfd = memfd_with_pages(c"fcvm-served-holes", 16, &[(0, 0xAB), (9, 0xAB)]);
+        let image = PathBuf::from(format!("/proc/self/fd/{}", memfd.as_raw_fd()));
+        let dir = tempfile::tempdir().expect("a socket directory");
+        let server = Arc::new(
+            UffdServer::new(
+                "holes".to_string(),
+                &image,
+                &dir.path().join("config.json"),
+                &dir.path().join("snapshot.lock"),
+                dir.path(),
+                ServeShape {
+                    backing: UffdBacking::Copy,
+                    prefetch: Prefetch::Off,
+                    record_window: Duration::ZERO,
+                    fault_around: FaultAround::OFF,
+                    nv2: false,
+                },
+            )
+            .await
+            .expect("serving the memfd"),
+        );
+        let PageSource::Copy { holes, .. } = &*server.source else {
+            panic!("a copy-mode server has a COPY page source");
+        };
+        assert_eq!(
+            holes.state(),
+            "building",
+            "the map must not be built before the server binds its socket"
+        );
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let running = tokio::spawn({
+            let server = Arc::clone(&server);
+            let cancel = cancel.clone();
+            async move { server.run(cancel).await }
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while holes.state() == "building" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the server never published the hole map"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        assert!(
+            server.socket_path().exists(),
+            "the socket is bound by the time the map is published"
+        );
+        let map = holes.published().expect("the map is published, not failed");
+        let hole_pages: Vec<usize> = (0..16)
+            .filter(|index| map.covers(index * page, page))
+            .collect();
+        let want: Vec<usize> = (1..9).chain(10..16).collect();
+        assert_eq!(
+            hole_pages, want,
+            "the server must map every page of its memory file that was never written"
+        );
+        cancel.cancel();
+        running
+            .await
+            .expect("the server task")
+            .expect("the server ran");
+    }
+
+    /// Until the server publishes its hole map, a fault on a hole of the memory file is served
+    /// from the file, which reads the hole as zeros: the answer is correct and only the saving
+    /// waits for the map. Once the map is published, a fault on a hole is a zero answer and
+    /// the file is not read. The snapshot here is a memfd with real holes.
+    #[test]
+    fn a_fault_before_the_hole_map_is_published_is_served_from_the_file() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (mut clone, uffd) = FaultAroundClone::new(0, 0, 4);
+        // File pages 0 and 1 hold data, and the rest are holes.
+        let memfd = memfd_with_pages(
+            c"fcvm-holes-unpublished",
+            clone.file_pages,
+            &[(0, 0xAB), (1, 0xCD)],
+        );
+        // SAFETY: a read-only mapping of a memfd this test owns.
+        let mmap = unsafe { MmapOptions::new().len(clone.file_pages * PAGE).map(&memfd) }
+            .expect("mapping the memfd");
+        clone.source = PageSource::Copy {
+            mmap,
+            fault_around: 0,
+            holes: FileHoles::default(),
+            nv2: false,
+        };
+        let mut state = clone.state();
+
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 2),
+            0,
+            "the file reads its hole as zeros"
+        );
+        assert_eq!(
+            state.hole_zero_filled, 0,
+            "before the map is published, a fault on a hole must be served from the file"
+        );
+        assert_eq!(
+            pagemap_flags(clone.region_addr(2)),
+            (true, true),
+            "a page served from the file is a private copy"
+        );
+
+        let PageSource::Copy { holes, .. } = &clone.source else {
+            unreachable!("the source set above is COPY");
+        };
+        holes.publish(Some(
+            build_file_holes(&memfd, clone.file_pages * PAGE).expect("mapping the memfd's holes"),
+        ));
+        assert_eq!(clone.touch(&uffd, &mut state, 3), 0);
+        assert_eq!(
+            state.hole_zero_filled, 1,
+            "once the map is published, a fault on a hole must be answered with zeros"
+        );
+        assert_eq!(
+            pagemap_flags(clone.region_addr(3)),
+            (true, false),
+            "a read fault answered with zeros maps the kernel's zero page"
+        );
+        assert_eq!(
+            clone.touch(&uffd, &mut state, 1),
+            0xCD,
+            "a page of data is still served from the file"
+        );
+        assert_eq!(state.hole_zero_filled, 1);
+        clone.unmap();
     }
 }

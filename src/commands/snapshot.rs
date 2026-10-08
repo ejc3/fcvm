@@ -441,21 +441,21 @@ where
     Ok(get_profile("default")?.and_then(|default| default.firecracker_args))
 }
 
-/// `snapshot serve`'s mode: the requested one, or copy when the snapshot's clones run
-/// with `--enable-nv2`. A serve launches no Firecracker, so it applies the rule the
-/// clones take their Firecracker arguments by (`profile_firecracker_args`).
+/// `snapshot serve`'s mode, and whether the snapshot's clones run with `--enable-nv2`: the
+/// requested mode, or copy for NV2 clones. A serve launches no Firecracker, so it applies the
+/// rule the clones take their Firecracker arguments by (`profile_firecracker_args`).
 fn serve_uffd_backing<GetProfile>(
     requested: UffdBacking,
     kernel_profile: Option<&str>,
     get_profile: GetProfile,
-) -> Result<UffdBacking>
+) -> Result<(UffdBacking, bool)>
 where
     GetProfile: FnMut(&str) -> Result<Option<crate::setup::KernelProfile>>,
 {
     let nv2 = profile_firecracker_args(kernel_profile, get_profile)?
         .as_deref()
         .is_some_and(crate::setup::firecracker_args_enable_nv2);
-    Ok(uffd_backing_for(requested, nv2))
+    Ok((uffd_backing_for(requested, nv2), nv2))
 }
 
 /// Memory transport for a Firecracker restore with no serve process: every
@@ -1201,7 +1201,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
         Some(mode) => UffdBacking::parse_mode(mode, hugepages)?,
         None => UffdBacking::Copy,
     };
-    let backing = serve_uffd_backing(
+    let (backing, nv2) = serve_uffd_backing(
         requested,
         snapshot_config.metadata.kernel_profile.as_deref(),
         crate::setup::get_kernel_profile,
@@ -1249,6 +1249,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             prefetch,
             record_window,
             fault_around,
+            nv2,
         },
     )
     .await
@@ -2336,6 +2337,7 @@ async fn cmd_snapshot_run_inner(
                     prefetch,
                     record_window,
                     fault_around,
+                    nv2,
                 },
             )
             .await
@@ -4906,13 +4908,13 @@ mod tests {
             assert_eq!(name, "nested");
             Ok(Some(nv2_kernel_profile()))
         });
-        assert_eq!(served.unwrap(), UffdBacking::Copy);
+        assert_eq!(served.unwrap(), (UffdBacking::Copy, true));
 
         let served = serve_uffd_backing(minor, None, |name| {
             assert_eq!(name, "default");
             Ok(Some(crate::setup::KernelProfile::default()))
         });
-        assert_eq!(served.unwrap(), minor);
+        assert_eq!(served.unwrap(), (minor, false));
     }
 
     /// A clone of a snapshot whose profile defines neither a Firecracker of its own nor
@@ -4929,7 +4931,7 @@ mod tests {
                 other => panic!("unexpected profile {other}"),
             }))
         });
-        assert_eq!(served.unwrap(), UffdBacking::Copy);
+        assert_eq!(served.unwrap(), (UffdBacking::Copy, true));
     }
 
     #[tokio::test]

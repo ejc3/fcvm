@@ -2514,7 +2514,22 @@ fcvm snapshot run --pid <serve_pid> --name clone1
   snapshot is always served in copy mode):
   - `copy`: the server maps the snapshot file read-only, so the page cache holds one
     copy. Guest RAM is anonymous memory, and each fault is filled with `UFFDIO_COPY`,
-    a private per-clone copy of the page.
+    a private per-clone copy of the page. Once it has bound its socket, the server maps
+    the file's holes (`SEEK_HOLE`) on a thread of its own and publishes the map when it is
+    whole (`published the hole map` with `hole_mib` and `build_ms`). Until then every
+    fault is served from the file, which reads a hole as zeros. A memory file on FUSE is
+    flushed (`fdatasync`) first, because fuse-pipe with the writeback cache in a nested
+    L1 answers `SEEK_HOLE` from what it has written back. A local filesystem answers it
+    from the page cache and is not flushed. Once the map is published, a fault on a hole,
+    or on a page the clone's balloon gave back, is answered with zeros and the file is
+    not read. A
+    read fault gets `UFFDIO_ZEROPAGE`: the kernel's shared zero page, read-only, so it
+    costs the clone no memory until the guest writes it, and that write is a
+    copy-on-write fault the server never sees. A write fault gets a private copy of
+    zeros, mapped writable, so the write does not fault again. So does every fault of an
+    NV2 clone, because on arm64 that copy-on-write drops every nested stage-2 mapping
+    (see "Copy-on-write on the File backend"), and every fault on hugetlb memory, which
+    refuses `UFFDIO_ZEROPAGE`.
   - `minor`: at startup the server copies the snapshot into one memfd (all-zero 4 KiB
     pages stay holes), seals it, and passes a read-only descriptor to every clone's
     Firecracker over the handshake socket. Guest RAM maps it `MAP_PRIVATE`, and each
@@ -2567,7 +2582,8 @@ separately.
 - **Record**: every demand fault within the clone's recording window marks its snapshot
   file offset in a 4 KiB-granular bitmap (32 KiB per GiB of guest RAM). A fault that is
   on a page the clone's balloon gave back when it is first read is the exception: it is
-  answered with zeros and not recorded. The window starts
+  answered with zeros and not recorded. A fault on a hole in the memory file (copy mode)
+  is answered with zeros and recorded like any other. The window starts
   at the clone's UFFD handshake and defaults to 300 s (`--uffd-prefetch-record-window` /
   `FCVM_UFFD_PREFETCH_RECORD_WINDOW`; 0 records nothing; issue #858). Later faults are
   served but not recorded. On handler exit the bitmap is unioned into the serve
@@ -2594,7 +2610,15 @@ separately.
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
   work is bounded by the image size, and no cap drops part of a large guest's set when it
   fragments into millions of runs. A recorded page the clone's balloon has given back
-  by the time replay reaches it is stepped over. In minor mode on shmem the backing memfd
+  by the time replay reaches it is stepped over. In copy mode a run of recorded pages
+  that are holes in the memory file is mapped to the kernel's shared zero page with one
+  `UFFDIO_ZEROPAGE`, as a read fault on a hole is, so a replaying clone holds no memory
+  for zeros it only reads and a later write is the kernel's own copy-on-write. An NV2
+  clone, and hugetlb memory, get private copies of zeros instead. `hole_zero_filled_pages`
+  on the replay line counts them (also in `prefetched_pages`), `hole_map_at_start` says
+  whether the hole map was published when replay started (before it is, a recorded hole
+  is replayed from the file), and the faults on holes are `hole_zero_filled` on the `VM
+  exited` line. In minor mode on shmem the backing memfd
   leaves the snapshot's all-zero pages unwritten (a hugetlb backing is written in full), and
   each stays a hole until a clone touches it, which fills it in the memfd with no fault
   reaching the server. `UFFDIO_CONTINUE` refuses a hole, and a refusal would give up the rest
@@ -2761,8 +2785,10 @@ with the granule.
   parked fault is retried between batches and fails the clone if it is still refused after
   2 s, so nothing optional may lengthen a batch. After a demand copy that found its page
   already present it populates nothing, because another populator owns that range. After a
-  fault on a page the clone's balloon gave back, which is answered with zeros, it populates
-  nothing either. And a page of the granule that the balloon gave back is stepped over.
+  fault on a page the clone's balloon gave back, which is answered with zeros, it
+  populates nothing either. A fault on a hole in the memory file is answered with zeros
+  and gets fault-around like any other. A page of the granule that the balloon gave back,
+  or that is a hole, is stepped over.
 - **Limitation: recording under the option is thin, and replay does not make up for it**:
   only the demanded page is recorded, and a page that fault-around installed is never
   recorded, because the guest never faults on it. So with the option on the recorded working
