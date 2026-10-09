@@ -56,7 +56,6 @@ from dataclasses import dataclass
 from typing import Callable, Iterable, Optional
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-REPO = os.path.abspath(os.path.join(HERE, "..", ".."))
 sys.path.insert(0, HERE)
 
 import reqbench  # noqa: E402
@@ -2373,12 +2372,17 @@ def sha256_file(path: str) -> str:
     return digest.hexdigest()
 
 
+# Every file a scale run reads or executes from its bundle; reqbench.sh stages
+# each of them (harness_hash_covers_every_staged_request_script).
+HARNESS_SOURCES = (
+    "reqscale.py", "reqscale_analyze.py", "reqbench.py", "cdpdrive.py",
+    "render.py", "faulttrace.bt", "guardexec.py", "guardsupervise.py",
+)
+
+
 def harness_sha256() -> str:
     digest = hashlib.sha256(b"fcvm-reqscale-harness-v1\0")
-    for name in (
-        "reqscale.py", "reqscale_analyze.py", "reqbench.py", "cdpdrive.py",
-        "render.py", "faulttrace.bt", "guardexec.py", "guardsupervise.py",
-    ):
+    for name in HARNESS_SOURCES:
         encoded = name.encode()
         digest.update(len(encoded).to_bytes(4, "big"))
         digest.update(encoded)
@@ -2582,14 +2586,33 @@ class SnapshotGenerationLease:
         self.close()
 
 
+def golden_runtime(args, identity: dict) -> tuple[dict, dict]:
+    """The leased golden's creator runtime, and this run's, which must be it.
+
+    The serial run's check (reqbench.require_golden_runtime) against the
+    golden's reqbench-provenance.json, read under the same shared lease.
+    """
+    try:
+        golden = reqbench.snapshot_generation(args.data_root, args.snapshot_tag)
+        if (golden["generation_id"], golden["config_sha256"]) != (
+                identity["generation_id"], identity["config_sha256"]):
+            raise RuntimeError(
+                "the golden's reqbench provenance names another generation than the leased one")
+        runtime = reqbench.require_golden_runtime(args.snapshot_tag, golden, args.fcvm)
+    except RuntimeError as error:
+        raise MeasurementInvalid(str(error)) from error
+    return {field: golden[field] for field in runtime}, runtime
+
+
 def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
-    fcvm = os.path.abspath(args.fcvm)
-    if not os.path.isfile(fcvm):
-        raise MeasurementInvalid(f"fcvm binary is missing: {fcvm}")
-    revision = _command(["git", "-C", REPO, "rev-parse", "HEAD"])
-    if not re.fullmatch(r"[0-9a-f]{40}", revision):
-        raise MeasurementInvalid(f"git returned invalid revision {revision!r}")
-    dirty = _command(["git", "-C", REPO, "status", "--porcelain=v1", "--untracked-files=all"])
+    fcvm = args.fcvm
+    revision = _command(["git", "-C", args.source_repo, "rev-parse", "HEAD"])
+    if revision != args.runtime["source_revision"]:
+        raise MeasurementInvalid(
+            f"the source repository is at {revision!r}, not the revision "
+            f"{args.runtime['source_revision']!r} this runtime was staged from")
+    dirty = _command(["git", "-C", args.source_repo, "status", "--porcelain=v1",
+                      "--untracked-files=all"])
     if dirty:
         raise MeasurementInvalid(
             "benchmark source tree is dirty; commit the harness before measuring"
@@ -2612,7 +2635,9 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
         "source_status_sha256": hashlib.sha256(dirty.encode()).hexdigest(),
         "harness_sha256": harness_sha256(),
         "fcvm_path": fcvm,
-        "fcvm_sha256": sha256_file(fcvm),
+        "fcvm_sha256": args.runtime["creator_fcvm_sha256"],
+        "runtime_bundle_sha256": args.runtime["creator_runtime_bundle_sha256"],
+        "golden_creator": args.golden_creator,
         "fcvm_version": _command([fcvm, "--version"]),
         "host_control": {
             "chromium_path": args.control_chromium,
@@ -3784,7 +3809,6 @@ def main() -> int:
     parser.add_argument("--max-control-median-drift-pct", type=float, required=True)
     parser.add_argument("--run-id", default="")
     parser.add_argument("--out-dir", required=True)
-    parser.add_argument("--fcvm", default=os.path.join(REPO, "target", "release", "fcvm"))
     parser.add_argument("--data-root", default="/mnt/fcvm-btrfs")
     parser.add_argument("--state-dir", default="")
     parser.add_argument("--cgroup-root", default="/sys/fs/cgroup")
@@ -3822,7 +3846,6 @@ def main() -> int:
     args = parser.parse_args()
 
     args.run_id = args.run_id or uuid.uuid4().hex
-    args.fcvm = os.path.abspath(args.fcvm)
     args.data_root = os.path.abspath(args.data_root)
     args.state_dir = args.state_dir or os.path.join(args.data_root, "state")
     args.out_dir = os.path.abspath(args.out_dir)
@@ -3885,6 +3908,9 @@ def main() -> int:
         return 0
     if os.geteuid() != 0:
         parser.error("measured runs must be root so owned accounting cgroups can be created")
+    # The bundle reqbench.sh staged this file into: its fcvm is the one measured.
+    args.fcvm = os.path.join(HERE, "fcvm")
+    args.source_repo = os.environ.get("REQBENCH_SOURCE_REPO", "")
     resolved_chromium = (
         args.control_chromium if os.path.isabs(args.control_chromium)
         else shutil.which(args.control_chromium)
@@ -3910,6 +3936,7 @@ def main() -> int:
                     strict_json_loads(stream.read(), config_path), os.environ)
             if refusal:
                 raise MeasurementInvalid(f"refusing a FILE arm that is not one: {refusal}")
+            args.golden_creator, args.runtime = golden_runtime(args, lease.identity)
             provenance = collect_provenance(args, schedule, args.snapshot_identity)
             with TerminationFence():
                 return execute(args, schedule, provenance)

@@ -1246,7 +1246,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         "source_revision", "source_dirty", "source_status_sha256",
         "harness_sha256", "fcvm_path", "fcvm_sha256", "fcvm_version",
         "host_control", "snapshot", "snapshot_generation_lease", "host",
-        "fault_trace",
+        "fault_trace", "runtime_bundle_sha256", "golden_creator",
     }
     if not isinstance(provenance, dict) or set(provenance) != required:
         raise AnalysisInvalid("provenance fields are incomplete or unknown")
@@ -1257,8 +1257,22 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
     if provenance.get("source_dirty") is not False:
         raise AnalysisInvalid("measurement source tree was dirty")
     _require_hex(provenance.get("source_revision"), 40, "source revision")
-    for name in ("source_status_sha256", "harness_sha256", "fcvm_sha256"):
+    for name in ("source_status_sha256", "harness_sha256", "fcvm_sha256",
+                 "runtime_bundle_sha256"):
         _require_hex(provenance.get(name), 64, name)
+    measured_runtime = {
+        "creator_fcvm_sha256": provenance["fcvm_sha256"],
+        "creator_runtime_bundle_sha256": provenance["runtime_bundle_sha256"],
+        "source_revision": provenance["source_revision"],
+    }
+    golden = provenance.get("golden_creator")
+    if not isinstance(golden, dict) or set(golden) != set(measured_runtime):
+        raise AnalysisInvalid("provenance does not name the runtime that created its golden")
+    for field, measured in measured_runtime.items():
+        if golden[field] != measured:
+            raise AnalysisInvalid(
+                f"the golden was created with {field}={golden[field]!r}, the run "
+                f"measured with {measured!r}; it is not the golden's runtime")
     if not isinstance(provenance.get("created_at"), str) or not provenance["created_at"]:
         raise AnalysisInvalid("provenance has no creation time")
     if (
@@ -1993,6 +2007,7 @@ def analyze(run_dir: str) -> dict:
             "cpu_count": provenance["host"]["cpu_count"],
             "fcvm_version": provenance["fcvm_version"],
             "fcvm_sha256": provenance["fcvm_sha256"],
+            "runtime_bundle_sha256": provenance["runtime_bundle_sha256"],
             "source_revision": provenance["source_revision"],
             "source_dirty": provenance["source_dirty"],
             "chromium_version": provenance["host_control"]["chromium_version"],

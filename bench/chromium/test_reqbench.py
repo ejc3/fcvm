@@ -9262,12 +9262,15 @@ class HarnessIdentity(unittest.TestCase):
 
     def test_harness_hash_covers_every_staged_request_script(self):
         sh = open(os.path.join(HERE, "reqbench.sh")).read()
-        m = re.search(r"for source in ([^;]+); do", sh)
+        m = re.search(r"runtime_sources=\(([^)]+)\)", sh)
         self.assertIsNotNone(m, "staged source list not found in reqbench.sh")
         staged = set(m.group(1).split())
         # reqanalyze.py is staged (the analysis step runs from the bundle) but
-        # defines no request sample.
-        self.assertEqual(set(reqbench.HARNESS_SOURCES), staged - {"reqanalyze.py"})
+        # defines no request sample; the scale run executes from the same bundle.
+        import reqscale
+        self.assertEqual(
+            staged,
+            set(reqbench.HARNESS_SOURCES) | {"reqanalyze.py"} | set(reqscale.HARNESS_SOURCES))
 
 
 # `make` invoked as a command in a repository script, ignoring comment lines:

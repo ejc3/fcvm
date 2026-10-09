@@ -1657,6 +1657,12 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             "harness_sha256": "2" * 64,
             "fcvm_path": "/usr/bin/fcvm",
             "fcvm_sha256": "3" * 64,
+            "runtime_bundle_sha256": "5" * 64,
+            "golden_creator": {
+                "creator_fcvm_sha256": "3" * 64,
+                "creator_runtime_bundle_sha256": "5" * 64,
+                "source_revision": "1" * 40,
+            },
             "fcvm_version": "fcvm fixture",
             "schedule_sha256": reqscale.schedule_sha256(schedule),
             "snapshot": snapshot,

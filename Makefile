@@ -1192,8 +1192,7 @@ SCALE_UFFD_MODE ?= copy
 SCALE_UFFD_PREFETCH ?= on
 SCALE_CONTROL_URL ?=
 SCALE_CONTROL_RESOLVE_ALL_TO ?=
-bench-chromium-scale: private SHELL := $(TARGET_LEASE_SHELL)
-bench-chromium-scale: build
+bench-chromium-scale:
 	@test -n "$(SCALE_RATES)" || (echo "ERROR: SCALE_RATES required (for example 2,4,8)"; exit 1)
 	@test -n "$(SCALE_BURSTS)" || (echo "ERROR: SCALE_BURSTS required (must be at least 5)"; exit 1)
 	@test -n "$(SCALE_SEED)" || (echo "ERROR: SCALE_SEED required"; exit 1)
@@ -1207,8 +1206,7 @@ bench-chromium-scale: build
 	@test -n "$(SCALE_MAX_LAUNCH_LAG_MS)" || (echo "ERROR: SCALE_MAX_LAUNCH_LAG_MS required"; exit 1)
 	@test -n "$(SCALE_MAX_CONTROL_DRIFT_PCT)" || (echo "ERROR: SCALE_MAX_CONTROL_DRIFT_PCT required"; exit 1)
 	@echo "==> Running open-loop Chromium request scalability benchmark..."
-	sudo -E env RUST_LOG=fcvm=debug python3 bench/chromium/reqscale.py \
-		--fcvm ./target/release/fcvm --snapshot-tag "$(SCALE_TAG)" \
+	TAG="$(SCALE_TAG)" RESULTS="$(RESULTS)" bash bench/chromium/reqbench.sh scale \
 		--url "$(SCALE_URL)" --rates "$(SCALE_RATES)" \
 		--bursts "$(SCALE_BURSTS)" --control-chromium "$(SCALE_CONTROL_CHROMIUM)" \
 		--max-offered-rps-error-pct "$(SCALE_MAX_OFFERED_ERROR_PCT)" \

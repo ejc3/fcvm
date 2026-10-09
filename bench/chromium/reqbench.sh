@@ -124,18 +124,18 @@ if [ "${BASH_SOURCE[0]}" = "$0" ] && [ "${REQBENCH_STAGED:-0}" != 1 ]; then
     source_revision_before=$(git -C "$REPO" rev-parse HEAD)
     mkdir -p "$RESULTS/runtime"
     stage_dir=$(mktemp -d "$RESULTS/runtime/.stage.XXXXXX")
-    for source in reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py; do
+    # The request harness, then the scale harness (reqscale.HARNESS_SOURCES).
+    runtime_sources=(reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py
+        reqscale.py reqscale_analyze.py faulttrace.bt guardexec.py guardsupervise.py)
+    for source in "${runtime_sources[@]}"; do
         cp --reflink=auto "$HERE/$source" "$stage_dir/$source"
     done
     cp --reflink=auto "$FC_AGENT" "$stage_dir/fc-agent"
     cp --reflink=auto "$FCVM" "$stage_dir/fcvm"
-    chmod 0555 "$stage_dir/fcvm" "$stage_dir/fc-agent" "$stage_dir/reqbench.sh" \
-        "$stage_dir/reqbench.py" "$stage_dir/reqanalyze.py" \
-        "$stage_dir/cdpdrive.py" "$stage_dir/render.py" "$stage_dir/wddrive.py"
     (
         cd "$stage_dir"
-        sha256sum fcvm fc-agent reqbench.sh reqbench.py reqanalyze.py cdpdrive.py render.py wddrive.py \
-            > MANIFEST.sha256
+        chmod 0555 fcvm fc-agent "${runtime_sources[@]}"
+        sha256sum fcvm fc-agent "${runtime_sources[@]}" > MANIFEST.sha256
     )
     bundle_hash=$(sha256sum "$stage_dir/MANIFEST.sha256" | cut -d' ' -f1)
     bundle_dir="$RESULTS/runtime/$bundle_hash"
@@ -2044,6 +2044,20 @@ cmd_diag() {
     return $rc
 }
 
+# The open-loop scale benchmark, from this bundle like every measured phase:
+# reqscale.py refuses a golden created by another bundle, fcvm or revision.
+cmd_scale() {
+    local rc=0
+    sudo -E env RUST_LOG=fcvm=debug \
+        REQBENCH_RUNTIME_BUNDLE="${REQBENCH_RUNTIME_BUNDLE:-}" \
+        REQBENCH_SOURCE_REPO="$REPO" \
+        REQBENCH_SOURCE_REVISION="${REQBENCH_SOURCE_REVISION:-}" \
+        python3 "$HERE/reqscale.py" --snapshot-tag "$TAG" \
+        --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" "$@" || rc=$?
+    verify_runtime_bundle || rc=1
+    return $rc
+}
+
 # Only dispatch when EXECUTED. Sourcing the file makes its helpers unit-testable
 # (see ReqbenchShell in test_reqbench.py) instead of reachable only through a
 # whole phase.
@@ -2055,6 +2069,7 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
         verify) cmd_verify ;;
         run)    cmd_run ;;
         diag)   cmd_diag ;;
+        scale)  shift; cmd_scale "$@" ;;
         all)
             # The chain's own build/golden/verify phases are the load the run
             # gate reads a minute later; default the settle window so a cold
@@ -2062,6 +2077,6 @@ if [ "${BASH_SOURCE[0]}" = "$0" ]; then
             # SETTLE_WAIT_SECS wins.
             export SETTLE_WAIT_SECS="${SETTLE_WAIT_SECS:-120}"
             cmd_build; cmd_golden; cmd_verify; cmd_run ;;
-        *) echo "usage: $0 {build|golden|verify|run|diag|all}" >&2; exit 2 ;;
+        *) echo "usage: $0 {build|golden|verify|run|diag|scale|all}" >&2; exit 2 ;;
     esac
 fi

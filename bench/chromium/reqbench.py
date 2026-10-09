@@ -1419,6 +1419,38 @@ def sha256_file(path: str) -> str:
     return h.hexdigest()
 
 
+def require_golden_runtime(snapshot_name: str, snapshot: dict, fcvm: str) -> dict:
+    """This process's staged runtime, refused unless it created the golden.
+
+    The runtime is the reqbench.sh bundle this process executes from: the
+    fcvm it runs, the hash of the bundle's MANIFEST.sha256, and the revision
+    it was staged at. reqbench.sh golden records the same three values for
+    the bundle that created the snapshot (snapshot_generation returns them).
+    """
+    runtime_bundle = os.environ.get("REQBENCH_RUNTIME_BUNDLE", "")
+    manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+    if not runtime_bundle or os.path.realpath(runtime_bundle) != os.path.realpath(HERE):
+        raise RuntimeError(
+            f"{HERE} is not reqbench.sh's staged runtime bundle "
+            f"(REQBENCH_RUNTIME_BUNDLE={runtime_bundle!r}); measured phases run from it"
+        )
+    if not os.path.isfile(manifest_path):
+        raise RuntimeError(f"staged runtime manifest is missing: {manifest_path}")
+    runtime = {
+        "creator_fcvm_sha256": sha256_file(fcvm),
+        "creator_runtime_bundle_sha256": sha256_file(manifest_path),
+        "source_revision": os.environ.get("REQBENCH_SOURCE_REVISION", ""),
+    }
+    for field, current in runtime.items():
+        if snapshot[field] != current:
+            raise RuntimeError(
+                f"snapshot {snapshot_name} was created with {field}="
+                f"{snapshot[field]!r}, current runtime is {current!r}; recreate "
+                "the golden with this staged runtime"
+            )
+    return runtime
+
+
 # Every script that defines one request sample, for either engine. Must stay
 # equal to reqbench.sh's staged runtime sources minus the binaries and the
 # analyzer (which reads samples but defines none); asserted by
@@ -4398,27 +4430,13 @@ def main_with_resources(resources: ExitStack) -> int:
         p.error(str(error))
 
     args.fcvm = os.path.abspath(args.fcvm)
-    runtime_bundle = os.environ.get("REQBENCH_RUNTIME_BUNDLE", "")
-    manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
-    if os.path.realpath(runtime_bundle) != os.path.realpath(HERE):
-        p.error("reqbench.py must execute from reqbench.sh's staged runtime bundle")
-    if not os.path.isfile(manifest_path):
-        p.error(f"staged runtime manifest is missing: {manifest_path}")
-    current_fcvm_sha256 = sha256_file(args.fcvm)
-    current_runtime_bundle_sha256 = sha256_file(manifest_path)
-    current_source_revision = os.environ.get("REQBENCH_SOURCE_REVISION", "")
-    creator_identity = {
-        "creator_fcvm_sha256": current_fcvm_sha256,
-        "creator_runtime_bundle_sha256": current_runtime_bundle_sha256,
-        "source_revision": current_source_revision,
-    }
-    for field, current in creator_identity.items():
-        if snapshot[field] != current:
-            p.error(
-                f"snapshot {snapshot_name} was created with {field}="
-                f"{snapshot[field]!r}, current runtime is {current!r}; recreate "
-                "the golden with this staged runtime"
-            )
+    try:
+        runtime = require_golden_runtime(snapshot_name, snapshot, args.fcvm)
+    except RuntimeError as error:
+        p.error(str(error))
+    current_fcvm_sha256 = runtime["creator_fcvm_sha256"]
+    current_runtime_bundle_sha256 = runtime["creator_runtime_bundle_sha256"]
+    current_source_revision = runtime["source_revision"]
     os.makedirs(args.out_dir, exist_ok=True)
     arms = [a.strip() for a in args.arms.split(",") if a.strip()]
     allowed_arms = allowed_arms_for_engine(args.engine)
