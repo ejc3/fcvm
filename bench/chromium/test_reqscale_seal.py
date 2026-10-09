@@ -197,6 +197,42 @@ class ScaleShell(unittest.TestCase):
             self.assertEqual(argv[argv.index("--url") + 1], "http://127.0.0.1/x")
 
 
+
+class ScaleOutputOwnership(unittest.TestCase):
+    def test_the_scale_output_is_handed_back_to_the_invoking_user(self):
+        """RED ON 418b7683: reqscale.py runs under sudo and creates its output
+        directory as root, so the campaign's analysis, which runs as the
+        invoking user, could not write into it. reqbench.sh scale now hands
+        the tree back once reqscale.py returns."""
+        with tempfile.TemporaryDirectory() as d:
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            for name, body in (("fcvm", "#!/bin/bash\nexit 0\n"),
+                               ("fc-agent", "#!/bin/bash\nexit 0\n"),
+                               ("bin/sudo", '#!/bin/bash\nprintf "%s\\n" "$*" >> "$SUDO_LOG"\n')):
+                with open(os.path.join(d, name), "w") as f:
+                    f.write(body)
+                os.chmod(os.path.join(d, name), 0o755)
+            os.makedirs(os.path.join(d, "state"))
+            out = os.path.join(d, "results", "scale")
+            os.makedirs(out)  # what reqscale.py would have created, as root
+            env = dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"],
+                       RESULTS=os.path.join(d, "results"), STATE_DIR=os.path.join(d, "state"),
+                       RUNID="0" * 32, FCVM=os.path.join(d, "fcvm"),
+                       FC_AGENT=os.path.join(d, "fc-agent"), TAG="cb-scale",
+                       SUDO_LOG=os.path.join(d, "sudo.log"))
+            result = subprocess.run(
+                [os.path.join(HERE, "reqbench.sh"), "scale", "--url", "http://127.0.0.1/x",
+                 "--out-dir", out],
+                env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            with open(env["SUDO_LOG"]) as f:
+                calls = f.read().splitlines()
+        run = next(i for i, c in enumerate(calls) if "/reqscale.py" in c)
+        handback = f"chown -R {os.getuid()}:{os.getgid()} -- {out}"
+        self.assertIn(handback, calls[run + 1:],
+                      f"the scale output was left to root: sudo calls {calls}")
+
 class ScaleGraph(test_reqbench.MakefileBenchGraph):
     def test_scale_never_rebuilds(self):
         c = self.closure("bench-chromium-scale")

@@ -154,6 +154,14 @@ acquire_diag_lock || exit 2
 # sub-make, and an earlier campaign's passed=true must not answer for this
 # one. The content-addressed runtime bundles under runtime/ and the phase
 # logs under logs/ are not the record and stay.
+# An earlier scale attempt's directory goes too: reqscale.py refuses to reuse
+# one. reqbench.sh scale hands it back to this user, but a run killed before
+# that leaves it owned by root, so sudo removes only what this user cannot,
+# with the diag lock's descriptor closed so no helper of sudo inherits it.
+if [ -e "${RESULTS:?}/scale" ]; then
+    rm -rf -- "$RESULTS/scale" 2>/dev/null \
+        || sudo rm -rf -- "$RESULTS/scale" {CAMPAIGN_DIAG_LOCK_FD}>&-
+fi
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
     "$RESULTS"/replay-queries.log \
     "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \

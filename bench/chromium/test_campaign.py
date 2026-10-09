@@ -2415,5 +2415,35 @@ class DiagPhase(unittest.TestCase):
                       "a failed diag does not end the campaign")
 
 
+
+class ScaleRetry(unittest.TestCase):
+    def test_a_retry_removes_the_earlier_scale_attempt(self):
+        """RED ON 418b7683: reqscale.py refuses an existing output directory,
+        and the startup cleanup that lets an explicit RESULTS be reused left
+        $RESULTS/scale in place, so every scale retry failed before
+        measuring. The cleanup removes it, through sudo only when this user
+        cannot, because a run killed before reqbench.sh handed it back leaves
+        it owned by root. Runs the shipped block, as DnsBrackets does."""
+        block = DnsBrackets.START_CLEANUP.search(campaign())
+        self.assertIsNotNone(block, "startup cleanup not found")
+        with tempfile.TemporaryDirectory() as d:
+            results = os.path.join(d, "results")
+            os.makedirs(os.path.join(results, "scale", "logs"))
+            os.makedirs(os.path.join(results, "diag"))
+            os.makedirs(os.path.join(results, "runtime"))
+            binx = os.path.join(d, "bin")
+            os.makedirs(binx)
+            with open(os.path.join(binx, "sudo"), "w") as f:
+                f.write('#!/bin/bash\nexec "$@"\n')
+            os.chmod(os.path.join(binx, "sudo"), 0o755)
+            script = f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'
+            result = subprocess.run(["bash", "-c", script],
+                                    env=dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"]),
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(os.path.exists(os.path.join(results, "scale")),
+                             "the earlier scale attempt survived the startup cleanup")
+            self.assertTrue(os.path.isdir(os.path.join(results, "runtime")))
+
 if __name__ == "__main__":
     unittest.main()

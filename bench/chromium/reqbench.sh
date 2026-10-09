@@ -2047,13 +2047,22 @@ cmd_diag() {
 # The open-loop scale benchmark, from this bundle like every measured phase:
 # reqscale.py refuses a golden created by another bundle, fcvm or revision.
 cmd_scale() {
-    local rc=0
+    local rc=0 out="" prev=""
+    for arg in "$@"; do
+        [ "$prev" = --out-dir ] && out=$arg
+        prev=$arg
+    done
     sudo -E env RUST_LOG=fcvm=debug \
         REQBENCH_RUNTIME_BUNDLE="${REQBENCH_RUNTIME_BUNDLE:-}" \
         REQBENCH_SOURCE_REPO="$REPO" \
         REQBENCH_SOURCE_REVISION="${REQBENCH_SOURCE_REVISION:-}" \
         python3 "$HERE/reqscale.py" --snapshot-tag "$TAG" \
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" "$@" || rc=$?
+    # reqscale.py runs as root and creates its output as root; the analysis and
+    # the campaign's evidence step run as this user and write into it.
+    if [ -n "$out" ] && [ -e "$out" ]; then
+        sudo chown -R "$(id -u):$(id -g)" -- "$out" || rc=1
+    fi
     verify_runtime_bundle || rc=1
     return $rc
 }
