@@ -293,6 +293,34 @@ class UffdServeRecordsPrefetch(unittest.TestCase):
         record = record[:record.index("}")]
         self.assertIn('"uffd_prefetch": getattr(self.args, "uffd_prefetch", "on"),', record)
 
+
+class ResolverEvidenceGate(unittest.TestCase):
+    RUN_ID = "0" * 32
+
+    def test_several_ip_literal_urls_need_no_resolver_evidence(self):
+        """RED ON 25906ca7: the gate called any run with more than one URL a
+        corpus run, so a standalone run over IP-literal or local URLs, which
+        resolve nothing, was refused for lacking the campaign's DNS evidence."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            gate = reqscale_analyze.corpus_dns_gate(
+                run_dir, {"run_id": self.RUN_ID,
+                          "urls": ["http://127.0.0.1/a", "http://localhost/b"]},
+                {"host_control": {"resolve_all_to": None}})
+        self.assertIsNone(gate, gate)
+
+    def test_a_hostname_url_needs_resolver_evidence_even_alone(self):
+        """RED ON 25906ca7: one hostname URL was not a corpus run, so it
+        published with no record of which resolver answered it."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            gate = reqscale_analyze.corpus_dns_gate(
+                run_dir, {"run_id": self.RUN_ID, "urls": ["https://example.com/"]},
+                {"host_control": {"resolve_all_to": None}})
+        self.assertIn("without the campaign's DNS evidence", gate or "the gate passed it")
+
 class ScaleGraph(test_reqbench.MakefileBenchGraph):
     def test_scale_never_rebuilds(self):
         c = self.closure("bench-chromium-scale")

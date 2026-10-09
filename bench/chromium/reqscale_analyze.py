@@ -19,6 +19,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
 import campaign_summary  # noqa: E402
+import reqanalyze  # noqa: E402
 import reqscale  # noqa: E402
 
 
@@ -146,9 +147,13 @@ def _null_or_ipv4(value) -> bool:
 def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     """None when publication needs no resolver evidence or has it, else why not.
 
-    A corpus run renders real host names, so whether each clone resolved them
-    through the replay server is recorded only by the corpus campaign's DNS
-    evidence beside this run directory. Without a clean bundle that names this
+    A run needs resolver evidence when a URL's host is a name only a resolver
+    can answer (reqanalyze.url_needs_resolver, which treats a URL it cannot read
+    the way the browser does as needing one) or when the host control maps
+    names; IP literals and localhost resolve nothing, however many there are.
+    Whether each clone resolved those names through the replay server is
+    recorded only by the corpus campaign's DNS evidence beside this run
+    directory. Without a clean bundle that names this
     run, a run against the wrong resolver is indistinguishable from a good one.
     The bundle is held to campaign_summary's check, the one the index applies:
     the run id, the :53 owner samples, the replay server's exit status, every
@@ -158,7 +163,8 @@ def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
     of them names. A WITHDRAWN marker in the campaign directory, the results
     directory the withdrawal rule in AGENTS.md governs, withdraws the run too.
     """
-    corpus = len(schedule["urls"]) > 1 or provenance["host_control"].get("resolve_all_to")
+    corpus = provenance["host_control"].get("resolve_all_to") or any(
+        reqanalyze.url_needs_resolver(url) is not False for url in schedule["urls"])
     if not corpus:
         return None
     campaign_dir = os.path.dirname(os.path.abspath(run_dir))
