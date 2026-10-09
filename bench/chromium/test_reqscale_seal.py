@@ -199,11 +199,12 @@ class ScaleShell(unittest.TestCase):
 
 
 class ScaleOutputOwnership(unittest.TestCase):
-    def test_the_scale_output_is_handed_back_to_the_invoking_user(self):
-        """RED ON 418b7683: reqscale.py runs under sudo and creates its output
-        directory as root, so the campaign's analysis, which runs as the
-        invoking user, could not write into it. reqbench.sh scale now hands
-        the tree back once reqscale.py returns."""
+    def test_a_pre_existing_output_directory_is_not_handed_back(self):
+        """RED ON f9f2fd96: reqbench.sh scale changed ownership of --out-dir
+        after reqscale.py returned, even when reqscale.py had refused it because
+        it already existed, so a mistyped SCALE_OUT could hand an existing
+        root-owned tree to the invoking user. Only reqscale.py, which knows
+        whether it created the directory, hands it back."""
         with tempfile.TemporaryDirectory() as d:
             binx = os.path.join(d, "bin")
             os.makedirs(binx)
@@ -215,7 +216,7 @@ class ScaleOutputOwnership(unittest.TestCase):
                 os.chmod(os.path.join(d, name), 0o755)
             os.makedirs(os.path.join(d, "state"))
             out = os.path.join(d, "results", "scale")
-            os.makedirs(out)  # what reqscale.py would have created, as root
+            os.makedirs(out)  # already there before this run: reqscale.py refuses it
             env = dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"],
                        RESULTS=os.path.join(d, "results"), STATE_DIR=os.path.join(d, "state"),
                        RUNID="0" * 32, FCVM=os.path.join(d, "fcvm"),
@@ -228,10 +229,37 @@ class ScaleOutputOwnership(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             with open(env["SUDO_LOG"]) as f:
                 calls = f.read().splitlines()
-        run = next(i for i, c in enumerate(calls) if "/reqscale.py" in c)
-        handback = f"chown -R {os.getuid()}:{os.getgid()} -- {out}"
-        self.assertIn(handback, calls[run + 1:],
-                      f"the scale output was left to root: sudo calls {calls}")
+        self.assertTrue(any("/reqscale.py" in c for c in calls), calls)
+        self.assertEqual([c for c in calls if c.startswith("chown")], [],
+                         f"reqbench.sh changed ownership of an existing directory: {calls}")
+
+
+class HandBackToInvoker(unittest.TestCase):
+    def test_reqscale_hands_back_only_the_directory_it_created(self):
+        with tempfile.TemporaryDirectory() as d:
+            root = os.path.join(d, "out")
+            os.makedirs(os.path.join(root, "logs"))
+            open(os.path.join(root, "logs", "a.json"), "w").close()
+            seen = []
+            with mock.patch.object(reqscale.os, "geteuid", return_value=0), \
+                    mock.patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "567"}), \
+                    mock.patch.object(reqscale.os, "lchown",
+                                      side_effect=lambda p, u, g: seen.append((p, u, g))):
+                reqscale.hand_back_to_invoker(root)
+            self.assertEqual(sorted(seen), sorted([
+                (root, 1234, 567), (os.path.join(root, "logs"), 1234, 567),
+                (os.path.join(root, "logs", "a.json"), 1234, 567)]))
+            seen.clear()
+            with mock.patch.object(reqscale.os, "geteuid", return_value=1000), \
+                    mock.patch.object(reqscale.os, "lchown", side_effect=lambda p, u, g: seen.append(p)):
+                reqscale.hand_back_to_invoker(root)
+            self.assertEqual(seen, [], "a run that is not root changed ownership")
+        with open(os.path.join(HERE, "reqscale.py")) as f:
+            source = f.read()
+        body = source[source.index("def execute(args, schedule: dict, provenance: dict) -> int:"):]
+        self.assertEqual([line.strip() for line in body.splitlines()[1:3]],
+                         ["os.mkdir(args.out_dir)", "atexit.register(hand_back_to_invoker, args.out_dir)"],
+                         "the handback is not registered right after reqscale.py creates its run directory")
 
 
 class UffdServeRecordsPrefetch(unittest.TestCase):

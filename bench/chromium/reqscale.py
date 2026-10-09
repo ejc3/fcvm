@@ -38,6 +38,7 @@ import fcntl
 import hashlib
 import json
 import math
+import atexit
 import os
 import platform
 import queue
@@ -3540,8 +3541,29 @@ def _interburst_membership(
     return members
 
 
+def hand_back_to_invoker(path: str) -> None:
+    """Give the run directory this process created to the user who ran sudo.
+
+    reqscale.py runs as root, and the campaign's analysis and evidence steps,
+    which write into the run directory, run as the invoking user. execute()
+    registers this only after its own os.mkdir of the directory succeeded, so a
+    directory that already existed is refused and never handed over.
+    """
+    if os.geteuid() != 0:
+        return
+    try:
+        uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
+    except (KeyError, ValueError):
+        return
+    for top, dirs, files in os.walk(path, topdown=False):
+        for name in dirs + files:
+            os.lchown(os.path.join(top, name), uid, gid)
+    os.lchown(path, uid, gid)
+
+
 def execute(args, schedule: dict, provenance: dict) -> int:
     os.mkdir(args.out_dir)
+    atexit.register(hand_back_to_invoker, args.out_dir)
     _fsync_directory(os.path.dirname(args.out_dir))
     log_dir = os.path.join(args.out_dir, "logs")
     trace_dir = os.path.join(args.out_dir, "fault-trace")
