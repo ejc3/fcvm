@@ -479,6 +479,169 @@ async fn test_user_snapshot_from_clone_uses_parent() -> Result<()> {
     Ok(())
 }
 
+/// A Diff snapshot of a clone restored through a memory server, with dirty tracking on, holds the
+/// pages the clone wrote and keeps the parent's bytes for pages the clone only read.
+///
+/// A served clone's memory is anonymous and filled by the server's UFFDIO_COPY from the parent's
+/// memory file, so a page the clone never wrote holds the parent's bytes, and only KVM's dirty log
+/// and Firecracker's own bitmap say which pages it wrote. `test_user_snapshot_from_clone_uses_parent`
+/// restores through the File backend and does not reach this path.
+#[tokio::test]
+async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pages() -> Result<()>
+{
+    let (parent_vm, clone_name, parent_tag, _) = common::unique_names("served-diff");
+    let child_tag = format!("{parent_tag}-child");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let fill = |file: &str| {
+        format!("dd if=/dev/urandom of=/dev/shm/{file} bs=1M count=8 2>/dev/null && sha256sum /dev/shm/{file} | cut -d' ' -f1")
+    };
+    let sum = |file: &str| format!("sha256sum /dev/shm/{file} | cut -d' ' -f1");
+
+    let (mut parent, parent_pid) = common::spawn_fcvm_with_logs(
+        // --no-snapshot: a parent restored from the startup snapshot cache would be a Diff
+        // over it, and the child's merge would no longer be the only one under test.
+        &[
+            "podman",
+            "run",
+            "--name",
+            &parent_vm,
+            "--network",
+            "rootless",
+            "--no-snapshot",
+            TEST_IMAGE,
+        ],
+        &parent_vm,
+    )
+    .await
+    .context("spawning the parent VM")?;
+    common::poll_health_by_pid(parent_pid, 120).await?;
+    // 8 MiB the parent holds, which the clone reads and never writes.
+    let parent_fill = fill("parent");
+    let parent_sum = common::exec_in_container(parent_pid, &[parent_fill.as_str()])
+        .await?
+        .trim()
+        .to_string();
+    assert_eq!(
+        parent_sum.len(),
+        64,
+        "expected a sha256 of the parent's 8 MiB, got {parent_sum:?}"
+    );
+    let output = snapshot_create(&fcvm_path, parent_pid, &parent_tag).await?;
+    let parent_stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    anyhow::ensure!(
+        output.status.success(),
+        "the parent's snapshot failed: {parent_stderr}"
+    );
+    assert!(
+        parent_stderr.contains("creating full snapshot"),
+        "the parent's snapshot is not Full, so the child's merge is not the only one: {parent_stderr}"
+    );
+    stop(parent_pid, &mut parent).await;
+
+    let (mut serve, serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &parent_tag],
+        &format!("{parent_tag}-serve"),
+    )
+    .await
+    .context("spawning the parent's memory server")?;
+    common::poll_serve_ready(&parent_tag, serve_pid, 30).await?;
+    // No --no-dirty-tracking: a served clone tracks dirty pages unless told not to.
+    let (mut clone, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid.to_string(),
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning the served clone")?;
+    common::poll_health_by_pid(clone_pid, 120).await?;
+    let parent_read = sum("parent");
+    assert_eq!(
+        common::exec_in_container(clone_pid, &[parent_read.as_str()])
+            .await?
+            .trim(),
+        parent_sum,
+        "the served clone does not read the parent's 8 MiB"
+    );
+    let clone_fill = fill("clone");
+    let clone_sum = common::exec_in_container(clone_pid, &[clone_fill.as_str()])
+        .await?
+        .trim()
+        .to_string();
+    assert_eq!(
+        clone_sum.len(),
+        64,
+        "expected a sha256 of the clone's 8 MiB, got {clone_sum:?}"
+    );
+    let output = snapshot_create(&fcvm_path, clone_pid, &child_tag).await?;
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    anyhow::ensure!(
+        output.status.success(),
+        "the served clone's snapshot failed: {stderr}"
+    );
+    assert!(
+        stderr.contains("creating diff snapshot") || stderr.contains("snapshot_type=\"Diff\""),
+        "the snapshot of a served clone is not a Diff: {stderr}"
+    );
+    assert!(
+        !stderr.contains("diff snapshot too small"),
+        "the tracked diff was retried as a Full snapshot: {stderr}"
+    );
+    if let Some(line) = stderr
+        .lines()
+        .find(|line| line.contains("diff merge complete"))
+    {
+        println!("  {}", line.trim());
+    }
+    stop(clone_pid, &mut clone).await;
+    stop(serve_pid, &mut serve).await;
+
+    // The child is restored through a memory server too.
+    let child_clone = format!("{clone_name}-child");
+    let (mut child_serve, child_serve_pid) = common::spawn_fcvm_with_logs(
+        &["snapshot", "serve", &child_tag],
+        &format!("{child_tag}-serve"),
+    )
+    .await
+    .context("spawning the child's memory server")?;
+    common::poll_serve_ready(&child_tag, child_serve_pid, 30).await?;
+    let (mut restored, restored_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &child_serve_pid.to_string(),
+            "--name",
+            &child_clone,
+        ],
+        &child_clone,
+    )
+    .await
+    .context("spawning a clone of the child")?;
+    common::poll_health_by_pid(restored_pid, 120).await?;
+    let clone_read = sum("clone");
+    let parent_back = common::exec_in_container(restored_pid, &[parent_read.as_str()]).await?;
+    let clone_back = common::exec_in_container(restored_pid, &[clone_read.as_str()]).await?;
+    stop(restored_pid, &mut restored).await;
+    stop(child_serve_pid, &mut child_serve).await;
+    assert_eq!(
+        clone_back.trim(),
+        clone_sum,
+        "a clone of the child does not hold the 8 MiB the served clone wrote"
+    );
+    assert_eq!(
+        parent_back.trim(),
+        parent_sum,
+        "a clone of the child does not hold the parent's 8 MiB, which the served clone only read"
+    );
+    Ok(())
+}
+
 /// The bytes of one `/proc/meminfo` field, which the kernel prints in KiB.
 fn meminfo_bytes(meminfo: &str, field: &str) -> Result<u64> {
     let line = meminfo
