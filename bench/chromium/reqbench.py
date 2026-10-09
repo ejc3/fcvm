@@ -76,7 +76,8 @@ the task into a zombie. A `/proc/<pid>/stat` read taken while the task is in
 state `Z` therefore already includes all of the reclaim. The sampler records
 whether it caught the `Z` state (`zombie_seen`); when it did, the CPU figure is
 COMPLETE, and when it did not (the parent's reaper won the race) the figure is a
-LOWER BOUND and is labelled as one. Never averaged together.
+LOWER BOUND and is labelled as one. A lower bound is averaged only into a
+figure that is itself labelled a lower bound.
 
 Whole-machine `/proc/stat` busy-jiffy deltas are recorded over a window that
 encloses the reclaim, then compared with an adjacent post-terminal ambient
@@ -228,6 +229,269 @@ def proc_stat_fields(pid: int):
         return f[0], int(f[11]), int(f[12]), int(f[19])
     except (IndexError, ValueError):
         return None
+
+
+def proc_cpu_ticks(pid: int):
+    """(utime, stime, cutime, cstime, starttime) ticks, or None if the pid is gone.
+
+    cutime and cstime hold the CPU of children the process has already
+    reaped, such as fcvm's short-lived `cp --reflink`, `nsenter` and `ip`
+    helpers, which are gone before any per-process reading can see them.
+    """
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            raw = f.read()
+    except OSError:
+        return None
+    try:
+        f = raw.rsplit(") ", 1)[1].split()
+        return int(f[11]), int(f[12]), int(f[13]), int(f[14]), int(f[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def serve_cpu_sample(serve_pid: int) -> dict:
+    """The memory server's cumulative CPU, its own and its reaped children's.
+
+    Read at the boundaries of the per-request windows ServeWindows keeps: a
+    window closes only once the server has acknowledged the work its clone
+    left it, and the sample that closes one window opens the next.
+    """
+    if not serve_pid:
+        return {"applicable": False}
+    ticks = proc_cpu_ticks(serve_pid)
+    if ticks is None:
+        return {"applicable": True, "error": "memory server not readable"}
+    return {"applicable": True, "ms": sum(ticks[:4]) * 1000.0 / CLK_TCK,
+            "starttime": ticks[4]}
+
+
+# How long a request waits for the memory server to acknowledge its clone,
+# and how often it looks. After the first failure the run stops waiting.
+SERVE_ACK_TIMEOUT_S = 30.0
+SERVE_ACK_POLL_S = 0.01
+# How long the serve's ready record may take to reach its log.
+SERVE_READY_TIMEOUT_S = 10.0
+# The memory server's threads that do work for a clone after the clone has
+# gone (fcvm-holes in src/uffd/server.rs, fcvm-ws-warm in src/uffd/warmup.rs).
+# fcvm-ws-write is not here: it lives as long as the serve, and the outcome
+# line logged for each clone's publication acknowledges that work.
+SERVE_DETACHED_THREADS = frozenset({"fcvm-holes", "fcvm-ws-warm"})
+# The lines that end a clone's working-set publication
+# (src/uffd/working_set.rs): fcvm-ws-write logs "merged" or "failed" once it
+# has finished, and the clone's own task logs "unavailable" when the worker
+# has gone and the publication is declined.
+SERVE_WORKER_OUTCOMES = (
+    ("merged", "merged this clone's faults into the snapshot's working set"),
+    ("failed", "could not persist the working set"),
+    ("unavailable", "working-set persistence worker is unavailable"),
+)
+# Logged at serve start when prefetch is on but no clone's publication will
+# be logged (src/uffd/server.rs).
+SERVE_PERSISTENCE_DISABLED = (
+    "no usable restore working set",
+    "working-set persistence is unavailable",
+)
+_SERVE_LOG_VM_ID = re.compile(r"\bvm_id=(vm-\d+)(?:\s|$)")
+
+
+def serve_log_vm_ids(lines, message: str) -> list:
+    """The vm_id field of every serve log line carrying this uffd message.
+
+    The serve logs `<time>  INFO uffd: <message> vm_id=vm-<n> ...` (fcvm's
+    tracing format with the target shown). A matching line without the
+    field contributes None.
+    """
+    marker = f" uffd: {message}"
+    ids = []
+    for line in lines:
+        if marker in line:
+            found = _SERVE_LOG_VM_ID.search(line.split(marker, 1)[1])
+            ids.append(found.group(1) if found else None)
+    return ids
+
+
+def serve_ack_verdict(lines, prefetch: bool, tasks):
+    """Whether the memory server has finished what one request's clone left it.
+
+    `lines` are the serve log lines written since the request's window
+    opened, read after its teardown returned; `tasks` are the server's thread
+    names (None if unreadable). Returns a dict once decided, or a string
+    naming what it is still waiting for.
+
+    Exactly one clone must have connected. Its window is acknowledged when
+    (B) its task has returned ("VM disconnected", printed after the task
+    scheduled the clone's working-set publication), (C) that publication's
+    outcome is logged (by fcvm-ws-write, or by the clone's task when the
+    worker has gone), which is expected only when prefetch is on and the
+    clone's fault handler started, and (D) no detached thread
+    is running. (D) is only sound after the connection line, because the
+    admission warm-up is spawned before that line is printed.
+    """
+    conns = serve_log_vm_ids(lines, "new VM connection")
+    if len(conns) != 1:
+        return {"acknowledged": False,
+                "reason": f"{len(conns)} clones connected to the memory server "
+                          "during this request"}
+    vm_id = conns[0]
+    if vm_id is None:
+        return {"acknowledged": False,
+                "reason": "the memory server's connection line carries no vm_id"}
+    if vm_id not in serve_log_vm_ids(lines, "VM disconnected"):
+        return f"{vm_id} to disconnect"
+    worker = None
+    if prefetch and vm_id in serve_log_vm_ids(lines, "page fault handler started"):
+        worker = next((outcome for outcome, message in SERVE_WORKER_OUTCOMES
+                       if vm_id in serve_log_vm_ids(lines, message)), None)
+        if worker is None:
+            return f"fcvm-ws-write to publish {vm_id}'s working set"
+    if tasks is None:
+        return {"acknowledged": False, "reason": "the memory server's threads are not readable"}
+    running = sorted(tasks & SERVE_DETACHED_THREADS)
+    if running:
+        return f"the memory server's {', '.join(running)} thread to exit"
+    return {"acknowledged": True, "vm_id": vm_id, "worker": worker}
+
+
+def serve_task_names(pid: int):
+    """The memory server's thread names, or None if its task list is unreadable.
+
+    A thread that exits between the listing and its read has gone, and its
+    CPU is then in the process's /proc/<pid>/stat.
+    """
+    base = f"/proc/{pid}/task"
+    try:
+        tids = os.listdir(base)
+    except OSError:
+        return None
+    names = set()
+    for tid in tids:
+        try:
+            with open(f"{base}/{tid}/comm") as comm:
+                names.add(comm.read().rstrip("\n"))
+        except OSError:
+            continue
+    return names
+
+
+class ServeLog:
+    """Reads a growing serve log, returning only complete lines."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self.file = open(path, "rb")
+        self._partial = b""
+
+    def read_new(self) -> list:
+        chunk = self.file.read()
+        if not chunk:
+            return []
+        *complete, self._partial = (self._partial + chunk).split(b"\n")
+        return [line.decode("utf-8", "replace") for line in complete]
+
+    def close(self) -> None:
+        self.file.close()
+
+
+def read_serve_ready_record(log: ServeLog, timeout_s: float):
+    """(the serve's ready record, the lines before it, the lines after it).
+
+    The ready record is the serve's one machine-readable line,
+    `{"status": "serving", ...}` (src/commands/snapshot.rs). Raises
+    RuntimeError if it has not arrived within timeout_s.
+    """
+    before = []
+    t0 = time.monotonic()
+    while True:
+        lines = log.read_new()
+        for index, line in enumerate(lines):
+            text = line.strip()
+            if text.startswith("{"):
+                try:
+                    record = json.loads(text)
+                except ValueError:
+                    record = None
+                if isinstance(record, dict) and record.get("status") == "serving":
+                    return record, before, lines[index + 1:]
+            before.append(line)
+        raise_if_harness_interrupted()
+        if time.monotonic() - t0 >= timeout_s:
+            raise RuntimeError(f"no serve ready record in {log.path} after {timeout_s:g} s")
+        time.sleep(SERVE_ACK_POLL_S)
+
+
+class ServeWindows:
+    """Per-request windows over the memory server's cumulative CPU.
+
+    The server keeps working for a clone after the clone's teardown returns:
+    with prefetch on it publishes the clone's working set on its detached
+    fcvm-ws-write thread, and a copy-mode admission starts a page-cache
+    warm-up. So a window does not end at the teardown. close() waits until
+    the server has acknowledged that work (serve_ack_verdict), then takes one
+    sample, which is both this request's serve_cpu_after and the next
+    request's serve_cpu_before, so the windows tile the run. The next request
+    launches only after that, so each window holds its own request's server
+    work to within one tick (the main loop logs "VM exited" after "VM
+    disconnected", and printing that line can fall in the next window). A
+    request that is not acknowledged records why, and
+    every later request records that an earlier one was not, without waiting.
+    """
+
+    def __init__(self, pid: int, log_path: str):
+        self.pid = pid
+        self.log = ServeLog(log_path)
+        try:
+            ready, before, after = read_serve_ready_record(self.log, SERVE_READY_TIMEOUT_S)
+            if ready.get("serve_pid") != pid:
+                raise RuntimeError(f"its ready record names serve PID "
+                                   f"{ready.get('serve_pid')!r}, not {pid}")
+            if not isinstance(ready.get("prefetch"), bool):
+                raise RuntimeError("its ready record carries no boolean prefetch")
+        except BaseException:
+            self.log.close()
+            raise
+        self.prefetch = ready["prefetch"]
+        self.disabled = None
+        if self.prefetch:
+            refused = next((message for message in SERVE_PERSISTENCE_DISABLED
+                            if serve_log_vm_ids(before, message)), None)
+            if refused is not None:
+                self.disabled = (f"the memory server logged '{refused}' at start, so no "
+                                 "clone's working-set publication is acknowledged")
+        # Lines after the ready record belong to the first window, so a clone
+        # that connected before the first request is counted against it.
+        self.window = list(after)
+        self.boundary = serve_cpu_sample(pid)
+
+    def _wait(self, t0: float) -> dict:
+        while True:
+            self.window.extend(self.log.read_new())
+            verdict = serve_ack_verdict(self.window, self.prefetch, serve_task_names(self.pid))
+            if isinstance(verdict, dict):
+                return verdict
+            if harness_interrupt_pending():
+                return {"acknowledged": False, "reason": "interrupted"}
+            if time.monotonic() - t0 >= SERVE_ACK_TIMEOUT_S:
+                return {"acknowledged": False,
+                        "reason": f"timed out after {SERVE_ACK_TIMEOUT_S:g} s "
+                                  f"waiting for {verdict}"}
+            time.sleep(SERVE_ACK_POLL_S)
+
+    def close(self) -> dict:
+        """End the current request's window; returns its acknowledgement."""
+        t0 = time.monotonic()
+        if self.disabled:
+            ack = {"acknowledged": False, "reason": self.disabled}
+        else:
+            ack = self._wait(t0)
+            if not ack["acknowledged"] and ack["reason"] != "interrupted":
+                self.disabled = f"an earlier request was not acknowledged: {ack['reason']}"
+        self.boundary = serve_cpu_sample(self.pid)
+        # Lines written after the boundary sample are the closing window's
+        # last ones ("VM exited"): no clone launches before this returns.
+        self.log.read_new()
+        self.window = []
+        return dict(ack, wait_ms=(time.monotonic() - t0) * 1000.0)
 
 
 def machine_cpu_ms() -> float:
@@ -659,7 +923,8 @@ def sample_all_until_gone(
     `exit_notify()`, so the reclaim is already in the counters by the time state
     `Z` is reachable, and MISSING the `Z` only downgrades that child's figure to a
     labelled LOWER BOUND — a state the record already models (`complete`, and
-    reqanalyze prints the two populations separately, never averaged).
+    reqanalyze prints the two populations separately, and averages a lower
+    bound only into a figure labelled as one).
     """
     live = dict(pids)
     last: dict = dict(initial_stats)
@@ -1717,6 +1982,7 @@ def measure_fast_reap(
         # entirely rather than making it small.
         pre_memory = {name: proc_private_dirty_kb(pid) for name, pid in tracked.items()}
         pre = {name: proc_stat_fields(pid) for name, pid in tracked.items()}
+        pre_ticks = {name: proc_cpu_ticks(pid) for name, pid in tracked.items()}
         missing_pre = [name for name, fields in pre.items() if fields is None]
         if missing_pre:
             raise RuntimeError(
@@ -1805,6 +2071,7 @@ def measure_fast_reap(
             "machine_window_ms": machine_window_ms,
             "parent_live": parent_live,
             "pre": pre,
+            "pre_ticks": pre_ticks,
             "pre_memory": pre_memory,
             "reclaim_cpu": reclaim_cpu,
             "sample_period_s": sample_period_s,
@@ -1920,6 +2187,13 @@ def teardown_fast(
         name: (fields[1] + fields[2]) * 1000.0 / CLK_TCK
         for name, fields in pre.items()
         if fields is not None
+    }
+    # What each pinned process's already-reaped children used: fcvm's setup
+    # helpers in particular. Not part of the per-child figures above.
+    out["reaped_children_cpu_ms_by_child"] = {
+        name: (ticks[2] + ticks[3]) * 1000.0 / CLK_TCK
+        for name, ticks in measured.get("pre_ticks", {}).items()
+        if ticks is not None
     }
     reclaim_cpu = measured["reclaim_cpu"]
     sample_period_s = measured["sample_period_s"]
@@ -4002,6 +4276,10 @@ def main_with_resources(resources: ExitStack) -> int:
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--serve-pid", type=int, default=0,
                    help="UFFD serve pid (omit when using --snapshot-tag)")
+    p.add_argument("--serve-log", default="",
+                   help="the UFFD serve's log, written at uffd=info (required with "
+                        "--serve-pid): each request's memory-server CPU window ends "
+                        "when the serve has acknowledged its clone there")
     p.add_argument("--snapshot-tag", default="",
                    help="FILE-backed restore from this tag instead of a UFFD serve")
     p.add_argument("--url", required=True,
@@ -4189,6 +4467,8 @@ def main_with_resources(resources: ExitStack) -> int:
             f"multi-URL runs need --warmup >= {2 * len(urls)} "
             f"(2x the URL count, working-set convergence); got {args.warmup}"
         )
+    if args.serve_pid and not args.serve_log:
+        p.error("--serve-log is required with --serve-pid")
     args.urls = urls
 
     args.run_id = args.run_id or uuid.uuid4().hex
@@ -4231,6 +4511,13 @@ def main_with_resources(resources: ExitStack) -> int:
         )
     except (KeyError, ValueError) as error:
         p.error(f"quiet-host guard provenance is incomplete: {error}")
+    serve = None
+    if args.serve_pid:
+        try:
+            serve = ServeWindows(args.serve_pid, args.serve_log)
+        except (OSError, RuntimeError) as error:
+            p.error(f"memory-server log {args.serve_log}: {error}")
+        resources.callback(serve.log.close)
     with open(out_path, "a") as out:
         meta = {
             "kind": "meta", "run_id": run_id, "seed": args.seed,
@@ -4279,6 +4566,7 @@ def main_with_resources(resources: ExitStack) -> int:
             # before spawning the next clone. Signals delivered during an
             # attempt are re-raised only after that attempt's exact teardown.
             raise_if_harness_interrupted()
+            serve_before = serve.boundary if serve else {"applicable": False}
             # Every rep records something, including the ones that blow up. A rep
             # that raises out of the loop used to take the whole run with it and
             # leave no trace in the artifact, so `n=` was the only evidence that
@@ -4315,6 +4603,15 @@ def main_with_resources(resources: ExitStack) -> int:
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
             rec["loadavg1"] = float(read_trimmed("/proc/loadavg").split()[0])
+            # The request's memory-server window (ServeWindows) ends once the
+            # server has acknowledged this clone, and its end opens the next
+            # request's. A fatal request leaves it open: the run stops here.
+            rec["serve_cpu_before"] = serve_before
+            if serve is None:
+                rec["serve_cpu_after"] = {"applicable": False}
+            elif fatal is None:
+                rec["serve_ack"] = serve.close()
+                rec["serve_cpu_after"] = serve.boundary
             out.write(json.dumps(rec) + "\n")
             out.flush()
             print(
@@ -4330,6 +4627,10 @@ def main_with_resources(resources: ExitStack) -> int:
                 print(f"\nABORTING SCHEDULE: {fatal}", file=sys.stderr, flush=True)
                 print(f"wrote {out_path}")
                 return 4
+    # A signal that arrived during the last request's acknowledgement wait,
+    # or after that request's own check, has no later iteration to stop at,
+    # and a cancelled run must not exit as complete. Its record is written.
+    raise_if_harness_interrupted()
     print(f"\nwrote {out_path}")
     return 0
 

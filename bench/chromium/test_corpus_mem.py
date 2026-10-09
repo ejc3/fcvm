@@ -1622,6 +1622,8 @@ case "$cmd" in
       *'Config.Labels'*)
         printf '%s|%s\n' '{self.CONTAINER_ID}' "$(cat "$PODMAN_TEST_STATE.owner")"
         ;;
+      *'.State.CgroupPath'*) echo "${{TEST_CGROUP_PATH-/fake-container.scope}}" ;;
+      *'.State.Pid'*) echo 4242 ;;
       *) exit 64 ;;
     esac
     ;;
@@ -1655,7 +1657,22 @@ import subprocess
 import time
 
 
+import os as _os
+
+
+def _bump_cpu():
+    """Advance the fixture cgroup's usage_usec by 2.5 ms, as a render would."""
+    path = _os.environ.get("TEST_CPU_STAT")
+    if not path or not _os.path.exists(path):
+        return
+    with open(path) as handle:
+        usage = int(handle.read().split()[1])
+    with open(path, "w") as handle:
+        handle.write(f"usage_usec {usage + 2500}\\nuser_usec 0\\nsystem_usec 0\\n")
+
+
 def drive(args):
+    _bump_cpu()
     env = os.environ
     if env.get("DRIVER_STARTED_FILE"):
         open(env["DRIVER_STARTED_FILE"], "w").close()
@@ -1803,6 +1820,14 @@ exec {real_date!r} "$@"
             RUNTIME_PAYLOAD=payload,
             WALL_CLOCK_STATE=wall_clock_state,
         )
+        scope = os.path.join(tmp, "cgroup", "fake-container.scope")
+        os.makedirs(scope)
+        with open(os.path.join(scope, "cpu.stat"), "w") as handle:
+            handle.write("usage_usec 1000000\nuser_usec 0\nsystem_usec 0\n")
+        with open(os.path.join(scope, "cgroup.procs"), "w") as handle:
+            handle.write("4242\n")
+        env.update(CGROUP_ROOT=os.path.join(tmp, "cgroup"),
+                   TEST_CPU_STAT=os.path.join(scope, "cpu.stat"))
         env.pop("CPUS", None)
         env.pop("CONTAINER_OWNER_TOKEN", None)
         env.update(overrides)

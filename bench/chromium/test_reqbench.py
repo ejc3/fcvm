@@ -570,10 +570,44 @@ class TeardownFastReapGuard(unittest.TestCase):
             out = reqbench.teardown_fast(p.pid, d, state, data, 5.0)
             p.wait(timeout=5)
             self.assertTrue(out["all_gone"])
+            self.assertEqual(set(out["reaped_children_cpu_ms_by_child"]),
+                             set(out["lifetime_cpu_ms_by_child"]))
             self.assertFalse(os.path.exists(state))
             self.assertFalse(os.path.exists(state + ".lock"), "the .json.lock must go too")
             self.assertFalse(os.path.isdir(data))
 
+
+    def test_a_reaped_helpers_cpu_is_recorded(self):
+        """RED BEFORE THE FIX: utime+stime at the kill missed a child that had
+        already run and been reaped, the shape of fcvm's cp/nsenter/ip setup
+        helpers. Here the pinned child burns CPU in a helper, reaps it, and
+        execs sleep; cutime survives the exec."""
+        burn = ("import time\nt = time.process_time()\n"
+                "while time.process_time() - t < 0.3: pass\n")
+        with tempfile.TemporaryDirectory() as d:
+            state = os.path.join(d, "vm-11111111111111111111111111111111.json")
+            data = os.path.join(d, "vm-disks", "vm-11111111111111111111111111111111")
+            with open(state, "w") as f:
+                json.dump({"vm_id": "vm-11111111111111111111111111111111"}, f)
+            with open(state + ".lock", "w") as f:
+                f.write("")
+            os.makedirs(data)
+            p = spawn_pdeathsig_parent(
+                ["bash", "-c", f"{sys.executable} -c '{burn}'; exec sleep 300"])
+            wait_for_child(p.pid)
+            deadline = time.monotonic() + 10
+            child = None
+            while time.monotonic() < deadline:
+                kids = open(f"/proc/{p.pid}/task/{p.pid}/children").read().split()
+                child = int(kids[0]) if kids else None
+                if child and reqbench.proc_comm(child) == "sleep":
+                    break
+                time.sleep(0.02)
+            self.assertEqual(reqbench.proc_comm(child), "sleep")
+            out = reqbench.teardown_fast(p.pid, d, state, data, 5.0)
+            p.wait(timeout=5)
+        self.assertGreaterEqual(out["reaped_children_cpu_ms_by_child"]["sleep"], 250.0)
+        self.assertLess(out["lifetime_cpu_ms_by_child"]["sleep"], 250.0)
 
     def test_failed_rmtree_aborts_the_run(self):
         """A reap that could not remove the data dir must STOP the schedule.
@@ -890,6 +924,11 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertIn("WsClosed", rec.get("error", ""))
             self.assertEqual(rec.get("failure_class"), "transport")
             self.assertEqual(rec.get("failure_stage"), "navigate")
+            # The request does not read the memory server. Its window is kept
+            # by main()'s loop (ServeWindows), which ends it only once the
+            # server has acknowledged the clone.
+            for key in ("serve_cpu_before", "serve_cpu_after"):
+                self.assertNotIn(key, rec)
 
     def test_cdp_response_waits_for_lifecycle_ready_before_fast_teardown(self):
         """A serving port is not yet permission to tear down clone setup."""
@@ -3818,6 +3857,885 @@ class AnalyzerAvailability(unittest.TestCase):
             )
             self.assertIn("below /proc tick resolution", text)
 
+    def _cpu_fixture(self, d, mutate=None, server=None):
+        """server: "windows" stamps tiled, acknowledged memory-server windows
+        on every request (30 ms for cdp-fast, 10 ms for the others),
+        "varying" does the same with cdp-fast windows of 10, 30, 50 ms and so
+        on, "file" marks every request file-backed, and None leaves no
+        samples."""
+        src = os.path.join(d, "r.jsonl")
+        dst = os.path.join(d, "r.json")
+        self._write_clean_backend(src, "uffd", 6, 372.0)
+        with open(src) as source:
+            rows = [json.loads(line) for line in source]
+        requests = [row for row in rows if row.get("kind") != "meta"]
+        if server in ("windows", "varying"):
+            ms = 1000.0
+            fast_seen = 0
+            for index, row in enumerate(requests):
+                before = {"applicable": True, "ms": ms, "starttime": 7}
+                if row["arm"] != "cdp-fast":
+                    ms += 10.0
+                elif server == "windows":
+                    ms += 30.0
+                else:
+                    ms += 10.0 + 20.0 * fast_seen
+                    fast_seen += 1
+                row["serve_cpu_before"] = before
+                row["serve_cpu_after"] = {"applicable": True, "ms": ms, "starttime": 7}
+                row["serve_ack"] = {"acknowledged": True, "vm_id": f"vm-{index}",
+                                    "worker": "merged", "wait_ms": 1.0}
+        elif server == "file":
+            for row in requests:
+                row["serve_cpu_before"] = {"applicable": False}
+                row["serve_cpu_after"] = {"applicable": False}
+        fast = [row for row in rows if row.get("arm") == "cdp-fast"]
+        measured = [row for row in fast if row.get("warmup") is False]
+        self.assertGreater(len(measured), 2)
+        for record in fast:
+            record["teardown"]["lifetime_cpu_ms_by_child"] = {
+                "fcvm": 40.0, "firecracker": 600.0, "pasta": 30.0}
+            record["teardown"]["reaped_children_cpu_ms_by_child"] = {
+                "fcvm": 5.0, "firecracker": 0.0, "pasta": 0.0}
+            record["teardown"]["per_child_cpu"] = {
+                "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
+                "pasta": {"reclaim_cpu_ms": 0.0, "complete": True},
+            }
+            record["teardown"]["tick_ms"] = 10.0
+        if mutate:
+            mutate(measured)
+        with open(src, "w") as target:
+            for row in rows:
+                target.write(json.dumps(row) + "\n")
+        printout = io.StringIO()
+        with redirect_stdout(printout):
+            self._run_gate_fixture(["--json-out", dst, src])
+        self.cpu_printout = printout.getvalue()
+        with open(dst) as result_file:
+            return json.load(result_file)["arms"]["cdp-fast"]["request_cpu_ms"], measured
+
+    def test_request_cpu_counts_reaped_helpers(self):
+        """RED BEFORE THE FIX: no reduction read the per-child CPU, and fcvm's
+        reaped setup helpers (cutime/cstime) were read nowhere. RED ON
+        defe392e: the memory server was attributed only in a single-arm run,
+        and a publishable schedule always has noop beside its CDP arm, so no
+        publishable UFFD run published the server figure or the total. With acknowledged
+        windows, the server's figure is the mean of the arm's windows."""
+        with tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, server="windows")
+        self.assertTrue(block["complete"])
+        self.assertEqual(block["clone_mean_ms"]["mean"], 670.0 + 5.0 + 110.0)
+        self.assertEqual(block["clone_mean_ms"]["n"], len(measured))
+        self.assertEqual(block["clone_parts_mean_ms"]["reaped_children"], 5.0)
+        self.assertEqual(block["records_with_lower_bound_reaping"], 0)
+        self.assertNotIn("clone_at_least_mean_ms", block)
+        server = block["memory_server"]
+        self.assertTrue(server.get("available"),
+                        f"four arms on one server withheld its figure: {server}")
+        self.assertEqual((server["mean_ms"], server["n"]), (30.0, len(measured)))
+        self.assertTrue(1 <= server["blocks"] <= len(measured))
+        bound = 40.0 * server["blocks"] / len(measured)
+        self.assertEqual(server["quantization_ms"], {"lo": -bound, "hi": bound})
+        self.assertEqual(block["total_mean_ms"]["mean"], 670.0 + 5.0 + 110.0 + 30.0)
+        self.assertEqual(block["total_quantization_ms"], {"lo": -bound, "hi": 120.0 + bound})
+
+    def test_the_totals_carry_the_memory_servers_sampling_error(self):
+        """RED ON 318a25e1: both totals added the memory server's point
+        estimate to the clone's figures. The server's windows vary from
+        request to request, so it has a sampling error of its own: the
+        at-least total's lower end left it out, and the complete total had
+        no interval. Each request's clone total is now paired with its own
+        server window and the sums are bootstrapped."""
+        def windows_of(measured):
+            return [r["serve_cpu_after"]["ms"] - r["serve_cpu_before"]["ms"] for r in measured]
+        with self.subTest("complete"), tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, server="varying")
+            windows = windows_of(measured)
+            self.assertGreater(len(set(windows)), 1, windows)
+            total = block["total_mean_ms"]
+            self.assertIsInstance(total, dict, f"the complete total carries no interval: {total!r}")
+            self.assertEqual((total["mean"], total["lo"], total["hi"], total["n"]),
+                             reqanalyze.mean_ci([670.0 + 5.0 + 110.0 + w for w in windows]))
+
+        def reaper_won(measured):
+            child = measured[1]["teardown"]["per_child_cpu"]["firecracker"]
+            child["reclaim_cpu_ms"] = 0.0
+            child["complete"] = False
+        with self.subTest("at least"), tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, reaper_won, server="varying")
+            clone = [670.0 + 5.0 + (0.0 if i == 1 else 110.0) for i in range(len(measured))]
+            m, lo, _hi, n = reqanalyze.mean_ci(
+                [c + w for c, w in zip(clone, windows_of(measured))])
+            q_lo = block["memory_server"]["quantization_ms"]["lo"]
+            t = block["total_at_least_mean_ms"]
+            self.assertEqual((t["at_least"], t["ci_lo"], t["n"]), (m + q_lo, lo + q_lo, n),
+                             "the at-least total's lower end left out the server's sampling error")
+
+    def test_a_lower_bound_reaping_publishes_only_at_least_figures(self):
+        """RED BEFORE THE FIX: a measured request whose child exited before
+        its terminal sample carries a reclaim that is only a lower bound,
+        possibly by all of it, and it was averaged into a mean marked
+        complete. Withholding every figure instead would publish nothing for
+        a real run, where most requests carry one. The complete figures stay
+        withheld and the means are published labelled as lower bounds."""
+        def reaper_won(complete):
+            def mutate(measured):
+                # Its last reading was the one taken at the kill.
+                child = measured[1]["teardown"]["per_child_cpu"]["firecracker"]
+                child["reclaim_cpu_ms"] = 0.0
+                child["complete"] = complete
+            return mutate
+        with tempfile.TemporaryDirectory() as d:
+            as_complete, _ = self._cpu_fixture(d, reaper_won(True))
+        with tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, reaper_won(False))
+        printout = self.cpu_printout
+        self.assertFalse(block["complete"],
+                         "a lower-bound reaping was averaged into a complete mean")
+        self.assertEqual(block["missing_records"], 0)
+        self.assertEqual(block["records_with_lower_bound_reaping"], 1)
+        self.assertIn("1 measured requests with a lower-bound reaping",
+                      block["withheld_because"])
+        for figure in ("clone_mean_ms", "clone_median_ms", "clone_parts_mean_ms",
+                       "by_child_at_kill_mean_ms", "total_mean_ms", "total_quantization_ms"):
+            self.assertNotIn(figure, block)
+        self.assertIn("clone_at_least_mean_ms", block,
+                      "a lower-bound reaping withheld the at-least figures too")
+        at_least = block["clone_at_least_mean_ms"]
+        self.assertEqual(sorted(at_least),
+                         ["at_least", "ci_lo", "n", "provenance", "quantization_ms"])
+        self.assertLessEqual(at_least["at_least"], as_complete["clone_mean_ms"]["mean"],
+                             "the at-least mean left out the lower-bound reading")
+        self.assertLessEqual(at_least["ci_lo"], as_complete["clone_mean_ms"]["lo"])
+        self.assertEqual(at_least["n"], len(measured))
+        self.assertEqual(at_least["quantization_ms"],
+                         as_complete["clone_mean_ms"]["quantization_ms"])
+        self.assertRegex(printout, r"clone AT LEAST .* LOWER BOUND")
+        self.assertNotIn("clone mean ", printout)
+        # No request carries a memory-server sample, so there is no total.
+        self.assertFalse(block["memory_server"]["available"])
+        self.assertNotIn("total_at_least_mean_ms", block)
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, reaper_won(False), server="file")
+        self.assertEqual(block["total_at_least_mean_ms"]["at_least"],
+                         block["clone_at_least_mean_ms"]["at_least"])
+        self.assertEqual(block["total_at_least_mean_ms"]["quantization_ms"],
+                         {"lo": 0.0, "hi": 120.0})
+        self.assertRegex(self.cpu_printout, r"total AT LEAST .* LOWER BOUND")
+
+    def test_one_incomplete_request_withholds_every_cpu_figure(self):
+        """RED BEFORE THE FIX: a request without a reading was dropped and
+        the rest published under a smaller n. A missing reading bounds
+        nothing, so no at-least figure is published either."""
+        def drop(measured):
+            del measured[0]["teardown"]["reaped_children_cpu_ms_by_child"]
+
+        def drop_and_reaper_won(measured):
+            drop(measured)
+            measured[1]["teardown"]["per_child_cpu"]["firecracker"]["complete"] = False
+        for mutate in (drop, drop_and_reaper_won):
+            with self.subTest(mutate.__name__), tempfile.TemporaryDirectory() as d:
+                block, _ = self._cpu_fixture(d, mutate)
+                self.assertFalse(block["complete"])
+                self.assertEqual(block["missing_records"], 1)
+                for figure in ("clone_mean_ms", "clone_at_least_mean_ms", "memory_server",
+                               "total_mean_ms", "total_at_least_mean_ms"):
+                    self.assertNotIn(figure, block)
+
+    def test_request_cpu_carries_the_proc_tick_quantization(self):
+        """RED BEFORE THE FIX: every part of the clone figure is a sum of
+        /proc counters truncated to the tick, and only a bootstrap CI was
+        published, so a mean read in 10 ms steps claimed precision below
+        them. Each of the three children's final utime+stime and its reaped
+        cutime+cstime are two truncated counters, so each record reads up to
+        6 x 2 x 10 ms low. A file-backed run has no memory server, so the
+        total carries the clone's bound alone."""
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d)
+        self.assertEqual(block["clone_mean_ms"]["quantization_ms"],
+                         {"lo": 0.0, "hi": 120.0, "tick_ms": 10.0})
+        self.assertNotIn("total_quantization_ms", block)
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, server="file")
+        self.assertEqual(block["memory_server"]["quantization_ms"], {"lo": 0.0, "hi": 0.0})
+        self.assertEqual(block["total_quantization_ms"], {"lo": 0.0, "hi": 120.0})
+
+    def test_a_request_without_its_tick_withholds_every_cpu_figure(self):
+        """Without the tick the readings' quantization cannot be stated."""
+        def drop(measured):
+            del measured[0]["teardown"]["tick_ms"]
+        with tempfile.TemporaryDirectory() as d:
+            block, _ = self._cpu_fixture(d, drop)
+        self.assertFalse(block["complete"])
+        self.assertNotIn("clone_mean_ms", block)
+
+    def test_a_malformed_cpu_value_counts_as_an_incomplete_reading(self):
+        """RED BEFORE THE FIX: the CPU maps were summed unchecked, so a
+        string raised TypeError out of the analyzer, and a negative or
+        boolean value published a lowered mean marked complete. A value that
+        is not a finite non-negative number is no reading, and one request
+        holding one withholds every figure."""
+        def set_value(key, child, value):
+            def mutate(measured):
+                measured[0]["teardown"][key][child] = value
+            return mutate
+
+        def set_reclaim(measured):
+            measured[0]["teardown"]["per_child_cpu"]["pasta"]["reclaim_cpu_ms"] = -50.0
+        for label, mutate in (
+                ("string at the kill", set_value("lifetime_cpu_ms_by_child", "firecracker", "600")),
+                ("negative reaped", set_value("reaped_children_cpu_ms_by_child", "fcvm", -500.0)),
+                ("boolean at the kill", set_value("lifetime_cpu_ms_by_child", "fcvm", True)),
+                ("negative reclaim", set_reclaim),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                block, _ = self._cpu_fixture(d, mutate)
+                self.assertFalse(block["complete"], "a malformed value was averaged in")
+                self.assertEqual(block["missing_records"], 1)
+                for figure in ("clone_mean_ms", "clone_at_least_mean_ms", "total_mean_ms"):
+                    self.assertNotIn(figure, block)
+
+
+
+class ServeCpuSample(unittest.TestCase):
+    """The memory server's cumulative CPU, its own and its reaped children's."""
+
+    def test_a_live_server_reads_all_four_counters(self):
+        ticks = reqbench.proc_cpu_ticks(os.getpid())
+        got = reqbench.serve_cpu_sample(os.getpid())
+        self.assertEqual(got["starttime"], ticks[4])
+        self.assertGreaterEqual(got["ms"], sum(ticks[:4]) * 1000.0 / reqbench.CLK_TCK)
+
+    def test_a_server_that_is_gone_is_an_error_not_zero(self):
+        p = subprocess.Popen(["true"])
+        p.wait()
+        got = reqbench.serve_cpu_sample(p.pid)
+        self.assertNotIn("ms", got)
+        self.assertIn("not readable", got["error"])
+
+    def test_a_file_backed_restore_has_no_server(self):
+        self.assertEqual(reqbench.serve_cpu_sample(0), {"applicable": False})
+
+
+class MemoryServerAverage(unittest.TestCase):
+    """The memory server's CPU per request, from per-request windows."""
+
+    @staticmethod
+    def schedule(windows, warmup=1, starttime=7, start_ms=100.0):
+        """Records in schedule order, one per (arm, window_ms), carrying
+        tiled, acknowledged memory-server windows; the first `warmup` are
+        warmups."""
+        recs, ms = [], start_ms
+        for index, (arm, window) in enumerate(windows):
+            before = {"applicable": True, "ms": ms, "starttime": starttime}
+            ms += window
+            recs.append({"arm": arm, "rep": index, "warmup": index < warmup,
+                         "serve_cpu_before": before,
+                         "serve_cpu_after": {"applicable": True, "ms": ms,
+                                             "starttime": starttime},
+                         "serve_ack": {"acknowledged": True, "vm_id": f"vm-{index}",
+                                       "worker": "merged", "wait_ms": 1.0}})
+        return recs
+
+    @staticmethod
+    def measured(recs, arm="cdp-fast"):
+        return [r for r in recs if r["arm"] == arm and not r["warmup"]]
+
+    def single_arm(self, windows):
+        """A warmup, then one measured cdp-fast request per window."""
+        return self.schedule([("cdp-fast", 5.0)] + [("cdp-fast", w) for w in windows])
+
+    def test_a_decreasing_server_counter_is_a_failed_reading(self):
+        """RED BEFORE THE FIX (defe392e): the samples were checked one by
+        one but not for order, so a reading below the one before it, with
+        the same starttime, gave negative growth that was reported as the
+        server's CPU and subtracted from the total. The counter only rises,
+        so a decrease is a failed reading."""
+        recs = self.single_arm([10.0, -10.0, 30.0])
+        got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+        self.assertFalse(got["available"], f"a decreasing counter was attributed: {got}")
+        self.assertEqual(got["reason"], "a memory-server sample decreased")
+
+    def test_interleaved_arms_with_acknowledged_windows_are_attributed(self):
+        """Every publishable schedule has noop beside its CDP arm, and the
+        figure used to be withheld from any UFFD run with a second arm
+        (test_request_cpu_counts_reaped_helpers drives that end to end).
+        Each acknowledged window holds its own request's server work to
+        within one tick, so the arm's figure is the mean of its windows. The truncation bound
+        counts one pair of end samples per run of the arm's consecutive
+        windows: here three runs over four requests."""
+        recs = self.schedule([
+            ("noop", 7.0), ("cdp-fast", 41.0),
+            ("cdp-fast", 30.0), ("noop", 10.0), ("cdp-fast", 34.0),
+            ("cdp-fast", 26.0), ("noop", 12.0), ("noop", 9.0), ("cdp-fast", 38.0),
+        ], warmup=2)
+        got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+        self.assertTrue(got["available"], got)
+        self.assertEqual(got["mean_ms"], (30.0 + 34.0 + 26.0 + 38.0) / 4)
+        self.assertEqual((got["n"], got["blocks"]), (4, 3))
+        self.assertEqual(got["quantization_ms"], {"lo": -30.0, "hi": 30.0})
+        self.assertLessEqual(got["lo"], got["mean_ms"])
+        self.assertGreaterEqual(got["hi"], got["mean_ms"])
+        single = self.single_arm([10.0, 20.0, 30.0])
+        got = reqanalyze.memory_server_average(single, self.measured(single), 10.0)
+        self.assertEqual((got["mean_ms"], got["blocks"]), (20.0, 1))
+        self.assertEqual(got["quantization_ms"], {"lo": -40.0 / 3, "hi": 40.0 / 3})
+
+    def test_a_window_the_record_cannot_prove_exclusive_is_not_attributed(self):
+        """A window holds its request's server work, to within one tick,
+        when every window was acknowledged, the windows tile the run, and
+        the first window, which also holds the server's start-up work, is a
+        warmup's."""
+        def unacknowledged_warmup(recs):
+            recs[0]["serve_ack"] = {
+                "acknowledged": False,
+                "reason": "timed out after 30 s waiting for vm-0 to disconnect",
+                "wait_ms": 30000.0}
+
+        def no_acknowledgement(recs):
+            del recs[3]["serve_ack"]
+
+        def a_gap_between_windows(recs):
+            recs[2]["serve_cpu_before"] = dict(
+                recs[2]["serve_cpu_before"], ms=recs[2]["serve_cpu_before"]["ms"] + 5.0)
+
+        def a_measured_first_window(recs):
+            recs[0]["warmup"] = False
+        for mutate, reason in (
+                (unacknowledged_warmup,
+                 "request cdp-fast:0 was not acknowledged by the memory server: "
+                 "timed out after 30 s waiting for vm-0 to disconnect"),
+                (no_acknowledgement,
+                 "request cdp-fast:3 was not acknowledged by the memory server: "
+                 "no acknowledgement recorded"),
+                (a_gap_between_windows, "the memory-server windows do not tile the schedule"),
+                (a_measured_first_window,
+                 "the first request's window holds the memory server's start-up work"),
+        ):
+            with self.subTest(mutate.__name__):
+                recs = self.single_arm([10.0, 20.0, 30.0])
+                mutate(recs)
+                got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+                self.assertFalse(got["available"], got)
+                self.assertEqual(got["reason"], reason)
+
+    def test_a_restarted_server_is_not_attributed(self):
+        recs = self.single_arm([10.0, 20.0])
+        recs[2]["serve_cpu_after"]["starttime"] = 8
+        got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+        self.assertFalse(got["available"])
+        self.assertIn("restarted", got["reason"])
+
+    def test_a_missing_sample_is_not_attributed(self):
+        recs = self.single_arm([10.0, 20.0])
+        recs[1]["serve_cpu_before"] = {"applicable": True, "error": "memory server not readable"}
+        got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+        self.assertFalse(got["available"])
+
+    def test_a_file_backed_run_has_no_server_cost(self):
+        recs = [{"arm": arm, "rep": 0, "warmup": False,
+                 "serve_cpu_before": {"applicable": False},
+                 "serve_cpu_after": {"applicable": False}} for arm in ("noop", "cdp-fast")]
+        got = reqanalyze.memory_server_average(recs, recs[1:], 10.0)
+        self.assertEqual((got["available"], got["mean_ms"]), (True, 0.0))
+
+    def test_a_malformed_server_sample_is_not_attributed(self):
+        """RED BEFORE THE FIX: a sample without a starttime raised KeyError,
+        a string ms raised TypeError, and a negative or boolean ms entered
+        the growth and lowered the mean. A sample whose ms is not a finite
+        non-negative number, or whose starttime is not an integer, failed."""
+        for label, sample in (
+                ("no ms or starttime", {"applicable": True}),
+                ("string ms", {"applicable": True, "ms": "130", "starttime": 7}),
+                ("negative ms", {"applicable": True, "ms": -5.0, "starttime": 7}),
+                ("boolean ms", {"applicable": True, "ms": True, "starttime": 7}),
+                ("float starttime", {"applicable": True, "ms": 130.0, "starttime": 7.0}),
+        ):
+            with self.subTest(label):
+                recs = self.single_arm([5.0, 5.0, 10.0])
+                recs[-1]["serve_cpu_after"] = sample
+                got = reqanalyze.memory_server_average(recs, self.measured(recs), 10.0)
+                self.assertFalse(got["available"], got)
+                self.assertEqual(got["reason"], "a memory-server sample failed")
+
+
+class ServeAckVerdict(unittest.TestCase):
+    """reqbench.serve_ack_verdict over one request's serve log lines."""
+
+    MESSAGES = {
+        "connect": ("INFO", "new VM connection"),
+        "handler": ("INFO", "page fault handler started"),
+        "disconnect": ("INFO", "VM disconnected"),
+        "merged": ("INFO", "merged this clone's faults into the snapshot's working set"),
+        "failed": ("WARN", "could not persist the working set; restore remains demand-page safe"),
+        "unavailable": ("WARN", "working-set persistence worker is unavailable; "
+                                "restore remains demand-page safe"),
+    }
+    QUIET = frozenset({"fcvm", "tokio-runtime-w", "fcvm-ws-write"})
+
+    def lines(self, *steps, vm_id="vm-3"):
+        """Serve log lines in fcvm's format, one per step, all for vm_id."""
+        out = []
+        for step in steps:
+            level, message = self.MESSAGES[step]
+            out.append(f"2026-10-08T00:00:00.000000Z  {level} uffd: {message} "
+                       f"vm_id={vm_id} peer_pid=4242")
+        return out
+
+    def test_the_window_stays_open_until_every_step_is_seen(self):
+        acked = {"acknowledged": True, "vm_id": "vm-3", "worker": "merged"}
+        whole = self.lines("connect", "handler", "disconnect", "merged")
+        cases = (
+            ("the clone has not disconnected", self.lines("connect", "handler"), True,
+             self.QUIET, "vm-3 to disconnect"),
+            ("the worker has not logged", self.lines("connect", "handler", "disconnect"), True,
+             self.QUIET, "fcvm-ws-write to publish vm-3's working set"),
+            ("the admission warm-up is running", whole, True, self.QUIET | {"fcvm-ws-warm"},
+             "the memory server's fcvm-ws-warm thread to exit"),
+            ("the hole map is being built", whole, True, self.QUIET | {"fcvm-holes"},
+             "the memory server's fcvm-holes thread to exit"),
+            ("everything is done", whole, True, self.QUIET, acked),
+            ("another clone's publication", self.lines("connect", "handler", "disconnect")
+             + self.lines("merged", vm_id="vm-30"), True, self.QUIET,
+             "fcvm-ws-write to publish vm-3's working set"),
+            ("prefetch off schedules no publication",
+             self.lines("connect", "handler", "disconnect"), False, self.QUIET,
+             dict(acked, worker=None)),
+            ("a failed handshake starts no handler, so schedules no publication",
+             self.lines("connect", "disconnect"), True, self.QUIET, dict(acked, worker=None)),
+            ("a failed publication was declined",
+             self.lines("connect", "handler", "disconnect", "failed"), True, self.QUIET,
+             dict(acked, worker="failed")),
+            ("an unavailable worker declined it",
+             self.lines("connect", "handler", "disconnect", "unavailable"), True, self.QUIET,
+             dict(acked, worker="unavailable")),
+            ("no clone connected", [], True, self.QUIET,
+             {"acknowledged": False,
+              "reason": "0 clones connected to the memory server during this request"}),
+            ("two clones connected", whole + self.lines("connect", vm_id="vm-4"), True,
+             self.QUIET,
+             {"acknowledged": False,
+              "reason": "2 clones connected to the memory server during this request"}),
+            ("the server's threads cannot be read", whole, True, None,
+             {"acknowledged": False, "reason": "the memory server's threads are not readable"}),
+        )
+        for label, lines, prefetch, tasks, want in cases:
+            with self.subTest(label):
+                self.assertEqual(reqbench.serve_ack_verdict(lines, prefetch, tasks), want)
+
+
+class ServeAcknowledgement(unittest.TestCase):
+    """Each request's memory-server window ends once the server has
+    acknowledged the work its clone left it (reqbench.ServeWindows).
+
+    These drive the real main() over a UFFD noop,cdp-fast schedule. The
+    fixture server does 20 ms of CPU while a clone runs and 30 ms more for
+    it after the clone's teardown returns, when its working-set worker
+    finishes four polls later; the clone's admission warm-up thread runs
+    for its first two polls.
+    """
+
+    SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
+    SEED = 7
+
+    class FakeServer:
+        def __init__(self, log_path, prefetch=True, publish=True, on_poll=None):
+            self.log_path = log_path
+            self.ms = 100.0
+            self.served = 0
+            self.pending = []
+            self.warm_polls = 0
+            self.publish = publish
+            self.on_poll = on_poll
+            with open(log_path, "w") as log:
+                log.write(f"Serving snapshot: {ServeAcknowledgement.SNAPSHOT}\n"
+                          f"  Serve PID: {os.getpid()}\n")
+                log.write(json.dumps({
+                    "status": "serving", "snapshot": ServeAcknowledgement.SNAPSHOT,
+                    "serve_pid": os.getpid(), "socket": "/tmp/uffd-fixture.sock",
+                    "uffd_mode": "copy", "prefetch": prefetch,
+                    "working_set_pages": 16, "working_set_bytes": 65536}) + "\n")
+            self.emit("UFFD server listening, waiting for VM connections...")
+
+        def emit(self, message, vm_id=None):
+            fields = f" vm_id={vm_id} peer_pid=4242" if vm_id else ""
+            with open(self.log_path, "a") as log:
+                log.write(f"2026-10-08T00:00:00.000000Z  INFO uffd: {message}{fields}\n")
+
+        def serve_clone(self):
+            """What one request's clone does to the server, up to its teardown."""
+            vm_id = f"vm-{self.served}"
+            self.served += 1
+            self.warm_polls = 2
+            self.emit("new VM connection", vm_id)
+            self.emit("page fault handler started", vm_id)
+            self.ms += 20.0
+            self.emit("VM disconnected", vm_id)
+            self.emit("VM exited active_vms=0")
+            if self.publish:
+                self.pending.append([4, vm_id])
+
+        def task_names(self, _pid):
+            """One poll: the detached work advances, then the threads are listed."""
+            if self.on_poll is not None:
+                self.on_poll(self)
+            for job in list(self.pending):
+                job[0] -= 1
+                if job[0] == 0:
+                    self.ms += 30.0
+                    self.emit("merged this clone's faults into the snapshot's working set",
+                              job[1])
+                    self.pending.remove(job)
+            names = {"fcvm", "tokio-runtime-w", "fcvm-ws-write"}
+            if self.warm_polls:
+                self.warm_polls -= 1
+                names.add("fcvm-ws-warm")
+            return names
+
+        def sample(self, _pid):
+            return {"applicable": True, "ms": self.ms, "starttime": 7}
+
+    def expected_schedule(self):
+        rng = random.Random(self.SEED)
+        schedule = []
+        for rep in range(3):
+            order = ["noop", "cdp-fast"]
+            rng.shuffle(order)
+            schedule.extend((arm, rep) for arm in order)
+        return schedule
+
+    def _drive_main(self, data_root, server=None, on_request=None, extra_patches=None):
+        """main() over noop,cdp-fast, one warmup and two measured reps,
+        against `server`, or file-backed when it is None. Returns (main's
+        return code, or the HarnessInterrupted it raised; the request rows)."""
+        SnapshotGenerationIdentity._write_generation(
+            data_root, "33333333-3333-4333-8333-333333333333",
+        )
+        # serve_uffd_mode needs a live process with a serve state record;
+        # this test process stands in for the server.
+        state_dir = os.path.join(data_root, "state")
+        os.makedirs(state_dir)
+        with open(os.path.join(state_dir, "vm-serve.json"), "w") as target:
+            json.dump({"pid": os.getpid(),
+                       "pid_start_time": reqbench.proc_stat_fields(os.getpid())[3],
+                       "config": {"process_type": "serve", "snapshot_name": self.SNAPSHOT,
+                                  "uffd_mode": "copy"}}, target)
+        runtime_bundle = os.path.join(data_root, "runtime")
+        os.makedirs(runtime_bundle)
+        manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+        with open(manifest_path, "w") as target:
+            target.write("sealed runtime fixture\n")
+        fcvm = os.path.join(runtime_bundle, "fcvm")
+        with open(fcvm, "w") as target:
+            target.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fcvm, 0o755)
+        exact_hashes = {
+            os.path.realpath(fcvm): "c" * 64,
+            os.path.realpath(manifest_path): "d" * 64,
+        }
+        calls = []
+
+        def request(arm, rep):
+            if server is not None:
+                server.serve_clone()
+            calls.append((arm, rep))
+            if on_request is not None:
+                on_request(len(calls))
+            return {"arm": arm, "rep": rep, "ok": True,
+                    "blocking_ms": 1.0, "wall_ms": 1.0, "teardown": {}}
+
+        patched = {
+            "HERE": runtime_bundle,
+            "run_noop_request": lambda _args, rep: request("noop", rep),
+            "run_cdp_request": lambda _args, rep, fast, probe=None: request(
+                "cdp-fast" if fast else "cdp", rep),
+            "sha256_file": lambda path: exact_hashes[os.path.realpath(path)],
+            "harness_sha256": lambda: "f" * 64,
+            "command_text": lambda _argv: "fcvm fixture",
+            "_pending_harness_signal": 0,
+            "SERVE_ACK_POLL_S": 0.0,
+        }
+        if server is not None:
+            patched.update(serve_cpu_sample=server.sample, serve_task_names=server.task_names)
+        patched.update(extra_patches or {})
+        saved = {name: getattr(reqbench, name) for name in patched if hasattr(reqbench, name)}
+        saved_argv = sys.argv
+        saved_signals = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        env_updates = {
+            "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+            "REQBENCH_SOURCE_REVISION": "e" * 40,
+            "REQBENCH_GUARD_LOADAVG1": "0.1",
+            "REQBENCH_GUARD_VM_PROCESSES": "0",
+            "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+            "REQBENCH_QUIET_GUARD": "1",
+            "ALLOW_BUSY": "0",
+        }
+        saved_env = {key: os.environ.get(key) for key in env_updates}
+        out_dir = os.path.join(data_root, "results")
+        backend = (["--serve-pid", str(os.getpid()), "--serve-log", server.log_path]
+                   if server is not None else ["--snapshot-tag", self.SNAPSHOT])
+        try:
+            os.environ.update(env_updates)
+            for name, value in patched.items():
+                setattr(reqbench, name, value)
+            sys.argv = ["reqbench.py"] + backend + [
+                "--snapshot-name", self.SNAPSHOT,
+                "--url", "http://fixture/medium.html",
+                "--arms", "noop,cdp-fast",
+                "--reps", "2",
+                "--warmup", "1",
+                "--seed", str(self.SEED),
+                "--image", "localhost/chromium-bench-req",
+                "--image-id", "sha256:" + "b" * 64,
+                "--network-mode", "rootless",
+                "--cpu", "2",
+                "--memory-mib", "1024",
+                "--fcvm", fcvm,
+                "--data-root", data_root,
+                "--out-dir", out_dir,
+                "--run-id", "3" * 32,
+            ]
+            try:
+                with redirect_stdout(io.StringIO()):
+                    outcome = reqbench.main()
+            except reqbench.HarnessInterrupted as interrupted:
+                outcome = interrupted
+        finally:
+            for name in patched:
+                if name in saved:
+                    setattr(reqbench, name, saved[name])
+                else:
+                    delattr(reqbench, name)
+            sys.argv = saved_argv
+            for signum, handler in saved_signals.items():
+                signal.signal(signum, handler)
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+            rows = [json.loads(line) for line in source]
+        self.assertEqual([row.get("kind") for row in rows[:1]], ["meta"])
+        self.assertEqual([(row["arm"], row["rep"]) for row in rows[1:]], calls)
+        return outcome, rows[1:]
+
+    def test_each_window_ends_after_the_work_its_clone_left_the_server(self):
+        """RED BEFORE THE FIX (defe392e): a request's window ended at its
+        teardown, and the server work its clone left (working-set
+        publication on the detached fcvm-ws-write thread) fell into the next
+        request's window, or for the last request into a final sample that
+        only waited for the counter to stop rising for 200 ms. Each window
+        now ends after the server's acknowledgement, holds the 20 ms the
+        server did during the request and the 30 ms after it, and ends at
+        the sample that starts the next."""
+        with tempfile.TemporaryDirectory() as d:
+            server = self.FakeServer(os.path.join(d, "serve.log"))
+            outcome, rows = self._drive_main(d, server)
+        self.assertEqual(outcome, 0)
+        self.assertEqual([(row["arm"], row["rep"]) for row in rows], self.expected_schedule())
+        self.assertEqual(rows[0]["serve_cpu_before"]["ms"], 100.0)
+        for index, row in enumerate(rows):
+            with self.subTest(request=index):
+                ack = row.get("serve_ack")
+                self.assertIsInstance(ack, dict, f"request {index} has no acknowledgement: {row}")
+                self.assertIs(ack["acknowledged"], True, ack)
+                self.assertEqual(
+                    row["serve_cpu_after"]["ms"] - row["serve_cpu_before"]["ms"], 50.0,
+                    "the window left out the work the server did for this clone "
+                    "after its teardown")
+                self.assertEqual((ack["vm_id"], ack["worker"]), (f"vm-{index}", "merged"))
+        for earlier, later in zip(rows, rows[1:]):
+            self.assertEqual(earlier["serve_cpu_after"], later["serve_cpu_before"],
+                             "the windows do not tile the run")
+        measured = [row for row in rows if row["arm"] == "cdp-fast" and not row["warmup"]]
+        got = reqanalyze.memory_server_average(rows, measured, 10.0)
+        self.assertEqual((got["available"], got["mean_ms"]), (True, 50.0), got)
+
+    def test_a_missing_acknowledgement_fails_closed_without_stalling_the_run(self):
+        """A clone whose publication is never logged ends its window at the
+        timeout with the reason. Every later request records that an earlier
+        one was not acknowledged without waiting again, and the analyzer
+        names the first."""
+        with tempfile.TemporaryDirectory() as d:
+            server = self.FakeServer(os.path.join(d, "serve.log"), publish=False)
+            outcome, rows = self._drive_main(
+                d, server, extra_patches={"SERVE_ACK_TIMEOUT_S": 0.05})
+        self.assertEqual(outcome, 0)
+        first = rows[0]["serve_ack"]
+        self.assertIs(first["acknowledged"], False)
+        self.assertEqual(first["reason"], "timed out after 0.05 s waiting for fcvm-ws-write "
+                                          "to publish vm-0's working set")
+        self.assertGreaterEqual(first["wait_ms"], 50.0)
+        for row in rows[1:]:
+            ack = row["serve_ack"]
+            self.assertIs(ack["acknowledged"], False)
+            self.assertEqual(ack["reason"],
+                             f"an earlier request was not acknowledged: {first['reason']}")
+            self.assertLess(ack["wait_ms"], 50.0, "a later request waited for its own timeout")
+        measured = [row for row in rows if row["arm"] == "cdp-fast" and not row["warmup"]]
+        got = reqanalyze.memory_server_average(rows, measured, 10.0)
+        self.assertFalse(got["available"])
+        self.assertEqual(got["reason"],
+                         f"request {rows[0]['arm']}:0 was not acknowledged by the memory "
+                         f"server: {first['reason']}")
+
+    def test_a_signal_during_the_last_wait_propagates_after_the_record(self):
+        """RED BEFORE THE FIX (defe392e): a pending INT or TERM was checked
+        only at the top of the loop, so one that arrived during the last
+        request's server wait, or after that request's own check, ended the
+        loop and main() returned 0, and the run counted as complete. The
+        last record is written and HarnessInterrupted then propagates."""
+        def signal_on_the_last_request(count):
+            if count == len(self.expected_schedule()):
+                reqbench._pending_harness_signal = signal.SIGTERM
+
+        def signal_while_the_last_request_waits(server):
+            if server.served == len(self.expected_schedule()):
+                reqbench._pending_harness_signal = signal.SIGTERM
+        with self.subTest("file-backed: a signal after the last request's own check"), \
+                tempfile.TemporaryDirectory() as d:
+            outcome, rows = self._drive_main(d, on_request=signal_on_the_last_request)
+            self.assertIsInstance(outcome, reqbench.HarnessInterrupted,
+                                  f"a cancelled run returned {outcome!r}")
+            self.assertEqual([(row["arm"], row["rep"]) for row in rows], self.expected_schedule())
+        with self.subTest("UFFD: a signal during the last acknowledgement wait"), \
+                tempfile.TemporaryDirectory() as d:
+            server = self.FakeServer(os.path.join(d, "serve.log"),
+                                     on_poll=signal_while_the_last_request_waits)
+            outcome, rows = self._drive_main(d, server)
+            self.assertIsInstance(outcome, reqbench.HarnessInterrupted,
+                                  f"a cancelled run returned {outcome!r}")
+            self.assertEqual([(row["arm"], row["rep"]) for row in rows], self.expected_schedule())
+            self.assertEqual(rows[-1]["serve_ack"]["reason"], "interrupted")
+            self.assertIs(rows[-2]["serve_ack"]["acknowledged"], True)
+
+    def test_a_serve_log_that_cannot_acknowledge_is_refused_or_disabled(self):
+        def write(path, *lines):
+            with open(path, "w") as log:
+                log.write("".join(line + "\n" for line in lines))
+
+        def ready(pid, prefetch=True):
+            return json.dumps({"status": "serving", "serve_pid": pid, "prefetch": prefetch})
+        with tempfile.TemporaryDirectory() as d:
+            log = os.path.join(d, "serve.log")
+            with self.subTest("another serve's log"):
+                write(log, ready(os.getpid() + 1))
+                with self.assertRaisesRegex(RuntimeError, "names serve PID"):
+                    reqbench.ServeWindows(os.getpid(), log)
+            with self.subTest("no ready record"):
+                write(log, "Serving snapshot: x")
+                saved = reqbench.SERVE_READY_TIMEOUT_S
+                reqbench.SERVE_READY_TIMEOUT_S = 0.05
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "no serve ready record"):
+                        reqbench.ServeWindows(os.getpid(), log)
+                finally:
+                    reqbench.SERVE_READY_TIMEOUT_S = saved
+            with self.subTest("prefetch on, but the server publishes nothing"):
+                write(log,
+                      "2026-10-08T00:00:00.000000Z  WARN uffd: working-set persistence is "
+                      "unavailable; loaded hints remain usable snapshot=x",
+                      ready(os.getpid()))
+                windows = reqbench.ServeWindows(os.getpid(), log)
+                try:
+                    ack = windows.close()
+                finally:
+                    windows.log.close()
+                self.assertIs(ack["acknowledged"], False)
+                self.assertIn("working-set persistence is unavailable", ack["reason"])
+                self.assertLess(ack["wait_ms"], 1000.0, "a disabled window waited")
+
+
+class ServeAcknowledgementSourcePin(unittest.TestCase):
+    """The acknowledgement reads fcvm's log text, which carries no field
+    contract, so a rename in fcvm must fail here before a run withholds the
+    server figure.
+
+    Each message reqbench.py matches must be the literal message of an info,
+    warn or error event on the uffd target (debug and trace are not logged
+    at the serve's uffd=info), with a Display-formatted vm_id where the
+    parser reads one. The server's named threads must be exactly the
+    detached ones the acknowledgement waits for plus fcvm-ws-write, every
+    thread it spawns outside tests must be named, and reqbench.sh must run
+    the serve at uffd=info.
+    """
+
+    REPO = os.path.dirname(os.path.dirname(HERE))
+    LEVELS = ("trace", "debug", "info", "warn", "error")
+
+    def source(self, rel):
+        """A src file up to its test module."""
+        with open(os.path.join(self.REPO, rel)) as source:
+            text = source.read()
+        found = re.search(r"#\[cfg\(test\)\]\s*mod tests\s*\{", text)
+        return text[:found.start()] if found else text
+
+    @classmethod
+    def events(cls, text):
+        """(level, body) of every tracing event macro call in text."""
+        events = []
+        for found in re.finditer(r"\b(" + "|".join(cls.LEVELS) + r")!\(", text):
+            depth, index, in_string = 0, found.end() - 1, False
+            while True:
+                char = text[index]
+                if in_string:
+                    if char == "\\":
+                        index += 1
+                    elif char == '"':
+                        in_string = False
+                elif char == '"':
+                    in_string = True
+                elif char == "(":
+                    depth += 1
+                elif char == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                index += 1
+            events.append((found.group(1), text[found.end():index]))
+        return events
+
+    def test_serve_acknowledgement_reads_messages_the_fcvm_source_prints(self):
+        events = [event for rel in ("src/uffd/server.rs", "src/uffd/working_set.rs",
+                                    "src/uffd/warmup.rs")
+                  for event in self.events(self.source(rel))]
+        read = ([("new VM connection", True), ("VM disconnected", True),
+                 ("page fault handler started", True)]
+                + [(message, True) for _outcome, message in reqbench.SERVE_WORKER_OUTCOMES]
+                + [(message, False) for message in reqbench.SERVE_PERSISTENCE_DISABLED])
+        for message, carries_vm_id in read:
+            with self.subTest(message):
+                matching = [(level, body) for level, body in events if f'"{message}' in body]
+                self.assertTrue(matching, f"no fcvm event logs {message!r}")
+                for level, body in matching:
+                    self.assertIn(level, ("info", "warn", "error"),
+                                  f"{message!r} is logged at {level}, below the serve's uffd=info")
+                    self.assertIn('target: "uffd"', body, message)
+                    if carries_vm_id:
+                        self.assertRegex(body, r"\bvm_id = %", message)
+
+    def test_the_server_threads_are_the_ones_the_acknowledgement_knows(self):
+        uffd = os.path.join(self.REPO, "src", "uffd")
+        text = "".join(self.source(os.path.join("src", "uffd", name))
+                       for name in sorted(os.listdir(uffd)) if name.endswith(".rs"))
+        builders = len(re.findall(r"thread::Builder::new\(\)", text))
+        names = re.findall(r'thread::Builder::new\(\)\s*\.name\(\s*"([^"]+)"', text)
+        self.assertEqual(len(names), builders, "a server thread is spawned without a literal name")
+        self.assertNotRegex(text, r"thread::spawn\(",
+                            "an unnamed server thread would carry its parent's name")
+        self.assertEqual(set(names), reqbench.SERVE_DETACHED_THREADS | {"fcvm-ws-write"})
+        for name in names:
+            self.assertLessEqual(len(name), 15, f"/proc comm truncates {name!r}")
+        ready = self.source("src/commands/snapshot.rs").split("fn serve_ready_record(", 1)[1]
+        ready = ready.split("\n}\n", 1)[0]
+        for field in ('"status": "serving"', '"serve_pid": serve_pid', '"prefetch": prefetch'):
+            self.assertIn(field, ready)
+        with open(os.path.join(HERE, "reqbench.sh")) as source:
+            shell = source.read()
+        self.assertIn('SERVE_RUST_LOG="warn,uffd=info"', shell)
+        self.assertIn('$SUDO env RUST_LOG="$SERVE_RUST_LOG" "$FCVM" snapshot serve', shell)
+
 
 class ProcStateReadOnce(unittest.TestCase):
     """A decision about a process reads its /proc state once.
@@ -4823,10 +5741,12 @@ exit 1
         argv = os.path.join(d, "argv.log")
         pyargv = os.path.join(d, "pyargv.log")
         driver_env = os.path.join(d, "driver-env.log")
+        serve_env = os.path.join(d, "serve-env.log")
         fcvm = os.path.join(d, "fcvm")
         self._write(fcvm, f"""#!/bin/bash
 echo "$@" >> {argv}
 if [ "$1 $2" = "snapshot serve" ]; then
+    echo "RUST_LOG=${{RUST_LOG-<unset>}}" >> {serve_env}
     echo "Serve PID: $$"; echo "Waiting for VMs"; exec sleep 30
 fi
 """)
@@ -5000,11 +5920,23 @@ printf 'before=%s count=%s after=%s\n' "$before" "$count" "$after"
             self.assertNotIn("--serve-pid", pyargv, pyargv)
 
     def test_backend_uffd_is_still_the_default_and_serves(self):
-        with tempfile.TemporaryDirectory() as d:
-            r, argv, pyargv = self._run_stub(d, "uffd")
-            self.assertIn("snapshot serve", argv, f"{argv}\n{r.stderr[-800:]}")
-            self.assertIn("--serve-pid", pyargv, pyargv)
-            self.assertNotIn("--snapshot-tag", pyargv, pyargv)
+        """The serve logs at uffd=info, through sudo's environment reset too,
+        and reqbench.py reads that log: its acknowledgement lines end each
+        request's memory-server window. RED ON defe392e: reqbench.sh set no
+        RUST_LOG, so the serve logged at the caller's level (warn when none
+        is set), and reqbench.py was not given its log."""
+        for sudo_env_reset in (False, True):
+            with self.subTest(sudo_env_reset=sudo_env_reset), \
+                    tempfile.TemporaryDirectory() as d:
+                r, argv, pyargv = self._run_stub(d, "uffd", sudo_env_reset=sudo_env_reset)
+                self.assertIn("snapshot serve", argv, f"{argv}\n{r.stderr[-800:]}")
+                self.assertIn("--serve-pid", pyargv, pyargv)
+                self.assertNotIn("--snapshot-tag", pyargv, pyargv)
+                self.assertEqual(
+                    self._read_if_exists(os.path.join(d, "serve-env.log")).strip(),
+                    "RUST_LOG=warn,uffd=info")
+                self.assertIn(
+                    f"--serve-log {os.path.join(d, 'results', 'logs', 'serve.log')}", pyargv)
 
     def test_analyzer_rejection_fails_the_driver(self):
         with tempfile.TemporaryDirectory() as d:

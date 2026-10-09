@@ -1082,10 +1082,35 @@ TOTAL_REPS=$((WARMUP + REPS))
 # imported once and each request times one drive() call, so no rep pays for
 # starting an interpreter. Each record is written before its rep is judged, so
 # a refused run keeps the row that refused it.
+# The container's CPU comes from its own cgroup's cpu.stat, the counter that
+# covers every process in it (Chromium and the page server alike).
+container_cgroup=$(podman inspect --format '{{.State.CgroupPath}}' "$CONTAINER_ID") \
+    || { log "REFUSING: cannot read the cgroup of container $CONTAINER_ID"; exit 5; }
+container_pid=$(podman inspect --format '{{.State.Pid}}' "$CONTAINER_ID") \
+    || { log "REFUSING: cannot read the main pid of container $CONTAINER_ID"; exit 5; }
+# An empty path, "/" or one that climbs would make the counter the whole
+# machine's (the root cgroup's cpu.stat is valid and readable).
+case "$container_cgroup" in
+    /?*) ;;
+    *) log "REFUSING: container cgroup '$container_cgroup' is not a cgroup below the root"; exit 5 ;;
+esac
+case "$container_cgroup/" in
+    */../*|*/./*|*//*) log "REFUSING: container cgroup '$container_cgroup' is not canonical"; exit 5 ;;
+esac
+[[ "$container_pid" =~ ^[1-9][0-9]*$ ]] \
+    || { log "REFUSING: container main pid '$container_pid' is not a pid"; exit 5; }
+CGROUP_DIR="${CGROUP_ROOT:-/sys/fs/cgroup}${container_cgroup}"
+# The container's own main process must be in that cgroup or below it, or the
+# counter belongs to something else.
+grep -rqx --include=cgroup.procs -- "$container_pid" "$CGROUP_DIR" 2>/dev/null \
+    || { log "REFUSING: container main pid $container_pid is not in $CGROUP_DIR"; exit 5; }
+CPU_STAT="$CGROUP_DIR/cpu.stat"
+grep -q '^usage_usec ' "$CPU_STAT" 2>/dev/null \
+    || { log "REFUSING: no usage_usec in $CPU_STAT"; exit 5; }
 drive_status=0
 python3 - "$HERE/cdpdrive.py" "$HERE/render.py" "127.0.0.1:$CDP_PORT" "$OUT" \
-        "$LOADAVG_FILE" "$run_json_sha256" "$WARMUP" "$TOTAL_REPS" "${URLS[@]}" \
-        <<'PY' || drive_status=$?
+        "$LOADAVG_FILE" "$run_json_sha256" "$WARMUP" "$TOTAL_REPS" "$CPU_STAT" \
+        "${URLS[@]}" <<'PY' || drive_status=$?
 import argparse
 import importlib.util
 import json
@@ -1094,8 +1119,8 @@ import sys
 import time
 
 (driver_path, render_module, address, out_path, loadavg_file, run_json_sha256,
- warmup, total) = sys.argv[1:9]
-urls = sys.argv[9:]
+ warmup, total, cpu_stat) = sys.argv[1:10]
+urls = sys.argv[10:]
 warmup, total = int(warmup), int(total)
 
 
@@ -1120,6 +1145,19 @@ def read_load():
     return None, raw, 0
 
 
+def cpu_usec():
+    """The container cgroup's cumulative usage_usec, or None if unreadable."""
+    try:
+        with open(cpu_stat) as handle:
+            for line in handle:
+                key, _, value = line.partition(" ")
+                if key == "usage_usec":
+                    return int(value)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 with open(out_path, "a") as out:
     for rep in range(total):
         url = urls[rep % len(urls)]
@@ -1131,6 +1169,7 @@ with open(out_path, "a") as out:
             nav_timing=True, print_target=False, host_header="", net_trace=None,
             net_trace_drain_ms=5000.0, render_module=render_module,
         )
+        cpu_before = cpu_usec()
         started = time.monotonic_ns()
         interrupted = None
         try:
@@ -1144,6 +1183,7 @@ with open(out_path, "a") as out:
         wall_ms = round((time.monotonic_ns() - started) / 1_000_000, 1)
         if not isinstance(result, dict):
             result = {"ok": False, "error": f"drive() returned {type(result).__name__}"}
+        cpu_after = cpu_usec()
         ok = result.get("ok") is True and "net_trace_error" not in result
         # Per-rep 1-minute load, the same field reqbench.py puts on every record
         # (rec["loadavg1"]). The start-of-run reading in run.json cannot show
@@ -1155,12 +1195,18 @@ with open(out_path, "a") as out:
             "warmup": rep < warmup, "wall_ms": wall_ms, "loadavg1": load,
             "loadavg1_raw": load_raw[-2000:], "loadavg1_read_status": load_status,
             "measurement_valid": load is not None, "url": url,
+            # Cumulative counters, so CPU between requests is recoverable too.
+            "container_cpu_usec_before": cpu_before,
+            "container_cpu_usec_after": cpu_after,
             "driver": driver_text,
         }) + "\n")
         out.flush()
         if interrupted is not None:
             log(f"REFUSING: rep {rep} interrupted ({type(interrupted).__name__})")
             raise interrupted
+        if cpu_before is None or cpu_after is None:
+            log(f"REFUSING: rep {rep} could not read usage_usec from {cpu_stat}")
+            sys.exit(5)
         if load is None:
             log(f"REFUSING: rep {rep} has no numeric 1-minute load from {loadavg_file} "
                 f"(status={load_status} raw={load_raw[:200]})")
@@ -1277,10 +1323,43 @@ if la:
             "median": round(statistics.median(la), 2), "max": round(max(la), 2)}
     print(f"loadavg1 during measured reps: min={load['min']} median={load['median']} "
           f"max={load['max']}   <-- contention check")
+# Container CPU per request, two ways. The window is the drive() call alone;
+# the run average divides everything the container burned from the first
+# measured rep's start to the last one's end, between-request work included,
+# by the measured count. A clone's CPU is all of its life, so the run average
+# is the comparable figure.
+windows = [(r["container_cpu_usec_after"] - r["container_cpu_usec_before"]) / 1000.0
+           for r in measured_rows]
+# Each measured rep's period runs from its start to the next rep's start, the
+# last to its own end, so the periods tile the run and their mean is the run
+# average. They vary with the between-request work, so the run average carries
+# a percentile-bootstrap interval over them, the estimator reqanalyze.mean_ci
+# gives the VM total it is compared with.
+periods = [(b["container_cpu_usec_before"] - a["container_cpu_usec_before"]) / 1000.0
+           for a, b in zip(measured_rows, measured_rows[1:])]
+periods.append((measured_rows[-1]["container_cpu_usec_after"]
+                - measured_rows[-1]["container_cpu_usec_before"]) / 1000.0)
+def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
+    import random
+    mean = statistics.fmean(xs)
+    if len(xs) < 3:
+        return mean, min(xs), max(xs)
+    rng = random.Random(seed)
+    boots = sorted(statistics.fmean(xs[rng.randrange(len(xs))] for _ in range(len(xs)))
+                   for _ in range(iters))
+    return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1]
+run_mean, run_lo, run_hi = mean_ci(periods)
+run_average = {"mean": round(run_mean, 1), "lo": round(run_lo, 1), "hi": round(run_hi, 1), "n": n}
+container_cpu = {"window_p50_ms": round(statistics.median(windows), 1),
+                 "window_mean_ms": round(statistics.mean(windows), 1),
+                 "run_average_ms": run_average, "n": n}
+print(f"container CPU per request: window p50={container_cpu['window_p50_ms']}ms "
+      f"run average={run_average['mean']}ms [{run_average['lo']}, {run_average['hi']}]")
 summary = {"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
            "mean_ms": round(statistics.mean(measured), 1),
            "failures": 0, "p50_convention": "statistics.median",
-           "loadavg1_measured": load, "per_url": per_url}
+           "loadavg1_measured": load, "per_url": per_url,
+           "container_cpu_ms": container_cpu}
 output_path = sys.argv[3]
 directory = os.path.dirname(output_path)
 fd, temporary = tempfile.mkstemp(prefix=".summary.", dir=directory)
