@@ -1832,7 +1832,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             "schema": reqscale.RECORD_SCHEMA, "kind": "uffd-serve",
             "run_id": RUN_ID, "pid": cls.SERVE_PID,
             "pid_start_time_ticks": 300, "state_path": "state/serve.json",
-            "uffd_mode": "copy", "snapshot_tag": snapshot["tag"],
+            "uffd_mode": "copy", "uffd_prefetch": "on", "snapshot_tag": snapshot["tag"],
             "snapshot_generation_id": cls.GENERATION,
             "snapshot_config_sha256": cls.CONFIG_SHA,
         }

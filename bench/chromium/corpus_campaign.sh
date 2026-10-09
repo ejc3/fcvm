@@ -102,7 +102,13 @@ LOGDIR="${LOGDIR:-/tmp/corpus-campaign-$STAMP}"
 # the scale run's first analysis (the one that may publish comes after the
 # evidence exists).
 if [ "$MEASURE" = scale ]; then
-    ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"
+    # Each attempt measures into its own directory beside the campaign's
+    # evidence, which the analyzer reads from the run directory's parent.
+    # Nothing removes one: a retry never meets reqscale.py's refusal to reuse
+    # a directory, a withdrawn attempt keeps its WITHDRAWN marker, and a second
+    # campaign on the same RESULTS cannot touch this one's run.
+    SCALE_DIR="$RESULTS/scale-$STAMP-$$"
+    ANALYSIS_JSON="$SCALE_DIR/analysis-pre-evidence.json"
 else
     ANALYSIS_JSON="$RESULTS/analysis.json"
 fi
@@ -154,14 +160,6 @@ acquire_diag_lock || exit 2
 # sub-make, and an earlier campaign's passed=true must not answer for this
 # one. The content-addressed runtime bundles under runtime/ and the phase
 # logs under logs/ are not the record and stay.
-# An earlier scale attempt's directory goes too: reqscale.py refuses to reuse
-# one. reqbench.sh scale hands it back to this user, but a run killed before
-# that leaves it owned by root, so sudo removes only what this user cannot,
-# with the diag lock's descriptor closed so no helper of sudo inherits it.
-if [ -e "${RESULTS:?}/scale" ]; then
-    rm -rf -- "$RESULTS/scale" 2>/dev/null \
-        || sudo rm -rf -- "$RESULTS/scale" {CAMPAIGN_DIAG_LOCK_FD}>&-
-fi
 rm -f "$RESULTS"/dns-evidence.json "$RESULTS"/verify-dns*.json "$RESULTS"/dns-owner.log \
     "$RESULTS"/replay-queries.log \
     "$RESULTS"/corpus-dns.log "$RESULTS"/corpus-access.log "$RESULTS"/corpus-serve.status \
@@ -954,7 +952,7 @@ run_rc=0
 if [ "$MEASURE" = scale ]; then
     say "measured run: open-loop scale over the corpus, rates ${SCALE_RATES:-unset}, $UFFD_MODE prefetch=$UFFD_PREFETCH"
     start_dns_sampler
-    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$RESULTS/scale" \
+    SCALE_URL="$URLS" SCALE_TAG="$TAG" SCALE_OUT="$SCALE_DIR" \
         SCALE_UFFD_MODE="$UFFD_MODE" SCALE_UFFD_PREFETCH="$UFFD_PREFETCH" \
         SCALE_CONTROL_URL="${SCALE_CONTROL_URL:-${URLS%%,*}}" \
         SCALE_CONTROL_RESOLVE_ALL_TO="${SCALE_CONTROL_RESOLVE_ALL_TO:-127.0.0.1}" \
@@ -964,7 +962,7 @@ if [ "$MEASURE" = scale ]; then
     # withholds publication until that evidence exists beside the run, so it
     # runs once here and once more after the evidence is written.
     if [ "$run_rc" -eq 0 ]; then
-        make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$RESULTS/scale" \
+        make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$SCALE_DIR" \
             SCALE_ANALYSIS_JSON="$ANALYSIS_JSON" 2>&1 | tee "$LOGDIR/analyze.log" \
             || run_rc=$?
     fi
@@ -992,15 +990,15 @@ if [ "$run_rc" -ne 0 ] || [ "$after_rc" -ne 0 ] || [ "$verdict" != clean ]; then
     exit 1
 fi
 if [ "$MEASURE" = scale ]; then
-    make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$RESULTS/scale" \
-        SCALE_ANALYSIS_JSON="$RESULTS/scale/analysis.json" 2>&1 \
+    make -C "$REPO" analyze-chromium-scale SCALE_RUN_DIR="$SCALE_DIR" \
+        SCALE_ANALYSIS_JSON="$SCALE_DIR/analysis.json" 2>&1 \
         | tee -a "$LOGDIR/analyze.log" \
         || { echo "FAILED: the scale analysis after the DNS evidence did not run" >&2; exit 1; }
-    jq -e '.publishable == true' "$RESULTS/scale/analysis.json" >/dev/null || {
-        echo "FAILED: scale analysis not publishable: $(jq -r '.publication_blocked_by' "$RESULTS/scale/analysis.json" 2>&1)" >&2
+    jq -e '.publishable == true' "$SCALE_DIR/analysis.json" >/dev/null || {
+        echo "FAILED: scale analysis not publishable: $(jq -r '.publication_blocked_by' "$SCALE_DIR/analysis.json" 2>&1)" >&2
         exit 1
     }
-    say "scale analysis: $RESULTS/scale/analysis.json (publishable)"
+    say "scale analysis: $SCALE_DIR/analysis.json (publishable)"
 fi
 
 say "records: $RESULTS"

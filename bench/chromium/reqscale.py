@@ -2950,6 +2950,7 @@ class UffdServe:
                                 "pid_start_time_ticks": identity.start_time_ticks,
                                 "state_path": os.path.relpath(path, self.args.data_root),
                                 "uffd_mode": config["uffd_mode"],
+                                "uffd_prefetch": getattr(self.args, "uffd_prefetch", "on"),
                                 "snapshot_tag": self.args.snapshot_tag,
                                 "snapshot_generation_id": self.args.snapshot_identity[
                                     "generation_id"

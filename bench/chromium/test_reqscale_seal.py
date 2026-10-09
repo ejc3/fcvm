@@ -233,6 +233,38 @@ class ScaleOutputOwnership(unittest.TestCase):
         self.assertIn(handback, calls[run + 1:],
                       f"the scale output was left to root: sudo calls {calls}")
 
+
+class UffdServeRecordsPrefetch(unittest.TestCase):
+    def test_the_prefetch_setting_is_required_and_published(self):
+        """RED ON a5d0159f: uffd-serve.json recorded only the memory mode, and
+        the analyzer neither required nor published the working-set prefetch
+        setting, so an on run and an off run read as the same UFFD experiment."""
+        with tempfile.TemporaryDirectory() as d:
+            CompleteAnalyzerFixture.build_run(d)
+            analysis = reqscale_analyze.analyze(d)
+        self.assertEqual(analysis.get("uffd"), {"mode": "copy", "prefetch": "on"})
+        for case, value in (("missing", None), ("invalid", "maybe")):
+            with self.subTest(case=case), tempfile.TemporaryDirectory() as d:
+                CompleteAnalyzerFixture.build_run(d)
+                path = os.path.join(d, "uffd-serve.json")
+                with open(path) as f:
+                    serve = json.load(f)
+                if value is None:
+                    serve.pop("uffd_prefetch", None)
+                else:
+                    serve["uffd_prefetch"] = value
+                with open(path, "w") as f:
+                    json.dump(serve, f, sort_keys=True)
+                with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "UFFD serve"):
+                    reqscale_analyze.analyze(d)
+
+    def test_the_serve_record_carries_the_configured_prefetch(self):
+        with open(os.path.join(HERE, "reqscale.py")) as f:
+            source = f.read()
+        record = source[source.index('"kind": "uffd-serve",'):]
+        record = record[:record.index("}")]
+        self.assertIn('"uffd_prefetch": getattr(self.args, "uffd_prefetch", "on"),', record)
+
 class ScaleGraph(test_reqbench.MakefileBenchGraph):
     def test_scale_never_rebuilds(self):
         c = self.closure("bench-chromium-scale")

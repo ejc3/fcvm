@@ -1624,7 +1624,7 @@ def _validate_uffd_serve(
 ) -> None:
     required_fields = {
         "schema", "kind", "run_id", "pid", "pid_start_time_ticks",
-        "state_path", "uffd_mode", "snapshot_tag", "snapshot_generation_id",
+        "state_path", "uffd_mode", "uffd_prefetch", "snapshot_tag", "snapshot_generation_id",
         "snapshot_config_sha256",
     }
     if not isinstance(serve, dict) or set(serve) != required_fields:
@@ -1646,6 +1646,8 @@ def _validate_uffd_serve(
         raise AnalysisInvalid(f"UFFD serve is not bound to this snapshot generation: {mismatch}")
     if serve.get("uffd_mode") not in ("copy", "minor"):
         raise AnalysisInvalid("UFFD serve has an invalid memory mode")
+    if serve.get("uffd_prefetch") not in ("on", "off"):
+        raise AnalysisInvalid("UFFD serve has an invalid working-set prefetch setting")
     state_path = serve.get("state_path")
     if (
         not isinstance(state_path, str)
@@ -1990,6 +1992,7 @@ def analyze(run_dir: str) -> dict:
         "publishable": block is None,
         "publication_blocked_by": block,
         "corpus": list(schedule["urls"]),
+        "uffd": {"mode": uffd_serve["uffd_mode"], "prefetch": uffd_serve["uffd_prefetch"]},
         # The report is the publication document, so the numbers that describe HOW the
         # run was scheduled, and on WHAT, have to come from the validated artifacts
         # rather than from prose written when the defaults happened to be these.
@@ -2058,7 +2061,8 @@ def markdown_report(analysis: dict) -> str:
         f"`{prov['source_revision'][:12]}`"
         f"{' with a DIRTY tree' if prov['source_dirty'] else ''}, driving "
         f"Chromium `{prov['chromium_version']}`. Full host and binary provenance is in "
-        f"`{prov['hostinfo']}`.",
+        f"`{prov['hostinfo']}`. The UFFD backend served in `{analysis['uffd']['mode']}` "
+        f"mode with working-set prefetch `{analysis['uffd']['prefetch']}`.",
         "",
         "FILE and UFFD were offered the same per-backend rate in one mixed stream. "
         "Each rate interval contained one request for each backend, separated by "

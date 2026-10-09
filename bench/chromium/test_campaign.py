@@ -1161,7 +1161,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                       f'URLS="{self._urls()}"\nBACKEND=uffd\nUFFD_MODE=minor\n'
                       'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
                       'STALL_MAX_MS=15000\nMEASURE=scale\nTAG=cb-req-corpus\n'
-                      'ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"\n'
+                      'SCALE_DIR="$RESULTS/scale-attempt"\nANALYSIS_JSON="$SCALE_DIR/analysis-pre-evidence.json"\n'
                       f'{self._helpers()}\nrun_rc=0\n'
                       f'{block.group(1)}\necho "run_rc=$run_rc"\n')
             result = self._run(script, env)
@@ -1170,7 +1170,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
                                        + ".bench-chromium-scale"))
             self.assertEqual(seen.get("SCALE_URL"), self._urls())
             self.assertEqual(seen.get("SCALE_TAG"), "cb-req-corpus")
-            self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale"))
+            self.assertEqual(seen.get("SCALE_OUT"), os.path.join(results, "scale-attempt"))
             self.assertEqual(seen.get("SCALE_UFFD_MODE"), "minor")
             self.assertEqual(seen.get("SCALE_UFFD_PREFETCH"), "on")
             self.assertEqual(seen.get("SCALE_CONTROL_URL"), self._urls().split(",")[0])
@@ -1184,11 +1184,11 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             # $RESULTS/analysis.json, which a scale run never writes).
             self.assertEqual(len(calls), 2, calls)
             self.assertIn("analyze-chromium-scale", calls[1])
-            self.assertIn(f"SCALE_RUN_DIR={results}/scale", calls[1])
+            self.assertIn(f"SCALE_RUN_DIR={results}/scale-attempt", calls[1])
             self.assertIn("SCALE_ANALYSIS_JSON=$ANALYSIS_JSON".replace(
-                "$ANALYSIS_JSON", os.path.join(results, "scale", "analysis-pre-evidence.json")),
+                "$ANALYSIS_JSON", os.path.join(results, "scale-attempt", "analysis-pre-evidence.json")),
                 calls[1])
-        self.assertIn('ANALYSIS_JSON="$RESULTS/scale/analysis-pre-evidence.json"', body)
+        self.assertIn('ANALYSIS_JSON="$SCALE_DIR/analysis-pre-evidence.json"', body)
         evidence = body[body.index("write_dns_evidence() {"):]
         evidence = evidence[:evidence.index("\n}\n")]
         self.assertIn('"$ANALYSIS_JSON"', evidence)
@@ -1196,8 +1196,8 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
             '${ANALYSIS_JSON:-$RESULTS/analysis.json}', ""))
         # After a clean verdict the run is analyzed again into the analysis
         # that may publish, and the campaign fails unless it does.
-        self.assertRegex(body, r'SCALE_ANALYSIS_JSON="\$RESULTS/scale/analysis\.json"')
-        self.assertIn("jq -e '.publishable == true' \"$RESULTS/scale/analysis.json\"", body)
+        self.assertRegex(body, r'SCALE_ANALYSIS_JSON="\$SCALE_DIR/analysis\.json"')
+        self.assertIn("jq -e '.publishable == true' \"$SCALE_DIR/analysis.json\"", body)
 
     # From `mkdir -p "$RESULTS"` to the end of the rm, which may continue over
     # backslash-newlines, plus the lock release that closes the block. The
@@ -2416,34 +2416,32 @@ class DiagPhase(unittest.TestCase):
 
 
 
-class ScaleRetry(unittest.TestCase):
-    def test_a_retry_removes_the_earlier_scale_attempt(self):
-        """RED ON 418b7683: reqscale.py refuses an existing output directory,
-        and the startup cleanup that lets an explicit RESULTS be reused left
-        $RESULTS/scale in place, so every scale retry failed before
-        measuring. The cleanup removes it, through sudo only when this user
-        cannot, because a run killed before reqbench.sh handed it back leaves
-        it owned by root. Runs the shipped block, as DnsBrackets does."""
-        block = DnsBrackets.START_CLEANUP.search(campaign())
+class ScaleAttemptDirectory(unittest.TestCase):
+    def test_each_attempt_measures_into_its_own_scale_directory(self):
+        """RED ON a5d0159f: every attempt measured into $RESULTS/scale, and a
+        retry's startup cleanup deleted the earlier attempt's tree, WITHDRAWN
+        marker included, and could delete a concurrent campaign's run while it
+        was still writing. Each attempt now measures into its own directory
+        beside the campaign's evidence, and nothing removes one."""
+        body = campaign()
+        block = DnsBrackets.START_CLEANUP.search(body)
         self.assertIsNotNone(block, "startup cleanup not found")
+        attempts = ("scale", "scale-20261009-010203-77")
         with tempfile.TemporaryDirectory() as d:
             results = os.path.join(d, "results")
-            os.makedirs(os.path.join(results, "scale", "logs"))
             os.makedirs(os.path.join(results, "diag"))
-            os.makedirs(os.path.join(results, "runtime"))
-            binx = os.path.join(d, "bin")
-            os.makedirs(binx)
-            with open(os.path.join(binx, "sudo"), "w") as f:
-                f.write('#!/bin/bash\nexec "$@"\n')
-            os.chmod(os.path.join(binx, "sudo"), 0o755)
+            for attempt in attempts:
+                os.makedirs(os.path.join(results, attempt))
+                with open(os.path.join(results, attempt, "WITHDRAWN"), "w") as f:
+                    f.write("measured against the wrong resolver\n")
             script = f'set -euo pipefail\nRESULTS="{results}"\n{block.group(1)}'
-            result = subprocess.run(["bash", "-c", script],
-                                    env=dict(os.environ, PATH=binx + os.pathsep + os.environ["PATH"]),
-                                    capture_output=True, text=True, timeout=30)
+            result = subprocess.run(["bash", "-c", script], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
-            self.assertFalse(os.path.exists(os.path.join(results, "scale")),
-                             "the earlier scale attempt survived the startup cleanup")
-            self.assertTrue(os.path.isdir(os.path.join(results, "runtime")))
+            for attempt in attempts:
+                self.assertTrue(os.path.isfile(os.path.join(results, attempt, "WITHDRAWN")),
+                                f"the startup cleanup removed {attempt}'s WITHDRAWN marker")
+        self.assertRegex(body, r'(?m)^    SCALE_DIR="\$RESULTS/scale-\$STAMP-\$\$"$')
+        self.assertNotRegex(body, r'rm -rf[^\n]*scale')
 
 if __name__ == "__main__":
     unittest.main()
