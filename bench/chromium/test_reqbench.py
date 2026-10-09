@@ -4010,6 +4010,32 @@ class AnalyzerAvailability(unittest.TestCase):
         self.assertFalse(block["complete"])
         self.assertNotIn("clone_mean_ms", block)
 
+    def test_a_malformed_cpu_value_counts_as_an_incomplete_reading(self):
+        """RED BEFORE THE FIX: the CPU maps were summed unchecked, so a
+        string raised TypeError out of the analyzer, and a negative or
+        boolean value published a lowered mean marked complete. A value that
+        is not a finite non-negative number is no reading, and one request
+        holding one withholds every figure."""
+        def set_value(key, child, value):
+            def mutate(measured):
+                measured[0]["teardown"][key][child] = value
+            return mutate
+
+        def set_reclaim(measured):
+            measured[0]["teardown"]["per_child_cpu"]["pasta"]["reclaim_cpu_ms"] = -50.0
+        for label, mutate in (
+                ("string at the kill", set_value("lifetime_cpu_ms_by_child", "firecracker", "600")),
+                ("negative reaped", set_value("reaped_children_cpu_ms_by_child", "fcvm", -500.0)),
+                ("boolean at the kill", set_value("lifetime_cpu_ms_by_child", "fcvm", True)),
+                ("negative reclaim", set_reclaim),
+        ):
+            with self.subTest(label), tempfile.TemporaryDirectory() as d:
+                block, _ = self._cpu_fixture(d, mutate)
+                self.assertFalse(block["complete"], "a malformed value was averaged in")
+                self.assertEqual(block["missing_records"], 1)
+                for figure in ("clone_mean_ms", "clone_at_least_mean_ms", "total_mean_ms"):
+                    self.assertNotIn(figure, block)
+
 
 
 class ServeCpuSample(unittest.TestCase):
@@ -4036,11 +4062,16 @@ class MemoryServerAverage(unittest.TestCase):
     """The memory server's CPU per request, over a single-arm run."""
 
     @staticmethod
-    def records(befores, afters, starttime=7, arm="cdp-fast"):
-        return [{"arm": arm, "rep": i,
+    def records(befores, afters, starttime=7, arm="cdp-fast", final=None):
+        recs = [{"arm": arm, "rep": i,
                  "serve_cpu_before": {"applicable": True, "ms": b, "starttime": starttime},
                  "serve_cpu_after": {"applicable": True, "ms": a, "starttime": starttime}}
                 for i, (b, a) in enumerate(zip(befores, afters))]
+        # The run's last record carries the server's reading once it settled.
+        recs[-1]["serve_cpu_final"] = {
+            "applicable": True, "ms": afters[-1] if final is None else final,
+            "starttime": starttime, "settled": True, "settle_wait_ms": 200.0}
+        return recs
 
     def test_growth_over_the_run_counts_work_finished_between_requests(self):
         """Red with per-request deltas: the 30 ms the server did between
@@ -4076,6 +4107,207 @@ class MemoryServerAverage(unittest.TestCase):
                  "serve_cpu_after": {"applicable": False}}]
         got = reqanalyze.memory_server_average(recs, ["cdp-fast", "noop"], 10.0)
         self.assertEqual((got["available"], got["mean_ms"]), (True, 0.0))
+
+    def test_a_malformed_server_sample_is_not_attributed(self):
+        """RED BEFORE THE FIX: a sample without a starttime raised KeyError,
+        a string ms raised TypeError, and a negative or boolean ms entered
+        the growth and lowered the mean. A sample whose ms is not a finite
+        non-negative number, or whose starttime is not an integer, failed."""
+        for label, key, sample in (
+                ("no ms or starttime", "serve_cpu_after", {"applicable": True}),
+                ("string ms", "serve_cpu_after", {"applicable": True, "ms": "130", "starttime": 7}),
+                ("negative ms", "serve_cpu_after", {"applicable": True, "ms": -5.0, "starttime": 7}),
+                ("boolean ms", "serve_cpu_after", {"applicable": True, "ms": True, "starttime": 7}),
+                ("float starttime", "serve_cpu_after",
+                 {"applicable": True, "ms": 130.0, "starttime": 7.0}),
+                ("string ms in the final sample", "serve_cpu_final",
+                 {"applicable": True, "ms": "140", "starttime": 7, "settled": True}),
+        ):
+            with self.subTest(label):
+                recs = self.records([100.0, 110.0, 120.0], [105.0, 115.0, 130.0])
+                recs[-1][key] = sample
+                got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
+                self.assertFalse(got["available"], got)
+                self.assertEqual(got["reason"], "a memory-server sample failed")
+
+    def test_an_unsettled_final_sample_is_not_attributed(self):
+        """RED BEFORE THE FIX: the growth ended at the last request's
+        after-sample, taken as soon as its teardown returned, so work the
+        server finished for that request afterwards (working-set persistence
+        on its fcvm-ws-write thread) was left out and the mean read low. The
+        growth ends at the run's final sample, and only a settled one."""
+        recs = self.records([100.0, 110.0, 120.0], [105.0, 115.0, 125.0], final=140.0)
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
+        self.assertTrue(got["available"], got)
+        self.assertEqual(got["mean_ms"], 40.0 / 3,
+                         "the 15 ms the server did after the last teardown was left out")
+        recs[-1]["serve_cpu_final"]["settled"] = False
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
+        self.assertFalse(got["available"], "an unsettled final sample was attributed")
+        self.assertEqual(got["reason"],
+                         "the memory server's CPU was still rising after the last request")
+        del recs[-1]["serve_cpu_final"]
+        got = reqanalyze.memory_server_average(recs, ["cdp-fast"], 10.0)
+        self.assertFalse(got["available"], "a run without a final sample was attributed")
+        self.assertIn("settled", got["reason"])
+
+
+class FinalServeSample(unittest.TestCase):
+    """The run's last memory-server reading waits for the server to settle.
+
+    A clone's teardown returns before the server has finished what that
+    clone left it: with UFFD prefetch on, working-set persistence runs on its
+    detached fcvm-ws-write thread. Every other request's after-sample is
+    followed by later samples that count that work; the last request's is
+    not. The fixture's server counter keeps rising after the last teardown.
+    """
+
+    SNAPSHOT = SnapshotGenerationIdentity.SNAPSHOT
+
+    @staticmethod
+    def counter(rise_for):
+        """A server counter that grows 10 ms per reading for rise_for readings."""
+        calls = []
+
+        def sample(serve_pid):
+            calls.append(serve_pid)
+            return {"applicable": True, "ms": 100.0 + 10.0 * min(len(calls), rise_for),
+                    "starttime": 7}
+        return sample
+
+    def _drive_main(self, data_root, counter, interval_s, timeout_s):
+        SnapshotGenerationIdentity._write_generation(
+            data_root, "33333333-3333-4333-8333-333333333333",
+        )
+        # serve_uffd_mode needs a live process with a serve state record;
+        # this test process stands in for the server, whose CPU is `counter`.
+        state_dir = os.path.join(data_root, "state")
+        os.makedirs(state_dir)
+        with open(os.path.join(state_dir, "vm-serve.json"), "w") as target:
+            json.dump({"pid": os.getpid(),
+                       "pid_start_time": reqbench.proc_stat_fields(os.getpid())[3],
+                       "config": {"process_type": "serve", "snapshot_name": self.SNAPSHOT,
+                                  "uffd_mode": "copy"}}, target)
+        runtime_bundle = os.path.join(data_root, "runtime")
+        os.makedirs(runtime_bundle)
+        manifest_path = os.path.join(runtime_bundle, "MANIFEST.sha256")
+        with open(manifest_path, "w") as target:
+            target.write("sealed runtime fixture\n")
+        fcvm = os.path.join(runtime_bundle, "fcvm")
+        with open(fcvm, "w") as target:
+            target.write("#!/bin/sh\nexit 0\n")
+        os.chmod(fcvm, 0o755)
+        exact_hashes = {
+            os.path.realpath(fcvm): "c" * 64,
+            os.path.realpath(manifest_path): "d" * 64,
+        }
+
+        def record(arm, rep):
+            return {"arm": arm, "rep": rep, "ok": True,
+                    "blocking_ms": 1.0, "wall_ms": 1.0, "teardown": {}}
+
+        def run_cdp(args, rep, fast, probe=None):
+            # Sampled as run_cdp_request samples: at the launch, and as soon
+            # as the teardown returns.
+            rec = record("cdp-fast" if fast else "cdp", rep)
+            rec["serve_cpu_before"] = reqbench.serve_cpu_sample(args.serve_pid)
+            rec["serve_cpu_after"] = reqbench.serve_cpu_sample(args.serve_pid)
+            return rec
+
+        patched = {
+            "HERE": runtime_bundle,
+            "run_noop_request": lambda _args, rep: record("noop", rep),
+            "run_cdp_request": run_cdp,
+            "serve_cpu_sample": counter,
+            "sha256_file": lambda path: exact_hashes[os.path.realpath(path)],
+            "harness_sha256": lambda: "f" * 64,
+            "command_text": lambda _argv: "fcvm fixture",
+            "_pending_harness_signal": 0,
+            "SERVE_SETTLE_INTERVAL_S": interval_s,
+            "SERVE_SETTLE_TIMEOUT_S": timeout_s,
+        }
+        saved = {name: getattr(reqbench, name) for name in patched if hasattr(reqbench, name)}
+        saved_argv = sys.argv
+        saved_signals = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+        env_updates = {
+            "REQBENCH_RUNTIME_BUNDLE": runtime_bundle,
+            "REQBENCH_SOURCE_REVISION": "e" * 40,
+            "REQBENCH_GUARD_LOADAVG1": "0.1",
+            "REQBENCH_GUARD_VM_PROCESSES": "0",
+            "REQBENCH_QUIET_LOADAVG1_LIMIT": "2.0",
+            "REQBENCH_QUIET_GUARD": "1",
+            "ALLOW_BUSY": "0",
+        }
+        saved_env = {key: os.environ.get(key) for key in env_updates}
+        out_dir = os.path.join(data_root, "results")
+        try:
+            os.environ.update(env_updates)
+            for name, value in patched.items():
+                setattr(reqbench, name, value)
+            sys.argv = [
+                "reqbench.py",
+                "--serve-pid", str(os.getpid()),
+                "--snapshot-name", self.SNAPSHOT,
+                "--url", "http://fixture/medium.html",
+                "--arms", "noop,cdp-fast",
+                "--reps", "2",
+                "--warmup", "0",
+                "--image", "localhost/chromium-bench-req",
+                "--image-id", "sha256:" + "b" * 64,
+                "--network-mode", "rootless",
+                "--cpu", "2",
+                "--memory-mib", "1024",
+                "--fcvm", fcvm,
+                "--data-root", data_root,
+                "--out-dir", out_dir,
+                "--run-id", "3" * 32,
+            ]
+            with redirect_stdout(io.StringIO()):
+                rc = reqbench.main()
+        finally:
+            for name in patched:
+                if name in saved:
+                    setattr(reqbench, name, saved[name])
+                else:
+                    delattr(reqbench, name)
+            sys.argv = saved_argv
+            for signum, handler in saved_signals.items():
+                signal.signal(signum, handler)
+            for key, value in saved_env.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+        self.assertEqual(rc, 0)
+        with open(os.path.join(out_dir, "reqbench.jsonl")) as source:
+            rows = [json.loads(line) for line in source]
+        self.assertEqual([row.get("kind") for row in rows[:1]], ["meta"])
+        return rows[1:]
+
+    def test_the_last_request_waits_for_the_memory_server_to_settle(self):
+        """RED BEFORE THE FIX: the run's last server reading was taken as
+        soon as the last teardown returned. Here the two cdp-fast requests
+        take four readings (110 to 140 ms) and the server then works for 30
+        ms more, which only a reading after it settled counts."""
+        with tempfile.TemporaryDirectory() as d:
+            rows = self._drive_main(d, self.counter(rise_for=7), 0.001, 5.0)
+        self.assertEqual(len(rows), 4)
+        self.assertIn("serve_cpu_final", rows[-1],
+                      "the run's last memory-server reading was taken before the server settled")
+        final = rows[-1]["serve_cpu_final"]
+        self.assertEqual((final["ms"], final["starttime"], final["settled"]), (170.0, 7, True))
+        self.assertEqual(["serve_cpu_final" in row for row in rows], [False, False, False, True])
+
+    def test_a_server_that_never_settles_ends_the_wait_unsettled(self):
+        """RED BEFORE THE FIX: no final reading was taken. A counter still
+        rising at the bound gives settled: false, which the analyzer does not
+        attribute, instead of holding the run open."""
+        with tempfile.TemporaryDirectory() as d:
+            rows = self._drive_main(d, self.counter(rise_for=10**9), 0.001, 0.05)
+        self.assertIn("serve_cpu_final", rows[-1], "the run took no final memory-server reading")
+        final = rows[-1]["serve_cpu_final"]
+        self.assertIs(final["settled"], False)
+        self.assertGreaterEqual(final["settle_wait_ms"], 50.0)
 
 
 class ProcStateReadOnce(unittest.TestCase):

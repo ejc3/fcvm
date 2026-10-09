@@ -256,7 +256,8 @@ def serve_cpu_sample(serve_pid: int) -> dict:
     A per-request delta of this counter is not the request's: the server
     finishes some work after a clone exits (working-set publication, copy-mode
     cache warming), and it is read in CLK_TCK steps. The analyzer instead
-    divides the counter's growth over a whole single-arm run by the request
+    divides the counter's growth over a whole single-arm run, ending at the
+    run's settled final sample (serve_cpu_settled_sample), by the request
     count, which counts that work and averages the quantization away.
     """
     if not serve_pid:
@@ -266,6 +267,42 @@ def serve_cpu_sample(serve_pid: int) -> dict:
         return {"applicable": True, "error": "memory server not readable"}
     return {"applicable": True, "ms": sum(ticks[:4]) * 1000.0 / CLK_TCK,
             "starttime": ticks[4]}
+
+
+SERVE_SETTLE_INTERVAL_S = 0.2
+SERVE_SETTLE_TIMEOUT_S = 30.0
+
+
+def serve_cpu_settled_sample(serve_pid: int) -> dict:
+    """The memory server's cumulative CPU once it has stopped rising.
+
+    A clone's teardown returns before the server has finished the work that
+    clone left it: with UFFD prefetch on, working-set persistence runs on the
+    server's detached fcvm-ws-write thread. Each request's after-sample is
+    followed by the next request's samples, which count that work, but the
+    run's last one is not, so the run ends with this reading. It samples the
+    counter every SERVE_SETTLE_INTERVAL_S until two consecutive readings are
+    equal and returns the last with settled: true. A counter still rising
+    after SERVE_SETTLE_TIMEOUT_S, or a pending INT/TERM, returns settled:
+    false, which the analyzer does not attribute. A failed reading or a
+    restarted server is returned as read, without settled.
+    """
+    t0 = time.monotonic()
+    prev = serve_cpu_sample(serve_pid)
+    if not prev.get("applicable") or prev.get("error"):
+        return prev
+    while True:
+        waited = time.monotonic() - t0
+        if harness_interrupt_pending() or waited >= SERVE_SETTLE_TIMEOUT_S:
+            return dict(prev, settled=False, settle_wait_ms=waited * 1000.0)
+        time.sleep(SERVE_SETTLE_INTERVAL_S)
+        cur = serve_cpu_sample(serve_pid)
+        if cur.get("error") or cur.get("starttime") != prev["starttime"]:
+            return cur
+        if cur["ms"] == prev["ms"]:
+            return dict(cur, settled=True,
+                        settle_wait_ms=(time.monotonic() - t0) * 1000.0)
+        prev = cur
 
 
 def machine_cpu_ms() -> float:
@@ -4372,6 +4409,10 @@ def main_with_resources(resources: ExitStack) -> int:
             rec["run_id"] = run_id
             rec["record_id"] = f"{run_id}:{arm}:{rep}:{int(is_warmup)}"
             rec["loadavg1"] = float(read_trimmed("/proc/loadavg").split()[0])
+            if fatal is None and args.serve_pid and (rep, arm, is_warmup) == schedule[-1]:
+                # The end of the run-wide memory-server window
+                # (reqanalyze.memory_server_average).
+                rec["serve_cpu_final"] = serve_cpu_settled_sample(args.serve_pid)
             out.write(json.dumps(rec) + "\n")
             out.flush()
             print(

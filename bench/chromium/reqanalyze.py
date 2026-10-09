@@ -164,15 +164,30 @@ def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
     return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1], n
 
 
+def cpu_reading(value) -> bool:
+    """Whether a CPU reading can be added: a finite non-negative number.
+
+    A string would raise in the sum, and a boolean or a negative value would
+    lower the mean, so a record holding one has no reading.
+    """
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
 def memory_server_average(records, arms, tick_ms):
     """The memory server's CPU per request over a single-arm run.
 
     Each record carries the server's cumulative CPU sampled at its launch
-    (serve_cpu_before) and after its teardown (serve_cpu_after). The growth
-    from the first measured request's sample to the last one's, divided by
-    the measured count, is the server's CPU per request, including the work
-    it finishes after a clone exits. A run with other arms shared the server,
-    so its growth is not this arm's.
+    (serve_cpu_before) and after its teardown (serve_cpu_after), and the
+    run's last record carries serve_cpu_final, read after the server stopped
+    rising: a clone's teardown leaves the server work it finishes later
+    (working-set persistence on its fcvm-ws-write thread), and only the last
+    request has no later sample to count it. The growth from the first
+    measured request's launch to that final sample, divided by the measured
+    count, is the server's CPU per request, including the work it finishes
+    after a clone exits. A final sample taken while the counter was still
+    rising would understate it, so it is not attributed. A run with other
+    arms shared the server, so its growth is not this arm's.
 
     Each sample is four /proc counters (utime, stime, cutime, cstime), each
     truncated to tick_ms, so it reads up to four ticks low and the growth is
@@ -189,13 +204,22 @@ def memory_server_average(records, arms, tick_ms):
     if len(arms) != 1:
         return {"available": False,
                 "reason": f"the memory server also served arm(s) {sorted(set(arms) - set([records[0].get('arm')]))}"}
-    samples = before + after
-    if any(s.get("error") or not s.get("applicable") for s in samples):
+    ordered = sorted(records, key=lambda r: r.get("rep", 0))
+    final = ordered[-1].get("serve_cpu_final")
+    if not isinstance(final, dict):
+        return {"available": False,
+                "reason": "the last request has no memory-server sample taken after it settled"}
+    samples = before + after + [final]
+    if any(s.get("error") or not s.get("applicable") or not cpu_reading(s.get("ms"))
+           or not isinstance(s.get("starttime"), int) or isinstance(s.get("starttime"), bool)
+           for s in samples):
         return {"available": False, "reason": "a memory-server sample failed"}
     if len({s["starttime"] for s in samples}) != 1:
         return {"available": False, "reason": "the memory server restarted during the run"}
-    ordered = sorted(records, key=lambda r: r.get("rep", 0))
-    growth = ordered[-1]["serve_cpu_after"]["ms"] - ordered[0]["serve_cpu_before"]["ms"]
+    if final.get("settled") is not True:
+        return {"available": False,
+                "reason": "the memory server's CPU was still rising after the last request"}
+    growth = final["ms"] - ordered[0]["serve_cpu_before"]["ms"]
     bound = 4 * tick_ms / len(records)
     return {"available": True, "mean_ms": growth / len(records), "n": len(records),
             "window_ms": growth, "quantization_ms": {"lo": -bound, "hi": bound}}
@@ -2362,11 +2386,12 @@ def analyze_backend(
         #           children used (fcvm's cp/nsenter/ip helpers), and what
         #           each spent being reaped after the kill.
         #   server  the shared memory server's cumulative CPU growth from the
-        #           first measured request's launch to the last one's
-        #           teardown, divided by the measured count. Detached work it
-        #           does after a clone exits is inside that window, and the
-        #           CLK_TCK steps average out. It is only this arm's when the
-        #           run had no other arm.
+        #           first measured request's launch to the run's final
+        #           sample, read once the server stopped rising, divided by
+        #           the measured count. Detached work it does after a clone
+        #           exits is inside that window, and the CLK_TCK steps
+        #           average out. It is only this arm's when the run had no
+        #           other arm.
         # Every reading is /proc counters truncated to the tick, so each
         # figure carries quantization_ms: the interval, before sampling error,
         # in which the mean of the untruncated counters lies around it. The
@@ -2395,11 +2420,16 @@ def analyze_backend(
                 reaped = t.get("reaped_children_cpu_ms_by_child") or {}
                 per_child = t.get("per_child_cpu") or {}
                 tick = t.get("tick_ms")
-                if ("firecracker" not in life or "fcvm" not in life
+                # The schedule validator does not check the two by-child maps,
+                # so a malformed value reaches here and is no reading.
+                if (not all(isinstance(x, dict) for x in (life, reaped, per_child))
+                        or "firecracker" not in life or "fcvm" not in life
                         or set(reaped) != set(life) or not per_child
-                        or any(c.get("reclaim_cpu_ms") is None for c in per_child.values())
-                        or isinstance(tick, bool) or not isinstance(tick, (int, float))
-                        or not math.isfinite(tick) or tick <= 0):
+                        or not all(cpu_reading(v) for v in life.values())
+                        or not all(cpu_reading(v) for v in reaped.values())
+                        or not all(isinstance(c, dict) and cpu_reading(c.get("reclaim_cpu_ms"))
+                                   for c in per_child.values())
+                        or not cpu_reading(tick) or tick <= 0):
                     return None
                 # Each reading is two counters (utime+stime, or cutime+cstime)
                 # truncated to the tick, so up to two ticks low. A child's
