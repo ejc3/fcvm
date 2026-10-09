@@ -45,6 +45,7 @@ class ScheduleIsAnArtifact(unittest.TestCase):
             ),
             trace_rate=None,
             trace_pairs=0,
+            urls=("http://127.0.0.1/fixture",),
         )
         values.update(overrides)
         return reqscale.ScheduleConfig(**values)
@@ -228,7 +229,8 @@ class OpenLoopIsActuallyOpenLoop(unittest.TestCase):
         clock = FakeClock()
         launcher = DeferredLauncher()
         records, summary = reqscale.run_open_loop_burst(
-            RUN_ID, spec, lambda context: {"backend": context.backend}, clock, launcher
+            RUN_ID, spec, lambda context: {"backend": context.backend,
+                                       "url": "http://127.0.0.1/fixture"}, clock, launcher
         )
 
         self.assertTrue(launcher.drain_called)
@@ -1140,7 +1142,8 @@ class AnalyzerRejectsCorruptEvidence(unittest.TestCase):
     def fixture(cls):
         spec = OpenLoopIsActuallyOpenLoop.one_request_spec()
         records, summary = reqscale.run_open_loop_burst(
-            RUN_ID, spec, lambda context: {"backend": context.backend},
+            RUN_ID, spec, lambda context: {"backend": context.backend,
+                                       "url": "http://127.0.0.1/fixture"},
             FakeClock(), DeferredLauncher(),
         )
         for index, row in enumerate(records):
@@ -1190,7 +1193,8 @@ class AnalyzerRejectsCorruptEvidence(unittest.TestCase):
                 "file": [], "uffd": [12],
             },
         )
-        schedule = {"run_id": RUN_ID, "bursts": [spec.to_dict()]}
+        schedule = {"run_id": RUN_ID, "urls": ["http://127.0.0.1/fixture"],
+                    "bursts": [spec.to_dict()]}
         return schedule, [summary], records
 
     def test_green_summary_cannot_hide_a_failed_raw_request(self):
@@ -1548,7 +1552,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         }
 
     @classmethod
-    def build_run(cls, directory):
+    def build_run(cls, directory, url="http://127.0.0.1/fixture",
+                  resolve_all_to=None):
         criteria = reqscale.CapacityCriteria(
             max_offered_rps_error_pct=1.0,
             min_departure_ratio=0.95,
@@ -1559,6 +1564,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
         schedule = reqscale.build_schedule(
             reqscale.ScheduleConfig(
                 rates=(0.8,), scored_bursts=5, seed=776, criteria=criteria,
+                urls=(url,),
             ),
             RUN_ID,
         )
@@ -1571,7 +1577,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             clock = FakeClock()
             clock.now_ns = next_start
             burst_rows, summary = reqscale.run_open_loop_burst(
-                RUN_ID, spec, lambda context: {"backend": context.backend},
+                RUN_ID, spec, lambda context: {"backend": context.backend,
+                                       "url": url},
                 clock, DeferredLauncher(),
             )
             for row in burst_rows:
@@ -1640,7 +1647,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
 
         snapshot = cls._snapshot()
         provenance = {
-            "schema": "fcvm.chromium.reqscale.provenance.v1",
+            "schema": "fcvm.chromium.reqscale.provenance.v2",
             "run_id": RUN_ID,
             "created_at": "2026-08-09T00:00:00+00:00",
             "argv": ["reqscale.py", "--fixture"],
@@ -1650,6 +1657,12 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             "harness_sha256": "2" * 64,
             "fcvm_path": "/usr/bin/fcvm",
             "fcvm_sha256": "3" * 64,
+            "runtime_bundle_sha256": "5" * 64,
+            "golden_creator": {
+                "creator_fcvm_sha256": "3" * 64,
+                "creator_runtime_bundle_sha256": "5" * 64,
+                "source_revision": "1" * 40,
+            },
             "fcvm_version": "fcvm fixture",
             "schedule_sha256": reqscale.schedule_sha256(schedule),
             "snapshot": snapshot,
@@ -1671,7 +1684,8 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "chromium_path": "/usr/bin/chromium",
                 "chromium_version": "Chromium fixture",
                 "chromium_sha256": "4" * 64,
-                "url": "http://127.0.0.1/fixture",
+                "url": url,
+                "resolve_all_to": resolve_all_to,
                 "timeout_seconds": 8.0,
             },
             "fault_trace": {
@@ -1818,7 +1832,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             "schema": reqscale.RECORD_SCHEMA, "kind": "uffd-serve",
             "run_id": RUN_ID, "pid": cls.SERVE_PID,
             "pid_start_time_ticks": 300, "state_path": "state/serve.json",
-            "uffd_mode": "copy", "snapshot_tag": snapshot["tag"],
+            "uffd_mode": "copy", "uffd_prefetch": "on", "snapshot_tag": snapshot["tag"],
             "snapshot_generation_id": cls.GENERATION,
             "snapshot_config_sha256": cls.CONFIG_SHA,
         }
@@ -2295,13 +2309,45 @@ class PlanOnlyCli(unittest.TestCase):
             self.assertIn("max-trace-perturbation-pct", result.stderr)
             self.assertFalse(os.path.exists(os.path.join(d, "out")))
 
+    def _plan(self, *extra):
+        with tempfile.TemporaryDirectory() as d:
+            return subprocess.run(
+                [
+                    sys.executable, self.SCRIPT,
+                    "--snapshot-tag", "not-opened-in-plan-mode",
+                    "--rates", "2", "--bursts", "5",
+                    "--seed", "776", "--run-id", RUN_ID,
+                    "--out-dir", os.path.join(d, "plan"), "--plan-only",
+                    *self.criteria_args(), *extra,
+                ],
+                capture_output=True, text=True, timeout=30,
+            )
+
+    def test_a_url_list_needs_a_single_control_url(self):
+        """Red before URL lists: the list became the control's one URL."""
+        corpus = "https://a.example/,https://b.example/"
+        result = self._plan("--url", corpus)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--control-url is required", result.stderr)
+        result = self._plan("--url", corpus, "--control-url", corpus)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("exactly one URL", result.stderr)
+        result = self._plan("--url", corpus, "--control-url", "https://a.example/",
+                            "--control-resolve-all-to", "127.0.0.1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_resolver_rule_must_be_an_ipv4_address(self):
+        result = self._plan("--url", "http://x/", "--control-resolve-all-to", "replay")
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("IPv4", result.stderr)
+
 
 
 class ConcurrentRequestRecords(unittest.TestCase):
     @staticmethod
-    def _inputs():
+    def _inputs(urls=None, pair_index=0):
         args = SimpleNamespace(
-            url="http://x/", format="jpeg", quality=80, cdp_port=9222, ws_url="",
+            url="http://x/", urls=urls, format="jpeg", quality=80, cdp_port=9222, ws_url="",
             fcvm="fcvm", data_root="/d", state_dir="/s", timeout=10.0,
             teardown_timeout=5.0, rust_log="off", run_id="r", snapshot_tag="t",
             cgroup_paths={"uffd": "/sys/fs/cgroup/x/uffd", "file": "/sys/fs/cgroup/x/file"},
@@ -2311,10 +2357,25 @@ class ConcurrentRequestRecords(unittest.TestCase):
                                population="score", traced=False, trace_pair_id=None)
         context = reqscale.RequestContext(
             run_id="r", burst_id="b", population="score", segment="score",
-            backend="uffd", target_rps=2.0, request_index=0, pair_index=0,
+            backend="uffd", target_rps=2.0, request_index=0, pair_index=pair_index,
             request_id="r:b:0", scheduled_ns=0, actual_launch_ns=1, request_seed=7,
         )
         return args, spec, context
+
+    def _record(self, cdp_record, urls=None, pair_index=0):
+        args, spec, context = self._inputs(urls, pair_index)
+        request = reqscale._make_request_fn(
+            args, spec, 1234, "/logs", {"uffd": mock.Mock(), "file": mock.Mock()}, None, 0)
+        seen = []
+
+        def run(request_args, rep, fast, **_options):
+            seen.append(request_args.url)
+            return dict(cdp_record)
+
+        with mock.patch.object(reqscale.reqbench, "run_cdp_request", side_effect=run):
+            record = request(context)
+        self.assertEqual(seen, [record["url"]], "the record names the page it rendered")
+        return record
 
     def test_a_concurrent_request_never_reads_the_memory_server(self):
         """Red while reqscale only dropped the samples from the record:
@@ -2343,6 +2404,294 @@ class ConcurrentRequestRecords(unittest.TestCase):
                 with self.assertRaises(Stop):
                     request(context)
         self.assertEqual(reads, [], "a concurrent UFFD request read the memory server")
+
+    def test_a_corpus_request_renders_its_pairs_url_and_says_so(self):
+        """Red before URL lists: every request rendered args.url, the whole
+        comma-separated spec, and no record named its page."""
+        urls = [f"https://site{i}.example/" for i in range(14)]
+        record = self._record({"ok": True}, urls=urls, pair_index=15)
+        self.assertEqual(record["url"], urls[1])
+
+
+CORPUS = tuple(f"https://site{i}.example/" for i in range(14))
+
+
+class CorpusPairing(unittest.TestCase):
+    def _config(self, rate):
+        return reqscale.ScheduleConfig(
+            rates=(rate,), scored_bursts=5, seed=776, urls=CORPUS,
+            criteria=reqscale.CapacityCriteria(
+                max_offered_rps_error_pct=1.0, min_departure_ratio=0.95,
+                max_score_end_backlog=8, max_p95_launch_lag_ms=25.0,
+                max_control_median_drift_pct=10.0))
+
+    def test_every_scored_window_renders_each_page_equally_often(self):
+        """Red before the whole-cycle rule: at 2 rps the 120 scored pairs of a
+        burst gave eight pages 9 renders and six pages 8, the same bias in
+        every burst, so the rate curve was confounded with the page mix."""
+        schedule = reqscale.build_schedule(self._config(1.4), RUN_ID)
+        self.assertEqual(schedule["urls"], list(CORPUS))
+        args = SimpleNamespace(url=",".join(CORPUS), urls=list(CORPUS))
+        for raw in schedule["bursts"]:
+            spec = reqscale.BurstSpec.from_dict(raw)
+            for backend in ("file", "uffd"):
+                pages = [reqscale.request_url(args, SimpleNamespace(pair_index=r.pair_index))
+                         for r in spec.requests
+                         if r.segment == "score" and r.backend == backend]
+                counts = {url: pages.count(url) for url in CORPUS}
+                self.assertEqual(set(counts.values()), {len(pages) // len(CORPUS)},
+                                 (raw["burst_id"], backend, counts))
+            halves = {}
+            for r in spec.requests:
+                halves.setdefault(r.pair_index, set()).add(
+                    reqscale.request_url(args, SimpleNamespace(pair_index=r.pair_index)))
+            self.assertTrue(all(len(urls) == 1 for urls in halves.values()))
+
+    def test_a_rate_that_splits_a_corpus_cycle_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "whole number of cycles"):
+            reqscale.build_schedule(self._config(2.0), RUN_ID)
+
+    def test_a_single_url_is_unchanged(self):
+        args = SimpleNamespace(url="http://x/", urls=None)
+        self.assertEqual(reqscale.request_url(args, SimpleNamespace(pair_index=9)), "http://x/")
+
+
+class AnalyzerHoldsTheCorpus(unittest.TestCase):
+    def test_a_request_that_rendered_another_page_is_rejected(self):
+        """Red before the corpus was in the schedule: a producer rendering one
+        page for every request passed as the corpus experiment."""
+        schedule, summaries, records = AnalyzerRejectsCorruptEvidence.fixture()
+        records[0]["url"] = "http://elsewhere/"
+        with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "url"):
+            reqscale_analyze._validate_requests(
+                schedule, summaries, records,
+                AnalyzerRejectsCorruptEvidence.GENERATION,
+                AnalyzerRejectsCorruptEvidence.CONFIG_SHA)
+
+    def _gate(self, evidence):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            if evidence is not None:
+                with open(os.path.join(d, "dns-evidence.json"), "w") as handle:
+                    json.dump(evidence, handle)
+            return reqscale_analyze.corpus_dns_gate(
+                run_dir, {"run_id": RUN_ID, "urls": list(CORPUS)},
+                {"host_control": {"resolve_all_to": "127.0.0.1"}})
+
+    def test_a_corpus_run_needs_the_campaigns_clean_dns_evidence(self):
+        """Red before the gate: a corpus run's analysis said publishable with
+        no evidence that its clones resolved through the replay server."""
+        self.assertIn("without the campaign's DNS evidence", self._gate(None))
+        self.assertIn("not 'clean'", self._gate({"verdict": "unclean", "run_id": RUN_ID}))
+        self.assertIn("records run_id='other'",
+                      self._gate({"verdict": "clean", "run_id": "other"}))
+
+    def test_the_dns_evidence_is_held_to_every_file_it_pins(self):
+        """Red while the gate read only verdict and run_id: an object holding
+        just those two fields, or a bundle whose replay log changed after the
+        verdict, left a corpus run publishable. The gate is campaign_summary's
+        check, so a bundle the index would refuse is refused here too."""
+        from test_campaign_summary import write_run
+
+        bare = self._gate({"verdict": "clean", "run_id": RUN_ID})
+        self.assertIsNotNone(bare, "two fields passed as a whole DNS evidence bundle")
+        self.assertIn("samples", bare)
+        schedule = {"run_id": RUN_ID, "urls": ["https://example.com/"]}
+        provenance = {"host_control": {"resolve_all_to": "127.0.0.1"}}
+        with tempfile.TemporaryDirectory() as d:
+            write_run(d, analysis_overrides={"run_id": RUN_ID})
+            run_dir = os.path.join(d, "scale")
+            os.mkdir(run_dir)
+            self.assertIsNone(reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance))
+            with open(os.path.join(d, "corpus-dns.log"), "a") as handle:
+                handle.write("{}\n")
+            refused = reqscale_analyze.corpus_dns_gate(run_dir, schedule, provenance)
+        self.assertIsNotNone(refused, "a replay log changed after the verdict passed")
+        self.assertIn("corpus-dns.log sha256", refused)
+
+    def test_a_single_page_run_needs_no_resolver_evidence(self):
+        self.assertIsNone(reqscale_analyze.corpus_dns_gate(
+            "/nonexistent/scale", {"run_id": RUN_ID, "urls": ["http://127.0.0.1/f"]},
+            {"host_control": {"resolve_all_to": None}}))
+
+    def test_the_control_resolver_must_be_null_or_an_ipv4_address(self):
+        for good in (None, "127.0.0.1"):
+            self.assertTrue(reqscale_analyze._null_or_ipv4(good), good)
+        for bad in ("", "replay", "127.0.0.01", 7):
+            self.assertFalse(reqscale_analyze._null_or_ipv4(bad), bad)
+
+
+class ScaleOutputHonoursThePublicationGate(unittest.TestCase):
+    """main() is what the campaign and `make report-chromium-scale` run."""
+
+    @staticmethod
+    def _corpus_run(d, evidence=True):
+        from test_campaign_summary import write_run
+
+        run_dir = os.path.join(d, "scale")
+        os.mkdir(run_dir)
+        CompleteAnalyzerFixture.build_run(
+            run_dir, url="https://example.com/", resolve_all_to="127.0.0.1")
+        if evidence:
+            write_run(d, analysis_overrides={"run_id": RUN_ID})
+        return run_dir
+
+    @staticmethod
+    def _main(*argv):
+        err = io.StringIO()
+        with mock.patch.object(sys, "argv", ["reqscale_analyze.py", *argv]), \
+                mock.patch.object(reqscale_analyze, "BOOTSTRAP_DRAWS", 1000), \
+                redirect_stderr(err):
+            return reqscale_analyze.main(), err.getvalue()
+
+    @staticmethod
+    def _load(path):
+        with open(path) as stream:
+            return json.load(stream)
+
+    def test_an_unpublishable_analysis_gets_json_but_no_report(self):
+        """RED BEFORE THE FIX: with the campaign's DNS evidence absent the
+        analysis said publishable false, and --markdown-out still wrote a
+        report saying the run passed its checks, at exit 0. The JSON-only
+        analysis still exits 0, because the campaign writes it before the
+        evidence exists to bind the run id the evidence names."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir = self._corpus_run(d, evidence=False)
+            report = os.path.join(out, "report.md")
+            rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+            self.assertNotEqual(rc, 0, "a report was written for an unpublishable analysis")
+            self.assertFalse(os.path.lexists(report))
+            self.assertIn("DNS evidence", err)
+            pre = os.path.join(out, "analysis-pre-evidence.json")
+            rc, err = self._main("--run-dir", run_dir, "--json-out", pre)
+            self.assertEqual(rc, 0, err)
+            self.assertFalse(self._load(pre)["publishable"])
+
+    def test_a_withdrawn_run_or_campaign_is_not_publishable(self):
+        """RED BEFORE THE FIX: the scale analyzer read no WITHDRAWN marker, so
+        re-analysing a withdrawn campaign whose clean DNS evidence stayed in
+        place said publishable, and its report was written."""
+        for where in ("campaign", "run"):
+            with self.subTest(where=where), tempfile.TemporaryDirectory() as d, \
+                    tempfile.TemporaryDirectory() as out:
+                run_dir = self._corpus_run(d)
+                before = os.path.join(out, "before.json")
+                rc, err = self._main("--run-dir", run_dir, "--json-out", before)
+                self.assertEqual(rc, 0, err)
+                self.assertTrue(self._load(before)["publishable"])
+                marked = d if where == "campaign" else run_dir
+                with open(os.path.join(marked, "WITHDRAWN"), "w") as marker:
+                    marker.write("resolver was ambient\n")
+                after = os.path.join(out, "after.json")
+                rc, err = self._main("--run-dir", run_dir, "--json-out", after)
+                self.assertEqual(rc, 0, err)
+                analysis = self._load(after)
+                self.assertFalse(analysis["publishable"], f"a withdrawn {where} stayed publishable")
+                self.assertIn("withdrawn: resolver was ambient",
+                              analysis["publication_blocked_by"])
+                report = os.path.join(out, "report.md")
+                rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+                self.assertNotEqual(rc, 0, err)
+                self.assertFalse(os.path.lexists(report))
+
+    def test_the_run_and_its_campaign_stay_locked_while_the_analysis_reads_them(self):
+        """RED BEFORE THE FIX: the analyzer held no lock, so a withdrawal
+        writer following AGENTS.md (exclusive flock on the directory, then the
+        marker) took either directory in the middle of validation, and the
+        analysis published from the state before its marker."""
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            run_dir = self._corpus_run(d)
+            report = os.path.join(out, "report.md")
+            real_analyze = reqscale_analyze.analyze
+            writers = []
+
+            def analyze_beside_a_writer(path):
+                for directory in (run_dir, d):
+                    writers.append(subprocess.run(
+                        ["flock", "-n", "-x", directory, "sh", "-c",
+                         'printf "late\\n" > "$1"', "sh",
+                         os.path.join(directory, "WITHDRAWN")],
+                        capture_output=True, text=True, timeout=10,
+                    ).returncode)
+                return real_analyze(path)
+
+            with mock.patch.object(reqscale_analyze, "analyze",
+                                   side_effect=analyze_beside_a_writer):
+                rc, err = self._main("--run-dir", run_dir, "--markdown-out", report)
+            self.assertEqual(writers, [1, 1],
+                             "a withdrawal writer locked a directory mid-analysis")
+            self.assertEqual(rc, 0, err)
+            self.assertTrue(os.path.isfile(report))
+            for directory in (run_dir, d):
+                self.assertFalse(os.path.lexists(os.path.join(directory, "WITHDRAWN")))
+                released = subprocess.run(
+                    ["flock", "-n", "-x", directory, "true"],
+                    capture_output=True, timeout=10,
+                )
+                self.assertEqual(released.returncode, 0,
+                                 f"{directory}: the analysis kept its lock")
+
+
+class RestorePathIsWhatItSays(unittest.TestCase):
+    def test_a_file_arm_that_would_restore_through_uffd_is_refused(self):
+        """Red before the check: hugepage, NV2 (kernel profile) and forced
+        restores made the FILE arm an implicit UFFD one."""
+        plain = {"metadata": {"hugepages": False, "kernel_profile": None}}
+        self.assertIsNone(reqscale.file_restore_refusal(plain, {}))
+        self.assertIn("hugepages", reqscale.file_restore_refusal(
+            {"metadata": {"hugepages": True}}, {}))
+        self.assertIn("nested", reqscale.file_restore_refusal(
+            {"metadata": {"kernel_profile": "nested"}}, {}))
+        self.assertIn("FCVM_FORCE_UFFD", reqscale.file_restore_refusal(
+            plain, {"FCVM_FORCE_UFFD": "1"}))
+
+    def test_the_server_must_run_the_requested_mode(self):
+        """Red before the check: NV2 coerced minor to copy and the UFFD cells
+        were labelled minor."""
+        reqscale.require_serve_mode("minor", "minor")
+        with self.assertRaisesRegex(reqscale.MeasurementInvalid, "runs copy mode"):
+            reqscale.require_serve_mode("copy", "minor")
+
+
+class SpawnedArgv(unittest.TestCase):
+    """What start() hands to Popen, captured by a Popen that refuses."""
+
+    def _capture(self, start):
+        seen = []
+
+        def refuse(argv, **_kw):
+            seen.append(list(argv))
+            raise RuntimeError("captured")
+
+        with mock.patch.object(reqscale.subprocess, "Popen", side_effect=refuse):
+            with self.assertRaises(Exception):
+                start()
+        self.assertEqual(len(seen), 1)
+        return seen[0]
+
+    def test_the_memory_server_starts_in_the_requested_mode(self):
+        """Red on the parent: the serve argv had no --uffd-mode, so every run
+        served copy mode."""
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(fcvm="/f", snapshot_tag="cb-req-corpus", state_dir=d,
+                                   data_root=d, uffd_mode="minor", uffd_prefetch="off",
+                                   rust_log="fcvm=debug")
+            serve = reqscale.UffdServe(args, mock.Mock(), "/sys/fs/cgroup/x/uffd", d)
+            argv = self._capture(serve.start)
+        self.assertEqual(argv[-8:], ["/f", "snapshot", "serve", "cb-req-corpus",
+                                     "--uffd-mode", "minor", "--uffd-prefetch", "off"])
+
+    def test_the_control_chromium_maps_names_to_the_replay_server(self):
+        """Red on the parent: the control argv had no resolver rule, so a
+        corpus control resolved on the live internet."""
+        with tempfile.TemporaryDirectory() as d:
+            args = SimpleNamespace(control_chromium="/c", control_resolve_all_to="127.0.0.1",
+                                   control_tmp_root=d, run_id="r")
+            control = reqscale.NativeChromiumControl(args, mock.Mock(), "/sys/fs/cgroup/x/c", d)
+            argv = self._capture(control.start)
+        self.assertIn("--host-resolver-rules=MAP * 127.0.0.1", argv)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

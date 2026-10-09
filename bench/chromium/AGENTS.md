@@ -199,8 +199,9 @@ hostname URLs and records no resolver (`guest_dns` null, no
 2026-08-16 corpus record, whose guests resolved through ambient DNS. A marker writer must first open the results directory and
 take an exclusive `flock` on that directory descriptor, then remove completion
 records and atomically rename the marker while holding the lock.
-`campaign_summary.py` and `compare.py` hold shared locks on every run directory
-whose authorization they consume, across validation and publication. This
+`campaign_summary.py`, `compare.py` and `reqscale_analyze.py` hold shared locks
+on every run directory whose authorization they consume, across validation and
+publication. This
 makes a withdrawal order before the publication (which refuses it) or after it
 (which invalidates it), with no unchecked interval between the last marker read
 and publication. The marker is tracked (`!results/**/WITHDRAWN` in

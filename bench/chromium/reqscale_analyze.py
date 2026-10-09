@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
 import math
 import os
@@ -17,6 +18,8 @@ from collections import defaultdict
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 
+import campaign_summary  # noqa: E402
+import reqanalyze  # noqa: E402
 import reqscale  # noqa: E402
 
 
@@ -132,6 +135,56 @@ def _canonical_generation(value) -> str:
     return canonical
 
 
+def _null_or_ipv4(value) -> bool:
+    if value is None:
+        return True
+    try:
+        return isinstance(value, str) and str(ipaddress.IPv4Address(value)) == value
+    except ValueError:
+        return False
+
+
+def corpus_dns_gate(run_dir: str, schedule: dict, provenance: dict):
+    """None when publication needs no resolver evidence or has it, else why not.
+
+    A run needs resolver evidence when a URL's host is a name only a resolver
+    can answer (reqanalyze.url_needs_resolver, which treats a URL it cannot read
+    the way the browser does as needing one) or when the host control maps
+    names; IP literals and localhost resolve nothing, however many there are.
+    Whether each clone resolved those names through the replay server is
+    recorded only by the corpus campaign's DNS evidence beside this run
+    directory. Without a clean bundle that names this
+    run, a run against the wrong resolver is indistinguishable from a good one.
+    The bundle is held to campaign_summary's check, the one the index applies:
+    the run id, the :53 owner samples, the replay server's exit status, every
+    verify bracket and replay log against the sha256 recorded at the verdict,
+    and brackets that covered exactly this run's pages. The scale schedule
+    records no guest resolver, so the brackets are held to the one the first
+    of them names. A WITHDRAWN marker in the campaign directory, the results
+    directory the withdrawal rule in AGENTS.md governs, withdraws the run too.
+    """
+    corpus = provenance["host_control"].get("resolve_all_to") or any(
+        reqanalyze.url_needs_resolver(url) is not False for url in schedule["urls"])
+    if not corpus:
+        return None
+    campaign_dir = os.path.dirname(os.path.abspath(run_dir))
+    withdrawn = campaign_summary.withdrawal_errors([campaign_dir])
+    if withdrawn:
+        return f"the campaign is withdrawn: {withdrawn[0]}"
+    path = os.path.join(campaign_dir, "dns-evidence.json")
+    if not os.path.isfile(path):
+        return f"corpus run without the campaign's DNS evidence ({path})"
+    sources = campaign_summary.Sources(campaign_dir)
+    try:
+        evidence = sources.read_json(path)
+        campaign_summary.check_evidence(
+            campaign_dir, evidence, sources, None, list(schedule["urls"]), schedule["run_id"]
+        )
+    except campaign_summary.RunError as error:
+        return f"the campaign's DNS evidence does not hold: {error}"
+    return None
+
+
 def _validate_schedule(schedule: dict) -> reqscale.ScheduleConfig:
     if not isinstance(schedule, dict):
         raise AnalysisInvalid("schedule is not an object")
@@ -162,6 +215,7 @@ def _validate_schedule(schedule: dict) -> reqscale.ScheduleConfig:
             score_seconds=schedule["score_seconds"],
             trace_rate=schedule["trace_rate"],
             trace_pairs=schedule["trace_pairs"],
+            urls=tuple(schedule["urls"]),
         )
         rebuilt = reqscale.build_schedule(config, schedule["run_id"])
     except (
@@ -516,6 +570,7 @@ def _validate_requests(
                 "backend": planned.backend,
                 "segment": planned.segment,
                 "pair_index": planned.pair_index,
+                "url": schedule["urls"][planned.pair_index % len(schedule["urls"])],
                 "request_seed": planned.seed,
                 "population": spec.population,
                 "target_rps": spec.target_rps,
@@ -1197,19 +1252,33 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         "source_revision", "source_dirty", "source_status_sha256",
         "harness_sha256", "fcvm_path", "fcvm_sha256", "fcvm_version",
         "host_control", "snapshot", "snapshot_generation_lease", "host",
-        "fault_trace",
+        "fault_trace", "runtime_bundle_sha256", "golden_creator",
     }
     if not isinstance(provenance, dict) or set(provenance) != required:
         raise AnalysisInvalid("provenance fields are incomplete or unknown")
-    if provenance.get("schema") != "fcvm.chromium.reqscale.provenance.v1":
+    if provenance.get("schema") != "fcvm.chromium.reqscale.provenance.v2":
         raise AnalysisInvalid("unsupported provenance schema")
     if provenance.get("run_id") != schedule["run_id"]:
         raise AnalysisInvalid("run identity differs between schedule and provenance")
     if provenance.get("source_dirty") is not False:
         raise AnalysisInvalid("measurement source tree was dirty")
     _require_hex(provenance.get("source_revision"), 40, "source revision")
-    for name in ("source_status_sha256", "harness_sha256", "fcvm_sha256"):
+    for name in ("source_status_sha256", "harness_sha256", "fcvm_sha256",
+                 "runtime_bundle_sha256"):
         _require_hex(provenance.get(name), 64, name)
+    measured_runtime = {
+        "creator_fcvm_sha256": provenance["fcvm_sha256"],
+        "creator_runtime_bundle_sha256": provenance["runtime_bundle_sha256"],
+        "source_revision": provenance["source_revision"],
+    }
+    golden = provenance.get("golden_creator")
+    if not isinstance(golden, dict) or set(golden) != set(measured_runtime):
+        raise AnalysisInvalid("provenance does not name the runtime that created its golden")
+    for field, measured in measured_runtime.items():
+        if golden[field] != measured:
+            raise AnalysisInvalid(
+                f"the golden was created with {field}={golden[field]!r}, the run "
+                f"measured with {measured!r}; it is not the golden's runtime")
     if not isinstance(provenance.get("created_at"), str) or not provenance["created_at"]:
         raise AnalysisInvalid("provenance has no creation time")
     if (
@@ -1269,7 +1338,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         not isinstance(host_control, dict)
         or set(host_control) != {
             "chromium_path", "chromium_sha256", "chromium_version", "url",
-            "interval_seconds", "timeout_seconds",
+            "resolve_all_to", "interval_seconds", "timeout_seconds",
         }
         or host_control.get("interval_seconds") != reqscale.CONTROL_INTERVAL_SECONDS
         or not isinstance(host_control.get("chromium_path"), str)
@@ -1278,6 +1347,7 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         or not host_control["chromium_version"]
         or not isinstance(host_control.get("url"), str)
         or not host_control["url"]
+        or not _null_or_ipv4(host_control.get("resolve_all_to"))
         or not 0 < _finite_number(
             host_control.get("timeout_seconds"), "host-control timeout", minimum=0,
         ) < reqscale.CONTROL_INTERVAL_SECONDS
@@ -1560,7 +1630,7 @@ def _validate_uffd_serve(
 ) -> None:
     required_fields = {
         "schema", "kind", "run_id", "pid", "pid_start_time_ticks",
-        "state_path", "uffd_mode", "snapshot_tag", "snapshot_generation_id",
+        "state_path", "uffd_mode", "uffd_prefetch", "snapshot_tag", "snapshot_generation_id",
         "snapshot_config_sha256",
     }
     if not isinstance(serve, dict) or set(serve) != required_fields:
@@ -1582,6 +1652,8 @@ def _validate_uffd_serve(
         raise AnalysisInvalid(f"UFFD serve is not bound to this snapshot generation: {mismatch}")
     if serve.get("uffd_mode") not in ("copy", "minor"):
         raise AnalysisInvalid("UFFD serve has an invalid memory mode")
+    if serve.get("uffd_prefetch") not in ("on", "off"):
+        raise AnalysisInvalid("UFFD serve has an invalid working-set prefetch setting")
     state_path = serve.get("state_path")
     if (
         not isinstance(state_path, str)
@@ -1916,11 +1988,17 @@ def analyze(run_dir: str) -> dict:
     else:
         trace_gate = {"enabled": False}
 
+    # A WITHDRAWN marker withdraws a scale run wherever it was measured.
+    withdrawn = campaign_summary.withdrawal_errors([run_dir])
+    block = withdrawn[0] if withdrawn else corpus_dns_gate(run_dir, schedule, provenance)
     return {
         "schema": ANALYSIS_SCHEMA,
         "run_id": run_id,
         "snapshot_generation_id": generation_id,
-        "publishable": True,
+        "publishable": block is None,
+        "publication_blocked_by": block,
+        "corpus": list(schedule["urls"]),
+        "uffd": {"mode": uffd_serve["uffd_mode"], "prefetch": uffd_serve["uffd_prefetch"]},
         # The report is the publication document, so the numbers that describe HOW the
         # run was scheduled, and on WHAT, have to come from the validated artifacts
         # rather than from prose written when the defaults happened to be these.
@@ -1938,6 +2016,7 @@ def analyze(run_dir: str) -> dict:
             "cpu_count": provenance["host"]["cpu_count"],
             "fcvm_version": provenance["fcvm_version"],
             "fcvm_sha256": provenance["fcvm_sha256"],
+            "runtime_bundle_sha256": provenance["runtime_bundle_sha256"],
             "source_revision": provenance["source_revision"],
             "source_dirty": provenance["source_dirty"],
             "chromium_version": provenance["host_control"]["chromium_version"],
@@ -1965,6 +2044,13 @@ def _format_seconds(value):
 
 
 def markdown_report(analysis: dict) -> str:
+    # The report says the run passed its checks, so an analysis that withholds
+    # publication gets none.
+    if analysis.get("publishable") is not True:
+        raise AnalysisInvalid(
+            "no report for an unpublishable analysis: "
+            f"{analysis.get('publication_blocked_by')}"
+        )
     sched = analysis["schedule"]
     prov = analysis["provenance"]
     warmup = sched["warmup_bursts"]
@@ -1981,7 +2067,8 @@ def markdown_report(analysis: dict) -> str:
         f"`{prov['source_revision'][:12]}`"
         f"{' with a DIRTY tree' if prov['source_dirty'] else ''}, driving "
         f"Chromium `{prov['chromium_version']}`. Full host and binary provenance is in "
-        f"`{prov['hostinfo']}`.",
+        f"`{prov['hostinfo']}`. The UFFD backend served in `{analysis['uffd']['mode']}` "
+        f"mode with working-set prefetch `{analysis['uffd']['prefetch']}`.",
         "",
         "FILE and UFFD were offered the same per-backend rate in one mixed stream. "
         "Each rate interval contained one request for each backend, separated by "
@@ -2076,33 +2163,47 @@ def main() -> int:
     args = parser.parse_args()
     if not args.json_out and not args.markdown_out:
         parser.error("at least one of --json-out or --markdown-out is required")
-    try:
-        analysis = analyze(os.path.abspath(args.run_dir))
-        if args.json_out:
-            reqscale.write_json_exclusive(os.path.abspath(args.json_out), analysis)
-        if args.markdown_out:
-            report_path = os.path.abspath(args.markdown_out)
-            directory = os.path.dirname(report_path)
-            os.makedirs(directory, exist_ok=True)
-            temp = os.path.join(
-                directory, f".{os.path.basename(report_path)}.{uuid.uuid4().hex}.tmp"
-            )
-            try:
-                fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-                with os.fdopen(fd, "w") as stream:
-                    stream.write(markdown_report(analysis))
-                    stream.flush()
-                    os.fsync(stream.fileno())
-                os.link(temp, report_path)
-                reqscale._fsync_directory(directory)
-            finally:
+    run_dir = os.path.abspath(args.run_dir)
+    # The reader side of the WITHDRAWN protocol in AGENTS.md: shared locks on
+    # the run directory and the directory holding it (for a corpus run, the
+    # campaign whose marker and DNS evidence authorize it) from the first read
+    # until the outputs are installed. A withdrawal writer's exclusive lock
+    # then lands wholly before this analysis, which reads its marker, or after.
+    with campaign_summary.shared_run_directory_locks(
+            [run_dir, os.path.dirname(run_dir)]) as lock_errors:
+        try:
+            if lock_errors:
+                raise AnalysisInvalid("; ".join(lock_errors))
+            analysis = analyze(run_dir)
+            report = markdown_report(analysis) if args.markdown_out else None
+            moved = campaign_summary.locked_run_directory_errors(lock_errors.run_dirs)
+            if moved:
+                raise AnalysisInvalid("; ".join(moved))
+            if args.json_out:
+                reqscale.write_json_exclusive(os.path.abspath(args.json_out), analysis)
+            if report is not None:
+                report_path = os.path.abspath(args.markdown_out)
+                directory = os.path.dirname(report_path)
+                os.makedirs(directory, exist_ok=True)
+                temp = os.path.join(
+                    directory, f".{os.path.basename(report_path)}.{uuid.uuid4().hex}.tmp"
+                )
                 try:
-                    os.unlink(temp)
-                except FileNotFoundError:
-                    pass
-    except (AnalysisInvalid, reqscale.MeasurementInvalid, OSError, ValueError) as error:
-        print(f"{type(error).__name__}: {error}", file=sys.stderr)
-        return 4
+                    fd = os.open(temp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+                    with os.fdopen(fd, "w") as stream:
+                        stream.write(report)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.link(temp, report_path)
+                    reqscale._fsync_directory(directory)
+                finally:
+                    try:
+                        os.unlink(temp)
+                    except FileNotFoundError:
+                        pass
+        except (AnalysisInvalid, reqscale.MeasurementInvalid, OSError, ValueError) as error:
+            print(f"{type(error).__name__}: {error}", file=sys.stderr)
+            return 4
     return 0
 
 

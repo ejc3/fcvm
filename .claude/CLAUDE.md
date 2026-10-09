@@ -834,14 +834,17 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-hostcdp` | `bench-chromium-request-build` | host-container CDP baseline, no VM; `COMPARISON_LABEL=` (default `standalone`), `CPU_BUDGET=` (default `unlimited`), `CPUS=` (requires `CPU_BUDGET=vm-matched`), `BENCH_RESOLVE_ALL_TO=` |
 | `bench-chromium-fault` | `build` + `setup-default` | `FAULT_OUT=` (required), `FAULT_ARGS=` |
 
-- **verify/diag/run must never gain a `build` dependency.** reqbench.sh seals
-  fcvm, fc-agent and its six sources into a hash-bound runtime bundle; the
-  run refuses a golden recorded under a different bundle hash. A rebuild, an
+- **verify/diag/run and bench-chromium-scale must never gain a `build` dependency.**
+  reqbench.sh seals fcvm, fc-agent, the request harness's six sources and the
+  scale harness's five into a hash-bound runtime bundle; the run, and the scale
+  run through `reqbench.sh scale`, refuse a golden recorded under a different
+  bundle hash. A rebuild, an
   edit to a sealed file, or a new commit between golden and run invalidates
   the chain: the run also refuses a golden whose recorded source_revision is
   not the current git HEAD. Regolden instead of working around the seal.
   Sealed set: reqbench.{sh,py}, reqanalyze.py, cdpdrive.py, render.py,
-  wddrive.py, fcvm, fc-agent. The Makefile and test files are not sealed:
+  wddrive.py, reqscale.py, reqscale_analyze.py, faulttrace.bt, guardexec.py,
+  guardsupervise.py, fcvm, fc-agent. The Makefile and test files are not sealed:
   uncommitted edits to them do not affect a golden or a run in progress, but
   committing them before the run does.
 - Hugepage goldens are part of the snapshot identity: distinct tag, e.g.
