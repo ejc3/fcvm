@@ -844,11 +844,18 @@ print(n.get("loopback_ip") or n.get("host_ip") or n.get("guest_ip") or "")')
 # --uffd-prefetch).
 SERVE_PID=""
 SERVE_BG=""
+# The serve logs its uffd target at info, so reqbench.py can read each
+# clone's connection, disconnection and working-set publication lines, which
+# end that request's memory-server CPU window. "warn," keeps every other
+# target's warnings (a directive list disables the targets it does not
+# name). Not debug: that adds per-page lines in the fault path, which would
+# put logging CPU inside the measured windows.
+SERVE_RUST_LOG="warn,uffd=info"
 start_serve() {
     local phase="$1" sf="$2"
     shift 2
     SERVE_PID=""; SERVE_BG=""
-    $SUDO "$FCVM" snapshot serve "$TAG" "$@" >"$sf" 2>&1 &
+    $SUDO env RUST_LOG="$SERVE_RUST_LOG" "$FCVM" snapshot serve "$TAG" "$@" >"$sf" 2>&1 &
     SERVE_BG=$!
     track "$SERVE_BG"
     local t0=$SECONDS
@@ -1487,7 +1494,7 @@ cmd_run() {
             start_serve run "$RESULTS/logs/serve.log" \
                 --uffd-mode "$UFFD_MODE" --uffd-prefetch "$UFFD_PREFETCH" || return 1
             log "run: serve pid $SERVE_PID -> reqbench.py"
-            backend_args=(--serve-pid "$SERVE_PID")
+            backend_args=(--serve-pid "$SERVE_PID" --serve-log "$RESULTS/logs/serve.log")
             ;;
         file)
             # No serve at all: clones restore MAP_PRIVATE from the snapshot files.

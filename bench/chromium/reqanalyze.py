@@ -174,55 +174,73 @@ def cpu_reading(value) -> bool:
             and math.isfinite(value) and value >= 0)
 
 
-def memory_server_average(records, arms, tick_ms):
-    """The memory server's CPU per request over a single-arm run.
+def memory_server_average(schedule, arm_records, tick_ms):
+    """The memory server's CPU per request for one arm, from per-request windows.
 
-    Each record carries the server's cumulative CPU sampled at its launch
-    (serve_cpu_before) and after its teardown (serve_cpu_after), and the
-    run's last record carries serve_cpu_final, read after the server stopped
-    rising: a clone's teardown leaves the server work it finishes later
-    (working-set persistence on its fcvm-ws-write thread), and only the last
-    request has no later sample to count it. The growth from the first
-    measured request's launch to that final sample, divided by the measured
-    count, is the server's CPU per request, including the work it finishes
-    after a clone exits. A final sample taken while the counter was still
-    rising would understate it, so it is not attributed. A run with other
-    arms shared the server, so its growth is not this arm's.
+    `schedule` is every record of the run in schedule order, warmups and
+    other arms included, and `arm_records` are the arm's measured records
+    among them. Each record carries the server's cumulative CPU at the start
+    of its window (serve_cpu_before) and at its end (serve_cpu_after), and
+    serve_ack, whether the server acknowledged the work the request's clone
+    left it before the window closed (reqbench.ServeWindows). A window holds
+    its own request's server work, to within one tick, when every request's
+    window was acknowledged, when each window ends at the sample that starts
+    the next (the windows tile the run, so no server work falls between
+    them), and when the first window, which also holds the server's start-up
+    work, belongs to a warmup request. The figure is the mean of the arm's
+    windows, whatever arms share the server.
 
     Each sample is four /proc counters (utime, stime, cutime, cstime), each
-    truncated to tick_ms, so it reads up to four ticks low and the growth is
-    known to within four ticks either way; quantization_ms is that interval
-    spread over the requests.
+    truncated to tick_ms, so it reads up to four ticks low. Over a run of
+    consecutive windows of this arm the truncation telescopes to its two
+    end samples, so the sum of the arm's windows is known to within four
+    ticks per such run (`blocks`) either way; quantization_ms is that
+    interval spread over the requests.
     """
-    before = [r.get("serve_cpu_before") for r in records]
-    after = [r.get("serve_cpu_after") for r in records]
-    if any(not isinstance(s, dict) for s in before + after):
+    samples = [sample for record in schedule
+               for sample in (record.get("serve_cpu_before"), record.get("serve_cpu_after"))]
+    if any(not isinstance(s, dict) for s in samples):
         return {"available": False, "reason": "a request has no memory-server sample"}
-    if not any(s.get("applicable") for s in before + after):
+    if not any(s.get("applicable") for s in samples):
         return {"available": True, "mean_ms": 0.0, "quantization_ms": {"lo": 0.0, "hi": 0.0},
                 "note": "file-backed: no memory server"}
-    if len(arms) != 1:
-        return {"available": False,
-                "reason": f"the memory server also served arm(s) {sorted(set(arms) - set([records[0].get('arm')]))}"}
-    ordered = sorted(records, key=lambda r: r.get("rep", 0))
-    final = ordered[-1].get("serve_cpu_final")
-    if not isinstance(final, dict):
-        return {"available": False,
-                "reason": "the last request has no memory-server sample taken after it settled"}
-    samples = before + after + [final]
     if any(s.get("error") or not s.get("applicable") or not cpu_reading(s.get("ms"))
            or not isinstance(s.get("starttime"), int) or isinstance(s.get("starttime"), bool)
            for s in samples):
         return {"available": False, "reason": "a memory-server sample failed"}
     if len({s["starttime"] for s in samples}) != 1:
         return {"available": False, "reason": "the memory server restarted during the run"}
-    if final.get("settled") is not True:
+    unacked = next((r for r in schedule
+                    if not isinstance(r.get("serve_ack"), dict)
+                    or r["serve_ack"].get("acknowledged") is not True), None)
+    if unacked is not None:
+        ack = unacked.get("serve_ack")
+        reason = ack.get("reason") if isinstance(ack, dict) else "no acknowledgement recorded"
         return {"available": False,
-                "reason": "the memory server's CPU was still rising after the last request"}
-    growth = final["ms"] - ordered[0]["serve_cpu_before"]["ms"]
-    bound = 4 * tick_ms / len(records)
-    return {"available": True, "mean_ms": growth / len(records), "n": len(records),
-            "window_ms": growth, "quantization_ms": {"lo": -bound, "hi": bound}}
+                "reason": f"request {unacked.get('arm')}:{unacked.get('rep')} was not "
+                          f"acknowledged by the memory server: {reason}"}
+
+    def key(sample):
+        return sample["ms"], sample["starttime"]
+    if any(key(a["serve_cpu_after"]) != key(b["serve_cpu_before"])
+           for a, b in zip(schedule, schedule[1:])):
+        return {"available": False,
+                "reason": "the memory-server windows do not tile the schedule"}
+    if any(r["serve_cpu_after"]["ms"] < r["serve_cpu_before"]["ms"] for r in schedule):
+        return {"available": False, "reason": "a memory-server sample decreased"}
+    if schedule[0].get("warmup") is not True:
+        return {"available": False,
+                "reason": "the first request's window holds the memory server's start-up work"}
+    windows = [r["serve_cpu_after"]["ms"] - r["serve_cpu_before"]["ms"] for r in arm_records]
+    mean, lo, hi, n = mean_ci(windows)
+    ids = {id(r) for r in arm_records}
+    positions = [index for index, r in enumerate(schedule) if id(r) in ids]
+    if not positions or len(positions) != len(arm_records):
+        return {"available": False, "reason": "a measured request is not in the schedule"}
+    blocks = 1 + sum(b != a + 1 for a, b in zip(positions, positions[1:]))
+    bound = 4 * tick_ms * blocks / n
+    return {"available": True, "mean_ms": mean, "lo": lo, "hi": hi, "n": n, "blocks": blocks,
+            "quantization_ms": {"lo": -bound, "hi": bound}}
 
 
 def fmt(med, lo, hi, n=None, unit="ms"):
@@ -2385,13 +2403,13 @@ def analyze_backend(
         #           includes the guest's vCPUs), what their already-reaped
         #           children used (fcvm's cp/nsenter/ip helpers), and what
         #           each spent being reaped after the kill.
-        #   server  the shared memory server's cumulative CPU growth from the
-        #           first measured request's launch to the run's final
-        #           sample, read once the server stopped rising, divided by
-        #           the measured count. Detached work it does after a clone
-        #           exits is inside that window, and the CLK_TCK steps
-        #           average out. It is only this arm's when the run had no
-        #           other arm.
+        #   server  the shared memory server's cumulative CPU growth over
+        #           each measured request's own window, averaged. A window
+        #           runs from the request's launch until the server has
+        #           acknowledged the work its clone left it (working-set
+        #           publication, warm-up), and the next request starts after
+        #           it, so it holds that request's server work whatever the
+        #           other arms are (memory_server_average).
         # Every reading is /proc counters truncated to the tick, so each
         # figure carries quantization_ms: the interval, before sampling error,
         # in which the mean of the untruncated counters lies around it. The
@@ -2466,7 +2484,7 @@ def analyze_backend(
                 tick = max(x["tick_ms"] for x in readings)
                 clone_q_hi = statistics.fmean(x["quantization_hi"] for x in readings)
                 clone_q = {"lo": 0.0, "hi": clone_q_hi, "tick_ms": tick}
-                server = memory_server_average(fast_records, arms, tick)
+                server = memory_server_average(recs, fast_records, tick)
                 total_q = ({"lo": server["quantization_ms"]["lo"],
                             "hi": clone_q_hi + server["quantization_ms"]["hi"]}
                            if server.get("available") else None)
@@ -2525,7 +2543,9 @@ def analyze_backend(
                       f"({q['tick_ms']:.0f} ms tick)")
                 s = block["memory_server"]
                 print("      memory server mean  "
-                      + (f"{s['mean_ms']:.1f} ms" if s.get("available")
+                      + ((f"{s['mean_ms']:.1f} ms" + (f" [{s['lo']:.1f}, {s['hi']:.1f}] n={s['n']}"
+                                                       if "lo" in s else ""))
+                         if s.get("available")
                          else f"not attributable: {s['reason']}"))
                 if "total_mean_ms" in block:
                     q = block["total_quantization_ms"]
