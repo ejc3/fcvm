@@ -491,6 +491,9 @@ async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pa
 {
     let (parent_vm, clone_name, parent_tag, _) = common::unique_names("served-diff");
     let child_tag = format!("{parent_tag}-child");
+    // Both snapshots go when the test ends, whether it passes or not.
+    let parent_guard = RemoveSnapshotOnDrop(snapshot_dir().join(&parent_tag));
+    let child_guard = RemoveSnapshotOnDrop(snapshot_dir().join(&child_tag));
     let fcvm_path = common::find_fcvm_binary()?;
     let fill = |file: &str| {
         format!("dd if=/dev/urandom of=/dev/shm/{file} bs=1M count=8 2>/dev/null && sha256sum /dev/shm/{file} | cut -d' ' -f1")
@@ -538,8 +541,10 @@ async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pa
     );
     stop(parent_pid, &mut parent).await;
 
+    // --uffd-mode copy: the path under test is anonymous memory filled by UFFDIO_COPY, and
+    // FCVM_UFFD_MODE in the environment would otherwise choose the server's mode.
     let (mut serve, serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &parent_tag],
+        &["snapshot", "serve", &parent_tag, "--uffd-mode", "copy"],
         &format!("{parent_tag}-serve"),
     )
     .await
@@ -604,7 +609,7 @@ async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pa
     // The child is restored through a memory server too.
     let child_clone = format!("{clone_name}-child");
     let (mut child_serve, child_serve_pid) = common::spawn_fcvm_with_logs(
-        &["snapshot", "serve", &child_tag],
+        &["snapshot", "serve", &child_tag, "--uffd-mode", "copy"],
         &format!("{child_tag}-serve"),
     )
     .await
@@ -638,6 +643,11 @@ async fn test_tracked_diff_of_a_served_clone_keeps_its_writes_and_the_parents_pa
         parent_back.trim(),
         parent_sum,
         "a clone of the child does not hold the parent's 8 MiB, which the served clone only read"
+    );
+    drop((parent_guard, child_guard));
+    assert!(
+        !snapshot_dir().join(&parent_tag).exists() && !snapshot_dir().join(&child_tag).exists(),
+        "the test left a snapshot behind"
     );
     Ok(())
 }
