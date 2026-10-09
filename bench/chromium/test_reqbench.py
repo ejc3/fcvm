@@ -3859,19 +3859,28 @@ class AnalyzerAvailability(unittest.TestCase):
 
     def _cpu_fixture(self, d, mutate=None, server=None):
         """server: "windows" stamps tiled, acknowledged memory-server windows
-        on every request (30 ms for cdp-fast, 10 ms for the others), "file"
-        marks every request file-backed, and None leaves no samples."""
+        on every request (30 ms for cdp-fast, 10 ms for the others),
+        "varying" does the same with cdp-fast windows of 10, 30, 50 ms and so
+        on, "file" marks every request file-backed, and None leaves no
+        samples."""
         src = os.path.join(d, "r.jsonl")
         dst = os.path.join(d, "r.json")
         self._write_clean_backend(src, "uffd", 6, 372.0)
         with open(src) as source:
             rows = [json.loads(line) for line in source]
         requests = [row for row in rows if row.get("kind") != "meta"]
-        if server == "windows":
+        if server in ("windows", "varying"):
             ms = 1000.0
+            fast_seen = 0
             for index, row in enumerate(requests):
                 before = {"applicable": True, "ms": ms, "starttime": 7}
-                ms += 30.0 if row["arm"] == "cdp-fast" else 10.0
+                if row["arm"] != "cdp-fast":
+                    ms += 10.0
+                elif server == "windows":
+                    ms += 30.0
+                else:
+                    ms += 10.0 + 20.0 * fast_seen
+                    fast_seen += 1
                 row["serve_cpu_before"] = before
                 row["serve_cpu_after"] = {"applicable": True, "ms": ms, "starttime": 7}
                 row["serve_ack"] = {"acknowledged": True, "vm_id": f"vm-{index}",
@@ -3927,8 +3936,40 @@ class AnalyzerAvailability(unittest.TestCase):
         self.assertTrue(1 <= server["blocks"] <= len(measured))
         bound = 40.0 * server["blocks"] / len(measured)
         self.assertEqual(server["quantization_ms"], {"lo": -bound, "hi": bound})
-        self.assertEqual(block["total_mean_ms"], 670.0 + 5.0 + 110.0 + 30.0)
+        self.assertEqual(block["total_mean_ms"]["mean"], 670.0 + 5.0 + 110.0 + 30.0)
         self.assertEqual(block["total_quantization_ms"], {"lo": -bound, "hi": 120.0 + bound})
+
+    def test_the_totals_carry_the_memory_servers_sampling_error(self):
+        """RED ON 318a25e1: both totals added the memory server's point
+        estimate to the clone's figures. The server's windows vary from
+        request to request, so it has a sampling error of its own: the
+        at-least total's lower end left it out, and the complete total had
+        no interval. Each request's clone total is now paired with its own
+        server window and the sums are bootstrapped."""
+        def windows_of(measured):
+            return [r["serve_cpu_after"]["ms"] - r["serve_cpu_before"]["ms"] for r in measured]
+        with self.subTest("complete"), tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, server="varying")
+            windows = windows_of(measured)
+            self.assertGreater(len(set(windows)), 1, windows)
+            total = block["total_mean_ms"]
+            self.assertIsInstance(total, dict, f"the complete total carries no interval: {total!r}")
+            self.assertEqual((total["mean"], total["lo"], total["hi"], total["n"]),
+                             reqanalyze.mean_ci([670.0 + 5.0 + 110.0 + w for w in windows]))
+
+        def reaper_won(measured):
+            child = measured[1]["teardown"]["per_child_cpu"]["firecracker"]
+            child["reclaim_cpu_ms"] = 0.0
+            child["complete"] = False
+        with self.subTest("at least"), tempfile.TemporaryDirectory() as d:
+            block, measured = self._cpu_fixture(d, reaper_won, server="varying")
+            clone = [670.0 + 5.0 + (0.0 if i == 1 else 110.0) for i in range(len(measured))]
+            m, lo, _hi, n = reqanalyze.mean_ci(
+                [c + w for c, w in zip(clone, windows_of(measured))])
+            q_lo = block["memory_server"]["quantization_ms"]["lo"]
+            t = block["total_at_least_mean_ms"]
+            self.assertEqual((t["at_least"], t["ci_lo"], t["n"]), (m + q_lo, lo + q_lo, n),
+                             "the at-least total's lower end left out the server's sampling error")
 
     def test_a_lower_bound_reaping_publishes_only_at_least_figures(self):
         """RED BEFORE THE FIX: a measured request whose child exited before

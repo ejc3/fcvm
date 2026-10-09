@@ -2485,6 +2485,11 @@ def analyze_backend(
                 clone_q_hi = statistics.fmean(x["quantization_hi"] for x in readings)
                 clone_q = {"lo": 0.0, "hi": clone_q_hi, "tick_ms": tick}
                 server = memory_server_average(recs, fast_records, tick)
+                # Each request's server window pairs with its own clone total,
+                # so the totals' intervals carry both parts' sampling error.
+                paired = ([t + r["serve_cpu_after"]["ms"] - r["serve_cpu_before"]["ms"]
+                           for t, r in zip(totals, fast_records)]
+                          if server.get("available") and "n" in server else list(totals))
                 total_q = ({"lo": server["quantization_ms"]["lo"],
                             "hi": clone_q_hi + server["quantization_ms"]["hi"]}
                            if server.get("available") else None)
@@ -2498,9 +2503,10 @@ def analyze_backend(
                         "provenance": provenance(fast_records)}
                     block["memory_server"] = server
                     if total_q is not None:
+                        tm, tlo, _thi, tn = mean_ci(paired)
                         block["total_at_least_mean_ms"] = {
-                            "at_least": m + server["mean_ms"] + server["quantization_ms"]["lo"],
-                            "ci_lo": lo + server["mean_ms"] + server["quantization_ms"]["lo"], "n": n,
+                            "at_least": tm + server["quantization_ms"]["lo"],
+                            "ci_lo": tlo + server["quantization_ms"]["lo"], "n": tn,
                             "quantization_ms": total_q}
                 else:
                     block["clone_mean_ms"] = {"mean": m, "lo": lo, "hi": hi, "n": n,
@@ -2519,7 +2525,8 @@ def analyze_backend(
                     }
                     block["memory_server"] = server
                     if total_q is not None:
-                        block["total_mean_ms"] = m + server["mean_ms"]
+                        tm, tlo, thi, tn = mean_ci(paired)
+                        block["total_mean_ms"] = {"mean": tm, "lo": tlo, "hi": thi, "n": tn}
                         block["total_quantization_ms"] = total_q
             out["arms"][a]["request_cpu_ms"] = block
             print(f"    request CPU: {len(fast_records) - missing - lower}/{len(fast_records)} "
@@ -2548,8 +2555,10 @@ def analyze_backend(
                          if s.get("available")
                          else f"not attributable: {s['reason']}"))
                 if "total_mean_ms" in block:
+                    t = block["total_mean_ms"]
                     q = block["total_quantization_ms"]
-                    print(f"      total mean          {block['total_mean_ms']:.1f} ms "
+                    print(f"      total mean          {t['mean']:.1f} ms "
+                          f"[{t['lo']:.1f}, {t['hi']:.1f}] n={t['n']} "
                           f"(/proc tick quantization {q['lo']:+.1f} to {q['hi']:+.1f} ms)")
                 if "total_at_least_mean_ms" in block:
                     t = block["total_at_least_mean_ms"]
