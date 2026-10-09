@@ -714,6 +714,50 @@ async fn load_snapshot_create_target(
 }
 
 /// Create snapshot from running VM
+/// A snapshot directory's working-set store, and the length of its memory image.
+fn open_snapshot_working_set(snapshot_dir: &Path) -> Result<(crate::uffd::WorkingSetStore, u64)> {
+    let memory = snapshot_dir.join("memory.bin");
+    let mem_len = std::fs::metadata(&memory)
+        .with_context(|| format!("reading the size of {}", memory.display()))?
+        .len();
+    let store = crate::uffd::WorkingSetStore::open(
+        &memory,
+        mem_len,
+        &snapshot_dir.join("config.json"),
+        &super::common::snapshot_sibling(snapshot_dir, "lock"),
+    )?;
+    Ok((store, mem_len))
+}
+
+/// `--inherit-working-set`: merge `parent`'s recorded working set into the working set of
+/// the snapshot at `child_dir`. Returns the pages and bytes inherited, `(0, 0)` when the
+/// parent recorded none.
+///
+/// The child's store takes the child's generation lock shared to publish, so this runs only
+/// after the create has given its own locks back.
+fn inherit_working_set(
+    parent: &crate::uffd::WorkingSetStore,
+    parent_len: u64,
+    child_dir: &Path,
+) -> Result<(u64, u64)> {
+    let inherited = parent.to_prefetch();
+    if inherited.is_empty() {
+        return Ok((0, 0));
+    }
+    let (child, child_len) = open_snapshot_working_set(child_dir)?;
+    anyhow::ensure!(
+        child_len == parent_len,
+        "the new memory image is {child_len} bytes and the parent's is {parent_len}, \
+         so the parent's offsets do not name the same guest pages"
+    );
+    let outcome = child.merge_and_persist(&inherited)?;
+    anyhow::ensure!(
+        !outcome.superseded,
+        "the snapshot was replaced before its working set was written"
+    );
+    Ok((inherited.len(), inherited.bytes()))
+}
+
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
     use crate::storage::snapshot::{SnapshotType, SnapshotVolumeConfig};
@@ -990,11 +1034,65 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         );
     }
 
+    // --inherit-working-set reads the parent's set while this create still pins the
+    // parent's generation, so the set describes the image the diff was merged onto. A parent
+    // that is the target itself is held exclusive by this create, and its set described the
+    // image just replaced.
+    let inherit_from = if !args.inherit_working_set {
+        None
+    } else if published_memory.is_none() {
+        warn!("--inherit-working-set applies to Firecracker memory snapshots; nothing inherited");
+        None
+    } else {
+        match parent_dir.as_deref() {
+            None => {
+                warn!("--inherit-working-set: the VM has no parent snapshot; nothing inherited");
+                None
+            }
+            Some(parent) if parent == snapshot_dir.as_path() => {
+                warn!(
+                    "--inherit-working-set: the snapshot replaced its own parent; nothing inherited"
+                );
+                None
+            }
+            Some(parent) => match open_snapshot_working_set(parent) {
+                Ok(store) => Some(store),
+                Err(error) => {
+                    warn!(
+                        error = %format!("{error:#}"),
+                        "--inherit-working-set: could not read the parent's working set"
+                    );
+                    None
+                }
+            },
+        }
+    };
+
     // The snapshot is published and recorded as the VM's diff base. Give the locks back
     // before the memory file is measured, so no clone, create or balloon change waits on
     // the walk.
     drop(_vm_lock);
     drop(_generation_locks);
+
+    if let Some((parent, parent_len)) = inherit_from {
+        match inherit_working_set(&parent, parent_len, &snapshot_dir) {
+            Ok((0, _)) => info!(
+                snapshot = %snapshot_name,
+                "--inherit-working-set: the parent has no recorded working set"
+            ),
+            Ok((pages, bytes)) => info!(
+                snapshot = %snapshot_name,
+                pages,
+                mib = bytes / (1024 * 1024),
+                "inherited the parent's restore working set"
+            ),
+            Err(error) => warn!(
+                snapshot = %snapshot_name,
+                error = %format!("{error:#}"),
+                "--inherit-working-set: the new snapshot has no working set"
+            ),
+        }
+    }
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -3928,6 +4026,63 @@ async fn cmd_snapshot_ls() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A snapshot directory holding a `mem_len`-byte memory image and the given config bytes.
+    fn working_set_fixture(root: &Path, name: &str, mem_len: u64, config: &[u8]) -> PathBuf {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("memory.bin"), vec![0u8; mem_len as usize]).unwrap();
+        std::fs::write(dir.join("config.json"), config).unwrap();
+        dir
+    }
+
+    #[test]
+    fn inherit_working_set_gives_the_child_the_parents_recorded_set() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mem_len = 64 * 4096;
+        let parent_dir = working_set_fixture(tmp.path(), "parent", mem_len, b"parent");
+        let child_dir = working_set_fixture(tmp.path(), "child", mem_len, b"child");
+        let (recording, _) = open_snapshot_working_set(&parent_dir).unwrap();
+        let mut observed = recording.recorder();
+        observed.insert_range(3 * 4096, 5 * 4096);
+        observed.insert_range(40 * 4096, 4096);
+        recording.merge_and_persist(&observed).unwrap();
+
+        // What the create does: open the parent from disk, then inherit into the child.
+        let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
+        assert_eq!(
+            inherit_working_set(&parent, parent_len, &child_dir).unwrap(),
+            (6, 6 * 4096)
+        );
+
+        // A serve of the child loads the sidecar the inherit wrote, keyed to the child's image.
+        let (child, _) = open_snapshot_working_set(&child_dir).unwrap();
+        assert_eq!(child.to_prefetch(), observed);
+    }
+
+    #[test]
+    fn inherit_working_set_refuses_an_image_of_another_size() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let parent_dir = working_set_fixture(tmp.path(), "parent", 64 * 4096, b"parent");
+        let child_dir = working_set_fixture(tmp.path(), "child", 32 * 4096, b"child");
+        let (recording, _) = open_snapshot_working_set(&parent_dir).unwrap();
+        let mut observed = recording.recorder();
+        observed.insert_range(0, 4096);
+        recording.merge_and_persist(&observed).unwrap();
+
+        let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
+        let error = inherit_working_set(&parent, parent_len, &child_dir).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("do not name the same guest pages"),
+            "{error:#}"
+        );
+        let sidecar = crate::uffd::WorkingSetStore::path_for(&child_dir.join("memory.bin"));
+        assert!(
+            !sidecar.exists(),
+            "a refused inherit wrote {}",
+            sidecar.display()
+        );
+    }
 
     /// What counts as in use is the lock a reader holds on the memory file (#1067). The
     /// pass used to ask fcvm's state directory, which names a snapshot a running VM was only

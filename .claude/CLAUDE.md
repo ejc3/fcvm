@@ -2685,6 +2685,23 @@ separately.
   prevent. The config digest makes atomically installed generations distinct even under inode
   reuse. Safe because a working set only says WHICH offsets to copy; the BYTES always come
   from the file being served, so a stale set wastes a copy and can never corrupt a guest.
+- **Inheritance (`snapshot create --inherit-working-set`)**: a new snapshot starts with no set,
+  so its first restore faults every page on demand and a recording pass has to run before
+  restores are fast. With the flag, a Firecracker memory snapshot whose VM has a parent (the
+  snapshot it was restored from or last snapshotted to) gets the parent's recorded set as its
+  own sidecar. A snapshot of a restored clone is the parent's image with the clone's writes
+  merged at the same offsets, so the parent's offsets name the same guest pages. The parent's
+  set is read while the create still pins the parent's generation and written after the
+  create gives its locks back, because the new store takes the new snapshot's generation lock
+  shared to publish. A parent that is the target itself, a different image length, or any
+  read or write failure logs a warning and leaves the snapshot without a set. The inherited
+  set is a hint like any other: serves of the new snapshot keep recording on top of it, and
+  since sets only grow, a long chain of inherited sets grows with it (#955). Measured on a
+  128 GiB guest, one per-diff snapshot: a clone of it with the inherited set (13.7 M pages)
+  was ready in 317 s, the same as with a set recorded for it in a 485 s pass (6.6 M pages, 315 s)
+  and against 606 s with no set, but held 52.7 GiB at healthy against 25.4 GiB. Inheriting
+  skips the recording pass at the price of every clone's memory, until a recording that
+  replaces the set (rather than adding to it) takes its place.
 - **Isolation**: replay touches pages the guest never asked for, so it must stay private.
   `UFFDIO_COPY` writes into the clone's own anonymous memory, and `UFFDIO_CONTINUE` installs a
   read-only PTE that copies on write. Proven by `prefetched_pages_are_private_to_each_clone`

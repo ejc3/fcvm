@@ -496,6 +496,18 @@ pub struct SnapshotCreateArgs {
     /// captured disk instead of resuming via UFFD. See docs/disk-only-clone.html.
     #[arg(long)]
     pub disk_only: bool,
+
+    /// Give the new snapshot the restore working set recorded for its parent, the snapshot
+    /// this VM was restored from or last snapshotted to.
+    ///
+    /// A new snapshot has no working set, so its first restores fault every page in on demand
+    /// until a clone records one. A snapshot of a restored clone is the parent's memory with
+    /// the clone's writes merged in at the same offsets, so the parent's set names the same
+    /// guest pages. The set only says which pages to copy; the bytes come from the new memory
+    /// file. Serves of the new snapshot keep recording on top of it. Firecracker memory
+    /// snapshots only; a failure to inherit is logged and leaves the snapshot without a set.
+    #[arg(long, conflicts_with = "disk_only")]
+    pub inherit_working_set: bool,
 }
 
 #[derive(Args, Debug)]
