@@ -438,7 +438,8 @@ class HostCdpContainerCpu(unittest.TestCase):
         with open(os.path.join(d, "results", "summary.json")) as handle:
             cpu = json.load(handle)["container_cpu_ms"]
         self.assertEqual(cpu, {"window_p50_ms": 2.5, "window_mean_ms": 2.5,
-                               "run_average_ms": 2.5, "n": 4})
+                               "run_average_ms": {"mean": 2.5, "lo": 2.5, "hi": 2.5, "n": 4},
+                               "n": 4})
 
     def test_a_container_without_a_cpu_counter_is_refused(self):
         """Red on #1046: the run had no CPU reading to refuse on."""
@@ -528,9 +529,53 @@ class HostCdpCpuSummary(unittest.TestCase):
                 cpu = json.load(handle)["container_cpu_ms"]
         self.assertEqual(cpu["window_p50_ms"], 2.0)
         self.assertEqual(cpu["window_mean_ms"], 2.0)
-        self.assertEqual(cpu["run_average_ms"], round((3 * 2.0 + 2 * 3.0) / 3, 1))
+        self.assertEqual(cpu["run_average_ms"]["mean"], round((3 * 2.0 + 2 * 3.0) / 3, 1))
         self.assertEqual(cpu["n"], 3)
 
+
+    def test_the_run_average_carries_a_sampling_interval(self):
+        """RED ON e42ed154: the run average was a bare number while the VM
+        total it is compared with carries a bootstrap interval. Each measured
+        rep's period runs from its start to the next rep's start, the last to
+        its own end, so the periods tile the run, their mean is the run
+        average, and they give it an interval."""
+        with open(SH) as handle:
+            body = handle.read()
+        import re
+        import reqanalyze
+        block = re.search(r"^python3 - \"\$OUT\" \"\$WARMUP\" \"\$RESULTS/\.summary\.pending\" <<'PY'\n(.*?)\nPY\n",
+                          body, re.S | re.M)
+        self.assertIsNotNone(block, "summary step not found")
+        rows, counter = [], 0
+        for rep, gap in enumerate((1000, 1000, 6000, 500, 9000, 2000)):
+            before = counter
+            counter += 2000
+            rows.append({"rep": rep, "warmup": rep == 0, "wall_ms": 10.0 + rep,
+                         "loadavg1": 0.5, "url": URLS[0],
+                         "container_cpu_usec_before": before,
+                         "container_cpu_usec_after": counter})
+            counter += gap
+        with tempfile.TemporaryDirectory() as d:
+            out = os.path.join(d, "hostcdp.jsonl")
+            with open(out, "w") as handle:
+                handle.writelines(json.dumps(r) + "\n" for r in rows)
+            pending = os.path.join(d, "summary.pending")
+            proc = subprocess.run([sys.executable, "-", out, "1", pending],
+                                  input=block.group(1), text=True, capture_output=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            with open(pending) as handle:
+                cpu = json.load(handle)["container_cpu_ms"]
+        measured = rows[1:]
+        periods = [(b["container_cpu_usec_before"] - a["container_cpu_usec_before"]) / 1000.0
+                   for a, b in zip(measured, measured[1:])]
+        periods.append((measured[-1]["container_cpu_usec_after"]
+                        - measured[-1]["container_cpu_usec_before"]) / 1000.0)
+        mean, lo, hi, n = reqanalyze.mean_ci(periods)
+        run = cpu["run_average_ms"]
+        self.assertIsInstance(run, dict, f"the run average carries no interval: {run!r}")
+        self.assertEqual(run, {"mean": round(mean, 1), "lo": round(lo, 1),
+                               "hi": round(hi, 1), "n": n})
+        self.assertLess(run["lo"], run["hi"])
 
 class HostCdpCpuBudget(unittest.TestCase):
     """The host control's CPU budget has to be settable and recorded.

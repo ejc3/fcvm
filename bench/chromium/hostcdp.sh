@@ -1330,13 +1330,31 @@ if la:
 # is the comparable figure.
 windows = [(r["container_cpu_usec_after"] - r["container_cpu_usec_before"]) / 1000.0
            for r in measured_rows]
-run_ms = (measured_rows[-1]["container_cpu_usec_after"]
-          - measured_rows[0]["container_cpu_usec_before"]) / 1000.0
+# Each measured rep's period runs from its start to the next rep's start, the
+# last to its own end, so the periods tile the run and their mean is the run
+# average. They vary with the between-request work, so the run average carries
+# a percentile-bootstrap interval over them, the estimator reqanalyze.mean_ci
+# gives the VM total it is compared with.
+periods = [(b["container_cpu_usec_before"] - a["container_cpu_usec_before"]) / 1000.0
+           for a, b in zip(measured_rows, measured_rows[1:])]
+periods.append((measured_rows[-1]["container_cpu_usec_after"]
+                - measured_rows[-1]["container_cpu_usec_before"]) / 1000.0)
+def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
+    import random
+    mean = statistics.fmean(xs)
+    if len(xs) < 3:
+        return mean, min(xs), max(xs)
+    rng = random.Random(seed)
+    boots = sorted(statistics.fmean(xs[rng.randrange(len(xs))] for _ in range(len(xs)))
+                   for _ in range(iters))
+    return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1]
+run_mean, run_lo, run_hi = mean_ci(periods)
+run_average = {"mean": round(run_mean, 1), "lo": round(run_lo, 1), "hi": round(run_hi, 1), "n": n}
 container_cpu = {"window_p50_ms": round(statistics.median(windows), 1),
                  "window_mean_ms": round(statistics.mean(windows), 1),
-                 "run_average_ms": round(run_ms / n, 1), "n": n}
+                 "run_average_ms": run_average, "n": n}
 print(f"container CPU per request: window p50={container_cpu['window_p50_ms']}ms "
-      f"run average={container_cpu['run_average_ms']}ms")
+      f"run average={run_average['mean']}ms [{run_average['lo']}, {run_average['hi']}]")
 summary = {"n": n, "p50_ms": round(p50, 1), "p95_ms": round(p95, 1),
            "mean_ms": round(statistics.mean(measured), 1),
            "failures": 0, "p50_convention": "statistics.median",
