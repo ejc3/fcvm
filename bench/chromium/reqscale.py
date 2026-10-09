@@ -3541,13 +3541,25 @@ def _interburst_membership(
     return members
 
 
-def hand_back_to_invoker(path: str) -> None:
-    """Give the run directory this process created to the user who ran sudo.
+def pin_run_directory(path: str) -> int:
+    """A descriptor for the run directory this process just created.
+
+    Opened without following a symlink, right after mkdir, so the handback at
+    exit acts on that inode however the path is renamed or replaced during the
+    run: the directory's parent belongs to the invoking user, who can rename
+    entries in it.
+    """
+    return os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+
+
+def hand_back_to_invoker(dir_fd: int) -> None:
+    """Give the pinned run directory and everything in it to the user who ran sudo.
 
     reqscale.py runs as root, and the campaign's analysis and evidence steps,
-    which write into the run directory, run as the invoking user. execute()
-    registers this only after its own os.mkdir of the directory succeeded, so a
-    directory that already existed is refused and never handed over.
+    which write into the run directory, run as the invoking user. The walk goes
+    through dir_fd and never follows a symlink, so a path swapped in during the
+    run is never reached, and a directory that already existed was refused by
+    execute()'s mkdir before it was pinned. An OSError propagates.
     """
     if os.geteuid() != 0:
         return
@@ -3555,15 +3567,15 @@ def hand_back_to_invoker(path: str) -> None:
         uid, gid = int(os.environ["SUDO_UID"]), int(os.environ["SUDO_GID"])
     except (KeyError, ValueError):
         return
-    for top, dirs, files in os.walk(path, topdown=False):
+    for _top, dirs, files, top_fd in os.fwalk(".", dir_fd=dir_fd, follow_symlinks=False):
         for name in dirs + files:
-            os.lchown(os.path.join(top, name), uid, gid)
-    os.lchown(path, uid, gid)
-
+            os.chown(name, uid, gid, dir_fd=top_fd, follow_symlinks=False)
+    os.fchown(dir_fd, uid, gid)
 
 def execute(args, schedule: dict, provenance: dict) -> int:
     os.mkdir(args.out_dir)
-    atexit.register(hand_back_to_invoker, args.out_dir)
+    run_dir_fd = pin_run_directory(args.out_dir)
+    atexit.register(hand_back_to_invoker, run_dir_fd)
     _fsync_directory(os.path.dirname(args.out_dir))
     log_dir = os.path.join(args.out_dir, "logs")
     trace_dir = os.path.join(args.out_dir, "fault-trace")
@@ -3802,6 +3814,9 @@ def execute(args, schedule: dict, provenance: dict) -> int:
         "errors": failures,
     }
     write_json_exclusive(os.path.join(args.out_dir, "status.json"), status)
+    # Here, not only at exit: an OSError reaches main() and exits 4 instead of
+    # leaving a successful-looking run whose output is still root's.
+    hand_back_to_invoker(run_dir_fd)
     if failures:
         print(status["error"], file=sys.stderr)
         return 4

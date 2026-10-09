@@ -235,31 +235,76 @@ class ScaleOutputOwnership(unittest.TestCase):
 
 
 class HandBackToInvoker(unittest.TestCase):
-    def test_reqscale_hands_back_only_the_directory_it_created(self):
+    def _record(self, uid_env=True, euid=0):
+        seen = []
+        patches = [mock.patch.object(reqscale.os, "geteuid", return_value=euid),
+                   mock.patch.object(reqscale.os, "chown",
+                                     side_effect=lambda name, u, g, **kw: seen.append((name, u, g))),
+                   mock.patch.object(reqscale.os, "fchown",
+                                     side_effect=lambda fd, u, g: seen.append(("<pinned>", u, g)))]
+        if uid_env:
+            patches.append(mock.patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "567"}))
+        return seen, patches
+
+    def test_the_handback_follows_the_pinned_directory_not_its_path(self):
+        """RED ON a1e0e4bd: the handback walked the run directory by path when
+        reqscale.py exited, so a process running as the invoking user could
+        rename the directory during the run and leave a symlink in its place,
+        and root would change ownership of whatever tree it named. The
+        directory is pinned by a descriptor right after mkdir, and the
+        handback walks that descriptor without following a symlink."""
         with tempfile.TemporaryDirectory() as d:
             root = os.path.join(d, "out")
             os.makedirs(os.path.join(root, "logs"))
             open(os.path.join(root, "logs", "a.json"), "w").close()
-            seen = []
-            with mock.patch.object(reqscale.os, "geteuid", return_value=0), \
-                    mock.patch.dict(os.environ, {"SUDO_UID": "1234", "SUDO_GID": "567"}), \
-                    mock.patch.object(reqscale.os, "lchown",
-                                      side_effect=lambda p, u, g: seen.append((p, u, g))):
-                reqscale.hand_back_to_invoker(root)
-            self.assertEqual(sorted(seen), sorted([
-                (root, 1234, 567), (os.path.join(root, "logs"), 1234, 567),
-                (os.path.join(root, "logs", "a.json"), 1234, 567)]))
-            seen.clear()
-            with mock.patch.object(reqscale.os, "geteuid", return_value=1000), \
-                    mock.patch.object(reqscale.os, "lchown", side_effect=lambda p, u, g: seen.append(p)):
-                reqscale.hand_back_to_invoker(root)
-            self.assertEqual(seen, [], "a run that is not root changed ownership")
+            victim = os.path.join(d, "victim")
+            os.makedirs(victim)
+            open(os.path.join(victim, "secret"), "w").close()
+            fd = reqscale.pin_run_directory(root)
+            try:
+                os.rename(root, root + ".moved")
+                os.symlink(victim, root)
+                seen, patches = self._record()
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    reqscale.hand_back_to_invoker(fd)
+            finally:
+                os.close(fd)
+        names = sorted(name for name, _u, _g in seen)
+        self.assertEqual(names, sorted(["<pinned>", "a.json", "logs"]), names)
+        self.assertTrue(all((u, g) == (1234, 567) for _n, u, g in seen), seen)
+
+    def test_a_run_that_is_not_root_changes_nothing(self):
+        with tempfile.TemporaryDirectory() as d:
+            fd = reqscale.pin_run_directory(d)
+            try:
+                seen, patches = self._record(euid=1000)
+                with contextlib.ExitStack() as stack:
+                    for patch in patches:
+                        stack.enter_context(patch)
+                    reqscale.hand_back_to_invoker(fd)
+            finally:
+                os.close(fd)
+        self.assertEqual(seen, [], "a run that is not root changed ownership")
+
+    def test_execute_pins_then_hands_back_before_it_returns(self):
+        """RED ON a1e0e4bd: the handback ran only from atexit, so a failed
+        chown could not change the exit status of a run that left its output
+        root-owned. execute() now hands back explicitly before it returns,
+        where an OSError reaches main() and exits 4, and atexit is the
+        fallback for an early exit."""
         with open(os.path.join(HERE, "reqscale.py")) as f:
             source = f.read()
         body = source[source.index("def execute(args, schedule: dict, provenance: dict) -> int:"):]
-        self.assertEqual([line.strip() for line in body.splitlines()[1:3]],
-                         ["os.mkdir(args.out_dir)", "atexit.register(hand_back_to_invoker, args.out_dir)"],
-                         "the handback is not registered right after reqscale.py creates its run directory")
+        body = body[:body.index("\ndef ", 10)]
+        self.assertEqual([line.strip() for line in body.splitlines()[1:4]],
+                         ["os.mkdir(args.out_dir)",
+                          "run_dir_fd = pin_run_directory(args.out_dir)",
+                          "atexit.register(hand_back_to_invoker, run_dir_fd)"])
+        status = body.index('write_json_exclusive(os.path.join(args.out_dir, "status.json"), status)')
+        self.assertIn("hand_back_to_invoker(run_dir_fd)", body[status:body.index("if failures:", status)],
+                      "execute() returns without handing back its run directory")
 
 
 class UffdServeRecordsPrefetch(unittest.TestCase):
