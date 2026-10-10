@@ -713,7 +713,6 @@ async fn load_snapshot_create_target(
     }
 }
 
-/// Create snapshot from running VM
 /// A snapshot directory's working-set store, and the length of its memory image.
 fn open_snapshot_working_set(snapshot_dir: &Path) -> Result<(crate::uffd::WorkingSetStore, u64)> {
     let memory = snapshot_dir.join("memory.bin");
@@ -729,43 +728,41 @@ fn open_snapshot_working_set(snapshot_dir: &Path) -> Result<(crate::uffd::Workin
     Ok((store, mem_len))
 }
 
-/// `--inherit-working-set`: merge `parent`'s recorded working set into the working set of
-/// the snapshot at `child_dir`. Returns the pages and bytes inherited, `(0, 0)` when the
-/// parent recorded none.
+/// `--inherit-working-set`: write `parent`'s recorded working set as the recorded working set
+/// of the snapshot at `child_dir`, replacing any. Returns the pages and bytes inherited,
+/// `(0, 0)` when the parent recorded none.
 ///
-/// The child's store takes the child's generation lock shared to publish, so this runs only
-/// after the create has given its own locks back. `published` is the identity of the
-/// generation the create published, recorded while its lock still held: a child that opens
-/// with another identity was replaced in that gap by another create, and gets nothing.
+/// The create calls this while it still holds the child's generation lock exclusively, so
+/// it takes no generation lock itself: see
+/// [`crate::uffd::WorkingSetStore::seed_held_generation`].
 fn inherit_working_set(
     parent: &crate::uffd::WorkingSetStore,
     parent_len: u64,
     child_dir: &Path,
-    published: crate::uffd::ImageKey,
 ) -> Result<(u64, u64)> {
     let inherited = parent.to_prefetch();
     if inherited.is_empty() {
         return Ok((0, 0));
     }
-    let (child, child_len) = open_snapshot_working_set(child_dir)?;
-    anyhow::ensure!(
-        child.image_key() == published,
-        "the snapshot was replaced after this create published it, so its working set belongs \
-         to another create"
-    );
+    let memory = child_dir.join("memory.bin");
+    let child_len = std::fs::metadata(&memory)
+        .with_context(|| format!("reading the size of {}", memory.display()))?
+        .len();
     anyhow::ensure!(
         child_len == parent_len,
         "the new memory image is {child_len} bytes and the parent's is {parent_len}, \
          so the parent's offsets do not name the same guest pages"
     );
-    let outcome = child.merge_and_persist(&inherited)?;
-    anyhow::ensure!(
-        !outcome.superseded,
-        "the snapshot was replaced before its working set was written"
-    );
+    crate::uffd::WorkingSetStore::seed_held_generation(
+        &memory,
+        child_len,
+        &child_dir.join("config.json"),
+        &inherited,
+    )?;
     Ok((inherited.len(), inherited.bytes()))
 }
 
+/// Create snapshot from running VM
 async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     use super::common::VSOCK_VOLUME_PORT_BASE;
     use crate::storage::snapshot::{SnapshotType, SnapshotVolumeConfig};
@@ -1076,33 +1073,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
         }
     };
 
-    // Identify the generation this create published while its lock still pins it. The set is
-    // written after the locks are given back, and a create that replaces this tag in between
-    // must not receive this create's parent set.
-    let inherit_from = inherit_from.and_then(|(parent, parent_len)| {
-        match crate::uffd::ImageKey::of_generation(
-            &snapshot_dir.join("memory.bin"),
-            &snapshot_dir.join("config.json"),
-        ) {
-            Ok(published) => Some((parent, parent_len, published)),
-            Err(error) => {
-                warn!(
-                    error = %format!("{error:#}"),
-                    "--inherit-working-set: could not identify the published snapshot; nothing inherited"
-                );
-                None
-            }
-        }
-    });
-
-    // The snapshot is published and recorded as the VM's diff base. Give the locks back
-    // before the memory file is measured, so no clone, create or balloon change waits on
-    // the walk.
+    // The snapshot is published and recorded as the VM's diff base, so the VM lock goes back
+    // now: the inheritance below needs only the new snapshot's generation lock.
     drop(_vm_lock);
-    drop(_generation_locks);
 
-    if let Some((parent, parent_len, published)) = inherit_from {
-        match inherit_working_set(&parent, parent_len, &snapshot_dir, published) {
+    // Write the inherited set while this create still holds the new snapshot's generation
+    // lock exclusively. A serve loads a snapshot's working set when it starts and reads it
+    // again only after a clone exits, so a serve waiting on that lock would otherwise start
+    // without the set, and its first clones would replay nothing.
+    if let Some((parent, parent_len)) = inherit_from {
+        match inherit_working_set(&parent, parent_len, &snapshot_dir) {
             Ok((0, _)) => info!(
                 snapshot = %snapshot_name,
                 "--inherit-working-set: the parent has no recorded working set"
@@ -1120,6 +1100,10 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             ),
         }
     }
+
+    // Give the generation lock back before the memory file is measured, so no clone, create
+    // or balloon change waits on the walk.
+    drop(_generation_locks);
 
     // Print user-friendly output
     let vm_name = vm_state
@@ -4078,8 +4062,7 @@ mod tests {
         // What the create does: open the parent from disk, then inherit into the child.
         let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
         assert_eq!(
-            inherit_working_set(&parent, parent_len, &child_dir, published_key(&child_dir))
-                .unwrap(),
+            inherit_working_set(&parent, parent_len, &child_dir).unwrap(),
             (6, 6 * 4096)
         );
 
@@ -4088,42 +4071,41 @@ mod tests {
         assert_eq!(child.to_prefetch(), observed);
     }
 
-    /// The key a create records for the generation it has just published in `dir`.
-    fn published_key(dir: &Path) -> crate::uffd::ImageKey {
-        crate::uffd::ImageKey::of_generation(&dir.join("memory.bin"), &dir.join("config.json"))
-            .unwrap()
-    }
-
+    /// `snapshot create` writes the inherited set while it holds the new snapshot's
+    /// generation lock exclusively, so the write must not wait on that lock, and a serve that
+    /// opens the snapshot once the create gives the lock back must find the set.
     #[test]
-    fn inherit_working_set_refuses_a_snapshot_replaced_after_it_was_published() {
+    fn inherit_working_set_runs_while_the_create_holds_the_snapshot_lock() {
         let tmp = tempfile::TempDir::new().unwrap();
         let mem_len = 64 * 4096;
         let parent_dir = working_set_fixture(tmp.path(), "parent", mem_len, b"parent");
-        let child_dir = working_set_fixture(tmp.path(), "child", mem_len, b"first create");
+        let child_dir = working_set_fixture(tmp.path(), "child", mem_len, b"child");
         let (recording, _) = open_snapshot_working_set(&parent_dir).unwrap();
         let mut observed = recording.recorder();
         observed.insert_range(3 * 4096, 5 * 4096);
         recording.merge_and_persist(&observed).unwrap();
-        let published = published_key(&child_dir);
-
-        // A second create replaces the tag after the first gives its locks back and before it
-        // writes the inherited set: a new memory image and a new config at the same paths.
-        let replacement = child_dir.join("memory.bin.replacement");
-        std::fs::write(&replacement, vec![0u8; mem_len as usize]).unwrap();
-        std::fs::rename(&replacement, child_dir.join("memory.bin")).unwrap();
-        std::fs::write(child_dir.join("config.json"), b"second create").unwrap();
-
         let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
-        let error = inherit_working_set(&parent, parent_len, &child_dir, published).unwrap_err();
-        assert!(
-            format!("{error:#}").contains("replaced after this create published it"),
-            "{error:#}"
-        );
-        let (child, _) = open_snapshot_working_set(&child_dir).unwrap();
-        assert!(
-            child.to_prefetch().is_empty(),
-            "the second create's snapshot received the first create's parent set"
-        );
+
+        let held = std::fs::File::create(crate::commands::common::snapshot_sibling(
+            &child_dir, "lock",
+        ))
+        .unwrap();
+        fs2::FileExt::try_lock_exclusive(&held).unwrap();
+
+        let (done, finished) = std::sync::mpsc::channel();
+        let child = child_dir.clone();
+        std::thread::spawn(move || {
+            let result = inherit_working_set(&parent, parent_len, &child);
+            done.send(result.map_err(|error| format!("{error:#}"))).ok();
+        });
+        let inherited = finished
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("inherit_working_set did not finish within 30 s while the create held the generation lock");
+        assert_eq!(inherited.unwrap(), (5, 5 * 4096));
+
+        fs2::FileExt::unlock(&held).unwrap();
+        let (served, _) = open_snapshot_working_set(&child_dir).unwrap();
+        assert_eq!(served.to_prefetch(), observed);
     }
 
     #[test]
@@ -4137,8 +4119,7 @@ mod tests {
         recording.merge_and_persist(&observed).unwrap();
 
         let (parent, parent_len) = open_snapshot_working_set(&parent_dir).unwrap();
-        let error = inherit_working_set(&parent, parent_len, &child_dir, published_key(&child_dir))
-            .unwrap_err();
+        let error = inherit_working_set(&parent, parent_len, &child_dir).unwrap_err();
         assert!(
             format!("{error:#}").contains("do not name the same guest pages"),
             "{error:#}"

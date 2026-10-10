@@ -13,7 +13,6 @@ pub use server::{
     preflight_clone_hugepages, record_window_from_env, FaultAround, Prefetch, ServeShape,
     UffdBacking, UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
 };
+/// Exported so integration tests can read back what a real restore recorded.
+pub use working_set::WorkingSetStore;
 pub(crate) use working_set::GRANULE;
-/// Exported so integration tests can read back what a real restore recorded, and so a
-/// snapshot create can pin the generation it published.
-pub use working_set::{ImageKey, WorkingSetStore};

@@ -6349,6 +6349,18 @@ mod tests {
                 ],
             );
         }
+        // A serve waiting on the new snapshot's generation lock loads its working set when it
+        // starts, so the create writes the inherited set before it gives that lock back.
+        assert_in_order(
+            "cmd_snapshot_create",
+            body_of(include_str!("snapshot.rs"), "async fn cmd_snapshot_create("),
+            &[
+                "create_snapshot_core(",
+                "drop(_vm_lock)",
+                "inherit_working_set(&parent",
+                "drop(_generation_locks)",
+            ],
+        );
     }
 
     /// A memory snapshot is not taken of a VM whose guest left its balloon device

@@ -2691,13 +2691,11 @@ separately.
   has a parent (the snapshot it was restored from or last snapshotted to) gets the parent's
   recorded set as its own sidecar. A snapshot of a restored clone is the parent's image with
   the clone's writes merged at the same offsets, so the parent's offsets name the same guest
-  pages. The parent's
-  set is read while the create still pins the parent's generation and written after the
-  create gives its locks back, because the new store takes the new snapshot's generation lock
-  shared to publish. Before giving the locks back, the create records the identity of the
-  generation it published, and the write refuses a snapshot whose identity has changed since,
-  so a create that replaced the tag in that gap never receives this one's parent set. A parent
-  that is the target itself, a different image length, a replaced snapshot, or any read or
+  pages. The parent's set is read while the create still pins the parent's generation, and
+  written into the new snapshot's sidecar before the create gives back that snapshot's
+  generation lock, so a serve waiting on the lock loads the set when it starts. The write
+  takes only the sidecar's own lock, because the create already holds the generation lock
+  exclusively. A parent that is the target itself, a different image length, or any read or
   write failure logs a warning and leaves the snapshot without a set. The inherited
   set is a hint like any other: serves of the new snapshot keep recording on top of it, and
   since sets only grow, a long chain of inherited sets grows with it (#955). Measured on a
