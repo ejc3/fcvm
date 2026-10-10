@@ -84,6 +84,19 @@ impl ImageKey {
         hasher.update(meta.dev().to_le_bytes());
         Ok(Self(hasher.finalize().into()))
     }
+
+    /// Derive the key of the snapshot generation whose memory image and config are at these
+    /// paths: the key [`WorkingSetStore::open`] binds a store to.
+    pub fn of_generation(mem_path: &Path, config_path: &Path) -> Result<Self> {
+        let config = std::fs::read(config_path).with_context(|| {
+            format!(
+                "reading snapshot generation config {}",
+                config_path.display()
+            )
+        })?;
+        let config_digest: [u8; 32] = Sha256::digest(&config).into();
+        Self::of(mem_path, &config_digest)
+    }
 }
 
 impl std::fmt::Debug for ImageKey {
@@ -521,9 +534,7 @@ impl WorkingSetStore {
         let generation_config_digest: [u8; 32] = Sha256::digest(&generation_config).into();
         let key = ImageKey::of(mem_file_path, &generation_config_digest)?;
         let path = Self::path_for(mem_file_path);
-        let mut lock_name = path.file_name().unwrap_or_default().to_os_string();
-        lock_name.push(".lock");
-        let lock_path = path.with_file_name(lock_name);
+        let lock_path = sidecar_lock_path(&path);
 
         let known = match read_set(&path, &key, mem_len) {
             Some(set) => {
@@ -567,6 +578,44 @@ impl WorkingSetStore {
             mem_len,
             known: Mutex::new(known),
         })
+    }
+
+    /// Write `set` as the recorded working set of the snapshot generation whose memory image
+    /// and config are at these paths, replacing any, for a caller that holds that generation's
+    /// lock exclusively: `snapshot create` calls it after publishing the snapshot and before it
+    /// gives the lock back.
+    ///
+    /// No serve can open the generation's store or publish into it while that lock is held,
+    /// so the set is on disk before any serve of the generation loads one. This takes no
+    /// generation lock of its own: the caller already holds it, and a second `flock` on it
+    /// from this process through another descriptor would wait on the caller. The sidecar's
+    /// own lock still orders the write against any other writer.
+    pub(crate) fn seed_held_generation(
+        mem_file_path: &Path,
+        mem_len: u64,
+        generation_config_path: &Path,
+        set: &PageSet,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            mem_len <= MAX_MEM_LEN,
+            "memory image {} is {mem_len} bytes, past the {MAX_MEM_LEN}-byte working-set limit",
+            mem_file_path.display()
+        );
+        let key = ImageKey::of_generation(mem_file_path, generation_config_path)?;
+        let path = Self::path_for(mem_file_path);
+        let lock_file = File::options()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(sidecar_lock_path(&path))
+            .with_context(|| format!("opening the working-set lock for {}", path.display()))?;
+        let lock = Flock::lock(lock_file, FlockArg::LockExclusive)
+            .map_err(|(_, err)| err)
+            .context("locking working set")?;
+        let result = write_set(&path, set, &key, mem_len);
+        lock.unlock().map_err(|(_, err)| err).ok();
+        result
     }
 
     /// The set to prefetch for a clone starting now.
@@ -796,6 +845,13 @@ fn read_set(path: &Path, key: &ImageKey, mem_len: u64) -> Option<PageSet> {
         return None;
     }
     PageSet::decode(&buf, key, mem_len)
+}
+
+/// The lock file that orders writers of the working set at `sidecar`.
+fn sidecar_lock_path(sidecar: &Path) -> PathBuf {
+    let mut name = sidecar.file_name().unwrap_or_default().to_os_string();
+    name.push(".lock");
+    sidecar.with_file_name(name)
 }
 
 /// Publish a set atomically: unique temp name in the same directory, then rename.
