@@ -84,6 +84,19 @@ impl ImageKey {
         hasher.update(meta.dev().to_le_bytes());
         Ok(Self(hasher.finalize().into()))
     }
+
+    /// Derive the key of the snapshot generation whose memory image and config are at these
+    /// paths: the key [`WorkingSetStore::open`] binds a store to.
+    pub fn of_generation(mem_path: &Path, config_path: &Path) -> Result<Self> {
+        let config = std::fs::read(config_path).with_context(|| {
+            format!(
+                "reading snapshot generation config {}",
+                config_path.display()
+            )
+        })?;
+        let config_digest: [u8; 32] = Sha256::digest(&config).into();
+        Self::of(mem_path, &config_digest)
+    }
 }
 
 impl std::fmt::Debug for ImageKey {
@@ -572,6 +585,11 @@ impl WorkingSetStore {
     /// The set to prefetch for a clone starting now.
     pub fn to_prefetch(&self) -> PageSet {
         self.known.lock().expect("working set mutex").clone()
+    }
+
+    /// The identity of the snapshot generation this store was opened against.
+    pub fn image_key(&self) -> ImageKey {
+        self.key
     }
 
     /// An empty set sized for this image, for a clone to record into.

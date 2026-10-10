@@ -2686,15 +2686,19 @@ separately.
   reuse. Safe because a working set only says WHICH offsets to copy; the BYTES always come
   from the file being served, so a stale set wastes a copy and can never corrupt a guest.
 - **Inheritance (`snapshot create --inherit-working-set`)**: a new snapshot starts with no set,
-  so its first restore faults every page on demand and a recording pass has to run before
-  restores are fast. With the flag, a Firecracker memory snapshot whose VM has a parent (the
-  snapshot it was restored from or last snapshotted to) gets the parent's recorded set as its
-  own sidecar. A snapshot of a restored clone is the parent's image with the clone's writes
-  merged at the same offsets, so the parent's offsets name the same guest pages. The parent's
+  so its first restore faults in on demand every page the guest touches, and a recording pass
+  has to run before restores are fast. With the flag, a Firecracker memory snapshot whose VM
+  has a parent (the snapshot it was restored from or last snapshotted to) gets the parent's
+  recorded set as its own sidecar. A snapshot of a restored clone is the parent's image with
+  the clone's writes merged at the same offsets, so the parent's offsets name the same guest
+  pages. The parent's
   set is read while the create still pins the parent's generation and written after the
   create gives its locks back, because the new store takes the new snapshot's generation lock
-  shared to publish. A parent that is the target itself, a different image length, or any
-  read or write failure logs a warning and leaves the snapshot without a set. The inherited
+  shared to publish. Before giving the locks back, the create records the identity of the
+  generation it published, and the write refuses a snapshot whose identity has changed since,
+  so a create that replaced the tag in that gap never receives this one's parent set. A parent
+  that is the target itself, a different image length, a replaced snapshot, or any read or
+  write failure logs a warning and leaves the snapshot without a set. The inherited
   set is a hint like any other: serves of the new snapshot keep recording on top of it, and
   since sets only grow, a long chain of inherited sets grows with it (#955). Measured on a
   128 GiB guest, one per-diff snapshot: a clone of it with the inherited set (13.7 M pages)

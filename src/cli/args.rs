@@ -500,12 +500,13 @@ pub struct SnapshotCreateArgs {
     /// Give the new snapshot the restore working set recorded for its parent, the snapshot
     /// this VM was restored from or last snapshotted to.
     ///
-    /// A new snapshot has no working set, so its first restores fault every page in on demand
-    /// until a clone records one. A snapshot of a restored clone is the parent's memory with
-    /// the clone's writes merged in at the same offsets, so the parent's set names the same
-    /// guest pages. The set only says which pages to copy; the bytes come from the new memory
-    /// file. Serves of the new snapshot keep recording on top of it. Firecracker memory
-    /// snapshots only; a failure to inherit is logged and leaves the snapshot without a set.
+    /// A new snapshot has no working set, so its first restores fault in on demand every page
+    /// the guest touches, until a clone records one. A snapshot of a restored clone is the
+    /// parent's memory with the clone's writes merged in at the same offsets, so the parent's
+    /// set names the same guest pages. The set only says which pages to copy; the bytes come
+    /// from the new memory file. Serves of the new snapshot keep recording on top of it.
+    /// Firecracker memory snapshots only; a failure to inherit is logged and leaves the
+    /// snapshot without a set.
     #[arg(long, conflicts_with = "disk_only")]
     pub inherit_working_set: bool,
 }
@@ -564,8 +565,8 @@ pub struct SnapshotServeArgs {
     ///   when it starts and when a clone connects, so replay does not read them from disk one
     ///   fault at a time. On a 128 GiB guest with a cold cache that took replay from 94.5 s
     ///   to 32.3 s, and to 22.3 s when the clone connected after the warm-up had finished.
-    /// - `off`: no recording, no replay, no page cache warm-up. Every clone faults every page
-    ///   in.
+    /// - `off`: no recording, no replay, no page cache warm-up. Every clone faults in every page
+    ///   it touches.
     #[arg(long, value_name = "on|off", env = "FCVM_UFFD_PREFETCH")]
     pub uffd_prefetch: Option<String>,
 
