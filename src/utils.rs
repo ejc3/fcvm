@@ -285,7 +285,8 @@ pub async fn graceful_kill_async(pid: u32, timeout_ms: u64) {
 }
 
 /// Whether a guest console line is logged at INFO (fc-agent's own lines and
-/// container output) or at DEBUG (everything else).
+/// container output) or at DEBUG (everything else). A guest kernel crash
+/// headline is logged apart from both, by [`log_kernel_crash_headline`].
 pub fn console_line_is_important(clean: &str) -> bool {
     let marker = ["[fc-agent]", "[ctr:"]
         .iter()
@@ -300,6 +301,99 @@ pub fn console_line_is_important(clean: &str) -> bool {
         }
     }
     marker.is_some() || clean.contains("fc-agent")
+}
+
+/// What the guest kernel prints first when it panics, oopses, hits a BUG or a
+/// WARN, finds a CPU, a task or RCU stalled, or kills a process for memory. All
+/// but `WARNING: CPU:` are printed at error level or above, which the guest's
+/// console level (kernel.printk=4) passes. `WARNING: CPU:` is printed at
+/// warning level, which the console shows only while its level is above 4: in
+/// early boot, before systemd-sysctl sets 4, and after fc-agent raises it
+/// before a poweroff.
+const KERNEL_CRASH_HEADLINES: &[&str] = &[
+    "Kernel panic - not syncing",
+    "Rebooting in ",
+    "BUG: ",
+    "kernel BUG at ",
+    "Oops: ",
+    "Unable to handle kernel ",
+    "general protection fault",
+    "hard LOCKUP",
+    "WARNING: CPU: ",
+    "INFO: task ",
+    "rcu: INFO: ",
+    // "Out of memory: Killed process" and "Memory cgroup out of memory: Killed process".
+    ": Killed process ",
+];
+
+/// Whether `clean` holds a guest kernel crash headline. Each printk timestamp
+/// (`[    9.814619] `) in the line starts a record that runs to the next one, and
+/// the line holds a headline when any record does. Timestamps are looked for
+/// anywhere, because a kernel line can land in the middle of a line a program
+/// was writing, and two records can share a line. A user program's fault report
+/// (`traps: app[123] general protection fault`), the stack frames under a
+/// headline and a panic's closing `---[ end Kernel panic ...` record are not
+/// headlines.
+fn is_kernel_crash_headline(clean: &str) -> bool {
+    let stamps = printk_timestamps(clean);
+    stamps.iter().enumerate().any(|(i, &(_, start))| {
+        let end = stamps.get(i + 1).map_or(clean.len(), |&(next, _)| next);
+        let message = &clean[start..end];
+        !message.starts_with("traps: ")
+            && !message.starts_with("---[ end ")
+            && KERNEL_CRASH_HEADLINES
+                .iter()
+                .any(|headline| message.contains(headline))
+    })
+}
+
+/// How far past a `[` its printk timestamp can end. A timestamp is the seconds,
+/// padded with spaces to five columns, a `.` and six digits: 14 bytes with its
+/// brackets below 100,000 s, and longer only past that.
+const PRINTK_TIMESTAMP_MAX: usize = 24;
+
+/// Where each printk timestamp (`[    9.814619] `) in `line` is: the index of its
+/// `[` and the index where the message after it starts. The `] ` is looked for
+/// only within [`PRINTK_TIMESTAMP_MAX`] bytes of the `[`, so the scan is linear in
+/// the line, also for a line of many `[` with no `] ` after them.
+fn printk_timestamps(line: &str) -> Vec<(usize, usize)> {
+    let bytes = line.as_bytes();
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = bytes[from..].iter().position(|&b| b == b'[') {
+        let open = from + offset;
+        let after = open + 1;
+        let window = &bytes[after..bytes.len().min(after + PRINTK_TIMESTAMP_MAX)];
+        if let Some(close) = window.windows(2).position(|pair| pair == b"] ") {
+            let stamp: Vec<u8> = window[..close]
+                .iter()
+                .copied()
+                .skip_while(|&b| b == b' ')
+                .collect();
+            if stamp.contains(&b'.') && stamp.iter().all(|b| b.is_ascii_digit() || *b == b'.') {
+                // Everything from the `[` to the `] ` is ASCII, so both indexes fall on
+                // character boundaries.
+                found.push((open, after + close + 2));
+            }
+        }
+        from = after;
+    }
+    found
+}
+
+/// Log `clean` at WARN under `fcvm::guest` when it is a guest kernel crash
+/// headline, and say whether it was. The console's own targets (`firecracker`,
+/// `cloud-hypervisor`) are outside `fcvm`, so a log filtered to fcvm's targets
+/// (RUST_LOG=fcvm=info) drops them, and a guest that panics leaves nothing else
+/// that says why: on x86 it reboots through a triple fault (`reboot=t
+/// panic=1`) and Firecracker logs only "Unexpected exit reason on vcpu run:
+/// Shutdown"; on arm64 it resets through PSCI (`reboot=k`).
+pub fn log_kernel_crash_headline(clean: &str) -> bool {
+    if !is_kernel_crash_headline(clean) {
+        return false;
+    }
+    tracing::warn!(target: "fcvm::guest", "guest kernel: {}", clean);
+    true
 }
 
 /// Strip Firecracker timestamp and instance prefix from log lines.
@@ -1037,6 +1131,62 @@ mod tests {
         ));
     }
 
+    /// Finding printk timestamps takes time linear in the line's length. A console line of many
+    /// `[` with no `] ` after them, such as a large nested-array log line, is classified well within
+    /// a second. The scan runs in the VMM's output reader, so a slow one stops the pipe draining and
+    /// holds up the guest.
+    ///
+    /// RED BEFORE THE FIX: each `[` searched the rest of the line for `] `, so this line took seconds.
+    #[test]
+    fn a_long_line_of_brackets_is_classified_in_linear_time() {
+        let line = "[".repeat(400_000);
+        let start = std::time::Instant::now();
+        assert!(!is_kernel_crash_headline(&line));
+        let took = start.elapsed();
+        assert!(
+            took < std::time::Duration::from_secs(1),
+            "classifying 400,000 brackets took {took:?}"
+        );
+    }
+
+    /// Which guest console lines hold a kernel crash headline: what the kernel prints first when
+    /// it panics, oopses, warns, stalls or kills for memory, also when it lands inside a line a
+    /// program was writing. Stack frames, text without a printk timestamp, a user program's fault
+    /// report and a panic's closing line do not.
+    #[test]
+    fn guest_kernel_crash_headlines_are_recognized() {
+        for line in [
+            "[    9.814619] Kernel panic - not syncing: sysrq triggered crash",
+            "[    9.843746] Rebooting in 1 seconds..",
+            "[  123.456789] BUG: unable to handle page fault for address: 0000000000001234",
+            "[   45.000001] watchdog: BUG: soft lockup - CPU#3 stuck for 22s! [kworker/3:1:123]",
+            "[   45.000002] Oops: 0002 [#1] PREEMPT SMP NOPTI",
+            "[   45.000003] general protection fault, probably for non-canonical address 0xdead: 0000 [#1] SMP",
+            "[   45.000005] kernel BUG at mm/slub.c:123!",
+            "[   45.000006] Unable to handle kernel NULL pointer dereference at virtual address 0000000000000008",
+            "[   45.000007] CPU2: Watchdog detected hard LOCKUP on cpu 3",
+            "[   45.000004] WARNING: CPU: 2 PID: 1 at mm/page_alloc.c:4321 __alloc_pages+0x1/0x2",
+            "[fc-agent] sync complet[    9.814619] Kernel panic - not syncing: sysrq triggered crash",
+            "[   12.000001] traps: app[123] general protection fault ip:7f00 [   13.000002] Kernel panic - not syncing: two records on one line",
+            "[  242.000001] INFO: task kworker/u64:2:77 blocked for more than 120 seconds.",
+            "[   61.000001] rcu: INFO: rcu_preempt self-detected stall on CPU",
+            "[   88.000001] Out of memory: Killed process 1234 (app) total-vm:1kB",
+            "[   88.000002] Memory cgroup out of memory: Killed process 1234 (app) total-vm:1kB",
+        ] {
+            assert!(is_kernel_crash_headline(line), "not a crash headline: {line}");
+        }
+        for line in [
+            "[    9.816260]  sysrq_handle_crash+0x15/0x20",
+            "Kernel panic - not syncing: printed by a program, not the kernel",
+            "[  OK  ] Started BUG: a unit whose name says BUG.",
+            "[fcvm-vitals] pileup up=41.75 runnable=9 blocked=0 busy=[R:BUG: *1]",
+            "[   12.000001] traps: app[123] general protection fault ip:7f00 sp:7ffd error:0 in libc.so.6",
+            "[    9.843756] ---[ end Kernel panic - not syncing: sysrq triggered crash ]---",
+        ] {
+            assert!(!is_kernel_crash_headline(line), "taken for a crash headline: {line}");
+        }
+    }
+
     #[test]
     fn test_strip_firecracker_prefix_preserves_fc_agent() {
         // Guest serial output without Firecracker prefix — [fc-agent] must NOT be stripped
@@ -1408,5 +1558,39 @@ mod sbin_path_tests {
                  the PATH built for an empty environment: {repaired:?}"
             );
         }
+    }
+}
+
+/// What a closure logs, captured through a subscriber with a given EnvFilter. For tests of where
+/// log lines go.
+#[cfg(test)]
+pub(crate) mod log_capture {
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct Buffer(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Buffer {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// What `f` logged through a subscriber with the EnvFilter `filter`.
+    pub(crate) fn logged(filter: &str, f: impl FnOnce()) -> String {
+        let buffer = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
+            .with_writer(move || writer.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, f);
+        let bytes = buffer.0.lock().unwrap().clone();
+        String::from_utf8(bytes).unwrap()
     }
 }

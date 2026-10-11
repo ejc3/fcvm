@@ -364,8 +364,6 @@ impl VmManager {
         let console_lines = Arc::clone(&self.console_lines);
         let spawned = spawn_streaming(cmd, move |line, is_stderr| {
             let clean = strip_firecracker_prefix(line);
-            // fc-agent and container output at INFO/WARN, everything else at DEBUG
-            let is_important = crate::utils::console_line_is_important(clean);
             if !is_stderr {
                 // Firecracker writes the guest serial console to its stdout
                 // (its own logs go to --log-path), so every stdout line is
@@ -382,16 +380,8 @@ impl VmManager {
                     }
                     tail.push_back(clean.to_string());
                 }
-                if is_important {
-                    warn!(target: "firecracker", "{}", clean);
-                } else {
-                    debug!(target: "firecracker", "{}", clean);
-                }
-            } else if is_important {
-                info!(target: "firecracker", "{}", clean);
-            } else {
-                debug!(target: "firecracker", "{}", clean);
             }
+            log_firecracker_line(clean, is_stderr);
         })
         .context("spawning Firecracker process")?;
 
@@ -676,6 +666,28 @@ impl Drop for VmManager {
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+    }
+}
+
+/// Log one line Firecracker printed: from its stderr, or from its stdout, which is the guest's
+/// serial console. A guest kernel crash headline goes to WARN under `fcvm::guest`
+/// (`log_kernel_crash_headline`); fc-agent's lines and container output to INFO (WARN from
+/// stderr); everything else to DEBUG.
+fn log_firecracker_line(clean: &str, is_stderr: bool) {
+    if !is_stderr && crate::utils::log_kernel_crash_headline(clean) {
+        return;
+    }
+    let is_important = crate::utils::console_line_is_important(clean);
+    if is_stderr {
+        if is_important {
+            warn!(target: "firecracker", "{}", clean);
+        } else {
+            debug!(target: "firecracker", "{}", clean);
+        }
+    } else if is_important {
+        info!(target: "firecracker", "{}", clean);
+    } else {
+        debug!(target: "firecracker", "{}", clean);
     }
 }
 
@@ -1015,5 +1027,39 @@ mod tests {
         );
         assert!(refused.contains("FCVM_FIRECRACKER_LOG_LEVEL"), "{refused}");
         assert!(seen.is_none(), "Firecracker must not be spawned: {seen:?}");
+    }
+
+    /// A guest kernel's panic line reaches fcvm's default log (RUST_LOG unset is "warn") and a
+    /// log filtered to fcvm's own targets (RUST_LOG=fcvm=info), exactly once: never also under the
+    /// console's own `firecracker` target. A guest that panics resets, and Firecracker's own log
+    /// says only that it did, so this line is the one record of why. The stack frames under it
+    /// stay out.
+    #[test]
+    fn a_guest_kernel_panic_line_is_logged_once_at_warn_under_fcvm() {
+        use crate::utils::log_capture::logged;
+        let panic_line = "[    9.814619] Kernel panic - not syncing: sysrq triggered crash";
+        let frame = "[    9.816260]  sysrq_handle_crash+0x15/0x20";
+        for filter in ["warn", "fcvm=info"] {
+            let log = logged(filter, || {
+                super::log_firecracker_line(panic_line, false);
+                super::log_firecracker_line(frame, false);
+            });
+            assert_eq!(
+                log.matches("Kernel panic - not syncing").count(),
+                1,
+                "the panic line in a log filtered to {filter}: {log:?}"
+            );
+            assert!(
+                !log.contains("sysrq_handle_crash"),
+                "a stack frame at {filter}: {log:?}"
+            );
+        }
+        let console_target = logged("firecracker=trace", || {
+            super::log_firecracker_line(panic_line, false)
+        });
+        assert!(
+            !console_target.contains("Kernel panic"),
+            "the panic line was also logged under the console's target: {console_target:?}"
+        );
     }
 }
