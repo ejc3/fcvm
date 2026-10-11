@@ -126,7 +126,7 @@ impl<H: FilesystemHandler + 'static> AsyncServer<H> {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let server = AsyncServer::new(PassthroughFs::new("/data"));
+    /// let server = AsyncServer::new(PassthroughFs::for_volume("/data", false));
     /// server.serve_vsock_forwarded("/tmp/vm/vsock.sock", 5000).await?;
     /// // Listens on /tmp/vm/vsock.sock_5000
     /// ```
