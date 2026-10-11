@@ -502,8 +502,8 @@ impl Hypervisor for CloudHypervisorBackend {
     }
 
     async fn stream_console(&self, _console_path: &Path) -> Result<mpsc::Receiver<String>> {
-        // Cloud Hypervisor's virtio console (hvc0) is captured from the process stdout by
-        // spawn_streaming, not via a separate console device file. Return an empty stream.
+        // The guest console (hvc0) goes to a file in the VM dir, which tail_console_to_tracing
+        // follows into fcvm's logs. There is no stream to return.
         let (_tx, rx) = mpsc::channel(1);
         Ok(rx)
     }
@@ -668,9 +668,23 @@ pub const fn default_guest_cid() -> u32 {
     GUEST_CID
 }
 
+/// Log one line of the guest console: a kernel crash headline at WARN under `fcvm::guest`
+/// (`log_kernel_crash_headline`), fc-agent's lines and container output at INFO, the rest at DEBUG.
+fn log_console_line(clean: &str) {
+    if crate::utils::log_kernel_crash_headline(clean) {
+        return;
+    }
+    if crate::utils::console_line_is_important(clean) {
+        info!(target: "cloud-hypervisor", "{}", clean);
+    } else {
+        debug!(target: "cloud-hypervisor", "{}", clean);
+    }
+}
+
 /// Follow the Cloud Hypervisor guest console file and emit each new line to fcvm's
-/// tracing logs (the portable equivalent of Firecracker streaming its serial to stdout).
-/// fc-agent / container lines go at INFO, kernel/boot noise at DEBUG. The loop exits once
+/// tracing logs (the portable equivalent of Firecracker streaming its serial to stdout)
+/// through [`log_console_line`]. Each read is logged as it returns, so a line Cloud
+/// Hypervisor writes in two pieces across a poll is logged as two (#1107). The loop exits once
 /// the file has been gone for a few seconds (the VM dir was cleaned up), so it never
 /// outlives its VM. Each line also bumps `console_lines` (dead-console detection
 /// after restore — see [`Hypervisor::console_line_counter`]).
@@ -701,12 +715,7 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
                             Ok(n) => {
                                 pos += n as u64;
                                 console_lines.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                let clean = line.trim_end();
-                                if crate::utils::console_line_is_important(clean) {
-                                    info!(target: "cloud-hypervisor", "{}", clean);
-                                } else {
-                                    debug!(target: "cloud-hypervisor", "{}", clean);
-                                }
+                                log_console_line(line.trim_end());
                             }
                             Err(_) => break,
                         }
@@ -727,6 +736,25 @@ async fn tail_console_to_tracing(path: PathBuf, console_lines: Arc<std::sync::at
 
 #[cfg(test)]
 mod tests {
+    /// A guest kernel's panic line in the Cloud Hypervisor console file reaches fcvm's default
+    /// log once, at WARN under fcvm::guest, and not also under the console's own target.
+    #[test]
+    fn cloud_hypervisor_console_logs_a_guest_kernel_panic_line_once_at_warn() {
+        use crate::utils::log_capture::logged;
+        let line = "[    9.814619] Kernel panic - not syncing: sysrq triggered crash";
+        let log = logged("warn", || super::log_console_line(line));
+        assert_eq!(
+            log.matches("Kernel panic - not syncing").count(),
+            1,
+            "{log:?}"
+        );
+        let console_target = logged("cloud-hypervisor=trace", || super::log_console_line(line));
+        assert!(
+            !console_target.contains("Kernel panic"),
+            "{console_target:?}"
+        );
+    }
+
     use super::*;
 
     #[tokio::test]
