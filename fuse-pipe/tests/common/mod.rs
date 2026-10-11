@@ -14,16 +14,18 @@
 // Allow dead code - these utilities are conditionally used by different test files
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Once;
+use std::sync::{Arc, Mutex, Once};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use fuse_pipe::{
-    AsyncServer, MountConfig, MountHandle, MountSettings, PassthroughFs, ServerConfig,
+    AsyncServer, FilesystemHandler, MountConfig, MountHandle, MountSettings, PassthroughFs,
+    ServerConfig, VolumeRequest, VolumeResponse,
 };
 use tracing::{debug, info};
 
@@ -161,6 +163,39 @@ impl Drop for ServerGuard {
     }
 }
 
+/// The requests a fixture's server handled, by `VolumeRequest::op_name`.
+#[derive(Default)]
+pub struct RequestCounts(Mutex<HashMap<&'static str, u64>>);
+
+impl RequestCounts {
+    fn record(&self, op: &'static str) {
+        *self.0.lock().unwrap().entry(op).or_default() += 1;
+    }
+
+    /// How many `op` requests the server handled.
+    pub fn get(&self, op: &str) -> u64 {
+        self.0.lock().unwrap().get(op).copied().unwrap_or(0)
+    }
+}
+
+/// The fixture's server: the volume's PassthroughFs, counting every request it handles.
+struct CountingFs {
+    inner: PassthroughFs,
+    counts: Arc<RequestCounts>,
+}
+
+impl FilesystemHandler for CountingFs {
+    fn handle_request_with_groups(
+        &self,
+        request: &VolumeRequest,
+        supplementary_groups: &[u32],
+    ) -> VolumeResponse {
+        self.counts.record(request.op_name());
+        self.inner
+            .handle_request_with_groups(request, supplementary_groups)
+    }
+}
+
 /// In-process FUSE mount fixture.
 ///
 /// Spawns server and client in-process:
@@ -175,6 +210,8 @@ pub struct FuseMount {
     mount_dir: PathBuf,
     /// Handle for FUSE mount - dropped FIRST to unmount before server shutdown
     mount_handle: Option<MountHandle>,
+    /// What the server handled
+    requests: Arc<RequestCounts>,
 }
 
 impl FuseMount {
@@ -192,7 +229,8 @@ impl FuseMount {
         )
     }
 
-    /// Create a new FUSE mount made with `settings`.
+    /// Create a new FUSE mount made with `settings`, served the way fcvm serves
+    /// a volume with the same read-only setting (`PassthroughFs::for_volume`).
     ///
     /// # Panics
     /// Panics if mount setup fails (e.g., insufficient privileges).
@@ -227,6 +265,9 @@ impl FuseMount {
         // Start server in dedicated thread with its own runtime
         let server_data_path = data_path.to_path_buf();
         let server_socket = socket_path.clone();
+        let requests = Arc::new(RequestCounts::default());
+        let server_requests = Arc::clone(&requests);
+        let read_only = settings.read_only();
         let server_thread = thread::spawn(move || {
             info!(target: TARGET, socket = %server_socket, data = ?server_data_path, "Server thread starting");
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -235,7 +276,10 @@ impl FuseMount {
                 .expect("build server runtime");
 
             rt.block_on(async {
-                let fs = PassthroughFs::new(&server_data_path);
+                let fs = CountingFs {
+                    inner: PassthroughFs::for_volume(&server_data_path, read_only),
+                    counts: server_requests,
+                };
                 let config = ServerConfig::default();
                 let server = AsyncServer::with_config(fs, config);
 
@@ -309,7 +353,13 @@ impl FuseMount {
             data_dir: data_path.to_path_buf(),
             mount_dir: mount_path.to_path_buf(),
             mount_handle: Some(mount_handle),
+            requests,
         }
+    }
+
+    /// How many `op` requests (`VolumeRequest::op_name`) the server has handled.
+    pub fn server_requests(&self, op: &str) -> u64 {
+        self.requests.get(op)
     }
 
     /// Get the FUSE mount path (where operations should be performed).

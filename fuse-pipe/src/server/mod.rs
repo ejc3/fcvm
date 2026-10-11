@@ -12,7 +12,7 @@
 //! ```rust,ignore
 //! use fuse_pipe::server::{AsyncServer, PassthroughFs, ServerConfig};
 //!
-//! let fs = PassthroughFs::new("/path/to/serve");
+//! let fs = PassthroughFs::for_volume("/path/to/serve", false);
 //! let config = ServerConfig::default();
 //! let server = AsyncServer::with_config(fs, config);
 //! server.run_blocking("/tmp/fuse.sock")?;
