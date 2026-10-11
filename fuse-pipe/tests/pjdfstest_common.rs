@@ -229,7 +229,7 @@ pub fn run_single_category(category: &str, jobs: usize) -> (bool, usize, usize) 
     let server_data_dir = data_dir.clone();
     let server_socket = socket.clone();
     let _server_handle = std::thread::spawn(move || {
-        let fs = PassthroughFs::new(&server_data_dir);
+        let fs = PassthroughFs::for_volume(&server_data_dir, false);
         let config = ServerConfig::default();
         let server = AsyncServer::with_config(fs, config);
 

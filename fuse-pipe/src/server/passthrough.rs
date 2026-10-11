@@ -54,32 +54,57 @@ pub struct PassthroughFs {
     inner: Arc<FuseBackendPassthrough>,
     root_path: PathBuf,
     attr_ttl_secs: u64,
+    /// The server of a read-only volume: OPEN answers ENOSYS, see `try_for_volume`.
+    zero_message_open: bool,
 }
 
 impl PassthroughFs {
-    /// Create a new passthrough filesystem rooted at the given path.
+    /// Create the server of a volume that is `read_only` or not.
     ///
     /// # Panics
     /// Panics if the passthrough filesystem cannot be created or imported.
-    /// Use [`try_new()`](Self::try_new) for a fallible version that returns `Result`.
-    pub fn new<P: Into<PathBuf>>(root_path: P) -> Self {
-        Self::try_new(root_path).expect("Failed to create passthrough filesystem")
+    /// Use [`try_for_volume()`](Self::try_for_volume) for a fallible version.
+    pub fn for_volume<P: Into<PathBuf>>(root_path: P, read_only: bool) -> Self {
+        Self::try_for_volume(root_path, read_only).expect("Failed to create passthrough filesystem")
     }
 
-    /// Create a new passthrough filesystem rooted at the given path.
+    /// Create the server of a volume that is `read_only` or not.
+    ///
+    /// A read-only volume's server answers OPEN and FLUSH with ENOSYS (fuse-backend-rs's
+    /// zero-message open). After the mount's first OPEN and FLUSH, which those replies switch off,
+    /// the kernel sends no OPEN, FLUSH or RELEASE for it,
+    /// keeps a file's page cache from one open to the next, and reads with file handle 0, which the
+    /// server serves by opening the inode. Without it every open and close of a file is three round
+    /// trips and drops the file's cached pages. The guest mounts a read-only volume read-only and
+    /// without the writeback cache (`MountSettings::for_volume`), so the kernel takes each file's size
+    /// and mtime from this server once the attribute timeout passes, and FUSE_AUTO_INVAL_DATA drops
+    /// pages whose file the host changed. A read-write volume opens and closes through the server,
+    /// as its writes need.
     ///
     /// # Errors
     /// Returns an error if the passthrough filesystem cannot be created or
     /// if the root directory cannot be imported.
-    pub fn try_new<P: Into<PathBuf>>(root_path: P) -> std::io::Result<Self> {
+    pub fn try_for_volume<P: Into<PathBuf>>(
+        root_path: P,
+        read_only: bool,
+    ) -> std::io::Result<Self> {
         let root_path = root_path.into();
         let root_dir = root_path.to_string_lossy().to_string();
+
+        // fuse-backend-rs turns no_open back off, logging only a warning, unless the cache policy
+        // is Always (passthrough/mod.rs). Always changes nothing else here: this server drops the
+        // open options fuse-backend-rs returns and replies to OPEN and OPENDIR without flags.
+        let (no_open, cache_policy) = if read_only {
+            (true, fuse_backend_rs::passthrough::CachePolicy::Always)
+        } else {
+            (false, fuse_backend_rs::passthrough::CachePolicy::Auto)
+        };
 
         let cfg = Config {
             root_dir,
             do_import: true,
             writeback: true, // Server-side: handle open flags for writeback
-            no_open: false,
+            no_open,
             no_opendir: false,
             xattr: true,
             // Use real host inode numbers instead of sequential virtual ones.
@@ -89,7 +114,7 @@ impl PassthroughFs {
             // preserves the old i_size for reused inodes, causing truncated reads.
             // Host inodes are unique per-file, preventing this collision.
             use_host_ino: true,
-            cache_policy: fuse_backend_rs::passthrough::CachePolicy::Auto,
+            cache_policy,
             attr_timeout: Duration::from_secs(ATTR_TTL_SECS),
             entry_timeout: Duration::from_secs(ATTR_TTL_SECS),
             ..Default::default()
@@ -104,12 +129,19 @@ impl PassthroughFs {
         // - AUTO_INVAL_DATA: kernel checks mtime on reads and invalidates cached
         //   pages if the file was modified. Essential for FICLONE/reflink where
         //   file content changes without going through normal write path.
-        inner.init(FsOptions::WRITEBACK_CACHE | FsOptions::AUTO_INVAL_DATA)?;
+        // - ZERO_MESSAGE_OPEN, read-only volumes only: turns on fuse-backend-rs's no_open, so OPEN
+        //   and FLUSH answer ENOSYS (see try_for_volume).
+        let mut options = FsOptions::WRITEBACK_CACHE | FsOptions::AUTO_INVAL_DATA;
+        if no_open {
+            options |= FsOptions::ZERO_MESSAGE_OPEN;
+        }
+        inner.init(options)?;
 
         Ok(Self {
             inner: Arc::new(inner),
             root_path,
             attr_ttl_secs: ATTR_TTL_SECS,
+            zero_message_open: no_open,
         })
     }
 
@@ -727,6 +759,11 @@ impl FilesystemHandler for PassthroughFs {
                 tracing::debug!(target: "passthrough", ino, fh, "release succeeded");
                 VolumeResponse::Ok
             }
+            // A read-only volume's server answers ENOSYS by design (try_for_volume).
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                tracing::debug!(target: "passthrough", ino, fh, "release not supported (zero-message open)");
+                VolumeResponse::error(libc::ENOSYS)
+            }
             Err(e) => {
                 tracing::error!(target: "passthrough", ino, fh, error = ?e, "release failed");
                 VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO))
@@ -742,6 +779,11 @@ impl FilesystemHandler for PassthroughFs {
             Ok(()) => {
                 tracing::debug!(target: "passthrough", ino, fh, "flush succeeded");
                 VolumeResponse::Ok
+            }
+            // A read-only volume's server answers ENOSYS by design (try_for_volume).
+            Err(e) if e.raw_os_error() == Some(libc::ENOSYS) => {
+                tracing::debug!(target: "passthrough", ino, fh, "flush not supported (zero-message open)");
+                VolumeResponse::error(libc::ENOSYS)
             }
             Err(e) => {
                 tracing::error!(target: "passthrough", ino, fh, error = ?e, "flush failed");
@@ -1047,6 +1089,13 @@ impl FilesystemHandler for PassthroughFs {
         }
         let offset_u64 = offset as u64;
 
+        // A file the guest opened without asking has handle 0, and fuse-backend-rs seeks only
+        // through a handle. ENOSYS makes the kernel stop sending LSEEK for the mount and seek by
+        // itself, which takes the whole file for data (SEEK_DATA 0, SEEK_HOLE at the end).
+        if self.zero_message_open && fh == 0 {
+            return VolumeResponse::error(libc::ENOSYS);
+        }
+
         match self.inner.lseek(&ctx, ino, fh, offset_u64, whence) {
             Ok(new_offset) => VolumeResponse::Lseek { offset: new_offset },
             Err(e) => VolumeResponse::error(e.raw_os_error().unwrap_or(libc::EIO)),
@@ -1276,14 +1325,14 @@ mod tests {
     #[test]
     fn test_passthrough_fs_creation() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
         assert_eq!(fs.root_path(), &dir.path().to_path_buf());
     }
 
     #[test]
     fn test_passthrough_getattr_root() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let resp = fs.getattr(1); // Root inode
         match resp {
@@ -1300,7 +1349,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("test.txt"), "hello").unwrap();
 
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
@@ -1317,7 +1366,7 @@ mod tests {
     #[test]
     fn test_passthrough_read_write() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         // Create file (use current user's uid/gid)
         // Note: flags must include O_RDWR for read/write access
@@ -1354,13 +1403,57 @@ mod tests {
         assert!(resp.is_ok());
     }
 
+    /// A read-only volume's server answers OPEN and FLUSH with ENOSYS, the zero-message open that
+    /// makes the kernel stop sending OPEN, FLUSH and RELEASE, and reads a file by inode with file
+    /// handle 0. A read-write volume's server opens files. fuse-backend-rs turns no_open off with
+    /// only a warning in its log unless the cache policy is Always, so this checks the replies,
+    /// not the configuration.
+    #[test]
+    fn test_read_only_server_answers_open_with_enosys() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("small.txt"), "content").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+
+        for read_only in [true, false] {
+            let fs = PassthroughFs::for_volume(dir.path(), read_only);
+            let ino = match fs.lookup(1, b"small.txt", uid, gid, 0) {
+                VolumeResponse::Entry { attr, .. } => attr.ino,
+                other => panic!("lookup: {other:?}"),
+            };
+            let opened = fs.open(ino, libc::O_RDONLY as u32, uid, gid, 0);
+            if read_only {
+                assert_eq!(
+                    opened.errno(),
+                    Some(libc::ENOSYS),
+                    "read-only open: {opened:?}"
+                );
+                let flushed = fs.flush(ino, 0);
+                assert_eq!(
+                    flushed.errno(),
+                    Some(libc::ENOSYS),
+                    "read-only flush: {flushed:?}"
+                );
+                match fs.read(ino, 0, 0, 100, uid, gid, 0) {
+                    VolumeResponse::Data { data } => assert_eq!(data, b"content"),
+                    other => panic!("read with file handle 0: {other:?}"),
+                }
+            } else {
+                assert!(
+                    matches!(opened, VolumeResponse::Opened { .. }),
+                    "read-write open: {opened:?}"
+                );
+            }
+        }
+    }
+
     #[test]
     fn test_passthrough_open_read_write() {
         let dir = tempfile::tempdir().unwrap();
         let test_file = dir.path().join("existing.txt");
         std::fs::write(&test_file, "initial content").unwrap();
 
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
@@ -1475,7 +1568,7 @@ mod tests {
         }
         std::fs::remove_file(&test_src).ok();
 
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
@@ -1587,7 +1680,7 @@ mod tests {
     #[test]
     fn test_readdir_returns_all_entries_across_chunks() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         // Choose enough entries with long names to exceed a single READDIR chunk.
         // Linux filename limit is 255 bytes, so use 200-char suffix (entry-NNN- is ~10 chars).
@@ -1639,7 +1732,7 @@ mod tests {
         std::fs::create_dir(dir.path().join("parent")).unwrap();
         std::fs::create_dir(dir.path().join("parent").join("child")).unwrap();
 
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
@@ -1697,7 +1790,7 @@ mod tests {
     #[test]
     fn test_remap_file_range() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();
@@ -1813,7 +1906,7 @@ mod tests {
     #[test]
     fn test_remap_file_range_partial() {
         let dir = tempfile::tempdir().unwrap();
-        let fs = PassthroughFs::new(dir.path());
+        let fs = PassthroughFs::for_volume(dir.path(), false);
 
         let uid = nix::unistd::Uid::effective().as_raw();
         let gid = nix::unistd::Gid::effective().as_raw();

@@ -113,10 +113,13 @@ impl VolumeServer {
             "VolumeServer starting"
         );
 
-        // Create fuse-pipe's passthrough filesystem
-        let fs = fuse_pipe::PassthroughFs::new(&self.host_path);
+        // Create fuse-pipe's passthrough filesystem. A read-only volume's server
+        // answers OPEN and FLUSH with ENOSYS, so the guest kernel stops sending
+        // OPEN, FLUSH and RELEASE and keeps file pages between opens
+        // (PassthroughFs::try_for_volume).
+        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only);
 
-        // read_only is not enforced here: this server accepts writes on every
+        // Writes are not refused here: this server accepts writes on every
         // volume. fc-agent mounts a read-only volume read-only, so the guest
         // kernel refuses a write before it becomes a request. A guest that
         // remounts the volume read-write can still write to the host
@@ -192,7 +195,7 @@ impl VolumeServer {
             "VolumeServer starting (Unix socket)"
         );
 
-        let fs = fuse_pipe::PassthroughFs::new(&self.host_path);
+        let fs = fuse_pipe::PassthroughFs::for_volume(&self.host_path, self.config.read_only);
         let server = fuse_pipe::AsyncServer::new(fs);
         server
             .serve_unix(&path_str)
@@ -399,7 +402,7 @@ pub async fn spawn_volume_servers_with_tables(
         let port = config.port;
 
         if config.portable {
-            let fs = fuse_pipe::PassthroughFs::new(&host_path);
+            let fs = fuse_pipe::PassthroughFs::for_volume(&host_path, config.read_only);
             let table = inode_tables.get(idx).and_then(|t| t.as_ref());
 
             let remap = if let Some(json) = table {
@@ -532,9 +535,9 @@ mod tests {
     async fn inode_tables_round_trip_through_the_socket() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("held.txt"), b"x").unwrap();
-        let remap = Arc::new(fuse_pipe::RemapFs::new(fuse_pipe::PassthroughFs::new(
-            dir.path(),
-        )));
+        let remap = Arc::new(fuse_pipe::RemapFs::new(
+            fuse_pipe::PassthroughFs::for_volume(dir.path(), false),
+        ));
         use fuse_pipe::FilesystemHandler;
         // The volume server's entry point; RemapFs does not implement the per-operation methods.
         let lookup = remap.handle_request_with_groups(
