@@ -136,8 +136,8 @@ async fn main() {
 
 /// The console line that says why the agent failed, with every cause on it.
 ///
-/// fcvm logs a console line at INFO only when it carries the `[fc-agent]`
-/// prefix (console_line_is_important in src/utils.rs). anyhow's `{:?}` puts
+/// fcvm logs a console line from the agent at INFO only when it carries the
+/// `[fc-agent]` prefix (console_line_is_important in src/utils.rs). anyhow's `{:?}` puts
 /// each cause on a line of its own under "Caused by:", without the prefix, so
 /// the host showed the outermost context and nothing of what went wrong.
 fn fatal_error_line(error: &anyhow::Error) -> String {

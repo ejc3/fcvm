@@ -503,12 +503,20 @@ Routing is by prefix and it is load-bearing (`console_line_is_important` in `src
 classifies console lines for both backends, and checks this prefix before anything else, because
 a pile-up line can name a thread called `fc-agent`): `[fcvm-vitals]` is DEBUG, so the 10s sampler lands in the per-VM file and NOT the job log, which
 is what lets it run for every VM without flooding a runner. `[fc-agent] VITALS` is INFO, so the
-on-failure block also reaches the test's captured output.
+on-failure block also reaches the test's captured output. A guest kernel crash headline (panic,
+Oops, BUG, a WARN, a stalled CPU, task or RCU, an OOM kill) is WARN under `fcvm::guest`, apart
+from the console's own `firecracker` and `cloud-hypervisor` targets, so it survives fcvm's default
+filter and RUST_LOG=fcvm=info: a guest that panics leaves
+nothing else that says why (on x86 Firecracker logs only `Unexpected exit reason on vcpu run:
+Shutdown`; on arm64 the guest resets through PSCI).
 
 Rules learned the hard way, each from a check that could not fire:
 
-- **Never conclude "no OOM" from a job log.** Guest console lines are DEBUG and filtered out of
-  it, and host `dmesg` only reaches an artifact. Measured: `grep -c "DEBUG firecracker"` on a
+- **Never conclude "no OOM" from a job log.** A job log keeps no guest console line but a crash
+  headline: the console's `firecracker` target is outside `fcvm`, so a filter on fcvm's targets
+  drops even fc-agent's INFO lines. Lines below the guest's console level (4, between early boot
+  and the poweroff) never reach the console, console output can be lost or run into another line,
+  and host `dmesg` only reaches an artifact. Measured: `grep -c "DEBUG firecracker"` on a
   259,570-line job log returns 0. Render resource verdicts against `/tmp/fcvm-test-logs/*`, and
   fail closed when the artifact is missing.
 - **Prefer `/proc/vmstat`'s `oom_kill` to dmesg.** It is monotonic and cannot wrap. The guest's
@@ -2331,7 +2339,7 @@ fuse-pipe/benches/
 fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hypervisor/`), selected with `--hypervisor firecracker|cloud-hypervisor` (default: firecracker). Both cold-boot fcvm's kernel + initrd + rootfs and run a Podman container; fc-agent is injected at boot via initrd in both cases. Rootfs is Ubuntu 24.04 with systemd, Podman, and iproute2 for both.
 
 **Firecracker** (default)
-- **Kernel**: vmlinux or bzImage, boot args: `console=ttyS0 reboot=k panic=1 pci=off`
+- **Kernel**: vmlinux or bzImage, boot args: `console=ttyS0 reboot=t panic=1 pci=off` on x86_64 (`reboot=k` on arm64)
 - **Rootfs**: ext4 or btrfs (via `--rootfs-type`)
 
 **Cloud Hypervisor** (ARM64)
