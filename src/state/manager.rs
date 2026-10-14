@@ -86,6 +86,26 @@ pub struct StateManager {
     state_dir: PathBuf,
 }
 
+/// The state directory's entries, as paths. The directory is opened and read on one
+/// blocking thread, with `after_open` between the two: a test seam for the window a
+/// rename has to land in to be missed by a btrfs scan (`list_vms_after_open`).
+async fn scan_state_dir(
+    dir: &Path,
+    after_open: impl FnOnce() + Send + 'static,
+) -> Result<Vec<PathBuf>> {
+    let dir = dir.to_path_buf();
+    tokio::task::spawn_blocking(move || -> std::io::Result<Vec<PathBuf>> {
+        let entries = std::fs::read_dir(&dir)?;
+        after_open();
+        entries
+            .map(|entry| entry.map(|entry| entry.path()))
+            .collect()
+    })
+    .await
+    .context("scanning state directory")?
+    .context("reading state directory")
+}
+
 impl StateManager {
     pub fn new(state_dir: PathBuf) -> Self {
         Self { state_dir }
@@ -477,6 +497,17 @@ impl StateManager {
 
     /// List all VMs
     pub async fn list_vms(&self) -> Result<Vec<VmState>> {
+        self.list_vms_after_open(|| {}).await
+    }
+
+    /// `list_vms` with a seam for tests: `after_open` runs once the state directory is
+    /// open and before any of its entries are read, which is the window a state-file
+    /// rename has to land in to be missed by a btrfs directory scan.
+    #[doc(hidden)]
+    pub async fn list_vms_after_open(
+        &self,
+        after_open: impl FnOnce() + Send + 'static,
+    ) -> Result<Vec<VmState>> {
         let mut vms = Vec::new();
 
         if !self.state_dir.exists() {
@@ -492,13 +523,32 @@ impl StateManager {
             "list_vms: scanning directory"
         );
 
-        let mut entries = fs::read_dir(&self.state_dir)
-            .await
-            .context("reading state directory")?;
+        let paths = scan_state_dir(&self.state_dir, after_open).await?;
 
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|s| s.to_str()) == Some("json") {
+        // A state file is replaced by rename on every update. On btrfs a scan that
+        // overlaps the rename can miss the name: since Linux 6.5 btrfs readdir stops at
+        // the last directory index that existed when the scan began, and the rename
+        // gives the file a new, higher index. A VM's lock file (`<vm_id>.json.lock`) is
+        // made before its first save, kept until its state is deleted, and never
+        // renamed, so every VM that existed when the scan began shows up through its
+        // state file, its lock file, or both. Each state file is then read by path,
+        // which always finds the current one.
+        let mut vm_ids = std::collections::BTreeSet::new();
+        for path in paths {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if let Some(vm_id) = name
+                .strip_suffix(".json.lock")
+                .or_else(|| name.strip_suffix(".json"))
+            {
+                vm_ids.insert(vm_id.to_string());
+            }
+        }
+
+        for vm_id in vm_ids {
+            let path = self.state_dir.join(format!("{vm_id}.json"));
+            {
                 tracing::trace!(
                     path = %path.display(),
                     "list_vms: reading state file"
@@ -523,12 +573,14 @@ impl StateManager {
                             );
                         }
                     },
-                    // A VM that exits deletes its state file, and this scan can
-                    // be between the directory entry and the read. Not an error.
+                    // A VM that exits deletes its state file before its lock file,
+                    // and a new VM makes its lock file before its state file, so a
+                    // name from the scan can have no state file by the time it is
+                    // read. Not an error.
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         tracing::debug!(
                             path = %path.display(),
-                            "list_vms: state file vanished during the scan"
+                            "list_vms: no state file for this name (VM starting or gone)"
                         );
                     }
                     Err(e) => {
