@@ -41,7 +41,7 @@ clap = { version = "4", features = ["derive", "env"] }
 clap_complete = "4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
@@ -105,7 +105,7 @@ rand = { version = "0.8", features = ["small_rng"] }
 serde_norway = "0.9.42"
 
 [build-dependencies]
-sha2 = "0.10"
+sha2 = "0.11"
 hex = "0.4"
 
 [[bench]]
