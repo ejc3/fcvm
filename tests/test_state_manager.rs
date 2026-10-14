@@ -327,6 +327,66 @@ async fn test_load_state_by_name_duplicate_detection() {
 }
 
 /// Helper to create a minimal VmState with given vm_id and pid
+/// `list_vms` finds a VM whose state file is replaced while the directory is being
+/// scanned. Every update writes a new state file and renames it over the old one, and the
+/// health monitor updates after every check. On btrfs, since Linux 6.5, a directory scan
+/// stops at the last directory index that existed when it was opened, and the rename gives
+/// the file a new, higher index, so a scan that opened before the rename sees neither name.
+/// `fcvm ls --pid`, `load_state_by_pid`, loopback address allocation and a serve process's
+/// cleanup all read state through `list_vms`; a missed VM made `fcvm exec --pid` fail, and
+/// the chaos fuzz's StateRead report "found no state" for a VM that was running.
+///
+/// The rename runs inside the scan's window through `list_vms_after_open`, so the
+/// interleaving is the same on every run. RED BEFORE THE FIX: the VM was missing from the
+/// listing every time.
+#[tokio::test]
+async fn list_vms_finds_a_vm_whose_state_file_is_replaced_during_the_scan() {
+    // The miss needs btrfs, which is what fcvm's data directory is; anywhere else this
+    // test could not fail. Nothing else need have created that directory yet (a container
+    // unit-test run has not), so make it.
+    let data_dir = fcvm::paths::data_dir();
+    std::fs::create_dir_all(&data_dir).unwrap();
+    let temp_dir = TempDir::new_in(&data_dir).unwrap();
+    assert_eq!(
+        nix::sys::statfs::statfs(temp_dir.path())
+            .unwrap()
+            .filesystem_type(),
+        nix::sys::statfs::BTRFS_SUPER_MAGIC,
+        "{} is not on btrfs",
+        temp_dir.path().display()
+    );
+    let manager = StateManager::new(temp_dir.path().to_path_buf());
+    manager.init().await.unwrap();
+    for i in 0..70 {
+        let other = make_vm_state(&format!("vm-other-{i}"), &format!("other-{i}"), 10_000 + i);
+        manager.save_state(&other).await.unwrap();
+    }
+    manager
+        .save_state(&make_vm_state("vm-target", "target", 9_999))
+        .await
+        .unwrap();
+
+    // What update_state does, done by hand inside the scan's window: write the new state
+    // file and rename it over the old one.
+    let state_file = temp_dir.path().join("vm-target.json");
+    let temp_file = temp_dir.path().join("vm-target.json.tmp");
+    let replaced = std::fs::read_to_string(&state_file).unwrap();
+    let vms = manager
+        .list_vms_after_open(move || {
+            std::fs::write(&temp_file, &replaced).unwrap();
+            std::fs::rename(&temp_file, &state_file).unwrap();
+        })
+        .await
+        .unwrap();
+
+    assert!(
+        vms.iter().any(|vm| vm.vm_id == "vm-target"),
+        "list_vms missed the VM whose state file was replaced during the scan; it listed {} VMs",
+        vms.len()
+    );
+    assert_eq!(vms.len(), 71, "every VM is listed exactly once");
+}
+
 fn make_vm_state(vm_id: &str, name: &str, pid: u32) -> VmState {
     VmState {
         schema_version: 1,
