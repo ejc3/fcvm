@@ -14,7 +14,7 @@
 //! use fuse_pipe::{AsyncServer, PassthroughFs, ServerConfig};
 //!
 //! // Create a passthrough filesystem
-//! let fs = PassthroughFs::new("/path/to/serve");
+//! let fs = PassthroughFs::for_volume("/path/to/serve", false);
 //!
 //! // Start the async server
 //! let server = AsyncServer::with_config(fs, ServerConfig::default());
@@ -34,8 +34,8 @@
 //!
 //! The following operations can panic:
 //!
-//! - [`PassthroughFs::new()`] panics if the filesystem cannot be created.
-//!   Use [`PassthroughFs::try_new()`] for a fallible version.
+//! - [`PassthroughFs::for_volume`] panics if the filesystem cannot be created.
+//!   Use [`PassthroughFs::try_for_volume`] for a fallible version.
 //! - [`UnixTransport::clone()`] panics if the socket cannot be cloned.
 //!   Use [`UnixTransport::try_clone()`] for a fallible version.
 //! - Internal mutex locks use poison recovery, so they won't panic on poisoning.

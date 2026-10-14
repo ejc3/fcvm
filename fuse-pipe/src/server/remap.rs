@@ -688,8 +688,12 @@ impl<T: FilesystemHandler> RemapFs<T> {
     }
 
     /// Whether `guest_fh` was given to the guest before the restore this server was built from.
+    ///
+    /// Handle 0 never was: it is the handle of a file the guest opened without asking (the inner
+    /// server of a read-only volume answers OPEN with ENOSYS), and this server's own handles start at
+    /// `handle_base + 1`.
     fn is_stale_handle(&self, guest_fh: u64) -> bool {
-        self.handle_base > 0 && guest_fh <= self.handle_base
+        guest_fh != 0 && self.handle_base > 0 && guest_fh <= self.handle_base
     }
 
     /// The inner handle for guest handle `guest_fh` on stable inode `stable_ino`.
@@ -698,6 +702,11 @@ impl<T: FilesystemHandler> RemapFs<T> {
     /// passed on: the inner handle table numbers from 1 again, so the stale number could name another
     /// open file.
     fn inner_handle(&self, guest_fh: u64, stable_ino: Option<u64>, is_dir: bool) -> Option<u64> {
+        // Handle 0 is no handle (is_stale_handle) and the inner server serves it by inode. It is
+        // passed on as it is: the subtraction below is for handles this server gave out.
+        if guest_fh == 0 {
+            return Some(0);
+        }
         if !self.is_stale_handle(guest_fh) {
             return Some(guest_fh - self.handle_base);
         }
@@ -715,6 +724,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
             | VolumeResponse::Created { fh, .. } => fh,
             _ => return response,
         };
+        // An inner server that opened nothing answers handle 0, which stays 0 (is_stale_handle).
+        if *fh == 0 {
+            return response;
+        }
         // A base above MAX_HANDLE_BASE is refused when the table is read, so this cannot fail for a
         // handle the inner server gives out; if it does, the open fails rather than handing the guest
         // a wrapped number the server would take for a stale handle.
@@ -779,6 +792,10 @@ impl<T: FilesystemHandler> RemapFs<T> {
             VolumeResponse::Opened { fh, .. } => *fh,
             VolumeResponse::Openeddir { fh } => *fh,
             VolumeResponse::Created { fh, .. } => *fh,
+            // An inner server that opens nothing (a read-only volume's) reads by inode with handle
+            // 0, so the guest's handle maps to 0. It came from a server that did open files, in a
+            // snapshot taken before read-only volumes stopped opening them.
+            _ if resp.errno() == Some(libc::ENOSYS) => 0,
             _ => return None,
         };
 
@@ -925,6 +942,140 @@ mod tests {
         }
     }
 
+    /// A restored server of a read-only volume reads with file handle 0. Its inner server answers
+    /// OPEN with ENOSYS (zero-message open), so the guest kernel opens nothing and reads with handle
+    /// 0; that is no handle at all, not one from before the snapshot to reopen. FLUSH with handle 0
+    /// gets the inner server's ENOSYS, the reply that makes the kernel stop sending it.
+    ///
+    /// RED BEFORE THE FIX: a restored RemapFs took handle 0 for a stale handle, tried to reopen it,
+    /// got ENOSYS and answered EBADF, so every read in a restored clone failed.
+    #[test]
+    fn a_restored_read_only_volume_reads_with_handle_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("held"), b"A").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), true)),
+            uid,
+            gid,
+        };
+        let held = source.lookup("held");
+        assert_eq!(source.first_byte(held, 0), Ok(b'A'), "the source server");
+        let table = source.fs.serialize_table();
+
+        let clone = Real {
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), true),
+                &table,
+            ),
+            uid,
+            gid,
+        };
+        assert_eq!(clone.first_byte(held, 0), Ok(b'A'), "the restored server");
+        let flushed = clone.call(VolumeRequest::Flush { ino: held, fh: 0 });
+        assert_eq!(
+            flushed.errno(),
+            Some(libc::ENOSYS),
+            "flush on the restored server: {flushed:?}"
+        );
+    }
+
+    /// A handle the guest got from a server that opened files, restored onto a read-only volume's
+    /// server that opens nothing, still reads. fcvm reuses a cached startup snapshot whenever its
+    /// key matches, so a snapshot taken before read-only volumes stopped opening files can be
+    /// restored onto the new server without anyone asking for it.
+    ///
+    /// RED BEFORE THE FIX: the reopen of the guest's handle got ENOSYS from every OPEN, so the read
+    /// got EBADF.
+    #[test]
+    fn a_handle_from_a_server_that_opened_files_still_reads_after_a_read_only_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("held"), b"A").unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false)),
+            uid,
+            gid,
+        };
+        let held = source.lookup("held");
+        let held_fh = source.open(held);
+        assert_ne!(held_fh, 0, "the source server opens files");
+        let table = source.fs.serialize_table();
+
+        let clone = Real {
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), true),
+                &table,
+            ),
+            uid,
+            gid,
+        };
+        assert_eq!(
+            clone.first_byte(held, held_fh),
+            Ok(b'A'),
+            "a read through handle {held_fh} on the restored read-only server"
+        );
+    }
+
+    /// A restored server of a read-only volume gives the guest handle 0 for a file CREATE made (its
+    /// inner server opens nothing), and a WRITE through handle 0 then reaches the file. A guest that
+    /// remounts the volume read-write can create files (#1042); handle 0 is no handle there either.
+    ///
+    /// RED BEFORE THE FIX: the restored server added its handle base to the 0, so the guest held a
+    /// number the server took for a handle from before the restore, and the WRITE got EBADF.
+    #[test]
+    fn a_restored_read_only_volume_hands_out_handle_zero_from_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let uid = nix::unistd::Uid::effective().as_raw();
+        let gid = nix::unistd::Gid::effective().as_raw();
+        let source = Real {
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), true)),
+            uid,
+            gid,
+        };
+        let table = source.fs.serialize_table();
+        let clone = Real {
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), true),
+                &table,
+            ),
+            uid,
+            gid,
+        };
+        let (ino, fh) = match clone.call(VolumeRequest::Create {
+            parent: 1,
+            name: b"made".to_vec(),
+            mode: 0o644,
+            flags: (libc::O_RDWR | libc::O_CREAT) as u32,
+            uid,
+            gid,
+            pid: 0,
+        }) {
+            VolumeResponse::Created { attr, fh, .. } => (attr.ino, fh),
+            other => panic!("create on the restored server: {other:?}"),
+        };
+        assert_eq!(
+            fh, 0,
+            "the handle the restored server gave the guest for a file it did not open"
+        );
+        let written = clone.call(VolumeRequest::Write {
+            ino,
+            fh,
+            offset: 0,
+            data: b"Z".to_vec(),
+            uid,
+            gid,
+            pid: 0,
+        });
+        assert!(
+            matches!(written, VolumeResponse::Written { size: 1 }),
+            "write through handle {fh} on the restored server: {written:?}"
+        );
+        assert_eq!(std::fs::read(dir.path().join("made")).unwrap(), b"Z");
+    }
+
     /// A table written before the handle base was recorded, a bare map of paths, still restores its
     /// paths, and its handles are treated as stale up to LEGACY_HANDLE_BASE.
     #[test]
@@ -991,7 +1142,7 @@ mod tests {
             return;
         }
         let source = Real {
-            fs: RemapFs::new(crate::server::PassthroughFs::new(dir.path())),
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false)),
             uid,
             gid,
         };
@@ -999,7 +1150,10 @@ mod tests {
         let fh = source.open(ino);
         let table = source.fs.serialize_table();
         let clone = Real {
-            fs: RemapFs::restore_from_table(crate::server::PassthroughFs::new(dir.path()), &table),
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), false),
+                &table,
+            ),
             uid,
             gid,
         };
@@ -1017,7 +1171,7 @@ mod tests {
         let gid = nix::unistd::Gid::effective().as_raw();
 
         let source = Real {
-            fs: RemapFs::new(crate::server::PassthroughFs::new(dir.path())),
+            fs: RemapFs::new(crate::server::PassthroughFs::for_volume(dir.path(), false)),
             uid,
             gid,
         };
@@ -1033,7 +1187,10 @@ mod tests {
         let table = source.fs.serialize_table();
 
         let clone = Real {
-            fs: RemapFs::restore_from_table(crate::server::PassthroughFs::new(dir.path()), &table),
+            fs: RemapFs::restore_from_table(
+                crate::server::PassthroughFs::for_volume(dir.path(), false),
+                &table,
+            ),
             uid,
             gid,
         };
