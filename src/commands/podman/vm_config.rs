@@ -1289,6 +1289,7 @@ pub(crate) fn build_launch_config(
         non_blocking_output: args.non_blocking_output,
         rootfs_size: args.rootfs_size.clone(),
         health_check_url: args.health_check.clone(),
+        restore_hook: args.on_restore.clone(),
         user: args.user.clone(),
         forward_localhost: args.forward_localhost.clone(),
         portable_volumes: args.portable_volumes,

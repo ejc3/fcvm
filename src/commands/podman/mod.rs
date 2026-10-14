@@ -1565,6 +1565,7 @@ async fn prepare_vm_for_lifecycle(
     vm_state.config.volumes = args.map.clone();
     vm_state.config.health_check_url = args.health_check.clone();
     vm_state.config.health_check_timeout = args.health_check_timeout;
+    vm_state.config.restore_hook = args.on_restore.clone();
     vm_state.config.hugepages = args.hugepages;
     vm_state.config.balloon_mib = args.balloon;
     vm_state.config.balloon_free_page_reporting = args.free_page_reporting;
@@ -3127,6 +3128,7 @@ mod tests {
             hypervisor: crate::cli::args::Hypervisor::Firecracker,
             health_check: None,
             health_check_timeout: 5,
+            on_restore: None,
             privileged: false,
             interactive: false,
             tty: false,

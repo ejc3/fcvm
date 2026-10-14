@@ -440,6 +440,7 @@ pub(super) fn build_firecracker_config(
         interactive: args.interactive,
         rootfs_size: args.rootfs_size.clone(),
         health_check_url: args.health_check.clone(),
+        restore_hook: args.on_restore.clone(),
         user: args.user.clone(),
         port_mappings,
         forward_localhost: args.forward_localhost.clone(),

@@ -163,6 +163,10 @@ pub struct VmConfig {
     /// Timeout in seconds for HTTP health check requests.
     #[serde(default = "default_health_check_timeout")]
     pub health_check_timeout: u64,
+    /// The command the guest runs inside the container after every restore of this
+    /// VM's snapshot, before the clone is published; see `--on-restore`.
+    #[serde(default)]
+    pub restore_hook: Option<String>,
     /// Which snapshot this process is serving or was cloned from
     pub snapshot_name: Option<String>,
     /// Process type: vm (podman run), serve (snapshot serve), clone (snapshot run)
@@ -331,6 +335,7 @@ impl VmState {
                 nfs_shares: Vec::new(),
                 health_check_url: None,
                 health_check_timeout: 5,
+                restore_hook: None,
                 snapshot_name: None,
                 process_type: Some(ProcessType::Vm),
                 serve_pid: None,

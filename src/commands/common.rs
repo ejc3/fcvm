@@ -3736,6 +3736,7 @@ pub fn build_snapshot_config(
             volumes,
             health_check_url: vm_state.config.health_check_url.clone(),
             health_check_timeout: vm_state.config.health_check_timeout,
+            restore_hook: vm_state.config.restore_hook.clone(),
             hugepages: vm_state.config.hugepages,
             extra_disks,
             pmem_devices: vm_state.config.pmem_devices.clone(),

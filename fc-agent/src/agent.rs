@@ -91,6 +91,7 @@ pub async fn run() -> Result<()> {
     network::pin_namespace_neighbour().await;
 
     network::publish_to_loopback(&plan.published_guest_ports);
+    crate::restore::set_restore_hook(plan.restore_hook.clone());
 
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);

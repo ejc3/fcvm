@@ -170,6 +170,9 @@ pub struct RestorePhases {
     pub tcp_reassert_ms: f64,
     pub tcp_destroy_ms: f64,
     pub tcp_reopen_ms: f64,
+    /// The restore hook's run inside the boundary, between the socket retirement
+    /// and the gate opening; zero when the plan names none.
+    pub tcp_hook_ms: f64,
     /// The cleanup's counts, from the same report: sockets destroyed, sockets
     /// the kernel had already retired, and the SOCK_DESTROY datagrams sent.
     pub tcp_destroyed: usize,
@@ -196,6 +199,7 @@ impl RestorePhases {
         self.tcp_reassert_ms = boundary.reassert_ms;
         self.tcp_destroy_ms = boundary.destroy_ms;
         self.tcp_reopen_ms = boundary.reopen_ms;
+        self.tcp_hook_ms = boundary.hook_ms;
         self.tcp_destroyed = boundary.tally.destroyed;
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
@@ -240,6 +244,18 @@ fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// metadata watcher. Re-fetching the metadata document here would repeat the
 /// transport round trip milliseconds after the watcher completed it, for a
 /// value with one-second resolution.
+/// The plan's restore hook, set once from the boot plan. A restored clone keeps
+/// the fc-agent that booted the snapshot's VM, so the hook travels in memory.
+static RESTORE_HOOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+pub fn set_restore_hook(hook: Option<String>) {
+    let _ = RESTORE_HOOK.set(hook);
+}
+
+fn restore_hook() -> Option<&'static str> {
+    RESTORE_HOOK.get().and_then(|hook| hook.as_deref())
+}
+
 pub async fn handle_clone_restore(
     signals: &RestoreSignals,
     clone_ipv6: Option<&str>,
@@ -325,7 +341,7 @@ pub async fn handle_clone_restore(
         "[fc-agent] restore phase=tcp-cleanup epoch={} begin",
         restore_epoch
     );
-    let boundary = crate::snapshot_network::restore_snapshot_network()
+    let boundary = crate::snapshot_network::restore_snapshot_network(restore_hook())
         .await
         .context("restore phase tcp-cleanup")?;
     phases.tcp_cleanup_ms = elapsed_ms(tcp_cleanup_started);
@@ -749,7 +765,7 @@ mod tests {
             .find("network::refresh_gateway_arp()")
             .expect("the restore path no longer announces the clone at all");
         let publish = source
-            .find("crate::snapshot_network::restore_snapshot_network()")
+            .find("crate::snapshot_network::restore_snapshot_network(")
             .expect("the restore path no longer runs the snapshot boundary");
         assert!(
             announce < publish,
@@ -758,7 +774,7 @@ mod tests {
              first opens a window where fcvm's post-restore verification can \
              time out with \"guest never appeared at L2\" on a guest that is \
              perfectly healthy. Move network::refresh_gateway_arp() above \
-             restore_snapshot_network()."
+             restore_snapshot_network(...)."
         );
 
         // Flushing inherited entries after pinning would delete the pin, and

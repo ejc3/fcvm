@@ -6624,3 +6624,96 @@ async fn test_async_pf_inside_nmi_does_not_panic_a_restored_guest() -> Result<()
         ))),
     }
 }
+
+/// The command a VM boots with (`--on-restore`) runs inside every clone restored
+/// from its snapshot, before the clone is published: the record it leaves names
+/// the clone's own restore (the uptime it wrote is the clone's), the source that
+/// was snapshotted never ran it, and fc-agent's restore record carries its
+/// timing. A workload uses it to redo what a snapshot made stale, here HHVM's
+/// ServiceRouter tiers; the test's hook only writes a file.
+///
+/// RED BEFORE THE FIX: the flag did not exist.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_runs_in_the_restored_clone_and_not_in_the_source() -> anyhow::Result<()> {
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names("rhook");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            "--on-restore",
+            "cut -d' ' -f1 /proc/uptime > /tmp/fcvm-restore-hook-ran",
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    common::poll_health(&mut child, 300).await?;
+
+    let outcome = async {
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        // The source resumed. The hook belongs to restored clones, not to the VM
+        // that produced the snapshot.
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let on_source = common::exec_in_container(
+            pid,
+            &["sh -c 'test -e /tmp/fcvm-restore-hook-ran && echo RAN || echo ABSENT'"],
+        )
+        .await?;
+
+        let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
+        let clone = async {
+            common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let result = async {
+                common::poll_health(&mut clone, 300).await?;
+                let in_clone = common::exec_in_container(
+                    clone_pid,
+                    &["sh -c 'cat /tmp/fcvm-restore-hook-ran 2>/dev/null || echo ABSENT'"],
+                )
+                .await?;
+                let clone_uptime =
+                    common::exec_in_vm(clone_pid, &["cut -d' ' -f1 /proc/uptime"]).await?;
+                anyhow::Ok((in_clone, clone_uptime))
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            result
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve.wait().await;
+        anyhow::Ok((on_source, clone?))
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+
+    let (on_source, (in_clone, clone_uptime)) = outcome?;
+    assert_eq!(
+        on_source.trim(),
+        "ABSENT",
+        "the hook ran in the source VM at snapshot time; it is for restored clones"
+    );
+    let hook_uptime: f64 = in_clone
+        .trim()
+        .parse()
+        .map_err(|e| anyhow::anyhow!("the hook left no uptime in the clone: {in_clone:?}: {e}"))?;
+    let clone_uptime: f64 = clone_uptime.trim().parse()?;
+    // The clone's clock continues from the snapshot, so the hook's uptime lies
+    // between the snapshot (when the source had been up for a while) and now.
+    assert!(
+        hook_uptime > 0.0 && hook_uptime <= clone_uptime,
+        "the hook's record ({hook_uptime}) is not from this clone's life (uptime now {clone_uptime})"
+    );
+    Ok(())
+}

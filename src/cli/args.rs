@@ -350,6 +350,16 @@ pub struct RunArgs {
     #[arg(long, default_value = "5")]
     pub health_check_timeout: u64,
 
+    /// A command the guest runs inside the container after every restore of this VM's
+    /// snapshot, before the clone is published: `sh -c <CMD>` as the container's user,
+    /// with a 60 s limit. It runs with the network gate still closed, so no published-port
+    /// client reaches the clone before it is done, and its own loopback connections pass.
+    /// A failure keeps the clone unpublished and fails the restore. For state a process
+    /// cannot carry across a snapshot, such as service-discovery data as old as the snapshot.
+    /// Example: --on-restore 'curl -sf http://[::1]:8088/sr-resubscribe-tiers'
+    #[arg(long)]
+    pub on_restore: Option<String>,
+
     /// Run container as USER:GROUP (e.g., --user 1000:1000)
     /// Equivalent to podman run --userns=keep-id on the host
     #[arg(long)]

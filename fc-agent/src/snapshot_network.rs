@@ -814,6 +814,8 @@ pub struct RestoreNetworkReport {
     pub reassert_ms: f64,
     /// Milliseconds loading the manifest and retiring its sockets.
     pub destroy_ms: f64,
+    /// The restore hook's run, inside the boundary.
+    pub hook_ms: f64,
     /// Milliseconds removing the gate, raising the link, and reinstating
     /// routes.
     pub reopen_ms: f64,
@@ -1283,11 +1285,13 @@ async fn restore_with<
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
     S: ManifestStore,
+    H: RestoreHook,
 >(
     gate: &G,
     receive_barrier: &B,
     diagnostic: &mut D,
     store: &S,
+    hook: &H,
     budget: std::time::Duration,
 ) -> Result<RestoreNetworkReport> {
     // The gate chains are VERIFIED rather than reinstalled; the link-down and
@@ -1396,6 +1400,14 @@ async fn restore_with<
         .remove()
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
     let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
+    // The plan's restore hook, with the gate still closed: whatever the workload
+    // must redo after a restore happens before a published-port client can
+    // reach it. A failure keeps the clone unpublished, like a failed retirement.
+    let hook_started = std::time::Instant::now();
+    hook.run()
+        .await
+        .context("running the restore hook; the clone stays unpublished")?;
+    let hook_ms = hook_started.elapsed().as_secs_f64() * 1000.0;
     let reopen_started = std::time::Instant::now();
     reopen_with(gate)
         .await
@@ -1406,6 +1418,7 @@ async fn restore_with<
         verify_ms,
         reassert_ms,
         destroy_ms,
+        hook_ms,
         reopen_ms: reopen_started.elapsed().as_secs_f64() * 1000.0,
     })
 }
@@ -1469,19 +1482,114 @@ pub async fn resume_source_network() -> Result<()> {
     Ok(())
 }
 
-pub async fn restore_snapshot_network() -> Result<RestoreNetworkReport> {
+/// What a restored clone runs inside the boundary, after the snapshot-time
+/// sockets are retired and before the gate opens: a process that must redo work
+/// the snapshot made stale does it here, before any published-port client can
+/// reach the clone. Loopback passes the closed gate, so the hook can talk to the
+/// container's own services.
+pub trait RestoreHook {
+    async fn run(&self) -> Result<()>;
+}
+
+/// No hook: the plan named none.
+pub struct NoRestoreHook;
+
+impl RestoreHook for NoRestoreHook {
+    async fn run(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// How long the hook may take. It runs with the gate closed, so every second
+/// here is a second the clone stays unpublished.
+const RESTORE_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The plan's hook, run as `sh -c <command>` inside the container through
+/// `podman exec`, as the container's user.
+pub struct ContainerRestoreHook {
+    pub command: String,
+}
+
+impl RestoreHook for ContainerRestoreHook {
+    async fn run(&self) -> Result<()> {
+        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+        argv.extend(
+            ["podman", "exec", "fcvm-container", "sh", "-c"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        argv.push(self.command.clone());
+        let started = std::time::Instant::now();
+        let output = tokio::time::timeout(
+            RESTORE_HOOK_BUDGET,
+            tokio::process::Command::new(&argv[0])
+                .args(&argv[1..])
+                .stdin(std::process::Stdio::null())
+                .output(),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "restore hook {:?} did not finish within {:?}",
+                self.command,
+                RESTORE_HOOK_BUDGET
+            )
+        })?
+        .with_context(|| format!("spawning restore hook {:?}", self.command))?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            bail!(
+                "restore hook {:?} exited {} after {elapsed_ms:.0} ms; stdout: {}; stderr: {}",
+                self.command,
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        eprintln!(
+            "[fc-agent] restore hook {:?} exited 0 in {elapsed_ms:.0} ms; stdout: {}",
+            self.command,
+            stdout.trim()
+        );
+        Ok(())
+    }
+}
+
+pub async fn restore_snapshot_network(hook: Option<&str>) -> Result<RestoreNetworkReport> {
     let _transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic::new();
-    let report = restore_with(
-        &gate,
-        &receive_barrier,
-        &mut diagnostic,
-        &FileManifestStore::default(),
-        CLEANUP_BUDGET,
-    )
-    .await?;
+    let store = FileManifestStore::default();
+    let report = match hook {
+        Some(command) => {
+            let hook = ContainerRestoreHook {
+                command: command.to_string(),
+            };
+            restore_with(
+                &gate,
+                &receive_barrier,
+                &mut diagnostic,
+                &store,
+                &hook,
+                CLEANUP_BUDGET,
+            )
+            .await?
+        }
+        None => {
+            restore_with(
+                &gate,
+                &receive_barrier,
+                &mut diagnostic,
+                &store,
+                &NoRestoreHook,
+                CLEANUP_BUDGET,
+            )
+            .await?
+        }
+    };
     eprintln!(
         "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
          verified_armed={} link=UNTOUCHED gate=open",
@@ -1572,6 +1680,7 @@ mod tests {
         fail_barrier: bool,
         fail_dump: bool,
         fail_destroy: bool,
+        fail_hook: bool,
         /// Calls to the model diagnostic's destroy, one datagram each.
         destroy_calls: usize,
     }
@@ -1618,6 +1727,21 @@ mod tests {
                 spec: "169.254.169.254 dev eth0 proto static scope link".to_string(),
             },
         ]
+    }
+
+    /// A restore hook that records when it ran, so a test can place it against the
+    /// gate opening.
+    struct ModelHook(Arc<Mutex<ModelState>>);
+
+    impl RestoreHook for ModelHook {
+        async fn run(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.events.push("restore-hook");
+            if state.fail_hook {
+                bail!("injected restore hook failure");
+            }
+            Ok(())
+        }
     }
 
     struct ModelBarrier(Arc<Mutex<ModelState>>);
@@ -2336,9 +2460,16 @@ COMMIT\\n\"",
             "preparing the boundary purged the source's routes"
         );
 
-        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect("restore");
+        restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect("restore");
         assert_eq!(
             state.lock().unwrap().live_routes,
             model_routes(),
@@ -2475,9 +2606,16 @@ COMMIT\\n\"",
         // replacement. A cookie-bound destroy must therefore report
         // already_gone and leave the replacement alone; a tuple-based one would
         // report a destroy and take the wrong socket with it.
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             report.tally,
             CleanupTally {
@@ -2523,9 +2661,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect("an unverifiable boundary must repair, not fail the restore");
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect("an unverifiable boundary must repair, not fail the restore");
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2564,9 +2709,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(report.verified_armed, "the gate itself was intact");
         let events = state.lock().unwrap().events.clone();
         let barrier = events
@@ -2612,9 +2764,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(report.verified_armed);
         let state = state.lock().unwrap();
         assert!(
@@ -2651,9 +2810,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2692,9 +2858,16 @@ COMMIT\\n\"",
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect_err("a failed exact destroy must fail restore closed");
+        restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect_err("a failed exact destroy must fail restore closed");
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
@@ -2732,9 +2905,16 @@ COMMIT\\n\"",
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        let error = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect_err("manifest retirement failure must prevent clone publication");
+        let error = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect_err("manifest retirement failure must prevent clone publication");
         assert!(
             format!("{error:#}").contains("retiring snapshot network manifest"),
             "unexpected diagnostic: {error:#}"
@@ -2746,6 +2926,100 @@ COMMIT\\n\"",
         );
         assert!(state.gate_closed);
         assert!(!state.link_down, "the boundary took the link down");
+    }
+
+    /// The restore hook runs inside the boundary: after the snapshot-time sockets
+    /// are retired and before the gate opens. A process that must redo work a
+    /// snapshot made stale (service-discovery data as old as the snapshot) gets to
+    /// do it before any published-port client can reach the clone, and the hook's
+    /// own loopback connections pass the closed gate.
+    ///
+    /// RED BEFORE THE FIX: the boundary ran no hook at all.
+    #[tokio::test]
+    async fn the_restore_hook_runs_after_cleanup_and_before_the_clone_is_published() {
+        let stale = socket(31, [198, 51, 100, 9]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        state.lock().unwrap().live_routes = model_routes();
+        let mut diag = ModelDiag(state.clone());
+        let hook = ModelHook(state.clone());
+
+        restore_with(&gate, &barrier, &mut diag, &store, &hook, CLEANUP_BUDGET)
+            .await
+            .expect("restore with a hook");
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "rx-barrier",
+                "cookie-destroy",
+                "restore-hook",
+                "gate-open"
+            ],
+            "the hook runs after the sockets are retired and before the gate opens"
+        );
+        assert!(!state.gate_closed);
+    }
+
+    /// A hook that fails leaves the clone unpublished: the gate stays closed and the
+    /// restore reports the failure, the same way a failed socket retirement does.
+    ///
+    /// RED BEFORE THE FIX: the boundary ran no hook at all.
+    #[tokio::test]
+    async fn a_failed_restore_hook_keeps_the_restored_clone_closed() {
+        let stale = socket(32, [198, 51, 100, 10]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            live: vec![stale],
+            fail_hook: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        state.lock().unwrap().live_routes = model_routes();
+        let mut diag = ModelDiag(state.clone());
+        let hook = ModelHook(state.clone());
+
+        let error = restore_with(&gate, &barrier, &mut diag, &store, &hook, CLEANUP_BUDGET)
+            .await
+            .expect_err("a failed restore hook must prevent clone publication");
+        assert!(
+            format!("{error:#}").contains("restore hook"),
+            "unexpected diagnostic: {error:#}"
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "rx-barrier",
+                "cookie-destroy",
+                "restore-hook"
+            ]
+        );
+        assert!(state.gate_closed, "the gate opened after the hook failed");
     }
 
     #[tokio::test]
@@ -2778,6 +3052,7 @@ COMMIT\\n\"",
             &barrier,
             &mut diag,
             &store,
+            &NoRestoreHook,
             std::time::Duration::ZERO,
         )
         .await
@@ -2887,6 +3162,7 @@ COMMIT\\n\"",
             &ModelBarrier(state.clone()),
             &mut diag,
             &store,
+            &NoRestoreHook,
             CLEANUP_BUDGET,
         )
         .await
@@ -3004,6 +3280,7 @@ COMMIT\\n\"",
             &ModelBarrier(state.clone()),
             &mut diag,
             &store,
+            &NoRestoreHook,
             CLEANUP_BUDGET,
         )
         .await
