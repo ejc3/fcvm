@@ -71,6 +71,18 @@ impl std::fmt::Display for SnapshotKind {
     }
 }
 
+/// The directory inside a snapshot's directory that holds its disks (`disk.raw` and
+/// the extra disks). It is a btrfs subvolume where the store allows one, so a clone
+/// gets its disks as one subvolume snapshot of it (`DiskManager::create_cow_disk`),
+/// and it holds nothing else, so that snapshot carries nothing to unlink and the
+/// kernel flushes nothing but the disks (reflinks, so already clean) to take it.
+pub const SNAPSHOT_DISK_SUBDIR: &str = "disk";
+
+/// Where a snapshot directory keeps its disks.
+pub fn snapshot_disk_dir(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join(SNAPSHOT_DISK_SUBDIR)
+}
+
 /// Snapshot configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotConfig {
