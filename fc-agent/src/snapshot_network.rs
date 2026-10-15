@@ -298,6 +298,11 @@ trait FirewallGate {
     /// Remove whatever is left of the gate in both families: both directions,
     /// or only INPUT after `open_egress()`.
     async fn open(&self) -> Result<()>;
+    /// Restore side only: also refuse client-direction UDP while ingress is
+    /// gated (`udp_ingress_rule_args`). The snapshot side never calls this: a
+    /// snapshot must not disturb the VM it is taken from, and this rule would
+    /// answer a live client's datagram with an ICMP unreachable.
+    async fn gate_udp_ingress(&self) -> Result<()>;
     /// Report whether the gate is already fully installed: both directional
     /// chains present with exactly the boundary rules, each hooked from its
     /// built-in chain, in both address families.
@@ -430,14 +435,11 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// a published-port SYN is DNATed to a loopback destination in PREROUTING and
 /// arrives on eth0, and must still be rejected while the gate is closed.
 ///
-/// INPUT also refuses inbound UDP in the flow's original direction: a
-/// published UDP port reaches the workload through the port forwarders like a
-/// TCP one, and a client's datagram during the cookie dump or the restore hook
-/// would read or change state the hook is about to repair. The match is the
-/// direction, not the conntrack state, because a client that exchanged traffic
-/// before the snapshot inherits an ESTABLISHED entry in the restored guest and
-/// a NEW-only rule would pass it. Replies to the guest's own outbound UDP are
-/// reply-direction and pass; OUTPUT never gates UDP (DNS, NTP).
+/// These are the rules both the snapshot side and the restore side carry, and
+/// what verification expects. UDP is not among them: a restored clone adds its
+/// own UDP rejection to INPUT with `gate_udp_ingress` (see there), which the
+/// snapshot side must not install, because it would answer a live client's
+/// datagram on the source VM with an ICMP unreachable during the cookie dump.
 fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
     let mut rules = vec![owned(&[
@@ -464,27 +466,37 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
         "--reject-with",
         "tcp-reset",
     ])]);
-    if ingress {
-        let unreachable = if loopback_network.contains(':') {
-            "icmp6-port-unreachable"
-        } else {
-            "icmp-port-unreachable"
-        };
-        rules.push(owned(&[
-            "-p",
-            "udp",
-            "-m",
-            "conntrack",
-            "--ctdir",
-            "ORIGINAL",
-            "-j",
-            "REJECT",
-            "--reject-with",
-            unreachable,
-        ]));
-    }
     rules.push(owned(&["-j", "RETURN"]));
     rules
+}
+
+/// The restored clone's UDP rejection, inserted into the INPUT gate chain below
+/// the two loopback exemptions: a published UDP port reaches the workload
+/// through the port forwarders like a TCP one, and a client's datagram while
+/// ingress is gated would read or change state the restore hook is about to
+/// repair. The match is the flow's direction, not the conntrack state, because
+/// a client that exchanged traffic before the snapshot inherits an ESTABLISHED
+/// entry in the restored guest and a NEW-only rule would pass it. Replies to
+/// the guest's own outbound UDP are reply-direction and pass; OUTPUT never
+/// gates UDP (DNS, NTP). Removed with the chain when ingress opens.
+fn udp_ingress_rule_args(loopback_network: &str) -> [&'static str; 10] {
+    let unreachable = if loopback_network.contains(':') {
+        "icmp6-port-unreachable"
+    } else {
+        "icmp-port-unreachable"
+    };
+    [
+        "-p",
+        "udp",
+        "-m",
+        "conntrack",
+        "--ctdir",
+        "ORIGINAL",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        unreachable,
+    ]
 }
 
 /// The one rule that routes a built-in chain into a gate chain, as `-S`
@@ -886,6 +898,21 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
     async fn open(&self) -> Result<()> {
         self.remove_both_families(&[Direction::Input, Direction::Output])
             .await
+    }
+
+    async fn gate_udp_ingress(&self) -> Result<()> {
+        for (program, network) in [("iptables", IPV4_LOOPBACK), ("ip6tables", IPV6_LOOPBACK)] {
+            // Position 3: below the loopback exemptions (rules 1 and 2), above
+            // the TCP rejection. The chain is removed whole on open, so the
+            // rule needs no removal of its own and the retained parse (hook
+            // counts and chain presence) stays valid.
+            let mut args = vec!["-w", "-I", GATE_INPUT_CHAIN, "3"];
+            args.extend(udp_ingress_rule_args(network));
+            self.required(program, &args)
+                .await
+                .with_context(|| format!("gating client-direction UDP in {program}"))?;
+        }
+        Ok(())
     }
 
     async fn is_closed(&self) -> Result<bool> {
@@ -1487,6 +1514,11 @@ async fn restore_boundary_with<
             .await
             .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
     }
+    // The clone's own addition to the inherited gate: client-direction UDP is
+    // refused until publication. Never part of the snapshot-side gate.
+    gate.gate_udp_ingress()
+        .await
+        .context("gating client-direction UDP on the restored clone")?;
     // No link-down here either. The clone inherits a CLOSED gate inside the
     // artifact, so no new flow can appear while the recorded cookies are
     // destroyed, and the barrier below drains what was already in flight.
@@ -2016,6 +2048,8 @@ mod tests {
         /// The egress half of the gate (new outbound connections rejected).
         /// Closed with the ingress half; opened by `open_egress` alone.
         egress_closed: bool,
+        /// The restored clone's UDP rejection, part of the ingress half.
+        udp_gated: bool,
         link_down: bool,
         /// The guest's live route table, as the kernel keeps it: emptied when
         /// the link goes down and NOT refilled when it comes back up. Without
@@ -2060,7 +2094,19 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             state.gate_closed = false;
             state.egress_closed = false;
+            state.udp_gated = false;
             state.events.push("gate-open");
+            Ok(())
+        }
+
+        async fn gate_udp_ingress(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert!(
+                state.gate_closed,
+                "the UDP rejection was added to a gate that is not closed"
+            );
+            state.udp_gated = true;
+            state.events.push("gate-udp-ingress");
             Ok(())
         }
 
@@ -2100,8 +2146,8 @@ mod tests {
                  and the workload's reconnects, would be answered with resets"
             );
             assert!(
-                state.gate_closed,
-                "the restore hook ran after the clone was published"
+                state.gate_closed && state.udp_gated,
+                "the restore hook ran after the clone was published, or without the UDP rejection"
             );
             state.events.push("restore-hook");
             if state.fail_hook {
@@ -2534,31 +2580,44 @@ mod tests {
                 && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
         );
-        // A published UDP port is reachable through the port forwarders too; while
-        // the gate is closed an inbound datagram from a client must be refused like
-        // a new TCP connection, or a UDP client reaches the workload during the
-        // cookie dump or the restore hook. The match is the flow's direction, not
-        // its state: a client that exchanged traffic before the snapshot inherits
-        // an ESTABLISHED conntrack entry in the restored guest, so a NEW-only rule
-        // would let it through. Replies to the guest's own outbound UDP are
-        // reply-direction and pass; outbound UDP (DNS) is never gated.
+        // The UDP rejection belongs to the restored clone only (see
+        // the_udp_rejection_is_installed_on_restore_only): installed by close(), it
+        // would answer a live client's datagram on the VM being snapshotted with an
+        // ICMP unreachable during the cookie dump, and a snapshot must not disturb
+        // its source.
+        assert!(
+            !calls.contains("-p udp"),
+            "close() gates UDP on the source VM during the cookie dump:\n{calls}"
+        );
+    }
+
+    /// The restored clone also refuses client-direction UDP while its ingress is
+    /// gated: a published UDP port reaches the workload like a TCP one, and a client
+    /// whose flow predates the snapshot is ESTABLISHED in the restored guest, so the
+    /// match is the flow's direction, not its state. The rule is inserted after the
+    /// inherited gate is verified, below the loopback exemptions, and the ingress
+    /// open removes it with the chain. The snapshot side never installs it.
+    ///
+    /// RED BEFORE THE FIX: the rule was part of every close(), the source VM's too.
+    #[tokio::test]
+    async fn the_udp_rejection_is_installed_on_restore_only() {
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        IptablesGate::new(runner).gate_udp_ingress().await.unwrap();
+        let calls = calls.lock().unwrap().join("\n");
         assert!(
             calls.contains(
-                "iptables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
+                "iptables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
                  --reject-with icmp-port-unreachable"
             ) && calls.contains(
-                "ip6tables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
+                "ip6tables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
                  --reject-with icmp6-port-unreachable"
             ),
-            "client-direction UDP passes the closed ingress gate:\n{calls}"
+            "client-direction UDP passes the restored clone's closed ingress gate:\n{calls}"
         );
         assert!(
-            !calls.contains("FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW"),
-            "a NEW-only UDP rule lets a client's pre-snapshot flow through:\n{calls}"
-        );
-        assert!(
-            !calls.contains("FCVM_SNAPSHOT_OUT -p udp"),
-            "outbound UDP must never be gated (DNS, NTP):\n{calls}"
+            !calls.contains("--ctstate NEW") && !calls.contains("FCVM_SNAPSHOT_OUT"),
+            "the UDP rule must match direction, not state, and never gate egress:\n{calls}"
         );
     }
 
@@ -2620,7 +2679,6 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
-        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT --reject-with icmp-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
@@ -2637,7 +2695,6 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
-        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT --reject-with icmp6-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
@@ -3053,6 +3110,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3107,6 +3165,7 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3217,6 +3276,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3265,6 +3325,7 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3313,6 +3374,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy"
@@ -3370,6 +3432,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy"
@@ -3615,13 +3678,14 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
                 "restore-hook",
                 "gate-open"
             ],
-            "egress opens after the barrier and before the retirement; ingress after the hook"
+            "the UDP rejection joins the verified gate, egress opens after the barrier and before the retirement, ingress after the hook"
         );
         assert!(!state.gate_closed && !state.egress_closed);
         assert!(report.egress_open_ms >= 0.0);
@@ -3696,6 +3760,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3748,6 +3813,7 @@ COMMIT\\n\"",
             state.events,
             vec![
                 "gate-verify",
+                "gate-udp-ingress",
                 "rx-barrier",
                 "gate-open-egress",
                 "cookie-destroy",
@@ -3801,7 +3867,12 @@ COMMIT\\n\"",
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "gate-open-egress"]
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress"
+            ]
         );
         assert!(state.gate_closed, "a timed-out cleanup published ingress");
         assert!(
