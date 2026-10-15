@@ -430,11 +430,14 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// a published-port SYN is DNATed to a loopback destination in PREROUTING and
 /// arrives on eth0, and must still be rejected while the gate is closed.
 ///
-/// INPUT also refuses new inbound UDP flows: a published UDP port reaches the
-/// workload through the port forwarders like a TCP one, and a client's
-/// datagram during the cookie dump or the restore hook would read or change
-/// state the hook is about to repair. Replies to the guest's own outbound UDP
-/// are not NEW and pass; OUTPUT never gates UDP (DNS, NTP).
+/// INPUT also refuses inbound UDP in the flow's original direction: a
+/// published UDP port reaches the workload through the port forwarders like a
+/// TCP one, and a client's datagram during the cookie dump or the restore hook
+/// would read or change state the hook is about to repair. The match is the
+/// direction, not the conntrack state, because a client that exchanged traffic
+/// before the snapshot inherits an ESTABLISHED entry in the restored guest and
+/// a NEW-only rule would pass it. Replies to the guest's own outbound UDP are
+/// reply-direction and pass; OUTPUT never gates UDP (DNS, NTP).
 fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
     let mut rules = vec![owned(&[
@@ -472,8 +475,8 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
             "udp",
             "-m",
             "conntrack",
-            "--ctstate",
-            "NEW",
+            "--ctdir",
+            "ORIGINAL",
             "-j",
             "REJECT",
             "--reject-with",
@@ -2532,19 +2535,26 @@ mod tests {
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
         );
         // A published UDP port is reachable through the port forwarders too; while
-        // the gate is closed a new inbound datagram flow must be refused like a new
-        // TCP connection, or a UDP client reaches the workload during the cookie
-        // dump or the restore hook. Replies to the guest's own outbound UDP are not
-        // NEW and pass; outbound UDP (DNS) is never gated.
+        // the gate is closed an inbound datagram from a client must be refused like
+        // a new TCP connection, or a UDP client reaches the workload during the
+        // cookie dump or the restore hook. The match is the flow's direction, not
+        // its state: a client that exchanged traffic before the snapshot inherits
+        // an ESTABLISHED conntrack entry in the restored guest, so a NEW-only rule
+        // would let it through. Replies to the guest's own outbound UDP are
+        // reply-direction and pass; outbound UDP (DNS) is never gated.
         assert!(
             calls.contains(
-                "iptables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT \
+                "iptables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
                  --reject-with icmp-port-unreachable"
             ) && calls.contains(
-                "ip6tables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT \
+                "ip6tables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
                  --reject-with icmp6-port-unreachable"
             ),
-            "new inbound UDP flows pass the closed ingress gate:\n{calls}"
+            "client-direction UDP passes the closed ingress gate:\n{calls}"
+        );
+        assert!(
+            !calls.contains("FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW"),
+            "a NEW-only UDP rule lets a client's pre-snapshot flow through:\n{calls}"
         );
         assert!(
             !calls.contains("FCVM_SNAPSHOT_OUT -p udp"),
@@ -2610,7 +2620,7 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
-        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp-port-unreachable\n\
+        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT --reject-with icmp-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
@@ -2627,7 +2637,7 @@ mod tests {
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
-        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp6-port-unreachable\n\
+        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctdir ORIGINAL -j REJECT --reject-with icmp6-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
