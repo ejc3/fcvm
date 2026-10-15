@@ -3699,6 +3699,7 @@ async fn build_clone_reboot_plan(
         non_blocking_output,
         None,
         ipv6_prefix,
+        meta.restore_hook.clone(),
     );
 
     // This runs when the guest reboots, and the relaunched fc-agent mounts the
@@ -3773,6 +3774,10 @@ async fn build_clone_reboot_plan(
 /// `ipv6_prefix` is the prefix the run gives the clone: the one `snapshot run --ipv6-prefix`
 /// was given, for a disk-only clone, and the clone's own, for the reboot plan. The prefix
 /// the snapshot recorded is never used (#1079).
+///
+/// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
+/// disk-only clone the caller's `--on-restore`, else the recorded one when the command
+/// line inherits (`restore_hook_for`); for the reboot plan the clone's own.
 #[allow(clippy::too_many_arguments)]
 fn run_args_from_snapshot_metadata(
     meta: &crate::storage::SnapshotMetadata,
@@ -3784,6 +3789,7 @@ fn run_args_from_snapshot_metadata(
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
     ipv6_prefix: Option<&String>,
+    restore_hook: Option<String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
 
@@ -3852,7 +3858,7 @@ fn run_args_from_snapshot_metadata(
         // fail outright on a CH-only host). meta.hypervisor is recorded at snapshot create.
         hypervisor: meta.hypervisor.into(),
         health_check: meta.health_check_url.clone(),
-        on_restore: meta.restore_hook.clone(),
+        on_restore: restore_hook,
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
         interactive: meta.interactive,
@@ -3951,6 +3957,12 @@ async fn cmd_snapshot_run_disk_only(
         args.non_blocking_output,
         Some(disk_path),
         args.ipv6_prefix.as_ref(),
+        // The caller's hook, the recorded one only for a command line that inherits.
+        restore_hook_for(
+            args.on_restore.as_deref(),
+            args.inherit_recorded_hook,
+            meta.restore_hook.as_deref(),
+        ),
     );
 
     info!(
@@ -4067,6 +4079,29 @@ pub(crate) fn restore_hook_for(
 
 #[cfg(test)]
 mod tests {
+    /// A disk-only clone (`snapshot run --snapshot <disk-only> --on-restore <cmd>`)
+    /// runs the caller's hook, resolved the same way as a memory restore, instead of
+    /// copying the snapshot's recorded hook over an accepted flag (a Codex finding on
+    /// PR 1112). The builder takes the resolved hook; the disk-only path resolves it
+    /// with `restore_hook_for`, pinned at the source because that path boots a VM.
+    ///
+    /// RED BEFORE THE FIX: the builder copied `meta.restore_hook` and the disk-only
+    /// path never called `restore_hook_for`.
+    #[test]
+    fn a_disk_only_clone_runs_the_callers_hook() {
+        let source = include_str!("snapshot.rs");
+        let start = source
+            .find("async fn cmd_snapshot_run_disk_only(")
+            .expect("the disk-only path exists");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("the disk-only path ends");
+        let body = &body[..end];
+        assert!(
+            body.contains("restore_hook_for(") && body.contains("args.on_restore"),
+            "the disk-only path does not resolve the caller's --on-restore"
+        );
+    }
+
     /// A run that gave no hook must not run the one its startup snapshot recorded
     /// (another run's: the hook is not in the cache key), while a command-line
     /// `snapshot run` without the flag inherits it.
@@ -4297,6 +4332,7 @@ mod tests {
                 false,
                 None,
                 given,
+                None,
             )
             .ipv6_prefix
         };
@@ -4366,6 +4402,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -4390,6 +4427,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -4409,6 +4447,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -4426,6 +4465,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
         );
@@ -4460,6 +4500,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
         );
@@ -4517,6 +4558,7 @@ mod tests {
             false,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -4533,6 +4575,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
         );
@@ -4574,6 +4617,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
             );
