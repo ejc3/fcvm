@@ -55,6 +55,10 @@ pub struct RoutedNetwork {
     /// The IPv6 resolver the launch's resolv.conf snapshot selected, threaded
     /// in by the caller. None means the snapshot named no IPv6 server.
     ipv6_dns: Option<String>,
+    /// A clone restoring into this network. Its guest already holds the
+    /// resolver it booted with, so `setup` reports the one it was given and
+    /// never probes for another.
+    restore_mode: bool,
 
     // Network state (populated during setup)
     namespace_id: Option<String>,
@@ -77,6 +81,7 @@ impl RoutedNetwork {
             ipv6_prefix: None,
             forward_localhost: Vec::new(),
             ipv6_dns: None,
+            restore_mode: false,
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
@@ -90,10 +95,6 @@ impl RoutedNetwork {
         self
     }
 
-    /// Set guest localhost ports to forward to the host's loopback (--forward-localhost).
-    ///
-    /// fc-agent relays guest 127.0.0.1:<port> to 10.0.2.2:<port>; setup() makes the
-    /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
     /// The IPv6 resolver chosen from the launch's single resolv.conf snapshot.
     ///
     /// The same snapshot the snapshot key and the guest's search domains come
@@ -104,9 +105,41 @@ impl RoutedNetwork {
         self
     }
 
+    /// Set guest localhost ports to forward to the host's loopback (--forward-localhost).
+    ///
+    /// fc-agent relays guest 127.0.0.1:<port> to 10.0.2.2:<port>; setup() makes the
+    /// namespace own 10.0.2.2 and relays each connection to the host's loopback.
     pub fn with_forward_localhost(mut self, ports: Vec<u16>) -> Self {
         self.forward_localhost = ports;
         self
+    }
+
+    /// A clone restores into this network: `setup` reports the resolver it was
+    /// given, which is the one the snapshot recorded, and never probes.
+    pub fn with_restore_mode(mut self) -> Self {
+        self.restore_mode = true;
+        self
+    }
+
+    /// What `setup` reports as the guest's IPv6 resolver without probing.
+    #[cfg(test)]
+    pub(crate) fn ipv6_dns(&self) -> Option<&str> {
+        self.ipv6_dns.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ipv6_prefix(&self) -> Option<&str> {
+        self.ipv6_prefix.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn forward_localhost(&self) -> &[u16] {
+        &self.forward_localhost
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_restore(&self) -> bool {
+        self.restore_mode
     }
 
     /// Parse `--ipv6-prefix` into (network bits, prefix length).
@@ -862,7 +895,11 @@ impl NetworkManager for RoutedNetwork {
             loopback_ip: self.needs_loopback_ip().then_some(loopback_ip),
             // IPv4 DNS (e.g. VPC's 10.0.0.2) is unreachable without MASQUERADE.
             // Detect an IPv6 DNS server reachable via native routed IPv6.
-            dns_server: detect_ipv6_dns(self.ipv6_dns.clone()).await,
+            dns_server: if probes_for_resolver(self.restore_mode, &self.ipv6_dns) {
+                detect_ipv6_dns(None).await
+            } else {
+                self.ipv6_dns.clone()
+            },
             // Include /128 prefix so fc-agent uses a host route instead of /64 on-link.
             // With /64, the VM would try NDP for other addresses in the host's subnet
             // directly on eth0, which fails (they're behind the veth + physical network).
@@ -1150,6 +1187,13 @@ async fn generate_link_local_from_mac(iface: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Whether `setup` probes for an IPv6 resolver: only a fresh launch whose
+/// resolv.conf snapshot named none. A restore reports what the snapshot
+/// recorded, because its guest already booted with that.
+fn probes_for_resolver(restore_mode: bool, selected: &Option<String>) -> bool {
+    !restore_mode && selected.is_none()
 }
 
 /// The DNS server a routed guest reaches over IPv6.
@@ -1454,6 +1498,22 @@ mod tests {
             detect_ipv6_dns(from_snapshot.clone()).await,
             from_snapshot,
             "the resolver must come from the launch snapshot, not a fresh read"
+        );
+    }
+
+    /// A restore never probes, whatever its snapshot recorded: with no
+    /// resolver recorded, a probe on a VPC host would hand the clone's state,
+    /// its reboot plan and any later snapshot a resolver its guest never
+    /// booted with. A fresh launch probes only when its snapshot named none.
+    #[test]
+    fn only_a_fresh_launch_without_a_resolver_probes() {
+        let given = Some("2001:db8::53".to_string());
+        assert!(!probes_for_resolver(false, &given));
+        assert!(probes_for_resolver(false, &None));
+        assert!(!probes_for_resolver(true, &given));
+        assert!(
+            !probes_for_resolver(true, &None),
+            "a restore must not probe"
         );
     }
 

@@ -1692,6 +1692,26 @@ pub(crate) async fn cmd_snapshot_run_attempt(args: SnapshotRunArgs) -> SnapshotR
     SnapshotRunAttempt { result, generation }
 }
 
+/// The routed network a clone restores into, before its preflight and loopback
+/// allocation: in restore mode, with the resolver the snapshot recorded, its
+/// forwarded localhost ports, and the prefix this run was given.
+fn routed_network_for_restore(
+    vm_id: String,
+    tap_device: String,
+    port_mappings: Vec<crate::network::PortMapping>,
+    meta: &crate::storage::SnapshotMetadata,
+    restore_prefix: Option<String>,
+) -> RoutedNetwork {
+    let mut net = RoutedNetwork::new(vm_id, tap_device, port_mappings)
+        .with_restore_mode()
+        .with_ipv6_dns(meta.network_config.dns_server.clone())
+        .with_forward_localhost(meta.forward_localhost.clone());
+    if let Some(prefix) = restore_prefix {
+        net = net.with_ipv6_prefix(prefix);
+    }
+    net
+}
+
 /// The prefix a routed clone's address is derived from: the one this run was given
 /// (`--ipv6-prefix` or FCVM_IPV6_PREFIX). Without one, routed networking detects the
 /// host's own /64, as a fresh `podman run` does. The prefix belongs to the host that runs
@@ -2188,15 +2208,13 @@ async fn cmd_snapshot_run_inner(
             Box::new(net)
         }
         FcNetworkMode::Routed => {
-            let mut net =
-                RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-            if let Some(prefix) = restore_prefix.clone() {
-                net = net.with_ipv6_prefix(prefix);
-            }
-            if !snapshot_config.metadata.forward_localhost.is_empty() {
-                net =
-                    net.with_forward_localhost(snapshot_config.metadata.forward_localhost.clone());
-            }
+            let mut net = routed_network_for_restore(
+                vm_id.clone(),
+                tap_device.clone(),
+                port_mappings.clone(),
+                &snapshot_config.metadata,
+                restore_prefix.clone(),
+            );
             setup_try!(net
                 .preflight_check()
                 .context("routed mode preflight check failed"));
@@ -4284,6 +4302,36 @@ mod tests {
         );
     }
 
+    /// A routed clone's network is in restore mode and carries what the
+    /// snapshot recorded (its resolver and forwarded localhost ports) and the
+    /// prefix this run was given. Without the mode, `RoutedNetwork::setup`
+    /// probes the AWS VPC resolver, a 2 s timeout on every host outside such a
+    /// VPC, whenever the snapshot recorded no resolver.
+    #[test]
+    fn a_routed_restore_carries_the_snapshots_resolver() {
+        let mut meta = metadata_fixture();
+        meta.network_config.dns_server = Some("2001:db8::53".to_string());
+        meta.forward_localhost = vec![3300, 4026];
+        let net = routed_network_for_restore(
+            "vm-restore".to_string(),
+            "tap-vm-resto".to_string(),
+            Vec::new(),
+            &meta,
+            Some("2001:db8:1::/64".to_string()),
+        );
+        assert!(
+            net.is_restore(),
+            "a clone's network must be in restore mode"
+        );
+        assert_eq!(
+            net.ipv6_dns(),
+            Some("2001:db8::53"),
+            "the restore's network must carry the snapshot's resolver"
+        );
+        assert_eq!(net.forward_localhost(), &[3300, 4026]);
+        assert_eq!(net.ipv6_prefix(), Some("2001:db8:1::/64"));
+    }
+
     /// #1079: a disk-only routed clone boots under the prefix `snapshot run` was given, and
     /// without one detects the host's /64 as `podman run` does. The prefix the snapshot
     /// recorded is never used. A rootless clone has none.
@@ -4291,36 +4339,17 @@ mod tests {
     fn run_args_from_metadata_take_the_restore_prefix() {
         let recorded = "2001:db8:aaaa:1::/112".to_string();
         let given = "2001:db8:bbbb:2::/112".to_string();
-        let routed = crate::storage::SnapshotMetadata {
-            image: "localhost/app:latest".to_string(),
-            vcpu: 1,
-            memory_mib: 512,
-            network_config: crate::network::NetworkConfig::default(),
-            volumes: vec![],
-            health_check_url: None,
-            health_check_timeout: 5,
-            restore_hook: None,
-            hugepages: false,
-            extra_disks: vec![],
-            nfs_shares: vec![],
-            username: None,
-            user: None,
-            port_mappings: vec![],
-            forward_localhost: vec![],
-            network_mode: crate::firecracker::FcNetworkMode::Routed,
-            ipv6_prefix: Some(recorded),
-            tty: false,
-            interactive: false,
-            kernel_profile: None,
-            image_mode: None,
-            image_disk_path: None,
-            image_disk_identity: None,
-            hypervisor: Default::default(),
-            firecracker_bin: None,
-            balloon_mib: None,
-            balloon_free_page_reporting: false,
-            pmem_devices: vec![],
-        };
+        let mut routed = metadata_fixture();
+        routed.image = "localhost/app:latest".to_string();
+        routed.vcpu = 1;
+        routed.memory_mib = 512;
+        routed.username = None;
+        routed.user = None;
+        routed.network_mode = crate::firecracker::FcNetworkMode::Routed;
+        routed.ipv6_prefix = Some(recorded);
+        routed.kernel_profile = None;
+        routed.image_mode = None;
+        routed.image_disk_path = None;
         let boot = |meta: &crate::storage::SnapshotMetadata, given: Option<&String>| {
             run_args_from_snapshot_metadata(
                 meta,
@@ -4355,14 +4384,9 @@ mod tests {
         );
     }
 
-    /// The synthesized RunArgs must carry the recorded boot-plan metadata:
-    /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
-    /// (overlay layers live on a separate read-only disk), and the USER env
-    /// (fc-agent maps the rootless username from it — without it a --user clone
-    /// would diverge from the captured passwd entry).
-    #[test]
-    fn run_args_from_metadata_carries_boot_plan_fields() {
-        let meta = crate::storage::SnapshotMetadata {
+    /// A snapshot's metadata, for the tests that read it back.
+    fn metadata_fixture() -> crate::storage::SnapshotMetadata {
+        crate::storage::SnapshotMetadata {
             image: "localhost/myapp:latest".to_string(),
             vcpu: 2,
             memory_mib: 1024,
@@ -4391,7 +4415,17 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
-        };
+        }
+    }
+
+    /// The synthesized RunArgs must carry the recorded boot-plan metadata:
+    /// kernel profile (a btrfs disk needs a btrfs kernel), image mode + device
+    /// (overlay layers live on a separate read-only disk), and the USER env
+    /// (fc-agent maps the rootless username from it — without it a --user clone
+    /// would diverge from the captured passwd entry).
+    #[test]
+    fn run_args_from_metadata_carries_boot_plan_fields() {
+        let meta = metadata_fixture();
         let args = run_args_from_snapshot_metadata(
             &meta,
             &[],
@@ -4518,36 +4552,16 @@ mod tests {
     /// (and fail outright on a CH-only host). Regression for the hard-coded Firecracker.
     #[test]
     fn run_args_from_metadata_propagates_backend() {
-        let base = crate::storage::SnapshotMetadata {
-            image: "localhost/app:latest".to_string(),
-            vcpu: 1,
-            memory_mib: 512,
-            network_config: crate::network::NetworkConfig::default(),
-            volumes: vec![],
-            health_check_url: None,
-            health_check_timeout: 5,
-            restore_hook: None,
-            hugepages: false,
-            extra_disks: vec![],
-            pmem_devices: vec![],
-            nfs_shares: vec![],
-            username: None,
-            user: None,
-            port_mappings: vec![],
-            forward_localhost: vec![],
-            network_mode: crate::firecracker::FcNetworkMode::Rootless,
-            ipv6_prefix: None,
-            tty: false,
-            interactive: false,
-            kernel_profile: None,
-            image_mode: None,
-            image_disk_path: None,
-            image_disk_identity: None,
-            hypervisor: crate::hypervisor::Backend::CloudHypervisor,
-            firecracker_bin: None,
-            balloon_mib: None,
-            balloon_free_page_reporting: false,
-        };
+        let mut base = metadata_fixture();
+        base.image = "localhost/app:latest".to_string();
+        base.vcpu = 1;
+        base.memory_mib = 512;
+        base.username = None;
+        base.user = None;
+        base.kernel_profile = None;
+        base.image_mode = None;
+        base.image_disk_path = None;
+        base.hypervisor = crate::hypervisor::Backend::CloudHypervisor;
         let args = run_args_from_snapshot_metadata(
             &base,
             &[],
