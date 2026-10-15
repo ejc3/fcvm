@@ -78,12 +78,6 @@ pub struct FirecrackerConfig {
     /// Minimum free space on root filesystem (e.g., "10G").
     /// Affects disk size after CoW copy, so must be in cache key.
     pub rootfs_size: String,
-    /// A command the guest runs inside the container after every restore of this
-    /// VM's snapshot, before the clone is published. Part of the cache key: a
-    /// snapshot whose clones run it behaves differently at restore from one whose
-    /// clones do not, and the restore cannot reconcile that.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub restore_hook: Option<String>,
     /// Health check URL for the VM (e.g., "http://localhost/").
     /// Part of cache key because it's a property of the VM configuration —
     /// clones must inherit the same health check behavior.
@@ -242,7 +236,6 @@ impl Default for FirecrackerConfig {
             non_blocking_output: false,
             rootfs_size: "10G".to_string(),
             health_check_url: None,
-            restore_hook: None,
             user: None,
             port_mappings: Vec::new(),
             forward_localhost: Vec::new(),
@@ -539,7 +532,6 @@ impl FirecrackerConfig {
                     "https_proxy": runtime.https_proxy,
                     "no_proxy": runtime.no_proxy,
                     "ntp_servers": runtime.ntp_servers,
-                    "restore_hook": self.restore_hook,
                 },
                 "host-time": runtime.host_time,
             }

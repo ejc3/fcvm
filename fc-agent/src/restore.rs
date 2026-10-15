@@ -244,16 +244,26 @@ fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// metadata watcher. Re-fetching the metadata document here would repeat the
 /// transport round trip milliseconds after the watcher completed it, for a
 /// value with one-second resolution.
-/// The plan's restore hook, set once from the boot plan. A restored clone keeps
-/// the fc-agent that booted the snapshot's VM, so the hook travels in memory.
-static RESTORE_HOOK: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+/// Whether the container has been started in this guest. A pre-start snapshot
+/// is taken before it exists, so its restore has no container to run a hook in.
+static CONTAINER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub fn set_restore_hook(hook: Option<String>) {
-    let _ = RESTORE_HOOK.set(hook);
+pub fn mark_container_started() {
+    CONTAINER_STARTED.store(true, Ordering::Release);
 }
 
-fn restore_hook() -> Option<&'static str> {
-    RESTORE_HOOK.get().and_then(|hook| hook.as_deref())
+/// The hook this restore runs: the one the host sent, once the container exists.
+/// Before that there is nothing to run it in, and nothing stale to redo: the
+/// container that starts after the restore starts fresh.
+fn hook_for_this_restore(sent: Option<&str>, container_started: bool) -> Option<&str> {
+    match (sent, container_started) {
+        (Some(hook), true) => Some(hook),
+        (Some(_), false) => {
+            eprintln!("[fc-agent] restore hook skipped: the container has not started");
+            None
+        }
+        (None, _) => None,
+    }
 }
 
 pub async fn handle_clone_restore(
@@ -262,6 +272,7 @@ pub async fn handle_clone_restore(
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
     host_time: &str,
+    restore_hook: Option<&str>,
 ) -> anyhow::Result<RestorePhases> {
     let restore_started = std::time::Instant::now();
     let mut phases = RestorePhases::default();
@@ -341,7 +352,8 @@ pub async fn handle_clone_restore(
         "[fc-agent] restore phase=tcp-cleanup epoch={} begin",
         restore_epoch
     );
-    let boundary = crate::snapshot_network::restore_snapshot_network(restore_hook())
+    let hook = hook_for_this_restore(restore_hook, CONTAINER_STARTED.load(Ordering::Acquire));
+    let boundary = crate::snapshot_network::restore_snapshot_network(hook)
         .await
         .context("restore phase tcp-cleanup")?;
     phases.tcp_cleanup_ms = elapsed_ms(tcp_cleanup_started);
@@ -758,6 +770,17 @@ mod tests {
     /// The chaos fuzz found that, but only by landing inside the window. This
     /// pins the ordering that makes the window impossible, so a regression
     /// fails here every time rather than one run in N.
+    /// The hook the host sent runs only once the container exists. A pre-start
+    /// snapshot restores before that, and `podman exec` on a container that does
+    /// not exist would fail the restore of every cached boot.
+    #[test]
+    fn the_hook_waits_for_the_container() {
+        assert_eq!(hook_for_this_restore(Some("true"), true), Some("true"));
+        assert_eq!(hook_for_this_restore(Some("true"), false), None);
+        assert_eq!(hook_for_this_restore(None, true), None);
+        assert_eq!(hook_for_this_restore(None, false), None);
+    }
+
     #[test]
     fn the_clone_announces_itself_before_the_boundary_publishes() {
         let source = include_str!("restore.rs");

@@ -2270,6 +2270,13 @@ async fn cmd_snapshot_run_inner(
     // The cache key includes health_check_url, so each config gets its own snapshot.
     vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
     vm_state.config.health_check_timeout = snapshot_config.metadata.health_check_timeout;
+    // The restore hook: this invocation's when it gave one (`podman run` restoring
+    // its startup snapshot passes its own flag), else the snapshot's. The clone's
+    // restore runs it, and a snapshot taken from this clone records it.
+    vm_state.config.restore_hook = args
+        .on_restore
+        .clone()
+        .or_else(|| snapshot_config.metadata.restore_hook.clone());
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
@@ -2595,6 +2602,12 @@ async fn cmd_snapshot_run_inner(
     });
     if let Some((_, ref new_ipv6)) = clone_ipv6_swap {
         restore_latest["clone-ipv6"] = serde_json::Value::String(new_ipv6.clone());
+    }
+    // The command the guest runs in the container before this clone is published
+    // (`--on-restore`, recorded in the snapshot's metadata). Carried here, per
+    // restore, so it is no part of the snapshot's cache key.
+    if let Some(ref hook) = vm_state.config.restore_hook {
+        restore_latest["restore-hook"] = serde_json::Value::String(hook.clone());
     }
     let bootplan_socket = format!(
         "{}_{}",
@@ -4699,6 +4712,7 @@ mod tests {
             firecracker_args: Some("--enable-nv2".to_string()),
             hugepages: None,
             non_blocking_output: false,
+            on_restore: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
@@ -4770,6 +4784,7 @@ mod tests {
             firecracker_args: None,
             hugepages: None,
             non_blocking_output: false,
+            on_restore: None,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,

@@ -91,7 +91,6 @@ pub async fn run() -> Result<()> {
     network::pin_namespace_neighbour().await;
 
     network::publish_to_loopback(&plan.published_guest_ports);
-    crate::restore::set_restore_hook(plan.restore_hook.clone());
 
     if !plan.forward_localhost.is_empty() {
         network::setup_localhost_forwarding(&plan.forward_localhost);
@@ -583,6 +582,9 @@ pub async fn run() -> Result<()> {
     } else {
         container::build_podman_args(&plan, &image_ref, user_ref)
     };
+
+    // From here the container exists, so a restore may run the plan's hook in it.
+    crate::restore::mark_container_started();
 
     // TTY mode: never returns
     if plan.tty {

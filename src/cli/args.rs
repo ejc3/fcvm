@@ -351,11 +351,14 @@ pub struct RunArgs {
     pub health_check_timeout: u64,
 
     /// A command the guest runs inside the container after every restore of this VM's
-    /// snapshot, before the clone is published: `sh -c <CMD>` as the container's user,
-    /// with a 60 s limit. It runs with the network gate still closed, so no published-port
-    /// client reaches the clone before it is done, and its own loopback connections pass.
-    /// A failure keeps the clone unpublished and fails the restore. For state a process
-    /// cannot carry across a snapshot, such as service-discovery data as old as the snapshot.
+    /// snapshot, before the clone is published: `timeout -k 5 60 sh -c <CMD>` as the
+    /// container's user (the image needs sh and timeout). It runs with the network gate
+    /// still closed, so no published-port client reaches the clone before it is done, and
+    /// its own loopback connections pass. A failure or the 60 s limit keeps the clone
+    /// unpublished and fails the restore. A restore of the pre-start snapshot, which
+    /// happens before the container exists, skips it. Recorded in the VM's state and the
+    /// snapshot's metadata, not in the snapshot cache key. For state a process cannot
+    /// carry across a snapshot, such as service-discovery data as old as the snapshot.
     /// Example: --on-restore 'curl -sf http://[::1]:8088/sr-resubscribe-tiers'
     #[arg(long)]
     pub on_restore: Option<String>,
@@ -695,6 +698,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --non-blocking-output when restoring from a snapshot.
     #[arg(skip)]
     pub non_blocking_output: bool,
+
+    /// A command the guest runs inside the container after this restore, before the clone
+    /// is published, instead of the one the snapshot recorded (see `podman run --on-restore`).
+    /// `podman run` restoring its startup snapshot passes its own flag here.
+    #[arg(long)]
+    pub on_restore: Option<String>,
 }
 
 // ============================================================================

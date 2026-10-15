@@ -1504,38 +1504,109 @@ impl RestoreHook for NoRestoreHook {
 /// here is a second the clone stays unpublished.
 const RESTORE_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// The plan's hook, run as `sh -c <command>` inside the container through
-/// `podman exec`, as the container's user.
+/// How many seconds the hook's own `timeout` gives the command inside the
+/// container, and how many more before it is killed outright. The budget above
+/// is the client-side backstop and must exceed their sum.
+const RESTORE_HOOK_COMMAND_SECS: u64 = 45;
+const RESTORE_HOOK_KILL_AFTER_SECS: u64 = 5;
+
+/// How much of the hook's stdout and of its stderr is kept, for the log line
+/// and the error. The rest is drained and dropped, so a chatty hook neither
+/// blocks on a full pipe nor grows the guest's memory.
+const RESTORE_HOOK_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+/// What a bounded run leaves behind.
+#[derive(Debug)]
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `argv` with a budget. The child is killed when the budget ends (and when
+/// this future is dropped), and at most `RESTORE_HOOK_OUTPUT_LIMIT` bytes of each
+/// stream are kept.
+async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<BoundedOutput> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawning {:?}", argv[0]))?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let run = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (read_out, read_err) = tokio::join!(
+            async {
+                (&mut stdout)
+                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
+                    .read_to_end(&mut out)
+                    .await?;
+                tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
+            },
+            async {
+                (&mut stderr)
+                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
+                    .read_to_end(&mut err)
+                    .await?;
+                tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
+            }
+        );
+        read_out.context("reading the hook's stdout")?;
+        read_err.context("reading the hook's stderr")?;
+        let status = child.wait().await.context("waiting for the hook")?;
+        Ok::<_, anyhow::Error>(BoundedOutput {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(budget, run).await {
+        Ok(result) => result,
+        Err(_) => {
+            // The future above is dropped by the timeout; kill the child and reap it,
+            // so nothing it spawned keeps running under the clone's name.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("did not finish within {budget:?}")
+        }
+    }
+}
+
+/// The plan's hook, run inside the container through `podman exec`, as the
+/// container's user, under the container's own `timeout` so the command ends
+/// there when the budget does, not only its client here.
 pub struct ContainerRestoreHook {
     pub command: String,
 }
 
-impl RestoreHook for ContainerRestoreHook {
-    async fn run(&self) -> Result<()> {
+impl ContainerRestoreHook {
+    fn argv(&self) -> Vec<String> {
         let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
         argv.extend(
-            ["podman", "exec", "fcvm-container", "sh", "-c"]
+            ["podman", "exec", "fcvm-container", "timeout", "-k"]
                 .into_iter()
                 .map(str::to_string),
         );
+        argv.push(RESTORE_HOOK_KILL_AFTER_SECS.to_string());
+        argv.push(RESTORE_HOOK_COMMAND_SECS.to_string());
+        argv.extend(["sh", "-c"].into_iter().map(str::to_string));
         argv.push(self.command.clone());
+        argv
+    }
+}
+
+impl RestoreHook for ContainerRestoreHook {
+    async fn run(&self) -> Result<()> {
         let started = std::time::Instant::now();
-        let output = tokio::time::timeout(
-            RESTORE_HOOK_BUDGET,
-            tokio::process::Command::new(&argv[0])
-                .args(&argv[1..])
-                .stdin(std::process::Stdio::null())
-                .output(),
-        )
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "restore hook {:?} did not finish within {:?}",
-                self.command,
-                RESTORE_HOOK_BUDGET
-            )
-        })?
-        .with_context(|| format!("spawning restore hook {:?}", self.command))?;
+        let output = run_bounded(&self.argv(), RESTORE_HOOK_BUDGET)
+            .await
+            .with_context(|| format!("restore hook {:?}", self.command))?;
         let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -2926,6 +2997,91 @@ COMMIT\\n\"",
         );
         assert!(state.gate_closed);
         assert!(!state.link_down, "the boundary took the link down");
+    }
+
+    /// A hook that outlives its budget is killed, not left running: the client the
+    /// guest spawned is gone once the budget's error is returned.
+    ///
+    /// RED BEFORE THE FIX: the timed-out future was dropped and the process ran on.
+    #[tokio::test]
+    async fn a_hook_past_its_budget_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            &format!("echo $$ > {}; sleep 30", pid_file.display()),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let error = run_bounded(&argv, std::time::Duration::from_millis(300))
+            .await
+            .expect_err("a 30 s command cannot finish in 300 ms");
+        assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The shell is reaped by the kill; a dead-but-unreaped child would still
+        // have a /proc entry, so this reads as "gone" only once it is killed and
+        // waited for.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the hook's shell (pid {pid}) is still running after the budget"
+        );
+    }
+
+    /// At most 64 KiB of each stream is kept; the rest is drained so the hook is
+    /// never blocked on a full pipe.
+    #[tokio::test]
+    async fn a_hooks_output_is_bounded() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "head -c 1000000 /dev/zero | tr '\\0' x; echo err >&2",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let output = run_bounded(&argv, std::time::Duration::from_secs(30))
+            .await
+            .expect("a bounded run of a chatty command");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len() as u64, RESTORE_HOOK_OUTPUT_LIMIT);
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    /// The command runs in the container under its own `timeout`, so a hook that
+    /// hangs ends inside the container too, not only at the podman client.
+    #[test]
+    fn the_hook_runs_under_the_containers_own_timeout() {
+        let hook = ContainerRestoreHook {
+            command: "curl -sf http://[::1]:8088/x".to_string(),
+        };
+        let argv = hook.argv();
+        let container = argv
+            .iter()
+            .position(|a| a == "fcvm-container")
+            .expect("the container");
+        assert_eq!(
+            &argv[container + 1..],
+            &[
+                "timeout",
+                "-k",
+                &RESTORE_HOOK_KILL_AFTER_SECS.to_string(),
+                &RESTORE_HOOK_COMMAND_SECS.to_string(),
+                "sh",
+                "-c",
+                "curl -sf http://[::1]:8088/x",
+            ]
+        );
+        assert!(
+            RESTORE_HOOK_BUDGET.as_secs()
+                > RESTORE_HOOK_COMMAND_SECS + RESTORE_HOOK_KILL_AFTER_SECS,
+            "the client budget must outlast the container's timeout and its kill grace"
+        );
     }
 
     /// The restore hook runs inside the boundary: after the snapshot-time sockets

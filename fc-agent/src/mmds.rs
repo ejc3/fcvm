@@ -318,6 +318,7 @@ pub async fn watch_restore_epoch(
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
                         &metadata.host_time,
+                        metadata.restore_hook.as_deref(),
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -340,6 +341,7 @@ pub async fn watch_restore_epoch(
                         egress_gen_at_last_stable,
                         metadata.clone_ipv6.as_deref(),
                         &metadata.host_time,
+                        metadata.restore_hook.as_deref(),
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -381,6 +383,7 @@ async fn apply_restore_epoch(
     egress_gen_at_last_stable: Option<u64>,
     clone_ipv6: Option<&str>,
     host_time: &str,
+    restore_hook: Option<&str>,
 ) {
     if let Err(error) = signals.restore_status.begin() {
         eprintln!(
@@ -400,6 +403,7 @@ async fn apply_restore_epoch(
         egress_gen_at_last_stable,
         current,
         host_time,
+        restore_hook,
     )
     .await
     {

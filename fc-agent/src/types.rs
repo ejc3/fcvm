@@ -63,11 +63,6 @@ pub struct Plan {
     /// into the guest's chronyd at boot; empty means the host had none to give.
     #[serde(default)]
     pub ntp_servers: Vec<String>,
-    /// A command to run inside the container after every restore, before the
-    /// clone is published (`sh -c`, as the container's user). See
-    /// `snapshot_network::RestoreHook`.
-    #[serde(default)]
-    pub restore_hook: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -111,6 +106,10 @@ pub struct LatestMetadata {
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
     #[serde(rename = "clone-ipv6", default)]
     pub clone_ipv6: Option<String>,
+    /// The command to run inside the container before this restore is published
+    /// (`--on-restore`). See `snapshot_network::RestoreHook`.
+    #[serde(rename = "restore-hook", default)]
+    pub restore_hook: Option<String>,
 }
 
 #[cfg(test)]

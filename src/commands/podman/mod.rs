@@ -833,6 +833,7 @@ fn snapshot_restore_args(
         firecracker_args,
         hugepages: Some(args.hugepages),
         non_blocking_output: args.non_blocking_output,
+        on_restore: args.on_restore.clone(),
     }
 }
 

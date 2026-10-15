@@ -3214,6 +3214,12 @@ pub async fn restore_from_snapshot(
         if let Some(ref ipv6) = clone_ipv6 {
             mmds_latest["clone-ipv6"] = serde_json::Value::String(ipv6.clone());
         }
+        // The command the guest runs in the container before the restored VM is
+        // published (`--on-restore`). The guest skips it when its container has not
+        // started yet, which is every restore of a pre-start snapshot.
+        if let Some(ref hook) = vm_state.config.restore_hook {
+            mmds_latest["restore-hook"] = serde_json::Value::String(hook.clone());
+        }
         client
             .put_mmds(serde_json::json!({ "latest": mmds_latest }))
             .await
