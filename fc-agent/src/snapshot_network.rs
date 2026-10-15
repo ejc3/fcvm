@@ -423,12 +423,18 @@ const IPV6_LOOPBACK: &str = "::1/128";
 ///
 /// Loopback passes in both chains: the direction's own end (`loopback_flag`:
 /// `-s` for INPUT, `-d` for OUTPUT) is the guest talking to itself. INPUT also
-/// passes what enters on `lo`: the transparent egress proxy's redirected flows,
-/// which the nat table sent to the proxy's loopback listener with the guest's
-/// own address as their source, and which INPUT would otherwise reset while
-/// ingress is gated. The exemption is by interface, not by destination: a
-/// published-port SYN is DNATed to a loopback destination in PREROUTING and
+/// passes whatever enters on `lo`: the transparent egress proxy's redirected
+/// flows, which the nat table sent to the proxy's loopback listener with the
+/// guest's own address as their source, and which INPUT would otherwise reset
+/// while ingress is gated. The exemption is by interface, not by destination:
+/// a published-port SYN is DNATed to a loopback destination in PREROUTING and
 /// arrives on eth0, and must still be rejected while the gate is closed.
+///
+/// INPUT also refuses new inbound UDP flows: a published UDP port reaches the
+/// workload through the port forwarders like a TCP one, and a client's
+/// datagram during the cookie dump or the restore hook would read or change
+/// state the hook is about to repair. Replies to the guest's own outbound UDP
+/// are not NEW and pass; OUTPUT never gates UDP (DNS, NTP).
 fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
     let mut rules = vec![owned(&[
@@ -439,13 +445,31 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
         "-j",
         "RETURN",
     ])];
-    if loopback_flag == "-s" {
-        rules.push(owned(&["-p", "tcp", "-i", "lo", "-j", "RETURN"]));
+    let ingress = loopback_flag == "-s";
+    if ingress {
+        rules.push(owned(&["-i", "lo", "-j", "RETURN"]));
     }
-    rules.extend([
-        owned(&[
+    rules.extend([owned(&[
+        "-p",
+        "tcp",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "NEW",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "tcp-reset",
+    ])]);
+    if ingress {
+        let unreachable = if loopback_network.contains(':') {
+            "icmp6-port-unreachable"
+        } else {
+            "icmp-port-unreachable"
+        };
+        rules.push(owned(&[
             "-p",
-            "tcp",
+            "udp",
             "-m",
             "conntrack",
             "--ctstate",
@@ -453,10 +477,10 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<Stri
             "-j",
             "REJECT",
             "--reject-with",
-            "tcp-reset",
-        ]),
-        owned(&["-j", "RETURN"]),
-    ]);
+            unreachable,
+        ]));
+    }
+    rules.push(owned(&["-j", "RETURN"]));
     rules
 }
 
@@ -2503,9 +2527,28 @@ mod tests {
              cross the gate:\n{calls}"
         );
         assert!(
-            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -p tcp -i lo -j RETURN")
-                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -p tcp -i lo -j RETURN"),
+            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN")
+                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
             "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
+        );
+        // A published UDP port is reachable through the port forwarders too; while
+        // the gate is closed a new inbound datagram flow must be refused like a new
+        // TCP connection, or a UDP client reaches the workload during the cookie
+        // dump or the restore hook. Replies to the guest's own outbound UDP are not
+        // NEW and pass; outbound UDP (DNS) is never gated.
+        assert!(
+            calls.contains(
+                "iptables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT \
+                 --reject-with icmp-port-unreachable"
+            ) && calls.contains(
+                "ip6tables -w -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT \
+                 --reject-with icmp6-port-unreachable"
+            ),
+            "new inbound UDP flows pass the closed ingress gate:\n{calls}"
+        );
+        assert!(
+            !calls.contains("FCVM_SNAPSHOT_OUT -p udp"),
+            "outbound UDP must never be gated (DNS, NTP):\n{calls}"
         );
     }
 
@@ -2565,8 +2608,9 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -i lo -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
@@ -2581,8 +2625,9 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -i lo -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
+        -A FCVM_SNAPSHOT_IN -p udp -m conntrack --ctstate NEW -j REJECT --reject-with icmp6-port-unreachable\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
