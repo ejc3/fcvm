@@ -352,14 +352,16 @@ pub struct RunArgs {
 
     /// A command the guest runs inside the container after every restore of this VM's
     /// snapshot, before the clone is published: `timeout -k 5 45 sh -c <CMD>` as the
-    /// container's user (the image needs sh and timeout). It runs with the network gate
-    /// still closed, so no published-port client reaches the clone before it is done, and
-    /// its own loopback connections pass. A failure, or the command outliving its 45 s
-    /// (the guest gives up on the whole hook at 60 s), keeps the clone unpublished and
-    /// fails the restore. A restore of the pre-start snapshot, which
-    /// happens before the container exists, skips it. Recorded in the VM's state and the
-    /// snapshot's metadata, not in the snapshot cache key. For state a process cannot
-    /// carry across a snapshot, such as service-discovery data as old as the snapshot.
+    /// container's user (the image needs sh and timeout). It runs last in the restore,
+    /// after the stale sockets are retired and the network, NFS shares and egress proxy
+    /// are back, with new inbound connections still gated: the command can reach out,
+    /// and no published-port client reaches the clone before it is done. A failure, or
+    /// the command outliving its 45 s (the guest gives up on the whole hook at 60 s),
+    /// keeps the clone unpublished and fails the restore. A restore of the pre-start
+    /// snapshot, which happens before the container exists, skips it. Recorded in the
+    /// VM's state and the snapshot's metadata, not in the snapshot cache key. For state a
+    /// process cannot carry across a snapshot, such as service-discovery data as old as
+    /// the snapshot.
     /// Example: --on-restore 'curl -sf http://[::1]:8088/sr-resubscribe-tiers'
     #[arg(long)]
     pub on_restore: Option<String>,

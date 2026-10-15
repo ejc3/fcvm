@@ -6794,3 +6794,114 @@ async fn the_restore_hook_runs_when_a_healthy_startup_snapshot_restores() -> any
     );
     Ok(())
 }
+
+/// The restore hook can reach the network: it connects to a host listener (a
+/// non-loopback destination, so the gate's egress half governs it) and records the
+/// answer. The first version ran the hook with the whole NEW-flow gate closed, which
+/// answered that connection, and every reconnect the workload made meanwhile, with a
+/// reset.
+///
+/// Two destinations are tried, the guest's gateway address (which the rootless
+/// network maps to the host's loopback) and the host's own global IPv6 address,
+/// from the hook and again after publication, so a failure names which path and
+/// which moment.
+///
+/// RED BEFORE THE FIX: the hook's fetch was refused and the file read `REFUSED`.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn the_restore_hook_reaches_the_network() -> anyhow::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let listener = tokio::net::TcpListener::bind("[::]:0").await?;
+    let port = listener.local_addr()?.port();
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut stream, _) = listener.accept().await?;
+            let _ = stream
+                .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 11\r\n\r\nhook-egress")
+                .await;
+            let _ = stream.shutdown().await;
+        }
+        #[allow(unreachable_code)]
+        anyhow::Ok(())
+    });
+    // The host's own global IPv6 address: the source a connection to the outside
+    // would take. No packet leaves for this.
+    let probe = std::net::UdpSocket::bind("[::]:0")?;
+    probe.connect("[2001:4860:4860::8888]:9")?;
+    let host_v6 = probe.local_addr()?.ip();
+    // The container's environment may carry the host's proxy settings, which would
+    // send both fetches to the proxy instead of the listener; wget gets none.
+    let fetch = |target: &str, out: &str| {
+        format!(
+            "http_proxy= https_proxy= wget -q -T 10 -O {out} http://{target}:{port}/ 2>{out}.err || {{ echo REFUSED; cat {out}.err; }} > {out}"
+        )
+    };
+    let hook = format!(
+        "{}; {}",
+        fetch("10.0.2.2", "/tmp/fcvm-hook-egress-gw"),
+        fetch(&format!("[{host_v6}]"), "/tmp/fcvm-hook-egress-v6")
+    );
+    let read_both = "sh -c 'for f in gw v6; do echo \"$f=$(cat /tmp/fcvm-hook-egress-$f 2>/dev/null | tr \"\\n\" \" \" || echo ABSENT)\"; done'";
+
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names("rhook-egress");
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            "--on-restore",
+            &hook,
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    common::poll_health(&mut child, 300).await?;
+
+    let after_publication = format!(
+        "sh -c '{}; {}; for f in gw v6; do echo \"later-$f=$(cat /tmp/fcvm-later-$f | tr \"\\n\" \" \")\"; done'",
+        fetch("10.0.2.2", "/tmp/fcvm-later-gw"),
+        fetch(&format!("[{host_v6}]"), "/tmp/fcvm-later-v6")
+    );
+    let outcome = async {
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
+        let clone = async {
+            common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let result = async {
+                common::poll_health(&mut clone, 300).await?;
+                let in_hook = common::exec_in_container(clone_pid, &[read_both]).await?;
+                let later = common::exec_in_container(clone_pid, &[&after_publication]).await?;
+                anyhow::Ok((in_hook, later))
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            result
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve.wait().await;
+        clone
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+    server.abort();
+
+    let (in_hook, later) = outcome?;
+    assert!(
+        in_hook.contains("gw=hook-egress") && in_hook.contains("v6=hook-egress"),
+        "the restore hook could not reach the host listener; in the hook: {in_hook}; after publication: {later}"
+    );
+    Ok(())
+}
