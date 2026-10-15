@@ -357,8 +357,8 @@ pub struct RunArgs {
     /// are back, with new inbound connections still gated: the command can reach out,
     /// and no published-port client reaches the clone before it is done. A failure, or
     /// the command outliving its 45 s (the guest gives up on the whole hook at 60 s),
-    /// keeps the clone unpublished and fails the restore. A restore of the pre-start
-    /// snapshot, which happens before the container exists, skips it. Recorded in the
+    /// keeps the clone unpublished and fails the restore. A restore whose container is not
+    /// running (the pre-start snapshot's, taken before it exists) skips it. Recorded in the
     /// VM's state and the snapshot's metadata, not in the snapshot cache key. For state a
     /// process cannot carry across a snapshot, such as service-discovery data as old as
     /// the snapshot.
@@ -707,6 +707,13 @@ pub struct SnapshotRunArgs {
     /// `podman run` restoring its startup snapshot passes its own flag here.
     #[arg(long)]
     pub on_restore: Option<String>,
+
+    /// What a missing `--on-restore` means. On the command line, the snapshot's recorded
+    /// hook. For `podman run` restoring its startup snapshot, none: the hook is not in the
+    /// snapshot cache key, so the snapshot may have been made by a run that gave a hook
+    /// this run did not, and a hook the caller never named must not run in its clone.
+    #[arg(skip = true)]
+    pub inherit_recorded_hook: bool,
 }
 
 // ============================================================================

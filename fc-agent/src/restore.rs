@@ -247,28 +247,6 @@ fn elapsed_ms(since: std::time::Instant) -> f64 {
 /// metadata watcher. Re-fetching the metadata document here would repeat the
 /// transport round trip milliseconds after the watcher completed it, for a
 /// value with one-second resolution.
-/// Whether the container has been started in this guest. A pre-start snapshot
-/// is taken before it exists, so its restore has no container to run a hook in.
-static CONTAINER_STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-pub fn mark_container_started() {
-    CONTAINER_STARTED.store(true, Ordering::Release);
-}
-
-/// The hook this restore runs: the one the host sent, once the container exists.
-/// Before that there is nothing to run it in, and nothing stale to redo: the
-/// container that starts after the restore starts fresh.
-fn hook_for_this_restore(sent: Option<&str>, container_started: bool) -> Option<&str> {
-    match (sent, container_started) {
-        (Some(hook), true) => Some(hook),
-        (Some(_), false) => {
-            eprintln!("[fc-agent] restore hook skipped: the container has not started");
-            None
-        }
-        (None, _) => None,
-    }
-}
-
 pub async fn handle_clone_restore(
     signals: &RestoreSignals,
     clone_ipv6: Option<&str>,
@@ -460,11 +438,12 @@ pub async fn handle_clone_restore(
     // the NFS shares remounted and the egress proxy reconnected, so whatever
     // it reaches for (a loopback admin port, a share, the network) is there;
     // then the gate's ingress half opens and a published-port client can
-    // reach the clone. The hook is decided here, not at the top, so a
-    // container that started during the restore counts.
-    let hook = hook_for_this_restore(restore_hook, CONTAINER_STARTED.load(Ordering::Acquire));
+    // reach the clone. Whether the hook has a container to run in is the
+    // container's state at this moment, asked of podman, not a marker: a
+    // marker stored before podman started was wrong for a snapshot taken in
+    // between, in either order.
     let boundary = restored
-        .publish(hook)
+        .publish(restore_hook)
         .await
         .context("restore phase publish")?;
     phases.record_boundary(&boundary);
@@ -793,17 +772,6 @@ mod tests {
     /// The chaos fuzz found that, but only by landing inside the window. This
     /// pins the ordering that makes the window impossible, so a regression
     /// fails here every time rather than one run in N.
-    /// The hook the host sent runs only once the container exists. A pre-start
-    /// snapshot restores before that, and `podman exec` on a container that does
-    /// not exist would fail the restore of every cached boot.
-    #[test]
-    fn the_hook_waits_for_the_container() {
-        assert_eq!(hook_for_this_restore(Some("true"), true), Some("true"));
-        assert_eq!(hook_for_this_restore(Some("true"), false), None);
-        assert_eq!(hook_for_this_restore(None, true), None);
-        assert_eq!(hook_for_this_restore(None, false), None);
-    }
-
     #[test]
     fn the_clone_announces_itself_before_the_boundary_publishes() {
         let source = include_str!("restore.rs");

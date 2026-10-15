@@ -2270,13 +2270,14 @@ async fn cmd_snapshot_run_inner(
     // The cache key includes health_check_url, so each config gets its own snapshot.
     vm_state.config.health_check_url = snapshot_config.metadata.health_check_url.clone();
     vm_state.config.health_check_timeout = snapshot_config.metadata.health_check_timeout;
-    // The restore hook: this invocation's when it gave one (`podman run` restoring
-    // its startup snapshot passes its own flag), else the snapshot's. The clone's
-    // restore runs it, and a snapshot taken from this clone records it.
-    vm_state.config.restore_hook = args
-        .on_restore
-        .clone()
-        .or_else(|| snapshot_config.metadata.restore_hook.clone());
+    // The restore hook: this invocation's when it gave one, else the snapshot's
+    // for a command-line `snapshot run`, else none. The clone's restore runs it,
+    // and a snapshot taken from this clone records it.
+    vm_state.config.restore_hook = restore_hook_for(
+        args.on_restore.as_deref(),
+        args.inherit_recorded_hook,
+        snapshot_config.metadata.restore_hook.as_deref(),
+    );
     vm_state.config.hugepages = args.hugepages.unwrap_or(snapshot_config.metadata.hugepages);
     // Restore username for rootless health checks (runuser -u <username>).
     vm_state.config.username = snapshot_config.metadata.username.clone();
@@ -4048,8 +4049,43 @@ async fn cmd_snapshot_ls() -> Result<()> {
     Ok(())
 }
 
+/// The hook a restored clone runs: the caller's own, else the snapshot's recorded one
+/// when the caller inherits (a command-line `snapshot run`), else none. `podman run`
+/// restoring its startup snapshot does not inherit: the hook is not in the snapshot
+/// cache key, so the snapshot may carry a hook another run gave.
+pub(crate) fn restore_hook_for(
+    given: Option<&str>,
+    inherit_recorded: bool,
+    recorded: Option<&str>,
+) -> Option<String> {
+    match (given, inherit_recorded) {
+        (Some(hook), _) => Some(hook.to_string()),
+        (None, true) => recorded.map(str::to_string),
+        (None, false) => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A run that gave no hook must not run the one its startup snapshot recorded
+    /// (another run's: the hook is not in the cache key), while a command-line
+    /// `snapshot run` without the flag inherits it.
+    ///
+    /// RED BEFORE THE FIX: the cache-hit path fell back to the recorded hook.
+    #[test]
+    fn a_cache_hit_without_a_hook_runs_none_and_the_command_line_inherits() {
+        assert_eq!(restore_hook_for(None, false, Some("recorded")), None);
+        assert_eq!(
+            restore_hook_for(None, true, Some("recorded")).as_deref(),
+            Some("recorded")
+        );
+        assert_eq!(
+            restore_hook_for(Some("mine"), false, Some("recorded")).as_deref(),
+            Some("mine")
+        );
+        assert_eq!(restore_hook_for(None, true, None), None);
+    }
+
     use super::*;
 
     /// A snapshot directory holding a `mem_len`-byte memory image and the given config bytes.
@@ -4713,6 +4749,7 @@ mod tests {
             hugepages: None,
             non_blocking_output: false,
             on_restore: None,
+            inherit_recorded_hook: true,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,
@@ -4785,6 +4822,7 @@ mod tests {
             hugepages: None,
             non_blocking_output: false,
             on_restore: None,
+            inherit_recorded_hook: true,
             no_dirty_tracking: false,
             no_swap: false,
             vsock_dir: None,

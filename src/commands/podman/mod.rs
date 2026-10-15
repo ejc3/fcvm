@@ -834,6 +834,9 @@ fn snapshot_restore_args(
         hugepages: Some(args.hugepages),
         non_blocking_output: args.non_blocking_output,
         on_restore: args.on_restore.clone(),
+        // This run's own flag or nothing: the snapshot's recorded hook may be another
+        // run's (the hook is not in the cache key).
+        inherit_recorded_hook: false,
     }
 }
 

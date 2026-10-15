@@ -1718,7 +1718,57 @@ pub struct ContainerRestoreHook {
     pub command: String,
 }
 
+/// Whether the plan's hook has a running container to run in, read from podman
+/// at publication. A pre-start snapshot restores before the container exists;
+/// a snapshot taken while podman was still starting it finds it not running.
+/// Neither has anything stale to redo: the container that starts after the
+/// restore starts fresh.
+#[derive(Debug, PartialEq, Eq)]
+enum HookEligibility {
+    Run,
+    Skip(String),
+}
+
+/// Decide from `podman inspect --format {{.State.Running}} fcvm-container`:
+/// `true` runs the hook; `false`, or any failure (no such container), skips it.
+fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let state = stdout.trim();
+    if inspect.status.success() && state == "true" {
+        HookEligibility::Run
+    } else if inspect.status.success() {
+        HookEligibility::Skip(format!("fcvm-container is not running (Running={state})"))
+    } else {
+        let stderr = String::from_utf8_lossy(&inspect.stderr);
+        HookEligibility::Skip(format!(
+            "podman inspect exited {}: {}",
+            inspect.status,
+            stderr.trim()
+        ))
+    }
+}
+
+/// How long the container-state read may take before the hook is skipped as
+/// if the container were absent.
+const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl ContainerRestoreHook {
+    fn inspect_argv() -> Vec<String> {
+        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+        argv.extend(
+            [
+                "podman",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                "fcvm-container",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        argv
+    }
+
     fn argv(&self) -> Vec<String> {
         let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
         argv.extend(
@@ -1736,6 +1786,13 @@ impl ContainerRestoreHook {
 
 impl RestoreHook for ContainerRestoreHook {
     async fn run(&self) -> Result<()> {
+        let inspect = run_bounded(&Self::inspect_argv(), HOOK_INSPECT_BUDGET)
+            .await
+            .context("reading fcvm-container's state before the restore hook")?;
+        if let HookEligibility::Skip(reason) = hook_eligibility(&inspect) {
+            eprintln!("[fc-agent] restore hook skipped: {reason}");
+            return Ok(());
+        }
         let started = std::time::Instant::now();
         let output = run_bounded(&self.argv(), RESTORE_HOOK_BUDGET)
             .await
@@ -3282,20 +3339,75 @@ COMMIT\\n\"",
         };
         let nfs = at("mount_nfs_shares(");
         let waits = at("tokio::try_join!(exec_wait, egress_wait)");
-        let hook = at("hook_for_this_restore(");
-        let publish = at(".publish(hook)");
+        let publish = at(".publish(restore_hook)");
         assert!(
-            nfs < hook,
-            "the hook is decided before the NFS shares are remounted: a hook reading a \
-             share blocks on the dead hard mount"
+            nfs < publish,
+            "the hook runs before the NFS shares are remounted: a hook reading a share \
+             blocks on the dead hard mount"
         );
         assert!(
-            waits < hook,
-            "the hook is decided before the egress proxy and exec server are back"
+            waits < publish,
+            "the hook runs before the egress proxy and exec server are back"
         );
+    }
+
+    /// Whether the hook has a container to run in is the container's state at
+    /// publication, asked of podman, not a marker set when the agent was about to
+    /// start it. A user snapshot taken between that marker and podman's start
+    /// recorded a container that did not exist, and its clones failed their
+    /// restore on `podman exec`; the opposite order would have skipped the hook
+    /// for a container that did exist.
+    ///
+    /// RED BEFORE THE FIX: `CONTAINER_STARTED` was stored in agent.rs and read in
+    /// restore.rs.
+    #[test]
+    fn the_hook_asks_the_container_state_not_a_marker() {
+        for (name, source) in [
+            ("restore.rs", include_str!("restore.rs")),
+            ("agent.rs", include_str!("agent.rs")),
+        ] {
+            assert!(
+                !source.contains("CONTAINER_STARTED") && !source.contains("mark_container_started"),
+                "{name} still carries the container-started marker"
+            );
+        }
+        let argv = ContainerRestoreHook::inspect_argv();
         assert!(
-            hook < publish,
-            "the hook must run as part of the publication"
+            argv.windows(3)
+                .any(|w| w == ["inspect", "--format", "{{.State.Running}}"]),
+            "the hook does not read the container's state: {argv:?}"
+        );
+    }
+
+    /// The decision from podman's answer: a running container runs the hook; a
+    /// stopped one, or none at all, skips it with the reason.
+    #[test]
+    fn the_hook_runs_only_in_a_running_container() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code: i32, stdout: &str, stderr: &str| BoundedOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            hook_eligibility(&output(0, "true\n", "")),
+            HookEligibility::Run
+        );
+        assert_eq!(
+            hook_eligibility(&output(0, "false\n", "")),
+            HookEligibility::Skip("fcvm-container is not running (Running=false)".to_string())
+        );
+        assert_eq!(
+            hook_eligibility(&output(
+                125,
+                "",
+                "Error: no container with name or ID \"fcvm-container\" found"
+            )),
+            HookEligibility::Skip(
+                "podman inspect exited exit status: 125: Error: no container with name or ID \
+                 \"fcvm-container\" found"
+                    .to_string()
+            )
         );
     }
 

@@ -583,9 +583,6 @@ pub async fn run() -> Result<()> {
         container::build_podman_args(&plan, &image_ref, user_ref)
     };
 
-    // From here the container exists, so a restore may run the plan's hook in it.
-    crate::restore::mark_container_started();
-
     // TTY mode: never returns
     if plan.tty {
         eprintln!("[fc-agent] TTY mode enabled, using PTY");

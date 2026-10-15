@@ -6905,3 +6905,74 @@ async fn the_restore_hook_reaches_the_network() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A run that gives no hook and restores a startup snapshot made by a run that did
+/// runs no hook. The hook is not in the snapshot cache key, so the two runs share
+/// the snapshot, and the recorded hook is the other run's.
+///
+/// RED BEFORE THE FIX: the second run inherited the recorded hook and the marker
+/// read `RAN`.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn a_cache_hit_without_a_hook_runs_none() -> anyhow::Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("rhooknone");
+    let common_args = [
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        "--health-check",
+        "http://localhost/",
+    ];
+    // First boot, with a hook: cold, creates the startup snapshot once healthy.
+    let mut with_hook: Vec<&str> = common_args.to_vec();
+    with_hook.extend([
+        "--on-restore",
+        "touch /tmp/fcvm-restore-hook-ran",
+        common::TEST_IMAGE,
+    ]);
+    let (mut first, first_pid, _) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&with_hook, &[]).await?;
+    let first_outcome = common::poll_health(&mut first, 300).await;
+    common::kill_process(first_pid).await;
+    let _ = first.wait().await;
+    first_outcome?;
+
+    // Second boot, no hook: the same configuration restores that startup snapshot.
+    let mut without_hook: Vec<&str> = common_args.to_vec();
+    without_hook.push(common::TEST_IMAGE);
+    let (mut second, pid, log_path) =
+        common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(&without_hook, &[]).await?;
+    let outcome = async {
+        common::poll_health(&mut second, 300).await?;
+        common::exec_in_container(
+            pid,
+            &["sh -c 'test -e /tmp/fcvm-restore-hook-ran && echo RAN || echo ABSENT'"],
+        )
+        .await
+    }
+    .await;
+    common::kill_process(pid).await;
+    let _ = second.wait().await;
+
+    let in_container = outcome?;
+    let log = std::fs::read_to_string(&log_path)?;
+    assert!(
+        log.contains("Startup snapshot hit!"),
+        "the second boot did not restore the startup snapshot; log at {}",
+        log_path.display()
+    );
+    assert!(
+        !log.contains("restore hook \"touch"),
+        "the second boot ran the first run's hook; log at {}",
+        log_path.display()
+    );
+    assert_eq!(
+        in_container.trim(),
+        "ABSENT",
+        "a run that gave no hook ran the one its startup snapshot recorded"
+    );
+    Ok(())
+}
