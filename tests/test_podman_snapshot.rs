@@ -65,7 +65,9 @@ fn list_snapshot_entries_in(snapshots: &Path) -> HashSet<String> {
                 // Check if this is a complete snapshot entry
                 if path.join("memory.bin").exists()
                     && path.join("vmstate.bin").exists()
-                    && path.join("disk.raw").exists()
+                    && fcvm::storage::snapshot::snapshot_disk_dir(&path)
+                        .join("disk.raw")
+                        .exists()
                     && path.join("config.json").exists()
                 {
                     entries.insert(name);
@@ -238,10 +240,12 @@ async fn snapshot_entry_lookup_skips_other_vms_entries() -> Result<()> {
     let snapshots = std::env::temp_dir().join(format!("fcvm-entry-lookup-{}", std::process::id()));
     let add = |name: &str, vm_id: &str| -> Result<()> {
         let entry = snapshots.join(name);
-        std::fs::create_dir_all(&entry)?;
-        for file in ["memory.bin", "vmstate.bin", "disk.raw"] {
+        let disk_dir = fcvm::storage::snapshot::snapshot_disk_dir(&entry);
+        std::fs::create_dir_all(&disk_dir)?;
+        for file in ["memory.bin", "vmstate.bin"] {
             std::fs::write(entry.join(file), b"")?;
         }
+        std::fs::write(disk_dir.join("disk.raw"), b"")?;
         std::fs::write(
             entry.join("config.json"),
             format!(r#"{{"vm_id":"{vm_id}"}}"#),
@@ -267,7 +271,9 @@ fn snapshot_entry_exists(snapshot_key: &str) -> bool {
     let path = snapshot_dir().join(snapshot_key);
     path.join("memory.bin").exists()
         && path.join("vmstate.bin").exists()
-        && path.join("disk.raw").exists()
+        && fcvm::storage::snapshot::snapshot_disk_dir(&path)
+            .join("disk.raw")
+            .exists()
         && path.join("config.json").exists()
 }
 

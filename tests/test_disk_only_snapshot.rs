@@ -53,9 +53,14 @@ async fn test_disk_only_capture_artifacts_and_source_survives() -> Result<()> {
         String::from_utf8_lossy(&output.stderr)
     );
 
-    // Artifacts: disk.raw + config.json present; NO memory image (disk-only).
+    // Artifacts: disk/disk.raw + config.json present; NO memory image (disk-only).
     let dir = snapshot_dir().join(&snap);
-    assert!(dir.join("disk.raw").exists(), "disk.raw must exist");
+    assert!(
+        fcvm::storage::snapshot::snapshot_disk_dir(&dir)
+            .join("disk.raw")
+            .exists(),
+        "disk/disk.raw must exist"
+    );
     assert!(dir.join("config.json").exists(), "config.json must exist");
     assert!(
         !dir.join("memory.bin").exists(),

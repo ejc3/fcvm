@@ -3932,10 +3932,10 @@ async fn cmd_snapshot_run_disk_only(
         );
     }
 
-    let disk_path = paths::snapshot_dir().join(&snapshot_name).join("disk.raw");
+    let disk_path = snapshot_config.disk_path.clone();
     if !disk_path.exists() {
         bail!(
-            "disk-only snapshot '{}' is missing disk.raw at {}",
+            "disk-only snapshot '{}' is missing its disk at {}",
             snapshot_name,
             disk_path.display()
         );

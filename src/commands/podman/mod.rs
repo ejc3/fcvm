@@ -492,6 +492,37 @@ async fn verify_prepared_snapshot(
     verify_prepared_snapshot_in(&paths::data_dir(), &paths::snapshot_dir(), target, cache).await
 }
 
+/// Flush a prepared generation to disk: every file under `dir`, each directory
+/// after its files, then `dir` itself. The disks sit in the `disk/` subvolume,
+/// so the walk descends. Returns the paths it synced in that order.
+fn sync_generation(dir: &std::path::Path) -> Result<Vec<std::path::PathBuf>> {
+    let mut synced = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("reading prepared generation {}", dir.display()))?
+    {
+        let entry = entry.context("reading prepared generation entry")?;
+        let path = entry.path();
+        let file_type = entry
+            .file_type()
+            .context("reading prepared generation entry type")?;
+        if file_type.is_dir() {
+            synced.extend(sync_generation(&path)?);
+        } else if file_type.is_file() {
+            std::fs::File::open(&path)
+                .with_context(|| format!("opening prepared artifact {}", path.display()))?
+                .sync_all()
+                .with_context(|| format!("syncing prepared artifact {}", path.display()))?;
+            synced.push(path);
+        }
+    }
+    std::fs::File::open(dir)
+        .with_context(|| format!("opening prepared generation {}", dir.display()))?
+        .sync_all()
+        .with_context(|| format!("syncing prepared generation {}", dir.display()))?;
+    synced.push(dir.to_path_buf());
+    Ok(synced)
+}
+
 /// Verify the generation installed at `target.name`.
 ///
 /// `Ok(None)` means this invocation has nothing to publish: either nothing is installed
@@ -562,13 +593,18 @@ async fn verify_prepared_snapshot_in(
             &config.vmstate_path,
             snapshot_dir.join("vmstate.bin"),
         ),
-        ("disk", &config.disk_path, snapshot_dir.join("disk.raw")),
+        (
+            "disk",
+            &config.disk_path,
+            crate::storage::snapshot::snapshot_disk_dir(&snapshot_dir).join("disk.raw"),
+        ),
     ] {
         anyhow::ensure!(
             configured == &expected,
-            "prepared snapshot {} {} path points outside its generation: {}",
+            "prepared snapshot {} {} path is not {}: {}; delete and recreate the snapshot",
             snapshot_key,
             label,
+            expected.display(),
             configured.display()
         );
         let metadata = tokio::fs::metadata(configured).await.with_context(|| {
@@ -603,7 +639,7 @@ async fn verify_prepared_snapshot_in(
             disk.drive_id,
             disk.filename
         );
-        let path = snapshot_dir.join(&disk.filename);
+        let path = crate::storage::snapshot::snapshot_disk_dir(&snapshot_dir).join(&disk.filename);
         let metadata = tokio::fs::metadata(&path).await.with_context(|| {
             format!(
                 "reading prepared snapshot {} extra disk {} artifact {}",
@@ -673,29 +709,7 @@ async fn verify_prepared_snapshot_in(
     let sync_dir = snapshot_dir.clone();
     let sync_root = snapshot_root.to_path_buf();
     tokio::task::spawn_blocking(move || -> Result<()> {
-        for entry in std::fs::read_dir(&sync_dir)
-            .with_context(|| format!("reading prepared generation {}", sync_dir.display()))?
-        {
-            let entry = entry.context("reading prepared generation entry")?;
-            if entry
-                .file_type()
-                .context("reading prepared generation entry type")?
-                .is_file()
-            {
-                std::fs::File::open(entry.path())
-                    .with_context(|| {
-                        format!("opening prepared artifact {}", entry.path().display())
-                    })?
-                    .sync_all()
-                    .with_context(|| {
-                        format!("syncing prepared artifact {}", entry.path().display())
-                    })?;
-            }
-        }
-        std::fs::File::open(&sync_dir)
-            .with_context(|| format!("opening prepared generation {}", sync_dir.display()))?
-            .sync_all()
-            .with_context(|| format!("syncing prepared generation {}", sync_dir.display()))?;
+        sync_generation(&sync_dir)?;
         std::fs::File::open(&sync_root)
             .with_context(|| format!("opening snapshot root {}", sync_root.display()))?
             .sync_all()
@@ -4592,6 +4606,9 @@ mod tests {
         .unwrap();
         config.content_key = Some(snapshot_key.to_string());
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
         }
         tokio::fs::write(
@@ -4650,6 +4667,9 @@ mod tests {
         .unwrap();
         config.content_key = Some(snapshot_key.to_string());
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
         }
         tokio::fs::write(
@@ -4748,6 +4768,9 @@ mod tests {
         .unwrap();
         config.content_key = content_key.map(str::to_string);
         for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
+            tokio::fs::create_dir_all(path.parent().unwrap())
+                .await
+                .unwrap();
             tokio::fs::write(path, b"durable-artifact").await.unwrap();
         }
         tokio::fs::write(
@@ -4933,6 +4956,51 @@ mod tests {
     }
 
     /// A generation is only complete if every artifact a clone opens is in it. The three
+    /// The durability sync reaches the disks in `disk/`, not only the generation's
+    /// top-level files: a prepared generation whose disk is still in the page cache
+    /// at a host crash would verify as prepared and restore a torn disk.
+    #[test]
+    fn the_durability_sync_reaches_the_disk_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let generation = temp.path().join("0123456789ab-startup");
+        let disk_dir = crate::storage::snapshot::snapshot_disk_dir(&generation);
+        std::fs::create_dir_all(&disk_dir).unwrap();
+        for name in ["memory.bin", "vmstate.bin", "config.json"] {
+            std::fs::write(generation.join(name), b"x").unwrap();
+        }
+        std::fs::write(disk_dir.join("disk.raw"), b"x").unwrap();
+        std::fs::write(disk_dir.join("disk-dir-0.raw"), b"x").unwrap();
+
+        let synced = super::sync_generation(&generation).unwrap();
+        for wanted in [
+            generation.join("memory.bin"),
+            disk_dir.join("disk.raw"),
+            disk_dir.join("disk-dir-0.raw"),
+            disk_dir.clone(),
+            generation.clone(),
+        ] {
+            assert!(
+                synced.contains(&wanted),
+                "{} was not synced",
+                wanted.display()
+            );
+        }
+        let dir_at = synced.iter().position(|p| p == &disk_dir).unwrap();
+        let file_at = synced
+            .iter()
+            .position(|p| p == &disk_dir.join("disk.raw"))
+            .unwrap();
+        assert!(
+            file_at < dir_at,
+            "a directory must be synced after its files"
+        );
+        assert_eq!(
+            synced.last(),
+            Some(&generation),
+            "the generation itself is synced last"
+        );
+    }
+
     /// core files are not the whole set: an extra disk or a portable volume's inode table
     /// can be absent while memory, vmstate and disk are all present and non-empty.
     #[tokio::test]
@@ -4969,12 +5037,18 @@ mod tests {
             config.metadata.extra_disks = extra_disks;
             config.metadata.volumes = volumes;
             for path in [&config.memory_path, &config.vmstate_path, &config.disk_path] {
-                tokio::fs::write(path, b"durable-artifact").await.unwrap();
-            }
-            for (name, bytes) in side_files {
-                tokio::fs::write(snapshot_dir.join(name), bytes)
+                tokio::fs::create_dir_all(path.parent().unwrap())
                     .await
                     .unwrap();
+                tokio::fs::write(path, b"durable-artifact").await.unwrap();
+            }
+            // Side files are named relative to the generation; a disk sits in `disk/`.
+            for (name, bytes) in side_files {
+                let path = snapshot_dir.join(name);
+                tokio::fs::create_dir_all(path.parent().unwrap())
+                    .await
+                    .unwrap();
+                tokio::fs::write(path, bytes).await.unwrap();
             }
             tokio::fs::write(
                 snapshot_dir.join("config.json"),
@@ -5028,7 +5102,7 @@ mod tests {
             temp.path(),
             vec![disk("disk-dir-0.raw")],
             Vec::new(),
-            &[("disk-dir-0.raw", b"")],
+            &[("disk/disk-dir-0.raw", b"")],
         )
         .await
         .expect_err("an empty extra disk must not verify");
@@ -5074,7 +5148,7 @@ mod tests {
                 vec![disk("disk-dir-0.raw")],
                 vec![volume(true)],
                 &[
-                    ("disk-dir-0.raw", b"disk-bytes"),
+                    ("disk/disk-dir-0.raw", b"disk-bytes"),
                     ("volume-5001-inode-table.json", b"{}"),
                 ],
             )

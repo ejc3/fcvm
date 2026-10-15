@@ -2863,24 +2863,34 @@ async fn prepare_clone_substrate(
     );
     namespace.mount_redirects = Some(redirects);
 
-    // Copy extra disk images (disk-dir) from snapshot to the clone's disk directory so the
-    // redirected baseline paths resolve to real files.
+    // Extra disk images (disk-dir) in the clone's disk directory, so the redirected baseline
+    // paths resolve to real files. A disk directory made as a subvolume snapshot of the
+    // snapshot's disk directory already holds them; the reflink copy is for one that was not.
     let extra_disks_result: Result<()> = async {
-        if !restore_config.extra_disks.is_empty() {
-            if let Some(ref snap_dir) = restore_config.snapshot_dir {
-                for extra_disk in &restore_config.extra_disks {
-                    let source = snap_dir.join(&extra_disk.filename);
-                    let dest = vm_dir.join(&extra_disk.filename);
-                    reflink_copy(&source, &dest)
-                        .await
-                        .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+        if !restore_config.extra_disks.is_empty() && restore_config.snapshot_dir.is_some() {
+            // The extra disks sit beside the recorded source disk.
+            let snap_disk_dir = restore_config
+                .source_disk_path
+                .parent()
+                .context("the snapshot's source disk has no parent directory")?;
+            let mut copied = 0usize;
+            for extra_disk in &restore_config.extra_disks {
+                let source = snap_disk_dir.join(&extra_disk.filename);
+                let dest = vm_dir.join(&extra_disk.filename);
+                if tokio::fs::try_exists(&dest).await.with_context(|| {
+                    format!("checking the clone's extra disk {}", extra_disk.filename)
+                })? {
+                    continue;
                 }
-                info!(
-                    num_disks = restore_config.extra_disks.len(),
-                    "copied {} extra disk image(s) to clone",
-                    restore_config.extra_disks.len()
-                );
+                reflink_copy(&source, &dest)
+                    .await
+                    .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
+                copied += 1;
             }
+            info!(
+                num_disks = restore_config.extra_disks.len(),
+                copied, "extra disk image(s) in place for the clone"
+            );
         }
         Ok(())
     }
@@ -3603,12 +3613,16 @@ async fn reflink_disks_to_snapshot(
     snapshot_config: &crate::storage::snapshot::SnapshotConfig,
     temp_snapshot_dir: &Path,
 ) -> Result<()> {
-    reflink_copy(disk_path, &temp_snapshot_dir.join("disk.raw")).await?;
+    let disk_dir = crate::storage::snapshot::snapshot_disk_dir(temp_snapshot_dir);
+    crate::storage::disk::create_dir_or_subvolume(&disk_dir)
+        .await
+        .context("creating the snapshot's disk directory")?;
+    reflink_copy(disk_path, &disk_dir.join("disk.raw")).await?;
     for extra_disk in &snapshot_config.metadata.extra_disks {
         let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
             .join("disks")
             .join(&extra_disk.filename);
-        let dest = temp_snapshot_dir.join(&extra_disk.filename);
+        let dest = disk_dir.join(&extra_disk.filename);
         reflink_copy(&source, &dest)
             .await
             .with_context(|| format!("copying extra disk {}", extra_disk.filename))?;
@@ -3728,7 +3742,7 @@ pub fn build_snapshot_config(
         content_key: None,
         memory_path: snapshot_dir.join("memory.bin"),
         vmstate_path: snapshot_dir.join("vmstate.bin"),
-        disk_path: snapshot_dir.join("disk.raw"),
+        disk_path: crate::storage::snapshot::snapshot_disk_dir(snapshot_dir).join("disk.raw"),
         created_at: chrono::Utc::now(),
         snapshot_type,
         // Prod builder always produces Full snapshots; the disk-only path (P2)
@@ -4128,10 +4142,11 @@ pub async fn create_disk_only_snapshot_core(
 ) -> Result<()> {
     use crate::commands::exec::run_exec_in_vm_captured;
 
+    // memory_path's parent is the snapshot dir (the disk sits one level down, in `disk/`).
     let snapshot_dir = snapshot_config
-        .disk_path
+        .memory_path
         .parent()
-        .ok_or_else(|| anyhow::anyhow!("invalid disk_path in snapshot config"))?
+        .ok_or_else(|| anyhow::anyhow!("invalid memory_path in snapshot config"))?
         .to_path_buf();
     let temp_snapshot_dir = snapshot_sibling(&snapshot_dir, "creating");
 
@@ -4234,13 +4249,17 @@ pub async fn create_disk_only_snapshot_core(
 
     // Reflink the disk (+ any disk-dir images) while frozen.
     let copy_result: Result<()> = async {
-        let temp_disk = temp_snapshot_dir.join("disk.raw");
+        let disk_dir = crate::storage::snapshot::snapshot_disk_dir(&temp_snapshot_dir);
+        crate::storage::disk::create_dir_or_subvolume(&disk_dir)
+            .await
+            .context("creating the snapshot's disk directory")?;
+        let temp_disk = disk_dir.join("disk.raw");
         reflink_copy(disk_path, &temp_disk).await?;
         for extra in &snapshot_config.metadata.extra_disks {
             let source = paths::vm_runtime_dir(&snapshot_config.vm_id)
                 .join("disks")
                 .join(&extra.filename);
-            let dest = temp_snapshot_dir.join(&extra.filename);
+            let dest = disk_dir.join(&extra.filename);
             reflink_copy(&source, &dest).await?;
         }
         Ok(())
@@ -6554,7 +6573,7 @@ mod tests {
         .unwrap();
         assert_eq!(config.memory_path, Path::new("/mnt/snap/key/memory.bin"));
         assert_eq!(config.vmstate_path, Path::new("/mnt/snap/key/vmstate.bin"));
-        assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk.raw"));
+        assert_eq!(config.disk_path, Path::new("/mnt/snap/key/disk/disk.raw"));
     }
 
     #[test]

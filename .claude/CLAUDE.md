@@ -2406,6 +2406,19 @@ fcvm runs two microVM backends behind a pluggable `Hypervisor` trait (`src/hyper
 - All data under `/mnt/fcvm-btrfs/` — native btrfs used directly if host is btrfs, otherwise a loopback image is created (size from `paths.btrfs_size` in rootfs-config.toml, default 60G)
 - Base rootfs: `/mnt/fcvm-btrfs/rootfs/layer2-{sha}.raw` (~10GB raw disk with Ubuntu 24.04 + Podman)
 - VM disks: `/mnt/fcvm-btrfs/vm-disks/{vm_id}/disks/rootfs.raw` (sparse, expanded per `--rootfs-size`)
+- A snapshot keeps its disks (`disk.raw` and the extra disks) in `snapshots/{tag}/disk/`, a btrfs subvolume, and a
+  clone's `disks/` directory is one `btrfs subvolume snapshot` of it with the disk renamed to `rootfs.raw`. A reflink
+  copy of the disk is O(extents): 9 to 11 s per clone on a 154 GB www root disk with 860,177 extents, 11 of a 25 s
+  restore ACK (2026-10-15); the subvolume snapshot costs one transaction commit whatever the extent count: 20 to 60 ms
+  on a quiet host, 0.2 to 1.0 s on a shared devserver at load 14 to 46. The disks sit in their own
+  subvolume because taking a snapshot flushes the source subvolume's dirty data first, and the memory image of a
+  fresh snapshot can hold tens of GiB of it, while unlinking a shared file inside a snapshot costs one reference per
+  extent (2.57 s for a 128 GiB memory image of 2,969,599 extents). Where the store cannot make a subvolume (not
+  btrfs, or btrfs behind a FUSE map in a nested guest) `disk/` is an ordinary directory and the clone reflinks the
+  disk as before, and so does an unprivileged clone of a snapshot another user made (a snapshot keeps every inode's
+  owner, so it would get a disk it cannot write or remove). `rm -rf` removes subvolumes, so teardown is unchanged, but
+  btrfs reclaims a removed subvolume's space on its cleaner thread after the rmdir returns, where an unlinked reflink
+  freed its space at once; `df` right after many clone teardowns can read high for a while.
 - Initrd: `/mnt/fcvm-btrfs/initrd/fc-agent-{sha}.initrd` (injects fc-agent at boot)
 
 **Per-VM Disk Sizing (`--rootfs-size`):**
@@ -2974,6 +2987,7 @@ data_dir (default: /mnt/fcvm-btrfs, override per nesting level)
 ├── state/{vm_id}.json            # VM state files
 ├── pmem/{sha}.img                # --pmem copies, one per image version, read-only
 └── snapshots/{name}/             # Firecracker snapshots
+    └── disk/                     # the snapshot's disks, a btrfs subvolume (clones snapshot it)
 ```
 
 ## Key Learnings

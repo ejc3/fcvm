@@ -6976,3 +6976,122 @@ async fn a_cache_hit_without_a_hook_runs_none() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// A snapshot keeps its disks in a `disk/` directory that is a btrfs subvolume, and
+/// a clone gets its disks as one subvolume snapshot of it: the clone's disk
+/// directory is itself a subvolume holding the disk under the rootfs name and the
+/// snapshot's extra disks, and nothing else. A reflink of the disk costs one extent
+/// reference per extent (9 to 11 s on a 154 GB disk with 860,177 extents, which is
+/// what a 128 GiB guest's root disk grows into); a subvolume snapshot costs the same
+/// whatever the extent count (20 ms measured on that disk).
+///
+/// RED BEFORE THE FIX: the snapshot held its disk beside the memory image in an
+/// ordinary directory (inode not 256) and the clone's disk directory held a reflink.
+#[tokio::test]
+#[cfg_attr(not(feature = "privileged-tests"), ignore)]
+async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyhow::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let (vm_name, clone_name, snap_tag, _) = common::unique_names("subvol");
+    // A --disk-dir becomes an image in the VM's disk directory, which the snapshot
+    // records as an extra disk (a --disk file stays at its host path and is not).
+    let extra_dir = std::path::PathBuf::from(format!("/tmp/fcvm-{vm_name}-data"));
+    tokio::fs::create_dir_all(&extra_dir).await?;
+    tokio::fs::write(extra_dir.join("test.txt"), "hello\n").await?;
+    let disk_spec = format!("{}:/data:ro", extra_dir.display());
+    let (mut child, pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &vm_name,
+            "--network",
+            "rootless",
+            "--health-check",
+            "http://localhost/",
+            "--disk-dir",
+            &disk_spec,
+            common::TEST_IMAGE,
+        ],
+        &vm_name,
+    )
+    .await?;
+    common::poll_health(&mut child, 300).await?;
+
+    let outcome = async {
+        common::create_snapshot_by_pid(pid, &snap_tag).await?;
+        let snapshot_disk_dir = fcvm::storage::snapshot::snapshot_disk_dir(
+            &fcvm::paths::snapshot_dir().join(&snap_tag),
+        );
+        let snapshot_ino = std::fs::metadata(&snapshot_disk_dir)?.ino();
+        let snapshot = fcvm::storage::SnapshotManager::new(fcvm::paths::snapshot_dir())
+            .load_snapshot(&snap_tag)
+            .await?;
+        let extra_disk_names: Vec<String> = snapshot
+            .metadata
+            .extra_disks
+            .iter()
+            .map(|disk| disk.filename.clone())
+            .collect();
+        anyhow::ensure!(
+            extra_disk_names.len() == 1,
+            "the snapshot records {extra_disk_names:?} extra disks, wanted one"
+        );
+        let (mut serve, serve_pid) = common::start_memory_server(&snap_tag).await?;
+        let clone = async {
+            common::poll_serve_ready(&snap_tag, serve_pid, 60).await?;
+            let (mut clone, clone_pid) = common::spawn_clone(serve_pid, &clone_name).await?;
+            let result = async {
+                common::poll_health(&mut clone, 300).await?;
+                let states = fcvm::state::StateManager::new(fcvm::paths::state_dir());
+                let clone_state = states.load_state_by_pid(clone_pid).await?;
+                let disks = fcvm::paths::vm_runtime_dir(&clone_state.vm_id).join("disks");
+                let disks_ino = std::fs::metadata(&disks)?.ino();
+                let mut entries: Vec<String> = std::fs::read_dir(&disks)?
+                    .map(|e| e.map(|e| e.file_name().to_string_lossy().into_owned()))
+                    .collect::<Result<_, _>>()?;
+                entries.sort();
+                // The clone still serves from those disks.
+                let served =
+                    common::exec_in_container(clone_pid, &["cat", "/data/test.txt"]).await?;
+                anyhow::Ok((disks_ino, entries, served))
+            }
+            .await;
+            common::kill_process(clone_pid).await;
+            let _ = clone.wait().await;
+            result
+        }
+        .await;
+        common::kill_process(serve_pid).await;
+        let _ = serve.wait().await;
+        anyhow::Ok((snapshot_ino, extra_disk_names, clone?))
+    }
+    .await;
+
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    let _ = common::delete_snapshot(&snap_tag).await;
+    tokio::fs::remove_dir_all(&extra_dir).await.ok();
+
+    let (snapshot_ino, extra_disk_names, (disks_ino, entries, served)) = outcome?;
+    assert_eq!(
+        snapshot_ino, 256,
+        "the snapshot's disk directory is not a btrfs subvolume (inode {snapshot_ino})"
+    );
+    assert_eq!(
+        disks_ino, 256,
+        "the clone's disk directory is not a subvolume snapshot (inode {disks_ino})"
+    );
+    let mut wanted = vec!["rootfs.raw".to_string()];
+    wanted.extend(extra_disk_names);
+    wanted.sort();
+    assert_eq!(
+        entries, wanted,
+        "the clone's disk directory holds other than its disks"
+    );
+    assert!(
+        served.contains("hello"),
+        "the clone cannot read the extra disk: {served}"
+    );
+    Ok(())
+}
