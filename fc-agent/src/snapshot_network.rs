@@ -421,19 +421,28 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// prefix. Shared by installation and verification so the two can never
 /// drift: what close() appends is literally what is_closed() expects.
 ///
-/// A TCP flow with loopback at either end passes. The direction's own end
-/// (`loopback_flag`: `-s` for INPUT, `-d` for OUTPUT) is the guest talking to
-/// itself. The other end is the transparent egress proxy's redirected flows:
-/// an outbound connection the nat table sent to the proxy's loopback listener
-/// still carries the guest's own address as its source, and INPUT would
-/// otherwise reset it while ingress is gated. Nothing from outside can carry
-/// a loopback address at either end, so the exemption opens no inbound path.
-fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> [Vec<String>; 4] {
+/// Loopback passes in both chains: the direction's own end (`loopback_flag`:
+/// `-s` for INPUT, `-d` for OUTPUT) is the guest talking to itself. INPUT also
+/// passes what enters on `lo`: the transparent egress proxy's redirected flows,
+/// which the nat table sent to the proxy's loopback listener with the guest's
+/// own address as their source, and which INPUT would otherwise reset while
+/// ingress is gated. The exemption is by interface, not by destination: a
+/// published-port SYN is DNATed to a loopback destination in PREROUTING and
+/// arrives on eth0, and must still be rejected while the gate is closed.
+fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
-    let other_end = if loopback_flag == "-s" { "-d" } else { "-s" };
-    [
-        owned(&["-p", "tcp", loopback_flag, loopback_network, "-j", "RETURN"]),
-        owned(&["-p", "tcp", other_end, loopback_network, "-j", "RETURN"]),
+    let mut rules = vec![owned(&[
+        "-p",
+        "tcp",
+        loopback_flag,
+        loopback_network,
+        "-j",
+        "RETURN",
+    ])];
+    if loopback_flag == "-s" {
+        rules.push(owned(&["-p", "tcp", "-i", "lo", "-j", "RETURN"]));
+    }
+    rules.extend([
         owned(&[
             "-p",
             "tcp",
@@ -447,7 +456,8 @@ fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> [Vec<String>
             "tcp-reset",
         ]),
         owned(&["-j", "RETURN"]),
-    ]
+    ]);
+    rules
 }
 
 /// The one rule that routes a built-in chain into a gate chain, as `-S`
@@ -1762,8 +1772,8 @@ fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
     }
 }
 
-/// How long the container-state read may take before the hook is skipped as
-/// if the container were absent.
+/// How long the container-state read may take. A read that does not finish in
+/// time fails the restore closed, like any other inspect failure.
 const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
 
 impl ContainerRestoreHook {
@@ -2482,6 +2492,21 @@ mod tests {
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
             "gateway exemptions let routed external clients cross the generation boundary:\n{calls}"
         );
+        // A published-port SYN is DNATed to 127.0.0.1 in PREROUTING, before filter
+        // INPUT, so a destination-loopback exemption there would let it through
+        // while the cookie dump or the restore hook runs. Locally redirected
+        // traffic (the egress proxy's) enters on lo; that is the exemption.
+        assert!(
+            !calls.contains("FCVM_SNAPSHOT_IN -p tcp -d 127.0.0.0/8")
+                && !calls.contains("FCVM_SNAPSHOT_IN -p tcp -d ::1/128"),
+            "a destination-loopback exemption on INPUT lets DNATed published-port SYNs \
+             cross the gate:\n{calls}"
+        );
+        assert!(
+            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -p tcp -i lo -j RETURN")
+                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -p tcp -i lo -j RETURN"),
+            "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
+        );
     }
 
     /// Runner that answers `-S` with a canned dump and records every call.
@@ -2540,11 +2565,10 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -d 127.0.0.0/8 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_OUT -s 127.0.0.0/8 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 
@@ -2557,11 +2581,10 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_IN -d ::1/128 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
-        -A FCVM_SNAPSHOT_OUT -s ::1/128 -p tcp -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_OUT -j RETURN\n";
 
