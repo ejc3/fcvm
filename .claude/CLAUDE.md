@@ -133,10 +133,13 @@ system configs. With the restore hook inside that window (4 to 35 s, where the
 window had been about 0.1 s) a www clone served 500s for as long as it lived
 (2026-10-14, `Sitevar FBLOGGER_CONFIG could not be loaded from Configerator` on
 every request, with a no-op hook as well as the real one). So the OUTPUT half
-of the gate is removed right after the socket retirement, the restore remounts
-NFS and waits for the exec server and the egress proxy, the hook runs last,
-and the INPUT half is removed after it: publication. `ModelHook` fails if the
-hook runs with egress closed or after ingress opened;
+of the gate is removed as soon as the receive barrier has drained, before the
+first socket is retired (a socket opened from then on is not in the manifest,
+so the cookie-bound retirement never touches it), the restore remounts NFS and
+waits for the exec server and the egress proxy, the hook runs last, and the
+INPUT half is removed after it: publication. `ModelDiag` fails if a socket is
+retired with egress closed, `ModelHook` if the hook runs with egress closed or
+after ingress opened;
 `the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
 source order of `handle_clone_restore`.
 

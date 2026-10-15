@@ -896,8 +896,9 @@ pub struct RestoreNetworkReport {
     pub reassert_ms: f64,
     /// Milliseconds loading the manifest and retiring its sockets.
     pub destroy_ms: f64,
-    /// Milliseconds removing the gate's egress half, right after the
-    /// retirement, so the workload's reconnects and the hook reach out.
+    /// Milliseconds removing the gate's egress half, after the receive barrier
+    /// and before the first socket is retired, so the workload's reconnects
+    /// and the hook reach out.
     pub egress_open_ms: f64,
     /// The restore hook's run: egress open, ingress still gated.
     pub hook_ms: f64,
@@ -1389,9 +1390,9 @@ async fn restore_with<
 }
 
 /// The restore boundary: verify the inherited gate, drain receive processing,
-/// retire the snapshot-time sockets, retire the manifest, and open the gate's
-/// egress half. The clone can reach out from here, and nothing reaches it
-/// until `publish_with` opens the ingress half.
+/// open the gate's egress half, retire the snapshot-time sockets and the
+/// manifest. The clone can reach out from the moment the barrier has drained,
+/// and nothing reaches it until `publish_with` opens the ingress half.
 async fn restore_boundary_with<
     G: FirewallGate,
     B: PacketReceiveBarrier,
@@ -1462,6 +1463,21 @@ async fn restore_boundary_with<
     } else {
         reassert_started.elapsed().as_secs_f64() * 1000.0
     };
+    // Egress opens here, before the first socket is retired. Every daemon whose
+    // connection the retirement kills reconnects at once; with this half still
+    // closed those connects were answered with a reset (the gate rejects with
+    // tcp-reset), which clients treat as a definitive refusal: ServiceRouter
+    // marked the hosts down, the configerator clients fell back to system
+    // configs, and a www clone served 500s for as long as it lived. A socket a
+    // daemon opens from here on is not in the manifest, so the cookie-bound
+    // retirement below never touches it, whatever four-tuple it reuses.
+    // Ingress stays closed until publication, so no published-port client
+    // reaches the clone yet.
+    let egress_started = std::time::Instant::now();
+    gate.open_egress()
+        .await
+        .context("opening the egress half of the snapshot TCP NEW-flow gate")?;
+    let egress_open_ms = egress_started.elapsed().as_secs_f64() * 1000.0;
     let destroy_started = std::time::Instant::now();
     let manifest = store.load()?;
     let started = std::time::Instant::now();
@@ -1510,25 +1526,13 @@ async fn restore_boundary_with<
         .remove()
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
     let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
-    // Egress opens as soon as the stale sockets are gone. Every daemon whose
-    // connection was just retired reconnects at once; with this half still
-    // closed those connects were answered with a reset (the gate rejects with
-    // tcp-reset), which clients treat as a definitive refusal: ServiceRouter
-    // marked the hosts down, the configerator clients fell back to system
-    // configs, and a www clone served 500s for as long as it lived. Ingress
-    // stays closed until publication, so no published-port client reaches
-    // the clone yet.
-    let egress_started = std::time::Instant::now();
-    gate.open_egress()
-        .await
-        .context("opening the egress half of the snapshot TCP NEW-flow gate")?;
     Ok(RestoreNetworkReport {
         tally,
         verified_armed,
         verify_ms,
         reassert_ms,
         destroy_ms,
-        egress_open_ms: egress_started.elapsed().as_secs_f64() * 1000.0,
+        egress_open_ms,
         hook_ms: 0.0,
         reopen_ms: 0.0,
     })
@@ -1727,24 +1731,34 @@ pub struct ContainerRestoreHook {
 enum HookEligibility {
     Run,
     Skip(String),
+    /// podman could not say: the restore fails closed rather than publish a
+    /// clone whose stale-state repair was silently left out.
+    Fail(String),
 }
 
 /// Decide from `podman inspect --format {{.State.Running}} fcvm-container`:
-/// `true` runs the hook; `false`, or any failure (no such container), skips it.
+/// `true` runs the hook; `false` skips it (a snapshot taken while podman was
+/// still starting the container); podman's "no such container" skips it (a
+/// pre-start snapshot); any other failure fails the restore.
 fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
     let stdout = String::from_utf8_lossy(&inspect.stdout);
     let state = stdout.trim();
     if inspect.status.success() && state == "true" {
-        HookEligibility::Run
-    } else if inspect.status.success() {
-        HookEligibility::Skip(format!("fcvm-container is not running (Running={state})"))
+        return HookEligibility::Run;
+    }
+    if inspect.status.success() {
+        return HookEligibility::Skip(format!("fcvm-container is not running (Running={state})"));
+    }
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    let detail = format!(
+        "podman inspect exited {}: {}",
+        inspect.status,
+        stderr.trim()
+    );
+    if stderr.contains("no such container") || stderr.contains("no container with name or ID") {
+        HookEligibility::Skip(detail)
     } else {
-        let stderr = String::from_utf8_lossy(&inspect.stderr);
-        HookEligibility::Skip(format!(
-            "podman inspect exited {}: {}",
-            inspect.status,
-            stderr.trim()
-        ))
+        HookEligibility::Fail(detail)
     }
 }
 
@@ -1789,9 +1803,18 @@ impl RestoreHook for ContainerRestoreHook {
         let inspect = run_bounded(&Self::inspect_argv(), HOOK_INSPECT_BUDGET)
             .await
             .context("reading fcvm-container's state before the restore hook")?;
-        if let HookEligibility::Skip(reason) = hook_eligibility(&inspect) {
-            eprintln!("[fc-agent] restore hook skipped: {reason}");
-            return Ok(());
+        match hook_eligibility(&inspect) {
+            HookEligibility::Run => {}
+            HookEligibility::Skip(reason) => {
+                eprintln!("[fc-agent] restore hook skipped: {reason}");
+                return Ok(());
+            }
+            HookEligibility::Fail(reason) => {
+                bail!(
+                    "restore hook {:?} cannot tell whether the container runs; {reason}",
+                    self.command
+                );
+            }
         }
         let started = std::time::Instant::now();
         let output = run_bounded(&self.argv(), RESTORE_HOOK_BUDGET)
@@ -2107,8 +2130,13 @@ mod tests {
             let mut state = self.0.lock().unwrap();
             state.destroy_calls += 1;
             assert!(
-                state.gate_closed && state.egress_closed,
-                "restore opened the gate before destroying sockets"
+                state.gate_closed,
+                "restore published ingress before destroying sockets"
+            );
+            assert!(
+                !state.egress_closed,
+                "restore retired a socket with egress still closed: the daemon that owned it \
+                 reconnects into a reset"
             );
             // The closed gate is what protects the cleanup; the link stays up
             // throughout so the clone's routes and neighbours survive.
@@ -2948,8 +2976,8 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "gate-open",
             ]
         );
@@ -3002,8 +3030,8 @@ COMMIT\\n\"",
                 "gate-verify",
                 "gate-close",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "gate-open",
             ]
         );
@@ -3112,8 +3140,8 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "gate-open",
             ],
             "the link and the barrier must be re-asserted even on the fast path"
@@ -3160,8 +3188,8 @@ COMMIT\\n\"",
                 "gate-verify",
                 "gate-close",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "gate-open",
             ]
         );
@@ -3205,7 +3233,12 @@ COMMIT\\n\"",
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
+            vec![
+                "gate-verify",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy"
+            ]
         );
         assert!(state.gate_closed, "failed restore published ingress");
         assert!(
@@ -3257,7 +3290,12 @@ COMMIT\\n\"",
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
+            vec![
+                "gate-verify",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy"
+            ]
         );
         assert!(state.gate_closed);
         assert!(!state.link_down, "the boundary took the link down");
@@ -3380,7 +3418,11 @@ COMMIT\\n\"",
     }
 
     /// The decision from podman's answer: a running container runs the hook; a
-    /// stopped one, or none at all, skips it with the reason.
+    /// stopped one, or none at all, skips it with the reason; podman failing for
+    /// any other reason fails the restore closed, because a clone published
+    /// without its stale-state repair is the failure the hook exists to prevent.
+    ///
+    /// RED BEFORE THE FIX: every nonzero exit skipped the hook.
     #[test]
     fn the_hook_runs_only_in_a_running_container() {
         use std::os::unix::process::ExitStatusExt;
@@ -3409,15 +3451,30 @@ COMMIT\\n\"",
                     .to_string()
             )
         );
+        assert_eq!(
+            hook_eligibility(&output(
+                125,
+                "",
+                "Error: unable to connect to Podman socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
+            )),
+            HookEligibility::Fail(
+                "podman inspect exited exit status: 125: Error: unable to connect to Podman \
+                 socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
+                    .to_string()
+            )
+        );
     }
 
     /// The hook runs with the egress half of the gate open and the ingress half
     /// closed: it can reach out, and nothing from outside reaches the clone yet.
     /// The model hook asserts both; the event order shows the egress half opened
-    /// right after the retirement and before the hook.
+    /// after the barrier, before the first socket is retired (a daemon whose
+    /// socket goes first reconnects at once), and before the hook.
     ///
     /// RED BEFORE THE FIX: the hook ran with both halves closed, so its own and
-    /// the workload's new connections were answered with resets.
+    /// the workload's new connections were answered with resets; then egress
+    /// opened only after the last retirement, and the first daemon's reconnect
+    /// still met a reset.
     #[tokio::test]
     async fn the_restore_hook_runs_with_egress_open_and_ingress_gated() {
         let stale = socket(41, [198, 51, 100, 41]);
@@ -3450,12 +3507,12 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "restore-hook",
                 "gate-open"
             ],
-            "egress opens after the retirement and before the hook; ingress after it"
+            "egress opens after the barrier and before the retirement; ingress after the hook"
         );
         assert!(!state.gate_closed && !state.egress_closed);
         assert!(report.egress_open_ms >= 0.0);
@@ -3492,9 +3549,9 @@ COMMIT\\n\"",
         );
     }
 
-    /// The restore hook runs inside the boundary: after the snapshot-time sockets
-    /// are retired and the egress half of the gate opens, and before the ingress
-    /// half does. A process that must redo work a snapshot made stale
+    /// The restore hook runs inside the boundary: after the egress half of the
+    /// gate opens and the snapshot-time sockets are retired, and before the
+    /// ingress half opens. A process that must redo work a snapshot made stale
     /// (service-discovery data as old as the snapshot) gets to do it, with the
     /// network, before any published-port client can reach the clone.
     ///
@@ -3531,8 +3588,8 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "restore-hook",
                 "gate-open"
             ],
@@ -3583,8 +3640,8 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "rx-barrier",
-                "cookie-destroy",
                 "gate-open-egress",
+                "cookie-destroy",
                 "restore-hook"
             ]
         );
@@ -3633,7 +3690,10 @@ COMMIT\\n\"",
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.events, vec!["gate-verify", "rx-barrier"]);
+        assert_eq!(
+            state.events,
+            vec!["gate-verify", "rx-barrier", "gate-open-egress"]
+        );
         assert!(state.gate_closed, "a timed-out cleanup published ingress");
         assert!(
             !state.link_down,
