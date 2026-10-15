@@ -377,12 +377,12 @@ pub async fn handle_clone_restore(
                 .await;
         }
         // No mount record: the boot's check passed the mounts this restore reproduces.
-        if let Err(e) = crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None) {
-            eprintln!(
-                "[fc-agent] WARNING: NFS remount after restore failed: {:?}",
-                e
-            );
-        }
+        // A failure fails the restore closed: the hook below may use the share,
+        // and a mount point that is an ordinary directory would take its writes;
+        // a published clone whose share is missing is the stale state the hook
+        // exists to prevent.
+        crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None)
+            .context("remounting NFS shares after restore, so the clone stays unpublished")?;
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
 

@@ -3412,6 +3412,37 @@ COMMIT\\n\"",
         );
     }
 
+    /// A failed NFS remount fails the restore. The remount runs before the hook
+    /// so that a hook can use the share; a remount that failed and was only
+    /// logged left the mount point an ordinary directory, so a hook writing
+    /// there would succeed against the wrong place and the clone would publish
+    /// with its share missing (a Codex finding on PR 1112). Like the ordering
+    /// test above, this pins the source: the remount is a system call sequence
+    /// with no seam a runtime test can hold.
+    ///
+    /// RED BEFORE THE FIX: the failure was an eprintln WARNING and the restore
+    /// went on to publish.
+    #[test]
+    fn a_failed_nfs_remount_keeps_the_clone_unpublished() {
+        let source = include_str!("restore.rs");
+        let start = source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is in restore.rs");
+        let body = &source[start..];
+        let call = body
+            .find("mount_nfs_shares(")
+            .expect("the restore remounts the NFS shares");
+        let statement = &body[call..call + body[call..].find(';').expect("statement end") + 1];
+        assert!(
+            !body.contains("NFS remount after restore failed"),
+            "the NFS remount failure is still only logged"
+        );
+        assert!(
+            statement.contains(".context(") && statement.trim_end().ends_with("?;"),
+            "the NFS remount failure is not propagated: {statement}"
+        );
+    }
+
     /// Whether the hook has a container to run in is the container's state at
     /// publication, asked of podman, not a marker set when the agent was about to
     /// start it. A user snapshot taken between that marker and podman's start
