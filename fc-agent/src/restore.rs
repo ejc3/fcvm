@@ -170,6 +170,11 @@ pub struct RestorePhases {
     pub tcp_reassert_ms: f64,
     pub tcp_destroy_ms: f64,
     pub tcp_reopen_ms: f64,
+    /// Milliseconds opening the gate's egress half after the socket retirement.
+    pub tcp_egress_open_ms: f64,
+    /// The restore hook's run at publication, with the egress half open and the
+    /// ingress half still gated; zero when the plan names none.
+    pub tcp_hook_ms: f64,
     /// The cleanup's counts, from the same report: sockets destroyed, sockets
     /// the kernel had already retired, and the SOCK_DESTROY datagrams sent.
     pub tcp_destroyed: usize,
@@ -196,6 +201,8 @@ impl RestorePhases {
         self.tcp_reassert_ms = boundary.reassert_ms;
         self.tcp_destroy_ms = boundary.destroy_ms;
         self.tcp_reopen_ms = boundary.reopen_ms;
+        self.tcp_egress_open_ms = boundary.egress_open_ms;
+        self.tcp_hook_ms = boundary.hook_ms;
         self.tcp_destroyed = boundary.tally.destroyed;
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
@@ -246,6 +253,7 @@ pub async fn handle_clone_restore(
     egress_gen_before: Option<u64>,
     restore_epoch: &str,
     host_time: &str,
+    restore_hook: Option<&str>,
 ) -> anyhow::Result<RestorePhases> {
     let restore_started = std::time::Instant::now();
     let mut phases = RestorePhases::default();
@@ -325,14 +333,20 @@ pub async fn handle_clone_restore(
         "[fc-agent] restore phase=tcp-cleanup epoch={} begin",
         restore_epoch
     );
-    let boundary = crate::snapshot_network::restore_snapshot_network()
+    // The boundary retires the snapshot-time sockets and opens the gate's
+    // egress half; ingress stays gated until the publication below. The
+    // boundary lock is held across everything in between.
+    let restored = crate::snapshot_network::restore_snapshot_network()
         .await
         .context("restore phase tcp-cleanup")?;
     phases.tcp_cleanup_ms = elapsed_ms(tcp_cleanup_started);
-    phases.record_boundary(&boundary);
     eprintln!(
-        "[fc-agent] restore phase=tcp-cleanup epoch={} complete elapsed_ms={:.3}",
-        restore_epoch, phases.tcp_cleanup_ms
+        "[fc-agent] restore phase=tcp-cleanup epoch={} complete elapsed_ms={:.3} \
+         destroyed={} already_gone={}",
+        restore_epoch,
+        phases.tcp_cleanup_ms,
+        restored.report().tally.destroyed,
+        restored.report().tally.already_gone
     );
 
     // Do not flush the neighbor table. A client can already be using an entry
@@ -363,12 +377,12 @@ pub async fn handle_clone_restore(
                 .await;
         }
         // No mount record: the boot's check passed the mounts this restore reproduces.
-        if let Err(e) = crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None) {
-            eprintln!(
-                "[fc-agent] WARNING: NFS remount after restore failed: {:?}",
-                e
-            );
-        }
+        // A failure fails the restore closed: the hook below may use the share,
+        // and a mount point that is an ordinary directory would take its writes;
+        // a published clone whose share is missing is the stale state the hook
+        // exists to prevent.
+        crate::mounts::mount_nfs_shares(&signals.nfs_mounts, None)
+            .context("remounting NFS shares after restore, so the clone stays unpublished")?;
     }
     phases.nfs_ms = elapsed_ms(nfs_started);
 
@@ -419,6 +433,20 @@ pub async fn handle_clone_restore(
     phases.exec_wait_ms = exec_wait_ms;
     phases.egress_wait_ms = egress_wait_ms;
     eprintln!("[fc-agent] exec re-registered after restore");
+
+    // Publication, last: the plan's restore hook runs now, with egress open,
+    // the NFS shares remounted and the egress proxy reconnected, so whatever
+    // it reaches for (a loopback admin port, a share, the network) is there;
+    // then the gate's ingress half opens and a published-port client can
+    // reach the clone. Whether the hook has a container to run in is the
+    // container's state at this moment, asked of podman, not a marker: a
+    // marker stored before podman started was wrong for a snapshot taken in
+    // between, in either order.
+    let boundary = restored
+        .publish(restore_hook)
+        .await
+        .context("restore phase publish")?;
+    phases.record_boundary(&boundary);
 
     phases.total_ms = elapsed_ms(restore_started);
     eprintln!(
@@ -620,6 +648,8 @@ mod tests {
         phases.tcp_reassert_ms = 99_999.999;
         phases.tcp_destroy_ms = 99_999.999;
         phases.tcp_reopen_ms = 99_999.999;
+        phases.tcp_egress_open_ms = 99_999.999;
+        phases.tcp_hook_ms = 99_999.999;
         phases.tcp_destroyed = 999_999;
         phases.tcp_already_gone = 999_999;
         phases.tcp_destroy_datagrams = 999_999;
@@ -749,7 +779,7 @@ mod tests {
             .find("network::refresh_gateway_arp()")
             .expect("the restore path no longer announces the clone at all");
         let publish = source
-            .find("crate::snapshot_network::restore_snapshot_network()")
+            .find("crate::snapshot_network::restore_snapshot_network(")
             .expect("the restore path no longer runs the snapshot boundary");
         assert!(
             announce < publish,
@@ -758,7 +788,7 @@ mod tests {
              first opens a window where fcvm's post-restore verification can \
              time out with \"guest never appeared at L2\" on a guest that is \
              perfectly healthy. Move network::refresh_gateway_arp() above \
-             restore_snapshot_network()."
+             restore_snapshot_network(...)."
         );
 
         // Flushing inherited entries after pinning would delete the pin, and

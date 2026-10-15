@@ -75,6 +75,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             user: None,
             username: None,
             health_check_timeout: 5,
+            restore_hook: None,
             hypervisor: Default::default(),
             firecracker_bin: None,
             balloon_mib: None,

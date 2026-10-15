@@ -188,6 +188,10 @@ pub struct SnapshotMetadata {
     /// Health check timeout in seconds (default 5)
     #[serde(default = "default_health_check_timeout")]
     pub health_check_timeout: u64,
+    /// The command the guest runs inside the container after every restore, before
+    /// the clone is published; see `--on-restore`.
+    #[serde(default)]
+    pub restore_hook: Option<String>,
     /// Whether VM uses 2MB hugepage-backed memory
     #[serde(default)]
     pub hugepages: bool,
@@ -713,6 +717,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 health_check_timeout: 5,
+                restore_hook: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -913,6 +918,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 health_check_timeout: 5,
+                restore_hook: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -998,6 +1004,7 @@ mod tests {
                     volumes: vec![],
                     health_check_url: None,
                     health_check_timeout: 5,
+                    restore_hook: None,
                     hugepages: false,
                     extra_disks: vec![],
                     pmem_devices: vec![],
@@ -1070,6 +1077,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 health_check_timeout: 5,
+                restore_hook: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1266,6 +1274,7 @@ mod tests {
                 volumes: vec![],
                 health_check_url: None,
                 health_check_timeout: 5,
+                restore_hook: None,
                 hugepages: false,
                 extra_disks: vec![],
                 pmem_devices: vec![],
@@ -1419,6 +1428,7 @@ mod tests {
             volumes: vec![],
             health_check_url: None,
             health_check_timeout: 5,
+            restore_hook: None,
             hugepages: false,
             extra_disks: vec![],
             pmem_devices: vec![],

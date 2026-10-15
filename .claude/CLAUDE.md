@@ -123,6 +123,26 @@ addresses across one snapshot and fails on any difference. The `ModelBarrier`
 and `ModelDiag` invariants in `fc-agent/src/snapshot_network.rs` fail if any
 boundary step takes the link down, on the source or the clone path.
 
+### On restore, the gate's egress half opens as soon as the stale sockets are gone
+
+The restored clone inherits the gate closed in both directions. Every daemon
+whose connection the cleanup retires reconnects at once, and a connection the
+gate answers with a TCP reset is a definitive refusal to its client, not a
+retry: ServiceRouter marks the host down, the configerator clients fall back to
+system configs. With the restore hook inside that window (4 to 35 s, where the
+window had been about 0.1 s) a www clone served 500s for as long as it lived
+(2026-10-14, `Sitevar FBLOGGER_CONFIG could not be loaded from Configerator` on
+every request, with a no-op hook as well as the real one). So the OUTPUT half
+of the gate is removed as soon as the receive barrier has drained, before the
+first socket is retired (a socket opened from then on is not in the manifest,
+so the cookie-bound retirement never touches it), the restore remounts NFS and
+waits for the exec server and the egress proxy, the hook runs last, and the
+INPUT half is removed after it: publication. `ModelDiag` fails if a socket is
+retired with egress closed, `ModelHook` if the hook runs with egress closed or
+after ingress opened;
+`the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
+source order of `handle_clone_restore`.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,

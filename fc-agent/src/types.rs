@@ -106,6 +106,10 @@ pub struct LatestMetadata {
     /// For routed mode clones: unique IPv6 to replace the snapshot's shared guest IPv6.
     #[serde(rename = "clone-ipv6", default)]
     pub clone_ipv6: Option<String>,
+    /// The command to run inside the container before this restore is published
+    /// (`--on-restore`). See `snapshot_network::RestoreHook`.
+    #[serde(rename = "restore-hook", default)]
+    pub restore_hook: Option<String>,
 }
 
 #[cfg(test)]

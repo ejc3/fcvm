@@ -288,7 +288,21 @@ impl ManifestStore for FileManifestStore {
 
 trait FirewallGate {
     async fn close(&self) -> Result<()>;
+    /// Let the guest's own new connections out again while new inbound
+    /// connections stay rejected: remove the OUTPUT direction of the gate in
+    /// both address families and keep the INPUT direction. A restored clone
+    /// opens this half before its restore hook runs, so the hook, and the
+    /// workload's reconnects behind it, reach the network, while nothing
+    /// from outside reaches the clone until `open()` publishes it.
+    async fn open_egress(&self) -> Result<()>;
+    /// Remove whatever is left of the gate in both families: both directions,
+    /// or only INPUT after `open_egress()`.
     async fn open(&self) -> Result<()>;
+    /// Restore side only: also refuse client-direction UDP while ingress is
+    /// gated (`udp_ingress_rule_args`). The snapshot side never calls this: a
+    /// snapshot must not disturb the VM it is taken from, and this rule would
+    /// answer a live client's datagram with an ICMP unreachable.
+    async fn gate_udp_ingress(&self) -> Result<()>;
     /// Report whether the gate is already fully installed: both directional
     /// chains present with exactly the boundary rules, each hooked from its
     /// built-in chain, in both address families.
@@ -411,23 +425,77 @@ const IPV6_LOOPBACK: &str = "::1/128";
 /// The exact rule bodies a gate chain carries, without the `-A <chain>`
 /// prefix. Shared by installation and verification so the two can never
 /// drift: what close() appends is literally what is_closed() expects.
-fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> [Vec<String>; 3] {
+///
+/// Loopback passes in both chains: the direction's own end (`loopback_flag`:
+/// `-s` for INPUT, `-d` for OUTPUT) is the guest talking to itself. INPUT also
+/// passes whatever enters on `lo`: the transparent egress proxy's redirected
+/// flows, which the nat table sent to the proxy's loopback listener with the
+/// guest's own address as their source, and which INPUT would otherwise reset
+/// while ingress is gated. The exemption is by interface, not by destination:
+/// a published-port SYN is DNATed to a loopback destination in PREROUTING and
+/// arrives on eth0, and must still be rejected while the gate is closed.
+///
+/// These are the rules both the snapshot side and the restore side carry, and
+/// what verification expects. UDP is not among them: a restored clone adds its
+/// own UDP rejection to INPUT with `gate_udp_ingress` (see there), which the
+/// snapshot side must not install, because it would answer a live client's
+/// datagram on the source VM with an ICMP unreachable during the cookie dump.
+fn gate_chain_rules(loopback_flag: &str, loopback_network: &str) -> Vec<Vec<String>> {
     let owned = |tokens: &[&str]| tokens.iter().map(|token| token.to_string()).collect();
+    let mut rules = vec![owned(&[
+        "-p",
+        "tcp",
+        loopback_flag,
+        loopback_network,
+        "-j",
+        "RETURN",
+    ])];
+    let ingress = loopback_flag == "-s";
+    if ingress {
+        rules.push(owned(&["-i", "lo", "-j", "RETURN"]));
+    }
+    rules.extend([owned(&[
+        "-p",
+        "tcp",
+        "-m",
+        "conntrack",
+        "--ctstate",
+        "NEW",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        "tcp-reset",
+    ])]);
+    rules.push(owned(&["-j", "RETURN"]));
+    rules
+}
+
+/// The restored clone's UDP rejection, inserted into the INPUT gate chain below
+/// the two loopback exemptions: a published UDP port reaches the workload
+/// through the port forwarders like a TCP one, and a client's datagram while
+/// ingress is gated would read or change state the restore hook is about to
+/// repair. The match is the flow's direction, not the conntrack state, because
+/// a client that exchanged traffic before the snapshot inherits an ESTABLISHED
+/// entry in the restored guest and a NEW-only rule would pass it. Replies to
+/// the guest's own outbound UDP are reply-direction and pass; OUTPUT never
+/// gates UDP (DNS, NTP). Removed with the chain when ingress opens.
+fn udp_ingress_rule_args(loopback_network: &str) -> [&'static str; 10] {
+    let unreachable = if loopback_network.contains(':') {
+        "icmp6-port-unreachable"
+    } else {
+        "icmp-port-unreachable"
+    };
     [
-        owned(&["-p", "tcp", loopback_flag, loopback_network, "-j", "RETURN"]),
-        owned(&[
-            "-p",
-            "tcp",
-            "-m",
-            "conntrack",
-            "--ctstate",
-            "NEW",
-            "-j",
-            "REJECT",
-            "--reject-with",
-            "tcp-reset",
-        ]),
-        owned(&["-j", "RETURN"]),
+        "-p",
+        "udp",
+        "-m",
+        "conntrack",
+        "--ctdir",
+        "ORIGINAL",
+        "-j",
+        "REJECT",
+        "--reject-with",
+        unreachable,
     ]
 }
 
@@ -681,22 +749,40 @@ impl<R: CommandRunner> IptablesGate<R> {
     /// guest-wide lock serializes them); a privileged workload sharing this
     /// namespace can, and then a `-D` or `-X` names something that no longer
     /// matches and the batch fails, which fails the restore closed.
-    async fn remove_family(&self, program: &str) -> Result<()> {
+    ///
+    /// `directions` names which halves to remove. The egress half alone
+    /// (`[Direction::Output]`) is what a restored clone removes before its
+    /// hook runs; the parse of what remains goes back into the retained
+    /// state, so the later removal of the ingress half still spends no read.
+    async fn remove_family(&self, program: &str, directions: &[Direction]) -> Result<()> {
         // Bounded: a hook carrying more duplicate jumps than any interrupted
         // sequence could leave is tampering, not drift, and deleting without
         // bound would hang restore instead of reporting it.
         const MAX_DUPLICATE_HOOKS: usize = 64;
         let cached = self.state_cache.lock().unwrap().remove(program);
-        let state = match cached {
+        let mut state = match cached {
             Some(state) => state,
             None => self.read_family_state(program).await?,
         };
         let mut lines = vec!["*filter".to_string()];
         let hooks = [
-            ("INPUT", GATE_INPUT_CHAIN, state.input_hooks),
-            ("OUTPUT", GATE_OUTPUT_CHAIN, state.output_hooks),
+            (
+                Direction::Input,
+                "INPUT",
+                GATE_INPUT_CHAIN,
+                state.input_hooks,
+            ),
+            (
+                Direction::Output,
+                "OUTPUT",
+                GATE_OUTPUT_CHAIN,
+                state.output_hooks,
+            ),
         ];
-        for (hook, chain, count) in hooks {
+        for (direction, hook, chain, count) in hooks {
+            if !directions.contains(&direction) {
+                continue;
+            }
             if count > MAX_DUPLICATE_HOOKS {
                 bail!(
                     "{program} {hook} jumps to {chain} {count} times \
@@ -708,16 +794,40 @@ impl<R: CommandRunner> IptablesGate<R> {
             }
         }
         let chains = [
-            (GATE_INPUT_CHAIN, state.input_rules.is_some()),
-            (GATE_OUTPUT_CHAIN, state.output_rules.is_some()),
+            (
+                Direction::Input,
+                GATE_INPUT_CHAIN,
+                state.input_rules.is_some(),
+            ),
+            (
+                Direction::Output,
+                GATE_OUTPUT_CHAIN,
+                state.output_rules.is_some(),
+            ),
         ];
-        for (chain, declared) in chains {
-            if declared {
+        for (direction, chain, declared) in chains {
+            if declared && directions.contains(&direction) {
                 lines.push(format!("-F {chain}"));
                 lines.push(format!("-X {chain}"));
             }
         }
+        // What this batch leaves behind, kept for the removal of the other half.
+        if directions.contains(&Direction::Input) {
+            state.input_hooks = 0;
+            state.input_rules = None;
+            state.input_hook_is_first_rule = false;
+        }
+        if directions.contains(&Direction::Output) {
+            state.output_hooks = 0;
+            state.output_rules = None;
+            state.output_hook_is_first_rule = false;
+        }
+        let residual = state;
         if lines.len() == 1 {
+            self.state_cache
+                .lock()
+                .unwrap()
+                .insert(program.to_string(), residual);
             return Ok(());
         }
         lines.push("COMMIT".to_string());
@@ -735,8 +845,40 @@ impl<R: CommandRunner> IptablesGate<R> {
                 command_failure(&restore_program, &args, &output)
             );
         }
+        self.state_cache
+            .lock()
+            .unwrap()
+            .insert(program.to_string(), residual);
         Ok(())
     }
+
+    /// Remove the named halves of the gate in both families, collecting both
+    /// verdicts so one family's failure cannot mask the other's.
+    async fn remove_both_families(&self, directions: &[Direction]) -> Result<()> {
+        // Mutations stay sequential on purpose. iptables-nft has no shared
+        // userspace lock (`-w` is a no-op there) and commits race the
+        // kernel's per-netns generation counter, where a lost retry surfaces
+        // as EAGAIN; through required() that would fail the restore and kill
+        // the clone, a poor trade for one process spawn of overlap.
+        let ipv4 = self.remove_family("iptables", directions).await;
+        let ipv6 = self.remove_family("ip6tables", directions).await;
+        match (ipv4, ipv6) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(a), Ok(())) => Err(a),
+            (Ok(()), Err(b)) => Err(b),
+            (Err(a), Err(b)) => Err(anyhow::anyhow!(
+                "IPv4 gate cleanup: {a:#}; IPv6 gate cleanup: {b:#}"
+            )),
+        }
+    }
+}
+
+/// One half of the NEW-flow gate: the INPUT chain's half rejects new inbound
+/// connections, the OUTPUT chain's half new outbound ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Direction {
+    Input,
+    Output,
 }
 
 impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
@@ -749,24 +891,28 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
             .context("installing IPv6 snapshot network gate")
     }
 
+    async fn open_egress(&self) -> Result<()> {
+        self.remove_both_families(&[Direction::Output]).await
+    }
+
     async fn open(&self) -> Result<()> {
-        // Mutations stay sequential on purpose. iptables-nft has no shared
-        // userspace lock (`-w` is a no-op there) and commits race the
-        // kernel's per-netns generation counter, where a lost retry surfaces
-        // as EAGAIN; through required() that would fail the restore and kill
-        // the clone, a poor trade for one process spawn of overlap. Both
-        // verdicts are still collected so one family's failure cannot mask
-        // the other's.
-        let ipv4 = self.remove_family("iptables").await;
-        let ipv6 = self.remove_family("ip6tables").await;
-        match (ipv4, ipv6) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(a), Ok(())) => Err(a),
-            (Ok(()), Err(b)) => Err(b),
-            (Err(a), Err(b)) => Err(anyhow::anyhow!(
-                "IPv4 gate cleanup: {a:#}; IPv6 gate cleanup: {b:#}"
-            )),
+        self.remove_both_families(&[Direction::Input, Direction::Output])
+            .await
+    }
+
+    async fn gate_udp_ingress(&self) -> Result<()> {
+        for (program, network) in [("iptables", IPV4_LOOPBACK), ("ip6tables", IPV6_LOOPBACK)] {
+            // Position 3: below the loopback exemptions (rules 1 and 2), above
+            // the TCP rejection. The chain is removed whole on open, so the
+            // rule needs no removal of its own and the retained parse (hook
+            // counts and chain presence) stays valid.
+            let mut args = vec!["-w", "-I", GATE_INPUT_CHAIN, "3"];
+            args.extend(udp_ingress_rule_args(network));
+            self.required(program, &args)
+                .await
+                .with_context(|| format!("gating client-direction UDP in {program}"))?;
         }
+        Ok(())
     }
 
     async fn is_closed(&self) -> Result<bool> {
@@ -814,8 +960,14 @@ pub struct RestoreNetworkReport {
     pub reassert_ms: f64,
     /// Milliseconds loading the manifest and retiring its sockets.
     pub destroy_ms: f64,
-    /// Milliseconds removing the gate, raising the link, and reinstating
-    /// routes.
+    /// Milliseconds removing the gate's egress half, after the receive barrier
+    /// and before the first socket is retired, so the workload's reconnects
+    /// and the hook reach out.
+    pub egress_open_ms: f64,
+    /// The restore hook's run: egress open, ingress still gated.
+    pub hook_ms: f64,
+    /// Milliseconds removing the gate's ingress half, which publishes the
+    /// clone.
     pub reopen_ms: f64,
     /// What the cleanup did to the manifest's sockets.
     pub(crate) tally: CleanupTally,
@@ -1278,7 +1430,34 @@ async fn prepare_with<
     Ok(manifest.sockets.len())
 }
 
+/// Both phases of a restore in one call: the boundary, then the publication
+/// with `hook`. Production runs them apart (`RestoredNetwork`), with the NFS
+/// remount and the exec and egress-proxy waits between them; the model tests
+/// run them together.
+#[cfg(test)]
 async fn restore_with<
+    G: FirewallGate,
+    B: PacketReceiveBarrier,
+    D: SocketDiagnostic,
+    S: ManifestStore,
+    H: RestoreHook,
+>(
+    gate: &G,
+    receive_barrier: &B,
+    diagnostic: &mut D,
+    store: &S,
+    hook: &H,
+    budget: std::time::Duration,
+) -> Result<RestoreNetworkReport> {
+    let report = restore_boundary_with(gate, receive_barrier, diagnostic, store, budget).await?;
+    publish_with(gate, report, hook).await
+}
+
+/// The restore boundary: verify the inherited gate, drain receive processing,
+/// open the gate's egress half, retire the snapshot-time sockets and the
+/// manifest. The clone can reach out from the moment the barrier has drained,
+/// and nothing reaches it until `publish_with` opens the ingress half.
+async fn restore_boundary_with<
     G: FirewallGate,
     B: PacketReceiveBarrier,
     D: SocketDiagnostic,
@@ -1335,6 +1514,11 @@ async fn restore_with<
             .await
             .context("ensuring restored snapshot TCP NEW-flow gate is closed")?;
     }
+    // The clone's own addition to the inherited gate: client-direction UDP is
+    // refused until publication. Never part of the snapshot-side gate.
+    gate.gate_udp_ingress()
+        .await
+        .context("gating client-direction UDP on the restored clone")?;
     // No link-down here either. The clone inherits a CLOSED gate inside the
     // artifact, so no new flow can appear while the recorded cookies are
     // destroyed, and the barrier below drains what was already in flight.
@@ -1348,6 +1532,21 @@ async fn restore_with<
     } else {
         reassert_started.elapsed().as_secs_f64() * 1000.0
     };
+    // Egress opens here, before the first socket is retired. Every daemon whose
+    // connection the retirement kills reconnects at once; with this half still
+    // closed those connects were answered with a reset (the gate rejects with
+    // tcp-reset), which clients treat as a definitive refusal: ServiceRouter
+    // marked the hosts down, the configerator clients fell back to system
+    // configs, and a www clone served 500s for as long as it lived. A socket a
+    // daemon opens from here on is not in the manifest, so the cookie-bound
+    // retirement below never touches it, whatever four-tuple it reuses.
+    // Ingress stays closed until publication, so no published-port client
+    // reaches the clone yet.
+    let egress_started = std::time::Instant::now();
+    gate.open_egress()
+        .await
+        .context("opening the egress half of the snapshot TCP NEW-flow gate")?;
+    let egress_open_ms = egress_started.elapsed().as_secs_f64() * 1000.0;
     let destroy_started = std::time::Instant::now();
     let manifest = store.load()?;
     let started = std::time::Instant::now();
@@ -1396,18 +1595,39 @@ async fn restore_with<
         .remove()
         .context("retiring snapshot network manifest after cookie-bound cleanup")?;
     let destroy_ms = destroy_started.elapsed().as_secs_f64() * 1000.0;
-    let reopen_started = std::time::Instant::now();
-    reopen_with(gate)
-        .await
-        .context("publishing restored network after cookie-bound cleanup")?;
     Ok(RestoreNetworkReport {
         tally,
         verified_armed,
         verify_ms,
         reassert_ms,
         destroy_ms,
-        reopen_ms: reopen_started.elapsed().as_secs_f64() * 1000.0,
+        egress_open_ms,
+        hook_ms: 0.0,
+        reopen_ms: 0.0,
     })
+}
+
+/// The publication: run the restore hook with egress open and ingress still
+/// gated, then open the ingress half. Whatever the workload must redo after a
+/// restore happens before a published-port client can reach it, and the hook
+/// has the network to do it with. A failure keeps the clone unpublished, like
+/// a failed retirement.
+async fn publish_with<G: FirewallGate, H: RestoreHook>(
+    gate: &G,
+    mut report: RestoreNetworkReport,
+    hook: &H,
+) -> Result<RestoreNetworkReport> {
+    let hook_started = std::time::Instant::now();
+    hook.run()
+        .await
+        .context("running the restore hook; the clone stays unpublished")?;
+    report.hook_ms = hook_started.elapsed().as_secs_f64() * 1000.0;
+    let reopen_started = std::time::Instant::now();
+    reopen_with(gate)
+        .await
+        .context("publishing restored network after cookie-bound cleanup")?;
+    report.reopen_ms = reopen_started.elapsed().as_secs_f64() * 1000.0;
+    Ok(report)
 }
 
 pub async fn prepare_snapshot_network() -> Result<()> {
@@ -1469,25 +1689,290 @@ pub async fn resume_source_network() -> Result<()> {
     Ok(())
 }
 
-pub async fn restore_snapshot_network() -> Result<RestoreNetworkReport> {
-    let _transaction_lock = acquire_boundary_lock()?;
+/// What a restored clone runs at publication: after the snapshot-time sockets
+/// are retired and the gate's egress half is open, and before the ingress half
+/// opens. A process that must redo work the snapshot made stale does it here,
+/// with the network, before any published-port client can reach the clone.
+pub trait RestoreHook {
+    async fn run(&self) -> Result<()>;
+}
+
+/// No hook: the plan named none.
+pub struct NoRestoreHook;
+
+impl RestoreHook for NoRestoreHook {
+    async fn run(&self) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// How long the hook may take. It runs with ingress still gated, so every
+/// second here is a second the clone stays unpublished.
+const RESTORE_HOOK_BUDGET: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// How many seconds the hook's own `timeout` gives the command inside the
+/// container, and how many more before it is killed outright. The budget above
+/// is the client-side backstop and must exceed their sum.
+const RESTORE_HOOK_COMMAND_SECS: u64 = 45;
+const RESTORE_HOOK_KILL_AFTER_SECS: u64 = 5;
+
+/// How much of the hook's stdout and of its stderr is kept, for the log line
+/// and the error. The rest is drained and dropped, so a chatty hook neither
+/// blocks on a full pipe nor grows the guest's memory.
+const RESTORE_HOOK_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+/// What a bounded run leaves behind.
+#[derive(Debug)]
+struct BoundedOutput {
+    status: std::process::ExitStatus,
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+/// Run `argv` with a budget. The child is killed when the budget ends (and when
+/// this future is dropped), and at most `RESTORE_HOOK_OUTPUT_LIMIT` bytes of each
+/// stream are kept.
+async fn run_bounded(argv: &[String], budget: std::time::Duration) -> Result<BoundedOutput> {
+    use tokio::io::AsyncReadExt;
+    let mut child = tokio::process::Command::new(&argv[0])
+        .args(&argv[1..])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawning {:?}", argv[0]))?;
+    let mut stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let run = async {
+        let mut out = Vec::new();
+        let mut err = Vec::new();
+        let (read_out, read_err) = tokio::join!(
+            async {
+                (&mut stdout)
+                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
+                    .read_to_end(&mut out)
+                    .await?;
+                tokio::io::copy(&mut stdout, &mut tokio::io::sink()).await
+            },
+            async {
+                (&mut stderr)
+                    .take(RESTORE_HOOK_OUTPUT_LIMIT)
+                    .read_to_end(&mut err)
+                    .await?;
+                tokio::io::copy(&mut stderr, &mut tokio::io::sink()).await
+            }
+        );
+        read_out.context("reading the hook's stdout")?;
+        read_err.context("reading the hook's stderr")?;
+        let status = child.wait().await.context("waiting for the hook")?;
+        Ok::<_, anyhow::Error>(BoundedOutput {
+            status,
+            stdout: out,
+            stderr: err,
+        })
+    };
+    match tokio::time::timeout(budget, run).await {
+        Ok(result) => result,
+        Err(_) => {
+            // The future above is dropped by the timeout; kill the child and reap it,
+            // so nothing it spawned keeps running under the clone's name.
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            bail!("did not finish within {budget:?}")
+        }
+    }
+}
+
+/// The plan's hook, run inside the container through `podman exec`, as the
+/// container's user, under the container's own `timeout` so the command ends
+/// there when the budget does, not only its client here.
+pub struct ContainerRestoreHook {
+    pub command: String,
+}
+
+/// Whether the plan's hook has a running container to run in, read from podman
+/// at publication. A pre-start snapshot restores before the container exists;
+/// a snapshot taken while podman was still starting it finds it not running.
+/// Neither has anything stale to redo: the container that starts after the
+/// restore starts fresh.
+#[derive(Debug, PartialEq, Eq)]
+enum HookEligibility {
+    Run,
+    Skip(String),
+    /// podman could not say: the restore fails closed rather than publish a
+    /// clone whose stale-state repair was silently left out.
+    Fail(String),
+}
+
+/// Decide from `podman inspect --format {{.State.Running}} fcvm-container`:
+/// `true` runs the hook; `false` skips it (a snapshot taken while podman was
+/// still starting the container); podman's "no such container" skips it (a
+/// pre-start snapshot); any other failure fails the restore.
+fn hook_eligibility(inspect: &BoundedOutput) -> HookEligibility {
+    let stdout = String::from_utf8_lossy(&inspect.stdout);
+    let state = stdout.trim();
+    if inspect.status.success() && state == "true" {
+        return HookEligibility::Run;
+    }
+    if inspect.status.success() {
+        return HookEligibility::Skip(format!("fcvm-container is not running (Running={state})"));
+    }
+    let stderr = String::from_utf8_lossy(&inspect.stderr);
+    let detail = format!(
+        "podman inspect exited {}: {}",
+        inspect.status,
+        stderr.trim()
+    );
+    if stderr.contains("no such container") || stderr.contains("no container with name or ID") {
+        HookEligibility::Skip(detail)
+    } else {
+        HookEligibility::Fail(detail)
+    }
+}
+
+/// How long the container-state read may take. A read that does not finish in
+/// time fails the restore closed, like any other inspect failure.
+const HOOK_INSPECT_BUDGET: std::time::Duration = std::time::Duration::from_secs(10);
+
+impl ContainerRestoreHook {
+    fn inspect_argv() -> Vec<String> {
+        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+        argv.extend(
+            [
+                "podman",
+                "inspect",
+                "--format",
+                "{{.State.Running}}",
+                "fcvm-container",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
+        argv
+    }
+
+    fn argv(&self) -> Vec<String> {
+        let mut argv: Vec<String> = crate::container::podman_cmd_prefix().to_vec();
+        argv.extend(
+            ["podman", "exec", "fcvm-container", "timeout", "-k"]
+                .into_iter()
+                .map(str::to_string),
+        );
+        argv.push(RESTORE_HOOK_KILL_AFTER_SECS.to_string());
+        argv.push(RESTORE_HOOK_COMMAND_SECS.to_string());
+        argv.extend(["sh", "-c"].into_iter().map(str::to_string));
+        argv.push(self.command.clone());
+        argv
+    }
+}
+
+impl RestoreHook for ContainerRestoreHook {
+    async fn run(&self) -> Result<()> {
+        let inspect = run_bounded(&Self::inspect_argv(), HOOK_INSPECT_BUDGET)
+            .await
+            .context("reading fcvm-container's state before the restore hook")?;
+        match hook_eligibility(&inspect) {
+            HookEligibility::Run => {}
+            HookEligibility::Skip(reason) => {
+                eprintln!("[fc-agent] restore hook skipped: {reason}");
+                return Ok(());
+            }
+            HookEligibility::Fail(reason) => {
+                bail!(
+                    "restore hook {:?} cannot tell whether the container runs; {reason}",
+                    self.command
+                );
+            }
+        }
+        let started = std::time::Instant::now();
+        let output = run_bounded(&self.argv(), RESTORE_HOOK_BUDGET)
+            .await
+            .with_context(|| format!("restore hook {:?}", self.command))?;
+        let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if !output.status.success() {
+            bail!(
+                "restore hook {:?} exited {} after {elapsed_ms:.0} ms; stdout: {}; stderr: {}",
+                self.command,
+                output.status,
+                stdout.trim(),
+                stderr.trim()
+            );
+        }
+        eprintln!(
+            "[fc-agent] restore hook {:?} exited 0 in {elapsed_ms:.0} ms; stdout: {}",
+            self.command,
+            stdout.trim()
+        );
+        Ok(())
+    }
+}
+
+/// A restored clone's network between the two phases of its boundary: the
+/// snapshot-time sockets are retired and egress is open, ingress is still
+/// gated, and the guest-wide boundary lock is held until `publish` opens it.
+/// The restore sequence does its other work (the NFS remount, the exec and
+/// egress-proxy waits) in between, so the hook runs with everything a
+/// workload may need already restored.
+pub struct RestoredNetwork {
+    _transaction_lock: std::fs::File,
+    gate: IptablesGate<SystemCommandRunner>,
+    report: RestoreNetworkReport,
+}
+
+impl RestoredNetwork {
+    /// What the boundary did so far (the publication fields are still zero).
+    pub fn report(&self) -> &RestoreNetworkReport {
+        &self.report
+    }
+
+    /// Run the plan's restore hook, if any, then open ingress: the clone is
+    /// published. A hook failure keeps it unpublished and fails the restore.
+    pub async fn publish(self, hook: Option<&str>) -> Result<RestoreNetworkReport> {
+        let report = match hook {
+            Some(command) => {
+                let hook = ContainerRestoreHook {
+                    command: command.to_string(),
+                };
+                publish_with(&self.gate, self.report, &hook).await?
+            }
+            None => publish_with(&self.gate, self.report, &NoRestoreHook).await?,
+        };
+        eprintln!(
+            "[fc-agent] snapshot network published: destroyed={} already_gone={} \
+             verified_armed={} link=UNTOUCHED gate=open",
+            report.tally.destroyed, report.tally.already_gone, report.verified_armed
+        );
+        Ok(report)
+    }
+}
+
+pub async fn restore_snapshot_network() -> Result<RestoredNetwork> {
+    let transaction_lock = acquire_boundary_lock()?;
     let gate = IptablesGate::new(SystemCommandRunner);
     let receive_barrier = SystemPacketReceiveBarrier;
     let mut diagnostic = SystemSocketDiagnostic::new();
-    let report = restore_with(
+    let store = FileManifestStore::default();
+    let report = restore_boundary_with(
         &gate,
         &receive_barrier,
         &mut diagnostic,
-        &FileManifestStore::default(),
+        &store,
         CLEANUP_BUDGET,
     )
     .await?;
     eprintln!(
         "[fc-agent] snapshot network cleanup complete: destroyed={} already_gone={} \
-         verified_armed={} link=UNTOUCHED gate=open",
+         verified_armed={} link=UNTOUCHED gate=egress-open",
         report.tally.destroyed, report.tally.already_gone, report.verified_armed
     );
-    Ok(report)
+    Ok(RestoredNetwork {
+        _transaction_lock: transaction_lock,
+        gate,
+        report,
+    })
 }
 
 /// Whether this process image was captured behind the snapshot network
@@ -1558,7 +2043,13 @@ mod tests {
 
     #[derive(Default)]
     struct ModelState {
+        /// The ingress half of the gate (new inbound connections rejected).
         gate_closed: bool,
+        /// The egress half of the gate (new outbound connections rejected).
+        /// Closed with the ingress half; opened by `open_egress` alone.
+        egress_closed: bool,
+        /// The restored clone's UDP rejection, part of the ingress half.
+        udp_gated: bool,
         link_down: bool,
         /// The guest's live route table, as the kernel keeps it: emptied when
         /// the link goes down and NOT refilled when it comes back up. Without
@@ -1572,6 +2063,7 @@ mod tests {
         fail_barrier: bool,
         fail_dump: bool,
         fail_destroy: bool,
+        fail_hook: bool,
         /// Calls to the model diagnostic's destroy, one datagram each.
         destroy_calls: usize,
     }
@@ -1583,6 +2075,7 @@ mod tests {
         async fn close(&self) -> Result<()> {
             let mut state = self.0.lock().unwrap();
             state.gate_closed = true;
+            state.egress_closed = true;
             state.events.push("gate-close");
             if state.fail_gate_close {
                 bail!("injected gate close failure after partial installation");
@@ -1590,10 +2083,30 @@ mod tests {
             Ok(())
         }
 
+        async fn open_egress(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            state.egress_closed = false;
+            state.events.push("gate-open-egress");
+            Ok(())
+        }
+
         async fn open(&self) -> Result<()> {
             let mut state = self.0.lock().unwrap();
             state.gate_closed = false;
+            state.egress_closed = false;
+            state.udp_gated = false;
             state.events.push("gate-open");
+            Ok(())
+        }
+
+        async fn gate_udp_ingress(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert!(
+                state.gate_closed,
+                "the UDP rejection was added to a gate that is not closed"
+            );
+            state.udp_gated = true;
+            state.events.push("gate-udp-ingress");
             Ok(())
         }
 
@@ -1620,13 +2133,37 @@ mod tests {
         ]
     }
 
+    /// A restore hook that records when it ran, so a test can place it against the
+    /// gate opening.
+    struct ModelHook(Arc<Mutex<ModelState>>);
+
+    impl RestoreHook for ModelHook {
+        async fn run(&self) -> Result<()> {
+            let mut state = self.0.lock().unwrap();
+            assert!(
+                !state.egress_closed,
+                "the restore hook ran behind a closed egress gate: its own connections, \
+                 and the workload's reconnects, would be answered with resets"
+            );
+            assert!(
+                state.gate_closed && state.udp_gated,
+                "the restore hook ran after the clone was published, or without the UDP rejection"
+            );
+            state.events.push("restore-hook");
+            if state.fail_hook {
+                bail!("injected restore hook failure");
+            }
+            Ok(())
+        }
+    }
+
     struct ModelBarrier(Arc<Mutex<ModelState>>);
 
     impl PacketReceiveBarrier for ModelBarrier {
         fn synchronize(&self) -> Result<()> {
             let mut state = self.0.lock().unwrap();
             assert!(
-                state.gate_closed,
+                state.gate_closed && state.egress_closed,
                 "receive barrier ran before the NEW-flow gate"
             );
             // The link is deliberately never touched: the gate already rejects
@@ -1653,7 +2190,7 @@ mod tests {
         fn dump_tcp_sockets(&mut self) -> Result<Vec<TcpSocketIdentity>> {
             let mut state = self.0.lock().unwrap();
             assert!(
-                state.gate_closed,
+                state.gate_closed && state.egress_closed,
                 "cookie dump raced ahead of the NEW-flow gate"
             );
             assert!(
@@ -1677,7 +2214,12 @@ mod tests {
             state.destroy_calls += 1;
             assert!(
                 state.gate_closed,
-                "restore opened the gate before destroying sockets"
+                "restore published ingress before destroying sockets"
+            );
+            assert!(
+                !state.egress_closed,
+                "restore retired a socket with egress still closed: the daemon that owned it \
+                 reconnects into a reset"
             );
             // The closed gate is what protects the cleanup; the link stays up
             // throughout so the clone's routes and neighbours survive.
@@ -2023,6 +2565,60 @@ mod tests {
             !calls.contains("10.0.2.") && !calls.contains("fd00:"),
             "gateway exemptions let routed external clients cross the generation boundary:\n{calls}"
         );
+        // A published-port SYN is DNATed to 127.0.0.1 in PREROUTING, before filter
+        // INPUT, so a destination-loopback exemption there would let it through
+        // while the cookie dump or the restore hook runs. Locally redirected
+        // traffic (the egress proxy's) enters on lo; that is the exemption.
+        assert!(
+            !calls.contains("FCVM_SNAPSHOT_IN -p tcp -d 127.0.0.0/8")
+                && !calls.contains("FCVM_SNAPSHOT_IN -p tcp -d ::1/128"),
+            "a destination-loopback exemption on INPUT lets DNATed published-port SYNs \
+             cross the gate:\n{calls}"
+        );
+        assert!(
+            calls.contains("iptables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN")
+                && calls.contains("ip6tables -w -A FCVM_SNAPSHOT_IN -i lo -j RETURN"),
+            "the egress proxy's redirected flows (entering on lo) must pass INPUT:\n{calls}"
+        );
+        // The UDP rejection belongs to the restored clone only (see
+        // the_udp_rejection_is_installed_on_restore_only): installed by close(), it
+        // would answer a live client's datagram on the VM being snapshotted with an
+        // ICMP unreachable during the cookie dump, and a snapshot must not disturb
+        // its source.
+        assert!(
+            !calls.contains("-p udp"),
+            "close() gates UDP on the source VM during the cookie dump:\n{calls}"
+        );
+    }
+
+    /// The restored clone also refuses client-direction UDP while its ingress is
+    /// gated: a published UDP port reaches the workload like a TCP one, and a client
+    /// whose flow predates the snapshot is ESTABLISHED in the restored guest, so the
+    /// match is the flow's direction, not its state. The rule is inserted after the
+    /// inherited gate is verified, below the loopback exemptions, and the ingress
+    /// open removes it with the chain. The snapshot side never installs it.
+    ///
+    /// RED BEFORE THE FIX: the rule was part of every close(), the source VM's too.
+    #[tokio::test]
+    async fn the_udp_rejection_is_installed_on_restore_only() {
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        IptablesGate::new(runner).gate_udp_ingress().await.unwrap();
+        let calls = calls.lock().unwrap().join("\n");
+        assert!(
+            calls.contains(
+                "iptables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
+                 --reject-with icmp-port-unreachable"
+            ) && calls.contains(
+                "ip6tables -w -I FCVM_SNAPSHOT_IN 3 -p udp -m conntrack --ctdir ORIGINAL -j REJECT \
+                 --reject-with icmp6-port-unreachable"
+            ),
+            "client-direction UDP passes the restored clone's closed ingress gate:\n{calls}"
+        );
+        assert!(
+            !calls.contains("--ctstate NEW") && !calls.contains("FCVM_SNAPSHOT_OUT"),
+            "the UDP rule must match direction, not state, and never gate egress:\n{calls}"
+        );
     }
 
     /// Runner that answers `-S` with a canned dump and records every call.
@@ -2081,6 +2677,7 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s 127.0.0.0/8 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d 127.0.0.0/8 -p tcp -j RETURN\n\
@@ -2096,6 +2693,7 @@ mod tests {
         -A INPUT -j FCVM_SNAPSHOT_IN\n\
         -A OUTPUT -j FCVM_SNAPSHOT_OUT\n\
         -A FCVM_SNAPSHOT_IN -s ::1/128 -p tcp -j RETURN\n\
+        -A FCVM_SNAPSHOT_IN -i lo -j RETURN\n\
         -A FCVM_SNAPSHOT_IN -p tcp -m conntrack --ctstate NEW -j REJECT --reject-with tcp-reset\n\
         -A FCVM_SNAPSHOT_IN -j RETURN\n\
         -A FCVM_SNAPSHOT_OUT -d ::1/128 -p tcp -j RETURN\n\
@@ -2188,7 +2786,7 @@ mod tests {
         };
         let calls = runner.calls.clone();
         IptablesGate::new(runner)
-            .remove_family("iptables")
+            .remove_family("iptables", &[Direction::Input, Direction::Output])
             .await
             .unwrap();
         assert_eq!(
@@ -2221,7 +2819,9 @@ COMMIT\\n\"",
             .family_is_closed("iptables", IPV4_LOOPBACK)
             .await
             .unwrap());
-        gate.remove_family("iptables").await.unwrap();
+        gate.remove_family("iptables", &[Direction::Input, Direction::Output])
+            .await
+            .unwrap();
         let reads = calls
             .lock()
             .unwrap()
@@ -2252,7 +2852,9 @@ COMMIT\\n\"",
         gate.install_family("iptables", IPV4_LOOPBACK)
             .await
             .unwrap();
-        gate.remove_family("iptables").await.unwrap();
+        gate.remove_family("iptables", &[Direction::Input, Direction::Output])
+            .await
+            .unwrap();
         let reads = calls
             .lock()
             .unwrap()
@@ -2273,7 +2875,7 @@ COMMIT\\n\"",
         };
         let calls = runner.calls.clone();
         IptablesGate::new(runner)
-            .remove_family("iptables")
+            .remove_family("iptables", &[Direction::Input, Direction::Output])
             .await
             .unwrap();
         assert_eq!(calls.lock().unwrap().as_slice(), ["iptables -w -S"]);
@@ -2336,9 +2938,16 @@ COMMIT\\n\"",
             "preparing the boundary purged the source's routes"
         );
 
-        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect("restore");
+        restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect("restore");
         assert_eq!(
             state.lock().unwrap().live_routes,
             model_routes(),
@@ -2454,6 +3063,7 @@ COMMIT\\n\"",
         let replacement = socket(22, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![replacement],
             ..Default::default()
         }));
@@ -2475,9 +3085,16 @@ COMMIT\\n\"",
         // replacement. A cookie-bound destroy must therefore report
         // already_gone and leave the replacement alone; a tuple-based one would
         // report a destroy and take the wrong socket with it.
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             report.tally,
             CleanupTally {
@@ -2491,7 +3108,14 @@ COMMIT\\n\"",
         assert_eq!(state.live, vec![replacement]);
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy", "gate-open",]
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy",
+                "gate-open",
+            ]
         );
         assert!(!state.gate_closed);
         assert!(!state.link_down);
@@ -2507,6 +3131,7 @@ COMMIT\\n\"",
         let stale = socket(28, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![stale],
             fail_gate_verify: true,
             ..Default::default()
@@ -2523,9 +3148,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect("an unverifiable boundary must repair, not fail the restore");
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect("an unverifiable boundary must repair, not fail the restore");
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2533,7 +3165,9 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
+                "gate-udp-ingress",
                 "rx-barrier",
+                "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
             ]
@@ -2548,6 +3182,7 @@ COMMIT\\n\"",
         let stale = socket(29, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             link_down: false,
             live: vec![stale],
             ..Default::default()
@@ -2564,9 +3199,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(report.verified_armed, "the gate itself was intact");
         let events = state.lock().unwrap().events.clone();
         let barrier = events
@@ -2597,6 +3239,7 @@ COMMIT\\n\"",
         let stale = socket(26, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -2612,9 +3255,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(report.verified_armed);
         let state = state.lock().unwrap();
         assert!(
@@ -2624,7 +3274,14 @@ COMMIT\\n\"",
         );
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy", "gate-open",],
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy",
+                "gate-open",
+            ],
             "the link and the barrier must be re-asserted even on the fast path"
         );
     }
@@ -2651,9 +3308,16 @@ COMMIT\\n\"",
         let barrier = ModelBarrier(state.clone());
         let mut diag = ModelDiag(state.clone());
 
-        let report = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .unwrap();
+        let report = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .unwrap();
         assert!(!report.verified_armed);
         let state = state.lock().unwrap();
         assert_eq!(
@@ -2661,7 +3325,9 @@ COMMIT\\n\"",
             vec![
                 "gate-verify",
                 "gate-close",
+                "gate-udp-ingress",
                 "rx-barrier",
+                "gate-open-egress",
                 "cookie-destroy",
                 "gate-open",
             ]
@@ -2675,6 +3341,7 @@ COMMIT\\n\"",
         let stale = socket(23, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![stale],
             fail_destroy: true,
             ..Default::default()
@@ -2692,13 +3359,26 @@ COMMIT\\n\"",
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect_err("a failed exact destroy must fail restore closed");
+        restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect_err("a failed exact destroy must fail restore closed");
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy"
+            ]
         );
         assert!(state.gate_closed, "failed restore published ingress");
         assert!(
@@ -2716,6 +3396,7 @@ COMMIT\\n\"",
         let stale = socket(24, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -2732,9 +3413,16 @@ COMMIT\\n\"",
         state.lock().unwrap().live_routes = model_routes();
         let mut diag = ModelDiag(state.clone());
 
-        let error = restore_with(&gate, &barrier, &mut diag, &store, CLEANUP_BUDGET)
-            .await
-            .expect_err("manifest retirement failure must prevent clone publication");
+        let error = restore_with(
+            &gate,
+            &barrier,
+            &mut diag,
+            &store,
+            &NoRestoreHook,
+            CLEANUP_BUDGET,
+        )
+        .await
+        .expect_err("manifest retirement failure must prevent clone publication");
         assert!(
             format!("{error:#}").contains("retiring snapshot network manifest"),
             "unexpected diagnostic: {error:#}"
@@ -2742,10 +3430,397 @@ COMMIT\\n\"",
         let state = state.lock().unwrap();
         assert_eq!(
             state.events,
-            vec!["gate-verify", "rx-barrier", "cookie-destroy"]
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy"
+            ]
         );
         assert!(state.gate_closed);
         assert!(!state.link_down, "the boundary took the link down");
+    }
+
+    /// A hook that outlives its budget is killed, not left running: the client the
+    /// guest spawned is gone once the budget's error is returned.
+    ///
+    /// RED BEFORE THE FIX: the timed-out future was dropped and the process ran on.
+    #[tokio::test]
+    async fn a_hook_past_its_budget_is_killed() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            &format!("echo $$ > {}; sleep 30", pid_file.display()),
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let error = run_bounded(&argv, std::time::Duration::from_millis(300))
+            .await
+            .expect_err("a 30 s command cannot finish in 300 ms");
+        assert!(format!("{error:#}").contains("did not finish"), "{error:#}");
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        // The shell is reaped by the kill; a dead-but-unreaped child would still
+        // have a /proc entry, so this reads as "gone" only once it is killed and
+        // waited for.
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the hook's shell (pid {pid}) is still running after the budget"
+        );
+    }
+
+    /// At most 64 KiB of each stream is kept; the rest is drained so the hook is
+    /// never blocked on a full pipe.
+    #[tokio::test]
+    async fn a_hooks_output_is_bounded() {
+        let argv: Vec<String> = [
+            "sh",
+            "-c",
+            "head -c 1000000 /dev/zero | tr '\\0' x; echo err >&2",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let output = run_bounded(&argv, std::time::Duration::from_secs(30))
+            .await
+            .expect("a bounded run of a chatty command");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len() as u64, RESTORE_HOOK_OUTPUT_LIMIT);
+        assert_eq!(String::from_utf8_lossy(&output.stderr).trim(), "err");
+    }
+
+    /// The restore hook is decided and run at publication, after the NFS remount
+    /// and the exec and egress-proxy waits. The first version ran it inside the
+    /// socket cleanup, before `handle_clone_restore` remounted the shares, so a
+    /// hook that read an `--nfs` share blocked on the dead hard mount until its
+    /// timeout and failed the restore (a Codex finding on PR 1112). That sequence
+    /// is a run of system calls with no seam a runtime test can hold, so this
+    /// pins the source order of `handle_clone_restore` itself.
+    ///
+    /// RED BEFORE THE FIX: `hook_for_this_restore(` came before `mount_nfs_shares(`.
+    #[test]
+    fn the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits() {
+        let source = include_str!("restore.rs");
+        let start = source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is in restore.rs");
+        let body = &source[start..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        let nfs = at("mount_nfs_shares(");
+        let waits = at("tokio::try_join!(exec_wait, egress_wait)");
+        let publish = at(".publish(restore_hook)");
+        assert!(
+            nfs < publish,
+            "the hook runs before the NFS shares are remounted: a hook reading a share \
+             blocks on the dead hard mount"
+        );
+        assert!(
+            waits < publish,
+            "the hook runs before the egress proxy and exec server are back"
+        );
+    }
+
+    /// A failed NFS remount fails the restore. The remount runs before the hook
+    /// so that a hook can use the share; a remount that failed and was only
+    /// logged left the mount point an ordinary directory, so a hook writing
+    /// there would succeed against the wrong place and the clone would publish
+    /// with its share missing (a Codex finding on PR 1112). Like the ordering
+    /// test above, this pins the source: the remount is a system call sequence
+    /// with no seam a runtime test can hold.
+    ///
+    /// RED BEFORE THE FIX: the failure was an eprintln WARNING and the restore
+    /// went on to publish.
+    #[test]
+    fn a_failed_nfs_remount_keeps_the_clone_unpublished() {
+        let source = include_str!("restore.rs");
+        let start = source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is in restore.rs");
+        let body = &source[start..];
+        let call = body
+            .find("mount_nfs_shares(")
+            .expect("the restore remounts the NFS shares");
+        let statement = &body[call..call + body[call..].find(';').expect("statement end") + 1];
+        assert!(
+            !body.contains("NFS remount after restore failed"),
+            "the NFS remount failure is still only logged"
+        );
+        assert!(
+            statement.contains(".context(") && statement.trim_end().ends_with("?;"),
+            "the NFS remount failure is not propagated: {statement}"
+        );
+    }
+
+    /// Whether the hook has a container to run in is the container's state at
+    /// publication, asked of podman, not a marker set when the agent was about to
+    /// start it. A user snapshot taken between that marker and podman's start
+    /// recorded a container that did not exist, and its clones failed their
+    /// restore on `podman exec`; the opposite order would have skipped the hook
+    /// for a container that did exist.
+    ///
+    /// RED BEFORE THE FIX: `CONTAINER_STARTED` was stored in agent.rs and read in
+    /// restore.rs.
+    #[test]
+    fn the_hook_asks_the_container_state_not_a_marker() {
+        for (name, source) in [
+            ("restore.rs", include_str!("restore.rs")),
+            ("agent.rs", include_str!("agent.rs")),
+        ] {
+            assert!(
+                !source.contains("CONTAINER_STARTED") && !source.contains("mark_container_started"),
+                "{name} still carries the container-started marker"
+            );
+        }
+        let argv = ContainerRestoreHook::inspect_argv();
+        assert!(
+            argv.windows(3)
+                .any(|w| w == ["inspect", "--format", "{{.State.Running}}"]),
+            "the hook does not read the container's state: {argv:?}"
+        );
+    }
+
+    /// The decision from podman's answer: a running container runs the hook; a
+    /// stopped one, or none at all, skips it with the reason; podman failing for
+    /// any other reason fails the restore closed, because a clone published
+    /// without its stale-state repair is the failure the hook exists to prevent.
+    ///
+    /// RED BEFORE THE FIX: every nonzero exit skipped the hook.
+    #[test]
+    fn the_hook_runs_only_in_a_running_container() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |code: i32, stdout: &str, stderr: &str| BoundedOutput {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        assert_eq!(
+            hook_eligibility(&output(0, "true\n", "")),
+            HookEligibility::Run
+        );
+        assert_eq!(
+            hook_eligibility(&output(0, "false\n", "")),
+            HookEligibility::Skip("fcvm-container is not running (Running=false)".to_string())
+        );
+        assert_eq!(
+            hook_eligibility(&output(
+                125,
+                "",
+                "Error: no container with name or ID \"fcvm-container\" found"
+            )),
+            HookEligibility::Skip(
+                "podman inspect exited exit status: 125: Error: no container with name or ID \
+                 \"fcvm-container\" found"
+                    .to_string()
+            )
+        );
+        assert_eq!(
+            hook_eligibility(&output(
+                125,
+                "",
+                "Error: unable to connect to Podman socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
+            )),
+            HookEligibility::Fail(
+                "podman inspect exited exit status: 125: Error: unable to connect to Podman \
+                 socket: dial unix /run/podman/podman.sock: connect: no such file or directory"
+                    .to_string()
+            )
+        );
+    }
+
+    /// The hook runs with the egress half of the gate open and the ingress half
+    /// closed: it can reach out, and nothing from outside reaches the clone yet.
+    /// The model hook asserts both; the event order shows the egress half opened
+    /// after the barrier, before the first socket is retired (a daemon whose
+    /// socket goes first reconnects at once), and before the hook.
+    ///
+    /// RED BEFORE THE FIX: the hook ran with both halves closed, so its own and
+    /// the workload's new connections were answered with resets; then egress
+    /// opened only after the last retirement, and the first daemon's reconnect
+    /// still met a reset.
+    #[tokio::test]
+    async fn the_restore_hook_runs_with_egress_open_and_ingress_gated() {
+        let stale = socket(41, [198, 51, 100, 41]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        state.lock().unwrap().live_routes = model_routes();
+        let mut diag = ModelDiag(state.clone());
+        let hook = ModelHook(state.clone());
+
+        let report = restore_with(&gate, &barrier, &mut diag, &store, &hook, CLEANUP_BUDGET)
+            .await
+            .expect("restore with a hook");
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy",
+                "restore-hook",
+                "gate-open"
+            ],
+            "the UDP rejection joins the verified gate, egress opens after the barrier and before the retirement, ingress after the hook"
+        );
+        assert!(!state.gate_closed && !state.egress_closed);
+        assert!(report.egress_open_ms >= 0.0);
+    }
+
+    /// The command runs in the container under its own `timeout`, so a hook that
+    /// hangs ends inside the container too, not only at the podman client.
+    #[test]
+    fn the_hook_runs_under_the_containers_own_timeout() {
+        let hook = ContainerRestoreHook {
+            command: "curl -sf http://[::1]:8088/x".to_string(),
+        };
+        let argv = hook.argv();
+        let container = argv
+            .iter()
+            .position(|a| a == "fcvm-container")
+            .expect("the container");
+        assert_eq!(
+            &argv[container + 1..],
+            &[
+                "timeout",
+                "-k",
+                &RESTORE_HOOK_KILL_AFTER_SECS.to_string(),
+                &RESTORE_HOOK_COMMAND_SECS.to_string(),
+                "sh",
+                "-c",
+                "curl -sf http://[::1]:8088/x",
+            ]
+        );
+        assert!(
+            RESTORE_HOOK_BUDGET.as_secs()
+                > RESTORE_HOOK_COMMAND_SECS + RESTORE_HOOK_KILL_AFTER_SECS,
+            "the client budget must outlast the container's timeout and its kill grace"
+        );
+    }
+
+    /// The restore hook runs inside the boundary: after the egress half of the
+    /// gate opens and the snapshot-time sockets are retired, and before the
+    /// ingress half opens. A process that must redo work a snapshot made stale
+    /// (service-discovery data as old as the snapshot) gets to do it, with the
+    /// network, before any published-port client can reach the clone.
+    ///
+    /// RED BEFORE THE FIX: the boundary ran no hook at all.
+    #[tokio::test]
+    async fn the_restore_hook_runs_after_cleanup_and_before_the_clone_is_published() {
+        let stale = socket(31, [198, 51, 100, 9]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: vec![stale],
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        state.lock().unwrap().live_routes = model_routes();
+        let mut diag = ModelDiag(state.clone());
+        let hook = ModelHook(state.clone());
+
+        restore_with(&gate, &barrier, &mut diag, &store, &hook, CLEANUP_BUDGET)
+            .await
+            .expect("restore with a hook");
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy",
+                "restore-hook",
+                "gate-open"
+            ],
+            "the hook runs after the sockets are retired, with egress open, before ingress opens"
+        );
+        assert!(!state.gate_closed);
+    }
+
+    /// A hook that fails leaves the clone unpublished: the ingress half of the gate
+    /// stays closed and the restore reports the failure, the same way a failed
+    /// socket retirement does.
+    ///
+    /// RED BEFORE THE FIX: the boundary ran no hook at all.
+    #[tokio::test]
+    async fn a_failed_restore_hook_keeps_the_restored_clone_closed() {
+        let stale = socket(32, [198, 51, 100, 10]);
+        let state = Arc::new(Mutex::new(ModelState {
+            gate_closed: true,
+            egress_closed: true,
+            live: vec![stale],
+            fail_hook: true,
+            ..Default::default()
+        }));
+        let store = MemoryStore::default();
+        store
+            .save(&SnapshotNetworkManifest {
+                version: MANIFEST_VERSION,
+                routes: model_routes(),
+                sockets: vec![stale],
+            })
+            .unwrap();
+        let gate = ModelGate(state.clone());
+        let barrier = ModelBarrier(state.clone());
+        state.lock().unwrap().live_routes = model_routes();
+        let mut diag = ModelDiag(state.clone());
+        let hook = ModelHook(state.clone());
+
+        let error = restore_with(&gate, &barrier, &mut diag, &store, &hook, CLEANUP_BUDGET)
+            .await
+            .expect_err("a failed restore hook must prevent clone publication");
+        assert!(
+            format!("{error:#}").contains("restore hook"),
+            "unexpected diagnostic: {error:#}"
+        );
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress",
+                "cookie-destroy",
+                "restore-hook"
+            ]
+        );
+        assert!(state.gate_closed, "the gate opened after the hook failed");
     }
 
     #[tokio::test]
@@ -2753,6 +3828,7 @@ COMMIT\\n\"",
         let stale = socket(25, [198, 51, 100, 8]);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             live: vec![stale],
             ..Default::default()
         }));
@@ -2778,6 +3854,7 @@ COMMIT\\n\"",
             &barrier,
             &mut diag,
             &store,
+            &NoRestoreHook,
             std::time::Duration::ZERO,
         )
         .await
@@ -2788,7 +3865,15 @@ COMMIT\\n\"",
         );
 
         let state = state.lock().unwrap();
-        assert_eq!(state.events, vec!["gate-verify", "rx-barrier"]);
+        assert_eq!(
+            state.events,
+            vec![
+                "gate-verify",
+                "gate-udp-ingress",
+                "rx-barrier",
+                "gate-open-egress"
+            ]
+        );
         assert!(state.gate_closed, "a timed-out cleanup published ingress");
         assert!(
             !state.link_down,
@@ -2870,6 +3955,7 @@ COMMIT\\n\"",
         let kernel = SharedKernel::new(&sockets, ModelAnswer::Kernel, ModelDelivery::InOrder);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             ..Default::default()
         }));
         let store = MemoryStore::default();
@@ -2887,6 +3973,7 @@ COMMIT\\n\"",
             &ModelBarrier(state.clone()),
             &mut diag,
             &store,
+            &NoRestoreHook,
             CLEANUP_BUDGET,
         )
         .await
@@ -2988,6 +4075,7 @@ COMMIT\\n\"",
             SharedKernel::new(&sockets[..100], ModelAnswer::Kernel, ModelDelivery::InOrder);
         let state = Arc::new(Mutex::new(ModelState {
             gate_closed: true,
+            egress_closed: true,
             ..Default::default()
         }));
         let store = MemoryStore::default();
@@ -3004,6 +4092,7 @@ COMMIT\\n\"",
             &ModelBarrier(state.clone()),
             &mut diag,
             &store,
+            &NoRestoreHook,
             CLEANUP_BUDGET,
         )
         .await

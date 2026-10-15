@@ -53,6 +53,7 @@ fn test_run_args(name: &str) -> RunArgs {
         label: vec![],
         non_blocking_output: false,
         health_check_timeout: 5,
+        on_restore: None,
         ipv6_prefix: None,
         dns: None,
         image: common::TEST_IMAGE.to_string(),

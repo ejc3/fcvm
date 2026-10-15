@@ -318,6 +318,7 @@ async fn create_sandbox(
         hypervisor: crate::cli::args::Hypervisor::Firecracker,
         ipv6_prefix: None,
         health_check: None,
+        on_restore: None,
         health_check_timeout: 5,
         privileged: false,
         interactive: false,
