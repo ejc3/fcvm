@@ -269,6 +269,36 @@ impl Progress {
     }
 }
 
+/// Test only: every thread that has called [`populate_chunk_counted`] since the set was
+/// last cleared. Replay's thread count is pinned by the threads that copied.
+#[cfg(test)]
+pub(crate) fn populate_threads_seen() -> PopulateThreadsSeen {
+    static SEEN: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+    > = std::sync::OnceLock::new();
+    PopulateThreadsSeen(SEEN.get_or_init(Default::default))
+}
+
+#[cfg(test)]
+pub(crate) struct PopulateThreadsSeen(
+    &'static std::sync::Mutex<std::collections::HashSet<std::thread::ThreadId>>,
+);
+
+#[cfg(test)]
+impl PopulateThreadsSeen {
+    pub(crate) fn insert(&self, id: std::thread::ThreadId) {
+        self.0.lock().unwrap().insert(id);
+    }
+
+    pub(crate) fn clear(&self) {
+        self.0.lock().unwrap().clear();
+    }
+
+    pub(crate) fn ids(&self) -> Vec<std::thread::ThreadId> {
+        self.0.lock().unwrap().iter().copied().collect()
+    }
+}
+
 /// [`populate_chunk_counted`], for a caller that only needs to know how far to advance.
 #[cfg(test)]
 pub fn populate_chunk(
@@ -308,6 +338,8 @@ pub fn populate_chunk_counted(
     page_size: usize,
     vm_id: &str,
 ) -> Result<Progress, Stop> {
+    #[cfg(test)]
+    populate_threads_seen().insert(std::thread::current().id());
     let Some(remaining) = segment
         .len
         .checked_sub(done)

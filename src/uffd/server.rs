@@ -486,6 +486,8 @@ enum PageSource {
     Copy {
         mmap: memmap2::Mmap,
         fault_around: usize,
+        /// How many threads a clone's working-set replay copies on ([`ReplayThreads`]).
+        replay_threads: usize,
         holes: FileHoles,
         nv2: bool,
     },
@@ -722,6 +724,64 @@ pub fn record_window_from_env() -> Result<Duration> {
 /// Env var behind `--uffd-fault-around`, in bytes.
 pub const FAULT_AROUND_ENV: &str = "FCVM_UFFD_FAULT_AROUND";
 
+/// Env var behind `--uffd-replay-threads`.
+pub const REPLAY_THREADS_ENV: &str = "FCVM_UFFD_REPLAY_THREADS";
+
+/// How many threads a copy-mode clone's working-set replay copies on
+/// (`--uffd-replay-threads`). The recorded set of a large guest is millions of runs a
+/// few pages long (one 128 GiB guest: 2.36 M pages in 1.00 M runs, 2.36 pages a run, and
+/// merging runs across gaps of up to 4 pages would have cost 39 percent more pages), so
+/// replay is bound by `UFFDIO_COPY` calls, about 15 us each on one thread: 15.3 s for that
+/// set, during which the guest demand-faulted 479,129 pages replay had not reached. The
+/// handler keeps reading events and serving demand faults; the copies go to these threads.
+/// Minor mode replays on the handler alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayThreads(usize);
+
+impl ReplayThreads {
+    /// The handler copies alone.
+    pub const ONE: Self = Self(1);
+    /// The default on a host with at least this many cores; fewer cores, fewer threads.
+    pub const DEFAULT: usize = 8;
+    /// The most threads accepted.
+    pub const MAX: usize = 64;
+
+    pub fn new(count: u64) -> Result<Self> {
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        if !(1..=Self::MAX).contains(&count) {
+            anyhow::bail!(
+                "--uffd-replay-threads {count}: 1 through {} threads",
+                Self::MAX
+            );
+        }
+        Ok(Self(count))
+    }
+
+    pub fn from_env() -> Result<Self> {
+        match std::env::var(REPLAY_THREADS_ENV) {
+            Ok(raw) => raw
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("{REPLAY_THREADS_ENV}={raw:?} is not a count"))
+                .and_then(Self::new),
+            Err(_) => Ok(Self::default()),
+        }
+    }
+
+    pub fn count(self) -> usize {
+        self.0
+    }
+}
+
+impl Default for ReplayThreads {
+    /// [`Self::DEFAULT`], or fewer on a host with fewer cores. Clones restored together
+    /// each get their own pool.
+    fn default() -> Self {
+        let cores = std::thread::available_parallelism().map_or(Self::DEFAULT, |n| n.get());
+        Self(Self::DEFAULT.min(cores).max(1))
+    }
+}
+
 /// The largest fault-around granule. It is one replay chunk, so one ioctl populates a whole
 /// run of missing pages, and it is one 2 MiB guest page.
 pub const MAX_FAULT_AROUND: usize = prefetch::CHUNK_BYTES;
@@ -825,6 +885,8 @@ pub struct ServeShape {
     /// Copy mode only: how much of the snapshot each demand fault materialises around the
     /// page that faulted. See [`FaultAround`].
     pub fault_around: FaultAround,
+    /// Copy mode only: how many threads replay copies on. See [`ReplayThreads`].
+    pub replay_threads: ReplayThreads,
     /// The clones run with `--enable-nv2` (ARM64 NV2), which only copy mode serves. Every
     /// fault answered with zeros then gets a private copy of zeros, never the kernel's zero
     /// page. See [`VmContext::zero_fill`].
@@ -886,6 +948,7 @@ impl UffdServer {
             prefetch,
             record_window,
             fault_around,
+            replay_threads,
             nv2,
         } = shape;
 
@@ -1001,6 +1064,7 @@ impl UffdServer {
                     PageSource::Copy {
                         mmap,
                         fault_around: fault_around.bytes(),
+                        replay_threads: replay_threads.count(),
                         holes,
                         nv2,
                     },
@@ -1858,6 +1922,8 @@ struct VmContext<'a> {
     page_size: usize,
     page_mask: usize,
     mem_size: usize,
+    /// Keeps replay workers' copies and the handler's REMOVE reads apart ([`ReplayGate`]).
+    gate: &'a Arc<ReplayGate>,
 }
 
 impl<'a> VmContext<'a> {
@@ -1870,6 +1936,19 @@ impl<'a> VmContext<'a> {
             PageSource::Copy {
                 mmap, fault_around, ..
             } if *fault_around > self.page_size => Some((*fault_around, &mmap[..])),
+            _ => None,
+        }
+    }
+
+    /// The threads this clone's working-set replay copies on, with the snapshot mapping
+    /// they copy from. `None` when the handler copies alone: minor mode, or one thread.
+    fn replay_workers(&self) -> Option<(usize, &'a [u8])> {
+        match self.source {
+            PageSource::Copy {
+                mmap,
+                replay_threads,
+                ..
+            } if *replay_threads > 1 => Some((*replay_threads, &mmap[..])),
             _ => None,
         }
     }
@@ -2353,8 +2432,9 @@ fn replay_steps_after_drain(outcome: DrainOutcome) -> &'static [ReplayStep] {
 
 /// When replay yields to the runtime.
 ///
-/// Replay drains the fault queue before every populate call, so a guest fault never waits behind
-/// more than one call of speculation. What it does once per batch is yield. A batch ends after
+/// Replay drains the fault queue before every populate call the handler makes, so a guest fault
+/// never waits behind more than one of the handler's calls of speculation (the workers' copies
+/// run beside the fault service). What it does once per batch is yield. A batch ends after
 /// [`prefetch::CHUNK_BYTES`] of population or [`ReplayPacer::MAX_POPULATES`] populate calls,
 /// whichever comes first. A populate the kernel refused and a step over a run that is given
 /// back or a hole each count as a call. A fragmented recording needs the second bound: a
@@ -2453,6 +2533,7 @@ async fn handle_vm_page_faults(
     let async_peer_pidfd = AsyncFd::new(PidfdRef(&peer.pidfd))
         .context("registering peer VMM pidfd with the reactor")?;
 
+    let gate = Arc::new(ReplayGate::default());
     let ctx = VmContext {
         vm_id: &vm_id,
         mappings: &mappings,
@@ -2460,6 +2541,7 @@ async fn handle_vm_page_faults(
         page_size,
         page_mask,
         mem_size,
+        gate: &gate,
     };
     if let PageSource::Copy { fault_around, .. } = ctx.source {
         match ctx.fault_around() {
@@ -2568,6 +2650,698 @@ async fn replay_then_serve(
     serve_faults(ctx, async_uffd, async_peer_pidfd, peer_pid, state).await
 }
 
+/// What keeps a replay worker's copy and the handler's reading of a balloon REMOVE apart.
+///
+/// Reading a REMOVE lets the kernel zap the range and then accept copies into it again. A
+/// worker that checked a job before the REMOVE was read and copied after the zap would install
+/// the snapshot's bytes in memory the guest gave back, which the handler answers with zeros
+/// ([`RemovedPages`]). So the handler holds `reading` while it reads an event and, for a
+/// REMOVE, records the range and bumps `generation`; a worker holds a `copiers` count from its
+/// check of a job's generation through one copy, and skips a job whose generation is stale.
+/// The two exclude each other: the handler waits for the copies in flight to finish before it
+/// reads, and a worker that finds `reading` set backs off until it is clear. Both wait by
+/// spinning, because every wait is one copy or one read long: worker copies are at most
+/// [`ReplayWorkers::COPY_BYTES`], and the handler takes the gate only when the queue is
+/// readable ([`drain_if_readable`]), not before every chunk it plans. A read-write lock here,
+/// taken for every event read including the empty ones, made eight threads slower than one
+/// (replay 16.5 s against 14.3 s on a 2.4 M page set).
+#[derive(Debug, Default)]
+pub(crate) struct ReplayGate {
+    generation: std::sync::atomic::AtomicU64,
+    reading: std::sync::atomic::AtomicBool,
+    copiers: AtomicUsize,
+    /// Test only: the threads of the workers spawned for this gate's clone, so a test reads
+    /// its own workers and not another test's.
+    #[cfg(test)]
+    workers: std::sync::Mutex<Vec<std::thread::ThreadId>>,
+}
+
+impl ReplayGate {
+    #[cfg(test)]
+    fn worker_ids(&self) -> Vec<std::thread::ThreadId> {
+        self.workers.lock().unwrap().clone()
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
+    }
+
+    /// Bump when a REMOVE was recorded.
+    fn removed(&self) {
+        self.generation.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Hold while reading an event and recording a REMOVE. Returns once no copy is in flight;
+    /// a worker that arrives meanwhile waits.
+    fn reading(&self) -> ReadingGuard<'_> {
+        self.reading.store(true, Ordering::SeqCst);
+        while self.copiers.load(Ordering::SeqCst) != 0 {
+            std::hint::spin_loop();
+        }
+        ReadingGuard(self)
+    }
+
+    /// Hold from the check of a job's generation through one copy. Returns once the handler is
+    /// not reading.
+    fn copying(&self) -> CopyingGuard<'_> {
+        loop {
+            self.copiers.fetch_add(1, Ordering::SeqCst);
+            if !self.reading.load(Ordering::SeqCst) {
+                return CopyingGuard(self);
+            }
+            self.copiers.fetch_sub(1, Ordering::SeqCst);
+            while self.reading.load(Ordering::SeqCst) {
+                std::hint::spin_loop();
+            }
+        }
+    }
+}
+
+/// The handler's hold on the [`ReplayGate`].
+struct ReadingGuard<'a>(&'a ReplayGate);
+
+impl Drop for ReadingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.reading.store(false, Ordering::SeqCst);
+    }
+}
+
+/// A worker's hold on the [`ReplayGate`].
+struct CopyingGuard<'a>(&'a ReplayGate);
+
+impl Drop for CopyingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.copiers.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// One run of recorded pages for a replay worker to copy: a place in the clone, a place in
+/// the snapshot, a length of at most [`ReplayWorkers::COPY_BYTES`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReplayRun {
+    host_addr: usize,
+    file_offset: u64,
+    len: usize,
+}
+
+impl ReplayRun {
+    fn segment(&self) -> prefetch::Segment {
+        prefetch::Segment {
+            host_addr: self.host_addr,
+            file_offset: self.file_offset,
+            len: self.len,
+        }
+    }
+}
+
+/// A batch of runs for one worker, and the [`ReplayGate`] generation they were planned under.
+/// A recorded set is millions of runs a few pages long, so a job holds up to
+/// [`ReplayWorkers::RUNS_PER_JOB`] of them, or one chunk of bytes: one queue slot, one wake of
+/// the handler and one outcome per batch, not per run.
+struct ReplayJob {
+    runs: Vec<ReplayRun>,
+    generation: u64,
+}
+
+/// What a replay worker did with one job.
+enum ReplayOutcome {
+    /// The job's pages are resident, bar the ones that already were.
+    Done { populated: usize },
+    /// The kernel refused a copy and the REMOVE behind it was not read in time: the rest of
+    /// the job faults on demand.
+    Refused { populated: usize },
+    /// The job was planned before a REMOVE the handler has since read. `rest` is what the
+    /// worker had not copied, for the handler to re-plan.
+    Stale { populated: usize, rest: ReplayJob },
+    /// The clone's mm is gone.
+    VmGone,
+}
+
+/// The snapshot mapping, as a worker thread may address it. The mapping belongs to the
+/// server's [`PageSource`], which the handler borrows for the whole replay, and the workers
+/// never outlive the replay: [`ReplayWorkers::finish`] joins them on every path out of
+/// [`replay_working_set`], and the Drop backstop joins what a path that did not finish left.
+#[derive(Clone, Copy)]
+struct SnapshotSlice {
+    ptr: usize,
+    len: usize,
+}
+
+/// The threads a copy-mode clone's working-set replay copies on ([`ReplayThreads`]).
+///
+/// The handler plans the segments, steps over the runs replay must not copy (given-back
+/// pages, holes), copies zeros itself, keeps reading events and serving demand faults, and
+/// hands the plain runs here in batches ([`ReplayJob`]). Each worker has its own handle on
+/// the clone's userfaultfd and copies with [`prefetch::populate_chunk_counted`] as the handler
+/// would. The job queue is bounded, and the handler waits for room, or for the last outcomes,
+/// together with the userfaultfd's readability, so a demand fault is served while it waits.
+/// A job planned before a REMOVE the handler has since read comes back and is planned again
+/// ([`ReplayGate`]).
+struct ReplayWorkers {
+    jobs: Option<std::sync::mpsc::SyncSender<ReplayJob>>,
+    /// Signalled by a worker each time it takes a job: room in the queue.
+    room: Arc<tokio::sync::Notify>,
+    results: tokio::sync::mpsc::UnboundedReceiver<ReplayOutcome>,
+    handles: Vec<std::thread::JoinHandle<()>>,
+    /// Runs planned and not yet submitted: the next job, and the generation its first run
+    /// was planned under.
+    pending: Vec<ReplayRun>,
+    pending_bytes: usize,
+    pending_generation: u64,
+    /// Jobs that came back stale, for the handler to re-plan.
+    stale: Vec<ReplayJob>,
+    dispatched: u64,
+    runs: u64,
+    populated: u64,
+    refused: u64,
+    requeued: u64,
+    vm_gone: bool,
+    /// Set by the Drop backstop before it joins: a worker takes no further job and starts no
+    /// further copy, so the queued jobs are discarded.
+    stop: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ReplayWorkers {
+    /// Jobs queued ahead of the workers, per worker.
+    const QUEUE_PER_WORKER: usize = 4;
+    /// Runs in one job, at most. A job also closes at one chunk of bytes.
+    const RUNS_PER_JOB: usize = 64;
+    /// Bytes in one worker copy, at most, on small pages: what the handler waits for at the
+    /// gate before it reads an event, so a demand fault behind a worker's copy waits for 16
+    /// pages, not a 2 MiB chunk. A clone on 2 MiB hugetlb pages copies one page per piece,
+    /// since `UFFDIO_COPY` takes nothing smaller than the registered page
+    /// ([`PlainRuns::piece_cap`]).
+    const COPY_BYTES: usize = 64 * 1024;
+
+    fn spawn(
+        count: usize,
+        uffd: &Uffd,
+        mmap: &[u8],
+        page_size: usize,
+        vm_id: &str,
+        gate: &Arc<ReplayGate>,
+    ) -> Result<Self> {
+        use std::os::fd::AsFd;
+        let (jobs, jobs_rx) =
+            std::sync::mpsc::sync_channel::<ReplayJob>(count * Self::QUEUE_PER_WORKER);
+        let jobs_rx = Arc::new(std::sync::Mutex::new(jobs_rx));
+        let room = Arc::new(tokio::sync::Notify::new());
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (results_tx, results) = tokio::sync::mpsc::unbounded_channel();
+        let slice = SnapshotSlice {
+            ptr: mmap.as_ptr() as usize,
+            len: mmap.len(),
+        };
+        let mut handles: Vec<std::thread::JoinHandle<()>> = Vec::with_capacity(count);
+        let join_started = |handles: Vec<std::thread::JoinHandle<()>>| {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        };
+        for index in 0..count {
+            // F_DUPFD_CLOEXEC: a child the server spawns meanwhile must not inherit it.
+            let worker_fd = match uffd.as_fd().try_clone_to_owned() {
+                Ok(fd) => fd,
+                Err(error) => {
+                    drop(jobs);
+                    join_started(handles);
+                    return Err(error)
+                        .context("duplicating the clone's userfaultfd for a replay worker");
+                }
+            };
+            let jobs_rx = Arc::clone(&jobs_rx);
+            let results_tx = results_tx.clone();
+            let room = Arc::clone(&room);
+            let stop = Arc::clone(&stop);
+            let gate = Arc::clone(gate);
+            let vm_id = vm_id.to_string();
+            let spawned = std::thread::Builder::new()
+                .name(format!("fcvm-replay-{index}"))
+                .spawn(move || {
+                    use std::os::fd::IntoRawFd;
+                    // SAFETY: `worker_fd` is a userfaultfd this thread now owns.
+                    let worker_uffd = unsafe { Uffd::from_raw_fd(worker_fd.into_raw_fd()) };
+                    replay_worker(
+                        &worker_uffd,
+                        slice,
+                        page_size,
+                        &vm_id,
+                        &gate,
+                        &jobs_rx,
+                        &room,
+                        &stop,
+                        &results_tx,
+                    );
+                });
+            match spawned {
+                Ok(handle) => handles.push(handle),
+                Err(error) => {
+                    drop(jobs);
+                    join_started(handles);
+                    return Err(error).context("spawning a replay worker thread");
+                }
+            }
+        }
+        #[cfg(test)]
+        {
+            *gate.workers.lock().unwrap() = handles.iter().map(|h| h.thread().id()).collect();
+        }
+        Ok(Self {
+            jobs: Some(jobs),
+            room,
+            results,
+            handles,
+            pending: Vec::with_capacity(Self::RUNS_PER_JOB),
+            pending_bytes: 0,
+            pending_generation: gate.generation(),
+            stale: Vec::new(),
+            dispatched: 0,
+            runs: 0,
+            populated: 0,
+            refused: 0,
+            requeued: 0,
+            vm_gone: false,
+            stop,
+        })
+    }
+
+    /// Queue one job without waiting. `Err(Full(job))` asks the caller to wait for room;
+    /// `Err(Disconnected(job))` says every worker has exited.
+    fn try_submit(
+        &mut self,
+        job: ReplayJob,
+    ) -> std::result::Result<(), std::sync::mpsc::TrySendError<ReplayJob>> {
+        let Some(jobs) = &self.jobs else {
+            return Err(std::sync::mpsc::TrySendError::Disconnected(job));
+        };
+        let runs = job.runs.len() as u64;
+        jobs.try_send(job)?;
+        self.dispatched += 1;
+        self.runs += runs;
+        Ok(())
+    }
+
+    /// Wait for room in the queue while the handler keeps serving demand faults, parked
+    /// ones included: a fault the kernel refused while a REMOVE was unread is retried here,
+    /// as [`serve_faults`] retries it, not when the wait ends. The workers' outcomes end the
+    /// wait too: a worker that found the VMM gone ends it as `VmExited`, and once every worker
+    /// has exited (the outcome channel closed) it ends so the next submit finds the queue
+    /// disconnected. Neither sends a room signal, and a VMM that has exited sends no event.
+    async fn wait_for_room(
+        &mut self,
+        ctx: &VmContext<'_>,
+        async_uffd: &AsyncFd<Uffd>,
+        state: &mut VmState,
+    ) -> Result<DrainOutcome> {
+        self.collect();
+        if self.vm_gone {
+            return Ok(DrainOutcome::VmExited);
+        }
+        let retry_due = parked_retry_due(state);
+        let outcome = tokio::select! {
+            biased;
+            readable = async_uffd.readable() => {
+                let mut guard = readable.context("waiting for UFFD readability")?;
+                let outcome = drain_events(guard.get_inner(), ctx, state)?;
+                if outcome == DrainOutcome::QueueDrained {
+                    guard.clear_ready();
+                }
+                outcome
+            }
+            _ = self.room.notified() => DrainOutcome::QueueDrained,
+            outcome = self.results.recv() => match outcome {
+                Some(outcome) => {
+                    self.tally(outcome);
+                    if self.vm_gone {
+                        DrainOutcome::VmExited
+                    } else {
+                        DrainOutcome::QueueDrained
+                    }
+                }
+                None => DrainOutcome::QueueDrained,
+            },
+            _ = retry_due => DrainOutcome::QueueDrained,
+        };
+        if outcome != DrainOutcome::VmExited
+            && !retry_parked_faults(ctx, async_uffd.get_ref(), state)?
+        {
+            return Ok(DrainOutcome::VmExited);
+        }
+        Ok(outcome)
+    }
+
+    /// Tally the outcomes reported so far; stale jobs wait in `stale` for the handler.
+    fn collect(&mut self) {
+        while let Ok(outcome) = self.results.try_recv() {
+            self.tally(outcome);
+        }
+    }
+
+    fn tally(&mut self, outcome: ReplayOutcome) {
+        match outcome {
+            ReplayOutcome::Done { populated } => self.populated += populated as u64,
+            ReplayOutcome::Refused { populated } => {
+                self.populated += populated as u64;
+                self.refused += 1;
+            }
+            ReplayOutcome::Stale { populated, rest } => {
+                self.populated += populated as u64;
+                self.requeued += 1;
+                if !rest.runs.is_empty() {
+                    self.stale.push(rest);
+                }
+            }
+            ReplayOutcome::VmGone => self.vm_gone = true,
+        }
+    }
+
+    /// Close the queue, take every outcome while still serving demand faults, and join the
+    /// threads. The runs of a job that came back stale meanwhile are left to demand paging,
+    /// as a refused copy's are: replay is a hint. The runs still pending are submitted first,
+    /// unless the clone is gone.
+    async fn finish(
+        mut self,
+        ctx: &VmContext<'_>,
+        async_uffd: &AsyncFd<Uffd>,
+        state: &mut VmState,
+    ) -> Result<ReplayWorkersTally> {
+        if !self.vm_gone {
+            self.flush(ctx, async_uffd, state).await?;
+        }
+        self.jobs.take();
+        loop {
+            let retry_due = parked_retry_due(state);
+            tokio::select! {
+                biased;
+                readable = async_uffd.readable() => {
+                    let mut guard = readable.context("waiting for UFFD readability")?;
+                    match drain_events(guard.get_inner(), ctx, state)? {
+                        DrainOutcome::VmExited => self.vm_gone = true,
+                        DrainOutcome::QueueDrained => guard.clear_ready(),
+                        DrainOutcome::BatchFull => {}
+                    }
+                }
+                outcome = self.results.recv() => match outcome {
+                    Some(outcome) => self.tally(outcome),
+                    None => break,
+                },
+                _ = retry_due => {}
+            }
+            if !self.vm_gone && !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
+                self.vm_gone = true;
+            }
+        }
+        // Every worker has dropped its outcome sender by now, so each is at its exit and the
+        // joins return at once. They run here, not on a spawned blocking task: the handles
+        // stay owned until the join ends, so a cancellation cannot leave a worker running
+        // past the snapshot mapping it copies from.
+        let joined = self
+            .handles
+            .drain(..)
+            .map(|handle| handle.join().is_err())
+            .filter(|panicked| *panicked)
+            .count();
+        if joined > 0 {
+            warn!(
+                target: "uffd",
+                vm_id = %ctx.vm_id,
+                panicked = joined,
+                "replay worker thread(s) panicked; their jobs fault on demand"
+            );
+        }
+        let stale = self.stale.len() as u64;
+        Ok(ReplayWorkersTally {
+            dispatched: self.dispatched,
+            runs: self.runs,
+            populated: self.populated,
+            refused: self.refused + stale,
+            requeued: self.requeued,
+            vm_gone: self.vm_gone,
+        })
+    }
+
+    /// Plan `[file_offset, file_offset + len)` of the snapshot at `host_addr` onto the pending
+    /// job: the pages the guest has given back are left out, the rest is cut into runs of at
+    /// most one chunk, and the job is submitted once it is full. `Ok(false)` says the pool is
+    /// gone and the caller copies the run itself.
+    async fn dispatch_run(
+        &mut self,
+        ctx: &VmContext<'_>,
+        async_uffd: &AsyncFd<Uffd>,
+        state: &mut VmState,
+        host_addr: usize,
+        file_offset: u64,
+        len: usize,
+    ) -> Result<bool> {
+        // The generation these runs are planned under, read before the split and kept across
+        // the flushes between them: a flush that waits for room can read a REMOVE, and the
+        // pieces still to come were split against the given-back pages before it, so the
+        // flush that submits them must find them stale and plan them again.
+        let planned = ctx.gate.generation();
+        if self.pending.is_empty() {
+            self.pending_generation = planned;
+        }
+        let mut plain = PlainRuns::new(host_addr, file_offset, len);
+        while let Some(run) = plain.next(&state.removed, ctx.page_size) {
+            self.pending_bytes += run.len;
+            self.pending.push(run);
+            if self.pending.len() >= Self::RUNS_PER_JOB
+                || self.pending_bytes >= prefetch::CHUNK_BYTES
+            {
+                if !self.flush(ctx, async_uffd, state).await? {
+                    return Ok(false);
+                }
+                if self.vm_gone {
+                    return Ok(true);
+                }
+                self.pending_generation = planned;
+            }
+        }
+        Ok(true)
+    }
+
+    /// Submit the pending job, waiting for room while serving demand faults. A job the
+    /// handler still holds when the gate's generation moves (a REMOVE was read while it
+    /// waited, or while its runs were planned) is planned again against the given-back pages,
+    /// never re-stamped. `Ok(false)` says the pool is gone.
+    async fn flush(
+        &mut self,
+        ctx: &VmContext<'_>,
+        async_uffd: &AsyncFd<Uffd>,
+        state: &mut VmState,
+    ) -> Result<bool> {
+        if self.pending.is_empty() {
+            return Ok(true);
+        }
+        let mut job = ReplayJob {
+            runs: std::mem::replace(&mut self.pending, Vec::with_capacity(Self::RUNS_PER_JOB)),
+            generation: self.pending_generation,
+        };
+        self.pending_bytes = 0;
+        loop {
+            if job.generation != ctx.gate.generation() {
+                // A REMOVE was read since these runs were planned: they are planned again.
+                job = split_job_against_removed(ctx, &state.removed, job);
+                if job.runs.is_empty() {
+                    return Ok(true);
+                }
+            }
+            match self.try_submit(job) {
+                Ok(()) => return Ok(true),
+                Err(std::sync::mpsc::TrySendError::Full(returned)) => {
+                    job = returned;
+                    if self.wait_for_room(ctx, async_uffd, state).await? == DrainOutcome::VmExited {
+                        self.vm_gone = true;
+                        return Ok(true);
+                    }
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Ok(false),
+            }
+        }
+    }
+
+    /// Re-plan the jobs that came back stale: each is split again against the given-back
+    /// pages and its plain runs are submitted under the current generation.
+    async fn replan_stale(
+        &mut self,
+        ctx: &VmContext<'_>,
+        async_uffd: &AsyncFd<Uffd>,
+        state: &mut VmState,
+    ) -> Result<()> {
+        let stale = std::mem::take(&mut self.stale);
+        for job in stale {
+            for run in job.runs {
+                if !self
+                    .dispatch_run(
+                        ctx,
+                        async_uffd,
+                        state,
+                        run.host_addr,
+                        run.file_offset,
+                        run.len,
+                    )
+                    .await?
+                {
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Resolves when the next round of parked-fault retries is due, never while nothing is
+/// parked. The handler's waits select on it so a parked fault is retried on time.
+fn parked_retry_due(state: &VmState) -> impl std::future::Future<Output = ()> {
+    let pause = (!state.parked_faults.is_empty()).then(|| state.parked_faults.retry_pause());
+    async move {
+        match pause {
+            Some(pause) => pause.wait().await,
+            None => std::future::pending::<()>().await,
+        }
+    }
+}
+
+impl Drop for ReplayWorkers {
+    /// The backstop for a path that did not finish: stop the workers, close the queue and join
+    /// the threads, so no worker outlives the snapshot mapping it copies from. Closing the
+    /// queue alone would leave the jobs it holds to be copied, each waiting MAX_PARKED_WAIT
+    /// for a copy a REMOVE nobody reads now refuses, so the stop flag discards them: the join
+    /// waits for at most one copy per worker.
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        self.jobs.take();
+        for handle in self.handles.drain(..) {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// One worker's loop: take a job, copy its runs under the gate, each after a check of the
+/// generation they were planned under, report.
+#[allow(clippy::too_many_arguments)]
+fn replay_worker(
+    uffd: &Uffd,
+    slice: SnapshotSlice,
+    page_size: usize,
+    vm_id: &str,
+    gate: &ReplayGate,
+    jobs: &std::sync::Mutex<std::sync::mpsc::Receiver<ReplayJob>>,
+    room: &tokio::sync::Notify,
+    stop: &std::sync::atomic::AtomicBool,
+    results: &tokio::sync::mpsc::UnboundedSender<ReplayOutcome>,
+) {
+    // SAFETY: see `SnapshotSlice`.
+    let snapshot = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
+    let source = prefetch::Source::Copy(snapshot);
+    loop {
+        let job = match jobs.lock() {
+            Ok(rx) => rx.recv(),
+            Err(_) => break,
+        };
+        let Ok(job) = job else { break };
+        if stop.load(Ordering::Acquire) {
+            break;
+        }
+        room.notify_one();
+        let mut populated = 0usize;
+        let mut outcome = ReplayOutcome::Done { populated: 0 };
+        let mut index = 0usize;
+        'runs: while index < job.runs.len() {
+            let run = job.runs[index];
+            let segment = run.segment();
+            let mut done = 0usize;
+            let mut refused_since: Option<std::time::Instant> = None;
+            while done < run.len {
+                // The pool is being dropped: no further copy, refused retries included.
+                if stop.load(Ordering::Acquire) {
+                    outcome = ReplayOutcome::Refused { populated };
+                    break 'runs;
+                }
+                // Held from the check through the copy: the handler reads no event meanwhile,
+                // so a REMOVE cannot be read between the two ([`ReplayGate`]).
+                let copying = gate.copying();
+                // Planned before a REMOVE the handler has since read: the rest of the job
+                // may hold pages the guest gave back. The handler re-plans it.
+                if job.generation != gate.generation() {
+                    drop(copying);
+                    outcome = stale_from(&job, index, done, populated);
+                    break 'runs;
+                }
+                let copied = prefetch::populate_chunk_counted(
+                    uffd, &source, &segment, done, page_size, vm_id,
+                );
+                drop(copying);
+                match copied {
+                    Ok(progress) => {
+                        done += progress.advanced;
+                        populated += progress.populated;
+                        refused_since = None;
+                    }
+                    Err(prefetch::Stop::VmGone) => {
+                        outcome = ReplayOutcome::VmGone;
+                        break 'runs;
+                    }
+                    Err(prefetch::Stop::Refused) => {
+                        // A zero-progress EAGAIN: a REMOVE is queued and unread. Once the
+                        // handler reads it, either the generation moves and this job is stale,
+                        // or the job was planned after the read and the refusal clears when the
+                        // balloon's thread finishes a moment later. So the copy is retried, a
+                        // millisecond apart, until it lands or the generation moves; a refusal
+                        // nothing clears within MAX_PARKED_WAIT leaves the rest of the job to
+                        // demand paging.
+                        let refused_at = *refused_since.get_or_insert_with(std::time::Instant::now);
+                        if refused_at.elapsed() >= MAX_PARKED_WAIT {
+                            outcome = ReplayOutcome::Refused { populated };
+                            break 'runs;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+            }
+            index += 1;
+            outcome = ReplayOutcome::Done { populated };
+        }
+        let gone = matches!(outcome, ReplayOutcome::VmGone);
+        if results.send(outcome).is_err() || gone {
+            break;
+        }
+    }
+}
+
+/// The stale outcome for a job whose run `index` was copied up to `done` bytes: the rest of
+/// that run and every run after it go back to the handler.
+fn stale_from(job: &ReplayJob, index: usize, done: usize, populated: usize) -> ReplayOutcome {
+    let mut rest = Vec::with_capacity(job.runs.len() - index);
+    let current = job.runs[index];
+    if done < current.len {
+        rest.push(ReplayRun {
+            host_addr: current.host_addr.saturating_add(done),
+            file_offset: current.file_offset.saturating_add(done as u64),
+            len: current.len - done,
+        });
+    }
+    rest.extend_from_slice(&job.runs[index + 1..]);
+    ReplayOutcome::Stale {
+        populated,
+        rest: ReplayJob {
+            runs: rest,
+            generation: job.generation,
+        },
+    }
+}
+
+/// What the replay workers did, once joined.
+#[derive(Debug, Default, Clone, Copy)]
+struct ReplayWorkersTally {
+    dispatched: u64,
+    runs: u64,
+    populated: u64,
+    refused: u64,
+    requeued: u64,
+    vm_gone: bool,
+}
+
 /// How a working-set replay ended.
 #[derive(Debug, PartialEq, Eq)]
 enum Replay {
@@ -2589,6 +3363,240 @@ async fn replay_working_set(
     recorded: &PageSet,
     state: &mut VmState,
 ) -> Result<Replay> {
+    // The copies of plain runs go to the worker threads when the clone has them. A pool that
+    // cannot be started is logged and the handler copies alone, as every other replay
+    // failure degrades to demand paging. The workers are finished, which joins them, whatever
+    // the loop returns: a worker must not outlive the snapshot mapping it copies from.
+    let mut workers = match ctx.replay_workers() {
+        Some((count, mmap)) => {
+            match ReplayWorkers::spawn(
+                count,
+                async_uffd.get_ref(),
+                mmap,
+                ctx.page_size,
+                ctx.vm_id,
+                ctx.gate,
+            ) {
+                Ok(workers) => Some(workers),
+                Err(error) => {
+                    warn!(target: "uffd", vm_id = %ctx.vm_id, %error, "replay workers could not start; the handler copies alone");
+                    None
+                }
+            }
+        }
+        None => None,
+    };
+    let ran = replay_segments(ctx, async_uffd, recorded, state, &mut workers).await;
+    // A replay error enters the fail-closed path, which kills the VMM: the workers are
+    // dropped, which closes the queue and joins them, with no flush and no wait for outcomes
+    // ahead of the kill. The normal path finishes them.
+    let tally = match workers.take() {
+        Some(workers) if ran.is_ok() => workers.finish(ctx, async_uffd, state).await?,
+        Some(workers) => {
+            drop(workers);
+            ReplayWorkersTally::default()
+        }
+        None => ReplayWorkersTally::default(),
+    };
+    let mut ran = ran?;
+    if tally.vm_gone {
+        return Ok(Replay::Exited);
+    }
+    ran.refused += tally.refused;
+    ran.bytes += tally.populated;
+    info!(
+        target: "uffd",
+        vm_id = %ctx.vm_id,
+        prefetched_pages = ran.bytes / ctx.page_size as u64,
+        prefetched_mib = ran.bytes / (1024 * 1024),
+        segments = ran.segments,
+        refused_segments = ran.refused,
+        replay_threads = ctx.replay_workers().map_or(1, |(count, _)| count),
+        worker_jobs = tally.dispatched,
+        worker_runs = tally.runs,
+        worker_populated_mib = tally.populated / (1024 * 1024),
+        worker_jobs_replanned = tally.requeued,
+        filled_holes_mapped = ran.filled_holes_mapped,
+        hole_skipped_mib = ran.hole_skipped / (1024 * 1024),
+        hole_zero_filled_pages = ran.hole_zero_filled,
+        hole_map_at_start = ran.hole_map_at_start,
+        hole_queries_failed = ran.hole_queries_failed,
+        yields = ran.yields,
+        prefetch_ms = ran.started.elapsed().as_millis(),
+        demand_faults_during_replay = state.fault_count,
+        "replayed recorded working set"
+    );
+    Ok(if ran.exited {
+        Replay::Exited
+    } else {
+        Replay::Finished {
+            refused_segments: ran.refused,
+            filled_holes_mapped: ran.filled_holes_mapped,
+        }
+    })
+}
+
+/// What one pass over the plan did, for [`replay_working_set`] to log once the workers are
+/// finished.
+struct ReplayedSegments {
+    exited: bool,
+    started: std::time::Instant,
+    bytes: u64,
+    segments: u64,
+    refused: u64,
+    filled_holes_mapped: u64,
+    hole_skipped: u64,
+    hole_zero_filled: u64,
+    hole_queries_failed: u64,
+    yields: u64,
+    hole_map_at_start: &'static str,
+}
+
+/// A cursor over the plain runs of `[file_offset, file_offset + len)`: the pages the guest has
+/// given back are left out, and each run is at most [`ReplayWorkers::COPY_BYTES`], or one page
+/// where the page is larger ([`Self::piece_cap`]). It plans
+/// one run per call and holds five words, whatever the range: a dense 128 GiB set would be
+/// 2 M runs of 64 KiB, and a planned list of them 48 MiB in the fault server. It asks for the
+/// given-back pages at each call rather than borrowing them, so the caller can read events,
+/// which may record a REMOVE, between two runs; a run planned after that read is planned
+/// against the pages it gave back.
+struct PlainRuns {
+    at: usize,
+    host: usize,
+    left: usize,
+    /// The plain stretch the cursor is inside, and how far into it the next run starts.
+    stretch: usize,
+    stretch_at: usize,
+}
+
+impl PlainRuns {
+    fn new(host_addr: usize, file_offset: u64, len: usize) -> Self {
+        Self {
+            at: usize::try_from(file_offset).unwrap_or(usize::MAX),
+            host: host_addr,
+            left: len,
+            stretch: 0,
+            stretch_at: 0,
+        }
+    }
+
+    /// The most a piece holds: [`ReplayWorkers::COPY_BYTES`], or one page on pages larger than
+    /// that, because `UFFDIO_COPY` refuses a destination or a length that is not a whole
+    /// number of the registered page (EINVAL), and a refused piece is retried for
+    /// MAX_PARKED_WAIT and then left to demand paging.
+    fn piece_cap(page_size: usize) -> usize {
+        ReplayWorkers::COPY_BYTES.max(page_size)
+    }
+
+    fn next(&mut self, removed: &RemovedPages, page_size: usize) -> Option<ReplayRun> {
+        loop {
+            if self.stretch_at < self.stretch {
+                let piece = (self.stretch - self.stretch_at).min(Self::piece_cap(page_size));
+                let run = ReplayRun {
+                    host_addr: self.host.saturating_add(self.stretch_at),
+                    file_offset: self.at.saturating_add(self.stretch_at) as u64,
+                    len: piece,
+                };
+                self.stretch_at += piece;
+                return Some(run);
+            }
+            // The stretch is done: move past it and look at the next one.
+            self.at = self.at.saturating_add(self.stretch);
+            self.host = self.host.saturating_add(self.stretch);
+            self.left -= self.stretch;
+            self.stretch = 0;
+            self.stretch_at = 0;
+            if self.left == 0 {
+                return None;
+            }
+            let (given_back, run) = removed.run_at(self.at, self.left, page_size);
+            let run = run.clamp(page_size.min(self.left), self.left);
+            if given_back {
+                self.at = self.at.saturating_add(run);
+                self.host = self.host.saturating_add(run);
+                self.left -= run;
+            } else {
+                self.stretch = run;
+            }
+        }
+    }
+}
+
+/// Test only: every run the cursor yields for a range.
+#[cfg(test)]
+fn plain_runs_collected(
+    ctx: &VmContext<'_>,
+    removed: &RemovedPages,
+    host_addr: usize,
+    file_offset: u64,
+    len: usize,
+) -> Vec<ReplayRun> {
+    let mut plain = PlainRuns::new(host_addr, file_offset, len);
+    let mut runs = Vec::new();
+    while let Some(run) = plain.next(removed, ctx.page_size) {
+        runs.push(run);
+    }
+    runs
+}
+
+/// `job` planned again: every run split against the given-back pages, under the current
+/// generation.
+fn split_job_against_removed(
+    ctx: &VmContext<'_>,
+    removed: &RemovedPages,
+    job: ReplayJob,
+) -> ReplayJob {
+    let mut runs = Vec::with_capacity(job.runs.len());
+    for run in job.runs {
+        let mut plain = PlainRuns::new(run.host_addr, run.file_offset, run.len);
+        while let Some(piece) = plain.next(removed, ctx.page_size) {
+            runs.push(piece);
+        }
+    }
+    ReplayJob {
+        runs,
+        generation: ctx.gate.generation(),
+    }
+}
+
+/// [`drain_events`] when the userfaultfd is readable, nothing otherwise: the replay loop asks
+/// before every chunk it plans, and with workers copying, a drain that finds nothing would
+/// still stop them at the gate for the length of a read. One `poll` syscall answers instead.
+fn drain_if_readable(
+    uffd: &Uffd,
+    ctx: &VmContext<'_>,
+    state: &mut VmState,
+) -> Result<DrainOutcome> {
+    let mut readiness = libc::pollfd {
+        fd: uffd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one initialised pollfd on a userfaultfd this handler owns; a zero timeout.
+    let ready = unsafe { libc::poll(&mut readiness, 1, 0) };
+    if ready < 0 {
+        let error = std::io::Error::last_os_error();
+        if error.kind() == std::io::ErrorKind::Interrupted {
+            return Ok(DrainOutcome::QueueDrained);
+        }
+        return Err(error).context("polling the userfaultfd before a replay chunk");
+    }
+    if ready == 0 {
+        return Ok(DrainOutcome::QueueDrained);
+    }
+    drain_events(uffd, ctx, state)
+}
+
+/// The replay loop: plan the recorded set, step over what must not be copied, hand plain
+/// runs to `workers` when there are any, copy the rest here, and drain demand faults before
+/// every populate call.
+async fn replay_segments(
+    ctx: &VmContext<'_>,
+    async_uffd: &AsyncFd<Uffd>,
+    recorded: &PageSet,
+    state: &mut VmState,
+    workers: &mut Option<ReplayWorkers>,
+) -> Result<ReplayedSegments> {
     let regions: Vec<prefetch::Region> = ctx
         .mappings
         .iter()
@@ -2627,12 +3635,40 @@ async fn replay_working_set(
         segments += 1;
         let mut done = 0usize;
         'chunk: while done < segment.len {
-            for step in replay_steps_after_drain(drain_events(async_uffd.get_ref(), ctx, state)?) {
+            for step in
+                replay_steps_after_drain(drain_if_readable(async_uffd.get_ref(), ctx, state)?)
+            {
                 match step {
-                    ReplayStep::VmExited => return Ok(Replay::Exited),
+                    ReplayStep::VmExited => {
+                        return Ok(ReplayedSegments {
+                            exited: true,
+                            started,
+                            bytes,
+                            segments,
+                            refused,
+                            filled_holes_mapped,
+                            hole_skipped,
+                            hole_zero_filled,
+                            hole_queries_failed,
+                            yields,
+                            hole_map_at_start,
+                        })
+                    }
                     ReplayStep::RetryPending => {
                         if !retry_parked_faults(ctx, async_uffd.get_ref(), state)? {
-                            return Ok(Replay::Exited);
+                            return Ok(ReplayedSegments {
+                                exited: true,
+                                started,
+                                bytes,
+                                segments,
+                                refused,
+                                filled_holes_mapped,
+                                hole_skipped,
+                                hole_zero_filled,
+                                hole_queries_failed,
+                                yields,
+                                hole_map_at_start,
+                            });
                         }
                     }
                     ReplayStep::Populate => {}
@@ -2724,20 +3760,78 @@ async fn replay_working_set(
                     (source, wanted, done)
                 }
             };
-            match prefetch::populate_chunk_counted(
-                async_uffd.get_ref(),
-                &from,
-                &wanted,
-                done_in_wanted,
-                ctx.page_size,
-                ctx.vm_id,
-            ) {
+            // A plain run of the snapshot goes to the replay workers when the clone has them,
+            // after any stale job of theirs is re-planned; the handler copies zeros, holes and
+            // everything else itself. A dispatched run counts as advanced here and as populated
+            // when its workers report.
+            let dispatched = workers.is_some() && zeros.is_none();
+            let outcome = match (workers.as_mut(), zeros.is_none()) {
+                (Some(pool), true) => {
+                    pool.collect();
+                    pool.replan_stale(ctx, async_uffd, state).await?;
+                    if pool
+                        .dispatch_run(
+                            ctx,
+                            async_uffd,
+                            state,
+                            wanted.host_addr.saturating_add(done_in_wanted),
+                            wanted.file_offset.saturating_add(done_in_wanted as u64),
+                            wanted.len - done_in_wanted,
+                        )
+                        .await?
+                    {
+                        if pool.vm_gone {
+                            return Ok(ReplayedSegments {
+                                exited: true,
+                                started,
+                                bytes,
+                                segments,
+                                refused,
+                                filled_holes_mapped,
+                                hole_skipped,
+                                hole_zero_filled,
+                                hole_queries_failed,
+                                yields,
+                                hole_map_at_start,
+                            });
+                        }
+                        Ok(prefetch::Progress {
+                            advanced: wanted.len - done_in_wanted,
+                            populated: 0,
+                        })
+                    } else {
+                        // Every worker has exited: the handler copies from here on.
+                        warn!(target: "uffd", vm_id = %ctx.vm_id, "replay workers are gone; the handler copies alone");
+                        *workers = None;
+                        prefetch::populate_chunk_counted(
+                            async_uffd.get_ref(),
+                            &from,
+                            &wanted,
+                            done_in_wanted,
+                            ctx.page_size,
+                            ctx.vm_id,
+                        )
+                    }
+                }
+                _ => prefetch::populate_chunk_counted(
+                    async_uffd.get_ref(),
+                    &from,
+                    &wanted,
+                    done_in_wanted,
+                    ctx.page_size,
+                    ctx.vm_id,
+                ),
+            };
+            match outcome {
                 Ok(prefetch::Progress {
                     advanced: progress,
                     populated,
                 }) => {
                     done += progress;
-                    bytes += progress as u64;
+                    // A dispatched run is counted when its worker reports it populated.
+                    if !dispatched {
+                        bytes += progress as u64;
+                    }
                     if filled {
                         filled_holes_mapped += (populated / ctx.page_size) as u64;
                     }
@@ -2749,7 +3843,21 @@ async fn replay_working_set(
                         tokio::task::yield_now().await;
                     }
                 }
-                Err(prefetch::Stop::VmGone) => return Ok(Replay::Exited),
+                Err(prefetch::Stop::VmGone) => {
+                    return Ok(ReplayedSegments {
+                        exited: true,
+                        started,
+                        bytes,
+                        segments,
+                        refused,
+                        filled_holes_mapped,
+                        hole_skipped,
+                        hole_zero_filled,
+                        hole_queries_failed,
+                        yields,
+                        hole_map_at_start,
+                    })
+                }
                 Err(prefetch::Stop::Refused) => {
                     refused += 1;
                     if pacer.populated(0) {
@@ -2762,26 +3870,18 @@ async fn replay_working_set(
         }
     }
 
-    info!(
-        target: "uffd",
-        vm_id = %ctx.vm_id,
-        prefetched_pages = bytes / ctx.page_size as u64,
-        prefetched_mib = bytes / (1024 * 1024),
+    Ok(ReplayedSegments {
+        exited: false,
+        started,
+        bytes,
         segments,
-        refused_segments = refused,
+        refused,
         filled_holes_mapped,
-        hole_skipped_mib = hole_skipped / (1024 * 1024),
-        hole_zero_filled_pages = hole_zero_filled,
-        hole_map_at_start,
+        hole_skipped,
+        hole_zero_filled,
         hole_queries_failed,
         yields,
-        prefetch_ms = started.elapsed().as_millis(),
-        demand_faults_during_replay = state.fault_count,
-        "replayed recorded working set"
-    );
-    Ok(Replay::Finished {
-        refused_segments: refused,
-        filled_holes_mapped,
+        hole_map_at_start,
     })
 }
 
@@ -3155,6 +4255,9 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
             if handled >= MAX_EVENTS_PER_BATCH {
                 return Ok(DrainOutcome::BatchFull);
             }
+            // Held across the read, and across the recording of a REMOVE: no replay worker
+            // is between its check and its copy while a REMOVE is read ([`ReplayGate`]).
+            let mut gate = Some(ctx.gate.reading());
             let event = match uffd.read_event() {
                 Ok(Some(event)) => event,
                 Ok(None) => break, // No more events ready
@@ -3172,6 +4275,7 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
 
             match event {
                 Event::Pagefault { addr, kind, rw, .. } => {
+                    gate.take();
                     state.fault_count += 1;
                     let write = matches!(rw, ReadWrite::Write);
 
@@ -3376,6 +4480,8 @@ fn drain_events(uffd: &Uffd, ctx: &VmContext<'_>, state: &mut VmState) -> Result
                     // moment later. The guest's next touch of a page in the range is a
                     // fault on a remembered granule, answered with zeros.
                     let bytes = remember_removed(ctx, &mut state.removed, start_addr, end_addr);
+                    ctx.gate.removed();
+                    gate.take();
                     state.given_back.events += 1;
                     state.given_back.bytes += bytes as u64;
                     debug!(
@@ -4606,6 +5712,7 @@ mod tests {
                     prefetch,
                     record_window: DEFAULT_PREFETCH_RECORD_WINDOW,
                     fault_around: FaultAround::OFF,
+                    replay_threads: ReplayThreads::ONE,
                     nv2: false,
                 },
             )
@@ -5272,6 +6379,7 @@ mod tests {
                 page_size: Self::PAGE,
                 page_mask: !(Self::PAGE - 1),
                 mem_size: self.mem_size,
+                gate: test_gate(),
             }
         }
 
@@ -5813,6 +6921,7 @@ mod tests {
         let source = Arc::new(PageSource::Copy {
             mmap,
             fault_around: 0,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2: false,
         });
@@ -5904,6 +7013,7 @@ mod tests {
         let source = Arc::new(PageSource::Copy {
             mmap,
             fault_around: 0,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2: false,
         });
@@ -6381,6 +7491,7 @@ mod tests {
                 source: PageSource::Copy {
                     mmap,
                     fault_around: 0,
+                    replay_threads: 1,
                     holes: FileHoles::default(),
                     nv2: false,
                 },
@@ -6406,6 +7517,7 @@ mod tests {
                 page_size: Self::PAGE,
                 page_mask: !(Self::PAGE - 1),
                 mem_size: self.mem_size,
+                gate: test_gate(),
             }
         }
 
@@ -6882,18 +7994,19 @@ mod tests {
         );
     }
 
-    /// The replay loop drains before every populate call and yields only when the pacer ends a
-    /// batch. A loop that made the drain conditional would let a fault wait behind a whole
-    /// batch, and one that yielded after every populate call again would pass every behavioural
-    /// test while replay time followed the run count.
+    /// The replay loop drains before every populate call (through [`drain_if_readable`], whose
+    /// poll is what finds an empty queue) and yields only when the pacer ends a batch. A loop
+    /// that made the drain conditional would let a fault wait behind a whole batch, and one
+    /// that yielded after every populate call again would pass every behavioural test while
+    /// replay time followed the run count.
     #[test]
     fn replay_loop_drains_before_every_populate_and_yields_by_batch() {
         let source = include_str!("server.rs");
         let start = source
-            .find("async fn replay_working_set")
-            .expect("replay_working_set was renamed without updating this test");
+            .find("async fn replay_segments")
+            .expect("replay_segments was renamed without updating this test");
         let body = &source[start..];
-        let body = &body[..body.find("\n}\n").expect("replay_working_set ends")];
+        let body = &body[..body.find("\n}\n").expect("replay_segments ends")];
         let at = |needle: &str| {
             body.find(needle)
                 .unwrap_or_else(|| panic!("the replay loop lost `{needle}`"))
@@ -6905,13 +8018,18 @@ mod tests {
             "one pacer for the whole replay: a pacer per segment never ends a batch of small runs"
         );
         let chunk = at("'chunk: while done < segment.len {");
-        let drain = at("drain_events(");
+        let drain = at("drain_if_readable(");
         let populate = at("prefetch::populate_chunk_counted(");
         assert!(
             chunk < drain && drain < populate,
             "every populate call follows a drain"
         );
-        assert_eq!(count("drain_events("), 1);
+        assert_eq!(count("drain_if_readable("), 1);
+        assert_eq!(
+            count("drain_events("),
+            0,
+            "the replay loop drains through drain_if_readable"
+        );
         assert!(
             !body[chunk..drain].contains("if "),
             "nothing may gate the drain"
@@ -7017,6 +8135,7 @@ mod tests {
                     prefetch: Prefetch::Off,
                     record_window: Duration::ZERO,
                     fault_around: FaultAround::for_host_page(65536, 4096).unwrap(),
+                    replay_threads: ReplayThreads::ONE,
                     nv2: false,
                 },
             )
@@ -7125,6 +8244,7 @@ mod tests {
         let source = PageSource::Copy {
             mmap,
             fault_around: GRANULE,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2: false,
         };
@@ -7135,6 +8255,7 @@ mod tests {
             page_size,
             page_mask: !(page_size - 1),
             mem_size: 4096,
+            gate: test_gate(),
         };
         assert_eq!(
             ctx(4096).fault_around().map(|(granule, _)| granule),
@@ -7170,6 +8291,12 @@ mod tests {
     /// stretches of guard pages that are registered on the same userfaultfd and belong to no
     /// region, so a granule that escaped its region shows up as resident guard pages. Page
     /// `i` of the snapshot file is filled with the byte `i + 1`.
+    /// One gate for every test clone: nothing in the tests reads a REMOVE while a worker copies.
+    fn test_gate() -> &'static Arc<ReplayGate> {
+        static GATE: std::sync::OnceLock<Arc<ReplayGate>> = std::sync::OnceLock::new();
+        GATE.get_or_init(Default::default)
+    }
+
     struct FaultAroundClone {
         base: usize,
         guard_pages: usize,
@@ -7223,6 +8350,7 @@ mod tests {
                 source: PageSource::Copy {
                     mmap,
                     fault_around: granule_pages * Self::PAGE,
+                    replay_threads: 1,
                     holes: FileHoles::default(),
                     nv2: false,
                 },
@@ -7241,6 +8369,12 @@ mod tests {
         }
 
         fn ctx(&self) -> VmContext<'_> {
+            self.ctx_with_gate(test_gate())
+        }
+
+        /// [`Self::ctx`] on a gate of the test's own, for a test whose workers and REMOVE
+        /// reads must not meet another test's.
+        fn ctx_with_gate<'a>(&'a self, gate: &'a Arc<ReplayGate>) -> VmContext<'a> {
             VmContext {
                 vm_id: "fault-around-clone",
                 mappings: &self.mappings,
@@ -7248,6 +8382,7 @@ mod tests {
                 page_size: Self::PAGE,
                 page_mask: !(Self::PAGE - 1),
                 mem_size: self.file_pages * Self::PAGE,
+                gate,
             }
         }
 
@@ -7289,6 +8424,35 @@ mod tests {
             });
             wait_for_uffd_event(uffd, "the REMOVE event");
             balloon
+        }
+
+        /// [`Self::inflate`] for a queue that already holds events, where the userfaultfd
+        /// being readable proves nothing: returns once the balloon thread sleeps in the
+        /// kernel with its REMOVE queued.
+        fn inflate_queued(&self, region_page: usize) -> std::thread::JoinHandle<libc::c_int> {
+            let addr = self.region_addr(region_page);
+            let (tid_tx, tid_rx) = std::sync::mpsc::channel();
+            let balloon = std::thread::spawn(move || {
+                // SAFETY: gettid on the current thread.
+                tid_tx.send(unsafe { libc::gettid() }).ok();
+                // SAFETY: advising this test's own live mapping.
+                unsafe { libc::madvise(addr as *mut libc::c_void, Self::PAGE, libc::MADV_DONTNEED) }
+            });
+            let tid = tid_rx.recv().expect("the balloon thread reports its tid");
+            // The thread sleeps in `userfaultfd_event_wait_completion`; the name wchan shows
+            // for it differs between kernels, so any userfaultfd sleep counts.
+            let mut seen = std::collections::BTreeSet::new();
+            for _ in 0..5000 {
+                let wchan = std::fs::read_to_string(format!("/proc/self/task/{tid}/wchan"))
+                    .unwrap_or_default();
+                let wchan = wchan.trim().to_string();
+                if wchan.starts_with("userfaultfd") {
+                    return balloon;
+                }
+                seen.insert(wchan);
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            panic!("the balloon thread never slept with its REMOVE queued; wchan seen: {seen:?}");
         }
 
         fn resident_region_pages(&self) -> Vec<usize> {
@@ -7544,6 +8708,915 @@ mod tests {
             assert_eq!(clone.byte(7), 10, "file page 9");
             assert_eq!(state.fault_count, 0, "nothing faulted");
             assert_eq!(state.fault_around.granules, 0, "replay is not fault-around");
+        }
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// A job planned before a REMOVE was read is not copied after it: the worker finds the
+    /// job's generation stale and leaves the run to demand paging, where a fault on a
+    /// given-back page is answered with zeros. Without the check the worker copies the
+    /// snapshot's bytes into memory the guest gave back.
+    #[tokio::test]
+    async fn a_replay_job_planned_before_a_remove_is_not_copied_after_it() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) = FaultAroundClone::new(1, 0, 8);
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx();
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(2, async_uffd.get_ref(), mmap, PAGE, "stale-job", &gate)
+                .expect("spawning replay workers");
+        // The job names region page 3 (file page 3), planned under the current generation;
+        // then a REMOVE is recorded before any worker takes it.
+        let stale = ReplayJob {
+            runs: vec![ReplayRun {
+                host_addr: clone.region_addr(3),
+                file_offset: (3 * PAGE) as u64,
+                len: PAGE,
+            }],
+            generation: gate.generation(),
+        };
+        gate.removed();
+        workers.try_submit(stale).expect("room in an empty queue");
+        let tally = workers
+            .finish(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("finishing the workers");
+        assert_eq!(tally.dispatched, 1);
+        assert_eq!(
+            tally.requeued, 1,
+            "the worker must hand a job planned before the REMOVE back for re-planning"
+        );
+        // The worker copied nothing, and finish leaves the stale job's run to demand paging.
+        assert_eq!(
+            clone.resident_region_pages(),
+            Vec::<usize>::new(),
+            "a job planned before the REMOVE was copied after it"
+        );
+        assert_eq!(tally.populated, 0);
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// A job the dispatcher holds while the queue is full is planned again when a REMOVE is
+    /// read in the wait: the given-back page is left out, not re-stamped and copied. One
+    /// worker, a queued REMOVE on region page 7 that makes the worker's first copy wait for
+    /// the generation, four jobs filling the queue, then page 7 is dispatched: the wait for
+    /// room reads the REMOVE, and page 7 must not become resident.
+    #[tokio::test]
+    async fn a_job_held_while_a_remove_is_read_is_replanned_against_it() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "held-job", &gate)
+                .expect("spawning replay workers");
+        let balloon = clone.inflate(async_uffd.get_ref(), 7);
+        let job = |page: usize| ReplayJob {
+            runs: vec![ReplayRun {
+                host_addr: clone.region_addr(page),
+                file_offset: (page * PAGE) as u64,
+                len: PAGE,
+            }],
+            generation: gate.generation(),
+        };
+        // The worker takes page 0 and waits on its refused copy; pages 1 to 4 fill the queue.
+        for page in 0..=ReplayWorkers::QUEUE_PER_WORKER {
+            let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+            loop {
+                match workers.try_submit(job(page)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the worker never took its first job"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => panic!("no workers"),
+                }
+            }
+        }
+        assert!(
+            matches!(
+                workers.try_submit(job(5)),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ),
+            "the queue must be full before the held job is dispatched"
+        );
+        workers.collect();
+        assert_eq!(
+            workers.populated, 0,
+            "nothing is copied while the REMOVE is unread"
+        );
+        // Page 7 is planned onto the pending job, then flushed into the full queue.
+        let planned = workers
+            .dispatch_run(
+                &ctx,
+                &async_uffd,
+                &mut state,
+                clone.region_addr(7),
+                (7 * PAGE) as u64,
+                PAGE,
+            )
+            .await
+            .expect("planning the held job");
+        assert!(planned, "the pool is alive");
+        assert_eq!(
+            workers.pending.len(),
+            1,
+            "the held job is pending, not submitted"
+        );
+        let submitted = workers
+            .flush(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("flushing the held job");
+        assert!(submitted, "the pool is alive");
+        assert_eq!(
+            state.given_back.events, 1,
+            "the wait for room read the REMOVE"
+        );
+        balloon.join().expect("the balloon thread");
+        let tally = workers
+            .finish(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("finishing the workers");
+        // The five jobs planned before the REMOVE come back stale and finish leaves them to
+        // demand paging; the held job's page must not be resident.
+        assert_eq!(
+            clone.resident_region_pages(),
+            Vec::<usize>::new(),
+            "the held job was copied although its page was given back while it waited"
+        );
+        assert_eq!(
+            tally.dispatched,
+            (ReplayWorkers::QUEUE_PER_WORKER + 1) as u64
+        );
+        assert_eq!(tally.requeued, (ReplayWorkers::QUEUE_PER_WORKER + 1) as u64);
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// A demand fault the kernel refuses while a REMOVE is unread is parked, and the handler
+    /// retries it as soon as the REMOVE is read. While it waits for room in the workers'
+    /// queue the handler is still the one serving faults, so the retry happens inside the
+    /// wait, not when the wait ends: a vCPU asleep in a parked fault must not wait behind the
+    /// queued jobs. A reader faults on page 9, then a REMOVE on page 7 is queued behind the
+    /// fault, the queue fills behind a copy the REMOVE refuses, and the flush of a held job
+    /// waits for room: its drain parks the fault, reads the REMOVE and must retry the fault
+    /// before it returns.
+    #[tokio::test]
+    async fn a_fault_parked_while_the_handler_waits_for_room_is_retried_in_the_wait() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "parked-in-wait", &gate)
+                .expect("spawning replay workers");
+        // Two REMOVEs with the fault between them: the drain reads the first, then the
+        // fault, whose copy the kernel refuses while the second is unread, so the fault is
+        // parked; then the second. Each balloon thread sleeps with its event queued.
+        let balloon_a = clone.inflate_queued(7);
+        let reader = FaultingReader::spawn(clone.region_addr(9));
+        reader.wait_until_asleep();
+        let balloon_b = clone.inflate_queued(6);
+        let job = |page: usize| ReplayJob {
+            runs: vec![ReplayRun {
+                host_addr: clone.region_addr(page),
+                file_offset: (page * PAGE) as u64,
+                len: PAGE,
+            }],
+            generation: gate.generation(),
+        };
+        for page in 0..=ReplayWorkers::QUEUE_PER_WORKER {
+            let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+            loop {
+                match workers.try_submit(job(page)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the worker never took its first job"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => panic!("no workers"),
+                }
+            }
+        }
+        assert!(
+            matches!(
+                workers.try_submit(job(5)),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ),
+            "the queue must be full before the held job is flushed"
+        );
+        // Page 8 is held and flushed into the full queue: the wait for room drains.
+        let planned = workers
+            .dispatch_run(
+                &ctx,
+                &async_uffd,
+                &mut state,
+                clone.region_addr(8),
+                (8 * PAGE) as u64,
+                PAGE,
+            )
+            .await
+            .expect("planning the held job");
+        assert!(planned, "the pool is alive");
+        let submitted = workers
+            .flush(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("flushing the held job");
+        assert!(submitted, "the pool is alive");
+        assert_eq!(
+            state.given_back.events, 2,
+            "the wait for room read both REMOVEs"
+        );
+        assert!(state.fault_count >= 1, "the wait for room read the fault");
+        // The retry that resolves the fault happens inside the handler's waits (for room,
+        // then for the last outcomes), or not at all: nothing after `finish` retries it.
+        let tally = workers
+            .finish(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("finishing the workers");
+        let (got, _) = reader.finish(
+            "the fault parked in the wait for room was not retried inside the handler's waits",
+        );
+        assert_eq!(got, 10, "page 9 holds the snapshot's byte");
+        assert!(state.parked_faults.is_empty(), "nothing stays parked");
+        balloon_a.join().expect("the first balloon thread");
+        balloon_b.join().expect("the second balloon thread");
+        assert!(
+            clone.resident_region_pages().contains(&8),
+            "the held job was planned again and copied"
+        );
+        assert_eq!(tally.requeued, (ReplayWorkers::QUEUE_PER_WORKER + 1) as u64);
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// One long run is planned in pieces, and a flush between two of them can read a REMOVE
+    /// that covers a piece still to come. The pieces after the flush carry the generation the
+    /// run was planned under, so the flush that submits them plans them again and leaves the
+    /// given-back page out; stamping them with the generation read after the flush would send
+    /// the given-back page to a worker. The queue is filled behind a copy the queued REMOVE
+    /// refuses, then one run of 2,040 pages, 128 pieces and two jobs, is dispatched over the
+    /// REMOVE's page.
+    #[tokio::test]
+    async fn the_pieces_of_a_run_after_a_flush_that_read_a_remove_are_planned_again() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        const REGION_PAGES: usize = 2048;
+        const GIVEN_BACK: usize = 1500;
+        let (clone, uffd) = FaultAroundClone::with_features(
+            0,
+            0,
+            REGION_PAGES,
+            userfaultfd::FeatureFlags::EVENT_REMOVE,
+        );
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "long-run", &gate)
+                .expect("spawning replay workers");
+        let balloon = clone.inflate_queued(GIVEN_BACK);
+        let job = |page: usize| ReplayJob {
+            runs: vec![ReplayRun {
+                host_addr: clone.region_addr(page),
+                file_offset: (page * PAGE) as u64,
+                len: PAGE,
+            }],
+            generation: gate.generation(),
+        };
+        for page in 0..=ReplayWorkers::QUEUE_PER_WORKER {
+            let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+            loop {
+                match workers.try_submit(job(page)) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the worker never took its first job"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => panic!("no workers"),
+                }
+            }
+        }
+        assert!(
+            matches!(
+                workers.try_submit(job(5)),
+                Err(std::sync::mpsc::TrySendError::Full(_))
+            ),
+            "the queue must be full before the long run is dispatched"
+        );
+        // Pages 8 through 2047: the first job's flush waits for room and reads the REMOVE.
+        let planned = workers
+            .dispatch_run(
+                &ctx,
+                &async_uffd,
+                &mut state,
+                clone.region_addr(8),
+                (8 * PAGE) as u64,
+                (REGION_PAGES - 8) * PAGE,
+            )
+            .await
+            .expect("dispatching the long run");
+        assert!(planned, "the pool is alive");
+        assert_eq!(state.given_back.events, 1, "the flush read the REMOVE");
+        assert!(gate.generation() > 0);
+        balloon.join().expect("the balloon thread");
+        let tally = workers
+            .finish(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("finishing the workers");
+        let resident = clone.resident_region_pages();
+        assert!(
+            !resident.contains(&GIVEN_BACK),
+            "a piece planned before the REMOVE was read was copied over the given-back page"
+        );
+        assert!(
+            resident.contains(&(GIVEN_BACK - 1)) && resident.contains(&(GIVEN_BACK + 1)),
+            "the pieces around the given-back page were copied"
+        );
+        assert!(
+            resident.contains(&8) && resident.contains(&(REGION_PAGES - 1)),
+            "the run's ends were copied"
+        );
+        assert!(tally.dispatched >= 2, "the run took at least two jobs");
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// A copy the kernel refuses because a REMOVE is queued and unread is retried until the
+    /// refusal clears, not only until the generation moves: the read of that REMOVE lets the
+    /// balloon thread finish, which clears `mmap_changing` a moment later with no further
+    /// generation change, and a job planned after the read must still be copied. The REMOVE
+    /// is read here without the handler, so the generation never moves; the worker's copy must
+    /// land all the same, well inside MAX_PARKED_WAIT.
+    #[tokio::test]
+    async fn a_refused_copy_is_retried_until_the_remove_behind_it_clears() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "refused-retry", &gate)
+                .expect("spawning replay workers");
+        let balloon = clone.inflate_queued(7);
+        let started = std::time::Instant::now();
+        workers
+            .try_submit(ReplayJob {
+                runs: vec![ReplayRun {
+                    host_addr: clone.region_addr(8),
+                    file_offset: (8 * PAGE) as u64,
+                    len: PAGE,
+                }],
+                generation: gate.generation(),
+            })
+            .expect("room in an empty queue");
+        // The worker's copy is refused while the REMOVE is unread. Read it here, as a drain
+        // that recorded nothing would: the balloon thread finishes and the refusal clears.
+        std::thread::sleep(Duration::from_millis(20));
+        workers.collect();
+        assert_eq!(
+            workers.populated, 0,
+            "nothing is copied while the REMOVE is unread"
+        );
+        match async_uffd.get_ref().read_event() {
+            Ok(Some(userfaultfd::Event::Remove { .. })) => {}
+            other => panic!("expected the REMOVE event, read {other:?}"),
+        }
+        balloon.join().expect("the balloon thread");
+        let tally = workers
+            .finish(&ctx, &async_uffd, &mut state)
+            .await
+            .expect("finishing the workers");
+        let took = started.elapsed();
+        assert_eq!(
+            clone.resident_region_pages(),
+            vec![8],
+            "the refused copy was not retried once the REMOVE behind it was read"
+        );
+        assert_eq!(tally.refused, 0, "the job was not given up");
+        assert!(
+            took < MAX_PARKED_WAIT,
+            "the copy landed only after the worker's wait expired ({took:?})"
+        );
+        assert_eq!(gate.generation(), 0, "the generation never moved");
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// A hugetlb clone's page is 2 MiB, and `UFFDIO_COPY` takes a destination and a length
+    /// aligned to the registered page, so the cursor's pieces are at least one page: a 64 KiB
+    /// piece of a 2 MiB page would be refused with EINVAL, retried for MAX_PARKED_WAIT and
+    /// then left to demand paging, for every job of the clone.
+    #[test]
+    fn the_cursor_cuts_a_hugepage_run_at_the_page() {
+        const HUGE: usize = 2 * 1024 * 1024;
+        let (clone, uffd) = FaultAroundClone::new(0, 0, 4);
+        let ctx = clone.ctx();
+        // Six hugepages, none given back: six pieces of one page each, not 192 of 64 KiB.
+        let mut plain = PlainRuns::new(0x1000_0000, 0, 6 * HUGE);
+        let mut pieces = Vec::new();
+        while let Some(run) = plain.next(&RemovedPages::default(), HUGE) {
+            pieces.push(run);
+        }
+        assert_eq!(
+            pieces.iter().map(|run| run.len).collect::<Vec<_>>(),
+            vec![HUGE; 6],
+            "a hugepage run is cut at the page, never inside it"
+        );
+        assert!(
+            pieces
+                .iter()
+                .all(|run| run.host_addr % HUGE == 0 && run.file_offset % HUGE as u64 == 0),
+            "every piece starts at a page"
+        );
+        // Small pages keep the 64 KiB cap.
+        let mut plain = PlainRuns::new(0, 0, 6 * HUGE);
+        let mut small = 0usize;
+        while let Some(run) = plain.next(&RemovedPages::default(), ctx.page_size) {
+            assert_eq!(run.len, ReplayWorkers::COPY_BYTES);
+            small += 1;
+        }
+        assert_eq!(small, 6 * HUGE / ReplayWorkers::COPY_BYTES);
+        drop(uffd);
+        clone.unmap();
+    }
+
+    /// The wait for room ends when the workers do. A worker that finds the VMM gone reports it
+    /// and exits, and with every worker gone nothing signals room again, a VMM that has exited
+    /// sends no event, and no fault is parked: a wait that watched only those never returned,
+    /// so the clone's task never ended. Here the queue is full and nothing takes from it, and
+    /// the outcome channel holds one VmGone before it closes, or closes empty.
+    #[tokio::test]
+    async fn the_wait_for_room_ends_when_the_workers_exit() {
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let gate = Arc::new(ReplayGate::default());
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        for gone in [true, false] {
+            let (jobs, queue) = std::sync::mpsc::sync_channel::<ReplayJob>(1);
+            jobs.try_send(ReplayJob {
+                runs: Vec::new(),
+                generation: 0,
+            })
+            .expect("filling the queue");
+            let (outcomes, results) = tokio::sync::mpsc::unbounded_channel();
+            if gone {
+                outcomes
+                    .send(ReplayOutcome::VmGone)
+                    .expect("reporting the VMM gone");
+            }
+            drop(outcomes);
+            let mut workers = ReplayWorkers {
+                jobs: Some(jobs),
+                room: Arc::new(tokio::sync::Notify::new()),
+                results,
+                handles: Vec::new(),
+                pending: Vec::new(),
+                pending_bytes: 0,
+                pending_generation: 0,
+                stale: Vec::new(),
+                dispatched: 0,
+                runs: 0,
+                populated: 0,
+                refused: 0,
+                requeued: 0,
+                vm_gone: false,
+                stop: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            let waited = tokio::time::timeout(
+                Duration::from_secs(5),
+                workers.wait_for_room(&ctx, &async_uffd, &mut state),
+            )
+            .await
+            .expect("the wait for room did not end after every worker exited")
+            .expect("waiting for room");
+            if gone {
+                assert_eq!(
+                    waited,
+                    DrainOutcome::VmExited,
+                    "a worker reported the VMM gone"
+                );
+                assert!(workers.vm_gone);
+            } else {
+                assert_ne!(
+                    waited,
+                    DrainOutcome::VmExited,
+                    "no worker reported the VMM gone"
+                );
+            }
+            drop(queue);
+        }
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// Dropping the pool discards the jobs it queued. On the error and cancellation paths the
+    /// handler drops the pool and joins the workers without reading events, so a queued REMOVE
+    /// stays unread and refuses every copy: a worker that drained the queue waited
+    /// MAX_PARKED_WAIT per job. One worker in a refused copy behind a queued REMOVE, four more
+    /// jobs queued behind it, then the drop: it must return well inside one MAX_PARKED_WAIT.
+    #[tokio::test]
+    async fn dropping_the_pool_discards_the_queued_jobs() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) =
+            FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
+        let gate = Arc::new(ReplayGate::default());
+        let mmap: &[u8] = match &clone.source {
+            PageSource::Copy { mmap, .. } => &mmap[..],
+            PageSource::Minor { .. } => unreachable!(),
+        };
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let ctx = clone.ctx_with_gate(&gate);
+        let mut state = clone.state();
+        let mut workers =
+            ReplayWorkers::spawn(1, async_uffd.get_ref(), mmap, PAGE, "drop-discards", &gate)
+                .expect("spawning replay workers");
+        let balloon = clone.inflate_queued(7);
+        for page in 0..=ReplayWorkers::QUEUE_PER_WORKER {
+            let deadline = std::time::Instant::now() + MAX_PARKED_WAIT / 2;
+            loop {
+                let job = ReplayJob {
+                    runs: vec![ReplayRun {
+                        host_addr: clone.region_addr(page),
+                        file_offset: (page * PAGE) as u64,
+                        len: PAGE,
+                    }],
+                    generation: gate.generation(),
+                };
+                match workers.try_submit(job) {
+                    Ok(()) => break,
+                    Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the worker never took its first job"
+                        );
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(std::sync::mpsc::TrySendError::Disconnected(_)) => panic!("no workers"),
+                }
+            }
+        }
+        let started = std::time::Instant::now();
+        drop(workers);
+        let took = started.elapsed();
+        drain_if_readable(async_uffd.get_ref(), &ctx, &mut state).expect("reading the REMOVE");
+        balloon.join().expect("the balloon thread");
+        assert!(
+            took < MAX_PARKED_WAIT / 2,
+            "dropping the pool took {took:?}: the workers copied the queued jobs instead of discarding them"
+        );
+        assert_eq!(
+            clone.resident_region_pages(),
+            Vec::<usize>::new(),
+            "no queued job was copied"
+        );
+        drop(async_uffd);
+        clone.unmap();
+    }
+
+    /// The gate keeps the handler's read apart from a worker's copy: `reading` waits for the
+    /// copy in flight, and a copy that arrives while the handler reads waits for the read.
+    #[test]
+    fn the_gate_keeps_a_read_apart_from_a_copy_in_flight() {
+        let gate = Arc::new(ReplayGate::default());
+        // A worker holds the gate across a copy; the handler's read must wait for it.
+        let (copying_tx, copying_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let worker = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let copying = gate.copying();
+                copying_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+                drop(copying);
+            })
+        };
+        copying_rx.recv().unwrap();
+        let (read_tx, read_rx) = std::sync::mpsc::channel();
+        let handler = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let reading = gate.reading();
+                read_tx.send(std::time::Instant::now()).unwrap();
+                std::thread::sleep(Duration::from_millis(50));
+                drop(reading);
+            })
+        };
+        assert!(
+            read_rx.recv_timeout(Duration::from_millis(200)).is_err(),
+            "the handler read while a copy was in flight"
+        );
+        let released = std::time::Instant::now();
+        release_tx.send(()).unwrap();
+        let read_at = read_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read proceeds once the copy is done");
+        assert!(
+            read_at >= released,
+            "the read came before the copy finished"
+        );
+        // While the handler reads, a worker's copy waits for the read to end.
+        let copy_at = {
+            let gate = Arc::clone(&gate);
+            std::thread::spawn(move || {
+                let copying = gate.copying();
+                let at = std::time::Instant::now();
+                drop(copying);
+                at
+            })
+        }
+        .join()
+        .unwrap();
+        assert!(
+            copy_at.duration_since(read_at) >= Duration::from_millis(50),
+            "a copy was made while the handler was reading"
+        );
+        worker.join().unwrap();
+        handler.join().unwrap();
+        assert_eq!(gate.copiers.load(Ordering::SeqCst), 0);
+        assert!(!gate.reading.load(Ordering::SeqCst));
+    }
+
+    /// The handler reads events under the gate and a worker copies under it: pinned at the
+    /// source, since the race the gate closes needs a preemption no test can schedule.
+    #[test]
+    fn events_are_read_and_runs_are_copied_under_the_gate() {
+        let source = include_str!("server.rs");
+        let drain = source
+            .find("fn drain_events(")
+            .expect("drain_events was renamed without updating this test");
+        let drain = &source[drain..];
+        let drain = &drain[..drain.find("\n}\n").expect("drain_events ends")];
+        let gate = drain
+            .find("ctx.gate.reading()")
+            .expect("drain_events takes the gate");
+        let read = drain
+            .find("uffd.read_event()")
+            .expect("drain_events reads events");
+        assert!(gate < read, "the gate is taken before the read");
+        let worker = source
+            .find("fn replay_worker(")
+            .expect("replay_worker was renamed without updating this test");
+        let worker = &source[worker..];
+        let worker = &worker[..worker.find("\n}\n").expect("replay_worker ends")];
+        let copying = worker
+            .find("gate.copying()")
+            .expect("the worker takes the gate");
+        let check = worker
+            .find("job.generation != gate.generation()")
+            .expect("the worker checks the generation");
+        let copy = worker
+            .find("populate_chunk_counted(")
+            .expect("the worker copies");
+        assert!(
+            copying < check && check < copy,
+            "the worker's gate hold must start before its generation check and span the copy"
+        );
+        let release = worker[copy..]
+            .find("drop(copying)")
+            .expect("the worker releases the gate after the copy");
+        assert!(
+            !worker[copy..copy + release].contains("gate.copying()"),
+            "the gate is held once per copy"
+        );
+        // The replay loop drains behind a poll, so an empty queue costs the workers nothing.
+        let segments = source
+            .find("async fn replay_segments(")
+            .expect("replay_segments was renamed without updating this test");
+        let segments = &source[segments..];
+        let segments = &segments[..segments.find("\n}\n").expect("replay_segments ends")];
+        assert!(
+            segments.contains("drain_if_readable(") && !segments.contains("drain_events("),
+            "the replay loop drains through drain_if_readable"
+        );
+    }
+
+    /// Replay joins its workers on every path out: the loop runs in `replay_segments`, and
+    /// `replay_working_set` finishes the workers whatever that returned, before it propagates
+    /// the result. A worker left behind would copy out of a snapshot mapping the server may
+    /// have dropped. The Drop backstop closes the queue and joins what is left.
+    #[test]
+    fn replay_finishes_its_workers_on_every_path() {
+        let source = include_str!("server.rs");
+        let start = source
+            .find("async fn replay_working_set")
+            .expect("replay_working_set was renamed without updating this test");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").expect("replay_working_set ends")];
+        let segments = body
+            .find("replay_segments(")
+            .expect("replay_working_set runs the loop through replay_segments");
+        let finish = body
+            .find(".finish(")
+            .expect("replay_working_set finishes its workers");
+        assert!(
+            segments < finish,
+            "the workers are finished after the loop ran"
+        );
+        let between = &body[segments..finish];
+        assert!(
+            !between.contains("return ") && !between.contains("?;"),
+            "nothing returns between running the loop and finishing the workers: {between}"
+        );
+        assert!(
+            source.contains("impl Drop for ReplayWorkers"),
+            "ReplayWorkers has no Drop backstop"
+        );
+        // A replay error goes to the fail-closed kill without finish's flush and outcome wait:
+        // the workers are dropped, which closes the queue and joins them.
+        assert!(
+            body.contains("if ran.is_ok()") && body.contains("drop(workers)"),
+            "a replay error must drop the workers instead of finishing them"
+        );
+        // The join holds the thread handles until it ends: a join through a spawned blocking
+        // task, with the handles moved out first, detaches on a cancellation at its await and
+        // leaves the Drop backstop nothing to join.
+        let finish = source
+            .find("    async fn finish(")
+            .expect("ReplayWorkers::finish was renamed without updating this test");
+        let finish = &source[finish..];
+        let finish = &finish[..finish.find("\n    }\n").expect("finish ends")];
+        assert!(
+            !finish.contains("spawn_blocking") && !finish.contains("mem::take(&mut self.handles)"),
+            "finish must join the workers without moving their handles out across an await"
+        );
+        // A job the handler holds across a wait is split again against the given-back pages
+        // when the generation moved, never re-stamped with the new generation.
+        let flush = source
+            .find("    async fn flush(")
+            .expect("ReplayWorkers::flush was renamed without updating this test");
+        let flush = &source[flush..];
+        let flush = &flush[..flush.find("\n    }\n").expect("flush ends")];
+        assert!(
+            !flush.contains(".generation = "),
+            "flush re-stamps a job instead of re-planning it"
+        );
+        assert!(
+            flush.contains("split_job_against_removed("),
+            "flush must plan the held job again after a generation change"
+        );
+        // The runs of one dispatch_run call carry the generation read before they were
+        // split, across every flush between them: a generation read after a flush would hide
+        // the REMOVE that flush drained from the pieces still to come.
+        let dispatch = source
+            .find("    async fn dispatch_run(")
+            .expect("ReplayWorkers::dispatch_run was renamed without updating this test");
+        let dispatch = &source[dispatch..];
+        let dispatch = &dispatch[..dispatch.find("\n    }\n").expect("dispatch_run ends")];
+        assert_eq!(
+            dispatch.matches("ctx.gate.generation()").count(),
+            1,
+            "dispatch_run reads the generation once"
+        );
+        // The runs are planned one at a time through the cursor, never collected: a dense
+        // 128 GiB set is 2 M runs of 64 KiB, and a list of them is 48 MiB in the fault server.
+        let cursor = dispatch
+            .find("PlainRuns::new(")
+            .expect("dispatch_run plans through the PlainRuns cursor");
+        assert!(
+            dispatch.find("ctx.gate.generation()").unwrap() < cursor,
+            "the generation is read before the runs are planned"
+        );
+        assert!(
+            !dispatch.contains("collect") && !dispatch.contains("Vec"),
+            "dispatch_run must not collect the runs of a range"
+        );
+    }
+
+    /// The splitter leaves out the pages the guest gave back, cuts the rest into chunks, and
+    /// stamps every piece with the gate's current generation.
+    #[test]
+    fn split_against_removed_leaves_out_given_back_pages_and_cuts_chunks() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        let (clone, uffd) = FaultAroundClone::new(1, 0, 8);
+        let ctx = clone.ctx();
+        let mut removed = RemovedPages::default();
+        // File pages 2 and 3 are given back.
+        remember_removed(
+            &ctx,
+            &mut removed,
+            clone.region_addr(2),
+            clone.region_addr(4),
+        );
+        ctx.gate.removed();
+        let collect = |removed: &RemovedPages, host: usize, offset: u64, len: usize| {
+            plain_runs_collected(&ctx, removed, host, offset, len)
+        };
+        let pieces = collect(&removed, clone.region_addr(0), 0, 8 * PAGE);
+        let spans: Vec<(u64, usize)> = pieces.iter().map(|p| (p.file_offset, p.len)).collect();
+        assert_eq!(
+            spans,
+            vec![(0, 2 * PAGE), ((4 * PAGE) as u64, 4 * PAGE)],
+            "the given-back pages must be left out and the rest kept whole"
+        );
+        // A long plain run is cut into copies of COPY_BYTES.
+        let big = collect(&RemovedPages::default(), 0, 0, 5 * prefetch::CHUNK_BYTES);
+        assert_eq!(
+            big.len(),
+            5 * prefetch::CHUNK_BYTES / ReplayWorkers::COPY_BYTES
+        );
+        assert!(big.iter().all(|p| p.len == ReplayWorkers::COPY_BYTES));
+        drop(uffd);
+        clone.unmap();
+    }
+
+    /// With `--uffd-replay-threads` above one, replay's copies run on the worker threads, and
+    /// the clone ends up with exactly the recorded pages, each with the snapshot's bytes. The
+    /// thread ids `populate_chunk_counted` saw are the evidence that the workers copied.
+    #[tokio::test]
+    async fn replay_copies_on_the_worker_threads_when_asked() {
+        const PAGE: usize = FaultAroundClone::PAGE;
+        // 2,048 single-page runs: 32 jobs of RUNS_PER_JOB, for 4 workers.
+        const REGION_PAGES: usize = 64 * ReplayWorkers::RUNS_PER_JOB;
+        let (mut clone, uffd) = FaultAroundClone::new(1, 0, REGION_PAGES);
+        if let PageSource::Copy { replay_threads, .. } = &mut clone.source {
+            *replay_threads = 4;
+        }
+        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let gate = Arc::new(ReplayGate::default());
+        {
+            let ctx = clone.ctx_with_gate(&gate);
+            assert_eq!(ctx.replay_workers().map(|(count, _)| count), Some(4));
+            let mut state = clone.state();
+            // Every other page of the region is recorded: single-page runs.
+            let mut recorded = PageSet::empty((clone.file_pages * PAGE) as u64);
+            for page in (0..REGION_PAGES).step_by(2) {
+                recorded.insert_range((page * PAGE) as u64, PAGE as u64);
+            }
+            prefetch::populate_threads_seen().clear();
+            let exited = replay_working_set(&ctx, &async_uffd, &recorded, &mut state)
+                .await
+                .expect("replay")
+                == Replay::Exited;
+            assert!(!exited, "the clone is alive");
+            assert_eq!(
+                clone.resident_region_pages(),
+                (0..REGION_PAGES).step_by(2).collect::<Vec<_>>(),
+                "replay populated other than the recorded pages"
+            );
+            for page in (0..REGION_PAGES).step_by(2) {
+                assert_eq!(clone.byte(page), (page + 1) as u8, "file page {page}");
+            }
+            // The record is process-wide; the ids of this clone's own workers, held on its
+            // gate, pick its copies out of it.
+            let seen = prefetch::populate_threads_seen().ids();
+            let workers = gate.worker_ids();
+            assert_eq!(workers.len(), 4, "the gate names this replay's workers");
+            let on_workers = seen.iter().filter(|id| workers.contains(id)).count();
+            assert!(
+                on_workers >= 2,
+                "the copies ran on {on_workers} worker thread(s) of {} (seen {} thread(s) in all); replay with 4 workers must use them",
+                workers.len(),
+                seen.len()
+            );
+            assert!(
+                !seen.contains(&std::thread::current().id()),
+                "the handler copied a run itself although it had workers"
+            );
+            assert_eq!(state.fault_count, 0, "nothing faulted");
         }
         drop(async_uffd);
         clone.unmap();
@@ -8210,6 +10283,7 @@ mod tests {
         let source = PageSource::Copy {
             mmap,
             fault_around: 0,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2: false,
         };
@@ -8237,6 +10311,7 @@ mod tests {
             page_size: PAGE,
             page_mask: !(PAGE - 1),
             mem_size: 64 * PAGE,
+            gate: test_gate(),
         };
         let mut removed = RemovedPages::default();
 
@@ -8839,6 +10914,7 @@ mod tests {
             page_size,
             page_mask: !(page_size - 1),
             mem_size: HUGE_PAGE_2M,
+            gate: test_gate(),
         }
     }
 
@@ -8856,6 +10932,7 @@ mod tests {
                 .make_read_only()
                 .expect("sealing the snapshot"),
             fault_around: 0,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2,
         };
@@ -9034,6 +11111,7 @@ mod tests {
                     prefetch: Prefetch::Off,
                     record_window: Duration::ZERO,
                     fault_around: FaultAround::OFF,
+                    replay_threads: ReplayThreads::ONE,
                     nv2: false,
                 },
             )
@@ -9103,6 +11181,7 @@ mod tests {
         clone.source = PageSource::Copy {
             mmap,
             fault_around: 0,
+            replay_threads: 1,
             holes: FileHoles::default(),
             nv2: false,
         };
