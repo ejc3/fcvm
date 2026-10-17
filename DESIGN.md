@@ -1496,29 +1496,54 @@ included, and its merge punches each run of its all-zero pages at least `MERGE_M
 MiB merge window, as a hole, so memory a restored guest gave back in runs that long is a hole in its snapshot. The
 `nested` arm64 profile builds its own fork (`nv2-on-main`), which writes every page of a Full snapshot and leaves
 discarded pages out of a diff. A diff's merge base is a copy of the parent's `memory.bin` made with `copy_file_range`,
-which on btrfs clones the parent's extents, so a child keeps its parent's holes.
+which on btrfs clones the parent's extents, so a child keeps its parent's holes, bar the short ones inside a
+range a merge in whole granules rewrites (below).
 
 **A snapshot of a restored VM**: a VM that was itself restored from a snapshot is saved as a diff. Firecracker
 writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the base snapshot's `memory.bin`, and
-`merge_diff_snapshot` (`src/commands/common.rs`) copies each data run of the diff to the same offset of that copy:
+`merge_diff_snapshot` (`src/commands/common.rs`) lays the diff's data runs over that copy:
 
+- **Whole granules for a diff of many small runs.** A first walk writes nothing and counts the diff's runs. Where
+  there are at least 262,144 (`MERGE_ROUND_FROM_RUNS`) and whole 1 MiB granules (`MERGE_GRANULE`) add at most 64 KiB
+  for each run (`MERGE_ROUND_BELOW`), every run is rounded out, neighbours are joined, and each range is written
+  back whole: the base's bytes with the diff's runs over them. One write per run splits the base's extents and costs
+  a write for every run, and writes to one file take its lock one at a time, so many small runs are merged faster in
+  granules and leave a file with fewer extents for later restores to read through. Measured in
+  `fcvm snapshot create` of a 128 GiB guest with 37 to 38 GiB touched in 2.25 to 2.38 million runs: one write per
+  run took 554 s with 16 workers and left 5,251,673 extents, and whole granules took 263 s and left 1,045,539.
+  The choice is made once for the diff: made for each 8 MiB window, the same merge took 300 s.
+  Granules rewrite memory the VM did not touch, and that part of the file stops sharing extents with the base:
+  with the two files of such a snapshot merged whole, 111 GiB of the 128 were rewritten.
+- **Run by run otherwise**, which writes the diff's own bytes and no more. A diff of fewer runs takes at most 36 s
+  that way at the rate measured, and the diff a small guest leaves is far below the bar (58.9 MiB in 4,775 runs on
+  a 1 GiB guest, which whole granules would write as 350 MiB). Runs scattered one to a granule would have the whole
+  file rewritten for them. And whole granules are written only when the free space beside the file holds them and
+  the memory file once more, never on a filesystem that does not say how much is free. That leaves room for a full
+  snapshot of a guest this size, whose dump must not run out of space while its VM is paused, and two merges that
+  read the same free space both fit, because neither writes more than its file's size. The reading is a check and
+  not a reservation: more large merges or full snapshots at once than that can still run a short disk out of
+  space, as full snapshots at once can without any merge. The amount compared is the bytes written; a compressing
+  filesystem stores them in less. The merge takes no lock.
 - **Workers.** One for each 256 MiB or 4,096 writes (`MERGE_BYTES_PER_WORKER`, `MERGE_WRITES_PER_WORKER`), up to 16
-  (`MERGE_WORKERS`), because one reader waits for one read at a time: on a 128 GiB guest with 38.1 GiB touched in
-  2,328,992 runs, one worker took 1,646 s and 16 took 323 s. A first walk writes nothing and counts the runs. Each
-  worker then takes the next 8 MiB of the file nobody has taken (`MERGE_WINDOW`), so they stay busy wherever in
-  the file the diff's data lies. The calling thread is one of them, so a merge of at most 256 MiB in at most
-  4,096 writes starts no thread. A worker that fails stops the others before their next write.
-- **Zero pages.** A worker reads each piece of a run once. Each run of its all-zero 4 KiB pages (`GRANULE`) at least
-  `MERGE_MIN_PUNCH` (128 KiB) long is punched as a hole (`FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE`), and the rest is
-  written: the data, a shorter zero run with the data beside it, and a page the piece holds only part of. A run is
-  measured inside its piece's window, so a zero run of 128 to 248 KiB that straddles a window boundary can be cut into
+  (`MERGE_WORKERS`), because one reader waits for one read at a time. The writes are counted one for each run, so a
+  merge in whole granules takes the workers its runs would have taken, which with these numbers is all 16. Each
+  takes the next 8 MiB window (`MERGE_WINDOW`) nobody has taken, so they stay busy wherever in the file the diff's
+  data lies. The calling thread is one of them, so a merge of at most 256 MiB in at most 4,096 writes starts no
+  thread. A worker that fails stops the others before their next write.
+- **Zero pages.** A worker reads each range it writes once: a piece of a run, or in whole granules the diff's runs in
+  the range and, where they leave part of it uncovered, the base. Each run of the range's all-zero 4 KiB pages
+  (`GRANULE`) at least `MERGE_MIN_PUNCH` (128 KiB) long is punched as a hole (`FALLOC_FL_PUNCH_HOLE |
+  FALLOC_FL_KEEP_SIZE`), and the rest is written: the data, a shorter zero run with the data beside it, and a page the
+  range holds only part of. A range of whole granules holds the base's own bytes too, so a hole the base copy
+  inherited stays a hole when it is at least 128 KiB long and is written as zeros when it is shorter. A run is
+  measured inside its range's window, so a zero run of 128 to 248 KiB that straddles a window boundary can be cut into
   two shorter runs and written. A short zero run costs more to punch than to write: on btrfs with compress-force=zstd, a
   merge of 1 GiB of alternating 4 KiB pages of data and zeros took 4.3 s with every zero page punched, 1.3 s with each
   zero page written by its own call, and 0.80 s with the zeros written in one call with the data beside them, which is
   what a run shorter than the minimum gets and what the merge did before it punched anything. Runs of 2 MiB took 0.48 s
   punched, against 0.76 s written in one call per piece. The holes never took more disk than the written zeros. The
-  window is a multiple of the granule, so one worker alone writes or punches each page. A worker that fails stops the
-  others between the runs of a piece as well as between pieces. A filesystem that refuses a punch with EOPNOTSUPP gets
+  window is a multiple of the page, so one worker alone writes or punches each page. A worker that fails stops the
+  others between the runs of a range as well as between ranges. A filesystem that refuses a punch with EOPNOTSUPP gets
   the zeros written, counted apart and logged once per merge, and is not asked again during that merge. Any other punch
   error fails the merge. `zero_bytes` counts the bytes of the punches that succeeded. They are holes on a filesystem of
   4 KiB blocks, as btrfs is. A filesystem of larger blocks zeroes in place the part of a block a punch does not cover
@@ -1526,9 +1551,10 @@ writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the bas
 - **Flush and cleanup.** The merged file is flushed before the snapshot's `config.json` is written, and a failed
   flush fails the snapshot. The diff is removed once it is merged. A failed merge removes the unfinished snapshot
   directory.
-- `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the pieces written (`writes`), the
-  holes punched (`punches`), the bytes they covered (`zero_bytes`), the bytes of zero runs written after a refusal
-  (`unpunched_zero_bytes`), the workers and the duration.
+- `create_snapshot_core` logs `diff merge complete` with the diff's bytes and runs, the ranges written (`writes`) and
+  their bytes (`bytes_written`), what whole granules everywhere would have written (`rounded_bytes`), the base reads
+  (`base_reads`), the holes punched (`punches`), the bytes they covered (`zero_bytes`), the bytes of zero runs written
+  after a refusal (`unpunched_zero_bytes`), the workers and the duration.
 
 
 #### `fcvm snapshot serve`
