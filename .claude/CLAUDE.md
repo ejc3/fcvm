@@ -2648,9 +2648,45 @@ separately.
   userfaultfd (fcvm loads with `resume_vm: false`), but nothing waits for it: fcvm patches
   the root drive and resumes the guest as soon as the load returns, and replay continues
   while the guest runs. The handler drains pending demand faults before every populate
-  call, so a demand fault waits behind at most one call. Replay yields to the
-  runtime once per batch (one 2 MiB chunk, or 32 populate calls when the runs are small),
-  because a yield after every small copy cost more than the copy. Every recorded run is
+  call it makes itself, so a demand fault waits behind at most one of the handler's calls.
+  Replay yields to the runtime once per batch (one 2 MiB chunk, or 32 populate calls when the
+  runs are small), because a yield after every small copy cost more than the copy. In copy
+  mode the copies of plain runs go to worker threads (`--uffd-replay-threads`,
+  `FCVM_UFFD_REPLAY_THREADS`, default 8 or the host's core count if lower): a large guest's
+  set is millions of runs a few pages long (one 128 GiB guest: 2.36 M pages in 1.00 M runs,
+  and merging runs across gaps of up to 4 pages would have cost 39 percent more pages), so
+  replay is bound by `UFFDIO_COPY` calls, about 15 us each, and one thread took 15.3 s for
+  that set while the guest demand-faulted 479,129 pages replay had not reached. The handler
+  still plans the segments, steps over given-back pages and holes, copies zeros itself, and
+  keeps serving demand faults, also while it waits for room in the workers' queue and for
+  their last outcomes; the workers' copies run beside the handler's fault service, never ahead
+  of it in the queue. A job is a batch of up to 64 runs, or one 2 MiB chunk of bytes, through
+  a bounded queue: one queue slot, one wake of the handler and one outcome per batch, not per
+  run. Each worker has its own handle on the clone's userfaultfd. A copy the kernel refuses
+  while a REMOVE is queued and unread is retried a millisecond apart until it lands or the
+  generation moves; if the retries do not clear the refusal within 2 s, the rest of the job
+  falls back to demand paging. A clone on 2 MiB hugetlb pages copies one page per piece,
+  since `UFFDIO_COPY` takes nothing smaller than the registered page. A balloon REMOVE the handler
+  reads lets the kernel zap the range and accept copies into it again, so a run planned
+  before it must not be copied after it: every job carries the generation it was planned
+  under, the handler moves the generation when it records a REMOVE, a worker checks it before
+  each copy, and a stale job goes back to the handler, which plans it again against the
+  given-back pages, as it does with a job it still held when the generation moved. The check
+  and the copy are kept apart from the read by a spin gate (`ReplayGate`): the handler holds
+  it across each event read and waits for the copies in flight first, a worker holds it from
+  its check through one copy (at most 64 KiB on 4 KiB pages, one page on 2 MiB hugetlb
+  pages), and a worker that finds the handler reading waits for the read. The handler takes the gate only when the queue is readable (one `poll`
+  before each chunk it plans), because a read-write lock taken for every read, the empty ones
+  included, made eight threads slower than one (replay 16.5 s against 14.3 s on that set).
+  The spin itself costs about 1.5 s of replay against no exclusion (6.4 to 6.9 s against
+  5.1 s); beginning the read and planning runs while the copies in flight finished measured
+  the same (6.3 to 6.6 s), so the handler spins. The runs of a planned range come out of a
+  cursor (`PlainRuns`) one at a time, so a dense 128 GiB set, 2 M runs of 64 KiB, costs the
+  fault server no list. A
+  pool that cannot start, or whose threads have all exited, means the handler copies alone,
+  as it does in minor mode. The runs of a job that a REMOVE read while the workers are finished turned
+  stale are left to demand paging, as a refused copy's are. The replay line carries `replay_threads`, `worker_jobs`,
+  `worker_runs`, `worker_populated_mib` and `worker_jobs_replanned`. Every recorded run is
   planned. The plan is an iterator over the recorded bitmap, so planning costs no memory, its
   work is bounded by the image size, and no cap drops part of a large guest's set when it
   fragments into millions of runs. A recorded page the clone's balloon has given back

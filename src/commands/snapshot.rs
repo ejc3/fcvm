@@ -21,8 +21,8 @@ use crate::state::{
 };
 use crate::storage::{validate_snapshot_name, SnapshotGeneration, SnapshotManager};
 use crate::uffd::{
-    record_window_from_env, FaultAround, Prefetch, ServeShape, UffdBacking, UffdServer,
-    DEFAULT_PREFETCH_RECORD_WINDOW,
+    record_window_from_env, FaultAround, Prefetch, ReplayThreads, ServeShape, UffdBacking,
+    UffdServer, DEFAULT_PREFETCH_RECORD_WINDOW,
 };
 use crate::volume::{SpawnedVolumes, VolumeConfig};
 
@@ -1339,6 +1339,10 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     // Copy mode only: how much of the snapshot each demand fault materialises around the
     // page that faulted (--uffd-fault-around / FCVM_UFFD_FAULT_AROUND). Off unless asked for.
     let fault_around = FaultAround::new(args.uffd_fault_around.unwrap_or(0))?;
+    let replay_threads = match args.uffd_replay_threads {
+        Some(count) => ReplayThreads::new(count)?,
+        None => ReplayThreads::default(),
+    };
 
     release_idle_snapshot_memory(&args.snapshot_name);
 
@@ -1358,6 +1362,7 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
             prefetch,
             record_window,
             fault_around,
+            replay_threads,
             nv2,
         },
     )
@@ -1393,6 +1398,9 @@ async fn cmd_snapshot_serve(args: SnapshotServeArgs) -> Result<()> {
     println!("  Serve PID: {}", my_pid);
     println!("  Socket: {}", socket_path.display());
     println!("  UFFD mode: {}", backing.name());
+    if matches!(backing, UffdBacking::Copy) {
+        println!("  Replay threads: {}", replay_threads.count());
+    }
     if fault_around != FaultAround::OFF {
         println!("  Fault-around: {} bytes", fault_around.bytes());
     }
@@ -2438,11 +2446,13 @@ async fn cmd_snapshot_run_inner(
             let prefetch = setup_try!(Prefetch::from_env());
             let record_window = setup_try!(record_window_from_env());
             let fault_around = setup_try!(FaultAround::from_env());
+            let replay_threads = setup_try!(ReplayThreads::from_env());
             info!(
                 reason = %reason,
                 mode = backing.name(),
                 prefetch = ?prefetch,
                 fault_around_bytes = fault_around.bytes(),
+                replay_threads = replay_threads.count(),
                 "starting implicit UFFD server for snapshot restore"
             );
 
@@ -2475,6 +2485,7 @@ async fn cmd_snapshot_run_inner(
                     prefetch,
                     record_window,
                     fault_around,
+                    replay_threads,
                     nv2,
                 },
             )

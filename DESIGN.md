@@ -1538,6 +1538,7 @@ writes the pages the VM touched to a sparse `memory.diff`, fcvm reflinks the bas
 **Usage**:
 ```bash
 fcvm snapshot serve <SNAPSHOT_NAME> [--uffd-mode copy|minor] [--uffd-fault-around BYTES]
+                    [--uffd-replay-threads COUNT]
                     [--uffd-prefetch on|off] [--uffd-prefetch-record-window SECS]
 ```
 
@@ -1558,6 +1559,7 @@ The memory server:
 |------|---------|---------|--------|
 | `--uffd-mode copy\|minor` | `FCVM_UFFD_MODE` | `copy` | `copy` fills faults with `UFFDIO_COPY` (private per-clone pages); `minor` serves a sealed memfd with `UFFDIO_CONTINUE` (true page sharing) |
 | `--uffd-fault-around BYTES` | `FCVM_UFFD_FAULT_AROUND` | `0` (off) | Experimental. Copy mode only. A demand fault is served first exactly as without the option, then the rest of its granule is populated: `BYTES` aligned in snapshot file offsets and clipped to the region. A fault on a page the balloon gave back is answered with zeros and gets no fault-around. A fault on a hole in the memory file is answered with zeros and gets fault-around like any other. A given-back page or a hole inside a fault's granule is stepped over. `0`, or a power of two above the host page size through `2097152`. Each fault privately materialises the rest of its granule, bar pages the balloon gave back and holes, so memory per clone grows and clones per host drop. Measured once, on a 128 GiB guest at 64 KiB: the first real page after a restore went from 518.4 s to 336.2 s, restore to healthy went from 2m23s to 4m07s, and 17.5 million pages were installed beyond the demanded ones, 14.5 per fault. Limitation: with the option on, a page that fault-around installed is never recorded, so the recorded working set converges one demanded page per granule per clone, and replay never restores what fault-around would have installed. Record the working set with the option off. A non-zero value with `--uffd-mode minor` is an error |
+| `--uffd-replay-threads COUNT` | `FCVM_UFFD_REPLAY_THREADS` | `8`, or the host's core count if lower | Copy mode only. The threads a clone's working-set replay copies on; the handler keeps planning, stepping over given-back pages and holes, and serving demand faults. `1` through `64`. One thread took 15.3 s to replay a 128 GiB guest's 9.0 GiB recorded set of 1.00 M runs, during which the guest demand-faulted 479,129 pages replay had not reached |
 | `--uffd-prefetch on\|off` | `FCVM_UFFD_PREFETCH` | `on` | Working-set replay. `on` records faulted offsets to `<memory.bin>.working-set`, replays them into later clones, and in copy mode reads the recorded set into the page cache when the serve starts and when a clone connects; `off` is fully inert: no recording, no replay, no warm-up, no files |
 | `--uffd-prefetch-record-window SECS` | `FCVM_UFFD_PREFETCH_RECORD_WINDOW` | `300` | Seconds after a clone's UFFD handshake during which its demand faults are recorded into the working set. Later faults are served but not recorded. `0` records nothing; replay of an existing record is unaffected |
 
