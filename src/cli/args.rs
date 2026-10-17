@@ -572,6 +572,17 @@ pub struct SnapshotServeArgs {
     #[arg(long, value_name = "BYTES", env = "FCVM_UFFD_FAULT_AROUND")]
     pub uffd_fault_around: Option<u64>,
 
+    /// Threads a copy-mode clone's working-set replay copies on (1 through 64; default 8, or
+    /// the host's core count if lower).
+    ///
+    /// A large guest's recorded set is millions of runs a few pages long, so replay is bound
+    /// by `UFFDIO_COPY` calls: one thread took 15 s to replay 9.0 GiB of a 128 GiB guest in
+    /// 1.0 M runs, while the guest demand-faulted 479,129 pages replay had not reached. The
+    /// handler keeps serving demand faults; the copies run on these threads. Minor mode
+    /// replays on the handler alone.
+    #[arg(long, value_name = "COUNT", env = "FCVM_UFFD_REPLAY_THREADS")]
+    pub uffd_replay_threads: Option<u64>,
+
     /// Whether to record each clone's restore working set and replay it into the next one.
     ///
     /// - `on` (default): the pages a clone faults are recorded beside the snapshot and
