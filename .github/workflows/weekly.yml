@@ -13,7 +13,7 @@ jobs:
     name: Benchmarks
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -25,7 +25,7 @@ jobs:
           export CONTAINER_ARCH=x86_64
           make container-bench
       - name: Upload results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: benchmark-results-${{ github.run_id }}
           path: /tmp/fcvm-container-target/criterion/
@@ -44,7 +44,7 @@ jobs:
           sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps
@@ -119,7 +119,7 @@ jobs:
         run: make fuzz SEEDS=20 OPS=25
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fuzz-logs-${{ github.run_id }}
           path: /tmp/fcvm-test-logs/
@@ -144,7 +144,7 @@ jobs:
           sudo chown -R $USER:$USER ${{ github.workspace }}/fcvm 2>/dev/null || true
           sudo chmod -R u+w ~/.cargo/advisory-db* 2>/dev/null || true
           sudo chown -R $USER:$USER ~/.cargo/advisory-db* 2>/dev/null || true
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
       - uses: ./fcvm/.github/actions/checkout-deps

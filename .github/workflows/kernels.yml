@@ -46,7 +46,7 @@ jobs:
         run: |
           sudo chown -R $USER:$USER ${{ github.workspace }}
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
           # This job holds `contents: write` and then runs checkout-controlled
@@ -204,7 +204,7 @@ jobs:
         run: |
           sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
           # This job holds `contents: write` and then runs checkout-controlled
@@ -481,7 +481,7 @@ jobs:
         run: |
           sudo chown -R $USER:$USER ${{ github.workspace }} 2>/dev/null || true
 
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           path: fcvm
           # This job holds `contents: write` and then runs checkout-controlled
@@ -682,7 +682,7 @@ jobs:
     permissions:
       contents: read
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           persist-credentials: false
 
