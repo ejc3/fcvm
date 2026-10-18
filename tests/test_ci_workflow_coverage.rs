@@ -749,7 +749,10 @@ fn claude_infrastructure_retry_is_trusted_bounded_and_gates_ci_fix() {
     );
     assert!(
         steps.iter().all(|step| {
-            step.get("uses").and_then(Value::as_str) != Some("actions/create-github-app-token@v3")
+            !step
+                .get("uses")
+                .and_then(Value::as_str)
+                .is_some_and(|uses| uses.starts_with("actions/create-github-app-token@"))
         }),
         "the classifier should use its narrowly scoped GITHUB_TOKEN, not mint an app token"
     );
