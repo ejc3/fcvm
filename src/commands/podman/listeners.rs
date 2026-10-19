@@ -700,6 +700,131 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
     Ok(telemetry)
 }
 
+/// File in a VM's data directory that holds the container's output while `podman prepare` runs. That
+/// command forwards none of the output (its stdout carries the JSON result), so before this file a
+/// prepare whose container failed left no record of why. Teardown copies it to
+/// `/tmp/fcvm-container-<vm_id>.log`, beside the Firecracker log.
+pub(crate) const CONTAINER_LOG: &str = "container.log";
+
+/// Where [`CONTAINER_LOG`] goes when it reaches [`CONTAINER_LOG_CAP`]; teardown copies it too, to
+/// `/tmp/fcvm-container-<vm_id>.1.log`.
+pub(crate) const CONTAINER_LOG_ROTATED: &str = "container.log.1";
+
+/// The most bytes [`CONTAINER_LOG`] holds before it moves to [`CONTAINER_LOG_ROTATED`] and starts over,
+/// so a prepare whose container prints without end keeps at most twice this, and always its latest lines.
+pub(crate) const CONTAINER_LOG_CAP: u64 = 64 << 20;
+
+/// The task keeping a prepare's container output and the token that tells it to stop.
+pub struct ContainerLogWriter {
+    pub(crate) handle: tokio::task::JoinHandle<()>,
+    pub(crate) stop: tokio_util::sync::CancellationToken,
+}
+
+impl ContainerLogWriter {
+    /// Start keeping the lines broadcast on `rx` in `dir`/[`CONTAINER_LOG`].
+    pub(crate) fn spawn(
+        rx: tokio::sync::broadcast::Receiver<LogLine>,
+        dir: &std::path::Path,
+    ) -> Self {
+        let stop = tokio_util::sync::CancellationToken::new();
+        let path = dir.join(CONTAINER_LOG);
+        let token = stop.clone();
+        let handle = tokio::spawn(async move {
+            if let Err(e) = write_container_log(rx, path.clone(), token, CONTAINER_LOG_CAP).await {
+                warn!(path = %path.display(), error = %e, "could not keep the container's output");
+            }
+        });
+        Self { handle, stop }
+    }
+
+    /// Tell the writer to stop once it has written the lines already sent, and wait at most `bound`
+    /// for it, so the file is whole before teardown copies it. Call it after the output listener,
+    /// the only sender of new lines, has been joined.
+    pub(crate) async fn finish(self, bound: std::time::Duration) -> Result<(), String> {
+        self.stop.cancel();
+        match tokio::time::timeout(bound, self.handle).await {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(e)) => Err(format!("joining the container log writer: {e}")),
+            Err(_) => Err(format!(
+                "the container log writer did not finish within {bound:?}"
+            )),
+        }
+    }
+}
+
+async fn open_container_log(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
+    tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .open(path)
+        .await
+}
+
+/// Append every line broadcast on `rx` to `path` as `<stream>: <content>`, and return how many lines
+/// were written. It returns when the channel closes, or when `stop` fires and the lines already sent
+/// are written. Each line is its own write. A receiver more than the channel's capacity behind loses
+/// lines; it writes how many in their place, so the file never reads as the whole output when it is
+/// not. Before a line would take the file past `cap` bytes, the file moves to `<path>.1` (replacing
+/// the one before) and a new one starts with a line saying so. The files are created 0600: the
+/// output is the workload's and can carry what other local users should not read.
+pub(crate) async fn write_container_log(
+    mut rx: tokio::sync::broadcast::Receiver<LogLine>,
+    path: std::path::PathBuf,
+    stop: tokio_util::sync::CancellationToken,
+    cap: u64,
+) -> std::io::Result<u64> {
+    use tokio::io::AsyncWriteExt;
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    let rotated = path.with_file_name(CONTAINER_LOG_ROTATED);
+    let mut file = open_container_log(&path).await?;
+    let mut size = 0u64; // bytes of output in the current file, not counting its rotation note
+    let mut written = 0u64;
+    let mut stopping = false;
+    loop {
+        let next = if stopping {
+            // Stopped: write what was sent before the stop, then return.
+            match rx.try_recv() {
+                Ok(line) => Ok(line),
+                Err(TryRecvError::Lagged(lost)) => Err(lost),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => return Ok(written),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                received = rx.recv() => match received {
+                    Ok(line) => Ok(line),
+                    Err(RecvError::Lagged(lost)) => Err(lost),
+                    Err(RecvError::Closed) => return Ok(written),
+                },
+                () = stop.cancelled() => {
+                    stopping = true;
+                    continue;
+                }
+            }
+        };
+        let text = match next {
+            Ok(line) => {
+                written += 1;
+                format!("{}: {}\n", line.stream, line.content)
+            }
+            Err(lost) => format!("fcvm: {lost} lines of container output were dropped here\n"),
+        };
+        if size > 0 && size + text.len() as u64 > cap {
+            drop(file);
+            tokio::fs::rename(&path, &rotated).await?;
+            file = open_container_log(&path).await?;
+            file.write_all(
+                format!("fcvm: the earlier output is in {CONTAINER_LOG_ROTATED}\n").as_bytes(),
+            )
+            .await?;
+            size = 0;
+        }
+        file.write_all(text.as_bytes()).await?;
+        size += text.len() as u64;
+    }
+}
+
 /// Bidirectional I/O listener for container stdin/stdout/stderr.
 ///
 /// Listens on port 4997 for raw output from fc-agent.
@@ -889,6 +1014,126 @@ pub(crate) async fn run_output_listener(
 
     info!(vm_id = %vm_id, lines = lines_forwarded, "Output listener finished");
     Ok(())
+}
+
+#[cfg(test)]
+mod container_log_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use tokio_util::sync::CancellationToken;
+
+    fn line(n: usize) -> LogLine {
+        LogLine {
+            stream: "stdout".into(),
+            content: format!("line {n}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn every_line_reaches_the_file_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONTAINER_LOG);
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let writer = tokio::spawn(write_container_log(
+            rx,
+            path.clone(),
+            CancellationToken::new(),
+            CONTAINER_LOG_CAP,
+        ));
+        for n in 0..5 {
+            tx.send(line(n)).unwrap();
+        }
+        tx.send(LogLine {
+            stream: "stderr".into(),
+            content: "boom".into(),
+        })
+        .unwrap();
+        drop(tx);
+        assert_eq!(writer.await.unwrap().unwrap(), 6);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "stdout: line 0\nstdout: line 1\nstdout: line 2\nstdout: line 3\nstdout: line 4\nstderr: boom\n"
+        );
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "the container's output is created readable by its owner only"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lagging_writer_says_how_many_lines_it_lost() {
+        // Ten lines into a channel that holds four, before the writer reads any: the writer must say
+        // it lost six, not write the last four as if they were the whole output.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONTAINER_LOG);
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        for n in 0..10 {
+            tx.send(line(n)).unwrap();
+        }
+        drop(tx);
+        let written = write_container_log(
+            rx,
+            path.clone(),
+            CancellationToken::new(),
+            CONTAINER_LOG_CAP,
+        )
+        .await
+        .unwrap();
+        assert_eq!(written, 4);
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "fcvm: 6 lines of container output were dropped here\nstdout: line 6\nstdout: line 7\nstdout: line 8\nstdout: line 9\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn stop_writes_the_lines_already_sent_while_a_sender_is_still_alive() {
+        // Teardown holds a sender (VmContext keeps one for subscribe_logs), so the channel never closes;
+        // the writer must still finish, and must not drop the lines sent before the stop.
+        let dir = tempfile::tempdir().unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let writer = ContainerLogWriter::spawn(rx, dir.path());
+        for n in 0..3 {
+            tx.send(line(n)).unwrap();
+        }
+        writer
+            .finish(std::time::Duration::from_secs(2))
+            .await
+            .expect("the writer finishes while a sender is alive");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONTAINER_LOG)).unwrap(),
+            "stdout: line 0\nstdout: line 1\nstdout: line 2\n"
+        );
+        drop(tx);
+    }
+
+    #[tokio::test]
+    async fn the_log_moves_aside_at_the_cap_and_keeps_the_latest_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONTAINER_LOG);
+        let (tx, rx) = tokio::sync::broadcast::channel(64);
+        // Each line is 15 bytes ("stdout: line N\n" for N < 10); a 40-byte cap holds two.
+        for n in 0..5 {
+            tx.send(line(n)).unwrap();
+        }
+        drop(tx);
+        write_container_log(rx, path.clone(), CancellationToken::new(), 40)
+            .await
+            .unwrap();
+        let note = "fcvm: the earlier output is in container.log.1\n";
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{note}stdout: line 4\n"),
+            "the current file holds the latest line"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONTAINER_LOG_ROTATED)).unwrap(),
+            format!("{note}stdout: line 2\nstdout: line 3\n"),
+            "the file before it is kept as container.log.1"
+        );
+        assert!(std::fs::metadata(&path).unwrap().len() <= 40 + note.len() as u64);
+    }
 }
 
 #[cfg(test)]

@@ -935,3 +935,76 @@ async fn test_sanity_chrony_ntp_configured() -> Result<()> {
     println!("✅ chrony: {source_lines} NTP source(s) from {origin}");
     Ok(())
 }
+
+/// `podman prepare` forwards none of the container's output, so a prepare whose container fails
+/// must still leave that output on the host: teardown copies it to `/tmp/fcvm-container-<vm_id>.log`.
+/// Before that file existed, a prepare that failed before its snapshot left no record of why.
+#[tokio::test]
+async fn test_failed_prepare_keeps_the_container_output() -> Result<()> {
+    use std::time::{Duration, SystemTime};
+
+    let (vm_name, _, tag, _) = common::unique_names("prepare-output");
+    let marker = format!("{vm_name}-marker");
+    let script = format!("echo {marker}-out; echo {marker}-err >&2; exit 1");
+    let started = SystemTime::now();
+    // Prepare is the snapshot lifecycle, which the SnapshotDisabled lane switches off with
+    // FCVM_NO_SNAPSHOT (prepare then refuses to run); opt back in so the test means the same in every lane.
+    let (mut child, _pid, _log) = common::spawn_fcvm_snapshots_enabled_with_env_and_log_path(
+        &[
+            "podman",
+            "prepare",
+            "--name",
+            &vm_name,
+            "--tag",
+            &tag,
+            "--ready-timeout",
+            "300",
+            common::TEST_IMAGE,
+            "sh",
+            "-c",
+            &script,
+        ],
+        &[],
+    )
+    .await
+    .context("spawning fcvm podman prepare")?;
+    let status = tokio::time::timeout(Duration::from_secs(600), child.wait())
+        .await
+        .context("the prepare did not end within 600 s")??;
+    assert!(
+        !status.success(),
+        "a prepare whose container exits 1 must fail, got {status}"
+    );
+
+    let mut kept = None;
+    for entry in std::fs::read_dir("/tmp")? {
+        let path = entry?.path();
+        let is_container_log = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("fcvm-container-") && n.ends_with(".log"));
+        if !is_container_log || std::fs::metadata(&path)?.modified()? < started {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)?;
+        if text.contains(&marker) {
+            kept = Some((path, text));
+            break;
+        }
+    }
+    let (path, text) = kept.context(
+        "no /tmp/fcvm-container-*.log written by this prepare holds the container's output",
+    )?;
+    assert!(
+        text.contains(&format!("stdout: {marker}-out")),
+        "{}: {text}",
+        path.display()
+    );
+    assert!(
+        text.contains(&format!("stderr: {marker}-err")),
+        "{}: {text}",
+        path.display()
+    );
+    let _ = std::fs::remove_file(&path);
+    Ok(())
+}

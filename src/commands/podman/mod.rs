@@ -8,6 +8,8 @@ use tracing::{info, warn};
 
 mod image;
 mod listeners;
+pub use listeners::ContainerLogWriter;
+pub(crate) use listeners::{CONTAINER_LOG, CONTAINER_LOG_ROTATED};
 mod namespace;
 mod snapshot;
 mod types;
@@ -1919,6 +1921,13 @@ async fn prepare_vm_for_lifecycle(
     // Broadcast channel for container output (used by VmHandle::subscribe_logs())
     let (log_tx, _) = tokio::sync::broadcast::channel::<LogLine>(1000);
 
+    // `podman prepare` forwards none of the container's output, so keep it in the VM's directory;
+    // teardown stops the writer, waits for it, and copies the file out (listeners::CONTAINER_LOG).
+    // Subscribed before the output listener starts, so no line is sent before there is a receiver.
+    let container_log = lifecycle
+        .is_prepare()
+        .then(|| listeners::ContainerLogWriter::spawn(log_tx.subscribe(), &data_dir));
+
     // For non-TTY mode, use async output listener
     let output_reconnect = Arc::new(tokio::sync::Notify::new());
     let output_handle = if !tty_mode {
@@ -2004,6 +2013,9 @@ async fn prepare_vm_for_lifecycle(
         if let Some(handle) = output_handle {
             handle.abort();
         }
+        if let Some(writer) = container_log {
+            writer.handle.abort();
+        }
 
         // Abort egress proxy if running
         if let Some(handle) = egress_proxy_handle {
@@ -2060,6 +2072,7 @@ async fn prepare_vm_for_lifecycle(
         tty_handle,
         tty_socket_path: tty_mode.then_some(tty_socket_path),
         output_handle,
+        container_log,
         egress_proxy_handle,
         cache_rx,
         startup_rx,
@@ -2863,6 +2876,7 @@ pub async fn cleanup_vm_context(mut ctx: VmContext) {
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
             output_listener_handle: ctx.output_handle,
+            container_log: ctx.container_log,
         },
         ctx.vm_manager.as_mut(),
         &mut ctx.holder_child,
@@ -2903,6 +2917,7 @@ async fn cleanup_vm_context_verified(mut ctx: VmContext) -> Result<()> {
             health_cancel_token: Some(ctx.health_cancel_token),
             health_monitor_handle: Some(ctx.health_monitor_handle),
             output_listener_handle: ctx.output_handle,
+            container_log: ctx.container_log,
         },
         ctx.vm_manager.as_mut(),
         &mut ctx.holder_child,
