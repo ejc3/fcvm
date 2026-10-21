@@ -707,7 +707,7 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
 pub(crate) const CONTAINER_LOG: &str = "container.log";
 
 /// Where [`CONTAINER_LOG`] goes when it reaches [`CONTAINER_LOG_CAP`]; teardown copies it too, to
-/// `/tmp/fcvm-container-<vm_id>.1.log`.
+/// `/tmp/fcvm-container.1-<vm_id>.log`.
 pub(crate) const CONTAINER_LOG_ROTATED: &str = "container.log.1";
 
 /// The most bytes [`CONTAINER_LOG`] holds before it moves to [`CONTAINER_LOG_ROTATED`] and starts over,
@@ -738,16 +738,22 @@ impl ContainerLogWriter {
     }
 
     /// Tell the writer to stop once it has written the lines already sent, and wait at most `bound`
-    /// for it, so the file is whole before teardown copies it. Call it after the output listener,
-    /// the only sender of new lines, has been joined.
+    /// for it, so the file is whole before teardown copies it. A writer still running at `bound` is
+    /// aborted and joined, so it does not write on while teardown copies and removes its file. Call
+    /// it after the output listener, the only sender of new lines, has been joined.
     pub(crate) async fn finish(self, bound: std::time::Duration) -> Result<(), String> {
         self.stop.cancel();
-        match tokio::time::timeout(bound, self.handle).await {
+        let mut handle = self.handle;
+        match tokio::time::timeout(bound, &mut handle).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(e)) => Err(format!("joining the container log writer: {e}")),
-            Err(_) => Err(format!(
-                "the container log writer did not finish within {bound:?}"
-            )),
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                Err(format!(
+                    "the container log writer did not finish within {bound:?}; stopped it"
+                ))
+            }
         }
     }
 }
@@ -1019,7 +1025,7 @@ pub(crate) async fn run_output_listener(
 #[cfg(test)]
 mod container_log_tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
     use tokio_util::sync::CancellationToken;
 
     fn line(n: usize) -> LogLine {
@@ -1106,6 +1112,35 @@ mod container_log_tests {
             "stdout: line 0\nstdout: line 1\nstdout: line 2\n"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn finish_stops_a_writer_it_gave_up_waiting_for() {
+        // A writer that does not finish in time must not outlive finish, or it keeps writing while
+        // teardown copies and removes its file. This one cannot finish: its log is a FIFO with no
+        // reader, so its open blocks.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONTAINER_LOG);
+        nix::unistd::mkfifo(&path, nix::sys::stat::Mode::from_bits_truncate(0o600)).unwrap();
+        let (tx, rx) = tokio::sync::broadcast::channel(16);
+        let writer = ContainerLogWriter::spawn(rx, dir.path());
+        let err = writer
+            .finish(std::time::Duration::from_millis(100))
+            .await
+            .expect_err("a writer blocked in open does not finish");
+        // The writer task owns the receiver, so the count says whether the task is still alive.
+        let receivers = tx.receiver_count();
+        // Give the FIFO a reader for good, so an open still blocked on the blocking pool returns and
+        // the runtime can shut down whatever the assertions below find.
+        std::mem::forget(
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&path)
+                .unwrap(),
+        );
+        assert!(err.contains("did not finish"), "{err}");
+        assert_eq!(receivers, 0, "the writer task is gone once finish returns");
     }
 
     #[tokio::test]
