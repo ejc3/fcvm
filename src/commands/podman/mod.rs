@@ -9,7 +9,7 @@ use tracing::{info, warn};
 mod image;
 mod listeners;
 pub use listeners::ContainerLogWriter;
-pub(crate) use listeners::{CONTAINER_LOG, CONTAINER_LOG_ROTATED};
+pub(crate) use listeners::{CONTAINER_LOG, CONTAINER_LOG_ROTATED, OUTPUT_DRAIN_BOUND};
 mod namespace;
 mod snapshot;
 mod types;
@@ -2013,15 +2013,17 @@ async fn prepare_vm_for_lifecycle(
         // Abort status listener
         status_handle.abort();
 
-        // Abort output listener task if still running
-        if let Some(handle) = output_handle {
-            handle.abort();
-        }
-        // Joined, not just aborted: cleanup_failed_prepare removes the directory it writes in.
+        // A prepare drains its output listener and joins its writer, so the lines the guest sent
+        // are kept and nothing writes while cleanup_failed_prepare removes the directory.
         if let Some(writer) = container_log {
-            if let Err(error) = writer.finish(std::time::Duration::from_secs(5)).await {
+            if let Err(error) = writer
+                .finish_after_listener(output_handle, listeners::OUTPUT_DRAIN_BOUND)
+                .await
+            {
                 warn!("{error}");
             }
+        } else if let Some(handle) = output_handle {
+            handle.abort();
         }
 
         // Abort egress proxy if running

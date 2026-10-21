@@ -700,6 +700,10 @@ fn validate_restore_completion_frame(frame: &[u8], expected_epoch: &str) -> Resu
     Ok(telemetry)
 }
 
+/// How long teardown gives a prepare's output listener to read the guest's last lines, and then the
+/// writer to write them. The VMM is killed alongside, so the connection normally ends well within it.
+pub(crate) const OUTPUT_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// File in a VM's data directory that holds the container's output while `podman prepare` runs. That
 /// command forwards none of the output (its stdout carries the JSON result), so before this file a
 /// prepare whose container failed left no record of why. Teardown copies it to
@@ -745,6 +749,42 @@ impl ContainerLogWriter {
         }
     }
 
+    /// Drain and join the output listener, then finish the writer, each within `bound`: the listener
+    /// stops accepting connections and reads the established one to its end, so the lines the guest
+    /// sent as it went down reach the file before the writer stops. A listener still running at
+    /// `bound` is aborted and joined. Every path that tears down a prepare's output ends here.
+    pub(crate) async fn finish_after_listener(
+        self,
+        listener: Option<tokio::task::JoinHandle<()>>,
+        bound: std::time::Duration,
+    ) -> Result<(), String> {
+        self.listener_drain.cancel();
+        let mut errors = Vec::new();
+        if let Some(mut listener) = listener {
+            let joined = match tokio::time::timeout(bound, &mut listener).await {
+                Ok(joined) => joined,
+                Err(_) => {
+                    warn!(?bound, "the output listener did not reach the end of the guest's output; stopping it");
+                    listener.abort();
+                    listener.await
+                }
+            };
+            if let Err(error) = joined {
+                if !error.is_cancelled() {
+                    errors.push(format!("joining output listener: {error}"));
+                }
+            }
+        }
+        if let Err(error) = self.finish(bound).await {
+            errors.push(error);
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+
     /// Tell the writer to stop once it has written the lines already sent, and wait at most `bound`
     /// for it, so the file is whole before teardown copies it. A writer still running at `bound` is
     /// aborted and joined, so it does not write on while teardown copies and removes its file. Call
@@ -764,6 +804,24 @@ impl ContainerLogWriter {
             }
         }
     }
+}
+
+/// A record longer than `cap` cut to fit it, after a line saying how long it was, so one line
+/// without a newline cannot take the file past the cap.
+fn fit_to_cap(text: String, cap: u64) -> String {
+    let cap = usize::try_from(cap).unwrap_or(usize::MAX);
+    if text.len() <= cap {
+        return text;
+    }
+    let note = format!(
+        "fcvm: the next line was cut to fit the log from {} bytes\n",
+        text.len()
+    );
+    let mut keep = cap.saturating_sub(note.len() + 1);
+    while !text.is_char_boundary(keep) {
+        keep -= 1;
+    }
+    format!("{note}{}\n", &text[..keep])
 }
 
 async fn open_container_log(path: &std::path::Path) -> std::io::Result<tokio::fs::File> {
@@ -830,6 +888,7 @@ pub(crate) async fn write_container_log(
             }
             Err(lost) => format!("fcvm: {lost} lines of container output were dropped here\n"),
         };
+        let text = fit_to_cap(text, cap);
         if size > 0 && size + text.len() as u64 > cap {
             file.flush().await?;
             drop(file);
@@ -1222,10 +1281,88 @@ mod container_log_tests {
             .split("cleanup_failed_prepare(")
             .next()
             .unwrap();
-        assert!(branch.contains("writer.finish("), "the writer is joined");
+        assert!(
+            branch.contains("finish_after_listener("),
+            "the listener is drained and the writer joined"
+        );
         assert!(
             !branch.contains("writer.handle.abort()"),
             "the writer is not just aborted"
+        );
+    }
+
+    #[tokio::test]
+    async fn finishing_after_the_listener_keeps_what_the_guest_sends_as_teardown_starts() {
+        // Both teardown paths go through finish_after_listener. The guest's last line arrives
+        // after it has started; with the listener aborted instead of drained, that line was lost.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("output-finish.sock");
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let (log_tx, log_rx) = tokio::sync::broadcast::channel::<LogLine>(16);
+        let writer = ContainerLogWriter::spawn(log_rx, dir.path());
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let drain = writer.listener_drain.clone();
+        let listener = tokio::spawn(async move {
+            let _ = run_output_listener(
+                &socket_str,
+                "test-vm",
+                Some(log_tx),
+                std::sync::Arc::new(tokio::sync::Notify::new()),
+                false,
+                false,
+                Some(connected_tx),
+                Some(drain),
+            )
+            .await;
+        });
+        for _ in 0..200 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut guest = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        connected_rx.await.unwrap();
+        let guest = tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            tokio::io::AsyncWriteExt::write_all(&mut guest, b"stderr:exit 1: the reason\n")
+                .await
+                .unwrap();
+        });
+        writer
+            .finish_after_listener(Some(listener), OUTPUT_DRAIN_BOUND)
+            .await
+            .expect("the listener and the writer finish");
+        guest.await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join(CONTAINER_LOG)).unwrap(),
+            "stderr: exit 1: the reason\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_line_longer_than_the_cap_is_cut_to_fit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CONTAINER_LOG);
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        tx.send(LogLine {
+            stream: "stdout".into(),
+            content: "y".repeat(1000),
+        })
+        .unwrap();
+        drop(tx);
+        write_container_log(rx, path.clone(), CancellationToken::new(), 100)
+            .await
+            .unwrap();
+        let kept = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            kept.len() <= 100,
+            "{} bytes in a log capped at 100",
+            kept.len()
+        );
+        assert!(
+            kept.starts_with("fcvm: the next line was cut to fit the log from 1009 bytes\n"),
+            "{kept:?}"
         );
     }
 
