@@ -4721,7 +4721,14 @@ class ServeAcknowledgementSourcePin(unittest.TestCase):
                        for name in sorted(os.listdir(uffd)) if name.endswith(".rs"))
         builders = len(re.findall(r"thread::Builder::new\(\)", text))
         names = re.findall(r'thread::Builder::new\(\)\s*\.name\(\s*"([^"]+)"', text)
-        self.assertEqual(len(names), builders, "a server thread is spawned without a literal name")
+        # The replay workers are the one numbered family. ReplayWorkers joins them before the
+        # clone's replay ends, so they are per-clone work, not detached threads.
+        numbered = re.findall(r'thread::Builder::new\(\)\s*\.name\(\s*format!\("(fcvm-replay-)\{index\}"\)', text)
+        self.assertEqual(numbered, ["fcvm-replay-"], "the replay workers are named fcvm-replay-<index>")
+        most = int(re.search(r"pub const MAX: usize = (\d+);", self.source("src/uffd/server.rs")).group(1))
+        self.assertLessEqual(len(f"fcvm-replay-{most - 1}"), 15, "/proc comm truncates the last replay worker")
+        self.assertEqual(len(names) + len(numbered), builders,
+                         "a server thread is spawned without a literal name")
         self.assertNotRegex(text, r"thread::spawn\(",
                             "an unnamed server thread would carry its parent's name")
         self.assertEqual(set(names), reqbench.SERVE_DETACHED_THREADS | {"fcvm-ws-write"})
