@@ -768,7 +768,7 @@ async fn open_container_log(path: &std::path::Path) -> std::io::Result<tokio::fs
 }
 
 /// Append every line broadcast on `rx` to `path` as `<stream>: <content>`, and return how many lines
-/// were written. It returns when the channel closes, or when `stop` fires and the lines already sent
+/// were written. The file is flushed before it returns or rotates, so a write that failed is reported. It returns when the channel closes, or when `stop` fires and the lines already sent
 /// are written. Each line is its own write. A receiver more than the channel's capacity behind loses
 /// lines; it writes how many in their place, so the file never reads as the whole output when it is
 /// not. Before a line would take the file past `cap` bytes, the file moves to `<path>.1` (replacing
@@ -793,7 +793,10 @@ pub(crate) async fn write_container_log(
             match rx.try_recv() {
                 Ok(line) => Ok(line),
                 Err(TryRecvError::Lagged(lost)) => Err(lost),
-                Err(TryRecvError::Empty | TryRecvError::Closed) => return Ok(written),
+                Err(TryRecvError::Empty | TryRecvError::Closed) => {
+                    file.flush().await?;
+                    return Ok(written);
+                }
             }
         } else {
             tokio::select! {
@@ -801,7 +804,10 @@ pub(crate) async fn write_container_log(
                 received = rx.recv() => match received {
                     Ok(line) => Ok(line),
                     Err(RecvError::Lagged(lost)) => Err(lost),
-                    Err(RecvError::Closed) => return Ok(written),
+                    Err(RecvError::Closed) => {
+                        file.flush().await?;
+                        return Ok(written);
+                    }
                 },
                 () = stop.cancelled() => {
                     stopping = true;
@@ -817,6 +823,7 @@ pub(crate) async fn write_container_log(
             Err(lost) => format!("fcvm: {lost} lines of container output were dropped here\n"),
         };
         if size > 0 && size + text.len() as u64 > cap {
+            file.flush().await?;
             drop(file);
             tokio::fs::rename(&path, &rotated).await?;
             file = open_container_log(&path).await?;
@@ -1112,6 +1119,24 @@ mod container_log_tests {
             "stdout: line 0\nstdout: line 1\nstdout: line 2\n"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_failed_last_write_is_reported() {
+        // tokio's File::write_all returns once its buffer holds the bytes; the write itself runs
+        // later. Every write to /dev/full fails, so a writer that returns without flushing reports
+        // success for a line that never reached the file.
+        let (tx, rx) = tokio::sync::broadcast::channel(4);
+        tx.send(line(0)).unwrap();
+        drop(tx);
+        let result = write_container_log(
+            rx,
+            std::path::PathBuf::from("/dev/full"),
+            CancellationToken::new(),
+            CONTAINER_LOG_CAP,
+        )
+        .await;
+        assert!(result.is_err(), "the failed write is reported: {result:?}");
     }
 
     #[tokio::test]
