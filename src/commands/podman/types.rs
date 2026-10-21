@@ -85,6 +85,9 @@ pub struct VmContext {
     /// Used to unblock the TTY accept thread if the guest never connected.
     pub tty_socket_path: Option<String>,
     pub output_handle: Option<tokio::task::JoinHandle<()>>,
+    /// `podman prepare` only: the task keeping the container's output (`listeners::CONTAINER_LOG`);
+    /// teardown stops and joins it before copying the file out.
+    pub container_log: Option<super::listeners::ContainerLogWriter>,
     /// Egress proxy task (rootless mode only); aborted during cleanup.
     pub egress_proxy_handle: Option<tokio::task::JoinHandle<()>>,
     pub cache_rx: Option<mpsc::Receiver<CacheRequest>>,

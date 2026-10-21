@@ -2144,6 +2144,7 @@ async fn cmd_snapshot_run_inner(
                 non_blocking_output,
                 true,
                 Some(output_connected_tx),
+                None,
             )
             .await
             {
@@ -2942,6 +2943,7 @@ async fn cmd_snapshot_run_inner(
                 health_cancel_token: None, // no health monitor in exec path
                 health_monitor_handle: None,
                 output_listener_handle: output_handle, // abort output listener task
+                container_log: None,
             },
             vm_manager.as_mut(),
             &mut holder_child,
@@ -3578,6 +3580,7 @@ async fn cmd_snapshot_run_inner(
             health_cancel_token: Some(health_cancel_token),
             health_monitor_handle,
             output_listener_handle: output_handle, // abort output listener task
+            container_log: None,
         },
         vm_manager.as_mut(),
         &mut holder_child,

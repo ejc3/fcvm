@@ -1551,6 +1551,9 @@ pub struct CleanupContext {
     pub health_cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub health_monitor_handle: Option<JoinHandle<()>>,
     pub output_listener_handle: Option<JoinHandle<()>>,
+    /// `podman prepare` only: the container output writer, stopped and joined after the output
+    /// listener and before the logs are copied out.
+    pub container_log: Option<super::podman::ContainerLogWriter>,
 }
 
 /// Errors observed while tearing down independent VM resources.
@@ -1745,6 +1748,69 @@ pub async fn cleanup_vm_verified(
     cleanup_vm_inner(ctx, vm_manager, holder_child, network, state_manager).await
 }
 
+/// Copy a VM's logs into `dest_dir` as `fcvm-<kind>-<vm_id>.log`: the Firecracker log (for
+/// debugging snapshot restore failures) and the container output a `podman prepare` kept, which it
+/// forwards nowhere else. A Firecracker log that cannot be copied is logged; container output that
+/// cannot be copied is an error, because it is lost once the directory is removed.
+async fn save_vm_logs(data_dir: &Path, vm_id: &str, dest_dir: &Path) -> Result<()> {
+    let mut lost = Vec::new();
+    for (name, kind) in [
+        ("firecracker.log", "firecracker"),
+        (super::podman::CONTAINER_LOG, "container"),
+        (super::podman::CONTAINER_LOG_ROTATED, "container.1"),
+    ] {
+        let src = data_dir.join(name);
+        if !src.exists() {
+            continue;
+        }
+        let dest = dest_dir.join(format!("fcvm-{kind}-{vm_id}.log"));
+        match publish_log(&src, &dest).await {
+            Ok(()) => info!(vm_id = %vm_id, log = %dest.display(), "saved {kind} log"),
+            Err(e) if kind == "firecracker" => {
+                debug!(vm_id = %vm_id, error = %e, "could not save {kind} log")
+            }
+            Err(e) => lost.push(format!("{}: {e:#}", dest.display())),
+        }
+    }
+    if lost.is_empty() {
+        Ok(())
+    } else {
+        bail!("could not save the container's output: {}", lost.join("; "))
+    }
+}
+
+/// Copy a VM's log out of its directory to `dest` (a path in /tmp other users can guess), as a file
+/// this process creates: written to a new 0600 file opened create-exclusive beside `dest`, then renamed
+/// over it. A rename replaces whatever `dest` is, a symlink included, instead of writing through it,
+/// so a symlink planted at the name cannot make fcvm (often root) overwrite the file it points to.
+pub(crate) async fn publish_log(
+    src: &std::path::Path,
+    dest: &std::path::Path,
+) -> std::io::Result<()> {
+    let name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("fcvm.log");
+    let tmp = dest.with_file_name(format!(".{name}.{}.tmp", uuid::Uuid::new_v4().simple()));
+    let mut out = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+        .await?;
+    let copied = async {
+        let mut input = tokio::fs::File::open(src).await?;
+        tokio::io::copy(&mut input, &mut out).await?;
+        drop(out);
+        tokio::fs::rename(&tmp, dest).await
+    }
+    .await;
+    if copied.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    copied
+}
+
 async fn cleanup_vm_inner(
     ctx: CleanupContext,
     vm_manager: &mut dyn Hypervisor,
@@ -1760,6 +1826,7 @@ async fn cleanup_vm_inner(
         health_cancel_token,
         health_monitor_handle,
         mut output_listener_handle,
+        container_log,
     } = ctx;
     // Started before the first log line so `caller_blocking_ms` covers everything the
     // caller actually waits for, including our own bookkeeping.
@@ -1802,8 +1869,12 @@ async fn cleanup_vm_inner(
     if let Some(ref token) = health_cancel_token {
         token.cancel();
     }
-    if let Some(handle) = output_listener_handle.as_ref() {
-        handle.abort();
+    // A prepare keeps the container's output, so its listener drains the established connection
+    // instead of being aborted with the guest's last lines still unread.
+    match (container_log.as_ref(), output_listener_handle.as_ref()) {
+        (Some(writer), _) => writer.listener_drain.cancel(),
+        (None, Some(handle)) => handle.abort(),
+        (None, None) => {}
     }
     for handle in &volume_server_handles {
         handle.abort();
@@ -1832,7 +1903,15 @@ async fn cleanup_vm_inner(
     };
     let listeners_stopped = async {
         let mut errors = Vec::new();
-        if let Some(handle) = output_listener_handle.take() {
+        if let Some(writer) = container_log {
+            let listener = output_listener_handle.take();
+            if let Err(error) = writer
+                .finish_after_listener(listener, super::podman::OUTPUT_DRAIN_BOUND)
+                .await
+            {
+                errors.push(error);
+            }
+        } else if let Some(handle) = output_listener_handle.take() {
             if let Err(error) = handle.await {
                 if !error.is_cancelled() {
                     errors.push(format!("joining output listener: {error}"));
@@ -1890,20 +1969,11 @@ async fn cleanup_vm_inner(
     let exports_removed = super::podman::cleanup_nfs_exports(&vm_id);
     let state_deleted = state_manager.delete_state(&vm_id);
     let data_dir_removed = async {
-        // Preserve the Firecracker log (for debugging snapshot restore failures) BEFORE
-        // removing the directory it lives in.
-        let fc_log = data_dir.join("firecracker.log");
-        if fc_log.exists() {
-            let dest = std::path::PathBuf::from(format!("/tmp/fcvm-firecracker-{}.log", vm_id));
-            if let Err(e) = tokio::fs::copy(&fc_log, &dest).await {
-                debug!(vm_id = %vm_id, error = %e, "could not save firecracker log");
-            } else {
-                info!(vm_id = %vm_id, log = %dest.display(), "saved firecracker log");
-            }
-        }
+        // The logs are copied out BEFORE removing the directory they live in.
+        let saved = save_vm_logs(&data_dir, &vm_id, std::path::Path::new("/tmp")).await;
 
         // Includes disks, sockets, everything under the VM's runtime directory.
-        match tokio::fs::remove_dir_all(&data_dir).await {
+        let removed = match tokio::fs::remove_dir_all(&data_dir).await {
             Ok(()) => {
                 info!(vm_id = %vm_id, "cleaned up VM data directory");
                 Ok(())
@@ -1911,12 +1981,14 @@ async fn cleanup_vm_inner(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error)
                 .with_context(|| format!("removing VM data directory {}", data_dir.display())),
-        }
+        };
+        (saved, removed)
     };
-    let (exports_removed, state_deleted, data_dir_removed) =
+    let (exports_removed, state_deleted, (logs_saved, data_dir_removed)) =
         tokio::join!(exports_removed, state_deleted, data_dir_removed);
     failures.record("removing NFS exports", exports_removed);
     failures.record("deleting state", state_deleted);
+    failures.record("saving the container's output", logs_saved);
     failures.record("removing VM data directory", data_dir_removed);
     let disk_us = disk_start.elapsed().as_micros();
 
@@ -8089,5 +8161,62 @@ mod tests {
             let error = assert_ch_config_vsock_source_matches(&invalid, source).unwrap_err();
             assert!(error.to_string().contains("has no vsock.socket"));
         }
+    }
+}
+
+#[cfg(test)]
+mod publish_log_tests {
+    use super::{publish_log, save_vm_logs};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn container_output_that_cannot_be_saved_is_an_error() {
+        // The destination is a regular file, so nothing can be created under it.
+        let dir = tempfile::tempdir().unwrap();
+        let not_a_dir = dir.path().join("tmp");
+        std::fs::write(&not_a_dir, "").unwrap();
+        let data = dir.path().join("vm");
+        std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("firecracker.log"), "fc\n").unwrap();
+        assert!(
+            save_vm_logs(&data, "vm-x", &not_a_dir).await.is_ok(),
+            "a Firecracker log that cannot be copied is logged, not an error"
+        );
+        std::fs::write(
+            data.join(crate::commands::podman::CONTAINER_LOG),
+            "stdout: why\n",
+        )
+        .unwrap();
+        let error = save_vm_logs(&data, "vm-x", &not_a_dir)
+            .await
+            .expect_err("the container output is lost once the directory goes");
+        assert!(
+            format!("{error}").contains("fcvm-container-vm-x.log"),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_symlink_at_the_destination_is_replaced_not_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("container.log");
+        std::fs::write(&src, "the log\n").unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, "precious\n").unwrap();
+        let dest = dir.path().join("fcvm-container-vm.log");
+        std::os::unix::fs::symlink(&victim, &dest).unwrap();
+        publish_log(&src, &dest).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "precious\n",
+            "the symlink's target was written through"
+        );
+        let meta = std::fs::symlink_metadata(&dest).unwrap();
+        assert!(
+            meta.file_type().is_file(),
+            "the destination is a regular file now"
+        );
+        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "the log\n");
     }
 }
