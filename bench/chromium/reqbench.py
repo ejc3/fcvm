@@ -275,7 +275,8 @@ SERVE_READY_TIMEOUT_S = 10.0
 # The memory server's threads that do work for a clone after the clone has
 # gone (fcvm-holes in src/uffd/server.rs, fcvm-ws-warm in src/uffd/warmup.rs).
 # fcvm-ws-write is not here: it lives as long as the serve, and the outcome
-# line logged for each clone's publication acknowledges that work.
+# line logged for each clone's publication acknowledges that work. Nor are the
+# fcvm-replay-<index> workers: they are joined before their clone's replay ends.
 SERVE_DETACHED_THREADS = frozenset({"fcvm-holes", "fcvm-ws-warm"})
 # The lines that end a clone's working-set publication
 # (src/uffd/working_set.rs): fcvm-ws-write logs "merged" or "failed" once it
