@@ -718,6 +718,10 @@ pub(crate) const CONTAINER_LOG_CAP: u64 = 64 << 20;
 pub struct ContainerLogWriter {
     pub(crate) handle: tokio::task::JoinHandle<()>,
     pub(crate) stop: tokio_util::sync::CancellationToken,
+    /// Teardown cancels this instead of aborting the output listener: the listener then stops
+    /// accepting connections and reads the established one to its end, so the lines the guest
+    /// sent as it went down reach this writer.
+    pub(crate) listener_drain: tokio_util::sync::CancellationToken,
 }
 
 impl ContainerLogWriter {
@@ -734,7 +738,11 @@ impl ContainerLogWriter {
                 warn!(path = %path.display(), error = %e, "could not keep the container's output");
             }
         });
-        Self { handle, stop }
+        Self {
+            handle,
+            stop,
+            listener_drain: tokio_util::sync::CancellationToken::new(),
+        }
     }
 
     /// Tell the writer to stop once it has written the lines already sent, and wait at most `bound`
@@ -848,6 +856,7 @@ pub(crate) async fn write_container_log(
 /// Lines are forwarded (to stdout/stderr and to `log_tx`) as they arrive and are
 /// never retained: the listener runs for the whole life of the VM, so holding
 /// every line would grow without bound.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_output_listener(
     socket_path: &str,
     vm_id: &str,
@@ -856,6 +865,7 @@ pub(crate) async fn run_output_listener(
     non_blocking_output: bool,
     emit_output: bool,
     connected_tx: Option<tokio::sync::oneshot::Sender<()>>,
+    drain: Option<tokio_util::sync::CancellationToken>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, BufReader};
     use tokio::net::UnixListener;
@@ -911,7 +921,11 @@ pub(crate) async fn run_output_listener(
     }
 
     let mut reader = BufReader::new(initial_stream);
-    let mut line_buf = String::new();
+    // read_until keeps the bytes of a line it was interrupted in (a select! arm firing), where
+    // read_line would lose them, so the buffer is cleared only after a whole line.
+    let mut line_bytes: Vec<u8> = Vec::new();
+    let drain = drain.unwrap_or_default();
+    let mut draining = false;
 
     // Read lines from the current connection.
     // fc-agent may reconnect multiple times (snapshot create/restore cycles).
@@ -919,21 +933,30 @@ pub(crate) async fn run_output_listener(
     // reading from the current one, switch to it. The latest connection is
     // always the right one because it's from fc-agent's latest vsock connect.
     loop {
-        line_buf.clear();
-
-        // Race: read data vs new connection vs reconnect signal
+        // Race: read data vs new connection vs reconnect signal vs a drain request. Once draining,
+        // only the established connection is read, until its end.
         tokio::select! {
-            result = reader.read_line(&mut line_buf) => {
+            result = reader.read_until(b'\n', &mut line_bytes) => {
                 match result {
+                    Ok(0) if draining => {
+                        info!(vm_id = %vm_id, lines_read, "Output connection EOF while draining");
+                        break;
+                    }
                     Ok(0) => {
                         // EOF — connection closed. Wait for next.
                         info!(vm_id = %vm_id, lines_read, "Output connection EOF");
-                        match listener.accept().await {
+                        let accepted = tokio::select! {
+                            accepted = listener.accept() => accepted,
+                            // Asked to drain with no connection open: there is nothing left to read.
+                            () = drain.cancelled() => break,
+                        };
+                        match accepted {
                             Ok((s, _)) => {
                                 connection_count += 1;
                                 lines_read = 0;
                                 debug!(vm_id = %vm_id, connection_count, "Output connection established (after EOF)");
                                 reader = BufReader::new(s);
+                                line_bytes.clear();
                                 continue;
                             }
                             Err(e) => {
@@ -947,7 +970,9 @@ pub(crate) async fn run_output_listener(
                         if lines_read <= 3 || lines_read.is_multiple_of(1000) {
                             debug!(vm_id = %vm_id, lines_read, bytes = n, "Output line received");
                         }
-                        let line = line_buf.trim_end();
+                        let text = String::from_utf8_lossy(&line_bytes).into_owned();
+                        line_bytes.clear();
+                        let line = text.trim_end();
                         if let Some((stream, content)) = line.split_once(':') {
                             if stream == "heartbeat" {
                                 info!(vm_id = %vm_id, phase = %content, "VM heartbeat");
@@ -988,7 +1013,11 @@ pub(crate) async fn run_output_listener(
                     }
                 }
             }
-            accept = listener.accept() => {
+            () = drain.cancelled(), if !draining => {
+                info!(vm_id = %vm_id, lines_read, "Draining the output connection");
+                draining = true;
+            }
+            accept = listener.accept(), if !draining => {
                 // New connection arrived while reading — switch to it.
                 // The latest connection is always from fc-agent's latest reconnect.
                 match accept {
@@ -996,6 +1025,7 @@ pub(crate) async fn run_output_listener(
                         connection_count += 1;
                         info!(vm_id = %vm_id, connection_count, lines_read, "Switching to newer output connection");
                         reader = BufReader::new(new_stream);
+                        line_bytes.clear();
                         lines_read = 0;
                     }
                     Err(e) => {
@@ -1004,14 +1034,19 @@ pub(crate) async fn run_output_listener(
                     }
                 }
             }
-            _ = reconnect_notify.notified() => {
+            _ = reconnect_notify.notified(), if !draining => {
                 info!(vm_id = %vm_id, lines_read, "Reconnect signal, waiting for new connection");
-                match listener.accept().await {
+                let accepted = tokio::select! {
+                    accepted = listener.accept() => accepted,
+                    () = drain.cancelled() => break,
+                };
+                match accepted {
                     Ok((s, _)) => {
                         connection_count += 1;
                         lines_read = 0;
                         debug!(vm_id = %vm_id, connection_count, "Output connection established (after signal)");
                         reader = BufReader::new(s);
+                        line_bytes.clear();
                     }
                     Err(e) => {
                         warn!(vm_id = %vm_id, error = %e, "Accept failed after signal");
@@ -1119,6 +1154,79 @@ mod container_log_tests {
             "stdout: line 0\nstdout: line 1\nstdout: line 2\n"
         );
         drop(tx);
+    }
+
+    #[tokio::test]
+    async fn a_draining_listener_reads_the_open_connection_to_its_end() {
+        // Teardown asks the listener to drain before the guest's last line has arrived; that line
+        // must still reach the log, and the listener must return at the connection's end.
+        let dir = tempfile::tempdir().unwrap();
+        let socket_path = dir.path().join("output-drain.sock");
+        let socket_str = socket_path.to_string_lossy().to_string();
+        let (log_tx, mut log_rx) = tokio::sync::broadcast::channel::<LogLine>(16);
+        let drain = CancellationToken::new();
+        let (connected_tx, connected_rx) = tokio::sync::oneshot::channel();
+        let listener = tokio::spawn({
+            let drain = drain.clone();
+            async move {
+                run_output_listener(
+                    &socket_str,
+                    "test-vm",
+                    Some(log_tx),
+                    std::sync::Arc::new(tokio::sync::Notify::new()),
+                    false,
+                    false,
+                    Some(connected_tx),
+                    Some(drain),
+                )
+                .await
+            }
+        });
+        for _ in 0..200 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let mut guest = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        connected_rx.await.unwrap();
+        drain.cancel();
+        tokio::io::AsyncWriteExt::write_all(&mut guest, b"stderr:the last words\n")
+            .await
+            .unwrap();
+        drop(guest);
+        tokio::time::timeout(std::time::Duration::from_secs(5), listener)
+            .await
+            .expect("a draining listener returns at the connection's end")
+            .unwrap()
+            .unwrap();
+        let line = log_rx
+            .try_recv()
+            .expect("the line sent after the drain request is kept");
+        assert_eq!(
+            (line.stream.as_str(), line.content.as_str()),
+            ("stderr", "the last words")
+        );
+    }
+
+    #[test]
+    fn a_failed_setup_joins_the_writer_before_removing_its_directory() {
+        // Aborting the writer and dropping its handle let it keep writing while
+        // cleanup_failed_prepare removed the directory. No runtime fault reaches this branch
+        // cheaply, so the order is pinned in the source.
+        let source = include_str!("mod.rs");
+        let branch = source
+            .split("VM setup failed, cleaning up resources")
+            .nth(1)
+            .expect("the setup-failure branch")
+            .split("cleanup_failed_prepare(")
+            .next()
+            .unwrap();
+        assert!(branch.contains("writer.finish("), "the writer is joined");
+        assert!(
+            !branch.contains("writer.handle.abort()"),
+            "the writer is not just aborted"
+        );
     }
 
     #[tokio::test]
@@ -1477,7 +1585,17 @@ mod tests {
         let socket_str = socket_path.to_string_lossy().to_string();
         let reconnect = std::sync::Arc::new(tokio::sync::Notify::new());
         let handle = tokio::spawn(async move {
-            run_output_listener(&socket_str, "test-vm", None, reconnect, lossy, true, None).await
+            run_output_listener(
+                &socket_str,
+                "test-vm",
+                None,
+                reconnect,
+                lossy,
+                true,
+                None,
+                None,
+            )
+            .await
         });
         for _ in 0..50 {
             if socket_path.exists() {
@@ -1532,6 +1650,7 @@ mod tests {
                 reconnect,
                 false,
                 false, // emit_output=false: the `podman prepare` path
+                None,
                 None,
             )
             .await

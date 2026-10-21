@@ -1936,6 +1936,9 @@ async fn prepare_vm_for_lifecycle(
         let log_tx_clone = Some(log_tx.clone());
         let reconnect = output_reconnect.clone();
         let non_blocking_output = args.non_blocking_output;
+        let drain = container_log
+            .as_ref()
+            .map(|writer| writer.listener_drain.clone());
         Some(tokio::spawn(async move {
             match run_output_listener(
                 &socket_path,
@@ -1945,6 +1948,7 @@ async fn prepare_vm_for_lifecycle(
                 non_blocking_output,
                 !lifecycle.is_prepare(),
                 None,
+                drain,
             )
             .await
             {
@@ -2013,8 +2017,11 @@ async fn prepare_vm_for_lifecycle(
         if let Some(handle) = output_handle {
             handle.abort();
         }
+        // Joined, not just aborted: cleanup_failed_prepare removes the directory it writes in.
         if let Some(writer) = container_log {
-            writer.handle.abort();
+            if let Err(error) = writer.finish(std::time::Duration::from_secs(5)).await {
+                warn!("{error}");
+            }
         }
 
         // Abort egress proxy if running

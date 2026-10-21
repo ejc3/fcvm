@@ -1556,6 +1556,10 @@ pub struct CleanupContext {
     pub container_log: Option<super::podman::ContainerLogWriter>,
 }
 
+/// How long teardown lets a prepare's output listener read the guest's last lines before it stops
+/// it. The VMM is killed in the same phase, so the connection normally ends well within this.
+const OUTPUT_DRAIN_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Errors observed while tearing down independent VM resources.
 ///
 /// Cleanup must always attempt every resource even when an earlier action fails.  Normal
@@ -1838,8 +1842,12 @@ async fn cleanup_vm_inner(
     if let Some(ref token) = health_cancel_token {
         token.cancel();
     }
-    if let Some(handle) = output_listener_handle.as_ref() {
-        handle.abort();
+    // A prepare keeps the container's output, so its listener drains the established connection
+    // instead of being aborted with the guest's last lines still unread.
+    match (container_log.as_ref(), output_listener_handle.as_ref()) {
+        (Some(writer), _) => writer.listener_drain.cancel(),
+        (None, Some(handle)) => handle.abort(),
+        (None, None) => {}
     }
     for handle in &volume_server_handles {
         handle.abort();
@@ -1868,8 +1876,20 @@ async fn cleanup_vm_inner(
     };
     let listeners_stopped = async {
         let mut errors = Vec::new();
-        if let Some(handle) = output_listener_handle.take() {
-            if let Err(error) = handle.await {
+        if let Some(mut handle) = output_listener_handle.take() {
+            let joined = if container_log.is_some() {
+                match tokio::time::timeout(OUTPUT_DRAIN_BOUND, &mut handle).await {
+                    Ok(joined) => joined,
+                    Err(_) => {
+                        warn!(vm_id = %vm_id, bound = ?OUTPUT_DRAIN_BOUND, "the output listener did not reach the end of the guest's output; stopping it");
+                        handle.abort();
+                        handle.await
+                    }
+                }
+            } else {
+                handle.await
+            };
+            if let Err(error) = joined {
                 if !error.is_cancelled() {
                     errors.push(format!("joining output listener: {error}"));
                 }

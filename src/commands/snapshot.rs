@@ -2144,6 +2144,7 @@ async fn cmd_snapshot_run_inner(
                 non_blocking_output,
                 true,
                 Some(output_connected_tx),
+                None,
             )
             .await
             {
