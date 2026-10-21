@@ -862,6 +862,7 @@ fn snapshot_restore_args(
         no_swap: false,
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
+        map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
