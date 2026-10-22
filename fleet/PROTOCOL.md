@@ -3,7 +3,8 @@
 The renderer is the program in the container of every GPU VM (fcvm and EC2
 alike). It draws one rectangle of one shared image and streams it as H.264.
 The agent (or, locally, any client) sets the scene with `POST /scene`;
-browsers read frames from `GET /frames` and stats from `GET /health`.
+browsers read frames from `GET /frames`, a poster frame from `GET /still`
+and stats from `GET /health`.
 
 The renderer listens on `0.0.0.0:8080` (IPv4 and IPv6, plain HTTP and
 WebSocket; TLS comes later). Source: `fleet/renderer/`.
@@ -18,7 +19,14 @@ WebSocket; TLS comes later). Source: `fleet/renderer/`.
   (the GPU's baked terrain covers |x|, |z| < 512 km and is computed directly
   beyond, at a higher cost per frame).
 - The eye is kept at least 60 m above the ground and the sea; a keyframe
-  below that is lifted.
+  below that is lifted. It may go as high as you like: above about 10 km the
+  terrain march reaches the horizon, and above 60 km the camera is outside the
+  atmosphere, which is then drawn as a limb around the curved planet
+  (`tools/scene-high.json` holds at 80 km).
+- The world has one fixed landmark: an orbital ring, a band 120 km wide at
+  420 km above the surface on an axis through the planet's centre, seen as an
+  arc over the southern sky. It is part of the world, like the terrain, and
+  needs nothing in the scene.
 - **`t`** is seconds since `epoch_unix_ms` on the VM's clock (chrony keeps the
   VMs in step): `t = (now_unix_ms - epoch_unix_ms) / 1000`.
 - **Frames are drawn on a fixed grid of times:** `t = k / 30` for integer `k`
@@ -49,7 +57,7 @@ grants. The body is at most 1 MiB.
 | `rect` | this renderer's part of the whole image, normalized, origin top-left | inside the unit square, `w` and `h` at least 1/256 |
 | `image_aspect` | whole image width / height | 0.1 to 10 |
 | `camera` | keyframes; sorted by `t` on arrival | 1 to 4096 entries; `fov_deg` (vertical) 1 to 170 |
-| `time_of_day` | sun position: 0.25 sunrise, 0.5 noon, 0.75 sunset | 0 to 1 |
+| `time_of_day` | sun position: 0.25 sunrise, 0.5 noon, 0.75 sunset (the built-in scene uses 0.245, golden hour) | 0 to 1 |
 | `words` | viewer text | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
 | `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
@@ -73,20 +81,30 @@ field. A scene replaces the previous one whole.
 
 - **Text** is uppercased; characters outside the font (A-Z, 0-9 and
   `: . , - + ! ? ' " / # & @ ( ) = * < > _`) become `?`; at most 28 characters.
-- A word appears at its `t` (fading in over 1.5 s) as large glowing letters in
-  the sky about 8 km ahead of where the camera was at that `t`, placed sideways
-  by a hash of its index and `t`, and fades out at 90 s. Each viewer sees it
-  face their current camera. The newest 16 words are drawn.
+- Words and the clock are laid out on the screen of the whole image, not in
+  the world: each is placed along the camera's own right and up axes at a
+  fixed distance in front of it, so it keeps its place in the frame while the
+  camera moves, and every tile computes the same layout from the same camera.
+  Changed in round 5; before, they were anchored in the world.
 - **The clock** is always drawn: the UTC time of the frame
-  (`epoch_unix_ms / 1000 + t`, to the second), 12 km ahead of the camera and
-  above the horizon.
+  (`epoch_unix_ms / 1000 + t`, to the second), centred, its middle at 66% of
+  the half-height above the image centre, 7.5% of the image height tall.
+  Its letters are solid and dark with a bright rim and a dark halo, so it
+  reads over cloud, sky and terrain (at 180 px tiles too), and nothing in the
+  world hides it.
+- A word appears at its `t` (fading in over 1.5 s) and fades out at 90 s.
+  The newest 16 words are drawn, 5% of the image height tall, in 6 rows
+  (centres from 38% of the half-height above the image centre down to 62%
+  below it) and 3 columns, filled newest first down the left column, then the
+  middle, then the right, each nudged sideways by a hash of its index and
+  `t`. A word is moved as needed to keep it inside the middle 85% of the image
+  width, so none is cut off at the edge. Terrain in front of a word hides it.
 - A **light** appears at its `t` as a glowing sphere (35 m) of its `color`, and
   lights the terrain within 3 km. At most 32.
-- Words and the clock are glowing glass tubes in the world: lit by the sun and
-  the sky, with an emissive core, a bright rim and a soft halo. They, and the
-  light spheres, are drawn every frame at that frame's `t`, without sampling
-  noise, on top of the accumulated image (below), and are hidden where terrain
-  is in front of them.
+- Words are glowing glass tubes: lit by the sun and the sky, with an emissive
+  core, a bright rim and a soft halo. Words, the clock and the light spheres
+  are drawn every frame at that frame's `t`, without sampling noise, on top of
+  the accumulated image (below).
 
 ## `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
@@ -302,6 +320,24 @@ hold with 16 samples split 4 x 4 for the whole image and 2 x 8 for the tiles;
 on the 12th of 12 consecutive moving frames with history; and the same two with
 checkerboard frames of stride 2 and 4. Two controls (a tile drawn one pixel off, another `t`)
 must differ.
+
+## `GET /still?h=<height>&quality=<1-100>` (addition, round 5)
+
+A poster frame: the next frame of this renderer's rectangle, as a baseline
+JPEG (`image/jpeg`, 4:2:0, default `quality` 90), with the same
+`X-Fleet-Tile` header as `GET /raw` (it says `hold` and `hold_samples`, so a
+page can tell how far the image has converged). `Access-Control-Allow-Origin:
+*` and `Access-Control-Expose-Headers: X-Fleet-Tile` are set, so a page can
+read it with `fetch`.
+
+- `h` is the tile height, as in `GET /frames` (16 to 2160, default 540;
+  anything else is `400`).
+- While a stream runs, the frame is the stream's, at the stream's height.
+- With no stream, the request makes the renderer draw every slot for tile
+  height `h` for the next 30 s, and the frame returned is drawn that way. In a
+  hold, each frame adds samples (the same accumulation as a stream), so a
+  second request a few seconds later returns a more converged image.
+- `503` if no frame was drawn within 15 s (the GPU is not ready yet).
 
 ## `GET /raw?t=<t>` (debug)
 

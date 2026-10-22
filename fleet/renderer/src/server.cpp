@@ -17,6 +17,7 @@
 
 #include "json.h"
 #include "nvenc.h"
+#include "jpeg.h"
 #include "proto.h"
 
 namespace {
@@ -198,6 +199,28 @@ void Server::handle(int fd) {
              "HTTP/1.1 200 OK\r\nContent-Type: image/x-portable-pixmap\r\nContent-Length: %zu\r\nX-Fleet-Tile: %s\r\nConnection: close\r\n\r\n",
              ppm.size(), tile.c_str());
     std::string out = std::string(h) + ppm;
+    write_all(fd, out.data(), out.size());
+    return;
+  }
+  if (path == "/still" && (method == "GET" || method == "HEAD")) {
+    // the next frame drawn, as JPEG: at the height being streamed, or with no
+    // stream at tile height h (the renderer keeps drawing that way for
+    // STILL_HOLD_S, so in a hold repeated requests return a converging image)
+    int quality = std::clamp(query_int(query, "quality", 90), 1, 100);
+    int sh = query_int(query, "h", 540);
+    if (sh < 16 || sh > 2160) return respond(fd, 400, "Bad Request", "{\"error\":\"h must be 16..2160\"}");
+    std::vector<uint8_t> px;
+    int w = 0, h = 0;
+    std::string tile;
+    if (!p_.next_frame(sh, &px, &w, &h, &tile)) return respond(fd, 503, "Service Unavailable", "{\"error\":\"no frame drawn\"}");
+    std::string jpg = jpeg_encode(px.data(), w, h, quality);
+    char hd[640];
+    snprintf(hd, sizeof hd,
+             "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: %zu\r\nX-Fleet-Tile: %s\r\n"
+             "Access-Control-Allow-Origin: *\r\nAccess-Control-Expose-Headers: X-Fleet-Tile\r\nCache-Control: no-store\r\n"
+             "Connection: close\r\n\r\n",
+             jpg.size(), tile.c_str());
+    std::string out = std::string(hd) + (method == "HEAD" ? std::string() : jpg);
     write_all(fd, out.data(), out.size());
     return;
   }

@@ -2,14 +2,16 @@
 
 The program in every GPU VM of the fleet wall: it path-traces its rectangle of
 one shared procedural planet with CUDA, encodes it with NVENC and streams it
-over WebSocket. The interface (`POST /scene`, `GET /frames`, `GET /health`) is
+over WebSocket. The interface (`POST /scene`, `GET /frames`, `GET /still`,
+`GET /health`) is
 in [`../PROTOCOL.md`](../PROTOCOL.md); the design is in
 [`../../docs/fleet/ARCHITECTURE.md`](../../docs/fleet/ARCHITECTURE.md).
 
 ## The scene
 
-A planet seen from a few hundred metres to a few kilometres up, every pixel a
-pure function of `t`, the scene and its whole-image coordinates:
+A planet seen from a few hundred metres to 100 km up, every pixel a pure
+function of `t`, the scene and its whole-image coordinates. The built-in
+scene is at golden hour (sun about 7 degrees up):
 
 - **Terrain**, ray marched: continents and seas, mountain massifs of eroded
   fbm (octaves damped by the accumulated slope) with domain-warped ridges,
@@ -18,17 +20,27 @@ pure function of `t`, the scene and its whole-image coordinates:
   filtered 2048 x 2048 texture over +-512 km, which halves the cost of a march
   step; outside it they are computed directly. Shading reads the same fields
   through a quadratic B-spline, because the hardware's bilinear filter is not
-  smooth enough for normals.
-- **Materials** by height, slope and noise: rock, meadow, dry grass, forest,
-  beach, snow on flatter high ground, with albedo detail down to tens of
-  metres; Lambert plus GGX.
+  smooth enough for normals. Bare rock gets ridged detail normals (gullies a
+  few tens of metres across), faded out where a pixel is larger than them.
+- **Materials** by height, slope and noise: two rock colours in strata, scree
+  below cliffs, meadow, heath and dry grass, mottled forest canopy, beach, and
+  snow on flatter high ground, with albedo detail down to tens of metres;
+  Lambert plus GGX.
 - **Water** at sea level with animated wave normals, Fresnel reflection of
   terrain, sky and clouds, sun glitter, depth-tinted seabed and shore foam.
 - **Atmosphere**: Rayleigh, Mie and ozone single scattering over a precomputed
   transmittance table, a cheap multiple-scattering term, aerial perspective on
-  everything, the sun's disc with limb darkening, stars at night.
+  everything (a denser haze than before, so distant ranges fade into it), the
+  sun's disc with limb darkening, stars at night. From above 60 km the march
+  starts where the view ray enters the atmosphere, so the planet's limb and
+  its blue rim are drawn against black space.
+- **The orbital ring**: a band 120 km wide, 420 km up, around an axis through
+  the planet's centre: panels, lit seams on its night side, the planet's
+  shadow. It arcs over the southern sky and hides the sun and stars behind it.
 - **Clouds**: a cumulus layer (2.7 to 5.6 km) ray marched through a tileable
-  Perlin-Worley volume (128^3, generated at start): two octaves for the body,
+  Perlin-Worley volume (128^3, generated at start), its lookup warped by a
+  ground-fixed noise and its second octave rotated, so the 14 km tile does not
+  repeat visibly from high up: two octaves for the body,
   two finer ones eroding the edges (billows on top, wisps below), flat bases,
   denser cores rising higher. The march takes coarse steps through empty air
   and steps of 1.5% of the distance (120 to 600 m) inside clouds, so edges stay
@@ -39,11 +51,18 @@ pure function of `t`, the scene and its whole-image coordinates:
 - **Light transport**: per sample a soft sun shadow (a random point of the
   sun's disc), cloud shadow, and one bounce of sky or ground light; viewers'
   lights add point lighting.
-- **Words and the clock**: glowing glass tubes along a stroke font, ray
-  marched as 3D distance fields, lit by the sun and the sky with a specular
-  highlight, an emissive core, a bright rim and a halo; viewers' lights are
-  glowing spheres. All drawn exactly (no sampling) every frame.
-- ACES-like tone mapping, sRGB, a dither seeded by the whole-image pixel.
+- **Words and the clock**: tubes along a stroke font, ray marched as 3D
+  distance fields and laid out on the screen (the clock centred near the top,
+  words in a grid below it, inside a safe area). Words are glowing glass; the
+  clock is solid dark metal with a bright rim and a dark halo, readable over
+  cloud and sky. Viewers' lights are glowing spheres. All drawn exactly (no
+  sampling) every frame.
+- The sun's glare: three exponential lobes around the sun's direction, scaled
+  by how much of the sun the camera sees (a terrain and cloud shadow ray from
+  the camera, one per frame).
+- ACES tone mapping (the fitted RRT and ODT), a warm-highlight, cool-shadow
+  split tone, a vignette over the whole image, sRGB, a dither seeded by the
+  whole-image pixel.
 
 Convergence: exact accumulation while the camera holds; while it moves, each
 frame averages itself with its last 7 frames reprojected through a guard band
@@ -98,7 +117,8 @@ Tools (Python 3 standard library, plus Pillow and the `ffmpeg` CLI for
 decoding):
 
 ```bash
-python3 tools/smoke.py HOST 8080                     # health, 60 frames, decode
+python3 tools/smoke.py HOST 8080                     # health, 60 frames, decode, GET /still
+curl -o poster.jpg 'http://HOST:8080/still?h=540'    # this rectangle's next frame as JPEG
 Q=lo python3 tools/mosaic.py ...                     # any tool: Q=hi|std|lo picks the stream quality
 python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving camera
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame
@@ -109,6 +129,11 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 
 ## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
 
+The fps table and the seam numbers are from round 5; the stream-quality and
+subscriber numbers are from round 4. Round 5's scene costs 10% more per
+sample than round 4's (`fleet-renderer bench --h 720`, one sample per pixel,
+on the host: 29.1 ms before, 31.9 ms after; the low sun alone is about 1 ms).
+
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
 budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
 tiles are a 1/16 x 1/9 rect of a 16:9 image, the detail view is one such tile
@@ -117,13 +142,13 @@ the checkerboard stride (1: every pixel draws).
 
 | inner size | stream (with overlap) | fps | samples/pixel/frame | checker | render ms | encode ms |
 |---|---|---|---|---|---|---|
-| 146 x 146 (asked 136) | 178 x 178 | 30.0 | 5 | 1 | 14.8 | 0.51 |
-| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 10.9 | 0.68 |
-| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.5 | 0.75 |
-| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 8.7 | 1.16 |
-| 1080 x 1080 detail view | 1112 x 1112 | 30.0 | 1 | 4 | 24.5 | 3.93 |
-| 1280 x 720 whole image | 1280 x 720 | 30.0 | 1 | 4 | 27.9 | 2.52 |
-| 1920 x 1080 whole image | 1920 x 1080 | 14.9 | 1 | 4 | 58.8 | 4.02 |
+| 146 x 146 (asked 136) | 178 x 178 | 31.5 | 5 | 1 | 12.4 | 0.53 |
+| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 10.7 | 0.74 |
+| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.7 | 0.74 |
+| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 9.4 | 1.18 |
+| 1080 x 1080 detail view | 1112 x 1112 | 30.0 | 1 | 4 | 26.9 | 4.06 |
+| 1280 x 720 whole image | 1280 x 720 | 29.9 | 1 | 4 | 29.5 | 2.52 |
+| 1920 x 1080 whole image | 1920 x 1080 | 12.5 | 1 | 4 | 61.3 | 4.05 |
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
@@ -147,10 +172,24 @@ the GPU; 307 to 330 ms with `nvidia-persistenced` running in the guest.
 Relaunch (round 2, cache-hit `fcvm podman run`): 6.15 to 6.28 s from the
 command to the first frame at the client.
 
-Seams: the seam test passes in VMs on three different T4s with the same
-hashes. A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
+Seams (round 5): the seam test passes in VMs on three different T4s with the
+same hashes (`fnv64 1fee6f746d08e12d`, `b6c76adc254cc36b`, `9785fc0b8858b93b`).
+A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
 equals the same frame drawn whole in another VM in all 2,073,600 pixels, with
 every pixel drawing and with stride-4 checkerboard frames. At 540 px tiles its
-seam ratio is 0.63 to 1.22 unencoded and 0.76 to 1.34 as the eight `std`
-streams decode it, cropped. Shots stitched from eight VMs on eight GPUs are in
-`shots/`.
+seam ratio is 0.72 to 3.72 unencoded and 0.82 to 3.81 as the eight `std`
+streams decode it, cropped. The 3.72 is the clock: it is centred, so a digit's
+stroke lies on the middle boundary in the unencoded frame too. The largest
+increase from encoding, 1.00 to 1.76, is at a boundary in flat, dark forest,
+where the metric divides by a near-zero gradient; a 2x crop shows no line.
+Golden-hour hold 0.93 to 1.41, high-altitude hold 0.63 to 1.16 (decoded).
+
+`GET /still?h=540` from the eight VMs, 12 s after the first request with no
+stream running, in the 80 km hold: 360 to 381 samples per pixel, stitched in
+`shots/still-high-8gpu.jpg`.
+
+Shots stitched from eight VMs on eight GPUs are in `shots/`:
+`mosaic-hold-8gpu.jpg` (golden hour, held), `mosaic-high-8gpu.jpg` (80 km
+up, held), `mosaic-move-8gpu.jpg` (moving), the two holds at 180 px tiles,
+`raw-move-8gpu.jpg` and `decoded-move-8gpu.jpg` (one moving frame, unencoded
+and decoded).

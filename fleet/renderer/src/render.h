@@ -13,6 +13,7 @@ struct RenderStats {
   int spp = 0;          // samples drawn per pixel in the last frame
   int hold_samples = 0; // samples accumulated in the current hold (0 while moving)
   bool hold = false;
+  unsigned int bad_samples = 0;  // non-finite samples dropped in the last frame (should be 0)
   int half = 1;          // checkerboard stride: 1 every pixel drew, 2 half, 4 a quarter
 };
 

@@ -137,17 +137,19 @@ void Pipeline::run() {
   double window_start = mono_s();
   while (!stop_) {
     std::shared_ptr<const Scene> sc;
-    bool any;
+    bool any, paced;
     {
       std::unique_lock<std::mutex> l(mu_);
       sc = scene_;
       any = !subs_.empty();
+      // a recent GET /still keeps the renderer drawing every slot
+      paced = any || std::chrono::steady_clock::now() < still_until_;
       if (scene_version_ != seen_version) { seen_version = scene_version_; last_k = LLONG_MIN; }
     }
     double now = now_unix_ms();
     double tcur = (now - (double)sc->epoch_unix_ms) / 1000.0;
     long long k = (long long)std::floor(tcur * opt_.fps);
-    if (any) {
+    if (paced) {
       k += 1;  // the next slot
       if (k <= last_k) k = last_k + 1;
       double slot_ms = (double)sc->epoch_unix_ms + k * 1000.0 / opt_.fps;
@@ -159,8 +161,11 @@ void Pipeline::run() {
     } else if (last_k != LLONG_MIN) {
       // nobody is watching: draw twice a second so /health stays current
       std::unique_lock<std::mutex> l(mu_);
-      cv_.wait_for(l, std::chrono::milliseconds(500), [&] { return stop_.load() || !subs_.empty() || scene_version_ != seen_version; });
-      if (!subs_.empty() || scene_version_ != seen_version) continue;
+      cv_.wait_for(l, std::chrono::milliseconds(500), [&] {
+        return stop_.load() || !subs_.empty() || scene_version_ != seen_version ||
+               std::chrono::steady_clock::now() < still_until_;
+      });
+      if (!subs_.empty() || scene_version_ != seen_version || std::chrono::steady_clock::now() < still_until_) continue;
       k = std::max(k, last_k + 1);
     }
     double t = (double)k / opt_.fps;
@@ -240,6 +245,10 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     }
   }
   int render_h = opt_.idle_h;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    if (std::chrono::steady_clock::now() < still_until_) render_h = encode_geometry(*sc, still_h_).h;
+  }
   if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
   double px = r_.drawn_pixels(rt);
@@ -261,20 +270,22 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     std::lock_guard<std::mutex> l(mu_);
     bool any = false;
     for (auto& rq : raw_reqs_) {
-      if (rq->done || rq->k > k) continue;
+      bool next = rq->k == LLONG_MIN;
+      if (rq->done || (!next && rq->k > k)) continue;
+      if (next && rq->want_h > 0 && encs_.empty() && render_h != encode_geometry(*sc, rq->want_h).h)
+        continue;  // drawn at another height
       rq->done = true;
       any = true;
-      if (rq->k < k) continue;  // that slot was skipped
-      std::vector<uint8_t> px;
-      r_.download_rgba(&px);
-      char h[64];
-      snprintf(h, sizeof h, "P6\n%d %d\n255\n", rt.w, rt.h);
-      rq->ppm = h;
-      rq->ppm.reserve(rq->ppm.size() + px.size() / 4 * 3);
-      for (size_t i = 0; i < px.size(); i += 4) rq->ppm.append((const char*)&px[i], 3);
-      char tj[192];
-      snprintf(tj, sizeof tj, "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"spp\":%d,\"checkerboard\":%d}",
-               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half);
+      if (!next && rq->k < k) continue;  // that slot was skipped
+      r_.download_rgba(&rq->rgba);
+      rq->w = rt.w;
+      rq->h = rt.h;
+      char tj[256];
+      snprintf(tj, sizeof tj,
+               "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,"
+               "\"spp\":%d,\"checkerboard\":%d,\"hold\":%s,\"hold_samples\":%d}",
+               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half,
+               r_.stats().hold ? "true" : "false", r_.stats().hold_samples);
       rq->tile = tj;
       rq->ok = true;
     }
@@ -384,17 +395,41 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   encode_ms_ = enc_ms;
 }
 
-bool Pipeline::raw_frame(double t, std::string* ppm, std::string* tile_json) {
+bool Pipeline::capture(long long k, int want_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) {
   auto r = std::make_shared<RawReq>();
-  r->k = std::llround(t * opt_.fps);
+  r->k = k;
+  r->want_h = want_h;
   std::unique_lock<std::mutex> l(mu_);
+  if (want_h > 0) {
+    still_h_ = want_h;
+    still_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(STILL_HOLD_S);
+  }
   raw_reqs_.push_back(r);
+  cv_.notify_all();  // an idle render loop draws sooner
   raw_cv_.wait_for(l, std::chrono::seconds(15), [&] { return r->done; });
   raw_reqs_.erase(std::remove(raw_reqs_.begin(), raw_reqs_.end(), r), raw_reqs_.end());
   if (!r->ok) return false;
-  *ppm = std::move(r->ppm);
+  *rgba = std::move(r->rgba);
+  *w = r->w;
+  *h = r->h;
   *tile_json = r->tile;
   return true;
+}
+
+bool Pipeline::raw_frame(double t, std::string* ppm, std::string* tile_json) {
+  std::vector<uint8_t> px;
+  int w, h;
+  if (!capture(std::llround(t * opt_.fps), 0, &px, &w, &h, tile_json)) return false;
+  char hd[64];
+  snprintf(hd, sizeof hd, "P6\n%d %d\n255\n", w, h);
+  *ppm = hd;
+  ppm->reserve(ppm->size() + px.size() / 4 * 3);
+  for (size_t i = 0; i < px.size(); i += 4) ppm->append((const char*)&px[i], 3);
+  return true;
+}
+
+bool Pipeline::next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json) {
+  return capture(LLONG_MIN, still_h, rgba, w, h, tile_json);
 }
 
 std::string Pipeline::health_json() {
