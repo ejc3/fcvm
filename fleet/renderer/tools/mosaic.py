@@ -6,7 +6,7 @@ Gives renderer k the rect of grid cell k (row-major), posts the same scene and
 epoch to all of them, subscribes to each at TILE_H for SECONDS, then picks the
 latest frame time t that every stream delivered, decodes each stream up to that
 frame and pastes every tile at its whole-image pixel offset (x0, y0 from the
-stream header). Writes OUT_PREFIX.png and OUT_PREFIX.json (per tile: t, frame,
+stream header), drawing only each stream's inner rectangle (its `crop`). Writes OUT_PREFIX.png and OUT_PREFIX.json (per tile: t, frame,
 GPU, size).
 """
 import json
@@ -65,9 +65,11 @@ for k, (hdr, fr) in enumerate(results):
     idx = [i for i, (m, _) in enumerate(fr) if m["t"] == t_pick][0]
     imgs = fc.decode([a for _, a in fr[:idx + 1]], hdr["width"], hdr["height"])
     tile = Image.frombytes("RGB", (hdr["width"], hdr["height"]), imgs[idx])
+    c = hdr.get("crop", {"left": 0, "top": 0, "right": 0, "bottom": 0})  # draw only the inner rectangle
+    tile = tile.crop((c["left"], c["top"], hdr["width"] - c["right"], hdr["height"] - c["bottom"]))
     canvas.paste(tile, (hdr["x0"], hdr["y0"]))
     hl = fc.health(*ends[k])
-    meta.append({"cell": k, "x0": hdr["x0"], "y0": hdr["y0"], "w": hdr["width"], "h": hdr["height"],
+    meta.append({"cell": k, "x0": hdr["x0"], "y0": hdr["y0"], "w": hdr["width"], "h": hdr["height"], "crop": c,
                  "t": t_pick, "frame": fr[idx][0]["frame"], "gpu": hl["gpu"], "fps": hl["fps"],
                  "spp": hl["spp"], "hold_samples": hl["hold_samples"], "bits_per_s": round(rates[k])})
 canvas.save(out + ".png")

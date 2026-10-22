@@ -24,7 +24,7 @@ static void usage() {
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
           "       fleet-renderer sleep                          wait forever without using the GPU\n"
-          "env: PORT, FPS (30), BUDGET pixel-samples per frame (500000), ADAPT (0), ACCUMULATE (1)\n");
+          "env: PORT, FPS (30), BUDGET pixel-samples per frame (250000), ADAPT (0), MARGIN (16), ACCUMULATE (1)\n");
 }
 
 static double envd(const char* k, double d) {
@@ -55,7 +55,7 @@ static int cmd_still(int argc, char** argv) {
     else { usage(); return 2; }
   }
   Renderer r;
-  r.set_budget(envd("BUDGET", 5.0e5));
+  r.set_budget(envd("BUDGET", 2.5e5));
   std::string err;
   if (!r.init(&err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
   Tile tile = tile_geometry(sc.rect, sc.image_aspect, h);
@@ -97,7 +97,7 @@ static int cmd_startup(int argc, char** argv) {
   void* nv = r.alloc_nv12(tl.w, tl.h, &pitch);
   H264Encoder enc;
   if (!enc.open(r.cu_context(), nv, pitch, tl.w, tl.h, 30, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
-  r.to_nv12(nv, pitch, tl.w, tl.h);
+  r.to_nv12(nv, pitch, tl.w, tl.h, tl.x0, tl.y0, tl.full_h);
   std::vector<uint8_t> au;
   bool key;
   if (!enc.encode(true, &au, &key, &err)) { fprintf(stderr, "encode: %s\n", err.c_str()); return 1; }
@@ -134,8 +134,9 @@ int main(int argc, char** argv) {
   Options o;
   o.port = (int)envd("PORT", 8080);
   o.fps = (int)envd("FPS", 30);
-  o.budget = envd("BUDGET", 5.0e5);
+  o.budget = envd("BUDGET", 2.5e5);
   o.adapt = envd("ADAPT", 0) != 0;
+  o.margin = (int)envd("MARGIN", 16);
   o.accumulate = envd("ACCUMULATE", 1) != 0;
   Pipeline p(o);
   p.set_process_start(start);
@@ -168,7 +169,7 @@ static int cmd_bench(int argc, char** argv) {
   // a wall-like tile: 1/16 of the width, 1/9 of the height (an 16 x 9 grid)
   Rect wall{0.5, 0.333, 1.0 / 16, 1.0 / 9};
   Renderer r;
-  r.set_budget(envd("BUDGET", 5.0e5));
+  r.set_budget(envd("BUDGET", 2.5e5));
   std::string err;
   if (!r.init(&err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
   printf("height,width,spp,render_ms_mean,encode_ms_mean,fps_capacity,mode\n");
@@ -188,7 +189,7 @@ static int cmd_bench(int argc, char** argv) {
         double t = t0 + f / 30.0;
         r.render(sc, tl, t, true);
         auto a = std::chrono::steady_clock::now();
-        r.to_nv12(nv, pitch, tl.w, tl.h);
+        r.to_nv12(nv, pitch, tl.w, tl.h, tl.x0, tl.y0, tl.full_h);
         std::vector<uint8_t> au;
         bool key;
         enc.encode(f == 0, &au, &key, &err);
