@@ -33,7 +33,7 @@ struct SnapshotInfo {
     size_human: String,
     memory_size_bytes: u64,
     /// The directories the snapshot maps into the guest. `snapshot run --map` serves a
-    /// read-only one from another host directory.
+    /// read-only, portable one from another host directory.
     maps: Vec<SnapshotMapInfo>,
 }
 
@@ -42,6 +42,7 @@ struct SnapshotInfo {
 struct SnapshotMapInfo {
     guest_path: String,
     read_only: bool,
+    portable: bool,
 }
 
 fn snapshot_maps(config: &SnapshotConfig) -> Vec<SnapshotMapInfo> {
@@ -52,6 +53,7 @@ fn snapshot_maps(config: &SnapshotConfig) -> Vec<SnapshotMapInfo> {
         .map(|v| SnapshotMapInfo {
             guest_path: v.guest_path.clone(),
             read_only: v.read_only,
+            portable: v.portable,
         })
         .collect()
 }
@@ -505,8 +507,8 @@ mod tests {
         assert_eq!(
             listed,
             serde_json::json!([
-                {"guest_path": "/var/creds", "read_only": true},
-                {"guest_path": "/data", "read_only": false},
+                {"guest_path": "/var/creds", "read_only": true, "portable": true},
+                {"guest_path": "/data", "read_only": false, "portable": true},
             ])
         );
     }

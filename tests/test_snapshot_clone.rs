@@ -3553,7 +3553,12 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
     let recorded = tempfile::tempdir()?;
     let replacement = tempfile::tempdir()?;
     std::fs::write(recorded.path().join("marker"), "from-A\n")?;
-    std::fs::write(replacement.path().join("marker"), "from-B\n")?;
+    // A different length: the guest revalidates a cached file by its size and mtime, and
+    // two files written this close together can share an mtime.
+    std::fs::write(
+        replacement.path().join("marker"),
+        "from-B, the replacement\n",
+    )?;
     let recorded_map = format!("{}:/data:ro", recorded.path().display());
     let replacement_map = format!("{}:/data:ro", replacement.path().display());
 
@@ -3565,6 +3570,7 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
             &baseline_name,
             "--network",
             "rootless",
+            "--portable-volumes",
             "--map",
             &recorded_map,
             common::TEST_IMAGE,
@@ -3618,7 +3624,7 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
         .map(|s| s["maps"].clone());
     assert_eq!(
         maps,
-        Some(serde_json::json!([{"guest_path": "/data", "read_only": true}])),
+        Some(serde_json::json!([{"guest_path": "/data", "read_only": true, "portable": true}])),
         "snapshots ls names the snapshot's map"
     );
 
@@ -3650,7 +3656,7 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
     healthy?;
     assert_eq!(
         seen?.trim(),
-        "from-B",
+        "from-B, the replacement",
         "the clone reads the directory --map named"
     );
     Ok(())

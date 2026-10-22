@@ -1243,13 +1243,13 @@ fn ensure_no_passthrough_in_memory_snapshot(gpus: &[String], disk_only: bool) ->
 
 /// The directories a clone serves to the guest's mounts.
 ///
-/// Without `--map` they are the snapshot's. With it, each requested `HOST:GUEST[:ro]`
-/// replaces the host side of the snapshot's mapping of GUEST, which must exist with the
-/// same read-only flag: the guest mounted every mapping when it booted, the restore keeps
-/// those mounts, and a clone cannot add or drop one. The vsock port and the portable flag
-/// stay the snapshot's. A portable volume's inode table names files by their path under
-/// the mount, so the guest's open files are found again in the new directory when it holds
-/// the same tree.
+/// Without `--map` they are the snapshot's. With it, each requested `HOST:GUEST:ro`
+/// replaces the host side of the snapshot's mapping of GUEST, which must be a read-only,
+/// portable map: the guest mounted every mapping when it booted, the restore keeps those
+/// mounts, and a clone cannot add or drop one. The vsock port stays the snapshot's. A
+/// portable volume's inode table names files by their path under the mount, so the guest's
+/// open files are found again in the new directory when it holds the same tree; a
+/// non-portable one holds host inode numbers, which name nothing there.
 fn clone_volumes(
     snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
     requested: &[String],
@@ -1288,6 +1288,14 @@ fn clone_volumes(
         if !mapping.read_only {
             bail!(
                 "--map {spec}: the snapshot mapped {} read-only; give :ro",
+                volume.guest_path
+            );
+        }
+        if !volume.portable {
+            bail!(
+                "--map {spec}: the snapshot did not map {} with --portable-volumes. Its guest \
+                 holds the recorded directory's host inode numbers, which name nothing in \
+                 another directory, so files it has open would answer EIO.",
                 volume.guest_path
             );
         }
@@ -4918,6 +4926,15 @@ mod tests {
         let flag = clone_volumes(&snapshot, &requested(&[&format!("{h}:/var/creds")])).unwrap_err();
         assert!(format!("{flag:#}").contains("read-only"), "{flag:#}");
         let writable = vec![volume(recorded.path(), "/data", false, 5001)];
+        let mut nonportable = volume(recorded.path(), "/var/creds", true, 5000);
+        nonportable.portable = false;
+        let host_inodes =
+            clone_volumes(&[nonportable], &requested(&[&format!("{h}:/var/creds:ro")]))
+                .unwrap_err();
+        assert!(
+            format!("{host_inodes:#}").contains("--portable-volumes"),
+            "{host_inodes:#}"
+        );
         for spec in [format!("{h}:/data"), format!("{h}:/data:ro")] {
             let rw = clone_volumes(&writable, &requested(&[&spec])).unwrap_err();
             assert!(

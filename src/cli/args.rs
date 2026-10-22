@@ -677,13 +677,17 @@ pub struct SnapshotRunArgs {
 
     /// Serve a directory the snapshot mapped read-only from this host directory instead of
     /// the one it recorded. Grammar: HOST:GUEST:ro, as for `podman run --map`, repeated.
-    /// Each GUEST must be a path the snapshot mapped read-only: the guest mounted it when
-    /// it booted and the restore keeps that mount. A read-write map cannot be moved, since
-    /// the guest treats the sizes and pages it cached from one as its own. Files the guest
+    /// Each GUEST must be a path the snapshot mapped read-only with --portable-volumes:
+    /// the guest mounted it when it booted and the restore keeps that mount. A read-write
+    /// map cannot be moved, since the guest treats the sizes and pages it cached from one
+    /// as its own, and neither can one without portable volumes, whose open files the guest
+    /// names by host inode numbers. Files the guest
     /// held open are found again by their path under the mount, so the new directory
     /// should hold the same tree. What the guest cached from the recorded directory it
     /// checks against the new one once the map's attribute timeout (1 s of guest time)
-    /// passes, as it does when a host file changes under a running VM. Use it to give a
+    /// passes, by each file's size and modification time, as it does when a host file
+    /// changes under a running VM: a file whose size and mtime both match keeps the
+    /// guest's cached pages. Use it to give a
     /// clone this host's copy of what the snapshot read from its own: certificates,
     /// credentials, a checkout. Without this flag the clone serves the recorded host
     /// directories.
