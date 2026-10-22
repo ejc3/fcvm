@@ -1301,7 +1301,7 @@ async fn prepare_vm_for_lifecycle(
     } else {
         crate::setup::get_kernel_profile("default")?
     };
-    let runtime_config = runtime_config_from_kernel_profiles(
+    let mut runtime_config = runtime_config_from_kernel_profiles(
         effective_profile_name,
         profile,
         default_profile,
@@ -1328,6 +1328,15 @@ async fn prepare_vm_for_lifecycle(
             .await
             .context("setting up kernel")?
     };
+    // A profile with an NVIDIA driver image attaches it to every cold boot, GPU or
+    // not, so its snapshots carry the mounted driver and any restore can take a GPU.
+    // The modules are built against the profile's kernel, so --kernel gets none.
+    if args.kernel.is_none() {
+        runtime_config.gpu_driver_image =
+            crate::setup::profile_nvidia_driver_image(kernel_profile_name, args.setup)
+                .await
+                .context("setting up the NVIDIA driver image")?;
+    }
 
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
     let rootfs_type = resolve_rootfs_type(&args);
@@ -1473,6 +1482,7 @@ async fn prepare_vm_for_lifecycle(
             cmd_args.clone(),
             resolved_mode,
             runtime_config.firecracker_bin.as_deref(),
+            runtime_config.gpu_driver_image.as_deref(),
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
             boot_inputs.clone(),
@@ -3386,6 +3396,7 @@ mod tests {
                 ImageMode::Overlay,
                 None,
                 None,
+                None,
                 extra,
                 GuestBootInputs::default(),
                 &[],
@@ -3564,6 +3575,7 @@ mod tests {
                 Path::new("/initrd"),
                 None,
                 ImageMode::Overlay,
+                None,
                 None,
                 None,
                 None,
@@ -3905,6 +3917,7 @@ mod tests {
             Path::new("/initrd"),
             None,
             ImageMode::Overlay,
+            None,
             None,
             None,
             None,

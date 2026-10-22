@@ -50,6 +50,11 @@ pub struct FirecrackerConfig {
     /// get different keys.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub pmem: Vec<String>,
+    /// The NVIDIA driver image attached read-only after every other drive. Its
+    /// content-addressed path names the driver version and the kernel build its
+    /// modules were compiled against, and the snapshot holds the guest's mount of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_driver_image: Option<PathBuf>,
     /// Environment variables passed to the container.
     /// Format: "KEY=value" - affects container behavior so must be in cache key.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -228,6 +233,7 @@ impl Default for FirecrackerConfig {
             data_dir: PathBuf::new(),
             extra_disks: Vec::new(),
             pmem: Vec::new(),
+            gpu_driver_image: None,
             env_vars: Vec::new(),
             volume_mounts: Vec::new(),
             privileged: false,
@@ -512,6 +518,7 @@ impl FirecrackerConfig {
                     "pmem_mounts": runtime.pmem_mounts,
                     "image_device": runtime.image_device,
                     "image_mode": runtime.image_device.as_ref().map(|_| self.image_mode.to_string()),
+                    "gpu_driver": runtime.gpu_driver_device.as_ref().map(|device| serde_json::json!({ "device": device })),
                     "privileged": self.privileged,
                     "user": self.user.as_deref(),
                     "subuid_start": runtime.subuid_start,
@@ -552,6 +559,8 @@ pub struct MmdsRuntime {
     pub pmem_mounts: Vec<serde_json::Value>,
     /// Device path for localhost image (e.g., "/dev/vdb"), used by all image modes
     pub image_device: Option<String>,
+    /// Device path of the NVIDIA driver image (`gpu_driver_image`), if attached
+    pub gpu_driver_device: Option<String>,
     /// Resolved HTTP proxy URL (IP, not hostname)
     pub http_proxy: Option<String>,
     /// Resolved HTTPS proxy URL
@@ -734,6 +743,22 @@ mod tests {
         let mut config2 = test_config();
         config2.extra_disks = vec!["/tmp/data:/mydata:ro".to_string()];
         assert_ne!(config1.snapshot_key(), config2.snapshot_key());
+    }
+
+    #[test]
+    fn the_driver_image_keys_only_the_profiles_that_have_one() {
+        // A profile without a driver image keeps the key it had before the field
+        // existed: the field is omitted, not serialized as null.
+        let plain = test_config();
+        assert!(!serde_json::to_string(&plain)
+            .unwrap()
+            .contains("gpu_driver_image"));
+        let mut gpu = test_config();
+        gpu.gpu_driver_image = Some(PathBuf::from("/assets/nvidia/driver-a.img"));
+        assert_ne!(plain.snapshot_key(), gpu.snapshot_key());
+        let mut other = test_config();
+        other.gpu_driver_image = Some(PathBuf::from("/assets/nvidia/driver-b.img"));
+        assert_ne!(gpu.snapshot_key(), other.snapshot_key());
     }
 
     #[test]
@@ -985,6 +1010,7 @@ mod tests {
             nfs_mounts: vec![],
             pmem_mounts: vec![],
             image_device: None,
+            gpu_driver_device: None,
             http_proxy: None,
             https_proxy: None,
             no_proxy: None,
@@ -997,6 +1023,36 @@ mod tests {
         assert_eq!(
             plan.pointer("/latest/container-plan/published_guest_ports"),
             Some(&serde_json::json!(["80", "81"]))
+        );
+    }
+
+    /// fc-agent reads `container-plan.gpu_driver.device` (fc-agent `Plan.gpu_driver`).
+    #[test]
+    fn mmds_names_the_driver_image_device() {
+        let runtime = |gpu_driver_device: Option<&str>| MmdsRuntime {
+            volumes: vec![],
+            extra_disks: vec![],
+            nfs_mounts: vec![],
+            pmem_mounts: vec![],
+            image_device: None,
+            gpu_driver_device: gpu_driver_device.map(str::to_string),
+            http_proxy: None,
+            https_proxy: None,
+            no_proxy: None,
+            subuid_start: None,
+            subuid_count: None,
+            host_time: "0".to_string(),
+            ntp_servers: vec![],
+        };
+        let plan = test_config().to_mmds_json(runtime(Some("/dev/vdc")));
+        assert_eq!(
+            plan.pointer("/latest/container-plan/gpu_driver"),
+            Some(&serde_json::json!({ "device": "/dev/vdc" }))
+        );
+        let plan = test_config().to_mmds_json(runtime(None));
+        assert_eq!(
+            plan.pointer("/latest/container-plan/gpu_driver"),
+            Some(&serde_json::Value::Null)
         );
     }
 }
