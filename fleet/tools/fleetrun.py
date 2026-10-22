@@ -45,14 +45,14 @@ v.close()
 
 def race(run):
     v = Live()
-    v.until(lambda s: all_running(s) and (s["race"]["cooldown_until"] or 0) < time.time() * 1000, 600)
+    v.until(lambda s: all_running(s) and (s["cooldown_until"] or 0) < time.time() * 1000, 600)
     time.sleep(20)  # settle: every renderer streaming nothing, GPUs idle
     r = v.intent("restart_now", {})
     assert r["outcome"] == "committed", r
     with v.cv:
         while v.snap["version"] < r["version"]:
             v.cv.wait(30)
-        rid = v.snap["state"]["race"]["running"]
+        rid = v.snap["state"]["relaunch_all"]["race"]
     st = v.until(lambda s: any(x["id"] == rid and x["fcvm"]["done_at"] for x in s["races"]), 600)
     ra = [x for x in st["races"] if x["id"] == rid][0]
     h = ra["fcvm"]

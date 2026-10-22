@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Exercise a running wall through its coordinator: races (`restart_now`) and the
 scoreboard, a borrowed GPU (`claim_gpu`: click to the private VM's first frame, its frames,
-`steer`, a race during the claim, the return to the wall) and the poster frame. Results go
+`claim_camera`, a race during the claim, the return to the wall) and the poster frame. Results go
 to OUT as they are taken (jsonl and images), so a box that dies keeps what it had.
 
     wallrun.py ws://<coordinator>/live OUT RACES
@@ -37,13 +37,13 @@ def now_ms():
 
 
 def race(v, label):
-    v.until(lambda s: (s["race"]["cooldown_until"] or 0) < now_ms(), 600)
+    v.until(lambda s: (s["cooldown_until"] or 0) < now_ms(), 600)
     r = v.intent("restart_now", {})
     assert r["outcome"] == "committed", r
     with v.cv:
         while v.snap["version"] < r["version"]:
             v.cv.wait(30)
-        rid = v.snap["state"]["race"]["running"]
+        rid = v.snap["state"]["relaunch_all"]["race"]
     st = v.until(lambda s: any(x["id"] == rid and x["fcvm"]["done_at"] for x in s["races"]), 600)
     ra = [x for x in st["races"] if x["id"] == rid][0]
     h = ra["fcvm"]
@@ -112,11 +112,16 @@ for i in range(RACES):
         append("races.jsonl", {"label": f"race {i + 1}", "error": repr(e)})
 
 v.until(lambda s: all_running(s, n), 600)
-body, meta = poster(os.path.join(OUT, "poster.jpg"))
-meta["director"] = v.snap["state"]["director"]
-append("poster.jsonl", meta)
-log(f"poster: {meta['bytes']} bytes, {meta['content_type']}, {meta['cache_control']}, "
-    f"viewpoint {meta['director']['viewpoint']}")
+body = None
+try:
+    body, meta = poster(os.path.join(OUT, "poster.jpg"))
+    meta["director"] = v.snap["state"]["director"]
+    append("poster.jsonl", meta)
+    log(f"poster: {meta['bytes']} bytes, {meta['content_type']}, {meta['cache_control']}, "
+        f"viewpoint {meta['director']['viewpoint']}")
+except Exception as e:
+    log(f"poster failed: {e!r}")
+    append("poster.jsonl", {"error": repr(e)})
 
 # A visitor's own GPU.
 a = Live(client_ip=None)
@@ -125,22 +130,23 @@ r = a.intent("claim_gpu", {})
 log("claim_gpu", r["outcome"], r.get("reason"))
 append("claim.jsonl", {"event": "receipt", "receipt": r, "clicked_local": clicked})
 if r["outcome"] == "committed":
-    m = a.message("claim", 300)
+    m = a.message("claim", 300, lambda m: m["claim"]["phase"] == "running")["claim"]
     got = now_ms()
     st = v.until(lambda s: s["claims"] and s["claims"][0]["click_to_first_frame_ms"] is not None, 60)
     c = st["claims"][0]
     borrowed = [t for t in fcvm_tiles(st) if t["id"] == c["borrowed"]][0]
-    rec = {"event": "claim", "session": m["session"], "slot": m["slot"], "borrowed": c["borrowed"],
-           "click_to_first_frame_ms": m["click_to_first_frame_ms"], "local_click_to_message_ms": got - clicked,
+    rec = {"event": "claim", "session": m["id"], "slot": c["slot"], "borrowed": m["tile"], "gpu": m["gpu"],
+           "click_to_first_frame_ms": m["first_frame_at"] - m["clicked_at"], "phases": m["phases"],
+           "local_click_to_message_ms": got - clicked,
            "tile_phase_for_others": borrowed["phase"], "tile_frame_url_for_others": borrowed["frame_url"],
            "token_in_snapshot": m["token"] in json.dumps(st), "last_relaunch": borrowed["last_relaunch"]}
     append("claim.jsonl", rec)
-    log(f"claim {m['session']} on {m['slot']} ({c['borrowed']}): click to first frame "
-        f"{m['click_to_first_frame_ms']} ms; others see {borrowed['phase']}")
+    log(f"claim {m['id']} on {c['slot']} ({m['tile']}): click to first frame "
+        f"{rec['click_to_first_frame_ms']} ms; others see {borrowed['phase']}")
     try:
         append("claim.jsonl", {"event": "frame", **grab(m["frame_url"], 540, os.path.join(OUT, "claim-frame.png"))})
-        s2 = a.intent("steer", {"drag": {"yaw_deg": 35.0, "pitch_deg": -5.0, "dive": 2.0}})
-        log("steer", s2["outcome"], s2.get("reason"))
+        s2 = a.intent("claim_camera", {"drag": {"yaw_deg": 35.0, "pitch_deg": -5.0, "dive": 2.0}})
+        log("claim_camera", s2["outcome"], s2.get("reason"))
         time.sleep(3)
         append("claim.jsonl", {"event": "frame-steered", **grab(m["frame_url"], 540, os.path.join(OUT, "claim-frame-steered.png"))})
     except Exception as e:
@@ -158,7 +164,7 @@ if r["outcome"] == "committed":
         log(f"poster during the claim failed: {e!r}")
     left = now_ms()
     a.close()
-    want = f"return:{m['session']}"
+    want = f"return:{m['id']}"
     st = v.until(lambda s: any(t["id"] == c["borrowed"] and t["last_relaunch"] and t["last_relaunch"]["by"] == want
                                and t["last_relaunch"]["first_frame_at"] for t in fcvm_tiles(s)), 600)
     t = [t for t in fcvm_tiles(st) if t["id"] == c["borrowed"]][0]

@@ -86,13 +86,13 @@ class Live:
                     raise TimeoutError("condition not met")
                 self.cv.wait(left)
 
-    def message(self, kind, timeout):
-        """The first message of `kind` (not a snapshot or receipt)."""
+    def message(self, kind, timeout, pred=lambda m: True):
+        """The first message of `kind` (not a snapshot or receipt) that `pred` accepts."""
         end = time.time() + timeout
         with self.cv:
             while True:
                 for m in self.others:
-                    if m["type"] == kind:
+                    if m["type"] == kind and pred(m):
                         return m
                 left = end - time.time()
                 if left <= 0 or self.closed:
