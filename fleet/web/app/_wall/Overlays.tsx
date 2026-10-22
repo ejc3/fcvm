@@ -120,6 +120,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
           {!phone && view.controls ? (
             <span className="hint" style={{ right: `calc(100vw - ${img.x + img.w - 16}px)`, bottom: `calc(100dvh - ${img.y + img.h - 16}px)` }}>
               <span className={view.controls.latencyMeasured ? "latency" : undefined} data-testid="latency">{view.controls.latency}</span>
+              {statsOn ? <span data-testid="bandwidth">{view.bandwidth}</span> : null}
               <span>{view.controls.help}</span>
             </span>
           ) : null}

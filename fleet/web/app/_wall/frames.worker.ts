@@ -45,7 +45,10 @@ interface Held {
   frame: VideoFrame;
   /** The stream's margins when this frame was decoded. */
   crop: Crop;
+  grid: Grid | null;
 }
+
+type Grid = { fullWidth: number; fullHeight: number; x0: number; y0: number };
 
 class TileStream {
   readonly id: string;
@@ -71,6 +74,10 @@ class TileStream {
   lastH = 0;
   /** Margins of the stream as the last header gave them. */
   crop: Crop = NO_CROP;
+  /** Where the inner rectangle sits in the whole image's pixel grid (from the header). */
+  grid: Grid | null = null;
+  /** Bytes of frame messages received, for the bandwidth reading. */
+  bytes = 0;
   /** When the tile last went from nothing shown to a frame (for the fade-in). */
   appearedAt: number | null = null;
 
@@ -131,6 +138,7 @@ class TileStream {
     const h = parseStreamHeader(text);
     if (!h) return;
     this.crop = h.crop;
+    this.grid = h.grid;
     this.configure(h.codec, h.width, h.height);
   }
 
@@ -150,6 +158,7 @@ class TileStream {
   }
 
   private onFrame(buf: Uint8Array): void {
+    this.bytes += buf.byteLength;
     const p = parseFrame(buf);
     if (!p.ok) return;
     const f = p.frame;
@@ -187,6 +196,7 @@ class TileStream {
       return;
     }
     const crop = this.crop;
+    const grid = this.grid;
     this.lastW = frame.displayWidth - crop.left - crop.right;
     this.lastH = frame.displayHeight - crop.top - crop.bottom;
     this.decodedTimes.push(now());
@@ -194,11 +204,11 @@ class TileStream {
     const at = this.frames.findIndex((h) => h.t >= t - SAME_T_EPS);
     if (at >= 0 && Math.abs(this.frames[at]!.t - t) <= SAME_T_EPS) {
       this.frames[at]!.frame.close();
-      this.frames[at] = { t, frame, crop };
+      this.frames[at] = { t, frame, crop, grid };
     } else if (at >= 0) {
-      this.frames.splice(at, 0, { t, frame, crop });
+      this.frames.splice(at, 0, { t, frame, crop, grid });
     } else {
-      this.frames.push({ t, frame, crop });
+      this.frames.push({ t, frame, crop, grid });
     }
     while (this.frames.length > BUFFER_FRAMES) this.frames.shift()!.frame.close();
   }
@@ -255,7 +265,7 @@ class TileStream {
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let dpr = 1;
-let plan: DrawPlan = { tiles: [], image: null, dpr: 1, darkFill: "#06080B" };
+let plan: DrawPlan = { tiles: [], image: null, dpr: 1, darkFill: "#06080B", estimatedBps: 0 };
 let settings: DrawSettings = { background: "#000000", dimAlpha: 0.5, fadeInMs: 280 };
 const streams = new Map<string, TileStream>();
 let prevT: number | null = null;
@@ -324,6 +334,15 @@ function devBox(b: Box): [number, number, number, number] {
   return [x, y, Math.round((b.x + b.w) * dpr) - x, Math.round((b.y + b.h) * dpr) - y];
 }
 
+/** Device-pixel box of a stream's inner rectangle placed in the image by its grid position. */
+function gridBox(image: Box, g: Grid, w: number, h: number): [number, number, number, number] {
+  const x0 = Math.round((image.x + (g.x0 / g.fullWidth) * image.w) * dpr);
+  const y0 = Math.round((image.y + (g.y0 / g.fullHeight) * image.h) * dpr);
+  const x1 = Math.round((image.x + ((g.x0 + w) / g.fullWidth) * image.w) * dpr);
+  const y1 = Math.round((image.y + ((g.y0 + h) / g.fullHeight) * image.h) * dpr);
+  return [x0, y0, x1 - x0, y1 - y0];
+}
+
 function drawDark(t: DrawTile): void {
   if (!ctx || !t.box) return;
   const [x, y, w, h] = devBox(t.box);
@@ -381,7 +400,10 @@ function draw(): void {
       drawDark(t);
       continue;
     }
-    const [x, y, w, h] = devBox(t.box);
+    const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
+    // In the mosaic the inner rectangle goes where the renderer says it sits in
+    // the whole image (x0, y0 of full_width x full_height); opened, it fills its box.
+    const [x, y, w, h] = plan.image && frame.grid ? gridBox(plan.image, frame.grid, inner.sw, inner.sh) : devBox(t.box);
     if (s.appearedAt === null) s.appearedAt = at;
     const fade = Math.min(1, (at - s.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
@@ -392,7 +414,6 @@ function draw(): void {
     // Only the inner rectangle shows: the whole frame is drawn scaled so its
     // inner rectangle covers the tile's box, clipped to the box. (WebKit ignores
     // a VideoFrame's source rectangle and visibleRect when drawing.)
-    const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
     const kx = w / inner.sw;
     const ky = h / inner.sh;
     if (inner.sx === 0 && inner.sy === 0 && inner.sw === frame.frame.displayWidth && inner.sh === frame.frame.displayHeight) {
@@ -460,12 +481,14 @@ function report(): void {
   while (drawTimes.length > 0 && drawTimes[0]! < at - 2000) drawTimes.shift();
   const tiles: Record<string, TileFrameStats> = {};
   let decoded = 0;
+  let bytes = 0;
   const decodeAll: number[] = [];
   for (const t of plan.tiles) {
     const s = streams.get(t.id);
     if (!s) continue;
     const fps = s.fps(at);
     decoded += fps;
+    bytes += s.bytes;
     decodeAll.push(...s.decodeMs.slice(-20));
     const show = lastChoice.show.get(t.id);
     tiles[t.id] = {
@@ -491,6 +514,7 @@ function report(): void {
     decodeMsP50: pct(decodeAll, 0.5),
     decodeMsP95: pct(decodeAll, 0.95),
     decodedPerSec: decoded,
+    bytesReceived: bytes,
     drawsPerSec: drawTimes.length / 2,
     tilesSynced: kinds.filter((k) => k.kind === "sync").length,
     tilesBehind: kinds.filter((k) => k.kind === "behind").length,

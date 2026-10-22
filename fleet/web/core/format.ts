@@ -78,3 +78,9 @@ export function timeOfDay(hours: number): string {
   const minutes = Math.round((((hours % 24) + 24) % 24) * 60) % (24 * 60);
   return `${String(Math.floor(minutes / 60)).padStart(2, "0")}:${String(minutes % 60).padStart(2, "0")}`;
 }
+
+/** A bit rate: "42 Mbit/s", "0.6 Mbit/s". */
+export function mbps(bps: number): string {
+  const m = bps / 1e6;
+  return m < 10 ? `${m.toFixed(1)} Mbit/s` : `${Math.round(m)} Mbit/s`;
+}

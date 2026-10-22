@@ -34,6 +34,8 @@ export interface BenchStats {
   decodeMsP50: number;
   decodeMsP95: number;
   decodedPerSec: number;
+  /** Frame bytes received over all streams since the worker started. */
+  bytesReceived: number;
   drawsPerSec: number;
   tilesSynced: number;
   tilesBehind: number;

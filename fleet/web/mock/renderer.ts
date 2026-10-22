@@ -6,7 +6,7 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { buildFrame } from "../core/frame.ts";
-import { tileGeometry, type TileGeometry } from "../core/layout.ts";
+import { deliveredGeometry, tileGeometry, type TileGeometry } from "../core/layout.ts";
 import type { Rect } from "../core/protocol.ts";
 import { Encoder } from "./encoder.ts";
 import type { PatternScene } from "./pattern.ts";
@@ -16,9 +16,6 @@ function groupsAlive(subs: Set<{ tile: string; width: number; height: number }>,
   for (const s of subs) if (`${s.tile}|${s.width}x${s.height}` === key) return true;
   return false;
 }
-
-/** Pixels of margin a stream carries on each inner side (even, for 4:2:0). */
-const MARGIN = 8;
 
 /** Frames of one stream drawn at the same time, at most. */
 const MAX_INFLIGHT = 4;
@@ -168,18 +165,14 @@ export class MockRenderers {
     const entry = this.tiles.get(sub.tile);
     if (!entry) return;
     const tile = tileGeometry(entry.rect, this.opts.scene().image_aspect, this.clampHeight(h));
-    // Like the renderer, encode the tile plus a margin (none at the image's own
-    // edges) and say in the header how much to crop.
-    const crop = {
-      left: tile.x0 > 0 ? MARGIN : 0,
-      top: tile.y0 > 0 ? MARGIN : 0,
-      right: tile.x0 + tile.width < tile.fullWidth ? MARGIN : 0,
-      bottom: tile.y0 + tile.height < tile.fullHeight ? MARGIN : 0,
-    };
+    // Like the renderer, encode the tile plus up to 16 px of the image around it
+    // and say in the header how much to crop.
+    const delivered = deliveredGeometry(tile);
+    const crop = delivered.crop;
     const geometry: TileGeometry = {
       ...tile,
-      width: tile.width + crop.left + crop.right,
-      height: tile.height + crop.top + crop.bottom,
+      width: delivered.width,
+      height: delivered.height,
       x0: tile.x0 - crop.left,
       y0: tile.y0 - crop.top,
     };

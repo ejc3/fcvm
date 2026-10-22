@@ -89,6 +89,8 @@ export interface StreamHeader {
    * edge, and the page draws only the inner rectangle. Zeros when absent.
    */
   crop: Crop;
+  /** Where the inner rectangle sits in the whole image's pixel grid, when the renderer says. */
+  grid: { fullWidth: number; fullHeight: number; x0: number; y0: number } | null;
 }
 
 /** The inner rectangle of a delivered frame, as a source rectangle to draw from. */
@@ -117,7 +119,13 @@ export function parseStreamHeader(text: string): StreamHeader | null {
     crop = { left: side("left"), top: side("top"), right: side("right"), bottom: side("bottom") };
     if (crop.left + crop.right >= o["width"] || crop.top + crop.bottom >= o["height"]) return null;
   }
-  return { codec: o["codec"], width: o["width"], height: o["height"], crop };
+  const n = (k: string) => (typeof o[k] === "number" && Number.isFinite(o[k] as number) ? (o[k] as number) : null);
+  const fw = n("full_width");
+  const fh = n("full_height");
+  const x0 = n("x0");
+  const y0 = n("y0");
+  const grid = fw !== null && fh !== null && x0 !== null && y0 !== null && fw > 0 && fh > 0 ? { fullWidth: fw, fullHeight: fh, x0, y0 } : null;
+  return { codec: o["codec"], width: o["width"], height: o["height"], crop, grid };
 }
 
 /** The codec string for an SPS NAL unit (without its start code): avc1.PPCCLL. */

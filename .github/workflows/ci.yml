@@ -189,7 +189,7 @@ jobs:
     # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
     # @playwright/test version in fleet/web/package.json.
     container:
-      image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:7eeb4d698577291987c889407a4e4f8ef7626f8f93311aa465e166c9cb335dfd
+      image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:06a9939e57531807f8d5fd76ce44b53165ffb7d7501d87ab10e285c20b1e971f
     # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
     timeout-minutes: 30
     defaults:

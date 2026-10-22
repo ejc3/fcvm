@@ -113,24 +113,37 @@ software). The mock renderers ran on the same machine. These numbers are indicat
 only: a laptop or phone decodes in hardware and composites on its GPU. Mock streams are
 30 frames per second, on the renderer's t = k/30 grid.
 
-| tiles | viewport | stream height | decoded frames/s (of 30 x tiles) | draw per frame, p50 / p95 | display frame interval, p50 / p95 | browser CPU (all processes) | CPU per decoded frame |
-|---|---|---|---|---|---|---|---|
-| 16 | 1440x900 | 216 | 479 of 480 | 5.7 / 6.0 ms | 16.7 / 16.8 ms | 0.45 cores | 0.94 ms |
-| 50 | 1440x900 | 180 | 1500 of 1500 | 7.3 / 8.3 ms | 16.7 / 17.1 ms | 0.69 cores | 0.46 ms |
-| 100 | 1440x900 | 90 | 3000 of 3000 | 9.4 / 9.8 ms | 16.7 / 17.5 ms | 1.01 cores | 0.34 ms |
-| 100 | 2560x1440 | 144 | 2930 of 3000 | 18.9 / 20.9 ms | 19.8 / 31.5 ms | 1.45 cores | 0.49 ms |
+| tiles | viewport | stream height | decoded frames/s (of 30 x tiles) | draw per frame, p50 / p95 | display frame, p50 / p95 | incoming (mock) | at the renderer's rate | browser CPU | CPU per decoded frame |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 1440x900 | 216 | 478 of 480 | 5.9 / 8.0 ms | 16.7 / 16.8 ms | 6.4 Mbit/s | 37.6 Mbit/s | 0.46 cores | 0.97 ms |
+| 50 | 1440x900 | 180 | 1500 of 1500 | 7.8 / 8.3 ms | 16.7 / 16.8 ms | 9.1 Mbit/s | 46.6 Mbit/s | 0.75 cores | 0.50 ms |
+| 100 | 1440x900 | 90 | 3001 of 3000 | 10.3 / 12.6 ms | 16.7 / 17.6 ms | 11.2 Mbit/s | 60.0 Mbit/s | 1.12 cores | 0.37 ms |
+| 16 | 2560x1440 | 360 (cut by the budget) | 459 of 480 | 22.4 / 23.5 ms | 16.7 / 24.0 ms | 11.2 Mbit/s | 80.0 Mbit/s | 0.66 cores | 1.44 ms |
+| 100 | 2560x1440 | 144 | 2943 of 3000 | 19.5 / 21.6 ms | 22.9 / 31.6 ms | 14.2 Mbit/s | 79.7 Mbit/s | 1.48 cores | 0.50 ms |
 
 Command: `FLEET_MOCK_THREADS=40 node scripts/measure.ts 16 50 100` (8 s warm-up, 15 s
 measured) and `FLEET_MEASURE_VIEW=2560x1440 FLEET_MOCK_THREADS=60 node scripts/measure.ts
-100`, with the machine's load average at 26 from other work. At 1440x900 every run held
-all tiles at one t with none behind, and decode latency (decode call to output frame)
-stayed under 1.5 ms at p95. Draw time follows the pixels drawn, about 5 ms per million in
-this software canvas, more than the number of tiles: 100 small tiles cost 1.6x what 16
-large ones do. At 2560x1440 a draw (18.9 ms) no longer fits a 60 Hz display frame, the
-display loop slows to 20 to 32 ms, and the page decoded 2930 of the 3000 frames sent per
-second: this software canvas is the limit there. On this evidence 100 tiles fit one
-browser's decoding budget; the measurement in `docs/fleet/ARCHITECTURE.md` (a laptop and
-a phone, with GPU compositing, Chrome and Safari) should set `max_tiles`.
+16 100`, with the machine's load average at 9 to 13 from other work. "Incoming (mock)" is
+what the page received from the mock's libx264 at constant quality; "at the renderer's
+rate" is what the same streams cost from the real renderer, which encodes at a constant
+0.8 bits per delivered pixel (overlap included) at 30 fps, at least 0.6 Mbit/s each
+(`core/bandwidth.ts`). At 1440x900 every run held all tiles at one t with none behind,
+and decode latency stayed under 3.5 ms at p95. Draw time follows the pixels drawn, about
+5 ms per million in this software canvas, more than the number of tiles. At 2560x1440 a
+draw takes longer than a 60 Hz frame and the page decoded 98% of the frames sent: this
+software canvas is the limit there (in the 16-tile run the mock also fell behind on its
+360p frames). On this evidence 100 tiles fit one browser's decoding budget; the
+measurement in `docs/fleet/ARCHITECTURE.md` (a laptop and a phone, with GPU compositing,
+Chrome and Safari) should set `max_tiles`.
+
+**Bandwidth.** Each tile asks for the device pixels it covers, rounded up to the next of
+the twelve heights. The page then keeps the streams within 80 Mbit/s at the renderer's
+rate: while the sum is over, the tallest stream steps down one height. With a tile
+opened, every other tile keeps streaming at the smallest height (72) so closing it is
+instant, and only the opened tile asks for its full size. The floor of 0.6 Mbit/s a
+stream sets the cost of a large wall: 100 tiles cost 60 Mbit/s at any height, so a
+fleet that wants 100 tiles on ordinary connections needs a lower floor or fewer tiles
+per viewer. The stats switch shows the current total.
 
 **Safari.** According to WebKit's release notes, WebCodecs `VideoDecoder` shipped in Safari 16.4 (macOS and iOS), with H.264
 among its codecs, as did `OffscreenCanvas` with a 2D context. Playwright's WebKit build
@@ -154,7 +167,10 @@ around its rectangle with `crop: {left, top, right, bottom}` in its header (zero
 absent) so separately encoded tiles meet without an H.264 edge. The page draws only
 the inner rectangle: it draws the whole frame scaled so the inner rectangle covers the
 tile's box, clipped to the box, because WebKit ignores a VideoFrame's source rectangle
-and `visibleRect` when drawing. The mock encodes an 8 px margin on each inner side. The
+and `visibleRect` when drawing. In the mosaic the inner rectangle is placed at `x0, y0` of
+`full_width x full_height`; an opened tile fills its box. The mock delivers exactly the
+renderer's overlap (up to 16 px inside the image, one side a pixel short to keep sizes
+even). The
 page never reads `/health` (so not `slots_missed`) and never sets the scene's `budget`. The brief's older shapes
 (`fleet.hosts` as a number, `waiting_for_capacity`, `applied`) are still read.
 

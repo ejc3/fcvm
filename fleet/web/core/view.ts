@@ -4,6 +4,7 @@
 import { serverNow } from "./clock.ts";
 import * as fmt from "./format.ts";
 import {
+  STREAM_HEIGHTS,
   layoutFocus,
   layoutMosaic,
   seamSegments,
@@ -12,6 +13,7 @@ import {
   type Segment,
 } from "./layout.ts";
 import { frameSocketUrl, urlHost } from "./net.ts";
+import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import type { Action, FleetState, Half, IntentMsg, Tile } from "./protocol.ts";
 import { sceneUnixMs } from "./scene.ts";
 import type { ClientState, Notice } from "./store.ts";
@@ -685,6 +687,8 @@ export interface DrawPlan {
   image: Box | null;
   dpr: number;
   darkFill: string;
+  /** What the live streams cost at the renderer's bit rate, bits per second. */
+  estimatedBps: number;
 }
 
 // ---- seams --------------------------------------------------------------------
@@ -745,6 +749,8 @@ export interface WallView {
   seams: SeamView;
   gridLabel: string;
   notices: { key: string; text: string }[];
+  /** What the streams cost, for the stats switch. */
+  bandwidth: string;
 }
 
 export function pendingIntents(s: ClientState): IntentMsg[] {
@@ -763,7 +769,7 @@ export function wallView(input: WallInput): WallView {
   } else if (!st) {
     banner = "Connecting to the fleet.";
   }
-  const emptyPlan: DrawPlan = { tiles: [], image: null, dpr: input.dpr, darkFill: "#06080B" };
+  const emptyPlan: DrawPlan = { tiles: [], image: null, dpr: input.dpr, darkFill: "#06080B", estimatedBps: 0 };
   if (!st) {
     return {
       title: TITLE,
@@ -782,6 +788,7 @@ export function wallView(input: WallInput): WallView {
       seams: { visible: false, segments: [], lineWidth: 1 / input.dpr, outline: null, label: null },
       gridLabel: "",
       notices: [],
+      bandwidth: "",
     };
   }
   const pend = pendingIntents(s);
@@ -793,14 +800,24 @@ export function wallView(input: WallInput): WallView {
     ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input)
     : null;
 
+  // Heights: each tile asks for the device pixels it covers; with a tile
+  // opened, the others (still streaming, not drawn) ask for the smallest; then
+  // the tallest step down until the streams fit the bandwidth budget.
+  const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
+    const focused = focus !== null && focus.id === t.id && focus.placed !== null;
+    const height = focused ? focus!.placed!.streamHeight : focus ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
+    return { id: t.id, rect: t.rect, height, keep: focused };
+  });
+  const fitted = fitBandwidth(asks, st.image_aspect);
   const plan: DrawPlan = {
     ...emptyPlan,
+    estimatedBps: fitted.bps,
     image: focus ? null : layout?.image ?? null,
     tiles: st.tiles.map((t, i) => {
       const tv = tiles[i]!;
       const placed = placedById.get(t.id);
       const focused = focus !== null && focus.id === t.id && focus.placed !== null;
-      const height = focused ? focus!.placed!.streamHeight : placed?.streamHeight ?? 144;
+      const height = fitted.heights.get(t.id) ?? placed?.streamHeight ?? 144;
       const live = isLive(t);
       const box = focus ? (focused ? focus!.placed!.box : null) : placed?.box ?? null;
       return {
@@ -831,6 +848,7 @@ export function wallView(input: WallInput): WallView {
     phone: input.phone ? phoneView(st) : null,
     plan,
     seams: seamView(s, focus ? null : layout, tiles, input.dpr),
+    bandwidth: `${fmt.count(plan.tiles.filter((x) => x.url !== null).length, "stream", "streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     notices: s.notices.flatMap((n) => {
       const text = noticeText(n);
       return text === null ? [] : [{ key: n.id, text }];

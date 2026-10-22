@@ -122,8 +122,9 @@ test("opening a tile asks only that renderer for a taller stream of the same rec
     .toBe(wanted);
   const after = await page.evaluate(() => window.__fleet!.client.getState().frames!.tiles);
   expect(after["fcvm:3"]!.height).toBeGreaterThan(before);
-  // The other tiles keep their small streams.
-  expect(after["fcvm:4"]!.height).toBeLessThanOrEqual(before);
+  // The others keep streaming (for an instant return) at the smallest height.
+  const others = await page.evaluate(() => window.__fleet!.view().plan.tiles.filter((x) => x.id !== "fcvm:3" && x.url !== null).map((x) => x.height));
+  expect(new Set(others)).toEqual(new Set([72]));
   // Same rectangle: the drawn frame keeps the tile's aspect.
   expect(after["fcvm:3"]!.width / after["fcvm:3"]!.height).toBeCloseTo(t.box!.w / t.box!.h, 1);
   await expect(page.getByTestId("focus-stream")).toContainText(new RegExp(`^${wanted}p`));

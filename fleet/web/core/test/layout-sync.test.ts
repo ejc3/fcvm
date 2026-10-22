@@ -6,9 +6,11 @@ import {
   seamSegments,
   streamHeightFor,
   tileGeometry,
+  deliveredGeometry,
   tileAt,
 } from "../layout.ts";
 import { chooseCommonT } from "../sync.ts";
+import { fitBandwidth, MIN_STREAM_BPS, streamBitrate } from "../bandwidth.ts";
 import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
 
@@ -204,5 +206,37 @@ describe("the renderer's camera", () => {
     }
     // Up on the image is up in the world.
     expect(lightPosition(keys, 3, 0.5, 0.1, 16 / 9)![1]).toBeGreaterThan(lightPosition(keys, 3, 0.5, 0.9, 16 / 9)![1]);
+  });
+});
+
+describe("stream overlap and bandwidth", () => {
+  it("delivers the tile plus up to 16 px inside the image, as the renderer's example", () => {
+    const g = tileGeometry({ x: 0.25, y: 0, w: 0.25, h: 0.5 }, 16 / 9, 540);
+    expect(g).toMatchObject({ width: 480, height: 540, fullWidth: 1920, fullHeight: 1080, x0: 480, y0: 0 });
+    expect(deliveredGeometry(g)).toEqual({ width: 512, height: 556, crop: { left: 16, top: 0, right: 16, bottom: 16 } });
+    // A corner tile only overlaps inward; near an edge the overlap is what is there.
+    expect(deliveredGeometry({ width: 100, height: 50, fullWidth: 1000, fullHeight: 500, x0: 0, y0: 0 }).crop).toEqual({ left: 0, top: 0, right: 16, bottom: 16 });
+    expect(deliveredGeometry({ width: 100, height: 50, fullWidth: 1000, fullHeight: 500, x0: 7, y0: 0 })).toEqual({ width: 122, height: 66, crop: { left: 7, top: 0, right: 15, bottom: 16 } });
+  });
+
+  it("steps the tallest streams down until they fit, keeping the opened one", () => {
+    const rect = (x: number) => ({ x, y: 0, w: 1 / 16, h: 1 / 9 });
+    const asks = Array.from({ length: 16 }, (_, i) => ({ id: `t${i}`, rect: rect((i % 16) / 16), height: 540, keep: i === 0 }));
+    const before = asks.reduce((a, x) => a + streamBitrate(x.rect, 16 / 9, x.height), 0);
+    const fit = fitBandwidth(asks, 16 / 9, 40e6);
+    expect(before).toBeGreaterThan(40e6);
+    expect(fit.bps).toBeLessThanOrEqual(40e6);
+    expect(fit.heights.get("t0")).toBe(540);
+    expect(Math.max(...asks.slice(1).map((a) => fit.heights.get(a.id)!))).toBeLessThan(540);
+    // Under the budget nothing changes.
+    expect(fitBandwidth(asks, 16 / 9, 1e12).heights.get("t5")).toBe(540);
+  });
+
+  it("stops at the smallest height, over budget if it must", () => {
+    const asks = Array.from({ length: 100 }, (_, i) => ({ id: `t${i}`, rect: { x: 0, y: 0, w: 0.05, h: 0.1 }, height: 90, keep: false }));
+    const fit = fitBandwidth(asks, 16 / 9, 10e6);
+    expect([...fit.heights.values()].every((h) => h === 72)).toBe(true);
+    expect(fit.bps).toBeGreaterThan(10e6);
+    expect(fit.bps).toBeGreaterThanOrEqual(100 * MIN_STREAM_BPS);
   });
 });

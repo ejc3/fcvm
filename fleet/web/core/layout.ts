@@ -223,3 +223,34 @@ export function seamSegments(placed: readonly PlacedTile[], image: Box, dpr: num
   }
   return out;
 }
+
+/** Pixels of neighbouring image a stream carries on each inner side (the renderer's MARGIN). */
+export const STREAM_MARGIN = 16;
+
+export interface Delivered {
+  /** The delivered picture, overlap included. */
+  width: number;
+  height: number;
+  crop: { left: number; top: number; right: number; bottom: number };
+}
+
+/**
+ * The renderer's delivered picture for a tile: the tile plus up to MARGIN pixels
+ * on every side that lies inside the image, none past the image's own edges, one
+ * side a pixel short where that keeps the size even.
+ */
+export function deliveredGeometry(g: TileGeometry, margin: number = STREAM_MARGIN): Delivered {
+  let left = Math.min(margin, g.x0);
+  let right = Math.min(margin, Math.max(0, g.fullWidth - (g.x0 + g.width)));
+  let top = Math.min(margin, g.y0);
+  let bottom = Math.min(margin, Math.max(0, g.fullHeight - (g.y0 + g.height)));
+  if ((g.width + left + right) % 2 === 1) {
+    if (right > 0) right--;
+    else left--;
+  }
+  if ((g.height + top + bottom) % 2 === 1) {
+    if (bottom > 0) bottom--;
+    else top--;
+  }
+  return { width: g.width + left + right, height: g.height + top + bottom, crop: { left, top, right, bottom } };
+}

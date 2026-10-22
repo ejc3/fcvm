@@ -102,6 +102,7 @@ for (const total of totals) {
   const pidsBefore = browserPids();
   const cpu0 = cpuTicks(pidsBefore);
   const render0 = (await (await fetch(`http://localhost:${base + 1}/mock/render-stats`)).json()) as { framesSent: number; framesSkipped: number };
+  const bytes0 = await page.evaluate(() => window.__fleet!.client.bench!.bytesReceived);
   const samples: { decoded: number; draws: number; synced: number; behind: number; drawP50: number; drawP95: number; rafP50: number; rafP95: number; decP50: number; decP95: number; height: number }[] = [];
   const t0 = Date.now();
   while (Date.now() - t0 < RUN_MS) {
@@ -131,6 +132,8 @@ for (const total of totals) {
   const cpu1 = cpuTicks(pidsAfter);
   const render1 = (await (await fetch(`http://localhost:${base + 1}/mock/render-stats`)).json()) as { framesSent: number; framesSkipped: number };
   const cores = (cpu1 - cpu0) / TICK / seconds;
+  const bytes1 = await page.evaluate(() => window.__fleet!.client.bench!.bytesReceived);
+  const rendererBps = await page.evaluate(() => window.__fleet!.view().plan.estimatedBps);
   const decodedPerSec = samples.reduce((a, s) => a + s.decoded, 0) / samples.length;
   const row = {
     tiles: perHalf * 2,
@@ -147,6 +150,8 @@ for (const total of totals) {
     rafMsP95: +pct(samples.map((s) => s.rafP95), 0.95).toFixed(2),
     decodeLatencyMsP50: +pct(samples.map((s) => s.decP50), 0.5).toFixed(2),
     decodeLatencyMsP95: +pct(samples.map((s) => s.decP95), 0.95).toFixed(2),
+    incomingMbps: +(((bytes1 - bytes0) * 8) / seconds / 1e6).toFixed(1),
+    rendererRateMbps: +(rendererBps / 1e6).toFixed(1),
     browserCores: +cores.toFixed(2),
     cpuMsPerDecodedFrame: +((cores * 1000) / decodedPerSec).toFixed(3),
   };
