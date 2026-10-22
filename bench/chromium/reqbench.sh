@@ -39,10 +39,13 @@ case "$ENGINE" in
 chromium)
     IMAGE="${IMAGE:-localhost/chromium-bench-req}"
     CONTAINERFILE="Containerfile.chromium-bench"
+    # The program whose `--version` the golden records as browser_version.
+    BROWSER_BIN="chromium"
     ;;
 webkit)
     IMAGE="${IMAGE:-localhost/webkit-bench-req}"
     CONTAINERFILE="Containerfile.webkit-bench"
+    BROWSER_BIN="WebKitWebDriver"
     CDP_PORT="${CDP_PORT:-9515}"
     # cdp-fast is CDP WebSocket prewiring; exec's guest driver is CDP-only.
     ARMS="${ARMS:-cdp,noop}"
@@ -676,6 +679,22 @@ cmd_golden() {
         || { log "golden: prepare reported no generation_id"; return 1; }
     prepared_digest=$(jq -er '.config_digest' <"$prepared_json") \
         || { log "golden: prepare reported no config_digest"; return 1; }
+    # The browser build the snapshot froze. The image tag and its package are
+    # unpinned, so without this line no record says which browser a run drove.
+    # The image is the exact ID the snapshot was built from, run offline.
+    local browser_version
+    browser_version=$(podman run --rm --network none --entrypoint "$BROWSER_BIN" \
+        "$image_id" --version 2>/dev/null | head -1) || browser_version=""
+    [ -n "$browser_version" ] \
+        || { log "golden: '$BROWSER_BIN --version' printed nothing in $image_id"; return 1; }
+    # The Firecracker pin in rootfs-config.toml at the source revision this
+    # golden was built from; empty outside a revision-stamped run.
+    local firecracker_config=""
+    if [ -n "${REQBENCH_SOURCE_REVISION:-}" ]; then
+        firecracker_config=$(git -C "$REPO" show \
+            "${REQBENCH_SOURCE_REVISION}:rootfs-config.toml") \
+            || { log "golden: cannot read rootfs-config.toml at ${REQBENCH_SOURCE_REVISION}"; return 1; }
+    fi
     # Bind the mutable image tag to the exact content captured by this snapshot.
     # The file lives inside the atomically replaced snapshot directory and names
     # its generation, so a recreated tag cannot inherit stale provenance.
@@ -686,16 +705,21 @@ cmd_golden() {
         "$prepared_generation" "$prepared_digest" \
         "$(sha256sum "$FCVM" | cut -d' ' -f1)" \
         "$(sha256sum "$HERE/MANIFEST.sha256" | cut -d' ' -f1)" \
-        "${REQBENCH_SOURCE_REVISION:-}" "$GUEST_DNS" "${guest_env_entries[@]}" <<'PY'
+        "${REQBENCH_SOURCE_REVISION:-}" "$browser_version" "$firecracker_config" \
+        "$HERE" \
+        "$GUEST_DNS" "${guest_env_entries[@]}" <<'PY'
 import fcntl, hashlib, json, os, sys, tempfile, uuid
 (
     config_path, output_path, lock_path, image_label, image_id, image_digest,
     image_cache_key, built_image_id, prepared_generation, prepared_digest,
-    fcvm_sha256, runtime_bundle_sha256, source_revision, guest_dns,
-) = sys.argv[1:15]
+    fcvm_sha256, runtime_bundle_sha256, source_revision, browser_version,
+    firecracker_config, harness_dir, guest_dns,
+) = sys.argv[1:18]
 # The GUEST_ENV entries that became `--env` flags, in order; empty when the
 # knob was unset.
-guest_env = sys.argv[15:]
+guest_env = sys.argv[18:]
+sys.path.insert(0, harness_dir)
+from reqbench import firecracker_identity
 lock = open(lock_path, "a+")
 fcntl.flock(lock, fcntl.LOCK_SH)
 with open(config_path, "rb") as source:
@@ -767,6 +791,10 @@ record = {
     "creator_fcvm_sha256": fcvm_sha256,
     "creator_runtime_bundle_sha256": runtime_bundle_sha256,
     "source_revision": source_revision,
+    "browser_version": browser_version,
+    "firecracker": firecracker_identity(
+        metadata.get("firecracker_bin"), firecracker_config
+    ),
 }
 directory = os.path.dirname(output_path)
 fd, temporary = tempfile.mkstemp(prefix=".reqbench-provenance.", dir=directory)
@@ -1521,7 +1549,7 @@ cmd_run() {
         --data-root "$DATA_ROOT" --state-dir "$STATE_DIR" \
         --network-mode "$NETMODE" --cpu "$CPU" --memory-mib "$MEM" \
         --run-id "$RUNID" --arms "${ARMS:-exec,cdp,cdp-fast,noop}" \
-        --engine "$ENGINE" \
+        --engine "$ENGINE" --resolve-poll-ms "${RESOLVE_POLL_MS:-50}" \
         "${prewire_args[@]}" &
     local driver_bg=$!
     track "$driver_bg"

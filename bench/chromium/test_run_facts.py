@@ -1,0 +1,498 @@
+#!/usr/bin/env python3
+"""Facts a run records that the benchmark page used to say no record held.
+
+Each class pins one field: the host's instance type and CPU, the memory
+server's prefetch setting, the browser build and Firecracker build a golden
+ran on, when fcvm's restore milestones reached a clone's log, what each poll
+for the page target found, the navigation timing marks that split navigate,
+the html-fast arm, and the poll interval. Every test here failed on the
+parent commit, which recorded none of them.
+
+Run: python3 -m unittest test_run_facts -v
+"""
+
+import argparse
+import hashlib
+import io
+import json
+import os
+import re
+import sys
+import tempfile
+import tomllib
+import types
+import unittest
+import urllib.error
+from contextlib import redirect_stdout
+from unittest import mock
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+REPO = os.path.dirname(os.path.dirname(HERE))
+sys.path.insert(0, HERE)
+
+import cdpdrive  # noqa: E402
+import reqanalyze  # noqa: E402
+import reqbench  # noqa: E402
+import test_reqbench  # noqa: E402
+
+
+def write(root, relative, text):
+    path = os.path.join(root, relative.lstrip("/"))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as handle:
+        handle.write(text)
+    return path
+
+
+class HostFacts(unittest.TestCase):
+    """meta.host: the machine without its name, address or account."""
+
+    def lscpu(self, model):
+        def run(argv, **_kwargs):
+            self.assertEqual(argv, ["lscpu"])
+            return types.SimpleNamespace(stdout=f"Architecture: aarch64\nModel name:  {model}\n")
+        return run
+
+    def fixture(self, root, vendor):
+        write(root, "/sys/class/dmi/id/sys_vendor", vendor + "\n")
+        write(root, "/sys/class/dmi/id/product_name", "c8g.metal-48xl\n")
+        write(root, "/proc/meminfo", "MemTotal:       395389732 kB\nMemFree: 1 kB\n")
+        write(root, "/etc/os-release", 'NAME="Ubuntu"\nPRETTY_NAME="Ubuntu 24.04.4 LTS"\n')
+
+    def test_an_ec2_host_reports_its_instance_type(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.fixture(root, "Amazon EC2")
+            facts = reqbench.host_facts(root, run=self.lscpu("Neoverse-V2"),
+                                        cpu_count=lambda: 192)
+        self.assertEqual(facts, {
+            "instance_type": "c8g.metal-48xl", "cpu_model": "Neoverse-V2", "nproc": 192,
+            "mem_total_kb": 395389732, "os": "Ubuntu 24.04.4 LTS",
+        })
+
+    def test_another_vendor_reports_no_instance_type(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.fixture(root, "QEMU")
+            facts = reqbench.host_facts(root, run=self.lscpu("x"), cpu_count=lambda: 4)
+        self.assertIsNone(facts["instance_type"])
+
+    def test_no_field_names_the_machine(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.fixture(root, "Amazon EC2")
+            facts = reqbench.host_facts(root, run=self.lscpu("x"), cpu_count=lambda: 4)
+        self.assertEqual(set(facts), {"instance_type", "cpu_model", "nproc",
+                                      "mem_total_kb", "os"})
+
+
+class FirecrackerIdentity(unittest.TestCase):
+    """provenance.firecracker: the binary, and the commit its name encodes."""
+
+    PIN = ('[firecracker]\nrepo = "ejc3/firecracker"\n'
+           'branch = "agent/uffd-minor"\ncommit = "' + "8" * 40 + '"\n')
+
+    def test_a_binary_named_for_the_pin_records_the_commit(self):
+        name = reqbench.firecracker_build_name(
+            "default", "ejc3/firecracker", "agent/uffd-minor", "8" * 40,
+            "aarch64", "libc-2.39")
+        with tempfile.TemporaryDirectory() as d:
+            binary = write(d, name, "firecracker bytes")
+            record = reqbench.firecracker_identity(binary, self.PIN, "aarch64", "libc-2.39")
+        self.assertEqual(record, {
+            "binary": binary, "sha256": hashlib.sha256(b"firecracker bytes").hexdigest(),
+            "repo": "ejc3/firecracker", "branch": "agent/uffd-minor", "commit": "8" * 40,
+            "commit_matches_binary": True,
+        })
+
+    def test_a_binary_built_from_anything_else_records_no_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            binary = write(d, "firecracker-default-000000000000.bin", "x")
+            record = reqbench.firecracker_identity(binary, self.PIN, "aarch64", "libc-2.39")
+        self.assertIsNone(record["commit"])
+        self.assertFalse(record["commit_matches_binary"])
+        self.assertEqual(record["sha256"], hashlib.sha256(b"x").hexdigest())
+
+    def test_the_known_build_name(self):
+        """The binary `fcvm setup` built for rootfs-config.toml's pin on an
+        aarch64 Ubuntu 24.04 host (glibc 2.39), observed on 2026-10-22."""
+        self.assertEqual(
+            reqbench.firecracker_build_name(
+                "default", "ejc3/firecracker", "agent/uffd-minor-v1.17.0-discard-dirty",
+                "8819f112ad79ad3efb1b4717c1175229fd21b3cb", "aarch64", "libc-2.39"),
+            "firecracker-default-0834213edfce.bin")
+
+    def test_the_repository_config_pins_a_commit(self):
+        with open(os.path.join(REPO, "rootfs-config.toml"), "rb") as handle:
+            pin = tomllib.load(handle)["firecracker"]
+        for field in ("repo", "branch", "commit"):
+            self.assertIsInstance(pin.get(field), str, field)
+
+
+class FirecrackerBuildNamePin(unittest.TestCase):
+    """firecracker_build_name mirrors src/setup/kernel.rs byte for byte."""
+
+    def test_the_rust_side_names_builds_the_way_the_harness_reads_them(self):
+        with open(os.path.join(REPO, "src", "setup", "kernel.rs")) as handle:
+            source = handle.read()
+        for needle in (
+            'hasher.update(b"fcvm-firecracker-cache-v2\\0");',
+            "for field in [repo, branch, commit_hash, arch, libc_tag] {",
+            "hasher.update((field.len() as u64).to_le_bytes());",
+            "hex::encode(&result[..6])",
+            'dir.join(format!("firecracker-{profile_name}-{sha}.bin"))',
+            'return format!("libc-{}", ver);',
+        ):
+            self.assertIn(needle, source)
+
+
+class RestoreMarks(unittest.TestCase):
+    """restore_marks: fcvm's restore milestones, in ms from the launch."""
+
+    LOG = (
+        "2026-10-22T02:00:00.010000Z  INFO fcvm::commands::common: snapshot load completed "
+        "duration_ms=6 track_dirty_pages=false\n"
+        "2026-10-22T02:00:00.012500Z  INFO fcvm::commands::common: disk patch completed "
+        "duration_ms=1\n"
+        "2026-10-22T02:00:00.020000Z  INFO fcvm::commands::common: VM resume completed "
+        "duration_ms=7 total_snapshot_ms=14\n"
+        "2026-10-22T02:00:00.090000Z  INFO fcvm::commands::common: VM lifecycle ready "
+        "vm_id=vm-1\n"
+    )
+
+    def launch(self):
+        import datetime
+        return datetime.datetime.fromisoformat("2026-10-22T02:00:00Z").timestamp()
+
+    def test_each_milestone_is_timed_from_the_launch(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", "starting\n" + self.LOG)
+            marks = reqbench.restore_marks(log, self.launch())
+        self.assertEqual({k: round(v, 3) for k, v in marks.items()}, {
+            "snapshot_loaded_ms": 10.0, "disk_patched_ms": 12.5,
+            "resumed_ms": 20.0, "lifecycle_ready_ms": 90.0,
+        })
+
+    def test_a_missing_milestone_is_null_and_a_missing_log_says_why(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", self.LOG.splitlines(True)[0])
+            marks = reqbench.restore_marks(log, self.launch())
+            missing = reqbench.restore_marks(os.path.join(d, "absent.log"), self.launch())
+        self.assertIsNone(marks["resumed_ms"])
+        self.assertIn("FileNotFoundError", missing["error"])
+
+
+class RestoreMarkSourcePin(unittest.TestCase):
+    """Every marker is an info! line fcvm writes on the restore path."""
+
+    def test_each_marker_is_an_info_line_in_fcvm(self):
+        with open(os.path.join(REPO, "src", "commands", "common.rs")) as handle:
+            source = handle.read()
+        for _key, message in reqbench.RESTORE_MARKS:
+            match = re.search(r'info!\((?:[^;]|\n)*?"' + re.escape(message) + '"', source)
+            self.assertIsNotNone(match, f"no info! line carries {message!r}")
+            self.assertNotIn("debug!(", match.group(0))
+
+    def test_the_runs_log_level_keeps_info(self):
+        with open(os.path.join(HERE, "reqbench.sh")) as handle:
+            self.assertIn('FCVM_LOG must select fcvm=debug or fcvm=trace', handle.read())
+
+
+class ResolvePolls(unittest.TestCase):
+    """render.resolve_polls: what each /json/list poll found, and when."""
+
+    class Response(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+    def test_each_poll_records_its_outcome(self):
+        answers = [
+            urllib.error.URLError(ConnectionRefusedError(111, "refused")),
+            [{"type": "browser"}],
+            [{"type": "page", "url": "about:blank", "webSocketDebuggerUrl": "ws://x/p"}],
+        ]
+
+        def urlopen(_request, timeout):
+            answer = answers.pop(0)
+            if isinstance(answer, Exception):
+                raise answer
+            return self.Response(json.dumps(answer).encode())
+
+        stats = {}
+        with mock.patch.object(cdpdrive.urllib.request, "urlopen", urlopen):
+            target = cdpdrive.resolve_target("127.0.0.1:9", 1e12, 10, "", stats, poll_s=0.0)
+        self.assertEqual(target["webSocketDebuggerUrl"], "ws://x/p")
+        self.assertEqual([p["outcome"] for p in stats["resolve_polls"]],
+                         ["os-ECONNREFUSED", "no-page", "page"])
+        times = [p["t_ms"] for p in stats["resolve_polls"]]
+        self.assertEqual(times, sorted(times))
+
+    def test_the_poll_interval_is_the_one_asked_for(self):
+        slept = []
+
+        def urlopen(_request, timeout):
+            raise urllib.error.URLError(ConnectionRefusedError(111, "refused"))
+
+        with mock.patch.object(cdpdrive.urllib.request, "urlopen", urlopen), \
+                mock.patch.object(cdpdrive.time, "sleep", slept.append):
+            with self.assertRaises(ConnectionError):
+                cdpdrive.resolve_target("127.0.0.1:9", 1e12, 3, "", {}, poll_s=0.005)
+        self.assertEqual(slept, [0.005, 0.005])
+
+    def test_drive_passes_the_run_s_interval(self):
+        seen = {}
+
+        def resolve(host, deadline, retries, header, stats, poll_s):
+            seen["poll_s"] = poll_s
+            raise ConnectionError("stop here")
+
+        args = argparse.Namespace(
+            cdp_host="127.0.0.1:9", url="http://x/", format="jpeg", quality=80,
+            timeout=5.0, idle_wait_ms=0.0, out_prefix="", ws_url="", connect_retries=1,
+            nav_timing=True, print_target=False, host_header="", op="screenshot",
+            resolve_poll_ms=5.0, render_module=os.path.join(HERE, "render.py"))
+        with mock.patch.object(cdpdrive, "resolve_target", resolve):
+            cdpdrive.drive(args)
+        self.assertEqual(seen["poll_s"], 0.005)
+
+
+class NavMarks(unittest.TestCase):
+    """render.nav carries the marks that split navigate."""
+
+    def test_the_marks_are_ms_from_the_navigation_start(self):
+        entry = {"startTime": 0, "responseStart": 20.0, "requestStart": 5.0,
+                 "responseEnd": 30.5, "domInteractive": 80.0,
+                 "domContentLoadedEventEnd": 95.0, "loadEventStart": 210.0,
+                 "loadEventEnd": 211.0}
+
+        class Cdp:
+            def cmd(self, method, params, deadline):
+                return {"result": {"value": json.dumps(entry)}}
+
+        nav = cdpdrive.nav_timing(Cdp(), 1e12)
+        self.assertEqual(
+            {k: nav[k] for k in ("response_end_ms", "dom_interactive_ms",
+                                 "dom_content_loaded_end_ms", "load_event_start_ms")},
+            {"response_end_ms": 30.5, "dom_interactive_ms": 80.0,
+             "dom_content_loaded_end_ms": 95.0, "load_event_start_ms": 210.0})
+        self.assertEqual(nav["ttfb_ms"], 15.0)
+
+
+class RunMetaFacts(unittest.TestCase):
+    """main() stamps the facts into the run's meta line."""
+
+    SNAPSHOT = test_reqbench.ServeAcknowledgement.SNAPSHOT
+    SEED = test_reqbench.ServeAcknowledgement.SEED
+    FakeServer = test_reqbench.ServeAcknowledgement.FakeServer
+    _drive_main = test_reqbench.ServeAcknowledgement._drive_main
+
+    def meta(self, prefetch):
+        with tempfile.TemporaryDirectory() as d:
+            server = self.FakeServer(os.path.join(d, "serve.log"), prefetch=prefetch)
+            facts = {"instance_type": "c8g.metal-48xl", "cpu_model": "Neoverse-V2",
+                     "nproc": 192, "mem_total_kb": 1, "os": "Ubuntu"}
+            self._drive_main(d, server, extra_patches={"host_facts": lambda: facts})
+            with open(os.path.join(d, "results", "reqbench.jsonl")) as handle:
+                return json.loads(handle.readline()), facts
+
+    def test_the_meta_names_the_host_prefetch_and_poll_interval(self):
+        for prefetch, word in ((True, "on"), (False, "off")):
+            with self.subTest(prefetch=word):
+                meta, facts = self.meta(prefetch)
+                self.assertEqual(meta["uffd_prefetch"], word)
+                self.assertEqual(meta["host"], facts)
+                self.assertEqual(meta["resolve_poll_ms"], 50.0)
+                self.assertFalse(meta["hugepages"])
+                for field in ("browser_version", "firecracker"):
+                    self.assertIn(field, meta)
+
+    def test_the_snapshot_provenance_reaches_the_meta(self):
+        with tempfile.TemporaryDirectory() as d:
+            test_reqbench.SnapshotGenerationIdentity._write_generation(
+                d, "44444444-4444-4444-8444-444444444444")
+            path = os.path.join(d, "snapshots", self.SNAPSHOT, "reqbench-provenance.json")
+            with open(path) as handle:
+                provenance = json.load(handle)
+            provenance["browser_version"] = "Chromium 151.0.0.0 fixture"
+            provenance["firecracker"] = {"commit": "8" * 40}
+            with open(path, "w") as handle:
+                json.dump(provenance, handle)
+            snapshot = reqbench.snapshot_generation(d, self.SNAPSHOT)
+        self.assertEqual(snapshot["browser_version"], "Chromium 151.0.0.0 fixture")
+        self.assertEqual(snapshot["firecracker"], {"commit": "8" * 40})
+
+
+class AnalysisCarriesTheFacts(unittest.TestCase):
+    """analysis.json: the cell carries the facts, and the arms their timeline."""
+
+    _run_gate_fixture = test_reqbench.AnalyzerAvailability._run_gate_fixture
+    _fast_median_ci = staticmethod(test_reqbench.AnalyzerAvailability._fast_median_ci)
+    _fast_shift = staticmethod(test_reqbench.AnalyzerAvailability._fast_shift)
+
+    FACTS = {
+        "uffd_prefetch": "on", "browser_version": "Chromium 151.0.0.0 fixture",
+        "firecracker": {"commit": "8" * 40}, "hugepages": False,
+        "host": {"instance_type": "c8g.metal-48xl"}, "resolve_poll_ms": 50.0,
+    }
+
+    def analyze(self, d, mutate=None, **meta):
+        src = os.path.join(d, "r.jsonl")
+        dst = os.path.join(d, "r.json")
+        test_reqbench.AnalyzerAvailability._write_clean_backend(src, "uffd", 6, 372.0, **meta)
+        if mutate is not None:
+            with open(src) as source:
+                rows = [json.loads(line) for line in source]
+            mutate(rows)
+            with open(src, "w") as target:
+                for row in rows:
+                    target.write(json.dumps(row) + "\n")
+        with redirect_stdout(io.StringIO()):
+            rc = self._run_gate_fixture(["--json-out", dst, src])
+        if not os.path.exists(dst):
+            return rc, None
+        with open(dst) as handle:
+            return rc, json.load(handle)
+
+    def cell(self, analysis):
+        cells = [value for key, value in analysis.items() if key in ("cell", "cells")]
+        if cells and isinstance(cells[0], dict):
+            return cells[0]
+        if cells and isinstance(cells[0], list):
+            return cells[0][0]
+        self.fail(f"no cell in {sorted(analysis)}")
+
+    def test_the_cell_carries_the_recorded_facts(self):
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, **self.FACTS)
+        cell = self.cell(analysis)
+        for field, value in self.FACTS.items():
+            self.assertEqual(cell.get(field), value, field)
+
+    def test_a_uffd_run_without_its_prefetch_setting_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            errors = self._errors(d, dict(self.FACTS, uffd_prefetch=None))
+        self.assertTrue(any("uffd_prefetch" in e for e in errors), errors)
+
+    def test_a_malformed_fact_is_refused(self):
+        for field, bad in (("uffd_prefetch", "yes"), ("hugepages", "no"),
+                           ("host", "box"), ("resolve_poll_ms", 0)):
+            with self.subTest(field), tempfile.TemporaryDirectory() as d:
+                errors = self._errors(d, dict(self.FACTS, **{field: bad}))
+                self.assertTrue(any(field in e for e in errors), errors)
+
+    def _errors(self, d, meta):
+        src = os.path.join(d, "r.jsonl")
+        test_reqbench.AnalyzerAvailability._write_clean_backend(src, "uffd", 6, 372.0, **meta)
+        return [e for ds in reqanalyze.load([src]) for e in ds["metadata_errors"]]
+
+    def test_the_timeline_summarises_marks_polls_and_navigation(self):
+        def stamp(rows):
+            for row in rows:
+                if row.get("kind") == "meta":
+                    continue
+                row["restore_marks"] = {"snapshot_loaded_ms": 10.0, "resumed_ms": 20.0}
+                render = row.get("render")
+                if render is not None:
+                    render["resolve_polls"] = [
+                        {"t_ms": 0.5, "outcome": "os-ECONNREFUSED"},
+                        {"t_ms": 51.0, "outcome": "no-page"},
+                        {"t_ms": 102.0, "outcome": "page"}]
+                    render["nav"].update(response_end_ms=30.0, dom_interactive_ms=80.0,
+                                         dom_content_loaded_end_ms=95.0,
+                                         load_event_start_ms=210.0)
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, stamp, **self.FACTS)
+        cdp = analysis["arms"]["cdp"]["timeline"]
+        self.assertEqual(cdp["restore_marks_ms"]["resumed_ms"]["median"], 20.0)
+        polls = cdp["resolve_polls"]
+        self.assertEqual(polls["first_page_poll_ms"]["median"], 102.0)
+        self.assertEqual(polls["last_miss_poll_ms"]["median"], 51.0)
+        self.assertEqual(polls["polls_per_request"]["median"], 3)
+        self.assertEqual(set(polls["outcomes"]), {"os-ECONNREFUSED", "no-page", "page"})
+        self.assertEqual(cdp["nav_marks_ms"]["load_event_start_ms"]["median"], 210.0)
+        self.assertEqual(analysis["arms"]["noop"]["timeline"]["restore_marks_ms"]
+                         ["snapshot_loaded_ms"]["median"], 10.0)
+
+    def test_html_fast_publishes_cpu_like_cdp_fast(self):
+        """html-fast: the html op with the fast teardown, so its CPU is read."""
+        def to_html_fast(rows):
+            for row in rows:
+                if row.get("kind") == "meta":
+                    row["arms"] = ["html-fast" if a == "cdp-fast" else a for a in row["arms"]]
+                    continue
+                if row["arm"] != "cdp-fast":
+                    continue
+                row["arm"] = "html-fast"
+                row["record_id"] = row["record_id"].replace(":cdp-fast:", ":html-fast:")
+                render = row["render"]
+                for key in ("image_bytes", "image_sha256", "width", "height", "quality"):
+                    render.pop(key)
+                render.update(html_bytes=4096, html_sha256="7" * 64)
+                stages = render["stages"]
+                stages.pop("screenshot_ms")
+                stages.pop("decode_ms")
+                stages["extract_ms"] = 2.0
+                row["teardown"].update(
+                    lifetime_cpu_ms_by_child={"fcvm": 40.0, "firecracker": 600.0,
+                                              "pasta": 30.0},
+                    reaped_children_cpu_ms_by_child={"fcvm": 5.0, "firecracker": 0.0,
+                                                     "pasta": 0.0},
+                    per_child_cpu={"firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
+                                   "pasta": {"reclaim_cpu_ms": 0.0, "complete": True}},
+                    tick_ms=10.0)
+        with tempfile.TemporaryDirectory() as d:
+            rc, analysis = self.analyze(d, to_html_fast, **self.FACTS)
+        self.assertIsNotNone(analysis, f"the analyzer refused html-fast (rc={rc})")
+        block = analysis["arms"]["html-fast"]["request_cpu_ms"]
+        self.assertEqual(block["clone_mean_ms"]["mean"], 670.0 + 5.0 + 110.0)
+        self.assertIn("extract_ms", analysis["arms"]["html-fast"])
+
+
+class HtmlFastArm(unittest.TestCase):
+    """reqbench routes html-fast to the html op with the fast teardown."""
+
+    def test_dispatch(self):
+        seen = []
+
+        def run(args, rep, fast, probe=None, op="screenshot"):
+            seen.append((fast, op))
+            return {}
+
+        with mock.patch.object(reqbench, "run_cdp_request", run):
+            for arm in ("cdp", "cdp-fast", "html", "html-fast"):
+                reqbench.dispatch_request(argparse.Namespace(), 0, arm, False)
+        self.assertEqual(seen, [(False, "screenshot"), (True, "screenshot"),
+                                (False, "html"), (True, "html")])
+        self.assertIn("html-fast", reqbench.allowed_arms_for_engine("chromium"))
+        self.assertNotIn("html-fast", reqbench.allowed_arms_for_engine("webkit"))
+        self.assertTrue(reqbench.publication_arms_ok({"noop", "html-fast"}))
+
+
+class HostControlArms(unittest.TestCase):
+    """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
+
+    def budget(self, arm):
+        with open(os.path.join(HERE, "corpus_extra.sh")) as handle:
+            source = handle.read()
+        start = source.index("hostcdp_arm_budget() {")
+        end = source.index("\n}\n", start) + 3
+        import subprocess
+        return subprocess.run(
+            ["bash", "-c", source[start:end] + f'\nhostcdp_arm_budget "{arm}"'],
+            capture_output=True, text=True, timeout=10)
+
+    def test_each_rung_has_a_cpu_matched_arm(self):
+        for arm, want in (("free", "all unlimited"), ("cpu2", "2 vm-matched"),
+                          ("cpu4", "4 vm-matched"), ("cpu8", "8 vm-matched")):
+            with self.subTest(arm):
+                result = self.budget(arm)
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, want))
+
+    def test_other_names_are_refused(self):
+        for arm in ("cpu0", "cpu", "cpux", "half"):
+            with self.subTest(arm):
+                self.assertEqual(self.budget(arm).returncode, 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

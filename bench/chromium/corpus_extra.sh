@@ -1248,19 +1248,29 @@ done
 [ -z "$missing" ] || { printf 'BLOCKED: the corpus does not serve every URL:%s\n' "$missing" >&2; exit 3; }
 say "corpus complete: all $checked URLs replay locally"
 
-# Two descriptive host arms. "free" gives the container the whole box; "cpu2"
-# caps it at the VM clone's vCPU count. They repeat the VM workload but run in
-# separate time blocks, so compare.py records their medians without publishing
-# VM/host effect ratios. Such ratios need one joint request-level schedule, a
-# drift-control probe, and uncertainty.
+# Descriptive host arms. "free" gives the container the whole box; "cpuN"
+# caps it at N CPUs, a VM clone's vCPU count (cpu2, cpu4, cpu8 for the
+# ladder). They repeat the VM workload but run in separate time blocks, so
+# compare.py records their medians without publishing VM/host effect ratios.
+# Such ratios need one joint request-level schedule, a drift-control probe,
+# and uncertainty.
 HOSTCDP_ARMS="${HOSTCDP_ARMS:-free,cpu2}"
+
+# "<cpus> <cpu_budget>" for one host arm, cpus "all" for the whole box.
+hostcdp_arm_budget() {
+    case "$1" in
+        free) echo "all unlimited" ;;
+        cpu[1-9]|cpu[1-9][0-9]|cpu[1-9][0-9][0-9]) echo "${1#cpu} vm-matched" ;;
+        *) return 2 ;;
+    esac
+}
+
 if [[ ",$PHASES," == *",hostcdp,"* ]]; then
     for arm in $(printf '%s' "$HOSTCDP_ARMS" | tr ',' ' '); do
-        case "$arm" in
-            free) cpus=""; cpu_budget=unlimited ;;
-            cpu2) cpus=2; cpu_budget=vm-matched ;;
-            *) echo "BLOCKED: unknown hostcdp arm '$arm'" >&2; exit 2 ;;
-        esac
+        budget=$(hostcdp_arm_budget "$arm") \
+            || { echo "BLOCKED: unknown hostcdp arm '$arm'" >&2; exit 2; }
+        read -r cpus cpu_budget <<<"$budget"
+        [ "$cpus" != all ] || cpus=""
         say "hostcdp/$arm over the corpus: $REPS measured reps plus $WARMUP warmup, cpus=${cpus:-<all>}, resolver rule -> 127.0.0.1"
         run_logged "$LOGDIR/hostcdp-$arm.log" env \
             URL="$URLS" REPS="$REPS" WARMUP="$WARMUP" \

@@ -47,6 +47,7 @@ sent; test_net_trace.py pins the wire sequence.
 
 import argparse
 import base64
+import errno
 import hashlib
 import importlib.util
 import json
@@ -119,7 +120,8 @@ class TargetNotReady(ConnectionError):
 
 
 def resolve_target(cdp_host: str, deadline: float, retries: int,
-                   host_header: str = "", stats: dict | None = None) -> dict:
+                   host_header: str = "", stats: dict | None = None,
+                   poll_s: float = RESOLVE_RETRY_S) -> dict:
     """GET /json/list and pick the page target. Bounded by the DEADLINE, not by burst.
 
     Chromium's DevTools HTTP handler validates the Host header and rejects values
@@ -150,10 +152,19 @@ def resolve_target(cdp_host: str, deadline: float, retries: int,
     """
     last = None
     attempts = 0
+    started = time.monotonic()
+    # One row per poll: when it finished, from the first poll's start, and
+    # what it found. The page target's arrival lies between the last poll
+    # that found none and the first that found one; a refused connect and an
+    # answered list with no page are different states of the restored guest.
+    polls = []
+    if stats is not None:
+        stats["resolve_polls"] = polls
     while True:
         attempts += 1
         if stats is not None:
             stats["resolve_attempts"] = attempts
+        outcome = "error"
         try:
             timeout = max(0.05, deadline - time.monotonic())
             req = urllib.request.Request(f"http://{cdp_host}/json/list")
@@ -167,21 +178,32 @@ def resolve_target(cdp_host: str, deadline: float, retries: int,
                 if t.get("type") == "page" and not str(t.get("url", "")).startswith("devtools://")
             ]
             if pages:
+                polls.append({"t_ms": (time.monotonic() - started) * 1000,
+                              "outcome": "page"})
                 return pages[0]
+            outcome = "no-page"
             last = RuntimeError(f"no page target among {len(targets)}")
         except urllib.error.HTTPError as e:
             last = e
+            outcome = f"http-{e.code}"
             if 400 <= e.code < 500:
+                polls.append({"t_ms": (time.monotonic() - started) * 1000,
+                              "outcome": outcome})
                 raise ConnectionError(
                     f"CDP target resolution rejected after {attempts} attempt(s): {e} "
                     f"(deterministic {e.code}; not retryable)"
                 ) from e
         except OSError as e:
             last = e
+            reason = getattr(e, "reason", None)
+            code = getattr(reason, "errno", None) if reason is not None else e.errno
+            outcome = (f"os-{errno.errorcode.get(code, code)}" if code is not None
+                       else f"os-{type(reason or e).__name__}")
         now = time.monotonic()
+        polls.append({"t_ms": (now - started) * 1000, "outcome": outcome})
         if now >= deadline or attempts >= max(1, retries):
             break
-        time.sleep(min(RESOLVE_RETRY_S, deadline - now))
+        time.sleep(min(poll_s, deadline - now))
     msg = f"CDP target resolution failed after {attempts} attempts: {last}"
     if isinstance(last, RuntimeError):
         # The endpoint ANSWERED; it just had no page yet. Readiness, not transport.
@@ -292,7 +314,20 @@ def nav_timing(cdp, deadline: float) -> dict:
         return max(0.0, nav.get(a, 0) - nav.get(b, 0))
 
     tls = d("connectEnd", "secureConnectionStart") if nav.get("secureConnectionStart", 0) else 0.0
+
+    def at(key):
+        # Milliseconds from the navigation's startTime, as the entry gives
+        # them; null when the entry lacks the mark.
+        value = nav.get(key)
+        return float(value) if isinstance(value, (int, float)) and value > 0 else None
+
     return {
+        # Marks that split navigate: the document's last byte, the parser's
+        # finish, DOMContentLoaded's handlers, and the load event's start.
+        "response_end_ms": at("responseEnd"),
+        "dom_interactive_ms": at("domInteractive"),
+        "dom_content_loaded_end_ms": at("domContentLoadedEventEnd"),
+        "load_event_start_ms": at("loadEventStart"),
         "dns_ms": d("domainLookupEnd", "domainLookupStart"),
         "connect_ms": d("connectEnd", "connectStart"),
         "tls_ms": tls,
@@ -527,8 +562,10 @@ def drive(args) -> dict:
             # function's except tuple — it would escape drive(), be swallowed by
             # run_cdp_request's `except Exception`, and fail EVERY cdp rep. The
             # Namespace also carries the field now; both halves, deliberately.
+            poll_ms = getattr(args, "resolve_poll_ms", None)
             target = resolve_target(args.cdp_host, deadline, args.connect_retries,
-                                    getattr(args, "host_header", ""), out)
+                                    getattr(args, "host_header", ""), out,
+                                    RESOLVE_RETRY_S if poll_ms is None else poll_ms / 1000.0)
             ws_url = target["webSocketDebuggerUrl"]
             target_id = target.get("id", "")
             stages["resolve_ms"] = (time.monotonic() - t) * 1000

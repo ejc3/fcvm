@@ -534,6 +534,8 @@ esac
 ''')
         write_exec(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
         write_exec(os.path.join(binx, "podman"), '''#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:%s","Id":"%s"}]'
     exit 0
