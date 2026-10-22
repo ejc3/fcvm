@@ -27,7 +27,7 @@ test("screenshots", async ({ page, browser }) => {
     await page.getByRole("button", { name: "Drop a light" }).click();
     await page.mouse.click(img.x + u * img.w, img.y + v * img.h);
   }
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 15.5 }));
+  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.65 }));
   await page.waitForTimeout(1500);
   const bar = { x: page.viewportSize()!.width / 2, y: page.viewportSize()!.height - 5 };
   await page.mouse.move(bar.x, bar.y);
@@ -56,6 +56,18 @@ test("screenshots", async ({ page, browser }) => {
   await shot(page, "tile-opened");
   await page.getByRole("button", { name: "Back to the wall" }).click();
 
+  // Aggregated: two joined streams, the same tile state and hover on top.
+  await page.getByTestId("mode-aggregated").click();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.shownMode), { timeout: 20_000 }).toBe("aggregated");
+  await page.getByTestId("stats-switch").click();
+  const h = await tileBox(page, "ec2-2");
+  await page.mouse.move(h.x + h.w / 2, h.y + h.h / 2);
+  await page.waitForTimeout(800);
+  await shot(page, "wall-aggregated");
+  await page.getByTestId("stats-switch").click();
+  await page.getByTestId("mode-direct").click();
+  await page.mouse.move(bar.x, bar.y);
+
   const ctx = await browser.newContext({ ...devices["iPhone 13"] });
   const phone = await ctx.newPage();
   await openWall(phone, 7);
@@ -65,5 +77,5 @@ test("screenshots", async ({ page, browser }) => {
 
   // Leave the fleet at rest for the next file.
   await expect(page.getByTestId("stamp-ec2")).toHaveText(/^last relaunch all/, { timeout: 30_000 });
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 10 }));
+  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
 });

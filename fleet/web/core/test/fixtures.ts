@@ -36,11 +36,12 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     tiles,
     image_aspect: 16 / 9,
     fleet: { hosts: 1, gpus: tiles.length, n: cols * rows, max_tiles: 100 },
-    scene: { epoch_unix_ms: EPOCH, camera: [{ t: 0, x: 0, y: 0, zoom: 1 }], time_of_day: 12, words: [], lights: [] },
+    scene: { epoch_unix_ms: EPOCH, camera: [{ t: 0, x: 0, y: 0, zoom: 1 }], time_of_day: 0.5, words: [], lights: [] },
     settings: { auto_relaunch_secs: null },
     relaunch_all: null,
     viewers: { count: 2 },
     actions: [],
+    aggregators: [],
     ...over,
   };
 }

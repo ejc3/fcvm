@@ -29,7 +29,9 @@ import {
   splitNals,
   type Box,
   type DrawPlan,
+  type DrawSource,
   type DrawTile,
+  type StreamMode,
   type FrameStats,
   type SyncChoice,
   type TileFrameStats,
@@ -265,7 +267,17 @@ class TileStream {
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let dpr = 1;
-let plan: DrawPlan = { tiles: [], image: null, dpr: 1, darkFill: "#06080B", estimatedBps: 0 };
+let plan: DrawPlan = { mode: "direct", direct: [], aggregated: [], tiles: [], focus: null, image: null, dpr: 1, darkFill: "#06080B", estimatedBps: 0 };
+/** The mode being drawn. It becomes plan.mode only once that mode can be drawn whole. */
+let shownMode: StreamMode = "direct";
+/** When each tile last stopped being dark, for its fade back in. */
+const litAt = new Map<string, number>();
+const wasDark = new Set<string>();
+/** Draws recorded for a test: the t drawn, the mode, and regions drawn without a frame. */
+let trace: { T: number | null; mode: StreamMode; missing: number }[] | null = null;
+/** When the current switch began; after SWITCH_HOLD_LIMIT_MS the image stops waiting for it. */
+let switchStarted: number | null = null;
+const SWITCH_HOLD_LIMIT_MS = 4000;
 let settings: DrawSettings = { background: "#000000", dimAlpha: 0.5, fadeInMs: 280 };
 const streams = new Map<string, TileStream>();
 let prevT: number | null = null;
@@ -289,28 +301,94 @@ function post(m: FromWorker): void {
   self.postMessage(m);
 }
 
+function sourcesOf(mode: StreamMode): DrawSource[] {
+  return mode === "direct" ? plan.direct : plan.aggregated;
+}
+
+/** The streams to hold: the mode drawn, the mode wanted (while switching), and an opened tile. */
+function wantedSources(): Map<string, DrawSource> {
+  const out = new Map<string, DrawSource>();
+  for (const src of sourcesOf(shownMode)) out.set(src.id, src);
+  if (plan.mode !== shownMode) for (const src of sourcesOf(plan.mode)) out.set(src.id, src);
+  if (plan.focus) out.set(plan.focus.id, plan.focus);
+  return out;
+}
+
+function syncStreams(): void {
+  const wanted = wantedSources();
+  for (const src of wanted.values()) {
+    if (src.url === null || src.baseUrl === null) continue;
+    const st = streams.get(src.id);
+    if (!st || st.baseUrl !== src.baseUrl) {
+      st?.close();
+      streams.set(src.id, new TileStream(src.id, src.baseUrl, src.url, src.height));
+    } else {
+      st.setHeight(src.height, src.url);
+    }
+  }
+  for (const [id, st] of streams) {
+    const w = wanted.get(id);
+    if (!w || w.url === null) {
+      st.close();
+      streams.delete(id);
+    }
+  }
+}
+
 function applyPlan(p: DrawPlan): void {
   plan = p;
   dirty = true;
   needsClear = true;
-  const wanted = new Set<string>();
-  for (const t of p.tiles) {
-    if (t.url === null || t.baseUrl === null) continue;
-    wanted.add(t.id);
-    const s = streams.get(t.id);
-    if (!s || s.baseUrl !== t.baseUrl) {
-      s?.close();
-      streams.set(t.id, new TileStream(t.id, t.baseUrl, t.url, t.height));
-    } else {
-      s.setHeight(t.height, t.url);
-    }
+  // Before anything is on screen there is nothing to keep: start in the wanted mode.
+  if (prevT === null && plan.mode !== shownMode) {
+    shownMode = plan.mode;
+    post({ type: "mode-shown", mode: shownMode });
   }
-  for (const [id, s] of streams) {
-    if (!wanted.has(id)) {
-      s.close();
-      streams.delete(id);
-    }
+  syncStreams();
+}
+
+/**
+ * Switch to the wanted mode once every one of its regions holds a decoded
+ * frame at one t no older than the t on screen: then the next draw shows it
+ * whole, at a t that does not go back, and the old streams close after it.
+ */
+/**
+ * While switching: the newest t every incoming region holds. The image on
+ * screen does not advance past it, so a later incoming stream (an aggregator
+ * joins tiles before it encodes) can catch up with what is shown; the shown
+ * streams keep their frames meanwhile. Null when nothing caps.
+ */
+function switchCap(): number {
+  if (plan.mode === shownMode || plan.focus) return Infinity;
+  const target = sourcesOf(plan.mode).filter((src) => src.box !== null && src.url !== null);
+  if (target.length === 0 || !target.every((src) => (streams.get(src.id)?.frames.length ?? 0) > 0)) return Infinity;
+  if (switchStarted !== null && now() - switchStarted > SWITCH_HOLD_LIMIT_MS) return Infinity;
+  const newest = Math.min(...target.map((src) => { const f = streams.get(src.id)!.frames; return f[f.length - 1]!.t; }));
+  // Never below what is on screen: the shown frames at prevT are still held.
+  return prevT === null ? newest : Math.max(newest, prevT);
+}
+
+function trySwitch(): void {
+  if (plan.mode === shownMode) {
+    switchStarted = null;
+    return;
   }
+  switchStarted ??= now();
+  const target = sourcesOf(plan.mode).filter((src) => src.box !== null && src.url !== null);
+  if (target.length > 0) {
+    if (!target.every((src) => streams.has(src.id))) return;
+    const c = chooseCommonT(
+      target.map((src) => ({ id: src.id, ts: streams.get(src.id)!.frames.map((h) => h.t) })),
+      prevT,
+    );
+    if (c.T === null || (prevT !== null && c.T < prevT - SAME_T_EPS)) return;
+    if (!target.every((src) => c.show.get(src.id)?.kind === "sync")) return;
+  }
+  shownMode = plan.mode;
+  switchStarted = null;
+  dirty = true;
+  needsClear = true;
+  post({ type: "mode-shown", mode: shownMode });
 }
 
 function resize(w: number, h: number, d: number): void {
@@ -343,16 +421,28 @@ function gridBox(image: Box, g: Grid, w: number, h: number): [number, number, nu
   return [x0, y0, x1 - x0, y1 - y0];
 }
 
-function drawDark(t: DrawTile): void {
-  if (!ctx || !t.box) return;
-  const [x, y, w, h] = devBox(t.box);
+/** A region with no frame to show. */
+function fillDark(b: Box): void {
+  if (!ctx) return;
+  const [x, y, w, h] = devBox(b);
   ctx.fillStyle = plan.darkFill;
   ctx.fillRect(x, y, w, h);
-  if (w <= 2 || h <= 2) return;
-  ctx.strokeStyle = t.outline;
-  ctx.lineWidth = Math.max(1, Math.round(dpr));
-  const inset = ctx.lineWidth / 2;
-  ctx.strokeRect(x + inset, y + inset, w - ctx.lineWidth, h - ctx.lineWidth);
+}
+
+/** A dark tile, outlined in its half's colour, at an opacity (for its fade). */
+function drawDark(t: DrawTile, alpha: number): void {
+  if (!ctx || !t.box) return;
+  const [x, y, w, h] = devBox(t.box);
+  ctx.globalAlpha = alpha;
+  ctx.fillStyle = plan.darkFill;
+  ctx.fillRect(x, y, w, h);
+  if (w > 2 && h > 2) {
+    ctx.strokeStyle = t.outline;
+    ctx.lineWidth = Math.max(1, Math.round(dpr));
+    const inset = ctx.lineWidth / 2;
+    ctx.strokeRect(x + inset, y + inset, w - ctx.lineWidth, h - ctx.lineWidth);
+  }
+  ctx.globalAlpha = 1;
 }
 
 function draw(): void {
@@ -364,15 +454,17 @@ function draw(): void {
   }
   lastFrameAt = t0;
 
-  const drawable = plan.tiles.filter((t) => t.box !== null && !t.dark && streams.has(t.id));
-  const buffers = drawable.map((t) => ({ id: t.id, ts: streams.get(t.id)!.frames.map((h) => h.t) }));
-  const choice = chooseCommonT(buffers, prevT);
+  trySwitch();
+  const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
+  const drawable = shown.filter((src) => src.box !== null && streams.has(src.id));
+  const buffers = drawable.map((src) => ({ id: src.id, ts: streams.get(src.id)!.frames.map((h) => h.t) }));
+  const choice = chooseCommonT(buffers, prevT, undefined, switchCap());
   lastChoice = choice;
   if (choice.T !== null) prevT = choice.T;
 
   // Frames change at the renderers' rate, not the display's: draw only when
   // what would be drawn changed.
-  let sig = String(choice.T);
+  let sig = `${shownMode}|${String(choice.T)}`;
   for (const [id, sh] of choice.show) sig += `|${id}:${sh.kind}${"t" in sh ? sh.t : ""}`;
   if (!dirty && sig === lastSig && captures.length === 0) return;
   lastSig = sig;
@@ -386,34 +478,32 @@ function draw(): void {
   }
   ctx.imageSmoothingEnabled = true;
   const at = now();
-  for (const t of plan.tiles) {
-    if (!t.box) continue;
-    const s = streams.get(t.id);
-    const show = choice.show.get(t.id);
-    if (t.dark || !s || !show || show.kind === "waiting" || show.kind === "empty") {
-      if (s) s.appearedAt = null;
-      drawDark(t);
-      continue;
-    }
-    const frame = s.frameAt(show.t);
-    if (!frame) {
-      drawDark(t);
+  let missing = 0;
+  for (const src of shown) {
+    if (!src.box) continue;
+    const st = streams.get(src.id);
+    const show = choice.show.get(src.id);
+    const frame = st && show && (show.kind === "sync" || show.kind === "behind") ? st.frameAt(show.t) : null;
+    if (!st || !show || !frame) {
+      if (st) st.appearedAt = null;
+      if (src.url !== null) missing++;
+      fillDark(src.box);
       continue;
     }
     const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
-    // In the mosaic the inner rectangle goes where the renderer says it sits in
+    // In the mosaic the inner rectangle goes where the stream says it sits in
     // the whole image (x0, y0 of full_width x full_height); opened, it fills its box.
-    const [x, y, w, h] = plan.image && frame.grid ? gridBox(plan.image, frame.grid, inner.sw, inner.sh) : devBox(t.box);
-    if (s.appearedAt === null) s.appearedAt = at;
-    const fade = Math.min(1, (at - s.appearedAt) / settings.fadeInMs);
+    const [x, y, w, h] = plan.image && frame.grid && !plan.focus ? gridBox(plan.image, frame.grid, inner.sw, inner.sh) : devBox(src.box);
+    if (st.appearedAt === null) st.appearedAt = at;
+    const fade = Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
-      drawDark(t);
+      fillDark(src.box);
       dirty = true;
     }
     ctx.globalAlpha = fade;
     // Only the inner rectangle shows: the whole frame is drawn scaled so its
-    // inner rectangle covers the tile's box, clipped to the box. (WebKit ignores
-    // a VideoFrame's source rectangle and visibleRect when drawing.)
+    // inner rectangle covers the box, clipped to the box. (WebKit ignores a
+    // VideoFrame's source rectangle and visibleRect when drawing.)
     const kx = w / inner.sw;
     const ky = h / inner.sh;
     if (inner.sx === 0 && inner.sy === 0 && inner.sw === frame.frame.displayWidth && inner.sh === frame.frame.displayHeight) {
@@ -432,11 +522,41 @@ function draw(): void {
       ctx.fillRect(x, y, w, h);
     }
   }
-  for (const t of plan.tiles) {
-    const s = streams.get(t.id);
-    if (!s) continue;
-    const keep = releaseBefore(choice, t.id);
-    if (keep !== null) s.releaseOlder(keep);
+  // Each tile's own state, the same in both modes: dark while it relaunches
+  // (outlined in its half's colour), fading out when it comes back.
+  if (!plan.focus) {
+    for (const t of plan.tiles) {
+      if (!t.box) continue;
+      if (t.dark) {
+        wasDark.add(t.id);
+        litAt.delete(t.id);
+        drawDark(t, 1);
+        continue;
+      }
+      if (wasDark.has(t.id)) {
+        wasDark.delete(t.id);
+        litAt.set(t.id, at);
+      }
+      const since = litAt.get(t.id);
+      if (since === undefined) continue;
+      const left = 1 - (at - since) / settings.fadeInMs;
+      if (left <= 0) {
+        litAt.delete(t.id);
+        continue;
+      }
+      drawDark(t, left);
+      dirty = true;
+    }
+  }
+  for (const src of shown) {
+    const st = streams.get(src.id);
+    if (!st) continue;
+    const keep = releaseBefore(choice, src.id);
+    if (keep !== null) st.releaseOlder(keep);
+  }
+  if (trace) {
+    trace.push({ T: choice.T, mode: shownMode, missing });
+    if (trace.length > 20_000) trace.shift();
   }
 
   // Captures read back exactly what this draw put on the canvas.
@@ -449,7 +569,7 @@ function draw(): void {
         const d = ctx!.getImageData(Math.floor(p.x * dpr), Math.floor(p.y * dpr), 1, 1).data;
         return [d[0]!, d[1]!, d[2]!, d[3]!] as [number, number, number, number];
       });
-      const result: CaptureResult = { req: c.req, T: choice.T, shown, pixels };
+      const result: CaptureResult = { req: c.req, T: choice.T, shown, pixels, mode: shownMode };
       post({ type: "capture", result });
     }
     captures = [];
@@ -483,15 +603,13 @@ function report(): void {
   let decoded = 0;
   let bytes = 0;
   const decodeAll: number[] = [];
-  for (const t of plan.tiles) {
-    const s = streams.get(t.id);
-    if (!s) continue;
+  for (const [id, s] of streams) {
     const fps = s.fps(at);
     decoded += fps;
     bytes += s.bytes;
     decodeAll.push(...s.decodeMs.slice(-20));
-    const show = lastChoice.show.get(t.id);
-    tiles[t.id] = {
+    const show = lastChoice.show.get(id);
+    tiles[id] = {
       connected: s.ws !== null && s.ws.readyState === WebSocket.OPEN,
       fps,
       newestT: s.frames.length > 0 ? s.frames[s.frames.length - 1]!.t : null,
@@ -518,7 +636,7 @@ function report(): void {
     drawsPerSec: drawTimes.length / 2,
     tilesSynced: kinds.filter((k) => k.kind === "sync").length,
     tilesBehind: kinds.filter((k) => k.kind === "behind").length,
-    tilesDrawn: plan.tiles.filter((t) => t.box !== null).length,
+    tilesDrawn: (plan.focus ? [plan.focus] : sourcesOf(shownMode)).filter((src) => src.box !== null).length,
   };
   post({ type: "stats", stats, bench });
 }
@@ -557,6 +675,14 @@ self.onmessage = (e: MessageEvent<ToWorker>) => {
       break;
     case "tick":
       if (mainTicks) draw();
+      break;
+    case "trace":
+      if (m.on) {
+        trace = [];
+      } else {
+        post({ type: "trace", req: m.req, entries: trace ?? [] });
+        trace = null;
+      }
       break;
       case "capture":
       captures.push({ req: m.req, points: m.points });

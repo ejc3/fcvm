@@ -4,8 +4,19 @@ import type { CaptureResult } from "../app/_wall/worker-msgs.ts";
 
 export const COORD = `http://localhost:${process.env.FLEET_E2E_COORD_PORT}`;
 
-/** Open the wall and wait until every live tile draws at the common t. */
-export async function openWall(page: Page, minSynced = 15): Promise<void> {
+/**
+ * Open the wall in a stream mode the viewer has chosen (so the page's own
+ * suggestion cannot move it mid-test) and wait until every live region draws
+ * at the common t.
+ */
+export async function openWall(page: Page, minSynced = 15, mode: "direct" | "aggregated" = "direct"): Promise<void> {
+  await page.addInitScript((m) => {
+    try {
+      window.localStorage.setItem("fleet-wall.mode", m);
+    } catch {
+      // Without storage the page starts direct anyway.
+    }
+  }, mode);
   await page.goto("/?debug=1");
   await page.waitForFunction(() => window.__fleet !== undefined);
   await expect
@@ -160,7 +171,7 @@ export async function focusError(page: Page, tileId: string): Promise<{ err: num
   const v = await page.evaluate((id) => {
     const view = window.__fleet!.view();
     const t = window.__fleet!.client.getState().accepted!.tiles.find((x) => x.id === id)!;
-    return { box: view.plan.tiles.find((x) => x.id === id)!.box!, rect: t.rect };
+    return { box: view.plan.focus!.box!, rect: t.rect };
   }, tileId);
   const pts: { x: number; y: number }[] = [];
   for (let j = 1; j < 10; j++) for (let i = 1; i < 16; i++) pts.push({ x: v.box.x + (v.box.w * i) / 16, y: v.box.y + (v.box.h * j) / 10 });
@@ -179,7 +190,7 @@ export async function focusError(page: Page, tileId: string): Promise<{ err: num
     const m = map(s.e);
     err += (Math.abs(s.o[0] - m[0]) + Math.abs(s.o[1] - m[1]) + Math.abs(s.o[2] - m[2])) / 3;
   }
-  return { err: err / samples.length, shown: res.shown[tileId] ?? "", T: res.T };
+  return { err: err / samples.length, shown: res.shown[`d:${tileId}`] ?? "", T: res.T };
 }
 
 /**

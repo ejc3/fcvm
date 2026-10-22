@@ -36,11 +36,17 @@ export interface RendererOptions {
 interface TileEntry {
   rect: Rect;
   available: boolean;
+  /** For an aggregator: the image rectangles of its tiles that are not running, drawn black. */
+  black: () => Rect[];
   /** Seconds added to the drawn t while keeping the stamp: a seam fault for tests. */
   skew: number;
 }
 
+/** The renderer's q levels as libx264 quality: hi, std (the default), lo. */
+const CRF: Record<string, number> = { hi: 14, std: 18, lo: 26 };
+
 interface Sub {
+  q: string;
   ws: WebSocket;
   tile: string;
   width: number;
@@ -92,7 +98,12 @@ export class MockRenderers {
         return;
       }
       const h = Number(url.searchParams.get("h") ?? "144");
-      this.wss.handleUpgrade(req, socket, head, (ws) => this.subscribe(ws, m[1]!, h));
+      const q = url.searchParams.get("q") ?? "std";
+      if (!(q in CRF)) {
+        socket.end("HTTP/1.1 400 Bad Request\r\n\r\n");
+        return;
+      }
+      this.wss.handleUpgrade(req, socket, head, (ws) => this.subscribe(ws, m[1]!, h, q));
     });
   }
 
@@ -115,9 +126,9 @@ export class MockRenderers {
     return `ws://${this.opts.publicHost}:${this.port}/frames/${id}`;
   }
 
-  setTile(id: string, rect: Rect): void {
+  setTile(id: string, rect: Rect, black: () => Rect[] = () => []): void {
     const e = this.tiles.get(id);
-    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0 });
+    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0, black });
   }
 
   /** A tile with no renderer refuses connections and drops the ones it has (its VM is gone). */
@@ -139,8 +150,8 @@ export class MockRenderers {
     return Math.min(this.opts.maxHeight, Number.isFinite(h) ? h : 144);
   }
 
-  private subscribe(ws: WebSocket, tile: string, h: number): void {
-    const sub: Sub = { ws, tile, width: 0, height: 0, geometry: null, encoder: null, stamps: [], sentKey: false };
+  private subscribe(ws: WebSocket, tile: string, h: number, q: string): void {
+    const sub: Sub = { q, ws, tile, width: 0, height: 0, geometry: null, encoder: null, stamps: [], sentKey: false };
     this.subs.add(sub);
     this.stats.subscribers = this.subs.size;
     this.resize(sub, h);
@@ -190,6 +201,7 @@ export class MockRenderers {
       height,
       fps,
       gop: Math.round(fps * 2),
+      crf: CRF[sub.q] ?? 18,
       onCodec: (codec) => {
         if (sub.encoder !== enc || sub.ws.readyState !== sub.ws.OPEN) return;
         sub.ws.send(
@@ -263,7 +275,7 @@ export class MockRenderers {
       const geometry = s0.geometry!;
       lane.inflight++;
       const started = Date.now();
-      const drawn = this.pool.render({ geometry, drawT: t + entry.skew, scene }).then((b) => {
+      const drawn = this.pool.render({ geometry, drawT: t + entry.skew, scene, black: entry.black() }).then((b) => {
         lane.lastMs = Date.now() - started;
         return b;
       });

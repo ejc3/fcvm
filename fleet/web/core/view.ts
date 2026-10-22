@@ -7,6 +7,8 @@ import {
   STREAM_HEIGHTS,
   layoutFocus,
   layoutMosaic,
+  rectOnScreen,
+  streamHeightFor,
   seamSegments,
   type Box,
   type MosaicLayout,
@@ -14,9 +16,10 @@ import {
 } from "./layout.ts";
 import { frameSocketUrl, urlHost } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
-import type { Action, FleetState, Half, IntentMsg, Tile } from "./protocol.ts";
+import { suggestMode } from "./mode.ts";
+import type { Action, FleetState, Half, IntentMsg, Rect, Tile } from "./protocol.ts";
 import { sceneUnixMs } from "./scene.ts";
-import type { ClientState, Notice } from "./store.ts";
+import type { ClientState, Notice, StreamMode } from "./store.ts";
 
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
@@ -116,6 +119,16 @@ export interface WallInput {
   /** WebCodecs H.264 is available. */
   canDecode: boolean;
   phone: boolean;
+  /** The browser's downlink estimate (Mbit/s), when it gives one. */
+  downlinkMbps?: number | null;
+  /** Share of drawn tiles behind the common t lately, in direct mode. */
+  lateShare?: number | null;
+  /** Boxes the hover label must not cover (the race and counter cards), measured by the page. */
+  avoid?: Box[];
+  /** The hover label's measured size. */
+  labelSize?: { w: number; h: number };
+  /** The direct streams' bandwidth budget, bits per second (BANDWIDTH_BUDGET_BPS when absent). */
+  budgetBps?: number;
 }
 
 // ---- tiles -------------------------------------------------------------------
@@ -174,7 +187,7 @@ function tileView(
 ): TileView {
   const requested = pendingRelaunch(pendingIntents, t) && isLive(t);
   const phase = requested ? "requested" : t.phase;
-  const fs = s.frames?.tiles[t.id];
+  const fs = s.frames?.tiles[sourceIdFor(t, s.ui.shownMode, st.aggregators)];
   const waitingForFrames = isLive(t) && !requested && (!fs || fs.newestT === null);
   const dark = !isLive(t) || requested || waitingForFrames;
   const accent = COLORS[t.half].accent;
@@ -344,8 +357,19 @@ export interface Option {
   label: string;
 }
 
+export interface ModeView {
+  label: string;
+  options: { value: StreamMode; label: string; disabled: boolean }[];
+  selected: StreamMode;
+  /** "switching to aggregated" while the drawer still shows the other mode. */
+  note: string;
+  suggestion: { mode: StreamMode; text: string };
+  detail: string;
+}
+
 export interface ControlsView {
   site: string;
+  mode: ModeView;
   relaunchAll: { label: string; disabled: boolean; note: string };
   auto: { label: string; options: Option[]; selected: string; note: string; pending: boolean };
   stats: { label: string; on: boolean };
@@ -358,7 +382,7 @@ export interface ControlsView {
   latencyMeasured: boolean;
 }
 
-export const WORD_MAX = 24;
+export const WORD_MAX = 28;
 
 function autoValue(secs: number | null): string {
   return secs === null ? "off" : String(secs);
@@ -382,7 +406,34 @@ function lastAction(st: FleetState, name: string): Action | null {
   return best;
 }
 
-function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingIntents: IntentMsg[]): ControlsView {
+function modeView(s: ClientState, st: FleetState, plan: DrawPlan, input: WallInput): ModeView {
+  const has = st.aggregators.length > 0;
+  const sug = suggestMode({
+    aggregators: st.aggregators.length,
+    downlinkMbps: input.downlinkMbps ?? null,
+    directBps: plan.estimatedBps,
+    lateShare: input.lateShare ?? null,
+  });
+  const name = (m: StreamMode) => (m === "direct" ? "Direct" : "Aggregated");
+  const selected = has ? s.ui.mode : "direct";
+  const detail =
+    selected === "direct"
+      ? `${fmt.count(plan.direct.length, "stream", "streams")}, one per tile, about ${fmt.mbps(plan.estimatedBps)}`
+      : `${fmt.count(plan.aggregated.length, "stream", "streams")}, each a joined region`;
+  return {
+    label: "Streams",
+    options: [
+      { value: "direct", label: "Direct", disabled: false },
+      { value: "aggregated", label: "Aggregated", disabled: !has },
+    ],
+    selected,
+    note: selected !== s.ui.shownMode ? `switching to ${name(selected).toLowerCase()}` : "",
+    suggestion: { mode: sug.mode, text: `${name(sug.mode)} suggested: ${sug.reason}` },
+    detail,
+  };
+}
+
+function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingIntents: IntentMsg[]): Omit<ControlsView, "mode"> {
   const ra = st.relaunch_all;
   const raceOn = ra !== null && (ra.fcvm_done_at === null || ra.ec2_done_at === null);
   const pendingAll = pendingIntents.some((i) => i.name === "relaunch_all");
@@ -401,7 +452,8 @@ function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingInt
   if (secs !== null && !opts.includes(secs)) opts.push(secs);
   let note = "";
   if (st.settings.auto_relaunch_secs !== null && !pendingAuto) {
-    const setBy = lastAction(st, "set_auto_relaunch")?.by;
+    const last = lastAction(st, "set_auto_relaunch");
+    const setBy = last === null ? undefined : s.you !== null && (last.viewer === s.you || last.by === s.you) ? "you" : last.by;
     // A tile never relaunched is due at once.
     const due = st.tiles
       .filter((t) => t.gpu !== null)
@@ -459,7 +511,7 @@ function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingInt
       status: wordStatus,
       statusKind,
     },
-    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 23.75, step: 0.25, valueText: fmt.timeOfDay(tod), pending: pendingTod !== undefined },
+    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod), pending: pendingTod !== undefined },
     viewers: `${st.viewers.count} watching`,
     help: "Drag to steer the camera together, scroll to dive. Click a square to open it.",
     latency,
@@ -469,9 +521,10 @@ function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingInt
 
 // ---- actions ticker ----------------------------------------------------------
 
-function actionText(a: Action): string | null {
+function actionText(a: Action, you: string | null): string | null {
   if (a.outcome === "refused") return null;
-  const who = a.by === "" ? "someone" : a.by;
+  const mine = you !== null && (a.viewer === you || a.by === you);
+  const who = mine ? "you" : a.by === "" ? "someone" : a.by;
   const args = a.args;
   if (args === null) {
     // The coordinator sends a summary instead of the arguments: "relaunch slot-3",
@@ -511,6 +564,8 @@ function actionText(a: Action): string | null {
       return `${who} dropped a light`;
     case "time_of_day":
       return typeof args["v"] === "number" ? `${who} set the time of day to ${fmt.timeOfDay(args["v"] as number)}` : null;
+    case "camera":
+      return null;
     default:
       return a.summary === null ? null : `${who}: ${a.summary}`;
   }
@@ -522,11 +577,11 @@ export interface TickerItem {
   when: string;
 }
 
-function tickerView(st: FleetState, srvNow: number): TickerItem[] {
+function tickerView(st: FleetState, srvNow: number, you: string | null): TickerItem[] {
   const out: TickerItem[] = [];
   const sorted = [...st.actions].sort((a, b) => b.at - a.at);
   for (const a of sorted) {
-    const text = actionText(a);
+    const text = actionText(a, you);
     if (text === null) continue;
     out.push({ key: `${a.at}-${a.by}-${a.name}-${out.length}`, text, when: fmt.ago(srvNow - a.at) });
     if (out.length === 4) break;
@@ -610,7 +665,7 @@ export function mirrorTile(tiles: readonly Tile[], t: Tile): Tile | null {
 }
 
 function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input: WallInput): FocusView {
-  const fs = s.frames?.tiles[t.id];
+  const fs = s.frames?.tiles[`d:${t.id}`];
   const mirror = mirrorTile(st.tiles, t);
   const pair = [t, mirror].filter((x): x is Tile => x !== null);
   const axis = Math.max(1, ...pair.map(partsTotal));
@@ -667,28 +722,51 @@ function phoneView(st: FleetState): PhoneView {
 
 // ---- what the frame drawer gets -------------------------------------------------
 
-export interface DrawTile {
+/** One frame stream the drawer may open: a tile's renderer, or an aggregator. */
+export interface DrawSource {
+  /** `d:<tile id>` for a tile's own stream, `a:<aggregator id>` for an aggregator. */
   id: string;
-  half: Half;
-  /** Frame socket URL with h, or null: do not connect. */
+  /** Frame socket URL with h (and q), or null: do not connect. */
   url: string | null;
   baseUrl: string | null;
   height: number;
-  /** Where to draw, or null: keep streaming, do not draw. */
+  /** Where it is drawn in the mosaic, or null: keep streaming, do not draw. */
   box: Box | null;
-  /** Draw dark even if frames are held (a relaunch is under way). */
+}
+
+/** A tile's own state, drawn the same way whatever stream its pixels came from. */
+export interface DrawTile {
+  id: string;
+  half: Half;
+  box: Box | null;
+  /** Drawn dark over any frame (a relaunch, no GPU, no frames yet). */
   dark: boolean;
   /** Outline of a dark tile, in its half's colour. */
   outline: string;
 }
 
 export interface DrawPlan {
+  /** The mode this viewer wants; the drawer switches to it when it can do so without a gap. */
+  mode: StreamMode;
+  direct: DrawSource[];
+  aggregated: DrawSource[];
   tiles: DrawTile[];
+  /** With a tile opened: its direct source, drawn alone. */
+  focus: DrawSource | null;
   image: Box | null;
   dpr: number;
   darkFill: string;
-  /** What the live streams cost at the renderer's bit rate, bits per second. */
+  /** What the direct streams cost at the renderer's bit rate, bits per second. */
   estimatedBps: number;
+}
+
+/** The source a tile's pixels come from in a mode: its own stream, or the aggregator holding its centre. */
+export function sourceIdFor(t: Tile, mode: StreamMode, aggregators: readonly { id: string; rect: Rect }[]): string {
+  if (mode === "direct") return `d:${t.id}`;
+  const cx = t.rect.x + t.rect.w / 2;
+  const cy = t.rect.y + t.rect.h / 2;
+  const a = aggregators.find((g) => cx >= g.rect.x && cx < g.rect.x + g.rect.w && cy >= g.rect.y && cy < g.rect.y + g.rect.h);
+  return a ? `a:${a.id}` : `d:${t.id}`;
 }
 
 // ---- seams --------------------------------------------------------------------
@@ -700,26 +778,69 @@ export interface SeamView {
   /** One device pixel, in CSS pixels. */
   lineWidth: number;
   outline: { box: Box; color: string } | null;
-  label: (HoverLabel & { accent: string; x: number; y: number; alignRight: boolean; below: boolean }) | null;
+  /** The label's top-left corner, placed off the cards and inside the image's area. */
+  label: (HoverLabel & { accent: string; x: number; y: number }) | null;
 }
 
-function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[], dpr: number): SeamView {
+function overlaps(a: Box, b: Box): boolean {
+  return a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+}
+
+/**
+ * Where the hover label goes: the first of above, below, beside and inside the
+ * tile that stays inside the area and covers none of the boxes to avoid (the
+ * race and counter cards). Failing all, the one covering the least of them.
+ */
+export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box, avoid: readonly Box[]): { x: number; y: number } {
+  const gap = 6;
+  const { w, h } = size;
+  const candidates: { x: number; y: number }[] = [
+    { x: tile.x, y: tile.y - h - gap },
+    { x: tile.x + tile.w - w, y: tile.y - h - gap },
+    { x: tile.x, y: tile.y + tile.h + gap },
+    { x: tile.x + tile.w - w, y: tile.y + tile.h + gap },
+    { x: tile.x + tile.w + gap, y: tile.y },
+    { x: tile.x - w - gap, y: tile.y },
+    { x: tile.x + gap, y: tile.y + gap },
+    { x: tile.x + tile.w - w - gap, y: tile.y + tile.h - h - gap },
+  ];
+  const inside = (c: { x: number; y: number }) => c.x >= area.x && c.y >= area.y && c.x + w <= area.x + area.w && c.y + h <= area.y + area.h;
+  const cover = (c: { x: number; y: number }) => {
+    const b = { x: c.x, y: c.y, w, h };
+    let n = 0;
+    for (const a of avoid) {
+      if (!overlaps(a, b)) continue;
+      n += (Math.min(a.x + a.w, b.x + b.w) - Math.max(a.x, b.x)) * (Math.min(a.y + a.h, b.y + b.h) - Math.max(a.y, b.y));
+    }
+    return n;
+  };
+  const clean = candidates.find((c) => inside(c) && cover(c) === 0);
+  if (clean) return clean;
+  // Then the same places pushed just past whatever card they hit.
+  const pushed: { x: number; y: number }[] = [];
+  for (const c of candidates) {
+    for (const a of avoid) {
+      if (!overlaps(a, { x: c.x, y: c.y, w, h })) continue;
+      pushed.push({ x: c.x, y: a.y + a.h + gap }, { x: a.x + a.w + gap, y: c.y }, { x: c.x, y: a.y - h - gap }, { x: a.x - w - gap, y: c.y });
+    }
+  }
+  const moved = pushed.find((c) => inside(c) && cover(c) === 0);
+  if (moved) return moved;
+  const fits = candidates.filter(inside);
+  const pool = fits.length > 0 ? fits : candidates;
+  return pool.reduce((best, c) => (cover(c) < cover(best) ? c : best));
+}
+
+function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[], input: WallInput): SeamView {
+  const dpr = input.dpr;
   const target = s.ui.hoverId ?? s.ui.keyId;
   const tv = target === null ? null : tiles.find((t) => t.id === target) ?? null;
   const segments = layout ? seamSegments(layout.tiles, layout.image, dpr) : [];
   let label: SeamView["label"] = null;
   if (tv && tv.box && layout) {
-    const b = tv.box;
-    const alignRight = b.x + b.w / 2 > layout.image.x + layout.image.w / 2;
-    const below = b.y < layout.image.y + 64;
-    label = {
-      ...tv.hover,
-      accent: tv.accent,
-      x: alignRight ? b.x + b.w : b.x,
-      y: below ? b.y + b.h : b.y,
-      alignRight,
-      below,
-    };
+    const area = input.mosaicArea ?? layout.image;
+    const at = placeLabel(tv.box, input.labelSize ?? { w: 230, h: 92 }, area, input.avoid ?? []);
+    label = { ...tv.hover, accent: tv.accent, x: at.x, y: at.y };
   }
   return {
     visible: s.ui.pointerOverImage || s.ui.keyId !== null,
@@ -769,7 +890,7 @@ export function wallView(input: WallInput): WallView {
   } else if (!st) {
     banner = "Connecting to the fleet.";
   }
-  const emptyPlan: DrawPlan = { tiles: [], image: null, dpr: input.dpr, darkFill: "#06080B", estimatedBps: 0 };
+  const emptyPlan: DrawPlan = { mode: "direct", direct: [], aggregated: [], tiles: [], focus: null, image: null, dpr: input.dpr, darkFill: "#06080B", estimatedBps: 0 };
   if (!st) {
     return {
       title: TITLE,
@@ -800,33 +921,51 @@ export function wallView(input: WallInput): WallView {
     ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input)
     : null;
 
-  // Heights: each tile asks for the device pixels it covers; with a tile
+  // Direct: each tile asks for the device pixels it covers; with a tile
   // opened, the others (still streaming, not drawn) ask for the smallest; then
-  // the tallest step down until the streams fit the bandwidth budget.
+  // small tiles drop to q=lo and the tallest step down until the streams fit
+  // the bandwidth budget.
+  const opened = focus && focus.placed ? focusTile : null;
   const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
-    const focused = focus !== null && focus.id === t.id && focus.placed !== null;
+    const focused = opened !== null && opened.id === t.id;
     const height = focused ? focus!.placed!.streamHeight : focus ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
-  const fitted = fitBandwidth(asks, st.image_aspect);
+  const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
+  const direct: DrawSource[] = st.tiles.filter(isLive).map((t) => {
+    const height = fitted.heights.get(t.id) ?? 144;
+    const q = fitted.quality.get(t.id) ?? "std";
+    return {
+      id: `d:${t.id}`,
+      url: frameSocketUrl(t.frame_url!, height, q),
+      baseUrl: t.frame_url,
+      height,
+      box: focus ? (opened?.id === t.id ? focus.placed!.box : null) : placedById.get(t.id)?.box ?? null,
+    };
+  });
+  // Aggregated: each aggregator is one big tile; it asks for the height its
+  // region covers, like a tile.
+  const aggregated: DrawSource[] = st.aggregators
+    .filter((g) => g.frame_url !== null)
+    .map((g) => {
+      const box = layout ? rectOnScreen(layout.image, g.rect, input.dpr) : null;
+      const height = focus || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
+      return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: focus ? null : box };
+    });
   const plan: DrawPlan = {
     ...emptyPlan,
+    mode: st.aggregators.length > 0 ? s.ui.mode : "direct",
+    direct,
+    aggregated,
+    focus: opened ? direct.find((d) => d.id === `d:${opened.id}`) ?? null : null,
     estimatedBps: fitted.bps,
     image: focus ? null : layout?.image ?? null,
     tiles: st.tiles.map((t, i) => {
       const tv = tiles[i]!;
-      const placed = placedById.get(t.id);
-      const focused = focus !== null && focus.id === t.id && focus.placed !== null;
-      const height = fitted.heights.get(t.id) ?? placed?.streamHeight ?? 144;
-      const live = isLive(t);
-      const box = focus ? (focused ? focus!.placed!.box : null) : placed?.box ?? null;
       return {
         id: t.id,
         half: t.half,
-        url: live && t.frame_url ? frameSocketUrl(t.frame_url, height) : null,
-        baseUrl: live ? t.frame_url : null,
-        height,
-        box,
+        box: focus ? null : placedById.get(t.id)?.box ?? null,
         dark: tv.dark && !(tv.darkPhase === "connecting"),
         outline: COLORS[t.half].darkOutline,
       };
@@ -842,13 +981,13 @@ export function wallView(input: WallInput): WallView {
     layout,
     tiles,
     race: raceView(st, srvNow),
-    controls: controlsView(s, st, srvNow, pend),
-    ticker: tickerView(st, srvNow),
+    controls: { ...controlsView(s, st, srvNow, pend), mode: modeView(s, st, plan, input) },
+    ticker: tickerView(st, srvNow, s.you),
     focus,
     phone: input.phone ? phoneView(st) : null,
     plan,
-    seams: seamView(s, focus ? null : layout, tiles, input.dpr),
-    bandwidth: `${fmt.count(plan.tiles.filter((x) => x.url !== null).length, "stream", "streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
+    seams: seamView(s, focus ? null : layout, tiles, input),
+    bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     notices: s.notices.flatMap((n) => {
       const text = noticeText(n);
       return text === null ? [] : [{ key: n.id, text }];

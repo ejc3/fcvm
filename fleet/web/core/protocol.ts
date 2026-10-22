@@ -71,7 +71,7 @@ export interface Light {
 export interface Scene {
   epoch_unix_ms: number;
   camera: CameraKey[];
-  /** Hours, 0..24. */
+  /** Fraction of the day, 0..1 (0.25 sunrise, 0.5 noon, 0.75 sunset). */
   time_of_day: number;
   words: Word[];
   lights: Light[];
@@ -87,6 +87,8 @@ export interface RelaunchAll {
 export interface Action {
   at: number;
   by: string;
+  /** The viewer id of the connection that acted, when the coordinator sends it. */
+  viewer: string | null;
   name: string;
   /** The intent's arguments, when the coordinator includes them. */
   args: Record<string, unknown> | null;
@@ -105,12 +107,31 @@ export interface FleetState {
   relaunch_all: RelaunchAll | null;
   viewers: { count: number };
   actions: Action[];
+  /**
+   * Aggregators: each joins a region of tiles at one t and streams it in the
+   * renderer's frame protocol. Empty when the fleet runs none.
+   */
+  aggregators: Aggregator[];
+}
+
+export interface Aggregator {
+  id: string;
+  frame_url: string | null;
+  rect: Rect;
 }
 
 export interface SnapshotMsg {
   type: "snapshot";
   version: number;
   state: FleetState;
+  /** This connection's own viewer id, when the coordinator sends it with the snapshot. */
+  you?: string;
+}
+
+/** The coordinator telling a connection who it is. */
+export interface WelcomeMsg {
+  type: "welcome";
+  viewer: string;
 }
 
 export interface ReceiptMsg {
@@ -133,7 +154,7 @@ export interface ErrorMsg {
   reason: string;
 }
 
-export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg;
+export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | WelcomeMsg;
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
@@ -304,7 +325,7 @@ function parseScene(o: Obj): Scene {
   return {
     epoch_unix_ms: num(o, "epoch_unix_ms", "scene"),
     camera,
-    time_of_day: numOrNull(o, "time_of_day", "scene") ?? 12,
+    time_of_day: numOrNull(o, "time_of_day", "scene") ?? 0.5,
     words,
     lights,
   };
@@ -338,6 +359,7 @@ function parseState(o: Obj): FleetState {
       {
         at: typeof a["at"] === "number" ? a["at"] : 0,
         by: typeof a["by"] === "string" ? a["by"] : "",
+        viewer: typeof a["viewer"] === "string" ? a["viewer"] : typeof a["actor"] === "string" ? a["actor"] : null,
         name: typeof a["name"] === "string" ? a["name"] : "",
         args: isObj(a["args"]) ? a["args"] : null,
         summary: typeof a["summary"] === "string" ? a["summary"] : null,
@@ -362,6 +384,11 @@ function parseState(o: Obj): FleetState {
     relaunch_all: relaunchAll,
     viewers: { count: typeof viewers["count"] === "number" ? viewers["count"] : 0 },
     actions,
+    aggregators: arr(o, "aggregators", "state").map((a, i) => {
+      const where = `aggregators[${i}]`;
+      if (!isObj(a)) throw new ProtocolError(`${where} is not an object`);
+      return { id: str(a, "id", where), frame_url: strOrNull(a, "frame_url", where), rect: parseRect(obj(a, "rect", where), `${where}.rect`) };
+    }),
   };
 }
 
@@ -375,8 +402,14 @@ export function parseServerMsg(text: string): ServerMsg {
   }
   if (!isObj(v)) throw new ProtocolError("message is not an object");
   switch (v["type"]) {
-    case "snapshot":
-      return { type: "snapshot", version: num(v, "version", "snapshot"), state: parseState(obj(v, "state", "snapshot")) };
+    case "snapshot": {
+      const m: SnapshotMsg = { type: "snapshot", version: num(v, "version", "snapshot"), state: parseState(obj(v, "state", "snapshot")) };
+      const you = strOrNull(v, "you", "snapshot");
+      if (you !== null) m.you = you;
+      return m;
+    }
+    case "welcome":
+      return { type: "welcome", viewer: str(v, "viewer", "welcome") };
     case "receipt": {
       const r: ReceiptMsg = {
         type: "receipt",

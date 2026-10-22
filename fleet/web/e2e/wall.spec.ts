@@ -77,6 +77,18 @@ test("hovering the image fades in every seam, outlines the tile and labels it", 
   await expect(label).toContainText("Tesla T4");
   await expect(label).toContainText("g4dn.xlarge");
   await expect(label).toContainText(/no relaunch yet|last relaunch \d/);
+  // The label covers none of the race and counter cards, for a tile right under one.
+  const top = v.tiles.find((x) => x.name === "slot-1")!;
+  await page.mouse.move(top.box!.x + top.box!.w / 2, top.box!.y + top.box!.h - 10);
+  await expect(page.getByTestId("hover-outline")).toHaveAttribute("data-tile", "slot-1");
+  const covered = await page.evaluate(() => {
+    const l = document.querySelector(".hover-label")!.getBoundingClientRect();
+    return [...document.querySelectorAll("[data-avoid]")].some((el) => {
+      const c = el.getBoundingClientRect();
+      return l.left < c.right && c.left < l.right && l.top < c.bottom && c.top < l.bottom;
+    });
+  });
+  expect(covered).toBe(false);
   // The lines are drawn by the page, over the frames, not in them: the canvas under a seam is unchanged.
   const lines = await page.getByTestId("seams").locator("line").count();
   expect(lines).toBeGreaterThanOrEqual(10);
@@ -109,24 +121,24 @@ test("keyboard: the tile grid takes focus, arrows move the outline, Enter opens,
 
 test("opening a tile asks only that renderer for a taller stream of the same rectangle", async ({ page }) => {
   await openWall(page, 15);
-  const before = await page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["fcvm:3"]!.height);
+  const before = await page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["d:fcvm:3"]!.height);
   const v = await view(page);
   const t = v.tiles.find((x) => x.id === "fcvm:3")!;
   await page.mouse.click(t.box!.x + t.box!.w / 2, t.box!.y + t.box!.h / 2);
   await expect(page.getByTestId("focus")).toBeVisible();
   // The height its box takes on screen, which the page asks that renderer for.
-  const wanted = await page.evaluate(() => window.__fleet!.view().plan.tiles.find((x) => x.id === "fcvm:3")!.height);
+  const wanted = await page.evaluate(() => window.__fleet!.view().plan.direct.find((x) => x.id === "d:fcvm:3")!.height);
   expect(wanted).toBeGreaterThan(before * 1.5);
   await expect
-    .poll(() => page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["fcvm:3"]!.height), { timeout: 15_000 })
+    .poll(() => page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["d:fcvm:3"]!.height), { timeout: 15_000 })
     .toBe(wanted);
   const after = await page.evaluate(() => window.__fleet!.client.getState().frames!.tiles);
-  expect(after["fcvm:3"]!.height).toBeGreaterThan(before);
+  expect(after["d:fcvm:3"]!.height).toBeGreaterThan(before);
   // The others keep streaming (for an instant return) at the smallest height.
-  const others = await page.evaluate(() => window.__fleet!.view().plan.tiles.filter((x) => x.id !== "fcvm:3" && x.url !== null).map((x) => x.height));
+  const others = await page.evaluate(() => window.__fleet!.view().plan.direct.filter((x) => x.id !== "d:fcvm:3").map((x) => x.height));
   expect(new Set(others)).toEqual(new Set([72]));
   // Same rectangle: the drawn frame keeps the tile's aspect.
-  expect(after["fcvm:3"]!.width / after["fcvm:3"]!.height).toBeCloseTo(t.box!.w / t.box!.h, 1);
+  expect(after["d:fcvm:3"]!.width / after["d:fcvm:3"]!.height).toBeCloseTo(t.box!.w / t.box!.h, 1);
   await expect(page.getByTestId("focus-stream")).toContainText(new RegExp(`^${wanted}p`));
   // And it is the picture: the tall stream matches the pattern at the drawn t.
   await page.waitForTimeout(1000);
@@ -147,6 +159,8 @@ test("a repeated intent id applies once, and both receipts are the same", async 
     return id;
   });
   await expect(page.getByTestId("word-status")).toHaveText("“twice” is in the scene");
+  // Shown in the hint stack on the image, where it cannot collide with the hint.
+  await expect(page.locator(".hint [data-testid=word-status]")).toHaveCount(1);
   const applied = (await (await fetch(`${COORD}/mock/applied?id=${id}`)).json()) as { count: number };
   expect(applied.count).toBe(1);
   const st = await mockState();
@@ -226,7 +240,7 @@ test("two viewers hold the same state at the same version", async ({ browser }) 
   const pb = await b.newPage();
   await openWall(pa, 15);
   await openWall(pb, 15);
-  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 18 }));
+  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.75 }));
   await expect(pb.locator("#tod")).toHaveAttribute("aria-valuetext", "18:00");
   // Read both until they sit on one version, then compare what each accepted.
   let same = false;
@@ -243,7 +257,7 @@ test("two viewers hold the same state at the same version", async ({ browser }) 
     }
   }
   expect(same).toBe(true);
-  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 10 }));
+  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
   await a.close();
   await b.close();
 });
@@ -293,6 +307,65 @@ test("auto-relaunch is one shared setting: every viewer sees who set it and the 
   await expect(page.getByLabel("Auto-relaunch, shared")).toHaveValue("off");
   await expect(page.getByTestId("auto-note")).toHaveText("");
   await other.context().close();
+});
+
+test("switching modes never shows a region without a frame, nor a t going back, both ways", { tag: "@engines" }, async ({ page }) => {
+  await openWall(page, 15, "direct");
+  await page.evaluate(() => window.__fleet!.client.traceStart());
+  await page.getByTestId("mode-aggregated").click();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.shownMode), { timeout: 20_000 }).toBe("aggregated");
+  await page.waitForTimeout(1500);
+  await page.getByTestId("mode-direct").click();
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.shownMode), { timeout: 20_000 }).toBe("direct");
+  await page.waitForTimeout(1500);
+  const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
+  const modes = trace.map((e) => e.mode);
+  // Both switches happened inside the trace.
+  expect(modes.indexOf("aggregated")).toBeGreaterThan(0);
+  expect(modes.lastIndexOf("direct")).toBeGreaterThan(modes.indexOf("aggregated"));
+  expect(trace.filter((e) => e.missing > 0)).toEqual([]);
+  for (let i = 1; i < trace.length; i++) expect(trace[i]!.T!, `draw ${i}`).toBeGreaterThanOrEqual(trace[i - 1]!.T!);
+  // The direct streams were closed while aggregated was shown, and reopened.
+  expect(await page.evaluate(() => Object.keys(window.__fleet!.client.getState().frames!.tiles).some((k) => k.startsWith("d:")))).toBe(true);
+});
+
+test("aggregated: no seam, and tile state drawn exactly as in direct mode", { tag: "@engines" }, async ({ page }) => {
+  await openWall(page, 2, "aggregated");
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().ui.shownMode)).toBe("aggregated");
+  await page.waitForTimeout(1000);
+  const r = await seamReport(page);
+  console.log(`aggregated seams: T=${r.T} samples=${r.samples} worst tile ${Math.max(...Object.values(r.perTile)).toFixed(2)} worst boundary ${Math.max(...r.boundaries.map((b) => b.err)).toFixed(2)}`);
+  for (const [id, sh] of Object.entries(r.shown)) if (sh !== "dark") expect(sh, id).toBe(`sync@${r.T}`);
+  expect(Object.keys(r.shown).every((k) => k.startsWith("a:") || r.shown[k] === "dark")).toBe(true);
+  for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
+  for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
+  // The waiting-for-capacity tile is dark and labelled from state, as in direct mode.
+  await expect(page.getByTestId("dark-ec2:8")).toContainText("waiting for capacity");
+  const box = (await view(page)).tiles.find((t) => t.id === "ec2:8")!.box!;
+  const res = await page.evaluate((p) => window.__fleet!.client.capture(p), [{ x: box.x + box.w / 2, y: box.y + box.h / 3 }]);
+  expect(res.pixels[0]!.slice(0, 3)).toEqual([6, 8, 11]);
+  // Hovering outlines and labels the tile, from state.
+  const t = (await view(page)).tiles.find((x) => x.name === "slot-3")!;
+  await page.mouse.move(t.box!.x + t.box!.w / 2, t.box!.y + t.box!.h / 2);
+  await expect(page.getByTestId("hover-outline")).toHaveAttribute("data-tile", "slot-3");
+  await expect(page.getByTestId("hover-label")).toContainText("Tesla T4");
+});
+
+test("this viewer's own actions read as you", async ({ page }) => {
+  await openWall(page, 15);
+  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.6 }));
+  await expect(page.locator(".ticker")).toContainText("you set the time of day to 14:24");
+  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
+});
+
+test("over the bandwidth budget, small direct tiles ask for q=lo", async ({ page }) => {
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
+  await page.goto("/?debug=1&budget=10");
+  await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().plan.direct.length > 0);
+  const urls = await page.evaluate(() => window.__fleet!.view().plan.direct.map((d) => d.url!));
+  expect(urls.filter((u) => u.includes("q=lo")).length).toBeGreaterThan(0);
+  // The mock renderers take q, and the tiles still draw at one t.
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });
 
 test("touch: a long press shows the pressed tile's seams and label", async ({ browser }) => {

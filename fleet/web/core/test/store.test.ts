@@ -140,7 +140,7 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
         { id: "ec2:1", half: "ec2", rect: { x: 0.5, y: 0, w: 0.25, h: 0.5 }, phase: "waiting_capacity", slot: null, frame_url: null, gpu: null, host: null, vm: null, generation: null, fps: null, gpu_stats: null, error: null, last_relaunch: null },
       ],
       fleet: { hosts: [{ name: "example-host", arch: "x86_64", gpus: [{ sbdf: "0000:01:00.0", name: "Tesla T4" }], draining: false }], gpus: 8, fcvm_gpus: 8, ec2_instances: 0, n: 8, max_tiles: 100, standby: [] },
-      scene: { epoch_unix_ms: 1761134400000, camera: [{ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 }], time_of_day: 10.0, words: [{ text: "hello", t: 12.5 }], lights: [{ pos: [1, 2, 3], color: [1, 0.5, 0], t: 14.0 }] },
+      scene: { epoch_unix_ms: 1761134400000, camera: [{ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 }], time_of_day: 0.3, words: [{ text: "hello", t: 12.5 }], lights: [{ pos: [1, 2, 3], color: [1, 0.5, 0], t: 14.0 }] },
       image_aspect: 3.5555555555555554,
       settings: { auto_relaunch_secs: null },
       relaunch_all: { started_at: 1761134400000, by: "viewer:v-4", fcvm_done_at: null, ec2_done_at: null, fcvm_last: null, ec2_last: null, fcvm_pending: 8, ec2_pending: 0 },

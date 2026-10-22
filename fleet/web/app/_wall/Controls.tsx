@@ -83,9 +83,11 @@ export function Controls({ client, view, compact }: { client: WallClient; view: 
       <button type="submit" className="btn">
         {c.word.submit}
       </button>
-      <span className={`word-status ${c.word.statusKind}`} role="status" data-testid="word-status">
-        {c.word.status}
-      </span>
+      {compact ? (
+        <span className={`word-status ${c.word.statusKind}`} role="status" data-testid="word-status">
+          {c.word.status}
+        </span>
+      ) : null}
     </form>
   );
 
@@ -106,6 +108,31 @@ export function Controls({ client, view, compact }: { client: WallClient; view: 
     </div>
   );
 
+  const mode = (
+    <div className="field" role="group" aria-labelledby={compact ? "mode-label-p" : "mode-label"}>
+      <span className="label" id={compact ? "mode-label-p" : "mode-label"}>
+        {c.mode.label}
+      </span>
+      <span className="segmented">
+        {c.mode.options.map((o) => (
+          <button
+            key={o.value}
+            type="button"
+            aria-pressed={c.mode.selected === o.value}
+            disabled={o.disabled}
+            data-testid={`mode-${o.value}`}
+            onClick={() => client.ui({ mode: o.value, modeChosen: true })}
+          >
+            {o.label}
+          </button>
+        ))}
+      </span>
+      <span className="note" data-testid="mode-note" title={`${c.mode.detail}. ${c.mode.suggestion.text}`}>
+        {c.mode.note}
+      </span>
+    </div>
+  );
+
   const toggles = (
     <>
       <button type="button" className="btn" role="switch" aria-checked={c.stats.on} onClick={() => client.ui({ stats: !c.stats.on })} data-testid="stats-switch">
@@ -121,6 +148,7 @@ export function Controls({ client, view, compact }: { client: WallClient; view: 
   if (compact) {
     return (
       <div>
+        {mode}
         {toggles}
         {wordForm}
         {tod}
@@ -143,6 +171,7 @@ export function Controls({ client, view, compact }: { client: WallClient; view: 
           {c.auto.note}
         </span>
       </div>
+      {mode}
       {toggles}
       {wordForm}
       {tod}

@@ -3,7 +3,7 @@
 // same t meet without a seam, and a tile drawn at another t shows one. It stands
 // in for the real renderer's path-traced planet: a moving nebula, a ringed
 // planet, stars, the viewers' words and lights, and the UTC time, rendered
-// from t, across the bottom of the image.
+// from t, in each half of the image.
 
 import { cameraAt } from "../core/scene.ts";
 import type { TileGeometry } from "../core/layout.ts";
@@ -24,7 +24,7 @@ export interface PatternScene {
   image_aspect: number;
   /** Keys with x, y and zoom: the mock's 2D camera. */
   camera: readonly { t: number }[];
-  /** Hours, 0..24. */
+  /** Fraction of the day, 0..1. */
   time_of_day: number;
   words: MockWord[];
   lights: MockLight[];
@@ -99,7 +99,7 @@ export interface FrameCtx {
 }
 
 export const WORD_HEIGHT = 0.07; // world units
-export const CLOCK_HEIGHT = 0.075; // fraction of the image height
+export const CLOCK_HEIGHT = 0.07; // fraction of the image height: 12 glyphs fit inside half the width
 export const CLOCK_V = 0.83;
 
 export function frameCtx(t: number, scene: PatternScene): FrameCtx {
@@ -108,7 +108,7 @@ export function frameCtx(t: number, scene: PatternScene): FrameCtx {
   const s = Math.floor(unix / 1000);
   const pad = (n: number) => String(n).padStart(2, "0");
   const clock = `${pad(Math.floor((s % 86400) / 3600))}:${pad(Math.floor((s % 3600) / 60))}:${pad(s % 60)} UTC`;
-  const tod = scene.time_of_day / 24;
+  const tod = scene.time_of_day;
   const day = 0.5 - 0.5 * Math.cos(TAU * tod);
   const sunA = Math.PI * (0.15 + 0.7 * day);
   const sv = [-Math.cos(sunA), -0.45, Math.sin(sunA)];
@@ -298,11 +298,13 @@ export function shade(
     }
   }
 
-  // The UTC time, rendered from t, across the bottom of the whole image.
+  // The UTC time, rendered from t, centred in each half of the image, so each
+  // half shows it whole and it runs across that half's tile seams.
   {
     const cell = CLOCK_HEIGHT / 7;
     const width = f.clock.length * 6 - 1;
-    const tx = ((u - 0.5) * f.aspect) / cell + width / 2;
+    const centre = u < 0.5 ? 0.25 : 0.75;
+    const tx = ((u - centre) * f.aspect) / cell + width / 2;
     const ty = (v - CLOCK_V) / cell + 3.5;
     const c = textCoverage(f.clock, tx, ty);
     const shadow = textCoverage(f.clock, tx - 0.35, ty - 0.35);
@@ -336,7 +338,7 @@ export function expectedRgb(u: number, v: number, f: FrameCtx): [number, number,
  * as the renderer's tile geometry gives; each pixel samples the image at its
  * centre.
  */
-export function renderI420(g: TileGeometry, f: FrameCtx): Uint8Array {
+export function renderI420(g: TileGeometry, f: FrameCtx, black: readonly { x: number; y: number; w: number; h: number }[] = []): Uint8Array {
   const { width, height } = g;
   const ySize = width * height;
   const cw = width >> 1;
@@ -385,7 +387,14 @@ export function renderI420(g: TileGeometry, f: FrameCtx): Uint8Array {
       sep.w2 = cS[i]! * rC + cC[i]! * rS + r2;
       sep.grain = gS[i]! * gc - gC[i]! * gs;
       sep.swell = wS[i]! * wc + wC[i]! * ws;
-      shade(u, v, f, px, sep, stars);
+      if (black.length > 0 && black.some((r) => u >= r.x && u < r.x + r.w && v >= r.y && v < r.y + r.h)) {
+        // An aggregator's region whose tile is not running: nothing to show.
+        px[0] = 0;
+        px[1] = 0;
+        px[2] = 0;
+      } else {
+        shade(u, v, f, px, sep, stars);
+      }
       const k = (j * width + i) * 3;
       rgb[k] = px[0]!;
       rgb[k + 1] = px[1]!;

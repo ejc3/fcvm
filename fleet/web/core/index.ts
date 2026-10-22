@@ -7,6 +7,7 @@ export * from "./scene.ts";
 export * from "./net.ts";
 export * from "./stream.ts";
 export * from "./bandwidth.ts";
+export * from "./mode.ts";
 export * from "./store.ts";
 export * from "./view.ts";
 export * as fmt from "./format.ts";

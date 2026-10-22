@@ -16,6 +16,7 @@ import {
   type ClientState,
   type DrawPlan,
   type IntentName,
+  type StreamMode,
   type UiState,
 } from "../../core/index.ts";
 import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker } from "./worker-msgs.ts";
@@ -41,6 +42,10 @@ export class WallClient {
   private captureReq = 0;
   private captureWaiters = new Map<number, (r: CaptureResult) => void>();
   bench: BenchStats | null = null;
+  /** Share of drawn tiles behind the common t, over the last ten seconds of direct mode. */
+  lateShare: number | null = null;
+  private lateSamples: number[] = [];
+  private traceWaiters = new Map<number, (e: { T: number | null; mode: StreamMode; missing: number }[]) => void>();
   readonly url: string;
 
   constructor(url: string) {
@@ -149,6 +154,11 @@ export class WallClient {
       const m = e.data;
       if (m.type === "stats") {
         this.bench = m.bench;
+        if (this.state.ui.shownMode === "direct" && m.bench.tilesDrawn > 0) {
+          this.lateSamples.push(m.bench.tilesBehind / m.bench.tilesDrawn);
+          if (this.lateSamples.length > 20) this.lateSamples.shift();
+          if (this.lateSamples.length >= 10) this.lateShare = this.lateSamples.reduce((a, b) => a + b, 0) / this.lateSamples.length;
+        }
         this.dispatch({ type: "frame-stats", stats: m.stats });
       } else if (m.type === "camera-drawn") {
         this.dispatch({ type: "camera-drawn", id: m.id, drawnAt: m.drawnAt });
@@ -159,6 +169,11 @@ export class WallClient {
           requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
+      } else if (m.type === "mode-shown") {
+        this.dispatch({ type: "ui", patch: { shownMode: m.mode } });
+      } else if (m.type === "trace") {
+        this.traceWaiters.get(m.req)?.(m.entries);
+        this.traceWaiters.delete(m.req);
       } else if (m.type === "capture") {
         this.captureWaiters.get(m.result.req)?.(m.result);
         this.captureWaiters.delete(m.result.req);
@@ -190,6 +205,20 @@ export class WallClient {
     if (key === this.lastWatch) return;
     this.lastWatch = key;
     this.worker.postMessage({ type: "watch", targets } satisfies ToWorker);
+  }
+
+  /** Start recording draws (tests). */
+  traceStart(): void {
+    this.worker?.postMessage({ type: "trace", req: 0, on: true } satisfies ToWorker);
+  }
+
+  /** Stop recording draws and get them: t, mode and regions drawn without a frame (tests). */
+  traceStop(): Promise<{ T: number | null; mode: StreamMode; missing: number }[]> {
+    const req = ++this.captureReq;
+    return new Promise((resolve) => {
+      this.traceWaiters.set(req, resolve);
+      this.worker?.postMessage({ type: "trace", req, on: false } satisfies ToWorker);
+    });
   }
 
   /** Read back canvas pixels from the next draw (tests). Points are CSS pixels. */

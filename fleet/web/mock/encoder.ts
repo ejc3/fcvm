@@ -22,6 +22,8 @@ export interface EncoderOptions {
   fps: number;
   /** Keyframe interval, frames. */
   gop: number;
+  /** libx264 constant quality (lower is better). */
+  crf: number;
   onUnit: (u: EncodedUnit) => void;
   onCodec: (codec: string) => void;
   onExit: (code: number | null, stderr: string) => void;
@@ -64,7 +66,7 @@ export class Encoder {
       "-i", "pipe:0",
       "-an", "-fps_mode", "passthrough",
       "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency", "-profile:v", "baseline",
-      "-bf", "0", "-g", String(opts.gop), "-crf", "18", "-threads", "1",
+      "-bf", "0", "-g", String(opts.gop), "-crf", String(opts.crf), "-threads", "1",
       "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
       "-flush_packets", "1", "-f", "flv", "pipe:1",
     ];

@@ -189,7 +189,14 @@ button, input, select { font: inherit; color: inherit; }
 @media (max-width: 1500px) {
   .bar .site { display: none; }
   .field label[for="auto"] { display: none; }
+  .bar #mode-label { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .seams, .race-half .progress > span, .switch::after { transition: none; }
 }
+
+.segmented { display: inline-flex; gap: 4px; padding: 3px; border: 1px solid var(--control); border-radius: 8px; background: var(--bg); }
+.segmented button { min-height: 38px; min-width: 44px; padding: 0 12px; border: 0; border-radius: 6px; background: transparent; color: var(--muted); font-weight: 500; cursor: pointer; }
+.segmented button[aria-pressed="true"] { background: var(--text); color: #0b0d10; }
+.segmented button:disabled { opacity: 0.45; cursor: default; }
+.hint .word-status { position: static; border: 0; background: none; padding: 0; white-space: normal; text-align: right; }

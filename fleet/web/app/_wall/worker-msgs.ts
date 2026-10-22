@@ -1,7 +1,7 @@
 // Messages between the page and the frame worker. The worker owns the frame
 // sockets, the decoders and the canvas; the page owns everything else.
 
-import type { DrawPlan, FrameStats } from "../../core/index.ts";
+import type { DrawPlan, FrameStats, StreamMode } from "../../core/index.ts";
 
 export interface DrawSettings {
   /** Page background under the image (mosaic: black; an opened tile: the panel colour). */
@@ -17,7 +17,9 @@ export type ToWorker =
   | { type: "plan"; plan: DrawPlan; settings: DrawSettings }
   | { type: "watch"; targets: { id: string; tEff: number }[] }
   | { type: "tick" }
-  | { type: "capture"; req: number; points: { x: number; y: number }[] };
+  | { type: "capture"; req: number; points: { x: number; y: number }[] }
+  /** Start recording each draw (on), or stop and send what was recorded (off). */
+  | { type: "trace"; req: number; on: boolean };
 
 export interface CaptureResult {
   req: number;
@@ -27,6 +29,8 @@ export interface CaptureResult {
   shown: Record<string, string>;
   /** RGBA at each requested point. */
   pixels: [number, number, number, number][];
+  /** The mode drawn. */
+  mode: StreamMode;
 }
 
 export interface BenchStats {
@@ -48,4 +52,7 @@ export type FromWorker =
   | { type: "capture"; result: CaptureResult }
   | { type: "error"; message: string }
   /** The worker has no requestAnimationFrame: the page sends it one tick per display frame. */
-  | { type: "need-ticks" };
+  | { type: "need-ticks" }
+  /** The drawer now shows this mode (a switch completed). */
+  | { type: "mode-shown"; mode: StreamMode }
+  | { type: "trace"; req: number; entries: { T: number | null; mode: StreamMode; missing: number }[] };

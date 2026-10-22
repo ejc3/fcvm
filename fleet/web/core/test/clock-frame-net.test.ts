@@ -83,6 +83,8 @@ describe("connections", () => {
   it("sets h on a frame URL, replacing an old one", () => {
     expect(frameSocketUrl("wss://slot-3.example.test/frames", 240)).toBe("wss://slot-3.example.test/frames?h=240");
     expect(frameSocketUrl("ws://a/frames?x=1&h=90", 240)).toBe("ws://a/frames?x=1&h=240");
+    expect(frameSocketUrl("ws://a/frames?h=90&q=lo", 90, "lo")).toBe("ws://a/frames?h=90&q=lo");
+    expect(frameSocketUrl("ws://a/frames?h=90&q=lo", 90)).toBe("ws://a/frames?h=90");
   });
 
   it("finds the host of an IPv6 URL", () => {

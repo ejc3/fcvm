@@ -51,6 +51,16 @@ const NAMES_B = ["otter", "heron", "lynx", "comet", "falcon", "maple", "badger",
 interface Client {
   ws: WebSocket;
   name: string;
+  /** The connection's viewer id, as the coordinator gives it. */
+  viewer: string;
+}
+
+/** Who asked for what: the connection's name and viewer id, the intent and its arguments. */
+interface Act {
+  by: string;
+  viewer: string | null;
+  name: string;
+  args: Record<string, unknown>;
 }
 
 interface Receipt {
@@ -89,6 +99,8 @@ interface CameraKey {
   x: number;
   y: number;
   zoom: number;
+  /** The camera intent this key came from. */
+  intent?: string;
 }
 
 /** The grid for n tiles in a half: the factorisation whose tiles are closest to 16:9. */
@@ -106,6 +118,11 @@ export function halfGrid(n: number): { cols: number; rows: number } {
     }
   }
   return best;
+}
+
+function within(outer: Rect, inner: Rect): boolean {
+  const e = 1e-9;
+  return inner.x >= outer.x - e && inner.y >= outer.y - e && inner.x + inner.w <= outer.x + outer.w + e && inner.y + inner.h <= outer.y + outer.h + e;
 }
 
 /** A small deterministic generator, so a mock run is repeatable. */
@@ -139,12 +156,13 @@ export class MockCoordinator {
   private server: http.Server;
   private wss: WebSocketServer;
   private camera: CameraKey[] = [{ t: 0, x: 0, y: 0, zoom: 1 }];
-  private timeOfDay = 10;
+  private timeOfDay = 0.42;
   private words: { text: string; by: string; t: number; pos: { x: number; y: number } }[] = [];
   private lights: { pos: { x: number; y: number }; world: Vec3; color: [number, number, number]; by: string; t: number }[] = [];
   private autoSecs: number | null = null;
   private relaunchAll: { started_at: number; by: string; fcvm_done_at: number | null; ec2_done_at: number | null; fcvm_last: string | null; ec2_last: string | null } | null = null;
-  private actions: { at: number; by: string; name: string; summary: string; outcome: string }[] = [];
+  private aggregators: { id: string; rect: Rect }[] = [];
+  private actions: { at: number; by: string; viewer: string | null; name: string; args: Record<string, unknown>; summary: string; outcome: string }[] = [];
 
   constructor(opts: CoordinatorOptions) {
     this.opts = opts;
@@ -177,6 +195,25 @@ export class MockCoordinator {
           });
         }
       }
+    }
+    // Aggregators: on the fcvm half one per band of rows holding about a host's
+    // eight GPUs (a host's tiles are one contiguous region), and one for the
+    // EC2 half. Each joins its tiles server-side: the mock draws the region
+    // whole (the picture is a pure function of position) and blacks out tiles
+    // that are not running, as an aggregator has nothing from them.
+    const rowsPer = Math.max(1, Math.ceil(8 / cols));
+    for (let r0 = 0, b = 1; r0 < rows; r0 += rowsPer, b++) {
+      const n = Math.min(rowsPer, rows - r0);
+      this.aggregators.push({ id: `agg-fcvm-${b}`, rect: { x: 0, y: r0 / rows, w: 0.5, h: n / rows } });
+    }
+    this.aggregators.push({ id: "agg-ec2", rect: { x: 0.5, y: 0, w: 0.5, h: 1 } });
+    for (const a of this.aggregators) {
+      opts.renderers.setTile(a.id, a.rect, () =>
+        this.tiles
+          .filter((t) => t.phase !== "running" && within(a.rect, t.rect))
+          .map((t) => t.rect),
+      );
+      opts.renderers.setAvailable(a.id, true);
     }
     this.server = http.createServer((req, res) => this.admin(req, res));
     this.wss = new WebSocketServer({ server: this.server, path: "/live", perMessageDeflate: false });
@@ -243,7 +280,7 @@ export class MockCoordinator {
       },
       scene: {
         epoch_unix_ms: this.opts.epochUnixMs,
-        camera: this.camera.map((k) => ({ t: k.t, pos: [k.x, k.y, 0], look: [k.x, k.y, -10], fov_deg: 60 / k.zoom })),
+        camera: this.camera.map((k) => ({ t: k.t, pos: [k.x, k.y, 0], look: [k.x, k.y, -10], fov_deg: 60 / k.zoom, ...(k.intent ? { intent: k.intent } : {}) })),
         time_of_day: this.timeOfDay,
         words: this.words.map((w) => ({ text: w.text, t: w.t, by: w.by })),
         lights: this.lights.map((l) => ({ pos: l.world, color: l.color, t: l.t, by: l.by })),
@@ -257,6 +294,7 @@ export class MockCoordinator {
       },
       viewers: { count: this.clients.size },
       actions: this.actions,
+      aggregators: this.aggregators.map((a) => ({ id: a.id, frame_url: this.opts.renderers.frameUrl(a.id), rect: a.rect })),
     };
   }
 
@@ -273,8 +311,9 @@ export class MockCoordinator {
 
   private connect(ws: WebSocket): void {
     const k = this.nextViewer++;
-    const client: Client = { ws, name: `${NAMES_A[k % NAMES_A.length]} ${NAMES_B[Math.floor(k / NAMES_A.length) % NAMES_B.length]}` };
+    const client: Client = { ws, name: `${NAMES_A[k % NAMES_A.length]} ${NAMES_B[Math.floor(k / NAMES_A.length) % NAMES_B.length]}`, viewer: `viewer:v-${k + 1}` };
     this.clients.add(client);
+    this.sendTo(client, { type: "welcome", viewer: client.viewer });
     // Publish now, to everyone: a change made since the last snapshot belongs to
     // the next version, so the newcomer must not get it under the current one.
     this.dirty = true;
@@ -341,25 +380,27 @@ export class MockCoordinator {
       this.sendTo(client, await seen);
       return;
     }
-    const p = this.apply(client.name, id, name, args);
+    const p = this.apply({ by: client.name, viewer: client.viewer, name, args }, id);
     this.receipts.set(id, p);
     const r = await p;
     this.receipts.set(id, r);
     this.sendTo(client, r);
   }
 
-  private log(by: string, name: string, summary: string, outcome: string): void {
-    this.actions = [...this.actions, { at: this.now(), by, name, summary, outcome }].slice(-50);
+  private log(c: Act, summary: string, outcome: string): void {
+    // A refused word's text appears nowhere, not even in its arguments.
+    const args = c.name === "word" && outcome === "refused" ? {} : c.args;
+    this.actions = [...this.actions, { at: this.now(), by: c.by, viewer: c.viewer, name: c.name, args, summary, outcome }].slice(-50);
   }
 
-  private refuse(id: string, by: string, name: string, reason: string): Receipt {
-    this.log(by, name, reason, "refused");
+  private refuse(id: string, c: Act, reason: string): Receipt {
+    this.log(c, reason, "refused");
     return { type: "receipt", id, outcome: "refused", reason, version: this.markDirty() };
   }
 
-  private committed(id: string, by: string, name: string, summary: string): Receipt {
+  private committed(id: string, c: Act, summary: string): Receipt {
     this.appliedIds.push(id);
-    this.log(by, name, summary, "committed");
+    this.log(c, summary, "committed");
     return { type: "receipt", id, outcome: "committed", version: this.markDirty() };
   }
 
@@ -367,37 +408,38 @@ export class MockCoordinator {
     return sceneT(this.opts.epochUnixMs, this.now());
   }
 
-  private async apply(by: string, id: string, name: string, args: Record<string, unknown>): Promise<Receipt> {
+  private async apply(c: Act, id: string): Promise<Receipt> {
+    const { by, name, args } = c;
     switch (name) {
       case "relaunch": {
         const want = String(args["tile"]);
         const r = this.tiles.find((t) => t.id === want || t.slot === want);
-        if (!r) return this.refuse(id, by, name, `no tile ${want}`);
-        if (!r.slot) return this.refuse(id, by, name, `no GPU behind ${r.id}`);
+        if (!r) return this.refuse(id, c, `no tile ${want}`);
+        if (!r.slot) return this.refuse(id, c, `no GPU behind ${r.id}`);
         this.relaunch(r, by);
-        return this.committed(id, by, name, `relaunch ${r.slot}`);
+        return this.committed(id, c, `relaunch ${r.slot}`);
       }
       case "relaunch_all": {
         const ra = this.relaunchAll;
-        if (ra && (ra.fcvm_done_at === null || ra.ec2_done_at === null)) return this.refuse(id, by, name, "a relaunch all is already running");
+        if (ra && (ra.fcvm_done_at === null || ra.ec2_done_at === null)) return this.refuse(id, c, "a relaunch all is already running");
         const live = this.tiles.filter((t) => t.slot);
         this.relaunchAll = { started_at: this.now(), by, fcvm_done_at: null, ec2_done_at: null, fcvm_last: null, ec2_last: null };
         for (const r of live) this.relaunch(r, by);
-        return this.committed(id, by, name, `relaunch all (${live.length} tiles)`);
+        return this.committed(id, c, `relaunch all (${live.length} tiles)`);
       }
       case "set_auto_relaunch": {
         const secs = args["secs"];
         if (secs !== null && (typeof secs !== "number" || !(secs >= 10 && secs <= 86400))) {
-          return this.refuse(id, by, name, "auto-relaunch is off or 10 s to 1 day");
+          return this.refuse(id, c, "auto-relaunch is off or 10 s to 1 day");
         }
         this.autoSecs = secs as number | null;
-        return this.committed(id, by, name, secs === null ? "auto relaunch off" : `auto relaunch every ${secs} s`);
+        return this.committed(id, c, secs === null ? "auto relaunch off" : `auto relaunch every ${secs} s`);
       }
       case "time_of_day": {
         const v = args["v"];
-        if (typeof v !== "number" || !(v >= 0 && v < 24)) return this.refuse(id, by, name, "time of day is hours in [0, 24)");
+        if (typeof v !== "number" || !(v >= 0 && v <= 1)) return this.refuse(id, c, "time of day is a fraction of the day in [0, 1]");
         this.timeOfDay = v;
-        return this.committed(id, by, name, `time of day ${v.toFixed(1)} h`);
+        return this.committed(id, c, `time of day ${v.toFixed(3)}`);
       }
       case "camera": {
         const drag = args["drag"] as Record<string, unknown> | undefined;
@@ -405,7 +447,7 @@ export class MockCoordinator {
         const yaw = num("yaw_deg");
         const pitch = num("pitch_deg");
         const dive = num("dive");
-        if (!drag || ![yaw, pitch, dive].every(Number.isFinite)) return this.refuse(id, by, name, "camera drag is yaw_deg, pitch_deg, dive");
+        if (!drag || ![yaw, pitch, dive].every(Number.isFinite)) return this.refuse(id, c, "camera drag is yaw_deg, pitch_deg, dive");
         const t = this.sceneNow();
         // A move still easing in is the base for the next one, so drags that
         // arrive together add up.
@@ -419,17 +461,18 @@ export class MockCoordinator {
           x: cur.x + ((yaw / 90) * IMAGE_ASPECT) / zoom0,
           y: cur.y - pitch / 50 / zoom0,
           zoom: Math.min(6, Math.max(0.35, zoom0 * Math.exp(dive * 0.2))),
+          intent: id,
         };
         const kept = this.camera.filter((k) => k.t >= t - 2).slice(-4);
-        this.camera = easing ? [...kept, next] : [...kept.filter((k) => k.t <= t), { ...cur, t }, next];
-        return this.committed(id, by, name, "camera");
+        this.camera = easing ? [...kept, next] : [...kept.filter((k) => k.t <= t), { t, x: cur.x, y: cur.y, zoom: cur.zoom }, next];
+        return this.committed(id, c, "camera");
       }
       case "word": {
         const text = typeof args["text"] === "string" ? args["text"].replace(/\s+/g, " ").trim() : "";
         await new Promise((r) => setTimeout(r, this.opts.checkMs));
-        if (text.length === 0 || text.length > 24) return this.refuse(id, by, name, "a word is 1 to 24 characters");
+        if (text.length === 0 || text.length > 28) return this.refuse(id, c, "a word is 1 to 28 characters");
         const bad = !/^[A-Za-z0-9 .,!?'-]+$/.test(text) || this.opts.refusedWords.some((w) => text.toLowerCase().includes(w.toLowerCase()));
-        if (bad) return this.refuse(id, by, name, "the text check refused it");
+        if (bad) return this.refuse(id, c, "the text check refused it");
         const t = this.sceneNow();
         const cam = cameraAt(this.camera, t);
         const k = this.words.length;
@@ -437,29 +480,29 @@ export class MockCoordinator {
         const rad = 0.25 + 0.12 * (k % 4);
         const pos = { x: (cam["x"] ?? 0) + Math.cos(ang) * rad * 1.6, y: (cam["y"] ?? 0) + Math.sin(ang) * rad - 0.1 };
         this.words = [...this.words, { text, by, t, pos }].slice(-16);
-        return this.committed(id, by, name, `word ${JSON.stringify(text)}`);
+        return this.committed(id, c, `word ${JSON.stringify(text)}`);
       }
       case "light": {
         const pos = args["pos"];
         const color = rgbArray(args["color"]);
         if (!Array.isArray(pos) || pos.length !== 3 || !pos.every((x) => typeof x === "number" && Number.isFinite(x))) {
-          return this.refuse(id, by, name, "a light's pos is [x, y, z]");
+          return this.refuse(id, c, "a light's pos is [x, y, z]");
         }
-        if (!color) return this.refuse(id, by, name, "a light's color is [r, g, b]");
+        if (!color) return this.refuse(id, c, "a light's color is [r, g, b]");
         // The mock's world is flat: it shows the light where it appears on the image.
         const t = this.sceneNow();
         const keys = this.fleetState().scene.camera;
         const pose = poseAt(keys, t);
         const at = pose ? projectPoint(pose, pos as Vec3, IMAGE_ASPECT) : null;
-        if (!at) return this.refuse(id, by, name, "the light is behind the camera");
+        if (!at) return this.refuse(id, c, "the light is behind the camera");
         const cam = cameraAt(this.camera, t);
         const zoom = cam["zoom"] ?? 1;
         const world = { x: ((at.u - 0.5) * IMAGE_ASPECT) / zoom + (cam["x"] ?? 0), y: (at.v - 0.5) / zoom + (cam["y"] ?? 0) };
         this.lights = [...this.lights, { pos: world, world: pos as Vec3, color, by, t }].slice(-32);
-        return this.committed(id, by, name, "light");
+        return this.committed(id, c, "light");
       }
       default:
-        return this.refuse(id, by, name, `unknown intent ${name}`);
+        return this.refuse(id, c, `unknown intent ${name}`);
     }
   }
 
@@ -537,7 +580,7 @@ export class MockCoordinator {
       const last = r.lastRelaunch?.clicked_at ?? -Infinity; // never relaunched: due now
       if (now - last >= secs * 1000) {
         this.relaunch(r, "auto-relaunch");
-        this.log("auto-relaunch", "relaunch", `relaunch ${r.slot}`, "committed");
+        this.log({ by: "auto-relaunch", viewer: null, name: "relaunch", args: { tile: r.id } }, `relaunch ${r.slot}`, "committed");
       }
     }
   }

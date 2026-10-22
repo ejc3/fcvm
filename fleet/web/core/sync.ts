@@ -14,7 +14,7 @@ export const SAME_T_EPS = 0.0005;
 /** A tile more than this many seconds behind the newest tile stops holding the others back. */
 export const MAX_LAG_S = 0.35;
 /** Frames a tile keeps decoded and waiting. */
-export const BUFFER_FRAMES = 6;
+export const BUFFER_FRAMES = 10;
 
 export interface TileBuffer {
   id: string;
@@ -47,10 +47,14 @@ export function chooseCommonT(
   buffers: readonly TileBuffer[],
   prevT: number | null,
   maxLag: number = MAX_LAG_S,
+  maxT: number = Infinity,
 ): SyncChoice {
   const show = new Map<string, TileShow>();
-  const live = buffers.filter((b) => b.ts.length > 0);
-  for (const b of buffers) if (b.ts.length === 0) show.set(b.id, { kind: "empty" });
+  // Frames after maxT are not chosen yet (a mode switch holds the image back
+  // to where the incoming streams are); they stay in the buffers.
+  const capped = maxT === Infinity ? buffers : buffers.map((b) => ({ id: b.id, ts: b.ts.filter((t) => t <= maxT + SAME_T_EPS) }));
+  const live = capped.filter((b) => b.ts.length > 0);
+  for (const b of capped) if (b.ts.length === 0) show.set(b.id, { kind: buffers.find((x) => x.id === b.id)!.ts.length > 0 ? "waiting" : "empty" });
   if (live.length === 0) return { T: prevT, show };
 
   const newest = (b: TileBuffer) => b.ts[b.ts.length - 1]!;

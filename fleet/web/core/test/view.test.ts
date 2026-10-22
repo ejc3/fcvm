@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
-import { relaunchParts, wallView, type WallInput } from "../view.ts";
+import { placeLabel, relaunchParts, sourceIdFor, wallView, type WallInput } from "../view.ts";
+import { suggestMode } from "../mode.ts";
 import type { FleetState } from "../protocol.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
@@ -9,7 +10,7 @@ function stateWith(st: FleetState, version = 1): ClientState {
   let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
   s = reduce(s, { type: "message", text: snapshotText(version, st), at: EPOCH });
   const tiles: FrameStats["tiles"] = {};
-  for (const t of st.tiles) tiles[t.id] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
+  for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
   return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17 } });
 }
 
@@ -34,8 +35,8 @@ describe("formatting", () => {
     expect(fmt.raceClock(67_950)).toBe("1:07.9");
     expect(fmt.countdown(119_001)).toBe("2:00");
     expect(fmt.utcClock(Date.UTC(2026, 9, 22, 14, 3, 7))).toBe("14:03:07");
-    expect(fmt.timeOfDay(6)).toBe("06:00");
-    expect(fmt.timeOfDay(18.5)).toBe("18:30");
+    expect(fmt.timeOfDay(0.25)).toBe("06:00");
+    expect(fmt.timeOfDay(18.5 / 24)).toBe("18:30");
     expect(fmt.interval(120)).toBe("every 2 minutes");
   });
 });
@@ -97,7 +98,8 @@ describe("the race", () => {
     expect(tv.darkPhase).toBe("waiting for capacity");
     expect(tv.darkClock).toBe("");
     expect(v.race!.ec2.renderedBy).toBe("rendered by 3 EC2 GPUs");
-    expect(v.plan.tiles.find((x) => x.id === "ec2:4")!.url).toBeNull();
+    expect(v.plan.direct.find((x) => x.id === "d:ec2:4")).toBeUndefined();
+    expect(v.plan.tiles.find((x) => x.id === "ec2:4")!.dark).toBe(true);
   });
 });
 
@@ -105,7 +107,7 @@ describe("controls", () => {
   it("shows who set auto-relaunch and when the next one is due", () => {
     const st = fleet(2, 2, {
       settings: { auto_relaunch_secs: 120 },
-      actions: [{ at: EPOCH, by: "quiet heron", name: "set_auto_relaunch", args: null, summary: "auto relaunch every 120 s", outcome: "committed" }],
+      actions: [{ at: EPOCH, by: "quiet heron", viewer: null, name: "set_auto_relaunch", args: null, summary: "auto relaunch every 120 s", outcome: "committed" }],
     });
     const v = view(stateWith(st), EPOCH + 1000 + 1000);
     // Tiles were clicked at EPOCH + 1000: due at EPOCH + 121000.
@@ -162,12 +164,15 @@ describe("opened tile", () => {
     const st = fleet(5, 5);
     const s = reduce(stateWith(st), { type: "ui", patch: { focusId: "fcvm:7" } });
     const v = view(s, EPOCH, { focusArea: { x: 0, y: 0, w: 1280, h: 720 } });
-    const t = v.plan.tiles.find((x) => x.id === "fcvm:7")!;
+    const t = v.plan.direct.find((x) => x.id === "d:fcvm:7")!;
     expect(t.height).toBe(720);
     expect(t.url).toContain("h=720");
     // Same rectangle of the image: a tile of 1/10 x 1/5 keeps that aspect.
     expect(t.box!.w / t.box!.h).toBeCloseTo((0.1 * 16) / 9 / 0.2, 2);
-    expect(v.plan.tiles.filter((x) => x.box !== null)).toHaveLength(1);
+    expect(v.plan.direct.filter((x) => x.box !== null)).toHaveLength(1);
+    expect(v.plan.focus!.id).toBe("d:fcvm:7");
+    // The others keep streaming at the smallest height.
+    expect(new Set(v.plan.direct.filter((x) => x.id !== "d:fcvm:7").map((x) => x.height))).toEqual(new Set([72]));
     expect(v.focus!.bars.map((b) => b.title)).toEqual(["slot-7 (fcvm)", "ec2-7 (EC2)"]);
   });
 });
@@ -187,11 +192,11 @@ describe("relaunch timings", () => {
 describe("the recent actions", () => {
   it("words the coordinator's summaries, leaves out camera moves and refusals", () => {
     const actions = [
-      { at: EPOCH + 1, by: "teal otter", name: "relaunch", args: null, summary: "relaunch slot-3", outcome: "committed" },
-      { at: EPOCH + 2, by: "teal otter", name: "camera", args: null, summary: "camera", outcome: "committed" },
-      { at: EPOCH + 3, by: "quiet heron", name: "word", args: null, summary: "the text check refused it", outcome: "refused" },
-      { at: EPOCH + 4, by: "quiet heron", name: "word", args: null, summary: 'word "hello"', outcome: "committed" },
-      { at: EPOCH + 5, by: "teal otter", name: "time_of_day", args: null, summary: "time of day 15.5 h", outcome: "committed" },
+      { at: EPOCH + 1, by: "teal otter", viewer: null, name: "relaunch", args: null, summary: "relaunch slot-3", outcome: "committed" },
+      { at: EPOCH + 2, by: "teal otter", viewer: null, name: "camera", args: null, summary: "camera", outcome: "committed" },
+      { at: EPOCH + 3, by: "quiet heron", viewer: null, name: "word", args: null, summary: "the text check refused it", outcome: "refused" },
+      { at: EPOCH + 4, by: "quiet heron", viewer: null, name: "word", args: null, summary: 'word "hello"', outcome: "committed" },
+      { at: EPOCH + 5, by: "teal otter", viewer: null, name: "time_of_day", args: null, summary: "time of day 15.5 h", outcome: "committed" },
     ];
     const v = view(stateWith(fleet(2, 2, { actions })), EPOCH + 5000);
     expect(v.ticker.map((t) => t.text)).toEqual([
@@ -199,5 +204,77 @@ describe("the recent actions", () => {
       'quiet heron wrote "hello"',
       "teal otter relaunched slot-3",
     ]);
+  });
+});
+
+describe("you", () => {
+  it("names this viewer's own actions as you", () => {
+    const actions = [
+      { at: EPOCH + 1, by: "viewer:v-4", viewer: "viewer:v-4", name: "relaunch", args: { tile: "slot-3" }, summary: "relaunch slot-3", outcome: "committed" },
+      { at: EPOCH + 2, by: "viewer:v-7", viewer: "viewer:v-7", name: "relaunch_all", args: {}, summary: "relaunch all (8 tiles)", outcome: "committed" },
+      { at: EPOCH + 3, by: "viewer:v-4", viewer: "viewer:v-4", name: "set_auto_relaunch", args: { secs: 120 }, summary: "auto relaunch every 120 s", outcome: "committed" },
+    ];
+    let s = stateWith(fleet(2, 2, { actions, settings: { auto_relaunch_secs: 120 } }));
+    s = reduce(s, { type: "message", text: JSON.stringify({ type: "welcome", viewer: "viewer:v-4" }), at: EPOCH });
+    const v = view(s, EPOCH + 5000);
+    expect(v.ticker.map((t) => t.text)).toEqual(["you set auto-relaunch to every 2 minutes", "viewer:v-7 relaunched all", "you relaunched slot-3"]);
+    expect(v.controls!.auto.note).toMatch(/^set by you · next in /);
+  });
+});
+
+describe("hover label placement", () => {
+  const area = { x: 0, y: 0, w: 1440, h: 800 };
+  const card = { x: 20, y: 20, w: 200, h: 125 };
+  it("never covers a card when another place is free", () => {
+    // A tile just under the fcvm counter card: above would cover the card.
+    const tile = { x: 0, y: 200, w: 360, h: 200 };
+    const at = placeLabel(tile, { w: 230, h: 92 }, area, [card]);
+    const b = { x: at.x, y: at.y, w: 230, h: 92 };
+    expect(b.x < card.x + card.w && card.x < b.x + b.w && b.y < card.y + card.h && card.y < b.y + b.h).toBe(false);
+    expect(at.x).toBeGreaterThanOrEqual(0);
+    expect(at.y + 92).toBeLessThanOrEqual(800);
+  });
+  it("moves past a card that reaches below the tile it labels (a small screen)", () => {
+    const tile = { x: 54, y: 0, w: 229, h: 129 };
+    const cards = [{ x: 74, y: 20, w: 200, h: 118 }, { x: 421, y: 20, w: 182, h: 65 }];
+    const at = placeLabel(tile, { w: 190, h: 95 }, { x: 54, y: 0, w: 916, h: 515 }, cards);
+    const b = { x: at.x, y: at.y, w: 190, h: 95 };
+    for (const c of cards) expect(b.x < c.x + c.w && c.x < b.x + b.w && b.y < c.y + c.h && c.y < b.y + b.h).toBe(false);
+  });
+
+  it("prefers above the tile when that is free", () => {
+    expect(placeLabel({ x: 400, y: 300, w: 300, h: 200 }, { w: 230, h: 92 }, area, [card])).toEqual({ x: 400, y: 202 });
+  });
+});
+
+describe("streaming modes", () => {
+  const aggs = [
+    { id: "agg-fcvm", frame_url: "ws://example-host:2/frames/agg-fcvm", rect: { x: 0, y: 0, w: 0.5, h: 1 } },
+    { id: "agg-ec2", frame_url: "ws://example-host:2/frames/agg-ec2", rect: { x: 0.5, y: 0, w: 0.5, h: 1 } },
+  ];
+  it("plans both modes; tiles take their state from the source they are drawn from", () => {
+    let s = stateWith(fleet(2, 2, { aggregators: aggs }));
+    s = reduce(s, { type: "ui", patch: { mode: "aggregated" } });
+    const v = view(s, EPOCH);
+    expect(v.plan.mode).toBe("aggregated");
+    expect(v.plan.aggregated.map((a) => a.id)).toEqual(["a:agg-fcvm", "a:agg-ec2"]);
+    expect(v.plan.aggregated[0]!.box).toEqual({ x: 0, y: 0, w: 800, h: 900 });
+    expect(v.plan.direct).toHaveLength(8);
+    expect(sourceIdFor(fleet(2, 2).tiles[5]!, "aggregated", aggs)).toBe("a:agg-ec2");
+    // The drawer still shows direct until it can switch: the control says so.
+    expect(v.controls!.mode.note).toBe("switching to aggregated");
+    expect(view(reduce(s, { type: "ui", patch: { shownMode: "aggregated" } }), EPOCH).controls!.mode.note).toBe("");
+  });
+  it("stays direct when the fleet runs no aggregators", () => {
+    const s = reduce(stateWith(fleet(2, 2)), { type: "ui", patch: { mode: "aggregated" } });
+    const v = view(s, EPOCH);
+    expect(v.plan.mode).toBe("direct");
+    expect(v.controls!.mode.options.find((o) => o.value === "aggregated")!.disabled).toBe(true);
+  });
+  it("suggests aggregated when the link reports less than direct needs, or direct streams run late", () => {
+    expect(suggestMode({ aggregators: 2, downlinkMbps: 4, directBps: 30e6, lateShare: null }).mode).toBe("aggregated");
+    expect(suggestMode({ aggregators: 2, downlinkMbps: 10, directBps: 30e6, lateShare: null }).mode).toBe("direct");
+    expect(suggestMode({ aggregators: 2, downlinkMbps: null, directBps: 30e6, lateShare: 0.25 }).mode).toBe("aggregated");
+    expect(suggestMode({ aggregators: 0, downlinkMbps: 1, directBps: 30e6, lateShare: 0.9 }).mode).toBe("direct");
   });
 });

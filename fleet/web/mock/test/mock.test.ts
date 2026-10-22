@@ -4,6 +4,7 @@ import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, 
 import { MockCoordinator, halfGrid } from "../coordinator.ts";
 import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
+import { tileGeometry } from "../../core/layout.ts";
 import { spawnSync } from "node:child_process";
 import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
 
@@ -221,7 +222,7 @@ describe("mock renderer, height change", () => {
 
 describe("pattern", () => {
   it("is a pure function of image position: two halves drawn apart equal the whole", () => {
-    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [{ t: 0, x: 0.1, y: 0, zoom: 1.3 }], time_of_day: 7, words: [{ text: "hi", pos: { x: 0, y: 0 } }], lights: [] };
+    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [{ t: 0, x: 0.1, y: 0, zoom: 1.3 }], time_of_day: 0.3, words: [{ text: "hi", pos: { x: 0, y: 0 } }], lights: [] };
     const f = frameCtx(12.35, scene);
     const grid = { fullWidth: 128, fullHeight: 64, x0: 32, y0: 16, height: 16 };
     const whole = renderI420({ ...grid, width: 64 }, f);
@@ -230,7 +231,7 @@ describe("pattern", () => {
   });
 
   it("changes with t, so a tile drawn at another t shows a seam", () => {
-    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [], time_of_day: 7, words: [], lights: [] };
+    const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [], time_of_day: 0.3, words: [], lights: [] };
     const g = { width: 16, height: 16, fullWidth: 160, fullHeight: 160, x0: 0, y0: 0 };
     const a = renderI420(g, frameCtx(10, scene));
     const b = renderI420(g, frameCtx(10.5, scene));
@@ -292,6 +293,42 @@ describe("mock coordinator, review findings", () => {
     c.ws.send(JSON.stringify({ type: "ping", client_unix_ms: 1 }));
     expect(await c.next((m) => m["type"] === "error")).toMatchObject({ type: "error" });
     expect(await c.next((m) => m["type"] === "clock")).toMatchObject({ type: "clock" });
+    c.ws.close();
+  });
+});
+
+describe("mock aggregators", () => {
+  it("lists aggregators covering the image, each serving the renderer frame protocol", async () => {
+    const st = coord.fleetState();
+    expect(st.aggregators.map((a) => a.id)).toEqual(["agg-fcvm-1", "agg-ec2"]);
+    const area = st.aggregators.reduce((s, a) => s + a.rect.w * a.rect.h, 0);
+    expect(area).toBeCloseTo(1, 9);
+    const ws = new WebSocket(`${st.aggregators[1]!.frame_url}?h=90`);
+    const msgs: (string | Uint8Array)[] = [];
+    await new Promise<void>((res) => {
+      ws.on("message", (d, bin) => {
+        msgs.push(bin ? new Uint8Array(d as Buffer) : d.toString());
+        if (msgs.length === 3) res();
+      });
+    });
+    ws.close();
+    const header = parseStreamHeader(msgs[0] as string)!;
+    // The EC2 half asked at 90 is under the encoder's minimum width, so it comes taller.
+    const g = tileGeometry(st.aggregators[1]!.rect, 16 / 9, 90);
+    expect(g.height).toBeGreaterThan(90);
+    expect(header.grid).toEqual({ fullWidth: g.fullWidth, fullHeight: g.fullHeight, x0: g.x0, y0: g.y0 });
+    const f = parseFrame(msgs[1] as Uint8Array);
+    expect(f.ok && f.frame.keyframe).toBe(true);
+  });
+
+  it("tells each connection its viewer id and records actions with arguments and the actor", async () => {
+    const c = await live();
+    const welcome = await c.next((m) => m["type"] === "welcome");
+    expect(welcome["viewer"]).toMatch(/^viewer:v-\d+$/);
+    c.ws.send(JSON.stringify({ type: "intent", id: `tod-${Date.now()}`, name: "time_of_day", args: { v: 0.75 } }));
+    await c.next((m) => m["type"] === "receipt");
+    const a = coord.fleetState().actions.at(-1)!;
+    expect(a).toMatchObject({ name: "time_of_day", args: { v: 0.75 }, viewer: welcome["viewer"], outcome: "committed" });
     c.ws.close();
   });
 });

@@ -3,7 +3,7 @@
 // The wall page. It measures the screen, forwards input as actions, and draws
 // the view model core/ computes. It computes nothing itself.
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   addDrag,
   CLICK_SLOP_PX,
@@ -32,6 +32,21 @@ import { Overlays } from "./Overlays.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
 const localNow = () => performance.timeOrigin + performance.now();
+const MODE_KEY = "fleet-wall.mode";
+
+/** A bandwidth budget from ?budget=<Mbit/s>, for trying the q=lo rule on a fast link. */
+function budgetParam(): number | undefined {
+  if (typeof window === "undefined") return undefined;
+  const v = Number(new URLSearchParams(window.location.search).get("budget"));
+  return Number.isFinite(v) && v > 0 ? v * 1e6 : undefined;
+}
+
+/** The browser's downlink estimate in Mbit/s, where it gives one (Chrome). */
+function downlink(): number | null {
+  if (typeof navigator === "undefined") return null;
+  const c = (navigator as unknown as { connection?: { downlink?: unknown } }).connection;
+  return typeof c?.downlink === "number" && c.downlink > 0 ? c.downlink : null;
+}
 
 function boxOf(el: Element | null): Box | null {
   if (!el) return null;
@@ -75,6 +90,9 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
   const [dpr, setDpr] = useState(1);
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
   const [areas, setAreas] = useState<{ mosaic: Box | null; focus: Box | null }>({ mosaic: null, focus: null });
+  // Measured from the drawn page: the cards the hover label must not cover, and the label's size.
+  const [avoid, setAvoid] = useState<Box[]>([]);
+  const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
   const phone = useMedia("(max-width: 700px)");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const stageRef = useRef<HTMLDivElement | null>(null);
@@ -130,9 +148,45 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
         focusArea: state.ui.focusId ? areas.focus : null,
         canDecode,
         phone,
+        downlinkMbps: downlink(),
+        lateShare: client.lateShare,
+        avoid,
+        labelSize,
+        budgetBps: budgetParam(),
       }),
-    [state, now, dpr, areas, canDecode, phone],
+    [state, now, dpr, areas, canDecode, phone, client, avoid, labelSize],
   );
+
+  // After each draw of the page, measure what the next view model places around.
+  useLayoutEffect(() => {
+    const boxes = [...document.querySelectorAll("[data-avoid]")].map((el) => boxOf(el)).filter((b): b is Box => b !== null);
+    if (JSON.stringify(boxes) !== JSON.stringify(avoid)) setAvoid(boxes);
+    const label = boxOf(document.querySelector(".hover-label"));
+    if (label && (!labelSize || Math.abs(label.w - labelSize.w) > 1 || Math.abs(label.h - labelSize.h) > 1)) setLabelSize({ w: label.w, h: label.h });
+  });
+
+  // The viewer's own choice of mode is remembered on this browser; until they
+  // choose, the page follows its suggestion.
+  useEffect(() => {
+    try {
+      const saved = window.localStorage.getItem(MODE_KEY);
+      if (saved === "direct" || saved === "aggregated") client.ui({ mode: saved, modeChosen: true });
+    } catch {
+      // No storage here: the suggestion stands.
+    }
+  }, [client]);
+  useEffect(() => {
+    if (!state.ui.modeChosen) return;
+    try {
+      window.localStorage.setItem(MODE_KEY, state.ui.mode);
+    } catch {
+      // Not remembered; nothing else depends on it.
+    }
+  }, [state.ui.mode, state.ui.modeChosen]);
+  const suggested = view.controls?.mode.suggestion.mode;
+  useEffect(() => {
+    if (suggested && !client.getState().ui.modeChosen && client.getState().ui.mode !== suggested) client.ui({ mode: suggested });
+  }, [client, suggested]);
   viewRef.current = view;
 
   // The frame worker gets the canvas once, then plans.

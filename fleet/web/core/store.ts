@@ -65,7 +65,15 @@ export interface FrameStats {
   rafMsP95: number;
 }
 
+export type StreamMode = "direct" | "aggregated";
+
 export interface UiState {
+  /** How this viewer receives the image: the mode it wants. */
+  mode: StreamMode;
+  /** The viewer picked the mode (the page stops suggesting one). */
+  modeChosen: boolean;
+  /** The mode the canvas is drawing now; it changes when the switch is complete. */
+  shownMode: StreamMode;
   focusId: string | null;
   hoverId: string | null;
   /** The tile the keyboard grid has focus on. */
@@ -92,6 +100,8 @@ export interface ClientState {
   lastProtocolError: string | null;
   /** The last message the coordinator sent as {type:"error"}. */
   serverError: string | null;
+  /** This connection's viewer id, once the coordinator says it. */
+  you: string | null;
   ui: UiState;
 }
 
@@ -124,7 +134,8 @@ export function initialState(): ClientState {
     protocolErrors: 0,
     lastProtocolError: null,
     serverError: null,
-    ui: { focusId: null, hoverId: null, keyId: null, pointerOverImage: false, stats: false, lightMode: false },
+    you: null,
+    ui: { mode: "direct", modeChosen: false, shownMode: "direct", focusId: null, hoverId: null, keyId: null, pointerOverImage: false, stats: false, lightMode: false },
   };
 }
 
@@ -204,11 +215,13 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           return { ...s, clock: clockReceived(s.clock, msg.server_unix_ms, e.at, msg.client_unix_ms) };
         case "error":
           return { ...s, serverError: msg.reason };
+        case "welcome":
+          return { ...s, you: msg.viewer };
         case "snapshot": {
           if (msg.version <= s.version) return s; // older or repeated: dropped
           const accepted = msg.state;
           const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, accepted, msg.version));
-          return { ...s, accepted, version: msg.version, pending: settle(s.pending, msg.version), cameraWatches };
+          return { ...s, accepted, version: msg.version, pending: settle(s.pending, msg.version), cameraWatches, you: msg.you ?? s.you };
         }
         case "receipt": {
           if (s.handled.includes(msg.id)) return s; // a repeated receipt

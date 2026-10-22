@@ -12,6 +12,7 @@ coordinator and renderers are deployed.
 |---|---|
 | ![Relaunch all, 4 s in](docs/screenshots/race-mid.jpg) | ![Hovering a tile](docs/screenshots/wall-hover.jpg) |
 | ![The stats switch](docs/screenshots/wall-stats.jpg) | ![An opened tile](docs/screenshots/tile-opened.jpg) |
+| ![Aggregated mode, mid-race, with stats](docs/screenshots/wall-aggregated.jpg) | |
 
 <img src="docs/screenshots/phone.jpg" alt="The wall on a phone" width="260">
 
@@ -50,8 +51,8 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 89 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 20 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 102 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 26 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
@@ -62,6 +63,26 @@ makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ff
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
 
 ## How the page works
+
+**Two ways to receive the image.** Each viewer picks Direct (one stream per tile, from
+its VM) or Aggregated (a few streams, each an aggregator's joined region, drawn as one big
+tile with crop and x0/y0 as usual) with the Streams switch. Until the viewer picks, the
+page follows its suggestion: Aggregated when the fleet has aggregators and either the
+browser reports a downlink under what Direct needs at the renderer's rate, or more than
+10% of tiles ran behind the common t over the last ten seconds of Direct; otherwise
+Direct. A pick is remembered in this browser. Tile state (dark tiles, outlines in the
+half's colour, phases, clocks, hover outlines and labels) comes from the snapshot and is
+drawn the same way in both modes: in Aggregated mode a relaunching tile's region is
+painted dark over the aggregator's pixels.
+
+**Switching never hitches.** The page keeps the shown mode's streams and opens the other
+mode's in the background. While it waits, the drawn t does not advance past the newest
+frame every incoming region holds (an aggregator joins tiles before it encodes, so it runs
+a little behind), and never goes back. Once every incoming region holds a decoded frame at
+one t no older than the one on screen, the next draw shows the new mode whole, and the old
+streams close after it. After 4 s of waiting the image stops holding back for it and keeps
+playing the old mode. A test records every draw across a switch both ways and fails on any
+region drawn without a frame or any t going back.
 
 **Two kinds of connection.** One WebSocket to the coordinator's `/live` for snapshots,
 receipts and clock answers, and one per tile to its renderer for frames. The frame
@@ -137,8 +158,12 @@ measurement in `docs/fleet/ARCHITECTURE.md` (a laptop and a phone, with GPU comp
 Chrome and Safari) should set `max_tiles`.
 
 **Bandwidth.** Each tile asks for the device pixels it covers, rounded up to the next of
-the twelve heights. The page then keeps the streams within 80 Mbit/s at the renderer's
-rate: while the sum is over, the tallest stream steps down one height. With a tile
+the twelve heights. In Direct mode the page then keeps the streams within 80 Mbit/s at the
+renderer's rate: while the sum is over, the smallest tile still at the default quality
+asks for `q=lo` (small tiles lose least on screen), and once every tile is at `lo` the
+tallest stream steps down one height. `?budget=<Mbit/s>` sets another budget for trying it.
+The page models `lo` as half the default rate and floor, and `hi` as double; the renderer
+has not documented its figures yet. With a tile
 opened, every other tile keeps streaming at the smallest height (72) so closing it is
 instant, and only the opened tile asks for its full size. The floor of 0.6 Mbit/s a
 stream sets the cost of a large wall: 100 tiles cost 60 Mbit/s at any height, so a
@@ -184,25 +209,32 @@ What the page does where the protocol leaves a choice:
   page takes the camera at the drawn t from the snapshot's keys (linear between keys;
   the renderer's Catmull-Rom spline differs only while the camera moves) and places
   the light 2 km along the ray through the clicked pixel.
-- **Input-to-pixel latency** needs to know which camera key an intent produced. Keys
-  carry no intent id, so the page takes the first key newer than any it held when it
-  sent the intent, once the receipt's version is accepted. An `"intent"` field on a key
-  would make it exact; the page uses one when present.
-- **The opened tile and the grid** draw each frame into the tile's rectangle on screen,
-  not by `x0` / `full_width`; the two differ by under one stream pixel.
+- **Input-to-pixel latency** runs from the drag to the first draw at or past the camera
+  key tagged with that intent. For a coordinator that sends untagged keys the page falls
+  back to the first key newer than any it held when it sent the intent.
+- **In the mosaic** each stream's inner rectangle is placed at `x0, y0` of `full_width x
+  full_height`; an opened tile fills its box.
 
-Mismatches between the other two that the page cannot settle:
+From the coordinator's next round (#1146), which the page follows and the mock speaks:
+`time_of_day` is a fraction of the day, `image_aspect` defaults to 16/9, words are up to
+28 characters, camera keys carry the `intent` that made them (input-to-pixel latency is
+then exact), actions carry `args` and the actor's viewer id, and each connection is told
+its own viewer id, so the page says "you". Until that document lands the page assumes
+these shapes: the id arrives as `{"type": "welcome", "viewer": "<id>"}` (or as `you` on a
+snapshot message, never inside `state`, which every viewer shares), an action's actor is
+`viewer` (or `actor`), and the snapshot lists `aggregators: [{id, frame_url, rect}]`. The
+renderer's `q=hi|std|lo` goes on the frame URL; the page sends `q` only when it is not
+`std`.
 
-- `image_aspect` defaults to 32/9 in the coordinator and 16/9 in the renderer. At 32/9
-  the image is a strip 405 px tall on a 1440x900 screen.
-- `time_of_day` is hours in [0, 24) at the coordinator (the page sends hours) and a
-  fraction of a day in the renderer's `POST /scene`: the coordinator has to convert.
-- Words: the coordinator accepts 24 characters, the renderer draws 28.
-- `actions` carry `summary` but not the arguments, so the ticker words what it can from
-  the summary; arguments would let it say more without parsing.
-- A viewer's own name is not in the snapshot, so the page cannot say "you".
+Still open:
 
-The mock encodes H.264 baseline with libx264 rather than High with NVENC, reports EC2
+- `actions` from the coordinator in this round do not carry arguments yet, so until they
+  do the ticker words what it can from the summary.
+
+The mock encodes H.264 baseline with libx264 (`q` as constant quality 14, 18 or 26)
+rather than High with NVENC, runs one aggregator per band of about eight fcvm tiles and
+one for the EC2 half (each draws its region whole and blacks out tiles that are not
+running), draws the UTC clock once in each half, reports EC2
 phases `launching` and `starting` with `launch_ms` and `ready_ms` as the coordinator's
 EC2 driver does, and shows `relaunching` for 150 ms before a tile's first reported
 phase.

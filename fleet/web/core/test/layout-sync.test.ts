@@ -219,17 +219,28 @@ describe("stream overlap and bandwidth", () => {
     expect(deliveredGeometry({ width: 100, height: 50, fullWidth: 1000, fullHeight: 500, x0: 7, y0: 0 })).toEqual({ width: 122, height: 66, crop: { left: 7, top: 0, right: 15, bottom: 16 } });
   });
 
-  it("steps the tallest streams down until they fit, keeping the opened one", () => {
-    const rect = (x: number) => ({ x, y: 0, w: 1 / 16, h: 1 / 9 });
-    const asks = Array.from({ length: 16 }, (_, i) => ({ id: `t${i}`, rect: rect((i % 16) / 16), height: 540, keep: i === 0 }));
+  it("asks small tiles for q=lo first, then steps the tallest down, keeping the opened one", () => {
+    const rect = (x: number, w: number) => ({ x, y: 0, w, h: 1 / 9 });
+    const asks = Array.from({ length: 16 }, (_, i) => ({ id: `t${i}`, rect: rect(i / 32, i < 8 ? 1 / 32 : 1 / 16), height: 540, keep: i === 0 }));
     const before = asks.reduce((a, x) => a + streamBitrate(x.rect, 16 / 9, x.height), 0);
-    const fit = fitBandwidth(asks, 16 / 9, 40e6);
-    expect(before).toBeGreaterThan(40e6);
-    expect(fit.bps).toBeLessThanOrEqual(40e6);
-    expect(fit.heights.get("t0")).toBe(540);
-    expect(Math.max(...asks.slice(1).map((a) => fit.heights.get(a.id)!))).toBeLessThan(540);
+    const mild = fitBandwidth(asks, 16 / 9, before * 0.85);
+    expect(mild.bps).toBeLessThanOrEqual(before * 0.85);
+    // Only small tiles went to lo, and no height changed.
+    const lo = asks.filter((a) => mild.quality.get(a.id) === "lo");
+    expect(lo.length).toBeGreaterThan(0);
+    expect(lo.every((a) => a.rect.w === 1 / 32)).toBe(true);
+    expect([...mild.heights.values()].every((h) => h === 540)).toBe(true);
+    // A tight budget: everyone but the opened tile at lo, then heights fall.
+    const tight = fitBandwidth(asks, 16 / 9, 30e6);
+    expect(tight.bps).toBeLessThanOrEqual(30e6);
+    expect(tight.quality.get("t0")).toBe("std");
+    expect(tight.heights.get("t0")).toBe(540);
+    expect(asks.slice(1).every((a) => tight.quality.get(a.id) === "lo")).toBe(true);
+    expect(Math.max(...asks.slice(1).map((a) => tight.heights.get(a.id)!))).toBeLessThan(540);
     // Under the budget nothing changes.
-    expect(fitBandwidth(asks, 16 / 9, 1e12).heights.get("t5")).toBe(540);
+    const easy = fitBandwidth(asks, 16 / 9, 1e12);
+    expect(easy.heights.get("t5")).toBe(540);
+    expect(easy.quality.get("t5")).toBe("std");
   });
 
   it("stops at the smallest height, over budget if it must", () => {
@@ -237,6 +248,17 @@ describe("stream overlap and bandwidth", () => {
     const fit = fitBandwidth(asks, 16 / 9, 10e6);
     expect([...fit.heights.values()].every((h) => h === 72)).toBe(true);
     expect(fit.bps).toBeGreaterThan(10e6);
-    expect(fit.bps).toBeGreaterThanOrEqual(100 * MIN_STREAM_BPS);
+    expect(fit.bps).toBeGreaterThanOrEqual(100 * MIN_STREAM_BPS.lo);
+  });
+});
+
+describe("holding the image for a mode switch", () => {
+  const b = (id: string, ts: number[]) => ({ id, ts });
+  it("does not choose frames after maxT, and never goes back", () => {
+    const c = chooseCommonT([b("a", [1, 1.1, 1.2, 1.3]), b("b", [1, 1.1, 1.2, 1.3])], 1.0, 0.35, 1.1);
+    expect(c.T).toBe(1.1);
+    expect(c.show.get("a")).toEqual({ kind: "sync", t: 1.1 });
+    const held = chooseCommonT([b("a", [1.1, 1.2])], 1.2, 0.35, 1.0);
+    expect(held.T).toBe(1.2);
   });
 });

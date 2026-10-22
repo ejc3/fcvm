@@ -5,13 +5,14 @@ export function reconnectDelayMs(attempt: number): number {
   return Math.min(10_000, 500 * 2 ** Math.max(0, Math.min(attempt, 10)));
 }
 
-/** A tile's frame socket URL for a height: frame_url with h set. */
-export function frameSocketUrl(frameUrl: string, height: number): string {
+/** A frame socket URL: frame_url with h set, and q when it is not the default. */
+export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" | "std" | "lo" = "std"): string {
   const [base, query = ""] = frameUrl.split("?", 2) as [string, string?];
   const kept = query
     .split("&")
-    .filter((p) => p !== "" && !p.startsWith("h="));
+    .filter((p) => p !== "" && !p.startsWith("h=") && !p.startsWith("q="));
   kept.push(`h=${Math.round(height)}`);
+  if (quality !== "std") kept.push(`q=${quality}`);
   return `${base}?${kept.join("&")}`;
 }
 

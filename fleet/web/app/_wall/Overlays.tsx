@@ -13,7 +13,7 @@ function accent(color: string, soft?: string): CSSProperties {
 
 function HalfPanel({ h, style }: { h: HalfView; style: CSSProperties }) {
   return (
-    <div className={`race-half ${h.half}`} style={{ ...accent(h.accent, h.soft), ...style }} data-testid={`race-${h.half}`}>
+    <div data-avoid="" className={`race-half ${h.half}`} style={{ ...accent(h.accent, h.soft), ...style }} data-testid={`race-${h.half}`}>
       <span className="by">{h.renderedBy}</span>
       <span className="back">{h.back}</span>
       <span className="progress" aria-hidden="true">
@@ -89,7 +89,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
             <>
               {statsOn ? null : <HalfPanel h={view.race.fcvm} style={{ left: img.x + 20, top: img.y + 20 }} />}
               {statsOn ? null : <HalfPanel h={view.race.ec2} style={{ right: `calc(100vw - ${img.x + img.w - 20}px)`, top: img.y + 20 }} />}
-              <div className={`race-clock${view.race.active ? " active" : ""}`} style={{ left: img.x + img.w / 2, top: img.y + 20 }} data-testid="race-clock">
+              <div data-avoid="" className={`race-clock${view.race.active ? " active" : ""}`} style={{ left: img.x + img.w / 2, top: img.y + 20 }} data-testid="race-clock">
                 <div className="caption">{view.race.caption}</div>
                 <div className="value">{view.race.clock}</div>
                 {view.race.by ? <div className="started">{view.race.by}</div> : null}
@@ -100,13 +100,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
             <div
               className="hover-label"
               data-testid="hover-label"
-              style={{
-                ...accent(seams.label.accent),
-                left: seams.label.alignRight ? undefined : seams.label.x,
-                right: seams.label.alignRight ? `calc(100vw - ${seams.label.x}px)` : undefined,
-                top: seams.label.below ? seams.label.y + 6 : undefined,
-                bottom: seams.label.below ? undefined : `calc(100dvh - ${seams.label.y - 6}px)`,
-              }}
+              style={{ ...accent(seams.label.accent), left: seams.label.x, top: seams.label.y }}
             >
               <span className="top">
                 <span className="id">{seams.label.id}</span>
@@ -118,14 +112,20 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
             </div>
           ) : null}
           {!phone && view.controls ? (
-            <span className="hint" style={{ right: `calc(100vw - ${img.x + img.w - 16}px)`, bottom: `calc(100dvh - ${img.y + img.h - 16}px)` }}>
+            <span data-avoid="" className="hint" style={{ right: `calc(100vw - ${img.x + img.w - 16}px)`, bottom: `calc(100dvh - ${img.y + img.h - 16}px)` }}>
+              {view.controls.word.status ? (
+                <span className={`word-status ${view.controls.word.statusKind}`} role="status" data-testid="word-status">
+                  {view.controls.word.status}
+                </span>
+              ) : null}
               <span className={view.controls.latencyMeasured ? "latency" : undefined} data-testid="latency">{view.controls.latency}</span>
               {statsOn ? <span data-testid="bandwidth">{view.bandwidth}</span> : null}
+              {statsOn ? <span data-testid="mode-detail">{`${view.controls.mode.detail}. ${view.controls.mode.suggestion.text}`}</span> : null}
               <span>{view.controls.help}</span>
             </span>
           ) : null}
           {!phone && view.ticker.length > 0 ? (
-            <div className="ticker" style={{ left: img.x + 20, bottom: `calc(100dvh - ${img.y + img.h - 16}px)` }} aria-label="Recent actions">
+            <div data-avoid="" className="ticker" style={{ left: img.x + 20, bottom: `calc(100dvh - ${img.y + img.h - 16}px)` }} aria-label="Recent actions">
               {view.ticker.map((a) => (
                 <span key={a.key}>
                   {a.text}
