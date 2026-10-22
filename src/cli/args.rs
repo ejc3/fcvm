@@ -262,6 +262,18 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub pmem: Vec<String>,
 
+    /// Pass a host PCI device, such as a GPU, through to the VM: its address
+    /// (SSSS:BB:DD.F or BB:DD.F, as `lspci -D` prints it). Repeat for more than one.
+    /// The device must be bound to vfio-pci and its /dev/vfio group open to this
+    /// user. Needs --kernel-profile gpu (Firecracker with the PCI transport).
+    /// The VM boots and is snapshotted without the device, and the device is
+    /// attached when the VM is restored from that snapshot, so GPU and non-GPU runs
+    /// share one snapshot. A VM with a passthrough device cannot be snapshotted.
+    /// Not with --balloon or --pmem, whose memory handling pinned DMA memory forbids.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS",
+          conflicts_with_all = ["balloon", "pmem"])]
+    pub gpu: Vec<String>,
+
     /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
     /// Starts NFS server on host, VM mounts via network.
     /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
@@ -702,6 +714,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run runtime config when restoring from a snapshot cache hit.
     #[arg(skip)]
     pub firecracker_args: Option<String>,
+
+    /// Pass a host PCI device, such as a GPU, through to the restored VM (repeatable).
+    /// The snapshot must have been made with --kernel-profile gpu (PCI transport) and
+    /// without a balloon or pmem device; the device is attached before the VM resumes.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS")]
+    pub gpu: Vec<String>,
 
     /// Whether hugepages are enabled (internal use only).
     /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
