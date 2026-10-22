@@ -769,6 +769,42 @@ class MovingProcessSet(unittest.TestCase):
             self.read(flip + [[1, 2]])
 
 
+class ScaleProvenanceNamesNoHost(unittest.TestCase):
+    """reqscale's provenance records the instance type, never the host name."""
+
+    def test_the_host_name_is_not_recorded(self):
+        import platform
+        import reqscale
+        args = argparse.Namespace(
+            fcvm="/bin/true", source_repo="/repo", control_chromium="/bin/true",
+            control_url="https://example.com/", control_resolve_all_to="127.0.0.1",
+            control_timeout=30.0, runtime={"source_revision": "e" * 40,
+                                           "creator_fcvm_sha256": "c" * 64,
+                                           "creator_runtime_bundle_sha256": "d" * 64},
+            golden_creator={}, trace_faults=False, bpftrace="", max_trace_perturbation_pct=5.0,
+            snapshot_generation_lease=argparse.Namespace(path="/x/t.lock"))
+        commands = {("git", "-C", "/repo", "rev-parse", "HEAD"): "e" * 40}
+
+        def command(argv):
+            return commands.get(tuple(argv), "")
+
+        facts = {"instance_type": "c8g.metal-48xl", "cpu_model": "Neoverse-V2",
+                 "nproc": 192, "mem_total_kb": 1, "os": "Ubuntu"}
+        with mock.patch.object(reqscale, "_command", command), \
+                mock.patch.object(reqscale, "sha256_file", lambda _p: "a" * 64), \
+                mock.patch.object(reqscale, "harness_sha256", lambda: "b" * 64), \
+                mock.patch.object(reqscale, "schedule_sha256", lambda _s: "f" * 64), \
+                mock.patch.object(reqscale, "quiet_host_snapshot",
+                                  lambda: {"loadavg1": 0.1, "loadavg1_limit": 2.0,
+                                           "vm_process_count": 0, "vm_processes": []}), \
+                mock.patch.object(reqscale.reqbench, "host_facts", lambda: facts), \
+                mock.patch.object(reqscale.platform, "node", lambda: "ip-10-0-0-1"):
+            prov = reqscale.collect_provenance(args, {"run_id": "1" * 32}, {"tag": "t"})
+        self.assertNotIn("ip-10-0-0-1", json.dumps(prov))
+        self.assertEqual(prov["host"]["instance_type"], "c8g.metal-48xl")
+        self.assertNotIn("hostname", prov["host"])
+
+
 class HostControlArms(unittest.TestCase):
     """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
 
