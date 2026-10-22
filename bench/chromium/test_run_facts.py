@@ -179,6 +179,89 @@ class RestoreMarks(unittest.TestCase):
         self.assertIn("FileNotFoundError", missing["error"])
 
 
+class RestoreAck(unittest.TestCase):
+    """restore_ack: fcvm's restored record, with fc-agent's per-phase timing.
+
+    fcvm prints one JSON line on stdout once the guest acknowledges the
+    restore (restored_record in src/commands/snapshot.rs). Its guest_phases
+    split the guest's restore work, which is where a clone spends the time
+    between the VM resuming and its DevTools port answering."""
+
+    RECORD = {"status": "restored", "name": "rb-1", "snapshot": "cb", "vm_id": "vm-1",
+              "backend": "uffd", "hypervisor": "firecracker", "ack_ms": 367,
+              "guest_phases": {"tcp_cleanup_ms": 130.3, "tcp_reopen_ms": 109.9,
+                               "tcp_verified": True, "tcp_destroyed": 1, "total_ms": 303.6}}
+
+    def test_the_restored_record_is_read_from_the_log(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", RestoreMarks.LOG + json.dumps(self.RECORD) + "\n"
+                        + "{not json\n")
+            ack = reqbench.restore_ack(log)
+        self.assertEqual(ack, {"ack_ms": 367, "guest_phases": self.RECORD["guest_phases"]})
+
+    def test_a_log_without_the_record_says_so(self):
+        with tempfile.TemporaryDirectory() as d:
+            log = write(d, "clone.log", RestoreMarks.LOG + json.dumps({"status": "serving"}) + "\n")
+            ack = reqbench.restore_ack(log)
+            missing = reqbench.restore_ack(os.path.join(d, "absent.log"))
+        self.assertEqual(set(ack), {"error"})
+        self.assertIn("FileNotFoundError", missing["error"])
+
+    def test_both_request_paths_record_it(self):
+        """The cdp and noop request functions each set restore_ack beside restore_marks."""
+        with open(os.path.join(HERE, "reqbench.py")) as f:
+            source = f.read()
+        self.assertEqual(source.count('rec["restore_ack"] = restore_ack(log)'),
+                         source.count('rec["restore_marks"] = restore_marks(log, t_spawn_wall)'))
+        self.assertGreaterEqual(source.count('rec["restore_ack"] = restore_ack(log)'), 2)
+
+    def test_the_restored_record_is_a_println_in_fcvm(self):
+        with open(os.path.join(REPO, "src", "commands", "snapshot.rs")) as f:
+            source = f.read()
+        self.assertIn('"status": "restored"', source)
+        self.assertIn('"guest_phases": phases', source)
+        self.assertIn('"ack_ms": ack_ms', source)
+
+
+class RestoreAckExtraction(unittest.TestCase):
+    """restore_ack.py: the same reading for runs whose records predate it."""
+
+    def run_dir(self, d, logs):
+        rows = [{"kind": "meta", "run_id": "r1"}]
+        for i, text in enumerate(logs):
+            name = f"rb-r1-{i}-norm.log"
+            if text is not None:
+                write(d, name, text)
+            rows.append({"record_id": f"r1:cdp:{i}:0", "arm": "cdp", "rep": i, "warmup": False,
+                         "log": f"/elsewhere/{name}"})
+        write(d, "reqbench.jsonl", "".join(json.dumps(r) + "\n" for r in rows))
+
+    def test_every_record_gets_its_log_hash_and_reading(self):
+        import restore_ack
+        good = RestoreMarks.LOG + json.dumps(RestoreAck.RECORD) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [good, RestoreMarks.LOG])
+            with redirect_stdout(io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+            with open(os.path.join(d, "restore-ack.jsonl")) as f:
+                lines = [json.loads(line) for line in f]
+            with open(os.path.join(d, "reqbench.jsonl"), "rb") as f:
+                source = hashlib.sha256(f.read()).hexdigest()
+        self.assertEqual(lines[0]["source_sha256"], source)
+        self.assertEqual([x["record_id"] for x in lines[1:]], ["r1:cdp:0:0", "r1:cdp:1:0"])
+        self.assertEqual(lines[1]["restore_ack"]["guest_phases"]["tcp_cleanup_ms"], 130.3)
+        self.assertEqual(lines[1]["log_sha256"], hashlib.sha256(good.encode()).hexdigest())
+        self.assertIn("error", lines[2]["restore_ack"])
+
+    def test_a_missing_log_writes_nothing(self):
+        import restore_ack
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [RestoreMarks.LOG, None])
+            with redirect_stdout(io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 2)
+            self.assertFalse(os.path.exists(os.path.join(d, "restore-ack.jsonl")))
+
+
 class RestoreMarkSourcePin(unittest.TestCase):
     """Every marker is an info! line fcvm writes on the restore path."""
 
@@ -412,6 +495,23 @@ class AnalysisCarriesTheFacts(unittest.TestCase):
         self.assertEqual(cdp["nav_marks_ms"]["load_event_start_ms"]["median"], 210.0)
         self.assertEqual(analysis["arms"]["noop"]["timeline"]["restore_marks_ms"]
                          ["snapshot_loaded_ms"]["median"], 10.0)
+
+    def test_the_timeline_summarises_the_guest_restore_phases(self):
+        def stamp(rows):
+            for row in rows:
+                if row.get("kind") == "meta":
+                    continue
+                row["restore_ack"] = {"ack_ms": 300, "guest_phases": {
+                    "tcp_cleanup_ms": 150.0, "tcp_reopen_ms": 90.0, "tcp_verified": True,
+                    "tcp_destroyed": 1, "total_ms": 290.0}}
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, stamp, **self.FACTS)
+        for armname in ("cdp", "noop"):
+            timeline = analysis["arms"][armname]["timeline"]
+            self.assertEqual(timeline["restore_ack_ms"]["median"], 300.0)
+            phases = timeline["guest_phases_ms"]
+            self.assertEqual(set(phases), {"tcp_cleanup_ms", "tcp_reopen_ms", "total_ms"})
+            self.assertEqual(phases["tcp_cleanup_ms"]["median"], 150.0)
 
     def test_html_fast_publishes_cpu_like_cdp_fast(self):
         """html-fast: the html op with the fast teardown, so its CPU is read."""

@@ -2967,6 +2967,34 @@ def restore_marks(log_path: str, launch_wall: float) -> dict:
     return marks
 
 
+def restore_ack(log_path: str) -> dict:
+    """fcvm's restored record from a clone's log: the ACK time and the guest's phases.
+
+    fcvm prints one JSON line on stdout when fc-agent acknowledges the exact
+    restore generation (restored_record in src/commands/snapshot.rs):
+    ack_ms, the host-observed time from the start of the restore call to
+    the ACK, and guest_phases, fc-agent's per-phase milliseconds for its
+    side of the restore (socket cleanup, reopening the network gate, ...).
+    Read after the request's answer, so nothing here is timed. A log
+    without the record says so rather than reading as zero.
+    """
+    try:
+        with open(log_path, errors="replace") as handle:
+            for line in handle:
+                if not line.startswith("{"):
+                    continue
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(record, dict) and record.get("status") == "restored":
+                    return {"ack_ms": record.get("ack_ms"),
+                            "guest_phases": record.get("guest_phases")}
+    except OSError as error:
+        return {"error": f"{type(error).__name__}: {error}"}
+    return {"error": "no restored record in the clone's log"}
+
+
 def probe_batch_script(sections) -> str:
     """One shell script that runs every section and frames its output and status.
 
@@ -3989,6 +4017,7 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()
@@ -4159,6 +4188,7 @@ def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
+    rec["restore_ack"] = restore_ack(log)
     if interrupted is not None:
         raise interrupted
     raise_if_harness_interrupted()

@@ -66,11 +66,16 @@ source revision, with `commit` set only when the binary's name is the one
 `fcvm setup` gives a build of that commit). The analyzer copies them into the
 cell. Each CDP and noop record carries `restore_marks`, when fcvm's
 `snapshot load completed`, `disk patch completed`, `VM resume completed` and
-`VM lifecycle ready` lines reached the clone's log, in ms from the launch; each
-render carries `resolve_polls` (each poll's time and outcome) and `nav` gains
+`VM lifecycle ready` lines reached the clone's log, in ms from the launch, and
+`restore_ack`, the `ack_ms` and fc-agent `guest_phases` of the one-line
+restored record fcvm prints when the guest acknowledges the restore. For runs
+recorded before that field, `restore_ack.py <run dir>` reads the same record out
+of the per-request clone logs into `restore-ack.jsonl`, bound to
+`reqbench.jsonl` by sha256. Each render carries `resolve_polls` (each poll's time and outcome) and `nav` gains
 `response_end_ms`, `dom_interactive_ms`, `dom_content_loaded_end_ms` and
 `load_event_start_ms`. `analysis.json` summarises them per arm under
-`timeline`. `test_run_facts.py` pins every one of these.
+`timeline` (`restore_ack_ms` and `guest_phases_ms` among them). `test_run_facts.py` pins
+every one of these.
 
 `GUEST_ENV=` (golden only) bakes extra container environment into the
 snapshot: comma-separated `KEY=VALUE` entries, one `fcvm podman prepare
