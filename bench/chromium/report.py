@@ -213,6 +213,10 @@ class CgroupReadError(RuntimeError):
     """A cgroup basis could not be read completely."""
 
 
+class CgroupMoved(CgroupReadError):
+    """The process set changed while it was read."""
+
+
 def cgroup_bytes(cg_path):
     """memory.current of one cgroup (bytes), or refuse an incomplete basis."""
     path = os.path.join(cg_path, "memory.current")
@@ -282,24 +286,54 @@ def cgroup_stat(cg_path):
     return out
 
 
+# A clone's process set is not static: fcvm's health monitor runs `fcvm exec
+# ... podman inspect` in each clone's cgroup every 10 s. With 96 clones a sample
+# overlapped one on 2026-10-22 and the memory phase stopped on "process set
+# changed in .../req-fcvm96r4-23 while it was sampled: [... 4 pids] -> [... 5]".
+# A read whose set moved is taken again, a bounded number of times.
+STABLE_READ_ATTEMPTS = 20
+STABLE_READ_PAUSE_S = 0.05
+
+
 def measure_complete_cgroup(cg_path, with_stat=True):
-    """Read both bases over one process set that stayed unchanged."""
+    """Read both bases over one process set that stayed unchanged.
+
+    A read during which the set changed, or one of its processes exited, is
+    repeated up to STABLE_READ_ATTEMPTS times; a set still moving after that
+    refuses the sample.
+    """
+    for attempt in range(STABLE_READ_ATTEMPTS):
+        try:
+            return _measure_complete_cgroup_once(cg_path, with_stat)
+        except CgroupMoved:
+            if attempt == STABLE_READ_ATTEMPTS - 1:
+                raise
+            time.sleep(STABLE_READ_PAUSE_S)
+
+
+def _measure_complete_cgroup_once(cg_path, with_stat):
     if not os.path.isdir(cg_path):
         raise CgroupReadError(f"cgroup disappeared before it was sampled: {cg_path}")
     before = cgroup_procs(cg_path)
     if not before:
         after = cgroup_procs(cg_path)
         if after:
-            raise CgroupReadError(
+            raise CgroupMoved(
                 f"process set changed in {cg_path} while it was sampled: [] -> {after}")
         raise CgroupReadError(
             f"owned cgroup {cg_path} has no processes; zero is not a complete sample")
     current = cgroup_bytes(cg_path)
-    pss = sum(pss_kb_of_pid(pid) for pid in before)
+    try:
+        pss = sum(pss_kb_of_pid(pid) for pid in before)
+    except CgroupReadError as exc:
+        if sorted(cgroup_procs(cg_path)) != sorted(before):
+            raise CgroupMoved(
+                f"process set changed in {cg_path} while it was sampled: {exc}") from exc
+        raise
     stat = cgroup_stat(cg_path) if with_stat else {}
     after = cgroup_procs(cg_path)
     if sorted(before) != sorted(after):
-        raise CgroupReadError(
+        raise CgroupMoved(
             f"process set changed in {cg_path} while it was sampled: "
             f"{sorted(before)} -> {sorted(after)}")
     return before, current, pss, stat

@@ -743,6 +743,32 @@ class NonDumpablePss(unittest.TestCase):
                 report.pss_kb_of_pid(4242)
 
 
+class MovingProcessSet(unittest.TestCase):
+    """A memory read whose process set moved is taken again, a bounded number of times."""
+
+    def read(self, sets):
+        import report
+        sets = list(sets)
+        with tempfile.TemporaryDirectory() as cg, \
+                mock.patch.object(report, "cgroup_procs", lambda _p: sets.pop(0) if len(sets) > 1 else sets[0]), \
+                mock.patch.object(report, "cgroup_bytes", lambda _p: 4096), \
+                mock.patch.object(report, "pss_kb_of_pid", lambda pid: 10), \
+                mock.patch.object(report, "STABLE_READ_PAUSE_S", 0.0):
+            return report.measure_complete_cgroup(cg, with_stat=False)
+
+    def test_a_health_check_that_comes_and_goes_is_read_around(self):
+        # before/after of attempt 1 differ (a health-check exec appeared);
+        # attempt 2 is stable.
+        procs, current, pss, _stat = self.read([[1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4]])
+        self.assertEqual((sorted(procs), current, pss), ([1, 2, 3, 4], 4096, 40))
+
+    def test_a_set_that_never_settles_still_refuses(self):
+        import report
+        flip = [[1, 2], [1, 2, 3]] * report.STABLE_READ_ATTEMPTS
+        with self.assertRaises(report.CgroupReadError):
+            self.read(flip + [[1, 2]])
+
+
 class HostControlArms(unittest.TestCase):
     """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
 
