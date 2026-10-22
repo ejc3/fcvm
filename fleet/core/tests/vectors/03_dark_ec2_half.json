@@ -87,7 +87,30 @@
         ]
       }
     ],
+    "claims": [],
+    "director": {
+      "arrive_next_t": null,
+      "arrived_t": 0.0,
+      "decide_at_t": 5.0,
+      "hold_until_t": 7.0,
+      "next": null,
+      "offer": [
+        "horizon",
+        "dawn-valley",
+        "peak-seam-low-sun"
+      ],
+      "seed": 1,
+      "viewpoint": "coast",
+      "votes": {
+        "dawn-valley": 0,
+        "horizon": 0,
+        "peak-seam-low-sun": 0
+      }
+    },
+    "failures": [],
     "fleet": {
+      "borrow_cap": 1,
+      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 3,
       "gpus": 3,
@@ -117,34 +140,75 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "relaunch_all": null,
+    "race": {
+      "cooldown_secs": 60,
+      "cooldown_until": null,
+      "interval_secs": null,
+      "next_race_at": null,
+      "running": null
+    },
+    "races": [],
     "scene": {
       "camera": [
         {
-          "fov_deg": 62.0,
+          "fov_deg": 60.0,
           "look": [
-            -60.0,
-            1.9,
-            -100.0
+            -63.5,
+            2.2,
+            -87.0
           ],
           "pos": [
-            -32.0,
-            1.9,
-            -55.0
+            -100.0,
+            0.35,
+            -90.0
           ],
           "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.3,
+      "time_of_day": 0.33,
       "words": []
     },
-    "settings": {
-      "auto_relaunch_secs": null
+    "scoreboard": {
+      "ec2": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      },
+      "fcvm": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      }
     },
     "tiles": [
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -169,6 +233,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -193,6 +258,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -217,6 +283,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -238,6 +305,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -259,6 +327,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,

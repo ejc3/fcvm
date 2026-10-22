@@ -147,6 +147,7 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 frame_url: None,
                 timings: Default::default(),
                 error: None,
+                retry_in_ms: None,
             }),
         });
     }

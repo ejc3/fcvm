@@ -7,6 +7,7 @@
 //! (`tests/vectors/*.json`) and compare the states.
 
 pub mod apply;
+pub mod director;
 pub mod event;
 pub mod protocol;
 pub mod scene;

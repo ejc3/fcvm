@@ -2,7 +2,7 @@
   "config": {
     "ec2_max": 10
   },
-  "description": "EC2 tiles follow the fcvm GPU count; a tile EC2 has no capacity for stays dark, and fewer fcvm GPUs drop the extra EC2 tiles.",
+  "description": "EC2 tiles follow the fcvm GPU count; a tile EC2 has no capacity for stays dark; a race times the EC2 half from the same click, with a tile's wait for spot capacity recorded and kept out of the half's time; fewer fcvm GPUs drop the extra EC2 tiles.",
   "events": [
     {
       "at": 1000,
@@ -57,24 +57,60 @@
       "args": {},
       "at": 3000,
       "id": "ra",
-      "name": "relaunch_all",
+      "name": "restart_now",
       "type": "intent",
       "viewer": "v1"
     },
     {
-      "at": 4000,
+      "at": 9000,
       "report": {
         "frame_url": "ws://ec2-1.example:443/frames",
         "generation": 2,
         "id": "ec2-1",
         "phase": "running",
-        "timings": {},
+        "timings": {
+          "capacity_wait_ms": 0,
+          "launch_ms": 1500,
+          "ready_ms": 4500
+        },
         "vm": "instance-2"
       },
       "type": "ec2"
     },
     {
-      "at": 5000,
+      "at": 15000,
+      "report": {
+        "frame_url": "ws://ec2-2.example:443/frames",
+        "generation": 2,
+        "id": "ec2-2",
+        "phase": "running",
+        "timings": {
+          "capacity_wait_ms": 6000,
+          "launch_ms": 1200,
+          "ready_ms": 4800
+        },
+        "vm": "instance-3"
+      },
+      "type": "ec2"
+    },
+    {
+      "at": 10000,
+      "report": {
+        "frame_url": "ws://ec2-3.example:443/frames",
+        "generation": 2,
+        "id": "ec2-3",
+        "phase": "running",
+        "timings": {
+          "capacity_wait_ms": 0,
+          "launch_ms": 1600,
+          "ready_ms": 5000
+        },
+        "vm": "instance-4"
+      },
+      "type": "ec2"
+    },
+    {
+      "at": 20000,
       "host": "h1",
       "type": "agent_gone"
     }
@@ -106,17 +142,30 @@
       "after": 3,
       "checks": {
         "/ec2_assign/0/generation": 2,
-        "/view/relaunch_all/ec2_pending": 3
-      }
-    },
-    {
-      "after": 4,
-      "checks": {
-        "/view/relaunch_all/ec2_pending": 2
+        "/view/races/0/ec2/tiles/ec2-1/tile": "ec2:1"
       }
     },
     {
       "after": 5,
+      "checks": {
+        "/view/races/0/ec2/done_at": null,
+        "/view/races/0/ec2/tiles/ec2-2/capacity_wait_ms": 6000
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/view/races/0/ec2/capacity_wait_ms": 6000,
+        "/view/races/0/ec2/done_at": 10000,
+        "/view/races/0/ec2/time_ms": 7000,
+        "/view/scoreboard/ec2/last_capacity_wait_ms": 6000,
+        "/view/scoreboard/ec2/last_measured_on": 3,
+        "/view/scoreboard/ec2/last_ms": 7000
+      },
+      "note": "ec2-2 finished 12 s after the click but waited 6 s for capacity: 7 s from ec2-3 is the half's time"
+    },
+    {
+      "after": 7,
       "checks": {
         "/ec2_assign": [],
         "/view/fleet/n": 0,
@@ -130,14 +179,44 @@
         "args": {},
         "at": 3000,
         "id": "ra",
-        "name": "relaunch_all",
+        "name": "restart_now",
         "outcome": "committed",
-        "summary": "relaunch all (6 tiles)",
+        "summary": "race 1",
         "viewer": "v1"
       }
     ],
     "aggregates": [],
+    "claims": [],
+    "director": {
+      "arrive_next_t": null,
+      "arrived_t": 0.0,
+      "decide_at_t": 5.0,
+      "hold_until_t": 7.0,
+      "next": null,
+      "offer": [
+        "horizon",
+        "dawn-valley",
+        "peak-seam-low-sun"
+      ],
+      "seed": 1,
+      "viewpoint": "coast",
+      "votes": {
+        "dawn-valley": 0,
+        "horizon": 0,
+        "peak-seam-low-sun": 0
+      }
+    },
+    "failures": [
+      {
+        "host": "h1",
+        "kind": "host_reclaimed",
+        "retiling": true,
+        "since": 20000
+      }
+    ],
     "fleet": {
+      "borrow_cap": 0,
+      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
@@ -147,40 +226,129 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "relaunch_all": {
-      "by": "viewer:v1",
-      "ec2_done_at": 5000,
-      "ec2_last": null,
-      "ec2_pending": 0,
-      "fcvm_done_at": 5000,
-      "fcvm_last": null,
-      "fcvm_pending": 0,
-      "started_at": 3000
+    "race": {
+      "cooldown_secs": 60,
+      "cooldown_until": 63000,
+      "interval_secs": null,
+      "next_race_at": null,
+      "running": null
     },
+    "races": [
+      {
+        "by": "viewer:v1",
+        "ec2": {
+          "capacity_wait_ms": 6000,
+          "done_at": 10000,
+          "dropped": 0,
+          "last": "ec2-3",
+          "sitting_out": [],
+          "tiles": {
+            "ec2-1": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 9000,
+              "generation": 2,
+              "phases": {
+                "capacity_wait_ms": 0,
+                "launch_ms": 1500,
+                "ready_ms": 4500
+              },
+              "tile": "ec2:1"
+            },
+            "ec2-2": {
+              "capacity_wait_ms": 6000,
+              "first_frame_at": 15000,
+              "generation": 2,
+              "phases": {
+                "capacity_wait_ms": 6000,
+                "launch_ms": 1200,
+                "ready_ms": 4800
+              },
+              "tile": "ec2:2"
+            },
+            "ec2-3": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 10000,
+              "generation": 2,
+              "phases": {
+                "capacity_wait_ms": 0,
+                "launch_ms": 1600,
+                "ready_ms": 5000
+              },
+              "tile": "ec2:3"
+            }
+          },
+          "time_ms": 7000
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 3,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "id": 1,
+        "started_at": 3000
+      }
+    ],
     "scene": {
       "camera": [
         {
-          "fov_deg": 62.0,
+          "fov_deg": 60.0,
           "look": [
-            -60.0,
-            1.9,
-            -100.0
+            -63.5,
+            2.2,
+            -87.0
           ],
           "pos": [
-            -32.0,
-            1.9,
-            -55.0
+            -100.0,
+            0.35,
+            -90.0
           ],
           "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.3,
+      "time_of_day": 0.33,
       "words": []
     },
-    "settings": {
-      "auto_relaunch_secs": null
+    "scoreboard": {
+      "ec2": {
+        "last_capacity_wait_ms": 6000,
+        "last_measured_on": 3,
+        "last_ms": 7000,
+        "last_race": 1,
+        "measured_on_max": 3,
+        "measured_on_min": 3,
+        "median_ms": 7000,
+        "races": 1
+      },
+      "fcvm": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      }
     },
     "tiles": [],
     "viewers": {

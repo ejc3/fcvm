@@ -1,11 +1,19 @@
 //! `apply(state, event) -> state`: the only way the fleet state changes. No clock, no I/O,
-//! no randomness; the time is in the event.
+//! no randomness; the time is in the event (and a claim's token arrives as the intent's
+//! `secret`).
 
-use crate::event::{CameraMove, Event, Intent};
+use crate::director::viewpoints;
+use crate::event::{Event, Intent};
 use crate::protocol::{AgentMsg, HealthReport, SlotReport};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
 use crate::tiling::{bands, Half, Rect};
+use std::collections::BTreeMap;
+
+/// How long a reclaimed host stays in the failure list after it is gone.
+pub const RECLAIMED_KEEP_MS: u64 = 60_000;
+/// Races counted in the scoreboard's medians.
+pub const SCOREBOARD_RACES: usize = 20;
 
 /// Apply one event. The version moves exactly when the state changed; an intent id seen
 /// before changes nothing (its first receipt stays in `state.receipts`).
@@ -30,26 +38,60 @@ pub fn apply(mut state: State, event: &Event) -> State {
     state
 }
 
+/// The key the per-client limits use: the client address, else the viewer id.
+pub fn client_key<'a>(viewer: &'a str, client: Option<&'a str>) -> &'a str {
+    client.unwrap_or(viewer)
+}
+
 /// The checks `apply` would refuse a `word` on before its text check, so the coordinator
 /// spends no text-check call on an intent that is refused anyway. Returns the refusal
 /// reason, or `None` when the intent should go on to the text check.
 pub fn precheck_word(
     state: &State,
-    viewer: &str,
+    client: &str,
     args: &serde_json::Value,
     at: u64,
 ) -> Option<String> {
     match Intent::parse("word", args) {
         Err(reason) => Some(reason),
-        Ok(_) => word_rate(state, viewer, at).err(),
+        Ok(_) => word_rate(state, client, at).err(),
     }
 }
 
-fn word_rate(state: &State, viewer: &str, at: u64) -> Result<(), String> {
-    match state.fleet.last_word_at.get(viewer) {
-        Some(&last) if at < last + state.config.word_interval_ms => Err(format!(
-            "one word per {} s per viewer",
-            state.config.word_interval_ms / 1000
+/// The words in the sky now, which a new word must be checked together with.
+pub fn sky(state: &State) -> Vec<String> {
+    state
+        .fleet
+        .scene
+        .words
+        .iter()
+        .map(|w| w.text.clone())
+        .collect()
+}
+
+fn word_rate(state: &State, client: &str, at: u64) -> Result<(), String> {
+    rate(
+        &state.fleet.last_word_at,
+        client,
+        at,
+        state.config.word_interval_ms,
+        "word",
+    )
+}
+
+/// Refuse when this client's last committed intent of this kind is less than
+/// `interval_ms` old.
+fn rate(
+    last: &BTreeMap<String, u64>,
+    client: &str,
+    at: u64,
+    interval_ms: u64,
+    what: &str,
+) -> Result<(), String> {
+    match last.get(client) {
+        Some(&t) if at < t + interval_ms => Err(format!(
+            "one {what} per {} s per client",
+            interval_ms.div_ceil(1000)
         )),
         _ => Ok(()),
     }
@@ -60,17 +102,26 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
     match event {
         Event::Intent {
             viewer,
+            client,
             id,
             name,
             args,
             check,
+            secret,
             ..
         } => {
             if state.receipts.contains_key(id) {
                 return None;
             }
+            let ctx = Ctx {
+                viewer,
+                client: client_key(viewer, client.as_deref()),
+                id,
+                secret: secret.as_deref(),
+                at,
+            };
             let result = Intent::parse(name, args)
-                .and_then(|intent| intent_effect(state, viewer, id, &intent, check.as_ref(), at));
+                .and_then(|intent| intent_effect(state, &ctx, &intent, check.as_ref()));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
                 Err(reason) => (Outcome::Refused, Some(reason.clone()), reason),
@@ -102,21 +153,28 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 check: check.clone(),
             })
         }
-        Event::ViewerJoined { viewer, .. } => {
-            state.fleet.viewers.insert(viewer.clone());
+        Event::ViewerJoined { viewer, client, .. } => {
+            let key = client_key(viewer, client.as_deref()).to_string();
+            state.fleet.viewers.insert(viewer.clone(), key);
             None
         }
         Event::ViewerLeft { viewer, .. } => {
-            let f = &mut state.fleet;
-            f.viewers.remove(viewer);
-            f.last_word_at.remove(viewer);
-            f.last_light_at.remove(viewer);
-            f.last_relaunch_at.remove(viewer);
-            f.last_relaunch_all_at.remove(viewer);
+            state.fleet.viewers.remove(viewer);
+            // A viewer that leaves gives its GPU back.
+            let mine: Vec<u32> = state
+                .fleet
+                .slots
+                .iter()
+                .filter(|(_, s)| s.claim.as_ref().is_some_and(|c| c.viewer == *viewer))
+                .map(|(n, _)| *n)
+                .collect();
+            for n in mine {
+                release(&mut state.fleet, n, at);
+            }
             None
         }
         Event::Tick { .. } => {
-            auto_relaunch(&mut state.fleet, at);
+            tick(state, at);
             None
         }
         Event::Agent { host, msg, .. } => {
@@ -137,17 +195,26 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         observe_slot(&mut state.fleet, Half::Fcvm, n, Some(host), r, at);
                     }
                 }
-                AgentMsg::Health(h) => health(&mut state.fleet, host, h, at),
-                AgentMsg::Aggregate { frame_url } => {
-                    if let Some(h) = state.fleet.hosts.get_mut(host) {
-                        h.aggregate_url = Some(frame_url.clone());
-                    }
-                }
+                AgentMsg::Health(h) => health(&mut state.fleet, host, h),
                 AgentMsg::Draining { .. } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
                     }
-                    drop_pending_of_host(&mut state.fleet, host, at);
+                    state
+                        .fleet
+                        .reclaimed
+                        .entry(host.clone())
+                        .or_insert((at, None));
+                    drop_from_races(
+                        &mut state.fleet,
+                        |s| s.host.as_deref() == Some(host.as_str()),
+                        at,
+                    );
+                }
+                AgentMsg::Aggregate { frame_url } => {
+                    if let Some(h) = state.fleet.hosts.get_mut(host) {
+                        h.aggregate_url = Some(frame_url.clone());
+                    }
                 }
             }
             None
@@ -156,7 +223,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
-            drop_missing_pending(f, at);
+            f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
+            drop_missing_from_races(f, at);
             None
         }
         Event::Ec2 { report, .. } => {
@@ -165,7 +233,30 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::Degraded {
+            component, reason, ..
+        } => {
+            let f = &mut state.fleet;
+            match reason {
+                Some(r) => {
+                    let since = f.degraded.get(component).map_or(at, |(_, s)| *s);
+                    f.degraded.insert(component.clone(), (r.clone(), since));
+                }
+                None => {
+                    f.degraded.remove(component);
+                }
+            }
+            None
+        }
     }
+}
+
+struct Ctx<'a> {
+    viewer: &'a str,
+    client: &'a str,
+    id: &'a str,
+    secret: Option<&'a str>,
+    at: u64,
 }
 
 fn push_action(f: &mut Fleet, a: Action) {
@@ -177,13 +268,12 @@ fn push_action(f: &mut Fleet, a: Action) {
 
 fn intent_effect(
     state: &mut State,
-    viewer: &str,
-    id: &str,
+    c: &Ctx,
     intent: &Intent,
     check: Option<&TextCheck>,
-    at: u64,
 ) -> Result<String, String> {
-    let by = format!("viewer:{viewer}");
+    let at = c.at;
+    let by = format!("viewer:{}", c.viewer);
     match intent {
         Intent::Relaunch { tile } => {
             let (half, n) = state
@@ -191,7 +281,7 @@ fn intent_effect(
                 .ok_or_else(|| format!("no GPU behind {tile}"))?;
             rate(
                 &state.fleet.last_relaunch_at,
-                viewer,
+                c.client,
                 at,
                 state.config.relaunch_interval_ms,
                 "relaunch",
@@ -205,115 +295,48 @@ fn intent_effect(
             if half == Half::Fcvm && host_draining(&f.hosts, slot) {
                 return Err(format!("{} is on a draining host", slot.id));
             }
+            if slot.claim.is_some() {
+                return Err(format!("{} is a viewer's own GPU right now", slot.id));
+            }
             bump(slot, &by, at);
             let summary = format!("relaunch {}", slot.id);
-            f.last_relaunch_at.insert(viewer.to_string(), at);
+            f.last_relaunch_at.insert(c.client.to_string(), at);
             Ok(summary)
         }
-        Intent::RelaunchAll => {
-            rate(
-                &state.fleet.last_relaunch_all_at,
-                viewer,
-                at,
-                state.config.relaunch_all_interval_ms,
-                "relaunch_all",
-            )?;
-            let f = &mut state.fleet;
-            f.last_relaunch_all_at.insert(viewer.to_string(), at);
-            let mut fcvm_pending = std::collections::BTreeMap::new();
-            let mut ec2_pending = std::collections::BTreeMap::new();
-            let hosts = f.hosts.clone();
-            for slot in f.slots.values_mut() {
-                if host_draining(&hosts, slot) {
-                    continue;
-                }
-                bump(slot, "relaunch_all", at);
-                if slot.position.is_some() {
-                    fcvm_pending.insert(slot.id.clone(), slot.generation);
-                }
+        Intent::RestartNow => {
+            if let Some(until) = state.fleet.cooldown_until.filter(|u| *u > at) {
+                return Err(format!(
+                    "restart is cooling down for another {} s",
+                    (until - at).div_ceil(1000)
+                ));
             }
-            for slot in f.ec2.values_mut() {
-                bump(slot, "relaunch_all", at);
-                if slot.position.is_some() {
-                    ec2_pending.insert(slot.id.clone(), slot.generation);
-                }
-            }
-            let count = fcvm_pending.len() + ec2_pending.len();
-            f.relaunch_all = Some(RelaunchAll {
-                started_at: at,
-                by,
-                fcvm_done_at: None,
-                ec2_done_at: None,
-                fcvm_last: None,
-                ec2_last: None,
-                fcvm_pending,
-                ec2_pending,
-            });
-            Ok(format!("relaunch all ({count} tiles)"))
+            let id = start_race(state, &by, at);
+            Ok(format!("race {id}"))
         }
-        Intent::SetAutoRelaunch { secs } => {
-            let c = &state.config;
-            if let Some(s) = secs {
-                if *s < c.auto_relaunch_min_secs || *s > c.auto_relaunch_max_secs {
-                    return Err(format!(
-                        "auto relaunch must be off or {} to {} s",
-                        c.auto_relaunch_min_secs, c.auto_relaunch_max_secs
-                    ));
-                }
-            }
-            state.fleet.settings.auto_relaunch_secs = *secs;
-            Ok(match secs {
-                Some(s) => format!("auto relaunch every {s} s"),
-                None => "auto relaunch off".into(),
-            })
-        }
-        Intent::Camera(mv) => {
-            let scene = &mut state.fleet.scene;
-            let now = scene.t_at(at);
-            match mv {
-                CameraMove::Keyframes(k) => {
-                    scene.camera = k
-                        .iter()
-                        .map(|k| Keyframe {
-                            intent: Some(id.to_string()),
-                            ..k.clone()
-                        })
-                        .collect();
-                    scene.trim_history(now);
-                    Ok("camera path".into())
-                }
-                CameraMove::Drag {
-                    yaw_deg,
-                    pitch_deg,
-                    dive,
-                } => {
-                    let to = Keyframe {
-                        intent: Some(id.to_string()),
-                        ..drag(&scene.camera_at(now), *yaw_deg, *pitch_deg, *dive)
-                    };
-                    scene.steer(now, to);
-                    Ok("camera".into())
-                }
-            }
-        }
-        Intent::TimeOfDay { v } => {
-            state.fleet.scene.time_of_day = *v;
-            Ok(format!("time of day {v:.3}"))
+        Intent::Nudge { target } => {
+            state.fleet.director.vote(c.client, target, c.id)?;
+            Ok(format!("nudge {target}"))
         }
         Intent::Word { text } => {
-            word_rate(state, viewer, at)?;
+            word_rate(state, c.client, at)?;
             match check {
                 None => return Err("the text check did not run".into()),
-                Some(c) if c.verdict == "error" => {
-                    return Err(format!("the text check failed: {}", c.reason))
+                Some(k) if k.verdict == "error" => {
+                    return Err(format!("the text check failed: {}", k.reason))
                 }
-                Some(c) if !c.allowed() => {
-                    return Err(format!("the text check refused it: {}", c.reason))
+                Some(k) if !k.allowed() => {
+                    return Err(format!("the text check refused it: {}", k.reason))
+                }
+                Some(k) if k.sky != sky(state) => {
+                    return Err(
+                        "the words in the sky changed while this one was checked; send it again"
+                            .into(),
+                    )
                 }
                 Some(_) => {}
             }
             let f = &mut state.fleet;
-            f.last_word_at.insert(viewer.to_string(), at);
+            f.last_word_at.insert(c.client.to_string(), at);
             let t = f.scene.t_at(at);
             f.scene.words.push(Word {
                 text: text.clone(),
@@ -325,45 +348,205 @@ fn intent_effect(
             Ok(format!("word {text:?}"))
         }
         Intent::Light { pos, color } => {
+            let cap = state.config.lights_per_client;
             let f = &mut state.fleet;
-            if let Some(&last) = f.last_light_at.get(viewer) {
-                if at < last + state.config.light_interval_ms {
-                    return Err("too many lights; wait a moment".into());
-                }
+            rate(
+                &f.last_light_at,
+                c.client,
+                at,
+                state.config.light_interval_ms,
+                "light",
+            )?;
+            f.last_light_at.insert(c.client.to_string(), at);
+            // This client's oldest lights make room.
+            while f.light_owners.iter().filter(|o| *o == c.client).count() >= cap.max(1) {
+                let i = f.light_owners.iter().position(|o| o == c.client).unwrap();
+                f.light_owners.remove(i);
+                f.scene.lights.remove(i);
             }
-            f.last_light_at.insert(viewer.to_string(), at);
             let t = f.scene.t_at(at);
             f.scene.lights.push(Light {
                 pos: *pos,
                 color: *color,
                 t,
             });
+            f.light_owners.push(c.client.to_string());
             while f.scene.lights.len() > MAX_LIGHTS {
                 f.scene.lights.remove(0);
+                f.light_owners.remove(0);
             }
             Ok("light".into())
+        }
+        Intent::ClaimGpu => claim(state, c),
+        Intent::ReleaseGpu => {
+            let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
+            release(&mut state.fleet, n, at);
+            Ok("release".into())
+        }
+        Intent::Steer {
+            yaw_deg,
+            pitch_deg,
+            dive,
+        } => {
+            let n = own_claim(&state.fleet, c.viewer)
+                .ok_or("steer needs a GPU of your own (claim_gpu)")?;
+            let now = state.fleet.scene.t_at(at);
+            let claim = state
+                .fleet
+                .slots
+                .get_mut(&n)
+                .unwrap()
+                .claim
+                .as_mut()
+                .unwrap();
+            let mut cam = crate::scene::Scene {
+                epoch_unix_ms: 0,
+                camera: claim.camera.clone(),
+                time_of_day: 0.0,
+                words: vec![],
+                lights: vec![],
+            };
+            let to = Keyframe {
+                intent: Some(c.id.to_string()),
+                ..drag(&cam.camera_at(now), *yaw_deg, *pitch_deg, *dive)
+            };
+            cam.steer(now, to);
+            claim.camera = cam.camera;
+            Ok("steer".into())
         }
     }
 }
 
-/// Refuse when `viewer`'s last committed intent of this kind is less than `interval_ms` old.
-fn rate(
-    last: &std::collections::BTreeMap<String, u64>,
-    viewer: &str,
-    at: u64,
-    interval_ms: u64,
-    what: &str,
-) -> Result<(), String> {
-    match last.get(viewer) {
-        Some(&t) if at < t + interval_ms => Err(format!(
-            "one {what} per {} s per viewer",
-            interval_ms.div_ceil(1000)
-        )),
-        _ => Ok(()),
-    }
+fn own_claim(f: &Fleet, viewer: &str) -> Option<u32> {
+    f.slots
+        .iter()
+        .find(|(_, s)| s.claim.as_ref().is_some_and(|c| c.viewer == viewer))
+        .map(|(n, _)| *n)
 }
 
-fn host_draining(hosts: &std::collections::BTreeMap<String, Host>, slot: &Slot) -> bool {
+fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
+    let at = c.at;
+    let cfg = state.config.clone();
+    let f = &mut state.fleet;
+    let token = c
+        .secret
+        .ok_or("a claim needs a session token from the coordinator")?;
+    if f.slots
+        .values()
+        .any(|s| s.claim.as_ref().is_some_and(|k| k.client == c.client))
+    {
+        return Err("one GPU per client at a time".into());
+    }
+    if let Some(end) = f.last_claim_end.get(c.client) {
+        let free_at = end + cfg.claim_cooldown_secs * 1000;
+        if at < free_at {
+            return Err(format!(
+                "your last GPU was returned {} s ago; claim again in {} s",
+                (at - end) / 1000,
+                (free_at - at).div_ceil(1000)
+            ));
+        }
+    }
+    let hosts = f.hosts.clone();
+    let usable = |s: &Slot| {
+        s.claim.is_none()
+            && s.host
+                .as_ref()
+                .and_then(|h| hosts.get(h))
+                .is_some_and(|h| !h.draining)
+    };
+    // A standby GPU when there is one; otherwise a wall tile is lent. Only a tile that is
+    // running its current generation (not relaunching, not still racing) can be lent; the
+    // last such tile in slot order goes.
+    let standby = f
+        .slots
+        .iter()
+        .find(|(_, s)| s.position.is_none() && usable(s))
+        .map(|(n, _)| *n);
+    let (n, borrowed) = match standby {
+        Some(n) => (n, None),
+        None => {
+            let lent = f
+                .slots
+                .values()
+                .filter(|s| s.claim.as_ref().is_some_and(|k| k.borrowed.is_some()))
+                .count();
+            let cap = cfg.borrow_cap(f.n);
+            if lent >= cap {
+                return Err(format!(
+                    "{lent} of {cap} wall tiles are already lent to visitors; try again when one returns"
+                ));
+            }
+            let racing = |id: &str| {
+                f.races.iter().any(|r| {
+                    r.fcvm.done_at.is_none()
+                        && r.fcvm
+                            .tiles
+                            .get(id)
+                            .is_some_and(|t| t.first_frame_at.is_none())
+                })
+            };
+            let Some((n, k)) = f
+                .slots
+                .iter()
+                .filter(|(_, s)| {
+                    usable(s)
+                        && s.observed.phase == "running"
+                        && s.observed.generation == s.generation
+                        && !racing(&s.id)
+                })
+                .filter_map(|(n, s)| Some((*n, s.position?)))
+                .next_back()
+            else {
+                return Err(
+                    "no wall tile can be lent now: every tile is relaunching or racing".into(),
+                );
+            };
+            (n, Some(format!("fcvm:{}", k + 1)))
+        }
+    };
+    f.claim_count += 1;
+    let session = format!("claim-{}", f.claim_count);
+    let vp = &viewpoints()[f.director.current];
+    let now = f.scene.t_at(at);
+    let start = Keyframe {
+        t: now,
+        pos: vp.pos,
+        look: vp.look,
+        fov_deg: vp.fov_deg,
+        intent: Some(c.id.to_string()),
+    };
+    let slot = f.slots.get_mut(&n).unwrap();
+    bump(slot, &format!("claim:{session}"), at);
+    slot.claim = Some(Claim {
+        session: session.clone(),
+        viewer: c.viewer.to_string(),
+        client: c.client.to_string(),
+        token: token.to_string(),
+        claimed_at: at,
+        expires_at: at + cfg.claim_secs * 1000,
+        generation: slot.generation,
+        first_frame_at: None,
+        camera: vec![start],
+        borrowed,
+    });
+    Ok(format!("{session} on {}", slot.id))
+}
+
+/// End a claim: the slot is relaunched clean, back to standby.
+fn release(f: &mut Fleet, n: u32, at: u64) {
+    let Some(slot) = f.slots.get_mut(&n) else {
+        return;
+    };
+    let Some(claim) = slot.claim.take() else {
+        return;
+    };
+    // The VM restores back into the wall (or to standby), timed like any relaunch.
+    bump(slot, &format!("return:{}", claim.session), at);
+    f.last_claim_end.insert(claim.client, at);
+}
+
+fn host_draining(hosts: &BTreeMap<String, Host>, slot: &Slot) -> bool {
     slot.host
         .as_ref()
         .and_then(|h| hosts.get(h))
@@ -381,28 +564,107 @@ fn bump(slot: &mut Slot, by: &str, at: u64) {
     });
 }
 
-fn auto_relaunch(f: &mut Fleet, at: u64) {
-    let Some(secs) = f.settings.auto_relaunch_secs else {
-        return;
-    };
-    let due = |s: &Slot| {
-        let base = s
-            .last_relaunch
-            .as_ref()
-            .map_or(s.created_at, |r| r.clicked_at.max(s.created_at));
-        at >= base + secs * 1000
-    };
+/// A race: every tile relaunches at once (draining hosts and claimed GPUs excepted), and
+/// every placed tile is timed. Returns the race id.
+fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
+    let cfg = &state.config;
+    let f = &mut state.fleet;
     let hosts = f.hosts.clone();
+    let mut race = Race {
+        id: f.race_count + 1,
+        started_at: at,
+        by: by.to_string(),
+        fcvm: HalfRace::default(),
+        ec2: HalfRace::default(),
+    };
     for slot in f.slots.values_mut() {
-        if !host_draining(&hosts, slot) && due(slot) {
-            bump(slot, "auto", at);
+        if let (Some(c), Some(k)) = (&slot.claim, slot.position) {
+            if c.borrowed.is_some() {
+                race.fcvm.sitting_out.push(format!("fcvm:{}", k + 1));
+            }
+        }
+        if host_draining(&hosts, slot) || slot.claim.is_some() {
+            continue;
+        }
+        bump(slot, by, at);
+        if let Some(k) = slot.position {
+            race.fcvm.tiles.insert(
+                slot.id.clone(),
+                RaceTile {
+                    tile: format!("fcvm:{}", k + 1),
+                    generation: slot.generation,
+                    first_frame_at: None,
+                    phases: BTreeMap::new(),
+                    capacity_wait_ms: 0,
+                },
+            );
         }
     }
     for slot in f.ec2.values_mut() {
-        if due(slot) {
-            bump(slot, "auto", at);
+        bump(slot, by, at);
+        if let Some(k) = slot.position {
+            race.ec2.tiles.insert(
+                slot.id.clone(),
+                RaceTile {
+                    tile: format!("ec2:{}", k + 1),
+                    generation: slot.generation,
+                    first_frame_at: None,
+                    phases: BTreeMap::new(),
+                    capacity_wait_ms: 0,
+                },
+            );
         }
     }
+    f.race_count = race.id;
+    f.races.push_back(race);
+    while f.races.len() > MAX_RACES {
+        f.races.pop_front();
+    }
+    f.cooldown_until = Some(at + cfg.restart_cooldown_secs * 1000);
+    if let Some(s) = cfg.race_interval_secs {
+        f.next_race_at = Some(at + s * 1000);
+    }
+    f.race_count
+}
+
+fn tick(state: &mut State, at: u64) {
+    if state.fleet.next_race_at.is_some_and(|t| at >= t) {
+        start_race(state, "schedule", at);
+    }
+    let f = &mut state.fleet;
+    // The directed camera.
+    let now_t = f.scene.t_at(at);
+    if let Some(tod) = f.director.tick(now_t) {
+        f.scene.time_of_day = tod;
+    }
+    let cam = f.director.camera();
+    if f.scene.camera != cam {
+        f.scene.camera = cam;
+    }
+    // Claims expire.
+    let expired: Vec<u32> = f
+        .slots
+        .iter()
+        .filter(|(_, s)| s.claim.as_ref().is_some_and(|c| at >= c.expires_at))
+        .map(|(n, _)| *n)
+        .collect();
+    for n in expired {
+        release(f, n, at);
+    }
+    // A reclaimed host is listed for a minute after it is gone.
+    let hosts = f.hosts.clone();
+    f.reclaimed.retain(|h, (_, gone)| {
+        hosts.contains_key(h) || gone.is_some_and(|g| at < g + RECLAIMED_KEEP_MS)
+    });
+    // Per-client limits older than any interval are forgotten.
+    let keep = |m: &mut BTreeMap<String, u64>, ms: u64| m.retain(|_, t| at < *t + ms);
+    keep(&mut f.last_word_at, state.config.word_interval_ms);
+    keep(&mut f.last_light_at, state.config.light_interval_ms);
+    keep(&mut f.last_relaunch_at, state.config.relaunch_interval_ms);
+    keep(
+        &mut f.last_claim_end,
+        state.config.claim_cooldown_secs * 1000,
+    );
 }
 
 fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, at: u64) {
@@ -454,7 +716,8 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             aggregate_url: None,
         },
     );
-    drop_missing_pending(f, at);
+    f.reclaimed.remove(host);
+    drop_missing_from_races(f, at);
 }
 
 fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: u64) -> Slot {
@@ -472,6 +735,7 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
             ..Default::default()
         },
         last_relaunch: None,
+        claim: None,
     }
 }
 
@@ -490,6 +754,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     slot.observed.frame_url = r.frame_url.clone();
     slot.observed.timings = r.timings.clone();
     slot.observed.error = r.error.clone();
+    slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
@@ -501,27 +766,59 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
             rl.phases = r.timings.clone();
         }
     }
-    let id = slot.id.clone();
-    if let Some(ra) = f.relaunch_all.as_mut() {
-        let (pending, done, last) = match half {
-            Half::Fcvm => (
-                &mut ra.fcvm_pending,
-                &mut ra.fcvm_done_at,
-                &mut ra.fcvm_last,
-            ),
-            Half::Ec2 => (&mut ra.ec2_pending, &mut ra.ec2_done_at, &mut ra.ec2_last),
-        };
-        if pending.get(&id).is_some_and(|g| r.generation >= *g) {
-            pending.remove(&id);
-            if pending.is_empty() && done.is_none() {
-                *done = Some(at);
-                *last = Some(id);
-            }
+    if let Some(c) = slot.claim.as_mut() {
+        if c.generation == r.generation && c.first_frame_at.is_none() {
+            c.first_frame_at = Some(at);
         }
+    }
+    let id = slot.id.clone();
+    // The running report finishes this tile in every race still waiting for it.
+    for race in f.races.iter_mut() {
+        let h = match half {
+            Half::Fcvm => &mut race.fcvm,
+            Half::Ec2 => &mut race.ec2,
+        };
+        if h.done_at.is_some() {
+            continue;
+        }
+        let Some(t) = h.tiles.get_mut(&id) else {
+            continue;
+        };
+        if t.first_frame_at.is_some() || r.generation < t.generation {
+            continue;
+        }
+        t.first_frame_at = Some(at);
+        t.phases = r.timings.clone();
+        t.capacity_wait_ms = r.timings.get("capacity_wait_ms").copied().unwrap_or(0);
+        finish_half(h, race.started_at, Some(id.clone()), at);
     }
 }
 
-fn health(f: &mut Fleet, host: &str, h: &HealthReport, _at: u64) {
+/// A half is done when every tile still in it has its first frame: its time is the slowest
+/// tile's click to first frame, less that tile's capacity wait.
+fn finish_half(h: &mut HalfRace, started_at: u64, last: Option<String>, at: u64) {
+    if h.done_at.is_some() || h.tiles.is_empty() {
+        return;
+    }
+    if h.tiles.values().any(|t| t.first_frame_at.is_none()) {
+        return;
+    }
+    h.done_at = Some(at);
+    h.last = last;
+    h.time_ms = h
+        .tiles
+        .values()
+        .map(|t| (t.first_frame_at.unwrap() - started_at).saturating_sub(t.capacity_wait_ms))
+        .max();
+    h.capacity_wait_ms = h
+        .tiles
+        .values()
+        .map(|t| t.capacity_wait_ms)
+        .max()
+        .unwrap_or(0);
+}
+
+fn health(f: &mut Fleet, host: &str, h: &HealthReport) {
     let Some(n) = slot_number(&h.id) else { return };
     let Some(slot) = f.slots.get_mut(&n) else {
         return;
@@ -533,41 +830,49 @@ fn health(f: &mut Fleet, host: &str, h: &HealthReport, _at: u64) {
     slot.observed.gpu_stats = Some(h.gpu.clone());
 }
 
-/// A relaunch-all no longer waits for slots that left or whose host drains; if that
-/// empties a half, the half is done now.
-fn drop_pending_of_host(f: &mut Fleet, host: &str, at: u64) {
+/// Races stop waiting for tiles that leave (their host is reclaimed); a half that then has
+/// every remaining tile finished is done now.
+fn drop_from_races(f: &mut Fleet, leaving: impl Fn(&Slot) -> bool, at: u64) {
     let gone: Vec<String> = f
         .slots
         .values()
-        .filter(|s| s.host.as_deref() == Some(host))
+        .filter(|s| leaving(s))
         .map(|s| s.id.clone())
         .collect();
-    if let Some(ra) = f.relaunch_all.as_mut() {
-        let before = ra.fcvm_pending.len();
+    for race in f.races.iter_mut() {
+        if race.fcvm.done_at.is_some() {
+            continue;
+        }
         for id in &gone {
-            ra.fcvm_pending.remove(id);
+            if race
+                .fcvm
+                .tiles
+                .get(id)
+                .is_some_and(|t| t.first_frame_at.is_none())
+            {
+                race.fcvm.tiles.remove(id);
+                race.fcvm.dropped += 1;
+            }
         }
-        if before > 0 && ra.fcvm_pending.is_empty() && ra.fcvm_done_at.is_none() {
-            ra.fcvm_done_at = Some(at);
-        }
+        let last = race.fcvm.last.clone();
+        finish_half(&mut race.fcvm, race.started_at, last, at);
     }
 }
 
-fn drop_missing_pending(f: &mut Fleet, at: u64) {
-    let slots = &f.slots;
-    let ec2 = &f.ec2;
-    if let Some(ra) = f.relaunch_all.as_mut() {
-        let before = ra.fcvm_pending.len();
-        ra.fcvm_pending
-            .retain(|id, _| slot_number(id).is_some_and(|n| slots.contains_key(&n)));
-        if before > 0 && ra.fcvm_pending.is_empty() && ra.fcvm_done_at.is_none() {
-            ra.fcvm_done_at = Some(at);
-        }
-        let before = ra.ec2_pending.len();
-        ra.ec2_pending
-            .retain(|id, _| ec2_number(id).is_some_and(|n| ec2.contains_key(&n)));
-        if before > 0 && ra.ec2_pending.is_empty() && ra.ec2_done_at.is_none() {
-            ra.ec2_done_at = Some(at);
+fn drop_missing_from_races(f: &mut Fleet, at: u64) {
+    let slots: Vec<String> = f.slots.values().map(|s| s.id.clone()).collect();
+    let ec2: Vec<String> = f.ec2.values().map(|s| s.id.clone()).collect();
+    for race in f.races.iter_mut() {
+        for (h, live) in [(&mut race.fcvm, &slots), (&mut race.ec2, &ec2)] {
+            if h.done_at.is_some() {
+                continue;
+            }
+            let before = h.tiles.len();
+            h.tiles
+                .retain(|id, t| live.contains(id) || t.first_frame_at.is_some());
+            h.dropped += before - h.tiles.len();
+            let last = h.last.clone();
+            finish_half(h, race.started_at, last, at);
         }
     }
 }
@@ -575,22 +880,24 @@ fn drop_missing_pending(f: &mut Fleet, at: u64) {
 /// Recompute N, the EC2 tiles wanted and every slot's rectangle. Deterministic in the
 /// state, so it runs after every event.
 ///
-/// - fcvm GPUs: slots whose host is present and not draining, in slot-number order.
+/// - fcvm GPUs: slots whose host is present and not draining, in slot-number order; a
+///   GPU claimed from standby is left out, a borrowed wall tile keeps its place.
 /// - EC2 tiles wanted: `min(ec2_max, max_tiles, fcvm GPUs)`; `ec2-1..ec2-D` exist, higher
 ///   ones are dropped (the driver terminates their instances).
 /// - EC2 instances: EC2 tiles that report an instance.
-/// - N = min(max_tiles, max(fcvm GPUs, EC2 instances)); the first N fcvm slots take
-///   rectangles 1..N of the left half, `ec2-k` takes rectangle k of the right half, and
-///   the rest of each half is dark. fcvm slots beyond N are standby.
+/// - N = min(max_tiles, max(fcvm GPUs, EC2 instances)); the first N fcvm slots are grouped
+///   into one band per host, the EC2 half repeats the layout, and the rest of each half is
+///   dark. fcvm slots beyond N are standby.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
     let active: Vec<u32> = f
         .slots
         .iter()
         .filter(|(_, s)| {
-            s.host
-                .as_ref()
-                .and_then(|h| f.hosts.get(h))
-                .is_some_and(|h| !h.draining)
+            s.claim.as_ref().is_none_or(|c| c.borrowed.is_some())
+                && s.host
+                    .as_ref()
+                    .and_then(|h| f.hosts.get(h))
+                    .is_some_and(|h| !h.draining)
         })
         .map(|(n, _)| *n)
         .collect();
@@ -653,5 +960,5 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         s.position = (k < n).then_some(k);
         s.rect = f.layout.get(k).map(|r| Rect { x: r.x + 0.5, ..*r });
     }
-    drop_missing_pending(f, at);
+    drop_missing_from_races(f, at);
 }

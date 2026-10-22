@@ -1,5 +1,5 @@
 {
-  "description": "Each viewer may commit one relaunch per 2 s and one relaunch_all per 30 s; a refused intent does not count, and other viewers are not limited.",
+  "description": "Relaunch limits are keyed by client address, so two connections from one address share them and a reconnect does not reset them; a refused intent does not count.",
   "events": [
     {
       "at": 1000,
@@ -27,6 +27,7 @@
         "tile": "slot-1"
       },
       "at": 1000,
+      "client": "203.0.113.5",
       "id": "r1",
       "name": "relaunch",
       "type": "intent",
@@ -37,17 +38,8 @@
         "tile": "slot-2"
       },
       "at": 2000,
+      "client": "203.0.113.5",
       "id": "r2",
-      "name": "relaunch",
-      "type": "intent",
-      "viewer": "v1"
-    },
-    {
-      "args": {
-        "tile": "slot-2"
-      },
-      "at": 2000,
-      "id": "r3",
       "name": "relaunch",
       "type": "intent",
       "viewer": "v2"
@@ -56,55 +48,67 @@
       "args": {
         "tile": "slot-2"
       },
-      "at": 3000,
-      "id": "r4",
-      "name": "relaunch",
-      "type": "intent",
-      "viewer": "v1"
-    },
-    {
-      "args": {},
-      "at": 4000,
-      "id": "a1",
-      "name": "relaunch_all",
-      "type": "intent",
-      "viewer": "v1"
-    },
-    {
-      "args": {},
-      "at": 33999,
-      "id": "a2",
-      "name": "relaunch_all",
-      "type": "intent",
-      "viewer": "v1"
-    },
-    {
-      "args": {},
-      "at": 34000,
-      "id": "a3",
-      "name": "relaunch_all",
-      "type": "intent",
-      "viewer": "v1"
-    },
-    {
-      "args": {
-        "tile": "fcvm:9"
-      },
-      "at": 35000,
-      "id": "r5",
+      "at": 2000,
+      "client": "203.0.113.6",
+      "id": "r3",
       "name": "relaunch",
       "type": "intent",
       "viewer": "v3"
+    },
+    {
+      "at": 2100,
+      "type": "viewer_left",
+      "viewer": "v1"
+    },
+    {
+      "at": 2200,
+      "client": "203.0.113.5",
+      "type": "viewer_joined",
+      "viewer": "v4"
     },
     {
       "args": {
         "tile": "slot-1"
       },
-      "at": 35100,
+      "at": 2300,
+      "client": "203.0.113.5",
+      "id": "r4",
+      "name": "relaunch",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {
+        "tile": "slot-1"
+      },
+      "at": 3000,
+      "client": "203.0.113.5",
+      "id": "r5",
+      "name": "relaunch",
+      "type": "intent",
+      "viewer": "v4"
+    },
+    {
+      "args": {
+        "tile": "fcvm:9"
+      },
+      "at": 3100,
+      "client": "203.0.113.7",
       "id": "r6",
       "name": "relaunch",
       "type": "intent",
-      "viewer": "v3"
+      "viewer": "v5"
+    },
+    {
+      "args": {
+        "tile": "slot-1"
+      },
+      "at": 3200,
+      "client": "203.0.113.7",
+      "id": "r7",
+      "name": "relaunch",
+      "type": "intent",
+      "viewer": "v5"
     }
   ],
   "expect": [
@@ -120,7 +124,7 @@
       "checks": {
         "/assign/h1/1/generation": 1,
         "/receipts/r2/outcome": "refused",
-        "/receipts/r2/reason": "one relaunch per 2 s per viewer"
+        "/receipts/r2/reason": "one relaunch per 2 s per client"
       }
     },
     {
@@ -131,45 +135,30 @@
       }
     },
     {
-      "after": 4,
-      "checks": {
-        "/assign/h1/1/generation": 3,
-        "/receipts/r4/outcome": "committed"
-      }
-    },
-    {
-      "after": 5,
-      "checks": {
-        "/assign/h1/0/generation": 3,
-        "/receipts/a1/outcome": "committed"
-      }
-    },
-    {
       "after": 6,
       "checks": {
-        "/assign/h1/0/generation": 3,
-        "/receipts/a2/outcome": "refused",
-        "/receipts/a2/reason": "one relaunch_all per 30 s per viewer"
+        "/receipts/r4/outcome": "refused",
+        "/receipts/r4/reason": "one relaunch per 2 s per client"
       }
     },
     {
       "after": 7,
       "checks": {
-        "/assign/h1/0/generation": 4,
-        "/receipts/a3/outcome": "committed"
+        "/assign/h1/0/generation": 3,
+        "/receipts/r5/outcome": "committed"
       }
     },
     {
       "after": 8,
       "checks": {
-        "/receipts/r5/reason": "no GPU behind fcvm:9"
+        "/receipts/r6/reason": "no GPU behind fcvm:9"
       }
     },
     {
       "after": 9,
       "checks": {
-        "/assign/h1/0/generation": 5,
-        "/receipts/r6/outcome": "committed"
+        "/assign/h1/0/generation": 4,
+        "/receipts/r7/outcome": "committed"
       }
     }
   ],
@@ -194,8 +183,8 @@
         "id": "r2",
         "name": "relaunch",
         "outcome": "refused",
-        "summary": "one relaunch per 2 s per viewer",
-        "viewer": "v1"
+        "summary": "one relaunch per 2 s per client",
+        "viewer": "v2"
       },
       {
         "args": {
@@ -206,67 +195,51 @@
         "name": "relaunch",
         "outcome": "committed",
         "summary": "relaunch slot-2",
-        "viewer": "v2"
-      },
-      {
-        "args": {
-          "tile": "slot-2"
-        },
-        "at": 3000,
-        "id": "r4",
-        "name": "relaunch",
-        "outcome": "committed",
-        "summary": "relaunch slot-2",
-        "viewer": "v1"
-      },
-      {
-        "args": {},
-        "at": 4000,
-        "id": "a1",
-        "name": "relaunch_all",
-        "outcome": "committed",
-        "summary": "relaunch all (2 tiles)",
-        "viewer": "v1"
-      },
-      {
-        "args": {},
-        "at": 33999,
-        "id": "a2",
-        "name": "relaunch_all",
-        "outcome": "refused",
-        "summary": "one relaunch_all per 30 s per viewer",
-        "viewer": "v1"
-      },
-      {
-        "args": {},
-        "at": 34000,
-        "id": "a3",
-        "name": "relaunch_all",
-        "outcome": "committed",
-        "summary": "relaunch all (2 tiles)",
-        "viewer": "v1"
-      },
-      {
-        "args": {
-          "tile": "fcvm:9"
-        },
-        "at": 35000,
-        "id": "r5",
-        "name": "relaunch",
-        "outcome": "refused",
-        "summary": "no GPU behind fcvm:9",
         "viewer": "v3"
       },
       {
         "args": {
           "tile": "slot-1"
         },
-        "at": 35100,
-        "id": "r6",
+        "at": 2300,
+        "id": "r4",
+        "name": "relaunch",
+        "outcome": "refused",
+        "summary": "one relaunch per 2 s per client",
+        "viewer": "v4"
+      },
+      {
+        "args": {
+          "tile": "slot-1"
+        },
+        "at": 3000,
+        "id": "r5",
         "name": "relaunch",
         "outcome": "committed",
         "summary": "relaunch slot-1",
-        "viewer": "v3"
+        "viewer": "v4"
+      },
+      {
+        "args": {
+          "tile": "fcvm:9"
+        },
+        "at": 3100,
+        "id": "r6",
+        "name": "relaunch",
+        "outcome": "refused",
+        "summary": "no GPU behind fcvm:9",
+        "viewer": "v5"
+      },
+      {
+        "args": {
+          "tile": "slot-1"
+        },
+        "at": 3200,
+        "id": "r7",
+        "name": "relaunch",
+        "outcome": "committed",
+        "summary": "relaunch slot-1",
+        "viewer": "v5"
       }
     ],
     "aggregates": [
@@ -287,7 +260,30 @@
         ]
       }
     ],
+    "claims": [],
+    "director": {
+      "arrive_next_t": null,
+      "arrived_t": 0.0,
+      "decide_at_t": 5.0,
+      "hold_until_t": 7.0,
+      "next": null,
+      "offer": [
+        "horizon",
+        "dawn-valley",
+        "peak-seam-low-sun"
+      ],
+      "seed": 1,
+      "viewpoint": "coast",
+      "votes": {
+        "dawn-valley": 0,
+        "horizon": 0,
+        "peak-seam-low-sun": 0
+      }
+    },
+    "failures": [],
     "fleet": {
+      "borrow_cap": 1,
+      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 2,
       "gpus": 2,
@@ -313,47 +309,79 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "relaunch_all": {
-      "by": "viewer:v1",
-      "ec2_done_at": null,
-      "ec2_last": null,
-      "ec2_pending": 0,
-      "fcvm_done_at": null,
-      "fcvm_last": null,
-      "fcvm_pending": 2,
-      "started_at": 34000
+    "race": {
+      "cooldown_secs": 60,
+      "cooldown_until": null,
+      "interval_secs": null,
+      "next_race_at": null,
+      "running": null
     },
+    "races": [],
     "scene": {
       "camera": [
         {
-          "fov_deg": 62.0,
+          "fov_deg": 60.0,
           "look": [
-            -60.0,
-            1.9,
-            -100.0
+            -63.5,
+            2.2,
+            -87.0
           ],
           "pos": [
-            -32.0,
-            1.9,
-            -55.0
+            -100.0,
+            0.35,
+            -90.0
           ],
           "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.3,
+      "time_of_day": 0.33,
       "words": []
     },
-    "settings": {
-      "auto_relaunch_secs": null
+    "scoreboard": {
+      "ec2": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      },
+      "fcvm": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      }
     },
     "tiles": [
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
-        "generation": 5,
+        "generation": 4,
         "gpu": {
           "name": "Tesla T4",
           "sbdf": "0000:01:00.0"
@@ -363,8 +391,8 @@
         "host": "h1",
         "id": "fcvm:1",
         "last_relaunch": {
-          "by": "viewer:v3",
-          "clicked_at": 35100,
+          "by": "viewer:v5",
+          "clicked_at": 3200,
           "first_frame_at": null,
           "phases": {}
         },
@@ -379,10 +407,11 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
-        "generation": 5,
+        "generation": 2,
         "gpu": {
           "name": "Tesla T4",
           "sbdf": "0000:02:00.0"
@@ -392,8 +421,8 @@
         "host": "h1",
         "id": "fcvm:2",
         "last_relaunch": {
-          "by": "relaunch_all",
-          "clicked_at": 34000,
+          "by": "viewer:v3",
+          "clicked_at": 2000,
           "first_frame_at": null,
           "phases": {}
         },
@@ -408,6 +437,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -429,6 +459,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -451,7 +482,7 @@
       }
     ],
     "viewers": {
-      "count": 0
+      "count": 1
     }
   },
   "start_ms": 0

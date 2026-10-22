@@ -1,5 +1,5 @@
 {
-  "description": "relaunch bumps one slot's generation; relaunch_all bumps every slot's and finishes when each reaches its first frame at the new generation.",
+  "description": "relaunch bumps one slot's generation; restart_now races every slot and times each half from the click to the coordinator seeing the last first frame at the new generation.",
   "events": [
     {
       "at": 1000,
@@ -98,7 +98,7 @@
       "args": {},
       "at": 20000,
       "id": "ra",
-      "name": "relaunch_all",
+      "name": "restart_now",
       "type": "intent",
       "viewer": "v2"
     },
@@ -165,7 +165,6 @@
       "checks": {
         "/assign/h1/1/generation": 2,
         "/view/tiles/1/last_relaunch/clicked_at": 10000,
-        "/view/tiles/1/last_relaunch/first_frame_at": null,
         "/view/tiles/1/phase": "relaunching"
       }
     },
@@ -179,8 +178,7 @@
       "after": 5,
       "checks": {
         "/view/tiles/1/last_relaunch/first_frame_at": 14000,
-        "/view/tiles/1/last_relaunch/phases/gpu_ms": 3000,
-        "/view/tiles/1/phase": "running"
+        "/view/tiles/1/last_relaunch/phases/gpu_ms": 3000
       }
     },
     {
@@ -188,34 +186,45 @@
       "checks": {
         "/assign/h1/0/generation": 2,
         "/assign/h1/1/generation": 3,
-        "/view/relaunch_all/by": "viewer:v2",
-        "/view/relaunch_all/fcvm_pending": 2,
-        "/view/relaunch_all/started_at": 20000,
-        "/view/tiles/0/last_relaunch/by": "relaunch_all"
+        "/receipts/ra/outcome": "committed",
+        "/view/race/running": 1,
+        "/view/races/0/by": "viewer:v2",
+        "/view/races/0/fcvm/tiles/slot-1/tile": "fcvm:1",
+        "/view/races/0/fcvm/tiles/slot-2/generation": 3,
+        "/view/races/0/id": 1,
+        "/view/races/0/started_at": 20000,
+        "/view/scoreboard/fcvm/last_ms": null
       }
     },
     {
       "after": 7,
       "checks": {
-        "/view/relaunch_all/fcvm_done_at": null,
-        "/view/relaunch_all/fcvm_pending": 1
+        "/view/races/0/fcvm/done_at": null,
+        "/view/races/0/fcvm/tiles/slot-1/first_frame_at": 23000
       }
     },
     {
       "after": 8,
       "checks": {
-        "/view/relaunch_all/fcvm_pending": 1,
+        "/view/races/0/fcvm/done_at": null,
         "/view/tiles/1/phase": "relaunching"
       },
-      "note": "a report at the old generation does not finish the relaunch"
+      "note": "a report at the old generation does not finish the race"
     },
     {
       "after": 9,
       "checks": {
-        "/view/relaunch_all/ec2_done_at": null,
-        "/view/relaunch_all/fcvm_done_at": 24000,
-        "/view/relaunch_all/fcvm_last": "slot-2",
-        "/view/relaunch_all/fcvm_pending": 0
+        "/view/race/running": null,
+        "/view/races/0/ec2/done_at": null,
+        "/view/races/0/fcvm/done_at": 24000,
+        "/view/races/0/fcvm/last": "slot-2",
+        "/view/races/0/fcvm/tiles/slot-2/phases/gpu_ms": 3000,
+        "/view/races/0/fcvm/time_ms": 4000,
+        "/view/scoreboard/ec2/last_ms": null,
+        "/view/scoreboard/fcvm/last_measured_on": 2,
+        "/view/scoreboard/fcvm/last_ms": 4000,
+        "/view/scoreboard/fcvm/median_ms": 4000,
+        "/view/scoreboard/fcvm/races": 1
       }
     }
   ],
@@ -236,9 +245,9 @@
         "args": {},
         "at": 20000,
         "id": "ra",
-        "name": "relaunch_all",
+        "name": "restart_now",
         "outcome": "committed",
-        "summary": "relaunch all (2 tiles)",
+        "summary": "race 1",
         "viewer": "v2"
       }
     ],
@@ -260,7 +269,30 @@
         ]
       }
     ],
+    "claims": [],
+    "director": {
+      "arrive_next_t": null,
+      "arrived_t": 0.0,
+      "decide_at_t": 5.0,
+      "hold_until_t": 7.0,
+      "next": null,
+      "offer": [
+        "horizon",
+        "dawn-valley",
+        "peak-seam-low-sun"
+      ],
+      "seed": 1,
+      "viewpoint": "coast",
+      "votes": {
+        "dawn-valley": 0,
+        "horizon": 0,
+        "peak-seam-low-sun": 0
+      }
+    },
+    "failures": [],
     "fleet": {
+      "borrow_cap": 1,
+      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 2,
       "gpus": 2,
@@ -286,43 +318,120 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "relaunch_all": {
-      "by": "viewer:v2",
-      "ec2_done_at": null,
-      "ec2_last": null,
-      "ec2_pending": 0,
-      "fcvm_done_at": 24000,
-      "fcvm_last": "slot-2",
-      "fcvm_pending": 0,
-      "started_at": 20000
+    "race": {
+      "cooldown_secs": 60,
+      "cooldown_until": 80000,
+      "interval_secs": null,
+      "next_race_at": null,
+      "running": null
     },
+    "races": [
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": 24000,
+          "dropped": 0,
+          "last": "slot-2",
+          "sitting_out": [],
+          "tiles": {
+            "slot-1": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 23000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:1"
+            },
+            "slot-2": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 24000,
+              "generation": 3,
+              "phases": {
+                "container_ms": 500,
+                "first_frame_ms": 400,
+                "gpu_ms": 3000,
+                "restore_ms": 900,
+                "teardown_ms": 300
+              },
+              "tile": "fcvm:2"
+            }
+          },
+          "time_ms": 4000
+        },
+        "id": 1,
+        "started_at": 20000
+      }
+    ],
     "scene": {
       "camera": [
         {
-          "fov_deg": 62.0,
+          "fov_deg": 60.0,
           "look": [
-            -60.0,
-            1.9,
-            -100.0
+            -63.5,
+            2.2,
+            -87.0
           ],
           "pos": [
-            -32.0,
-            1.9,
-            -55.0
+            -100.0,
+            0.35,
+            -90.0
           ],
           "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.3,
+      "time_of_day": 0.33,
       "words": []
     },
-    "settings": {
-      "auto_relaunch_secs": null
+    "scoreboard": {
+      "ec2": {
+        "last_capacity_wait_ms": null,
+        "last_measured_on": null,
+        "last_ms": null,
+        "last_race": null,
+        "measured_on_max": null,
+        "measured_on_min": null,
+        "median_ms": null,
+        "races": 0
+      },
+      "fcvm": {
+        "last_capacity_wait_ms": 0,
+        "last_measured_on": 2,
+        "last_ms": 4000,
+        "last_race": 1,
+        "measured_on_max": 2,
+        "measured_on_min": 2,
+        "median_ms": 4000,
+        "races": 1
+      }
     },
     "tiles": [
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": "ws://h1:20001/frames",
@@ -336,7 +445,7 @@
         "host": "h1",
         "id": "fcvm:1",
         "last_relaunch": {
-          "by": "relaunch_all",
+          "by": "viewer:v2",
           "clicked_at": 20000,
           "first_frame_at": 23000,
           "phases": {}
@@ -352,6 +461,7 @@
         "vm": "fleet-slot-1"
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": "ws://h1:20002/frames",
@@ -365,7 +475,7 @@
         "host": "h1",
         "id": "fcvm:2",
         "last_relaunch": {
-          "by": "relaunch_all",
+          "by": "viewer:v2",
           "clicked_at": 20000,
           "first_frame_at": 24000,
           "phases": {
@@ -387,6 +497,7 @@
         "vm": "fleet-slot-2"
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,
@@ -408,6 +519,7 @@
         "vm": null
       },
       {
+        "borrowed": null,
         "error": null,
         "fps": null,
         "frame_url": null,

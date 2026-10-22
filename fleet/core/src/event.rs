@@ -1,7 +1,7 @@
 //! Events (the only inputs to [`crate::apply`]) and the intents viewers send.
 
 use crate::protocol::{AgentMsg, SlotReport};
-use crate::scene::{Keyframe, MAX_COORD, MAX_KEYFRAMES, MAX_WORD_CHARS};
+use crate::scene::{MAX_COORD, MAX_WORD_CHARS};
 use crate::state::TextCheck;
 use serde::{Deserialize, Serialize};
 
@@ -10,27 +10,35 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    /// A viewer's intent. `check` is the text check's verdict for a `word`, made before the
-    /// event was submitted; a `word` without one is refused.
+    /// A viewer's intent. `client` is the address the per-client limits are keyed by
+    /// (the viewer id when absent). `check` is the text check's verdict for a `word`, made
+    /// before the event was submitted; a `word` without one is refused. `secret` is a value
+    /// the coordinator draws for an intent that needs one (a claim's session token).
     Intent {
         at: u64,
         viewer: String,
+        #[serde(default)]
+        client: Option<String>,
         id: String,
         name: String,
         #[serde(default)]
         args: serde_json::Value,
         #[serde(default)]
         check: Option<TextCheck>,
+        #[serde(default)]
+        secret: Option<String>,
     },
     ViewerJoined {
         at: u64,
         viewer: String,
+        #[serde(default)]
+        client: Option<String>,
     },
     ViewerLeft {
         at: u64,
         viewer: String,
     },
-    /// Once a second; drives auto-relaunch.
+    /// Once a second; drives the race schedule, the director and claim expiry.
     Tick {
         at: u64,
     },
@@ -50,6 +58,13 @@ pub enum Event {
         at: u64,
         report: SlotReport,
     },
+    /// A coordinator component degraded (`reason`) or recovered (`None`).
+    Degraded {
+        at: u64,
+        component: String,
+        #[serde(default)]
+        reason: Option<String>,
+    },
 }
 
 impl Event {
@@ -61,33 +76,40 @@ impl Event {
             | Event::Tick { at }
             | Event::Agent { at, .. }
             | Event::AgentGone { at, .. }
-            | Event::Ec2 { at, .. } => *at,
+            | Event::Ec2 { at, .. }
+            | Event::Degraded { at, .. } => *at,
         }
     }
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum CameraMove {
-    /// Replace the path.
-    Keyframes(Vec<Keyframe>),
-    /// Turn and move from the current camera.
-    Drag {
-        yaw_deg: f64,
-        pitch_deg: f64,
-        dive: f64,
-    },
 }
 
 /// A parsed intent.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Intent {
-    Relaunch { tile: String },
-    RelaunchAll,
-    SetAutoRelaunch { secs: Option<u64> },
-    Camera(CameraMove),
-    TimeOfDay { v: f64 },
-    Word { text: String },
-    Light { pos: [f64; 3], color: [f64; 3] },
+    Relaunch {
+        tile: String,
+    },
+    /// Start a race now, outside the global cooldown.
+    RestartNow,
+    /// A vote for the next hold of the directed camera.
+    Nudge {
+        target: String,
+    },
+    Word {
+        text: String,
+    },
+    Light {
+        pos: [f64; 3],
+        color: [f64; 3],
+    },
+    /// Take a standby GPU for a private session.
+    ClaimGpu,
+    ReleaseGpu,
+    /// Turn and move the private session's camera.
+    Steer {
+        yaw_deg: f64,
+        pitch_deg: f64,
+        dive: f64,
+    },
 }
 
 fn num(args: &serde_json::Value, key: &str) -> Result<f64, String> {
@@ -101,20 +123,33 @@ fn num(args: &serde_json::Value, key: &str) -> Result<f64, String> {
     Ok(v)
 }
 
-fn vec3(v: &serde_json::Value, what: &str, bound: f64) -> Result<[f64; 3], String> {
+fn vec3(v: &serde_json::Value, what: &str) -> Result<[f64; 3], String> {
     let a = v
         .as_array()
         .filter(|a| a.len() == 3)
         .ok_or_else(|| format!("{what} must be an array of 3 numbers"))?;
     let mut out = [0.0; 3];
     for (o, x) in out.iter_mut().zip(a) {
-        let x = x
+        *o = x
             .as_f64()
-            .filter(|x| x.is_finite() && x.abs() <= bound)
-            .ok_or_else(|| format!("{what} must hold finite numbers within {bound}"))?;
-        *o = x;
+            .filter(|x| x.is_finite())
+            .ok_or_else(|| format!("{what} must hold finite numbers"))?;
     }
     Ok(out)
+}
+
+/// Light colour as given, each component clamped to [0, 1], then scaled down so the three
+/// add up to at most `MAX_LIGHT_SUM`: no light outshines the scene.
+pub const MAX_LIGHT_SUM: f64 = 2.0;
+
+pub fn clamp_color(c: [f64; 3]) -> [f64; 3] {
+    let c = c.map(|v| v.clamp(0.0, 1.0));
+    let sum: f64 = c.iter().sum();
+    if sum > MAX_LIGHT_SUM {
+        c.map(|v| v * MAX_LIGHT_SUM / sum)
+    } else {
+        c
+    }
 }
 
 /// Normalise viewer text: collapse whitespace, trim; refuse control characters, empty text
@@ -148,77 +183,15 @@ impl Intent {
                     tile: tile.to_string(),
                 })
             }
-            "relaunch_all" => Ok(Intent::RelaunchAll),
-            "set_auto_relaunch" => match args.get("secs") {
-                None | Some(serde_json::Value::Null) => Ok(Intent::SetAutoRelaunch { secs: None }),
-                Some(v) => {
-                    let secs = v
-                        .as_u64()
-                        .ok_or("args.secs must be a whole number or null")?;
-                    Ok(Intent::SetAutoRelaunch { secs: Some(secs) })
-                }
-            },
-            "camera" => {
-                if let Some(k) = args.get("keyframes") {
-                    let arr = k.as_array().ok_or("args.keyframes must be an array")?;
-                    if arr.is_empty() || arr.len() > MAX_KEYFRAMES {
-                        return Err(format!(
-                            "args.keyframes must hold 1 to {MAX_KEYFRAMES} keyframes"
-                        ));
-                    }
-                    let mut out = Vec::with_capacity(arr.len());
-                    for k in arr {
-                        let t = num(k, "t")?;
-                        let fov = num(k, "fov_deg")?;
-                        if !(10.0..=120.0).contains(&fov) {
-                            return Err("fov_deg must be within 10 and 120".into());
-                        }
-                        out.push(Keyframe {
-                            t,
-                            pos: vec3(
-                                k.get("pos").unwrap_or(&serde_json::Value::Null),
-                                "pos",
-                                MAX_COORD,
-                            )?,
-                            look: vec3(
-                                k.get("look").unwrap_or(&serde_json::Value::Null),
-                                "look",
-                                MAX_COORD,
-                            )?,
-                            fov_deg: fov,
-                            intent: None,
-                        });
-                    }
-                    if out.windows(2).any(|w| w[1].t < w[0].t) {
-                        return Err("keyframes must be in time order".into());
-                    }
-                    Ok(Intent::Camera(CameraMove::Keyframes(out)))
-                } else if let Some(d) = args.get("drag") {
-                    let yaw_deg = num(d, "yaw_deg")?;
-                    let pitch_deg = num(d, "pitch_deg")?;
-                    let dive = d
-                        .get("dive")
-                        .map(|_| num(d, "dive"))
-                        .transpose()?
-                        .unwrap_or(0.0);
-                    if yaw_deg.abs() > 360.0 || pitch_deg.abs() > 180.0 || dive.abs() > 1000.0 {
-                        return Err("drag is out of range".into());
-                    }
-                    Ok(Intent::Camera(CameraMove::Drag {
-                        yaw_deg,
-                        pitch_deg,
-                        dive,
-                    }))
-                } else {
-                    Err("camera needs args.keyframes or args.drag".into())
-                }
-            }
-            "time_of_day" => {
-                let v = num(args, "v")?;
-                if !(0.0..1.0).contains(&v) {
-                    return Err("args.v must be a fraction of the day in [0, 1)".into());
-                }
-                Ok(Intent::TimeOfDay { v })
+            "restart_now" => Ok(Intent::RestartNow),
+            "nudge" => {
+                let target = args
+                    .get("target")
+                    .and_then(|v| v.as_str())
+                    .ok_or("args.target must be a viewpoint name")?;
+                Ok(Intent::Nudge {
+                    target: target.to_string(),
+                })
             }
             "word" => {
                 let text = args
@@ -230,20 +203,38 @@ impl Intent {
                 })
             }
             "light" => {
-                let pos = vec3(
-                    args.get("pos").unwrap_or(&serde_json::Value::Null),
-                    "pos",
-                    MAX_COORD,
-                )?;
+                let pos = vec3(args.get("pos").unwrap_or(&serde_json::Value::Null), "pos")?;
+                if pos.iter().any(|v| v.abs() > MAX_COORD) {
+                    return Err(format!("pos must be within {MAX_COORD}"));
+                }
                 let color = vec3(
                     args.get("color").unwrap_or(&serde_json::Value::Null),
                     "color",
-                    1.0,
                 )?;
-                if color.iter().any(|c| *c < 0.0) {
-                    return Err("color components must be within 0 and 1".into());
+                Ok(Intent::Light {
+                    pos,
+                    color: clamp_color(color),
+                })
+            }
+            "claim_gpu" => Ok(Intent::ClaimGpu),
+            "release_gpu" => Ok(Intent::ReleaseGpu),
+            "steer" => {
+                let d = args.get("drag").ok_or("steer needs args.drag")?;
+                let yaw_deg = num(d, "yaw_deg")?;
+                let pitch_deg = num(d, "pitch_deg")?;
+                let dive = d
+                    .get("dive")
+                    .map(|_| num(d, "dive"))
+                    .transpose()?
+                    .unwrap_or(0.0);
+                if yaw_deg.abs() > 360.0 || pitch_deg.abs() > 180.0 || dive.abs() > 50.0 {
+                    return Err("drag is out of range".into());
                 }
-                Ok(Intent::Light { pos, color })
+                Ok(Intent::Steer {
+                    yaw_deg,
+                    pitch_deg,
+                    dive,
+                })
             }
             other => Err(format!("unknown intent {other:?}")),
         }

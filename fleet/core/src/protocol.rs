@@ -24,6 +24,10 @@ pub enum ClientMsg {
     Ping {
         client_unix_ms: f64,
     },
+    /// A Cloudflare Turnstile token, before the connection's first intent.
+    Verify {
+        token: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -48,6 +52,23 @@ pub enum ServerMsg {
     },
     /// First message on every connection: this viewer's id, as `actions[].viewer` names it.
     Hello { viewer: String },
+    /// The answer to `verify`.
+    Verified {
+        ok: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
+    /// To the claiming viewer only, once its GPU has drawn its first frame: where to read
+    /// it, the session token, and when it goes back to the pool.
+    Claim {
+        session: String,
+        token: String,
+        slot: String,
+        frame_url: String,
+        expires_at: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        click_to_first_frame_ms: Option<u64>,
+    },
     /// A message the coordinator could not read; nothing was applied.
     Error { reason: String },
 }
@@ -82,6 +103,9 @@ pub struct SlotReport {
     pub timings: BTreeMap<String, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// With `failed`: when the agent tries again.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_in_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -122,6 +146,9 @@ pub struct AssignSlot {
     pub generation: u64,
     /// `None` on standby or while the host drains: keep the VM, post no scene.
     pub rect: Option<Rect>,
+    /// A private session's camera: the renderer draws the whole image with it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub private_camera: Option<Vec<Keyframe>>,
 }
 
 /// The scene shared by every renderer; the agent adds each slot's rect to make the
@@ -214,6 +241,7 @@ mod tests {
                 sbdf: "0000:01:00.0".into(),
                 generation: 1,
                 rect: None,
+                private_camera: None,
             }],
             region: None,
         };
