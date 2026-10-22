@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Measure a running fleet through its coordinator: wait for every fcvm tile, relaunch all
-RUNS times (click to the last tile's first frame, and each slot's phases), relaunch one
+"""Measure a running fleet through its coordinator: wait for every fcvm tile, race RUNS
+times (`restart_now`: click to the last tile's first frame, and each slot's phases; the
+coordinator needs a short --restart-cooldown), relaunch one
 tile three times, then stitch a mosaic from the frame URLs the coordinator publishes.
 Results go to OUT as they are taken (jsonl), so a box that dies keeps what it had.
 
@@ -42,25 +43,27 @@ for t in fcvm_tiles(st):
 v.close()
 
 
-def relaunch_all(run):
+def race(run):
     v = Live()
-    v.until(lambda s: all_running(s), 600)
+    v.until(lambda s: all_running(s) and (s["race"]["cooldown_until"] or 0) < time.time() * 1000, 600)
     time.sleep(20)  # settle: every renderer streaming nothing, GPUs idle
-    r = v.intent("relaunch_all", {})
+    r = v.intent("restart_now", {})
     assert r["outcome"] == "committed", r
     with v.cv:
         while v.snap["version"] < r["version"]:
             v.cv.wait(30)
-        started = v.snap["state"]["relaunch_all"]["started_at"]
-    st = v.until(lambda s: s["relaunch_all"]["started_at"] == started and s["relaunch_all"]["fcvm_done_at"] is not None, 600)
-    ra = st["relaunch_all"]
-    rec = {"run": run, "started_at": ra["started_at"], "fcvm_done_at": ra["fcvm_done_at"],
-           "click_to_last_first_frame_ms": ra["fcvm_done_at"] - ra["started_at"], "last": ra["fcvm_last"],
-           "slots": [{"tile": t["id"], "slot": t["slot"], "gpu": t["gpu"]["sbdf"],
-                      "click_to_first_frame_ms": t["last_relaunch"]["first_frame_at"] - t["last_relaunch"]["clicked_at"],
-                      "phases": t["last_relaunch"]["phases"]} for t in fcvm_tiles(st)]}
-    append("relaunch_all.jsonl", rec)
-    log(f"relaunch_all run {run}: click to last first frame {rec['click_to_last_first_frame_ms']} ms, last {rec['last']}")
+        rid = v.snap["state"]["race"]["running"]
+    st = v.until(lambda s: any(x["id"] == rid and x["fcvm"]["done_at"] for x in s["races"]), 600)
+    ra = [x for x in st["races"] if x["id"] == rid][0]
+    h = ra["fcvm"]
+    rec = {"run": run, "race": rid, "started_at": ra["started_at"], "fcvm_done_at": h["done_at"],
+           "click_to_last_first_frame_ms": h["time_ms"], "last": h["last"], "measured_on": len(h["tiles"]),
+           "dropped": h["dropped"], "sitting_out": h["sitting_out"], "scoreboard": st["scoreboard"]["fcvm"],
+           "slots": [{"tile": t["tile"], "slot": sid, "click_to_first_frame_ms": t["first_frame_at"] - ra["started_at"],
+                      "phases": t["phases"]} for sid, t in sorted(h["tiles"].items())]}
+    append("races.jsonl", rec)
+    log(f"race {rid}: click to last first frame {rec['click_to_last_first_frame_ms']} ms on {rec['measured_on']} tiles, "
+        f"last {rec['last']}; median so far {st['scoreboard']['fcvm']['median_ms']} ms")
     v.close()
     return rec
 
@@ -68,10 +71,10 @@ def relaunch_all(run):
 recs = []
 for run in range(1, RUNS + 1):
     try:
-        recs.append(relaunch_all(run))
+        recs.append(race(run))
     except Exception as e:  # keep going; the record says what failed
-        log(f"relaunch_all run {run} failed: {e!r}")
-        append("relaunch_all.jsonl", {"run": run, "error": repr(e)})
+        log(f"race run {run} failed: {e!r}")
+        append("races.jsonl", {"run": run, "error": repr(e)})
 
 singles = []
 for run in range(1, 4):
@@ -95,12 +98,14 @@ for run in range(1, 4):
     except Exception as e:
         log(f"relaunch one run {run} failed: {e!r}")
 
-# A light and an evening sun for the picture, then let the hold converge.
+# A light for the picture, then a frame late in one of the director's holds.
 v = Live()
 v.until(lambda s: all_running(s), 600)
 log("light", v.intent("light", {"pos": [-36.0, 1.75, -61.0], "color": [1.0, 0.45, 0.15]})["outcome"])
-log("time_of_day", v.intent("time_of_day", {"v": 0.32})["outcome"])
-time.sleep(25)
+def late_in_hold(s):
+    d, now_t = s["director"], (time.time() * 1000 - s["scene"]["epoch_unix_ms"]) / 1000
+    return d["arrived_t"] + 5.0 <= now_t < d["hold_until_t"] - 1.0
+v.until(late_in_hold, 120)
 st = v.snap["state"]
 json.dump(st, open(os.path.join(OUT, "snapshot-at-mosaic.json"), "w"), indent=1)
 v.close()
@@ -167,5 +172,5 @@ log(f"mosaic of {len(tiles)} tiles at t={t_pick} ({canvas.size[0]}x{canvas.size[
 ok = [r for r in recs if "click_to_last_first_frame_ms" in r]
 if ok:
     xs = [r["click_to_last_first_frame_ms"] for r in ok]
-    log("relaunch_all click to last first frame ms:", xs, "median", statistics.median(xs))
+    log("race click to last first frame ms:", xs, "median", statistics.median(xs))
 log("FLEETRUN_DONE")

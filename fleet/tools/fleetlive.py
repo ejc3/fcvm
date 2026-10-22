@@ -15,16 +15,18 @@ def connect_to(url):
 class Live:
     """One viewer: a /live socket, the latest snapshot and the receipts."""
 
-    def __init__(self):
+    def __init__(self, client_ip=None):
         self.s = socket.create_connection((host, int(port)), timeout=600)
         key = base64.b64encode(os.urandom(16)).decode()
+        extra = f"CF-Connecting-IP: {client_ip}\r\n" if client_ip else ""
         self.s.sendall((f"GET /live HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
-                        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n").encode())
+                        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n{extra}\r\n").encode())
         head = b""
         while b"\r\n\r\n" not in head:
             head += self.s.recv(1)
         assert b" 101 " in head.split(b"\r\n")[0], head
         self.snap, self.receipts, self.cv, self.closed = None, {}, threading.Condition(), False
+        self.others = []  # hello, claim, verified, clock, error
         threading.Thread(target=self._read, daemon=True).start()
 
     def _read(self):
@@ -53,6 +55,8 @@ class Live:
                                 self.snap = m
                         elif m["type"] == "receipt":
                             self.receipts.setdefault(m["id"], m)
+                        else:
+                            self.others.append(m)
                         self.cv.notify_all()
         except (OSError, ConnectionError):
             pass  # closed by close() or by the coordinator
@@ -80,6 +84,19 @@ class Live:
                 left = end - time.time()
                 if left <= 0 or self.closed:
                     raise TimeoutError("condition not met")
+                self.cv.wait(left)
+
+    def message(self, kind, timeout):
+        """The first message of `kind` (not a snapshot or receipt)."""
+        end = time.time() + timeout
+        with self.cv:
+            while True:
+                for m in self.others:
+                    if m["type"] == kind:
+                        return m
+                left = end - time.time()
+                if left <= 0 or self.closed:
+                    raise TimeoutError(f"no {kind} message")
                 self.cv.wait(left)
 
     def intent(self, name, args):

@@ -25,7 +25,7 @@ log "warm-up ok=$ok after $(( ($(date +%s%N) - t0) / 1000000 )) ms"
 kill -TERM $WP; wait $WP
 [ $ok = 1 ] || { log "RUN_FAILED warm-up"; exit 1; }
 log "coordinator start"
-setsid $F fleet coord --listen 127.0.0.1:20000 --state-file $R/state.json --ec2 fake \
+setsid $F fleet coord --listen 127.0.0.1:20000 --state-file $R/state.json --ec2 fake --restart-cooldown 1 \
   --agent-cmd "$F fleet agent --stdio --host gpu-box --image $IMG --base-port 20100 --publish-ip 127.0.0.1" \
   > $R/coord.log 2>&1 < /dev/null &
 CP=$!

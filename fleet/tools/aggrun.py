@@ -17,9 +17,8 @@ from PIL import Image  # noqa: E402
 
 URL, OUT = sys.argv[1], sys.argv[2]
 SECS = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
-# hold: the camera holds still (the image converges, little changes); move: the camera
-# flies a loop for the whole measurement.
-MODE = os.environ.get("MODE", "hold")
+# The camera is the coordinator's director: 7 s holds joined by flights, so a measurement
+# of SECONDS covers both; the director's viewpoints during it are recorded.
 os.makedirs(OUT, exist_ok=True)
 fleetlive.connect_to(URL)
 
@@ -98,17 +97,6 @@ log("aggregate", agg["id"], "rect", agg["rect"], "tiles", agg["tiles"])
 agg_pid = pid_listening(ap)
 image_aspect = st["image_aspect"]
 layout = json.loads(urllib.request.urlopen(f"http://{ah}:{ap}/layout", timeout=5).read())
-if MODE == "move":
-    import math as _m
-    now_t = (time.time() * 1000 - st["scene"]["epoch_unix_ms"]) / 1000
-    keys = []
-    for i in range(40):
-        a = i * 0.25
-        pos = [-32 + 8 * _m.sin(a), 1.9 + 0.4 * _m.sin(a * 0.7), -55 + 8 * _m.cos(a)]
-        look = [pos[0] - 30 * _m.sin(a + 0.6), 1.2, pos[2] - 30 * _m.cos(a + 0.6)]
-        keys.append({"t": now_t + 1 + i * 5.0, "pos": pos, "look": look, "fov_deg": 62})
-    log("camera path", v.intent("camera", {"keyframes": keys})["outcome"])
-    time.sleep(2)
 
 # --- latency, bitrate, CPU over SECS ---------------------------------------------------
 first = tiles[agg["tiles"][0]]
@@ -141,7 +129,7 @@ added = sorted((a.recv[t] - d.recv[t]) * 1000 for t in common)
 pct = lambda xs, q: xs[min(len(xs) - 1, round((len(xs) - 1) * q))] if xs else None
 res = {
     "region": agg["rect"], "tiles": len(agg["tiles"]), "header": a.header, "seconds": round(span, 1),
-    "mode": MODE,
+    "director": v.snap["state"]["director"],
     "aggregate_kbps": round(a.bytes * 8 / span / 1000), "tile_kbps": round(d.bytes * 8 / span / 1000),
     "direct_total_kbps": round(sum(r_.bytes for r_ in directs) * 8 / span / 1000),
     "aggregate_frames": len(a.recv), "tile_frames": len(d.recv),
