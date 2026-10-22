@@ -27,6 +27,8 @@ pub struct FirecrackerBackend {
     vm: VmManager,
     /// Host-side vsock Unix socket path, recorded when [`Hypervisor::set_vsock`] runs.
     vsock_path: Option<PathBuf>,
+    /// Firecracker was spawned with its PCI transport on (`--enable-pci`).
+    pci_transport: bool,
 }
 
 impl FirecrackerBackend {
@@ -35,6 +37,7 @@ impl FirecrackerBackend {
         Self {
             vm: VmManager::new(vm_id, socket_path, log_path),
             vsock_path: None,
+            pci_transport: false,
         }
     }
 
@@ -45,6 +48,7 @@ impl FirecrackerBackend {
         Self {
             vm,
             vsock_path: None,
+            pci_transport: false,
         }
     }
 
@@ -93,6 +97,7 @@ impl Hypervisor for FirecrackerBackend {
         if let Some(redirects) = &spec.mount_redirects {
             self.vm.set_mount_redirects(redirects.clone());
         }
+        self.pci_transport = crate::gpu::pci_transport_enabled(spec.extra_args.as_deref());
         self.vm
             .start(&spec.binary, None, spec.extra_args.as_deref())
             .await
@@ -133,7 +138,9 @@ impl Hypervisor for FirecrackerBackend {
         track_dirty: bool,
     ) -> Result<()> {
         let client = self.vm.client()?;
-        config.apply(client, runtime_boot_args, track_dirty).await
+        config
+            .apply(client, runtime_boot_args, track_dirty, self.pci_transport)
+            .await
     }
 
     async fn add_drive(&mut self, drive: &DriveSpec) -> Result<()> {

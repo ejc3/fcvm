@@ -557,6 +557,48 @@ pub(super) async fn attach_extra_disks(
     Ok((extra_disks, image_device))
 }
 
+/// The driver image's drive comes after the --disk drives, the --disk-dir drives and
+/// the image disk, in that order (`attach_extra_disks`), so none of them moves.
+fn gpu_driver_drive_index(disks: usize, disk_dirs: usize, has_image_disk: bool) -> usize {
+    disks + disk_dirs + usize::from(has_image_disk)
+}
+
+/// Firecracker drive id of the NVIDIA driver image. Firecracker refuses an id with
+/// anything but ASCII letters, digits and underscores (400 "API Resource IDs can only
+/// contain alphanumeric characters and underscores").
+const GPU_DRIVER_DRIVE_ID: &str = "gpu_driver";
+
+/// Attach the NVIDIA driver image read-only as virtio-blk drive `index` (after the
+/// extra disks and the image disk, so their device names do not move) and return
+/// its guest device. fc-agent mounts it at boot (`Plan.gpu_driver`).
+async fn attach_gpu_driver_image(
+    hv: &mut dyn crate::hypervisor::Hypervisor,
+    image: &std::path::Path,
+    index: usize,
+) -> Result<String> {
+    let device = virtio_blk_device(index)?;
+    info!(image = %image.display(), %device, "attaching the NVIDIA driver image read-only");
+    hv.add_drive(&crate::hypervisor::DriveSpec {
+        drive_id: GPU_DRIVER_DRIVE_ID.to_string(),
+        path_on_host: image.to_path_buf(),
+        is_root_device: false,
+        is_read_only: true,
+    })
+    .await?;
+    Ok(device)
+}
+
+/// The guest name of the `index`th extra virtio-blk drive: the root drive is
+/// /dev/vda, so drive 0 is /dev/vdb.
+fn virtio_blk_device(index: usize) -> Result<String> {
+    let letter = u8::try_from(index)
+        .ok()
+        .and_then(|i| b'b'.checked_add(i))
+        .filter(|l| *l <= b'z')
+        .with_context(|| format!("extra drive {index} has no /dev/vdX name"))?;
+    Ok(format!("/dev/vd{}", letter as char))
+}
+
 /// Candidate paths for the host's chrony configuration, most specific first.
 const HOST_CHRONY_CONFS: &[&str] = &["/etc/chrony/chrony.conf", "/etc/chrony.conf"];
 
@@ -675,6 +717,8 @@ pub(super) fn build_boot_plan_json(
     vm_state: &VmState,
     volume_mappings: &[VolumeMapping],
     image_device: Option<String>,
+    gpu_driver_device: Option<String>,
+    await_gpu_restore: bool,
 ) -> serde_json::Value {
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
@@ -771,6 +815,8 @@ pub(super) fn build_boot_plan_json(
         nfs_mounts,
         pmem_mounts,
         image_device,
+        gpu_driver_device,
+        await_gpu_restore,
         http_proxy,
         https_proxy,
         no_proxy,
@@ -1281,6 +1327,12 @@ pub(crate) fn build_launch_config(
         data_dir: crate::paths::data_dir(),
         extra_disks,
         pmem: args.pmem.clone(),
+        gpu_driver_image: runtime_config
+            .gpu_driver_image
+            .as_ref()
+            .map(|driver| driver.path.clone()),
+        // Launch-only config: never hashed into a snapshot key, nothing to verify.
+        gpu_driver_identity: None,
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
@@ -1375,6 +1427,23 @@ pub(crate) async fn configure_and_boot_vm(
     .await?;
     vm_state.config.extra_disks = extra_disks;
     vm_state.config.pmem_devices = attach_pmem_devices(args, hv).await?;
+    let gpu_driver_device = match plan.launch_config.gpu_driver_image.as_deref() {
+        Some(image) => {
+            let index = gpu_driver_drive_index(
+                args.disk.len(),
+                args.disk_dir.len(),
+                image_device.is_some(),
+            );
+            let device = attach_gpu_driver_image(hv, image, index).await?;
+            // The key named one build of the image and the VMM opened it by path: a
+            // rebuild in between would pair this run's snapshot with another filesystem.
+            if let Some(expected) = plan.launch_config.gpu_driver_identity.as_deref() {
+                crate::utils::verify_image_disk_identity(image, expected)?;
+            }
+            Some(device)
+        }
+        None => None,
+    };
 
     // Host-once-only steps — skipped on an in-place reboot relaunch (network=None).
     if let Some(network) = network {
@@ -1477,6 +1546,8 @@ pub(crate) async fn configure_and_boot_vm(
         vm_state,
         volume_mappings,
         image_device,
+        gpu_driver_device,
+        !args.gpu.is_empty(),
     );
     // Wrapped in an abort-on-drop guard: if a later boot-config step (entropy/balloon/
     // boot) returns Err, the guard drops and aborts the listener task instead of leaking
@@ -1779,6 +1850,36 @@ async fn run_vm_setup_inner(
 
 #[cfg(test)]
 mod tests {
+    /// The driver image is the last drive: after two --disk drives, one --disk-dir and
+    /// the image disk it is drive 4, /dev/vdf, and no earlier drive changes name.
+    #[test]
+    fn the_driver_image_drive_id_is_one_firecracker_accepts() {
+        let id = super::GPU_DRIVER_DRIVE_ID;
+        assert!(
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "Firecracker refuses drive id {id:?}: only letters, digits and underscores"
+        );
+    }
+
+    #[test]
+    fn the_driver_image_is_the_last_drive() {
+        use super::{gpu_driver_drive_index, virtio_blk_device};
+        assert_eq!(
+            virtio_blk_device(gpu_driver_drive_index(0, 0, false)).unwrap(),
+            "/dev/vdb"
+        );
+        assert_eq!(
+            virtio_blk_device(gpu_driver_drive_index(0, 0, true)).unwrap(),
+            "/dev/vdc"
+        );
+        assert_eq!(
+            virtio_blk_device(gpu_driver_drive_index(2, 1, true)).unwrap(),
+            "/dev/vdf"
+        );
+        assert_eq!(virtio_blk_device(24).unwrap(), "/dev/vdz");
+        assert!(virtio_blk_device(25).is_err());
+    }
+
     /// chrony.conf directives are case-insensitive and whitespace-separated, and the
     /// consequence of missing one is not a parse error — it is a guest with ZERO time
     /// sources and no complaint anywhere. Cases taken from the review finding.
@@ -1995,6 +2096,7 @@ mod tests {
             firecracker_args: None,
             boot_args: None,
             fuse_readers: Some(8),
+            gpu_driver_image: None,
         };
         let inputs = GuestBootInputs::resolve(Some("10.0.2.2"), &runtime_config);
         assert_eq!(inputs.fuse_readers.as_deref(), Some("8"));
@@ -2017,6 +2119,7 @@ mod tests {
             firecracker_args: None,
             boot_args: None,
             fuse_readers: None,
+            gpu_driver_image: None,
         }
     }
 

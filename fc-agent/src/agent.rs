@@ -217,12 +217,20 @@ pub async fn run() -> Result<()> {
     // boot to read. Awaited (bounded) at shutdown below.
     let chronyd_task = tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
 
-    let mounted_disk_paths = if !plan.extra_disks.is_empty() {
-        eprintln!(
-            "[fc-agent] mounting {} extra disk(s)",
-            plan.extra_disks.len()
-        );
-        let paths = mounts::mount_extra_disks(&plan.extra_disks, &mut mount_record)
+    // The NVIDIA driver image mounts with the extra disks, read-only, at a
+    // path of its own. It is not in plan.extra_disks, so the container does
+    // not get it as a volume; CDI gives the container the files it needs.
+    let mut boot_disks = plan.extra_disks.clone();
+    if let Some(driver) = &plan.gpu_driver {
+        boot_disks.push(crate::types::ExtraDiskMount {
+            device: driver.device.clone(),
+            mount_path: crate::gpu::DRIVER_ROOT.to_string(),
+            read_only: true,
+        });
+    }
+    let mounted_disk_paths = if !boot_disks.is_empty() {
+        eprintln!("[fc-agent] mounting {} extra disk(s)", boot_disks.len());
+        let paths = mounts::mount_extra_disks(&boot_disks, &mut mount_record)
             .context("mounting extra disks")?;
         eprintln!("[fc-agent] extra disks mounted successfully");
         paths
@@ -426,6 +434,7 @@ pub async fn run() -> Result<()> {
     // host's pre-start snapshot pause can never capture the UART mid-transmit.
     // If the console cannot be proven quiet it returns Failed WITHOUT sending
     // cache-ready — the host never pauses us and the VM continues cold.
+    let mut restored = false;
     match container::get_image_digest(&image_ref, &cmd_prefix).await {
         Ok(digest) => {
             let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
@@ -445,6 +454,7 @@ pub async fn run() -> Result<()> {
                 }
                 container::CacheResult::WarmStart => {
                     eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
+                    restored = true;
                     // The watcher publishes Succeeded only after exec and egress are
                     // ready, and requests output reconnect before waking this wait.
                     // Failed is terminal and propagates to main(), which shuts the clone
@@ -492,6 +502,7 @@ pub async fn run() -> Result<()> {
             eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
         }
     }
+    crate::gpu::check_gpu_restore(plan.await_gpu_restore, restored)?;
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.
@@ -576,11 +587,14 @@ pub async fn run() -> Result<()> {
     let user_ref = user_info
         .as_ref()
         .map(|(username, runtime_dir)| (username.as_str(), runtime_dir.as_str()));
+    // Taken before the args: an attach still loading the driver finishes first, and
+    // from here a GPU attached by a later restore cannot reach this container.
+    let gpu_devices = crate::gpu::launch_devices().await;
     let podman_args = if provisioned && container::container_exists(&cmd_prefix) {
         eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
         container::build_start_args(&plan, user_ref)
     } else {
-        container::build_podman_args(&plan, &image_ref, user_ref)
+        container::build_podman_args(&plan, &image_ref, user_ref, &gpu_devices)
     };
 
     // TTY mode: never returns

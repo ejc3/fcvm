@@ -188,6 +188,11 @@ pub struct RestorePhases {
     /// How long the host took to answer the connection the ACK is sent on (#1080). Set by
     /// `vsock::notify_restore_complete` once the connection is answered.
     pub ack_connect_ms: f64,
+    /// GPU attach (rescan, driver load, CDI spec), from the start of the
+    /// restore sequence; it overlaps the network phases. Zero without GPUs.
+    pub gpu_ms: f64,
+    /// GPUs the driver initialised.
+    pub gpus: usize,
 }
 
 impl RestorePhases {
@@ -254,10 +259,25 @@ pub async fn handle_clone_restore(
     restore_epoch: &str,
     host_time: &str,
     restore_hook: Option<&str>,
+    gpus: &[String],
 ) -> anyhow::Result<RestorePhases> {
     let restore_started = std::time::Instant::now();
     let mut phases = RestorePhases::default();
     eprintln!("[fc-agent] handling restore (epoch={})", restore_epoch);
+
+    // GPUs the host attached before resuming: rescan, load the driver and
+    // write the CDI spec. Started first and awaited before publication, so it
+    // overlaps the network phases (it touches no network state) and a failure
+    // keeps the clone unpublished and unacknowledged. The container starts
+    // only after the acknowledgement, so it always sees the GPUs.
+    let gpu_attach = (!gpus.is_empty()).then(|| {
+        let gpus = gpus.to_vec();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let ready = crate::gpu::attach(&gpus).await?;
+            Ok::<_, anyhow::Error>((elapsed_ms(started), ready))
+        })
+    });
 
     // Request the exec re-register immediately (AsyncFd epoll is stale after the
     // transport reset). Reset confirmation flag, then signal. Set flag BEFORE
@@ -433,6 +453,16 @@ pub async fn handle_clone_restore(
     phases.exec_wait_ms = exec_wait_ms;
     phases.egress_wait_ms = egress_wait_ms;
     eprintln!("[fc-agent] exec re-registered after restore");
+
+    if let Some(job) = gpu_attach {
+        let (gpu_ms, ready) = job
+            .await
+            .context("joining the GPU attach")?
+            .context("restore phase gpu-attach")?;
+        phases.gpu_ms = gpu_ms;
+        phases.gpus = ready;
+        eprintln!("[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={ready} elapsed_ms={gpu_ms:.3}");
+    }
 
     // Publication, last: the plan's restore hook runs now, with egress open,
     // the NFS shares remounted and the egress proxy reconnected, so whatever
@@ -772,6 +802,32 @@ mod tests {
     /// The chaos fuzz found that, but only by landing inside the window. This
     /// pins the ordering that makes the window impossible, so a regression
     /// fails here every time rather than one run in N.
+    /// The container starts when the restore is acknowledged, and the host
+    /// publishes the clone then, so the GPU must be usable before either. The
+    /// attach is joined, with its error propagated, before the boundary
+    /// publishes and therefore before `apply_restore_epoch` sends the ACK.
+    #[test]
+    fn gpu_attach_completes_before_the_clone_is_published() {
+        let source = include_str!("restore.rs");
+        let body = &source[source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is gone")..];
+        let start = body
+            .find("crate::gpu::attach(&gpus)")
+            .expect("the restore path no longer attaches GPUs");
+        let join = body
+            .find(".context(\"restore phase gpu-attach\")?")
+            .expect("the restore path no longer fails closed on a GPU attach error");
+        let publish = body
+            .find(".publish(restore_hook)")
+            .expect("the restore path no longer publishes");
+        assert!(
+            start < join && join < publish,
+            "the GPU attach must start, then be joined with its error propagated, before \
+             the clone publishes: start={start} join={join} publish={publish}"
+        );
+    }
+
     #[test]
     fn the_clone_announces_itself_before_the_boundary_publishes() {
         let source = include_str!("restore.rs");
