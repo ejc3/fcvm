@@ -310,6 +310,33 @@ class MemoryRenderOperation(unittest.TestCase):
         self.assertIn('--op "$MEM_OP"', extra)
 
 
+class MemoryContainerRemoval(unittest.TestCase):
+    """A pool container is removed without podman's SIGTERM grace.
+
+    Chromium in the pool container does not exit on SIGTERM, so `podman rm -f`
+    waited its default 10 s stop timeout for every container, one after another
+    (480 s to clear a 48-container cell), and on 2026-10-22 one removal on a
+    loaded host took 72 s from the rm to the remove event, past the 30 s bound,
+    which failed the memory phase after 110 of its 140 cells. The container's
+    state is never read after it is sampled, so it is killed at once."""
+
+    def test_rm_does_not_wait_for_sigterm(self):
+        import corpus_mem
+        calls = []
+
+        def bounded(cmd, timeout):
+            calls.append((cmd, timeout))
+            rc = 1 if cmd[:3] == ["podman", "container", "exists"] else 0
+            return types.SimpleNamespace(returncode=rc, stdout="", stderr="")
+
+        with mock.patch.object(corpus_mem, "inspected_container_identity", lambda name: ("a" * 64, "tok")), \
+                mock.patch.object(corpus_mem, "sh_bounded", bounded):
+            corpus_mem.remove_owned_container("c", "tok")
+        rm = [cmd for cmd, _t in calls if cmd[:2] == ["podman", "rm"]]
+        self.assertEqual(len(rm), 1)
+        self.assertIn("--time=0", rm[0])
+
+
 class RestoreMarkSourcePin(unittest.TestCase):
     """Every marker is an info! line fcvm writes on the restore path."""
 

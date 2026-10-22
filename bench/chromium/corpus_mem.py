@@ -1175,7 +1175,10 @@ def remove_owned_container(name, owner_token, expected_id=None):
     if expected_id is not None and container_id != exact_container_id(expected_id):
         raise RuntimeError(
             f"owned container {name} changed identity from {expected_id} to {container_id}")
-    removed = sh_bounded(["podman", "rm", "-f", "--", container_id], 30)
+    # --time=0: Chromium in the pool container ignores SIGTERM, so the default
+    # stop timeout spent 10 s per container, serially, before the SIGKILL that
+    # ends it anyway; nothing reads the container after it is sampled.
+    removed = sh_bounded(["podman", "rm", "-f", "--time=0", "--", container_id], 30)
     if removed.returncode != 0:
         raise RuntimeError(
             f"cannot remove owned container {name} ({container_id}): "
