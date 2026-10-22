@@ -38,6 +38,10 @@ pub struct RuntimeConfig {
     pub boot_args: Option<String>,
     /// FUSE reader thread count override
     pub fuse_readers: Option<u32>,
+    /// The profile's NVIDIA driver image (src/setup/nvidia.rs), attached read-only to
+    /// every cold boot on the profile so its snapshots carry the mounted driver and a
+    /// restore can attach a GPU. None for a profile without one.
+    pub gpu_driver_image: Option<PathBuf>,
 }
 
 impl RuntimeConfig {

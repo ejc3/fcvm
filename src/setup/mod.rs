@@ -207,7 +207,9 @@ pub use kernel::{
     get_kernel_url_hash, get_profile_firecracker_path, install_host_kernel,
     newest_cached_cloud_hypervisor, rebuild_kernel_from_source,
 };
-pub use nvidia::{ensure_nvidia_driver_image, get_nvidia_driver_image_path};
+pub use nvidia::{
+    ensure_nvidia_driver_image, get_nvidia_driver_image_path, profile_nvidia_driver_image,
+};
 pub use pasta::{ensure_pasta, get_pasta_for_config};
 pub use rootfs::{
     ensure_fc_agent_initrd, ensure_rootfs, firecracker_args_enable_nv2, get_kernel_profile,

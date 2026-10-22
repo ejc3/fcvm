@@ -382,6 +382,7 @@ pub(super) fn build_firecracker_config(
     cmd_args: Option<Vec<String>>,
     image_mode: crate::firecracker::ImageMode,
     firecracker_bin: Option<&Path>,
+    gpu_driver_image: Option<&Path>,
     image_disk_identity: Option<String>,
     extra_boot_args: Option<String>,
     boot_inputs: super::vm_config::GuestBootInputs,
@@ -433,6 +434,7 @@ pub(super) fn build_firecracker_config(
         data_dir: crate::paths::data_dir(),
         extra_disks,
         pmem: args.pmem.clone(),
+        gpu_driver_image: gpu_driver_image.map(Path::to_path_buf),
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
@@ -563,6 +565,7 @@ mod tests {
             firecracker_args: Some("--enable-nv2".to_string()),
             boot_args: None,
             fuse_readers: None,
+            gpu_driver_image: None,
         };
 
         let (bin, args) = snapshot_run_firecracker_overrides(&runtime_config);

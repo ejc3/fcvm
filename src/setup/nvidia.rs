@@ -343,6 +343,22 @@ fn nvidia_config(profile: &KernelProfile, profile_name: &str) -> Result<NvidiaDr
     Ok(config)
 }
 
+/// The driver image every cold boot on `profile_name` attaches, or None for a
+/// profile without an NVIDIA table. Builds it when `allow_create` is set.
+pub async fn profile_nvidia_driver_image(
+    profile_name: &str,
+    allow_create: bool,
+) -> Result<Option<PathBuf>> {
+    match get_kernel_profile(profile_name)? {
+        Some(profile) if profile.nvidia.is_some() => {
+            ensure_nvidia_driver_image(profile_name, allow_create)
+                .await
+                .map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
 /// The driver image path for a profile, without building it.
 pub fn get_nvidia_driver_image_path(profile_name: &str) -> Result<PathBuf> {
     Ok(DriverImage::resolve(profile_name)?.path)

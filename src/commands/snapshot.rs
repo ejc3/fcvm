@@ -282,6 +282,7 @@ where
         firecracker_args: args.firecracker_args.clone(),
         boot_args: None,
         fuse_readers: None,
+        gpu_driver_image: None,
     };
     let requested = config.firecracker_bin.is_some();
 
@@ -1902,10 +1903,21 @@ async fn cmd_snapshot_run_inner(
     // state) and relaunches through here. No pre-restore exec session can
     // reference this state file, so restore needs no vsock-epoch bump.
     let vm_id = generate_vm_id();
-    let (runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
+    let (mut runtime_config, firecracker_choice) = snapshot_restore_runtime_config(
         &args,
         snapshot_config.metadata.kernel_profile.as_deref(),
         snapshot_config.metadata.firecracker_bin.as_deref(),
+    )
+    .await?;
+    // The snapshot was booted with its profile's driver image, so a clone that
+    // reboots in place cold-boots with it too.
+    runtime_config.gpu_driver_image = crate::setup::profile_nvidia_driver_image(
+        snapshot_config
+            .metadata
+            .kernel_profile
+            .as_deref()
+            .unwrap_or("default"),
+        false,
     )
     .await?;
     let vm_name = args.name.unwrap_or_else(|| {
