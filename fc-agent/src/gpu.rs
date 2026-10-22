@@ -493,6 +493,25 @@ fn create_device_nodes(nodes: &[DeviceNode]) -> Result<()> {
     Ok(())
 }
 
+/// Load the NVIDIA modules at boot, with no GPU on the bus, so the pre-start
+/// snapshot carries them: a restore that attaches a GPU then only probes it
+/// (the PCI rescan binds it to the loaded driver). The driver image's
+/// nvidia.ko is built to load without a GPU (src/setup/nvidia.rs). The
+/// firmware path is set here too, because the probe of a hot-added GPU
+/// requests the GSP firmware.
+///
+/// A failure here is not fatal: [`attach`] loads whatever is not loaded, and
+/// fails closed if that fails, so this only moves work out of the restore.
+pub async fn preload(driver_root: &Path) -> Result<()> {
+    let release = kernel_release()?;
+    let modules = check_module_dir(driver_root, &release)?;
+    set_firmware_path(&driver_root.join("lib/firmware"))?;
+    for module in MODULES {
+        load_module(&modules, module).await?;
+    }
+    Ok(())
+}
+
 /// Make the GPUs the host attached usable by the container.
 ///
 /// `announced` is the host's list of attached devices (host PCI addresses);

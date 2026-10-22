@@ -170,6 +170,24 @@ fetch_verified "$NV_TOOLKIT_URL" "$NV_TOOLKIT_SHA256" "$NV_DIR/toolkit-$NV_TOOLK
 rm -rf "$NV_DIR/driver" "$NV_DIR/toolkit" "$NV_ROOT"
 sh "$NV_DIR/driver-$NV_DRIVER_VERSION.run" --extract-only --target "$NV_DIR/driver" >/dev/null
 
+# Let nvidia.ko load with no GPU on the bus, as it already does when an NVSwitch
+# is present: nvidia_init_module refuses an empty bus only behind this local.
+# fc-agent loads the modules at boot, before the pre-start snapshot, so a
+# restore that attaches a GPU only probes it (PCI rescan) instead of loading
+# and initialising the driver.
+NV_C="$NV_DIR/driver/kernel-open/nvidia/nv.c"
+NV_NOGPU_FROM='const NvBool is_nvswitch_present = os_is_nvswitch_present();'
+NV_NOGPU_TO='const NvBool is_nvswitch_present = NV_TRUE;'
+if [[ $(grep -cF "$NV_NOGPU_FROM" "$NV_C") -ne 1 ]]; then
+    echo "ERROR: $NV_C does not declare is_nvswitch_present once as expected; cannot let the driver load without a GPU" >&2
+    exit 1
+fi
+sed -i "s/$NV_NOGPU_FROM/$NV_NOGPU_TO/" "$NV_C"
+if [[ $(grep -cF "$NV_NOGPU_TO" "$NV_C") -ne 1 ]]; then
+    echo "ERROR: patching $NV_C to load without a GPU failed" >&2
+    exit 1
+fi
+
 # Kernel modules, from the .run's own open sources, against this tree.
 make -C "$NV_DIR/driver/kernel-open" SYSSRC="$PWD" SYSOUT="$PWD" ARCH="$KERNEL_ARCH" -j"$NPROC" modules
 MODDIR="$NV_ROOT/lib/modules/$KREL/extra"
@@ -709,6 +727,53 @@ mod tests {
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$version" != "$NV_DRIVER_VERSION" ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$vermagic" != "$KREL "* ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#""$LIBDIR/libcuda.so.$NV_DRIVER_VERSION""#));
+    }
+
+    /// Run the stage's no-GPU patch against an `nv.c` holding `source`.
+    fn run_no_gpu_patch(source: &str) -> (bool, String, String) {
+        let start = DRIVER_IMAGE_STAGE
+            .find("NV_C=")
+            .expect("the stage no longer patches nv.c");
+        let end = DRIVER_IMAGE_STAGE[start..]
+            .find("# Kernel modules,")
+            .expect("the no-GPU patch must come before the module build")
+            + start;
+        let dir = tempfile::tempdir().unwrap();
+        let nvidia = dir.path().join("driver/kernel-open/nvidia");
+        std::fs::create_dir_all(&nvidia).unwrap();
+        std::fs::write(nvidia.join("nv.c"), source).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&DRIVER_IMAGE_STAGE[start..end])
+            .env("NV_DIR", dir.path())
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            std::fs::read_to_string(nvidia.join("nv.c")).unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// nvidia.ko must load with no GPU on the bus, so fc-agent can load it
+    /// before the pre-start snapshot. The open module's init refuses an empty
+    /// bus unless `is_nvswitch_present`; the stage makes that local true, and
+    /// fails the build when the driver source no longer has the line.
+    #[test]
+    fn the_stage_lets_the_driver_load_without_a_gpu() {
+        let declared = "    const NvBool is_nvswitch_present = os_is_nvswitch_present();\n";
+        let refusal = "    if ((count == 0) && (!is_nvswitch_present))\n";
+        let (ok, patched, stderr) = run_no_gpu_patch(&format!("{declared}{refusal}"));
+        assert!(ok, "{stderr}");
+        assert_eq!(
+            patched,
+            format!("    const NvBool is_nvswitch_present = NV_TRUE;\n{refusal}")
+        );
+
+        let (ok, unchanged, stderr) = run_no_gpu_patch(refusal);
+        assert!(!ok, "a driver without the declaration must fail the build");
+        assert_eq!(unchanged, refusal);
+        assert!(stderr.contains("is_nvswitch_present"), "{stderr}");
     }
 
     #[test]
