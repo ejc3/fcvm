@@ -126,7 +126,7 @@
       "at": 10000,
       "client": "198.51.100.20",
       "id": "s1",
-      "name": "steer",
+      "name": "claim_camera",
       "type": "intent",
       "viewer": "v1"
     },
@@ -140,7 +140,7 @@
       "at": 10100,
       "client": "198.51.100.21",
       "id": "s2",
-      "name": "steer",
+      "name": "claim_camera",
       "type": "intent",
       "viewer": "v2"
     },
@@ -169,6 +169,17 @@
       "id": "c5",
       "name": "claim_gpu",
       "secret": "token-e",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "claim": "claim-9"
+      },
+      "at": 40500,
+      "client": "198.51.100.21",
+      "id": "rel",
+      "name": "release_gpu",
       "type": "intent",
       "viewer": "v2"
     },
@@ -234,7 +245,7 @@
     {
       "after": 10,
       "checks": {
-        "/receipts/s2/reason": "steer needs a GPU of your own (claim_gpu)"
+        "/receipts/s2/reason": "claim_camera needs a GPU of your own (claim_gpu)"
       }
     },
     {
@@ -269,6 +280,13 @@
     },
     {
       "after": 15,
+      "checks": {
+        "/receipts/rel/reason": "\"claim-9\" is not this viewer's claim",
+        "/view/claims/0/session": "claim-2"
+      }
+    },
+    {
+      "after": 16,
       "checks": {
         "/assign/h1/2/generation": 5,
         "/view/claims": []
@@ -314,9 +332,9 @@
         },
         "at": 10000,
         "id": "s1",
-        "name": "steer",
+        "name": "claim_camera",
         "outcome": "committed",
-        "summary": "steer",
+        "summary": "claim camera",
         "viewer": "v1"
       },
       {
@@ -328,9 +346,9 @@
         },
         "at": 10100,
         "id": "s2",
-        "name": "steer",
+        "name": "claim_camera",
         "outcome": "refused",
-        "summary": "steer needs a GPU of your own (claim_gpu)",
+        "summary": "claim_camera needs a GPU of your own (claim_gpu)",
         "viewer": "v2"
       },
       {
@@ -349,6 +367,17 @@
         "name": "claim_gpu",
         "outcome": "committed",
         "summary": "claim-2 on slot-3",
+        "viewer": "v2"
+      },
+      {
+        "args": {
+          "claim": "claim-9"
+        },
+        "at": 40500,
+        "id": "rel",
+        "name": "release_gpu",
+        "outcome": "refused",
+        "summary": "\"claim-9\" is not this viewer's claim",
         "viewer": "v2"
       }
     ],
@@ -370,30 +399,15 @@
         ]
       }
     ],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 30.0,
-      "decide_at_t": 35.0,
-      "hold_until_t": 37.0,
-      "next": null,
-      "offer": [
-        "dawn-valley",
-        "peak-seam-low-sun",
-        "peak-close"
-      ],
-      "seed": 1,
-      "viewpoint": "horizon",
-      "votes": {
-        "dawn-valley": 0,
-        "peak-close": 0,
-        "peak-seam-low-sun": 0
-      }
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": null,
     "failures": [],
     "fleet": {
-      "borrow_cap": 1,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 3,
       "gpus": 3,
@@ -425,14 +439,32 @@
       ]
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 60,
-      "cooldown_until": null,
-      "interval_secs": null,
-      "next_race_at": null,
-      "running": null
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "horizon",
+      "next": null,
+      "next_hold_at": 37000,
+      "targets": [
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        }
+      ]
     },
     "races": [],
+    "relaunch_all": null,
     "scene": {
       "camera": [
         {
@@ -470,31 +502,14 @@
       "words": []
     },
     "scoreboard": {
-      "ec2": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      },
-      "fcvm": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      }
+      "ec2": null,
+      "fcvm": null
     },
     "tiles": [
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": 1,
@@ -520,6 +535,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": 1,
@@ -545,6 +561,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": null,
@@ -567,6 +584,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": null,

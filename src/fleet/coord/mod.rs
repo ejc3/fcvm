@@ -22,7 +22,7 @@ use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
-use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, ServerMsg, SharedScene};
+use fleet_core::protocol::{AgentMsg, AssignSlot, ClaimMsg, CoordMsg, ServerMsg, SharedScene};
 use fleet_core::tiling::{half_rect, Half, Rect};
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
@@ -30,17 +30,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
-
-/// What the claiming viewer alone is told about its GPU.
-#[derive(Debug, Clone, PartialEq, serde::Serialize)]
-pub struct ClaimInfo {
-    pub session: String,
-    pub token: String,
-    pub slot: String,
-    pub expires_at: u64,
-    pub frame_url: Option<String>,
-    pub click_to_first_frame_ms: Option<u64>,
-}
 
 /// The latest browser snapshot, serialized once for every socket.
 #[derive(Debug)]
@@ -74,7 +63,7 @@ pub enum Cmd {
     /// The claim a viewer holds and, once its renderer runs, its frame URL.
     ClaimFor {
         viewer: String,
-        reply: oneshot::Sender<Option<ClaimInfo>>,
+        reply: oneshot::Sender<Option<ClaimMsg>>,
     },
     /// The current camera hold and the aggregators to take its poster from.
     PosterPlan {
@@ -327,17 +316,27 @@ impl Actor {
                     let c = s.claim.as_ref().filter(|c| c.viewer == viewer)?;
                     let ready =
                         s.observed.phase == "running" && s.observed.generation >= c.generation;
-                    Some(ClaimInfo {
-                        session: c.session.clone(),
-                        token: c.token.clone(),
-                        slot: s.id.clone(),
-                        expires_at: c.expires_at,
+                    Some(ClaimMsg {
+                        id: c.session.clone(),
+                        tile: c.borrowed.clone(),
+                        phase: if ready { "running" } else { "restoring" }.into(),
                         frame_url: if ready {
                             s.observed.frame_url.clone()
                         } else {
                             None
                         },
-                        click_to_first_frame_ms: c.first_frame_at.map(|t| t - c.claimed_at),
+                        token: c.token.clone(),
+                        clicked_at: c.claimed_at,
+                        first_frame_at: c.first_frame_at,
+                        expires_at: c.expires_at,
+                        gpu: s.gpu.as_ref().map(|g| g.name.clone()),
+                        phases: if ready {
+                            s.observed.timings.clone()
+                        } else {
+                            Default::default()
+                        },
+                        camera: c.camera.clone(),
+                        ended: None,
                     })
                 });
                 let _ = reply.send(info);
@@ -499,7 +498,7 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    pub async fn claim_for(&self, viewer: &str) -> Option<ClaimInfo> {
+    pub async fn claim_for(&self, viewer: &str) -> Option<ClaimMsg> {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::ClaimFor {
@@ -699,6 +698,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         allowed_origins: args.allowed_origins,
         verifier,
         trust_cf_connecting_ip: args.trust_cf_connecting_ip,
+        turnstile_site_key: args.turnstile_site_key,
         poster,
     };
     tokio::select! {

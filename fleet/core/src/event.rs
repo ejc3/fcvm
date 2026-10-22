@@ -103,9 +103,12 @@ pub enum Intent {
     },
     /// Take a standby GPU for a private session.
     ClaimGpu,
-    ReleaseGpu,
+    /// End the viewer's claim; `claim`, when given, must name it.
+    ReleaseGpu {
+        claim: Option<String>,
+    },
     /// Turn and move the private session's camera.
-    Steer {
+    ClaimCamera {
         yaw_deg: f64,
         pitch_deg: f64,
         dive: f64,
@@ -217,9 +220,18 @@ impl Intent {
                 })
             }
             "claim_gpu" => Ok(Intent::ClaimGpu),
-            "release_gpu" => Ok(Intent::ReleaseGpu),
-            "steer" => {
-                let d = args.get("drag").ok_or("steer needs args.drag")?;
+            "release_gpu" => Ok(Intent::ReleaseGpu {
+                claim: match args.get("claim") {
+                    None | Some(serde_json::Value::Null) => None,
+                    Some(v) => Some(
+                        v.as_str()
+                            .ok_or("args.claim must be a claim id")?
+                            .to_string(),
+                    ),
+                },
+            }),
+            "claim_camera" => {
+                let d = args.get("drag").ok_or("claim_camera needs args.drag")?;
                 let yaw_deg = num(d, "yaw_deg")?;
                 let pitch_deg = num(d, "pitch_deg")?;
                 let dive = d
@@ -230,7 +242,7 @@ impl Intent {
                 if yaw_deg.abs() > 360.0 || pitch_deg.abs() > 180.0 || dive.abs() > 50.0 {
                     return Err("drag is out of range".into());
                 }
-                Ok(Intent::Steer {
+                Ok(Intent::ClaimCamera {
                     yaw_deg,
                     pitch_deg,
                     dive,

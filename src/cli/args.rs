@@ -199,8 +199,17 @@ pub struct FleetCoordArgs {
 
     /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
     /// intent. Without it no verification is asked for (local runs).
-    #[arg(long, env = "FLEET_TURNSTILE_SECRET", hide_env_values = true)]
+    #[arg(
+        long,
+        env = "FLEET_TURNSTILE_SECRET",
+        hide_env_values = true,
+        requires = "turnstile_site_key"
+    )]
     pub turnstile_secret: Option<String>,
+
+    /// The Turnstile site key the page's widget uses, sent in each connection's hello
+    #[arg(long, env = "FLEET_TURNSTILE_SITE_KEY", requires = "turnstile_secret")]
+    pub turnstile_site_key: Option<String>,
 
     /// Decoder for the poster frame (`raw` for tests)
     #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]

@@ -27,9 +27,20 @@ pub struct TileView {
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
     pub error: Option<String>,
+    /// Why the tile is not running when that is a fault.
+    pub failure: Option<TileFailure>,
     pub last_relaunch: Option<RelaunchView>,
     /// While the tile's GPU is lent to a visitor's private session.
     pub borrowed: Option<BorrowedView>,
+}
+
+/// A tile's fault: `relaunch_failed` (its VM did not come back; the agent tries again at
+/// `retry_at`).
+#[derive(Debug, Clone, Serialize)]
+pub struct TileFailure {
+    pub kind: String,
+    pub message: String,
+    pub retry_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -69,62 +80,81 @@ pub struct FleetView {
     pub n: usize,
     pub max_tiles: usize,
     pub standby: Vec<String>,
-    /// Wall tiles lent to visitors now, and how many may be at once.
-    pub borrowed: usize,
-    pub borrow_cap: usize,
 }
 
-/// The race clock everyone sees.
+/// Wall tiles lent to visitors: at most `cap` at once; the next comes back at
+/// `next_return_at`.
 #[derive(Debug, Clone, Serialize)]
-pub struct RaceClockView {
-    /// The owner's cadence; null when races run only on `restart_now`.
-    pub interval_secs: Option<u64>,
-    pub next_race_at: Option<u64>,
-    /// `restart_now` is refused until then.
-    pub cooldown_until: Option<u64>,
-    pub cooldown_secs: u64,
-    /// The race in progress, if any.
-    pub running: Option<u64>,
+pub struct BorrowView {
+    pub cap: usize,
+    pub lent: usize,
+    pub next_return_at: Option<u64>,
 }
 
-/// One half of the scoreboard: only measured numbers, each with what it was measured on.
+/// The latest race, as the page draws it: when it started, who started it (`schedule`
+/// for the owner's cadence), each half's progress and, once done, its time.
+#[derive(Debug, Clone, Serialize)]
+pub struct RelaunchAllView {
+    pub race: u64,
+    pub started_at: u64,
+    pub by: String,
+    pub fcvm_done_at: Option<u64>,
+    pub ec2_done_at: Option<u64>,
+    /// Tiles still to reach their first frame.
+    pub fcvm_pending: usize,
+    pub ec2_pending: usize,
+    /// Tiles timed in each half.
+    pub fcvm_gpus: usize,
+    pub ec2_gpus: usize,
+    /// Each half's time once done: click to the last first frame, less EC2 capacity waits.
+    pub fcvm_ms: Option<u64>,
+    pub ec2_ms: Option<u64>,
+    /// EC2 capacity waits finished so far (kept out of `ec2_ms`), and since when the
+    /// half's current wait has run (null when none runs).
+    pub ec2_capacity_wait_ms: u64,
+    pub ec2_waiting_since: Option<u64>,
+}
+
+/// One half of the scoreboard; null until a race of that half has finished. Only
+/// measured numbers, capacity waits left out of the times.
 #[derive(Debug, Clone, Serialize)]
 pub struct HalfScore {
-    /// Click to the last tile's first frame (less EC2 capacity waits), in the latest race
-    /// whose half finished.
-    pub last_ms: Option<u64>,
-    pub last_race: Option<u64>,
-    /// Tiles timed in that race.
-    pub last_measured_on: Option<usize>,
-    pub last_capacity_wait_ms: Option<u64>,
     /// Median over the last finished races (up to 20).
-    pub median_ms: Option<u64>,
-    /// Races and the fewest and most tiles they were measured on.
+    pub median_ms: u64,
+    pub last_ms: u64,
+    /// Races the median is over.
     pub races: usize,
-    pub measured_on_min: Option<usize>,
-    pub measured_on_max: Option<usize>,
+    /// Tiles timed in the last race.
+    pub measured_on: usize,
+    pub last_capacity_wait_ms: u64,
+    pub last_race: u64,
 }
 
 #[derive(Debug, Clone, Serialize)]
 pub struct Scoreboard {
-    pub fcvm: HalfScore,
-    pub ec2: HalfScore,
+    pub fcvm: Option<HalfScore>,
+    pub ec2: Option<HalfScore>,
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DirectorView {
-    pub viewpoint: String,
-    /// Scene seconds: arrived, holding until, the vote closes at.
-    pub arrived_t: f64,
-    pub hold_until_t: f64,
-    pub decide_at_t: f64,
-    /// The next hold, once the vote closed.
+pub struct NudgeTarget {
+    /// The viewpoint's name, what `nudge` sends as `target`.
+    pub id: String,
+    pub label: String,
+    pub votes: usize,
+}
+
+/// The directed camera: where it can hold next, with this hold's votes.
+#[derive(Debug, Clone, Serialize)]
+pub struct NudgesView {
+    pub targets: Vec<NudgeTarget>,
+    /// The viewpoint the camera holds on now, or null while it flies.
+    pub holding: Option<String>,
+    /// While holding, when the camera leaves for the next hold (Unix ms).
+    pub next_hold_at: Option<u64>,
+    /// The next hold once the vote has closed, and when the camera arrives there.
     pub next: Option<String>,
-    pub arrive_next_t: Option<f64>,
-    /// What `nudge` may name now, and the votes so far.
-    pub offer: Vec<String>,
-    pub votes: BTreeMap<String, usize>,
-    pub seed: u64,
+    pub arrive_next_at: Option<u64>,
 }
 
 /// What can be wrong, each with its own kind so the page can label it.
@@ -137,18 +167,11 @@ pub enum FailureView {
         since: u64,
         retiling: bool,
     },
-    /// A coordinator component is not working (the text check, the state file).
+    /// A coordinator component is not working (the text check).
     CoordinatorDegraded {
         component: String,
         reason: String,
         since: u64,
-    },
-    /// A tile's VM failed; the agent tries again at `retry_at`.
-    TileFailed {
-        tile: String,
-        slot: String,
-        error: Option<String>,
-        retry_at: Option<u64>,
     },
 }
 
@@ -195,11 +218,16 @@ pub struct View {
     pub fleet: FleetView,
     pub scene: Scene,
     pub image_aspect: f64,
-    pub race: RaceClockView,
+    /// When the owner's cadence races next, and until when `restart_now` is refused.
+    pub next_race_at: Option<u64>,
+    pub cooldown_until: Option<u64>,
+    pub relaunch_all: Option<RelaunchAllView>,
     pub scoreboard: Scoreboard,
     /// The latest races, newest last (up to 10), with every tile's phases.
     pub races: Vec<Race>,
-    pub director: DirectorView,
+    pub nudges: NudgesView,
+    pub borrow: BorrowView,
+    /// Problems that are not one tile's: hosts reclaimed, coordinator components down.
     pub failures: Vec<FailureView>,
     pub claims: Vec<ClaimView>,
     pub viewers: ViewersView,
@@ -239,6 +267,7 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
             fps: None,
             gpu_stats: None,
             error: None,
+            failure: None,
             last_relaunch: None,
             borrowed: None,
         },
@@ -272,6 +301,13 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
                 phases: r.phases.clone(),
             }),
             borrowed: lent,
+            failure: (s.observed.phase == "failed" && s.observed.generation >= s.generation).then(
+                || TileFailure {
+                    kind: "relaunch_failed".into(),
+                    message: s.observed.error.clone().unwrap_or_default(),
+                    retry_at: s.observed.retry_at,
+                },
+            ),
         },
     }
 }
@@ -372,35 +408,19 @@ pub fn view(state: &State) -> View {
             n: f.n,
             max_tiles: c.max_tiles,
             standby,
-            borrowed: f
-                .slots
-                .values()
-                .filter(|s| s.claim.as_ref().is_some_and(|k| k.borrowed.is_some()))
-                .count(),
-            borrow_cap: c.borrow_cap(f.n),
         },
         scene: f.scene.clone(),
         image_aspect: c.image_aspect,
-        race: RaceClockView {
-            interval_secs: c.race_interval_secs,
-            next_race_at: f.next_race_at,
-            cooldown_until: f.cooldown_until,
-            cooldown_secs: c.restart_cooldown_secs,
-            running: f
-                .races
-                .back()
-                .filter(|r| {
-                    r.fcvm.done_at.is_none() && !r.fcvm.tiles.is_empty()
-                        || r.ec2.done_at.is_none() && !r.ec2.tiles.is_empty()
-                })
-                .map(|r| r.id),
-        },
+        next_race_at: f.next_race_at,
+        cooldown_until: f.cooldown_until,
+        relaunch_all: f.races.back().map(relaunch_all),
         scoreboard: Scoreboard {
             fcvm: score(f.races.iter().map(|r| (r.id, &r.fcvm))),
             ec2: score(f.races.iter().map(|r| (r.id, &r.ec2))),
         },
         races: f.races.iter().rev().take(10).rev().cloned().collect(),
-        director: director_view(&f.director),
+        nudges: nudges(&f.director, f.scene.epoch_unix_ms),
+        borrow: borrow(state),
         failures: failures(state),
         claims: f
             .slots
@@ -428,47 +448,105 @@ pub fn view(state: &State) -> View {
     }
 }
 
-fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> HalfScore {
+fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> Option<HalfScore> {
     let done: Vec<(u64, &HalfRace)> = halves.filter(|(_, h)| h.time_ms.is_some()).collect();
-    let recent: Vec<&(u64, &HalfRace)> = done
+    let (last_id, last) = *done.last()?;
+    let mut times: Vec<u64> = done
         .iter()
         .rev()
         .take(crate::apply::SCOREBOARD_RACES)
+        .map(|(_, h)| h.time_ms.unwrap())
         .collect();
-    let mut times: Vec<u64> = recent.iter().map(|(_, h)| h.time_ms.unwrap()).collect();
     times.sort_unstable();
-    let median = if times.is_empty() {
-        None
-    } else if times.len() % 2 == 1 {
-        Some(times[times.len() / 2])
+    let median = if times.len() % 2 == 1 {
+        times[times.len() / 2]
     } else {
-        Some((times[times.len() / 2 - 1] + times[times.len() / 2]) / 2)
+        (times[times.len() / 2 - 1] + times[times.len() / 2]) / 2
     };
-    let last = done.last();
-    HalfScore {
-        last_ms: last.and_then(|(_, h)| h.time_ms),
-        last_race: last.map(|(id, _)| *id),
-        last_measured_on: last.map(|(_, h)| h.tiles.len()),
-        last_capacity_wait_ms: last.map(|(_, h)| h.capacity_wait_ms),
+    Some(HalfScore {
         median_ms: median,
-        races: recent.len(),
-        measured_on_min: recent.iter().map(|(_, h)| h.tiles.len()).min(),
-        measured_on_max: recent.iter().map(|(_, h)| h.tiles.len()).max(),
+        last_ms: last.time_ms.unwrap(),
+        races: times.len(),
+        measured_on: last.tiles.len(),
+        last_capacity_wait_ms: last.capacity_wait_ms,
+        last_race: last_id,
+    })
+}
+
+fn relaunch_all(r: &Race) -> RelaunchAllView {
+    let pending = |h: &HalfRace| {
+        h.tiles
+            .values()
+            .filter(|t| t.first_frame_at.is_none())
+            .count()
+    };
+    let waiting_since = r
+        .ec2
+        .tiles
+        .values()
+        .filter(|t| t.first_frame_at.is_none())
+        .filter_map(|t| t.waiting_since)
+        .min();
+    RelaunchAllView {
+        race: r.id,
+        started_at: r.started_at,
+        by: r.by.clone(),
+        fcvm_done_at: r.fcvm.done_at,
+        ec2_done_at: r.ec2.done_at,
+        fcvm_pending: pending(&r.fcvm),
+        ec2_pending: pending(&r.ec2),
+        fcvm_gpus: r.fcvm.tiles.len(),
+        ec2_gpus: r.ec2.tiles.len(),
+        fcvm_ms: r.fcvm.time_ms,
+        ec2_ms: r.ec2.time_ms,
+        ec2_capacity_wait_ms: r
+            .ec2
+            .tiles
+            .values()
+            .map(|t| t.capacity_wait_ms)
+            .max()
+            .unwrap_or(0),
+        ec2_waiting_since: waiting_since,
     }
 }
 
-fn director_view(d: &crate::director::Director) -> DirectorView {
+/// Scene seconds as Unix milliseconds.
+fn unix_ms(epoch_unix_ms: u64, t: f64) -> u64 {
+    (epoch_unix_ms as f64 + t * 1000.0).round().max(0.0) as u64
+}
+
+fn nudges(d: &crate::director::Director, epoch_unix_ms: u64) -> NudgesView {
     let vps = crate::director::viewpoints();
-    DirectorView {
-        viewpoint: vps[d.current].name.to_string(),
-        arrived_t: d.arrive_t,
-        hold_until_t: d.hold_until(),
-        decide_at_t: d.decide_at(),
+    let tally = d.tally();
+    NudgesView {
+        targets: d
+            .offer
+            .iter()
+            .map(|i| NudgeTarget {
+                id: vps[*i].name.to_string(),
+                label: vps[*i].label.to_string(),
+                votes: tally.get(vps[*i].name).copied().unwrap_or(0),
+            })
+            .collect(),
+        holding: (!d.flying).then(|| vps[d.current].name.to_string()),
+        next_hold_at: (!d.flying).then(|| unix_ms(epoch_unix_ms, d.hold_until())),
         next: d.next.map(|n| vps[n].name.to_string()),
-        arrive_next_t: d.arrive_next_at(),
-        offer: d.offer.iter().map(|i| vps[*i].name.to_string()).collect(),
-        votes: d.tally(),
-        seed: d.seed,
+        arrive_next_at: d.arrive_next_at().map(|t| unix_ms(epoch_unix_ms, t)),
+    }
+}
+
+fn borrow(state: &State) -> BorrowView {
+    let lent: Vec<&Claim> = state
+        .fleet
+        .slots
+        .values()
+        .filter_map(|s| s.claim.as_ref())
+        .filter(|c| c.borrowed.is_some())
+        .collect();
+    BorrowView {
+        cap: state.config.borrow_cap(state.fleet.n),
+        lent: lent.len(),
+        next_return_at: lent.iter().map(|c| c.expires_at).min(),
     }
 }
 
@@ -492,19 +570,6 @@ fn failures(state: &State) -> Vec<FailureView> {
                 since: *since,
             }),
     );
-    for s in f.slots.values().chain(f.ec2.values()) {
-        if s.observed.phase == "failed" {
-            out.push(FailureView::TileFailed {
-                tile: s
-                    .position
-                    .map(|k| format!("{}:{}", s.half.as_str(), k + 1))
-                    .unwrap_or_else(|| "standby".into()),
-                slot: s.id.clone(),
-                error: s.observed.error.clone(),
-                retry_at: s.observed.retry_at,
-            });
-        }
-    }
     out
 }
 

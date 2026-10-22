@@ -54,17 +54,27 @@
     {
       "after": 0,
       "checks": {
-        "/view/director/arrived_t": 0.0,
-        "/view/director/decide_at_t": 5.0,
-        "/view/director/hold_until_t": 7.0,
-        "/view/director/next": null,
-        "/view/director/offer": [
-          "horizon",
-          "dawn-valley",
-          "peak-seam-low-sun"
+        "/view/nudges/arrive_next_at": null,
+        "/view/nudges/holding": "coast",
+        "/view/nudges/next": null,
+        "/view/nudges/next_hold_at": 7000,
+        "/view/nudges/targets": [
+          {
+            "id": "horizon",
+            "label": "High above: the curve of the horizon",
+            "votes": 0
+          },
+          {
+            "id": "dawn-valley",
+            "label": "Dawn in the valley",
+            "votes": 0
+          },
+          {
+            "id": "peak-seam-low-sun",
+            "label": "The peak at a low sun",
+            "votes": 0
+          }
         ],
-        "/view/director/seed": 1,
-        "/view/director/viewpoint": "coast",
         "/view/scene/camera/0/t": 0.0,
         "/view/scene/camera/1/t": 7.0,
         "/view/scene/camera/2": null
@@ -73,35 +83,39 @@
     {
       "after": 1,
       "checks": {
-        "/view/director/next": null
+        "/view/nudges/next": null
       }
     },
     {
       "after": 2,
       "checks": {
-        "/view/director/arrive_next_t": 30.0,
-        "/view/director/next": "horizon",
+        "/view/nudges/arrive_next_at": 30000,
+        "/view/nudges/next": "horizon",
         "/view/scene/camera/1/t": 7.0,
         "/view/scene/camera/2/t": 18.5
       }
     },
     {
+      "after": 3,
+      "checks": {
+        "/view/nudges/holding": null,
+        "/view/nudges/next_hold_at": null
+      },
+      "note": "flying: no hold"
+    },
+    {
       "after": 4,
       "checks": {
-        "/view/director/viewpoint": "coast"
+        "/view/nudges/holding": null
       }
     },
     {
       "after": 5,
       "checks": {
-        "/view/director/arrived_t": 30.0,
-        "/view/director/next": null,
-        "/view/director/offer": [
-          "dawn-valley",
-          "peak-seam-low-sun",
-          "peak-close"
-        ],
-        "/view/director/viewpoint": "horizon"
+        "/view/nudges/holding": "horizon",
+        "/view/nudges/next": null,
+        "/view/nudges/next_hold_at": 37000,
+        "/view/nudges/targets/0/id": "dawn-valley"
       }
     },
     {
@@ -146,30 +160,15 @@
       }
     ],
     "aggregates": [],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 30.0,
-      "decide_at_t": 35.0,
-      "hold_until_t": 37.0,
-      "next": null,
-      "offer": [
-        "dawn-valley",
-        "peak-seam-low-sun",
-        "peak-close"
-      ],
-      "seed": 1,
-      "viewpoint": "horizon",
-      "votes": {
-        "dawn-valley": 0,
-        "peak-close": 0,
-        "peak-seam-low-sun": 0
-      }
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": null,
     "failures": [],
     "fleet": {
-      "borrow_cap": 0,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
@@ -179,14 +178,32 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 60,
-      "cooldown_until": null,
-      "interval_secs": null,
-      "next_race_at": null,
-      "running": null
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "horizon",
+      "next": null,
+      "next_hold_at": 37000,
+      "targets": [
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        },
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        }
+      ]
     },
     "races": [],
+    "relaunch_all": null,
     "scene": {
       "camera": [
         {
@@ -224,26 +241,8 @@
       "words": []
     },
     "scoreboard": {
-      "ec2": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      },
-      "fcvm": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      }
+      "ec2": null,
+      "fcvm": null
     },
     "tiles": [],
     "viewers": {

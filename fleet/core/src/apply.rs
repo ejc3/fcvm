@@ -378,18 +378,25 @@ fn intent_effect(
             Ok("light".into())
         }
         Intent::ClaimGpu => claim(state, c),
-        Intent::ReleaseGpu => {
+        Intent::ReleaseGpu { claim } => {
             let n = own_claim(&state.fleet, c.viewer).ok_or("this viewer holds no GPU")?;
+            let session = &state.fleet.slots[&n].claim.as_ref().unwrap().session;
+            if claim.as_ref().is_some_and(|k| k != session) {
+                return Err(format!(
+                    "{:?} is not this viewer's claim",
+                    claim.as_deref().unwrap()
+                ));
+            }
             release(&mut state.fleet, n, at);
             Ok("release".into())
         }
-        Intent::Steer {
+        Intent::ClaimCamera {
             yaw_deg,
             pitch_deg,
             dive,
         } => {
             let n = own_claim(&state.fleet, c.viewer)
-                .ok_or("steer needs a GPU of your own (claim_gpu)")?;
+                .ok_or("claim_camera needs a GPU of your own (claim_gpu)")?;
             let now = state.fleet.scene.t_at(at);
             let claim = state
                 .fleet
@@ -412,7 +419,7 @@ fn intent_effect(
             };
             cam.steer(now, to);
             claim.camera = cam.camera;
-            Ok("steer".into())
+            Ok("claim camera".into())
         }
     }
 }
@@ -596,6 +603,7 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
                     first_frame_at: None,
                     phases: BTreeMap::new(),
                     capacity_wait_ms: 0,
+                    waiting_since: None,
                 },
             );
         }
@@ -611,6 +619,7 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
                     first_frame_at: None,
                     phases: BTreeMap::new(),
                     capacity_wait_ms: 0,
+                    waiting_since: None,
                 },
             );
         }
@@ -755,6 +764,28 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     slot.observed.timings = r.timings.clone();
     slot.observed.error = r.error.clone();
     slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
+    if r.phase == "waiting_capacity" {
+        let id = slot.id.clone();
+        let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
+        for race in f.races.iter_mut() {
+            let h = match half {
+                Half::Fcvm => &mut race.fcvm,
+                Half::Ec2 => &mut race.ec2,
+            };
+            if let Some(t) = h.tiles.get_mut(&id) {
+                if h.done_at.is_none() && t.first_frame_at.is_none() && r.generation >= t.generation
+                {
+                    t.waiting_since.get_or_insert(since);
+                }
+            }
+        }
+    }
+    let Some(slot) = (match half {
+        Half::Fcvm => f.slots.get_mut(&n),
+        Half::Ec2 => f.ec2.get_mut(&n),
+    }) else {
+        return;
+    };
     if r.phase != "running" {
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;

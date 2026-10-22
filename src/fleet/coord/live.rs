@@ -42,6 +42,8 @@ pub struct LiveConfig {
     /// Browser origins allowed besides the coordinator's own.
     pub allowed_origins: Vec<String>,
     pub verifier: Arc<dyn Verifier>,
+    /// Sent in the hello when the verifier asks for a token.
+    pub turnstile_site_key: Option<String>,
     /// Key clients by `CF-Connecting-IP` (only behind Cloudflare, which sets it).
     pub trust_cf_connecting_ip: bool,
     pub poster: Arc<Poster>,
@@ -80,20 +82,24 @@ pub async fn serve(
 }
 
 /// The latest converged still of the whole image. Cached briefly: it changes at most once
-/// per camera hold.
+/// per camera hold. Readable from any origin: it is the public picture.
 async fn poster(State(app): State<App>) -> Response {
     match app.cfg.poster.latest() {
         Some(still) => (
             [
                 (header::CONTENT_TYPE, still.content_type),
                 (header::CACHE_CONTROL, "public, max-age=10"),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
             ],
             still.bytes.clone(),
         )
             .into_response(),
         None => (
             StatusCode::NOT_FOUND,
-            [(header::CACHE_CONTROL, "no-store")],
+            [
+                (header::CACHE_CONTROL, "no-store"),
+                (header::ACCESS_CONTROL_ALLOW_ORIGIN, "*"),
+            ],
             "no poster yet",
         )
             .into_response(),
@@ -181,6 +187,12 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
         .send(Message::Text(
             text(&ServerMsg::Hello {
                 viewer: viewer.clone(),
+                turnstile: app
+                    .cfg
+                    .verifier
+                    .required()
+                    .then(|| app.cfg.turnstile_site_key.clone())
+                    .flatten(),
             })
             .into(),
         ))
@@ -277,7 +289,7 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
                         reason: "an intent id must be 1 to 128 bytes".into(),
                     })
                 } else if !verified.load(Ordering::SeqCst) {
-                    Some(unrecorded_refusal(id, "verify with Turnstile first"))
+                    Some(unrecorded_refusal(id, "verify first"))
                 } else if name == "word" {
                     let app = app.clone();
                     let viewer = viewer.clone();
@@ -335,27 +347,43 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
         .await;
 }
 
-/// Tell the claiming viewer, and only it, its GPU's frame URL and session token once the
-/// private VM has drawn its first frame.
+/// Keep the claiming viewer, and only it, told about its GPU: a `claim` message whenever
+/// the claim changes (restoring, then running with its frame URL, a new camera), and a
+/// last one when it ends.
 async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerMsg>) {
-    for _ in 0..(90 * 5) {
+    let mut last: Option<fleet_core::protocol::ClaimMsg> = None;
+    loop {
         match handle.claim_for(&viewer).await {
-            None => return,
-            Some(c) if c.frame_url.is_some() => {
-                let _ = direct
-                    .send(ServerMsg::Claim {
-                        session: c.session,
-                        token: c.token,
-                        slot: c.slot,
-                        frame_url: c.frame_url.unwrap(),
-                        expires_at: c.expires_at,
-                        click_to_first_frame_ms: c.click_to_first_frame_ms,
-                    })
-                    .await;
+            Some(c) => {
+                if last.as_ref() != Some(&c) {
+                    if direct
+                        .send(ServerMsg::Claim { claim: c.clone() })
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    last = Some(c);
+                }
+            }
+            None => {
+                let Some(mut c) = last else { return };
+                let now = now_ms();
+                c.ended = Some(
+                    if now >= c.expires_at {
+                        "expired"
+                    } else {
+                        "released"
+                    }
+                    .into(),
+                );
+                c.phase = "ended".into();
+                c.frame_url = None;
+                let _ = direct.send(ServerMsg::Claim { claim: c }).await;
                 return;
             }
-            Some(_) => tokio::time::sleep(Duration::from_millis(200)).await,
         }
+        tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 

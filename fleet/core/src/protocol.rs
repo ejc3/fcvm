@@ -50,27 +50,45 @@ pub enum ServerMsg {
         server_unix_ms: u64,
         client_unix_ms: f64,
     },
-    /// First message on every connection: this viewer's id, as `actions[].viewer` names it.
-    Hello { viewer: String },
+    /// First message on every connection: this viewer's id, as `actions[].viewer` names it,
+    /// and the Turnstile site key when intents need a `verify` first (null otherwise).
+    Hello {
+        viewer: String,
+        turnstile: Option<String>,
+    },
     /// The answer to `verify`.
-    Verified {
-        ok: bool,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        reason: Option<String>,
-    },
-    /// To the claiming viewer only, once its GPU has drawn its first frame: where to read
-    /// it, the session token, and when it goes back to the pool.
-    Claim {
-        session: String,
-        token: String,
-        slot: String,
-        frame_url: String,
-        expires_at: u64,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        click_to_first_frame_ms: Option<u64>,
-    },
+    Verified { ok: bool, reason: Option<String> },
+    /// The viewer's own GPU, to the claiming connection only, whenever it changes and once
+    /// more when it ends.
+    Claim { claim: ClaimMsg },
     /// A message the coordinator could not read; nothing was applied.
     Error { reason: String },
+}
+
+/// A viewer's own GPU as its viewer sees it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimMsg {
+    /// The session (`claim-3`), what `release_gpu` names as `claim`.
+    pub id: String,
+    /// The wall tile whose GPU it borrowed (`fcvm:3`); null for a standby GPU.
+    pub tile: Option<String>,
+    /// `restoring` until the private VM's first frame, `running`, then `ended`.
+    pub phase: String,
+    /// The private renderer's frame WebSocket, once it runs.
+    pub frame_url: Option<String>,
+    /// The session token for this viewer alone.
+    pub token: String,
+    pub clicked_at: u64,
+    pub first_frame_at: Option<u64>,
+    pub expires_at: u64,
+    /// The GPU's name.
+    pub gpu: Option<String>,
+    /// The agent's timings of the private VM's restore.
+    pub phases: BTreeMap<String, u64>,
+    pub camera: Vec<crate::scene::Keyframe>,
+    /// Why it ended: `expired` (its time ran out) or `released` (`release_gpu`, or the GPU
+    /// left the fleet); null while it lasts.
+    pub ended: Option<String>,
 }
 
 impl ServerMsg {

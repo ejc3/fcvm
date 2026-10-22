@@ -22,6 +22,8 @@ pub const OFFER: usize = 3;
 #[derive(Debug, Clone, PartialEq)]
 pub struct Viewpoint {
     pub name: &'static str,
+    /// What the page shows for it.
+    pub label: &'static str,
     pub pos: [f64; 3],
     pub look: [f64; 3],
     pub fov_deg: f64,
@@ -41,6 +43,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
     vec![
         Viewpoint {
             name: "peak-seam",
+            label: "The peak across the seam",
             pos: [-47.0, 2.6, -101.0],
             look: [MAIN_PEAK[0], 2.75, MAIN_PEAK[2]],
             fov_deg: 55.0,
@@ -49,6 +52,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "sunset-ridge",
+            label: "Sunset over the ridge",
             pos: [-36.0, 2.4, -70.0],
             look: [-73.5, 2.4, -121.75],
             fov_deg: 60.0,
@@ -57,6 +61,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "dawn-valley",
+            label: "Dawn in the valley",
             pos: [-18.0, 1.8, -92.0],
             look: [-10.75, 2.6, -105.5],
             fov_deg: 62.0,
@@ -65,6 +70,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "horizon",
+            label: "High above: the curve of the horizon",
             pos: [-30.0, 38.0, -60.0],
             look: [-75.0, 28.0, -170.0],
             fov_deg: 70.0,
@@ -73,6 +79,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "coast",
+            label: "From the coast",
             pos: [-100.0, 0.35, -90.0],
             look: [-63.5, 2.2, -87.0],
             fov_deg: 60.0,
@@ -81,6 +88,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "peak-close",
+            label: "Close to the peak",
             pos: [-62.0, 3.5, -105.0],
             look: [MAIN_PEAK[0], 2.9, MAIN_PEAK[2]],
             fov_deg: 50.0,
@@ -89,6 +97,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "high-lakes",
+            label: "The high lakes",
             pos: [-25.0, 2.4, -140.0],
             look: [-21.25, 2.3, -150.0],
             fov_deg: 65.0,
@@ -97,6 +106,7 @@ pub fn viewpoints() -> Vec<Viewpoint> {
         },
         Viewpoint {
             name: "peak-seam-low-sun",
+            label: "The peak at a low sun",
             pos: [-66.0, 2.5, -101.0],
             look: [MAIN_PEAK[0], 2.75, MAIN_PEAK[2]],
             fov_deg: 55.0,

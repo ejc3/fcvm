@@ -62,6 +62,20 @@
       "viewer": "v1"
     },
     {
+      "at": 5000,
+      "report": {
+        "frame_url": null,
+        "generation": 2,
+        "id": "ec2-2",
+        "phase": "waiting_capacity",
+        "timings": {
+          "capacity_wait_ms": 1000
+        },
+        "vm": null
+      },
+      "type": "ec2"
+    },
+    {
       "at": 9000,
       "report": {
         "frame_url": "ws://ec2-1.example:443/frames",
@@ -142,30 +156,43 @@
       "after": 3,
       "checks": {
         "/ec2_assign/0/generation": 2,
-        "/view/races/0/ec2/tiles/ec2-1/tile": "ec2:1"
+        "/view/races/0/ec2/tiles/ec2-1/tile": "ec2:1",
+        "/view/relaunch_all/ec2_waiting_since": null
       }
     },
     {
-      "after": 5,
+      "after": 4,
       "checks": {
-        "/view/races/0/ec2/done_at": null,
-        "/view/races/0/ec2/tiles/ec2-2/capacity_wait_ms": 6000
-      }
+        "/view/relaunch_all/ec2_capacity_wait_ms": 0,
+        "/view/relaunch_all/ec2_pending": 3,
+        "/view/relaunch_all/ec2_waiting_since": 4000
+      },
+      "note": "ec2-2 has waited 1 s for capacity, since 4000"
     },
     {
       "after": 6,
       "checks": {
+        "/view/races/0/ec2/done_at": null,
+        "/view/races/0/ec2/tiles/ec2-2/capacity_wait_ms": 6000,
+        "/view/relaunch_all/ec2_capacity_wait_ms": 6000,
+        "/view/relaunch_all/ec2_waiting_since": null
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
         "/view/races/0/ec2/capacity_wait_ms": 6000,
         "/view/races/0/ec2/done_at": 10000,
         "/view/races/0/ec2/time_ms": 7000,
+        "/view/relaunch_all/ec2_ms": 7000,
         "/view/scoreboard/ec2/last_capacity_wait_ms": 6000,
-        "/view/scoreboard/ec2/last_measured_on": 3,
-        "/view/scoreboard/ec2/last_ms": 7000
+        "/view/scoreboard/ec2/last_ms": 7000,
+        "/view/scoreboard/ec2/measured_on": 3
       },
       "note": "ec2-2 finished 12 s after the click but waited 6 s for capacity: 7 s from ec2-3 is the half's time"
     },
     {
-      "after": 7,
+      "after": 8,
       "checks": {
         "/ec2_assign": [],
         "/view/fleet/n": 0,
@@ -186,26 +213,13 @@
       }
     ],
     "aggregates": [],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 0.0,
-      "decide_at_t": 5.0,
-      "hold_until_t": 7.0,
-      "next": null,
-      "offer": [
-        "horizon",
-        "dawn-valley",
-        "peak-seam-low-sun"
-      ],
-      "seed": 1,
-      "viewpoint": "coast",
-      "votes": {
-        "dawn-valley": 0,
-        "horizon": 0,
-        "peak-seam-low-sun": 0
-      }
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": 63000,
     "failures": [
       {
         "host": "h1",
@@ -215,8 +229,6 @@
       }
     ],
     "fleet": {
-      "borrow_cap": 0,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
@@ -226,12 +238,29 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 60,
-      "cooldown_until": 63000,
-      "interval_secs": null,
-      "next_race_at": null,
-      "running": null
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
     },
     "races": [
       {
@@ -252,7 +281,8 @@
                 "launch_ms": 1500,
                 "ready_ms": 4500
               },
-              "tile": "ec2:1"
+              "tile": "ec2:1",
+              "waiting_since": null
             },
             "ec2-2": {
               "capacity_wait_ms": 6000,
@@ -263,7 +293,8 @@
                 "launch_ms": 1200,
                 "ready_ms": 4800
               },
-              "tile": "ec2:2"
+              "tile": "ec2:2",
+              "waiting_since": 4000
             },
             "ec2-3": {
               "capacity_wait_ms": 0,
@@ -274,7 +305,8 @@
                 "launch_ms": 1600,
                 "ready_ms": 5000
               },
-              "tile": "ec2:3"
+              "tile": "ec2:3",
+              "waiting_since": null
             }
           },
           "time_ms": 7000
@@ -292,6 +324,21 @@
         "started_at": 3000
       }
     ],
+    "relaunch_all": {
+      "by": "viewer:v1",
+      "ec2_capacity_wait_ms": 6000,
+      "ec2_done_at": 10000,
+      "ec2_gpus": 3,
+      "ec2_ms": 7000,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": null,
+      "fcvm_gpus": 0,
+      "fcvm_ms": null,
+      "fcvm_pending": 0,
+      "race": 1,
+      "started_at": 3000
+    },
     "scene": {
       "camera": [
         {
@@ -331,24 +378,13 @@
     "scoreboard": {
       "ec2": {
         "last_capacity_wait_ms": 6000,
-        "last_measured_on": 3,
         "last_ms": 7000,
         "last_race": 1,
-        "measured_on_max": 3,
-        "measured_on_min": 3,
+        "measured_on": 3,
         "median_ms": 7000,
         "races": 1
       },
-      "fcvm": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      }
+      "fcvm": null
     },
     "tiles": [],
     "viewers": {

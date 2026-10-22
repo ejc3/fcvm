@@ -69,10 +69,9 @@
     {
       "after": 0,
       "checks": {
-        "/view/race/cooldown_secs": 20,
-        "/view/race/cooldown_until": null,
-        "/view/race/interval_secs": 30,
-        "/view/race/next_race_at": 30000
+        "/view/cooldown_until": null,
+        "/view/next_race_at": 30000,
+        "/view/relaunch_all": null
       }
     },
     {
@@ -86,9 +85,10 @@
       "after": 2,
       "checks": {
         "/assign/h1/0/generation": 2,
-        "/view/race/cooldown_until": 50000,
-        "/view/race/next_race_at": 60000,
-        "/view/races/0/by": "schedule"
+        "/view/cooldown_until": 50000,
+        "/view/next_race_at": 60000,
+        "/view/races/0/by": "schedule",
+        "/view/relaunch_all/by": "schedule"
       }
     },
     {
@@ -104,8 +104,8 @@
       "checks": {
         "/assign/h1/0/generation": 3,
         "/receipts/rn2/outcome": "committed",
-        "/view/race/cooldown_until": 70000,
-        "/view/race/next_race_at": 80000,
+        "/view/cooldown_until": 70000,
+        "/view/next_race_at": 80000,
         "/view/races/1/by": "viewer:v1"
       }
     },
@@ -125,7 +125,7 @@
       "after": 7,
       "checks": {
         "/assign/h1/0/generation": 4,
-        "/view/race/next_race_at": 110000,
+        "/view/next_race_at": 110000,
         "/view/races/2/by": "schedule"
       }
     }
@@ -179,30 +179,15 @@
         ]
       }
     ],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 80.0,
-      "decide_at_t": 85.0,
-      "hold_until_t": 87.0,
-      "next": null,
-      "offer": [
-        "peak-close",
-        "high-lakes",
-        "peak-seam"
-      ],
-      "seed": 1,
-      "viewpoint": "peak-seam-low-sun",
-      "votes": {
-        "high-lakes": 0,
-        "peak-close": 0,
-        "peak-seam": 0
-      }
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": 100000,
     "failures": [],
     "fleet": {
-      "borrow_cap": 1,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 1,
       "gpus": 1,
@@ -224,12 +209,29 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 20,
-      "cooldown_until": 100000,
-      "interval_secs": 30,
-      "next_race_at": 110000,
-      "running": 3
+    "next_race_at": 110000,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "peak-seam-low-sun",
+      "next": null,
+      "next_hold_at": 87000,
+      "targets": [
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
+        },
+        {
+          "id": "high-lakes",
+          "label": "The high lakes",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam",
+          "label": "The peak across the seam",
+          "votes": 0
+        }
+      ]
     },
     "races": [
       {
@@ -255,7 +257,8 @@
               "first_frame_at": null,
               "generation": 2,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             }
           },
           "time_ms": null
@@ -286,7 +289,8 @@
               "first_frame_at": null,
               "generation": 3,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             }
           },
           "time_ms": null
@@ -317,7 +321,8 @@
               "first_frame_at": null,
               "generation": 4,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             }
           },
           "time_ms": null
@@ -326,6 +331,21 @@
         "started_at": 80000
       }
     ],
+    "relaunch_all": {
+      "by": "schedule",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": null,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": null,
+      "fcvm_gpus": 1,
+      "fcvm_ms": null,
+      "fcvm_pending": 1,
+      "race": 3,
+      "started_at": 80000
+    },
     "scene": {
       "camera": [
         {
@@ -363,31 +383,14 @@
       "words": []
     },
     "scoreboard": {
-      "ec2": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      },
-      "fcvm": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      }
+      "ec2": null,
+      "fcvm": null
     },
     "tiles": [
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": 4,
@@ -418,6 +421,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": null,

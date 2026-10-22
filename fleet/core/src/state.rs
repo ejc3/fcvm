@@ -179,6 +179,9 @@ pub struct RaceTile {
     pub phases: BTreeMap<String, u64>,
     /// Time spent waiting for EC2 spot capacity, kept out of the half's time.
     pub capacity_wait_ms: u64,
+    /// While EC2 refuses capacity for it: since when.
+    #[serde(default)]
+    pub waiting_since: Option<u64>,
 }
 
 /// One half of a race: every tile placed in it when the race started.

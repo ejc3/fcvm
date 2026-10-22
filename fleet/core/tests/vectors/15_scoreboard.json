@@ -189,12 +189,10 @@
     {
       "after": 11,
       "checks": {
-        "/view/scoreboard/ec2/median_ms": null,
-        "/view/scoreboard/ec2/races": 0,
+        "/view/scoreboard/ec2": null,
         "/view/scoreboard/fcvm/last_ms": 5000,
         "/view/scoreboard/fcvm/last_race": 3,
-        "/view/scoreboard/fcvm/measured_on_max": 2,
-        "/view/scoreboard/fcvm/measured_on_min": 2,
+        "/view/scoreboard/fcvm/measured_on": 2,
         "/view/scoreboard/fcvm/median_ms": 5000,
         "/view/scoreboard/fcvm/races": 3
       }
@@ -202,7 +200,8 @@
     {
       "after": 12,
       "checks": {
-        "/view/race/running": 4,
+        "/view/relaunch_all/fcvm_done_at": null,
+        "/view/relaunch_all/race": 4,
         "/view/scoreboard/fcvm/last_race": 3
       },
       "note": "a race in progress changes nothing on the board"
@@ -265,30 +264,15 @@
         ]
       }
     ],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 0.0,
-      "decide_at_t": 5.0,
-      "hold_until_t": 7.0,
-      "next": null,
-      "offer": [
-        "horizon",
-        "dawn-valley",
-        "peak-seam-low-sun"
-      ],
-      "seed": 1,
-      "viewpoint": "coast",
-      "votes": {
-        "dawn-valley": 0,
-        "horizon": 0,
-        "peak-seam-low-sun": 0
-      }
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": 31000,
     "failures": [],
     "fleet": {
-      "borrow_cap": 1,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 2,
       "gpus": 2,
@@ -314,12 +298,29 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 1,
-      "cooldown_until": 31000,
-      "interval_secs": null,
-      "next_race_at": null,
-      "running": 4
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
     },
     "races": [
       {
@@ -345,14 +346,16 @@
               "first_frame_at": 5000,
               "generation": 2,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             },
             "slot-2": {
               "capacity_wait_ms": 0,
               "first_frame_at": 6000,
               "generation": 2,
               "phases": {},
-              "tile": "fcvm:2"
+              "tile": "fcvm:2",
+              "waiting_since": null
             }
           },
           "time_ms": 4000
@@ -383,14 +386,16 @@
               "first_frame_at": 12000,
               "generation": 3,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             },
             "slot-2": {
               "capacity_wait_ms": 0,
               "first_frame_at": 17000,
               "generation": 3,
               "phases": {},
-              "tile": "fcvm:2"
+              "tile": "fcvm:2",
+              "waiting_since": null
             }
           },
           "time_ms": 7000
@@ -421,14 +426,16 @@
               "first_frame_at": 23000,
               "generation": 4,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             },
             "slot-2": {
               "capacity_wait_ms": 0,
               "first_frame_at": 25000,
               "generation": 4,
               "phases": {},
-              "tile": "fcvm:2"
+              "tile": "fcvm:2",
+              "waiting_since": null
             }
           },
           "time_ms": 5000
@@ -459,14 +466,16 @@
               "first_frame_at": null,
               "generation": 5,
               "phases": {},
-              "tile": "fcvm:1"
+              "tile": "fcvm:1",
+              "waiting_since": null
             },
             "slot-2": {
               "capacity_wait_ms": 0,
               "first_frame_at": null,
               "generation": 5,
               "phases": {},
-              "tile": "fcvm:2"
+              "tile": "fcvm:2",
+              "waiting_since": null
             }
           },
           "time_ms": null
@@ -475,6 +484,21 @@
         "started_at": 30000
       }
     ],
+    "relaunch_all": {
+      "by": "viewer:v1",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": null,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": null,
+      "fcvm_gpus": 2,
+      "fcvm_ms": null,
+      "fcvm_pending": 2,
+      "race": 4,
+      "started_at": 30000
+    },
     "scene": {
       "camera": [
         {
@@ -512,23 +536,12 @@
       "words": []
     },
     "scoreboard": {
-      "ec2": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      },
+      "ec2": null,
       "fcvm": {
         "last_capacity_wait_ms": 0,
-        "last_measured_on": 2,
         "last_ms": 5000,
         "last_race": 3,
-        "measured_on_max": 2,
-        "measured_on_min": 2,
+        "measured_on": 2,
         "median_ms": 5000,
         "races": 3
       }
@@ -537,6 +550,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": "ws://h1:20001/frames",
         "generation": 5,
@@ -567,6 +581,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": "ws://h1:20002/frames",
         "generation": 5,
@@ -597,6 +612,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": null,
@@ -619,6 +635,7 @@
       {
         "borrowed": null,
         "error": null,
+        "failure": null,
         "fps": null,
         "frame_url": null,
         "generation": null,

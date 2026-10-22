@@ -296,30 +296,15 @@
       }
     ],
     "aggregates": [],
-    "claims": [],
-    "director": {
-      "arrive_next_t": null,
-      "arrived_t": 0.0,
-      "decide_at_t": 5.0,
-      "hold_until_t": 7.0,
-      "next": null,
-      "offer": [
-        "horizon",
-        "dawn-valley",
-        "peak-seam-low-sun"
-      ],
-      "seed": 1,
-      "viewpoint": "coast",
-      "votes": {
-        "dawn-valley": 0,
-        "horizon": 0,
-        "peak-seam-low-sun": 0
-      }
+    "borrow": {
+      "cap": 0,
+      "lent": 0,
+      "next_return_at": null
     },
+    "claims": [],
+    "cooldown_until": null,
     "failures": [],
     "fleet": {
-      "borrow_cap": 0,
-      "borrowed": 0,
       "ec2_instances": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
@@ -329,14 +314,32 @@
       "standby": []
     },
     "image_aspect": 1.7777777777777777,
-    "race": {
-      "cooldown_secs": 60,
-      "cooldown_until": null,
-      "interval_secs": null,
-      "next_race_at": null,
-      "running": null
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
     },
     "races": [],
+    "relaunch_all": null,
     "scene": {
       "camera": [
         {
@@ -427,26 +430,8 @@
       "words": []
     },
     "scoreboard": {
-      "ec2": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      },
-      "fcvm": {
-        "last_capacity_wait_ms": null,
-        "last_measured_on": null,
-        "last_ms": null,
-        "last_race": null,
-        "measured_on_max": null,
-        "measured_on_min": null,
-        "median_ms": null,
-        "races": 0
-      }
+      "ec2": null,
+      "fcvm": null
     },
     "tiles": [],
     "viewers": {

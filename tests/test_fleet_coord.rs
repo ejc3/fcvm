@@ -31,6 +31,7 @@ struct Opts {
     trust_cf: bool,
     /// The EC2 aggregator as the coordinator reaches it.
     ec2_local: Option<String>,
+    site_key: Option<String>,
 }
 
 impl Default for Opts {
@@ -44,6 +45,7 @@ impl Default for Opts {
             verifier: Arc::new(turnstile::Off),
             trust_cf: true,
             ec2_local: None,
+            site_key: None,
         }
     }
 }
@@ -62,6 +64,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         allowed_origins: vec!["https://wall.example".into()],
         verifier: o.verifier,
         trust_cf_connecting_ip: o.trust_cf,
+        turnstile_site_key: o.site_key,
         poster: Arc::new(poster::Poster::default()),
     };
     let h = handle.clone();
@@ -180,8 +183,12 @@ impl Viewer {
     }
 
     async fn message(&mut self, kind: &str) -> Value {
+        self.message_where(kind, |_| true).await
+    }
+
+    async fn message_where(&mut self, kind: &str, f: impl Fn(&Value) -> bool) -> Value {
         loop {
-            if let Some(m) = self.other.iter().find(|m| m["type"] == kind) {
+            if let Some(m) = self.other.iter().find(|m| m["type"] == kind && f(m)) {
                 return m.clone();
             }
             self.recv().await;
@@ -223,6 +230,7 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
     let hello = a.recv().await;
     assert_eq!(hello["type"], "hello", "the first message names the viewer");
     assert!(hello["viewer"].as_str().unwrap().starts_with("v-"));
+    assert_eq!(hello["turnstile"], Value::Null, "no Turnstile configured");
     let first = a.recv().await;
     assert_eq!(first["type"], "snapshot");
     for key in [
@@ -230,10 +238,13 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
         "aggregates",
         "fleet",
         "scene",
-        "race",
+        "next_race_at",
+        "cooldown_until",
+        "relaunch_all",
         "scoreboard",
         "races",
-        "director",
+        "nudges",
+        "borrow",
         "failures",
         "claims",
         "viewers",
@@ -509,14 +520,17 @@ async fn intents_wait_for_turnstile() {
         verifier: Arc::new(turnstile::Fake {
             accept: ["good".to_string()].into_iter().collect(),
         }),
+        site_key: Some("site-key-for-tests".into()),
         ..Opts::default()
     })
     .await;
     let mut a = Viewer::connect(&c.url).await;
+    let hello = a.recv().await;
+    assert_eq!(hello["turnstile"], "site-key-for-tests", "{hello}");
     a.intent("l", "light", light(1.0)).await;
     let r = a.nth_receipt("l", 0).await;
     assert_eq!(r["outcome"], "refused");
-    assert_eq!(r["reason"], "verify with Turnstile first");
+    assert_eq!(r["reason"], "verify first");
     a.send(json!({"type": "verify", "token": "bad"})).await;
     let v = a.message("verified").await;
     assert_eq!(v["ok"], false);
@@ -726,18 +740,31 @@ async fn a_claim_borrows_a_tile_and_only_its_viewer_gets_the_frames() {
         "one GPU per client at a time"
     );
 
+    let first = a.message("claim").await["claim"].clone();
+    assert_eq!(first["phase"], "restoring", "{first}");
+    assert_eq!(first["frame_url"], Value::Null);
+    assert_eq!(first["tile"], "fcvm:2");
     agent.report("slot-2", "running", 2);
-    let claim = a.message("claim").await;
-    assert_eq!(claim["slot"], "slot-2");
+    let claim = a
+        .message_where("claim", |m| m["claim"]["phase"] == "running")
+        .await["claim"]
+        .clone();
+    assert_eq!(claim["id"], "claim-1");
     assert_eq!(claim["frame_url"], "ws://gpu-host.example:20002/frames");
+    assert_eq!(claim["gpu"], "Tesla T4");
+    assert_eq!(claim["phases"]["gpu_ms"], 3000);
     let token = claim["token"].as_str().unwrap().to_string();
     assert!(token.len() >= 16);
-    assert!(claim["click_to_first_frame_ms"].is_u64(), "{claim}");
+    assert!(
+        claim["first_frame_at"].as_u64().unwrap() >= claim["clicked_at"].as_u64().unwrap(),
+        "{claim}"
+    );
 
     let s = b.until(|s| s["claims"][0]["first_frame_at"].is_u64()).await;
     assert_eq!(s["tiles"][1]["phase"], "borrowed");
     assert_eq!(s["tiles"][1]["frame_url"], Value::Null);
-    assert_eq!(s["tiles"][1]["borrowed"]["session"], claim["session"]);
+    assert_eq!(s["tiles"][1]["borrowed"]["session"], claim["id"]);
+    assert_eq!(s["borrow"]["lent"], 1);
     assert_eq!(s["claims"][0]["borrowed"], "fcvm:2");
     let all_b = format!("{:?}{:?}{:?}", b.snapshots, b.other, b.receipts);
     assert!(
@@ -749,9 +776,15 @@ async fn a_claim_borrows_a_tile_and_only_its_viewer_gets_the_frames() {
         "another viewer got the claim message"
     );
 
-    // The claiming viewer leaving returns the GPU to the wall.
-    a.ws.close(None).await.unwrap();
-    drop(a);
+    // Releasing ends the session for its viewer, and the GPU returns to the wall.
+    a.intent("rel", "release_gpu", json!({"claim": "claim-1"}))
+        .await;
+    assert_eq!(a.receipt("rel").await["outcome"], "committed");
+    let ended = a
+        .message_where("claim", |m| m["claim"]["phase"] == "ended")
+        .await["claim"]
+        .clone();
+    assert_eq!(ended["ended"], "released");
     let slots = loop {
         let slots = agent.assign().await;
         if slots[1].private_camera.is_none() {
@@ -837,6 +870,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         allowed_origins: vec![],
         verifier: Arc::new(turnstile::Off),
         trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
         poster,
     };
     let h = handle.clone();
@@ -868,6 +902,11 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         "the poster was taken before the hold converged (t={taken_t})"
     );
     assert_eq!(r.headers()["cache-control"], "public, max-age=10");
+    assert_eq!(
+        r.headers()["access-control-allow-origin"],
+        "*",
+        "the page reads the poster from its own origin"
+    );
     assert_eq!(r.headers()["content-type"], "image/x-portable-pixmap");
     let body = r.bytes().await.unwrap();
     let header = b"P6\n8 2\n255\n";
