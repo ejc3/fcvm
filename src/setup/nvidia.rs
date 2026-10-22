@@ -4,8 +4,10 @@
 //! read-only ext4 image holding, for that profile's exact kernel build:
 //!
 //! - `lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko`, built from the
-//!   `kernel-open/` sources inside the pinned driver `.run` against a tree
-//!   configured and built from the same inputs as the profile's kernel;
+//!   `kernel-open/` sources (or, with `module_type = "proprietary"`, the
+//!   proprietary `kernel/` sources) inside the pinned driver `.run` against a
+//!   tree configured and built from the same inputs as the profile's kernel,
+//!   and `nvidia.params`, the parameters fc-agent loads nvidia.ko with;
 //! - `lib/firmware/nvidia/<version>/gsp_*.bin`, the GSP firmware the open
 //!   modules boot on Turing and later;
 //! - `usr/lib/<triplet>/lib*.so.<version>` and `usr/bin/nvidia-smi` and
@@ -53,6 +55,52 @@ pub struct NvidiaDriverConfig {
     pub toolkit_url: String,
     /// SHA-256 of that archive, lowercase hex.
     pub toolkit_sha256: String,
+    /// Which of the `.run`'s kernel modules the image carries.
+    #[serde(default)]
+    pub module_type: ModuleType,
+}
+
+/// The NVIDIA kernel modules a driver image carries. Both come from the same
+/// `.run` and work with the same user-space driver.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleType {
+    /// `kernel-open/`. The driver's resource manager runs on the GPU's GSP, so
+    /// every GPU initialisation boots the GSP firmware first.
+    #[default]
+    Open,
+    /// `kernel/`, the proprietary modules, loaded with `NVreg_EnableGpuFirmware=0`
+    /// so the resource manager runs on the CPU and no GSP firmware is booted.
+    /// On a T4 in a gpu VM that halved the GPU initialisation (nvidia-persistenced
+    /// start 576 to 623 ms against 1,113 to 1,156 ms with the open modules).
+    /// Turing and Ampere only: later GPUs have no proprietary module support.
+    Proprietary,
+}
+
+impl ModuleType {
+    /// The `.run`'s directory holding these modules' sources.
+    fn source_dir(self) -> &'static str {
+        match self {
+            ModuleType::Open => "kernel-open",
+            ModuleType::Proprietary => "kernel",
+        }
+    }
+
+    /// The parameters nvidia.ko is loaded with (fc-agent reads them from
+    /// `nvidia.params` beside the module).
+    fn nvidia_params(self) -> &'static str {
+        match self {
+            ModuleType::Open => "",
+            ModuleType::Proprietary => "NVreg_EnableGpuFirmware=0",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ModuleType::Open => "open",
+            ModuleType::Proprietary => "proprietary",
+        }
+    }
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -175,7 +223,7 @@ sh "$NV_DIR/driver-$NV_DRIVER_VERSION.run" --extract-only --target "$NV_DIR/driv
 # fc-agent loads the modules at boot, before the pre-start snapshot, so a
 # restore that attaches a GPU only probes it (PCI rescan) instead of loading
 # and initialising the driver.
-NV_C="$NV_DIR/driver/kernel-open/nvidia/nv.c"
+NV_C="$NV_DIR/driver/$NV_MODULE_SRC/nvidia/nv.c"
 NV_NOGPU_FROM='const NvBool is_nvswitch_present = os_is_nvswitch_present();'
 NV_NOGPU_TO='const NvBool is_nvswitch_present = NV_TRUE;'
 if [[ $(grep -cF "$NV_NOGPU_FROM" "$NV_C") -ne 1 ]]; then
@@ -188,12 +236,13 @@ if [[ $(grep -cF "$NV_NOGPU_TO" "$NV_C") -ne 1 ]]; then
     exit 1
 fi
 
-# Kernel modules, from the .run's own open sources, against this tree.
-make -C "$NV_DIR/driver/kernel-open" SYSSRC="$PWD" SYSOUT="$PWD" ARCH="$KERNEL_ARCH" -j"$NPROC" modules
+# Kernel modules, from the .run's own sources (kernel-open/ or the proprietary
+# kernel/), against this tree.
+make -C "$NV_DIR/driver/$NV_MODULE_SRC" SYSSRC="$PWD" SYSOUT="$PWD" ARCH="$KERNEL_ARCH" -j"$NPROC" modules
 MODDIR="$NV_ROOT/lib/modules/$KREL/extra"
 mkdir -p "$MODDIR"
 for module in nvidia nvidia-uvm; do
-    ko="$NV_DIR/driver/kernel-open/$module.ko"
+    ko="$NV_DIR/driver/$NV_MODULE_SRC/$module.ko"
     version=$(modinfo -F version "$ko")
     vermagic=$(modinfo -F vermagic "$ko")
     if [[ "$version" != "$NV_DRIVER_VERSION" ]]; then
@@ -206,6 +255,8 @@ for module in nvidia nvidia-uvm; do
     fi
     install -m 0644 "$ko" "$MODDIR/$module.ko"
 done
+# The parameters fc-agent loads nvidia.ko with, one line, possibly empty.
+printf '%s\n' "$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params"
 
 # GSP firmware, where the firmware loader looks for nvidia/<version>/.
 install -d "$NV_ROOT/lib/firmware/nvidia/$NV_DRIVER_VERSION"
@@ -289,7 +340,8 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
     format!(
         "NV_DRIVER_VERSION=\"{}\"\nNV_DRIVER_URL=\"{}\"\nNV_DRIVER_SHA256=\"{}\"\n\
          NV_TOOLKIT_VERSION=\"{}\"\nNV_TOOLKIT_URL=\"{}\"\nNV_TOOLKIT_SHA256=\"{}\"\n\
-         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n",
+         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n\
+         NV_MODULE_SRC=\"{}\"\nNV_MODULE_PARAMS=\"{}\"\n",
         config.driver_version,
         config.driver_url,
         config.driver_sha256,
@@ -298,6 +350,8 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
         config.toolkit_sha256,
         triplet,
         image_tmp.display(),
+        config.module_type.source_dir(),
+        config.module_type.nvidia_params(),
     )
 }
 
@@ -322,6 +376,7 @@ pub fn driver_image_key(
         &config.toolkit_version,
         &config.toolkit_url,
         &config.toolkit_sha256,
+        config.module_type.as_str(),
         DRIVER_IMAGE_STAGE,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
@@ -609,6 +664,7 @@ mod tests {
             toolkit_url: "https://example.invalid/v1.20.1/toolkit_1.20.1_deb_arm64.tar.gz"
                 .to_string(),
             toolkit_sha256: "b".repeat(64),
+            module_type: ModuleType::Open,
         }
     }
 
@@ -684,6 +740,7 @@ mod tests {
             |c: &mut NvidiaDriverConfig| c.toolkit_version.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_url.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_sha256 = "d".repeat(64),
+            |c: &mut NvidiaDriverConfig| c.module_type = ModuleType::Proprietary,
         ] {
             let mut config = pinned();
             mutate(&mut config);
@@ -730,7 +787,7 @@ mod tests {
     }
 
     /// Run the stage's no-GPU patch against an `nv.c` holding `source`.
-    fn run_no_gpu_patch(source: &str) -> (bool, String, String) {
+    fn run_no_gpu_patch(module_src: &str, source: &str) -> (bool, String, String) {
         let start = DRIVER_IMAGE_STAGE
             .find("NV_C=")
             .expect("the stage no longer patches nv.c");
@@ -739,13 +796,14 @@ mod tests {
             .expect("the no-GPU patch must come before the module build")
             + start;
         let dir = tempfile::tempdir().unwrap();
-        let nvidia = dir.path().join("driver/kernel-open/nvidia");
+        let nvidia = dir.path().join("driver").join(module_src).join("nvidia");
         std::fs::create_dir_all(&nvidia).unwrap();
         std::fs::write(nvidia.join("nv.c"), source).unwrap();
         let output = std::process::Command::new("bash")
             .arg("-c")
             .arg(&DRIVER_IMAGE_STAGE[start..end])
             .env("NV_DIR", dir.path())
+            .env("NV_MODULE_SRC", module_src)
             .output()
             .unwrap();
         (
@@ -763,17 +821,56 @@ mod tests {
     fn the_stage_lets_the_driver_load_without_a_gpu() {
         let declared = "    const NvBool is_nvswitch_present = os_is_nvswitch_present();\n";
         let refusal = "    if ((count == 0) && (!is_nvswitch_present))\n";
-        let (ok, patched, stderr) = run_no_gpu_patch(&format!("{declared}{refusal}"));
-        assert!(ok, "{stderr}");
-        assert_eq!(
-            patched,
-            format!("    const NvBool is_nvswitch_present = NV_TRUE;\n{refusal}")
-        );
+        for module_type in [ModuleType::Open, ModuleType::Proprietary] {
+            let src = module_type.source_dir();
+            let (ok, patched, stderr) = run_no_gpu_patch(src, &format!("{declared}{refusal}"));
+            assert!(ok, "{src}: {stderr}");
+            assert_eq!(
+                patched,
+                format!("    const NvBool is_nvswitch_present = NV_TRUE;\n{refusal}"),
+                "{src}"
+            );
 
-        let (ok, unchanged, stderr) = run_no_gpu_patch(refusal);
-        assert!(!ok, "a driver without the declaration must fail the build");
-        assert_eq!(unchanged, refusal);
-        assert!(stderr.contains("is_nvswitch_present"), "{stderr}");
+            let (ok, unchanged, stderr) = run_no_gpu_patch(src, refusal);
+            assert!(
+                !ok,
+                "{src}: a driver without the declaration must fail the build"
+            );
+            assert_eq!(unchanged, refusal);
+            assert!(stderr.contains("is_nvswitch_present"), "{stderr}");
+        }
+    }
+
+    /// The module type picks the `.run` directory the stage builds and the
+    /// parameters it records for fc-agent; an unset type is the open modules.
+    #[test]
+    fn the_module_type_picks_the_sources_and_the_load_parameters() {
+        let parse = |extra: &str| -> Result<NvidiaDriverConfig, toml::de::Error> {
+            toml::from_str(&format!(
+                "driver_version = \"1\"\ndriver_url = \"u\"\ndriver_sha256 = \"s\"\n\
+                 toolkit_version = \"1\"\ntoolkit_url = \"u\"\ntoolkit_sha256 = \"s\"\n{extra}"
+            ))
+        };
+        assert_eq!(parse("").unwrap().module_type, ModuleType::Open);
+        assert_eq!(
+            parse("module_type = \"proprietary\"").unwrap().module_type,
+            ModuleType::Proprietary
+        );
+        assert!(parse("module_type = \"closed\"").is_err());
+
+        let mut config = pinned();
+        let open = stage_header(&config, "x86_64-linux-gnu", Path::new("/x/img.tmp"));
+        assert!(open.contains("NV_MODULE_SRC=\"kernel-open\"\n"), "{open}");
+        assert!(open.contains("NV_MODULE_PARAMS=\"\"\n"), "{open}");
+        config.module_type = ModuleType::Proprietary;
+        let closed = stage_header(&config, "x86_64-linux-gnu", Path::new("/x/img.tmp"));
+        assert!(closed.contains("NV_MODULE_SRC=\"kernel\"\n"), "{closed}");
+        assert!(
+            closed.contains("NV_MODULE_PARAMS=\"NVreg_EnableGpuFirmware=0\"\n"),
+            "{closed}"
+        );
+        assert!(DRIVER_IMAGE_STAGE.contains(r#"make -C "$NV_DIR/driver/$NV_MODULE_SRC""#));
+        assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params""#));
     }
 
     #[test]

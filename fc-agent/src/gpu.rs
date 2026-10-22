@@ -425,6 +425,19 @@ fn set_firmware_path(firmware_dir: &Path) -> Result<()> {
         .with_context(|| format!("setting {firmware_param} to {}", firmware_dir.display()))
 }
 
+/// The parameters `module` is loaded with: the words of `<module>.params`
+/// beside it in the image (the driver image records them for its module
+/// type, e.g. `NVreg_EnableGpuFirmware=0` for the proprietary modules), or
+/// none when the file is absent.
+pub fn module_params(module_dir: &Path, module: &str) -> Result<Vec<String>> {
+    let file = module_dir.join(format!("{module}.params"));
+    match std::fs::read_to_string(&file) {
+        Ok(text) => Ok(text.split_whitespace().map(str::to_string).collect()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error).with_context(|| format!("reading {}", file.display())),
+    }
+}
+
 /// `insmod` one of [`MODULES`] from the image, unless it is already loaded.
 async fn load_module(module_dir: &Path, module: &str) -> Result<()> {
     debug_assert!(MODULES.contains(&module));
@@ -437,7 +450,7 @@ async fn load_module(module_dir: &Path, module: &str) -> Result<()> {
     }
     let path = module_dir.join(format!("{module}.ko"));
     let mut insmod = tokio::process::Command::new("insmod");
-    insmod.arg(&path);
+    insmod.arg(&path).args(module_params(module_dir, module)?);
     if let Err(error) = run_checked(
         &format!("insmod {}", path.display()),
         insmod,
@@ -941,6 +954,32 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("nvidia-uvm"), "{error}");
+    }
+
+    /// nvidia.ko is loaded with the parameters its image records (the
+    /// proprietary modules need the GSP firmware switched off); a module
+    /// without a params file, or an image from before them, gets none.
+    #[test]
+    fn modules_load_with_the_parameters_the_image_records() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(module_params(dir.path(), "nvidia").unwrap().is_empty());
+        std::fs::write(dir.path().join("nvidia.params"), "\n").unwrap();
+        assert!(module_params(dir.path(), "nvidia").unwrap().is_empty());
+        std::fs::write(
+            dir.path().join("nvidia.params"),
+            "NVreg_EnableGpuFirmware=0\n",
+        )
+        .unwrap();
+        assert_eq!(
+            module_params(dir.path(), "nvidia").unwrap(),
+            vec!["NVreg_EnableGpuFirmware=0".to_string()]
+        );
+        assert!(module_params(dir.path(), "nvidia-uvm").unwrap().is_empty());
+        let code = include_str!("gpu.rs").split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code.contains(".args(module_params(module_dir, module)?)"),
+            "load_module must pass the recorded parameters to insmod"
+        );
     }
 
     #[test]
