@@ -177,12 +177,34 @@ async fn test_routed_vm_and_clone_take_the_given_ipv6_address() -> Result<()> {
     result
 }
 
+/// Run fcvm to completion. Every launch here is expected to be refused, but one that
+/// regressed would start a VM, so it dies with the test like `spawn_fcvm`'s do.
 async fn fcvm_output(fcvm: &std::path::Path, args: &[&str]) -> Result<std::process::Output> {
-    tokio::process::Command::new(fcvm)
-        .args(args)
+    let mut command = tokio::process::Command::new(fcvm);
+    command.args(args);
+    common::set_test_pdeathsig(&mut command);
+    command
         .output()
         .await
         .with_context(|| format!("running fcvm {args:?}"))
+}
+
+/// Every fcvm this file starts by hand carries the parent-death signal (CLAUDE.md, "PROCESS
+/// TEARDOWN IS PER-HOP"): a launch that regressed from a refusal to a running VM must not
+/// outlive a test nextest killed.
+#[test]
+fn every_hand_built_fcvm_command_here_dies_with_the_test() {
+    let source = include_str!("test_routed_address.rs");
+    let body = &source[..source
+        .find("fn every_hand_built_fcvm_command_here_dies_with_the_test")
+        .unwrap()];
+    let built = body.matches("Command::new(fcvm").count();
+    let armed = body.matches("common::set_test_pdeathsig(&mut").count();
+    assert!(built > 0, "the helper that builds fcvm commands moved");
+    assert_eq!(
+        built, armed,
+        "an fcvm command here is built without set_test_pdeathsig"
+    );
 }
 
 /// The address `suffix` inside `prefix` (CIDR, as fcvm's refusal prints it).

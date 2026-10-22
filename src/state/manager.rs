@@ -21,7 +21,7 @@ fn open_lock_file(path: &Path) -> Result<std::fs::File> {
     Ok(file)
 }
 
-pub(crate) fn lock_state_file(path: &Path, arg: FlockArg) -> Result<Flock<std::fs::File>> {
+fn lock_state_file(path: &Path, arg: FlockArg) -> Result<Flock<std::fs::File>> {
     lock_opened_state_file(path, open_lock_file(path)?, arg)
 }
 

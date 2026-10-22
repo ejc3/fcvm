@@ -44,18 +44,46 @@ impl Drop for AddressLease {
     fn drop(&mut self) {
         // Unlinked while still held (the lock is dropped after this body): a contender
         // that opened the old file finds it unlinked once it gets the lock and opens
-        // the path again (`lock_state_file`), so the file never outlives the lease.
+        // the path again (`lease_address`), so the file never outlives the lease.
         if let Err(error) = crate::state::manager::remove_if_exists(&self.path) {
             warn!(path = %self.path.display(), %error, "removing an IPv6 address lease");
         }
     }
 }
 
-/// Take the lease on `address` in `dir`, or None when another live process holds it.
+/// The process holding an address lease, as its holder wrote it into the lease file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseHolder {
+    pub pid: u32,
+    pub vm_id: String,
+}
+
+/// What `lease_address` found.
+pub(crate) enum LeaseAttempt {
+    Leased(AddressLease),
+    /// Another live process holds the address. `holder` is None only in the moment
+    /// between its lock and its write of who it is.
+    Held {
+        holder: Option<LeaseHolder>,
+    },
+}
+
+/// Take the lease on `address` in `dir` for VM `vm_id` of this process, or report who
+/// holds it.
+///
+/// The holder writes `<pid> <vm_id>` into the lease file, so a refused VM can name it
+/// even before the holder has recorded its address anywhere else. The file is therefore
+/// opened without truncation: a contender opening it must not erase what the holder
+/// wrote.
 pub(crate) fn lease_address(
     dir: &std::path::Path,
     address: std::net::Ipv6Addr,
-) -> Result<Option<AddressLease>> {
+    vm_id: &str,
+) -> Result<LeaseAttempt> {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::fs::MetadataExt;
+
     std::fs::create_dir_all(dir).with_context(|| {
         format!(
             "creating the IPv6 address lease directory {}",
@@ -65,17 +93,57 @@ pub(crate) fn lease_address(
     // Ipv6Addr's Display is the canonical (RFC 5952) form, so every spelling of one
     // address names one file.
     let path = dir.join(format!("{address}.lock"));
-    match crate::state::manager::lock_state_file(&path, nix::fcntl::FlockArg::LockExclusiveNonblock)
-    {
-        Ok(lock) => Ok(Some(AddressLease { path, _lock: lock })),
-        Err(error)
-            if error.downcast_ref::<nix::errno::Errno>()
-                == Some(&nix::errno::Errno::EWOULDBLOCK) =>
-        {
-            Ok(None)
+    // A retry needs a holder that unlinked the file between this open and this lock,
+    // which takes a release and a new lease each time.
+    for _ in 0..100 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening the lease of IPv6 address {address}"))?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                let held = lock
+                    .metadata()
+                    .context("reading the lease file's identity")?;
+                let current = match std::fs::metadata(&path) {
+                    Ok(current) => Some(current),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error).context("reading the lease path"),
+                };
+                if !current.is_some_and(|c| c.dev() == held.dev() && c.ino() == held.ino()) {
+                    // The previous holder unlinked this file after we opened it.
+                    continue;
+                }
+                let mut file: &std::fs::File = &lock;
+                file.set_len(0)
+                    .and_then(|()| file.rewind())
+                    .and_then(|()| writeln!(file, "{} {}", std::process::id(), vm_id))
+                    .with_context(|| format!("recording the holder of IPv6 address {address}"))?;
+                return Ok(LeaseAttempt::Leased(AddressLease { path, _lock: lock }));
+            }
+            Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
+                let mut written = String::new();
+                file.read_to_string(&mut written)
+                    .with_context(|| format!("reading the holder of IPv6 address {address}"))?;
+                let mut fields = written.split_whitespace();
+                let holder = match (fields.next().map(str::parse), fields.next()) {
+                    (Some(Ok(pid)), Some(vm_id)) => Some(LeaseHolder {
+                        pid,
+                        vm_id: vm_id.to_string(),
+                    }),
+                    _ => None,
+                };
+                return Ok(LeaseAttempt::Held { holder });
+            }
+            Err((_, error)) => {
+                return Err(error).with_context(|| format!("leasing IPv6 address {address}"))
+            }
         }
-        Err(error) => Err(error).with_context(|| format!("leasing IPv6 address {address}")),
     }
+    anyhow::bail!("the lease of IPv6 address {address} kept being replaced while taking it")
 }
 
 /// Refuse `--ipv6-address` for a VM that does not use routed networking: only routed
@@ -148,27 +216,26 @@ async fn host_route_for(address: &str) -> Result<Option<String>> {
 /// `ip` arguments that list the routes for one exact prefix, appended, in every table.
 const HOST_ROUTE_QUERY: [&str; 5] = ["-6", "route", "show", "table", "all"];
 
-/// Which live VM, if any, this data directory records at `address`: for the error that
-/// refuses an address another VM holds.
-async fn describe_address_holder(address: std::net::Ipv6Addr) -> String {
-    let recorded = format!("{address}/128");
+/// The VM holding `address`, for the error that refuses it to another: by the state this
+/// data directory records for the lease holder (its first state, with its name, is
+/// written before its network is set up), else by the pid and VM id the holder wrote
+/// into the lease.
+async fn describe_address_holder(holder: Option<LeaseHolder>) -> String {
+    let Some(holder) = holder else {
+        return "another live fcvm process, which has not yet recorded who it is".to_string();
+    };
     let manager = crate::state::StateManager::new(crate::paths::state_dir());
-    let holder = manager.list_vms().await.ok().and_then(|vms| {
-        vms.into_iter().find(|vm| {
-            vm.config.network.guest_ipv6.as_deref() == Some(recorded.as_str())
-                && crate::state::owner_is_live(vm)
-        })
-    });
-    match holder {
-        Some(vm) => format!(
+    let state = manager.load_state(&holder.vm_id).await.ok();
+    match state {
+        Some(vm) if vm.pid == Some(holder.pid) && crate::state::owner_is_live(&vm) => format!(
             "live VM '{}' (pid {})",
             vm.name.as_deref().unwrap_or(&vm.vm_id),
-            vm.pid
-                .map_or_else(|| "none".to_string(), |pid| pid.to_string())
+            holder.pid
         ),
-        None => "another live fcvm process (its VM is still starting, or runs from \
-                 another data directory)"
-            .to_string(),
+        _ => format!(
+            "fcvm pid {} (VM {}, recorded in another data directory)",
+            holder.pid, holder.vm_id
+        ),
     }
 }
 
@@ -612,12 +679,13 @@ impl NetworkManager for RoutedNetwork {
                 "the host's detected /64"
             };
             check_requested_address(network, prefix_len, address, source)?;
-            let Some(lease) = lease_address(lease_dir, address)? else {
-                anyhow::bail!(
+            let lease = match lease_address(lease_dir, address, &self.vm_id)? {
+                LeaseAttempt::Leased(lease) => lease,
+                LeaseAttempt::Held { holder } => anyhow::bail!(
                     "--ipv6-address {address} is held by {}; a routed VM's address is \
                      unique among live VMs",
-                    describe_address_holder(address).await
-                );
+                    describe_address_holder(holder).await
+                ),
             };
             let candidate = address.to_string();
             if let Some(route) = host_route_for(&candidate).await? {
@@ -643,7 +711,8 @@ impl NetworkManager for RoutedNetwork {
                 let address: std::net::Ipv6Addr = candidate
                     .parse()
                     .context("parsing a derived VM IPv6 address")?;
-                let Some(lease) = lease_address(lease_dir, address)? else {
+                let LeaseAttempt::Leased(lease) = lease_address(lease_dir, address, &self.vm_id)?
+                else {
                     warn!(ipv6 = %candidate, attempt, "IPv6 address leased by another VM, trying another");
                     continue;
                 };
@@ -1554,27 +1623,57 @@ mod tests {
         }
     }
 
+    fn leased(attempt: LeaseAttempt) -> Option<AddressLease> {
+        match attempt {
+            LeaseAttempt::Leased(lease) => Some(lease),
+            LeaseAttempt::Held { .. } => None,
+        }
+    }
+
     /// Two VMs asking for one address: the second is refused while the first holds it,
     /// in any spelling, and gets it once the first lets go.
     #[test]
     fn an_address_is_leased_to_one_vm_at_a_time() {
         let dir = tempfile::tempdir().unwrap();
         let address: std::net::Ipv6Addr = "2001:db8::5".parse().unwrap();
-        let first = lease_address(dir.path(), address).unwrap().expect("free");
+        let first = leased(lease_address(dir.path(), address, "vm-a").unwrap()).expect("free");
         let same: std::net::Ipv6Addr = "2001:0db8:0:0::0005".parse().unwrap();
         assert!(
-            lease_address(dir.path(), same).unwrap().is_none(),
+            leased(lease_address(dir.path(), same, "vm-b").unwrap()).is_none(),
             "a held address must not be leased again"
         );
-        assert!(lease_address(dir.path(), "2001:db8::6".parse().unwrap())
-            .unwrap()
-            .is_some());
+        assert!(
+            leased(lease_address(dir.path(), "2001:db8::6".parse().unwrap(), "vm-b").unwrap())
+                .is_some()
+        );
         drop(first);
         assert!(
             !dir.path().join("2001:db8::5.lock").exists(),
             "a released lease leaves no file"
         );
-        assert!(lease_address(dir.path(), same).unwrap().is_some());
+        assert!(leased(lease_address(dir.path(), same, "vm-b").unwrap()).is_some());
+    }
+
+    /// A VM refused an address learns who holds it from the lease itself, so the refusal
+    /// can name the holder before the holder has recorded its address anywhere else.
+    #[test]
+    fn a_refused_lease_names_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::8".parse().unwrap();
+        let _held = leased(lease_address(dir.path(), address, "vm-holder").unwrap()).unwrap();
+        for _ in 0..2 {
+            match lease_address(dir.path(), address, "vm-other").unwrap() {
+                LeaseAttempt::Held { holder } => assert_eq!(
+                    holder,
+                    Some(LeaseHolder {
+                        pid: std::process::id(),
+                        vm_id: "vm-holder".to_string()
+                    }),
+                    "a contender must read the holder, and must not erase it for the next one"
+                ),
+                LeaseAttempt::Leased(_) => panic!("a held address was leased again"),
+            }
+        }
     }
 
     /// A lease is held by the process, so a process that dies releases it with no
@@ -1601,10 +1700,10 @@ mod tests {
             .read_line(&mut line)
             .unwrap();
         assert_eq!(line.trim(), "locked");
-        assert!(lease_address(dir.path(), address).unwrap().is_none());
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_none());
         holder.kill().unwrap();
         holder.wait().unwrap();
-        assert!(lease_address(dir.path(), address).unwrap().is_some());
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_some());
     }
 
     /// An address the host itself holds has its /128 only in table `local`, and the

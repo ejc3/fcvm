@@ -1933,10 +1933,9 @@ async fn cmd_snapshot_run_inner(
             None
         }
     });
-    let vm_name = args.name.unwrap_or_else(|| {
-        // Auto-generate: snapshot-name + random suffix
-        format!("{}-{}", snapshot_name, &vm_id[..6])
-    });
+    let vm_name = args
+        .name
+        .unwrap_or_else(|| default_clone_name(&snapshot_name, &vm_id));
 
     // Validate VM name (whether user-provided or auto-generated)
     validate_vm_name(&vm_name).context("invalid VM name")?;
@@ -4015,13 +4014,38 @@ async fn clone_vsock_base(vsock_dir: Option<&str>, data_dir: &Path) -> Result<Pa
     Ok(socket_path)
 }
 
-/// The name of a disk-only clone run without `--name`: unique per run, since names are
-/// unique among live VMs and several clones of one tag may run at once.
-fn default_disk_only_clone_name(snapshot_name: &str) -> String {
-    format!(
-        "{snapshot_name}-clone-{}",
-        truncate_id(&generate_vm_id()[3..], 6)
-    )
+/// Hex characters of the VM id in a generated clone name: 48 random bits, so 100 clones
+/// of one snapshot started together share a name with odds of about 2 in 10^11.
+const CLONE_NAME_SUFFIX_LEN: usize = 12;
+
+/// The name of a clone run without `--name`: the snapshot's name and part of the clone's
+/// VM id. Names are unique among live VMs and many clones of one snapshot may run at once,
+/// so the random part must be long; and it must be a valid VM name for every valid
+/// snapshot name, so the snapshot's part is cut to fit 63 characters and a character a VM
+/// name refuses ('.') becomes '-'.
+fn default_clone_name(snapshot_name: &str, vm_id: &str) -> String {
+    let random = vm_id.strip_prefix("vm-").unwrap_or(vm_id);
+    let random = truncate_id(random, CLONE_NAME_SUFFIX_LEN);
+    let keep = 63 - 1 - random.len();
+    let base: String = snapshot_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_start_matches('-')
+        .chars()
+        .take(keep)
+        .collect();
+    if base.is_empty() {
+        format!("clone-{random}")
+    } else {
+        format!("{base}-{random}")
+    }
 }
 
 /// Cold-boot a clone from a disk-only snapshot.
@@ -4072,7 +4096,7 @@ async fn cmd_snapshot_run_disk_only(
     let vm_name = args
         .name
         .clone()
-        .unwrap_or_else(|| default_disk_only_clone_name(&snapshot_name));
+        .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
     let run_args = run_args_from_snapshot_metadata(
@@ -5714,15 +5738,32 @@ mod watchdog_exit_classification_tests {
 
     /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
     /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
-    /// Two unnamed disk-only clones of one tag must not share a name, or the second is
-    /// refused while the first runs.
+    /// A clone run without `--name` gets a name that is valid for every valid snapshot name
+    /// and does not repeat across clones of one snapshot: names are unique among live VMs,
+    /// so a repeat refuses the second clone.
     #[test]
-    fn unnamed_disk_only_clones_get_distinct_names() {
-        let first = crate::commands::snapshot::default_disk_only_clone_name("tag");
-        let second = crate::commands::snapshot::default_disk_only_clone_name("tag");
-        assert_ne!(first, second);
-        assert!(first.starts_with("tag-clone-"), "{first}");
-        crate::state::validate_vm_name(&first).unwrap();
+    fn generated_clone_names_are_valid_and_do_not_repeat() {
+        use crate::commands::snapshot::default_clone_name;
+        for len in 1..=128 {
+            let tag: String = "a.b-c_d".chars().cycle().take(len).collect();
+            crate::storage::snapshot::validate_snapshot_name(&tag).unwrap();
+            let name = default_clone_name(&tag, &crate::state::generate_vm_id());
+            crate::state::validate_vm_name(&name)
+                .unwrap_or_else(|e| panic!("tag of {len} characters gave {name:?}: {e}"));
+        }
+        for tag in ["-x", ".x", "..x", "_"] {
+            let name = default_clone_name(tag, &crate::state::generate_vm_id());
+            crate::state::validate_vm_name(&name)
+                .unwrap_or_else(|e| panic!("tag {tag:?} gave {name:?}: {e}"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let name = default_clone_name("golden", &crate::state::generate_vm_id());
+            assert!(
+                seen.insert(name.clone()),
+                "{name} repeated within 2000 clones"
+            );
+        }
     }
 
     /// Every error after the clone claims its name must go through `setup_try!`, which
