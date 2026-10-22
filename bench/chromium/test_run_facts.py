@@ -699,6 +699,50 @@ class MemoryPoolHealthcheck(unittest.TestCase):
             self.assertEqual(command[:3], ["podman", "create", "--no-healthcheck"])
 
 
+class NonDumpablePss(unittest.TestCase):
+    """report.py reads a non-dumpable process's PSS (pasta's) through sudo."""
+
+    def test_a_refused_read_is_retried_with_sudo(self):
+        import builtins
+        import subprocess
+        import report
+        real_open = builtins.open
+
+        def refusing_open(path, *args, **kwargs):
+            if str(path) == "/proc/4242/smaps_rollup":
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *args, **kwargs)
+
+        calls = []
+
+        def run(argv, **_kwargs):
+            calls.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "Rss: 900 kB\nPss: 812 kB\n", "")
+
+        with mock.patch("builtins.open", refusing_open), \
+                mock.patch.object(report.subprocess, "run", run):
+            self.assertEqual(report.pss_kb_of_pid(4242), 812)
+        self.assertEqual(calls, [["sudo", "-n", "cat", "/proc/4242/smaps_rollup"]])
+
+    def test_a_failed_sudo_read_still_refuses(self):
+        import builtins
+        import subprocess
+        import report
+        real_open = builtins.open
+
+        def refusing_open(path, *args, **kwargs):
+            if str(path) == "/proc/4242/smaps_rollup":
+                raise PermissionError(13, "Permission denied", path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", refusing_open), \
+                mock.patch.object(report.subprocess, "run",
+                                  lambda argv, **_k: subprocess.CompletedProcess(
+                                      argv, 1, "", "a password is required")):
+            with self.assertRaises(report.CgroupReadError):
+                report.pss_kb_of_pid(4242)
+
+
 class HostControlArms(unittest.TestCase):
     """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
 

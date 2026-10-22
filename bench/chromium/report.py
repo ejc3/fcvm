@@ -164,14 +164,38 @@ def read_meminfo():
 
 
 def pss_kb_of_pid(pid):
+    """PSS of one process, from its smaps_rollup.
+
+    pasta makes itself non-dumpable, so its /proc files belong to root and
+    the invoking user is refused even though it owns the process: the memory
+    phase's first 48-clone cell stopped on "cannot read
+    /proc/<pasta>/smaps_rollup: [Errno 13] Permission denied". The phase
+    already requires passwordless sudo, so a refused read is retried as
+    `sudo -n cat` of the same file.
+    """
     path = f"/proc/{pid}/smaps_rollup"
     try:
         with open(path) as f:
-            for line in f:
-                if line.startswith("Pss:"):
-                    return int(line.split()[1])
-    except (OSError, ValueError) as exc:
+            text = f.read()
+    except PermissionError as exc:
+        try:
+            result = subprocess.run(["sudo", "-n", "cat", path], capture_output=True,
+                                    text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError) as sudo_exc:
+            raise CgroupReadError(f"cannot read {path}: {exc}; sudo: {sudo_exc}") from exc
+        if result.returncode != 0:
+            raise CgroupReadError(
+                f"cannot read {path}: {exc}; sudo cat exited {result.returncode}: "
+                f"{result.stderr.strip()}") from exc
+        text = result.stdout
+    except OSError as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc
+    for line in text.splitlines():
+        if line.startswith("Pss:"):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError) as exc:
+                raise CgroupReadError(f"cannot read {path}: {exc}") from exc
     raise CgroupReadError(f"cannot read {path}: no Pss field")
 
 
