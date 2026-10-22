@@ -29,7 +29,7 @@ use sha2::{Digest, Sha256};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use tokio::process::Command;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::paths;
 use crate::setup::rootfs::{get_kernel_profile, KernelProfile};
@@ -359,6 +359,42 @@ pub async fn profile_nvidia_driver_image(
     }
 }
 
+/// The driver image a restored clone's in-place reboot attaches: the profile's
+/// current image when it resolves and exists, else None with a warning. Never an
+/// error, because the restore that precedes any reboot does not use it.
+pub fn reboot_driver_image(profile_name: &str) -> Option<PathBuf> {
+    let has_driver = match get_kernel_profile(profile_name) {
+        Ok(Some(profile)) => profile.nvidia.is_some(),
+        Ok(None) => false,
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), profile = profile_name, "reading the kernel profile for a reboot's driver image");
+            return None;
+        }
+    };
+    if !has_driver {
+        return None;
+    }
+    match get_nvidia_driver_image_path(profile_name) {
+        Ok(path) => present_for_reboot(path),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), profile = profile_name, "resolving the NVIDIA driver image for a reboot");
+            None
+        }
+    }
+}
+
+fn present_for_reboot(path: PathBuf) -> Option<PathBuf> {
+    if path.exists() {
+        Some(path)
+    } else {
+        warn!(
+            path = %path.display(),
+            "the profile's NVIDIA driver image is not built; a reboot of this clone gets none"
+        );
+        None
+    }
+}
+
 /// The driver image path for a profile, without building it.
 pub fn get_nvidia_driver_image_path(profile_name: &str) -> Result<PathBuf> {
     Ok(DriverImage::resolve(profile_name)?.path)
@@ -470,9 +506,13 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
     })?;
     let arch = std::env::consts::ARCH;
 
-    // A build tree of its own: the kernel build of the same profile uses
-    // /tmp/kernel-build-<profile>-<sha> under a different lock.
-    let build_dir = std::env::temp_dir().join(format!("nvidia-build-{profile_name}-{key}"));
+    // A build tree of this invocation's own: the store lock is per assets directory,
+    // so two setups with different assets directories can build the same key at
+    // once, and the kernel build of the same profile uses
+    // /tmp/kernel-build-<profile>-<sha> under a different lock. The build runs as
+    // the invoking user, so it stays in the temp directory that user can write.
+    let (build_dir, script_path) =
+        build_workspace(&std::env::temp_dir(), key, uuid::Uuid::new_v4());
     let image_tmp = image_path.with_extension(format!("ext4.tmp-{}", uuid::Uuid::new_v4()));
     let kernel_tmp = build_dir.join("kernel-image.discard");
     let _ = std::fs::remove_file(&kernel_tmp);
@@ -490,7 +530,6 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
         &repo_root,
         Some(&stage),
     )?;
-    let script_path = std::env::temp_dir().join(format!("fcvm-nvidia-build-{key}.sh"));
     std::fs::write(&script_path, &script).context("writing NVIDIA driver image build script")?;
     std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))?;
 
@@ -519,7 +558,23 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
             build_dir.display()
         );
     }
-    super::publish_store_entry(&image_tmp, image_path, "NVIDIA driver image").await
+    let published = super::publish_store_entry(&image_tmp, image_path, "NVIDIA driver image").await;
+    if published.is_ok() {
+        if let Err(error) = std::fs::remove_dir_all(&build_dir) {
+            warn!(build_dir = %build_dir.display(), %error, "removing the NVIDIA build tree");
+        }
+    }
+    published
+}
+
+/// The build tree and script of one driver image build, unique to the invocation
+/// so concurrent builds never share a file. The script sits beside the tree, which
+/// the script itself creates as the invoking user.
+fn build_workspace(temp: &Path, key: &str, invocation: uuid::Uuid) -> (PathBuf, PathBuf) {
+    (
+        temp.join(format!("nvidia-build-{key}-{invocation}")),
+        temp.join(format!("fcvm-nvidia-build-{key}-{invocation}.sh")),
+    )
 }
 
 #[cfg(test)]
@@ -537,6 +592,28 @@ mod tests {
                 .to_string(),
             toolkit_sha256: "b".repeat(64),
         }
+    }
+
+    #[test]
+    fn concurrent_builds_get_their_own_workspace() {
+        let temp = Path::new("/tmp");
+        let (a_dir, a_script) = build_workspace(temp, "k1", uuid::Uuid::new_v4());
+        let (b_dir, b_script) = build_workspace(temp, "k1", uuid::Uuid::new_v4());
+        assert_ne!(a_dir, b_dir);
+        assert_ne!(a_script, b_script);
+        assert!(
+            !a_script.starts_with(&a_dir),
+            "the script is written before its tree exists"
+        );
+    }
+
+    #[test]
+    fn a_reboot_without_a_built_image_gets_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nvidia-gpu.img");
+        assert_eq!(present_for_reboot(missing.clone()), None);
+        std::fs::write(&missing, b"").unwrap();
+        assert_eq!(present_for_reboot(missing.clone()), Some(missing));
     }
 
     #[test]

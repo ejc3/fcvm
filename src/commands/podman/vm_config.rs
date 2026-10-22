@@ -713,6 +713,7 @@ pub(super) fn build_boot_plan_json(
     volume_mappings: &[VolumeMapping],
     image_device: Option<String>,
     gpu_driver_device: Option<String>,
+    await_gpu_restore: bool,
 ) -> serde_json::Value {
     // Build volume mount info for MMDS
     // Format: { guest_path, vsock_port, read_only }
@@ -810,6 +811,7 @@ pub(super) fn build_boot_plan_json(
         pmem_mounts,
         image_device,
         gpu_driver_device,
+        await_gpu_restore,
         http_proxy,
         https_proxy,
         no_proxy,
@@ -1320,7 +1322,12 @@ pub(crate) fn build_launch_config(
         data_dir: crate::paths::data_dir(),
         extra_disks,
         pmem: args.pmem.clone(),
-        gpu_driver_image: runtime_config.gpu_driver_image.clone(),
+        gpu_driver_image: runtime_config
+            .gpu_driver_image
+            .as_ref()
+            .map(|driver| driver.path.clone()),
+        // Launch-only config: never hashed into a snapshot key, nothing to verify.
+        gpu_driver_identity: None,
         env_vars: args.env.to_vec(),
         volume_mounts: args.map.to_vec(),
         privileged: args.privileged,
@@ -1422,7 +1429,13 @@ pub(crate) async fn configure_and_boot_vm(
                 args.disk_dir.len(),
                 image_device.is_some(),
             );
-            Some(attach_gpu_driver_image(hv, image, index).await?)
+            let device = attach_gpu_driver_image(hv, image, index).await?;
+            // The key named one build of the image and the VMM opened it by path: a
+            // rebuild in between would pair this run's snapshot with another filesystem.
+            if let Some(expected) = plan.launch_config.gpu_driver_identity.as_deref() {
+                crate::utils::verify_image_disk_identity(image, expected)?;
+            }
+            Some(device)
         }
         None => None,
     };
@@ -1529,6 +1542,7 @@ pub(crate) async fn configure_and_boot_vm(
         volume_mappings,
         image_device,
         gpu_driver_device,
+        !args.gpu.is_empty(),
     );
     // Wrapped in an abort-on-drop guard: if a later boot-config step (entropy/balloon/
     // boot) returns Err, the guard drops and aborts the listener task instead of leaking

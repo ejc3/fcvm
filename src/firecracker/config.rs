@@ -55,6 +55,11 @@ pub struct FirecrackerConfig {
     /// modules were compiled against, and the snapshot holds the guest's mount of it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu_driver_image: Option<PathBuf>,
+    /// Build identity of `gpu_driver_image` (`utils::file_identity`): a rebuild at the
+    /// same path is a different filesystem, so it is a cache miss. Set only on the key
+    /// config (launch-only configs carry None), and verified after the drive is attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_driver_identity: Option<String>,
     /// Environment variables passed to the container.
     /// Format: "KEY=value" - affects container behavior so must be in cache key.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -234,6 +239,7 @@ impl Default for FirecrackerConfig {
             extra_disks: Vec::new(),
             pmem: Vec::new(),
             gpu_driver_image: None,
+            gpu_driver_identity: None,
             env_vars: Vec::new(),
             volume_mounts: Vec::new(),
             privileged: false,
@@ -519,6 +525,7 @@ impl FirecrackerConfig {
                     "image_device": runtime.image_device,
                     "image_mode": runtime.image_device.as_ref().map(|_| self.image_mode.to_string()),
                     "gpu_driver": runtime.gpu_driver_device.as_ref().map(|device| serde_json::json!({ "device": device })),
+                    "await_gpu_restore": runtime.await_gpu_restore,
                     "privileged": self.privileged,
                     "user": self.user.as_deref(),
                     "subuid_start": runtime.subuid_start,
@@ -561,6 +568,10 @@ pub struct MmdsRuntime {
     pub image_device: Option<String>,
     /// Device path of the NVIDIA driver image (`gpu_driver_image`), if attached
     pub gpu_driver_device: Option<String>,
+    /// The run's GPUs are attached by the restore of its pre-start snapshot (--gpu),
+    /// so this VM must not launch the container unless it is that restore. Not keyed:
+    /// fc-agent reads it only before the cache handshake, which a restore is past.
+    pub await_gpu_restore: bool,
     /// Resolved HTTP proxy URL (IP, not hostname)
     pub http_proxy: Option<String>,
     /// Resolved HTTPS proxy URL
@@ -759,6 +770,11 @@ mod tests {
         let mut other = test_config();
         other.gpu_driver_image = Some(PathBuf::from("/assets/nvidia/driver-b.img"));
         assert_ne!(gpu.snapshot_key(), other.snapshot_key());
+        // A rebuild at the same path is a different filesystem: a different key.
+        let mut rebuilt = gpu.clone();
+        gpu.gpu_driver_identity = Some("1841:1107296256:1765574672.000000000".to_string());
+        rebuilt.gpu_driver_identity = Some("2007:1107296256:1765581300.000000000".to_string());
+        assert_ne!(gpu.snapshot_key(), rebuilt.snapshot_key());
     }
 
     #[test]
@@ -1011,6 +1027,7 @@ mod tests {
             pmem_mounts: vec![],
             image_device: None,
             gpu_driver_device: None,
+            await_gpu_restore: false,
             http_proxy: None,
             https_proxy: None,
             no_proxy: None,
@@ -1036,6 +1053,7 @@ mod tests {
             pmem_mounts: vec![],
             image_device: None,
             gpu_driver_device: gpu_driver_device.map(str::to_string),
+            await_gpu_restore: gpu_driver_device.is_some(),
             http_proxy: None,
             https_proxy: None,
             no_proxy: None,
@@ -1048,6 +1066,10 @@ mod tests {
         assert_eq!(
             plan.pointer("/latest/container-plan/gpu_driver"),
             Some(&serde_json::json!({ "device": "/dev/vdc" }))
+        );
+        assert_eq!(
+            plan.pointer("/latest/container-plan/await_gpu_restore"),
+            Some(&serde_json::json!(true))
         );
         let plan = test_config().to_mmds_json(runtime(None));
         assert_eq!(
