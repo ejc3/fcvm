@@ -26,6 +26,8 @@ struct GText {
   float height;          // glyph cell height in km
   float alpha;           // fade in/out
   V3 color;              // emitted radiance
+  int style;             // 0: glowing glass tube (words), 1: dark core with a light rim (clock)
+  int occlude;           // 1: hidden behind nearer terrain
   int len;
   unsigned char ch[MAX_CHARS];
 };

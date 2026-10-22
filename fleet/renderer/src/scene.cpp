@@ -121,7 +121,7 @@ Scene default_scene() {
   Scene s;
   s.epoch_unix_ms = 0;
   s.loop_s = 120;
-  s.time_of_day = 0.30;
+  s.time_of_day = 0.245;  // golden hour: the sun about 7 degrees up
   // From the sea toward a mountain massif and back, with two holds. Positions
   // are km, the second coordinate altitude above sea level.
   auto K = [&](double t, double px, double py, double pz, double lx, double ly, double lz, double fov) {
@@ -295,16 +295,6 @@ V3 sun_direction(double tod) {
   return normalize(v3((float)east, (float)up, (float)north));
 }
 
-void billboard(GText& g, V3 center, V3 eye, float height) {
-  V3 n = normalize(eye - center);
-  V3 r = cross(v3(0, 1, 0), n);
-  if (length(r) < 1e-4f) r = v3(1, 0, 0);
-  r = normalize(r);
-  g.center = center;
-  g.right = r;
-  g.up = normalize(cross(n, r));
-  g.height = height;
-}
 
 void set_text(GText& g, const std::string& s) {
   g.len = (int)std::min<size_t>(s.size(), MAX_CHARS);
@@ -331,7 +321,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
   p.sun_e = v3(1.0f, 0.97f, 0.92f) * 22.0f;
   float se = p.sun_dir.y;
   float day = smoothstepf(-0.12f, 0.3f, se);
-  p.exposure = 0.55f / (0.04f + 2.6f * day);
+  p.exposure = 0.8f / (0.04f + 2.6f * day);
   // Cloud offset: the cloud volume tiles every CLOUD_TILE_KM, so reducing
   // modulo the tile keeps it continuous at any t.
   double wx = std::fmod(layer_t * 0.010, (double)CLOUD_TILE_KM), wz = std::fmod(layer_t * 0.0035, (double)CLOUD_TILE_KM);
@@ -351,7 +341,22 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     g.alpha = (float)std::min(1.0, (st - l.t) / 0.5);
     for (int i = 0; i < 3; i++) { key = mix64(key, dbits(l.pos[i])); key = mix64(key, dbits(l.color[i])); }
   }
-  // Text: the clock first, then the newest words.
+  // Text: the clock first, then the newest words. Both are placed in screen
+  // terms (direction from the eye) inside a safe area, so none is cut off at
+  // the image's edge and the clock is always in view; they sit in the world at
+  // a fixed distance and face the camera.
+  const float tanh_ = p.cam.tan_half, asp = (float)aspect;
+  auto place = [&](GText& g, float u, float v, float dist, float hfrac) {
+    V3 dir = normalize(p.cam.fwd + p.cam.right * (u * tanh_ * asp) + p.cam.up * (v * tanh_));
+    g.center = p.cam.pos + dir * dist;
+    g.right = p.cam.right;
+    g.up = p.cam.up;
+    g.height = hfrac * 2.0f * tanh_ * dist;  // hfrac of the image's height
+  };
+  auto text_halfwidth_u = [&](int len, float hfrac) {  // half the text's width in u (-1..1 across the image)
+    float wh = (len * GLYPH_ADVANCE - (GLYPH_ADVANCE - GLYPH_W)) / GLYPH_H;  // width / height
+    return hfrac * wh / asp;
+  };
   {
     GText& g = p.text[p.n_text++];
     time_t secs = (time_t)std::floor(s.epoch_unix_ms / 1000.0 + t);
@@ -360,37 +365,37 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     char buf[32];
     snprintf(buf, sizeof buf, "%02d:%02d:%02d UTC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
     set_text(g, buf);
-    V3 fl = normalize(v3(p.cam.fwd.x, 0.0f, p.cam.fwd.z) + v3(0, 1e-4f, 0));
-    V3 c = p.cam.pos + fl * 12.0f + v3(0, 1.75f, 0);
-    billboard(g, c, p.cam.pos, 0.42f);
-    g.color = v3(1.0f, 0.55f, 0.18f) * 2.6f;
+    place(g, 0.0f, 0.66f, 2.0f, 0.075f);
+    g.color = v3(1.0f, 0.86f, 0.62f) * 3.2f;  // the rim's light
+    g.style = 1;
+    g.occlude = 0;  // always readable
     g.alpha = 1.0f;
   }
   int first = std::max(0, (int)s.words.size() - (MAX_TEXTS - 1));
-  for (int i = first; i < (int)s.words.size(); i++) {
+  int slot = 0;
+  for (int i = (int)s.words.size() - 1; i >= first; i--) {  // newest first gets the top row
     const SceneWord& w = s.words[i];
     double age = st - w.t;
     if (age < 0 || age > 90) continue;
     GText& g = p.text[p.n_text++];
     set_text(g, w.text);
-    CamPose at = camera_at(s.camera, w.t);
-    clamp_above_ground(at.pos);
-    to_world(at.look);
-    GCam wc = make_cam(at.pos, at.look, at.fov_deg, aspect);
     uint32_t h = hash_u32((uint32_t)i * 2654435761u ^ (uint32_t)std::lround(w.t * 1000));
-    float side = (u01(h) - 0.5f) * 7.0f;
-    float rise = 0.15f + u01(hash_u32(h)) * 0.6f;
-    V3 fl = normalize(v3(wc.fwd.x, 0.0f, wc.fwd.z) + v3(0, 1e-4f, 0));
-    V3 rl = normalize(cross(fl, v3(0, 1, 0)));
-    V3 c = wc.pos + fl * 8.0f + rl * side;
-    float ground = fmaxf(0.0f, terrain_h(v2(c.x, c.z), 7, host_noise().tab.data()));
-    float base_y = fmaxf(alt_flat(wc.pos), ground) + rise;
-    c.y = base_y - (c.x * c.x + c.z * c.z) * (0.5f / PLANET_R);
-    billboard(g, c, p.cam.pos, 0.3f);
+    const float hf = 0.05f;
+    // six rows below the clock, three columns; the safe area is 85% of the
+    // width and from 0.45 down to -0.75 of the height
+    int row = slot % 6, col = (slot / 6) % 3;
+    slot++;
+    float v = 0.38f - row * 0.2f;
+    float half = text_halfwidth_u(g.len, hf);
+    float lim = std::max(0.0f, 0.85f - half);
+    float u = std::clamp((col - 1) * 0.55f + (u01(h) - 0.5f) * 0.3f, -lim, lim);
+    place(g, u, v, 2.5f, hf);
     float hue = u01(hash_u32(h ^ 0xABCDu));
-    V3 col = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
-                0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
-    g.color = (col * 0.85f + v3(0.15f)) * 2.6f;
+    V3 col3 = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
+                 0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
+    g.color = (col3 * 0.85f + v3(0.15f)) * 2.6f;
+    g.style = 0;
+    g.occlude = 1;
     g.alpha = (float)(std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0));
   }
 

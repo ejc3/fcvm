@@ -48,6 +48,8 @@ struct Globals {
 };
 
 __constant__ FrameParams cP;
+__device__ float g_sunvis;      // fraction of the sun the camera sees this frame (glare)
+__device__ unsigned int g_bad;  // samples that came out non-finite (counted, then dropped)
 __constant__ Globals cG;
 __constant__ V4 cSeg[FONT_MAX_SEGMENTS];
 __constant__ short cGStart[128];
@@ -63,8 +65,8 @@ __device__ __forceinline__ void densities(float h, float* r, float* m, float* o)
   *o = fmaxf(0.0f, 1.0f - fabsf(h - 25.0f) * (1.0f / 15.0f));
 }
 #define RAY_B v3(5.802e-3f, 13.558e-3f, 33.1e-3f)
-#define MIE_S 3.996e-3f
-#define MIE_E 4.40e-3f
+#define MIE_S 9.0e-3f   // aerosols: about twice a clear day, for aerial haze
+#define MIE_E 10.0e-3f
 #define OZO_A v3(0.650e-3f, 1.881e-3f, 0.085e-3f)
 
 __device__ __forceinline__ V3 extinction(float h) {
@@ -158,25 +160,37 @@ __device__ float sphere_near(V3 o, V3 d, float hs) {
 
 // Single scattering along o + d*s, s in [0, tmax], N steps. Returns in-scattered
 // radiance (for unit sun irradiance scaled by cP.sun_e) and the transmittance.
+__device__ __forceinline__ float sph_alt(V3 p) { return length(v3(p.x, p.y + PLANET_R, p.z)) - PLANET_R; }
+
 __device__ V3 scatter(V3 o, V3 d, float tmax, int N, V3* trans_out) {
   V3 sun = cP.sun_dir;
   float c = dot(d, sun);
   float pr = phase_ray(c), pm = phase_mie(c);
-  float ds = tmax / N;
   V3 T = v3(1.0f), L = v3(0.0f);
+  // a camera above the atmosphere starts at the ray's entry into it
+  float t0 = 0.0f;
+  if (sph_alt(o) > 59.9f) {
+    t0 = sphere_near(o, d, 59.9f);
+    if (t0 < 0.0f || t0 >= tmax) {
+      if (trans_out) *trans_out = T;
+      return L;
+    }
+  }
+  float span = tmax - t0;
+  float ds;
   for (int k = 0; k < N; k++) {
     // quadratic spacing puts more steps near the eye
     float u0 = k / (float)N, u1 = (k + 1) / (float)N;
-    float s0 = u0 * u0 * tmax, s1 = u1 * u1 * tmax;
+    float s0 = t0 + u0 * u0 * span, s1 = t0 + u1 * u1 * span;
     ds = s1 - s0;
     V3 p = o + d * (0.5f * (s0 + s1));
-    float h = fmaxf(alt_flat(p), 0.0f);
+    float h = fmaxf(sph_alt(p), 0.0f);
     float r, m, oz;
     densities(h, &r, &m, &oz);
     V3 ext = RAY_B * r + v3(MIE_E * m) + OZO_A * oz;
     V3 stepT = v3(__expf(-ext.x * ds), __expf(-ext.y * ds), __expf(-ext.z * ds));
     float mu_s = dot(up_at(p), sun);
-    V3 Ts = transmittance(h, mu_s);
+    V3 Ts = transmittance(fminf(h, 60.0f), mu_s);
     V3 scat = RAY_B * (r * pr) + v3(MIE_S * m * pm);
     // a cheap multiple-scattering term: isotropic, lit by a softened sun
     V3 ms = (RAY_B * r + v3(MIE_S * m)) * (0.09f * sat(mu_s * 3.0f + 0.35f));
@@ -201,7 +215,11 @@ __global__ void k_sky(V4* out) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
   if (i >= SKY_W || j >= SKY_H) return;
   V3 d = sky_dir_of(i, j);
+  // the sky as seen from near the ground below the camera: the map lights the
+  // terrain, clouds and water, which are down there even when the eye is not
   V3 o = cP.cam.pos;
+  float a = alt_flat(o);
+  if (a > 4.0f) o.y -= a - 4.0f;
   V3 L;
   if (d.y < -0.02f) {
     // below the horizon: haze over a dim ground
@@ -246,32 +264,51 @@ __device__ __forceinline__ V3 sun_at(V3 p) {
 
 __device__ __forceinline__ float cloud_tex(V3 q) { return tex3D<float>(cG.cloud, q.x, q.y, q.z); }
 
+// Coverage (where clouds form, fixed to the ground) at wp, and a warp for the
+// volume lookup from the same noise's second octave (its value and slope): the volume
+// tiles every CLOUD_TILE_KM, which reads as a lattice of identical puffs from
+// high up, so its lookup is shifted by a field that changes over ~20 km.
+__device__ __forceinline__ float cloud_cov(V2 wp, V2* warp) {
+  V2 p = wp + v2(31.7f, 4.1f);
+  V3 n1 = noised(p, cG.noise), n2 = noised(oct_step(p), cG.noise);
+  *warp = v2(0.45f * n2.x, 0.11f * (n2.y - n2.z));
+  float cov = (0.5f * n1.x + 0.25f * n2.x) * 0.5f + 0.5f;  // fbm(p, 2) * 0.5 + 0.5
+  return smoothstepf(0.27f, 0.64f, cov) * 0.97f;
+}
+
+// The cloud body: two octaves of the volume, the second rotated and scaled by
+// a non-integer factor so the two do not repeat together.
+__device__ __forceinline__ float cloud_base(V3 p, float h, V2 w, V3* qo) {
+  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM) + w.x, h * (1.0f / 6.0f),
+            (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM) + w.y);
+  *qo = q;
+  V3 r = v3(0.8f * q.x - 0.6f * q.z, q.y * 2.0f, 0.6f * q.x + 0.8f * q.z);
+  return 0.7f * cloud_tex(q) + 0.3f * cloud_tex(v3(r.x * 2.71f + 0.17f, r.y, r.z * 2.71f + 0.41f));
+}
+
 // Test for the coarse march: false only where cloud_density is zero (it skips
 // the height profile and the detail erosion, which only remove density).
 __device__ bool cloud_maybe(V3 p) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return false;
-  V2 wp = v2(p.x, p.z) * (1.0f / 42.0f);
-  float cov = fbm(wp + v2(31.7f, 4.1f), 2, cG.noise) * 0.5f + 0.5f;
-  cov = smoothstepf(0.27f, 0.64f, cov) * 0.97f;
+  V2 w;
+  float cov = cloud_cov(v2(p.x, p.z) * (1.0f / 42.0f), &w);
   if (cov <= 0.01f) return false;
-  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 6.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
-  float base = 0.7f * cloud_tex(q) + 0.3f * cloud_tex(v3(q.x * 3.0f + 0.17f, q.y * 2.0f, q.z * 3.0f + 0.41f));
-  return base > 1.0f - cov;
+  V3 q;
+  return cloud_base(p, h, w, &q) > 1.0f - cov;
 }
 
 __device__ float cloud_density(V3 p, bool detail) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return 0.0f;
-  V2 wp = v2(p.x, p.z) * (1.0f / 42.0f);  // where clouds form; fixed to the ground
-  float cov = fbm(wp + v2(31.7f, 4.1f), 2, cG.noise) * 0.5f + 0.5f;
-  cov = smoothstepf(0.27f, 0.64f, cov) * 0.97f;
+  V2 w;
+  float cov = cloud_cov(v2(p.x, p.z) * (1.0f / 42.0f), &w);  // where clouds form; fixed to the ground
   if (cov <= 0.01f) return 0.0f;
-  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 6.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
-  // two octaves of the volume for the body: cells of ~3.5 and ~1.2 km
-  float base = 0.7f * cloud_tex(q) + 0.3f * cloud_tex(v3(q.x * 3.0f + 0.17f, q.y * 2.0f, q.z * 3.0f + 0.41f));
+  // two octaves of the volume for the body: cells of ~3.5 and ~1.3 km
+  V3 q;
+  float base = cloud_base(p, h, w, &q);
   // coverage picks where the volume is cloud; the height profile then gives
   // flat bases and lets denser cores rise higher, so tops round into towers
   // instead of every cloud being cut into a lens by one height threshold
@@ -343,8 +380,8 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
   if (tb < 0.0f) tb = ta + 30.0f;
   tb = fminf(tb, tmax);
   tb = fminf(tb, ta + 45.0f);
-  float fade_start = 70.0f;
-  if (ta >= tb || ta > 160.0f) return out;
+  float fade_start = 70.0f + 1.5f * fmaxf(ho - CLOUD_TOP, 0.0f);  // seen from high up, clouds are far but not grazing
+  if (ta >= tb || ta > 160.0f + 2.0f * fmaxf(ho, 0.0f)) return out;
   // Two step sizes: coarse through empty air (the shape only), fine inside
   // clouds, 1.5% of the distance (120 to 600 m), so the
   // eroded edges are sampled at their own scale at any distance. A uniform
@@ -498,7 +535,7 @@ __device__ float terrain_shadow(V3 p, V3 l) {
     V3 q = p + l * t;
     float a = alt_flat(q);
     if (a > TERRAIN_MAX) break;
-    float dh = a - ground_h(v2(q.x, q.z), t < 0.6f ? 7 : 5);
+    float dh = a - ground_h(v2(q.x, q.z), t < 0.3f ? 9 : t < 2.0f ? 7 : 5);
     if (dh < 0.0f) return 0.0f;
     t += fmaxf(dh * 0.55f, 0.004f + 0.006f * t);
     if (t > 40.0f) break;
@@ -516,6 +553,7 @@ __device__ V3 terrain_normal(V3 p, float eps, int oct) {
 struct Material {
   V3 albedo;
   float rough;
+  float rock;  // how much of the surface is bare rock (for detail normals)
 };
 
 __device__ Material terrain_material(V3 p, float h, V3 n) {
@@ -523,29 +561,40 @@ __device__ Material terrain_material(V3 p, float h, V3 n) {
   float v = fbm(q * 2.3f + v2(3.1f, 1.7f), 3, cG.noise);
   float v2_ = noise(q * 7.0f, cG.noise);
   float slope = n.y;
-  V3 rock = mix(v3(0.33f, 0.28f, 0.23f), v3(0.19f, 0.17f, 0.16f), sat(v * 0.9f + 0.5f + 0.2f * v2_));
-  V3 grass = mix(v3(0.13f, 0.16f, 0.055f), v3(0.045f, 0.075f, 0.03f), sat(v * 1.2f + 0.5f));
-  V3 dry = v3(0.36f, 0.30f, 0.17f);
-  V3 sand = v3(0.52f, 0.46f, 0.35f);
-  V3 snow = v3(0.93f, 0.95f, 0.99f);
-  float wg = smoothstepf(0.78f, 0.9f, slope + 0.05f * v2_) * (1.0f - smoothstepf(1.1f, 1.7f, h + v * 0.35f));
-  V3 veg = mix(grass, dry, sat(smoothstepf(0.45f, 1.2f, h) * 0.6f + v * 0.4f));
-  // forests: dark patches on gentle lower slopes
+  // rock: warm sandstone low down, cool granite high up, in strata
+  float strata = 0.86f + 0.14f * sinf(h * 55.0f + v * 4.0f + 2.0f * v2_);
+  V3 rock_lo = v3(0.42f, 0.33f, 0.24f), rock_hi = v3(0.40f, 0.40f, 0.41f);
+  V3 rock = mix(rock_lo, rock_hi, smoothstepf(0.6f, 1.6f, h + 0.3f * v)) * strata;
+  V3 scree = v3(0.47f, 0.45f, 0.42f);
+  rock = mix(rock, scree, smoothstepf(0.45f, 0.62f, slope) * (1.0f - smoothstepf(0.62f, 0.78f, slope)) * 0.7f);
+  // vegetation: lowland grass, dark forest, bright alpine meadow, autumn heath
+  V3 grass = mix(v3(0.10f, 0.17f, 0.045f), v3(0.15f, 0.21f, 0.06f), sat(v * 1.2f + 0.5f));
+  V3 meadow = v3(0.21f, 0.25f, 0.075f);
+  V3 heath = v3(0.30f, 0.20f, 0.09f);
+  V3 veg = mix(grass, meadow, smoothstepf(0.5f, 1.1f, h + 0.2f * v));
+  veg = mix(veg, heath, smoothstepf(0.15f, 0.45f, v + 0.25f * v2_) * smoothstepf(0.7f, 1.3f, h));
   float fo = fbm(q * 1.1f + v2(7.7f, 3.3f), 4, cG.noise) + 0.25f * v2_;
-  float wf = smoothstepf(0.0f, 0.18f, fo) * smoothstepf(0.8f, 0.9f, slope) * (1.0f - smoothstepf(0.9f, 1.4f, h + 0.3f * v)) *
-             smoothstepf(0.02f, 0.06f, h);
-  veg = mix(veg, v3(0.028f, 0.045f, 0.022f), wf);
+  // forests: soft-edged stands on gentle lower slopes, mottled by the canopy
+  // (a flat near-black forest read as holes in the ground)
+  float wf = smoothstepf(-0.05f, 0.35f, fo) * smoothstepf(0.84f, 0.92f, slope) *
+             (1.0f - smoothstepf(0.6f, 1.0f, h + 0.3f * v)) * smoothstepf(0.02f, 0.06f, h);
+  float canopy = 0.75f + 0.5f * noise(q * 160.0f, cG.noise);
+  veg = mix(veg, v3(0.068f, 0.105f, 0.042f) * canopy, wf * 0.85f);
+  float wg = smoothstepf(0.76f, 0.86f, slope + 0.05f * v2_) * (1.0f - smoothstepf(1.45f, 1.85f, h + v * 0.3f));
   V3 a = mix(rock, veg, wg);
+  V3 sand = v3(0.62f, 0.55f, 0.42f);
   float ws = smoothstepf(0.014f, 0.003f, h + 0.004f * v2_) * smoothstepf(0.55f, 0.8f, slope);
   a = mix(a, sand, ws);
-  float wsn = smoothstepf(1.55f, 1.95f, h + v * 0.45f + 0.35f * (slope - 0.7f)) * smoothstepf(0.55f, 0.78f, slope + 0.06f * v2_);
+  V3 snow = v3(0.95f, 0.96f, 1.0f);
+  float wsn = smoothstepf(1.45f, 1.75f, h + v * 0.4f + 0.45f * (slope - 0.7f)) * smoothstepf(0.6f, 0.74f, slope + 0.05f * v2_);
   a = mix(a, snow, wsn);
-  // fine albedo variation (tens of metres): patches of grass, scree, shrubs
+  // fine albedo variation (tens of metres)
   float fd = fbm(q * 23.0f + v2(1.3f, 8.1f), 4, cG.noise);
-  a = a * (1.0f + 0.45f * fd);
+  a = a * (1.0f + 0.35f * fd * (1.0f - wsn));
   Material m;
   m.albedo = a;
-  m.rough = mixf(0.9f, 0.35f, wsn);
+  m.rough = mixf(mixf(0.9f, 0.65f, 1.0f - wg), 0.3f, wsn);
+  m.rock = (1.0f - wg) * (1.0f - wsn) * (1.0f - ws);
   return m;
 }
 
@@ -597,6 +646,22 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   int oct = (int)clampf(floorf(log2f(2.0f / eps)) + 1.0f, 5.0f, 12.0f);
   V3 n = terrain_normal(p, eps, oct);
   Material m = terrain_material(p, h, n);
+  // Rock detail the heightfield cannot carry: gullies running down the slope
+  // and fractured faces, as a normal perturbation, faded out where a pixel
+  // covers more than the detail.
+  if (m.rock > 0.05f && eps < 0.03f) {
+    V2 q = v2(p.x, p.z);
+    V3 g1 = noised(q * 45.0f + v2(2.1f, 7.3f), cG.noise);
+    V3 g2 = noised(oct_step(q * 45.0f) * 2.3f, cG.noise);
+    float k = m.rock * 0.07f * sat(1.0f - eps / 0.03f);
+    // ridged: |noise| creases make gullies; the tilt is bounded so no facet
+    // turns away from the light by more than the slope of a gully
+    float s1 = g1.x < 0.0f ? -1.0f : 1.0f, s2 = g2.x < 0.0f ? -1.0f : 1.0f;
+    V2 grad = v2(g1.y * s1 + 0.5f * g2.y * s2, g1.z * s1 + 0.5f * g2.z * s2);
+    float gl = length(grad);
+    if (gl > 3.0f) grad = grad * (3.0f / gl);
+    n = normalize(n + v3(-grad.x, 0.0f, -grad.y) * k);
+  }
   V3 v = -rd;
   V3 L = v3(0.0f);
   // sun
@@ -612,7 +677,10 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   // one bounce: sky or lit ground
   V3 bd = cosine_dir(n, rng.next(), rng.next());
   V3 Lin;
-  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 28, 5, 0.004f) : -1.0f;
+  // the bounce ray starts with the octaves the surface was found with (a
+  // coarser surface lies above it in places, and every bounce from there hit
+  // at once: black patches); farther out march_oct lowers them
+  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 32, 9, 0.004f) : -1.0f;
   if (th < 0.0f) {
     Lin = sky_lookup(bd) * (1.0f - 0.35f * sat(bd.y * 2.0f));  // clouds shade part of the sky
   } else {
@@ -648,10 +716,70 @@ __device__ V3 stars(V3 rd) {
   return v3(b * 0.9f, b * 0.95f, b);
 }
 
+// The orbital ring: a band 120 km wide on a cylinder of radius R + 420 km
+// around an axis through the planet's centre, its inner face toward the
+// planet. ring_hit gives the distance to the band along o + d*s, or -1.
+#define RING_R (PLANET_R + 420.0f)
+#define RING_W 120.0f
+__device__ __forceinline__ V3 ring_axis() { return normalize(v3(0.25f, 0.095f, 1.0f)); }  // arcs about 28 degrees up over the south
+// In float: the stable form of the quadratic keeps the roots to about 1e-7
+// relative (half a metre at the ring) with no cancellation, and the T4 runs
+// double precision at 1/32 rate; sky rays from every bounce come through here.
+__device__ float ring_hit(V3 o, V3 d) {
+  V3 a = ring_axis();
+  V3 c = v3(o.x, o.y + PLANET_R, o.z);  // relative to the planet's centre
+  float oa = dot(c, a), da = dot(d, a);
+  V3 pp = c - a * oa, qq = d - a * da;  // perpendicular to the axis
+  float A = dot(qq, qq), B = 2.0f * dot(pp, qq);
+  float Cc = (dot(pp, pp) - RING_R * RING_R);
+  float disc = B * B - 4.0f * A * Cc;
+  if (A < 1e-12f || disc < 0.0f) return -1.0f;
+  float qv = -0.5f * (B + copysignf(sqrtf(disc), B));
+  float t0 = qv / A, t1 = Cc / qv;
+  float ts[2] = {fminf(t0, t1), fmaxf(t0, t1)};
+  for (int i = 0; i < 2; i++) {
+    float t = ts[i];
+    if (t <= 0.0f) continue;
+    if (fabsf(oa + t * da) <= RING_W * 0.5f) return t;
+  }
+  return -1.0f;
+}
+
+__device__ V3 ring_shade(V3 o, V3 d, float t) {
+  V3 a = ring_axis();
+  V3 p = o + d * t;
+  V3 c = v3(p.x, p.y + PLANET_R, p.z);
+  float h = dot(c, a);
+  V3 radial = normalize(c - a * h);
+  V3 n = dot(radial, d) > 0.0f ? -radial : radial;  // the face toward the viewer
+  // panels: seams every 0.02 degrees around, and along the band
+  V3 b = normalize(cross(a, radial));
+  float phi = atan2f(dot(c, b), dot(c, normalize(cross(b, a))));
+  float panel = fractf(phi * 2865.0f), lane = fractf((h / RING_W + 0.5f) * 5.0f);
+  float seam = smoothstepf(0.0f, 0.04f, panel) * smoothstepf(1.0f, 0.96f, panel) * smoothstepf(0.0f, 0.08f, lane) *
+               smoothstepf(1.0f, 0.92f, lane);
+  V3 alb = v3(0.7f, 0.71f, 0.75f) * (0.55f + 0.45f * seam);
+  // in the planet's shadow?
+  V3 l = cP.sun_dir;
+  float bb = dot(c, l), cc = dot(c, c) - PLANET_R * PLANET_R;
+  bool lit = !(bb < 0.0f && bb * bb - cc > 0.0f);
+  float nl = fmaxf(dot(n, l), 0.0f);
+  V3 col = lit ? cP.sun_e * alb * (nl / PI_F + 0.25f * powf(fmaxf(dot(reflect(d, n), l), 0.0f), 24.0f)) : v3(0.0f);
+  // lights along the seams, brightest on its dark side
+  float lights = (1.0f - seam) * (lit ? 0.15f : 1.0f);
+  col += v3(1.0f, 0.75f, 0.45f) * (0.8f * lights);
+  // light from the planet's day side below it
+  col += alb * cP.sun_e * (0.03f * sat(cP.sun_dir.y * 4.0f + 0.3f));
+  return col;
+}
+
 __device__ V3 sky_ray(V3 o, V3 d, bool with_sun) {
   float tt = sphere_far(o, d, 60.0f);
   V3 T;
-  V3 L = scatter(o, d, fmaxf(tt, 1.0f), 24, &T);
+  int n = sph_alt(o) > 15.0f ? 40 : 24;  // the limb seen from high up is a long path
+  V3 L = scatter(o, d, fmaxf(tt, 1.0f), n, &T);
+  float tr = ring_hit(o, d);
+  if (tr > 0.0f) return L + ring_shade(o, d, tr) * T;  // the ring hides the sun and stars behind it
   if (with_sun) L += sun_disc(d) * T;
   L += stars(d) * T;
   return L;
@@ -715,9 +843,22 @@ struct Hit {
   float id;    // 0 sky, 1 land, 2 water
 };
 
+// One thread: how much of the sun the camera sees (terrain, then clouds).
+__global__ void k_sunvis() {
+  V3 o = cP.cam.pos;
+  float v = cP.sun_dir.y > -0.1f ? terrain_shadow(o, cP.sun_dir) : 0.0f;
+  if (v > 0.0f) v *= cloud_shadow(o, cP.sun_dir);
+  g_sunvis = v;
+}
+
 __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   Hit hres;
-  float th = march_terrain(o, d, 0.0f, 360.0f, 260, 9, fmaxf(0.6f * pix, 0.0002f));
+  // far enough to reach the horizon from any height (from 100 km it is 1,130 km away)
+  float hz = sqrtf(2.0f * PLANET_R * fmaxf(alt_flat(o), 0.0f)) + 300.0f;
+  // below 10 km the horizon is inside 360 km and haze hides what lies past it;
+  // from higher up the march reaches the horizon, with more steps
+  bool high = hz > 360.0f + 300.0f;
+  float th = march_terrain(o, d, 0.0f, high ? hz : 360.0f, high ? 360 : 260, 9, fmaxf(0.6f * pix, 0.0002f));
   V3 L;
   if (th >= 0.0f) {
     V3 p = o + d * th;
@@ -787,7 +928,8 @@ __device__ float text_sdf(const GText& g, V3 p, V3* nearest) {
   return sqrtf(best);
 }
 
-#define TEXT_TUBE 0.46f  // stroke radius, glyph units
+#define TEXT_TUBE 0.46f  // stroke radius, glyph units (words)
+#define CLOCK_TUBE 0.72f  // the clock's heavier strokes
 
 // Emissive text and light spheres, drawn per frame at the current t on top of
 // the accumulated image. Exact (no sampling), so the same on every GPU. They
@@ -823,7 +965,7 @@ __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
     for (int it = 0; it < 40 && t < t1; it++) {
       V3 pl = ol + dl * t;
       V3 nr;
-      float dist = text_sdf(g, pl, &nr) - TEXT_TUBE;
+      float dist = text_sdf(g, pl, &nr) - (g.style == 1 ? CLOCK_TUBE : TEXT_TUBE);
       if (dist < mind) { mind = dist; ph = pl; nmin = nr; tmin = t; }
       if (dist < 0.25f * fw) { hit = true; break; }
       t += fmaxf(dist, 0.05f) / sc;
@@ -835,7 +977,7 @@ __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
     if (cov > 0.0f) hit = true;
     float glow = __expf(-fmaxf(mind, 0.0f) * 1.2f) * 0.18f;
     float tw = hit ? t : 0.5f * (t0 + t1);
-    if (depth < tw) continue;  // behind terrain: the pixel's first hit is nearer
+    if (g.occlude && depth < tw) continue;  // behind terrain: the pixel's first hit is nearer
     float Ta = __expf(-tw * 0.018f);
     if (hit) {
       V3 nl = normalize(ph - nearest);
@@ -847,12 +989,25 @@ __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
       V3 amb = sky_lookup(n.y > -0.2f ? n : v3(0, 1, 0)) * 0.9f;
       float nv = sat(dot(n, v));
       float rim = powf(1.0f - nv, 2.5f);
-      V3 col = g.color * (1.0f / 2.6f);  // albedo-scaled hue
-      V3 lit = col * (Es * (ndl * 0.7f / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.22f, 0.04f);
-      V3 L = lit + g.color * (0.45f + 1.4f * rim);
+      V3 L;
+      if (g.style == 1) {
+        // dark lacquered core, lit by the scene, with a bright rim: reads over
+        // bright cloud (the core) and over dark ground (the rim)
+        V3 lit = v3(0.03f) * (Es * (ndl / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.25f, 0.05f);
+        L = lit + g.color * (0.03f + 2.4f * powf(1.0f - nv, 1.1f));
+      } else {
+        V3 col = g.color * (1.0f / 2.6f);  // albedo-scaled hue
+        V3 lit = col * (Es * (ndl * 0.7f / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.22f, 0.04f);
+        L = lit + g.color * (0.45f + 1.4f * rim);
+      }
       base = mix(base, L * Ta, g.alpha * cov);
     }
-    base = base + g.color * (glow * g.alpha * Ta);
+    if (g.style == 1) {
+      // a soft dark halo instead of a glow, so the outline holds over cloud
+      if (!hit || cov < 1.0f) base = base * (1.0f - 0.6f * __expf(-fmaxf(mind, 0.0f) * 0.7f) * g.alpha);
+    } else {
+      base = base + g.color * (glow * g.alpha * Ta);
+    }
   }
   for (int i = 0; i < cP.n_lights; i++) {
     const GLight& l = cP.lights[i];
@@ -884,6 +1039,17 @@ __device__ __forceinline__ V3 ray_dir(const GCam& c, float px, float py) {
 __device__ __forceinline__ float aces(float x) {
   return sat((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f));
 }
+// ACES filmic: sRGB -> ACES input, the fitted RRT + ODT curve, back to sRGB
+// (the published fit by Stephen Hill).
+__device__ V3 aces_fitted(V3 c) {
+  V3 a = v3(0.59719f * c.x + 0.35458f * c.y + 0.04823f * c.z, 0.07600f * c.x + 0.90834f * c.y + 0.01566f * c.z,
+            0.02840f * c.x + 0.13383f * c.y + 0.83777f * c.z);
+  auto fit = [](float v) { return (v * (v + 0.0245786f) - 0.000090537f) / (v * (0.983729f * v + 0.4329510f) + 0.238081f); };
+  a = v3(fit(a.x), fit(a.y), fit(a.z));
+  return v3(1.60475f * a.x - 0.53108f * a.y - 0.07367f * a.z, -0.10208f * a.x + 1.10813f * a.y - 0.00605f * a.z,
+            -0.00327f * a.x - 0.07276f * a.y + 1.07602f * a.z);
+}
+
 __device__ __forceinline__ float srgb(float x) {
   return x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
 }
@@ -916,6 +1082,7 @@ __global__ void k_moving(float4* ring, float2* ring_aux) {
     Rng rng{hash4(X, Y, cP.seed, (uint32_t)s)};
     float jx = rng.next(), jy = rng.next();
     Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
+    if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     sum += hh.L;
     if (s == 0) { depth = hh.dist; id = hh.id; }
   }
@@ -946,6 +1113,7 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
     Rng rng{hash4(X, Y, cP.seed, (uint32_t)k)};
     float jx = rng.next(), jy = rng.next();
     Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
+    if (!isfinite(hh.L.x + hh.L.y + hh.L.z)) { atomicAdd(&g_bad, 1u); hh.L = v3(0.0f); }
     acc.x += hh.L.x; acc.y += hh.L.y; acc.z += hh.L.z; acc.w += 1.0f;
     if (k == 0) aux = make_float2(hh.dist, hh.id);
   }
@@ -1120,16 +1288,30 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
     if (ws > 0.0f) color = mix(color, sum / ws, strength);
   }
   color = overlay(cam.pos, d0, color, pix, depth);
+  // sun glare: the sun's disc spread by the eye and lens, scaled by how much
+  // of the sun the camera sees (one value per frame), so it is the same on
+  // every tile and tile edges match
+  {
+    float c = dot(d0, cP.sun_dir);
+    float ang = acosf(clampf(c, -1.0f, 1.0f));
+    V3 Es = sun_at(cam.pos) * g_sunvis;
+    color += Es * (0.5f * __expf(-ang * (1.0f / 0.012f)) + 0.06f * __expf(-ang * (1.0f / 0.07f)) +
+                   0.01f * __expf(-ang * (1.0f / 0.35f)));
+  }
   hdr[idx] = make_float4(color.x, color.y, color.z, 1.0f);
-  // tone map: ACES-like curve, slight saturation lift, sRGB, dither by whole-image pixel
+  // tone map: ACES (fitted RRT + ODT), a warm/cool split, a light vignette in
+  // whole-image coordinates, sRGB, dither by whole-image pixel
   V3 t = color * cP.exposure;
+  t = aces_fitted(t);
   float l = lum(t);
-  t = vmax(mix(v3(l), t, 1.08f), 0.0f);
+  t = t * mix(v3(0.96f, 0.99f, 1.06f), v3(1.05f, 1.0f, 0.93f), smoothstepf(0.1f, 0.7f, l));
+  float vx = (X + 0.5f) / cP.full_w - 0.5f, vy = (Y + 0.5f) / cP.full_h - 0.5f;
+  t = t * (1.0f - 0.28f * (vx * vx + vy * vy));
   float dith = (u01(hash4((uint32_t)X, (uint32_t)Y, 0xD17Eu, 0u)) - 0.5f) * (1.0f / 255.0f);
   uint8_t* o = rgba + 4 * idx;
-  o[0] = (uint8_t)(sat(srgb(aces(t.x)) + dith) * 255.0f + 0.5f);
-  o[1] = (uint8_t)(sat(srgb(aces(t.y)) + dith) * 255.0f + 0.5f);
-  o[2] = (uint8_t)(sat(srgb(aces(t.z)) + dith) * 255.0f + 0.5f);
+  o[0] = (uint8_t)(sat(srgb(sat(t.x)) + dith) * 255.0f + 0.5f);
+  o[1] = (uint8_t)(sat(srgb(sat(t.y)) + dith) * 255.0f + 0.5f);
+  o[2] = (uint8_t)(sat(srgb(sat(t.z)) + dith) * 255.0f + 0.5f);
   o[3] = 255;
 }
 
@@ -1463,6 +1645,9 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   CK(cudaMemcpyToSymbolAsync(cP, &p, sizeof p, 0, cudaMemcpyHostToDevice, st));
   CK(cudaEventRecord((cudaEvent_t)ev0_, st));
   k_sky<<<dim3(SKY_W / 64, SKY_H), 64, 0, st>>>((V4*)sky_);
+  k_sunvis<<<1, 1, 0, st>>>();
+  unsigned int zero = 0;
+  CK(cudaMemcpyToSymbolAsync(g_bad, &zero, sizeof zero, 0, cudaMemcpyHostToDevice, st));
   dim3 bs(8, 8);
   if (held && p.sample_base < HOLD_MAX_SAMPLES) {
     k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)ring_[ri],
@@ -1490,6 +1675,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   float ms = 0;
   cudaEventElapsedTime(&ms, (cudaEvent_t)ev0_, (cudaEvent_t)ev1_);
   stats_.render_ms = ms;
+  CK(cudaMemcpyFromSymbol(&stats_.bad_samples, g_bad, sizeof(unsigned int)));
   stats_.spp = (held && p.sample_base >= HOLD_MAX_SAMPLES) ? 0 : spp;
   stats_.half = stride;
   stats_.hold = held;

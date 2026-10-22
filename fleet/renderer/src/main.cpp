@@ -67,8 +67,8 @@ static int cmd_still(int argc, char** argv) {
   for (int f = 0; f < frames; f++) {
     double tf = seq > 0 ? (std::llround(t * 30) - (seq - 1 - f)) / 30.0 : t;
     r.render(sc, tile, tf, frames > 1, spp);
-    fprintf(stderr, "frame %d: %dx%d spp %d hold %d (%d samples) %.1f ms\n", f, tile.w, tile.h, r.stats().spp,
-            (int)r.stats().hold, r.stats().hold_samples, r.stats().render_ms);
+    fprintf(stderr, "frame %d: %dx%d spp %d hold %d (%d samples) %.1f ms, %u bad samples\n", f, tile.w, tile.h,
+            r.stats().spp, (int)r.stats().hold, r.stats().hold_samples, r.stats().render_ms, r.stats().bad_samples);
   }
   std::vector<uint8_t> px;
   r.download_rgba(&px);

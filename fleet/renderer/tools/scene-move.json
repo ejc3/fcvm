@@ -1,6 +1,6 @@
 {"rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7777778,
  "camera": [{"t": 0.0, "pos": [-22, 0.7, -30], "look": [-45, 1.2, -85], "fov_deg": 60.0},
             {"t": 60.0, "pos": [-40, 2.4, -70], "look": [-20, 0.8, -40], "fov_deg": 64.0}],
- "time_of_day": 0.30,
+ "time_of_day": 0.245,
  "words": [{"text": "LIVE", "t": 0.0}],
  "lights": []}
