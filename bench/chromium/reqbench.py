@@ -3782,6 +3782,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     watch = DirWatch(args.state_dir)
     t_spawn = time.monotonic()
     t_spawn_wall = time.time()
+    # reqscale times each request of an open-loop run from these monotonic
+    # stamps (the same clock as its time.monotonic_ns schedule).
+    rec["started_monotonic_ns"] = int(t_spawn * 1e9)
     interrupted = None
     fcvm_start_time = None
     try:
@@ -3901,7 +3904,10 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
                 rec["failure_stage"] = result.get("stage", "")
             # THE CALLER'S ANSWER IS IN HAND HERE. Everything after this line is
             # teardown, and none of it is latency the caller pays.
-            rec["blocking_ms"] = (time.monotonic() - t_spawn) * 1000
+            t_answer = time.monotonic()
+            rec["blocking_ms"] = (t_answer - t_spawn) * 1000
+            if rec.get("ok"):
+                rec["artifact_monotonic_ns"] = int(t_answer * 1e9)
             t_owned = time.monotonic()
             state = wait_state_owned(
                 state_path,
@@ -4014,7 +4020,9 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["log"] = log
             e.record = rec
             raise e from interrupted
-    rec["wall_ms"] = (time.monotonic() - t_spawn) * 1000
+    t_finished = time.monotonic()
+    rec["wall_ms"] = (t_finished - t_spawn) * 1000
+    rec["finished_monotonic_ns"] = int(t_finished * 1e9)
     rec["log"] = log
     rec["restore_marks"] = restore_marks(log, t_spawn_wall)
     rec["restore_ack"] = restore_ack(log)

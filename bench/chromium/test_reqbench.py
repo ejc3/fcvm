@@ -1028,6 +1028,16 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
                 server.close()
 
             self.assertTrue(rec["ok"])
+            # reqscale's request function (_make_request_fn) times each corpus
+            # scale request from these three monotonic stamps, and refuses a
+            # successful record without artifact_ns; run_cdp_request set none
+            # of them, so every request of a corpus scale run was refused
+            # (2026-10-22: "successful request record is missing artifact_ns").
+            self.assertLess(rec["started_monotonic_ns"], rec["artifact_monotonic_ns"])
+            self.assertLessEqual(rec["artifact_monotonic_ns"], rec["finished_monotonic_ns"])
+            self.assertAlmostEqual(
+                (rec["artifact_monotonic_ns"] - rec["started_monotonic_ns"]) / 1e6,
+                rec["blocking_ms"], delta=1.0)
             self.assertEqual(owner_wait_calls, [True])
             self.assertTrue(os.path.exists(owner_wait_entered))
             self.assertGreaterEqual(rec["state_owner_wait_ms"], 150.0, rec)
