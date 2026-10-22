@@ -238,6 +238,13 @@ short buffer (a few frames) until all visible tiles have that frame; a tile that
 behind shows its last frame dimmed rather than tearing the image. A relaunched tile is
 dark until its first frame at the current `t`.
 
+**Detail follows the rectangle.** Each renderer has a fixed budget per frame (pixels times
+ray-march steps at its target frame rate) and spends all of it on its own rectangle, so a
+smaller rectangle gets more detail: more steps, deeper fractal iterations, more samples per
+pixel. More GPUs in the fleet means smaller rectangles and a finer whole image. Opening one
+tile asks its GPU for its rectangle at full resolution, which shows detail the whole image
+cannot: the click-to-zoom is a real increase in rendered detail, not an upscale.
+
 **Resolution follows the viewer.** The page asks each tile for the height its rectangle
 occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
 detail view for 1080p.
