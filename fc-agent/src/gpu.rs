@@ -51,6 +51,8 @@ const INSMOD_TIMEOUT: Duration = Duration::from_secs(120);
 /// nvidia-smi initialises the GPU on first open when nothing holds it open.
 const SMI_TIMEOUT: Duration = Duration::from_secs(120);
 const CDI_TIMEOUT: Duration = Duration::from_secs(60);
+/// nvidia-persistenced initialises the GPU and then detaches; its parent exits.
+const PERSISTENCED_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Orders GPU attachment against the container launch. An attach holds the gate
 /// from its check that no container is running until it has published the CDI
@@ -530,6 +532,8 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
     let proc_devices = std::fs::read_to_string("/proc/devices").context("reading /proc/devices")?;
     create_device_nodes(&device_nodes(&parse_char_majors(&proc_devices), &minors)?)?;
 
+    start_persistenced(driver_root).await?;
+
     let libraries = library_dir(driver_root);
     let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
     smi.arg("-L").env("LD_LIBRARY_PATH", &libraries);
@@ -557,6 +561,31 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
     Ok(initialised)
 }
 
+/// Start nvidia-persistenced from the driver image. Without it nothing holds the
+/// GPU open between processes, and every process that opens it initialises it
+/// again: `nvidia-smi -L` took 1.44 to 1.49 s each on a T4 in a gpu VM, and
+/// 0.023 to 0.031 s with the daemon running. It starts before `nvidia-smi -L`,
+/// so that check opens a GPU the daemon has initialised, and before the CDI spec
+/// is generated, which then mounts the daemon's socket into the container.
+async fn start_persistenced(driver_root: &Path) -> Result<()> {
+    run_checked(
+        "nvidia-persistenced",
+        persistenced_command(driver_root),
+        PERSISTENCED_TIMEOUT,
+    )
+    .await?;
+    eprintln!("[fc-agent] gpu: nvidia-persistenced started");
+    Ok(())
+}
+
+/// The nvidia-persistenced command: the image's binary, as root (its default),
+/// with the image's libraries. It forks the daemon and exits.
+pub fn persistenced_command(driver_root: &Path) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-persistenced"));
+    command.env("LD_LIBRARY_PATH", library_dir(driver_root));
+    command
+}
+
 /// Arguments for `nvidia-ctk cdi generate` against the mounted driver image.
 ///
 /// `--driver-root` makes the spec's host paths point into the image while the
@@ -579,6 +608,46 @@ pub fn cdi_generate_args(driver_root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// The daemon is the image's binary, run with the image's libraries.
+    #[test]
+    fn persistenced_runs_the_images_binary_with_its_libraries() {
+        let root = std::path::Path::new("/run/fcvm-gpu/driver");
+        let command = super::persistenced_command(root);
+        let command = command.as_std();
+        assert_eq!(
+            command.get_program(),
+            root.join("usr/bin/nvidia-persistenced").as_os_str()
+        );
+        let libraries = command
+            .get_envs()
+            .find(|(key, _)| *key == "LD_LIBRARY_PATH")
+            .and_then(|(_, value)| value);
+        assert_eq!(libraries, Some(super::library_dir(root).as_os_str()));
+    }
+
+    /// The daemon must start once the device nodes exist, and before the checks
+    /// and the CDI spec: `nvidia-smi -L` then opens a GPU the daemon already
+    /// initialised, and the spec mounts the daemon's socket into the container.
+    #[test]
+    fn persistenced_starts_after_the_device_nodes_and_before_the_cdi_spec() {
+        let source = include_str!("gpu.rs");
+        let code = source.split("#[cfg(test)]").next().unwrap();
+        let body = &code[code
+            .find("async fn attach_devices(")
+            .expect("no attach_devices")..];
+        let nodes = body.find("create_device_nodes(").expect("no device nodes");
+        let daemon = body
+            .find("start_persistenced(driver_root)")
+            .expect("attach_devices does not start nvidia-persistenced");
+        let smi = body.find("\"nvidia-smi -L\"").expect("no nvidia-smi -L");
+        let cdi = body.find("cdi_generate_args(").expect("no CDI generation");
+        assert!(
+            nodes < daemon && daemon < smi && daemon < cdi,
+            "nvidia-persistenced must start after the device nodes ({nodes}) and before \
+             nvidia-smi -L ({smi}) and the CDI spec ({cdi}); it starts at {daemon}"
+        );
+    }
+
     /// A launch that starts while an attach is loading the driver waits for the
     /// attach and gets its devices; one that comes first makes a later attach fail.
     #[tokio::test]
