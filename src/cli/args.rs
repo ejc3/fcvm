@@ -36,6 +36,258 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Generate shell completions
     Completions(CompletionsArgs),
+    /// The GPU wall's control plane: coordinator and host agent (docs/fleet/ARCHITECTURE.md)
+    Fleet(FleetArgs),
+}
+
+// ============================================================================
+// Fleet Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct FleetArgs {
+    #[command(subcommand)]
+    pub cmd: FleetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FleetCommand {
+    /// Run the coordinator: the fleet state, the browser WebSocket and the agents
+    Coord(FleetCoordArgs),
+    /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
+    Agent(FleetAgentArgs),
+    /// Join a region's tile streams into one stream (POST /layout, GET /frames)
+    Aggregate(FleetAggregateArgs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetAggregateCodec {
+    /// H.264 through the ffmpeg CLI (decode; libx264 encode)
+    Ffmpeg,
+    /// Uncompressed pictures (tests)
+    Raw,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetAggregateArgs {
+    /// Address to serve /frames, /layout, /stats and /healthz on
+    #[arg(long)]
+    pub listen: String,
+
+    /// Height of the whole image in pixels; the region is encoded at its share of it
+    #[arg(long, default_value_t = 1080)]
+    pub image_height: u32,
+
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub codec: FleetAggregateCodec,
+
+    /// ffmpeg binary
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
+
+    /// libx264 constant rate factor of the region stream
+    #[arg(long, default_value_t = 20)]
+    pub crf: u32,
+
+    /// libx264 preset
+    #[arg(long, default_value = "veryfast")]
+    pub preset: String,
+
+    /// Bitrate cap of the region stream, kbit/s
+    #[arg(long, default_value_t = 20000)]
+    pub maxrate_kbps: u32,
+
+    /// Query added to every tile subscription
+    #[arg(long, default_value = "q=hi")]
+    pub tile_query: String,
+
+    /// How long past a slot's time the region waits for late tiles, ms
+    #[arg(long, default_value_t = 150)]
+    pub late_ms: u64,
+
+    /// Initial layout (JSON), instead of waiting for POST /layout
+    #[arg(long)]
+    pub layout: Option<std::path::PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetTextCheck {
+    /// Claude Haiku on Amazon Bedrock (needs --text-check-model and --text-check-region)
+    Bedrock,
+    /// No text check: every viewer word is refused
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetEc2 {
+    /// No EC2 tiles: the EC2 half stays dark
+    None,
+    /// Fake EC2 instances that come up after a delay and render nothing (dark tiles)
+    Fake,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetCoordArgs {
+    /// Address to serve the browser WebSocket (/live) and /healthz on, e.g. 127.0.0.1:20000
+    #[arg(long, env = "FLEET_COORD_LISTEN")]
+    pub listen: String,
+
+    /// Command that starts an agent speaking the agent protocol on its stdin and stdout,
+    /// e.g. "fcvm fleet agent --stdio ..." or "ssh gpu-host fcvm fleet agent --stdio ...".
+    /// Split like a shell would. Repeatable.
+    #[arg(long = "agent-cmd")]
+    pub agent_cmds: Vec<String>,
+
+    /// Keep the state in this JSON file (rewritten atomically) and resume from it
+    #[arg(long)]
+    pub state_file: Option<std::path::PathBuf>,
+
+    /// How viewer text is checked before it enters the scene
+    #[arg(long, value_enum, default_value_t = FleetTextCheck::None)]
+    pub text_check: FleetTextCheck,
+
+    /// Bedrock model id (or inference profile id) for the text check
+    #[arg(long, env = "FLEET_TEXT_CHECK_MODEL")]
+    pub text_check_model: Option<String>,
+
+    /// AWS region of the text check's Bedrock endpoint
+    #[arg(long, env = "FLEET_TEXT_CHECK_REGION")]
+    pub text_check_region: Option<String>,
+
+    /// The most tiles per half
+    #[arg(long, default_value_t = 100)]
+    pub max_tiles: usize,
+
+    /// Where EC2 tiles come from
+    #[arg(long, value_enum, default_value_t = FleetEc2::None)]
+    pub ec2: FleetEc2,
+
+    /// A browser origin (scheme://host[:port]) allowed to open /live besides the
+    /// coordinator's own. Repeatable. Other cross-origin WebSockets are refused with 403.
+    #[arg(long = "allowed-origin")]
+    pub allowed_origins: Vec<String>,
+
+    /// Run the EC2 half's aggregator on this address
+    #[arg(long, requires = "ec2_aggregate_url")]
+    pub ec2_aggregate_listen: Option<String>,
+
+    /// The EC2 half's aggregator frame WebSocket as browsers reach it
+    #[arg(long, requires = "ec2_aggregate_listen")]
+    pub ec2_aggregate_url: Option<String>,
+
+    /// Extra argument for the EC2 half's aggregator. Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
+
+    /// The owner's race cadence: relaunch every tile this many seconds after the last race.
+    /// Viewers cannot change it.
+    #[arg(long, env = "FLEET_RACE_EVERY")]
+    pub race_every: Option<u64>,
+
+    /// After any race, `restart_now` is refused for everyone for this many seconds
+    #[arg(long, default_value_t = 60)]
+    pub restart_cooldown: u64,
+
+    /// Seed of the directed camera's path
+    #[arg(long, default_value_t = 1)]
+    pub camera_seed: u64,
+
+    /// Key per-client limits by the CF-Connecting-IP header (set by Cloudflare in front of
+    /// the coordinator); without this flag, by the connection's peer address
+    #[arg(long)]
+    pub trust_cf_connecting_ip: bool,
+
+    /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
+    /// intent. Without it no verification is asked for (local runs).
+    #[arg(
+        long,
+        env = "FLEET_TURNSTILE_SECRET",
+        hide_env_values = true,
+        requires = "turnstile_site_key"
+    )]
+    pub turnstile_secret: Option<String>,
+
+    /// The Turnstile site key the page's widget uses, sent in each connection's hello
+    #[arg(long, env = "FLEET_TURNSTILE_SITE_KEY", requires = "turnstile_secret")]
+    pub turnstile_site_key: Option<String>,
+
+    /// Decoder for the poster frame (`raw` for tests)
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub poster_codec: FleetAggregateCodec,
+
+    /// Wall tiles that may be lent to visitors at once (default: 2 or a tenth of the
+    /// tiles, rounded up, whichever is smaller)
+    #[arg(long)]
+    pub max_borrowed: Option<usize>,
+
+    /// ffmpeg binary for the poster frame (decode, then JPEG)
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetAgentArgs {
+    /// Speak the agent protocol on stdin and stdout (the only transport today)
+    #[arg(long, required = true)]
+    pub stdio: bool,
+
+    /// Host name reported to the coordinator (default: the system host name)
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Renderer container image every slot runs
+    #[arg(long)]
+    pub image: String,
+
+    /// First host port; the slot on GPU index i publishes the renderer on base + i
+    #[arg(long, env = "FLEET_AGENT_BASE_PORT")]
+    pub base_port: u16,
+
+    /// Host address the renderer ports are published on
+    #[arg(long, default_value = "127.0.0.1")]
+    pub publish_ip: String,
+
+    /// Host name or address browsers use to reach the published ports (default: --publish-ip)
+    #[arg(long)]
+    pub frame_host: Option<String>,
+
+    /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
+    #[arg(long)]
+    pub gpus: Option<String>,
+
+    /// VMs this host runs at once (default: one per GPU)
+    #[arg(long)]
+    pub capacity: Option<usize>,
+
+    /// fcvm binary that runs the VMs (default: this executable)
+    #[arg(long)]
+    pub fcvm: Option<std::path::PathBuf>,
+
+    /// Extra argument for every `fcvm podman run`, before the image. Repeatable.
+    #[arg(long = "fcvm-arg", allow_hyphen_values = true)]
+    pub fcvm_args: Vec<String>,
+
+    /// EC2 metadata base URL to poll for spot interruption notices (IMDSv2), e.g.
+    /// http://169.254.169.254
+    #[arg(long)]
+    pub spot_notice_url: Option<String>,
+
+    /// Seconds a relaunch may take from fcvm start to the renderer's first frame
+    #[arg(long, default_value_t = 300)]
+    pub start_timeout_secs: u64,
+
+    /// Run this host's aggregator on this port (published on --publish-ip): it joins the
+    /// host's tiles into one stream
+    #[arg(long)]
+    pub aggregate_port: Option<u16>,
+
+    /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
+
+    /// sysfs root for the GPU inventory and VFIO group lookup (tests)
+    #[arg(long, default_value = "/sys", hide = true)]
+    pub sysfs_root: std::path::PathBuf,
 }
 
 // ============================================================================

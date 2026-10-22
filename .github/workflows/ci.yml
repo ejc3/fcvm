@@ -351,7 +351,7 @@ jobs:
           which cargo-deny || cargo install cargo-deny@0.18.9 --locked
       - name: Check formatting
         working-directory: fcvm
-        run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent --check
+        run: cargo fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core --check
       - name: Clippy
         working-directory: fcvm
         run: cargo clippy --all-targets -- -D warnings

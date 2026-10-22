@@ -721,8 +721,10 @@ dependencies = [
  "directories",
  "exec-proto",
  "failpoint",
+ "fleet-core",
  "fs2",
  "fuse-pipe",
+ "futures-util",
  "glob",
  "hex",
  "http-body-util",
@@ -746,6 +748,7 @@ dependencies = [
  "tar",
  "tempfile",
  "tokio",
+ "tokio-tungstenite",
  "tokio-util",
  "toml",
  "tower-http",
@@ -775,6 +778,14 @@ name = "find-msvc-tools"
 version = "0.1.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "645cbb3a84e60b7531617d5ae4e57f7e27308f6445f5abf653209ea76dec8dff"
+
+[[package]]
+name = "fleet-core"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "form_urlencoded"

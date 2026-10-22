@@ -1,0 +1,533 @@
+{
+  "description": "Hosts joining and leaving re-tile both halves in one event without changing any generation; slot names are reused lowest first.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "hA",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          }
+        ],
+        "host": "hA",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "host": "hB",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "hB",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 3000,
+      "host": "hA",
+      "type": "agent_gone"
+    },
+    {
+      "at": 4000,
+      "host": "hC",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          }
+        ],
+        "host": "hC",
+        "type": "hello"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/assign/hA/1/id": "slot-2",
+        "/view/fleet/n": 2,
+        "/view/tiles/0/rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        }
+      }
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/assign/hA/0/rect": {
+          "h": 0.4,
+          "w": 0.25,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/assign/hB/0/id": "slot-3",
+        "/assign/hB/2/id": "slot-5",
+        "/view/aggregates/0/id": "agg:hA",
+        "/view/aggregates/0/rect": {
+          "h": 0.4,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/aggregates/1/id": "agg:hB",
+        "/view/aggregates/1/rect": {
+          "h": 0.6,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.4
+        },
+        "/view/aggregates/1/tiles": [
+          "fcvm:3",
+          "fcvm:4",
+          "fcvm:5"
+        ],
+        "/view/fleet/n": 5,
+        "/view/tiles/0/rect": {
+          "h": 0.4,
+          "w": 0.25,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/tiles/2/rect": {
+          "h": 0.3,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.4
+        }
+      }
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/assign/hA": null,
+        "/assign/hB/0/generation": 1,
+        "/assign/hB/2/generation": 1,
+        "/view/fleet/n": 3,
+        "/view/tiles/0/rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/tiles/0/slot": "slot-3"
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/assign/hC/0/id": "slot-1",
+        "/view/aggregates/0/id": "agg:hC",
+        "/view/aggregates/1/rect": {
+          "h": 0.75,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
+        },
+        "/view/fleet/n": 4,
+        "/view/tiles/0/host": "hC",
+        "/view/tiles/0/rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/tiles/0/slot": "slot-1",
+        "/view/tiles/1/slot": "slot-3"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "hC",
+        "id": "agg:hC",
+        "rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1"
+        ]
+      },
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "hB",
+        "id": "agg:hB",
+        "rect": {
+          "h": 0.75,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
+        },
+        "tiles": [
+          "fcvm:2",
+          "fcvm:3",
+          "fcvm:4"
+        ]
+      }
+    ],
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "claims": [],
+    "cooldown_until": null,
+    "failures": [
+      {
+        "host": "hA",
+        "kind": "host_reclaimed",
+        "retiling": true,
+        "since": 3000
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 4,
+      "gpus": 4,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "hB"
+        },
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            }
+          ],
+          "name": "hC"
+        }
+      ],
+      "max_tiles": 100,
+      "n": 4,
+      "standby": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [],
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.33,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": null
+    },
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "hC",
+        "id": "fcvm:1",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "hB",
+        "id": "fcvm:2",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.375,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
+        },
+        "slot": "slot-3",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:02:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "hB",
+        "id": "fcvm:3",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.375,
+          "w": 0.25,
+          "x": 0.0,
+          "y": 0.625
+        },
+        "slot": "slot-4",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:03:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "hB",
+        "id": "fcvm:4",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.375,
+          "w": 0.25,
+          "x": 0.25,
+          "y": 0.625
+        },
+        "slot": "slot-5",
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:1",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:2",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.375,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.25
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:3",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.375,
+          "w": 0.25,
+          "x": 0.5,
+          "y": 0.625
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:4",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.375,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.625
+        },
+        "slot": null,
+        "vm": null
+      }
+    ],
+    "viewers": {
+      "count": 0
+    }
+  },
+  "start_ms": 0
+}

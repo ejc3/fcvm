@@ -1,0 +1,566 @@
+{
+  "description": "relaunch bumps one slot's generation; restart_now races every slot and times each half from the click to the coordinator seeing the last first frame at the new generation.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 5100,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {
+        "tile": "slot-2"
+      },
+      "at": 10000,
+      "id": "r1",
+      "name": "relaunch",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 10050,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "stopping",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {
+          "container_ms": 500,
+          "first_frame_ms": 400,
+          "gpu_ms": 3000,
+          "restore_ms": 900,
+          "teardown_ms": 300
+        },
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "args": {},
+      "at": 20000,
+      "id": "ra",
+      "name": "restart_now",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "at": 23000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 2,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 23500,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 2,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 24000,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 3,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {
+          "container_ms": 500,
+          "first_frame_ms": 400,
+          "gpu_ms": 3000,
+          "restore_ms": 900,
+          "teardown_ms": 300
+        },
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 1,
+      "checks": {
+        "/view/tiles/0/frame_url": "ws://h1:20001/frames",
+        "/view/tiles/0/phase": "running",
+        "/view/tiles/0/vm": "fleet-slot-1"
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/assign/h1/1/generation": 2,
+        "/view/tiles/1/last_relaunch/clicked_at": 10000,
+        "/view/tiles/1/phase": "relaunching"
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/tiles/1/phase": "stopping"
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/tiles/1/last_relaunch/first_frame_at": 14000,
+        "/view/tiles/1/last_relaunch/phases/gpu_ms": 3000
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/assign/h1/0/generation": 2,
+        "/assign/h1/1/generation": 3,
+        "/receipts/ra/outcome": "committed",
+        "/view/races/0/by": "viewer:v2",
+        "/view/races/0/fcvm/tiles/slot-1/tile": "fcvm:1",
+        "/view/races/0/fcvm/tiles/slot-2/generation": 3,
+        "/view/races/0/id": 1,
+        "/view/races/0/started_at": 20000,
+        "/view/relaunch_all/by": "viewer:v2",
+        "/view/relaunch_all/fcvm_gpus": 2,
+        "/view/relaunch_all/fcvm_pending": 2,
+        "/view/relaunch_all/race": 1,
+        "/view/scoreboard/fcvm": null
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/view/races/0/fcvm/done_at": null,
+        "/view/races/0/fcvm/tiles/slot-1/first_frame_at": 23000
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/view/races/0/fcvm/done_at": null,
+        "/view/tiles/1/phase": "relaunching"
+      },
+      "note": "a report at the old generation does not finish the race"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/view/races/0/ec2/done_at": null,
+        "/view/races/0/fcvm/done_at": 24000,
+        "/view/races/0/fcvm/last": "slot-2",
+        "/view/races/0/fcvm/tiles/slot-2/phases/gpu_ms": 3000,
+        "/view/races/0/fcvm/time_ms": 4000,
+        "/view/relaunch_all/fcvm_done_at": 24000,
+        "/view/relaunch_all/fcvm_ms": 4000,
+        "/view/relaunch_all/fcvm_pending": 0,
+        "/view/scoreboard/ec2": null,
+        "/view/scoreboard/fcvm/last_ms": 4000,
+        "/view/scoreboard/fcvm/measured_on": 2,
+        "/view/scoreboard/fcvm/median_ms": 4000,
+        "/view/scoreboard/fcvm/races": 1
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "args": {
+          "tile": "slot-2"
+        },
+        "at": 10000,
+        "id": "r1",
+        "name": "relaunch",
+        "outcome": "committed",
+        "summary": "relaunch slot-2",
+        "viewer": "v1"
+      },
+      {
+        "args": {},
+        "at": 20000,
+        "id": "ra",
+        "name": "restart_now",
+        "outcome": "committed",
+        "summary": "race 1",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2"
+        ]
+      }
+    ],
+    "borrow": {
+      "cap": 1,
+      "lent": 0,
+      "next_return_at": null
+    },
+    "claims": [],
+    "cooldown_until": 80000,
+    "failures": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 2,
+      "gpus": 2,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 100,
+      "n": 2,
+      "standby": []
+    },
+    "image_aspect": 1.7777777777777777,
+    "next_race_at": null,
+    "nudges": {
+      "arrive_next_at": null,
+      "holding": "coast",
+      "next": null,
+      "next_hold_at": 7000,
+      "targets": [
+        {
+          "id": "horizon",
+          "label": "High above: the curve of the horizon",
+          "votes": 0
+        },
+        {
+          "id": "dawn-valley",
+          "label": "Dawn in the valley",
+          "votes": 0
+        },
+        {
+          "id": "peak-seam-low-sun",
+          "label": "The peak at a low sun",
+          "votes": 0
+        }
+      ]
+    },
+    "races": [
+      {
+        "by": "viewer:v2",
+        "ec2": {
+          "capacity_wait_ms": 0,
+          "done_at": null,
+          "dropped": 0,
+          "last": null,
+          "sitting_out": [],
+          "tiles": {},
+          "time_ms": null
+        },
+        "fcvm": {
+          "capacity_wait_ms": 0,
+          "done_at": 24000,
+          "dropped": 0,
+          "last": "slot-2",
+          "sitting_out": [],
+          "tiles": {
+            "slot-1": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 23000,
+              "generation": 2,
+              "phases": {},
+              "tile": "fcvm:1",
+              "waiting_since": null
+            },
+            "slot-2": {
+              "capacity_wait_ms": 0,
+              "first_frame_at": 24000,
+              "generation": 3,
+              "phases": {
+                "container_ms": 500,
+                "first_frame_ms": 400,
+                "gpu_ms": 3000,
+                "restore_ms": 900,
+                "teardown_ms": 300
+              },
+              "tile": "fcvm:2",
+              "waiting_since": null
+            }
+          },
+          "time_ms": 4000
+        },
+        "id": 1,
+        "started_at": 20000
+      }
+    ],
+    "relaunch_all": {
+      "by": "viewer:v2",
+      "ec2_capacity_wait_ms": 0,
+      "ec2_done_at": null,
+      "ec2_gpus": 0,
+      "ec2_ms": null,
+      "ec2_pending": 0,
+      "ec2_waiting_since": null,
+      "fcvm_done_at": 24000,
+      "fcvm_gpus": 2,
+      "fcvm_ms": 4000,
+      "fcvm_pending": 0,
+      "race": 1,
+      "started_at": 20000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 0.0
+        },
+        {
+          "fov_deg": 60.0,
+          "look": [
+            -63.5,
+            2.2,
+            -87.0
+          ],
+          "pos": [
+            -100.0,
+            0.35,
+            -90.0
+          ],
+          "t": 7.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 0.33,
+      "words": []
+    },
+    "scoreboard": {
+      "ec2": null,
+      "fcvm": {
+        "last_capacity_wait_ms": 0,
+        "last_ms": 4000,
+        "last_race": 1,
+        "measured_on": 2,
+        "median_ms": 4000,
+        "races": 1
+      }
+    },
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 2,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:1",
+        "last_relaunch": {
+          "by": "viewer:v2",
+          "clicked_at": 20000,
+          "first_frame_at": 23000,
+          "phases": {}
+        },
+        "phase": "running",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": "fleet-slot-1"
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": "ws://h1:20002/frames",
+        "generation": 3,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:02:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:2",
+        "last_relaunch": {
+          "by": "viewer:v2",
+          "clicked_at": 20000,
+          "first_frame_at": 24000,
+          "phases": {
+            "container_ms": 500,
+            "first_frame_ms": 400,
+            "gpu_ms": 3000,
+            "restore_ms": 900,
+            "teardown_ms": 300
+          }
+        },
+        "phase": "running",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.5
+        },
+        "slot": "slot-2",
+        "vm": "fleet-slot-2"
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:1",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:2",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.5
+        },
+        "slot": null,
+        "vm": null
+      }
+    ],
+    "viewers": {
+      "count": 0
+    }
+  },
+  "start_ms": 0
+}
