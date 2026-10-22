@@ -28,8 +28,11 @@ the GPU behind it, for everyone. The per-tile view below is the detail view, one
 recording:
 
 - **Your words in the world.** A viewer types a word and it is written into the scene, lit
-  by the scene's sun, on every viewer's screen within a few frames (bounded length,
-  filtered, rate limited per viewer).
+  by the scene's sun, on every viewer's screen within a few frames (bounded length, rate
+  limited per viewer). **DECIDED (2026-10-22):** every piece of viewer text is checked by
+  Claude Haiku (Amazon Bedrock, in the fleet account) before the coordinator accepts it;
+  text the check refuses, or any text while the check cannot run, never reaches the scene
+  (fail closed). The check's verdict is part of the intent's receipt.
 - **The time, rendered.** A clock in the world shows the current UTC time to the second,
   rendered by the GPUs from `t`, continuous across tile seams.
 - **Input to pixels, measured.** After a camera drag the page shows the time from the
@@ -381,8 +384,8 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 
 ## Open questions
 
-1. **Scene.** One world shared by every tile, each GPU rendering its rectangle (see "What a
-   viewer sees"). Proposed, awaiting the owner: a procedurally generated planet, path
+1. **Scene. DECIDED (2026-10-22).** One world shared by every tile, each GPU rendering its
+   rectangle (see "What a viewer sees"): a procedurally generated planet, path
    traced (terrain and megastructures by ray marching, volumetric clouds, atmospheric
    scattering, a moving sun), about 92 megapixels per frame at 100 tiles of 1280x720. Two
    properties are required of any scene: every pixel is a pure function of time, camera
