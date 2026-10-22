@@ -61,6 +61,7 @@ jobs:
     outputs:
       code: ${{ steps.detect.outputs.code }}
       bench: ${{ steps.detect.outputs.bench }}
+      web: ${{ steps.detect.outputs.web }}
     steps:
       - name: Detect whether any non-doc path changed
         id: detect
@@ -83,6 +84,7 @@ jobs:
           if [ "$EVENT" != "pull_request" ]; then
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
             echo "event $EVENT: running the full matrix"
             exit 0
           fi
@@ -98,6 +100,7 @@ jobs:
             # An empty file list is unexpected, so fail toward running everything.
             echo "code=true" >> "$GITHUB_OUTPUT"
             echo "bench=true" >> "$GITHUB_OUTPUT"
+            echo "web=true" >> "$GITHUB_OUTPUT"
             echo "no changed files reported: running the full matrix"
             exit 0
           fi
@@ -110,6 +113,7 @@ jobs:
           # documents twice.
           code=false
           bench=false
+          web=false
           while IFS= read -r f; do
             # `bench/*` MUST precede the docs arm. A shell `case` glob matches
             # `/`, so `*.md` swallows bench/chromium/README.md and that PR
@@ -141,13 +145,18 @@ jobs:
               # is exactly the class that can break it.
               Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              # The fleet web page is TypeScript with its own suite (fleet-web);
+              # the VM matrix does not build or run it. Like bench/, it precedes
+              # the docs arm so its README still routes to its check.
+              fleet/web/*) web=true; echo "fleet web path: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
           done <<< "$files"
           echo "code=$code" >> "$GITHUB_OUTPUT"
           echo "bench=$bench" >> "$GITHUB_OUTPUT"
-          echo "code_changed=$code bench_changed=$bench"
+          echo "web=$web" >> "$GITHUB_OUTPUT"
+          echo "code_changed=$code bench_changed=$bench web_changed=$web"
 
   # The benchmark harness has four test files and, until now, CI ran none of
   # them: `grep -c bench/ ci.yml` was 0 while bench/chromium/test_reqbench.py,
@@ -164,6 +173,43 @@ jobs:
       - name: Run the bench harness test suite
         run: |
           python3 -m unittest discover -s bench/chromium -p 'test_*.py' -v
+
+  # The fleet web page (fleet/web): lint, the core's purity rules, unit tests, the
+  # Next.js build, and Playwright (Chromium and WebKit) against the mock fleet,
+  # which needs ffmpeg for its H.264 encoder.
+  fleet-web:
+    name: Fleet Web
+    needs: [changes]
+    if: ${{ needs.changes.outputs.web == 'true' }}
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: fleet/web
+    env:
+      # Ports for the mock fleet and the page under test: this runner runs nothing else.
+      FLEET_TEST_BASE_PORT: "24100"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
+        with:
+          node-version: '22'
+      - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
+        with:
+          version: 10.34.7
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+      - name: Lint and typecheck
+        run: pnpm lint && pnpm typecheck
+      - name: Unit tests
+        run: pnpm test
+      - name: Build
+        run: pnpm build
+      - name: Install browsers
+        run: pnpm exec playwright install --with-deps chromium webkit
+      - name: Browser tests
+        run: pnpm test:e2e
 
   # Lints every workflow file. Lives here, not in claude-lint.yml, so `Summary`
   # gates it: a PR that changes only `.github/workflows/claude*.yml` skips the
@@ -1167,7 +1213,7 @@ jobs:
   # Final summary job - runs after all test jobs
   summary:
     name: Summary
-    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, host, host-root, container]
+    needs: [changes, actionlint, skip-check, lint, packaging, fc-mock, bench-tests, fleet-web, host, host-root, container]
     if: always()
     runs-on: ubuntu-latest
     steps:
