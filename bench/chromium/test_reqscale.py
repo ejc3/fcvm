@@ -550,6 +550,23 @@ class PerFirecrackerFaults(unittest.TestCase):
         with self.assertRaisesRegex(reqscale.MeasurementInvalid, "exactly one"):
             reqscale.FirecrackerFaultProbe(proc, FakeAudit()).begin(100)
 
+    def test_a_helper_that_exits_during_the_scan_is_skipped(self):
+        """fcvm's short-lived helpers exit between the child listing and the
+        /proc open. RED BEFORE THE FIX: the probe raised "cannot open /proc
+        identity for pid N: No such file or directory" and failed the request;
+        on 2026-10-22 only 7 and 12 of 84 requests per path completed at 1.4
+        req/s."""
+        proc = FakeProcReader()
+        with tempfile.TemporaryDirectory() as empty_proc:
+            real_identity = proc.identity
+            proc.identity = lambda pid: (
+                reqscale.ProcIdentity(empty_proc, pid) if pid == 201 else real_identity(pid))
+            audit = FakeAudit()
+            probe = reqscale.FirecrackerFaultProbe(proc, audit)
+            probe.begin(100)
+        self.assertEqual(probe.finish()["pid"], 200)
+        self.assertEqual(audit.observed, [(100, "fcvm"), (200, "firecracker"), (202, "pasta")])
+
     def test_pid_reuse_is_rejected(self):
         proc = FakeProcReader()
         proc.samples[200][1] = reqscale.ProcessStat(200, "R", 37, 3, 501)

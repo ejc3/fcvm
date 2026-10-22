@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import dataclasses
+import errno
 import datetime as dt
 import fcntl
 import hashlib
@@ -1352,6 +1353,13 @@ class ProcReader:
         return ProcIdentity(self.root, pid)
 
 
+class ProcessGone(MeasurementInvalid):
+    """The process exited before /proc could be read for it."""
+
+
+_GONE_ERRNOS = (errno.ENOENT, errno.ESRCH)
+
+
 class ProcIdentity:
     """An open /proc/PID directory that cannot drift onto a reused pathname."""
 
@@ -1363,7 +1371,8 @@ class ProcIdentity:
                 os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
             )
         except OSError as error:
-            raise MeasurementInvalid(f"cannot open /proc identity for pid {pid}: {error}")
+            kind = ProcessGone if error.errno in _GONE_ERRNOS else MeasurementInvalid
+            raise kind(f"cannot open /proc identity for pid {pid}: {error}")
 
     def read(self, name: str) -> str:
         if self.fd is None:
@@ -1371,7 +1380,8 @@ class ProcIdentity:
         try:
             return _read_proc_member(self.fd, name)
         except (OSError, UnicodeError) as error:
-            raise MeasurementInvalid(
+            gone = isinstance(error, OSError) and error.errno in _GONE_ERRNOS
+            raise (ProcessGone if gone else MeasurementInvalid)(
                 f"cannot read {name} for pinned pid {self.pid}: {error}"
             ) from error
 
@@ -1523,7 +1533,14 @@ class FirecrackerFaultProbe:
         observed = []
         try:
             for pid in children:
-                identity = self.proc.identity(pid)
+                # fcvm's short-lived helpers (ip, nsenter and the like) can exit
+                # between the listing and the open. A child that is gone is not
+                # the VMM and holds nothing to audit; if Firecracker itself were
+                # gone, the count below fails closed.
+                try:
+                    identity = self.proc.identity(pid)
+                except ProcessGone:
+                    continue
                 try:
                     comm = identity.comm()
                     self.audit.observe_identity(identity, comm or "unnamed-child")
@@ -1533,6 +1550,8 @@ class FirecrackerFaultProbe:
                     if comm.startswith("firecracker"):
                         named.append(identity)
                         identity = None
+                except ProcessGone:
+                    continue
                 finally:
                     if identity is not None:
                         identity.close()
