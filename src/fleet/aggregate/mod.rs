@@ -105,6 +105,10 @@ pub struct FrameTiming {
     pub after_last_tile_ms: f64,
     /// From the first tile frame of the slot to the region frame leaving the encoder.
     pub after_first_tile_ms: f64,
+    /// The slowest tile's decode, its access unit in to its picture out.
+    pub decode_ms: f64,
+    /// The last tile picture decoded to the region composed.
+    pub wait_ms: f64,
     pub encode_ms: f64,
     /// Wall clock minus the slot's scene time, for the slowest tile frame and the output.
     pub tile_lateness_ms: f64,
@@ -202,6 +206,8 @@ impl Shared {
             "bitrate_kbps": if span > 0.0 { bytes as f64 * 8.0 / span / 1000.0 } else { 0.0 },
             "after_last_tile_ms": pct(&mut v, |f| f.after_last_tile_ms),
             "after_first_tile_ms": pct(&mut v, |f| f.after_first_tile_ms),
+            "decode_ms": pct(&mut v, |f| f.decode_ms),
+            "wait_ms": pct(&mut v, |f| f.wait_ms),
             "encode_ms": pct(&mut v, |f| f.encode_ms),
             "tile_lateness_ms": pct(&mut v, |f| f.tile_lateness_ms),
             "out_lateness_ms": pct(&mut v, |f| f.out_lateness_ms),
@@ -227,9 +233,20 @@ impl Shared {
     }
 }
 
-/// A composed slot waiting for the encoder: first and last tile frame arrival, compose
-/// time, the slowest tile's lateness, and tiles exact / held / black.
-type Pending = (Instant, Instant, Instant, f64, usize, usize, usize);
+/// A composed slot waiting for the encoder.
+struct Pending {
+    first_arrival: Instant,
+    last_arrival: Instant,
+    /// The slowest tile's decode (its access unit in to its picture out).
+    decode_ms: f64,
+    /// The last picture decoded to the composed region.
+    wait_ms: f64,
+    composed: Instant,
+    tile_late: f64,
+    exact: usize,
+    held: usize,
+    black: usize,
+}
 
 /// What a tile reader hands the compositor.
 pub(crate) enum TileEvent {
@@ -255,6 +272,7 @@ struct Held {
     header: Arc<Header>,
     arrived: Instant,
     arrived_unix_ms: f64,
+    decoded: Instant,
 }
 
 /// Run the aggregator until cancelled: one pipeline per layout.
@@ -358,7 +376,7 @@ async fn pipeline(
                     if next.is_none() {
                         next = Some(k);
                     }
-                    frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms });
+                    frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms, decoded: Instant::now() });
                 }
                 None => {}
             },
@@ -392,18 +410,21 @@ async fn pipeline(
                 frame_no = frame_no.wrapping_add(1);
                 let size = bytes.len();
                 shared.publish(Out::Frame { key: e.key, bytes });
-                if let Some((first, last, composed, tile_late, exact, held, black)) = pending.remove(&k) {
+                if let Some(p) = pending.remove(&k) {
                     let now = Instant::now();
+                    let ms = |a: Instant| now.duration_since(a).as_secs_f64() * 1000.0;
                     shared.record(FrameTiming {
                         t: e.t,
-                        after_last_tile_ms: now.duration_since(last).as_secs_f64() * 1000.0,
-                        after_first_tile_ms: now.duration_since(first).as_secs_f64() * 1000.0,
-                        encode_ms: now.duration_since(composed).as_secs_f64() * 1000.0,
-                        tile_lateness_ms: tile_late,
+                        after_last_tile_ms: ms(p.last_arrival),
+                        after_first_tile_ms: ms(p.first_arrival),
+                        decode_ms: p.decode_ms,
+                        wait_ms: p.wait_ms,
+                        encode_ms: ms(p.composed),
+                        tile_lateness_ms: p.tile_late,
                         out_lateness_ms: now_ms() as f64 - wall_of(layout.epoch_unix_ms, k, opts.fps),
-                        tiles_exact: exact,
-                        tiles_held: held,
-                        tiles_black: black,
+                        tiles_exact: p.exact,
+                        tiles_held: p.held,
+                        tiles_black: p.black,
                         bytes: size,
                     });
                 }
@@ -429,6 +450,8 @@ async fn pipeline(
             let (mut exact, mut held, mut black) = (0, 0, 0);
             let mut first: Option<Instant> = None;
             let mut last: Option<Instant> = None;
+            let mut last_decoded: Option<Instant> = None;
+            let mut decode_ms: f64 = 0.0;
             let mut late = f64::MIN;
             for tile_frames in &frames {
                 let pick = tile_frames
@@ -442,6 +465,10 @@ async fn pipeline(
                             exact += 1;
                             first = Some(first.map_or(h.arrived, |f| f.min(h.arrived)));
                             last = Some(last.map_or(h.arrived, |l| l.max(h.arrived)));
+                            last_decoded =
+                                Some(last_decoded.map_or(h.decoded, |l| l.max(h.decoded)));
+                            decode_ms = decode_ms
+                                .max(h.decoded.duration_since(h.arrived).as_secs_f64() * 1000.0);
                             late = late.max(
                                 h.arrived_unix_ms - wall_of(layout.epoch_unix_ms, k, opts.fps),
                             );
@@ -455,15 +482,18 @@ async fn pipeline(
             let composed = Instant::now();
             pending.insert(
                 k,
-                (
-                    first.unwrap_or(composed),
-                    last.unwrap_or(composed),
+                Pending {
+                    first_arrival: first.unwrap_or(composed),
+                    last_arrival: last.unwrap_or(composed),
+                    decode_ms,
+                    wait_ms: last_decoded
+                        .map_or(0.0, |d| composed.duration_since(d).as_secs_f64() * 1000.0),
                     composed,
-                    if late == f64::MIN { 0.0 } else { late },
+                    tile_late: if late == f64::MIN { 0.0 } else { late },
                     exact,
                     held,
                     black,
-                ),
+                },
             );
             let t = k as f64 / opts.fps as f64;
             if enc_tx.send((t, canvas)).await.is_err() {
