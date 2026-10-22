@@ -362,6 +362,46 @@ class MemoryCloneGone(unittest.TestCase):
                     corpus_mem.clone_gone(d, "mine")
 
 
+class ScaleCleanTree(unittest.TestCase):
+    """The scale run refuses a dirty source tree, so that what it measured is
+    committed. It counted the run's own outputs as dirt: the corpus campaign
+    writes the run's results under bench/chromium/results/ before the scale
+    phase starts, so `make bench-chromium-corpus MEASURE=scale` refused every
+    time ("benchmark source tree is dirty", 2026-10-22). Untracked files under
+    bench/chromium/results/ are outputs, not harness; anything else still
+    refuses."""
+
+    def repo(self, d):
+        import subprocess
+        for args in (["init", "-q"], ["config", "user.email", "t@example.test"],
+                     ["config", "user.name", "t"]):
+            subprocess.run(["git", "-C", d] + args, check=True)
+        write(d, "bench/chromium/reqbench.py", "x = 1\n")
+        subprocess.run(["git", "-C", d, "add", "-A"], check=True)
+        subprocess.run(["git", "-C", d, "commit", "-q", "-m", "c"], check=True)
+
+    def test_results_outputs_are_not_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/results/corpus-x/reqbench/analysis.json", "{}")
+            self.assertEqual(reqscale.source_tree_dirt(d), "")
+
+    def test_an_untracked_harness_file_is_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/new_driver.py", "y = 2\n")
+            self.assertIn("new_driver.py", reqscale.source_tree_dirt(d))
+
+    def test_a_modified_harness_file_is_dirt(self):
+        import reqscale
+        with tempfile.TemporaryDirectory() as d:
+            self.repo(d)
+            write(d, "bench/chromium/reqbench.py", "x = 3\n")
+            self.assertIn("reqbench.py", reqscale.source_tree_dirt(d))
+
+
 class RestoreMarkSourcePin(unittest.TestCase):
     """Every marker is an info! line fcvm writes on the restore path."""
 

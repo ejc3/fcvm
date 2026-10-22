@@ -2607,6 +2607,17 @@ def golden_runtime(args, identity: dict) -> tuple[dict, dict]:
     return {field: golden[field] for field in runtime}, runtime
 
 
+def source_tree_dirt(repo: str) -> str:
+    """`git status` of the source tree, leaving out bench/chromium/results/.
+
+    A run's results are outputs, not harness: the corpus campaign writes the
+    run's own directory there before the scale phase starts, so counting them
+    refused every corpus scale run.
+    """
+    return _command(["git", "-C", repo, "status", "--porcelain=v1", "--untracked-files=all",
+                     "--", ".", ":(exclude)bench/chromium/results"])
+
+
 def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
     fcvm = args.fcvm
     revision = _command(["git", "-C", args.source_repo, "rev-parse", "HEAD"])
@@ -2614,8 +2625,7 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
         raise MeasurementInvalid(
             f"the source repository is at {revision!r}, not the revision "
             f"{args.runtime['source_revision']!r} this runtime was staged from")
-    dirty = _command(["git", "-C", args.source_repo, "status", "--porcelain=v1",
-                      "--untracked-files=all"])
+    dirty = source_tree_dirt(args.source_repo)
     if dirty:
         raise MeasurementInvalid(
             "benchmark source tree is dirty; commit the harness before measuring"
