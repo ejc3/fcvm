@@ -5,6 +5,7 @@
 // reconnect, which height) come from core/; this file is the platform glue.
 
 import {
+  BORROW_FADE_MS,
   BUFFER_FRAMES,
   chooseCommonT,
   codecFromSps,
@@ -36,7 +37,7 @@ import {
   type SyncChoice,
   type TileFrameStats,
 } from "../../core/index.ts";
-import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker } from "./worker-msgs.ts";
+import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
 
 declare const self: DedicatedWorkerGlobalScope;
 
@@ -267,14 +268,43 @@ class TileStream {
 let canvas: OffscreenCanvas | null = null;
 let ctx: OffscreenCanvasRenderingContext2D | null = null;
 let dpr = 1;
-let plan: DrawPlan = { mode: "direct", direct: [], aggregated: [], tiles: [], focus: null, image: null, dpr: 1, darkFill: "#06080B", estimatedBps: 0 };
+let plan: DrawPlan = {
+  mode: "direct",
+  direct: [],
+  aggregated: [],
+  tiles: [],
+  focus: null,
+  image: null,
+  dpr: 1,
+  darkFill: "#06080B",
+  estimatedBps: 0,
+  poster: null,
+  paused: false,
+  darkFadeMs: 0,
+  suspended: false,
+};
 /** The mode being drawn. It becomes plan.mode only once that mode can be drawn whole. */
 let shownMode: StreamMode = "direct";
 /** When each tile last stopped being dark, for its fade back in. */
 const litAt = new Map<string, number>();
 const wasDark = new Set<string>();
-/** Draws recorded for a test: the t drawn, the mode, and regions drawn without a frame. */
-let trace: { T: number | null; mode: StreamMode; missing: number }[] | null = null;
+/** When each tile went dark, for its fade out when the viewer asked for less motion. */
+const darkAt = new Map<string, number>();
+/** Draws recorded for a test: the t drawn, the mode, regions drawn without a frame, tiles fading dark. */
+let trace: TraceEntry[] | null = null;
+/** The coordinator's poster, drawn where no stream has shown a frame yet. */
+let poster: ImageBitmap | null = null;
+/** The last picture drawn before the streams closed (a hidden tab), shown until they are back. */
+let held: ImageBitmap | null = null;
+/** Streams reopened after a suspension; the picture holds until every region has a frame at one t. */
+let resuming = false;
+/** When the live picture started fading in over the held one. */
+let heldFadeFrom: number | null = null;
+let resumeStarted = 0;
+let posterUrl: string | null = null;
+/** Every stream has shown a frame: the poster is no longer drawn. */
+let posterRetired = false;
+let painted = false;
 /** When the current switch began; after SWITCH_HOLD_LIMIT_MS the image stops waiting for it. */
 let switchStarted: number | null = null;
 const SWITCH_HOLD_LIMIT_MS = 4000;
@@ -308,6 +338,7 @@ function sourcesOf(mode: StreamMode): DrawSource[] {
 /** The streams to hold: the mode drawn, the mode wanted (while switching), and an opened tile. */
 function wantedSources(): Map<string, DrawSource> {
   const out = new Map<string, DrawSource>();
+  if (plan.suspended) return out;
   for (const src of sourcesOf(shownMode)) out.set(src.id, src);
   if (plan.mode !== shownMode) for (const src of sourcesOf(plan.mode)) out.set(src.id, src);
   if (plan.focus) out.set(plan.focus.id, plan.focus);
@@ -335,8 +366,71 @@ function syncStreams(): void {
   }
 }
 
+function loadPoster(url: string | null): void {
+  if (url === posterUrl) return;
+  posterUrl = url;
+  if (url === null) return;
+  void (async () => {
+    try {
+      const res = await fetch(url, { cache: "no-store" });
+      if (!res.ok || posterUrl !== url) return;
+      const bmp = await createImageBitmap(await res.blob());
+      if (posterUrl !== url) {
+        bmp.close();
+        return;
+      }
+      poster?.close();
+      poster = bmp;
+      dirty = true;
+      needsClear = true;
+    } catch {
+      // No poster: the image starts dark and fills in as streams arrive.
+    }
+  })();
+}
+
+/** The poster, while it is still drawn under streams that have not arrived. */
+function posterOn(): boolean {
+  return poster !== null && !posterRetired && plan.image !== null && plan.focus === null;
+}
+
+/** Paint the part of the poster under a box. */
+function drawPoster(b: Box): void {
+  if (!ctx || !poster || !plan.image) return;
+  const img = plan.image;
+  const [x, y, w, h] = devBox(b);
+  const sx = ((b.x - img.x) / img.w) * poster.width;
+  const sy = ((b.y - img.y) / img.h) * poster.height;
+  ctx.drawImage(poster, sx, sy, (b.w / img.w) * poster.width, (b.h / img.h) * poster.height, x, y, w, h);
+}
+
+/** What fills a region with no frame: the held picture while the live one fades in, the poster at first, dark after. */
+function fillEmpty(b: Box): void {
+  if (held && heldFadeFrom !== null && ctx) {
+    const [x, y, w, h] = devBox(b);
+    ctx.drawImage(held, x, y, w, h, x, y, w, h);
+  } else if (posterOn()) drawPoster(b);
+  else fillDark(b);
+}
+
 function applyPlan(p: DrawPlan): void {
+  const was = plan.suspended;
+  if (!was && p.suspended && canvas) {
+    // Keep what is on screen: it stays up while hidden and when the tab comes back.
+    held?.close();
+    held = null;
+    void createImageBitmap(canvas).then((b) => {
+      if (plan.suspended) held = b;
+      else b.close();
+    });
+  }
+  if (was && !p.suspended) {
+    resuming = true;
+    resumeStarted = now();
+    heldFadeFrom = null;
+  }
   plan = p;
+  loadPoster(p.poster);
   dirty = true;
   needsClear = true;
   // Before anything is on screen there is nothing to keep: start in the wanted mode.
@@ -454,11 +548,43 @@ function draw(): void {
   }
   lastFrameAt = t0;
 
-  trySwitch();
+  // Suspended (a hidden tab): no streams, nothing new to draw; the canvas keeps its picture.
+  if (plan.suspended) {
+    answerCaptures(null);
+    return;
+  }
+  // Paused: the picture holds what it shows; only a new plan or size redraws it.
+  if (plan.paused && !dirty && captures.length === 0) return;
+  if (!plan.paused) trySwitch();
   const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
   const drawable = shown.filter((src) => src.box !== null && streams.has(src.id));
   const buffers = drawable.map((src) => ({ id: src.id, ts: streams.get(src.id)!.frames.map((h) => h.t) }));
-  const choice = chooseCommonT(buffers, prevT, undefined, switchCap());
+  const choice = plan.paused ? lastChoice : chooseCommonT(buffers, prevT, undefined, switchCap());
+  if (resuming) {
+    // Back from hidden: the picture holds until every region has a frame at one
+    // t (the mode switch's rule), then the live image fades in over it.
+    const live = shown.filter((src) => src.box !== null && src.url !== null);
+    // A region that never sends a frame stops holding the rest after the switch's limit.
+    const ready =
+      (choice.T !== null && live.every((src) => choice.show.get(src.id)?.kind === "sync")) || now() - resumeStarted > SWITCH_HOLD_LIMIT_MS;
+    if (!ready) {
+      if (held && (dirty || needsClear) && ctx && canvas) {
+        ctx.drawImage(held, 0, 0, canvas.width, canvas.height);
+        dirty = false;
+        needsClear = false;
+      }
+      if (trace) trace.push({ T: prevT, mode: shownMode, missing: 0, darkIn: 0, poster: false, held: true });
+      answerCaptures(prevT);
+      return;
+    }
+    resuming = false;
+    heldFadeFrom = now();
+    for (const src of live) {
+      const st = streams.get(src.id);
+      if (st) st.appearedAt = null;
+    }
+    dirty = true;
+  }
   lastChoice = choice;
   if (choice.T !== null) prevT = choice.T;
 
@@ -474,6 +600,7 @@ function draw(): void {
   if (needsClear) {
     ctx.fillStyle = settings.background;
     ctx.fillRect(0, 0, canvas.width, canvas.height);
+    if (posterOn()) drawPoster(plan.image!);
     needsClear = false;
   }
   ctx.imageSmoothingEnabled = true;
@@ -487,7 +614,7 @@ function draw(): void {
     if (!st || !show || !frame) {
       if (st) st.appearedAt = null;
       if (src.url !== null) missing++;
-      fillDark(src.box);
+      fillEmpty(src.box);
       continue;
     }
     const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
@@ -497,7 +624,7 @@ function draw(): void {
     if (st.appearedAt === null) st.appearedAt = at;
     const fade = Math.min(1, (at - st.appearedAt) / settings.fadeInMs);
     if (fade < 1) {
-      fillDark(src.box);
+      fillEmpty(src.box);
       dirty = true;
     }
     ctx.globalAlpha = fade;
@@ -524,15 +651,28 @@ function draw(): void {
   }
   // Each tile's own state, the same in both modes: dark while it relaunches
   // (outlined in its half's colour), fading out when it comes back.
+  let darkIn = 0;
   if (!plan.focus) {
     for (const t of plan.tiles) {
       if (!t.box) continue;
       if (t.dark) {
-        wasDark.add(t.id);
+        if (!wasDark.has(t.id)) {
+          wasDark.add(t.id);
+          // A tile still fading back in starts its dark-out from where it is.
+          darkAt.set(t.id, at);
+        }
         litAt.delete(t.id);
-        drawDark(t, 1);
+        const since = darkAt.get(t.id) ?? at;
+        const fadeMs = Math.max(plan.darkFadeMs, t.slowFade ? BORROW_FADE_MS : 0);
+        const alpha = fadeMs > 0 ? Math.min(1, (at - since) / fadeMs) : 1;
+        if (alpha < 1) {
+          darkIn++;
+          dirty = true;
+        }
+        drawDark(t, alpha);
         continue;
       }
+      darkAt.delete(t.id);
       if (wasDark.has(t.id)) {
         wasDark.delete(t.id);
         litAt.set(t.id, at);
@@ -555,24 +695,31 @@ function draw(): void {
     if (keep !== null) st.releaseOlder(keep);
   }
   if (trace) {
-    trace.push({ T: choice.T, mode: shownMode, missing });
+    trace.push({ T: choice.T, mode: shownMode, missing, darkIn, poster: posterOn(), held: heldFadeFrom !== null });
     if (trace.length > 20_000) trace.shift();
+  }
+  // The held picture goes once the live one has faded in over it.
+  if (heldFadeFrom !== null && at - heldFadeFrom > settings.fadeInMs + 50) {
+    heldFadeFrom = null;
+    held?.close();
+    held = null;
+  }
+  // The poster goes once every stream drawn has shown a frame.
+  if (!posterRetired && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streams.get(src.id)?.appearedAt != null)) {
+    posterRetired = true;
+    dirty = true;
+  }
+  if (!painted && (posterOn() || shown.some((src) => streams.get(src.id)?.appearedAt != null))) {
+    painted = true;
+    post({ type: "painted" });
   }
 
   // Captures read back exactly what this draw put on the canvas.
   if (captures.length > 0) {
-    const shown: Record<string, string> = {};
-    for (const [id, sh] of choice.show) shown[id] = sh.kind === "sync" || sh.kind === "behind" ? `${sh.kind}@${sh.t}` : sh.kind;
-    for (const t of plan.tiles) if (t.dark) shown[t.id] = "dark";
-    for (const c of captures) {
-      const pixels = c.points.map((p) => {
-        const d = ctx!.getImageData(Math.floor(p.x * dpr), Math.floor(p.y * dpr), 1, 1).data;
-        return [d[0]!, d[1]!, d[2]!, d[3]!] as [number, number, number, number];
-      });
-      const result: CaptureResult = { req: c.req, T: choice.T, shown, pixels, mode: shownMode };
-      post({ type: "capture", result });
-    }
-    captures = [];
+    const shownBy: Record<string, string> = {};
+    for (const [id, sh] of choice.show) shownBy[id] = sh.kind === "sync" || sh.kind === "behind" ? `${sh.kind}@${sh.t}` : sh.kind;
+    for (const t of plan.tiles) if (t.dark) shownBy[t.id] = "dark";
+    answerCaptures(choice.T, shownBy);
   }
 
   if (choice.T !== null) {
@@ -588,6 +735,20 @@ function draw(): void {
   drawMs.push(spent);
   if (drawMs.length > 240) drawMs.shift();
   drawTimes.push(at);
+}
+
+/** Answer pending captures from what the canvas holds now. */
+function answerCaptures(T: number | null, shownBy: Record<string, string> = {}): void {
+  if (captures.length === 0 || !ctx) return;
+  for (const c of captures) {
+    const pixels = c.points.map((p) => {
+      const d = ctx!.getImageData(Math.floor(p.x * dpr), Math.floor(p.y * dpr), 1, 1).data;
+      return [d[0]!, d[1]!, d[2]!, d[3]!] as [number, number, number, number];
+    });
+    const result: CaptureResult = { req: c.req, T, shown: shownBy, pixels, mode: shownMode };
+    post({ type: "capture", result });
+  }
+  captures = [];
 }
 
 function pct(xs: readonly number[], p: number): number {

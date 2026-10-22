@@ -7,6 +7,7 @@ import {
   initialState,
   intentsToResend,
   makeIntent,
+  needsVerify,
   nextPingDelay,
   NOTICE_MS,
   reconnectDelayMs,
@@ -16,10 +17,9 @@ import {
   type ClientState,
   type DrawPlan,
   type IntentName,
-  type StreamMode,
   type UiState,
 } from "../../core/index.ts";
-import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker } from "./worker-msgs.ts";
+import type { BenchStats, CaptureResult, DrawSettings, FromWorker, ToWorker, TraceEntry } from "./worker-msgs.ts";
 
 const now = () => performance.timeOrigin + performance.now();
 
@@ -45,7 +45,10 @@ export class WallClient {
   /** Share of drawn tiles behind the common t, over the last ten seconds of direct mode. */
   lateShare: number | null = null;
   private lateSamples: number[] = [];
-  private traceWaiters = new Map<number, (e: { T: number | null; mode: StreamMode; missing: number }[]) => void>();
+  private traceWaiters = new Map<number, (e: TraceEntry[]) => void>();
+  /** The canvas has painted the poster or a frame. */
+  painted = false;
+  private paintedListeners = new Set<() => void>();
   readonly url: string;
 
   constructor(url: string) {
@@ -62,8 +65,17 @@ export class WallClient {
   };
 
   dispatch(e: ClientEvent): void {
+    const before = this.state;
     const next = reduce(this.state, e);
     if (next === this.state) return;
+    // Verified just now: send what the viewer pressed while it was being checked.
+    if (!before.turnstile.verified && next.turnstile.verified && next.turnstile.queued.length > 0) {
+      const queued = next.turnstile.queued;
+      this.state = next;
+      this.dispatch({ type: "queue-sent" });
+      for (const q of queued) this.send(q.name, q.args);
+      return;
+    }
     const hadWatches = cameraTargets(this.state);
     this.state = next;
     const watches = cameraTargets(next);
@@ -133,6 +145,32 @@ export class WallClient {
     return id;
   }
 
+  /**
+   * A viewer's action: sent now, or held until the Turnstile check passes when
+   * the coordinator asks for one. Returns false when it was held.
+   */
+  act(name: IntentName, args: Record<string, unknown> = {}): boolean {
+    if (needsVerify(this.state)) {
+      this.dispatch({ type: "queue", action: { name, args } });
+      return false;
+    }
+    this.send(name, args);
+    return true;
+  }
+
+  /** A Turnstile token for this connection. */
+  verify(token: string): void {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    this.dispatch({ type: "verify-sent" });
+    this.ws.send(JSON.stringify({ type: "verify", token }));
+  }
+
+  onPainted(fn: () => void): () => void {
+    if (this.painted) fn();
+    this.paintedListeners.add(fn);
+    return () => this.paintedListeners.delete(fn);
+  }
+
   /** Send an intent message again, as a retry after a dropped socket would. */
   resend(id: string): void {
     const p = this.state.pending.find((x) => x.intent.id === id);
@@ -169,6 +207,9 @@ export class WallClient {
           requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
+      } else if (m.type === "painted") {
+        this.painted = true;
+        for (const fn of this.paintedListeners) fn();
       } else if (m.type === "mode-shown") {
         this.dispatch({ type: "ui", patch: { shownMode: m.mode } });
       } else if (m.type === "trace") {
@@ -213,7 +254,7 @@ export class WallClient {
   }
 
   /** Stop recording draws and get them: t, mode and regions drawn without a frame (tests). */
-  traceStop(): Promise<{ T: number | null; mode: StreamMode; missing: number }[]> {
+  traceStop(): Promise<TraceEntry[]> {
     const req = ++this.captureReq;
     return new Promise((resolve) => {
       this.traceWaiters.set(req, resolve);

@@ -1,7 +1,8 @@
 // Wire types for the coordinator's /live socket and the renderer's frame socket,
 // and parsers that refuse anything that does not match. The coordinator and the
 // renderer are the authority on these shapes (fleet/PROTOCOL.md); this file is the
-// browser's reading of them.
+// browser's reading of them. Fields marked "assumed" are not in PROTOCOL.md yet:
+// they are this page's reading of the second design review, and the mock speaks them.
 
 export type Half = "fcvm" | "ec2";
 
@@ -28,6 +29,17 @@ export interface GpuInfo {
   util_pct: number | null;
 }
 
+/**
+ * Why a tile is not running when that is a fault (assumed): `relaunch_failed`
+ * (the VM did not come back; the coordinator retries at `retry_at`) or
+ * `host_reclaimed` (AWS took the spot host back; the fleet re-tiles).
+ */
+export interface Failure {
+  kind: string;
+  message: string;
+  retry_at: number | null;
+}
+
 export interface Tile {
   /** The tile's place, as the coordinator names it (`fcvm:3`). */
   id: string;
@@ -36,14 +48,21 @@ export interface Tile {
   phase: string;
   /** The slot behind the place (`slot-3`, `ec2-2`), when the coordinator names one. */
   slot: string | null;
+  /** The VM's name (`fleet-slot-3`), when it has one. */
+  vm: string | null;
+  /** How many times this slot has been started. */
+  generation: number | null;
   /** The renderer's own frames per second, when reported. */
   fps: number | null;
   error: string | null;
+  failure: Failure | null;
   /** Null while the tile has no renderer to connect to (waiting for capacity). */
   frame_url: string | null;
   gpu: GpuInfo | null;
   host: string | null;
   last_relaunch: LastRelaunch | null;
+  /** Lent to a visitor as their own GPU until this time (assumed); it sits out races meanwhile. */
+  borrowed: { until: number } | null;
 }
 
 export interface CameraKey {
@@ -57,7 +76,6 @@ export interface CameraKey {
 
 export interface Word {
   text: string;
-  by: string;
 }
 
 export interface Light {
@@ -65,7 +83,6 @@ export interface Light {
   pos: unknown;
   /** A CSS colour, from a string or linear RGB in 0..1. */
   color: string;
-  by: string;
 }
 
 export interface Scene {
@@ -79,59 +96,153 @@ export interface Scene {
 
 export interface RelaunchAll {
   started_at: number;
+  /** The viewer that pressed restart, or `schedule` for the owner's cadence. */
   by: string;
   fcvm_done_at: number | null;
   ec2_done_at: number | null;
+  /** Tiles still to reach their first frame. */
+  fcvm_pending: number | null;
+  ec2_pending: number | null;
+  /** GPUs restarted in each half (assumed). */
+  fcvm_gpus: number | null;
+  ec2_gpus: number | null;
+  /** Time the EC2 half has waited for spot capacity so far, not counted in its time (assumed). */
+  ec2_capacity_wait_ms: number;
+  /** When the EC2 half's current wait for capacity began, or null (assumed). */
+  ec2_waiting_since: number | null;
+}
+
+/** One half's measured restart times (assumed). Every number is the coordinator's. */
+export interface HalfScore {
+  /** Median click-to-last-first-frame over the races kept, capacity waits excluded. */
+  median_ms: number;
+  /** The last race's time, capacity wait excluded. */
+  last_ms: number;
+  /** Races the median is over. */
+  races: number;
+  /** GPUs the last race restarted in this half. */
+  measured_on: number;
+  /** How long the last race waited for spot capacity (EC2), not counted above. */
+  last_capacity_wait_ms: number;
+}
+
+export interface Scoreboard {
+  fcvm: HalfScore | null;
+  ec2: HalfScore | null;
+}
+
+/** Where the directed camera can hold next, with this hold's votes (assumed). */
+export interface NudgeTarget {
+  id: string;
+  label: string;
+  votes: number;
+}
+
+export interface Nudges {
+  targets: NudgeTarget[];
+  /** The target the camera holds on now, or null while it flies. */
+  holding: string | null;
+  /** When the camera leaves for the next hold. */
+  next_hold_at: number | null;
+}
+
+export interface Host {
+  name: string;
+  draining: boolean;
+}
+
+/** Wall GPUs lent to visitors (assumed): at most `cap` at once; the next comes back at `next_return_at`. */
+export interface Borrow {
+  cap: number;
+  lent: number;
+  next_return_at: number | null;
 }
 
 export interface Action {
   at: number;
-  by: string;
-  /** The viewer id of the connection that acted, when the coordinator sends it. */
+  /** The viewer id of the connection that acted (`schedule` for the owner's cadence). */
   viewer: string | null;
+  /** The intent's id. */
+  id: string | null;
   name: string;
   /** The intent's arguments, when the coordinator includes them. */
   args: Record<string, unknown> | null;
-  /** The coordinator's own one-line summary, when it sends one. */
+  /** The coordinator's own one-line summary. */
   summary: string | null;
   outcome: string | null;
+}
+
+/** A region one aggregator serves: its tiles joined at one t, in the renderer's frame protocol. */
+export interface Aggregate {
+  id: string;
+  half: Half;
+  host: string | null;
+  rect: Rect;
+  frame_url: string | null;
+  tiles: string[];
 }
 
 export interface FleetState {
   tiles: Tile[];
   /** Width over height of the whole image. */
   image_aspect: number;
-  fleet: { hosts: number; gpus: number; n: number; max_tiles: number | null };
+  fleet: { hosts: Host[]; gpus: number; n: number; max_tiles: number | null };
+  borrow: Borrow | null;
   scene: Scene;
-  settings: { auto_relaunch_secs: number | null };
   relaunch_all: RelaunchAll | null;
+  /** When the owner's cadence restarts everything next (assumed). */
+  next_race_at: number | null;
+  /** A viewer's "restart now" is refused until then (assumed). */
+  cooldown_until: number | null;
+  scoreboard: Scoreboard;
+  nudges: Nudges | null;
   viewers: { count: number };
   actions: Action[];
-  /**
-   * Aggregators: each joins a region of tiles at one t and streams it in the
-   * renderer's frame protocol. Empty when the fleet runs none.
-   */
-  aggregators: Aggregator[];
-}
-
-export interface Aggregator {
-  id: string;
-  frame_url: string | null;
-  rect: Rect;
+  aggregates: Aggregate[];
 }
 
 export interface SnapshotMsg {
   type: "snapshot";
   version: number;
   state: FleetState;
-  /** This connection's own viewer id, when the coordinator sends it with the snapshot. */
-  you?: string;
 }
 
-/** The coordinator telling a connection who it is. */
-export interface WelcomeMsg {
-  type: "welcome";
+/** The first message on a connection: who it acts as, and the Turnstile site key when actions need one (assumed). */
+export interface HelloMsg {
+  type: "hello";
   viewer: string;
+  turnstile: string | null;
+}
+
+/** The answer to a `verify` (assumed). */
+export interface VerifiedMsg {
+  type: "verified";
+  ok: boolean;
+  reason: string | null;
+}
+
+/** A viewer's own GPU, borrowed from a wall tile, sent only to the connection that claimed it (assumed). */
+export interface Claim {
+  id: string;
+  /** The wall tile whose GPU it borrowed. */
+  tile: string | null;
+  /** `restoring`, `running`, or `ended`. */
+  phase: string;
+  frame_url: string | null;
+  clicked_at: number;
+  first_frame_at: number | null;
+  /** When the GPU goes back to the pool. */
+  expires_at: number | null;
+  gpu: string | null;
+  phases: Record<string, number>;
+  camera: CameraKey[];
+  /** Why it ended, once it has. */
+  ended: string | null;
+}
+
+export interface ClaimMsg {
+  type: "claim";
+  claim: Claim;
 }
 
 export interface ReceiptMsg {
@@ -154,18 +265,20 @@ export interface ErrorMsg {
   reason: string;
 }
 
-export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | WelcomeMsg;
+export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMsg | VerifiedMsg | ClaimMsg;
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
 export type IntentName =
   | "relaunch"
   | "relaunch_all"
-  | "set_auto_relaunch"
-  | "camera"
+  | "nudge"
   | "time_of_day"
   | "word"
-  | "light";
+  | "light"
+  | "claim_gpu"
+  | "claim_camera"
+  | "release_gpu";
 
 export interface IntentMsg {
   type: "intent";
@@ -179,11 +292,24 @@ export interface PingMsg {
   client_unix_ms: number;
 }
 
-export type ClientMsg = IntentMsg | PingMsg;
+/** A Turnstile token for this connection (assumed). */
+export interface VerifyMsg {
+  type: "verify";
+  token: string;
+}
+
+export type ClientMsg = IntentMsg | PingMsg | VerifyMsg;
 
 /** Outcomes a receipt can carry that mean the intent took effect. */
 export function receiptApplied(r: ReceiptMsg): boolean {
   return r.outcome === "committed" || r.outcome === "applied" || r.outcome === "accepted" || r.outcome === "ok";
+}
+
+/** Two spellings of one viewer id (`v-4`, `viewer:v-4`) name the same viewer. */
+export function sameViewer(a: string | null, b: string | null): boolean {
+  if (a === null || b === null) return false;
+  const norm = (v: string) => v.replace(/^viewer:/, "");
+  return norm(a) === norm(b);
 }
 
 // ---- parsing ---------------------------------------------------------------
@@ -278,12 +404,16 @@ function parseTile(v: unknown, i: number): Tile {
     rect: parseRect(obj(v, "rect", where), `${where}.rect`),
     phase: str(v, "phase", where),
     slot: strOrNull(v, "slot", where),
+    vm: strOrNull(v, "vm", where),
+    generation: numOrNull(v, "generation", where),
     fps: numOrNull(v, "fps", where),
     error: strOrNull(v, "error", where),
+    failure: parseFailure(v["failure"], `${where}.failure`),
     frame_url: strOrNull(v, "frame_url", where),
     gpu: parseGpu(v["gpu"], v["gpu_stats"], `${where}.gpu`),
     host: strOrNull(v, "host", where),
     last_relaunch: parseLastRelaunch(v["last_relaunch"], `${where}.last_relaunch`),
+    borrowed: isObj(v["borrowed"]) ? { until: num(v["borrowed"], "until", `${where}.borrowed`) } : null,
   };
 }
 
@@ -301,33 +431,86 @@ export function cssColor(v: unknown): string {
   return "#ffffff";
 }
 
-function parseScene(o: Obj): Scene {
+function parseCamera(o: Obj, where: string): CameraKey[] {
   const camera: CameraKey[] = [];
-  for (const [i, k] of arr(o, "camera", "scene").entries()) {
-    if (!isObj(k)) throw new ProtocolError(`scene.camera[${i}] is not an object`);
-    const key: CameraKey = { t: num(k, "t", `scene.camera[${i}]`) };
+  for (const [i, k] of arr(o, "camera", where).entries()) {
+    if (!isObj(k)) throw new ProtocolError(`${where}.camera[${i}] is not an object`);
+    const key: CameraKey = { t: num(k, "t", `${where}.camera[${i}]`) };
     for (const [f, val] of Object.entries(k)) {
       if (typeof val === "number" || typeof val === "string") key[f] = val;
       else if (Array.isArray(val) && val.every((x) => typeof x === "number")) key[f] = val as number[];
     }
     camera.push(key);
   }
+  return camera;
+}
+
+function parseScene(o: Obj): Scene {
   const words: Word[] = arr(o, "words", "scene").map((w, i) => {
     const where = `scene.words[${i}]`;
     if (!isObj(w)) throw new ProtocolError(`${where} is not an object`);
-    return { text: str(w, "text", where), by: strOrNull(w, "by", where) ?? "" };
+    return { text: str(w, "text", where) };
   });
   const lights: Light[] = arr(o, "lights", "scene").map((l, i) => {
-    const where = `scene.lights[${i}]`;
-    if (!isObj(l)) throw new ProtocolError(`${where} is not an object`);
-    return { pos: l["pos"] ?? null, color: cssColor(l["color"]), by: strOrNull(l, "by", where) ?? "" };
+    if (!isObj(l)) throw new ProtocolError(`scene.lights[${i}] is not an object`);
+    return { pos: l["pos"] ?? null, color: cssColor(l["color"]) };
   });
   return {
     epoch_unix_ms: num(o, "epoch_unix_ms", "scene"),
-    camera,
+    camera: parseCamera(o, "scene"),
     time_of_day: numOrNull(o, "time_of_day", "scene") ?? 0.5,
     words,
     lights,
+  };
+}
+
+function parseFailure(v: unknown, where: string): Failure | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return { kind: str(v, "kind", where), message: strOrNull(v, "message", where) ?? "", retry_at: numOrNull(v, "retry_at", where) };
+}
+
+function parseHalfScore(v: unknown, where: string): HalfScore | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError(`${where} is not an object`);
+  return {
+    median_ms: num(v, "median_ms", where),
+    last_ms: num(v, "last_ms", where),
+    races: num(v, "races", where),
+    measured_on: num(v, "measured_on", where),
+    last_capacity_wait_ms: numOrNull(v, "last_capacity_wait_ms", where) ?? 0,
+  };
+}
+
+function parseNudges(v: unknown): Nudges | null {
+  if (v === null || v === undefined) return null;
+  if (!isObj(v)) throw new ProtocolError("nudges is not an object");
+  return {
+    targets: arr(v, "targets", "nudges").map((t, i) => {
+      const where = `nudges.targets[${i}]`;
+      if (!isObj(t)) throw new ProtocolError(`${where} is not an object`);
+      return { id: str(t, "id", where), label: str(t, "label", where), votes: numOrNull(t, "votes", where) ?? 0 };
+    }),
+    holding: strOrNull(v, "holding", "nudges"),
+    next_hold_at: numOrNull(v, "next_hold_at", "nudges"),
+  };
+}
+
+function parseRelaunchAll(ra: unknown): RelaunchAll | null {
+  if (ra === null || ra === undefined) return null;
+  if (!isObj(ra)) throw new ProtocolError("relaunch_all is neither an object nor null");
+  const w = "relaunch_all";
+  return {
+    started_at: num(ra, "started_at", w),
+    by: strOrNull(ra, "by", w) ?? "",
+    fcvm_done_at: numOrNull(ra, "fcvm_done_at", w),
+    ec2_done_at: numOrNull(ra, "ec2_done_at", w),
+    fcvm_pending: numOrNull(ra, "fcvm_pending", w),
+    ec2_pending: numOrNull(ra, "ec2_pending", w),
+    fcvm_gpus: numOrNull(ra, "fcvm_gpus", w),
+    ec2_gpus: numOrNull(ra, "ec2_gpus", w),
+    ec2_capacity_wait_ms: numOrNull(ra, "ec2_capacity_wait_ms", w) ?? 0,
+    ec2_waiting_since: numOrNull(ra, "ec2_waiting_since", w),
   };
 }
 
@@ -339,27 +522,14 @@ function parseState(o: Obj): FleetState {
     ids.add(t.id);
   }
   const fleet = obj(o, "fleet", "state");
-  const settings = isObj(o["settings"]) ? o["settings"] : {};
-  const ra = o["relaunch_all"];
-  let relaunchAll: RelaunchAll | null = null;
-  if (isObj(ra)) {
-    relaunchAll = {
-      started_at: num(ra, "started_at", "relaunch_all"),
-      by: strOrNull(ra, "by", "relaunch_all") ?? "",
-      fcvm_done_at: numOrNull(ra, "fcvm_done_at", "relaunch_all"),
-      ec2_done_at: numOrNull(ra, "ec2_done_at", "relaunch_all"),
-    };
-  } else if (ra !== null && ra !== undefined) {
-    throw new ProtocolError("relaunch_all is neither an object nor null");
-  }
   const viewers = isObj(o["viewers"]) ? o["viewers"] : {};
   const actions: Action[] = arr(o, "actions", "state").flatMap((a) => {
     if (!isObj(a)) return [];
     return [
       {
         at: typeof a["at"] === "number" ? a["at"] : 0,
-        by: typeof a["by"] === "string" ? a["by"] : "",
-        viewer: typeof a["viewer"] === "string" ? a["viewer"] : typeof a["actor"] === "string" ? a["actor"] : null,
+        viewer: typeof a["viewer"] === "string" ? a["viewer"] : null,
+        id: typeof a["id"] === "string" ? a["id"] : null,
         name: typeof a["name"] === "string" ? a["name"] : "",
         args: isObj(a["args"]) ? a["args"] : null,
         summary: typeof a["summary"] === "string" ? a["summary"] : null,
@@ -367,28 +537,70 @@ function parseState(o: Obj): FleetState {
       },
     ];
   });
-  const hosts = fleet["hosts"];
   const aspect = numOrNull(o, "image_aspect", "state") ?? DEFAULT_IMAGE_ASPECT;
   if (aspect <= 0) throw new ProtocolError("image_aspect is not positive");
+  const sb = isObj(o["scoreboard"]) ? o["scoreboard"] : {};
   return {
     tiles,
     image_aspect: aspect,
     fleet: {
-      hosts: Array.isArray(hosts) ? hosts.length : num(fleet, "hosts", "fleet"),
+      hosts: arr(fleet, "hosts", "fleet").map((h, i) => {
+        const where = `fleet.hosts[${i}]`;
+        if (!isObj(h)) throw new ProtocolError(`${where} is not an object`);
+        return { name: str(h, "name", where), draining: h["draining"] === true };
+      }),
       gpus: num(fleet, "gpus", "fleet"),
       n: num(fleet, "n", "fleet"),
       max_tiles: numOrNull(fleet, "max_tiles", "fleet"),
     },
+    borrow: isObj(o["borrow"])
+      ? {
+          cap: num(o["borrow"], "cap", "borrow"),
+          lent: num(o["borrow"], "lent", "borrow"),
+          next_return_at: numOrNull(o["borrow"], "next_return_at", "borrow"),
+        }
+      : null,
     scene: parseScene(obj(o, "scene", "state")),
-    settings: { auto_relaunch_secs: numOrNull(settings, "auto_relaunch_secs", "settings") },
-    relaunch_all: relaunchAll,
+    relaunch_all: parseRelaunchAll(o["relaunch_all"]),
+    next_race_at: numOrNull(o, "next_race_at", "state"),
+    cooldown_until: numOrNull(o, "cooldown_until", "state"),
+    scoreboard: { fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"), ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2") },
+    nudges: parseNudges(o["nudges"]),
     viewers: { count: typeof viewers["count"] === "number" ? viewers["count"] : 0 },
     actions,
-    aggregators: arr(o, "aggregators", "state").map((a, i) => {
-      const where = `aggregators[${i}]`;
+    aggregates: arr(o, "aggregates", "state").map((a, i) => {
+      const where = `aggregates[${i}]`;
       if (!isObj(a)) throw new ProtocolError(`${where} is not an object`);
-      return { id: str(a, "id", where), frame_url: strOrNull(a, "frame_url", where), rect: parseRect(obj(a, "rect", where), `${where}.rect`) };
+      const half = str(a, "half", where);
+      if (half !== "fcvm" && half !== "ec2") throw new ProtocolError(`${where}.half is ${half}`);
+      return {
+        id: str(a, "id", where),
+        half,
+        host: strOrNull(a, "host", where),
+        rect: parseRect(obj(a, "rect", where), `${where}.rect`),
+        frame_url: strOrNull(a, "frame_url", where),
+        tiles: arr(a, "tiles", where).filter((x): x is string => typeof x === "string"),
+      };
     }),
+  };
+}
+
+function parseClaim(v: Obj): Claim {
+  const w = "claim";
+  const phases: Record<string, number> = {};
+  if (isObj(v["phases"])) for (const [k, ms] of Object.entries(v["phases"])) if (typeof ms === "number" && Number.isFinite(ms)) phases[k] = ms;
+  return {
+    id: str(v, "id", w),
+    tile: strOrNull(v, "tile", w),
+    phase: str(v, "phase", w),
+    frame_url: strOrNull(v, "frame_url", w),
+    clicked_at: num(v, "clicked_at", w),
+    first_frame_at: numOrNull(v, "first_frame_at", w),
+    expires_at: numOrNull(v, "expires_at", w),
+    gpu: strOrNull(v, "gpu", w),
+    phases,
+    camera: parseCamera(v, "claim"),
+    ended: strOrNull(v, "ended", w),
   };
 }
 
@@ -402,14 +614,14 @@ export function parseServerMsg(text: string): ServerMsg {
   }
   if (!isObj(v)) throw new ProtocolError("message is not an object");
   switch (v["type"]) {
-    case "snapshot": {
-      const m: SnapshotMsg = { type: "snapshot", version: num(v, "version", "snapshot"), state: parseState(obj(v, "state", "snapshot")) };
-      const you = strOrNull(v, "you", "snapshot");
-      if (you !== null) m.you = you;
-      return m;
-    }
-    case "welcome":
-      return { type: "welcome", viewer: str(v, "viewer", "welcome") };
+    case "snapshot":
+      return { type: "snapshot", version: num(v, "version", "snapshot"), state: parseState(obj(v, "state", "snapshot")) };
+    case "hello":
+      return { type: "hello", viewer: str(v, "viewer", "hello"), turnstile: strOrNull(v, "turnstile", "hello") };
+    case "verified":
+      return { type: "verified", ok: v["ok"] === true, reason: strOrNull(v, "reason", "verified") };
+    case "claim":
+      return { type: "claim", claim: parseClaim(obj(v, "claim", "claim")) };
     case "receipt": {
       const r: ReceiptMsg = {
         type: "receipt",

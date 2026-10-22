@@ -26,3 +26,10 @@ export function urlHost(url: string): string | null {
   const m = /^[a-z]+:\/\/(\[[^\]]+\]|[^/:?#]+)/i.exec(url);
   return m ? m[1]! : null;
 }
+
+/** The coordinator's poster: the last whole image as a JPEG, on the /live socket's origin. */
+export function posterUrl(liveUrl: string): string | null {
+  const m = /^(wss?):\/\/([^/?#]+)/i.exec(liveUrl);
+  if (!m) return null;
+  return `${m[1]!.toLowerCase() === "wss" ? "https" : "http"}://${m[2]}/poster.jpg`;
+}

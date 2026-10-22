@@ -35,8 +35,34 @@ export async function mockState(): Promise<{
 }
 
 export async function setSkew(tile: string, skew: number): Promise<void> {
-  const r = await fetch(`${COORD}/mock/fault`, { method: "POST", body: JSON.stringify({ tile, skew }) });
-  expect(r.status).toBe(200);
+  await admin("/mock/fault", { tile, skew });
+}
+
+/** A mock admin route: faults, the schedule, Turnstile, going offline. */
+export async function admin(path: string, body: unknown): Promise<void> {
+  const r = await fetch(`${COORD}${path}`, { method: "POST", body: JSON.stringify(body) });
+  expect(r.status, `${path} ${await r.clone().text()}`).toBe(200);
+}
+
+/** The mock's state at the moment, typed loosely for tests. */
+export async function fleetNow(): Promise<FleetNow> {
+  return (await mockState()).state as unknown as FleetNow;
+}
+
+export interface FleetNow {
+  tiles: { id: string; phase: string; borrowed: { until: number } | null; last_relaunch: { first_frame_at: number | null; phases: Record<string, number> } | null }[];
+  relaunch_all: { started_at: number; by: string; fcvm_done_at: number | null; ec2_done_at: number | null; ec2_capacity_wait_ms: number } | null;
+  scoreboard: { fcvm: { last_ms: number; median_ms: number } | null; ec2: { last_ms: number; median_ms: number; last_capacity_wait_ms: number } | null };
+  nudges: { holding: string | null };
+  scene: { time_of_day: number };
+}
+
+/** Wait until no race runs, so the next test starts at rest. */
+export async function raceOver(): Promise<void> {
+  await expect.poll(async () => {
+    const ra = (await fleetNow()).relaunch_all;
+    return ra === null || (ra.fcvm_done_at !== null && ra.ec2_done_at !== null);
+  }, { timeout: 40_000 }).toBe(true);
 }
 
 export interface SeamReport {

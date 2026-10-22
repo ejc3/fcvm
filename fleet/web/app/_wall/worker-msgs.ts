@@ -46,6 +46,20 @@ export interface BenchStats {
   tilesDrawn: number;
 }
 
+/** One draw, recorded for a test. */
+export interface TraceEntry {
+  T: number | null;
+  mode: StreamMode;
+  /** Regions drawn without a frame. */
+  missing: number;
+  /** Tiles drawn part way into their dark-out fade. */
+  darkIn: number;
+  /** The poster was drawn under the streams. */
+  poster: boolean;
+  /** The picture from before a suspension was shown (held, or under the live one fading in). */
+  held: boolean;
+}
+
 export type FromWorker =
   | { type: "stats"; stats: FrameStats; bench: BenchStats }
   | { type: "camera-drawn"; id: string; drawnAt: number }
@@ -55,4 +69,6 @@ export type FromWorker =
   | { type: "need-ticks" }
   /** The drawer now shows this mode (a switch completed). */
   | { type: "mode-shown"; mode: StreamMode }
-  | { type: "trace"; req: number; entries: { T: number | null; mode: StreamMode; missing: number }[] };
+  | { type: "trace"; req: number; entries: TraceEntry[] }
+  /** The canvas shows something (the poster or a frame): the page's own poster can go. */
+  | { type: "painted" };

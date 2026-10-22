@@ -17,7 +17,9 @@ beforeAll(async () => {
   renderers = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 2, maxHeight: 360, epochUnixMs, scene: () => coord.patternScene() });
   await renderers.listen();
   coord = new MockCoordinator({
-    port: 0, perHalf: 2, ec2Short: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+    port: 0, perHalf: 2, ec2Short: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+    raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
+    borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
     refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
   });
   await coord.listen();
@@ -27,6 +29,23 @@ afterAll(async () => {
   await coord.close();
   await renderers.close();
 });
+
+async function admin(path: string, body: unknown): Promise<unknown> {
+  const r = await fetch(`http://localhost:${coord.port}${path}`, { method: "POST", body: JSON.stringify(body) });
+  expect(r.status, path).toBe(200);
+  return r.json();
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** Wait for a condition on the mock's state, polling. */
+async function until(pred: () => boolean, ms = 5000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!pred()) {
+    if (Date.now() > end) throw new Error("condition not met in time");
+    await sleep(20);
+  }
+}
 
 function live(): Promise<{ ws: WebSocket; msgs: Record<string, unknown>[]; next: (pred: (m: Record<string, unknown>) => boolean) => Promise<Record<string, unknown>> }> {
   return new Promise((resolve) => {
@@ -117,6 +136,7 @@ describe("mock coordinator", () => {
     expect(ra.ec2_done_at).not.toBeNull();
     expect(ra.fcvm_done_at!).toBeLessThan(ra.ec2_done_at!);
     c.ws.close();
+    await sleep(1000); // the cooldown
   });
 });
 
@@ -275,18 +295,6 @@ describe("mock coordinator, review findings", () => {
     b.ws.close();
   });
 
-  it("adds up camera drags that arrive together", async () => {
-    const c = await live();
-    const t0 = coord.patternScene().camera;
-    const start = t0[t0.length - 1] as unknown as { x: number };
-    c.ws.send(JSON.stringify({ type: "intent", id: `cam-a-${Date.now()}`, name: "camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
-    c.ws.send(JSON.stringify({ type: "intent", id: `cam-b-${Date.now()}`, name: "camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
-    await c.next(() => c.msgs.filter((m) => m["type"] === "receipt").length === 2);
-    const keys = coord.patternScene().camera as unknown as { x: number }[];
-    expect(keys[keys.length - 1]!.x - start.x).toBeCloseTo(2 * (9 / 90) * (16 / 9), 9);
-    c.ws.close();
-  });
-
   it("answers a JSON null with an error and keeps serving", async () => {
     const c = await live();
     c.ws.send("null");
@@ -297,13 +305,15 @@ describe("mock coordinator, review findings", () => {
   });
 });
 
-describe("mock aggregators", () => {
-  it("lists aggregators covering the image, each serving the renderer frame protocol", async () => {
+describe("mock aggregates", () => {
+  it("lists one aggregate per fcvm host and one for EC2, covering the image, each serving the frame protocol", async () => {
     const st = coord.fleetState();
-    expect(st.aggregators.map((a) => a.id)).toEqual(["agg-fcvm-1", "agg-ec2"]);
-    const area = st.aggregators.reduce((s, a) => s + a.rect.w * a.rect.h, 0);
+    expect(st.aggregates.map((a) => a.id)).toEqual(["agg:mock-host-1", "agg:mock-host-2", "agg:ec2"]);
+    expect(st.aggregates[0]!.tiles).toEqual(["fcvm:1"]);
+    const area = st.aggregates.reduce((s, a) => s + a.rect.w * a.rect.h, 0);
     expect(area).toBeCloseTo(1, 9);
-    const ws = new WebSocket(`${st.aggregators[1]!.frame_url}?h=90`);
+    const ec2 = st.aggregates.find((a) => a.id === "agg:ec2")!;
+    const ws = new WebSocket(`${ec2.frame_url}?h=90`);
     const msgs: (string | Uint8Array)[] = [];
     await new Promise<void>((res) => {
       ws.on("message", (d, bin) => {
@@ -314,21 +324,188 @@ describe("mock aggregators", () => {
     ws.close();
     const header = parseStreamHeader(msgs[0] as string)!;
     // The EC2 half asked at 90 is under the encoder's minimum width, so it comes taller.
-    const g = tileGeometry(st.aggregators[1]!.rect, 16 / 9, 90);
+    const g = tileGeometry(ec2.rect, 16 / 9, 90);
     expect(g.height).toBeGreaterThan(90);
     expect(header.grid).toEqual({ fullWidth: g.fullWidth, fullHeight: g.fullHeight, x0: g.x0, y0: g.y0 });
     const f = parseFrame(msgs[1] as Uint8Array);
     expect(f.ok && f.frame.keyframe).toBe(true);
   });
 
-  it("tells each connection its viewer id and records actions with arguments and the actor", async () => {
+  it("says hello with the viewer id and records actions with the viewer and intent id", async () => {
     const c = await live();
-    const welcome = await c.next((m) => m["type"] === "welcome");
-    expect(welcome["viewer"]).toMatch(/^viewer:v-\d+$/);
-    c.ws.send(JSON.stringify({ type: "intent", id: `tod-${Date.now()}`, name: "time_of_day", args: { v: 0.75 } }));
+    const hello = await c.next((m) => m["type"] === "hello");
+    expect(hello["viewer"]).toMatch(/^v-\d+$/);
+    expect(hello["turnstile"]).toBeUndefined();
+    const id = `tod-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 0.75 } }));
     await c.next((m) => m["type"] === "receipt");
     const a = coord.fleetState().actions.at(-1)!;
-    expect(a).toMatchObject({ name: "time_of_day", args: { v: 0.75 }, viewer: welcome["viewer"], outcome: "committed" });
+    expect(a).toMatchObject({ name: "time_of_day", args: { v: 0.75 }, viewer: hello["viewer"], id, outcome: "committed" });
     c.ws.close();
+  });
+});
+
+describe("mock race, second design review", () => {
+  it("runs the owner's cadence, logs it as the schedule, and holds viewers to the cooldown", async () => {
+    const c = await live();
+    await admin("/mock/schedule", { next_in_ms: 0, cooldown_s: 30 });
+    await until(() => coord.fleetState().relaunch_all?.by === "schedule" && coord.fleetState().relaunch_all!.ec2_done_at === null);
+    const st = coord.fleetState();
+    expect(st.actions.at(-1)).toMatchObject({ viewer: "schedule", name: "relaunch_all", outcome: "committed" });
+    expect(st.cooldown_until! - st.relaunch_all!.started_at).toBe(30_000);
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    c.ws.send(JSON.stringify({ type: "intent", id: `cool-${Date.now()}`, name: "relaunch_all", args: {} }));
+    const r = await c.next((m) => m["type"] === "receipt");
+    expect(r).toMatchObject({ outcome: "refused" });
+    expect(String(r["reason"])).toMatch(/^the next restart is allowed in \d+ s$/);
+    await admin("/mock/schedule", { next_in_ms: null, cooldown_s: 1, clear_cooldown: true });
+    c.ws.close();
+  });
+
+  it("keeps a capacity wait out of EC2's time and says how long it was", async () => {
+    const c = await live();
+    await admin("/mock/schedule", { capacity_wait_ms: 600 });
+    c.ws.send(JSON.stringify({ type: "intent", id: `cap-${Date.now()}`, name: "relaunch_all", args: {} }));
+    await c.next((m) => m["type"] === "receipt");
+    await until(() => coord.fleetState().relaunch_all!.ec2_waiting_since !== null);
+    await until(() => coord.fleetState().tiles.find((t) => t.id === "ec2:1")!.phase === "waiting_capacity");
+    expect(coord.fleetState().relaunch_all!.ec2_waiting_since).not.toBeNull();
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    const st = coord.fleetState();
+    const ra = st.relaunch_all!;
+    expect(ra.ec2_capacity_wait_ms).toBe(600);
+    expect(ra.ec2_waiting_since).toBeNull();
+    const sb = st.scoreboard.ec2!;
+    expect(sb.last_ms).toBe(ra.ec2_done_at! - ra.started_at - 600);
+    expect(sb.last_capacity_wait_ms).toBe(600);
+    expect(sb.measured_on).toBe(1);
+    expect(st.scoreboard.fcvm!.last_ms).toBe(ra.fcvm_done_at! - ra.started_at);
+    expect(st.scoreboard.fcvm!.measured_on).toBe(2);
+    expect(st.tiles.find((t) => t.id === "ec2:1")!.last_relaunch!.phases["capacity_wait_ms"]).toBe(600);
+    c.ws.close();
+    await sleep(1000);
+  });
+
+  it("chooses the next camera stop by the viewers' votes", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `n-${Date.now()}`, name: "nudge", args: { target: "stars" } }));
+    await c.next((m) => m["type"] === "receipt");
+    expect(coord.fleetState().nudges.targets.find((t) => t.id === "stars")!.votes).toBe(1);
+    await admin("/mock/schedule", { hold_in_ms: 0 });
+    await until(() => coord.fleetState().nudges.holding === "stars");
+    const keys = coord.patternScene().camera as unknown as { x: number; zoom: number }[];
+    expect(keys.at(-1)).toMatchObject({ x: 1.2, zoom: 0.7 });
+    expect(coord.fleetState().nudges.targets.every((t) => t.votes === 0)).toBe(true);
+    await admin("/mock/schedule", { hold_in_ms: 600_000 });
+    c.ws.close();
+  });
+
+  it("lends a wall GPU: the tile is borrowed and sits out races, the claim streams, then the tile restores", async () => {
+    const c = await live();
+    const other = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `claim-${Date.now()}`, name: "claim_gpu", args: {} }));
+    expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "committed" });
+    const first = await c.next((m) => m["type"] === "claim");
+    const claim = first["claim"] as Record<string, unknown>;
+    expect(claim).toMatchObject({ phase: "restoring", frame_url: null, tile: "fcvm:2" });
+    const tile = () => coord.fleetState().tiles.find((t) => t.id === "fcvm:2")!;
+    expect(tile().phase).toBe("borrowed");
+    expect(coord.fleetState().borrow).toMatchObject({ cap: 1, lent: 1 });
+    // The cap: a second viewer is told when to try again.
+    other.ws.send(JSON.stringify({ type: "intent", id: `claim2-${Date.now()}`, name: "claim_gpu", args: {} }));
+    const refused = await other.next((m) => m["type"] === "receipt");
+    expect(String(refused["reason"])).toMatch(/^all 1 GPUs we lend are out; the next comes back in \d+ s$/);
+    const running = await c.next((m) => m["type"] === "claim" && (m["claim"] as { phase: string }).phase === "running");
+    const rc = running["claim"] as { frame_url: string; first_frame_at: number; expires_at: number; clicked_at: number };
+    expect(rc.expires_at - rc.first_frame_at).toBe(1000);
+    expect(tile().borrowed!.until).toBe(rc.expires_at);
+    // A race now leaves the borrowed tile out.
+    await admin("/mock/schedule", { next_in_ms: 0 });
+    await until(() => coord.fleetState().relaunch_all?.by === "schedule" && coord.fleetState().relaunch_all!.started_at > rc.first_frame_at);
+    expect(coord.fleetState().relaunch_all!.fcvm_gpus).toBe(1);
+    expect(tile().phase).toBe("borrowed");
+    await admin("/mock/schedule", { next_in_ms: null });
+    // The claim's own camera.
+    const camId = `cc-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id: camId, name: "claim_camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
+    const moved = await c.next((m) => m["type"] === "claim" && ((m["claim"] as { camera: { intent?: string }[] }).camera.some((k) => k.intent === camId)));
+    expect(moved).toBeTruthy();
+    const ended = await c.next((m) => m["type"] === "claim" && (m["claim"] as { phase: string }).phase === "ended");
+    expect((ended["claim"] as { ended: string }).ended).toBe("Your minute is up. The GPU went back to the pool.");
+    expect(tile().borrowed).toBeNull();
+    expect(["relaunching", "stopping", "restoring", "starting"]).toContain(tile().phase);
+    await until(() => tile().phase === "running");
+    expect(tile().last_relaunch!.by).toBe("return");
+    c.ws.close();
+    other.ws.close();
+    await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
+    await admin("/mock/schedule", { clear_cooldown: true });
+  });
+
+  it("asks for Turnstile when it has a site key, refusing intents until verified", async () => {
+    await admin("/mock/turnstile", { sitekey: "example-sitekey" });
+    const c = await live();
+    expect(await c.next((m) => m["type"] === "hello")).toMatchObject({ turnstile: "example-sitekey" });
+    c.ws.send(JSON.stringify({ type: "intent", id: `ts-1-${Date.now()}`, name: "time_of_day", args: { v: 0.3 } }));
+    expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "refused", reason: "verify first" });
+    c.ws.send(JSON.stringify({ type: "verify", token: "wrong" }));
+    expect(await c.next((m) => m["type"] === "verified")).toMatchObject({ ok: false });
+    c.ws.send(JSON.stringify({ type: "verify", token: "mock-pass" }));
+    expect(await c.next((m) => m["type"] === "verified" && m["ok"] === true)).toMatchObject({ ok: true });
+    const id = `ts-2-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 0.3 } }));
+    expect(await c.next((m) => m["type"] === "receipt" && m["id"] === id)).toMatchObject({ outcome: "committed" });
+    await admin("/mock/turnstile", { sitekey: null });
+    c.ws.close();
+  });
+
+  it("serves the poster as a JPEG any origin can read", async () => {
+    const r = await fetch(`http://localhost:${coord.port}/poster.jpg`);
+    expect(r.status).toBe(200);
+    expect(r.headers.get("content-type")).toBe("image/jpeg");
+    expect(r.headers.get("access-control-allow-origin")).toBe("*");
+    const b = new Uint8Array(await r.arrayBuffer());
+    expect([b[0], b[1]]).toEqual([0xff, 0xd8]);
+  });
+
+  it("goes offline: drops /live and refuses it, then takes viewers again", async () => {
+    const c = await live();
+    const closed = new Promise<void>((res) => c.ws.on("close", () => res()));
+    await admin("/mock/offline", { ms: 400 });
+    await closed;
+    const refused = await new Promise<number>((res) => {
+      const ws = new WebSocket(`ws://localhost:${coord.port}/live`);
+      ws.on("unexpected-response", (_req, resp) => res(resp.statusCode ?? 0));
+      ws.on("open", () => {
+        ws.close();
+        res(101);
+      });
+    });
+    expect(refused).toBe(503);
+    await sleep(450);
+    const back = await live();
+    expect(await back.next((m) => m["type"] === "hello")).toBeTruthy();
+    back.ws.close();
+  });
+
+  it("fails a tile with a retry time, and reclaims a host: draining, then no GPU behind its places", async () => {
+    await admin("/mock/fault", { fail: "fcvm:1", message: "GPU did not come back", retry_ms: 300 });
+    let t = coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!;
+    expect(t.phase).toBe("failed");
+    expect(t.failure).toMatchObject({ kind: "relaunch_failed", message: "GPU did not come back" });
+    expect(t.error).toBe("GPU did not come back");
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.phase === "running");
+    expect(coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.failure).toBeNull();
+    await admin("/mock/fault", { reclaim: "mock-host-2" });
+    t = coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!;
+    expect(t.phase).toBe("draining");
+    expect(t.failure?.kind).toBe("host_reclaimed");
+    expect(coord.fleetState().fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(true);
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!.phase === "waiting_capacity");
+    t = coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!;
+    expect(t.slot).toBeNull();
+    expect(coord.fleetState().fleet.hosts.map((h) => h.name)).toEqual(["mock-host-1"]);
+    await admin("/mock/fault", { replace_host: "mock-host-2" });
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!.phase === "running");
   });
 });

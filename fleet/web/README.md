@@ -1,18 +1,23 @@
 # fleet/web: the GPU wall page
 
 The page for `docs/fleet/ARCHITECTURE.md`: one image tiled across every GPU, fcvm on the
-left half and EC2 on the right, live from each tile's own renderer, with the
-relaunch-all race, the shared camera, viewers' words and lights, a stats switch and a
-shared auto-relaunch setting. It runs against a mock fleet (`mock/`) until the
-coordinator and renderers are deployed.
+left half and EC2 on the right, live from each tile's own renderer. It is a stage, not a
+dashboard: the image sits letterboxed between the race (a countdown to the next restart
+and two bars, fcvm against EC2) and one button, "Restart all N GPUs". Everything else
+(the camera's next stop, words, lights, the time of day, how the streams arrive, stream
+stats) is in the Play drawer. A viewer can also borrow one of the wall's GPUs for a
+minute. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
+deployed.
 
 ![The wall at rest](docs/screenshots/wall-desktop.jpg)
 
 | | |
 |---|---|
-| ![Relaunch all, 4 s in](docs/screenshots/race-mid.jpg) | ![Hovering a tile](docs/screenshots/wall-hover.jpg) |
-| ![The stats switch](docs/screenshots/wall-stats.jpg) | ![An opened tile](docs/screenshots/tile-opened.jpg) |
-| ![Aggregated mode, mid-race, with stats](docs/screenshots/wall-aggregated.jpg) | |
+| ![A race mid-way: fcvm back, EC2 waiting for spot capacity](docs/screenshots/race-mid.jpg) | ![After the race](docs/screenshots/race-after.jpg) |
+| ![Hovering a tile](docs/screenshots/wall-hover.jpg) | ![The Play drawer](docs/screenshots/play-drawer.jpg) |
+| ![An opened VM](docs/screenshots/tile-opened.jpg) | ![A viewer's own GPU](docs/screenshots/own-gpu.jpg) |
+| ![The borrowed tile, as another viewer sees it](docs/screenshots/own-gpu-borrowed-tile.jpg) | ![A failed VM and a reclaimed host](docs/screenshots/failure-failed-and-reclaimed.jpg) |
+| ![The coordinator offline, the picture still live](docs/screenshots/failure-offline.jpg) | |
 
 <img src="docs/screenshots/phone.jpg" alt="The wall on a phone" width="260">
 
@@ -21,10 +26,15 @@ coordinator and renderers are deployed.
 ```
 core/      the rules, pure TypeScript: no DOM, no clock, no randomness, no I/O
            (lint and a tsconfig with no DOM types enforce it). Protocol parsing, the
-           reducer, pending intents, clock sync, layout, the common-t choice, view
-           models and every visible string.
+           reducer, pending intents, clock sync, layout, the common-t choice, the
+           race and scoreboard (race.ts), view models and every visible string.
 app/       Next.js (App Router). Draws view models and sends actions:
-           _wall/Wall.tsx           the page, input handling
+           _wall/Wall.tsx           the stage, input handling, the hidden-tab rule
+           _wall/Score.tsx          the countdown and the two bars
+           _wall/PlayDrawer.tsx     the Play drawer
+           _wall/OwnGpu.tsx         a viewer's own GPU, full screen
+           _wall/FocusPanel.tsx     one VM opened
+           _wall/Turnstile.tsx      the check before a viewer's first action
            _wall/frames.worker.ts   frame sockets, WebCodecs decoders, one OffscreenCanvas
            _wall/wall-client.ts     the coordinator socket and the store
            wall.css                 the surface's own stylesheet (no component library)
@@ -51,26 +61,84 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 102 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 26 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 128 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 34 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
 On a small machine, `FLEET_E2E_VIEW=1024x640 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
 makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
-`FLEET_MOCK_EC2_MS`, `FLEET_MOCK_FPS`, ...) are listed at the top of `mock/main.ts`.
+`FLEET_MOCK_EC2_MS`, `FLEET_MOCK_RACE_EVERY_S`, `FLEET_MOCK_TURNSTILE`, ...) are listed at the top of `mock/main.ts`.
+By default it restarts every GPU 20 s after start and every 5 minutes after that, holds
+"restart now" for 60 s after each restart, and a quarter of races wait 10 to 30 s for EC2
+spot capacity. fcvm restarts take 2.6 to 3.4 s (teardown, a restore holding a 0.6 s GPU
+reset, renderer start, first frame) and EC2 35 to 70 s (launch, boot, renderer start,
+first frame), shaped like the measured ones.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
 
 ## How the page works
 
-**Two ways to receive the image.** Each viewer picks Direct (one stream per tile, from
-its VM) or Aggregated (a few streams, each an aggregator's joined region, drawn as one big
-tile with crop and x0/y0 as usual) with the Streams switch. Until the viewer picks, the
-page follows its suggestion: Aggregated when the fleet has aggregators and either the
-browser reports a downlink under what Direct needs at the renderer's rate, or more than
-10% of tiles ran behind the common t over the last ten seconds of Direct; otherwise
-Direct. A pick is remembered in this browser. Tile state (dark tiles, outlines in the
+**The race is the hero.** The owner's schedule restarts every GPU on a cadence; the
+countdown to the next one is shared by every viewer. "Restart all N GPUs" starts one now,
+under a cooldown the coordinator sets for everyone; the button shows it ("available again
+in 0:23"). During a race each half has one counter (tiles show a ring of their restart's
+steps, not a clock of their own). fcvm's bar stops when its half is back while EC2's
+grows; a wait for spot capacity is drawn hatched, first on EC2's bar, labelled "AWS had no
+spot GPU", and left out of EC2's time. At rest the bars are each half's median, with a
+mark at the last race and how many GPUs it was measured on. Every figure is the
+coordinator's (`scoreboard`, `relaunch_all`, `last_relaunch`); the page computes no
+timing of its own. When a half is back a polite live region says so in a sentence.
+
+**Words on the stage.** One sentence under the title says what the page is, "fcvm" and
+"EC2" sit on backplates either side of the seam, and one line under each half says what a
+restart there is. Slots, relaunches and "8/8 back" are gone from the page: tiles are "fcvm
+VM 3", restarts are restarts, and a half is "all 8 GPUs streaming again".
+
+**First load.** The page paints the coordinator's `/poster.jpg` (the last whole image) in
+the HTML, before any script runs. The canvas then draws the same poster under every
+region without a frame yet and fades each tile in as its stream arrives; the page's own
+copy goes once the canvas has painted.
+
+**Failure states.** A VM that did not come back shows its error and when the coordinator
+retries it. A host AWS reclaimed shows its tiles as reclaimed, with a banner, while the
+image is re-tiled, then as places with no GPU. With the coordinator offline the streams
+keep playing (they come from the VMs), a banner says so, and the controls are paused
+until it is back. EC2 places with no instance are hatched "AWS had no spot GPU".
+
+**Your own GPU.** "Get your own GPU" borrows one of the wall's fcvm GPUs. The page opens a
+full-screen private view at once, timing from the click; the coordinator restores a VM on
+that GPU and the timer stops at its first frame; a 60 s countdown runs from there. The
+viewer has their own camera (drag, wheel, arrow keys, the buttons). On the wall, the
+borrowed tile fades out to a backplate, "a visitor's private GPU, back in 0:42", and sits
+out races. When the minute is up the view says so and returns to the wall, where the
+viewer watches their tile restore back in. With every lendable GPU out the button says
+so and when to try again.
+
+**Turnstile.** When the coordinator's hello carries a site key, the first action waits for
+a Turnstile check (in the Play drawer, or beside the button pressed), then goes. The
+script loads only then.
+
+**A hidden tab.** After `HIDDEN_PAUSE_MS` (5 minutes, `core/store.ts`) hidden, judged
+from the visibilitychange time so a throttled timer still decides right, the page closes
+every frame stream and stops decoding; the coordinator socket stays. Shown again, the
+last picture stays up while the streams reopen, and the live image fades in over it once
+every region has a frame at one t (the mode switch's rule, with its 4 s limit).
+
+**Accessibility.** Text is 14 px or larger at 4.5:1 or better against what is behind it
+(a test reads every visible text element), controls are at least 44 px, a Pause button
+holds the picture, and with reduced motion asked for a tile going dark fades over 0.7 s
+instead of flashing.
+
+**Phone.** The image full width, the countdown and the two bars, one button, and in
+portrait a hint to turn the phone.
+
+**Two ways to receive the image.** Aggregated is the default: one stream per host,
+each an aggregator's joined region, drawn as one big tile with crop and x0/y0 as usual.
+"See every VM's own stream" in the Play drawer switches to Direct, one stream per tile
+from its VM; when the browser reports a downlink under what Direct needs at the
+renderer's rate, or more than 10% of tiles ran behind the common t, the drawer says so.
+The choice is remembered in this browser. Tile state (dark tiles, outlines in the
 half's colour, phases, clocks, hover outlines and labels) comes from the snapshot and is
 drawn the same way in both modes: in Aggregated mode a relaunching tile's region is
 painted dark over the aggregator's pixels.
@@ -98,8 +166,8 @@ intents that have no receipt again, with the same ids; the coordinator applies a
 once and answers a repeat with the first receipt.
 
 **Clock.** Pings go out five times quickly, then every 2 s. The offset comes from the
-sample with the smallest round trip of the last eight. Race clocks, dark-tile clocks,
-the auto-relaunch countdown and frame age all use the coordinator's time.
+sample with the smallest round trip of the last eight. Race clocks, countdowns and frame
+age all use the coordinator's time.
 
 **One common t.** Each tile keeps up to six decoded frames. Every draw picks T, the
 frame time held by the most keeping-up tiles (the latest, on a tie), and draws each
@@ -118,13 +186,15 @@ occupies in device pixels, rounded up to one of 72, 90, 108, 144, 180, 216, 270,
 
 **Seams on demand.** With the pointer over the image every tile boundary fades in as a
 1-device-pixel line at 25% white, and the tile under the pointer gets an outline in its
-half's colour and a label (slot, kind, GPU, host, last relaunch). A long press does the
+half's colour and a label (VM, kind, GPU, host, last restart). A long press does the
 same on a touch screen; keyboard users tab into a grid of the tiles and move with the
 arrow keys. All of it is drawn by the page over the frames, never in them.
 
-**An opened tile** is drawn into a larger box with the tile's own aspect, and only its
-renderer is asked for a taller stream (`{"h": ...}` on the open socket). The page
-accepts either a new text header or a keyframe of the new size after a height change.
+**An opened VM** is drawn at the renderer's native size, 720 px tall at one device pixel
+per pixel (smaller only when the screen is, and the tag says how much), with the
+timeline of its last restart as the coordinator measured it and its GPU's temperature,
+power and load with two minutes of history. Only its renderer is asked for the taller
+stream (`{"h": ...}` on the open socket).
 
 ## Measurements
 
@@ -136,24 +206,27 @@ only: a laptop or phone decodes in hardware and composites on its GPU. Mock stre
 
 | tiles | viewport | stream height | decoded frames/s (of 30 x tiles) | draw per frame, p50 / p95 | display frame, p50 / p95 | incoming (mock) | at the renderer's rate | browser CPU | CPU per decoded frame |
 |---|---|---|---|---|---|---|---|---|---|
-| 16 | 1440x900 | 216 | 478 of 480 | 5.9 / 8.0 ms | 16.7 / 16.8 ms | 6.4 Mbit/s | 37.6 Mbit/s | 0.46 cores | 0.97 ms |
-| 50 | 1440x900 | 180 | 1500 of 1500 | 7.8 / 8.3 ms | 16.7 / 16.8 ms | 9.1 Mbit/s | 46.6 Mbit/s | 0.75 cores | 0.50 ms |
-| 100 | 1440x900 | 90 | 3001 of 3000 | 10.3 / 12.6 ms | 16.7 / 17.6 ms | 11.2 Mbit/s | 60.0 Mbit/s | 1.12 cores | 0.37 ms |
-| 16 | 2560x1440 | 360 (cut by the budget) | 459 of 480 | 22.4 / 23.5 ms | 16.7 / 24.0 ms | 11.2 Mbit/s | 80.0 Mbit/s | 0.66 cores | 1.44 ms |
-| 100 | 2560x1440 | 144 | 2943 of 3000 | 19.5 / 21.6 ms | 22.9 / 31.6 ms | 14.2 Mbit/s | 79.7 Mbit/s | 1.48 cores | 0.50 ms |
+| 16 | 1440x900 | 144 | 480 of 480 | 2.8 / 3.8 ms | 16.7 / 16.8 ms | 3.6 Mbit/s | 18.1 Mbit/s | 0.27 cores | 0.57 ms |
+| 50 | 1440x900 | 164 | 1500 of 1500 | 4.9 / 6.4 ms | 16.7 / 16.8 ms | 7.9 Mbit/s | 39.8 Mbit/s | 0.59 cores | 0.39 ms |
+| 100 | 1440x900 | 82 | 3000 of 3000 | 7.5 / 9.6 ms | 16.7 / 16.9 ms | 10.3 Mbit/s | 60.0 Mbit/s | 0.97 cores | 0.33 ms |
+
+Direct mode, measured on this branch (the stage letterboxes the image between the race
+and the button, so tiles cover fewer pixels than in the earlier full-window layout and ask
+for shorter streams; the tallest stream is listed, which the encoder's 146 px minimum
+width can raise above the twelve heights). Earlier, with the image filling the window,
+the same machine measured 16 tiles at 216p in 5.9 / 8.0 ms a draw and 100 tiles at 90p
+in 10.3 / 12.6 ms, and at 2560x1440 the software canvas became the limit (19.5 / 21.6 ms
+a draw at 100 tiles).
 
 Command: `FLEET_MOCK_THREADS=40 node scripts/measure.ts 16 50 100` (8 s warm-up, 15 s
-measured) and `FLEET_MEASURE_VIEW=2560x1440 FLEET_MOCK_THREADS=60 node scripts/measure.ts
-16 100`, with the machine's load average at 9 to 13 from other work. "Incoming (mock)" is
+measured), with the machine's load average at 11 to 13 from other work. "Incoming (mock)" is
 what the page received from the mock's libx264 at constant quality; "at the renderer's
 rate" is what the same streams cost from the real renderer, which encodes at a constant
 0.8 bits per delivered pixel (overlap included) at 30 fps, at least 0.6 Mbit/s each
-(`core/bandwidth.ts`). At 1440x900 every run held all tiles at one t with none behind,
-and decode latency stayed under 3.5 ms at p95. Draw time follows the pixels drawn, about
-5 ms per million in this software canvas, more than the number of tiles. At 2560x1440 a
-draw takes longer than a 60 Hz frame and the page decoded 98% of the frames sent: this
-software canvas is the limit there (in the 16-tile run the mock also fell behind on its
-360p frames). On this evidence 100 tiles fit one browser's decoding budget; the
+(`core/bandwidth.ts`). Every run held all tiles at one t with none behind, and decode
+latency stayed under 1 ms at p95. Draw time follows the pixels drawn, more than the
+number of tiles. In the default Aggregated mode a viewer decodes one stream per host
+instead of one per tile. On this evidence 100 tiles fit one browser's decoding budget; the
 measurement in `docs/fleet/ARCHITECTURE.md` (a laptop and a phone, with GPU compositing,
 Chrome and Safari) should set `max_tiles`.
 
@@ -179,65 +252,53 @@ not tested by this PR.
 
 ## Interface notes
 
-The page and the mock follow `fleet/PROTOCOL.md` as the coordinator PR (#1146,
-"Coordinator") and the renderer PR (#1144, "Renderer") write it: tiles are places
-(`fcvm:3`) with their slot (`slot-3`) beside them, the snapshot carries `image_aspect`,
-`gpu` is `{sbdf, name}` with readings in `gpu_stats`, timings are `<part>_ms`, receipts
-are `committed` or `refused`, the clock answer echoes `client_unix_ms`, `{"type":
-"error"}` exists, snapshots may skip versions, frames fall on `t = k/30`, the stream
-header carries `full_width`, `full_height`, `x0`, `y0` and `fps`, the stream may be
-larger than asked (the encoder's 146 x 50 minimum) and the page scales it into the
-tile, `{"h": N}` brings a new header and a keyframe, and a stream carries a margin
-around its rectangle with `crop: {left, top, right, bottom}` in its header (zeros when
-absent) so separately encoded tiles meet without an H.264 edge. The page draws only
-the inner rectangle: it draws the whole frame scaled so the inner rectangle covers the
-tile's box, clipped to the box, because WebKit ignores a VideoFrame's source rectangle
-and `visibleRect` when drawing. In the mosaic the inner rectangle is placed at `x0, y0` of
-`full_width x full_height`; an opened tile fills its box. The mock delivers exactly the
-renderer's overlap (up to 16 px inside the image, one side a pixel short to keep sizes
-even). The
-page never reads `/health` (so not `slots_missed`) and never sets the scene's `budget`. The brief's older shapes
-(`fleet.hosts` as a number, `waiting_for_capacity`, `applied`) are still read.
+The page and the mock follow `fleet/PROTOCOL.md` as the coordinator (#1146) and renderer
+(#1144) PRs write it: tiles are places (`fcvm:3`) with their slot beside them, the
+snapshot carries `image_aspect` and `aggregates: [{id, half, host, rect, frame_url,
+tiles}]`, the first message is `{"type": "hello", "viewer": "v-17"}`, actions are `{at,
+viewer, id, name, args, summary, outcome}`, `gpu` is `{sbdf, name}` with readings in
+`gpu_stats`, timings are `<part>_ms`, receipts are `committed` or `refused`, the clock
+answer echoes `client_unix_ms`, snapshots may skip versions, frames fall on `t = k/30`,
+the stream header carries `full_width`, `full_height`, `x0`, `y0`, `fps` and `crop`, the
+stream may be larger than asked, and `{"h": N}` brings a new header and a keyframe. The
+page draws only a stream's inner rectangle, placed at `x0, y0` of the full grid (an opened
+VM fills its box), by drawing the whole frame scaled and clipped, because WebKit ignores a
+VideoFrame's source rectangle and `visibleRect`.
 
-What the page does where the protocol leaves a choice:
+**Assumed, not yet in PROTOCOL.md.** The second design review's state is not published
+yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` marks each):
 
-- **Camera drag** sends `{"drag": {"yaw_deg", "pitch_deg", "dive"}}`: a drag across
-  the whole image width is 90 degrees of yaw (negative when dragging right: the drag
-  grabs the world), down the height 50 degrees of pitch, and a wheel notch one unit
-  of dive. The sign convention should be agreed with the coordinator.
-- **A dropped light** is sent as `{"pos": [x, altitude, z], "color": [r, g, b]}`: the
-  page takes the camera at the drawn t from the snapshot's keys (linear between keys;
-  the renderer's Catmull-Rom spline differs only while the camera moves) and places
-  the light 2 km along the ray through the clicked pixel.
-- **Input-to-pixel latency** runs from the drag to the first draw at or past the camera
-  key tagged with that intent. For a coordinator that sends untagged keys the page falls
-  back to the first key newer than any it held when it sent the intent.
-- **In the mosaic** each stream's inner rectangle is placed at `x0, y0` of `full_width x
-  full_height`; an opened tile fills its box.
+- state: `next_race_at` and `cooldown_until` (Unix ms or null); `scoreboard: {fcvm, ec2}`,
+  each null or `{median_ms, last_ms, races, measured_on, last_capacity_wait_ms}` with
+  capacity waits excluded from the times; `nudges: {targets: [{id, label, votes}],
+  holding, next_hold_at}`; `borrow: {cap, lent, next_return_at}`.
+- `relaunch_all` adds `fcvm_gpus`, `ec2_gpus`, `ec2_capacity_wait_ms` (so far) and
+  `ec2_waiting_since` (Unix ms while EC2 waits for capacity), and `by` is `schedule` for
+  the owner's cadence (also the `viewer` of that action).
+- a tile adds `failure: {kind, message, retry_at}` (`relaunch_failed`,
+  `host_reclaimed`), phase `borrowed` with `borrowed: {until}`, and phase `draining` for
+  a reclaimed host's tiles; `fleet.hosts[].draining` marks the host.
+- intents `nudge {target}`, `claim_gpu {}`, `claim_camera {drag}` and `release_gpu
+  {claim}`; the claim goes only to its connection as `{"type": "claim", "claim": {id,
+  tile, phase, frame_url, clicked_at, first_frame_at, expires_at, gpu, phases, camera,
+  ended}}`; a refusal is the receipt's reason.
+- `hello` adds `turnstile: "<site key>"` when actions need the check; the page sends
+  `{"type": "verify", "token"}` and the coordinator answers `{"type": "verified", "ok",
+  "reason"}`; until then intents are refused with "verify first".
+- `GET /poster.jpg` on the `/live` origin, readable from the page's origin (CORS).
 
-From the coordinator's next round (#1146), which the page follows and the mock speaks:
-`time_of_day` is a fraction of the day, `image_aspect` defaults to 16/9, words are up to
-28 characters, camera keys carry the `intent` that made them (input-to-pixel latency is
-then exact), actions carry `args` and the actor's viewer id, and each connection is told
-its own viewer id, so the page says "you". Until that document lands the page assumes
-these shapes: the id arrives as `{"type": "welcome", "viewer": "<id>"}` (or as `you` on a
-snapshot message, never inside `state`, which every viewer shares), an action's actor is
-`viewer` (or `actor`), and the snapshot lists `aggregators: [{id, frame_url, rect}]`. The
-renderer's `q=hi|std|lo` goes on the frame URL; the page sends `q` only when it is not
-`std`.
-
-Still open:
-
-- `actions` from the coordinator in this round do not carry arguments yet, so until they
-  do the ticker words what it can from the summary.
+The wall no longer sends camera drags or `set_auto_relaunch`: the camera is directed,
+with nudges, and the owner's cadence replaces the viewer setting. A dropped light is
+`{"pos": [x, altitude, z], "color": [r, g, b]}`, 2 km along the ray through the clicked
+pixel on the camera at the drawn t. Input-to-pixel latency is measured on a viewer's own
+GPU, from a drag to the first draw at or past the claim's camera key tagged with that
+intent. The renderer's `q=hi|std|lo` goes on the frame URL only when it is not `std`.
 
 The mock encodes H.264 baseline with libx264 (`q` as constant quality 14, 18 or 26)
-rather than High with NVENC, runs one aggregator per band of about eight fcvm tiles and
-one for the EC2 half (each draws its region whole and blacks out tiles that are not
-running), draws the UTC clock once in each half, reports EC2
-phases `launching` and `starting` with `launch_ms` and `ready_ms` as the coordinator's
-EC2 driver does, and shows `relaunching` for 150 ms before a tile's first reported
-phase.
+rather than High with NVENC, runs one aggregator per fcvm host and one for the EC2 half
+(each draws its region whole and blacks out tiles that are not running), draws the UTC
+clock once in each half, renders a viewer's own GPU as the whole image from its own
+camera, and shows `relaunching` for 150 ms before a tile's first reported phase.
 
 ## Not done here
 

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest";
 import { parseServerMsg, ProtocolError } from "../protocol.ts";
-import { initialState, intentsToResend, makeIntent, reduce, cameraTargets, type ClientState } from "../store.ts";
+import { HIDDEN_PAUSE_MS, initialState, intentsToResend, makeIntent, reduce, cameraTargets, streamsSuspended, type ClientState } from "../store.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
+import { wallView } from "../view.ts";
 
 function feed(s: ClientState, text: string, at = EPOCH): ClientState {
   return reduce(s, { type: "message", text, at });
@@ -108,13 +109,16 @@ describe("intents and receipts", () => {
 });
 
 describe("input to pixels", () => {
-  it("measures from the input to the first draw at the camera key's t", () => {
+  const claim = (camera: Record<string, unknown>[]) =>
+    JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera, ended: null } });
+
+  it("measures from the input on the viewer's own GPU to the first draw at the camera key's t", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("c", "camera", { drag: { dx: 0.1, dy: 0 } }), at: EPOCH + 100 });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    s = feed(s, claim([{ t: 10, x: 0 }]));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("c", "claim_camera", { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } }), at: EPOCH + 100 });
     expect(cameraTargets(s)).toEqual([]);
-    const st = fleet();
-    st.scene.camera = [{ t: 10, x: 0 }, { t: 10.05, x: 0.1, intent: "c" }];
-    s = feed(s, snapshotText(2, st));
+    s = feed(s, claim([{ t: 10, x: 0 }, { t: 10.05, x: 0.1, intent: "c" }]));
     expect(cameraTargets(s)).toEqual([{ id: "c", tEff: 10.05 }]);
     s = reduce(s, { type: "camera-drawn", id: "c", drawnAt: EPOCH + 283 });
     expect(s.lastInputLatencyMs).toBe(183);
@@ -142,10 +146,11 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
       fleet: { hosts: [{ name: "example-host", arch: "x86_64", gpus: [{ sbdf: "0000:01:00.0", name: "Tesla T4" }], draining: false }], gpus: 8, fcvm_gpus: 8, ec2_instances: 0, n: 8, max_tiles: 100, standby: [] },
       scene: { epoch_unix_ms: 1761134400000, camera: [{ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 }], time_of_day: 0.3, words: [{ text: "hello", t: 12.5 }], lights: [{ pos: [1, 2, 3], color: [1, 0.5, 0], t: 14.0 }] },
       image_aspect: 3.5555555555555554,
+      aggregates: [{ id: "agg:example-host", half: "fcvm", host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: null, tiles: ["fcvm:1"] }],
       settings: { auto_relaunch_secs: null },
       relaunch_all: { started_at: 1761134400000, by: "viewer:v-4", fcvm_done_at: null, ec2_done_at: null, fcvm_last: null, ec2_last: null, fcvm_pending: 8, ec2_pending: 0 },
       viewers: { count: 3 },
-      actions: [{ at: 1761134400000, by: "viewer:v-4", name: "relaunch_all", summary: "relaunch all (8 tiles)", outcome: "committed" }],
+      actions: [{ at: 1761134400000, viewer: "v-4", id: "i-1", name: "relaunch_all", args: {}, summary: "relaunch all (8 tiles)", outcome: "committed" }],
     },
   };
 
@@ -154,12 +159,16 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     if (m.type !== "snapshot") throw new Error("not a snapshot");
     const st = m.state;
     expect(st.image_aspect).toBeCloseTo(32 / 9);
-    expect(st.fleet.hosts).toBe(1);
+    expect(st.fleet.hosts).toEqual([{ name: "example-host", draining: false }]);
     expect(st.tiles[0]).toMatchObject({ slot: "slot-1", fps: 30, gpu: { name: "Tesla T4", temp_c: 61, power_w: 70.5, util_pct: 97 } });
     expect(st.tiles[1]).toMatchObject({ phase: "waiting_capacity", slot: null, gpu: null });
     expect(st.scene.lights[0]!.color).toBe("#ffbc00");
     expect(st.scene.camera[0]).toEqual({ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 });
-    expect(st.actions[0]).toMatchObject({ summary: "relaunch all (8 tiles)", outcome: "committed", args: null });
+    expect(st.actions[0]).toMatchObject({ summary: "relaunch all (8 tiles)", outcome: "committed", args: {} });
+    // Fields the second design review adds are absent from this document: read as none.
+    expect(st.scoreboard).toEqual({ fcvm: null, ec2: null });
+    expect(st.next_race_at).toBeNull();
+    expect(st.borrow).toBeNull();
   });
 
   it("takes a committed receipt as applied and an error message as the coordinator's error", () => {
@@ -173,15 +182,35 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     expect(s.protocolErrors).toBe(0);
   });
 
-  it("times a camera move from untagged keys: the first key newer than the page held", () => {
-    let s = feed(initialState(), JSON.stringify(doc));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("c", "camera", { drag: { yaw_deg: 5, pitch_deg: 0, dive: 0 } }), at: EPOCH });
-    s = feed(s, JSON.stringify({ type: "receipt", id: "c", outcome: "committed", version: 43 }));
-    expect(cameraTargets(s)).toEqual([]);
-    const next = structuredClone(doc);
-    next.version = 43;
-    next.state.scene.camera = [...doc.state.scene.camera, { t: 20, pos: [0, 2, 0], look: [1, 1.5, -10], fov_deg: 60 }, { t: 20.3, pos: [0, 2, 0], look: [2, 1.5, -10], fov_deg: 60 }];
-    s = feed(s, JSON.stringify(next));
-    expect(cameraTargets(s)).toEqual([{ id: "c", tEff: 20 }]);
+  it("reads hello, and an action's viewer and intent id", () => {
+    const s = feed(feed(initialState(), JSON.stringify({ type: "hello", viewer: "v-17" })), JSON.stringify(doc));
+    expect(s.you).toBe("v-17");
+    expect(s.turnstile.sitekey).toBeNull();
+    expect(s.accepted!.actions[0]).toMatchObject({ viewer: "v-4", id: "i-1", name: "relaunch_all" });
+    expect(s.accepted!.aggregates[0]).toMatchObject({ id: "agg:example-host", half: "fcvm", host: "example-host", frame_url: null, tiles: ["fcvm:1"] });
+  });
+});
+
+describe("a hidden tab", () => {
+  it("closes the streams after five minutes hidden, judged from when it was hidden", () => {
+    expect(HIDDEN_PAUSE_MS).toBe(300_000);
+    const hidden = EPOCH;
+    expect(streamsSuspended(null, EPOCH + 10 * HIDDEN_PAUSE_MS)).toBe(false);
+    expect(streamsSuspended(hidden, hidden + HIDDEN_PAUSE_MS - 1)).toBe(false);
+    expect(streamsSuspended(hidden, hidden + HIDDEN_PAUSE_MS)).toBe(true);
+    // A timer the browser held back for minutes still decides from the timestamp.
+    expect(streamsSuspended(hidden, hidden + 3 * HIDDEN_PAUSE_MS)).toBe(true);
+  });
+
+  it("tells the frame drawer to close the streams while suspended, and to reopen them when shown", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    const plan = (x: ClientState) => wallView({ state: x, now: EPOCH, dpr: 1, mosaicArea: { x: 0, y: 0, w: 1600, h: 900 }, focusArea: null, canDecode: true, phone: false }).plan;
+    expect(plan(s).suspended).toBe(false);
+    s = reduce(s, { type: "ui", patch: { hiddenSince: EPOCH, suspended: true } });
+    expect(plan(s).suspended).toBe(true);
+    // The rest of the plan is kept, so the streams reopen as they were.
+    expect(plan(s).direct.length).toBe(8);
+    s = reduce(s, { type: "ui", patch: { hiddenSince: null, suspended: false } });
+    expect(plan(s).suspended).toBe(false);
   });
 });

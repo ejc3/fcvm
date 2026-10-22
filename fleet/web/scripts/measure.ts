@@ -81,6 +81,8 @@ for (const total of totals) {
     FLEET_MOCK_RENDER_PORT: String(base + 2),
     FLEET_MOCK_TILES: String(perHalf),
     FLEET_MOCK_EC2_SHORT: "0",
+    // Nothing restarts while it measures.
+    FLEET_MOCK_RACE_EVERY_S: "0",
     FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "32",
   };
   const server = spawn(process.execPath, ["scripts/dev-mock.ts", "--prod"], { env, stdio: ["ignore", "pipe", "inherit"], detached: true });
@@ -91,6 +93,8 @@ for (const total of totals) {
   });
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: VIEW, deviceScaleFactor: 1 });
+  // Direct mode: one stream per tile, what the browser must decode at most.
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
   await page.goto(`http://localhost:${base}/?debug=1`);
   await page.waitForFunction(() => window.__fleet?.client.bench !== null && window.__fleet !== undefined);
   await page.waitForTimeout(WARM_MS);

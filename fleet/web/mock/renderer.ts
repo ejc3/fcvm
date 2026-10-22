@@ -3,12 +3,13 @@
 // drawn at the height each subscriber asks for and encoded with libx264. All
 // tiles step one shared clock, so their frames land on the same t values.
 
+import { spawn } from "node:child_process";
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { buildFrame } from "../core/frame.ts";
 import { deliveredGeometry, tileGeometry, type TileGeometry } from "../core/layout.ts";
 import type { Rect } from "../core/protocol.ts";
-import { Encoder } from "./encoder.ts";
+import { Encoder, FFMPEG } from "./encoder.ts";
 import type { PatternScene } from "./pattern.ts";
 import { RenderPool } from "./render-pool.ts";
 
@@ -40,6 +41,8 @@ interface TileEntry {
   black: () => Rect[];
   /** Seconds added to the drawn t while keeping the stamp: a seam fault for tests. */
   skew: number;
+  /** A scene of its own (a viewer's own GPU, with its own camera), or null for the shared one. */
+  scene: (() => PatternScene) | null;
 }
 
 /** The renderer's q levels as libx264 quality: hi, std (the default), lo. */
@@ -93,7 +96,7 @@ export class MockRenderers {
         socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
         return;
       }
-      if (!tile.available) {
+      if (!tile.available || this.silent) {
         socket.end("HTTP/1.1 503 Service Unavailable\r\n\r\n");
         return;
       }
@@ -126,9 +129,31 @@ export class MockRenderers {
     return `ws://${this.opts.publicHost}:${this.port}/frames/${id}`;
   }
 
-  setTile(id: string, rect: Rect, black: () => Rect[] = () => []): void {
+  setTile(id: string, rect: Rect, black: () => Rect[] = () => [], scene: (() => PatternScene) | null = null): void {
     const e = this.tiles.get(id);
-    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0, black });
+    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0, black, scene });
+  }
+
+  /** Forget a stream (a viewer's own GPU went back to the pool) and close its sockets. */
+  removeTile(id: string): void {
+    this.setAvailable(id, false);
+    this.tiles.delete(id);
+  }
+
+  /** The whole image at t as a JPEG, for the coordinator's poster. */
+  async poster(width: number, height: number, t: number, black: Rect[]): Promise<Buffer> {
+    const geometry: TileGeometry = { width, height, fullWidth: width, fullHeight: height, x0: 0, y0: 0 };
+    const i420 = await this.pool.render({ geometry, drawT: t, scene: this.opts.scene(), black });
+    return await new Promise<Buffer>((resolve, reject) => {
+      const p = spawn(FFMPEG, ["-hide_banner", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p", "-s", `${width}x${height}`, "-i", "pipe:0", "-frames:v", "1", "-q:v", "4", "-f", "mjpeg", "pipe:1"]);
+      const out: Buffer[] = [];
+      let err = "";
+      p.stdout.on("data", (d: Buffer) => out.push(d));
+      p.stderr.on("data", (d: Buffer) => (err += d.toString()));
+      p.on("error", reject);
+      p.on("close", (code) => (code === 0 ? resolve(Buffer.concat(out)) : reject(new Error(`ffmpeg exited ${code}: ${err.trim()}`))));
+      p.stdin.end(Buffer.from(i420.buffer, i420.byteOffset, i420.byteLength));
+    });
   }
 
   /** A tile with no renderer refuses connections and drops the ones it has (its VM is gone). */
@@ -139,6 +164,13 @@ export class MockRenderers {
     if (!available) {
       for (const s of [...this.subs]) if (s.tile === id) s.ws.close(1001, "relaunching");
     }
+  }
+
+  /** Tests: every renderer refuses connections (and drops its own), as if none had started. */
+  private silent = false;
+  setSilent(silent: boolean): void {
+    this.silent = silent;
+    if (silent) for (const s of [...this.subs]) s.ws.close(1001, "silent");
   }
 
   setSkew(id: string, seconds: number): void {
@@ -175,7 +207,7 @@ export class MockRenderers {
   private resize(sub: Sub, h: number): void {
     const entry = this.tiles.get(sub.tile);
     if (!entry) return;
-    const tile = tileGeometry(entry.rect, this.opts.scene().image_aspect, this.clampHeight(h));
+    const tile = tileGeometry(entry.rect, (entry.scene ?? this.opts.scene)().image_aspect, this.clampHeight(h));
     // Like the renderer, encode the tile plus up to 16 px of the image around it
     // and say in the header how much to crop.
     const delivered = deliveredGeometry(tile);
@@ -275,7 +307,7 @@ export class MockRenderers {
       const geometry = s0.geometry!;
       lane.inflight++;
       const started = Date.now();
-      const drawn = this.pool.render({ geometry, drawT: t + entry.skew, scene, black: entry.black() }).then((b) => {
+      const drawn = this.pool.render({ geometry, drawT: t + entry.skew, scene: entry.scene ? entry.scene() : scene, black: entry.black() }).then((b) => {
         lane.lastMs = Date.now() - started;
         return b;
       });

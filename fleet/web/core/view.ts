@@ -5,24 +5,32 @@ import { serverNow } from "./clock.ts";
 import * as fmt from "./format.ts";
 import {
   STREAM_HEIGHTS,
-  layoutFocus,
+  fitContain,
   layoutMosaic,
   rectOnScreen,
+  snap,
   streamHeightFor,
   seamSegments,
   type Box,
   type MosaicLayout,
+  type PlacedTile,
   type Segment,
 } from "./layout.ts";
-import { frameSocketUrl, urlHost } from "./net.ts";
+import { frameSocketUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import type { Action, FleetState, Half, IntentMsg, Rect, Tile } from "./protocol.ts";
+import { sameViewer, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { KIND_TAG, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
-import type { ClientState, Notice, StreamMode } from "./store.ts";
+import type { ClientState, GpuSample, Notice, StreamMode } from "./store.ts";
 
 export const SITE = "fcvm.dev";
 export const TITLE = "Every GPU, live";
+export const SENTENCE = "Each square is its own virtual machine with its own NVIDIA GPU. Restart them all and watch which side comes back.";
+export const CAPTIONS: Record<Half, string> = {
+  fcvm: "a fresh VM restored from a snapshot on a running host, GPU reset",
+  ec2: "a fresh EC2 instance launched from an AMI",
+};
 export const NO_FLEET = "FLEET_COORD_URL is not set, so this page has no fleet to show.";
 
 export const COLORS = {
@@ -30,60 +38,61 @@ export const COLORS = {
   ec2: { accent: "#F5A524", soft: "#FFE2B0", darkOutline: "#4A3410" },
 } as const;
 
-export const KIND_TAG: Record<Half, string> = { fcvm: "fcvm", ec2: "EC2" };
-export const KIND_NAME: Record<Half, string> = { fcvm: "fcvm sandbox", ec2: "EC2 instance" };
-const HALF_PLURAL: Record<Half, string> = { fcvm: "fcvm sandboxes", ec2: "EC2 instances" };
+export const KIND_NAME: Record<Half, string> = { fcvm: "fcvm VM", ec2: "EC2 instance" };
 
-export const AUTO_OPTIONS: readonly (number | null)[] = [null, 60, 120, 300, 900];
+/** A dark-out fades in over this long when the viewer asks for less motion (no flash). */
+export const REDUCED_MOTION_DARK_FADE_MS = 700;
+/** A tile lent to a visitor fades out of the image over this long, so the change reads. */
+export const BORROW_FADE_MS = 1200;
 
 const PHASE_TEXT: Record<string, string> = {
-  running: "running",
+  running: "streaming",
+  relaunching: "restart sent",
+  requested: "restart sent",
   stopping: "stopping the old VM",
-  restoring: "restoring from the snapshot",
-  attaching_gpu: "attaching the GPU",
+  restoring: "restoring the snapshot",
   starting: "starting the renderer",
-  terminating: "terminating",
+  pending: "waiting for its host",
   launching: "launching an instance",
-  pending: "assigned, waiting for its host",
-  relaunching: "relaunching",
-  waiting_capacity: "waiting for capacity",
-  waiting_for_capacity: "waiting for capacity",
-  draining: "host reclaimed, draining",
+  terminating: "terminating the old instance",
+  waiting_capacity: "AWS had no spot GPU",
+  draining: "host reclaimed by AWS",
   failed: "failed",
-  requested: "relaunch requested",
 };
 
 /**
- * The parts of a relaunch, in the order they run, with the label each gets. The
- * coordinator reports `<part>_ms`; `restore_ms` contains `gpu_ms`, so the bar
- * shows the restore without the GPU and the GPU after it. `total_ms` and
- * `ack_ms` are sums or other clocks and are not parts.
+ * The parts of a restart, in the order they run, with the label each gets. The
+ * coordinator reports `<part>_ms`; `restore_ms` contains `gpu_ms`, so the
+ * timeline shows the restore without the GPU and the GPU after it. `total_ms`
+ * and `ack_ms` are sums or other clocks and are not parts.
  */
 const PART_ORDER: [string, string][] = [
+  ["capacity_wait_ms", "waited for spot capacity"],
   ["teardown_ms", "old VM stopped"],
   ["restore_ms", "snapshot restored"],
-  ["gpu_ms", "GPU attached, driver loaded"],
-  ["launch_ms", "launch requested and accepted"],
+  ["gpu_ms", "GPU reset and driver loaded"],
+  ["launch_ms", "instance launched"],
+  ["boot_ms", "instance booted"],
   ["ready_ms", "instance boot to first frame"],
-  ["container_ms", "container started"],
+  ["container_ms", "renderer started"],
   ["first_frame_ms", "first frame"],
 ];
 const NOT_PARTS = new Set(["total_ms", "ack_ms"]);
 
-/** The parts of a relaunch's timings, in order, as [label, ms]. */
-export function relaunchParts(phases: Record<string, number>): [string, number][] {
-  const out: [string, number][] = [];
+/** The parts of a restart's timings, in order, as [key, label, ms]. */
+export function relaunchParts(phases: Record<string, number>): [string, string, number][] {
+  const out: [string, string, number][] = [];
   const restore = phases["restore_ms"];
   const gpu = phases["gpu_ms"];
   for (const [k, label] of PART_ORDER) {
     let ms = phases[k];
     if (ms === undefined) continue;
     if (k === "restore_ms" && gpu !== undefined && restore !== undefined) ms = Math.max(0, restore - gpu);
-    out.push([label, ms]);
+    out.push([k, label, ms]);
   }
   for (const [k, ms] of Object.entries(phases)) {
     if (NOT_PARTS.has(k) || PART_ORDER.some(([p]) => p === k)) continue;
-    out.push([k.replace(/_ms$/, "").replace(/_/g, " "), ms]);
+    out.push([k, k.replace(/_ms$/, "").replace(/_/g, " "), ms]);
   }
   return out;
 }
@@ -92,19 +101,19 @@ export function phaseText(phase: string): string {
   return PHASE_TEXT[phase] ?? phase.replace(/_/g, " ");
 }
 
-function isWaiting(phase: string): boolean {
-  return phase === "waiting_capacity" || phase === "waiting_for_capacity";
+/** The name a viewer reads for a tile: "fcvm VM 3", "EC2 VM 3". */
+export function tileName(t: { id: string; half: Half }): string {
+  const k = /:(\d+)$/.exec(t.id)?.[1];
+  return k === undefined ? t.id : `${KIND_TAG[t.half]} VM ${k}`;
 }
 
-/** The name a viewer reads for a tile: the slot behind it, or its place. */
-export function tileName(t: Tile): string {
-  return t.slot ?? t.id;
-}
-
-export interface Viewport {
-  w: number;
-  h: number;
-  dpr: number;
+/** A viewer as the activity feed names it. */
+export function viewerName(v: string | null, you: string | null): string {
+  if (v === null || v === "") return "someone";
+  if (sameViewer(v, you)) return "you";
+  if (v === "schedule") return "the schedule";
+  const k = /(\d+)$/.exec(v)?.[1];
+  return k === undefined ? v : `viewer ${k}`;
 }
 
 export interface WallInput {
@@ -112,23 +121,29 @@ export interface WallInput {
   /** Local Unix ms. */
   now: number;
   dpr: number;
-  /** Where the image may go, measured by the page. */
+  /** Where the image and its captions may go, measured by the page. */
   mosaicArea: Box | null;
-  /** Where an opened tile is drawn, measured by the page. */
+  /** Where an opened VM's stream is drawn, measured by the page. */
   focusArea: Box | null;
+  /** Where the viewer's own GPU is drawn, measured by the page. */
+  ownArea?: Box | null;
   /** WebCodecs H.264 is available. */
   canDecode: boolean;
   phone: boolean;
+  /** The viewer asked for less motion. */
+  reducedMotion?: boolean;
   /** The browser's downlink estimate (Mbit/s), when it gives one. */
   downlinkMbps?: number | null;
   /** Share of drawn tiles behind the common t lately, in direct mode. */
   lateShare?: number | null;
-  /** Boxes the hover label must not cover (the race and counter cards), measured by the page. */
+  /** Boxes the hover label must not cover, measured by the page. */
   avoid?: Box[];
   /** The hover label's measured size. */
   labelSize?: { w: number; h: number };
   /** The direct streams' bandwidth budget, bits per second (BANDWIDTH_BUDGET_BPS when absent). */
   budgetBps?: number;
+  /** The coordinator's poster URL. */
+  poster?: string | null;
 }
 
 // ---- tiles -------------------------------------------------------------------
@@ -141,27 +156,44 @@ export interface HoverLabel {
   last: string;
 }
 
+/** What a dark tile shows instead of a clock: how far its restart is, or what is wrong. */
+export interface Glyph {
+  kind: "progress" | "failed" | "capacity" | "reclaimed" | "empty" | "borrowed";
+  /** Steps of a restart in this half, and how many are done. */
+  steps: number;
+  done: number;
+}
+
 export interface TileView {
   id: string;
-  /** The slot behind it, or its place when there is none. */
   name: string;
   half: Half;
   box: Box | null;
   accent: string;
-  /** Drawn dark, with its phase and clock over it. */
+  /** Drawn dark, with its glyph and phase over it. */
   dark: boolean;
-  darkClock: string;
-  darkPhase: string;
+  /** Hatched: EC2 waiting for spot capacity. */
+  hatch: boolean;
+  glyph: Glyph;
+  /** One line over a dark tile: the phase, or the failure. */
+  phase: string;
+  /** A second line for a failure: "retrying in 0:12". */
+  detail: string;
   darkOutline: string;
+  /** Leaves the image slowly (lent to a visitor), whatever the motion setting. */
+  slowFade: boolean;
   /** Shown dimmed: behind the common time. */
   behind: boolean;
   ariaLabel: string;
   hover: HoverLabel;
   stats: string[];
-  /** Short line for the phone card and the focus view: "running · 2.8 s last relaunch". */
-  status: string;
-  lastShort: string;
 }
+
+const STEPS: Record<Half, Record<string, number>> = {
+  fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
+  ec2: { relaunching: 0, requested: 0, terminating: 0, waiting_capacity: 0, pending: 1, launching: 1, starting: 2 },
+};
+const STEP_COUNT: Record<Half, number> = { fcvm: 4, ec2: 3 };
 
 function relaunchMs(t: Tile): number | null {
   const lr = t.last_relaunch;
@@ -177,6 +209,16 @@ function isLive(t: Tile): boolean {
   return t.phase === "running" && t.frame_url !== null;
 }
 
+function glyphFor(t: Tile, phase: string): Glyph {
+  const steps = STEP_COUNT[t.half];
+  if (phase === "borrowed" || (t.borrowed !== null && phase !== "running")) return { kind: "borrowed", steps, done: 0 };
+  if (t.failure?.kind === "host_reclaimed" || phase === "draining") return { kind: "reclaimed", steps, done: 0 };
+  if (phase === "failed" || t.failure) return { kind: "failed", steps, done: 0 };
+  if (phase === "waiting_capacity") return { kind: t.half === "ec2" ? "capacity" : "empty", steps, done: 0 };
+  const step = STEPS[t.half][phase];
+  return { kind: "progress", steps, done: step ?? 0 };
+}
+
 function tileView(
   t: Tile,
   s: ClientState,
@@ -187,32 +229,37 @@ function tileView(
 ): TileView {
   const requested = pendingRelaunch(pendingIntents, t) && isLive(t);
   const phase = requested ? "requested" : t.phase;
-  const fs = s.frames?.tiles[sourceIdFor(t, s.ui.shownMode, st.aggregators)];
+  const fs = s.frames?.tiles[sourceIdFor(t, s.ui.shownMode, st.aggregates)];
   const waitingForFrames = isLive(t) && !requested && (!fs || fs.newestT === null);
-  const dark = !isLive(t) || requested || waitingForFrames;
+  const dark = !isLive(t) || requested;
   const accent = COLORS[t.half].accent;
   const rms = relaunchMs(t);
-  const lastShort = rms === null ? "" : fmt.seconds(rms);
-
-  let darkPhase = phaseText(phase);
-  let darkClock = "";
-  const clockRuns = !isWaiting(t.phase) && t.phase !== "failed" && !requested;
-  if (dark && clockRuns && t.last_relaunch && t.phase !== "running") {
-    darkClock = fmt.seconds(srvNow - t.last_relaunch.clicked_at);
-  }
-  if (waitingForFrames) {
-    darkPhase = "connecting";
-    darkClock = lastShort;
-  }
-
-  const gpuName = t.gpu?.name ?? "no GPU yet";
+  const glyph = glyphFor(t, phase);
   const name = tileName(t);
+
+  let phaseLine = phaseText(phase);
+  let detail = "";
+  if (glyph.kind === "empty") phaseLine = "no GPU here yet";
+  if (glyph.kind === "borrowed") {
+    phaseLine = "a visitor's private GPU";
+    const left = t.borrowed ? Math.max(0, t.borrowed.until - srvNow) : 0;
+    detail = st.relaunch_all !== null && st.relaunch_all.fcvm_done_at === null && t.half === "fcvm" ? `sitting out this race · back in ${fmt.countdown(left)}` : `back in ${fmt.countdown(left)}`;
+  }
+  if (glyph.kind === "reclaimed") {
+    phaseLine = "host reclaimed by AWS";
+    detail = "re-tiling";
+  } else if (glyph.kind === "failed") {
+    phaseLine = `failed: ${t.failure?.message || t.error || "no reason given"}`;
+    const retry = t.failure?.retry_at ?? null;
+    detail = retry === null ? "" : retry > srvNow ? `retrying in ${fmt.countdown(retry - srvNow)}` : "retrying now";
+  }
+
   const hover: HoverLabel = {
     id: name,
     kind: KIND_TAG[t.half],
-    gpu: gpuName,
+    gpu: t.gpu?.name ?? "no GPU yet",
     host: t.host ?? "no host yet",
-    last: rms === null ? "no relaunch yet" : `last relaunch ${fmt.seconds(rms)}`,
+    last: rms === null ? "no restart yet" : `last restart ${fmt.seconds(rms)}`,
   };
 
   const stats: string[] = [];
@@ -221,7 +268,7 @@ function tileView(
     const age = srvNow - sceneUnixMs(st.scene.epoch_unix_ms, fs.newestT);
     stats.push(`frame age ${fmt.millis(Math.max(0, age))}`);
   } else {
-    stats.push(dark ? phaseText(phase) : "no frames");
+    stats.push(dark ? phaseLine : waitingForFrames ? "connecting" : "no frames");
   }
   if (t.gpu) {
     const parts = [
@@ -231,13 +278,11 @@ function tileView(
     ].filter((x): x is string => x !== null);
     if (parts.length > 0) stats.push(parts.join(" · "));
   }
-  const up = t.last_relaunch?.first_frame_at ?? null;
-  stats.push(up === null ? name : `${name} · up ${fmt.span(srvNow - up)}`);
+  stats.push(name);
 
-  const status = dark ? phaseText(phase) : rms === null ? "running" : `running · ${fmt.seconds(rms)} last relaunch`;
-  const ariaLabel = `${name}, ${KIND_NAME[t.half]}, ${dark ? phaseText(phase) : "running"}${
-    rms === null ? "" : `, last relaunch ${fmt.seconds(rms)}`
-  }. Open it large.`;
+  const ariaLabel = `${name}, ${KIND_NAME[t.half]}, ${dark ? [phaseLine, detail].filter(Boolean).join(", ") : "streaming"}${
+    rms === null ? "" : `, last restart ${fmt.seconds(rms)}`
+  }. Open it.`;
 
   return {
     id: t.id,
@@ -246,491 +291,425 @@ function tileView(
     box,
     accent,
     dark,
-    darkClock,
-    darkPhase,
-    darkOutline: COLORS[t.half].darkOutline,
+    hatch: dark && glyph.kind === "capacity",
+    glyph,
+    phase: phaseLine,
+    detail,
+    darkOutline: glyph.kind === "failed" || glyph.kind === "reclaimed" ? "#B04A3E" : COLORS[t.half].darkOutline,
+    slowFade: glyph.kind === "borrowed",
     behind: fs?.behind ?? false,
     ariaLabel,
     hover,
     stats,
-    status,
-    lastShort,
   };
 }
 
-// ---- the race ----------------------------------------------------------------
-
-export interface HalfView {
-  half: Half;
-  accent: string;
-  soft: string;
-  title: string;
-  renderedBy: string;
-  back: string;
-  backFraction: number;
-  stamp: string;
-  median: string;
-}
-
-export interface RaceView {
-  active: boolean;
-  caption: string;
-  clock: string;
-  by: string;
-  fcvm: HalfView;
-  ec2: HalfView;
-}
-
-function halfTiles(st: FleetState, h: Half): Tile[] {
-  return st.tiles.filter((t) => t.half === h);
-}
-
-function halfView(st: FleetState, h: Half): HalfView {
-  const tiles = halfTiles(st, h);
-  const withGpu = tiles.filter((t) => !isWaiting(t.phase) && t.gpu !== null);
-  const ra = st.relaunch_all;
-  const durations = tiles.map(relaunchMs).filter((x): x is number => x !== null);
-  const med = fmt.median(durations);
-  const base = {
-    half: h,
-    accent: COLORS[h].accent,
-    soft: COLORS[h].soft,
-    title: HALF_PLURAL[h],
-    renderedBy: `rendered by ${fmt.count(withGpu.length, `${KIND_TAG[h]} GPU`, `${KIND_TAG[h]} GPUs`)}`,
-    median: med === null ? "no relaunches yet" : `median relaunch ${fmt.seconds(med)}`,
-  };
-  if (!ra) {
-    const up = tiles.filter(isLive).length;
-    return {
-      ...base,
-      back: `${up} / ${tiles.length} up`,
-      backFraction: tiles.length === 0 ? 0 : up / tiles.length,
-      stamp: "no relaunch all yet",
-    };
-  }
-  const racing = withGpu;
-  const back = racing.filter(
-    (t) => isLive(t) && t.last_relaunch !== null && t.last_relaunch.first_frame_at !== null &&
-      t.last_relaunch.first_frame_at >= ra.started_at,
-  ).length;
-  const doneAt = h === "fcvm" ? ra.fcvm_done_at : ra.ec2_done_at;
-  const raceOver = ra.fcvm_done_at !== null && ra.ec2_done_at !== null;
-  let stamp: string;
-  if (doneAt !== null) {
-    stamp = raceOver
-      ? `last relaunch all: ${fmt.seconds(doneAt - ra.started_at)}`
-      : `all back at ${fmt.raceClock(doneAt - ra.started_at)}`;
-  } else if (back === 0) {
-    stamp = h === "fcvm" ? "restoring" : "still launching";
-  } else {
-    stamp = "healing";
-  }
-  return {
-    ...base,
-    back: `${back} / ${racing.length} back`,
-    backFraction: racing.length === 0 ? 0 : back / racing.length,
-    stamp,
-  };
-}
-
-function raceView(st: FleetState, srvNow: number): RaceView {
-  const ra = st.relaunch_all;
-  const fcvm = halfView(st, "fcvm");
-  const ec2 = halfView(st, "ec2");
-  if (!ra) return { active: false, caption: "relaunch all to start the race", clock: "--", by: "", fcvm, ec2 };
-  const over = ra.fcvm_done_at !== null && ra.ec2_done_at !== null;
-  const end = over ? Math.max(ra.fcvm_done_at!, ra.ec2_done_at!) : srvNow;
-  return {
-    active: !over,
-    caption: over ? "last relaunch all, both halves back" : "since Relaunch all",
-    clock: fmt.raceClock(end - ra.started_at),
-    by: ra.by === "" ? "" : `started by ${ra.by}`,
-    fcvm,
-    ec2,
-  };
-}
-
-// ---- controls ----------------------------------------------------------------
-
-export interface Option {
-  value: string;
-  label: string;
-}
-
-export interface ModeView {
-  label: string;
-  options: { value: StreamMode; label: string; disabled: boolean }[];
-  selected: StreamMode;
-  /** "switching to aggregated" while the drawer still shows the other mode. */
-  note: string;
-  suggestion: { mode: StreamMode; text: string };
-  detail: string;
-}
-
-export interface ControlsView {
-  site: string;
-  mode: ModeView;
-  relaunchAll: { label: string; disabled: boolean; note: string };
-  auto: { label: string; options: Option[]; selected: string; note: string; pending: boolean };
-  stats: { label: string; on: boolean };
-  light: { label: string; on: boolean };
-  word: { label: string; placeholder: string; submit: string; maxLength: number; status: string; statusKind: "idle" | "pending" | "applied" | "refused" };
-  timeOfDay: { label: string; value: number; min: number; max: number; step: number; valueText: string; pending: boolean };
-  viewers: string;
-  help: string;
-  latency: string;
-  latencyMeasured: boolean;
-}
+// ---- the Play drawer -----------------------------------------------------------
 
 export const WORD_MAX = 28;
 
-function autoValue(secs: number | null): string {
-  return secs === null ? "off" : String(secs);
+export interface PlayView {
+  title: string;
+  close: string;
+  nudge: {
+    title: string;
+    note: string;
+    options: { id: string; label: string; votes: string; holding: boolean; chosen: boolean }[];
+    disabled: boolean;
+  } | null;
+  word: { label: string; placeholder: string; submit: string; maxLength: number; status: string; statusKind: "idle" | "pending" | "applied" | "refused" };
+  light: { label: string; on: boolean };
+  timeOfDay: { label: string; value: number; min: number; max: number; step: number; valueText: string };
+  streams: { label: string; on: boolean; note: string; disabled: boolean };
+  stats: { label: string; on: boolean };
+  verify: { needed: boolean; title: string; text: string; error: string };
+  disabled: boolean;
 }
 
-export function autoFromValue(v: string): number | null {
-  if (v === "off") return null;
-  const n = Number(v);
-  return Number.isFinite(n) && n > 0 ? n : null;
-}
-
-function autoLabel(secs: number | null): string {
-  if (secs === null) return "Off";
-  const s = fmt.interval(secs);
-  return s.charAt(0).toUpperCase() + s.slice(1);
-}
-
-function lastAction(st: FleetState, name: string): Action | null {
-  let best: Action | null = null;
-  for (const a of st.actions) if (a.name === name && a.outcome !== "refused" && (best === null || a.at >= best.at)) best = a;
-  return best;
-}
-
-function modeView(s: ClientState, st: FleetState, plan: DrawPlan, input: WallInput): ModeView {
-  const has = st.aggregators.length > 0;
-  const sug = suggestMode({
-    aggregators: st.aggregators.length,
-    downlinkMbps: input.downlinkMbps ?? null,
-    directBps: plan.estimatedBps,
-    lateShare: input.lateShare ?? null,
-  });
-  const name = (m: StreamMode) => (m === "direct" ? "Direct" : "Aggregated");
-  const selected = has ? s.ui.mode : "direct";
-  const detail =
-    selected === "direct"
-      ? `${fmt.count(plan.direct.length, "stream", "streams")}, one per tile, about ${fmt.mbps(plan.estimatedBps)}`
-      : `${fmt.count(plan.aggregated.length, "stream", "streams")}, each a joined region`;
-  return {
-    label: "Streams",
-    options: [
-      { value: "direct", label: "Direct", disabled: false },
-      { value: "aggregated", label: "Aggregated", disabled: !has },
-    ],
-    selected,
-    note: selected !== s.ui.shownMode ? `switching to ${name(selected).toLowerCase()}` : "",
-    suggestion: { mode: sug.mode, text: `${name(sug.mode)} suggested: ${sug.reason}` },
-    detail,
-  };
-}
-
-function controlsView(s: ClientState, st: FleetState, srvNow: number, pendingIntents: IntentMsg[]): Omit<ControlsView, "mode"> {
-  const ra = st.relaunch_all;
-  const raceOn = ra !== null && (ra.fcvm_done_at === null || ra.ec2_done_at === null);
-  const pendingAll = pendingIntents.some((i) => i.name === "relaunch_all");
-  const gpus = st.tiles.filter((t) => t.gpu !== null).length;
-  const relaunchAll = raceOn
-    ? { label: "Relaunch all in progress", disabled: true, note: ra!.by === "" ? "" : `started by ${ra!.by}` }
-    : pendingAll
-      ? { label: "Relaunch all requested", disabled: true, note: "" }
-      : { label: `Relaunch all ${fmt.count(gpus, "GPU", "GPUs")}`, disabled: gpus === 0, note: "" };
-
-  const pendingAuto = [...pendingIntents].reverse().find((i) => i.name === "set_auto_relaunch");
-  const secs = pendingAuto
-    ? (typeof pendingAuto.args["secs"] === "number" ? (pendingAuto.args["secs"] as number) : null)
-    : st.settings.auto_relaunch_secs;
-  const opts = [...AUTO_OPTIONS];
-  if (secs !== null && !opts.includes(secs)) opts.push(secs);
-  let note = "";
-  if (st.settings.auto_relaunch_secs !== null && !pendingAuto) {
-    const last = lastAction(st, "set_auto_relaunch");
-    const setBy = last === null ? undefined : s.you !== null && (last.viewer === s.you || last.by === s.you) ? "you" : last.by;
-    // A tile never relaunched is due at once.
-    const due = st.tiles
-      .filter((t) => t.gpu !== null)
-      .map((t) => (t.last_relaunch === null ? srvNow : t.last_relaunch.clicked_at + st.settings.auto_relaunch_secs! * 1000));
-    const next = due.length === 0 ? null : Math.min(...due);
-    const parts = [setBy ? `set by ${setBy}` : null, next === null ? null : `next in ${fmt.countdown(next - srvNow)}`];
-    note = parts.filter((p) => p !== null).join(" · ");
-  } else if (pendingAuto) {
-    note = "sending";
-  }
-
-  const pendingWord = pendingIntents.find((i) => i.name === "word");
+function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMsg[], plan: DrawPlan, input: WallInput, online: boolean): PlayView {
+  const pendingWord = pend.find((i) => i.name === "word");
   const lastWordNotice = [...s.notices].reverse().find((n) => n.intent === "word");
   let wordStatus = "";
-  let statusKind: ControlsView["word"]["statusKind"] = "idle";
+  let statusKind: PlayView["word"]["statusKind"] = "idle";
   if (pendingWord) {
     wordStatus = `Checking “${String(pendingWord.args["text"] ?? "")}”`;
     statusKind = "pending";
   } else if (lastWordNotice) {
     const text = String(lastWordNotice.args["text"] ?? "");
     if (lastWordNotice.kind === "applied") {
-      wordStatus = `“${text}” is in the scene`;
+      wordStatus = `“${text}” is in the world`;
       statusKind = "applied";
     } else {
       wordStatus = `“${text}” was not added${lastWordNotice.reason ? `: ${lastWordNotice.reason}` : ""}`;
       statusKind = "refused";
     }
   }
-
-  const pendingTod = [...pendingIntents].reverse().find((i) => i.name === "time_of_day");
+  const pendingTod = [...pend].reverse().find((i) => i.name === "time_of_day");
   const tod = pendingTod && typeof pendingTod.args["v"] === "number" ? (pendingTod.args["v"] as number) : st.scene.time_of_day;
 
-  const latency =
-    s.lastInputLatencyMs === null
-      ? "drag the image to measure input to pixels"
-      : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`;
+  let nudge: PlayView["nudge"] = null;
+  const nd = st.nudges;
+  if (nd) {
+    const mine = lastMine(st, s.you, "nudge", nd.next_hold_at);
+    const pendingNudge = [...pend].reverse().find((i) => i.name === "nudge");
+    const chosen = pendingNudge ? String(pendingNudge.args["target"] ?? "") : mine ? String(mine.args?.["target"] ?? "") : null;
+    const holding = nd.targets.find((x) => x.id === nd.holding);
+    const next = nd.next_hold_at === null ? "" : `next stop in ${fmt.countdown(nd.next_hold_at - srvNow)}`;
+    nudge = {
+      title: "Where the camera stops next",
+      note: [holding ? `holding on ${holding.label}` : "flying", next].filter(Boolean).join(" · "),
+      options: nd.targets.map((x) => ({
+        id: x.id,
+        label: x.label,
+        votes: fmt.count(x.votes, "vote", "votes"),
+        holding: x.id === nd.holding,
+        chosen: chosen === x.id,
+      })),
+      disabled: !online,
+    };
+  }
 
+  const hasAgg = st.aggregates.some((a) => a.frame_url !== null);
+  const sug = suggestMode({
+    aggregators: st.aggregates.length,
+    downlinkMbps: input.downlinkMbps ?? null,
+    directBps: plan.estimatedBps,
+    lateShare: input.lateShare ?? null,
+  });
+  const direct = !hasAgg || s.ui.mode === "direct";
+  let streamsNote = direct
+    ? `${fmt.count(plan.direct.length, "stream", "streams")} straight from the VMs, about ${fmt.mbps(plan.estimatedBps)}`
+    : `${fmt.count(plan.aggregated.length, "stream", "streams")}, one per host, each joining its VMs' frames`;
+  if (direct && hasAgg && sug.mode === "aggregated") streamsNote += `. ${sug.reason}`;
+  if (s.ui.mode !== s.ui.shownMode) streamsNote = `switching. ${streamsNote}`;
+
+  const ts = s.turnstile;
   return {
-    site: SITE,
-    relaunchAll,
-    auto: {
-      label: "Auto-relaunch, shared",
-      options: opts.map((o) => ({ value: autoValue(o), label: autoLabel(o) })),
-      selected: autoValue(secs),
-      note,
-      pending: pendingAuto !== undefined,
+    title: "Play",
+    close: "Close",
+    nudge,
+    word: { label: "Write a word into the world", placeholder: "a word", submit: "Write", maxLength: WORD_MAX, status: wordStatus, statusKind },
+    light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
+    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod) },
+    streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
+    stats: { label: "Show stream stats", on: s.ui.stats },
+    verify: {
+      needed: ts.sitekey !== null && !ts.verified,
+      title: "One check first",
+      text: ts.verifying ? "Checking" : "One check before your first action, so the fleet stays for people.",
+      error: ts.error ?? "",
     },
-    stats: { label: "Stats", on: s.ui.stats },
-    light: { label: s.ui.lightMode ? "Click the image to drop it" : "Drop a light", on: s.ui.lightMode },
-    word: {
-      label: "Write a word into the world",
-      placeholder: "a word",
-      submit: "Write",
-      maxLength: WORD_MAX,
-      status: wordStatus,
-      statusKind,
-    },
-    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod), pending: pendingTod !== undefined },
-    viewers: `${st.viewers.count} watching`,
-    help: "Drag to steer the camera together, scroll to dive. Click a square to open it.",
-    latency,
-    latencyMeasured: s.lastInputLatencyMs !== null,
+    disabled: !online,
   };
 }
 
-// ---- actions ticker ----------------------------------------------------------
-
-function actionText(a: Action, you: string | null): string | null {
-  if (a.outcome === "refused") return null;
-  const mine = you !== null && (a.viewer === you || a.by === you);
-  const who = mine ? "you" : a.by === "" ? "someone" : a.by;
-  const args = a.args;
-  if (args === null) {
-    // The coordinator sends a summary instead of the arguments: "relaunch slot-3",
-    // "word \"hello\"", "time of day 15.5 h".
-    const summary = a.summary ?? "";
-    const detail = summary.replace(/^\S+\s*/, "");
-    switch (a.name) {
-      case "camera":
-        return null;
-      case "relaunch":
-        return `${who} relaunched ${detail}`;
-      case "relaunch_all":
-        return `${who} relaunched all`;
-      case "word":
-        return `${who} wrote ${detail}`;
-      case "light":
-        return `${who} dropped a light`;
-      case "set_auto_relaunch":
-      case "time_of_day":
-        return `${who} set ${summary}`;
-      default:
-        return summary === "" ? null : `${who}: ${summary}`;
-    }
+/** This viewer's latest committed action of a kind since a time. */
+function lastMine(st: FleetState, you: string | null, name: string, before: number | null): Action | null {
+  let best: Action | null = null;
+  for (const a of st.actions) {
+    if (a.name !== name || a.outcome === "refused" || !sameViewer(a.viewer, you)) continue;
+    if (before !== null && a.at > before) continue;
+    if (best === null || a.at >= best.at) best = a;
   }
+  return best;
+}
+
+// ---- activity feed -------------------------------------------------------------
+
+function actionText(a: Action, st: FleetState, you: string | null): string | null {
+  if (a.outcome === "refused") return null;
+  const who = viewerName(a.viewer, you);
+  const args = a.args ?? {};
   switch (a.name) {
-    case "relaunch":
-      return `${who} relaunched ${String(args["tile"] ?? "a tile")}`;
     case "relaunch_all":
-      return `${who} relaunched all`;
-    case "set_auto_relaunch": {
-      const secs = typeof args["secs"] === "number" ? (args["secs"] as number) : null;
-      return secs === null ? `${who} turned auto-relaunch off` : `${who} set auto-relaunch to ${fmt.interval(secs)}`;
+      return a.viewer === "schedule" ? "the scheduled restart of every GPU began" : `${who} restarted every GPU`;
+    case "relaunch": {
+      const t = st.tiles.find((x) => x.id === args["tile"] || x.slot === args["tile"]);
+      return `${who} restarted ${t ? tileName(t) : "a VM"}`;
     }
     case "word":
-      return `${who} wrote “${String(args["text"] ?? "")}”`;
+      return typeof args["text"] === "string" ? `${who} wrote “${args["text"]}”` : `${who} wrote a word`;
     case "light":
       return `${who} dropped a light`;
     case "time_of_day":
       return typeof args["v"] === "number" ? `${who} set the time of day to ${fmt.timeOfDay(args["v"] as number)}` : null;
-    case "camera":
-      return null;
+    case "nudge": {
+      const target = st.nudges?.targets.find((x) => x.id === args["target"]);
+      return `${who} chose ${target ? target.label : "a stop"} for the camera`;
+    }
+    case "claim_gpu":
+      return `${who} got ${who === "you" ? "your" : "their"} own GPU`;
     default:
-      return a.summary === null ? null : `${who}: ${a.summary}`;
+      return null;
   }
 }
 
-export interface TickerItem {
+export interface FeedItem {
   key: string;
   text: string;
   when: string;
 }
 
-function tickerView(st: FleetState, srvNow: number, you: string | null): TickerItem[] {
-  const out: TickerItem[] = [];
+function feedView(st: FleetState, srvNow: number, you: string | null, n: number): FeedItem[] {
+  const out: FeedItem[] = [];
   const sorted = [...st.actions].sort((a, b) => b.at - a.at);
   for (const a of sorted) {
-    const text = actionText(a, you);
+    const text = actionText(a, st, you);
     if (text === null) continue;
-    out.push({ key: `${a.at}-${a.by}-${a.name}-${out.length}`, text, when: fmt.ago(srvNow - a.at) });
-    if (out.length === 4) break;
+    out.push({ key: a.id ?? `${a.at}-${out.length}`, text, when: fmt.ago(srvNow - a.at) });
+    if (out.length === n) break;
   }
   return out;
 }
 
-// ---- focus (one tile opened) --------------------------------------------------
+// ---- one VM opened -------------------------------------------------------------
 
-export interface PhaseSegment {
+export interface TimelineStep {
   label: string;
   value: string;
+  /** Start and length as fractions of the whole restart. */
+  start: number;
   fraction: number;
   shade: number;
+  hatch: boolean;
 }
 
-export interface PhaseBar {
-  title: string;
-  accent: string;
-  total: string;
-  segments: PhaseSegment[];
+export interface Reading {
+  label: string;
+  value: string;
+  /** SVG polyline points in a 100 x 24 box, oldest left. */
+  points: string;
 }
 
 export interface FocusView {
   id: string;
   accent: string;
   title: string;
+  kind: string;
   state: string;
-  nav: string;
   back: string;
   streamTag: string;
-  sourceTag: string;
-  caption: string;
   rows: { term: string; value: string }[];
-  relaunch: { label: string; disabled: boolean };
-  lastTitle: string;
-  lastValue: string;
-  lastNote: string;
-  bars: PhaseBar[];
+  restart: { label: string; disabled: boolean };
+  timelineTitle: string;
+  timelineTotal: string;
+  timelineNote: string;
+  timeline: TimelineStep[];
+  /** While it restarts: where it is now. */
+  now: string;
+  readingsTitle: string;
+  readings: Reading[];
   placed: { box: Box; streamHeight: number } | null;
 }
 
-function partsTotal(t: Tile): number {
-  const lr = t.last_relaunch;
-  if (!lr) return 0;
-  return relaunchMs(t) ?? relaunchParts(lr.phases).reduce((a, [, ms]) => a + ms, 0);
+/** The renderer's own resolution for one tile: what "native size" asks for. */
+export const NATIVE_TILE_HEIGHT = 720;
+
+function sparkline(samples: readonly GpuSample[], key: "temp_c" | "power_w" | "util_pct"): string {
+  const vals = samples.map((x) => x[key]).filter((v): v is number => v !== null);
+  if (vals.length < 2) return "";
+  const lo = Math.min(...vals);
+  const hi = Math.max(...vals);
+  const span = hi - lo || 1;
+  return vals.map((v, i) => `${((i / (vals.length - 1)) * 100).toFixed(1)},${(22 - ((v - lo) / span) * 20).toFixed(1)}`).join(" ");
 }
 
-function phaseBar(t: Tile, axisMs: number): PhaseBar | null {
-  const lr = t.last_relaunch;
-  if (!lr) return null;
-  const parts = relaunchParts(lr.phases);
-  if (parts.length === 0) return null;
-  return {
-    title: `${tileName(t)} (${KIND_TAG[t.half]})`,
-    accent: COLORS[t.half].accent,
-    total: fmt.seconds(partsTotal(t)),
-    segments: parts.map(([label, ms], i) => ({
-      label: `${KIND_TAG[t.half]}: ${label}`,
+/** Where a VM's stream goes: its native height at one device pixel per pixel, smaller only when the area is. */
+export function nativePlacement(area: Box, rect: Rect, imageAspect: number, dpr: number): { box: Box; streamHeight: number } {
+  const aspect = (rect.w * imageAspect) / rect.h;
+  const nativeH = NATIVE_TILE_HEIGHT / dpr;
+  const fit = fitContain(area, aspect);
+  const h = Math.min(fit.h, nativeH);
+  const w = h * aspect;
+  const x = area.x + (area.w - w) / 2;
+  const y = area.y + (area.h - h) / 2;
+  const box = { x: snap(x, dpr), y: snap(y, dpr), w: snap(x + w, dpr) - snap(x, dpr), h: snap(y + h, dpr) - snap(y, dpr) };
+  return { box, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(box.h * dpr)) };
+}
+
+function timelineOf(phases: Record<string, number>): { steps: TimelineStep[]; total: number } {
+  const parts = relaunchParts(phases);
+  const total = parts.reduce((a, [, , ms]) => a + ms, 0);
+  let at = 0;
+  const steps = parts.map(([k, label, ms], i) => {
+    const step = {
+      label,
       value: ms < 10_000 ? `${(ms / 1000).toFixed(2)} s` : fmt.seconds(ms),
-      fraction: axisMs > 0 ? ms / axisMs : 0,
+      start: total > 0 ? at / total : 0,
+      fraction: total > 0 ? ms / total : 0,
       shade: i,
-    })),
-  };
+      hatch: k === "capacity_wait_ms",
+    };
+    at += ms;
+    return step;
+  });
+  return { steps, total };
 }
 
-/** The tile in the other half at the same place in its half's grid. */
-export function mirrorTile(tiles: readonly Tile[], t: Tile): Tile | null {
-  const dx = t.half === "fcvm" ? 0.5 : -0.5;
-  let best: Tile | null = null;
-  let bestD = Infinity;
-  for (const o of tiles) {
-    if (o.half === t.half) continue;
-    const d = Math.abs(o.rect.x - (t.rect.x + dx)) + Math.abs(o.rect.y - t.rect.y);
-    if (d < bestD) {
-      bestD = d;
-      best = o;
-    }
-  }
-  return best;
-}
-
-function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input: WallInput): FocusView {
+function focusView(s: ClientState, st: FleetState, tv: TileView, t: Tile, input: WallInput, srvNow: number, online: boolean): FocusView {
   const fs = s.frames?.tiles[`d:${t.id}`];
-  const mirror = mirrorTile(st.tiles, t);
-  const pair = [t, mirror].filter((x): x is Tile => x !== null);
-  const axis = Math.max(1, ...pair.map(partsTotal));
-  const bars = pair.map((x) => phaseBar(x, axis)).filter((b): b is PhaseBar => b !== null);
-  const host = t.frame_url ? urlHost(t.frame_url) : null;
+  const lr = t.last_relaunch;
+  const { steps, total } = lr ? timelineOf(lr.phases) : { steps: [], total: 0 };
   const rms = relaunchMs(t);
-  const placed = input.focusArea ? layoutFocus(input.focusArea, t, input.dpr, st.image_aspect) : null;
+  const placed = input.focusArea ? nativePlacement(input.focusArea, t.rect, st.image_aspect, input.dpr) : null;
+  const history = s.gpuHistory[t.id] ?? [];
+  const g = t.gpu;
+  const readings: Reading[] = g
+    ? [
+        { label: "Temperature", value: g.temp_c === null ? "--" : `${Math.round(g.temp_c)} °C`, points: sparkline(history, "temp_c") },
+        { label: "Power", value: g.power_w === null ? "--" : `${Math.round(g.power_w)} W`, points: sparkline(history, "power_w") },
+        { label: "GPU busy", value: g.util_pct === null ? "--" : `${Math.round(g.util_pct)}%`, points: sparkline(history, "util_pct") },
+      ]
+    : [];
+  let streamTag = "no frames yet";
+  if (fs && fs.newestT !== null && placed) {
+    const scale = placed.box.h * input.dpr / fs.height;
+    streamTag = `${fs.height}p · ${Math.round(fs.fps)} fps · ${scale >= 0.995 ? "native size" : `shown at ${Math.round(scale * 100)}%`}`;
+  }
+  const restarting = tv.dark && lr !== null && lr.first_frame_at === null;
+  const up = lr?.first_frame_at ?? null;
   return {
     id: t.id,
     accent: tv.accent,
     title: tv.name,
-    state: tv.dark ? tv.darkPhase : "running",
-    nav: `${SITE} / ${tv.name}`,
+    kind: t.half === "fcvm" ? `fcvm: ${CAPTIONS.fcvm}` : `EC2: ${CAPTIONS.ec2}`,
+    state: tv.dark ? [tv.phase, tv.detail].filter(Boolean).join(", ") : "streaming",
     back: "Back to the wall",
-    streamTag: fs && fs.newestT !== null ? `${fs.height}p · ${Math.round(fs.fps)} fps` : "no frames yet",
-    sourceTag: "H.264 straight from the VM",
-    caption:
-      "The same rectangle of the image, drawn larger: the GPU spends its budget on more pixels of the same area. Frames come from the VM's own address; nothing relays them.",
+    streamTag,
     rows: [
-      { term: "Kind", value: KIND_NAME[t.half] },
-      { term: "GPU", value: t.gpu?.name ?? "none yet" },
+      { term: "GPU", value: g?.name ?? "none yet" },
       { term: "Host", value: t.host ?? "none yet" },
-      { term: "Address", value: host ?? "none yet" },
-      { term: "State", value: tv.dark ? tv.darkPhase : "running" },
+      { term: "VM", value: t.vm ?? "none yet" },
+      { term: "Started", value: t.generation === null ? "--" : fmt.count(t.generation, "time", "times") },
+      { term: "Up for", value: up === null || tv.dark ? "--" : fmt.span(srvNow - up) },
       ...(t.error ? [{ term: "Error", value: t.error }] : []),
     ],
-    relaunch: { label: `Relaunch ${tv.name}`, disabled: t.gpu === null },
-    lastTitle: "Last relaunch",
-    lastValue: rms === null ? "--" : fmt.seconds(rms),
-    lastNote: "Click to first new frame, both kinds on one time axis.",
-    bars,
+    restart: { label: "Restart this VM", disabled: !online || t.gpu === null || tv.dark },
+    timelineTitle: restarting ? "This restart" : "Last restart",
+    timelineTotal: rms === null ? (restarting && lr ? fmt.raceClock(srvNow - lr.clicked_at) : "--") : fmt.seconds(rms),
+    timelineNote: "From the click to its first frame, measured by the coordinator.",
+    timeline: steps.map((x) => ({ ...x, fraction: total > 0 ? x.fraction : 0 })),
+    now: restarting ? `now: ${tv.phase}` : "",
+    readingsTitle: "GPU, live",
+    readings,
     placed,
   };
 }
 
-// ---- phone header --------------------------------------------------------------
+// ---- your own GPU --------------------------------------------------------------
 
-export interface PhoneView {
-  up: { label: string; value: string };
-  fcvm: { label: string; value: string };
-  ec2: { label: string; value: string };
+/** A camera button on the viewer's own GPU: a turn (fractions of the image) or a move along the view. */
+export interface CameraMove {
+  label: string;
+  symbol: string;
+  dx: number;
+  dy: number;
+  dive: number;
 }
 
-function phoneView(st: FleetState): PhoneView {
-  const med = (h: Half) => fmt.median(halfTiles(st, h).map(relaunchMs).filter((x): x is number => x !== null));
-  const mf = med("fcvm");
-  const me = med("ec2");
+/** One press turns the camera this far, as a fraction of the image. */
+export const CAMERA_KEY_STEP = 0.08;
+
+export const CAMERA_MOVES: readonly CameraMove[] = [
+  { label: "Turn left", symbol: "←", dx: -CAMERA_KEY_STEP, dy: 0, dive: 0 },
+  { label: "Turn right", symbol: "→", dx: CAMERA_KEY_STEP, dy: 0, dive: 0 },
+  { label: "Tilt up", symbol: "↑", dx: 0, dy: -CAMERA_KEY_STEP, dive: 0 },
+  { label: "Tilt down", symbol: "↓", dx: 0, dy: CAMERA_KEY_STEP, dive: 0 },
+  { label: "Move closer", symbol: "+", dx: 0, dy: 0, dive: 1 },
+  { label: "Move back", symbol: "−", dx: 0, dy: 0, dive: -1 },
+];
+
+/** Keys that move the camera on the viewer's own GPU, by CAMERA_MOVES index. */
+export const CAMERA_KEYS: Record<string, number> = { ArrowLeft: 0, ArrowRight: 1, ArrowUp: 2, ArrowDown: 3, "+": 4, "=": 4, "-": 5 };
+
+export interface OwnView {
+  title: string;
+  cameraLabel: string;
+  moves: readonly CameraMove[];
+  status: string;
+  timerLabel: string;
+  timer: string;
+  timerRunning: boolean;
+  countdownLabel: string;
+  countdown: string;
+  ended: boolean;
+  back: string;
+  help: string;
+  latency: string;
+  gpu: string;
+  steps: TimelineStep[];
+  placed: { box: Box; streamHeight: number } | null;
+}
+
+export interface OwnButton {
+  label: string;
+  note: string;
+  disabled: boolean;
+}
+
+export const OWN_GPU_SECONDS = 60;
+
+function ownButton(st: FleetState, srvNow: number, online: boolean, busy: boolean): OwnButton {
+  const b = st.borrow;
+  const label = "Get your own GPU";
+  if (b === null || b.cap === 0) return { label, note: "this fleet lends no GPUs", disabled: true };
+  if (b.lent >= b.cap) {
+    const when = b.next_return_at === null ? "soon" : `in ${fmt.countdown(b.next_return_at - srvNow)}`;
+    const out = b.cap === 1 ? "the one GPU we lend is out" : `all ${b.cap} GPUs we lend are out`;
+    return { label, note: `${out}; try again ${when}`, disabled: true };
+  }
+  return { label, note: `borrow one of the wall's GPUs for a minute (${b.cap - b.lent} of ${b.cap} free)`, disabled: !online || busy };
+}
+
+function ownView(s: ClientState, st: FleetState, srvNow: number, input: WallInput): OwnView | null {
+  const own = s.own;
+  if (own.requestId === null && own.claim === null) return null;
+  const c = own.claim;
+  const clickedAt = c?.clicked_at ?? (own.requestedAt !== null ? serverNow(s.clock, own.requestedAt) : srvNow);
+  const first = c?.first_frame_at ?? null;
+  const ended = c?.phase === "ended";
+  const placed = input.ownArea && c && !ended ? (() => {
+    const box = fitContain(input.ownArea!, st.image_aspect);
+    const b = { x: snap(box.x, input.dpr), y: snap(box.y, input.dpr), w: snap(box.x + box.w, input.dpr) - snap(box.x, input.dpr), h: snap(box.y + box.h, input.dpr) - snap(box.y, input.dpr) };
+    return { box: b, streamHeight: Math.min(NATIVE_TILE_HEIGHT, streamHeightFor(b.h * input.dpr)) };
+  })() : null;
+  const left = c?.expires_at != null ? c.expires_at - srvNow : null;
+  const status = ended
+    ? c?.ended ?? "Your minute is up. The GPU went back to the pool."
+    : first === null
+      ? c ? "Restoring a VM for you" : "Asking for a GPU"
+      : "Your GPU is streaming";
   return {
-    up: { label: "Up", value: `${st.tiles.filter(isLive).length}/${st.tiles.length}` },
-    fcvm: { label: "fcvm relaunch", value: mf === null ? "--" : fmt.seconds(mf) },
-    ec2: { label: "EC2 relaunch", value: me === null ? "--" : fmt.seconds(me) },
+    title: "Your own GPU",
+    cameraLabel: "Camera",
+    moves: CAMERA_MOVES,
+    status,
+    timerLabel: "Click to first frame",
+    timer: first === null ? fmt.raceClock(srvNow - clickedAt) : fmt.seconds(first - clickedAt),
+    timerRunning: first === null && !ended,
+    countdownLabel: ended ? "" : "Back to the pool in",
+    countdown: ended ? "" : left === null ? fmt.countdown(OWN_GPU_SECONDS * 1000) : fmt.countdown(left),
+    ended,
+    back: "Back to the wall",
+    help: "Drag to turn the camera, scroll to move closer. Arrow keys and plus or minus work too.",
+    latency: s.lastInputLatencyMs === null ? "move the camera to measure input to pixels" : `input to pixels: ${fmt.millis(s.lastInputLatencyMs)}`,
+    gpu: c?.gpu ?? "",
+    steps: c ? timelineOf(c.phases).steps : [],
+    placed,
   };
 }
 
 // ---- what the frame drawer gets -------------------------------------------------
 
-/** One frame stream the drawer may open: a tile's renderer, or an aggregator. */
+/** One frame stream the drawer may open: a tile's renderer, an aggregator, or the viewer's own GPU. */
 export interface DrawSource {
-  /** `d:<tile id>` for a tile's own stream, `a:<aggregator id>` for an aggregator. */
+  /** `d:<tile id>`, `a:<aggregate id>`, or `o:<claim id>`. */
   id: string;
   /** Frame socket URL with h (and q), or null: do not connect. */
   url: string | null;
   baseUrl: string | null;
   height: number;
-  /** Where it is drawn in the mosaic, or null: keep streaming, do not draw. */
+  /** Where it is drawn, or null: keep streaming, do not draw. */
   box: Box | null;
 }
 
@@ -739,10 +718,12 @@ export interface DrawTile {
   id: string;
   half: Half;
   box: Box | null;
-  /** Drawn dark over any frame (a relaunch, no GPU, no frames yet). */
+  /** Drawn dark over any frame (a restart, no GPU, a failure). */
   dark: boolean;
-  /** Outline of a dark tile, in its half's colour. */
+  /** Outline of a dark tile. */
   outline: string;
+  /** Its dark-out fades over at least BORROW_FADE_MS. */
+  slowFade: boolean;
 }
 
 export interface DrawPlan {
@@ -751,25 +732,35 @@ export interface DrawPlan {
   direct: DrawSource[];
   aggregated: DrawSource[];
   tiles: DrawTile[];
-  /** With a tile opened: its direct source, drawn alone. */
+  /** With a VM opened or the viewer's own GPU: that stream, drawn alone. */
   focus: DrawSource | null;
   image: Box | null;
   dpr: number;
   darkFill: string;
   /** What the direct streams cost at the renderer's bit rate, bits per second. */
   estimatedBps: number;
+  /** The poster drawn where no stream has shown a frame yet. */
+  poster: string | null;
+  /** Hold the picture still. */
+  paused: boolean;
+  /** A tile going dark fades over this long (0: at once). */
+  darkFadeMs: number;
+  /** The tab has been hidden long enough: close every frame stream, keep the last picture. */
+  suspended: boolean;
 }
 
-/** The source a tile's pixels come from in a mode: its own stream, or the aggregator holding its centre. */
-export function sourceIdFor(t: Tile, mode: StreamMode, aggregators: readonly { id: string; rect: Rect }[]): string {
+/** The source a tile's pixels come from in a mode: its own stream, or the aggregate holding it. */
+export function sourceIdFor(t: Tile, mode: StreamMode, aggregates: readonly { id: string; rect: Rect; tiles?: string[] }[]): string {
   if (mode === "direct") return `d:${t.id}`;
+  const listed = aggregates.find((g) => g.tiles?.includes(t.id));
+  if (listed) return `a:${listed.id}`;
   const cx = t.rect.x + t.rect.w / 2;
   const cy = t.rect.y + t.rect.h / 2;
-  const a = aggregators.find((g) => cx >= g.rect.x && cx < g.rect.x + g.rect.w && cy >= g.rect.y && cy < g.rect.y + g.rect.h);
+  const a = aggregates.find((g) => cx >= g.rect.x && cx < g.rect.x + g.rect.w && cy >= g.rect.y && cy < g.rect.y + g.rect.h);
   return a ? `a:${a.id}` : `d:${t.id}`;
 }
 
-// ---- seams --------------------------------------------------------------------
+// ---- seams, labels, captions ------------------------------------------------------
 
 export interface SeamView {
   /** Fade every boundary in (the pointer is over the image, or a press or key focus). */
@@ -778,7 +769,7 @@ export interface SeamView {
   /** One device pixel, in CSS pixels. */
   lineWidth: number;
   outline: { box: Box; color: string } | null;
-  /** The label's top-left corner, placed off the cards and inside the image's area. */
+  /** The label's top-left corner, placed off the boxes to avoid and inside the image's area. */
   label: (HoverLabel & { accent: string; x: number; y: number }) | null;
 }
 
@@ -788,8 +779,9 @@ function overlaps(a: Box, b: Box): boolean {
 
 /**
  * Where the hover label goes: the first of above, below, beside and inside the
- * tile that stays inside the area and covers none of the boxes to avoid (the
- * race and counter cards). Failing all, the one covering the least of them.
+ * tile that stays inside the area and covers none of the boxes to avoid.
+ * Failing all, the same places pushed past what they hit, then the one covering
+ * the least.
  */
 export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box, avoid: readonly Box[]): { x: number; y: number } {
   const gap = 6;
@@ -816,7 +808,6 @@ export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box,
   };
   const clean = candidates.find((c) => inside(c) && cover(c) === 0);
   if (clean) return clean;
-  // Then the same places pushed just past whatever card they hit.
   const pushed: { x: number; y: number }[] = [];
   for (const c of candidates) {
     for (const a of avoid) {
@@ -831,10 +822,30 @@ export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box,
   return pool.reduce((best, c) => (cover(c) < cover(best) ? c : best));
 }
 
-function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[], input: WallInput): SeamView {
+/** How long the returning label stays after the borrowed tile's first frame. */
+export const RETURNING_HOLD_MS = 4000;
+
+const RESTORING_PHASES = new Set(["borrowed", "relaunching", "requested", "stopping", "restoring", "starting", "pending"]);
+
+/** Whether this viewer's borrowed tile is still coming back (not yet streaming for RETURNING_HOLD_MS). */
+export function stillReturning(st: FleetState, id: string | null, srvNow: number): boolean {
+  if (id === null) return false;
+  const t = st.tiles.find((x) => x.id === id);
+  if (!t) return false;
+  // Still lent, or restoring back in; a tile that is not on its way back (its host reclaimed, failed) drops the label.
+  if (t.borrowed !== null || RESTORING_PHASES.has(t.phase)) return true;
+  if (t.phase !== "running") return false;
+  const ff = t.last_relaunch?.first_frame_at ?? null;
+  return ff !== null && srvNow - ff < RETURNING_HOLD_MS;
+}
+
+function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[], input: WallInput, returning: boolean): SeamView {
   const dpr = input.dpr;
-  const target = s.ui.hoverId ?? s.ui.keyId;
-  const tv = target === null ? null : tiles.find((t) => t.id === target) ?? null;
+  const hovered = s.ui.hoverId ?? s.ui.keyId;
+  const target = hovered ?? (returning ? s.ui.returning : null);
+  const back = hovered === null && returning;
+  const found = target === null ? null : tiles.find((t) => t.id === target) ?? null;
+  const tv = found && back ? { ...found, hover: { ...found.hover, last: found.dark ? "your borrowed GPU, coming back" : "your borrowed GPU is back" } } : found;
   const segments = layout ? seamSegments(layout.tiles, layout.image, dpr) : [];
   let label: SeamView["label"] = null;
   if (tv && tv.box && layout) {
@@ -851,23 +862,67 @@ function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[]
   };
 }
 
+export interface StageLabels {
+  /** "fcvm" and "EC2" on backplates either side of the seam, top of the image. */
+  seam: { half: Half; text: string; x: number; y: number; align: "right" | "left" }[];
+  /** One line under each half. */
+  captions: { half: Half; tag: string; text: string; box: Box }[];
+}
+
+/** Height kept under the image for the captions. */
+export const CAPTION_BAND = 44;
+
+function stageLabels(layout: MosaicLayout | null): StageLabels {
+  if (!layout) return { seam: [], captions: [] };
+  const img = layout.image;
+  const mid = layout.halfLineX;
+  return {
+    seam: [
+      { half: "fcvm", text: "fcvm", x: mid - 8, y: img.y + 10, align: "right" },
+      { half: "ec2", text: "EC2", x: mid + 8, y: img.y + 10, align: "left" },
+    ],
+    captions: [
+      { half: "fcvm", tag: "fcvm", text: CAPTIONS.fcvm, box: { x: img.x, y: img.y + img.h + 6, w: mid - img.x - 8, h: 0 } },
+      { half: "ec2", tag: "EC2", text: CAPTIONS.ec2, box: { x: mid + 8, y: img.y + img.h + 6, w: img.x + img.w - mid - 8, h: 0 } },
+    ],
+  };
+}
+
 // ---- the whole page ------------------------------------------------------------
+
+export interface Banner {
+  kind: "decode" | "connecting" | "offline" | "reclaimed";
+  text: string;
+}
 
 export interface WallView {
   title: string;
   site: string;
+  sentence: string;
   ready: boolean;
   version: number;
-  banner: string | null;
+  online: boolean;
+  banners: Banner[];
   layout: MosaicLayout | null;
   tiles: TileView[];
-  race: RaceView | null;
-  controls: ControlsView | null;
-  ticker: TickerItem[];
+  score: ScoreView | null;
+  labels: StageLabels;
+  play: PlayView | null;
+  playButton: { label: string; open: boolean };
+  pause: { label: string; on: boolean };
+  feed: FeedItem[];
   focus: FocusView | null;
-  phone: PhoneView | null;
+  own: OwnView | null;
+  ownButton: OwnButton | null;
+  /** Shown when this viewer's claim was refused. */
+  ownRefusal: { text: string; dismiss: string } | null;
+  viewers: string;
+  help: string;
+  rotateHint: string;
   plan: DrawPlan;
   seams: SeamView;
+  /** This viewer's borrowed tile is coming back into the image (labelled until it streams). */
+  returning: boolean;
   gridLabel: string;
   notices: { key: string; text: string }[];
   /** What the streams cost, for the stats switch. */
@@ -878,57 +933,120 @@ export function pendingIntents(s: ClientState): IntentMsg[] {
   return s.pending.map((p) => p.intent);
 }
 
+/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
+const CAPTION_CHAR_PX = 7.4;
+const CAPTION_LINE_PX = 18;
+
+/**
+ * The image's area: the stage less the band its captions sit in, tall enough
+ * for the longer caption at the width half the image will have.
+ */
+export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9): Box {
+  if (phone) return stage;
+  let band = CAPTION_BAND;
+  for (let i = 0; i < 3; i++) {
+    const half = Math.min(stage.w, (stage.h - band) * aspect) / 2 - 8;
+    const chars = Math.max(...Object.values(CAPTIONS).map((c) => c.length + 6));
+    const lines = Math.max(1, Math.ceil((chars * CAPTION_CHAR_PX) / Math.max(1, half)));
+    band = Math.max(CAPTION_BAND, lines * CAPTION_LINE_PX + 8);
+  }
+  return { x: stage.x, y: stage.y, w: stage.w, h: Math.max(0, stage.h - band) };
+}
+
 export function wallView(input: WallInput): WallView {
   const s = input.state;
   const st = s.accepted;
   const srvNow = serverNow(s.clock, input.now);
-  let banner: string | null = null;
+  const online = s.connection === "open";
+  const banners: Banner[] = [];
   if (!input.canDecode) {
-    banner = "This browser cannot decode H.264 with WebCodecs, so the tiles stay dark. Chrome, Edge and Safari 16.4 or later can.";
-  } else if (s.connection === "closed") {
-    banner = "Lost the connection to the fleet. Reconnecting.";
-  } else if (!st) {
-    banner = "Connecting to the fleet.";
+    banners.push({ kind: "decode", text: "This browser cannot decode H.264 with WebCodecs, so the picture stays still. Chrome, Edge and Safari 16.4 or later can." });
   }
-  const emptyPlan: DrawPlan = { mode: "direct", direct: [], aggregated: [], tiles: [], focus: null, image: null, dpr: input.dpr, darkFill: "#06080B", estimatedBps: 0 };
   if (!st) {
+    banners.push({ kind: "connecting", text: s.connection === "closed" ? "Cannot reach the fleet yet. Trying again." : "Connecting to the fleet." });
+  } else if (!online) {
+    banners.push({ kind: "offline", text: "The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back." });
+  }
+  if (st) {
+    const draining = st.fleet.hosts.filter((h) => h.draining);
+    if (draining.length > 0) {
+      banners.push({
+        kind: "reclaimed",
+        text: `AWS reclaimed ${draining.length === 1 ? "an fcvm host" : `${draining.length} fcvm hosts`}. Its squares stay dark while the image is re-tiled onto the GPUs left.`,
+      });
+    }
+  }
+  const poster = input.poster ?? null;
+  const emptyPlan: DrawPlan = {
+    mode: s.ui.mode,
+    direct: [],
+    aggregated: [],
+    tiles: [],
+    focus: null,
+    image: null,
+    dpr: input.dpr,
+    darkFill: "#06080B",
+    estimatedBps: 0,
+    poster,
+    paused: s.ui.paused,
+    darkFadeMs: input.reducedMotion ? REDUCED_MOTION_DARK_FADE_MS : 0,
+    suspended: s.ui.suspended,
+  };
+  const area = input.mosaicArea ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect) : null;
+  const common = {
+    title: TITLE,
+    site: SITE,
+    sentence: SENTENCE,
+    version: s.version,
+    online,
+    banners,
+    playButton: { label: "Play", open: s.ui.drawer },
+    pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
+    help: "Click a square to look at its VM.",
+    rotateHint: "Turn your phone sideways for a bigger picture.",
+  };
+  if (!st) {
+    // Before the first snapshot the poster still goes where the image will be.
+    const image = area ? fitContain(area, 16 / 9) : null;
     return {
-      title: TITLE,
-      site: SITE,
+      ...common,
       ready: false,
-      version: s.version,
-      banner,
       layout: null,
       tiles: [],
-      race: null,
-      controls: null,
-      ticker: [],
+      score: null,
+      labels: { seam: [], captions: [] },
+      play: null,
+      feed: [],
       focus: null,
-      phone: null,
-      plan: emptyPlan,
+      own: null,
+      ownButton: null,
+      ownRefusal: null,
+      viewers: "",
+      plan: { ...emptyPlan, image },
       seams: { visible: false, segments: [], lineWidth: 1 / input.dpr, outline: null, label: null },
+      returning: false,
       gridLabel: "",
       notices: [],
       bandwidth: "",
     };
   }
   const pend = pendingIntents(s);
-  const layout = input.mosaicArea ? layoutMosaic(input.mosaicArea, st.tiles, input.dpr, st.image_aspect) : null;
-  const placedById = new Map(layout?.tiles.map((p) => [p.id, p]) ?? []);
+  const layout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
+  const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
   const tiles = st.tiles.map((t) => tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend));
   const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
-  const focus = focusTile
-    ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input)
-    : null;
+  const focus = focusTile ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online) : null;
+  const own = ownView(s, st, srvNow, input);
+  const covered = focus !== null || own !== null;
 
-  // Direct: each tile asks for the device pixels it covers; with a tile
-  // opened, the others (still streaming, not drawn) ask for the smallest; then
-  // small tiles drop to q=lo and the tallest step down until the streams fit
-  // the bandwidth budget.
-  const opened = focus && focus.placed ? focusTile : null;
+  // Direct: each tile asks for the device pixels it covers; with a VM opened
+  // or the viewer's own GPU on screen, the others (still streaming, not drawn)
+  // ask for the smallest; then small tiles drop to q=lo and the tallest step
+  // down until the streams fit the bandwidth budget.
+  const opened = focus && focus.placed && !own ? focusTile : null;
   const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
     const focused = opened !== null && opened.id === t.id;
-    const height = focused ? focus!.placed!.streamHeight : focus ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
+    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
@@ -940,59 +1058,63 @@ export function wallView(input: WallInput): WallView {
       url: frameSocketUrl(t.frame_url!, height, q),
       baseUrl: t.frame_url,
       height,
-      box: focus ? (opened?.id === t.id ? focus.placed!.box : null) : placedById.get(t.id)?.box ?? null,
+      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedById.get(t.id)?.box ?? null,
     };
   });
-  // Aggregated: each aggregator is one big tile; it asks for the height its
-  // region covers, like a tile.
-  const aggregated: DrawSource[] = st.aggregators
+  // Aggregated: each region is one big tile; it asks for the height it covers.
+  const aggregated: DrawSource[] = st.aggregates
     .filter((g) => g.frame_url !== null)
     .map((g) => {
       const box = layout ? rectOnScreen(layout.image, g.rect, input.dpr) : null;
-      const height = focus || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
-      return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: focus ? null : box };
+      const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
+      return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: covered ? null : box };
     });
+  let focusSource: DrawSource | null = null;
+  if (own && own.placed && s.own.claim?.frame_url) {
+    const c = s.own.claim;
+    focusSource = { id: `o:${c.id}`, url: frameSocketUrl(c.frame_url!, own.placed.streamHeight), baseUrl: c.frame_url, height: own.placed.streamHeight, box: own.placed.box };
+  } else if (opened) {
+    focusSource = direct.find((d) => d.id === `d:${opened.id}`) ?? null;
+  }
   const plan: DrawPlan = {
     ...emptyPlan,
-    mode: st.aggregators.length > 0 ? s.ui.mode : "direct",
+    mode: st.aggregates.some((a) => a.frame_url !== null) ? s.ui.mode : "direct",
     direct,
     aggregated,
-    focus: opened ? direct.find((d) => d.id === `d:${opened.id}`) ?? null : null,
+    focus: focusSource,
     estimatedBps: fitted.bps,
-    image: focus ? null : layout?.image ?? null,
+    image: covered ? null : layout?.image ?? null,
     tiles: st.tiles.map((t, i) => {
       const tv = tiles[i]!;
-      return {
-        id: t.id,
-        half: t.half,
-        box: focus ? null : placedById.get(t.id)?.box ?? null,
-        dark: tv.dark && !(tv.darkPhase === "connecting"),
-        outline: COLORS[t.half].darkOutline,
-      };
+      return { id: t.id, half: t.half, box: covered ? null : placedById.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
     }),
   };
 
+  const play = playView(s, st, srvNow, pend, plan, input, online);
+  const returning = stillReturning(st, s.ui.returning, srvNow);
   return {
-    title: TITLE,
-    site: SITE,
+    ...common,
     ready: true,
-    version: s.version,
-    banner,
     layout,
     tiles,
-    race: raceView(st, srvNow),
-    controls: { ...controlsView(s, st, srvNow, pend), mode: modeView(s, st, plan, input) },
-    ticker: tickerView(st, srvNow, s.you),
+    score: scoreView({ st, now: srvNow, pending: pend, online }),
+    labels: stageLabels(covered ? null : layout),
+    play,
+    feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
     focus,
-    phone: input.phone ? phoneView(st) : null,
+    own,
+    ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
+    ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
+    viewers: fmt.count(st.viewers.count, "person watching", "people watching"),
     plan,
-    seams: seamView(s, focus ? null : layout, tiles, input),
+    seams: seamView(s, covered ? null : layout, tiles, input, returning),
+    returning,
     bandwidth: `${fmt.count(plan.direct.length, "direct stream", "direct streams")}, about ${fmt.mbps(plan.estimatedBps)} at the renderer's bit rate`,
     notices: s.notices.flatMap((n) => {
       const text = noticeText(n);
       return text === null ? [] : [{ key: n.id, text }];
     }),
-    gridLabel: `The image, ${fmt.count(st.tiles.length, "tile", "tiles")}: fcvm on the left, EC2 on the right. Arrow keys move between tiles, Enter opens one.`,
+    gridLabel: `The image, ${fmt.count(st.tiles.length, "square", "squares")}: fcvm on the left, EC2 on the right. Arrow keys move between squares, Enter opens one.`,
   };
 }
 
@@ -1000,16 +1122,22 @@ export function wallView(input: WallInput): WallView {
 export const NOTICE_MS = 8000;
 
 const INTENT_LABEL: Record<string, string> = {
-  relaunch_all: "Relaunch all",
-  set_auto_relaunch: "Auto-relaunch",
+  relaunch_all: "The restart",
+  relaunch: "The restart",
   light: "The light",
   time_of_day: "The time of day",
-  camera: "The camera move",
+  nudge: "Your choice of stop",
 };
 
-/** A refused action, as the page says it. Words have their own status line. */
+/** A refused action, as the page says it. Words and claims have their own lines. */
 export function noticeText(n: Notice): string | null {
-  if (n.kind !== "refused" || n.intent === "word") return null;
-  const what = n.intent === "relaunch" ? `Relaunch ${String(n.args["tile"] ?? "")}` : INTENT_LABEL[n.intent] ?? n.intent;
+  if (n.kind !== "refused" || n.intent === "word" || n.intent === "claim_gpu" || n.intent === "claim_camera" || n.intent === "release_gpu") return null;
+  const what = INTENT_LABEL[n.intent] ?? n.intent;
   return `${what} was not applied${n.reason ? `: ${n.reason}` : ""}`;
 }
+
+/** Whether the page must verify the viewer before sending an action. */
+export function needsVerify(s: ClientState): boolean {
+  return s.turnstile.sitekey !== null && !s.turnstile.verified;
+}
+

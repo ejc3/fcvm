@@ -12,6 +12,8 @@ import {
   parseServerMsg,
   ProtocolError,
   receiptApplied,
+  type CameraKey,
+  type Claim,
   type FleetState,
   type IntentMsg,
   type IntentName,
@@ -68,10 +70,8 @@ export interface FrameStats {
 export type StreamMode = "direct" | "aggregated";
 
 export interface UiState {
-  /** How this viewer receives the image: the mode it wants. */
+  /** How this viewer receives the image: the mode it wants (aggregated unless it asks to see every VM). */
   mode: StreamMode;
-  /** The viewer picked the mode (the page stops suggesting one). */
-  modeChosen: boolean;
   /** The mode the canvas is drawing now; it changes when the switch is complete. */
   shownMode: StreamMode;
   focusId: string | null;
@@ -82,6 +82,62 @@ export interface UiState {
   pointerOverImage: boolean;
   stats: boolean;
   lightMode: boolean;
+  /** The Play drawer is open. */
+  drawer: boolean;
+  /** The viewer paused the moving picture. */
+  paused: boolean;
+  /** The wall tile whose GPU this viewer borrowed, while it comes back into the image. */
+  returning: string | null;
+  /** When the tab was hidden (local Unix ms), or null while it is visible. */
+  hiddenSince: number | null;
+  /** The frame streams are closed: the tab has been hidden for HIDDEN_PAUSE_MS. */
+  suspended: boolean;
+}
+
+/** A tab hidden this long stops its frame streams; the coordinator socket stays. */
+export const HIDDEN_PAUSE_MS = 5 * 60_000;
+
+/**
+ * Whether the streams should be closed: hidden for at least the limit, judged
+ * from the visibilitychange time, so a throttled background timer that fires
+ * late still decides correctly.
+ */
+export function streamsSuspended(hiddenSince: number | null, now: number, limitMs: number = HIDDEN_PAUSE_MS): boolean {
+  return hiddenSince !== null && now - hiddenSince >= limitMs;
+}
+
+/** A GPU reading kept for the detail view's history. */
+export interface GpuSample {
+  at: number;
+  temp_c: number | null;
+  power_w: number | null;
+  util_pct: number | null;
+}
+
+/** An action held until this connection is verified. */
+export interface QueuedAction {
+  name: IntentName;
+  args: Record<string, unknown>;
+}
+
+export interface TurnstileState {
+  /** The site key from hello; null when actions need no verification. */
+  sitekey: string | null;
+  verified: boolean;
+  /** A token was sent and its answer has not come. */
+  verifying: boolean;
+  error: string | null;
+  /** Actions pressed before verification, sent once it succeeds. */
+  queued: QueuedAction[];
+}
+
+export interface OwnGpu {
+  /** The claim_gpu intent's id, while its receipt is awaited. */
+  requestId: string | null;
+  requestedAt: number | null;
+  claim: Claim | null;
+  /** Why the coordinator refused the claim. */
+  refused: string | null;
 }
 
 export interface ClientState {
@@ -102,6 +158,10 @@ export interface ClientState {
   serverError: string | null;
   /** This connection's viewer id, once the coordinator says it. */
   you: string | null;
+  turnstile: TurnstileState;
+  own: OwnGpu;
+  /** Recent GPU readings per tile, oldest first. */
+  gpuHistory: Record<string, GpuSample[]>;
   ui: UiState;
 }
 
@@ -113,11 +173,21 @@ export type ClientEvent =
   | { type: "frame-stats"; stats: FrameStats }
   | { type: "camera-drawn"; id: string; drawnAt: number }
   | { type: "ui"; patch: Partial<UiState> }
-  | { type: "notice-expired"; before: number };
+  | { type: "notice-expired"; before: number }
+  /** An action pressed before verification. */
+  | { type: "queue"; action: QueuedAction }
+  | { type: "verify-sent" }
+  /** The queued actions were sent. */
+  | { type: "queue-sent" }
+  | { type: "turnstile-error"; error: string }
+  /** The viewer closed its own-GPU view, or dismissed a refusal. */
+  | { type: "own-closed" };
 
 const HANDLED_KEPT = 512;
 const NOTICES_KEPT = 6;
 const WATCHES_KEPT = 32;
+/** GPU readings kept per tile: two minutes at the coordinator's two-second cadence. */
+export const GPU_HISTORY = 60;
 
 export function initialState(): ClientState {
   return {
@@ -135,7 +205,24 @@ export function initialState(): ClientState {
     lastProtocolError: null,
     serverError: null,
     you: null,
-    ui: { mode: "direct", modeChosen: false, shownMode: "direct", focusId: null, hoverId: null, keyId: null, pointerOverImage: false, stats: false, lightMode: false },
+    turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [] },
+    own: { requestId: null, requestedAt: null, claim: null, refused: null },
+    gpuHistory: {},
+    ui: {
+      mode: "aggregated",
+      shownMode: "aggregated",
+      focusId: null,
+      hoverId: null,
+      keyId: null,
+      pointerOverImage: false,
+      stats: false,
+      lightMode: false,
+      drawer: false,
+      paused: false,
+      returning: null,
+      hiddenSince: null,
+      suspended: false,
+    },
   };
 }
 
@@ -144,9 +231,28 @@ function settle(pending: PendingIntent[], version: number): PendingIntent[] {
   return pending.filter((p) => p.receipt === null || p.receipt.version > version);
 }
 
-function latestKeyT(state: FleetState | null): number | null {
-  if (!state || state.scene.camera.length === 0) return null;
-  return Math.max(...state.scene.camera.map((k) => k.t));
+/** The camera keys a viewer's own camera intents land in: its own GPU's. */
+function ownKeys(s: ClientState): CameraKey[] | null {
+  return s.own.claim?.camera ?? null;
+}
+
+function latestKeyT(keys: readonly CameraKey[] | null): number | null {
+  if (!keys || keys.length === 0) return null;
+  return Math.max(...keys.map((k) => k.t));
+}
+
+function appendGpu(history: Record<string, GpuSample[]>, st: FleetState, at: number): Record<string, GpuSample[]> {
+  let out = history;
+  for (const t of st.tiles) {
+    if (!t.gpu) continue;
+    const h = history[t.id] ?? [];
+    const last = h[h.length - 1];
+    const same = last && last.temp_c === t.gpu.temp_c && last.power_w === t.gpu.power_w && last.util_pct === t.gpu.util_pct;
+    if (same) continue;
+    if (out === history) out = { ...history };
+    out[t.id] = [...h, { at, temp_c: t.gpu.temp_c, power_w: t.gpu.power_w, util_pct: t.gpu.util_pct }].slice(-GPU_HISTORY);
+  }
+  return out;
 }
 
 /**
@@ -154,11 +260,11 @@ function latestKeyT(state: FleetState | null): number | null {
  * intent's id, or, untagged, the first key newer than any the page held when it
  * sent the intent, once the receipt's version is accepted.
  */
-function resolveWatch(w: CameraWatch, state: FleetState | null, version: number): CameraWatch {
-  if (w.tEff !== null || !state) return w;
-  for (const k of state.scene.camera) if (k.intent === w.id) return { ...w, tEff: k.t };
+function resolveWatch(w: CameraWatch, keys: readonly CameraKey[] | null, version: number): CameraWatch {
+  if (w.tEff !== null || !keys) return w;
+  for (const k of keys) if (k.intent === w.id) return { ...w, tEff: k.t };
   if (w.receiptVersion === null || version < w.receiptVersion) return w;
-  const newer = state.scene.camera.filter((k) => w.keysBefore === null || k.t > w.keysBefore).map((k) => k.t);
+  const newer = keys.filter((k) => w.keysBefore === null || k.t > w.keysBefore).map((k) => k.t);
   return newer.length === 0 ? w : { ...w, tEff: Math.min(...newer) };
 }
 
@@ -176,13 +282,15 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       if (s.pending.some((p) => p.intent.id === e.intent.id)) return s;
       const pending = [...s.pending, { intent: e.intent, sentAt: e.at, receipt: null }];
       const cameraWatches =
-        e.intent.name === "camera"
+        e.intent.name === "claim_camera"
           ? [
               ...s.cameraWatches,
-              { id: e.intent.id, inputAt: e.at, keysBefore: latestKeyT(s.accepted), receiptVersion: null, tEff: null },
+              { id: e.intent.id, inputAt: e.at, keysBefore: latestKeyT(ownKeys(s)), receiptVersion: null, tEff: null },
             ].slice(-WATCHES_KEPT)
           : s.cameraWatches;
-      return { ...s, pending, cameraWatches };
+      const own =
+        e.intent.name === "claim_gpu" ? { requestId: e.intent.id, requestedAt: e.at, claim: null, refused: null } : s.own;
+      return { ...s, pending, cameraWatches, own };
     }
     case "frame-stats":
       return { ...s, frames: e.stats };
@@ -199,6 +307,16 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, ui: { ...s.ui, ...e.patch } };
     case "notice-expired":
       return { ...s, notices: s.notices.filter((n) => n.at >= e.before) };
+    case "queue":
+      return { ...s, turnstile: { ...s.turnstile, queued: [...s.turnstile.queued, e.action].slice(-8), error: null } };
+    case "verify-sent":
+      return { ...s, turnstile: { ...s.turnstile, verifying: true, error: null } };
+    case "queue-sent":
+      return { ...s, turnstile: { ...s.turnstile, queued: [] } };
+    case "turnstile-error":
+      return { ...s, turnstile: { ...s.turnstile, verifying: false, error: e.error } };
+    case "own-closed":
+      return { ...s, own: { requestId: null, requestedAt: null, claim: null, refused: null } };
     case "message": {
       let msg;
       try {
@@ -215,13 +333,38 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           return { ...s, clock: clockReceived(s.clock, msg.server_unix_ms, e.at, msg.client_unix_ms) };
         case "error":
           return { ...s, serverError: msg.reason };
-        case "welcome":
-          return { ...s, you: msg.viewer };
+        case "hello":
+          // A new connection: verification belongs to the connection, so it starts over.
+          return {
+            ...s,
+            you: msg.viewer,
+            turnstile: { ...s.turnstile, sitekey: msg.turnstile, verified: false, verifying: false, error: null },
+          };
+        case "verified":
+          return {
+            ...s,
+            turnstile: { ...s.turnstile, verified: msg.ok, verifying: false, error: msg.ok ? null : msg.reason ?? "verification failed" },
+          };
+        case "claim": {
+          // Only the claim this page asked for, or the one it holds.
+          if (s.own.requestId === null && s.own.claim === null) return s;
+          if (s.own.claim !== null && s.own.claim.id !== msg.claim.id) return s;
+          const own = { ...s.own, requestId: null, claim: msg.claim };
+          const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, msg.claim.camera, s.version));
+          return { ...s, own, cameraWatches };
+        }
         case "snapshot": {
           if (msg.version <= s.version) return s; // older or repeated: dropped
           const accepted = msg.state;
-          const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, accepted, msg.version));
-          return { ...s, accepted, version: msg.version, pending: settle(s.pending, msg.version), cameraWatches, you: msg.you ?? s.you };
+          const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, ownKeys(s), msg.version));
+          return {
+            ...s,
+            accepted,
+            version: msg.version,
+            pending: settle(s.pending, msg.version),
+            cameraWatches,
+            gpuHistory: appendGpu(s.gpuHistory, accepted, e.at),
+          };
         }
         case "receipt": {
           if (s.handled.includes(msg.id)) return s; // a repeated receipt
@@ -253,10 +396,15 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           }
           const cameraWatches = applied
             ? s.cameraWatches.map((w) =>
-                w.id === msg.id ? resolveWatch({ ...w, receiptVersion: msg.version }, s.accepted, s.version) : w,
+                w.id === msg.id ? resolveWatch({ ...w, receiptVersion: msg.version }, ownKeys(s), s.version) : w,
               )
             : s.cameraWatches.filter((w) => w.id !== msg.id);
-          return { ...s, handled, pending, notices, cameraWatches };
+          let own = s.own;
+          if (s.own.requestId === msg.id) {
+            // Applied: the claim message (which can come before or after this) ends the request.
+            if (!applied) own = { ...s.own, requestId: null, requestedAt: null, refused: msg.reason ?? "refused" };
+          }
+          return { ...s, handled, pending, notices, cameraWatches, own };
         }
       }
     }

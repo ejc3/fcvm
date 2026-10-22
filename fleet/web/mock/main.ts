@@ -5,8 +5,17 @@
 //   FLEET_MOCK_HOST          host name the browser uses for frame_url (localhost)
 //   FLEET_MOCK_TILES         tiles per half (8, so 16 in all)
 //   FLEET_MOCK_EC2_SHORT     EC2 tiles waiting for capacity (1)
-//   FLEET_MOCK_FCVM_MS       fcvm relaunch time (3000)
-//   FLEET_MOCK_EC2_MS        EC2 relaunch time (60000)
+//   FLEET_MOCK_GPUS_PER_HOST GPUs per fcvm host (8)
+//   FLEET_MOCK_FCVM_MS       typical fcvm restart (3000; each takes 0.87 to 1.13 of it)
+//   FLEET_MOCK_EC2_MS        typical EC2 restart (52000; each takes 0.67 to 1.33 of it)
+//   FLEET_MOCK_RACE_EVERY_S  the owner's cadence: restart every GPU this often (300; 0 for none)
+//   FLEET_MOCK_FIRST_RACE_S  the first scheduled restart, after start (20)
+//   FLEET_MOCK_COOLDOWN_S    after a restart of every GPU, "restart now" waits this long (60)
+//   FLEET_MOCK_WAIT_PERCENT  chance in percent that a race's EC2 half waits for spot capacity (25)
+//   FLEET_MOCK_BORROW_CAP    wall GPUs lent to visitors at most at once (2)
+//   FLEET_MOCK_CLAIM_S       how long a claimed GPU lasts (60)
+//   FLEET_MOCK_HOLD_S        how long the directed camera holds on a stop (20)
+//   FLEET_MOCK_TURNSTILE     a Turnstile site key: actions need the check (unset: none)
 //   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
@@ -62,8 +71,19 @@ export async function startMock() {
     port: int("FLEET_MOCK_COORD_PORT"),
     perHalf: int("FLEET_MOCK_TILES", 8),
     ec2Short: int("FLEET_MOCK_EC2_SHORT", 1),
+    gpusPerHost: Math.max(1, int("FLEET_MOCK_GPUS_PER_HOST", 8)),
     fcvmRelaunchMs: int("FLEET_MOCK_FCVM_MS", 3000),
-    ec2RelaunchMs: int("FLEET_MOCK_EC2_MS", 60000),
+    ec2RelaunchMs: int("FLEET_MOCK_EC2_MS", 52000),
+    raceEverySecs: int("FLEET_MOCK_RACE_EVERY_S", 300),
+    firstRaceSecs: int("FLEET_MOCK_FIRST_RACE_S", 20),
+    cooldownSecs: int("FLEET_MOCK_COOLDOWN_S", 60),
+    capacityWaitProb: int("FLEET_MOCK_WAIT_PERCENT", 25) / 100,
+    capacityWaitMs: [10_000, 30_000],
+    borrowCap: int("FLEET_MOCK_BORROW_CAP", 2),
+    claimSecs: int("FLEET_MOCK_CLAIM_S", 60),
+    holdSecs: int("FLEET_MOCK_HOLD_S", 20),
+    travelSecs: 4,
+    turnstileSitekey: process.env.FLEET_MOCK_TURNSTILE || null,
     refusedWords: env("FLEET_MOCK_REFUSED", "forbidden").split(",").filter(Boolean),
     checkMs: 250,
     epochUnixMs,
