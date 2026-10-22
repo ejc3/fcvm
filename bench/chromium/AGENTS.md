@@ -40,10 +40,13 @@ are part of the snapshot identity — give them their own tag
 the same `TAG=` must then be passed to `-verify` and `-run`, or they select
 the default snapshot).
 
-`ARMS=` takes `cdp`, `cdp-fast`, `html`, `html-fast`, `noop` and `exec`.
-`html` is the `cdp` path with `document.documentElement.outerHTML` extracted
-in place of the screenshot; `html-fast` is `html` with `cdp-fast`'s teardown,
-so `analysis.json` carries `request_cpu_ms` for it as it does for `cdp-fast`.
+`ARMS=` takes `cdp`, `cdp-fast`, `html`, `html-fast`, `noop`, `noop-fast`
+and `exec`. `html` is the `cdp` path with `document.documentElement.outerHTML`
+extracted in place of the screenshot; `html-fast` is `html` with `cdp-fast`'s
+teardown, so `analysis.json` carries `request_cpu_ms` for it as it does for
+`cdp-fast`. `noop-fast` restores a clone, holds it until fcvm publishes it
+ready, renders nothing and tears it down fast: its `request_cpu_ms` is the CPU
+of a restore. The drift control stays `noop`.
 `make bench-chromium-corpus-extra PHASES=hostcdp HOSTCDP_ARMS=free,cpu2,cpu4,cpu8`
 runs the host control once with the whole box and once capped at each
 ladder rung's vCPU count (`cpuN`, `CPU_BUDGET=vm-matched`); the default is

@@ -437,15 +437,57 @@ class AnalysisCarriesTheFacts(unittest.TestCase):
                                               "pasta": 30.0},
                     reaped_children_cpu_ms_by_child={"fcvm": 5.0, "firecracker": 0.0,
                                                      "pasta": 0.0},
-                    per_child_cpu={"firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
+                    per_child_cpu={"fcvm": {"reclaim_cpu_ms": 0.0, "complete": True},
+                                   "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
                                    "pasta": {"reclaim_cpu_ms": 0.0, "complete": True}},
                     tick_ms=10.0)
         with tempfile.TemporaryDirectory() as d:
             rc, analysis = self.analyze(d, to_html_fast, **self.FACTS)
         self.assertIsNotNone(analysis, f"the analyzer refused html-fast (rc={rc})")
+        self.assertEqual(analysis["metadata_errors"], [])
         block = analysis["arms"]["html-fast"]["request_cpu_ms"]
         self.assertEqual(block["clone_mean_ms"]["mean"], 670.0 + 5.0 + 110.0)
         self.assertIn("extract_ms", analysis["arms"]["html-fast"])
+
+
+    def test_noop_fast_publishes_the_cpu_of_a_restore_without_a_render(self):
+        def to_noop_fast(rows):
+            for row in rows:
+                if row.get("kind") == "meta":
+                    row["arms"] = ["noop-fast" if a == "cdp-fast" else a for a in row["arms"]]
+                    continue
+                if row["arm"] != "cdp-fast":
+                    continue
+                row["arm"] = "noop-fast"
+                row["record_id"] = row["record_id"].replace(":cdp-fast:", ":noop-fast:")
+                for key in ("render", "endpoint", "state_to_port_ms"):
+                    row.pop(key, None)
+                row["teardown"].update(
+                    lifetime_cpu_ms_by_child={"fcvm": 40.0, "firecracker": 200.0,
+                                              "pasta": 30.0},
+                    reaped_children_cpu_ms_by_child={"fcvm": 5.0, "firecracker": 0.0,
+                                                     "pasta": 0.0},
+                    per_child_cpu={"fcvm": {"reclaim_cpu_ms": 0.0, "complete": True},
+                                   "firecracker": {"reclaim_cpu_ms": 110.0, "complete": True},
+                                   "pasta": {"reclaim_cpu_ms": 0.0, "complete": True}},
+                    tick_ms=10.0)
+        with tempfile.TemporaryDirectory() as d:
+            rc, analysis = self.analyze(d, to_noop_fast, **self.FACTS)
+        self.assertIsNotNone(analysis, f"the analyzer refused noop-fast (rc={rc})")
+        self.assertEqual(analysis["metadata_errors"], [])
+        block = analysis["arms"]["noop-fast"]["request_cpu_ms"]
+        self.assertEqual(block["clone_mean_ms"]["mean"], 270.0 + 5.0 + 110.0)
+        self.assertTrue(analysis["drift"]["evaluated"],
+                        "the drift control is still the noop arm")
+
+        def stale(rows):
+            to_noop_fast(rows)
+            next(r for r in rows if r.get("arm") == "noop-fast")["teardown"].pop(
+                "accounting_version")
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, stale, **self.FACTS)
+        self.assertTrue(any("stale accounting" in e for e in analysis["metadata_errors"]),
+                        "a noop-fast teardown escaped the fast-teardown checks")
 
 
 class HtmlFastArm(unittest.TestCase):
@@ -463,6 +505,12 @@ class HtmlFastArm(unittest.TestCase):
                 reqbench.dispatch_request(argparse.Namespace(), 0, arm, False)
         self.assertEqual(seen, [(False, "screenshot"), (True, "screenshot"),
                                 (False, "html"), (True, "html")])
+        noops = []
+        with mock.patch.object(reqbench, "run_noop_request",
+                               lambda args, rep, fast=False: noops.append(fast) or {}):
+            for arm in ("noop", "noop-fast"):
+                reqbench.dispatch_request(argparse.Namespace(), 0, arm, False)
+        self.assertEqual(noops, [False, True])
         self.assertIn("html-fast", reqbench.allowed_arms_for_engine("chromium"))
         self.assertNotIn("html-fast", reqbench.allowed_arms_for_engine("webkit"))
         self.assertTrue(reqbench.publication_arms_ok({"noop", "html-fast"}))

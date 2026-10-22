@@ -17,6 +17,9 @@ of being reported as one lump:
   html      the cdp arm's path with document.documentElement.outerHTML
             extracted in place of the screenshot.
   html-fast html with cdp-fast's teardown, which reads each clone child's CPU.
+  noop      the drift control: a restored clone, no page, normal teardown.
+  noop-fast noop held until fcvm publishes the clone ready, then the fast
+            teardown: the CPU of a restore without a render.
 
 WHY ONE SIGNAL IS THE CONCURRENT KILL
 -------------------------------------
@@ -3945,8 +3948,14 @@ def clone_backend_args(args) -> list:
     return ["--pid", str(args.serve_pid)]
 
 
-def run_noop_request(args, rep: int) -> dict:
+def run_noop_request(args, rep: int, fast: bool = False) -> dict:
     """DRIFT CONTROL. Clone spawn -> CDP port answers -> normal teardown. No page.
+
+    fast=True is the noop-fast arm: the same clone, held until fcvm has
+    published it ready (the restore is complete), then cdp-fast's one-SIGKILL
+    teardown, which reads each clone child's CPU. Its request_cpu_ms is what a
+    restore costs without a render. It is not the drift control; that stays
+    the noop arm.
 
     AGENTS.md defect 2 requires a probe that exercises NONE of the varied
     dimension, so wall-clock drift is measurable and removable rather than being
@@ -3959,9 +3968,9 @@ def run_noop_request(args, rep: int) -> dict:
     spawn, snapshot restore, and fcvm's own teardown — so a machine that slows
     down over the run shows up here, in a series with no arm effect in it.
     """
-    name = f"rb-{args.run_id}-{rep}-noop"
+    name = f"rb-{args.run_id}-{rep}-{'noopfast' if fast else 'noop'}"
     log = os.path.join(args.out_dir, f"{name}.log")
-    rec: dict = {"arm": "noop", "rep": rep, "name": name}
+    rec: dict = {"arm": "noop-fast" if fast else "noop", "rep": rep, "name": name}
     cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
@@ -4043,16 +4052,31 @@ def run_noop_request(args, rep: int) -> dict:
         watch.close()
     rec.setdefault("blocking_ms", (time.monotonic() - t_spawn) * 1000)
     try:
-        rec["teardown"] = teardown_normal(
-            proc,
-            fcvm_pid,
-            args.teardown_timeout,
-            args.data_root,
-            state_path,
-            data_dir,
-            verify_disk_cleanup=True,
-            expected_pid_start_time=fcvm_start_time,
-        )
+        if fast:
+            rec["teardown"] = teardown_fast(
+                fcvm_pid,
+                args.data_root,
+                state_path,
+                data_dir,
+                args.teardown_timeout,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+        else:
+            rec["teardown"] = teardown_normal(
+                proc,
+                fcvm_pid,
+                args.teardown_timeout,
+                args.data_root,
+                state_path,
+                data_dir,
+                verify_disk_cleanup=True,
+                expected_pid_start_time=fcvm_start_time,
+            )
     except SurvivedTeardown as e:
         rec["teardown"] = e.teardown
         rec["ok"] = False
@@ -4447,6 +4471,8 @@ def dispatch_request(args, rep: int, arm: str, is_warmup: bool, probe=None) -> d
         return run_exec_request(args, rep)
     if arm == "noop":
         return run_noop_request(args, rep)
+    if arm == "noop-fast":
+        return run_noop_request(args, rep, fast=True)
     if arm in ("html", "html-fast"):
         return run_cdp_request(args, rep, fast=(arm == "html-fast"), probe=probe, op="html")
     return run_cdp_request(args, rep, fast=(arm == "cdp-fast"), probe=probe)
@@ -4472,8 +4498,8 @@ def allowed_arms_for_engine(engine: str) -> frozenset:
     DOM-extraction op; the request would silently return screenshot records the
     analyzer then rejects for missing extract_ms/html_bytes/html_sha256)."""
     if engine == "webkit":
-        return frozenset({"cdp", "cdp-fast", "noop"})
-    return frozenset({"exec", "cdp", "cdp-fast", "html", "html-fast", "noop"})
+        return frozenset({"cdp", "cdp-fast", "noop", "noop-fast"})
+    return frozenset({"exec", "cdp", "cdp-fast", "html", "html-fast", "noop", "noop-fast"})
 
 
 def publication_arms_ok(arms) -> bool:
