@@ -37,8 +37,11 @@ struct Subscriber {
 struct Options {
   int port = 8080;
   int fps = 30;
-  double budget = 1.0e6;  // pixel-samples per frame to start from
-  bool adapt = true;      // adjust the samples so a frame's GPU time fits its slot
+  double budget = 5.0e5;  // pixel-samples per frame (drawn pixels x samples)
+  // Adjust the budget so a frame's GPU time fits its slot. Off by default:
+  // with it, tiles of one image draw different sample counts, and moving
+  // frames stop matching across tile edges.
+  bool adapt = false;
   int idle_h = 144;
   bool accumulate = true;
 };
@@ -55,6 +58,9 @@ class Pipeline {
   void unsubscribe(const std::shared_ptr<Subscriber>& s);
   void wake();
   bool post_scene(const std::string& body, std::string* err);
+  // Debug: the unencoded tile of the frame at time t (a future frame slot), as
+  // a binary PPM. Waits for that frame; false if this renderer skipped it.
+  bool raw_frame(double t, std::string* ppm, std::string* tile_json);
   std::string health_json();
   bool ready() const { return ready_; }
   std::string fatal() const;
@@ -73,6 +79,14 @@ class Pipeline {
   Tile encode_geometry(const Scene& sc, int h);
   int min_w_ = 0, min_h_ = 0;
   std::string header_json(const Enc& e);
+  struct RawReq {
+    long long k;
+    bool done = false;
+    bool ok = false;
+    std::string ppm, tile;
+  };
+  std::vector<std::shared_ptr<RawReq>> raw_reqs_;  // under mu_
+  std::condition_variable raw_cv_;
 
   Options opt_;
   Renderer r_;
@@ -97,6 +111,7 @@ class Pipeline {
   std::vector<int> heights_;
   RenderStats rstats_;
   double encode_ms_ = 0;
+  uint64_t slots_missed_ = 0;  // frame slots skipped while someone was subscribed
   double startup_ready_ms_ = -1, first_frame_ms_ = -1, first_sent_ms_ = -1;
   std::string gpu_name_;
 };

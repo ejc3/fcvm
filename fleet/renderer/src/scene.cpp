@@ -108,6 +108,10 @@ Scene parse_scene(const std::string& body) {
       s.lights.push_back(sl);
     }
   }
+  if (j.has("budget")) {
+    s.budget = j.at("budget").number("budget");
+    if (!(s.budget >= 1e4 && s.budget <= 5e7)) throw std::runtime_error("'budget' must be in 10000..50000000");
+  }
   std::stable_sort(s.words.begin(), s.words.end(), [](const SceneWord& a, const SceneWord& b) { return a.t < b.t; });
   std::stable_sort(s.lights.begin(), s.lights.end(), [](const SceneLight& a, const SceneLight& b) { return a.t < b.t; });
   return s;
@@ -358,7 +362,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     set_text(g, buf);
     V3 fl = normalize(v3(p.cam.fwd.x, 0.0f, p.cam.fwd.z) + v3(0, 1e-4f, 0));
     V3 c = p.cam.pos + fl * 12.0f + v3(0, 1.75f, 0);
-    billboard(g, c, p.cam.pos, 0.30f);
+    billboard(g, c, p.cam.pos, 0.42f);
     g.color = v3(1.0f, 0.55f, 0.18f) * 2.6f;
     g.alpha = 1.0f;
   }

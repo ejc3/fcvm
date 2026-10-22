@@ -7,6 +7,9 @@
 #include <cuda_runtime.h>
 
 #include <cstdio>
+#include <algorithm>
+#include <climits>
+#include <cmath>
 #include <cstring>
 #include <stdexcept>
 
@@ -25,8 +28,8 @@
 #define SKY_W 128
 #define SKY_H 64
 #define CLOUD_N 128
-#define CLOUD_BASE 2.3f
-#define CLOUD_TOP 4.9f
+#define CLOUD_BASE 2.7f
+#define CLOUD_TOP 5.6f
 #define PI_F 3.14159265f
 
 struct Globals {
@@ -35,6 +38,7 @@ struct Globals {
   const V4* sky;
   cudaTextureObject_t cloud;
   cudaTextureObject_t macro;
+  const float4* macro_arr;  // the same fields, for C1-smooth sampling in shading
 };
 
 __constant__ FrameParams cP;
@@ -240,26 +244,27 @@ __device__ float cloud_density(V3 p, bool detail) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return 0.0f;
-  // weather: where clouds form; drifts with the wind
   V2 wp = v2(p.x, p.z) * (1.0f / 42.0f);  // where clouds form; fixed to the ground
   float cov = fbm(wp + v2(31.7f, 4.1f), 3, cG.noise) * 0.5f + 0.5f;
-  cov = smoothstepf(0.3f, 0.66f, cov) * 0.92f;
+  cov = smoothstepf(0.3f, 0.66f, cov) * 0.95f;
   if (cov <= 0.01f) return 0.0f;
-  // rounded bottoms, cauliflower tops that narrow upward
-  float prof = smoothstepf(0.0f, 0.12f, h01) * smoothstepf(1.0f, 0.55f, h01 + 0.25f * (1.0f - cov));
-  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 9.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
+  // flat bases, rounded tops that narrow upward
+  float prof = smoothstepf(0.0f, 0.06f, h01) * smoothstepf(1.0f, 0.3f, h01);
+  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 6.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
   float base = cloud_tex(q);
   float thr = 1.0f - cov * prof;
   float d = (base - thr) / fmaxf(1.0f - thr, 1e-3f);
   if (d <= 0.0f) return 0.0f;
   if (detail) {
-    V3 q2 = v3(q.x * 5.0f + 0.31f, q.y * 3.0f, q.z * 5.0f + 0.57f);
-    float det = cloud_tex(q2);
-    float e = 0.32f * mixf(det, 1.0f - det, sat(h01 * 3.0f));
+    // erode the edges with finer noise: billows at the top, wisps below
+    V3 q2 = v3(q.x * 9.0f + 0.31f, q.y * 7.0f, q.z * 9.0f + 0.57f);
+    V3 q3 = v3(q.x * 31.0f + 0.71f, q.y * 23.0f, q.z * 31.0f + 0.13f);
+    float det = 0.65f * cloud_tex(q2) + 0.35f * cloud_tex(q3);
+    float e = 0.6f * mixf(1.0f - det, det, sat(h01 * 2.5f)) * (1.0f - 0.65f * sat(d));
     d = (d - e) / (1.0f - e);
     if (d <= 0.0f) return 0.0f;
   }
-  return d * sat(d * 3.0f) * 28.0f;  // extinction per km
+  return d * 60.0f;  // extinction per km
 }
 
 // Optical depth from p toward the sun through the cloud layer.
@@ -332,14 +337,14 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     // several orders of scattering, each softer and less directional
     float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
     for (int o2 = 0; o2 < 3; o2++) {
-      float ph = mixf(phase_hg(c, 0.8f * g), phase_hg(c, -0.25f * g), 0.3f);
+      float ph = mixf(phase_hg(c, 0.85f * g), phase_hg(c, -0.2f * g), 0.4f);
       S += a * __expf(-od * b) * ph;
-      a *= 0.6f; b *= 0.22f; g *= 0.5f;
+      a *= 0.55f; b *= 0.3f; g *= 0.5f;
     }
     float h01 = sat((alt_flat(p) - CLOUD_BASE) / (CLOUD_TOP - CLOUD_BASE));
     // light reaching the inside is softer near the edges: "powder"
     float powder = 1.0f - 0.6f * __expf(-sig * 0.25f);
-    V3 Lin = sun_at(p) * (S * 4.0f * PI_F * 0.5f * powder) + mix(amb_bot, amb_top, h01) * (0.35f + 0.65f * h01);
+    V3 Lin = sun_at(p) * (S * 4.0f * PI_F * 0.55f * powder) + mix(amb_bot, amb_top, h01) * (0.2f + 0.8f * h01);
     float st = __expf(-sig * ds);
     V3 Sint = Lin * (1.0f - st);
     out.L += Sint * out.T;
@@ -367,6 +372,30 @@ __device__ __forceinline__ Macro macro_at(V2 p) {
   return macro_direct(p, cG.noise);
 }
 __device__ __forceinline__ float terrain(V2 p, int oct) { return terrain_from(p, macro_at(p), oct, cG.noise); }
+
+// The baked fields through a quadratic B-spline (9 texels). Hardware bilinear
+// filtering is only C0 and steps its weights in 1/256 of a texel, which shows
+// in shading normals as streaks; marching does not see that, shading does.
+__device__ Macro macro_smooth(V2 p) {
+  float x = (p.x * (1.0f / MACRO_KM) + 0.5f) * MACRO_N - 0.5f;
+  float y = (p.y * (1.0f / MACRO_KM) + 0.5f) * MACRO_N - 0.5f;
+  if (!(x > 2.0f && y > 2.0f && x < MACRO_N - 3.0f && y < MACRO_N - 3.0f)) return macro_direct(p, cG.noise);
+  int ix = (int)floorf(x + 0.5f), iy = (int)floorf(y + 0.5f);
+  float fx = x - ix, fy = y - iy;
+  float wx[3] = {0.5f * (0.5f - fx) * (0.5f - fx), 0.75f - fx * fx, 0.5f * (0.5f + fx) * (0.5f + fx)};
+  float wy[3] = {0.5f * (0.5f - fy) * (0.5f - fy), 0.75f - fy * fy, 0.5f * (0.5f + fy) * (0.5f + fy)};
+  float4 a = make_float4(0, 0, 0, 0);
+  for (int j = 0; j < 3; j++)
+    for (int i = 0; i < 3; i++) {
+      float4 v = __ldg(cG.macro_arr + (iy - 1 + j) * MACRO_N + (ix - 1 + i));
+      float w = wx[i] * wy[j];
+      a.x += v.x * w; a.y += v.y * w; a.z += v.z * w; a.w += v.w * w;
+    }
+  Macro r;
+  r.land = a.x; r.massif = a.y; r.w = v2(a.z, a.w);
+  return r;
+}
+__device__ __forceinline__ float terrain_s(V2 p, int oct) { return terrain_from(p, macro_smooth(p), oct, cG.noise); }
 __device__ __forceinline__ float ground_h(V2 p, int oct) { return fmaxf(terrain(p, oct), 0.0f); }
 
 __global__ void k_macro(float4* out) {
@@ -427,8 +456,8 @@ __device__ float terrain_shadow(V3 p, V3 l) {
 
 __device__ V3 terrain_normal(V3 p, float eps, int oct) {
   V2 q = v2(p.x, p.z);
-  float hx0 = terrain(q - v2(eps, 0), oct), hx1 = terrain(q + v2(eps, 0), oct);
-  float hz0 = terrain(q - v2(0, eps), oct), hz1 = terrain(q + v2(0, eps), oct);
+  float hx0 = terrain_s(q - v2(eps, 0), oct), hx1 = terrain_s(q + v2(eps, 0), oct);
+  float hz0 = terrain_s(q - v2(0, eps), oct), hz1 = terrain_s(q + v2(0, eps), oct);
   return normalize(v3(hx0 - hx1, 2.0f * eps, hz0 - hz1));
 }
 
@@ -459,6 +488,9 @@ __device__ Material terrain_material(V3 p, float h, V3 n) {
   a = mix(a, sand, ws);
   float wsn = smoothstepf(1.55f, 1.95f, h + v * 0.45f + 0.35f * (slope - 0.7f)) * smoothstepf(0.55f, 0.78f, slope + 0.06f * v2_);
   a = mix(a, snow, wsn);
+  // fine albedo variation (tens of metres): patches of grass, scree, shrubs
+  float fd = fbm(q * 23.0f + v2(1.3f, 8.1f), 4, cG.noise);
+  a = a * (1.0f + 0.45f * fd);
   Material m;
   m.albedo = a;
   m.rough = mixf(0.9f, 0.35f, wsn);
@@ -508,7 +540,7 @@ __device__ V3 point_lights(V3 p, V3 n) {
 
 // Radiance leaving a terrain point toward the eye, with one bounce of sky and ground light.
 __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full) {
-  float h = terrain(v2(p.x, p.z), 8);
+  float h = terrain_s(v2(p.x, p.z), 8);
   float eps = fmaxf(0.0012f, t * pix);
   int oct = (int)clampf(floorf(log2f(2.0f / eps)) + 1.0f, 5.0f, 12.0f);
   V3 n = terrain_normal(p, eps, oct);
@@ -675,48 +707,100 @@ __device__ float seg_dist(V2 p, V4 s) {
   return length(pa - ba * h);
 }
 
-__device__ float glyph_dist(unsigned char ch, V2 p) {
-  if (ch >= 128) return 1e9f;
-  int s0 = cGStart[ch], n = cGCount[ch];
-  float d = 1e9f;
-  for (int k = 0; k < n; k++) d = fminf(d, seg_dist(p, cSeg[s0 + k]));
-  return d;
+// Distance from p (glyph units, z out of the text plane) to the strokes of
+// glyphs gi-1..gi+1 of a text, as round tubes along each segment. Also returns
+// the nearest point on the stroke centre lines (for the normal).
+__device__ float text_sdf(const GText& g, V3 p, V3* nearest) {
+  int gi = (int)floorf(p.x / GLYPH_ADVANCE);
+  float best = 1e9f;
+  V3 bc = v3(0.0f);
+  for (int k = gi - 1; k <= gi + 1; k++) {
+    if (k < 0 || k >= g.len) continue;
+    unsigned char ch = g.ch[k];
+    if (ch >= 128) continue;
+    int s0 = cGStart[ch], n = cGCount[ch];
+    V2 q = v2(p.x - k * GLYPH_ADVANCE, p.y);
+    for (int m = 0; m < n; m++) {
+      V4 sg = cSeg[s0 + m];
+      V2 a = v2(sg.x, sg.y), b = v2(sg.z, sg.w);
+      V2 pa = q - a, ba = b - a;
+      float h = sat(dot(pa, ba) / fmaxf(dot(ba, ba), 1e-6f));
+      V2 c = a + ba * h;
+      V2 dd = q - c;
+      float d2 = dot(dd, dd) + p.z * p.z;
+      if (d2 < best) { best = d2; bc = v3(c.x + k * GLYPH_ADVANCE, c.y, 0.0f); }
+    }
+  }
+  *nearest = bc;
+  return sqrtf(best);
 }
+
+#define TEXT_TUBE 0.46f  // stroke radius, glyph units
 
 // Emissive text and light spheres, drawn per frame at the current t on top of
 // the accumulated image. Exact (no sampling), so the same on every GPU. They
 // are hidden where the pixel's first hit (`depth`, from the frame's or the
-// hold's first sample) is nearer than they are.
+// hold's first sample) is nearer than they are. Letters are glowing glass
+// tubes: lit by the sun and the sky, with an emissive core, a bright rim and a
+// soft halo.
 __device__ V3 overlay(V3 o, V3 d, V3 base, float pix, float depth) {
   for (int i = 0; i < cP.n_text; i++) {
     const GText& g = cP.text[i];
     if (g.alpha <= 0.0f || g.len == 0) continue;
-    V3 nrm = cross(g.right, g.up);
-    float den = dot(d, nrm);
-    if (fabsf(den) < 1e-5f) continue;
-    float tp = dot(g.center - o, nrm) / den;
-    if (tp <= 0.0f) continue;
-    V3 q = o + d * tp - g.center;
-    float sc = GLYPH_H / g.height;
+    V3 nrm = cross(g.right, g.up);  // toward the camera that the text faces
+    float sc = GLYPH_H / g.height;  // glyph units per km
     float width = g.len * GLYPH_ADVANCE - (GLYPH_ADVANCE - GLYPH_W);
-    V2 uv = v2(dot(q, g.right) * sc + 0.5f * width, dot(q, g.up) * sc + 0.5f * GLYPH_H);
-    const float margin = 3.5f;
-    if (uv.x < -margin || uv.x > width + margin || uv.y < -margin || uv.y > GLYPH_H + margin) continue;
-    int gi = (int)floorf(uv.x / GLYPH_ADVANCE);
-    float dist = 1e9f;
-    for (int k = gi - 1; k <= gi + 1; k++) {
-      if (k < 0 || k >= g.len) continue;
-      dist = fminf(dist, glyph_dist(g.ch[k], uv - v2(k * GLYPH_ADVANCE, 0.0f)));
+    V3 oc = o - g.center;
+    // ray in glyph space; t stays in km
+    V3 ol = v3(dot(oc, g.right) * sc + 0.5f * width, dot(oc, g.up) * sc + 0.5f * GLYPH_H, dot(oc, nrm) * sc);
+    V3 dl = v3(dot(d, g.right) * sc, dot(d, g.up) * sc, dot(d, nrm) * sc);
+    if (fabsf(dl.z) < 1e-6f) continue;
+    // slab |z| <= margin around the text plane
+    const float margin = 3.0f;
+    float t0 = (-margin - ol.z) / dl.z, t1 = (margin - ol.z) / dl.z;
+    if (t0 > t1) { float tt = t0; t0 = t1; t1 = tt; }
+    t0 = fmaxf(t0, 0.0f);
+    if (t1 <= t0) continue;
+    V3 pm = ol + dl * (0.5f * (t0 + t1));
+    if (pm.x < -margin - 2.0f || pm.x > width + margin + 2.0f || pm.y < -margin - 2.0f || pm.y > GLYPH_H + margin + 2.0f)
+      continue;
+    float fw = fmaxf(pix * t0 * sc, 1e-4f);  // a pixel in glyph units at the slab
+    float t = t0, mind = 1e9f, tmin = t0;
+    bool hit = false;
+    V3 nearest = v3(0.0f), ph = v3(0.0f), nmin = v3(0.0f);
+    for (int it = 0; it < 40 && t < t1; it++) {
+      V3 pl = ol + dl * t;
+      V3 nr;
+      float dist = text_sdf(g, pl, &nr) - TEXT_TUBE;
+      if (dist < mind) { mind = dist; ph = pl; nmin = nr; tmin = t; }
+      if (dist < 0.25f * fw) { hit = true; break; }
+      t += fmaxf(dist, 0.05f) / sc;
     }
-    const float sw = 0.42f;
-    float fw = fmaxf(pix * tp * sc, 1e-4f);
-    float cov = sat((sw - dist) / fw + 0.5f);
-    float glow = __expf(-fmaxf(dist - sw, 0.0f) * 1.3f) * 0.22f;
-    if (cov < 1e-3f && glow < 2e-3f) continue;
-    if (depth < tp) continue;  // behind terrain: the pixel's first hit is nearer
-    float Ta = __expf(-tp * 0.018f);
-    V3 c = g.color * (g.alpha * Ta);
-    base = mix(base, c, cov * g.alpha) + c * glow;
+    nearest = nmin;
+    t = tmin;
+    // full cover on a hit, partial for a ray passing within a pixel of the tube
+    float cov = hit ? 1.0f : sat(1.0f - mind / fw);
+    if (cov > 0.0f) hit = true;
+    float glow = __expf(-fmaxf(mind, 0.0f) * 1.2f) * 0.18f;
+    float tw = hit ? t : 0.5f * (t0 + t1);
+    if (depth < tw) continue;  // behind terrain: the pixel's first hit is nearer
+    float Ta = __expf(-tw * 0.018f);
+    if (hit) {
+      V3 nl = normalize(ph - nearest);
+      V3 n = normalize(g.right * nl.x + g.up * nl.y + nrm * nl.z);
+      V3 v = -d;
+      V3 wp = o + d * t;
+      V3 Es = sun_at(wp);
+      float ndl = fmaxf(dot(n, cP.sun_dir), 0.0f);
+      V3 amb = sky_lookup(n.y > -0.2f ? n : v3(0, 1, 0)) * 0.9f;
+      float nv = sat(dot(n, v));
+      float rim = powf(1.0f - nv, 2.5f);
+      V3 col = g.color * (1.0f / 2.6f);  // albedo-scaled hue
+      V3 lit = col * (Es * (ndl * 0.7f / PI_F) + amb) + Es * ggx_spec(n, v, cP.sun_dir, 0.22f, 0.04f);
+      V3 L = lit + g.color * (0.45f + 1.4f * rim);
+      base = mix(base, L * Ta, g.alpha * cov);
+    }
+    base = base + g.color * (glow * g.alpha * Ta);
   }
   for (int i = 0; i < cP.n_lights; i++) {
     const GLight& l = cP.lights[i];
@@ -752,99 +836,183 @@ __device__ __forceinline__ float srgb(float x) {
   return x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
 }
 
-__global__ void k_frame(uint8_t* rgba, float4* hdr, float4* hold_sum, float2* hold_aux, const float4* taa_in,
-                        const float2* taa_aux_in, float4* taa_out, float2* taa_aux_out) {
+// Draw this frame's samples over the drawn region (tile plus guard band) into
+// the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
+// frame seed, s), the first sample's hit distance and kind.
+__global__ void k_moving(float4* ring, float2* ring_aux) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
-  if (i >= cP.w || j >= cP.h) return;
-  int idx = j * cP.w + i;
-  uint32_t X = (uint32_t)(cP.x0 + i), Y = (uint32_t)(cP.y0 + j);
+  if (i >= cP.ew || j >= cP.eh) return;
+  uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
   const GCam& cam = cP.cam;
-  float pix = 2.0f * cam.tan_half / cP.full_h;  // radians per pixel (approx)
-  V3 color;
+  float pix = 2.0f * cam.tan_half / cP.full_h;
+  V3 sum = v3(0.0f);
   float depth = 1e9f, id = 0.0f;
+  for (int s = 0; s < cP.spp; s++) {
+    Rng rng{hash4(X, Y, cP.seed, (uint32_t)s)};
+    float jx = rng.next(), jy = rng.next();
+    Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
+    sum += hh.L;
+    if (s == 0) { depth = hh.dist; id = hh.id; }
+  }
+  sum = sum / (float)cP.spp;
+  int idx = j * cP.ew + i;
+  ring[idx] = make_float4(sum.x, sum.y, sum.z, (float)cP.spp);
+  ring_aux[idx] = make_float2(depth, id);
+}
+
+// Hold: add samples sample_base.. to each pixel's sum, in order, so the sum
+// after n samples does not depend on how frames split them; the ring entry for
+// this frame is the hold's current average.
+__global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2* ring_aux) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.ew || j >= cP.eh) return;
+  uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
+  const GCam& cam = cP.cam;
+  float pix = 2.0f * cam.tan_half / cP.full_h;
+  int idx = j * cP.ew + i;
+  float4 acc = hold_sum[idx];
+  float2 aux = hold_aux[idx];
+  for (int s = 0; s < cP.spp; s++) {
+    int k = cP.sample_base + s;
+    if (k >= HOLD_MAX_SAMPLES) break;
+    Rng rng{hash4(X, Y, cP.seed, (uint32_t)k)};
+    float jx = rng.next(), jy = rng.next();
+    Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
+    acc.x += hh.L.x; acc.y += hh.L.y; acc.z += hh.L.z; acc.w += 1.0f;
+    if (k == 0) aux = make_float2(hh.dist, hh.id);
+  }
+  hold_sum[idx] = acc;
+  hold_aux[idx] = aux;
+  float inv = 1.0f / fmaxf(acc.w, 1.0f);
+  ring[idx] = make_float4(acc.x * inv, acc.y * inv, acc.z * inv, acc.w);
+  ring_aux[idx] = aux;
+}
+
+struct Ring {
+  const float4* c[TEMPORAL_WINDOW];
+  const float2* a[TEMPORAL_WINDOW];
+};
+
+// Resolve the tile's pixels. Moving: this frame's samples plus the previous
+// frames' (up to TEMPORAL_WINDOW - 1 of them) reprojected through this pixel's
+// first hit. A previous frame's texel counts only where its hit kind matches,
+// its distance agrees within 4%, and the displacement is within `guard`
+// pixels; the rule names whole-image pixels only, and every texel it can read
+// lies in the drawn region, so the result is the same on every renderer that
+// drew the same frames. Hold: the hold's average, with the motion output it
+// started from blended in until HOLD_BLEND_OUT samples.
+__global__ void k_resolve(float4* resolved, const float4* hold_blend, const float4* hold_sum, const float2* /*hold_aux*/,
+                          const float4* cur, const float2* cur_aux, Ring hist) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.rw || j >= cP.rh) return;
+  int X = cP.rx0 + i, Y = cP.ry0 + j;
+  int eidx = (Y - cP.ey0) * cP.ew + (X - cP.ex0);
+  int idx = j * cP.rw + i;
+  const GCam& cam = cP.cam;
+  V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
+  V3 color;
+  float depth, wtot;
   if (cP.hold) {
-    float4 acc = hold_sum[idx];
-    float2 aux = hold_aux[idx];
-    for (int s = 0; s < cP.spp; s++) {
-      int k = cP.sample_base + s;
-      if (k >= HOLD_MAX_SAMPLES) break;
-      Rng rng{hash4(X, Y, cP.seed, (uint32_t)k)};
-      float jx = rng.next(), jy = rng.next();
-      Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
-      acc.x += hh.L.x; acc.y += hh.L.y; acc.z += hh.L.z; acc.w += 1.0f;
-      if (k == 0) aux = make_float2(hh.dist, hh.id);
-    }
-    hold_sum[idx] = acc;
-    hold_aux[idx] = aux;
-    float4 th = taa_in[idx];
-    float m = th.w * fmaxf(0.0f, 1.0f - acc.w / HOLD_BLEND_OUT);
+    float4 acc = hold_sum[eidx];
+    float4 hb = hold_blend[idx];
+    float m = fminf(hb.w, (float)TAA_MAX_HISTORY) * fmaxf(0.0f, 1.0f - acc.w / HOLD_BLEND_OUT);
     float inv = 1.0f / fmaxf(acc.w + m, 1e-6f);
-    color = v3((acc.x + th.x * m) * inv, (acc.y + th.y * m) * inv, (acc.z + th.z * m) * inv);
-    depth = aux.x; id = aux.y;
-    taa_out[idx] = make_float4(color.x, color.y, color.z, fminf(acc.w + m, (float)TAA_MAX_HISTORY));
-    taa_aux_out[idx] = make_float2(depth, id);
+    color = v3((acc.x + hb.x * m) * inv, (acc.y + hb.y * m) * inv, (acc.z + hb.z * m) * inv);
+    wtot = acc.w + m;
   } else {
-    V3 sum = v3(0.0f);
-    for (int s = 0; s < cP.spp; s++) {
-      Rng rng{hash4(X, Y, cP.seed, (uint32_t)s)};
-      float jx = rng.next(), jy = rng.next();
-      Hit hh = trace(cam.pos, ray_dir(cam, X + jx, Y + jy), pix, rng);
-      sum += hh.L;
-      if (s == 0) { depth = hh.dist; id = hh.id; }
-    }
-    float n = (float)cP.spp;
-    float hist_n = 0.0f;
-    V3 hist = v3(0.0f);
-    if (cP.have_prev) {
-      // reproject this pixel's first hit into the previous frame
-      V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
-      const GCam& pc = cP.prev;
+    float4 c0 = cur[eidx];
+    float2 a0 = cur_aux[eidx];
+    depth = a0.x;
+    float id = a0.y;
+    V3 sum = v3(c0.x, c0.y, c0.z) * c0.w;
+    wtot = c0.w;
+    for (int h = 0; h < TEMPORAL_WINDOW - 1; h++) {
+      if (!hist.c[h]) continue;
+      const GCam& pc = cP.hist_cam[h];
       V3 rel = depth < 1e8f ? (cam.pos + d0 * depth - pc.pos) : d0;
       float z = dot(rel, pc.fwd);
-      if (z > 1e-6f) {
-        float sx = dot(rel, pc.right) / (z * pc.tan_half * pc.aspect);
-        float sy = dot(rel, pc.up) / (z * pc.tan_half);
-        float px = (sx * 0.5f + 0.5f) * cP.full_w - 0.5f - cP.x0;
-        float py = (0.5f - 0.5f * sy) * cP.full_h - 0.5f - cP.y0;
-        float expect = depth < 1e8f ? length(rel) : 1e9f;
-        int ix = (int)floorf(px), iy = (int)floorf(py);
-        float fx = px - ix, fy = py - iy;
-        float wsum = 0.0f, nmin = 1e9f;
-        for (int b = 0; b < 4; b++) {
-          int xx = ix + (b & 1), yy = iy + (b >> 1);
-          if (xx < 0 || yy < 0 || xx >= cP.w || yy >= cP.h) continue;
-          float w = ((b & 1) ? fx : 1.0f - fx) * ((b >> 1) ? fy : 1.0f - fy);
-          float2 a = taa_aux_in[yy * cP.w + xx];
-          if (a.y != id) continue;
-          if (depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
-          float4 hv = taa_in[yy * cP.w + xx];
-          hist += v3(hv.x, hv.y, hv.z) * w;
-          wsum += w;
-          nmin = fminf(nmin, hv.w);
-        }
-        if (wsum > 0.3f) {
-          hist = hist / wsum;
-          hist_n = fminf(nmin, (float)TAA_MAX_HISTORY);
-        }
+      if (z <= 1e-6f) continue;
+      float sx = dot(rel, pc.right) / (z * pc.tan_half * pc.aspect);
+      float sy = dot(rel, pc.up) / (z * pc.tan_half);
+      float qx = (sx * 0.5f + 0.5f) * cP.full_w - 0.5f, qy = (0.5f - 0.5f * sy) * cP.full_h - 0.5f;
+      if (!(fabsf(qx - X) <= cP.guard && fabsf(qy - Y) <= cP.guard)) continue;
+      if (!(qx >= 0.0f && qy >= 0.0f && qx <= cP.full_w - 1.0f && qy <= cP.full_h - 1.0f)) continue;
+      float expect = depth < 1e8f ? length(rel) : 1e9f;
+      int ix = (int)floorf(qx), iy = (int)floorf(qy);
+      float fx = qx - ix, fy = qy - iy;
+      V3 hc = v3(0.0f);
+      float ws = 0.0f, wn = 1e9f;
+      for (int b = 0; b < 4; b++) {
+        int xx = min(ix + (b & 1), cP.full_w - 1), yy = min(iy + (b >> 1), cP.full_h - 1);
+        float w = ((b & 1) ? fx : 1.0f - fx) * ((b >> 1) ? fy : 1.0f - fy);
+        if (w <= 0.0f) continue;
+        int e = (yy - cP.ey0) * cP.ew + (xx - cP.ex0);
+        float2 a = hist.a[h][e];
+        if (a.y != id) continue;
+        if (depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
+        float4 hv = hist.c[h][e];
+        hc += v3(hv.x, hv.y, hv.z) * w;
+        ws += w;
+        wn = fminf(wn, hv.w);
       }
+      if (ws < 0.3f) continue;
+      float wf = fminf(wn, (float)TEMPORAL_FRAME_CAP);
+      sum += hc * (wf / ws);
+      wtot += wf;
     }
-    float tot = hist_n + n;
-    color = (hist * hist_n + sum) / tot;
-    taa_out[idx] = make_float4(color.x, color.y, color.z, fminf(tot, (float)TAA_MAX_HISTORY));
-    taa_aux_out[idx] = make_float2(depth, id);
+    color = sum / wtot;
   }
+  resolved[idx] = make_float4(color.x, color.y, color.z, fminf(wtot, (float)HOLD_MAX_SAMPLES));
+}
+
+// Finish the tile's pixels: where few samples are in (fast motion, a fresh
+// renderer), an edge-aware 5x5 filter over the resolved region (which reaches
+// DENOISE_R pixels past the tile, drawn under the same rules, so the filter
+// matches across tile edges); then the overlays, tone mapping and dither.
+__global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, const float2* aux) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.w || j >= cP.h) return;
+  int X = cP.x0 + i, Y = cP.y0 + j;
+  int idx = j * cP.w + i;
+  const GCam& cam = cP.cam;
+  float pix = 2.0f * cam.tan_half / cP.full_h;
   V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
+  float4 c = resolved[(Y - cP.ry0) * cP.rw + (X - cP.rx0)];
+  float2 ca = aux[(Y - cP.ey0) * cP.ew + (X - cP.ex0)];
+  float depth = ca.x;
+  V3 color = v3(c.x, c.y, c.z);
+  float strength = sat(1.5f - c.w / 32.0f);
+  if (strength > 0.0f) {
+    float lc = lum(color);
+    V3 sum = v3(0.0f);
+    float ws = 0.0f;
+    for (int dy = -DENOISE_R; dy <= DENOISE_R; dy++)
+      for (int dx = -DENOISE_R; dx <= DENOISE_R; dx++) {
+        int xx = X + dx, yy = Y + dy;
+        if (xx < cP.rx0 || yy < cP.ry0 || xx >= cP.rx0 + cP.rw || yy >= cP.ry0 + cP.rh) continue;
+        float2 na = aux[(yy - cP.ey0) * cP.ew + (xx - cP.ex0)];
+        if (na.y != ca.y) continue;
+        if (depth < 1e8f && fabsf(na.x - depth) > 0.03f * depth + 0.002f) continue;
+        float4 nv = resolved[(yy - cP.ry0) * cP.rw + (xx - cP.rx0)];
+        V3 n = v3(nv.x, nv.y, nv.z);
+        float w = __expf(-(float)(dx * dx + dy * dy) * (1.0f / 4.5f)) *
+                  __expf(-fabsf(lum(n) - lc) / (0.35f * lc + 0.02f));
+        sum += n * w;
+        ws += w;
+      }
+    if (ws > 0.0f) color = mix(color, sum / ws, strength);
+  }
   color = overlay(cam.pos, d0, color, pix, depth);
   hdr[idx] = make_float4(color.x, color.y, color.z, 1.0f);
   // tone map: ACES-like curve, slight saturation lift, sRGB, dither by whole-image pixel
-  V3 c = color * cP.exposure;
-  float l = lum(c);
-  c = vmax(mix(v3(l), c, 1.08f), 0.0f);
-  float dith = (u01(hash4(X, Y, 0xD17Eu, 0u)) - 0.5f) * (1.0f / 255.0f);
+  V3 t = color * cP.exposure;
+  float l = lum(t);
+  t = vmax(mix(v3(l), t, 1.08f), 0.0f);
+  float dith = (u01(hash4((uint32_t)X, (uint32_t)Y, 0xD17Eu, 0u)) - 0.5f) * (1.0f / 255.0f);
   uint8_t* o = rgba + 4 * idx;
-  o[0] = (uint8_t)(sat(srgb(aces(c.x)) + dith) * 255.0f + 0.5f);
-  o[1] = (uint8_t)(sat(srgb(aces(c.y)) + dith) * 255.0f + 0.5f);
-  o[2] = (uint8_t)(sat(srgb(aces(c.z)) + dith) * 255.0f + 0.5f);
+  o[0] = (uint8_t)(sat(srgb(aces(t.x)) + dith) * 255.0f + 0.5f);
+  o[1] = (uint8_t)(sat(srgb(aces(t.y)) + dith) * 255.0f + 0.5f);
+  o[2] = (uint8_t)(sat(srgb(aces(t.z)) + dith) * 255.0f + 0.5f);
   o[3] = 255;
 }
 
@@ -1009,7 +1177,7 @@ bool Renderer::init(std::string* err) {
     cudaTextureObject_t tex;
     CK(cudaCreateTextureObject(&tex, &rd, &td, nullptr));
     cloud_tex_ = tex;
-    Globals g{(const V4*)noise_, (const V4*)trans_, (const V4*)sky_, tex, 0};
+    Globals g{(const V4*)noise_, (const V4*)trans_, (const V4*)sky_, tex, 0, nullptr};
     CK(cudaMemcpyToSymbolAsync(cG, &g, sizeof g, 0, cudaMemcpyHostToDevice, st));
     // bake the large-scale terrain fields into a filtered 2D texture
     float4* mac = nullptr;
@@ -1032,10 +1200,10 @@ bool Renderer::init(std::string* err) {
     cudaTextureObject_t mtex;
     CK(cudaCreateTextureObject(&mtex, &mrd, &mtd, nullptr));
     g.macro = mtex;
+    g.macro_arr = mac;
     CK(cudaMemcpyToSymbolAsync(cG, &g, sizeof g, 0, cudaMemcpyHostToDevice, st));
     CK(cudaStreamSynchronize(st));
     CK(cudaFree(vol));
-    CK(cudaFree(mac));
   } catch (const std::exception& e) {
     *err = e.what();
     return false;
@@ -1043,42 +1211,55 @@ bool Renderer::init(std::string* err) {
   return true;
 }
 
+double Renderer::drawn_pixels(const Tile& t) {
+  int g = (int)ceilf(GUARD_FRAC * t.full_h) + 2 + DENOISE_R;
+  return (double)(t.w + 2 * g) * (t.h + 2 * g);
+}
+
 void Renderer::ensure_buffers(const Tile& t) {
   if (have_tile_ && t.w == tile_.w && t.h == tile_.h && t.full_w == tile_.full_w && t.full_h == tile_.full_h &&
       t.x0 == tile_.x0 && t.y0 == tile_.y0)
     return;
-  bool realloc = !have_tile_ || t.w != tile_.w || t.h != tile_.h;
+  int g = (int)ceilf(GUARD_FRAC * t.full_h);
+  int m = g + 2 + DENOISE_R;  // resolved pixels reach DENOISE_R past the tile, their taps one past the guard
+  int ex0 = std::max(0, t.x0 - m), ey0 = std::max(0, t.y0 - m);
+  int ex1 = std::min(t.full_w, t.x0 + t.w + m), ey1 = std::min(t.full_h, t.y0 + t.h + m);
+  // a tile may overhang the image by its rounding pixel; keep it inside the drawn region
+  ex1 = std::max(ex1, t.x0 + t.w);
+  ey1 = std::max(ey1, t.y0 + t.h);
+  int rx0 = std::max(0, t.x0 - DENOISE_R), ry0 = std::max(0, t.y0 - DENOISE_R);
+  int rx1 = std::max(std::min(t.full_w, t.x0 + t.w + DENOISE_R), t.x0 + t.w);
+  int ry1 = std::max(std::min(t.full_h, t.y0 + t.h + DENOISE_R), t.y0 + t.h);
   size_t n = (size_t)t.w * t.h;
-  if (realloc) {
-    cudaFree(rgba_); cudaFree(hdr_); cudaFree(hold_sum_); cudaFree(hold_aux_);
-    for (int i = 0; i < 2; i++) { cudaFree(taa_[i]); cudaFree(taa_aux_[i]); }
-    CK(cudaMalloc(&rgba_, n * 4));
-    CK(cudaMalloc(&hdr_, n * sizeof(float4)));
-    CK(cudaMalloc(&hold_sum_, n * sizeof(float4)));
-    CK(cudaMalloc(&hold_aux_, n * sizeof(float2)));
-    for (int i = 0; i < 2; i++) {
-      CK(cudaMalloc(&taa_[i], n * sizeof(float4)));
-      CK(cudaMalloc(&taa_aux_[i], n * sizeof(float2)));
-    }
+  size_t nr = (size_t)(rx1 - rx0) * (ry1 - ry0);
+  size_t ne = (size_t)(ex1 - ex0) * (ey1 - ey0);
+  cudaFree(rgba_); cudaFree(hdr_); cudaFree(display_); cudaFree(hold_blend_);
+  cudaFree(hold_sum_); cudaFree(hold_aux_);
+  for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); }
+  CK(cudaMalloc(&rgba_, n * 4));
+  CK(cudaMalloc(&hdr_, n * sizeof(float4)));
+  CK(cudaMalloc(&display_, nr * sizeof(float4)));
+  CK(cudaMalloc(&hold_blend_, nr * sizeof(float4)));
+  CK(cudaMalloc(&hold_sum_, ne * sizeof(float4)));
+  CK(cudaMalloc(&hold_aux_, ne * sizeof(float2)));
+  for (int i = 0; i < TEMPORAL_WINDOW; i++) {
+    CK(cudaMalloc(&ring_[i], ne * sizeof(float4)));
+    CK(cudaMalloc(&ring_aux_[i], ne * sizeof(float2)));
   }
   tile_ = t;
+  ex0_ = ex0; ey0_ = ey0; ew_ = ex1 - ex0; eh_ = ey1 - ey0; guard_ = g;
+  rx0_ = rx0; ry0_ = ry0; rw_ = rx1 - rx0; rh_ = ry1 - ry0;
   have_tile_ = true;
   reset_history();
 }
 
 void Renderer::reset_history() {
-  if (!have_tile_) return;
-  size_t n = (size_t)tile_.w * tile_.h;
-  cudaStream_t st = (cudaStream_t)stream_;
-  for (int i = 0; i < 2; i++) {
-    CK(cudaMemsetAsync(taa_[i], 0, n * sizeof(float4), st));
-    CK(cudaMemsetAsync(taa_aux_[i], 0, n * sizeof(float2), st));
-  }
-  CK(cudaMemsetAsync(hold_sum_, 0, n * sizeof(float4), st));
-  CK(cudaMemsetAsync(hold_aux_, 0, n * sizeof(float2), st));
+  for (int i = 0; i < TEMPORAL_WINDOW; i++) ring_slot_[i] = LLONG_MIN;
   hold_key_ = 0;
   hold_n_ = 0;
-  have_prev_ = false;
+  if (!have_tile_) return;
+  size_t nr = (size_t)rw_ * rh_;
+  CK(cudaMemsetAsync(display_, 0, nr * sizeof(float4), (cudaStream_t)stream_));
 }
 
 void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulate, int spp) {
@@ -1087,40 +1268,59 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   uint64_t key = 0;
   bool held = false;
   FrameParams p = build_frame(s, tile, t, &key, &held);
-  if (spp <= 0) spp = (int)(budget_ / ((double)tile.w * tile.h));
+  if (spp <= 0) spp = (int)(budget_ / drawn_pixels(tile));
   spp = spp < 1 ? 1 : spp > 64 ? 64 : spp;
   p.spp = spp;
-  size_t n = (size_t)tile.w * tile.h;
-  int in = cur_, out = 1 - cur_;
+  p.ex0 = ex0_; p.ey0 = ey0_; p.ew = ew_; p.eh = eh_; p.guard = guard_;
+  p.rx0 = rx0_; p.ry0 = ry0_; p.rw = rw_; p.rh = rh_;
+  size_t nr = (size_t)rw_ * rh_, ne = (size_t)ew_ * eh_;
+  long long k = std::llround(t * fps_);
+  int ri = (int)(((k % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW);
   if (!accumulate) {
-    p.hold = 0;
-    p.have_prev = 0;
     held = false;
+    p.hold = 0;
+    reset_history();
   } else if (held) {
     if (key != hold_key_) {
-      CK(cudaMemsetAsync(hold_sum_, 0, n * sizeof(float4), st));
-      CK(cudaMemsetAsync(hold_aux_, 0, n * sizeof(float2), st));
+      CK(cudaMemsetAsync(hold_sum_, 0, ne * sizeof(float4), st));
+      CK(cudaMemsetAsync(hold_aux_, 0, ne * sizeof(float2), st));
+      CK(cudaMemcpyAsync(hold_blend_, display_, nr * sizeof(float4), cudaMemcpyDeviceToDevice, st));
       hold_key_ = key;
       hold_n_ = 0;
-      hold_src_ = cur_;
     }
-    in = hold_src_;
-    out = 1 - hold_src_;
     p.sample_base = hold_n_;
     hold_n_ = hold_n_ + spp > HOLD_MAX_SAMPLES ? HOLD_MAX_SAMPLES : hold_n_ + spp;
   } else {
     hold_key_ = 0;
     hold_n_ = 0;
-    p.have_prev = have_prev_ ? 1 : 0;
-    p.prev = prev_cam_;
+  }
+  // previous frames k-1 .. k-W+1 that this renderer drew
+  Ring ring;
+  for (int h = 0; h < TEMPORAL_WINDOW - 1; h++) {
+    long long kk = k - 1 - h;
+    int r = (int)(((kk % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW);
+    bool have = accumulate && !held && ring_slot_[r] == kk;
+    ring.c[h] = have ? (const float4*)ring_[r] : nullptr;
+    ring.a[h] = have ? (const float2*)ring_aux_[r] : nullptr;
+    if (have) p.hist_cam[h] = ring_cam_[r];
   }
   CK(cudaMemcpyToSymbolAsync(cP, &p, sizeof p, 0, cudaMemcpyHostToDevice, st));
   CK(cudaEventRecord((cudaEvent_t)ev0_, st));
   k_sky<<<dim3(SKY_W / 64, SKY_H), 64, 0, st>>>((V4*)sky_);
-  dim3 bs(8, 8), gs((tile.w + 7) / 8, (tile.h + 7) / 8);
-  k_frame<<<gs, bs, 0, st>>>((uint8_t*)rgba_, (float4*)hdr_, (float4*)hold_sum_, (float2*)hold_aux_,
-                             (const float4*)taa_[in], (const float2*)taa_aux_[in], (float4*)taa_[out],
-                             (float2*)taa_aux_[out]);
+  dim3 bs(8, 8);
+  if (held && p.sample_base < HOLD_MAX_SAMPLES) {
+    k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)ring_[ri],
+                                                               (float2*)ring_aux_[ri]);
+  } else if (!held) {
+    k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri]);
+  }
+  CK(cudaGetLastError());
+  k_resolve<<<dim3((rw_ + 7) / 8, (rh_ + 7) / 8), bs, 0, st>>>((float4*)display_, (const float4*)hold_blend_,
+                                                                (const float4*)hold_sum_, (const float2*)hold_aux_,
+                                                                (const float4*)ring_[ri], (const float2*)ring_aux_[ri], ring);
+  CK(cudaGetLastError());
+  k_finish<<<dim3((tile.w + 7) / 8, (tile.h + 7) / 8), bs, 0, st>>>(
+      (uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_, held ? (const float2*)hold_aux_ : (const float2*)ring_aux_[ri]);
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)ev1_, st));
   CK(cudaEventSynchronize((cudaEvent_t)ev1_));
@@ -1131,9 +1331,21 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   stats_.hold = held;
   stats_.hold_samples = held ? hold_n_ : 0;
   if (accumulate) {
-    cur_ = out;
-    have_prev_ = true;
-    prev_cam_ = p.cam;
+    // A saturated hold draws nothing new; its ring entry still holds the
+    // hold's average from an earlier frame, so mark it for this slot too by
+    // copying (cheap, and only while saturated).
+    if (held && p.sample_base >= HOLD_MAX_SAMPLES) {
+      int prev = -1;
+      for (int i = 0; i < TEMPORAL_WINDOW; i++)
+        if (ring_slot_[i] != LLONG_MIN && (prev < 0 || ring_slot_[i] > ring_slot_[prev])) prev = i;
+      if (prev >= 0 && prev != ri) {
+        CK(cudaMemcpyAsync(ring_[ri], ring_[prev], ne * sizeof(float4), cudaMemcpyDeviceToDevice, st));
+        CK(cudaMemcpyAsync(ring_aux_[ri], ring_aux_[prev], ne * sizeof(float2), cudaMemcpyDeviceToDevice, st));
+        CK(cudaStreamSynchronize(st));
+      }
+    }
+    ring_slot_[ri] = k;
+    ring_cam_[ri] = p.cam;
   }
 }
 

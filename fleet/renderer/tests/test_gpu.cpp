@@ -96,7 +96,30 @@ int main(int argc, char** argv) {
         (int)r.stats().hold, r.stats().hold_samples);
   fprintf(stderr, "hold whole: fnv64 %016llx\n", (unsigned long long)fnv(wh.rgba));
 
-  // 3. Controls: the comparison can fail. A tile drawn one pixel to the right
+  // 3. Moving camera with history: the same 12 consecutive frames on the 1/30 s
+  // grid, drawn whole and as tiles, each in a fresh renderer. After the
+  // history window every frame is a function of the frame sequence only, so the
+  // last frames must stitch exactly.
+  {
+    std::vector<std::pair<double, int>> seq;
+    const long k0 = 37 * 30;  // the default path moves here
+    for (int k = 0; k < 12; k++) seq.push_back({(k0 + k) / 30.0, 2});
+    Img wmv = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    Img qm[4];
+    quads(r, s, h, seq, true, qm);
+    d = compare(wmv, qm, &hd);
+    CHECK(d == 0 && hd == 0, "moving with history, after the window: %ld pixels differ (8-bit), %ld (float)", d, hd);
+    CHECK(!r.stats().hold, "the moving sequence is not a hold");
+    // and the history is really used: the same last frame without it differs
+    Img alone = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, {seq.back()}, false);
+    long used = 0;
+    for (size_t p = 0; p < alone.rgba.size(); p += 4) used += memcmp(&alone.rgba[p], &wmv.rgba[p], 3) != 0;
+    CHECK(used > (long)(alone.rgba.size() / 4 / 2), "history changes most pixels of a moving frame (%ld of %zu)", used,
+          alone.rgba.size() / 4);
+    fprintf(stderr, "moving whole: fnv64 %016llx\n", (unsigned long long)fnv(wmv.rgba));
+  }
+
+  // 4. Controls: the comparison can fail. A tile drawn one pixel to the right
   // but placed where the true tile goes, and another t.
   Img off = draw(r, s, Rect{0.5 + 1.0 / whole.tile.full_w, 0.5, 0.5, 0.5}, h, {{tm, 2}}, false);
   off.tile.x0 -= 1;
