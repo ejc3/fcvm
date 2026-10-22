@@ -3600,6 +3600,28 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
     );
     common::kill_process(baseline_pid).await;
 
+    // The listing names the directory, so a caller can tell which --map the snapshot takes.
+    let listing = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "ls", "--json"])
+        .output()
+        .await
+        .context("running snapshots ls")?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "snapshots ls failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&listing.stdout)?;
+    let maps = listed
+        .iter()
+        .find(|s| s["name"] == snapshot_name.as_str())
+        .map(|s| s["maps"].clone());
+    assert_eq!(
+        maps,
+        Some(serde_json::json!([{"guest_path": "/data", "read_only": true}])),
+        "snapshots ls names the snapshot's map"
+    );
+
     let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
         &[
             "snapshot",
