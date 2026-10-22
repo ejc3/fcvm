@@ -5736,8 +5736,6 @@ mod watchdog_exit_classification_tests {
         );
     }
 
-    /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
-    /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
     /// A clone run without `--name` gets a name that is valid for every valid snapshot name
     /// and does not repeat across clones of one snapshot: names are unique among live VMs,
     /// so a repeat refuses the second clone.
@@ -5789,6 +5787,8 @@ mod watchdog_exit_classification_tests {
         assert!(bare.is_empty(), "bare `?` after the name claim: {bare:#?}");
     }
 
+    /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
+    /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
     #[test]
     fn a_failed_watchdog_kill_goes_through_cleanup() {
         let source = include_str!("snapshot.rs");
