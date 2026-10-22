@@ -124,6 +124,11 @@ impl DiskDirStaging {
                             host.display()
                         );
                     }
+                    // A HOST_DIR given as a symlink names its target: hashing and
+                    // `cp -a` would otherwise both take the link itself, and the staged
+                    // copy would be a link back to the mutable original, or dangle.
+                    let host = std::fs::canonicalize(&host)
+                        .with_context(|| format!("resolving --disk-dir {}", host.display()))?;
                     let content_hash = hash_tree(&host).with_context(|| {
                         format!("hashing --disk-dir {} for snapshot key", host.display())
                     })?;
@@ -235,8 +240,9 @@ fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
 }
 
 /// SHA-256 over a sorted walk of `root`. Each entry contributes its path relative to
-/// `root`, file type, permission bits, then a regular file's bytes, a symlink's target,
-/// or a device's number. Timestamps are left out, so a directory recreated with the
+/// `root`, file type, permission bits, the extended attributes this process can list
+/// (names and values, sorted; `cp -a` and `mkfs.ext4 -d` carry them into the image),
+/// then a regular file's bytes, a symlink's target, or a device's number. Timestamps are left out, so a directory recreated with the
 /// same content hashes the same. The hash covers what lands in the image: uid and gid
 /// enter it only when fcvm runs as root, because a non-root fcvm's copy, and so its
 /// image, belongs to the copier whatever the source's owners.
@@ -249,6 +255,60 @@ fn hash_tree_with(root: &Path, keep_owners: bool) -> Result<String> {
     let mut hasher = Sha256::new();
     hash_entry(root, Path::new(""), keep_owners, &mut hasher)?;
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// The extended attributes of `path` (not following a symlink) that this process can
+/// list and read, sorted by name. A filesystem without xattr support has none.
+fn extended_attributes(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .with_context(|| format!("NUL in {}", path.display()))?;
+    let unsupported = |error: &std::io::Error| error.raw_os_error() == Some(libc::ENOTSUP);
+    // Sized read with a retry: the list or a value can grow between the two calls.
+    let read = |call: &dyn Fn(*mut libc::c_char, usize) -> isize| loop {
+        let size = call(std::ptr::null_mut(), 0);
+        if size < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; size as usize];
+        let got = call(buf.as_mut_ptr().cast(), buf.len());
+        if got >= 0 {
+            buf.truncate(got as usize);
+            return Ok(buf);
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ERANGE) {
+            return Err(error);
+        }
+    };
+    let names = match read(&|buf, len| {
+        // SAFETY: c_path is NUL-terminated; buf is null with len 0 or valid for len bytes.
+        unsafe { libc::llistxattr(c_path.as_ptr(), buf, len) }
+    }) {
+        Ok(names) => names,
+        Err(error) if unsupported(&error) => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("listing xattrs of {}", path.display()))
+        }
+    };
+    let mut xattrs = Vec::new();
+    for name in names.split(|b| *b == 0).filter(|n| !n.is_empty()) {
+        let c_name = std::ffi::CString::new(name).expect("split on NUL");
+        let value = read(&|buf, len| {
+            // SAFETY: both strings are NUL-terminated; buf is null with len 0 or valid
+            // for len bytes.
+            unsafe { libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), buf.cast(), len) }
+        })
+        .with_context(|| {
+            format!(
+                "reading xattr {} of {}",
+                String::from_utf8_lossy(name),
+                path.display()
+            )
+        })?;
+        xattrs.push((name.to_vec(), value));
+    }
+    xattrs.sort();
+    Ok(xattrs)
 }
 
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
@@ -282,6 +342,12 @@ fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha2
     if keep_owners {
         hasher.update(md.uid().to_le_bytes());
         hasher.update(md.gid().to_le_bytes());
+    }
+    let xattrs = extended_attributes(path)?;
+    hasher.update((xattrs.len() as u64).to_le_bytes());
+    for (name, value) in xattrs {
+        hash_bytes(hasher, &name);
+        hash_bytes(hasher, &value);
     }
     match kind {
         b'f' => {
@@ -420,6 +486,114 @@ mod tests {
         assert!(
             format!("{error:#}").contains("changed during the launch"),
             "{error:#}"
+        );
+    }
+
+    /// A HOST_DIR given as a symlink to a directory, relative or absolute, hashes like
+    /// the directory and stages its contents, not the link.
+    #[test]
+    fn a_symlinked_host_dir_hashes_and_stages_its_target() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        write_tree(&dir, b"bravo");
+        let relative = tmp.path().join("relative-link");
+        std::os::unix::fs::symlink("data", &relative).unwrap();
+        let absolute = tmp.path().join("absolute-link");
+        std::os::unix::fs::symlink(&dir, &absolute).unwrap();
+        let direct = {
+            let specs = vec![format!("{}:/data:ro", dir.display())];
+            let (_s, resolved) =
+                DiskDirStaging::resolve(&tmp.path().join("s-direct"), &[], &specs).unwrap();
+            resolved.disk_dirs[0].clone().unwrap().content_hash
+        };
+        for (n, link) in [&relative, &absolute].into_iter().enumerate() {
+            let root = tmp.path().join(format!("s{n}"));
+            let specs = vec![format!("{}:/data:ro", link.display())];
+            let (mut staging, resolved) = DiskDirStaging::resolve(&root, &[], &specs).unwrap();
+            let staged = resolved.disk_dirs[0].clone().unwrap();
+            assert_eq!(
+                staged.content_hash,
+                direct,
+                "{} hashed unlike its target",
+                link.display()
+            );
+            staging.stage().unwrap();
+            let md = std::fs::symlink_metadata(&staged.source).unwrap();
+            assert!(
+                md.is_dir(),
+                "{} staged a link, not the directory",
+                link.display()
+            );
+            assert_eq!(
+                std::fs::read(staged.source.join("sub/b.txt")).unwrap(),
+                b"bravo"
+            );
+        }
+    }
+
+    /// Set a `user.` extended attribute, or return the error.
+    fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let name = std::ffi::CString::new(name).unwrap();
+        // SAFETY: both strings are NUL-terminated and the value slice outlives the call.
+        let rc = unsafe {
+            libc::lsetxattr(
+                path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr().cast(),
+                value.len(),
+                0,
+            )
+        };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+
+    /// Two trees that differ only in an extended attribute hash differently: `cp -a`
+    /// and `mkfs.ext4 -d` carry xattrs into the image.
+    #[test]
+    fn an_extended_attribute_changes_the_hash() {
+        // tmpfs takes user xattrs on recent kernels; fall back to the crate's own
+        // directory, which is on a disk filesystem, and fail if neither does.
+        let candidates = [
+            std::env::temp_dir(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        ];
+        let mut tried = Vec::new();
+        let tmp = candidates
+            .iter()
+            .find_map(|base| {
+                let tmp = tempfile::tempdir_in(base).ok()?;
+                let probe = tmp.path().join("probe");
+                std::fs::write(&probe, b"").unwrap();
+                match set_user_xattr(&probe, "user.fcvm-probe", b"1") {
+                    Ok(()) => Some(tmp),
+                    Err(error) => {
+                        tried.push(format!("{}: {error}", base.display()));
+                        None
+                    }
+                }
+            })
+            .unwrap_or_else(|| panic!("no directory here takes user xattrs: {tried:?}"));
+        let (a, b) = (tmp.path().join("a"), tmp.path().join("b"));
+        write_tree(&a, b"bravo");
+        write_tree(&b, b"bravo");
+        assert_eq!(hash_tree(&a).unwrap(), hash_tree(&b).unwrap());
+        set_user_xattr(&b.join("sub/b.txt"), "user.fcvm-test", b"x").unwrap();
+        assert_ne!(
+            hash_tree(&a).unwrap(),
+            hash_tree(&b).unwrap(),
+            "an extended attribute did not change the hash"
+        );
+        set_user_xattr(&a.join("sub/b.txt"), "user.fcvm-test", b"y").unwrap();
+        assert_ne!(
+            hash_tree(&a).unwrap(),
+            hash_tree(&b).unwrap(),
+            "an extended attribute's value did not change the hash"
         );
     }
 
