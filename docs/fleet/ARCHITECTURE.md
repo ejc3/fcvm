@@ -330,31 +330,29 @@ largest is attacked first. A GPU VM cannot be snapshotted after it warms up (the
 state is not saved), so the driver and first-frame work happen on every relaunch and are
 where the work is.
 
-## The launch event: 1,000 GPUs
+## The launch event: 100 GPUs
 
-Day to day the fleet runs on whatever spot capacity gives it. For the announcement, 1,000
-GPU VMs in one image: 500 fcvm GPUs (63 g4dn.metal) against 500 EC2 GPUs (500 g4dn.xlarge),
-relaunched all at once and recorded in one take. At current spot prices an hour costs
-about $250 for the fcvm half and $125 for the EC2 half. It needs a G spot quota of about
-6,000 vCPUs for the fcvm half plus 2,000 for EC2, spread over the regions.
+Day to day the fleet runs on whatever spot capacity gives it. For the announcement, about
+100 GPU VMs in one image: 50 fcvm GPUs (seven g4dn.metal, 56 GPUs) against 50 EC2 GPUs
+(50 g4dn.xlarge), relaunched all at once and recorded in one take. At current spot prices
+an hour costs about $28 for the fcvm half and $13 for the EC2 half, and it needs about 900
+vCPUs of G spot quota across the fleet regions.
 
-What changes at that scale:
-
-- **Transport.** A browser cannot hold 1,000 video streams. Each host runs a compositor
-  that receives its VMs' rectangles and sends one stream for the host, so the wall view
-  opens one stream per host (about 125); each rectangle is still rendered by its own GPU.
-  Opening a tile connects straight to that VM, as at any scale.
-- **Relaunch all.** Hosts relaunch their slots independently and in parallel, each serving
-  all its restores from one snapshot memory server, so the total is the slowest host. The
-  page shows the slowest host's phase breakdown after every relaunch all.
-- **EC2.** The coordinator launches the EC2 half with `CreateFleet` across every AZ and
-  both instance types; what spot cannot place shows dark.
-- **Coordinator.** 1,000 agents and tiles are a few hundred kilobytes of state; the camera
-  and clock are one broadcast per change, not per frame.
+**DECIDED (2026-10-22): the wall never asks more of a browser than it can play.** Every
+tile streams straight from its own VM, with no compositor in between, so the number of
+tiles is capped by what a browser can decode and draw: `max_tiles` in the coordinator,
+100 until the browser measurement below sets it. A browser holds 200 to 255 WebSockets
+(Chrome's socket pool caps WebSockets at 255, Firefox defaults to 200), so connections are
+not the limit at 100; the open question is 100 concurrent decoders, which the measurement
+answers. N = min(max_tiles, max(fcvm GPUs, EC2 instances)); GPUs beyond that are standby.
 
 ## Measurements to take
 
 None of these exist yet; each is taken on a parallel box, never on a shared host:
+
+- what a browser can play: N synthetic 128x72 H.264 streams decoded with WebCodecs into one
+  canvas, N = 25, 50, 100, 200, with dropped frames, frame time and CPU, in Chrome and
+  Safari on a laptop and on a phone; this sets `max_tiles`;
 
 - relaunch time from click to first new frame, per slot, and its parts (teardown, restore,
   GPU attach, container start, first frame);
