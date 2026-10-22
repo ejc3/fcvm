@@ -362,8 +362,18 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 
 ## Open questions
 
-1. **Scene. DECIDED (2026-10-22):** one ray-marched fractal world shared by every tile,
-   each GPU rendering its rectangle (see "What a viewer sees").
+1. **Scene.** One world shared by every tile, each GPU rendering its rectangle (see "What a
+   viewer sees"). Proposed, awaiting the owner: a procedurally generated planet, path
+   traced (terrain and megastructures by ray marching, volumetric clouds, atmospheric
+   scattering, a moving sun), about 92 megapixels per frame at 100 tiles of 1280x720. Two
+   properties are required of any scene: every pixel is a pure function of time, camera
+   and pixel position, so a relaunched GPU rejoins at the current frame with no state to
+   catch up and tile edges match exactly; and while the camera holds still each GPU keeps
+   adding samples, so the image converges to near-photoreal and a relaunched tile shows as
+   a noisy patch healing. Viewers share the camera, the time of day, and lights they drop
+   into the world. A scene with shared simulation state (particles, fluid) across tiles is
+   ruled out: it needs the GPUs to agree on state and a relaunched GPU could not rejoin
+   at once.
 2. **Hardware.** Recommended: g4dn.metal, eight T4 per host and NVENC on each, so one host
    fills a grid. g5g.metal has two T4G per host at a sixth of the price.
 3. **Zone. DECIDED (2026-10-22): `fcvm.dev`**, bought through Cloudflare Registrar so the
