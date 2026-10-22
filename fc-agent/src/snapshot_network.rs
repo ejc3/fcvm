@@ -22,6 +22,7 @@ use crate::netlink::{
     NetlinkHeader, OnInterrupt, NEXT_NETLINK_SEQUENCE, NLMSG_DONE, NLMSG_ERROR, NLMSG_NOOP,
     NLMSG_OVERRUN, NLM_F_ACK, NLM_F_DUMP, NLM_F_REQUEST,
 };
+use crate::nftables::{Family, GateHalf, Removal};
 
 const MANIFEST_VERSION: u32 = 1;
 const MANIFEST_PATH: &str = "/run/fcvm/snapshot-network.json";
@@ -307,6 +308,10 @@ trait FirewallGate {
     /// chains present with exactly the boundary rules, each hooked from its
     /// built-in chain, in both address families.
     async fn is_closed(&self) -> Result<bool>;
+    /// What each gate operation has cost so far in this transaction.
+    fn timings(&self) -> GateTimings {
+        GateTimings::default()
+    }
 }
 
 trait PacketReceiveBarrier {
@@ -315,18 +320,6 @@ trait PacketReceiveBarrier {
 
 trait CommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output>;
-
-    /// Run with `input` piped to stdin. Exists for the batch tools
-    /// (`iptables-restore`, `ip -batch -`) that let one process spawn carry
-    /// what would otherwise be a dozen: on a freshly restored clone every
-    /// spawn faults its text and libraries back in through the memory
-    /// backend, so spawn count is the boundary's dominant cost.
-    async fn output_with_input(
-        &self,
-        program: &str,
-        args: &[&str],
-        input: &[u8],
-    ) -> io::Result<std::process::Output>;
 }
 
 struct SystemCommandRunner;
@@ -334,28 +327,6 @@ struct SystemCommandRunner;
 impl CommandRunner for SystemCommandRunner {
     async fn output(&self, program: &str, args: &[&str]) -> io::Result<std::process::Output> {
         Command::new(program).args(args).output().await
-    }
-
-    async fn output_with_input(
-        &self,
-        program: &str,
-        args: &[&str],
-        input: &[u8],
-    ) -> io::Result<std::process::Output> {
-        use tokio::io::AsyncWriteExt;
-
-        let mut child = Command::new(program)
-            .args(args)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()?;
-        let mut stdin = child.stdin.take().ok_or_else(|| {
-            io::Error::other(format!("{program} child has no stdin despite piped()"))
-        })?;
-        stdin.write_all(input).await?;
-        drop(stdin);
-        child.wait_with_output().await
     }
 }
 
@@ -383,24 +354,128 @@ impl PacketReceiveBarrier for SystemPacketReceiveBarrier {
     }
 }
 
-struct IptablesGate<R> {
+struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     runner: R,
-    /// Per-program `-S` parse retained from verification for the removal that
-    /// follows it in the same transaction, dropped by every gate mutation
-    /// this module makes. No other fc-agent transaction can invalidate it:
-    /// they serialize on the guest-wide boundary lock. A privileged workload
-    /// can, and then the computed removal names a rule that no longer
-    /// matches, which fails the batch and fails the restore closed.
-    /// Guards the map only, never held across an await.
-    state_cache: std::sync::Mutex<std::collections::HashMap<String, FamilyGateState>>,
+    /// Opens the nfnetlink socket the gate's removal is committed on.
+    netfilter: N,
+    /// That socket, opened by the first removal and kept for the gate's
+    /// lifetime, then released off the caller's thread when the gate is
+    /// dropped (see `Drop`). Guards the slot only, never held across an await.
+    channel: std::sync::Mutex<Option<N::Channel>>,
+    /// Per family and direction: whether this transaction has seen iptables
+    /// report that half of the gate installed (a verification that found the
+    /// gate closed, or a close that succeeded), and has not removed it since.
+    /// A removal that finds such a half missing from nf_tables refuses instead
+    /// of reporting the gate open: iptables and nf_tables disagreeing means
+    /// the gate lives somewhere this removal does not reach (an
+    /// iptables-legacy binary, for one), and an unpublished clone is the
+    /// failure the restore can report. Indexed `[family][direction]`.
+    /// Guards the array only, never held across an await.
+    installed: std::sync::Mutex<[[bool; 2]; 2]>,
+    /// What each gate operation of this transaction cost.
+    timings: std::sync::Mutex<GateTimings>,
 }
 
-impl<R> IptablesGate<R> {
+/// Opens the netlink socket nf_tables batches are sent on.
+trait NetfilterOpener {
+    type Channel: NetlinkChannel + Send + 'static;
+    fn open(&self) -> Result<Self::Channel>;
+}
+
+struct SystemNetfilter;
+
+impl NetfilterOpener for SystemNetfilter {
+    type Channel = KernelChannel;
+
+    fn open(&self) -> Result<KernelChannel> {
+        KernelChannel::open(crate::nftables::NETLINK_NETFILTER, "nf_tables netlink")
+    }
+}
+
+/// Milliseconds each gate operation of one restore took, carried into the
+/// restore ACK's phase record so a regression in any one of them is visible
+/// per restore. Verification and the UDP rule are process spawns per family;
+/// each removal is a read of the rule handles and one commit for both
+/// families.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct GateTimings {
+    pub verify_ipv4_ms: f64,
+    pub verify_ipv6_ms: f64,
+    pub udp_ipv4_ms: f64,
+    pub udp_ipv6_ms: f64,
+    pub egress_read_ms: f64,
+    pub egress_commit_ms: f64,
+    pub ingress_read_ms: f64,
+    pub ingress_commit_ms: f64,
+}
+
+/// Releasing an nfnetlink socket runs nf_tables' NETLINK_URELEASE notifier
+/// (`nft_rcv_nl_event`), which takes the namespace's commit mutex and, holding
+/// it, flushes the pending transaction destruction, and the destruction a
+/// rule-deleting commit schedules begins with `synchronize_rcu()`. So the
+/// release after a removal waits one RCU grace period, and every nf_tables
+/// commit in the namespace waits behind it. That was the whole cost of opening
+/// the gate (#1151): each `iptables-restore` did its work in about 3 ms and
+/// then waited 26, 46 or 79 ms (2, 4, 8 vCPUs) in close() at exit, twice per
+/// half. Releasing the egress half's socket while the restore went on put the
+/// ingress commit behind that mutex instead (20 ms median at 2 vCPUs).
+///
+/// So the gate keeps one socket for both halves and releases it when it is
+/// dropped, after publication, on a thread of its own. The commits have
+/// already moved the packet path to the new ruleset generation; the grace
+/// period only delays freeing the deleted rules.
+impl<R, N: NetfilterOpener> Drop for IptablesGate<R, N> {
+    fn drop(&mut self) {
+        if let Some(channel) = self.channel.get_mut().ok().and_then(Option::take) {
+            crate::network::release_off_path(channel);
+        }
+    }
+}
+
+impl<R> IptablesGate<R, SystemNetfilter> {
     fn new(runner: R) -> Self {
+        Self::with_netfilter(runner, SystemNetfilter)
+    }
+}
+
+impl<R, N: NetfilterOpener> IptablesGate<R, N> {
+    fn with_netfilter(runner: R, netfilter: N) -> Self {
         Self {
             runner,
-            state_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
+            netfilter,
+            channel: std::sync::Mutex::new(None),
+            installed: std::sync::Mutex::new([[false; 2]; 2]),
+            timings: std::sync::Mutex::new(GateTimings::default()),
         }
+    }
+
+    fn mark_installed(&self, family: Family, directions: &[Direction], installed: bool) {
+        let mut marks = self.installed.lock().unwrap();
+        for direction in directions {
+            marks[family_index(family)][direction_index(*direction)] = installed;
+        }
+    }
+}
+
+fn family_index(family: Family) -> usize {
+    match family {
+        Family::Ipv4 => 0,
+        Family::Ipv6 => 1,
+    }
+}
+
+fn direction_index(direction: Direction) -> usize {
+    match direction {
+        Direction::Input => 0,
+        Direction::Output => 1,
+    }
+}
+
+fn family_of(program: &str) -> Family {
+    if program.starts_with("ip6") {
+        Family::Ipv6
+    } else {
+        Family::Ipv4
     }
 }
 
@@ -631,7 +706,7 @@ fn family_gate_is_closed(state: &FamilyGateState, loopback_network: &str) -> boo
         && state.output_hook_is_first_rule
 }
 
-impl<R: CommandRunner> IptablesGate<R> {
+impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
     async fn required(&self, program: &str, args: &[&str]) -> Result<()> {
         let output = self
             .runner
@@ -670,14 +745,17 @@ impl<R: CommandRunner> IptablesGate<R> {
     }
 
     async fn family_is_closed(&self, program: &str, loopback_network: &str) -> Result<bool> {
+        let started = std::time::Instant::now();
         let state = self.read_family_state(program).await?;
         let closed = family_gate_is_closed(&state, loopback_network);
-        // Retain the parse for the removal that follows verification in the
-        // same locked transaction, saving that removal's own `-S` spawn.
-        self.state_cache
-            .lock()
-            .unwrap()
-            .insert(program.to_string(), state);
+        let family = family_of(program);
+        self.mark_installed(family, &[Direction::Input, Direction::Output], closed);
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let mut timings = self.timings.lock().unwrap();
+        match family {
+            Family::Ipv4 => timings.verify_ipv4_ms = elapsed,
+            Family::Ipv6 => timings.verify_ipv6_ms = elapsed,
+        }
         Ok(closed)
     }
 
@@ -705,7 +783,7 @@ impl<R: CommandRunner> IptablesGate<R> {
         // SOMEWHERE, and a jump below a foreign rule is a gate that foreign
         // rule can bypass, so close() must put a copy ahead of everything.
         // A duplicate left lower in the chain is harmless (the first match
-        // governs) and remove_family retires every counted copy.
+        // governs) and the removal retires every copy it finds.
         self.required(program, &hook_install_args(hook, chain))
             .await?;
         self.required(program, &hook_check_args(hook, chain))
@@ -727,149 +805,95 @@ impl<R: CommandRunner> IptablesGate<R> {
             .await?;
         self.install_hook(program, "OUTPUT", GATE_OUTPUT_CHAIN)
             .await?;
-        // This family's rules just changed; a parse retained from an earlier
-        // verification no longer describes them.
-        self.state_cache.lock().unwrap().remove(program);
+        self.mark_installed(
+            family_of(program),
+            &[Direction::Input, Direction::Output],
+            true,
+        );
         Ok(())
     }
 
-    /// Remove one family's gate with one `iptables-restore --noflush` batch,
-    /// computed from a single `-S` read: exactly the counted hook deletions,
-    /// then flush and delete each chain that exists. When the same locked
-    /// transaction already read the state to verify, that parse is reused and
-    /// the removal spends no read at all. Explicit `-D`/`-F`/`-X` lines in
-    /// restore input are accepted (verified live on the guest's iptables
-    /// v1.8.10 nf_tables build, which removed both duplicate jumps and the
-    /// chain in one commit). One spawn instead of a dozen matters here: on a
-    /// freshly restored clone every spawn faults its pages back in through
-    /// the memory backend.
+    /// Remove the named halves of the gate in both families as ONE nf_tables
+    /// transaction: read the hook rules' handles and the chains of each half
+    /// in each family, then commit one batch that deletes the hooks, flushes
+    /// and deletes the chains, in both families at once. Either everything
+    /// read is removed or, if anything changed since the read, the batch
+    /// fails whole and nothing is; the restore then fails closed.
     ///
-    /// The plan is computed rather than probed, so it assumes the observed
-    /// state still holds. Other fc-agent transactions cannot break that (the
-    /// guest-wide lock serializes them); a privileged workload sharing this
-    /// namespace can, and then a `-D` or `-X` names something that no longer
-    /// matches and the batch fails, which fails the restore closed.
+    /// This used to be one `iptables-restore --noflush` per family: two
+    /// commits per half, with one family open and the other not between them,
+    /// and each process waited one RCU grace period on exit. The socket here
+    /// is kept for both halves and released off the restore's path (`Drop`).
     ///
     /// `directions` names which halves to remove. The egress half alone
     /// (`[Direction::Output]`) is what a restored clone removes before its
-    /// hook runs; the parse of what remains goes back into the retained
-    /// state, so the later removal of the ingress half still spends no read.
-    async fn remove_family(&self, program: &str, directions: &[Direction]) -> Result<()> {
-        // Bounded: a hook carrying more duplicate jumps than any interrupted
-        // sequence could leave is tampering, not drift, and deleting without
-        // bound would hang restore instead of reporting it.
-        const MAX_DUPLICATE_HOOKS: usize = 64;
-        let cached = self.state_cache.lock().unwrap().remove(program);
-        let mut state = match cached {
-            Some(state) => state,
-            None => self.read_family_state(program).await?,
+    /// hook runs; the ingress half follows at publication.
+    async fn remove_halves(&self, directions: &[Direction]) -> Result<()> {
+        let read_started = std::time::Instant::now();
+        let taken = self.channel.lock().unwrap().take();
+        let mut channel = match taken {
+            Some(channel) => channel,
+            None => self.netfilter.open()?,
         };
-        let mut lines = vec!["*filter".to_string()];
-        let hooks = [
-            (
-                Direction::Input,
-                "INPUT",
-                GATE_INPUT_CHAIN,
-                state.input_hooks,
-            ),
-            (
-                Direction::Output,
-                "OUTPUT",
-                GATE_OUTPUT_CHAIN,
-                state.output_hooks,
-            ),
-        ];
-        for (direction, hook, chain, count) in hooks {
-            if !directions.contains(&direction) {
-                continue;
-            }
-            if count > MAX_DUPLICATE_HOOKS {
-                bail!(
-                    "{program} {hook} jumps to {chain} {count} times \
-                     (limit {MAX_DUPLICATE_HOOKS}); refusing cleanup"
-                );
-            }
-            for _ in 0..count {
-                lines.push(format!("-D {hook} {}", hook_jump_args(chain).join(" ")));
-            }
-        }
-        let chains = [
-            (
-                Direction::Input,
-                GATE_INPUT_CHAIN,
-                state.input_rules.is_some(),
-            ),
-            (
-                Direction::Output,
-                GATE_OUTPUT_CHAIN,
-                state.output_rules.is_some(),
-            ),
-        ];
-        for (direction, chain, declared) in chains {
-            if declared && directions.contains(&direction) {
-                lines.push(format!("-F {chain}"));
-                lines.push(format!("-X {chain}"));
+        let mut removals = Vec::new();
+        for family in Family::BOTH {
+            for direction in directions {
+                let half = direction.half();
+                let layout = crate::nftables::read_half(&mut channel, family, half)?;
+                let installed = self.installed.lock().unwrap()[family_index(family)]
+                    [direction_index(*direction)];
+                if installed && (!layout.chain || layout.hooks.is_empty()) {
+                    bail!(
+                        "{}tables reported the gate's {} chain installed, but the \
+                         {} filter table in nf_tables holds {}; the gate is not where \
+                         this removal can reach it (is the guest's iptables the \
+                         nf_tables backend?), so the clone stays unpublished",
+                        if family == Family::Ipv6 { "ip6" } else { "ip" },
+                        half.chain,
+                        family.name(),
+                        if layout.chain {
+                            "no jump to it"
+                        } else {
+                            "no such chain"
+                        }
+                    );
+                }
+                removals.push(Removal {
+                    family,
+                    half,
+                    layout,
+                });
             }
         }
-        // What this batch leaves behind, kept for the removal of the other half.
+        let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+        let commit_started = std::time::Instant::now();
+        if let Some((batch, _begin, end)) = crate::nftables::removal_batch(&removals) {
+            crate::nftables::commit(&mut channel, &batch, end).with_context(|| {
+                format!(
+                    "removing the {} half of the snapshot network gate in both families",
+                    if directions.contains(&Direction::Input) {
+                        "ingress"
+                    } else {
+                        "egress"
+                    }
+                )
+            })?;
+        }
+        let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
+        // Kept for the next half; released when the gate is dropped (`Drop`).
+        *self.channel.lock().unwrap() = Some(channel);
+        for family in Family::BOTH {
+            self.mark_installed(family, directions, false);
+        }
+        let mut timings = self.timings.lock().unwrap();
         if directions.contains(&Direction::Input) {
-            state.input_hooks = 0;
-            state.input_rules = None;
-            state.input_hook_is_first_rule = false;
+            timings.ingress_read_ms = read_ms;
+            timings.ingress_commit_ms = commit_ms;
+        } else {
+            timings.egress_read_ms = read_ms;
+            timings.egress_commit_ms = commit_ms;
         }
-        if directions.contains(&Direction::Output) {
-            state.output_hooks = 0;
-            state.output_rules = None;
-            state.output_hook_is_first_rule = false;
-        }
-        let residual = state;
-        if lines.len() == 1 {
-            self.state_cache
-                .lock()
-                .unwrap()
-                .insert(program.to_string(), residual);
-            return Ok(());
-        }
-        lines.push("COMMIT".to_string());
-        let payload = lines.join("\n") + "\n";
-        let restore_program = format!("{program}-restore");
-        let args = ["-w", "--noflush"];
-        let output = self
-            .runner
-            .output_with_input(&restore_program, &args, payload.as_bytes())
-            .await
-            .with_context(|| format!("spawning {restore_program}"))?;
-        if !output.status.success() {
-            bail!(
-                "snapshot network gate batch removal failed: {} (batch input {payload:?})",
-                command_failure(&restore_program, &args, &output)
-            );
-        }
-        self.state_cache
-            .lock()
-            .unwrap()
-            .insert(program.to_string(), residual);
         Ok(())
-    }
-
-    /// Remove the named halves of the gate in both families, collecting both
-    /// verdicts so one family's failure cannot mask the other's.
-    async fn remove_both_families(&self, directions: &[Direction]) -> Result<()> {
-        // Mutations stay sequential on purpose. iptables-nft has no shared
-        // userspace lock (`-w` is a no-op there) and commits race the
-        // kernel's per-netns generation counter, where a lost retry surfaces
-        // as EAGAIN; through required() that would fail the restore and kill
-        // the clone, a poor trade for one process spawn of overlap.
-        let ipv4 = self.remove_family("iptables", directions).await;
-        let ipv6 = self.remove_family("ip6tables", directions).await;
-        match (ipv4, ipv6) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(a), Ok(())) => Err(a),
-            (Ok(()), Err(b)) => Err(b),
-            (Err(a), Err(b)) => Err(anyhow::anyhow!(
-                "IPv4 gate cleanup: {a:#}; IPv6 gate cleanup: {b:#}"
-            )),
-        }
     }
 }
 
@@ -881,7 +905,22 @@ enum Direction {
     Output,
 }
 
-impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
+impl Direction {
+    fn half(self) -> GateHalf {
+        match self {
+            Direction::Input => GateHalf {
+                hook: "INPUT",
+                chain: GATE_INPUT_CHAIN,
+            },
+            Direction::Output => GateHalf {
+                hook: "OUTPUT",
+                chain: GATE_OUTPUT_CHAIN,
+            },
+        }
+    }
+}
+
+impl<R: CommandRunner + Sync, N: NetfilterOpener + Sync> FirewallGate for IptablesGate<R, N> {
     async fn close(&self) -> Result<()> {
         self.install_family("iptables", IPV4_LOOPBACK)
             .await
@@ -892,11 +931,11 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
     }
 
     async fn open_egress(&self) -> Result<()> {
-        self.remove_both_families(&[Direction::Output]).await
+        self.remove_halves(&[Direction::Output]).await
     }
 
     async fn open(&self) -> Result<()> {
-        self.remove_both_families(&[Direction::Input, Direction::Output])
+        self.remove_halves(&[Direction::Input, Direction::Output])
             .await
     }
 
@@ -904,13 +943,19 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
         for (program, network) in [("iptables", IPV4_LOOPBACK), ("ip6tables", IPV6_LOOPBACK)] {
             // Position 3: below the loopback exemptions (rules 1 and 2), above
             // the TCP rejection. The chain is removed whole on open, so the
-            // rule needs no removal of its own and the retained parse (hook
-            // counts and chain presence) stays valid.
+            // rule needs no removal of its own.
+            let started = std::time::Instant::now();
             let mut args = vec!["-w", "-I", GATE_INPUT_CHAIN, "3"];
             args.extend(udp_ingress_rule_args(network));
             self.required(program, &args)
                 .await
                 .with_context(|| format!("gating client-direction UDP in {program}"))?;
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            let mut timings = self.timings.lock().unwrap();
+            match family_of(program) {
+                Family::Ipv4 => timings.udp_ipv4_ms = elapsed,
+                Family::Ipv6 => timings.udp_ipv6_ms = elapsed,
+            }
         }
         Ok(())
     }
@@ -922,6 +967,10 @@ impl<R: CommandRunner + Sync> FirewallGate for IptablesGate<R> {
             self.family_is_closed("ip6tables", IPV6_LOOPBACK)
         );
         Ok(ipv4? && ipv6?)
+    }
+
+    fn timings(&self) -> GateTimings {
+        *self.timings.lock().unwrap()
     }
 }
 
@@ -971,6 +1020,8 @@ pub struct RestoreNetworkReport {
     pub reopen_ms: f64,
     /// What the cleanup did to the manifest's sockets.
     pub(crate) tally: CleanupTally,
+    /// Per-operation gate timings, refreshed at the end of each phase.
+    pub gate: GateTimings,
 }
 
 /// Total budget for retiring every socket named by the manifest.
@@ -1339,9 +1390,8 @@ fn parse_destroy_reply(header: NetlinkHeader, payload: &[u8]) -> Result<Option<D
 /// function used to reinstate routes, and a neighbour repair was on its way into
 /// it before the purge itself was removed instead.
 async fn reopen_with<G: FirewallGate>(gate: &G) -> Result<()> {
-    // Removing the IPv4 and IPv6 hooks cannot be one iptables transaction, so a
-    // failure between them leaves one family open. That fails closed: the caller
-    // reports it and the clone stays unpublished.
+    // One nf_tables transaction for both families: a failure removes nothing,
+    // the caller reports it and the clone stays unpublished.
     gate.open()
         .await
         .context("opening the snapshot TCP NEW-flow gate")
@@ -1604,6 +1654,7 @@ async fn restore_boundary_with<
         egress_open_ms,
         hook_ms: 0.0,
         reopen_ms: 0.0,
+        gate: gate.timings(),
     })
 }
 
@@ -1627,6 +1678,7 @@ async fn publish_with<G: FirewallGate, H: RestoreHook>(
         .await
         .context("publishing restored network after cookie-bound cleanup")?;
     report.reopen_ms = reopen_started.elapsed().as_secs_f64() * 1000.0;
+    report.gate = gate.timings();
     Ok(report)
 }
 
@@ -2526,24 +2578,6 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
-
-        async fn output_with_input(
-            &self,
-            program: &str,
-            args: &[&str],
-            input: &[u8],
-        ) -> io::Result<std::process::Output> {
-            self.0.lock().unwrap().push(format!(
-                "{program} {} <<< {:?}",
-                args.join(" "),
-                String::from_utf8_lossy(input)
-            ));
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
-                stderr: Vec::new(),
-            })
-        }
     }
 
     #[tokio::test]
@@ -2642,24 +2676,6 @@ mod tests {
             Ok(std::process::Output {
                 status: std::process::ExitStatus::from_raw(0),
                 stdout,
-                stderr: Vec::new(),
-            })
-        }
-
-        async fn output_with_input(
-            &self,
-            program: &str,
-            args: &[&str],
-            input: &[u8],
-        ) -> io::Result<std::process::Output> {
-            self.calls.lock().unwrap().push(format!(
-                "{program} {} <<< {:?}",
-                args.join(" "),
-                String::from_utf8_lossy(input)
-            ));
-            Ok(std::process::Output {
-                status: std::process::ExitStatus::from_raw(0),
-                stdout: Vec::new(),
                 stderr: Vec::new(),
             })
         }
@@ -2777,108 +2793,247 @@ mod tests {
         ));
     }
 
+    /// Opens the model nf_tables kernel for an `IptablesGate` under test.
+    struct ModelNetfilter(Arc<Mutex<crate::nftables::model::Kernel>>);
+
+    impl NetfilterOpener for ModelNetfilter {
+        type Channel = crate::nftables::model::Channel;
+
+        fn open(&self) -> Result<Self::Channel> {
+            self.0.lock().unwrap().opens += 1;
+            Ok(crate::nftables::model::Channel::new(self.0.clone()))
+        }
+    }
+
+    fn armed_model() -> Arc<Mutex<crate::nftables::model::Kernel>> {
+        let mut kernel = crate::nftables::model::Kernel::default();
+        kernel.arm(Family::Ipv4);
+        kernel.arm(Family::Ipv6);
+        Arc::new(Mutex::new(kernel))
+    }
+
+    fn holds_gate(table: &crate::nftables::model::Table, chain: &str) -> bool {
+        use crate::nftables::model::Rule;
+        table.chains.contains(&chain)
+            || table
+                .rules
+                .iter()
+                .any(|(c, _, rule)| *c == chain || matches!(rule, Rule::Jump(t) if *t == chain))
+    }
+
     #[tokio::test]
-    async fn computed_removal_issues_exactly_the_observed_deletions() {
-        let doubled = format!("{ARMED_V4_DUMP}-A INPUT -j FCVM_SNAPSHOT_IN\n");
-        let runner = ScriptedRunner {
-            dump: doubled,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        };
-        let calls = runner.calls.clone();
-        IptablesGate::new(runner)
-            .remove_family("iptables", &[Direction::Input, Direction::Output])
-            .await
-            .unwrap();
+    async fn opening_each_half_is_one_transaction_for_both_families() {
+        // Each half of the gate opens in both families in ONE nf_tables
+        // commit and spawns no process: egress (OUTPUT) first, ingress
+        // (INPUT) second, two observable steps in that order.
+        let kernel = armed_model();
+        let runner = RecordingRunner::default();
+        let calls = runner.0.clone();
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
+
+        gate.open_egress().await.unwrap();
+        {
+            let k = kernel.lock().unwrap();
+            assert_eq!(
+                k.commits.len(),
+                1,
+                "egress must be one commit: {:?}",
+                k.commits
+            );
+            let ops = k.commits[0].join("; ");
+            assert!(
+                ops.contains("ip delete rule OUTPUT") && ops.contains("ip6 delete rule OUTPUT"),
+                "{ops}"
+            );
+            assert!(
+                ops.contains("ip delete chain FCVM_SNAPSHOT_OUT")
+                    && ops.contains("ip6 delete chain FCVM_SNAPSHOT_OUT"),
+                "{ops}"
+            );
+            assert!(
+                !ops.contains("INPUT") && !ops.contains("FCVM_SNAPSHOT_IN"),
+                "egress touched ingress: {ops}"
+            );
+            for table in [&k.ipv4, &k.ipv6] {
+                assert!(!holds_gate(table, GATE_OUTPUT_CHAIN), "{table:?}");
+                assert!(
+                    holds_gate(table, GATE_INPUT_CHAIN),
+                    "ingress must stay gated: {table:?}"
+                );
+            }
+        }
+
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
         assert_eq!(
-            calls.lock().unwrap().as_slice(),
-            [
-                "iptables -w -S",
-                "iptables-restore -w --noflush <<< \"*filter\\n\
--D INPUT -j FCVM_SNAPSHOT_IN\\n\
--D INPUT -j FCVM_SNAPSHOT_IN\\n\
--D OUTPUT -j FCVM_SNAPSHOT_OUT\\n\
--F FCVM_SNAPSHOT_IN\\n\
--X FCVM_SNAPSHOT_IN\\n\
--F FCVM_SNAPSHOT_OUT\\n\
--X FCVM_SNAPSHOT_OUT\\n\
-COMMIT\\n\"",
-            ],
-            "removal must be one computed batch, never a probe or spawn per step"
+            k.commits.len(),
+            2,
+            "ingress must be one more commit: {:?}",
+            k.commits
+        );
+        let ops = k.commits[1].join("; ");
+        assert!(
+            ops.contains("ip delete rule INPUT") && ops.contains("ip6 delete rule INPUT"),
+            "{ops}"
+        );
+        for table in [&k.ipv4, &k.ipv6] {
+            assert!(
+                !holds_gate(table, GATE_INPUT_CHAIN) && !holds_gate(table, GATE_OUTPUT_CHAIN),
+                "{table:?}"
+            );
+        }
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "opening the gate must spawn no process: {:?}",
+            calls.lock().unwrap()
+        );
+        let timings = gate.timings();
+        assert!(
+            timings.egress_commit_ms > 0.0 && timings.ingress_commit_ms > 0.0,
+            "{timings:?}"
         );
     }
 
     #[tokio::test]
-    async fn removal_reuses_the_verification_read_in_one_transaction() {
+    async fn both_halves_share_one_socket_released_off_the_callers_thread() {
+        // Releasing an nfnetlink socket after a deletion waits an RCU grace
+        // period while holding nf_tables' commit mutex, so a release between
+        // the halves delays the ingress commit, and a release on the
+        // caller's thread delays the caller. The model's release blocks until
+        // let go (or two seconds pass).
+        let kernel = armed_model();
+        let (release, blocker) = std::sync::mpsc::channel::<()>();
+        kernel.lock().unwrap().close_blocker = Some(Arc::new(Mutex::new(blocker)));
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter(kernel.clone()),
+        );
+        let started = std::time::Instant::now();
+        gate.open_egress().await.unwrap();
+        gate.open().await.unwrap();
+        drop(gate);
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "opening the gate and dropping it waited {elapsed:?} for a socket release"
+        );
+        {
+            let k = kernel.lock().unwrap();
+            assert_eq!(k.commits.len(), 2);
+            assert_eq!(k.opens, 1, "both halves must share one socket");
+            assert_eq!(k.closes, 0, "released before the caller let it go");
+        }
+        release.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while kernel.lock().unwrap().closes == 0 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the socket was never released"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn removal_deletes_every_observed_hook_and_nothing_else() {
+        use crate::nftables::model::Rule;
+        let kernel = armed_model();
+        {
+            let mut k = kernel.lock().unwrap();
+            // A duplicate hook an interrupted close could leave, and a jump
+            // that carries a match, which is not ours.
+            k.add_rule(Family::Ipv4, "INPUT", Rule::Jump(GATE_INPUT_CHAIN));
+            k.add_rule(Family::Ipv6, "INPUT", Rule::Other);
+        }
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter(kernel.clone()),
+        );
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
+        assert_eq!(k.commits.len(), 1);
+        assert_eq!(
+            k.commits[0]
+                .iter()
+                .filter(|op| op.as_str() == "ip delete rule INPUT handle")
+                .count(),
+            2,
+            "{:?}",
+            k.commits
+        );
+        assert_eq!(
+            k.ipv6.rules,
+            vec![("INPUT", k.ipv6.rules[0].1, Rule::Other)]
+        );
+        assert!(k.ipv4.rules.is_empty(), "{:?}", k.ipv4.rules);
+    }
+
+    #[tokio::test]
+    async fn a_rule_gone_since_the_read_fails_the_batch_whole() {
+        let kernel = armed_model();
+        let mut channel = crate::nftables::model::Channel::new(kernel.clone());
+        let mut removals = Vec::new();
+        for family in Family::BOTH {
+            let half = Direction::Input.half();
+            let layout = crate::nftables::read_half(&mut channel, family, half).unwrap();
+            removals.push(Removal {
+                family,
+                half,
+                layout,
+            });
+        }
+        // Something removed the IPv6 hook between the read and the commit.
+        kernel
+            .lock()
+            .unwrap()
+            .ipv6
+            .rules
+            .retain(|(chain, _, _)| *chain != "INPUT");
+        let before = kernel.lock().unwrap().ipv4.clone();
+        let (batch, _, end) = crate::nftables::removal_batch(&removals).unwrap();
+        let error = crate::nftables::commit(&mut channel, &batch, end).unwrap_err();
+        assert!(format!("{error:#}").contains("No such file"), "{error:#}");
+        let k = kernel.lock().unwrap();
+        assert_eq!(
+            k.ipv4, before,
+            "a failed batch must leave the other family untouched"
+        );
+        assert!(k.commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn removal_of_an_absent_gate_commits_nothing() {
+        let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter(kernel.clone()),
+        );
+        gate.open().await.unwrap();
+        assert!(kernel.lock().unwrap().commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_gate_iptables_reports_but_nftables_does_not_hold_fails_closed() {
+        // iptables (by `-S`) says the gate is armed, nf_tables holds nothing:
+        // the gate lives where this removal cannot reach (an iptables-legacy
+        // binary would do this). Reporting it open would publish a clone that
+        // still rejects every new connection.
         let runner = ScriptedRunner {
             dump: ARMED_V4_DUMP.to_string(),
             calls: Arc::new(Mutex::new(Vec::new())),
         };
-        let calls = runner.calls.clone();
-        let gate = IptablesGate::new(runner);
+        let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
         assert!(gate
             .family_is_closed("iptables", IPV4_LOOPBACK)
             .await
             .unwrap());
-        gate.remove_family("iptables", &[Direction::Input, Direction::Output])
-            .await
-            .unwrap();
-        let reads = calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call.as_str() == "iptables -w -S")
-            .count();
-        assert_eq!(
-            reads, 1,
-            "verify-then-remove under one lock must spend one state read"
+        let error = gate.open_egress().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nf_tables backend"),
+            "{error:#}"
         );
-    }
-
-    #[tokio::test]
-    async fn a_gate_mutation_invalidates_the_retained_state_read() {
-        let runner = ScriptedRunner {
-            dump: ARMED_V4_DUMP.to_string(),
-            calls: Arc::new(Mutex::new(Vec::new())),
-        };
-        let calls = runner.calls.clone();
-        let gate = IptablesGate::new(runner);
-        assert!(gate
-            .family_is_closed("iptables", IPV4_LOOPBACK)
-            .await
-            .unwrap());
-        // The repair path re-closes after a failed verification; the removal
-        // that follows must observe the post-close state, not the retained
-        // pre-close parse.
-        gate.install_family("iptables", IPV4_LOOPBACK)
-            .await
-            .unwrap();
-        gate.remove_family("iptables", &[Direction::Input, Direction::Output])
-            .await
-            .unwrap();
-        let reads = calls
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|call| call.as_str() == "iptables -w -S")
-            .count();
-        assert_eq!(
-            reads, 2,
-            "a close between verify and remove must force a fresh read"
-        );
-    }
-
-    #[tokio::test]
-    async fn removal_of_an_absent_gate_is_a_read_and_nothing_else() {
-        let runner = ScriptedRunner {
-            dump: "-P INPUT ACCEPT\n-P FORWARD ACCEPT\n-P OUTPUT ACCEPT\n".to_string(),
-            calls: Arc::new(Mutex::new(Vec::new())),
-        };
-        let calls = runner.calls.clone();
-        IptablesGate::new(runner)
-            .remove_family("iptables", &[Direction::Input, Direction::Output])
-            .await
-            .unwrap();
-        assert_eq!(calls.lock().unwrap().as_slice(), ["iptables -w -S"]);
+        assert!(kernel.lock().unwrap().commits.is_empty());
     }
 
     #[tokio::test]

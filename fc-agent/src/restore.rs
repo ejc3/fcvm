@@ -180,6 +180,18 @@ pub struct RestorePhases {
     pub tcp_destroyed: usize,
     pub tcp_already_gone: usize,
     pub tcp_destroy_datagrams: usize,
+    /// Per-operation gate timings from the same report: each family's
+    /// verification read and UDP rule (one `iptables` spawn each), and for
+    /// each half of the gate the nf_tables read of its rules and the one
+    /// commit that removes it in both families.
+    pub tcp_gate_verify_ipv4_ms: f64,
+    pub tcp_gate_verify_ipv6_ms: f64,
+    pub tcp_gate_udp_ipv4_ms: f64,
+    pub tcp_gate_udp_ipv6_ms: f64,
+    pub tcp_gate_egress_read_ms: f64,
+    pub tcp_gate_egress_commit_ms: f64,
+    pub tcp_gate_ingress_read_ms: f64,
+    pub tcp_gate_ingress_commit_ms: f64,
     pub neighbor_ms: f64,
     pub nfs_ms: f64,
     pub exec_wait_ms: f64,
@@ -211,6 +223,15 @@ impl RestorePhases {
         self.tcp_destroyed = boundary.tally.destroyed;
         self.tcp_already_gone = boundary.tally.already_gone;
         self.tcp_destroy_datagrams = boundary.tally.datagrams;
+        let gate = boundary.gate;
+        self.tcp_gate_verify_ipv4_ms = gate.verify_ipv4_ms;
+        self.tcp_gate_verify_ipv6_ms = gate.verify_ipv6_ms;
+        self.tcp_gate_udp_ipv4_ms = gate.udp_ipv4_ms;
+        self.tcp_gate_udp_ipv6_ms = gate.udp_ipv6_ms;
+        self.tcp_gate_egress_read_ms = gate.egress_read_ms;
+        self.tcp_gate_egress_commit_ms = gate.egress_commit_ms;
+        self.tcp_gate_ingress_read_ms = gate.ingress_read_ms;
+        self.tcp_gate_ingress_commit_ms = gate.ingress_commit_ms;
     }
 
     /// Compact single-line JSON for the ACK frame.
@@ -683,6 +704,14 @@ mod tests {
         phases.tcp_destroyed = 999_999;
         phases.tcp_already_gone = 999_999;
         phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = 99_999.999;
+        phases.tcp_gate_verify_ipv6_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv4_ms = 99_999.999;
+        phases.tcp_gate_udp_ipv6_ms = 99_999.999;
+        phases.tcp_gate_egress_read_ms = 99_999.999;
+        phases.tcp_gate_egress_commit_ms = 99_999.999;
+        phases.tcp_gate_ingress_read_ms = 99_999.999;
+        phases.tcp_gate_ingress_commit_ms = 99_999.999;
         phases.neighbor_ms = 99_999.999;
         phases.nfs_ms = 99_999.999;
         phases.exec_wait_ms = 99_999.999;

@@ -7095,3 +7095,171 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     );
     Ok(())
 }
+
+/// One HTTP request to `address`:80 that must answer; returns how long it took.
+#[cfg(feature = "privileged-tests")]
+async fn http_get_v6(address: std::net::Ipv6Addr, limit: Duration) -> Result<Duration> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let started = Instant::now();
+    let mut stream = tokio::time::timeout(
+        limit,
+        tokio::net::TcpStream::connect((std::net::IpAddr::V6(address), 80)),
+    )
+    .await
+    .with_context(|| format!("connecting to [{address}]:80 timed out after {limit:?}"))?
+    .with_context(|| format!("connecting to [{address}]:80"))?;
+    stream.write_all(b"GET / HTTP/1.0\r\n\r\n").await?;
+    let mut head = [0u8; 8];
+    tokio::time::timeout(limit, stream.read_exact(&mut head))
+        .await
+        .context("reading the response timed out")??;
+    anyhow::ensure!(head.starts_with(b"HTTP/"), "not an HTTP answer: {head:?}");
+    Ok(started.elapsed())
+}
+
+/// A routed clone's own IPv6 address is open to a new inbound connection the
+/// moment the clone acknowledges its restore, even when a client was already
+/// dialling it while the clone restored (as a browser retrying its page does).
+///
+/// That client's Neighbor Solicitations reach the guest before it holds its
+/// new address, which leaves the host's neighbour entry INCOMPLETE until the
+/// next solicitation, a second later; measured, the first connection after
+/// the ACK then took 787 to 893 ms. The guest announces the address with an
+/// unsolicited Neighbor Advertisement right after taking it.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("v6-ingress");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone")?;
+
+    // The early client: dial the clone's address from the moment its state
+    // names it until the ACK.
+    let address: std::net::Ipv6Addr = {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Ok(value) = common::get_network_field(clone_pid, "guest_ipv6").await {
+                let bare = value.split('/').next().unwrap_or(&value).to_string();
+                break bare
+                    .parse()
+                    .with_context(|| format!("guest_ipv6 {value:?}"))?;
+            }
+            anyhow::ensure!(
+                Instant::now() < deadline,
+                "the clone never recorded guest_ipv6"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    let acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let early = {
+        let acked = acked.clone();
+        tokio::spawn(async move {
+            let mut attempts = 0u32;
+            while !acked.load(std::sync::atomic::Ordering::Acquire) {
+                attempts += 1;
+                let _ = http_get_v6(address, Duration::from_millis(300)).await;
+            }
+            attempts
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
+        if log.contains("acknowledged exact restore generation") {
+            break;
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "the clone never acknowledged its restore"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    acked.store(true, std::sync::atomic::Ordering::Release);
+    let first = http_get_v6(address, Duration::from_secs(5)).await;
+    let attempts = early.await?;
+    println!("early client made {attempts} attempts; first connection after the ACK: {first:?}");
+    let first = first.context("the first connection after the ACK failed")?;
+    anyhow::ensure!(
+        attempts > 0,
+        "the early client never dialled; the test proved nothing"
+    );
+    // A healthy connection takes about a millisecond; the stall this pins was
+    // a neighbour retransmit, about one second.
+    anyhow::ensure!(
+        first < Duration::from_millis(300),
+        "the first IPv6 connection after the ACK took {first:?}"
+    );
+    let rules = common::exec_in_vm(
+        clone_pid,
+        &[
+            "sh",
+            "-c",
+            "/usr/sbin/iptables -w -S; /usr/sbin/ip6tables -w -S",
+        ],
+    )
+    .await?;
+    anyhow::ensure!(
+        !rules.contains("FCVM_SNAPSHOT"),
+        "the gate is still installed after the ACK:\n{rules}"
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    Ok(())
+}
