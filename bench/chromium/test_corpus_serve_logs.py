@@ -456,6 +456,90 @@ class AccessLog(ReplayFixture, unittest.TestCase):
             self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR), 0,
                              "the server reset the connection after its 404")
 
+    def _answer_within(self, port, request, seconds, handler_attrs=None):
+        sock = socket.create_connection(("127.0.0.1", port), timeout=seconds)
+        self.addCleanup(sock.close)
+        sock.sendall(request)
+        try:
+            return sock.recv(65536)
+        except socket.timeout:
+            return None
+
+    def test_a_negative_chunk_size_does_not_read_to_eof(self):
+        """A chunk size of -3 parses as hex; read(-3 + 2) is read(-1), which
+        waits for the client to close, so a client that holds the connection
+        open never gets its answer (review of #1138)."""
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            answer = self._answer_within(
+                server.server_port,
+                b"POST /beacon HTTP/1.1\r\nHost: telemetry.test\r\n"
+                b"Transfer-Encoding: chunked\r\n\r\n-3\r\nabc", 3.0)
+            self.assertIsNotNone(answer, "no answer while the client held the connection")
+            self.assertTrue(answer.startswith(b"HTTP/1.0 404"), answer[:80])
+
+    def test_an_unfinished_body_does_not_hold_the_answer(self):
+        """A client that sends part of its body and stops must still get the
+        answer once the drain gives up, and shutdown must not wait on it."""
+        with tempfile.TemporaryDirectory() as d:
+            from pathlib import Path
+
+            exact, noquery, redirects = corpus_serve.load_indexes(Path(self._corpus(d)))
+
+            class H(corpus_serve.Handler):
+                DRAIN_TIMEOUT_S = 0.3
+
+            H.exact, H.noquery, H.redirects = exact, noquery, redirects
+            H.misses = []
+            H.access_log = None
+            server = corpus_serve.ReplayServer(("127.0.0.1", 0), H, None)
+            self.addCleanup(server.server_close)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.shutdown)
+            answer = self._answer_within(
+                server.server_port,
+                b"POST /beacon HTTP/1.1\r\nHost: telemetry.test\r\n"
+                b"Content-Length: 100\r\n\r\n0123456789", 3.0)
+            self.assertIsNotNone(answer, "no answer while the body stayed unfinished")
+            self.assertTrue(answer.startswith(b"HTTP/1.0 404"), answer[:80])
+
+    def test_a_trickled_body_is_cut_off_at_one_deadline(self):
+        """A client that sends one byte at a time must not keep the drain going
+        by resetting a per-read timeout: the drain has one deadline for the
+        whole body (review of #1138)."""
+        with tempfile.TemporaryDirectory() as d:
+            from pathlib import Path
+
+            exact, noquery, redirects = corpus_serve.load_indexes(Path(self._corpus(d)))
+
+            class H(corpus_serve.Handler):
+                DRAIN_TIMEOUT_S = 0.3
+
+            H.exact, H.noquery, H.redirects = exact, noquery, redirects
+            H.misses = []
+            H.access_log = None
+            server = corpus_serve.ReplayServer(("127.0.0.1", 0), H, None)
+            self.addCleanup(server.server_close)
+            threading.Thread(target=server.serve_forever, daemon=True).start()
+            self.addCleanup(server.shutdown)
+            sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=0.05)
+            self.addCleanup(sock.close)
+            sock.sendall(b"POST /beacon HTTP/1.1\r\nHost: telemetry.test\r\n"
+                         b"Content-Length: 100\r\n\r\n")
+            answer = None
+            deadline = time.monotonic() + 3.0
+            while answer is None and time.monotonic() < deadline:
+                try:
+                    sock.sendall(b"x")
+                except OSError:
+                    break
+                try:
+                    answer = sock.recv(65536) or None
+                except socket.timeout:
+                    time.sleep(0.05)
+            self.assertIsNotNone(answer, "the trickled body held the answer past 3 s")
+            self.assertTrue(answer.startswith(b"HTTP/1.0 404"), answer[:80])
+
     class BreaksAfter:
         """A JsonlLog that writes its first `n` rows and fails every one
         after, as a disk that fills part way through a run would."""
