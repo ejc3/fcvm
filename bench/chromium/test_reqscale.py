@@ -567,6 +567,26 @@ class PerFirecrackerFaults(unittest.TestCase):
         self.assertEqual(probe.finish()["pid"], 200)
         self.assertEqual(audit.observed, [(100, "fcvm"), (200, "firecracker"), (202, "pasta")])
 
+    def test_the_analyzer_finds_the_content_addressed_firecracker_in_the_audit(self):
+        """The audit records each process under its comm, so Firecracker is
+        "firecracker-def". RED BEFORE THE FIX: the analyzer looked for the role
+        "firecracker" and refused every request of the first complete corpus
+        scale run ("Firecracker identity is absent from its file cgroup audit")."""
+        import reqscale_analyze
+        status = {"final_cgroups": {
+            "file": {"observed": [{"pid": 200, "pid_start_time_ticks": 500, "role": "firecracker-def"}]},
+            "uffd": {"observed": [{"pid": 300, "pid_start_time_ticks": 600, "role": "firecracker-def"},
+                                  {"pid": 301, "pid_start_time_ticks": 601, "role": "pasta-4707649d2"}]},
+        }}
+        row = lambda rid, backend, pid, start: {
+            "request_id": rid, "backend": backend,
+            "firecracker_process_faults_ready_to_artifact": {"pid": pid, "pid_start_time_ticks": start}}
+        reqscale_analyze._validate_fault_cgroup_membership(
+            [row("a", "file", 200, 500), row("b", "uffd", 300, 600)], status)
+        for bad in (row("c", "uffd", 200, 500), row("d", "uffd", 301, 601)):
+            with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "absent"):
+                reqscale_analyze._validate_fault_cgroup_membership([bad], status)
+
     def test_pid_reuse_is_rejected(self):
         proc = FakeProcReader()
         proc.samples[200][1] = reqscale.ProcessStat(200, "R", 37, 3, 501)
@@ -1472,7 +1492,9 @@ class CompleteAnalyzerFixture(unittest.TestCase):
             "config_sha256": cls.CONFIG_SHA,
             "shape": {
                 "image": "chromium:test", "vcpu": 2, "memory_mib": 1024,
-                "network_mode": "rootless", "port_mappings": ["9222:9222"],
+                "network_mode": "rootless",
+                "port_mappings": [{"host_ip": None, "host_port": 9222,
+                                   "guest_port": 9222, "proto": "tcp"}],
             },
             "files": files,
         }
@@ -2096,7 +2118,9 @@ class ProvenanceFailsClosed(unittest.TestCase):
             "created_at": "2026-08-09T00:00:00Z", **paths,
             "metadata": {
                 "image": "chromium:test", "vcpu": 2, "memory_mib": 1024,
-                "network_mode": "rootless", "port_mappings": ["9222:9222"],
+                "network_mode": "rootless",
+                "port_mappings": [{"host_ip": None, "host_port": 9222,
+                                   "guest_port": 9222, "proto": "tcp"}],
             },
         }
         config_path = os.path.join(snapshot_dir, "config.json")
@@ -2117,6 +2141,20 @@ class ProvenanceFailsClosed(unittest.TestCase):
             self.assertEqual(
                 identity["generation_id"], "11111111-1111-4111-8111-111111111111"
             )
+
+    def test_the_analyzer_accepts_the_snapshot_identity_the_harness_records(self):
+        """fcvm writes each port mapping as an object; the analyzer only took
+        strings ("9222:9222", its own fixtures' shape). RED BEFORE THE FIX: the
+        first corpus scale run to finish every burst (2026-10-22, s12-r2) was
+        refused with "provenance snapshot shape contains invalid values"."""
+        import reqscale_analyze
+        with tempfile.TemporaryDirectory() as d:
+            self.make_snapshot(d)
+            identity = reqscale.snapshot_identity(d, "golden")
+            reqscale_analyze._validate_snapshot_provenance(identity)
+            identity["shape"]["port_mappings"] = [{"host_port": 9222}]
+            with self.assertRaisesRegex(reqscale_analyze.AnalysisInvalid, "invalid values"):
+                reqscale_analyze._validate_snapshot_provenance(identity)
 
     def test_missing_or_noncanonical_generation_id_is_rejected(self):
         with tempfile.TemporaryDirectory() as d:
