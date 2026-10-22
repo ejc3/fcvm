@@ -52,6 +52,12 @@ async page fault for every page it touches that the host has not paged in yet,
 so perf sampling with call chains in a clone hits it within seconds. The nested
 link is a `.vm.patch` so the x86 host kernel does not apply it.
 
+The gpu profile applies `kernel/patches-gpu` (`kernel/patches-gpu-x86` on
+x86_64): the default patches, linked, plus one Kconfig patch that gives
+`CONFIG_MMU_NOTIFIER` a prompt. NVIDIA's nvidia-uvm needs MMU notifiers, the
+option has no prompt upstream, and nothing in this kernel selects it. The gpu
+profile is not published as a release yet; `make setup-gpu` builds it.
+
 ## Release identity
 
 Published default profiles carry `kernel_sha`, the first 12 hexadecimal digits
