@@ -375,9 +375,12 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
 - **Directed camera with nudges. DECIDED.** The camera flies a choreographed path with
   scenic holds, where the path-traced image converges; viewers vote or queue where the
   next hold goes instead of steering continuously.
-- **Your own GPU. DECIDED.** Any viewer can claim a standby GPU: a private VM restores for
-  them in seconds, with their own camera, full screen, timed from click to first frame,
-  and returns to the pool after 60 seconds.
+- **Your own GPU. DECIDED.** Any viewer can claim a GPU: a private VM restores for them in
+  seconds, with their own camera, full screen, timed from click to first frame, for 60
+  seconds. The GPU is borrowed from the wall: the claimed tile visibly leaves the image,
+  labelled as a visitor's private GPU, and when the session ends its VM is destroyed and
+  the tile's VM restores back into the wall. One claim per address at a time, with a
+  cooldown; a cap on how many tiles may be borrowed at once keeps the wall mostly whole.
 - **The gpu profile uses NVIDIA's proprietary kernel modules with the GPU firmware off on
   x86 (#1149). DECIDED.** GPU setup takes about 0.58 s instead of 1.07 s with the open
   modules; the profile setting keeps `open` available for GPUs the proprietary modules do
