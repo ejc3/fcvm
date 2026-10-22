@@ -1,0 +1,26 @@
+# The fleet renderer. Build: make -C fleet/renderer image TAG=<tag>
+# The runtime image carries no NVIDIA libraries: fcvm's CDI injection
+# (--device nvidia.com/gpu=all) provides libcuda, libnvidia-encode and libnvidia-ml.
+FROM docker.io/nvidia/cuda:12.8.1-devel-ubuntu24.04 AS build
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends git ca-certificates make \
+    && rm -rf /var/lib/apt/lists/*
+# NVENC API header (MIT), pinned: n12.2.72.0
+RUN git clone -q https://github.com/FFmpeg/nv-codec-headers.git /opt/nv-codec-headers \
+    && git -C /opt/nv-codec-headers checkout -q c69278340ab1d5559c7d7bf0edf615dc33ddbba7
+WORKDIR /src
+COPY Makefile ./
+COPY src ./src
+COPY tests ./tests
+RUN make -j"$(nproc)" all && ./build/test-host
+
+FROM docker.io/library/ubuntu:24.04
+# Everything in the image is owned by root. Rootless fcvm exports an image's
+# layers as the invoking user, which cannot read a private directory owned by
+# another container user (the stock image's /home/ubuntu and apt's partial/
+# directories). Build with --squash-all (make image does) so no lower layer
+# still holds them.
+RUN userdel -r ubuntu 2>/dev/null; find / -xdev \( -path /proc -o -path /sys -o -path /dev \) -prune -o ! -uid 0 -exec chown -h 0:0 {} +
+COPY --from=build /src/build/fleet-renderer /src/build/fleet-renderer-test /usr/local/bin/
+ENV NVIDIA_VISIBLE_DEVICES=all NVIDIA_DRIVER_CAPABILITIES=compute,video,utility PORT=8080
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/fleet-renderer"]
