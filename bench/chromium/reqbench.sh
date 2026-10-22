@@ -1795,7 +1795,10 @@ def answered_by_replay(url, window):
         return False
     parts = urllib.parse.urlsplit(url)
     host = (parts.hostname or "").lower()
-    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    # The request target as sent, which is what the replay logs: urlsplit
+    # drops a bare trailing "?" (https://blog.cloudflare.com/cdn-cgi/rum?).
+    target = url.split(parts.netloc, 1)[1].split("#", 1)[0] if parts.netloc else ""
+    target = target or "/"
     start, end = window
     for entry in access:
         if not entry[3] and entry[1] == host and entry[2] == target and start <= entry[0] <= end:

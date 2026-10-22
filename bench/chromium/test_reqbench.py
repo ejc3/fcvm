@@ -6332,17 +6332,21 @@ if error:
 # names no address for it. STUB_CACHED=1: one the cache answered and one a
 # service worker answered, which carry no address either and say why.
 if os.environ.get("STUB_UNADDRESSED") == "1":
-    rows.append({"request_id": "r5", "url": url + "late.js", "remote_ip": "",
+    rows.append({"request_id": "r5", "url": os.environ.get("STUB_BEACON_URL") or (url + "late.js"), "remote_ip": "",
                  "status": None, "failed": False, "pending_at_load": True,
                  "error_text": "", "from_cache": False, "from_service_worker": False})
     # STUB_ACCESS_LOG=<path>: the replay's access log, with a line saying it
     # answered that request now (or, with STUB_ACCESS_TS, at that time).
     if os.environ.get("STUB_ACCESS_LOG"):
         import time, urllib.parse
-        parts = urllib.parse.urlsplit(url + "late.js")
+        # The path as the replay logs it: the raw request target, so a URL
+        # ending in a bare "?" keeps it (STUB_BEACON_URL, a beacon's shape).
+        beacon = os.environ.get("STUB_BEACON_URL") or (url + "late.js")
+        parts = urllib.parse.urlsplit(beacon)
+        raw = beacon.split(parts.netloc, 1)[1].split("#", 1)[0] or "/"
         line = {"ts": float(os.environ.get("STUB_ACCESS_TS") or time.time()),
                 "peer": "127.0.0.1:1", "method": "POST", "host": parts.netloc,
-                "path": parts.path, "status": 404, "bytes": 0, "duration_ms": 0.2}
+                "path": raw, "status": 404, "bytes": 0, "duration_ms": 0.2}
         with open(os.environ["STUB_ACCESS_LOG"], "a") as log:
             log.write(json.dumps(line) + "\n")
 if os.environ.get("STUB_CACHED") == "1":
@@ -6591,9 +6595,14 @@ exec __PYTHON__ "$@"
         On 2026-10-22 these resets failed most diags on one host.
 
         RED BEFORE THE FIX: the logged request still failed the diag."""
-        for when, passes in (("", True), ("1.0", False)):
+        # The second beacon is the shape that failed on 2026-10-22 after the
+        # first fix: https://blog.cloudflare.com/cdn-cgi/rum? with an empty
+        # query, which the replay logs as "/cdn-cgi/rum?".
+        for when, passes, beacon in (("", True, ""), ("1.0", False, ""),
+                                     ("", True, "https://blog.cloudflare.com/cdn-cgi/rum?")):
             with tempfile.TemporaryDirectory() as d:
-                env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1")
+                env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1",
+                                                     STUB_BEACON_URL=beacon)
                 os.makedirs(env["RESULTS"], exist_ok=True)
                 env["STUB_ACCESS_LOG"] = os.path.join(env["RESULTS"], "corpus-access.log")
                 env["STUB_ACCESS_TS"] = when
