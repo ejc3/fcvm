@@ -791,6 +791,28 @@ fn validate_free_page_reporting(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// `--gpu` devices are attached when fcvm restores the pre-start snapshot, which is
+/// taken without them. A run that never restores that snapshot would run without them.
+fn validate_gpu_run(args: &RunArgs, lifecycle: &PodmanLifecycle, no_snapshot: bool) -> Result<()> {
+    anyhow::ensure!(
+        args.hypervisor == crate::cli::args::Hypervisor::Firecracker,
+        "--gpu is not supported with --hypervisor cloud-hypervisor: fcvm attaches GPUs only \
+         on a Firecracker restore"
+    );
+    anyhow::ensure!(
+        !lifecycle.is_prepare(),
+        "--gpu is not supported by podman prepare: a prepared snapshot is taken after the \
+         container starts, and a VM with a passthrough device can not be snapshotted"
+    );
+    anyhow::ensure!(
+        !no_snapshot,
+        "--gpu needs the snapshot cache: its devices are attached when fcvm restores the \
+         pre-start snapshot, and this run skips the cache (--no-snapshot, FCVM_NO_SNAPSHOT, \
+         FCVM_BOOTPLAN=vsock or a disk-only clone)"
+    );
+    Ok(())
+}
+
 /// Whether the guest agent's first "cache-ready" ask is handed to the run loop:
 /// when the run may take a pre-start snapshot, and when a cold boot
 /// with `--free-page-reporting` owes the check of its balloon
@@ -841,12 +863,15 @@ fn snapshot_restore_args(
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
         ipv6_prefix: launch_ipv6_prefix(args),
-        startup_snapshot_base_key,
+        // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
+        // no startup snapshot.
+        startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
         cpu: Some(args.cpu),
         mem: Some(args.mem),
         balloon: args.balloon,
         firecracker_bin,
         firecracker_args,
+        gpu: args.gpu.clone(),
         hugepages: Some(args.hugepages),
         non_blocking_output: args.non_blocking_output,
         on_restore: args.on_restore.clone(),
@@ -870,6 +895,15 @@ fn is_snapshot_load_failure(err: &anyhow::Error) -> bool {
     // boot, which re-stats the disk and provisions coherently.
     // "snapshot pmem image changed" is check_snapshot_pmem_images' marker, for
     // the same reason: Firecracker reopens the recorded image path on restore.
+    // A --gpu device that Firecracker could not attach (the device is busy, the
+    // host is not set up) is a fault of this run, not of the shared snapshot:
+    // Firecracker reports it inside its "Load snapshot error", with the two
+    // markers below (vmm::persist::RestoreFromSnapshotError).
+    if rendered.contains("passthrough device on restore")
+        || rendered.contains("Device passthrough on restore")
+    {
+        return false;
+    }
     rendered.contains("Load snapshot error")
         || rendered.contains("image disk build changed")
         || rendered.contains("snapshot pmem image changed")
@@ -1267,7 +1301,7 @@ async fn prepare_vm_for_lifecycle(
     } else {
         crate::setup::get_kernel_profile("default")?
     };
-    let runtime_config = runtime_config_from_kernel_profiles(
+    let mut runtime_config = runtime_config_from_kernel_profiles(
         effective_profile_name,
         profile,
         default_profile,
@@ -1294,6 +1328,17 @@ async fn prepare_vm_for_lifecycle(
             .await
             .context("setting up kernel")?
     };
+    // A profile with an NVIDIA driver image attaches it to every cold boot, GPU or
+    // not, so its snapshots carry the mounted driver and any restore can take a GPU.
+    // The modules are built against the profile's kernel, so --kernel gets none.
+    if args.kernel.is_none() {
+        runtime_config.gpu_driver_image =
+            crate::setup::profile_nvidia_driver_image(kernel_profile_name, args.setup)
+                .await
+                .context("setting up the NVIDIA driver image")?
+                .map(crate::commands::common::GpuDriverImage::at)
+                .transpose()?;
+    }
 
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
     let rootfs_type = resolve_rootfs_type(&args);
@@ -1411,6 +1456,14 @@ async fn prepare_vm_for_lifecycle(
             .unwrap_or(false),
         std::env::var("FCVM_BOOTPLAN").as_deref() == Ok("vsock"),
     );
+    if !args.gpu.is_empty() {
+        validate_gpu_run(&args, &lifecycle, no_snapshot)?;
+        args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
+        crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        for sbdf in &args.gpu {
+            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+        }
+    }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
     // key (via fc_config or the fallback launch config) and the bridged
     // network's guest DNS below, so the hashed value and the guest-visible
@@ -1431,6 +1484,7 @@ async fn prepare_vm_for_lifecycle(
             cmd_args.clone(),
             resolved_mode,
             runtime_config.firecracker_bin.as_deref(),
+            runtime_config.gpu_driver_image.as_ref(),
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
             boot_inputs.clone(),
@@ -1466,7 +1520,12 @@ async fn prepare_vm_for_lifecycle(
         }
 
         // Check for startup snapshot first (fully initialized application)
-        if !lifecycle.is_prepare() && check_podman_snapshot(&startup_key).await.is_some() {
+        // A --gpu run never restores a startup snapshot: its container started without the
+        // GPU. It restores the pre-start snapshot, which is taken before the container runs.
+        if !lifecycle.is_prepare()
+            && args.gpu.is_empty()
+            && check_podman_snapshot(&startup_key).await.is_some()
+        {
             info!(
                 snapshot_key = %startup_key,
                 image = %args.image,
@@ -2578,11 +2637,16 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                             // forwarding, NFS shares) historically never restored because
                             // per-run paths make their cache keys unique — forcing them
                             // through restore regressed all three classes.
-                            if nv2_profile(&ctx.vm_state.config.kernel_profile) {
+                            //
+                            // A --gpu run converges too: its devices are attached by the
+                            // restore, so this cold-booted VM has none of them.
+                            if nv2_profile(&ctx.vm_state.config.kernel_profile)
+                                || !ctx.args.gpu.is_empty()
+                            {
                                 info!(
                                     snapshot_key = %key,
                                     "Pre-start snapshot created; relaunching by restoring it \
-                                     (NV2 miss path converges on the hit path)"
+                                     (the miss path converges on the hit path)"
                                 );
                                 // Recorded BEFORE the return drops the oneshot: a
                                 // re-asking guest must hear "cache-doomed", never
@@ -2602,6 +2666,14 @@ pub async fn run_vm_loop(ctx: &mut VmContext, cancel: CancellationToken) -> Resu
                                     state.config.snapshot_name = Some(key.clone());
                                 })
                                 .await;
+                        }
+                        SnapshotOutcome::Failed(e) if !ctx.args.gpu.is_empty() => {
+                            // Continuing cold would run the container without its GPU.
+                            *ctx.cache_verdict.lock().unwrap() = CacheVerdict::Doomed;
+                            return Err(e.context(
+                                "creating the pre-start snapshot that --gpu restores with its \
+                                 devices attached",
+                            ));
                         }
                         SnapshotOutcome::Failed(e) => {
                             warn!(snapshot_key = %key, error = %e, "Failed to create pre-start snapshot");
@@ -3160,6 +3232,7 @@ mod tests {
             disk: vec![],
             disk_dir: vec![],
             pmem: vec![],
+            gpu: vec![],
             nfs: vec![],
             env: vec![],
             cmd: None,
@@ -3229,6 +3302,48 @@ mod tests {
         );
     }
 
+    /// `--gpu` devices are attached by a restore of the pre-start snapshot, so every
+    /// run that never makes that restore is refused before any VM boots.
+    #[test]
+    fn a_gpu_run_must_restore_the_pre_start_snapshot() {
+        let mut args = test_args();
+        args.gpu = vec!["0000:01:00.0".to_string()];
+        assert!(validate_gpu_run(&args, &PodmanLifecycle::Run, false).is_ok());
+
+        let err = format!(
+            "{:#}",
+            validate_gpu_run(&args, &PodmanLifecycle::Run, true).unwrap_err()
+        );
+        assert!(err.contains("needs the snapshot cache"), "{err}");
+        let prepare = PodmanLifecycle::Prepare(PrepareOptions::default());
+        let err = format!(
+            "{:#}",
+            validate_gpu_run(&args, &prepare, false).unwrap_err()
+        );
+        assert!(err.contains("podman prepare"), "{err}");
+        args.hypervisor = crate::cli::args::Hypervisor::CloudHypervisor;
+        let err = format!(
+            "{:#}",
+            validate_gpu_run(&args, &PodmanLifecycle::Run, false).unwrap_err()
+        );
+        assert!(err.contains("cloud-hypervisor"), "{err}");
+    }
+
+    /// A GPU restore can never take a startup snapshot (Firecracker refuses to snapshot
+    /// a VM with a passthrough device), and it carries its devices to `snapshot run`.
+    #[test]
+    fn a_gpu_restore_takes_no_startup_snapshot() {
+        let mut args = test_args();
+        let plain = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
+        assert_eq!(plain.startup_snapshot_base_key.as_deref(), Some("k"));
+        assert!(plain.gpu.is_empty());
+
+        args.gpu = vec!["0000:01:00.0".to_string()];
+        let gpu = snapshot_restore_args(&args, "k", Some("k".to_string()), (None, None));
+        assert_eq!(gpu.startup_snapshot_base_key, None);
+        assert_eq!(gpu.gpu, ["0000:01:00.0"]);
+    }
+
     /// A cache hit restores through `snapshot run`, where a clone chooses where it
     /// publishes. The restore has to publish where THIS run asked.
     #[test]
@@ -3281,6 +3396,7 @@ mod tests {
                 Path::new("/initrd"),
                 None,
                 ImageMode::Overlay,
+                None,
                 None,
                 None,
                 extra,
@@ -3461,6 +3577,7 @@ mod tests {
                 Path::new("/initrd"),
                 None,
                 ImageMode::Overlay,
+                None,
                 None,
                 None,
                 None,
@@ -3802,6 +3919,7 @@ mod tests {
             Path::new("/initrd"),
             None,
             ImageMode::Overlay,
+            None,
             None,
             None,
             None,
@@ -5341,6 +5459,24 @@ mod image_disk_identity_classifier_tests {
         assert!(super::is_snapshot_load_failure(&pmem));
         let unrelated = anyhow::anyhow!("some other failure");
         assert!(!super::is_snapshot_load_failure(&unrelated));
+    }
+
+    #[test]
+    fn a_gpu_that_cannot_attach_keeps_the_snapshot() {
+        // Firecracker's rendering of a VFIO attach failure during PUT /snapshot/load.
+        // The snapshot is fine; invalidating it would delete a shared cache entry.
+        let attach = anyhow::anyhow!(
+            "Load snapshot error: Failed to restore from snapshot: Failed to attach a \
+             passthrough device on restore: Attaching the passthrough device failed: busy"
+        );
+        assert!(!super::is_snapshot_load_failure(&attach));
+        let kvm = anyhow::anyhow!(
+            "Load snapshot error: Failed to restore from snapshot: Device passthrough on \
+             restore requires a KVM VM"
+        );
+        assert!(!super::is_snapshot_load_failure(&kvm));
+        let other = anyhow::anyhow!("Load snapshot error: Failed to restore from snapshot: bad");
+        assert!(super::is_snapshot_load_failure(&other));
     }
 }
 

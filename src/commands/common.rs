@@ -38,6 +38,28 @@ pub struct RuntimeConfig {
     pub boot_args: Option<String>,
     /// FUSE reader thread count override
     pub fuse_readers: Option<u32>,
+    /// The profile's NVIDIA driver image (src/setup/nvidia.rs), attached read-only to
+    /// every cold boot on the profile so its snapshots carry the mounted driver and a
+    /// restore can attach a GPU. None for a profile without one.
+    pub gpu_driver_image: Option<GpuDriverImage>,
+}
+
+/// A profile's NVIDIA driver image and the build identity (`utils::file_identity`)
+/// it had when resolved. The identity keys the snapshot cache: a rebuild at the same
+/// path is a different filesystem, which a snapshot holding the guest's mount of the
+/// old one must not be restored against.
+#[derive(Clone, Debug)]
+pub struct GpuDriverImage {
+    pub path: PathBuf,
+    pub identity: String,
+}
+
+impl GpuDriverImage {
+    pub fn at(path: PathBuf) -> anyhow::Result<Self> {
+        let identity = crate::utils::file_identity(&path)
+            .with_context(|| format!("stat NVIDIA driver image {}", path.display()))?;
+        Ok(Self { path, identity })
+    }
 }
 
 impl RuntimeConfig {
@@ -2377,6 +2399,9 @@ pub struct RestoreParams<'a> {
     /// of the run that made the snapshot. Some sets this one before the guest
     /// resumes. None (a plain `snapshot run`) leaves the device as it was saved.
     pub balloon_target_mib: Option<u32>,
+    /// Host PCI devices (canonical SSSS:BB:DD.F) the snapshot load attaches to the
+    /// paused VM before it resumes. Empty for a VM without passthrough devices.
+    pub gpus: &'a [String],
 }
 
 /// Diagnostic helper (#608): the `vm-disks/<id>` directory ids whose **rootfs** path is
@@ -3025,6 +3050,7 @@ pub async fn restore_from_snapshot(
         track_dirty_pages,
         firecracker_choice,
         balloon_target_mib,
+        gpus,
     } = params;
     let vm_dir = data_dir.join("disks");
 
@@ -3174,6 +3200,7 @@ pub async fn restore_from_snapshot(
                     host_dev_name: network_config.tap_device.clone(),
                 }]),
                 vsock_override: vsock_override.clone(),
+                device_passthrough: crate::firecracker::api::DevicePassthrough::for_gpus(gpus),
             })
             .await
             .context("loading snapshot")
@@ -3301,6 +3328,10 @@ pub async fn restore_from_snapshot(
         // started yet, which is every restore of a pre-start snapshot.
         if let Some(ref hook) = vm_state.config.restore_hook {
             mmds_latest["restore-hook"] = serde_json::Value::String(hook.clone());
+        }
+        // The same GPU list the restore-only vsock document carries.
+        if !gpus.is_empty() {
+            mmds_latest["gpus"] = serde_json::json!(gpus);
         }
         client
             .put_mmds(serde_json::json!({ "latest": mmds_latest }))
@@ -3435,7 +3466,13 @@ pub async fn restore_from_snapshot_ch(
         track_dirty_pages: _,  // CH has no dirty-page tracking
         firecracker_choice: _, // CH restores run find_cloud_hypervisor's binary
         balloon_target_mib,
+        gpus,
     } = params;
+    // Only the Firecracker restore attaches passthrough devices; `snapshot run` and
+    // `podman run` refuse --gpu for this backend before getting here.
+    if !gpus.is_empty() {
+        bail!("a Cloud Hypervisor restore cannot attach passthrough devices ({gpus:?})");
+    }
     // No Cloud Hypervisor call sets a balloon target on a restored VM, so a target
     // named here would be dropped. `podman run` keeps this backend out of the
     // snapshot cache and names none.
@@ -7006,6 +7043,7 @@ mod tests {
             resume_vm: None,
             network_overrides: None,
             vsock_override: None,
+            device_passthrough: None,
         };
         assert!(!serde_json::to_string(&load)
             .unwrap()
@@ -7016,6 +7054,19 @@ mod tests {
         assert!(serde_json::to_string(&load)
             .unwrap()
             .contains(r#""vsock_override":{"uds_path":"/clone/vsock.sock"}"#));
+
+        // The passthrough list is omitted with no GPUs, and otherwise matches the
+        // fork's LoadSnapshotConfig field: [{"id", "sbdf"}].
+        assert!(!serde_json::to_string(&load)
+            .unwrap()
+            .contains("device_passthrough"));
+        load.device_passthrough = crate::firecracker::api::DevicePassthrough::for_gpus(&[
+            "0000:01:00.0".to_string(),
+            "0000:02:00.0".to_string(),
+        ]);
+        assert!(serde_json::to_string(&load).unwrap().contains(
+            r#""device_passthrough":[{"id":"gpu0","sbdf":"0000:01:00.0"},{"id":"gpu1","sbdf":"0000:02:00.0"}]"#
+        ));
     }
 
     #[test]

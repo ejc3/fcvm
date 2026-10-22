@@ -1894,6 +1894,28 @@ def read_trimmed(path: str) -> str:
         return f.read().strip()
 
 
+# Published records keep the instance type and never a host name, IP or boot id.
+# compare.py and reqanalyze.py need to know that two records ran on the same
+# boot, which is equality, so a record carries this digest and not the boot id.
+# hostcdp.sh computes the same function in shell; test_corpus_mem pins that the
+# two agree.
+BOOT_DIGEST_DOMAIN = b"fcvm-bench-boot\0"
+
+
+def host_boot_sha256(boot_id: str) -> str:
+    return hashlib.sha256(BOOT_DIGEST_DOMAIN + boot_id.encode()).hexdigest()
+
+
+def host_identity() -> dict:
+    """The host fields every run's meta line carries."""
+    return {
+        "host_boot_sha256": host_boot_sha256(
+            read_trimmed("/proc/sys/kernel/random/boot_id")),
+        "host_kernel_release": platform.release(),
+        "host_machine": platform.machine(),
+    }
+
+
 # ------------------------------------------------------------------- teardown
 
 
@@ -4800,9 +4822,7 @@ def main_with_resources(resources: ExitStack) -> int:
             "quiet_guard_loadavg1": quiet_guard_loadavg1,
             "quiet_vm_processes": quiet_guard_vm_processes,
             "quiet_loadavg1_limit": quiet_loadavg1_limit,
-            "host_boot_id": read_trimmed("/proc/sys/kernel/random/boot_id"),
-            "host_kernel_release": platform.release(),
-            "host_machine": platform.machine(),
+            **host_identity(),
             "host": host_facts(),
             # The memory server's own ready record says whether it records
             # and replays the working set; null for a file-backed restore.

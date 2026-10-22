@@ -2705,6 +2705,10 @@ exec {real_date!r} "$@"
                 run = json.load(handle)
             with open("/proc/sys/kernel/random/boot_id") as handle:
                 boot_id = handle.read().strip()
+            with open(os.path.join(env["RESULTS"], "run.json")) as handle:
+                run_text = handle.read()
+            self.assertNotIn(boot_id, run_text)
+            self.assertNotIn("host_boot_" + "id", run)
             revision = subprocess.check_output(
                 ["git", "-C", os.path.dirname(os.path.dirname(HERE)),
                  "rev-parse", "HEAD"], text=True).strip()
@@ -2716,7 +2720,7 @@ exec {real_date!r} "$@"
                 finalizer_hash = hashlib.sha256(handle.read()).hexdigest()
             import reqbench
             expected = {
-                "host_boot_id": boot_id,
+                "host_boot_sha256": reqbench.host_boot_sha256(boot_id),
                 "host_machine": os.uname().machine,
                 "host_kernel": os.uname().release,
                 "source_revision": revision,
@@ -7153,7 +7157,7 @@ class ComparePublicationGate(unittest.TestCase):
             "fcvm_sha256": "d" * 64, "runtime_bundle_sha256": "e" * 64,
             "snapshot_generation_id": "33333333-3333-4333-8333-333333333333",
             "snapshot_config_sha256": "5" * 64,
-            "host_boot_id": "00000000-0000-4000-8000-000000000001",
+            "host_boot_sha256": "1" * 64,
             "host_kernel_release": "k", "host_machine": "aarch64"}
 
     @staticmethod
@@ -7203,7 +7207,7 @@ class ComparePublicationGate(unittest.TestCase):
             "runtime_bundle_sha256": cell["runtime_bundle_sha256"],
             "snapshot_generation_id": cell["snapshot_generation_id"],
             "snapshot_config_sha256": cell["snapshot_config_sha256"],
-            "host_boot_id": cell["host_boot_id"],
+            "host_boot_sha256": cell["host_boot_sha256"],
             "host_kernel_release": cell["host_kernel_release"],
             "host_machine": cell["host_machine"],
             "cpu": cell["cpu"],
@@ -7346,7 +7350,7 @@ class ComparePublicationGate(unittest.TestCase):
             "cpus": 2, "driver": "cdpdrive.py",
             "network": "host (no VM, no DNAT)",
             "resolve_all_to": "127.0.0.1", "host_kernel": "k",
-            "host_boot_id": self.CELL["host_boot_id"],
+            "host_boot_sha256": self.CELL["host_boot_sha256"],
             "host_machine": self.CELL["host_machine"],
             "source_revision": self.CELL["source_revision"],
             "harness_sha256": self.CELL["harness_sha256"],
@@ -10102,7 +10106,7 @@ sys.stdin.read(1)
 
     def test_host_environment_and_producer_must_match_the_vm_arm(self):
         mutations = {
-            "host_boot_id": ("00000000-0000-4000-8000-000000000099", "boot"),
+            "host_boot_sha256": ("9" * 64, "boot"),
             "host_machine": ("x86_64", "machine"),
             "host_kernel": ("totally-other-kernel", "kernel"),
             "source_revision": ("9" * 40, "source_revision"),
@@ -10123,6 +10127,16 @@ sys.stdin.read(1)
                 )
                 self.assertIn(message, proc.stderr, proc.stderr)
                 self.assertFalse(os.path.exists(out))
+
+    def test_the_boot_must_be_a_hash_not_a_raw_boot_id(self):
+        raw = "00000000-0000-4000-8000-000000000001"
+        run, host = self.valid_comparison(
+            meta_overrides={"host_boot_sha256": raw})
+        proc, out = self.run_compare(run, [("host", host)])
+        self.assertNotEqual(proc.returncode, 0,
+                            "a raw boot id passed for a boot hash")
+        self.assertIn("host_boot_sha256", proc.stderr, proc.stderr)
+        self.assertFalse(os.path.exists(out))
 
     def test_host_cpu_budget_and_output_label_are_explicit(self):
         mutations = (
