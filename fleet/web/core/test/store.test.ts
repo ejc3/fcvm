@@ -158,6 +158,7 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     expect(st.tiles[0]).toMatchObject({ slot: "slot-1", fps: 30, gpu: { name: "Tesla T4", temp_c: 61, power_w: 70.5, util_pct: 97 } });
     expect(st.tiles[1]).toMatchObject({ phase: "waiting_capacity", slot: null, gpu: null });
     expect(st.scene.lights[0]!.color).toBe("#ffbc00");
+    expect(st.scene.camera[0]).toEqual({ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 });
     expect(st.actions[0]).toMatchObject({ summary: "relaunch all (8 tiles)", outcome: "committed", args: null });
   });
 

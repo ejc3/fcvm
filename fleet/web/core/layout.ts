@@ -102,10 +102,39 @@ export function layoutFocus(area: Box, tile: Tile, dpr: number, imageAspect: num
   return { id: tile.id, box, streamHeight: streamHeightFor(box.h * dpr) };
 }
 
-/** The pixel width a renderer should produce for a tile at `height` (even, for 4:2:0). */
-export function streamWidthFor(rect: Rect, height: number, imageAspect: number = DEFAULT_IMAGE_ASPECT): number {
-  const w = (height * rect.w * imageAspect) / rect.h;
-  return Math.max(2, Math.round(w / 2) * 2);
+/** NVENC's smallest H.264 frame on a T4: nothing narrower than 145 or shorter than 49 px. */
+export const MIN_STREAM_W = 146;
+export const MIN_STREAM_H = 50;
+
+export interface TileGeometry {
+  width: number;
+  height: number;
+  fullWidth: number;
+  fullHeight: number;
+  x0: number;
+  y0: number;
+}
+
+/**
+ * The renderer's tile geometry (fleet/PROTOCOL.md, "Tile geometry"): the
+ * whole-image pixel grid at a requested height and this tile's part of it. A
+ * height whose tile would be under the encoder's minimum is raised to the
+ * smallest even height that fits, so the stream can be larger than asked.
+ */
+export function tileGeometry(rect: Rect, imageAspect: number, requested: number): TileGeometry {
+  const at = (H: number): TileGeometry => {
+    const fullHeight = Math.round(H / rect.h);
+    const fullWidth = Math.round(fullHeight * imageAspect);
+    const w = Math.round(rect.w * fullWidth);
+    return { width: w + (w % 2), height: H, fullWidth, fullHeight, x0: Math.round(rect.x * fullWidth), y0: Math.round(rect.y * fullHeight) };
+  };
+  let H = Math.min(2160, Math.max(16, Math.round(requested))) & ~1;
+  let g = at(H);
+  while ((g.width < MIN_STREAM_W || g.height < MIN_STREAM_H) && H < 2160) {
+    H += 2;
+    g = at(H);
+  }
+  return g;
 }
 
 /** A point on screen in image fractions, or null when it is outside the image. */

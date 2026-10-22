@@ -26,7 +26,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
             phases:
             half === "fcvm"
               ? { teardown_ms: 300, restore_ms: 1600, gpu_ms: 1200, ack_ms: 1560, container_ms: 600, first_frame_ms: 300, total_ms: 2800 }
-              : { request_ms: 2000, boot_ms: 50000, container_ms: 4000, first_frame_ms: 2000, total_ms: 58000 },
+              : { launch_ms: 20000, ready_ms: 38000, total_ms: 58000 },
           },
         });
       }

@@ -197,6 +197,25 @@ test("releasing a drag sends the movement since the last send", async ({ page })
   await expect.poll(camX).toBeCloseTo(want, 6);
 });
 
+test("a dropped light lands in the world where it was clicked", async ({ page }) => {
+  await openWall(page, 15);
+  const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
+  const before = (await mockState()).pattern.lights.length;
+  const [u, v] = [0.3, 0.4];
+  await page.getByRole("button", { name: "Drop a light" }).click();
+  await page.mouse.click(img.x + u * img.w, img.y + v * img.h);
+  await expect.poll(async () => (await mockState()).pattern.lights.length).toBe(before + 1);
+  const st = await mockState();
+  // The page sent a world position (fleet/PROTOCOL.md: [x, altitude, z]) on the
+  // ray through the click; the mock shows it where that position projects.
+  const sent = (st.state as unknown as { scene: { lights: { pos: number[] }[] } }).scene.lights.at(-1)!.pos;
+  expect(sent).toHaveLength(3);
+  const cam = st.pattern.camera.at(-1) as unknown as { x: number; y: number; zoom: number };
+  const light = st.pattern.lights.at(-1)!;
+  expect(light.pos.x).toBeCloseTo(((u - 0.5) * (16 / 9)) / cam.zoom + cam.x, 2);
+  expect(light.pos.y).toBeCloseTo((v - 0.5) / cam.zoom + cam.y, 2);
+});
+
 test("two viewers hold the same state at the same version", async ({ browser }) => {
   const a = await browser.newContext();
   const b = await browser.newContext();

@@ -7,7 +7,7 @@
 //   FLEET_MOCK_EC2_SHORT     EC2 tiles waiting for capacity (1)
 //   FLEET_MOCK_FCVM_MS       fcvm relaunch time (3000)
 //   FLEET_MOCK_EC2_MS        EC2 relaunch time (60000)
-//   FLEET_MOCK_FPS           frames per second (20)
+//   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
 //   FLEET_MOCK_REFUSED       comma-separated words the fake text check refuses (forbidden)
@@ -35,13 +35,22 @@ function int(name: string, fallback?: number): number {
   return v;
 }
 
+function fps(): number {
+  const v = int("FLEET_MOCK_FPS", 30);
+  if (v === 0 || 30 % v !== 0) {
+    console.error("FLEET_MOCK_FPS must divide 30, so frames fall on the renderer's t = k/30 grid");
+    process.exit(2);
+  }
+  return v;
+}
+
 export async function startMock() {
   const epochUnixMs = Math.floor(Date.now() / 1000) * 1000;
   let coord: MockCoordinator | null = null;
   const renderers = new MockRenderers({
     port: int("FLEET_MOCK_RENDER_PORT"),
     publicHost: env("FLEET_MOCK_HOST", "localhost"),
-    fps: int("FLEET_MOCK_FPS", 20),
+    fps: fps(),
     threads: int("FLEET_MOCK_THREADS", 12),
     maxHeight: int("FLEET_MOCK_MAX_HEIGHT", 1080),
     epochUnixMs,

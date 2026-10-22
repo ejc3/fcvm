@@ -8,7 +8,7 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { DEFAULT_IMAGE_ASPECT, type Half, type Rect } from "../core/protocol.ts";
-import { cameraAt, sceneT } from "../core/scene.ts";
+import { cameraAt, poseAt, projectPoint, sceneT, type Vec3 } from "../core/scene.ts";
 import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
 
@@ -39,11 +39,11 @@ const FCVM_PLAN: { phase: string; share: number; key: string }[] = [
   { phase: "starting", share: 0.13, key: "first_frame_ms" },
 ];
 const EC2_PLAN: { phase: string; share: number; key: string }[] = [
-  { phase: "requesting", share: 0.05, key: "request_ms" },
-  { phase: "booting", share: 0.75, key: "boot_ms" },
-  { phase: "starting", share: 0.12, key: "container_ms" },
-  { phase: "starting", share: 0.08, key: "first_frame_ms" },
+  { phase: "launching", share: 0.35, key: "launch_ms" },
+  { phase: "starting", share: 0.65, key: "ready_ms" },
 ];
+/** The coordinator shows `relaunching` until the agent or EC2 driver reports. */
+const RELAUNCHING_MS = 150;
 
 const NAMES_A = ["teal", "quiet", "amber", "brisk", "silver", "copper", "violet", "mossy", "lucky", "polar"];
 const NAMES_B = ["otter", "heron", "lynx", "comet", "falcon", "maple", "badger", "orca", "wren", "ibis"];
@@ -118,11 +118,7 @@ function rng(seed: number): () => number {
 }
 
 function rgbArray(v: unknown): [number, number, number] | null {
-  if (Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "number" && x >= 0 && x <= 1)) return v as [number, number, number];
-  if (typeof v === "string" && /^#[0-9a-fA-F]{6}$/.test(v)) {
-    const n = parseInt(v.slice(1), 16);
-    return [((n >> 16) & 255) / 255, ((n >> 8) & 255) / 255, (n & 255) / 255];
-  }
+  if (Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "number" && x >= 0 && x <= 64)) return v as [number, number, number];
   return null;
 }
 
@@ -145,7 +141,7 @@ export class MockCoordinator {
   private camera: CameraKey[] = [{ t: 0, x: 0, y: 0, zoom: 1 }];
   private timeOfDay = 10;
   private words: { text: string; by: string; t: number; pos: { x: number; y: number } }[] = [];
-  private lights: { pos: { x: number; y: number }; color: [number, number, number]; by: string; t: number }[] = [];
+  private lights: { pos: { x: number; y: number }; world: Vec3; color: [number, number, number]; by: string; t: number }[] = [];
   private autoSecs: number | null = null;
   private relaunchAll: { started_at: number; by: string; fcvm_done_at: number | null; ec2_done_at: number | null; fcvm_last: string | null; ec2_last: string | null } | null = null;
   private actions: { at: number; by: string; name: string; summary: string; outcome: string }[] = [];
@@ -250,7 +246,7 @@ export class MockCoordinator {
         camera: this.camera.map((k) => ({ t: k.t, pos: [k.x, k.y, 0], look: [k.x, k.y, -10], fov_deg: 60 / k.zoom })),
         time_of_day: this.timeOfDay,
         words: this.words.map((w) => ({ text: w.text, t: w.t, by: w.by })),
-        lights: this.lights.map((l) => ({ pos: [l.pos.x, l.pos.y, 0], color: l.color, t: l.t, by: l.by })),
+        lights: this.lights.map((l) => ({ pos: l.world, color: l.color, t: l.t, by: l.by })),
       },
       image_aspect: IMAGE_ASPECT,
       settings: { auto_relaunch_secs: this.autoSecs },
@@ -322,7 +318,8 @@ export class MockCoordinator {
   private markDirty(): number {
     if (!this.dirty) {
       this.dirty = true;
-      this.flushTimer = setTimeout(() => this.flush(), 15);
+      // At most one snapshot every 50 ms, as the coordinator sends them.
+      this.flushTimer = setTimeout(() => this.flush(), 50);
     }
     return this.version + 1;
   }
@@ -444,24 +441,21 @@ export class MockCoordinator {
       }
       case "light": {
         const pos = args["pos"];
-        const color = rgbArray(args["color"]) ?? [1, 0.9, 0.7];
-        let world: { x: number; y: number } | null = null;
-        if (Array.isArray(pos) && pos.length === 3 && pos.every((x) => typeof x === "number")) {
-          world = { x: pos[0] as number, y: pos[1] as number };
-        } else if (typeof pos === "object" && pos !== null) {
-          // A point on the image: the mock places it in its 2D world.
-          const p = pos as Record<string, unknown>;
-          const u = p["u"];
-          const v = p["v"];
-          if (typeof u === "number" && typeof v === "number" && u >= 0 && u <= 1 && v >= 0 && v <= 1) {
-            const t = typeof p["t"] === "number" ? (p["t"] as number) : this.sceneNow();
-            const cam = cameraAt(this.camera, t);
-            const zoom = cam["zoom"] ?? 1;
-            world = { x: ((u - 0.5) * IMAGE_ASPECT) / zoom + (cam["x"] ?? 0), y: (v - 0.5) / zoom + (cam["y"] ?? 0) };
-          }
+        const color = rgbArray(args["color"]);
+        if (!Array.isArray(pos) || pos.length !== 3 || !pos.every((x) => typeof x === "number" && Number.isFinite(x))) {
+          return this.refuse(id, by, name, "a light's pos is [x, y, z]");
         }
-        if (!world) return this.refuse(id, by, name, "a light needs a position");
-        this.lights = [...this.lights, { pos: world, color, by, t: this.sceneNow() }].slice(-32);
+        if (!color) return this.refuse(id, by, name, "a light's color is [r, g, b]");
+        // The mock's world is flat: it shows the light where it appears on the image.
+        const t = this.sceneNow();
+        const keys = this.fleetState().scene.camera;
+        const pose = poseAt(keys, t);
+        const at = pose ? projectPoint(pose, pos as Vec3, IMAGE_ASPECT) : null;
+        if (!at) return this.refuse(id, by, name, "the light is behind the camera");
+        const cam = cameraAt(this.camera, t);
+        const zoom = cam["zoom"] ?? 1;
+        const world = { x: ((at.u - 0.5) * IMAGE_ASPECT) / zoom + (cam["x"] ?? 0), y: (at.v - 0.5) / zoom + (cam["y"] ?? 0) };
+        this.lights = [...this.lights, { pos: world, world: pos as Vec3, color, by, t }].slice(-32);
         return this.committed(id, by, name, "light");
       }
       default:
@@ -487,7 +481,7 @@ export class MockCoordinator {
     const total = base * (0.8 + 0.4 * this.rand());
     const plan = (fc ? FCVM_PLAN : EC2_PLAN).map((p) => ({ ...p, ms: Math.round(total * p.share) }));
     const phases: Record<string, number> = {};
-    r.phase = plan[0]!.phase;
+    r.phase = "relaunching";
     r.lastRelaunch = { clicked_at: clickedAt, by, first_frame_at: null, phases: {} };
     this.opts.renderers.setAvailable(r.slot!, false);
     this.markDirty();
@@ -517,7 +511,12 @@ export class MockCoordinator {
       this.checkRace(r);
       this.markDirty();
     };
-    r.timer = setTimeout(step, plan[0]!.ms);
+    r.timer = setTimeout(() => {
+      if (r.generation !== gen) return;
+      r.phase = plan[0]!.phase;
+      this.markDirty();
+      r.timer = setTimeout(step, Math.max(0, plan[0]!.ms - RELAUNCHING_MS));
+    }, RELAUNCHING_MS);
   }
 
   private checkRace(last: TileRuntime): void {

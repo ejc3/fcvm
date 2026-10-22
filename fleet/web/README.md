@@ -50,8 +50,8 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 85 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 19 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 87 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 20 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
@@ -111,24 +111,26 @@ Decode and draw cost in Playwright's headless Chromium 156 on this development m
 (a 96-core Arm Neoverse-V2 server with no GPU, so decoding and canvas drawing are both
 software). The mock renderers ran on the same machine. These numbers are indicative
 only: a laptop or phone decodes in hardware and composites on its GPU. Mock streams are
-20 frames per second; every run held all tiles at one t with none behind.
+30 frames per second, on the renderer's t = k/30 grid.
 
-| tiles | viewport | stream height | decoded frames/s | draw per frame, p50 / p95 | browser CPU (all processes) | CPU per decoded frame |
-|---|---|---|---|---|---|---|
-| 16 | 1440x900 | 216 | 320 | 5.7 / 7.8 ms | 0.32 cores | 1.01 ms |
-| 50 | 1440x900 | 180 | 1000 | 7.3 / 8.2 ms | 0.49 cores | 0.49 ms |
-| 100 | 1440x900 | 90 | 2000 | 9.4 / 11.4 ms | 0.72 cores | 0.36 ms |
-| 100 | 2560x1440 | 144 | 1994 | 18.4 / 20.8 ms | 1.02 cores | 0.51 ms |
+| tiles | viewport | stream height | decoded frames/s (of 30 x tiles) | draw per frame, p50 / p95 | display frame interval, p50 / p95 | browser CPU (all processes) | CPU per decoded frame |
+|---|---|---|---|---|---|---|---|
+| 16 | 1440x900 | 216 | 479 of 480 | 5.7 / 6.0 ms | 16.7 / 16.8 ms | 0.45 cores | 0.94 ms |
+| 50 | 1440x900 | 180 | 1500 of 1500 | 7.3 / 8.3 ms | 16.7 / 17.1 ms | 0.69 cores | 0.46 ms |
+| 100 | 1440x900 | 90 | 3000 of 3000 | 9.4 / 9.8 ms | 16.7 / 17.5 ms | 1.01 cores | 0.34 ms |
+| 100 | 2560x1440 | 144 | 2930 of 3000 | 18.9 / 20.9 ms | 19.8 / 31.5 ms | 1.45 cores | 0.49 ms |
 
-Command: `FLEET_MOCK_THREADS=32 node scripts/measure.ts 16 50 100` (8 s warm-up, 15 s
-measured) and `FLEET_MEASURE_VIEW=2560x1440 FLEET_MOCK_THREADS=48 node scripts/measure.ts
-100`. Decode latency (decode call to output frame) stayed under 1 ms at p50 and 3 ms at
-p95 in every run. Draw time follows the pixels drawn, about 5 ms per million in this
-software canvas, more than the number of tiles: 100 small tiles cost less than 2x what 16
-large ones do. At 100 tiles one software browser kept 2000 frames per second on one
-core, so on this evidence 100 is not the limit; the measurement in
-`docs/fleet/ARCHITECTURE.md` (a laptop and a phone, Chrome and Safari) should set
-`max_tiles`.
+Command: `FLEET_MOCK_THREADS=40 node scripts/measure.ts 16 50 100` (8 s warm-up, 15 s
+measured) and `FLEET_MEASURE_VIEW=2560x1440 FLEET_MOCK_THREADS=60 node scripts/measure.ts
+100`, with the machine's load average at 26 from other work. At 1440x900 every run held
+all tiles at one t with none behind, and decode latency (decode call to output frame)
+stayed under 1.5 ms at p95. Draw time follows the pixels drawn, about 5 ms per million in
+this software canvas, more than the number of tiles: 100 small tiles cost 1.6x what 16
+large ones do. At 2560x1440 a draw (18.9 ms) no longer fits a 60 Hz display frame, the
+display loop slows to 20 to 32 ms, and the page decoded 2930 of the 3000 frames sent per
+second: this software canvas is the limit there. On this evidence 100 tiles fit one
+browser's decoding budget; the measurement in `docs/fleet/ARCHITECTURE.md` (a laptop and
+a phone, with GPU compositing, Chrome and Safari) should set `max_tiles`.
 
 **Safari.** According to WebKit's release notes, WebCodecs `VideoDecoder` shipped in Safari 16.4 (macOS and iOS), with H.264
 among its codecs, as did `OffscreenCanvas` with a 2D context. Playwright's WebKit build
@@ -139,46 +141,49 @@ not tested by this PR.
 
 ## Interface notes
 
-The brief's interfaces and the coordinator's `fleet/PROTOCOL.md` (in the coordinator PR)
-differ in places. The page reads the coordinator's documented shapes and the brief's
-where they are compatible:
+The page and the mock follow `fleet/PROTOCOL.md` as the coordinator PR (#1146,
+"Coordinator") and the renderer PR (#1144, "Renderer") write it: tiles are places
+(`fcvm:3`) with their slot (`slot-3`) beside them, the snapshot carries `image_aspect`,
+`gpu` is `{sbdf, name}` with readings in `gpu_stats`, timings are `<part>_ms`, receipts
+are `committed` or `refused`, the clock answer echoes `client_unix_ms`, `{"type":
+"error"}` exists, snapshots may skip versions, frames fall on `t = k/30`, the stream
+header carries `full_width`, `full_height`, `x0`, `y0` and `fps`, the stream may be
+larger than asked (the encoder's 146 x 50 minimum) and the page scales it into the
+tile, and `{"h": N}` brings a new header and a keyframe. The brief's older shapes
+(`fleet.hosts` as a number, `waiting_for_capacity`, `applied`) are still read.
 
-- **Tile identity:** tiles are places (`fcvm:3`) with the GPU's `slot` (`slot-3`) beside
-  them. The page sends the tile id in `relaunch` and shows the slot name.
-- **`fleet.hosts`** is a list in PROTOCOL.md and a number in the brief; both are read.
-- **`image_aspect`** is a top-level field; the page uses it (default 16/9). PROTOCOL.md's
-  default is 32/9 while the renderer's is 16/9: one of them should change. At 32/9 the
-  image is a strip 405 px tall on a 1440x900 screen.
-- **`time_of_day`** is hours in [0, 24) in PROTOCOL.md (the page uses hours) but
-  `0..1` in the renderer's scene parser.
-- **`camera` drag** is `{"drag": {"yaw_deg", "pitch_deg", "dive"}}`. The page sends a drag
-  across the whole image width as 90 degrees of yaw (negative when dragging right: the
-  drag grabs the world), down the height as 50 degrees of pitch, and a wheel notch as one
-  unit of dive. The sign convention needs agreeing with the renderer.
+What the page does where the protocol leaves a choice:
+
+- **Camera drag** sends `{"drag": {"yaw_deg", "pitch_deg", "dive"}}`: a drag across
+  the whole image width is 90 degrees of yaw (negative when dragging right: the drag
+  grabs the world), down the height 50 degrees of pitch, and a wheel notch one unit
+  of dive. The sign convention should be agreed with the coordinator.
+- **A dropped light** is sent as `{"pos": [x, altitude, z], "color": [r, g, b]}`: the
+  page takes the camera at the drawn t from the snapshot's keys (linear between keys;
+  the renderer's Catmull-Rom spline differs only while the camera moves) and places
+  the light 2 km along the ray through the clicked pixel.
 - **Input-to-pixel latency** needs to know which camera key an intent produced. Keys
-  carry no intent id in PROTOCOL.md, so the page takes the first key newer than any it
-  held when it sent the intent, once the receipt's version is accepted. Tagging each key
-  with the intent id (`"intent": "<id>"`) would make it exact; the page uses the tag when
-  present.
-- **`light`**: PROTOCOL.md takes a world position `[x, y, z]`, which a browser cannot
-  know. The page sends the image point it was dropped on, `{"pos": {"u", "v", "t"},
-  "color": [r, g, b]}`, and the coordinator (or renderer) should place it.
-- **`gpu`** is `{sbdf, name}` with readings in a separate `gpu_stats`; the page reads
-  `temp_c`, `power_w` and `util_pct` from `gpu_stats` (the renderer's names) and ignores
-  negative values.
-- **`last_relaunch.phases`** holds `<part>_ms` keys in alphabetical order, with
-  `restore_ms` containing `gpu_ms` and `total_ms` a sum; the page orders the parts and
-  splits the GPU out of the restore. EC2 timing keys are not defined yet; the mock uses
-  `request_ms`, `boot_ms`, `container_ms`, `first_frame_ms`.
-- **`actions`** carry `summary` and `outcome`, not the arguments. The page words the
-  ticker from the name and the summary; arguments would let it say more without parsing.
-- **Receipts:** `committed` and `refused` (also `applied`, `accepted`, `ok`); a
-  `{"type": "error"}` message is kept, not counted as unreadable.
-- **The clock answer** echoes `client_unix_ms` in PROTOCOL.md; the brief's did not. The
-  page uses the echo and otherwise pairs the answer with its one outstanding ping.
-- **Phases:** `waiting_capacity` (PROTOCOL.md) and `waiting_for_capacity` both read as
-  "waiting for capacity"; `pending` and `relaunching` have their own words.
-- **A viewer's own name** is not in the snapshot, so the page cannot say "you".
+  carry no intent id, so the page takes the first key newer than any it held when it
+  sent the intent, once the receipt's version is accepted. An `"intent"` field on a key
+  would make it exact; the page uses one when present.
+- **The opened tile and the grid** draw each frame into the tile's rectangle on screen,
+  not by `x0` / `full_width`; the two differ by under one stream pixel.
+
+Mismatches between the other two that the page cannot settle:
+
+- `image_aspect` defaults to 32/9 in the coordinator and 16/9 in the renderer. At 32/9
+  the image is a strip 405 px tall on a 1440x900 screen.
+- `time_of_day` is hours in [0, 24) at the coordinator (the page sends hours) and a
+  fraction of a day in the renderer's `POST /scene`: the coordinator has to convert.
+- Words: the coordinator accepts 24 characters, the renderer draws 28.
+- `actions` carry `summary` but not the arguments, so the ticker words what it can from
+  the summary; arguments would let it say more without parsing.
+- A viewer's own name is not in the snapshot, so the page cannot say "you".
+
+The mock encodes H.264 baseline with libx264 rather than High with NVENC, reports EC2
+phases `launching` and `starting` with `launch_ms` and `ready_ms` as the coordinator's
+EC2 driver does, and shows `relaunching` for 150 ms before a tile's first reported
+phase.
 
 ## Not done here
 

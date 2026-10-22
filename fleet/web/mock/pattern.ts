@@ -6,6 +6,7 @@
 // from t, across the bottom of the image.
 
 import { cameraAt } from "../core/scene.ts";
+import type { TileGeometry } from "../core/layout.ts";
 
 export interface MockWord {
   text: string;
@@ -329,18 +330,14 @@ export function expectedRgb(u: number, v: number, f: FrameCtx): [number, number,
   return [Math.round(o[0]! * 255), Math.round(o[1]! * 255), Math.round(o[2]! * 255)];
 }
 
-export interface TileRect {
-  x: number;
-  y: number;
-  w: number;
-  h: number;
-}
-
 /**
- * Render a tile's rectangle at width x height into I420 (BT.709, limited range).
- * Pixel (i, j) samples the image at its centre.
+ * Render a tile into I420 (BT.709, limited range). The tile is whole-image
+ * pixels [x0, x0 + width) x [y0, y0 + height) of a fullWidth x fullHeight grid,
+ * as the renderer's tile geometry gives; each pixel samples the image at its
+ * centre.
  */
-export function renderI420(rect: TileRect, width: number, height: number, f: FrameCtx): Uint8Array {
+export function renderI420(g: TileGeometry, f: FrameCtx): Uint8Array {
+  const { width, height } = g;
   const ySize = width * height;
   const cw = width >> 1;
   const ch = height >> 1;
@@ -358,7 +355,7 @@ export function renderI420(rect: TileRect, width: number, height: number, f: Fra
   const wS = new Float64Array(width);
   const wC = new Float64Array(width);
   for (let i = 0; i < width; i++) {
-    const u = rect.x + ((i + 0.5) / width) * rect.w;
+    const u = (g.x0 + i + 0.5) / g.fullWidth;
     const X = ((u - 0.5) * f.aspect) / f.zoom + f.camX;
     us[i] = u;
     c1[i] = Math.sin(X * 1.3 + t * 0.35);
@@ -372,7 +369,7 @@ export function renderI420(rect: TileRect, width: number, height: number, f: Fra
   const sep: Separable = { w1: 0, w2: 0, grain: 0, swell: 0 };
   const stars: StarCache = { sx: NaN, sy: NaN, hf: 0 };
   for (let j = 0; j < height; j++) {
-    const v = rect.y + ((j + 0.5) / height) * rect.h;
+    const v = (g.y0 + j + 0.5) / g.fullHeight;
     const Y = (v - 0.5) / f.zoom + f.camY;
     const r1 = Math.sin(Y * 1.7 - t * 0.25);
     const rS = Math.sin(Y * 1.1);

@@ -15,6 +15,9 @@ import {
   takeDrag,
   tileAt,
   wheelDive,
+  lightPosition,
+  sceneT,
+  serverNow,
   LIGHT_COLORS,
   wallView,
   type Box,
@@ -245,10 +248,13 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
     const s = client.getState();
     if (s.ui.lightMode) {
       const p = imagePoint(e.clientX, e.clientY);
-      if (p) {
-        const t = s.frames?.T ?? null;
-        const color = LIGHT_COLORS[(s.accepted?.scene.lights.length ?? 0) % LIGHT_COLORS.length]!;
-        client.send("light", { pos: t === null ? { u: p.u, v: p.v } : { u: p.u, v: p.v, t }, color });
+      const st = s.accepted;
+      if (p && st) {
+        // The world point under the click, on the camera as it was drawn.
+        const t = s.frames?.T ?? sceneT(st.scene.epoch_unix_ms, serverNow(s.clock, localNow()));
+        const pos = lightPosition(st.scene.camera, t, p.u, p.v, st.image_aspect);
+        const color = LIGHT_COLORS[st.scene.lights.length % LIGHT_COLORS.length]!;
+        if (pos) client.send("light", { pos, color });
       }
       client.ui({ lightMode: false });
       return;

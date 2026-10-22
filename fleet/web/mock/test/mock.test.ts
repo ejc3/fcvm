@@ -212,15 +212,17 @@ describe("pattern", () => {
   it("is a pure function of image position: two halves drawn apart equal the whole", () => {
     const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [{ t: 0, x: 0.1, y: 0, zoom: 1.3 }], time_of_day: 7, words: [{ text: "hi", pos: { x: 0, y: 0 } }], lights: [] };
     const f = frameCtx(12.35, scene);
-    const whole = renderI420({ x: 0.25, y: 0.25, w: 0.5, h: 0.25 }, 64, 16, f);
-    const left = renderI420({ x: 0.25, y: 0.25, w: 0.25, h: 0.25 }, 32, 16, f);
+    const grid = { fullWidth: 128, fullHeight: 64, x0: 32, y0: 16, height: 16 };
+    const whole = renderI420({ ...grid, width: 64 }, f);
+    const left = renderI420({ ...grid, width: 32 }, f);
     for (let j = 0; j < 16; j++) for (let i = 0; i < 32; i++) expect(left[j * 32 + i]).toBe(whole[j * 64 + i]);
   });
 
   it("changes with t, so a tile drawn at another t shows a seam", () => {
     const scene = { epoch_unix_ms: 0, image_aspect: 16 / 9, camera: [], time_of_day: 7, words: [], lights: [] };
-    const a = renderI420({ x: 0, y: 0, w: 0.1, h: 0.1 }, 16, 16, frameCtx(10, scene));
-    const b = renderI420({ x: 0, y: 0, w: 0.1, h: 0.1 }, 16, 16, frameCtx(10.5, scene));
+    const g = { width: 16, height: 16, fullWidth: 160, fullHeight: 160, x0: 0, y0: 0 };
+    const a = renderI420(g, frameCtx(10, scene));
+    const b = renderI420(g, frameCtx(10.5, scene));
     let diff = 0;
     for (let i = 0; i < a.length; i++) diff += Math.abs(a[i]! - b[i]!);
     expect(diff / a.length).toBeGreaterThan(3);

@@ -51,7 +51,8 @@ export interface CameraKey {
   t: number;
   /** The intent that produced this key, when one did. */
   intent?: string;
-  [field: string]: number | string | undefined;
+  /** `pos`, `look` ([x, altitude, z] km), `fov_deg`, or a mock's own fields. */
+  [field: string]: number | string | number[] | undefined;
 }
 
 export interface Word {
@@ -286,6 +287,7 @@ function parseScene(o: Obj): Scene {
     const key: CameraKey = { t: num(k, "t", `scene.camera[${i}]`) };
     for (const [f, val] of Object.entries(k)) {
       if (typeof val === "number" || typeof val === "string") key[f] = val;
+      else if (Array.isArray(val) && val.every((x) => typeof x === "number")) key[f] = val as number[];
     }
     camera.push(key);
   }

@@ -6,7 +6,7 @@
 import http from "node:http";
 import { WebSocketServer, type WebSocket } from "ws";
 import { buildFrame } from "../core/frame.ts";
-import { streamWidthFor } from "../core/layout.ts";
+import { tileGeometry, type TileGeometry } from "../core/layout.ts";
 import type { Rect } from "../core/protocol.ts";
 import { Encoder } from "./encoder.ts";
 import type { PatternScene } from "./pattern.ts";
@@ -45,6 +45,7 @@ interface Sub {
   tile: string;
   width: number;
   height: number;
+  geometry: TileGeometry | null;
   encoder: Encoder | null;
   /** Stamps of frames written to the encoder, oldest first. */
   stamps: { t: number; frame: number }[];
@@ -135,12 +136,11 @@ export class MockRenderers {
   }
 
   private clampHeight(h: number): number {
-    const v = Number.isFinite(h) ? Math.round(h) : 144;
-    return Math.max(16, Math.min(this.opts.maxHeight, v)) & ~1;
+    return Math.min(this.opts.maxHeight, Number.isFinite(h) ? h : 144);
   }
 
   private subscribe(ws: WebSocket, tile: string, h: number): void {
-    const sub: Sub = { ws, tile, width: 0, height: 0, encoder: null, stamps: [], sentKey: false };
+    const sub: Sub = { ws, tile, width: 0, height: 0, geometry: null, encoder: null, stamps: [], sentKey: false };
     this.subs.add(sub);
     this.stats.subscribers = this.subs.size;
     this.resize(sub, h);
@@ -164,12 +164,13 @@ export class MockRenderers {
   private resize(sub: Sub, h: number): void {
     const entry = this.tiles.get(sub.tile);
     if (!entry) return;
-    const height = this.clampHeight(h);
-    const width = streamWidthFor(entry.rect, height);
+    const geometry = tileGeometry(entry.rect, this.opts.scene().image_aspect, this.clampHeight(h));
+    const { width, height } = geometry;
     if (sub.encoder && width === sub.width && height === sub.height) return;
     sub.encoder?.close();
     sub.width = width;
     sub.height = height;
+    sub.geometry = geometry;
     sub.stamps = [];
     sub.sentKey = false;
     const fps = this.opts.fps;
@@ -180,7 +181,18 @@ export class MockRenderers {
       gop: Math.round(fps * 2),
       onCodec: (codec) => {
         if (sub.encoder !== enc || sub.ws.readyState !== sub.ws.OPEN) return;
-        sub.ws.send(JSON.stringify({ codec, width, height }));
+        sub.ws.send(
+          JSON.stringify({
+            codec,
+            width,
+            height,
+            full_width: geometry.fullWidth,
+            full_height: geometry.fullHeight,
+            x0: geometry.x0,
+            y0: geometry.y0,
+            fps,
+          }),
+        );
       },
       onUnit: (u) => {
         if (sub.encoder !== enc) return;
@@ -236,9 +248,10 @@ export class MockRenderers {
       // it was drawn has a new encoder and must not get it.
       const width = s0.width;
       const height = s0.height;
+      const geometry = s0.geometry!;
       lane.inflight++;
       const started = Date.now();
-      const drawn = this.pool.render({ rect: entry.rect, width, height, drawT: t + entry.skew, scene }).then((b) => {
+      const drawn = this.pool.render({ geometry, drawT: t + entry.skew, scene }).then((b) => {
         lane.lastMs = Date.now() - started;
         return b;
       });

@@ -109,3 +109,98 @@ export const LIGHT_COLORS: readonly [number, number, number][] = [
   [0.5, 1, 0.45],
   [1, 0.62, 0.2],
 ];
+
+// ---- the renderer's camera: positions in km, [x, altitude, z] ----------------
+
+export type Vec3 = [number, number, number];
+
+export interface Pose {
+  pos: Vec3;
+  look: Vec3;
+  fovDeg: number;
+}
+
+function vec(v: unknown): Vec3 | null {
+  return Array.isArray(v) && v.length === 3 && v.every((x) => typeof x === "number") ? (v as Vec3) : null;
+}
+
+/**
+ * The camera at t from keys `{t, pos, look, fov_deg}`, interpolated linearly.
+ * The renderer follows a Catmull-Rom spline through the same keys, so between
+ * keys this is close, at a key or in a hold it is exact. Null when no key has a
+ * pose.
+ */
+export function poseAt(keys: readonly { t: number }[], t: number): Pose | null {
+  const ks = keys
+    .map((k) => {
+      const r = k as Record<string, unknown>;
+      const pos = vec(r["pos"]);
+      const look = vec(r["look"]);
+      const fov = typeof r["fov_deg"] === "number" ? (r["fov_deg"] as number) : null;
+      return pos && look && fov !== null ? { t: k.t, pos, look, fov } : null;
+    })
+    .filter((k): k is { t: number; pos: Vec3; look: Vec3; fov: number } => k !== null)
+    .sort((a, b) => a.t - b.t);
+  if (ks.length === 0) return null;
+  let i = 0;
+  while (i < ks.length && ks[i]!.t <= t) i++;
+  const a = ks[Math.max(0, i - 1)]!;
+  const b = ks[Math.min(ks.length - 1, i)]!;
+  const span = b.t - a.t;
+  const f = span > 0 ? Math.min(1, Math.max(0, (t - a.t) / span)) : 0;
+  const mix = (p: Vec3, q: Vec3): Vec3 => [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f, p[2] + (q[2] - p[2]) * f];
+  return { pos: mix(a.pos, b.pos), look: mix(a.look, b.look), fovDeg: a.fov + (b.fov - a.fov) * f };
+}
+
+function sub(a: Vec3, b: Vec3): Vec3 {
+  return [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+}
+function cross(a: Vec3, b: Vec3): Vec3 {
+  return [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+}
+function dot(a: Vec3, b: Vec3): number {
+  return a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+}
+function norm(a: Vec3): Vec3 {
+  const l = Math.hypot(a[0], a[1], a[2]) || 1;
+  return [a[0] / l, a[1] / l, a[2] / l];
+}
+
+/** The camera's forward, right and up unit vectors (world up is +altitude). */
+function basis(p: Pose): { f: Vec3; r: Vec3; u: Vec3 } {
+  const f = norm(sub(p.look, p.pos));
+  const r = norm(cross(f, [0, 1, 0]));
+  const u = cross(r, f);
+  return { f, r, u };
+}
+
+/** The unit ray through an image point (u, v in 0..1, v down) for a pose. */
+export function pixelRay(p: Pose, u: number, v: number, imageAspect: number): Vec3 {
+  const { f, r, u: up } = basis(p);
+  const th = Math.tan(((p.fovDeg / 2) * Math.PI) / 180);
+  const sx = (2 * u - 1) * th * imageAspect;
+  const sy = (1 - 2 * v) * th;
+  return norm([f[0] + r[0] * sx + up[0] * sy, f[1] + r[1] * sx + up[1] * sy, f[2] + r[2] * sx + up[2] * sy]);
+}
+
+/** Where a world point appears on the image, or null behind the camera. */
+export function projectPoint(p: Pose, w: Vec3, imageAspect: number): { u: number; v: number } | null {
+  const { f, r, u: up } = basis(p);
+  const d = sub(w, p.pos);
+  const z = dot(d, f);
+  if (z <= 1e-9) return null;
+  const th = Math.tan(((p.fovDeg / 2) * Math.PI) / 180);
+  return { u: (dot(d, r) / z / (th * imageAspect) + 1) / 2, v: (1 - dot(d, up) / z / th) / 2 };
+}
+
+/** How far ahead of the camera a dropped light is placed, km. */
+export const LIGHT_DISTANCE_KM = 2;
+
+/** The world position for a light dropped on an image point at scene time t. */
+export function lightPosition(keys: readonly { t: number }[], t: number, u: number, v: number, imageAspect: number): Vec3 | null {
+  const p = poseAt(keys, t);
+  if (!p) return null;
+  const d = pixelRay(p, u, v, imageAspect);
+  const r = (x: number) => Math.round(x * 1e6) / 1e6;
+  return [r(p.pos[0] + d[0] * LIGHT_DISTANCE_KM), r(p.pos[1] + d[1] * LIGHT_DISTANCE_KM), r(p.pos[2] + d[2] * LIGHT_DISTANCE_KM)];
+}

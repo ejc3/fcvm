@@ -22,8 +22,10 @@ test("screenshots", async ({ page, browser }) => {
     await page.keyboard.press("Enter");
     await expect(page.getByTestId("word-status")).toHaveText(`“${text}” is in the scene`);
   }
+  const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
   for (const [u, v] of [[0.18, 0.3], [0.62, 0.22], [0.84, 0.62], [0.35, 0.7]] as const) {
-    await page.evaluate(([pu, pv]) => window.__fleet!.client.send("light", { pos: { u: pu, v: pv }, color: [1, 0.85, 0.5] }), [u, v]);
+    await page.getByRole("button", { name: "Drop a light" }).click();
+    await page.mouse.click(img.x + u * img.w, img.y + v * img.h);
   }
   await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 15.5 }));
   await page.waitForTimeout(1500);

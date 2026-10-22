@@ -5,11 +5,11 @@ import {
   neighbour,
   seamSegments,
   streamHeightFor,
-  streamWidthFor,
+  tileGeometry,
   tileAt,
 } from "../layout.ts";
 import { chooseCommonT } from "../sync.ts";
-import { addDrag, cameraAt, emptyDrag, takeDrag } from "../scene.ts";
+import { addDrag, cameraAt, emptyDrag, lightPosition, poseAt, projectPoint, takeDrag } from "../scene.ts";
 import { fleet } from "./fixtures.ts";
 
 describe("layout", () => {
@@ -52,9 +52,11 @@ describe("layout", () => {
     expect(L.tiles[0]!.streamHeight).toBe(540); // 270 css px * 2
   });
 
-  it("gives an even width with the tile's aspect", () => {
-    expect(streamWidthFor({ x: 0, y: 0, w: 0.25, h: 0.25 }, 180)).toBe(320);
-    expect(streamWidthFor({ x: 0, y: 0, w: 0.1, h: 0.1 }, 91) % 2).toBe(0);
+  it("follows the renderer's tile geometry, including the encoder's minimum", () => {
+    expect(tileGeometry({ x: 0.5, y: 0, w: 0.25, h: 0.5 }, 16 / 9, 540)).toEqual({ width: 480, height: 540, fullWidth: 1920, fullHeight: 1080, x0: 960, y0: 0 });
+    // fleet/PROTOCOL.md: a 1/16 x 1/9 rect of a 16:9 image asked at h=136 streams at 146 x 146.
+    const g = tileGeometry({ x: 0, y: 0, w: 1 / 16, h: 1 / 9 }, 16 / 9, 136);
+    expect([g.width, g.height]).toEqual([146, 146]);
   });
 
   it("finds the tile under a point and its neighbours", () => {
@@ -176,5 +178,31 @@ describe("review findings, pinned", () => {
       const next = L.tiles.find((o) => Math.abs(o.box.y - a.box.y) < 0.01 && o.box.x > a.box.x && o.box.x - right < 1.5);
       if (next) expect(next.box.x, `${a.id} | ${next.id}`).toBe(right);
     }
+  });
+});
+
+describe("the renderer's camera", () => {
+  const keys = [
+    { t: 0, pos: [-16, 0.3, -19], look: [-42, 1.3, -72], fov_deg: 60 },
+    { t: 10, pos: [-20, 0.5, -25], look: [-42, 1.3, -72], fov_deg: 50 },
+  ];
+
+  it("interpolates pose between keys and holds outside them", () => {
+    expect(poseAt(keys, 5)).toEqual({ pos: [-18, 0.4, -22], look: [-42, 1.3, -72], fovDeg: 55 });
+    expect(poseAt(keys, 99)!.pos).toEqual([-20, 0.5, -25]);
+    expect(poseAt([{ t: 0 }], 0)).toBeNull();
+  });
+
+  it("places a dropped light on the clicked point, 2 km ahead", () => {
+    for (const [u, v] of [[0.5, 0.5], [0.1, 0.8], [0.93, 0.07]] as const) {
+      const w = lightPosition(keys, 3, u, v, 16 / 9)!;
+      const p = poseAt(keys, 3)!;
+      expect(Math.hypot(w[0] - p.pos[0], w[1] - p.pos[1], w[2] - p.pos[2])).toBeCloseTo(2, 5);
+      const back = projectPoint(p, w, 16 / 9)!;
+      expect(back.u).toBeCloseTo(u, 5);
+      expect(back.v).toBeCloseTo(v, 5);
+    }
+    // Up on the image is up in the world.
+    expect(lightPosition(keys, 3, 0.5, 0.1, 16 / 9)![1]).toBeGreaterThan(lightPosition(keys, 3, 0.5, 0.9, 16 / 9)![1]);
   });
 });

@@ -64,7 +64,7 @@ export default defineConfig({
       FLEET_MOCK_EC2_MS: "12000",
       FLEET_MOCK_TILES: "8",
       FLEET_MOCK_EC2_SHORT: "1",
-      FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "20",
+      FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "15",
       FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "12",
     },
   },
