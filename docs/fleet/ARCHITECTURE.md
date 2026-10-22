@@ -8,7 +8,10 @@ goes. Each tile is a Firecracker VM with
 one NVIDIA GPU passed through, running a renderer whose frames stream to the browser.
 Anyone watching can relaunch a tile or change what it renders, and everyone watching sees
 the same state and the same button presses in the same order. The point is to show that
-fcvm restores a GPU VM from a snapshot fast enough to do it on camera.
+fcvm restores a GPU VM from a snapshot fast enough to do it on camera, next to the usual
+way: about half the tiles are ordinary EC2 spot GPU instances launched from an AMI, running
+the same renderer, relaunched by terminating and launching a new instance. The two kinds of
+tile show the same clock, so the difference is on screen.
 
 ## What a viewer sees
 
@@ -20,7 +23,11 @@ fcvm restores a GPU VM from a snapshot fast enough to do it on camera.
 - Buttons: relaunch one tile, relaunch all, and a few controls that change the scene a tile
   renders. A relaunch deletes the VM and restores a fresh one from the snapshot; the tile
   shows the clock while that happens.
-- A header with the number of tiles up, the GPUs in the cluster and the last relaunch times.
+- A header with the number of tiles up, the GPUs in the cluster and the last relaunch times,
+  split by kind: fcvm sandbox or EC2 instance, with the median of each.
+- An auto-relaunch setting: off, or every N seconds (shared by every viewer, like any other
+  action). When it is on, the coordinator relaunches every tile on that schedule, fcvm and
+  EC2 alike, so the two clocks keep ticking without anyone clicking.
 
 ## Components
 
@@ -52,7 +59,10 @@ rewrites atomically on every change:
   and each slot's generation, a counter a relaunch increments;
 - **observed state:** what each agent last reported per slot (phase, VM id, timings,
   frames per second, the failure text if it failed);
-- **the intent log:** every viewer action with its client-chosen id, in the order applied.
+- **the intent log:** every viewer action with its client-chosen id, in the order applied;
+- **settings:** the auto-relaunch interval. The coordinator emits a `tick` event once a
+  second carrying the time, and `apply` relaunches the tiles whose last relaunch is older
+  than the interval, so the schedule is part of the replayed state, not a timer outside it.
 
 It runs as one ECS Fargate task in a cluster dedicated to this project. Its JSON state
 file lives in S3 (rewritten whole on each change, read once at start), so a replaced task
@@ -95,6 +105,27 @@ slots as draining; the coordinator stops sending relaunches there.
 
 ECS is used for the coordinator only. The GPU hosts stay plain EC2: the ECS GPU AMIs bind
 the NVIDIA driver on the host, and these hosts must leave every GPU to vfio-pci.
+
+### EC2 tiles (the comparison)
+
+An EC2 tile is one spot instance with one GPU: g4dn.xlarge (x86, one T4) or g5g.xlarge
+(arm64, one T4G), the same GPU as an fcvm slot on g4dn.metal or g5g.metal. It boots an AMI
+we build (Ubuntu, the NVIDIA driver, the container toolkit, the renderer image already
+pulled, a systemd unit that starts it), with nothing done at boot that the AMI could have
+done, so the comparison is against EC2 at its best rather than a cold install.
+
+The coordinator drives these tiles itself, through the EC2 API with its task role: a
+relaunch terminates the instance and launches a new one from the same launch template, and
+the tile is running when the renderer's health check answers. The tile keeps its name; its
+address is the new instance's IPv6, which the coordinator writes to the tile's AAAA record
+(TTL 60 s). The renderer gets the same certificate from Secrets Manager at boot. The
+timings it reports are the same parts where they apply: terminate, launch accepted,
+instance running, renderer first frame.
+
+The EC2 tiles share the fleet's regions where quota allows. The G spot quota counts their
+vCPUs (4 each) against the same 96 per region that one g4dn.metal fills, so they need
+either a quota increase or regions of their own; the split is about half the tiles each
+way, with the fcvm side set by the GPUs its hosts have.
 
 ### Agent
 
@@ -224,6 +255,7 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
 6. Agent: inventory, reconcile, reports; tested against a fake `fcvm`.
 7. Coordinator: browser routes, intents and receipts, agents over stdio and ssh.
 8. Web: client package and pages; local mode first.
+8a. EC2 tiles: the AMI, the coordinator's EC2 driver, the timings.
 9. Infrastructure (ejc3/aws): the coordinator service, the regional host groups, the AMI
    pipeline, DNS and certificates, and the staging deploy.
 
@@ -244,9 +276,10 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
    Alternatives: a fluid simulation viewers can stir; an image model generating frames.
 2. **Hardware.** Recommended: g4dn.metal, eight T4 per host and NVENC on each, so one host
    fills a grid. g5g.metal has two T4G per host at a sixth of the price.
-3. **Zone.** Recommended: `fcvm.dev`, unregistered when checked on 2026-10-22, bought
-   through Cloudflare Registrar so the zone is in Cloudflare from the start. The site at the
+3. **Zone. DECIDED (2026-10-22): `fcvm.dev`**, bought through Cloudflare Registrar so the
+   zone is in Cloudflare from the start. The site at the
    apex, slots at `slot-<n>.fcvm.dev`, the coordinator at `fleet-api.fcvm.dev`. `.dev` is
    HTTPS-only in browsers (HSTS preload), which this design meets everywhere.
-4. **Quota.** Three regions at the current G spot quota give at most three hosts. Raising
-   it in each region allows more hosts per region.
+4. **Quota.** Three regions at the current G spot quota give at most three hosts, and the
+   EC2 tiles compete for the same quota. Raising it in each region allows more hosts and
+   room for the EC2 half.
