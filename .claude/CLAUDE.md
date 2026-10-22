@@ -169,6 +169,9 @@ so nothing is built or booted twice when it doesn't have to be.
   Fragmenting the key silently kills sharing between behaviorally identical artifacts.
 - Before adding an opt-out or a key ingredient, ask: can the restore path absorb this
   difference? If yes, that is the fix.
+- **A key names content, not a path, where the snapshot keeps its own copy.** A read-only
+  `--disk-dir` is keyed on its tree's hash, taken in place so a hit copies nothing; a cold
+  boot builds the image from a private copy with that hash (`src/storage/disk_dir.rs`).
 
 ## VERIFY PLAN AND RUN NEW TESTS LOCALLY
 

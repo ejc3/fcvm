@@ -1,4 +1,5 @@
 pub mod disk;
+pub mod disk_dir;
 pub mod pmem;
 pub mod pmem_store;
 pub mod runtime_dir;

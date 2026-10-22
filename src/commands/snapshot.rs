@@ -4068,6 +4068,7 @@ fn run_args_from_snapshot_metadata(
         rootfs_override,
         image_disk_override: meta.image_disk_path.clone(),
         pmem_devices: meta.pmem_devices.clone(),
+        resolved_extra_disks: None,
     }
 }
 

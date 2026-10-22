@@ -1204,6 +1204,24 @@ fn resolve_pmem_into_store(args: &mut RunArgs, data_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Run a blocking step on a launch's --disk-dir staging, when it has one.
+async fn on_disk_dir_staging(
+    staging: &mut Option<crate::storage::disk_dir::DiskDirStaging>,
+    step: fn(&mut crate::storage::disk_dir::DiskDirStaging) -> Result<()>,
+) -> Result<()> {
+    let Some(mut held) = staging.take() else {
+        return Ok(());
+    };
+    let (held, result) = tokio::task::spawn_blocking(move || {
+        let result = step(&mut held);
+        (held, result)
+    })
+    .await
+    .context("--disk-dir staging task")?;
+    *staging = Some(held);
+    result
+}
+
 async fn prepare_vm_for_lifecycle(
     mut args: RunArgs,
     lifecycle: PodmanLifecycle,
@@ -1495,6 +1513,31 @@ async fn prepare_vm_for_lifecycle(
     // network's guest DNS below, so the hashed value and the guest-visible
     // value cannot diverge on a mid-launch resolv.conf change (#863).
     let boot_inputs = GuestBootInputs::resolve(args.dns.as_deref(), &runtime_config);
+
+    // Generated before the snapshot key so the staging path of a read-only --disk-dir
+    // is in this VM's data directory, which teardown removes.
+    let vm_id = generate_vm_id();
+    let vm_name = args.name.clone();
+
+    // Resolve the extra disks for the snapshot key ONCE: the key carries each read-only
+    // --disk-dir's content hash, taken in place, so a cache hit copies nothing. A cold
+    // boot copies the directory into this VM's data directory, checks the copy has that
+    // hash and builds the image from it, so a directory changing during the launch
+    // cannot put new content under an old key. A read-only --disk carries its image's
+    // file identity. Without the snapshot cache nothing is keyed or staged.
+    let mut disk_dir_staging = None;
+    if !no_snapshot && (!args.disk.is_empty() || !args.disk_dir.is_empty()) {
+        let root = paths::vm_runtime_dir(&vm_id).join("disk-dir-staging");
+        let (disk, disk_dir) = (args.disk.clone(), args.disk_dir.clone());
+        let (staging, resolved) = tokio::task::spawn_blocking(move || {
+            crate::storage::disk_dir::DiskDirStaging::resolve(&root, &disk, &disk_dir)
+        })
+        .await
+        .context("resolving --disk and --disk-dir for the snapshot key")??;
+        args.resolved_extra_disks = Some(resolved);
+        disk_dir_staging = Some(staging);
+    }
+
     let (fc_config, snapshot_key, prepare_target): (
         Option<crate::firecracker::FirecrackerConfig>,
         Option<String>,
@@ -1609,6 +1652,9 @@ async fn prepare_vm_for_lifecycle(
             image = %args.image,
             "Snapshot miss, will create snapshot after image load"
         );
+        // The cold boot builds each read-only --disk-dir image from a private copy, and
+        // refuses one whose content is no longer what the key names.
+        on_disk_dir_staging(&mut disk_dir_staging, |s| s.stage()).await?;
         (Some(config), Some(key), prepare_target)
     } else {
         if std::env::var("FCVM_NO_SNAPSHOT")
@@ -1621,10 +1667,6 @@ async fn prepare_vm_for_lifecycle(
         }
         (None, None, None)
     };
-
-    // Generate VM ID
-    let vm_id = generate_vm_id();
-    let vm_name = args.name.clone();
 
     if !volume_mappings.is_empty() {
         info!(
@@ -2109,6 +2151,18 @@ async fn prepare_vm_for_lifecycle(
         &mut vm_state,
     )
     .await;
+
+    // The disk-dir images are built, and a reboot relaunch re-attaches them, so the
+    // staged copies are no longer needed. A failed removal leaves them to teardown,
+    // which removes the VM's data directory.
+    if let Err(error) = on_disk_dir_staging(&mut disk_dir_staging, |s| {
+        s.remove();
+        Ok(())
+    })
+    .await
+    {
+        warn!(%error, "removing --disk-dir staging after boot");
+    }
 
     // If setup failed, cleanup all resources before propagating error
     if let Err(e) = setup_result {
@@ -3320,6 +3374,7 @@ mod tests {
             rootfs_override: None,
             image_disk_override: None,
             pmem_devices: vec![],
+            resolved_extra_disks: None,
         }
     }
 
@@ -3634,6 +3689,67 @@ mod tests {
             startup_snapshot_key("abc123def456", None),
             "abc123def456-startup"
         );
+    }
+
+    /// Both config builders give a read-only --disk-dir its content hash: the snapshot
+    /// key changes with the directory's bytes, stays when the same content is recreated,
+    /// and does not name the host path.
+    #[test]
+    fn the_snapshot_key_names_the_disk_dir_content() {
+        use std::path::Path;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir(&dir).unwrap();
+        let resolved_key = |staging: &str| {
+            let mut args = test_args();
+            args.disk_dir = vec![format!("{}:/data:ro", dir.display())];
+            let (_staging, resolved) = crate::storage::disk_dir::DiskDirStaging::resolve(
+                &tmp.path().join(staging),
+                &args.disk,
+                &args.disk_dir,
+            )
+            .unwrap();
+            args.resolved_extra_disks = Some(resolved);
+            let launch = build_launch_config(
+                &args,
+                Path::new("/rootfs"),
+                Path::new("/kernel"),
+                Path::new("/initrd"),
+                &None,
+                &RuntimeConfig::default(),
+                GuestBootInputs::default(),
+                &[],
+            );
+            let key_config = build_firecracker_config(
+                &args,
+                "sha256:test",
+                Path::new("/kernel"),
+                Path::new("/rootfs"),
+                Path::new("/initrd"),
+                None,
+                ImageMode::Overlay,
+                None,
+                None,
+                None,
+                None,
+                GuestBootInputs::default(),
+                &[],
+            );
+            assert_eq!(launch.extra_disks, key_config.extra_disks);
+            assert!(
+                !key_config.extra_disks[0].contains(&*dir.to_string_lossy()),
+                "the key names the host path: {:?}",
+                key_config.extra_disks
+            );
+            key_config.snapshot_key()
+        };
+        std::fs::write(dir.join("f"), b"one").unwrap();
+        let one = resolved_key("s1");
+        std::fs::remove_file(dir.join("f")).unwrap();
+        std::fs::write(dir.join("f"), b"one").unwrap();
+        assert_eq!(one, resolved_key("s2"), "recreated content changed the key");
+        std::fs::write(dir.join("f"), b"two").unwrap();
+        assert_ne!(one, resolved_key("s3"), "new content kept the key");
     }
 
     /// The device is attached from the launch config, at the target it carries.

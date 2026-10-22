@@ -461,16 +461,17 @@ pub(super) async fn attach_extra_disks(
                 dir_spec
             );
         }
-        let source_dir = std::path::Path::new(parts[0]);
+        // A read-only directory resolved for the snapshot key is built from its private
+        // copy, whose hash was checked against the key's, so the image holds exactly the
+        // content the key names.
+        let host_dir = std::path::Path::new(parts[0]);
+        let source_dir = args
+            .resolved_extra_disks
+            .as_ref()
+            .and_then(|r| r.disk_dirs.get(i))
+            .and_then(Option::as_ref)
+            .map_or(host_dir, |staged| staged.source.as_path());
         let mount_path = parts[1].to_string();
-
-        // Validate source directory exists
-        if !source_dir.is_dir() {
-            anyhow::bail!(
-                "Source directory does not exist or is not a directory: {}",
-                source_dir.display()
-            );
-        }
 
         // Validate mount path is absolute
         if !mount_path.starts_with('/') {
@@ -490,6 +491,14 @@ pub(super) async fn attach_extra_disks(
             .join("disks")
             .join(format!("disk-dir-{}.raw", disk_idx));
         if rebuild_disk_dir_images || !image_path.exists() {
+            // Checked only when the image is built: a relaunch re-attaches the existing
+            // image and never reads the directory, whose staged copy is gone by then.
+            if !source_dir.is_dir() {
+                anyhow::bail!(
+                    "Source directory does not exist or is not a directory: {}",
+                    source_dir.display()
+                );
+            }
             super::image::create_disk_from_dir(source_dir, &image_path, false).await?;
         } else {
             info!(
@@ -508,7 +517,7 @@ pub(super) async fn attach_extra_disks(
 
         info!(
             "Adding disk from dir: {} -> {} -> /dev/vd{} -> {} ({})",
-            source_dir.display(),
+            host_dir.display(),
             image_path.display(),
             (b'b' + disk_idx as u8) as char,
             mount_path,
@@ -1271,6 +1280,16 @@ impl GuestBootInputs {
     }
 }
 
+/// The snapshot key's extra-disk list for a run, shared by both config builders.
+pub(super) fn snapshot_key_extra_disks(args: &RunArgs) -> Vec<String> {
+    crate::storage::disk_dir::snapshot_key_extra_disks(
+        &args.disk,
+        &args.disk_dir,
+        &args.nfs,
+        args.resolved_extra_disks.as_ref(),
+    )
+}
+
 /// Build the FirecrackerConfig used to cold-boot a VM from a disk.
 ///
 /// Single source of truth for launch-config construction, shared by:
@@ -1291,11 +1310,7 @@ pub(crate) fn build_launch_config(
     use crate::firecracker::{BootSource, Drive, FcNetworkMode, FirecrackerConfig, MachineConfig};
     let network_mode: FcNetworkMode = args.network.into();
     let boot_inputs = boot_inputs.for_launch(network_mode, volume_mappings);
-    // Collect extra disk specifications
-    let mut extra_disks: Vec<String> = Vec::new();
-    extra_disks.extend(args.disk.iter().cloned());
-    extra_disks.extend(args.disk_dir.iter().cloned());
-    extra_disks.extend(args.nfs.iter().cloned());
+    let extra_disks = snapshot_key_extra_disks(args);
 
     let port_mappings = crate::network::PortMapping::parse_all_lenient(&args.publish);
 

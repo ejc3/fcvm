@@ -38,9 +38,12 @@ pub struct FirecrackerConfig {
     /// Included in cache key because Firecracker snapshots store absolute paths.
     /// Different data_dirs (e.g., root vs non-root) must use separate caches.
     pub data_dir: PathBuf,
-    /// Extra disk specifications (--disk, --disk-dir, --nfs).
-    /// These add block devices that must match between cache create and restore.
-    /// Format: "host_spec:guest_mount[:ro]" - host_spec included because content matters.
+    /// Extra disk specifications (--disk, --disk-dir, --nfs), in device order, from
+    /// `snapshot_key_extra_disks`. A cache hit restores the snapshot's own copy of each
+    /// --disk-dir image, so a read-only --disk-dir is named by the SHA-256 of its tree
+    /// (a cold boot builds the image from a private copy with that hash), not by its
+    /// host path, and a read-only --disk carries the
+    /// image's file identity beside its spec. Other specs are "host:guest[:ro]" as given.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub extra_disks: Vec<String>,
     /// Read-only virtio-pmem specs (--pmem), in device order, each naming the image's
