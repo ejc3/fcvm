@@ -1,0 +1,36 @@
+From cdbcc32b6258c7cb3597afae792b63ec6ecbae83 Mon Sep 17 00:00:00 2001
+From: ejc3 <ejc3@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 02:48:11 +0000
+Subject: [PATCH] mm: let MMU_NOTIFIER be enabled without an in-tree user
+
+MMU_NOTIFIER has no prompt, so only an in-tree option that selects it can
+enable it. NVIDIA's open kernel modules (nvidia-uvm) call
+__mmu_notifier_register() and fail to build without it, and the fcvm gpu
+guest kernel has none of the in-tree users (KVM, DRM, IOMMU SVA). Give the
+option a prompt so the gpu config fragment can request it directly.
+---
+ mm/Kconfig | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/mm/Kconfig b/mm/Kconfig
+index 76001e9..ee056a7 100644
+--- a/mm/Kconfig
++++ b/mm/Kconfig
+@@ -705,8 +705,13 @@ config BOUNCE
+ 	  selected, but you may say n to override this.
+ 
+ config MMU_NOTIFIER
+-	bool
++	bool "MMU notifiers for drivers built outside the kernel"
+ 	select INTERVAL_TREE
++	help
++	  MMU notifiers let a device driver follow changes to a process's
++	  page tables. In-tree users select this option. Say Y to provide
++	  it for an out-of-tree driver that needs it and selects nothing,
++	  such as NVIDIA's nvidia-uvm.
+ 
+ config KSM
+ 	bool "Enable KSM for page merging"
+-- 
+2.43.0
+

@@ -286,6 +286,10 @@ pub struct VmConfig {
     /// guest accepted. False for a VM with no balloon device.
     #[serde(default)]
     pub balloon_free_page_reporting: bool,
+    /// Host PCI addresses (SSSS:BB:DD.F) passed through to this VM (--gpu). They
+    /// were attached when the VM was restored; a VM with them can not be snapshotted.
+    #[serde(default)]
+    pub gpus: Vec<String>,
 }
 
 impl VmConfig {
@@ -362,6 +366,7 @@ impl VmState {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                gpus: Vec::new(),
             },
         }
     }

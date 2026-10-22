@@ -324,8 +324,8 @@ fn remove_file_if_exists(path: &Path) -> Result<()> {
 /// and runtime-data paths from the deserialized VM ID. State files are keyed by
 /// VM ID, not name or PID; in particular, a rootless clone parked at either
 /// restore failpoint (`restore.pre_resume`, `restore.post_network_pre_resume`)
-/// intentionally still has `pid = null`, because the PID is published only
-/// after the VMM resumes.
+/// is still `Starting`: the restore publishes `Running` only after the VMM
+/// resumes.
 fn artifacts_for_name(vm_name: &str) -> Result<Option<VmArtifacts>> {
     let state_dir = fcvm::paths::state_dir();
     let mut found = None;
@@ -1622,10 +1622,17 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
         let artifacts = wait_for_artifacts(&clone_name, clone_child, Duration::from_secs(10))
             .await
             .context("waiting for held clone network state")?;
+        // The name claim writes the clone's first state with its own PID; the restore
+        // publishes `Running` with its network once the VMM exists.
         anyhow::ensure!(
-            artifacts.state.pid.is_none() && !artifacts.state.lifecycle_ready,
-            "restore hold must precede VMM/lifecycle publication: pid={:?} ready={}",
+            artifacts.state.pid == Some(clone_pid)
+                && matches!(artifacts.state.status, fcvm::state::VmStatus::Starting)
+                && !artifacts.state.lifecycle_ready,
+            "restore hold must precede VMM/lifecycle publication: pid={:?} (clone {}) \
+             status={:?} ready={}",
             artifacts.state.pid,
+            clone_pid,
+            artifacts.state.status,
             artifacts.state.lifecycle_ready
         );
         let loopback_ip = artifacts
@@ -1769,15 +1776,15 @@ async fn test_lifecycle_interleave_early_connection_cannot_poison_restored_ingre
 /// Pins the signal-registration boundary of `fcvm snapshot run`. A rootless
 /// clone is held at `restore.pre_resume:block_until_file` after clone setup has
 /// published its state, lock, and runtime-data directory, but before the restore
-/// function starts. No restored VMM exists at this boundary and state still has
-/// `pid = null`. SIGTERM must already be owned by fcvm in this window; otherwise
+/// function starts. No restored VMM exists at this boundary: the state carries the
+/// PID the name claim wrote and is still `Starting`. SIGTERM must already be owned by fcvm in this window; otherwise
 /// the kernel's default action exits without cleanup and strands those setup
 /// artifacts.
 ///
 /// The marker and go-file make the interleaving deterministic:
 ///
 /// 1. wait for `restore.pre_resume reached` and all three exact clone artifacts;
-/// 2. prove the state still has no PID, deliver SIGTERM, and require fcvm's
+/// 2. prove the state is still `Starting`, deliver SIGTERM, and require fcvm's
 ///    signal-handler log while the failpoint remains held;
 /// 3. release the failpoint, require a bounded non-success exit, and require the
 ///    exact `state/<vm_id>.json`, `.json.lock`, and `vm-disks/<vm_id>` paths to
@@ -1879,11 +1886,17 @@ async fn test_lifecycle_interleave_snapshot_run_sigterm_before_resume_cleans_exa
                     log_tail(&clone_log, 40)
                 )
             })?;
+        // The name claim writes the clone's first state with its own PID; the restore
+        // publishes `Running` with its network once the VMM exists.
         anyhow::ensure!(
-            artifacts.state.pid.is_none(),
-            "restore.pre_resume must precede PID publication, but clone {} recorded PID {:?}",
+            artifacts.state.pid == Some(clone_pid)
+                && matches!(artifacts.state.status, fcvm::state::VmStatus::Starting),
+            "restore.pre_resume must precede the restore's state publication, but clone {} \
+             recorded PID {:?} (clone {}) and status {:?}",
             artifacts.vm_id,
-            artifacts.state.pid
+            artifacts.state.pid,
+            clone_pid,
+            artifacts.state.status
         );
         anyhow::ensure!(
             !artifacts.state.lifecycle_ready,

@@ -1320,6 +1320,7 @@ pub fn build_podman_args(
     plan: &Plan,
     image_ref: &str,
     user_info: Option<(&str, &str)>, // (username, runtime_dir)
+    cdi_devices: &[String],
 ) -> Vec<String> {
     let mut args = vec![
         "podman".to_string(),
@@ -1421,6 +1422,12 @@ pub fn build_podman_args(
         };
         args.push("-v".to_string());
         args.push(spec);
+    }
+
+    // GPUs, by CDI name (`gpu::attach` wrote the spec).
+    for device in cdi_devices {
+        args.push("--device".to_string());
+        args.push(device.clone());
     }
 
     args.push(image_ref.to_string());
@@ -1754,6 +1761,27 @@ pub async fn run_async(
 mod tests {
     use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};
 
+    /// An attached GPU reaches the container as a CDI device, before the image
+    /// name (podman reads everything after it as the command); without one the
+    /// arguments carry no --device.
+    #[test]
+    fn cdi_devices_are_passed_before_the_image() {
+        let plan: crate::types::Plan =
+            serde_json::from_str(r#"{"image": "alpine", "cmd": ["nvidia-smi"]}"#).unwrap();
+        let args =
+            super::build_podman_args(&plan, "alpine", None, &["nvidia.com/gpu=all".to_string()]);
+        let device = args
+            .windows(2)
+            .position(|w| w[0] == "--device" && w[1] == "nvidia.com/gpu=all")
+            .expect("the CDI device must be passed");
+        let image = args.iter().position(|a| a == "alpine").unwrap();
+        assert!(device < image, "{args:?}");
+        assert_eq!(args.last().unwrap(), "nvidia-smi");
+
+        let args = super::build_podman_args(&plan, "alpine", None, &[]);
+        assert!(!args.iter().any(|a| a == "--device"), "{args:?}");
+    }
+
     /// A pmem mount reaches the container read-only at the same path, as a
     /// read-only --disk does.
     #[test]
@@ -1763,7 +1791,7 @@ mod tests {
                 "pmem_mounts": [{"device": "/dev/pmem0", "mount_path": "/mnt/cache"}]}"#,
         )
         .unwrap();
-        let args = super::build_podman_args(&plan, "alpine", None);
+        let args = super::build_podman_args(&plan, "alpine", None, &[]);
         assert!(
             args.windows(2)
                 .any(|pair| pair[0] == "-v" && pair[1] == "/mnt/cache:/mnt/cache:ro"),

@@ -284,6 +284,7 @@ async fn create_sandbox(
         disk: vec![],
         disk_dir: vec![],
         pmem: vec![],
+        gpu: vec![],
         nfs: vec![],
         env: {
             let env_map = req.env.unwrap_or_default();
@@ -317,6 +318,7 @@ async fn create_sandbox(
         network: crate::cli::NetworkMode::Rootless,
         hypervisor: crate::cli::args::Hypervisor::Firecracker,
         ipv6_prefix: None,
+        ipv6_address: None,
         health_check: None,
         on_restore: None,
         health_check_timeout: 5,

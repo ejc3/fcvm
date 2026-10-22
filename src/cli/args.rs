@@ -514,6 +514,18 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub pmem: Vec<String>,
 
+    /// Pass a host PCI device, such as a GPU, through to the VM: its address
+    /// (SSSS:BB:DD.F or BB:DD.F, as `lspci -D` prints it). Repeat for more than one.
+    /// The device must be bound to vfio-pci and its /dev/vfio group open to this
+    /// user. Needs --kernel-profile gpu (Firecracker with the PCI transport).
+    /// The VM boots and is snapshotted without the device, and the device is
+    /// attached when the VM is restored from that snapshot, so GPU and non-GPU runs
+    /// share one snapshot. A VM with a passthrough device cannot be snapshotted.
+    /// Not with --balloon or --pmem, whose memory handling pinned DMA memory forbids.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS",
+          conflicts_with_all = ["balloon", "pmem"])]
+    pub gpu: Vec<String>,
+
     /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
     /// Starts NFS server on host, VM mounts via network.
     /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
@@ -586,6 +598,14 @@ pub struct RunArgs {
     /// The other network modes ignore it, and their snapshot keys do not include it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
+
+    /// The VM's IPv6 address in routed mode, instead of one derived from its random VM
+    /// id. It must lie inside the prefix in use (--ipv6-prefix, FCVM_IPV6_PREFIX or the
+    /// detected /64) and must not be the prefix's address 0 or 1. An address another
+    /// live VM holds is refused. Only valid with --network routed. Not part of any
+    /// snapshot key: a VM restored from a snapshot takes the address it is given.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
     /// The probe is plain HTTP for the URL's port, path and query, and the URL hostname is
@@ -916,6 +936,13 @@ pub struct SnapshotRunArgs {
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
+    /// The clone's IPv6 address, for a routed snapshot only: the guest's address is
+    /// swapped to it on restore, instead of one derived from the clone's random VM id.
+    /// The same rules as `podman run --ipv6-address` apply: inside the prefix in use,
+    /// not its address 0 or 1, and not held by another live VM.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
@@ -954,6 +981,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run runtime config when restoring from a snapshot cache hit.
     #[arg(skip)]
     pub firecracker_args: Option<String>,
+
+    /// Pass a host PCI device, such as a GPU, through to the restored VM (repeatable).
+    /// The snapshot must have been made with --kernel-profile gpu (PCI transport) and
+    /// without a balloon or pmem device; the device is attached before the VM resumes.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS")]
+    pub gpu: Vec<String>,
 
     /// Whether hugepages are enabled (internal use only).
     /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
