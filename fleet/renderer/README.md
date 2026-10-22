@@ -87,3 +87,26 @@ python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving ca
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame
 python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST8:8080
 ```
+
+## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
+
+Moving camera over the mountains, `tools/measure.py`, 8 s per row after 2 s
+to settle; wall tiles are a 1/16 x 1/9 rect of a 16:9 image:
+
+| stream | fps | samples/pixel/frame | GPU ms/frame (render) | encode ms |
+|--------|-----|---------------------|-----------------------|-----------|
+| 146 x 146 (asked 136) | 30.0 | 60.6 | 23.4 | 0.40 |
+| 180 x 180 | 30.0 | 57.8 | 23.3 | 0.53 |
+| 240 x 240 | 30.0 | 38.5 | 23.5 | 0.49 |
+| 360 x 360 | 30.0 | 20.0 | 23.8 | 0.62 |
+| 1280 x 720 whole image | 30.0 | 1 | 23.9 | 1.74 |
+| 1920 x 1080 whole image | 15.0 | 1 | 51.1 | 3.74 |
+
+Relaunch (`tools/relaunch.py`, cache-hit `fcvm podman run`, four runs): 6.07
+to 6.27 s from the command to the first frame at the client. Inside that, the
+renderer's own process start to first frame sent is 1.91 to 1.97 s, of which
+CUDA initialization is 1.51 to 1.56 s (the GPU is not held initialized between
+fc-agent's `nvidia-smi` and the renderer).
+
+The seam test passes in VMs on three different T4s, and the three print the
+same image hashes. Shots stitched from eight VMs on eight GPUs are in `shots/`.
