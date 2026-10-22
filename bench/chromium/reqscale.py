@@ -1528,7 +1528,9 @@ class FirecrackerFaultProbe:
                     comm = identity.comm()
                     self.audit.observe_identity(identity, comm or "unnamed-child")
                     observed.append((pid, comm))
-                    if comm == "firecracker":
+                    # fcvm runs content-addressed binaries, so the comm is
+                    # "firecracker-def" (cut to 15 bytes), not "firecracker".
+                    if comm.startswith("firecracker"):
                         named.append(identity)
                         identity = None
                 finally:
@@ -2656,7 +2658,10 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             "held_from_identity_read_through_terminal_verification": True,
         },
         "host": {
-            "hostname": platform.node(),
+            # The instance type and CPU, not the host name: records are
+            # published, and a host name names one machine on one network.
+            "instance_type": reqbench.host_facts()["instance_type"],
+            "cpu_model": reqbench.host_facts()["cpu_model"],
             "kernel": platform.release(),
             "machine": platform.machine(),
             "python": platform.python_version(),

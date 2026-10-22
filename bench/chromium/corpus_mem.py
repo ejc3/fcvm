@@ -1207,7 +1207,13 @@ class ContainerSide:
         for i in range(n):
             name = f"{self.prefix(cell_tag)}{i}"
             self.owned.add(name)
-            command = ["podman", "create", "--name", name,
+            # --no-healthcheck: the image's HEALTHCHECK is the golden's capture
+            # trigger and has no job in the pool, whose readiness is
+            # /run/bench-ready. Run per container from systemd timers, it put
+            # transient processes in the measured cgroups and held podman's
+            # locks: with 48 containers `podman ps` took 7.7 to 23.6 s and
+            # report.py's sample timed out at 20 s; without it, 0.04 s.
+            command = ["podman", "create", "--no-healthcheck", "--name", name,
                        "--label", f"{CONTAINER_OWNER_LABEL}={self.args.container_owner_token}",
                        "--network", CONTAINER_NET,
                        "-e", f"BENCH_RESOLVE_ALL_TO={CONTAINER_RESOLVE_TO}",

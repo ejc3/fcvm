@@ -1312,12 +1312,18 @@ def _validate_provenance(provenance: dict, schedule: dict) -> tuple[str, str]:
         raise AnalysisInvalid("snapshot generation lease provenance is incomplete")
     host = provenance.get("host")
     if not isinstance(host, dict) or set(host) != {
-        "hostname", "kernel", "machine", "python", "cpu_count", "quiet_gate",
+        "instance_type", "cpu_model", "kernel", "machine", "python", "cpu_count",
+        "quiet_gate",
     }:
         raise AnalysisInvalid("host provenance is incomplete")
-    for field in ("hostname", "kernel", "machine", "python"):
+    for field in ("kernel", "machine", "python"):
         if not isinstance(host.get(field), str) or not host[field]:
             raise AnalysisInvalid(f"host provenance lacks {field}")
+    for field in ("instance_type", "cpu_model"):
+        if host.get(field) is not None and (
+            not isinstance(host[field], str) or not host[field]
+        ):
+            raise AnalysisInvalid(f"host provenance has an invalid {field}")
     if (
         not isinstance(host.get("cpu_count"), int)
         or isinstance(host["cpu_count"], bool)
@@ -2010,7 +2016,8 @@ def analyze(run_dir: str) -> dict:
             "seed": config.seed,
         },
         "provenance": {
-            "hostname": provenance["host"]["hostname"],
+            "instance_type": provenance["host"]["instance_type"],
+            "cpu_model": provenance["host"]["cpu_model"],
             "kernel": provenance["host"]["kernel"],
             "machine": provenance["host"]["machine"],
             "cpu_count": provenance["host"]["cpu_count"],
@@ -2061,7 +2068,8 @@ def markdown_report(analysis: dict) -> str:
         f"`{analysis['snapshot_generation_id']}`. The run passed its provenance, "
         "continuous-accounting, and host drift-control checks.",
         "",
-        f"Measured on `{prov['hostname']}` ({prov['machine']}, {prov['cpu_count']} CPUs, "
+        f"Measured on `{prov['instance_type'] or 'an unrecorded instance type'}` "
+        f"({prov['cpu_model'] or prov['machine']}, {prov['cpu_count']} CPUs, "
         f"kernel `{prov['kernel']}`) with fcvm `{prov['fcvm_version']}` "
         f"(`{prov['fcvm_sha256'][:12]}`) at source revision "
         f"`{prov['source_revision'][:12]}`"

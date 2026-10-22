@@ -171,6 +171,32 @@ def mean_ci(xs, iters=20000, conf=0.95, seed=12345):
     return mean, boots[int((1 - conf) / 2 * iters)], boots[int((1 + conf) / 2 * iters) - 1], n
 
 
+def child_role(name):
+    """What a fast teardown's per-child key is, whatever its binary is named.
+
+    teardown_fast keys each child by its /proc comm, which the kernel cuts
+    to 15 bytes, and fcvm runs content-addressed binaries: Firecracker shows
+    as "firecracker-def" and pasta as "pasta-<hash>". The namespace holder
+    runs `sleep infinity`. A "#<pid>" suffix marks a comm collision.
+    """
+    base = name.split("#", 1)[0]
+    if base.startswith("firecracker"):
+        return "firecracker"
+    if base == "pasta" or base.startswith("pasta-"):
+        return "pasta"
+    if base == "sleep":
+        return "holder"
+    return base
+
+
+def by_role(per_child):
+    """per_child summed by child_role; None when a value cannot be added."""
+    out = {}
+    for name, value in per_child.items():
+        out[child_role(name)] = out.get(child_role(name), 0.0) + value
+    return out
+
+
 def finite_or_none(value):
     """value as a float when it is a finite number (not a boolean), else None."""
     if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
@@ -2541,7 +2567,8 @@ def analyze_backend(
                 # The schedule validator does not check the two by-child maps,
                 # so a malformed value reaches here and is no reading.
                 if (not all(isinstance(x, dict) for x in (life, reaped, per_child))
-                        or "firecracker" not in life or "fcvm" not in life
+                        or "firecracker" not in {child_role(k) for k in life}
+                        or "fcvm" not in life
                         or set(reaped) != set(life) or not per_child
                         or not all(cpu_reading(v) for v in life.values())
                         or not all(cpu_reading(v) for v in reaped.values())
@@ -2562,7 +2589,7 @@ def analyze_backend(
                     "reclaim": sum(c["reclaim_cpu_ms"] for c in per_child.values()),
                     "lower_bound": any(c.get("complete") is not True
                                        for c in per_child.values()),
-                    "by_child": life,
+                    "by_child": by_role(life),
                 }
 
             readings = [clone_cpu(r) for r in fast_records]
