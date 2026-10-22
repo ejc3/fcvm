@@ -17,6 +17,9 @@ from PIL import Image  # noqa: E402
 
 URL, OUT = sys.argv[1], sys.argv[2]
 SECS = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
+# hold: the camera holds still (the image converges, little changes); move: the camera
+# flies a loop for the whole measurement.
+MODE = os.environ.get("MODE", "hold")
 os.makedirs(OUT, exist_ok=True)
 fleetlive.connect_to(URL)
 
@@ -32,17 +35,23 @@ def hostport(url):
 
 
 def proc_cpu(pid):
-    """utime+stime in seconds of pid and its children (ffmpeg)."""
+    """utime+stime in seconds of pid and its children (the ffmpeg processes, which any of
+    its threads may have started)."""
     tck = os.sysconf("SC_CLK_TCK")
+    kids = []
+    for task in os.listdir(f"/proc/{pid}/task"):
+        try:
+            kids += [int(c) for c in open(f"/proc/{pid}/task/{task}/children").read().split()]
+        except OSError:
+            pass
     total = 0.0
-    pids = [pid] + [int(c) for c in open(f"/proc/{pid}/task/{pid}/children").read().split()]
-    for p in pids:
+    for p in [pid] + kids:
         try:
             f = open(f"/proc/{p}/stat").read().rsplit(")", 1)[1].split()
             total += (int(f[11]) + int(f[12])) / tck
         except OSError:
             pass
-    return total, len(pids)
+    return total, 1 + len(kids)
 
 
 def pid_listening(port):
@@ -89,6 +98,17 @@ log("aggregate", agg["id"], "rect", agg["rect"], "tiles", agg["tiles"])
 agg_pid = pid_listening(ap)
 image_aspect = st["image_aspect"]
 layout = json.loads(urllib.request.urlopen(f"http://{ah}:{ap}/layout", timeout=5).read())
+if MODE == "move":
+    import math as _m
+    now_t = (time.time() * 1000 - st["scene"]["epoch_unix_ms"]) / 1000
+    keys = []
+    for i in range(40):
+        a = i * 0.25
+        pos = [-32 + 8 * _m.sin(a), 1.9 + 0.4 * _m.sin(a * 0.7), -55 + 8 * _m.cos(a)]
+        look = [pos[0] - 30 * _m.sin(a + 0.6), 1.2, pos[2] - 30 * _m.cos(a + 0.6)]
+        keys.append({"t": now_t + 1 + i * 5.0, "pos": pos, "look": look, "fov_deg": 62})
+    log("camera path", v.intent("camera", {"keyframes": keys})["outcome"])
+    time.sleep(2)
 
 # --- latency, bitrate, CPU over SECS ---------------------------------------------------
 first = tiles[agg["tiles"][0]]
@@ -97,8 +117,16 @@ th = "127.0.0.1"
 tile_h = round(1080 * first["rect"]["h"]) & ~1
 a = Recorder(ah, ap, 1080)
 d = Recorder(th, tp, tile_h)
+# Every tile directly, at the height the aggregator asks for: direct mode's total.
+directs = []
+for tid in agg["tiles"]:
+    t_ = tiles[tid]
+    _h, _p = hostport(t_["frame_url"])
+    directs.append(Recorder("127.0.0.1", _p, round(1080 * t_["rect"]["h"]) & ~1))
 time.sleep(3)  # let both streams settle
 a.recv.clear(); d.recv.clear(); a.bytes = 0; d.bytes = 0
+for r_ in directs:
+    r_.bytes = 0
 c0, n0 = proc_cpu(agg_pid)
 t0 = time.time()
 time.sleep(SECS)
@@ -106,12 +134,16 @@ c1, n1 = proc_cpu(agg_pid)
 span = time.time() - t0
 stats = json.loads(urllib.request.urlopen(f"http://{ah}:{ap}/stats", timeout=5).read())
 a.stop = d.stop = True
+for r_ in directs:
+    r_.stop = True
 common = sorted(set(a.recv) & set(d.recv))
 added = sorted((a.recv[t] - d.recv[t]) * 1000 for t in common)
 pct = lambda xs, q: xs[min(len(xs) - 1, round((len(xs) - 1) * q))] if xs else None
 res = {
     "region": agg["rect"], "tiles": len(agg["tiles"]), "header": a.header, "seconds": round(span, 1),
+    "mode": MODE,
     "aggregate_kbps": round(a.bytes * 8 / span / 1000), "tile_kbps": round(d.bytes * 8 / span / 1000),
+    "direct_total_kbps": round(sum(r_.bytes for r_ in directs) * 8 / span / 1000),
     "aggregate_frames": len(a.recv), "tile_frames": len(d.recv),
     "added_ms_vs_direct_tile": {"p50": pct(added, 0.5), "p95": pct(added, 0.95), "max": pct(added, 1.0), "n": len(added)},
     "cpu_cores": round((c1 - c0) / span, 2), "processes": n1, "aggregator_stats": stats,
@@ -148,6 +180,7 @@ spanb = time.time() - tb
 stats_b = json.loads(urllib.request.urlopen("http://127.0.0.1:20202/stats", timeout=5).read())
 b.stop = True
 res["at_1080p_pixels"] = {"image_height": H2, "header": b.header, "kbps": round(b.bytes * 8 / spanb / 1000),
+                          "processes": proc_cpu(p2.pid)[1],
                           "cpu_cores": round((cb1 - cb0) / spanb, 2), "stats": stats_b}
 p2.terminate()
 log("1080p-equivalent:", b.header and (b.header["width"], b.header["height"]), res["at_1080p_pixels"]["kbps"], "kbps")
@@ -222,10 +255,12 @@ def ratio(img, vertical, b, lo, hi):
 
 ratios = [round(ratio(A, True, bx, 0, H), 3) for bx in sorted(bounds_x)] + \
          [round(ratio(A, False, by, 0, W), 3) for by in sorted(bounds_y)]
+raw_ratios = [round(ratio(R, True, bx, 0, H), 3) for bx in sorted(bounds_x)] + \
+             [round(ratio(R, False, by, 0, W), 3) for by in sorted(bounds_y)]
 res["seams"] = {"t": T, "tile_boundaries_x": sorted(bounds_x), "tile_boundaries_y": sorted(bounds_y),
                 "psnr_luma_vs_unencoded_db": {"within_2px_of_a_tile_edge": round(psnr(near), 2),
                                               "elsewhere": round(psnr(far), 2)},
-                "seam_ratio_aggregate": ratios}
+                "seam_ratio_aggregate": ratios, "seam_ratio_unencoded": raw_ratios}
 log("seams:", res["seams"])
 json.dump(res, open(os.path.join(OUT, "aggregate.json"), "w"), indent=1)
 
