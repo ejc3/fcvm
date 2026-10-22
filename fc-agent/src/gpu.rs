@@ -595,13 +595,17 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     start_persistenced(driver_root).await?;
     steps.persistenced_ms = clock.lap("persistenced");
 
-    let libraries = library_dir(driver_root);
-    let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
-    smi.arg("-L").env("LD_LIBRARY_PATH", &libraries);
-    let listed = match run_checked("nvidia-smi -L", smi, SMI_TIMEOUT).await {
-        Ok(text) => text,
-        Err(error) => bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await),
-    };
+    // Both only read the GPUs the daemon has initialised, so they run together.
+    // The spec is generated after the daemon starts so it mounts its socket.
+    let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(
+        timed(list_gpus(driver_root)),
+        timed(generate_cdi_spec(driver_root)),
+    );
+    steps.smi_ms = smi_ms;
+    steps.cdi_ms = cdi_ms;
+    eprintln!("[fc-agent] gpu: step=nvidia-smi elapsed_ms={smi_ms:.3}");
+    eprintln!("[fc-agent] gpu: step=cdi elapsed_ms={cdi_ms:.3}");
+    let listed = listed?;
     let initialised = listed.lines().filter(|l| l.starts_with("GPU ")).count();
     if initialised < announced.len() {
         bail!(
@@ -611,20 +615,42 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
         );
     }
     eprintln!("[fc-agent] gpu: {}", listed.trim().replace('\n', "; "));
-    steps.smi_ms = clock.lap("nvidia-smi");
-
-    std::fs::create_dir_all(Path::new(CDI_SPEC).parent().unwrap())
-        .context("creating the CDI spec directory")?;
-    let mut ctk = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-ctk"));
-    ctk.args(cdi_generate_args(driver_root))
-        .env("LD_LIBRARY_PATH", &libraries);
-    run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
+    spec?;
     eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-    steps.cdi_ms = clock.lap("cdi");
     Ok(AttachReport {
         gpus: initialised,
         steps,
     })
+}
+
+/// Run `future` and return its milliseconds with its output.
+async fn timed<T>(future: impl std::future::Future<Output = T>) -> (f64, T) {
+    let started = std::time::Instant::now();
+    let output = future.await;
+    (started.elapsed().as_secs_f64() * 1000.0, output)
+}
+
+/// `nvidia-smi -L` from the image: one `GPU <n>:` line per GPU the driver
+/// initialised. A failure carries the kernel log's NVRM lines.
+async fn list_gpus(driver_root: &Path) -> Result<String> {
+    let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
+    smi.arg("-L")
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    match run_checked("nvidia-smi -L", smi, SMI_TIMEOUT).await {
+        Ok(text) => Ok(text),
+        Err(error) => bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await),
+    }
+}
+
+/// Write the CDI spec with `nvidia-ctk cdi generate` from the image.
+async fn generate_cdi_spec(driver_root: &Path) -> Result<()> {
+    std::fs::create_dir_all(Path::new(CDI_SPEC).parent().unwrap())
+        .context("creating the CDI spec directory")?;
+    let mut ctk = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-ctk"));
+    ctk.args(cdi_generate_args(driver_root))
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
+    Ok(())
 }
 
 /// Start nvidia-persistenced from the driver image. Without it nothing holds the
@@ -691,26 +717,52 @@ mod tests {
         assert_eq!(libraries, Some(super::library_dir(root).as_os_str()));
     }
 
-    /// The daemon must start once the device nodes exist, and before the checks
-    /// and the CDI spec: `nvidia-smi -L` then opens a GPU the daemon already
-    /// initialised, and the spec mounts the daemon's socket into the container.
-    #[test]
-    fn persistenced_starts_after_the_device_nodes_and_before_the_cdi_spec() {
+    /// The body of `attach_devices`, for the source-order tests below.
+    fn attach_devices_body() -> &'static str {
         let source = include_str!("gpu.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
         let body = &code[code
             .find("async fn attach_devices(")
             .expect("no attach_devices")..];
+        &body[..body.find("\n}\n").expect("attach_devices does not end")]
+    }
+
+    /// The daemon must start once the device nodes exist, and before the checks
+    /// and the CDI spec: `nvidia-smi -L` then opens a GPU the daemon already
+    /// initialised, and the spec mounts the daemon's socket into the container.
+    #[test]
+    fn persistenced_starts_after_the_device_nodes_and_before_the_cdi_spec() {
+        let body = attach_devices_body();
         let nodes = body.find("create_device_nodes(").expect("no device nodes");
         let daemon = body
             .find("start_persistenced(driver_root)")
             .expect("attach_devices does not start nvidia-persistenced");
-        let smi = body.find("\"nvidia-smi -L\"").expect("no nvidia-smi -L");
-        let cdi = body.find("cdi_generate_args(").expect("no CDI generation");
+        let smi = body
+            .find("list_gpus(driver_root)")
+            .expect("no nvidia-smi -L");
+        let cdi = body
+            .find("generate_cdi_spec(driver_root)")
+            .expect("no CDI generation");
         assert!(
             nodes < daemon && daemon < smi && daemon < cdi,
             "nvidia-persistenced must start after the device nodes ({nodes}) and before \
              nvidia-smi -L ({smi}) and the CDI spec ({cdi}); it starts at {daemon}"
+        );
+    }
+
+    /// With the daemon up, `nvidia-smi -L` and the CDI generation only read the
+    /// initialised GPUs, so they run together rather than one after the other.
+    #[test]
+    fn the_gpu_check_and_the_cdi_spec_run_together() {
+        let body = attach_devices_body();
+        let join = body
+            .find("tokio::join!(")
+            .expect("attach_devices no longer joins the GPU check and the CDI spec");
+        let joined = &body[join..join + body[join..].find(");").unwrap()];
+        assert!(
+            joined.contains("list_gpus(driver_root)")
+                && joined.contains("generate_cdi_spec(driver_root)"),
+            "nvidia-smi -L and the CDI generation must be joined: {joined}"
         );
     }
 
