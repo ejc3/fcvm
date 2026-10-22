@@ -86,9 +86,9 @@ export async function seamReport(page: Page): Promise<SeamReport> {
   const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), pts.map(({ x, y }) => ({ x, y })))) as CaptureResult;
   const f = frameCtx(res.T!, (await mockState()).pattern);
   const uv = (x: number, y: number) => ({ u: (x - v.image.x) / v.image.w, v: (y - v.image.y) / v.image.h });
-  const sums: Record<string, { s: number; n: number }> = {};
-  const pairSums: Record<string, { s: number; n: number }> = {};
-  let samples = 0;
+  // Smooth sample pairs: expected and observed colour on each side.
+  type Sample = { tile: string; pair: string; e: [number, number, number]; o: [number, number, number] };
+  const pairs: [Sample, Sample][] = [];
   for (let i = 0; i < pts.length; i += 2) {
     const p = [pts[i]!, pts[i + 1]!];
     // Skip pairs where the picture itself changes fast (text, rings, stars):
@@ -104,27 +104,32 @@ export async function seamReport(page: Page): Promise<SeamReport> {
       });
     });
     if (!smooth) continue;
-    samples++;
-    const errs = p.map((q, k) => {
-      const c = uv(q.x, q.y);
-      const e = expectedRgb(c.u, c.v, f);
+    const mk = (k: number): Sample => {
+      const c = uv(p[k]!.x, p[k]!.y);
       const o = res.pixels[i + k]!;
-      return (Math.abs(o[0] - e[0]) + Math.abs(o[1] - e[1]) + Math.abs(o[2] - e[2])) / 3;
-    });
-    p.forEach((q, k) => {
-      const s = (sums[q.tile] ??= { s: 0, n: 0 });
-      s.s += errs[k]!;
+      return { tile: p[k]!.tile, pair: p[k]!.pair, e: expectedRgb(c.u, c.v, f), o: [o[0], o[1], o[2]] };
+    };
+    pairs.push([mk(0), mk(1)]);
+  }
+  // Browsers convert the decoded YUV to RGB in their own way (matrix, range,
+  // rounding), so compare up to one colour transform fitted over every sample:
+  // what is left is what differs between tiles.
+  const map = fitColour(pairs.flat());
+  const sums: Record<string, { s: number; n: number }> = {};
+  const pairSums: Record<string, { s: number; n: number }> = {};
+  const samples = pairs.length;
+  for (const [a, b] of pairs) {
+    for (const x of [a, b]) {
+      const m = map(x.e);
+      const s = (sums[x.tile] ??= { s: 0, n: 0 });
+      s.s += (Math.abs(x.o[0] - m[0]) + Math.abs(x.o[1] - m[1]) + Math.abs(x.o[2] - m[2])) / 3;
       s.n += 1;
-    });
+    }
     // Across the boundary: observed difference against the expected difference.
-    const o0 = res.pixels[i]!;
-    const o1 = res.pixels[i + 1]!;
-    const c0 = uv(p[0]!.x, p[0]!.y);
-    const c1 = uv(p[1]!.x, p[1]!.y);
-    const e0 = expectedRgb(c0.u, c0.v, f);
-    const e1 = expectedRgb(c1.u, c1.v, f);
-    const across = [0, 1, 2].reduce((acc, k) => acc + Math.abs(o1[k]! - o0[k]! - (e1[k]! - e0[k]!)), 0) / 3;
-    const ps = (pairSums[p[0]!.pair] ??= { s: 0, n: 0 });
+    const ma = map(a.e);
+    const mb = map(b.e);
+    const across = [0, 1, 2].reduce((acc, k) => acc + Math.abs(b.o[k]! - a.o[k]! - (mb[k]! - ma[k]!)), 0) / 3;
+    const ps = (pairSums[a.pair] ??= { s: 0, n: 0 });
     ps.s += across;
     ps.n += 1;
   }
@@ -148,15 +153,56 @@ export async function focusError(page: Page, tileId: string): Promise<{ err: num
   for (let j = 1; j < 10; j++) for (let i = 1; i < 16; i++) pts.push({ x: v.box.x + (v.box.w * i) / 16, y: v.box.y + (v.box.h * j) / 10 });
   const res = (await page.evaluate((p) => window.__fleet!.client.capture(p), pts)) as CaptureResult;
   const f = frameCtx(res.T!, (await mockState()).pattern);
-  let err = 0;
-  let n = 0;
-  pts.forEach((p, k) => {
+  const samples = pts.map((p, k) => {
     const u = v.rect.x + ((p.x - v.box.x) / v.box.w) * v.rect.w;
     const vv = v.rect.y + ((p.y - v.box.y) / v.box.h) * v.rect.h;
-    const e = expectedRgb(u, vv, f);
     const o = res.pixels[k]!;
-    err += (Math.abs(o[0] - e[0]) + Math.abs(o[1] - e[1]) + Math.abs(o[2] - e[2])) / 3;
-    n++;
+    return { e: expectedRgb(u, vv, f), o: [o[0], o[1], o[2]] as [number, number, number] };
   });
-  return { err: err / n, shown: res.shown[tileId] ?? "", T: res.T };
+  // Up to the browser's colour conversion, as in seamReport.
+  const map = fitColour(samples);
+  let err = 0;
+  for (const s of samples) {
+    const m = map(s.e);
+    err += (Math.abs(s.o[0] - m[0]) + Math.abs(s.o[1] - m[1]) + Math.abs(s.o[2] - m[2])) / 3;
+  }
+  return { err: err / samples.length, shown: res.shown[tileId] ?? "", T: res.T };
+}
+
+/**
+ * The colour transform that best maps expected RGB to observed RGB (each output
+ * channel an affine function of the three inputs, least squares).
+ */
+export function fitColour(samples: { e: [number, number, number]; o: [number, number, number] }[]): (e: [number, number, number]) => [number, number, number] {
+  const coef: number[][] = [];
+  for (let c = 0; c < 3; c++) {
+    // Normal equations for [r, g, b, 1] . w = o_c.
+    const A = Array.from({ length: 4 }, () => [0, 0, 0, 0]);
+    const y = [0, 0, 0, 0];
+    for (const s of samples) {
+      const x = [s.e[0], s.e[1], s.e[2], 1];
+      for (let i = 0; i < 4; i++) {
+        y[i]! += x[i]! * s.o[c]!;
+        for (let j = 0; j < 4; j++) A[i]![j]! += x[i]! * x[j]!;
+      }
+    }
+    for (let i = 0; i < 4; i++) A[i]![i]! += 1e-6; // a flat colour sample set stays solvable
+    coef.push(solve4(A, y));
+  }
+  return (e) => [0, 1, 2].map((c) => coef[c]![0]! * e[0] + coef[c]![1]! * e[1] + coef[c]![2]! * e[2] + coef[c]![3]!) as [number, number, number];
+}
+
+function solve4(A: number[][], y: number[]): number[] {
+  const m = A.map((row, i) => [...row, y[i]!]);
+  for (let col = 0; col < 4; col++) {
+    let piv = col;
+    for (let r = col + 1; r < 4; r++) if (Math.abs(m[r]![col]!) > Math.abs(m[piv]![col]!)) piv = r;
+    [m[col], m[piv]] = [m[piv]!, m[col]!];
+    for (let r = 0; r < 4; r++) {
+      if (r === col) continue;
+      const k = m[r]![col]! / m[col]![col]!;
+      for (let c = col; c < 5; c++) m[r]![c]! -= k * m[col]![c]!;
+    }
+  }
+  return m.map((row, i) => row[4]! / row[i]!);
 }

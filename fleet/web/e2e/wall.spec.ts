@@ -8,11 +8,13 @@ const view = (page: Page) =>
   });
 
 // Mean absolute error, 0..255 per channel, at smooth points either side of each
-// boundary. Measured on this mock: correct draws at the common t 1.0 to 1.3 at
-// worst over 16 tiles in Chromium and 2.7 to 3.1 in WebKit; a tile drawn 0.6 s
-// off its stamp 5.9 to 16.
-const TILE_ERR_MAX = 4;
-const ACROSS_ERR_MAX = 3.5;
+// boundary, after one colour transform fitted over all of them (browsers convert
+// YUV to RGB differently: before the fit, correct tiles read 1.0 in Chromium on
+// arm64, 2.7 to 3.1 in WebKit and up to 5.1 in Chromium on CI's x86 runner).
+// After it, correct draws at the common t measured 0.9 to 1.5 at worst over 16
+// tiles in Chromium and WebKit; a tile drawn 0.6 s off its stamp 10.
+const TILE_ERR_MAX = 3;
+const ACROSS_ERR_MAX = 3;
 
 test.describe.configure({ mode: "serial" });
 
