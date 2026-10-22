@@ -7,7 +7,7 @@
 //! copy whose hash must equal the key's, so a directory that changes during the launch
 //! cannot put new content under an old key.
 //! A read-only `--disk` is attached in place, so its key carries the image's file
-//! identity, which a rewrite cannot present again.
+//! identity and ctime, which a rewrite cannot present again.
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 /// snapshot key is computed. Both lists are parallel to their specs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ResolvedExtraDisks {
-    /// Per `--disk` spec: the image's file identity when the disk is read-only.
+    /// Per `--disk` spec: the image's identity (with ctime) when the disk is read-only.
     pub disk_identities: Vec<Option<String>>,
     /// Per `--disk-dir` spec: its content hash and staging path when it is read-only.
     pub disk_dirs: Vec<Option<StagedDiskDir>>,
@@ -107,7 +107,7 @@ impl DiskDirStaging {
         for spec in disk {
             let identity = match split_spec(spec) {
                 Some((host, _, true)) => Some(
-                    crate::utils::file_identity(Path::new(host))
+                    disk_image_identity(Path::new(host))
                         .with_context(|| format!("stat --disk image {host} for snapshot key"))?,
                 ),
                 _ => None,
@@ -239,18 +239,33 @@ fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// A read-only `--disk` image's identity for the key: `crate::utils::metadata_identity`
+/// (inode, size, mtime) plus the ctime, which a rewrite that restores the old mtime
+/// (`touch -r`) still moves and nobody can set back.
+fn disk_image_identity(path: &Path) -> Result<String> {
+    let md = std::fs::metadata(path)?;
+    Ok(format!(
+        "{} ctime={}.{:09}",
+        crate::utils::metadata_identity(&md),
+        md.ctime(),
+        md.ctime_nsec()
+    ))
+}
+
 /// SHA-256 over a sorted walk of `root`. Each entry contributes its path relative to
-/// `root`, file type, permission bits, the extended attributes this process can list
-/// (names and values, sorted; `cp -a` and `mkfs.ext4 -d` carry them into the image),
-/// then a regular file's bytes, a symlink's target, or a device's number. Timestamps are left out, so a directory recreated with the
-/// same content hashes the same. The hash covers what lands in the image: uid and gid
-/// enter it only when fcvm runs as root, because a non-root fcvm's copy, and so its
-/// image, belongs to the copier whatever the source's owners.
+/// `root`, file type, permission bits, its extended attributes (names and values,
+/// sorted), then a regular file's bytes, a symlink's target, or a device's number.
+/// Timestamps are left out, so a directory recreated with the same content hashes the
+/// same. The hash covers what a copy by this process carries into the image: as root,
+/// `cp -a` keeps owners and every attribute, so uid, gid and every listable attribute
+/// count; a non-root copy belongs to the copier and keeps only `user.` attributes (the
+/// rest it drops silently), so only those count.
 pub fn hash_tree(root: &Path) -> Result<String> {
     hash_tree_with(root, nix::unistd::geteuid().is_root())
 }
 
-/// [`hash_tree`] with the decision whether the copy keeps the source's owners passed in.
+/// [`hash_tree`] with the decision whether the copy keeps the source's owners, and so
+/// every attribute, passed in.
 fn hash_tree_with(root: &Path, keep_owners: bool) -> Result<String> {
     let mut hasher = Sha256::new();
     hash_entry(root, Path::new(""), keep_owners, &mut hasher)?;
@@ -343,7 +358,10 @@ fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha2
         hasher.update(md.uid().to_le_bytes());
         hasher.update(md.gid().to_le_bytes());
     }
-    let xattrs = extended_attributes(path)?;
+    let mut xattrs = extended_attributes(path)?;
+    if !keep_owners {
+        xattrs.retain(|(name, _)| name.starts_with(b"user."));
+    }
     hasher.update((xattrs.len() as u64).to_le_bytes());
     for (name, value) in xattrs {
         hash_bytes(hasher, &name);
@@ -391,6 +409,7 @@ fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha2
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
 
     fn write_tree(root: &Path, payload: &[u8]) {
         std::fs::create_dir_all(root.join("sub")).unwrap();
@@ -531,8 +550,8 @@ mod tests {
         }
     }
 
-    /// Set a `user.` extended attribute, or return the error.
-    fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+    /// Set an extended attribute, or return the error.
+    fn set_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
         use std::os::unix::ffi::OsStrExt;
         let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
         let name = std::ffi::CString::new(name).unwrap();
@@ -570,7 +589,7 @@ mod tests {
                 let tmp = tempfile::tempdir_in(base).ok()?;
                 let probe = tmp.path().join("probe");
                 std::fs::write(&probe, b"").unwrap();
-                match set_user_xattr(&probe, "user.fcvm-probe", b"1") {
+                match set_xattr(&probe, "user.fcvm-probe", b"1") {
                     Ok(()) => Some(tmp),
                     Err(error) => {
                         tried.push(format!("{}: {error}", base.display()));
@@ -583,17 +602,99 @@ mod tests {
         write_tree(&a, b"bravo");
         write_tree(&b, b"bravo");
         assert_eq!(hash_tree(&a).unwrap(), hash_tree(&b).unwrap());
-        set_user_xattr(&b.join("sub/b.txt"), "user.fcvm-test", b"x").unwrap();
+        set_xattr(&b.join("sub/b.txt"), "user.fcvm-test", b"x").unwrap();
         assert_ne!(
             hash_tree(&a).unwrap(),
             hash_tree(&b).unwrap(),
             "an extended attribute did not change the hash"
         );
-        set_user_xattr(&a.join("sub/b.txt"), "user.fcvm-test", b"y").unwrap();
+        set_xattr(&a.join("sub/b.txt"), "user.fcvm-test", b"y").unwrap();
         assert_ne!(
             hash_tree(&a).unwrap(),
             hash_tree(&b).unwrap(),
             "an extended attribute's value did not change the hash"
+        );
+    }
+
+    /// A POSIX ACL as the `system.posix_acl_access` value for mode 0644 plus read for
+    /// uid 65534. The file's owner can set it without privilege.
+    fn acl_value() -> Vec<u8> {
+        let mut value = 2u32.to_le_bytes().to_vec();
+        for (tag, perm, id) in [
+            (0x01u16, 6u16, u32::MAX), // ACL_USER_OBJ rw-
+            (0x02, 4, 65534),          // ACL_USER 65534 r--
+            (0x04, 4, u32::MAX),       // ACL_GROUP_OBJ r--
+            (0x10, 4, u32::MAX),       // ACL_MASK r--
+            (0x20, 4, u32::MAX),       // ACL_OTHER r--
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&perm.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        value
+    }
+
+    /// Without kept owners (a non-root copy) only `user.` attributes reach the copy, so
+    /// only they enter the hash: a tree with a `user.` attribute and an ACL hashes like
+    /// a copy carrying only the `user.` one. With kept owners every attribute counts.
+    #[test]
+    fn only_user_xattrs_enter_the_hash_when_owners_are_not_kept() {
+        // An ACL is an attribute outside `user.` that the file's owner can set; tmpfs and
+        // btrfs take one. Fail, never pass, where neither candidate does.
+        let candidates = [
+            std::env::temp_dir(),
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target"),
+        ];
+        let mut tried = Vec::new();
+        let tmp = candidates
+            .iter()
+            .find_map(|base| {
+                let tmp = tempfile::tempdir_in(base).ok()?;
+                let probe = tmp.path().join("probe");
+                std::fs::write(&probe, b"").unwrap();
+                std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o644)).unwrap();
+                let result = set_xattr(&probe, "user.fcvm-probe", b"1")
+                    .and_then(|()| set_xattr(&probe, "system.posix_acl_access", &acl_value()));
+                match result {
+                    Ok(()) => Some(tmp),
+                    Err(error) => {
+                        tried.push(format!("{}: {error}", base.display()));
+                        None
+                    }
+                }
+            })
+            .unwrap_or_else(|| {
+                panic!("no directory here takes a user xattr and an ACL: {tried:?}")
+            });
+        let (source, copy) = (tmp.path().join("source"), tmp.path().join("copy"));
+        for tree in [&source, &copy] {
+            write_tree(tree, b"bravo");
+            let file = tree.join("sub/b.txt");
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+            set_xattr(&file, "user.fcvm-test", b"x").unwrap();
+        }
+        set_xattr(
+            &source.join("sub/b.txt"),
+            "system.posix_acl_access",
+            &acl_value(),
+        )
+        .unwrap();
+        assert_eq!(
+            hash_tree_with(&source, false).unwrap(),
+            hash_tree_with(&copy, false).unwrap(),
+            "an attribute a non-root copy cannot carry changed the hash"
+        );
+        assert_ne!(
+            hash_tree_with(&source, true).unwrap(),
+            hash_tree_with(&copy, true).unwrap(),
+            "an attribute a root copy carries did not change the hash"
+        );
+        // The user. attribute still counts without kept owners.
+        set_xattr(&copy.join("sub/b.txt"), "user.fcvm-test", b"y").unwrap();
+        assert_ne!(
+            hash_tree_with(&source, false).unwrap(),
+            hash_tree_with(&copy, false).unwrap(),
+            "a user. attribute did not change the hash without kept owners"
         );
     }
 
@@ -679,6 +780,37 @@ mod tests {
         let before = key();
         std::fs::write(&image, b"two").unwrap();
         assert_ne!(before, key(), "an in-place rewrite kept the key");
+    }
+
+    /// A same-size in-place rewrite that restores the old mtime (`touch -r`) still gets
+    /// a different key: the identity carries the ctime, which cannot be set back.
+    #[test]
+    fn disk_image_rewritten_with_its_mtime_restored_changes_the_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        let image = tmp.path().join("disk.img");
+        std::fs::write(&image, b"one").unwrap();
+        let mtime = std::fs::metadata(&image).unwrap().modified().unwrap();
+        let specs = vec![format!("{}:/mnt:ro", image.display())];
+        let key = || {
+            let (_staged, resolved) =
+                DiskDirStaging::resolve(&tmp.path().join("s"), &specs, &[]).unwrap();
+            snapshot_key_extra_disks(&specs, &[], &[], Some(&resolved))
+        };
+        let before = key();
+        // Let the clock move past the first write's ctime at any granularity.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut file = std::fs::File::options().write(true).open(&image).unwrap();
+        std::io::Write::write_all(&mut file, b"two").unwrap();
+        file.set_modified(mtime).unwrap();
+        drop(file);
+        let md = std::fs::metadata(&image).unwrap();
+        assert_eq!(md.modified().unwrap(), mtime, "the mtime was not restored");
+        assert_eq!(md.len(), 3);
+        assert_ne!(
+            before,
+            key(),
+            "a same-size rewrite with its mtime restored kept the key"
+        );
     }
 
     /// Without a resolution the list is the raw specs, in device order.
