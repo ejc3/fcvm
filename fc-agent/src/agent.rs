@@ -217,12 +217,20 @@ pub async fn run() -> Result<()> {
     // boot to read. Awaited (bounded) at shutdown below.
     let chronyd_task = tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
 
-    let mounted_disk_paths = if !plan.extra_disks.is_empty() {
-        eprintln!(
-            "[fc-agent] mounting {} extra disk(s)",
-            plan.extra_disks.len()
-        );
-        let paths = mounts::mount_extra_disks(&plan.extra_disks, &mut mount_record)
+    // The NVIDIA driver image mounts with the extra disks, read-only, at a
+    // path of its own. It is not in plan.extra_disks, so the container does
+    // not get it as a volume; CDI gives the container the files it needs.
+    let mut boot_disks = plan.extra_disks.clone();
+    if let Some(driver) = &plan.gpu_driver {
+        boot_disks.push(crate::types::ExtraDiskMount {
+            device: driver.device.clone(),
+            mount_path: crate::gpu::DRIVER_ROOT.to_string(),
+            read_only: true,
+        });
+    }
+    let mounted_disk_paths = if !boot_disks.is_empty() {
+        eprintln!("[fc-agent] mounting {} extra disk(s)", boot_disks.len());
+        let paths = mounts::mount_extra_disks(&boot_disks, &mut mount_record)
             .context("mounting extra disks")?;
         eprintln!("[fc-agent] extra disks mounted successfully");
         paths
@@ -580,8 +588,10 @@ pub async fn run() -> Result<()> {
         eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
         container::build_start_args(&plan, user_ref)
     } else {
-        container::build_podman_args(&plan, &image_ref, user_ref)
+        container::build_podman_args(&plan, &image_ref, user_ref, &crate::gpu::cdi_devices())
     };
+    // From here a GPU attached by a later restore cannot reach this container.
+    crate::gpu::mark_container_launched();
 
     // TTY mode: never returns
     if plan.tty {
