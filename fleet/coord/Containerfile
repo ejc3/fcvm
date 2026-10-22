@@ -1,0 +1,16 @@
+# The fleet coordinator (`fcvm fleet coord`) for the ECS Fargate service in ejc3/aws
+# (fcvm-fleet.tf: ARM64, read-only root file system, cloudflared beside it forwarding
+# fleet-api-stage.fcvm.dev to localhost:8080). Build: make -C fleet/coord image, which
+# copies the fcvm binary `make build` produced into the context.
+FROM docker.io/library/ubuntu:24.04
+# ffmpeg decodes the poster frame; nothing else is needed at run time.
+RUN apt-get update -q && apt-get install -y -q --no-install-recommends ffmpeg ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY fcvm /usr/local/bin/fcvm
+USER 65534:65534
+EXPOSE 8080
+ENTRYPOINT ["/usr/local/bin/fcvm", "fleet", "coord"]
+# In memory until the coordinator keeps its state in S3 (FLEET_STATE_BUCKET/KEY); the
+# task's root file system is read-only. Browsers arrive through Cloudflare, so per-client
+# limits key on CF-Connecting-IP.
+CMD ["--listen", "0.0.0.0:8080", "--trust-cf-connecting-ip", "--allowed-origin", "https://stage.fcvm.dev"]
