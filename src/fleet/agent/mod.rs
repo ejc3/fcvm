@@ -26,6 +26,8 @@ pub struct Agent {
     pub base_port: u16,
     pub cfg: AgentCfg,
     pub spot_notice_url: Option<String>,
+    /// How often the spot notice URL is polled.
+    pub spot_poll: Duration,
 }
 
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
@@ -68,6 +70,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             stable_after: Duration::from_secs(60),
         },
         spot_notice_url: args.spot_notice_url,
+        spot_poll: Duration::from_secs(5),
     };
     serve(agent, tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -106,11 +109,12 @@ where
         .no_proxy()
         .build()
         .context("building the HTTP client")?;
+    let spot_poll = agent.spot_poll;
     let spot = agent.spot_notice_url.clone().map(|url| {
         let out = out.clone();
         let http = http.clone();
         tokio::spawn(async move {
-            let body = spot::wait_for_notice(&http, &url, Duration::from_secs(5)).await;
+            let body = spot::wait_for_notice(&http, &url, spot_poll).await;
             tracing::warn!(notice = %body, "spot interruption notice");
             let _ = out.send(AgentMsg::Draining {
                 reason: format!("spot interruption notice: {}", body.trim()),

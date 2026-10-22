@@ -87,6 +87,10 @@ struct Coord {
 
 impl Coord {
     fn start(f: &Fake, n: usize, cfg: AgentCfg) -> Coord {
+        Self::start_with(f, n, cfg, None)
+    }
+
+    fn start_with(f: &Fake, n: usize, cfg: AgentCfg, spot_notice_url: Option<String>) -> Coord {
         let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
         let (agent_in, agent_out): (ReadHalf<DuplexStream>, WriteHalf<DuplexStream>) =
             tokio::io::split(agent_side);
@@ -97,7 +101,8 @@ impl Coord {
             capacity: n,
             base_port: f.base,
             cfg,
-            spot_notice_url: None,
+            spot_notice_url,
+            spot_poll: Duration::from_millis(50),
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -645,4 +650,47 @@ async fn a_rect_change_right_after_running_is_posted() {
         .await
         .unwrap()
         .unwrap();
+}
+
+/// A spot interruption notice in instance metadata (IMDSv2) is reported as draining.
+#[tokio::test]
+async fn a_spot_notice_is_reported_as_draining() {
+    use axum::routing::{get, put};
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::Arc;
+    let polls = Arc::new(AtomicU32::new(0));
+    let p = polls.clone();
+    let imds = axum::Router::new()
+        .route("/latest/api/token", put(|| async { "token-1" }))
+        .route(
+            "/latest/meta-data/spot/instance-action",
+            get(move |h: axum::http::HeaderMap| {
+                let p = p.clone();
+                async move {
+                    assert_eq!(h["x-aws-ec2-metadata-token"], "token-1");
+                    // Not scheduled for the first three polls.
+                    if p.fetch_add(1, Ordering::SeqCst) < 3 {
+                        (axum::http::StatusCode::NOT_FOUND, String::new())
+                    } else {
+                        (
+                            axum::http::StatusCode::OK,
+                            r#"{"action":"terminate","time":"2026-10-22T10:00:00Z"}"#.to_string(),
+                        )
+                    }
+                }
+            }),
+        );
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, imds).await.unwrap() });
+    let f = fake(1, &[]);
+    let mut c = Coord::start_with(&f, 1, cfg(&f.fcvm), Some(url));
+    loop {
+        if let AgentMsg::Draining { reason } = c.next().await {
+            assert!(reason.contains("terminate"), "{reason}");
+            break;
+        }
+    }
+    assert!(polls.load(Ordering::SeqCst) >= 4);
+    c.close().await;
 }
