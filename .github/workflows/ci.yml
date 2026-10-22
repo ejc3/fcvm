@@ -184,7 +184,13 @@ jobs:
     needs: [changes]
     if: ${{ needs.changes.outputs.web == 'true' }}
     runs-on: ubuntu-latest
-    # The suite takes about 5 minutes; a hung package install fails instead of waiting.
+    # Playwright's own image carries Chromium, WebKit and their libraries, so
+    # the job installs nothing with apt: the Azure mirror stalled apt for 13 to
+    # 30 minutes in four runs on 2026-10-22. Tag and digest of 1.64.0, the
+    # @playwright/test version in fleet/web/package.json.
+    container:
+      image: mcr.microsoft.com/playwright:v1.64.0-noble@sha256:7eeb4d698577291987c889407a4e4f8ef7626f8f93311aa465e166c9cb335dfd
+    # The suite takes about 5 minutes; anything that hangs fails instead of waiting.
     timeout-minutes: 30
     defaults:
       run:
@@ -206,10 +212,9 @@ jobs:
         with:
           version: 10.34.7
       # ffmpeg from the ffmpeg-static package (a static build with libx264,
-      # downloaded from GitHub), not apt: the Azure mirror stalled apt-get
-      # install ffmpeg for 13 and 30 minutes on these runners (2026-10-22).
+      # downloaded from GitHub), not apt (see the container above).
       - name: Install ffmpeg
-        working-directory: ${{ runner.temp }}
+        working-directory: /tmp
         run: |
           set -euo pipefail
           mkdir ffmpeg && cd ffmpeg
@@ -225,8 +230,6 @@ jobs:
         run: pnpm test
       - name: Build
         run: pnpm build
-      - name: Install browsers
-        run: pnpm exec playwright install --with-deps chromium webkit
       - name: Browser tests
         run: pnpm test:e2e
 
