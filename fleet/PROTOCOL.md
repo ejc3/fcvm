@@ -156,8 +156,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   for a remote host. Repeatable. An agent that exits is removed from the fleet (its
   slots leave the tiling in that event) and restarted after a backoff of 1 s doubling to
   30 s.
-- `--state-file` keeps the state as JSON, rewritten atomically (temporary file and
-  rename) after changes; a restarted coordinator resumes its version, settings, scene,
+- `--state-file` keeps the state as JSON, rewritten atomically (temporary file, fsync,
+  rename) at most once a second while it changes; a restarted coordinator resumes its version, settings, scene,
   receipts and action log from it. Hosts and slots are rebuilt as agents say hello.
 - `GET /healthz` answers `ok`.
 
@@ -207,7 +207,7 @@ first frame), and `failed` (`error` says why; the agent retries with backoff).
 | `ack_ms` | fcvm's own restore clock (the record's `ack_ms`): restore call to the guest's ACK |
 | `gpu_ms` | the guest's GPU attach (the record's `guest_phases.gpu_ms`) |
 | `container_ms` | the `restored` record | the renderer's `GET /health` first answers |
-| `first_frame_ms` | `/health` first answers (the scene is posted then) | `/health` reports a frame |
+| `first_frame_ms` | `/health` first answers (the scene is posted then) | `/health` reports a frame: its `t` (the scene time of the latest frame) is a number |
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 ```json
