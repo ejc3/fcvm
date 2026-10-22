@@ -193,6 +193,9 @@ pub struct RestorePhases {
     pub gpu_ms: f64,
     /// GPUs the driver initialised.
     pub gpus: usize,
+    /// Each attach step's milliseconds; absent without GPUs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_steps: Option<crate::gpu::AttachSteps>,
 }
 
 impl RestorePhases {
@@ -274,8 +277,8 @@ pub async fn handle_clone_restore(
         let gpus = gpus.to_vec();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let ready = crate::gpu::attach(&gpus).await?;
-            Ok::<_, anyhow::Error>((elapsed_ms(started), ready))
+            let report = crate::gpu::attach(&gpus).await?;
+            Ok::<_, anyhow::Error>((elapsed_ms(started), report))
         })
     });
 
@@ -455,13 +458,17 @@ pub async fn handle_clone_restore(
     eprintln!("[fc-agent] exec re-registered after restore");
 
     if let Some(job) = gpu_attach {
-        let (gpu_ms, ready) = job
+        let (gpu_ms, report) = job
             .await
             .context("joining the GPU attach")?
             .context("restore phase gpu-attach")?;
         phases.gpu_ms = gpu_ms;
-        phases.gpus = ready;
-        eprintln!("[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={ready} elapsed_ms={gpu_ms:.3}");
+        phases.gpus = report.gpus;
+        phases.gpu_steps = Some(report.steps);
+        eprintln!(
+            "[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={} elapsed_ms={gpu_ms:.3}",
+            phases.gpus
+        );
     }
 
     // Publication, last: the plan's restore hook runs now, with egress open,
@@ -806,6 +813,35 @@ mod tests {
     /// publishes the clone then, so the GPU must be usable before either. The
     /// attach is joined, with its error propagated, before the boundary
     /// publishes and therefore before `apply_restore_epoch` sends the ACK.
+    /// The ACK's phase record names each GPU attach step, so a slow attach is
+    /// attributed to its step in the host's log; without GPUs it says nothing.
+    #[test]
+    fn the_ack_carries_each_gpu_attach_step() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            rescan_ms: 1.5,
+            persistenced_ms: 900.0,
+            ..Default::default()
+        });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        let steps = &frame["gpu_steps"];
+        assert_eq!(steps["rescan_ms"], 1.5, "{frame}");
+        assert_eq!(steps["persistenced_ms"], 900.0, "{frame}");
+        for step in [
+            "check_ms",
+            "nvidia_ms",
+            "uvm_ms",
+            "nodes_ms",
+            "smi_ms",
+            "cdi_ms",
+        ] {
+            assert!(steps.get(step).is_some(), "{step} missing from {frame}");
+        }
+    }
+
     #[test]
     fn gpu_attach_completes_before_the_clone_is_published() {
         let source = include_str!("restore.rs");

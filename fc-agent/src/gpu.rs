@@ -81,10 +81,10 @@ impl LaunchGate {
 
     /// Run `work`, which makes `count` GPUs usable, unless the container already
     /// launched, and publish the CDI devices when it succeeds.
-    pub async fn attach<F, Fut>(&self, count: usize, work: F) -> Result<usize>
+    pub async fn attach<F, Fut>(&self, count: usize, work: F) -> Result<AttachReport>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<usize>>,
+        Fut: std::future::Future<Output = Result<AttachReport>>,
     {
         let mut state = self.state.lock().await;
         if state.launched {
@@ -416,35 +416,38 @@ async fn run_checked(
     Ok(text)
 }
 
-async fn load_modules(module_dir: &Path, firmware_dir: &Path) -> Result<()> {
-    // The firmware loader looks in this directory first. Set it before
-    // nvidia.ko loads: the GSP firmware is requested from its probe.
+/// Point the firmware loader at the image's firmware. It looks in this
+/// directory first. Set before nvidia.ko probes a GPU: the GSP firmware is
+/// requested from the probe.
+fn set_firmware_path(firmware_dir: &Path) -> Result<()> {
     let firmware_param = "/sys/module/firmware_class/parameters/path";
     std::fs::write(firmware_param, firmware_dir.as_os_str().as_encoded_bytes())
-        .with_context(|| format!("setting {firmware_param} to {}", firmware_dir.display()))?;
+        .with_context(|| format!("setting {firmware_param} to {}", firmware_dir.display()))
+}
 
-    for module in MODULES {
-        if Path::new("/sys/module")
-            .join(module.replace('-', "_"))
-            .exists()
-        {
-            eprintln!("[fc-agent] gpu: {module} already loaded");
-            continue;
-        }
-        let path = module_dir.join(format!("{module}.ko"));
-        let mut insmod = tokio::process::Command::new("insmod");
-        insmod.arg(&path);
-        if let Err(error) = run_checked(
-            &format!("insmod {}", path.display()),
-            insmod,
-            INSMOD_TIMEOUT,
-        )
-        .await
-        {
-            bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await);
-        }
-        eprintln!("[fc-agent] gpu: loaded {module}");
+/// `insmod` one of [`MODULES`] from the image, unless it is already loaded.
+async fn load_module(module_dir: &Path, module: &str) -> Result<()> {
+    debug_assert!(MODULES.contains(&module));
+    if Path::new("/sys/module")
+        .join(module.replace('-', "_"))
+        .exists()
+    {
+        eprintln!("[fc-agent] gpu: {module} already loaded");
+        return Ok(());
     }
+    let path = module_dir.join(format!("{module}.ko"));
+    let mut insmod = tokio::process::Command::new("insmod");
+    insmod.arg(&path);
+    if let Err(error) = run_checked(
+        &format!("insmod {}", path.display()),
+        insmod,
+        INSMOD_TIMEOUT,
+    )
+    .await
+    {
+        bail!("{error:#}\nkernel log:\n{}", nvrm_log_tail().await);
+    }
+    eprintln!("[fc-agent] gpu: loaded {module}");
     Ok(())
 }
 
@@ -495,30 +498,86 @@ fn create_device_nodes(nodes: &[DeviceNode]) -> Result<()> {
 /// `announced` is the host's list of attached devices (host PCI addresses);
 /// only its length is compared with what the guest sees, because the guest
 /// address of a passed-through device is assigned by the VMM.
-/// Returns the number of GPUs the driver initialised.
-pub async fn attach(announced: &[String]) -> Result<usize> {
+/// Returns the number of GPUs the driver initialised and each step's duration.
+pub async fn attach(announced: &[String]) -> Result<AttachReport> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
     GATE.attach(announced.len(), || attach_devices(announced))
         .await
 }
 
-async fn attach_devices(announced: &[String]) -> Result<usize> {
+/// What a successful attach reports: the GPUs the driver initialised and the
+/// duration of each step, carried in the restore ACK's phase record.
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct AttachReport {
+    pub gpus: usize,
+    pub steps: AttachSteps,
+}
+
+/// Milliseconds spent in each step of [`attach_devices`].
+#[derive(Debug, Default, Clone, PartialEq, serde::Serialize)]
+pub struct AttachSteps {
+    /// The driver image check for this kernel.
+    pub check_ms: f64,
+    /// PCI rescan until the announced GPUs are on the bus.
+    pub rescan_ms: f64,
+    /// `firmware_class.path` and `insmod nvidia.ko` (the PCI probe runs here).
+    pub nvidia_ms: f64,
+    /// `insmod nvidia-uvm.ko`.
+    pub uvm_ms: f64,
+    /// Reading the probed minors and creating the device nodes.
+    pub nodes_ms: f64,
+    /// `nvidia-persistenced`, which initialises the GPU and keeps it open.
+    pub persistenced_ms: f64,
+    /// `nvidia-smi -L`.
+    pub smi_ms: f64,
+    /// `nvidia-ctk cdi generate`.
+    pub cdi_ms: f64,
+}
+
+/// Times one attach step and logs it, so a slow attach names the slow step in
+/// the guest log as well as in the ACK.
+struct StepClock(std::time::Instant);
+
+impl StepClock {
+    fn start() -> Self {
+        Self(std::time::Instant::now())
+    }
+
+    /// Milliseconds since the last lap (or the start), logged under `step`.
+    fn lap(&mut self, step: &str) -> f64 {
+        let now = std::time::Instant::now();
+        let ms = now.duration_since(self.0).as_secs_f64() * 1000.0;
+        self.0 = now;
+        eprintln!("[fc-agent] gpu: step={step} elapsed_ms={ms:.3}");
+        ms
+    }
+}
+
+async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
         announced.join(", ")
     );
+    let mut steps = AttachSteps::default();
+    let mut clock = StepClock::start();
 
     let driver_root = Path::new(DRIVER_ROOT);
     let release = kernel_release()?;
     let modules = check_module_dir(driver_root, &release)?;
+    steps.check_ms = clock.lap("check");
 
     let gpus = rescan_for_gpus(Path::new("/sys"), announced).await?;
     for gpu in &gpus {
         eprintln!("[fc-agent] gpu: found {gpu}");
     }
+    steps.rescan_ms = clock.lap("rescan");
 
-    load_modules(&modules, &driver_root.join("lib/firmware")).await?;
+    set_firmware_path(&driver_root.join("lib/firmware"))?;
+    load_module(&modules, "nvidia").await?;
+    steps.nvidia_ms = clock.lap("insmod-nvidia");
+    load_module(&modules, "nvidia-uvm").await?;
+    steps.uvm_ms = clock.lap("insmod-nvidia-uvm");
 
     let minors = probed_gpu_minors()?;
     if minors.len() < announced.len() {
@@ -531,8 +590,10 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
     }
     let proc_devices = std::fs::read_to_string("/proc/devices").context("reading /proc/devices")?;
     create_device_nodes(&device_nodes(&parse_char_majors(&proc_devices), &minors)?)?;
+    steps.nodes_ms = clock.lap("device-nodes");
 
     start_persistenced(driver_root).await?;
+    steps.persistenced_ms = clock.lap("persistenced");
 
     let libraries = library_dir(driver_root);
     let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
@@ -550,6 +611,7 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
         );
     }
     eprintln!("[fc-agent] gpu: {}", listed.trim().replace('\n', "; "));
+    steps.smi_ms = clock.lap("nvidia-smi");
 
     std::fs::create_dir_all(Path::new(CDI_SPEC).parent().unwrap())
         .context("creating the CDI spec directory")?;
@@ -558,7 +620,11 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
         .env("LD_LIBRARY_PATH", &libraries);
     run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
     eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-    Ok(initialised)
+    steps.cdi_ms = clock.lap("cdi");
+    Ok(AttachReport {
+        gpus: initialised,
+        steps,
+    })
 }
 
 /// Start nvidia-persistenced from the driver image. Without it nothing holds the
@@ -660,16 +726,22 @@ mod tests {
                 gate.attach(1, || async move {
                     started_tx.send(()).unwrap();
                     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    Ok(1)
+                    Ok(AttachReport {
+                        gpus: 1,
+                        ..Default::default()
+                    })
                 })
                 .await
             })
         };
         started_rx.await.unwrap();
         assert_eq!(gate.launch().await, vec![CDI_ALL_GPUS.to_string()]);
-        assert_eq!(attaching.await.unwrap().unwrap(), 1);
+        assert_eq!(attaching.await.unwrap().unwrap().gpus, 1);
 
-        let late = gate.attach(1, || async { Ok(1) }).await.unwrap_err();
+        let late = gate
+            .attach(1, || async { Ok(AttachReport::default()) })
+            .await
+            .unwrap_err();
         assert!(format!("{late:#}").contains("already running"), "{late:#}");
     }
 
