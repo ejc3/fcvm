@@ -4,6 +4,7 @@ mod console;
 mod container;
 mod exec;
 mod fuse;
+mod gpu;
 mod lock_test;
 mod mmds;
 mod mounts;

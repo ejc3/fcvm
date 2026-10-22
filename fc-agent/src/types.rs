@@ -63,6 +63,17 @@ pub struct Plan {
     /// into the guest's chronyd at boot; empty means the host had none to give.
     #[serde(default)]
     pub ntp_servers: Vec<String>,
+    /// The NVIDIA driver image (src/setup/nvidia.rs), attached read-only.
+    /// Mounted at boot at `gpu::DRIVER_ROOT`, so a snapshot carries the mount
+    /// and a GPU can be attached to any clone of it.
+    #[serde(default)]
+    pub gpu_driver: Option<GpuDriver>,
+}
+
+/// The block device holding the NVIDIA driver image.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GpuDriver {
+    pub device: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -110,6 +121,11 @@ pub struct LatestMetadata {
     /// (`--on-restore`). See `snapshot_network::RestoreHook`.
     #[serde(rename = "restore-hook", default)]
     pub restore_hook: Option<String>,
+    /// GPUs the host attached to this clone before resuming it, as host PCI
+    /// addresses. Non-empty means: rescan, load the driver and write the CDI
+    /// spec before this restore is acknowledged (`gpu::attach`).
+    #[serde(default)]
+    pub gpus: Vec<String>,
 }
 
 #[cfg(test)]
@@ -223,6 +239,25 @@ mod tests {
         let meta: LatestMetadata = serde_json::from_str(json).unwrap();
         assert_eq!(meta.host_time, "1731301800");
         assert_eq!(meta.restore_epoch.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn gpu_fields_parse_and_default_to_none() {
+        let plan: Plan = serde_json::from_str(
+            r#"{"image": "alpine:latest", "gpu_driver": {"device": "/dev/vdc"}}"#,
+        )
+        .unwrap();
+        assert_eq!(plan.gpu_driver.unwrap().device, "/dev/vdc");
+        let bare: Plan = serde_json::from_str(r#"{"image": "alpine:latest"}"#).unwrap();
+        assert!(bare.gpu_driver.is_none());
+
+        let meta: LatestMetadata = serde_json::from_str(
+            r#"{"host-time": "1", "restore-epoch": "e", "gpus": ["0000:01:00.0", "0000:02:00.0"]}"#,
+        )
+        .unwrap();
+        assert_eq!(meta.gpus.len(), 2);
+        let meta: LatestMetadata = serde_json::from_str(r#"{"host-time": "1"}"#).unwrap();
+        assert!(meta.gpus.is_empty());
     }
 
     #[test]
