@@ -295,7 +295,7 @@ toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/downl
 toolkit_sha256 = "2b58b68ec388cede52815a63fc87f3f019af96e21b7d29c3cb2890341db14b21"
 
 [kernel_profiles.gpu.amd64]
-description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA open kernel modules) (x86_64)"
+description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules) (x86_64)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
 build_inputs = [
@@ -310,7 +310,12 @@ firecracker_branch = "agent/vfio-hotplug-v1.17.0"
 firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
 firecracker_args = "--enable-pci"
 
+# The proprietary modules with the GSP firmware off: a T4's initialisation on
+# every restore takes half as long as with the open modules (see
+# module_type in src/setup/nvidia.rs). arm64 keeps the open modules until a
+# g5g.metal run measures the same there.
 [kernel_profiles.gpu.amd64.nvidia]
+module_type = "proprietary"
 driver_version = "580.196.07"
 driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-x86_64-580.196.07.run"
 driver_sha256 = "0aab0518db53cf73c412dc7f32bbc850ca95e839d8923d0de4bff42c1c9169ce"
