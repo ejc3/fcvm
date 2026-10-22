@@ -50,7 +50,7 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 87 unit tests (vitest)
+pnpm lint && pnpm typecheck && pnpm test     # 89 unit tests (vitest)
 pnpm build && pnpm test:e2e                  # 20 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
@@ -149,7 +149,13 @@ are `committed` or `refused`, the clock answer echoes `client_unix_ms`, `{"type"
 "error"}` exists, snapshots may skip versions, frames fall on `t = k/30`, the stream
 header carries `full_width`, `full_height`, `x0`, `y0` and `fps`, the stream may be
 larger than asked (the encoder's 146 x 50 minimum) and the page scales it into the
-tile, and `{"h": N}` brings a new header and a keyframe. The brief's older shapes
+tile, `{"h": N}` brings a new header and a keyframe, and a stream carries a margin
+around its rectangle with `crop: {left, top, right, bottom}` in its header (zeros when
+absent) so separately encoded tiles meet without an H.264 edge. The page draws only
+the inner rectangle: it draws the whole frame scaled so the inner rectangle covers the
+tile's box, clipped to the box, because WebKit ignores a VideoFrame's source rectangle
+and `visibleRect` when drawing. The mock encodes an 8 px margin on each inner side. The
+page never reads `/health` (so not `slots_missed`) and never sets the scene's `budget`. The brief's older shapes
 (`fleet.hosts` as a number, `waiting_for_capacity`, `applied`) are still read.
 
 What the page does where the protocol leaves a choice:

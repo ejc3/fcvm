@@ -69,10 +69,32 @@ export function buildFrame(h: FrameHeader, accessUnit: Uint8Array): Uint8Array {
   return out;
 }
 
+export interface Crop {
+  left: number;
+  top: number;
+  right: number;
+  bottom: number;
+}
+
+export const NO_CROP: Crop = { left: 0, top: 0, right: 0, bottom: 0 };
+
 export interface StreamHeader {
   codec: string;
+  /** The delivered frame, margin included. */
   width: number;
   height: number;
+  /**
+   * Pixels of margin on each side of the delivered frame: the renderer encodes
+   * its rectangle plus a margin so neighbouring streams meet without an H.264
+   * edge, and the page draws only the inner rectangle. Zeros when absent.
+   */
+  crop: Crop;
+}
+
+/** The inner rectangle of a delivered frame, as a source rectangle to draw from. */
+export function innerRect(h: { width: number; height: number; crop: Crop }): { sx: number; sy: number; sw: number; sh: number } {
+  const c = h.crop;
+  return { sx: c.left, sy: c.top, sw: Math.max(1, h.width - c.left - c.right), sh: Math.max(1, h.height - c.top - c.bottom) };
 }
 
 /** The text message a frame socket sends first (and, from some renderers, after a size change). */
@@ -87,7 +109,15 @@ export function parseStreamHeader(text: string): StreamHeader | null {
   const o = v as Record<string, unknown>;
   if (typeof o["codec"] !== "string" || !/^avc1\.[0-9A-Fa-f]{6}$/.test(o["codec"])) return null;
   if (typeof o["width"] !== "number" || typeof o["height"] !== "number") return null;
-  return { codec: o["codec"], width: o["width"], height: o["height"] };
+  const c = o["crop"];
+  let crop = NO_CROP;
+  if (typeof c === "object" && c !== null) {
+    const r = c as Record<string, unknown>;
+    const side = (k: string) => (typeof r[k] === "number" && (r[k] as number) >= 0 ? Math.floor(r[k] as number) : 0);
+    crop = { left: side("left"), top: side("top"), right: side("right"), bottom: side("bottom") };
+    if (crop.left + crop.right >= o["width"] || crop.top + crop.bottom >= o["height"]) return null;
+  }
+  return { codec: o["codec"], width: o["width"], height: o["height"], crop };
 }
 
 /** The codec string for an SPS NAL unit (without its start code): avc1.PPCCLL. */

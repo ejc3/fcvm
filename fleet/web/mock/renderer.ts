@@ -17,6 +17,9 @@ function groupsAlive(subs: Set<{ tile: string; width: number; height: number }>,
   return false;
 }
 
+/** Pixels of margin a stream carries on each inner side (even, for 4:2:0). */
+const MARGIN = 8;
+
 /** Frames of one stream drawn at the same time, at most. */
 const MAX_INFLIGHT = 4;
 
@@ -164,7 +167,22 @@ export class MockRenderers {
   private resize(sub: Sub, h: number): void {
     const entry = this.tiles.get(sub.tile);
     if (!entry) return;
-    const geometry = tileGeometry(entry.rect, this.opts.scene().image_aspect, this.clampHeight(h));
+    const tile = tileGeometry(entry.rect, this.opts.scene().image_aspect, this.clampHeight(h));
+    // Like the renderer, encode the tile plus a margin (none at the image's own
+    // edges) and say in the header how much to crop.
+    const crop = {
+      left: tile.x0 > 0 ? MARGIN : 0,
+      top: tile.y0 > 0 ? MARGIN : 0,
+      right: tile.x0 + tile.width < tile.fullWidth ? MARGIN : 0,
+      bottom: tile.y0 + tile.height < tile.fullHeight ? MARGIN : 0,
+    };
+    const geometry: TileGeometry = {
+      ...tile,
+      width: tile.width + crop.left + crop.right,
+      height: tile.height + crop.top + crop.bottom,
+      x0: tile.x0 - crop.left,
+      y0: tile.y0 - crop.top,
+    };
     const { width, height } = geometry;
     if (sub.encoder && width === sub.width && height === sub.height) return;
     sub.encoder?.close();
@@ -186,11 +204,12 @@ export class MockRenderers {
             codec,
             width,
             height,
-            full_width: geometry.fullWidth,
-            full_height: geometry.fullHeight,
-            x0: geometry.x0,
-            y0: geometry.y0,
+            full_width: tile.fullWidth,
+            full_height: tile.fullHeight,
+            x0: tile.x0,
+            y0: tile.y0,
             fps,
+            crop,
           }),
         );
       },

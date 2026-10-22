@@ -1,6 +1,6 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
-import { parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
+import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
 import { MockCoordinator, halfGrid } from "../coordinator.ts";
 import { MockRenderers } from "../renderer.ts";
 import { spawnSync } from "node:child_process";
@@ -134,7 +134,10 @@ describe("mock renderer", () => {
     ws.close();
     const header = parseStreamHeader(texts[0]!);
     expect(header).not.toBeNull();
-    expect(header!.height).toBe(90);
+    // The tile is 160 x 90 (1/4 x 1/2 of a 16:9 image at 90 high), sent with a
+    // margin of 8 px on its inner sides and a crop that says so.
+    expect(innerRect(header!)).toMatchObject({ sw: 160, sh: 90 });
+    expect(header!.crop.left + header!.crop.right + header!.crop.top + header!.crop.bottom).toBeGreaterThan(0);
     const ok = frames.map((f) => { if (!f.ok) throw new Error(f.error); return f.frame; });
     expect(ok[0]!.keyframe).toBe(true);
     const types = splitNals(ok[0]!.data).map(nalType);
@@ -144,7 +147,7 @@ describe("mock renderer", () => {
       expect(ok[i]!.frame).toBeGreaterThan(ok[i - 1]!.frame);
       expect(ok[i]!.t).toBeCloseTo(ok[i]!.frame / FPS, 9);
     }
-    expect(ok[0]!.width).toBe(160); // 1/4 x 1/2 of a 16:9 image at 90 high
+    expect([ok[0]!.width, ok[0]!.height]).toEqual([header!.width, header!.height]);
   });
 });
 
@@ -161,11 +164,13 @@ describe("mock renderer, height change", () => {
     const ws = new WebSocket(`${r.frameUrl("t1")}?h=90`);
     const after: { t: number; data: Uint8Array }[] = [];
     let headers = 0;
+    let last: ReturnType<typeof parseStreamHeader> = null;
     let sentResize = false;
     await new Promise<void>((res) => {
       ws.on("message", (d, bin) => {
         if (!bin) {
           headers++;
+          last = parseStreamHeader(d.toString());
           return;
         }
         const p = parseFrame(new Uint8Array(d as Buffer));
@@ -175,7 +180,7 @@ describe("mock renderer, height change", () => {
           ws.send(JSON.stringify({ h: 180 }));
           return;
         }
-        if (p.frame.height !== 180) return;
+        if (headers < 2 || p.frame.height !== last!.height) return;
         after.push({ t: p.frame.t, data: p.frame.data });
         if (after.length === 6) res();
       });
@@ -187,8 +192,11 @@ describe("mock renderer, height change", () => {
     const stream = Buffer.concat(after.map((f) => Buffer.from(f.data)));
     const out = spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], { input: stream, maxBuffer: 1 << 26 });
     expect(out.status).toBe(0);
-    const W = 320;
-    const H = 180;
+    // The delivered frame holds the 320 x 180 tile inside its margin.
+    const hdr = last!;
+    const W = hdr.width;
+    const H = hdr.height;
+    expect(innerRect(hdr)).toMatchObject({ sw: 320, sh: 180 });
     const frames = Math.floor(out.stdout.length / (W * H * 3));
     expect(frames).toBe(6);
     for (let k = 0; k < frames; k++) {
@@ -197,7 +205,9 @@ describe("mock renderer, height change", () => {
       let n = 0;
       for (let j = 5; j < H; j += 10) {
         for (let i = 5; i < W; i += 10) {
-          const e = expectedRgb(rect.x + ((i + 0.5) / W) * rect.w, rect.y + ((j + 0.5) / H) * rect.h, f);
+          const ii = i - hdr.crop.left;
+          const jj = j - hdr.crop.top;
+          const e = expectedRgb(rect.x + ((ii + 0.5) / 320) * rect.w, rect.y + ((jj + 0.5) / 180) * rect.h, f);
           const o = (k * W * H + j * W + i) * 3;
           err += (Math.abs(out.stdout[o]! - e[0]) + Math.abs(out.stdout[o + 1]! - e[1]) + Math.abs(out.stdout[o + 2]! - e[2])) / 3;
           n++;

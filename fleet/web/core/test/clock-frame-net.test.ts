@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { clockReceived, initialClock, pingSent, serverNow, shouldPing, PING_TIMEOUT_MS } from "../clock.ts";
 import { admitChunk, heightSent, heightToSend, MAX_DECODE_QUEUE, newStream, streamOpened, wantHeight } from "../stream.ts";
-import { buildFrame, codecFromSps, parseFrame, parseStreamHeader, splitNals, nalType } from "../frame.ts";
+import { buildFrame, codecFromSps, innerRect, NO_CROP, parseFrame, parseStreamHeader, splitNals, nalType } from "../frame.ts";
 import { frameSocketUrl, reconnectDelayMs, urlHost } from "../net.ts";
 
 describe("clock sync", () => {
@@ -70,7 +70,7 @@ describe("frame messages", () => {
   });
 
   it("reads a stream header and refuses a non-H.264 codec", () => {
-    expect(parseStreamHeader('{"codec":"avc1.42E01E","width":256,"height":144}')).toEqual({ codec: "avc1.42E01E", width: 256, height: 144 });
+    expect(parseStreamHeader('{"codec":"avc1.42E01E","width":256,"height":144}')).toEqual({ codec: "avc1.42E01E", width: 256, height: 144, crop: NO_CROP });
     expect(parseStreamHeader('{"codec":"vp8","width":256,"height":144}')).toBeNull();
   });
 });
@@ -88,6 +88,19 @@ describe("connections", () => {
   it("finds the host of an IPv6 URL", () => {
     expect(urlHost("wss://[2001:db8::3]:443/frames")).toBe("[2001:db8::3]");
     expect(urlHost("wss://slot-3.example.test/frames")).toBe("slot-3.example.test");
+  });
+});
+
+describe("stream margins", () => {
+  it("reads crop and draws only the inner rectangle", () => {
+    const h = parseStreamHeader('{"codec":"avc1.64001f","width":496,"height":556,"full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30,"crop":{"left":8,"top":0,"right":8,"bottom":16}}')!;
+    expect(h.crop).toEqual({ left: 8, top: 0, right: 8, bottom: 16 });
+    expect(innerRect(h)).toEqual({ sx: 8, sy: 0, sw: 480, sh: 540 });
+    expect(innerRect({ width: 100, height: 50, crop: NO_CROP })).toEqual({ sx: 0, sy: 0, sw: 100, sh: 50 });
+  });
+
+  it("refuses a crop that leaves nothing", () => {
+    expect(parseStreamHeader('{"codec":"avc1.64001f","width":20,"height":20,"crop":{"left":10,"right":10}}')).toBeNull();
   });
 });
 

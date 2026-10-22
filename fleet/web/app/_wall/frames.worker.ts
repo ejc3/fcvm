@@ -12,10 +12,13 @@ import {
   heightMessage,
   heightSent,
   heightToSend,
+  innerRect,
+  NO_CROP,
   nalType,
   newStream,
   streamOpened,
   wantHeight,
+  type Crop,
   type StreamCtl,
   NAL_SPS,
   parseFrame,
@@ -40,6 +43,8 @@ const now = () => performance.timeOrigin + performance.now();
 interface Held {
   t: number;
   frame: VideoFrame;
+  /** The stream's margins when this frame was decoded. */
+  crop: Crop;
 }
 
 class TileStream {
@@ -64,6 +69,8 @@ class TileStream {
   decodeMs: number[] = [];
   lastW = 0;
   lastH = 0;
+  /** Margins of the stream as the last header gave them. */
+  crop: Crop = NO_CROP;
   /** When the tile last went from nothing shown to a frame (for the fade-in). */
   appearedAt: number | null = null;
 
@@ -123,6 +130,7 @@ class TileStream {
   private onHeader(text: string): void {
     const h = parseStreamHeader(text);
     if (!h) return;
+    this.crop = h.crop;
     this.configure(h.codec, h.width, h.height);
   }
 
@@ -178,18 +186,19 @@ class TileStream {
       frame.close();
       return;
     }
-    this.lastW = frame.displayWidth;
-    this.lastH = frame.displayHeight;
+    const crop = this.crop;
+    this.lastW = frame.displayWidth - crop.left - crop.right;
+    this.lastH = frame.displayHeight - crop.top - crop.bottom;
     this.decodedTimes.push(now());
     // Keep ascending order; a repeated t replaces the old frame.
     const at = this.frames.findIndex((h) => h.t >= t - SAME_T_EPS);
     if (at >= 0 && Math.abs(this.frames[at]!.t - t) <= SAME_T_EPS) {
       this.frames[at]!.frame.close();
-      this.frames[at] = { t, frame };
+      this.frames[at] = { t, frame, crop };
     } else if (at >= 0) {
-      this.frames.splice(at, 0, { t, frame });
+      this.frames.splice(at, 0, { t, frame, crop });
     } else {
-      this.frames.push({ t, frame });
+      this.frames.push({ t, frame, crop });
     }
     while (this.frames.length > BUFFER_FRAMES) this.frames.shift()!.frame.close();
   }
@@ -220,8 +229,8 @@ class TileStream {
     while (this.frames.length > 1 && this.frames[0]!.t < t) this.frames.shift()!.frame.close();
   }
 
-  frameAt(t: number): VideoFrame | null {
-    for (const h of this.frames) if (Math.abs(h.t - t) <= SAME_T_EPS) return h.frame;
+  frameAt(t: number): Held | null {
+    for (const h of this.frames) if (Math.abs(h.t - t) <= SAME_T_EPS) return h;
     return null;
   }
 
@@ -380,7 +389,22 @@ function draw(): void {
       dirty = true;
     }
     ctx.globalAlpha = fade;
-    ctx.drawImage(frame, x, y, w, h);
+    // Only the inner rectangle shows: the whole frame is drawn scaled so its
+    // inner rectangle covers the tile's box, clipped to the box. (WebKit ignores
+    // a VideoFrame's source rectangle and visibleRect when drawing.)
+    const inner = innerRect({ width: frame.frame.displayWidth, height: frame.frame.displayHeight, crop: frame.crop });
+    const kx = w / inner.sw;
+    const ky = h / inner.sh;
+    if (inner.sx === 0 && inner.sy === 0 && inner.sw === frame.frame.displayWidth && inner.sh === frame.frame.displayHeight) {
+      ctx.drawImage(frame.frame, x, y, w, h);
+    } else {
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, w, h);
+      ctx.clip();
+      ctx.drawImage(frame.frame, x - inner.sx * kx, y - inner.sy * ky, frame.frame.displayWidth * kx, frame.frame.displayHeight * ky);
+      ctx.restore();
+    }
     ctx.globalAlpha = 1;
     if (show.kind === "behind") {
       ctx.fillStyle = `rgba(0,0,0,${settings.dimAlpha})`;
