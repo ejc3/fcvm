@@ -1909,17 +1909,24 @@ async fn cmd_snapshot_run_inner(
         snapshot_config.metadata.firecracker_bin.as_deref(),
     )
     .await?;
-    // The snapshot was booted with its profile's driver image, so a clone that
-    // reboots in place cold-boots with it too.
-    runtime_config.gpu_driver_image = crate::setup::profile_nvidia_driver_image(
+    // A clone that reboots in place cold-boots with its profile's driver image. The
+    // restore itself never needs it (Firecracker reopens the drive the snapshot
+    // recorded), so an image that is missing or does not resolve leaves the reboot
+    // without one instead of failing the restore.
+    runtime_config.gpu_driver_image = crate::setup::nvidia::reboot_driver_image(
         snapshot_config
             .metadata
             .kernel_profile
             .as_deref()
             .unwrap_or("default"),
-        false,
     )
-    .await?;
+    .and_then(|path| match crate::commands::common::GpuDriverImage::at(path) {
+        Ok(driver) => Some(driver),
+        Err(error) => {
+            warn!(error = %format!("{error:#}"), "a reboot of this clone gets no NVIDIA driver image");
+            None
+        }
+    });
     let vm_name = args.name.unwrap_or_else(|| {
         // Auto-generate: snapshot-name + random suffix
         format!("{}-{}", snapshot_name, &vm_id[..6])

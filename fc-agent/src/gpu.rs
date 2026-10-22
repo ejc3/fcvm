@@ -22,8 +22,6 @@
 use anyhow::{bail, Context, Result};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
 use std::time::Duration;
 
 /// Where the NVIDIA driver image is mounted (read-only).
@@ -54,20 +52,87 @@ const INSMOD_TIMEOUT: Duration = Duration::from_secs(120);
 const SMI_TIMEOUT: Duration = Duration::from_secs(120);
 const CDI_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Set once the container is launched. A GPU attached after that is refused:
-/// the container's device list was fixed when it was created.
-static CONTAINER_LAUNCHED: AtomicBool = AtomicBool::new(false);
-/// CDI devices to pass to `podman run`, set by a successful [`attach`].
-static CDI_DEVICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// Mark the container as launched. Called just before `podman run`.
-pub fn mark_container_launched() {
-    CONTAINER_LAUNCHED.store(true, Ordering::SeqCst);
+/// Orders GPU attachment against the container launch. An attach holds the gate
+/// from its check that no container is running until it has published the CDI
+/// devices, and the launch takes the gate to read them, so a launch that starts
+/// while an attach is loading the driver waits for it instead of creating the
+/// container without the GPU.
+pub struct LaunchGate {
+    state: tokio::sync::Mutex<GateState>,
 }
 
-/// The `--device` values for `podman run`: empty unless a GPU was attached.
-pub fn cdi_devices() -> Vec<String> {
-    CDI_DEVICES.lock().unwrap().clone()
+#[derive(Default)]
+struct GateState {
+    /// Set when the container is launched. A GPU attached after that is refused:
+    /// the container's device list was fixed when it was created.
+    launched: bool,
+    /// CDI devices for `podman run`, set by a successful attach.
+    devices: Vec<String>,
+}
+
+impl LaunchGate {
+    pub fn new() -> Self {
+        Self {
+            state: tokio::sync::Mutex::new(GateState::default()),
+        }
+    }
+
+    /// Run `work`, which makes `count` GPUs usable, unless the container already
+    /// launched, and publish the CDI devices when it succeeds.
+    pub async fn attach<F, Fut>(&self, count: usize, work: F) -> Result<usize>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<usize>>,
+    {
+        let mut state = self.state.lock().await;
+        if state.launched {
+            bail!(
+                "{count} GPU(s) were attached to a clone whose container is already running; \
+                 a container's devices are fixed when it is created, so GPUs can only be \
+                 attached to clones of the pre-start snapshot"
+            );
+        }
+        let initialised = work().await?;
+        state.devices = vec![CDI_ALL_GPUS.to_string()];
+        Ok(initialised)
+    }
+
+    /// Mark the container launched and return its `--device` values: empty unless
+    /// a GPU was attached. Waits for an attach in progress.
+    pub async fn launch(&self) -> Vec<String> {
+        let mut state = self.state.lock().await;
+        state.launched = true;
+        state.devices.clone()
+    }
+}
+
+impl Default for LaunchGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+static GATE: std::sync::LazyLock<LaunchGate> = std::sync::LazyLock::new(LaunchGate::new);
+
+/// The `--device` values for the container about to launch. Called just before
+/// `podman run`; from then on a GPU attached by a later restore is refused.
+pub async fn launch_devices() -> Vec<String> {
+    GATE.launch().await
+}
+
+/// A run whose GPUs are attached by a restore (the plan's `await_gpu_restore`)
+/// must not launch its container in a VM that was not restored: the GPUs are
+/// attached to the restore of the pre-start snapshot, never to the cold VM that
+/// made it. A failed cache handshake would otherwise launch it without them.
+pub fn check_gpu_restore(await_gpu_restore: bool, restored: bool) -> Result<()> {
+    if await_gpu_restore && !restored {
+        bail!(
+            "this run's GPUs are attached when the host restores the pre-start snapshot, and \
+             this VM was not restored (the cache handshake did not end in a restore); \
+             refusing to start the container without them"
+        );
+    }
+    Ok(())
 }
 
 /// One PCI function as sysfs describes it.
@@ -431,14 +496,11 @@ fn create_device_nodes(nodes: &[DeviceNode]) -> Result<()> {
 /// Returns the number of GPUs the driver initialised.
 pub async fn attach(announced: &[String]) -> Result<usize> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
-    if CONTAINER_LAUNCHED.load(Ordering::SeqCst) {
-        bail!(
-            "{} GPU(s) were attached to a clone whose container is already running; a \
-             container's devices are fixed when it is created, so GPUs can only be attached \
-             to clones of the pre-start snapshot",
-            announced.len()
-        );
-    }
+    GATE.attach(announced.len(), || attach_devices(announced))
+        .await
+}
+
+async fn attach_devices(announced: &[String]) -> Result<usize> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
@@ -492,8 +554,6 @@ pub async fn attach(announced: &[String]) -> Result<usize> {
         .env("LD_LIBRARY_PATH", &libraries);
     run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
     eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-
-    *CDI_DEVICES.lock().unwrap() = vec![CDI_ALL_GPUS.to_string()];
     Ok(initialised)
 }
 
@@ -519,6 +579,42 @@ pub fn cdi_generate_args(driver_root: &Path) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    /// A launch that starts while an attach is loading the driver waits for the
+    /// attach and gets its devices; one that comes first makes a later attach fail.
+    #[tokio::test]
+    async fn a_launch_during_an_attach_waits_for_its_devices() {
+        let gate = std::sync::Arc::new(LaunchGate::new());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let attaching = {
+            let gate = gate.clone();
+            tokio::spawn(async move {
+                gate.attach(1, || async move {
+                    started_tx.send(()).unwrap();
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                    Ok(1)
+                })
+                .await
+            })
+        };
+        started_rx.await.unwrap();
+        assert_eq!(gate.launch().await, vec![CDI_ALL_GPUS.to_string()]);
+        assert_eq!(attaching.await.unwrap().unwrap(), 1);
+
+        let late = gate.attach(1, || async { Ok(1) }).await.unwrap_err();
+        assert!(format!("{late:#}").contains("already running"), "{late:#}");
+    }
+
+    #[test]
+    fn a_gpu_run_refuses_to_launch_in_a_vm_that_was_not_restored() {
+        assert!(check_gpu_restore(true, true).is_ok());
+        assert!(check_gpu_restore(false, false).is_ok());
+        let err = check_gpu_restore(true, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("refusing to start the container"),
+            "{err:#}"
+        );
+    }
+
     use super::*;
 
     fn write_function(sysfs: &Path, address: &str, vendor: &str, device: &str, class: &str) {

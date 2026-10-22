@@ -68,6 +68,12 @@ pub struct Plan {
     /// and a GPU can be attached to any clone of it.
     #[serde(default)]
     pub gpu_driver: Option<GpuDriver>,
+    /// This run's GPUs are attached by the host's restore of the pre-start
+    /// snapshot, so a VM that was not restored must not launch the container
+    /// (`gpu::check_gpu_restore`). Read only before the cache handshake, so the
+    /// value a snapshot captures never applies to its restores.
+    #[serde(default)]
+    pub await_gpu_restore: bool,
 }
 
 /// The block device holding the NVIDIA driver image.

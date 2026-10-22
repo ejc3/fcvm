@@ -41,7 +41,25 @@ pub struct RuntimeConfig {
     /// The profile's NVIDIA driver image (src/setup/nvidia.rs), attached read-only to
     /// every cold boot on the profile so its snapshots carry the mounted driver and a
     /// restore can attach a GPU. None for a profile without one.
-    pub gpu_driver_image: Option<PathBuf>,
+    pub gpu_driver_image: Option<GpuDriverImage>,
+}
+
+/// A profile's NVIDIA driver image and the build identity (`utils::file_identity`)
+/// it had when resolved. The identity keys the snapshot cache: a rebuild at the same
+/// path is a different filesystem, which a snapshot holding the guest's mount of the
+/// old one must not be restored against.
+#[derive(Clone, Debug)]
+pub struct GpuDriverImage {
+    pub path: PathBuf,
+    pub identity: String,
+}
+
+impl GpuDriverImage {
+    pub fn at(path: PathBuf) -> anyhow::Result<Self> {
+        let identity = crate::utils::file_identity(&path)
+            .with_context(|| format!("stat NVIDIA driver image {}", path.display()))?;
+        Ok(Self { path, identity })
+    }
 }
 
 impl RuntimeConfig {

@@ -1335,7 +1335,9 @@ async fn prepare_vm_for_lifecycle(
         runtime_config.gpu_driver_image =
             crate::setup::profile_nvidia_driver_image(kernel_profile_name, args.setup)
                 .await
-                .context("setting up the NVIDIA driver image")?;
+                .context("setting up the NVIDIA driver image")?
+                .map(crate::commands::common::GpuDriverImage::at)
+                .transpose()?;
     }
 
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
@@ -1482,7 +1484,7 @@ async fn prepare_vm_for_lifecycle(
             cmd_args.clone(),
             resolved_mode,
             runtime_config.firecracker_bin.as_deref(),
-            runtime_config.gpu_driver_image.as_deref(),
+            runtime_config.gpu_driver_image.as_ref(),
             image_disk_identity.clone(),
             vm_config::effective_extra_boot_args(&runtime_config),
             boot_inputs.clone(),
