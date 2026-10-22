@@ -347,6 +347,14 @@ pub struct RunArgs {
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
+    /// The VM's IPv6 address in routed mode, instead of one derived from its random VM
+    /// id. It must lie inside the prefix in use (--ipv6-prefix, FCVM_IPV6_PREFIX or the
+    /// detected /64) and must not be the prefix's address 0 or 1. An address another
+    /// live VM holds is refused. Only valid with --network routed. Not part of any
+    /// snapshot key: a VM restored from a snapshot takes the address it is given.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
+
     /// HTTP health check URL. If not specified, health is based on container running status.
     /// The probe is plain HTTP for the URL's port, path and query, and the URL hostname is
     /// sent as the Host header.
@@ -675,6 +683,13 @@ pub struct SnapshotRunArgs {
     /// ignore it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
+
+    /// The clone's IPv6 address, for a routed snapshot only: the guest's address is
+    /// swapped to it on restore, instead of one derived from the clone's random VM id.
+    /// The same rules as `podman run --ipv6-address` apply: inside the prefix in use,
+    /// not its address 0 or 1, and not held by another live VM.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support

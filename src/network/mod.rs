@@ -11,7 +11,7 @@ pub mod veth;
 
 pub use bridged::BridgedNetwork;
 pub use pasta::PastaNetwork;
-pub use routed::RoutedNetwork;
+pub use routed::{require_routed_for_address, RoutedNetwork};
 pub use types::*;
 
 use anyhow::{Context, Result};

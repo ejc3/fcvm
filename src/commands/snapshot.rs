@@ -1732,9 +1732,11 @@ fn routed_network_for_restore(
     port_mappings: Vec<crate::network::PortMapping>,
     meta: &crate::storage::SnapshotMetadata,
     restore_prefix: Option<String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
 ) -> RoutedNetwork {
     let mut net = RoutedNetwork::new(vm_id, tap_device, port_mappings)
         .with_restore_mode()
+        .with_ipv6_address(ipv6_address)
         .with_ipv6_dns(meta.network_config.dns_server.clone())
         .with_forward_localhost(meta.forward_localhost.clone());
     if let Some(prefix) = restore_prefix {
@@ -1851,6 +1853,10 @@ async fn cmd_snapshot_run_inner(
     // --publish the snapshot cannot serve fails here with nothing to clean up.
     let port_mappings =
         clone_port_mappings(&snapshot_config.metadata.port_mappings, &args.publish)?;
+    crate::network::require_routed_for_address(
+        snapshot_config.metadata.network_mode,
+        args.ipv6_address,
+    )?;
 
     // Construct signal streams synchronously before either restore path can
     // allocate clone state.  Installing them inside a spawned task leaves the
@@ -2030,6 +2036,13 @@ async fn cmd_snapshot_run_inner(
             }
         };
     }
+
+    // The clone's first state is written here, under its name, and refused when a
+    // live VM already has that name.
+    setup_try!(state_manager
+        .claim_name(&mut vm_state)
+        .await
+        .context("claiming the VM name"));
 
     setup_try!(tokio::fs::create_dir_all(&data_dir)
         .await
@@ -2279,6 +2292,7 @@ async fn cmd_snapshot_run_inner(
                 port_mappings.clone(),
                 &snapshot_config.metadata,
                 restore_prefix.clone(),
+                args.ipv6_address,
             );
             setup_try!(net
                 .preflight_check()
@@ -3377,6 +3391,7 @@ async fn cmd_snapshot_run_inner(
                                 vm_state.config.balloon_device(),
                                 args.non_blocking_output,
                                 vm_state.config.ipv6_prefix.as_ref(),
+                                args.ipv6_address,
                                 &network_config,
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
@@ -3767,6 +3782,7 @@ async fn build_clone_reboot_plan(
     balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     ipv6_prefix: Option<&String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
@@ -3796,6 +3812,7 @@ async fn build_clone_reboot_plan(
         non_blocking_output,
         None,
         ipv6_prefix,
+        ipv6_address,
         meta.restore_hook.clone(),
     );
 
@@ -3870,7 +3887,8 @@ async fn build_clone_reboot_plan(
 ///
 /// `ipv6_prefix` is the prefix the run gives the clone: the one `snapshot run --ipv6-prefix`
 /// was given, for a disk-only clone, and the clone's own, for the reboot plan. The prefix
-/// the snapshot recorded is never used (#1079).
+/// the snapshot recorded is never used (#1079). `ipv6_address` is the clone's
+/// `--ipv6-address` in the same two cases.
 ///
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
@@ -3886,6 +3904,7 @@ fn run_args_from_snapshot_metadata(
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
     ipv6_prefix: Option<&String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
@@ -3986,6 +4005,7 @@ fn run_args_from_snapshot_metadata(
         non_blocking_output,
         label: vec![],
         ipv6_prefix: restore_ipv6_prefix(meta.network_mode, ipv6_prefix),
+        ipv6_address,
         image: meta.image.clone(),
         command_args: vec![],
         rootfs_override,
@@ -4055,6 +4075,7 @@ async fn cmd_snapshot_run_disk_only(
         args.non_blocking_output,
         Some(disk_path),
         args.ipv6_prefix.as_ref(),
+        args.ipv6_address,
         // The caller's hook, the recorded one only for a command line that inherits.
         restore_hook_for(
             args.on_restore.as_deref(),
@@ -4398,6 +4419,7 @@ mod tests {
             Vec::new(),
             &meta,
             Some("2001:db8:1::/64".to_string()),
+            Some("2001:db8:1::7".parse().unwrap()),
         );
         assert!(
             net.is_restore(),
@@ -4410,6 +4432,11 @@ mod tests {
         );
         assert_eq!(net.forward_localhost(), &[3300, 4026]);
         assert_eq!(net.ipv6_prefix(), Some("2001:db8:1::/64"));
+        assert_eq!(
+            net.ipv6_address(),
+            Some("2001:db8:1::7".parse().unwrap()),
+            "the restore's network must carry the clone's --ipv6-address"
+        );
     }
 
     /// #1079: a disk-only routed clone boots under the prefix `snapshot run` was given, and
@@ -4441,6 +4468,7 @@ mod tests {
                 false,
                 None,
                 given,
+                None,
                 None,
             )
             .ipv6_prefix
@@ -4517,6 +4545,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -4542,6 +4571,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -4562,6 +4592,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -4579,6 +4610,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4614,6 +4646,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4653,6 +4686,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -4669,6 +4703,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4711,6 +4746,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -4916,6 +4952,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            ipv6_address: None,
             gpu: vec![],
         };
 
@@ -4990,6 +5027,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            ipv6_address: None,
             gpu: vec![],
         }
     }
