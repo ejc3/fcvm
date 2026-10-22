@@ -337,6 +337,31 @@ class MemoryContainerRemoval(unittest.TestCase):
         self.assertIn("--time=0", rm[0])
 
 
+class MemoryCloneGone(unittest.TestCase):
+    """clone_gone lists the state directory, then reads each file. Another
+    clone's fcvm deletes its own state file as it exits, so a file can vanish
+    between the listing and the read; on 2026-10-22 that raised
+    CloneStateReadError and failed the memory phase after 101 of its 140
+    cells. A file that no longer exists holds no clone, so it is skipped; any
+    other unreadable file still fails closed."""
+
+    def test_a_state_file_deleted_after_the_listing_is_not_a_clone(self):
+        import corpus_mem
+        with tempfile.TemporaryDirectory() as d:
+            gone = os.path.join(d, "vm-gone.json")
+            other = write(d, "vm-other.json", json.dumps({"name": "someone-else"}))
+            with mock.patch.object(corpus_mem, "state_files", lambda _d: [gone, other]):
+                self.assertTrue(corpus_mem.clone_gone(d, "mine"))
+
+    def test_an_unreadable_state_file_still_fails_closed(self):
+        import corpus_mem
+        with tempfile.TemporaryDirectory() as d:
+            bad = write(d, "vm-bad.json", "{not json")
+            with mock.patch.object(corpus_mem, "state_files", lambda _d: [bad]):
+                with self.assertRaises(corpus_mem.CloneStateReadError):
+                    corpus_mem.clone_gone(d, "mine")
+
+
 class RestoreMarkSourcePin(unittest.TestCase):
     """Every marker is an info! line fcvm writes on the restore path."""
 

@@ -640,6 +640,11 @@ def clone_gone(state_dir, name):
         try:
             with open(path) as f:
                 state = json.load(f)
+        except FileNotFoundError:
+            # Deleted between the listing and the read: an exiting clone's
+            # fcvm removes its own state file, and a file that no longer
+            # exists holds no clone.
+            continue
         except (OSError, ValueError) as exc:
             raise CloneStateReadError(
                 f"cannot read clone state {path} while proving {name} is gone: {exc}"
