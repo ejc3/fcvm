@@ -1157,7 +1157,7 @@ for a in "$@"; do if [ "$a" = --quiet ]; then quiet=1; else args+=("$a"); fi; do
         self.assertRegex(body, r'(?m)^MEASURE="\$\{MEASURE:-reqbench\}"$')
         with tempfile.TemporaryDirectory() as tmp:
             env, results = self._fakes(tmp)
-            script = ('set -euo pipefail\nsay() { :; }\n'
+            script = ('set -euo pipefail\nsay() { :; }\nsettle_quiet() { :; }\n'
                       f'URLS="{self._urls()}"\nBACKEND=uffd\nUFFD_MODE=minor\n'
                       'UFFD_PREFETCH=on\nARMS=noop,cdp\nREPS=1\nWARMUP=1\n'
                       'STALL_MAX_MS=15000\nMEASURE=scale\nTAG=cb-req-corpus\n'
@@ -1433,6 +1433,21 @@ read -r _ < "$GO"
             self.assertEqual(seen.get("GUEST_DNS"), "10.0.2.2")
             with open(env["MAKE_ARGV"]) as handle:
                 self.assertIn("bench-chromium-request-golden", handle.read())
+
+    def test_the_run_settles_again_after_the_before_run_verify(self):
+        """RED BEFORE THE FIX: the settle wait came before the before-run
+        verify only. The verify boots two clones, and on 2026-10-22 the run
+        that followed refused at once: "REFUSING: box is busy (load=2.61, 0
+        firecracker/fcvm)". Both measured branches settle again after the
+        sampler starts and before their make."""
+        body = campaign()
+        before = body.index("run_verify before-run")
+        for target in ("bench-chromium-scale 2>&1", "engine_target run)"):
+            run = body.index(target, before)
+            sampler = body.rindex("start_dns_sampler\n", before, run)
+            self.assertIn("settle_quiet", body[sampler:run], target)
+        self.assertEqual(body.count("settle_quiet\n") + body.count("settle_quiet  #"), 3,
+                         "one settle before the verify and one in each measured branch")
 
     def test_every_phase_verifies_on_both_sides_of_the_measured_run(self):
         """Ordering in the main flow, which cannot run without a VM."""
