@@ -232,12 +232,11 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
     const d = drag.current;
     if (!d || d.id !== e.pointerId) return;
     if (d.longPress) clearTimeout(d.longPress);
+    // Send what the drag moved since its last send before letting it go.
+    if (d.moved) flushDrag(true);
     drag.current = null;
     setDragging(false);
-    if (d.moved) {
-      flushDrag(true);
-      return;
-    }
+    if (d.moved) return;
     if (d.pressedTile === "__long__") {
       client.ui({ hoverId: null, pointerOverImage: false });
       return;

@@ -149,6 +149,8 @@ jobs:
               # the VM matrix does not build or run it. Like bench/, it precedes
               # the docs arm so its README still routes to its check.
               fleet/web/*) web=true; echo "fleet web path: $f" ;;
+              # This file holds the fleet-web job, so a change here runs it too.
+              .github/workflows/ci.yml) code=true; web=true; echo "ci workflow: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
@@ -188,6 +190,11 @@ jobs:
     env:
       # Ports for the mock fleet and the page under test: this runner runs nothing else.
       FLEET_TEST_BASE_PORT: "24100"
+      # The mock renders every pixel in JavaScript. On a 4-vCPU runner it keeps up
+      # with 16 tiles at a 1024x640 screen and 10 frames per second.
+      FLEET_E2E_VIEW: "1024x640"
+      FLEET_MOCK_FPS: "10"
+      FLEET_MOCK_THREADS: "3"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7

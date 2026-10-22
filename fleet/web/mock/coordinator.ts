@@ -279,17 +279,25 @@ export class MockCoordinator {
     const k = this.nextViewer++;
     const client: Client = { ws, name: `${NAMES_A[k % NAMES_A.length]} ${NAMES_B[Math.floor(k / NAMES_A.length) % NAMES_B.length]}` };
     this.clients.add(client);
-    this.markDirty();
-    this.sendTo(client, { type: "snapshot", version: this.version, state: this.fleetState() });
+    // Publish now, to everyone: a change made since the last snapshot belongs to
+    // the next version, so the newcomer must not get it under the current one.
+    this.dirty = true;
+    if (this.flushTimer) clearTimeout(this.flushTimer);
+    this.flush();
     ws.on("message", (data, isBinary) => {
       if (isBinary) return;
-      let m: Record<string, unknown>;
+      let parsed: unknown;
       try {
-        m = JSON.parse(data.toString()) as Record<string, unknown>;
+        parsed = JSON.parse(data.toString());
       } catch {
         this.sendTo(client, { type: "error", reason: "message is not JSON" });
         return;
       }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+        this.sendTo(client, { type: "error", reason: "message is not an object" });
+        return;
+      }
+      const m = parsed as Record<string, unknown>;
       if (m["type"] === "ping") {
         this.sendTo(client, { type: "clock", server_unix_ms: this.now(), client_unix_ms: m["client_unix_ms"] });
       } else if (m["type"] === "intent" && typeof m["id"] === "string" && typeof m["name"] === "string") {
@@ -402,17 +410,21 @@ export class MockCoordinator {
         const dive = num("dive");
         if (!drag || ![yaw, pitch, dive].every(Number.isFinite)) return this.refuse(id, by, name, "camera drag is yaw_deg, pitch_deg, dive");
         const t = this.sceneNow();
-        const cur = cameraAt(this.camera, t);
-        const zoom0 = cur["zoom"] ?? 1;
-        const zoom = Math.min(6, Math.max(0.35, zoom0 * Math.exp(dive * 0.2)));
+        // A move still easing in is the base for the next one, so drags that
+        // arrive together add up.
+        const last = this.camera[this.camera.length - 1]!;
+        const easing = last.t > t;
+        const now = cameraAt(this.camera, t);
+        const cur = easing ? last : { t, x: now["x"] ?? 0, y: now["y"] ?? 0, zoom: now["zoom"] ?? 1 };
+        const zoom0 = cur.zoom;
         const next: CameraKey = {
-          t: t + 0.05,
-          x: (cur["x"] ?? 0) + ((yaw / 90) * IMAGE_ASPECT) / zoom0,
-          y: (cur["y"] ?? 0) - pitch / 50 / zoom0,
-          zoom,
+          t: Math.max(t, cur.t) + 0.05,
+          x: cur.x + ((yaw / 90) * IMAGE_ASPECT) / zoom0,
+          y: cur.y - pitch / 50 / zoom0,
+          zoom: Math.min(6, Math.max(0.35, zoom0 * Math.exp(dive * 0.2))),
         };
-        const kept = this.camera.filter((k) => k.t <= t && k.t >= t - 2).slice(-3);
-        this.camera = [...kept, { t, x: cur["x"] ?? 0, y: cur["y"] ?? 0, zoom: zoom0 }, next];
+        const kept = this.camera.filter((k) => k.t >= t - 2).slice(-4);
+        this.camera = easing ? [...kept, next] : [...kept.filter((k) => k.t <= t), { ...cur, t }, next];
         return this.committed(id, by, name, "camera");
       }
       case "word": {

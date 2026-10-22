@@ -2,8 +2,9 @@
 //
 // Each tile keeps a short buffer of decoded frames, each stamped with its scene
 // time t. Renderers share a clock and a frame rate, so their frames land on the
-// same t values. On every draw the page picks one T, the latest t every keeping-up
-// tile holds, and shows each tile's frame at exactly T. A tile with no frame at T
+// same t values. On every draw the page picks one T, the frame time the most
+// keeping-up tiles hold (the latest, on a tie), and shows each tile's frame at
+// exactly T. A tile with no frame at T
 // shows its newest frame from before T dimmed (it is behind), or nothing if all
 // its frames are after T (it just joined). Nothing is ever drawn from two
 // different times side by side undimmed, so there is no torn seam.
@@ -57,27 +58,24 @@ export function chooseCommonT(
   const floor = Math.max(newestMax - maxLag, prevT === null ? -Infinity : prevT - SAME_T_EPS);
   const candidates = live.filter((b) => newest(b) >= floor);
 
-  // The latest t that every candidate holds. Tiles that have nothing at or before
-  // that t (they joined after it) do not constrain it.
+  // The frame time held by the most keeping-up tiles, the latest of those on a
+  // tie. Counting over every tile's times keeps the choice independent of tile
+  // order, and a slow tile whose frames the others no longer hold loses to them
+  // instead of holding them dark.
   let T: number | null = prevT;
-  if (candidates.length > 0) {
-    T = null;
-    const pool = candidates.map((c) => c.ts);
-    const options = [...pool[0]!].sort((a, b) => b - a);
-    const settled = (t: number) =>
-      pool.every((ts) => has(ts, t) || ts[0]! > t + SAME_T_EPS);
-    for (const t of options) {
-      if (prevT !== null && t < prevT - SAME_T_EPS) break;
-      if (settled(t) && pool.some((ts) => has(ts, t))) {
-        T = t;
-        break;
-      }
-    }
-    if (T === null) {
-      // No shared frame time: hold the slowest candidate's newest.
-      T = Math.min(...candidates.map(newest));
+  const counts = new Map<number, { t: number; n: number }>();
+  for (const c of candidates) {
+    for (const t of c.ts) {
+      if (t < floor) continue;
+      const key = Math.round(t / SAME_T_EPS / 2);
+      const e = counts.get(key);
+      if (e) e.n++;
+      else counts.set(key, { t, n: 1 });
     }
   }
+  let best: { t: number; n: number } | null = null;
+  for (const e of counts.values()) if (best === null || e.n > best.n || (e.n === best.n && e.t > best.t)) best = e;
+  if (best !== null) T = best.t;
   if (prevT !== null && T !== null && T < prevT) T = prevT;
 
   for (const b of live) {

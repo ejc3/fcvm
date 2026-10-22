@@ -8,9 +8,10 @@ const view = (page: Page) =>
   });
 
 // Mean absolute error, 0..255 per channel, at smooth points either side of each
-// boundary. Measured on this mock: correct draws at the common t 1.3 at worst
-// over 16 tiles; a tile drawn 0.6 s off its stamp 5.9.
-const TILE_ERR_MAX = 3.5;
+// boundary. Measured on this mock: correct draws at the common t 1.0 to 1.3 at
+// worst over 16 tiles in Chromium and 2.7 to 3.1 in WebKit; a tile drawn 0.6 s
+// off its stamp 5.9 to 16.
+const TILE_ERR_MAX = 4;
 const ACROSS_ERR_MAX = 3.5;
 
 test.describe.configure({ mode: "serial" });
@@ -77,7 +78,8 @@ test("hovering the image fades in every seam, outlines the tile and labels it", 
   // The lines are drawn by the page, over the frames, not in them: the canvas under a seam is unchanged.
   const lines = await page.getByTestId("seams").locator("line").count();
   expect(lines).toBeGreaterThanOrEqual(10);
-  await page.mouse.move(5, 895);
+  // Off the image, onto the controls bar.
+  await page.mouse.move(5, page.viewportSize()!.height - 5);
   await expect(page.getByTestId("seams")).toHaveAttribute("data-visible", "0");
   await expect(page.getByTestId("hover-outline")).toHaveCount(0);
 });
@@ -110,16 +112,19 @@ test("opening a tile asks only that renderer for a taller stream of the same rec
   const t = v.tiles.find((x) => x.id === "fcvm:3")!;
   await page.mouse.click(t.box!.x + t.box!.w / 2, t.box!.y + t.box!.h / 2);
   await expect(page.getByTestId("focus")).toBeVisible();
+  // The height its box takes on screen, which the page asks that renderer for.
+  const wanted = await page.evaluate(() => window.__fleet!.view().plan.tiles.find((x) => x.id === "fcvm:3")!.height);
+  expect(wanted).toBeGreaterThan(before * 1.5);
   await expect
     .poll(() => page.evaluate(() => window.__fleet!.client.getState().frames!.tiles["fcvm:3"]!.height), { timeout: 15_000 })
-    .toBeGreaterThanOrEqual(540);
+    .toBe(wanted);
   const after = await page.evaluate(() => window.__fleet!.client.getState().frames!.tiles);
   expect(after["fcvm:3"]!.height).toBeGreaterThan(before);
   // The other tiles keep their small streams.
   expect(after["fcvm:4"]!.height).toBeLessThanOrEqual(before);
   // Same rectangle: the drawn frame keeps the tile's aspect.
   expect(after["fcvm:3"]!.width / after["fcvm:3"]!.height).toBeCloseTo(t.box!.w / t.box!.h, 1);
-  await expect(page.getByTestId("focus-stream")).toContainText(/^(540|720|1080)p/);
+  await expect(page.getByTestId("focus-stream")).toContainText(new RegExp(`^${wanted}p`));
   // And it is the picture: the tall stream matches the pattern at the drawn t.
   await page.waitForTimeout(1000);
   const fe = await focusError(page, "fcvm:3");
@@ -170,6 +175,26 @@ test("dragging steers the shared camera and shows input-to-pixel latency", async
   const ms = Number((await page.getByTestId("latency").textContent())!.match(/(\d+) ms/)![1]);
   expect(ms).toBeGreaterThan(0);
   expect(ms).toBeLessThan(2000);
+});
+
+test("releasing a drag sends the movement since the last send", async ({ page }) => {
+  await openWall(page, 15);
+  const camX = async () => {
+    const st = await mockState();
+    const keys = st.pattern.camera as unknown as { x: number }[];
+    return keys[keys.length - 1]!.x;
+  };
+  const x0 = await camX();
+  const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
+  // Two moves inside one 50 ms send interval, then release at once.
+  await page.mouse.move(400, 400);
+  await page.mouse.down();
+  await page.mouse.move(500, 400);
+  await page.mouse.move(600, 400);
+  await page.mouse.up();
+  // 200 px of drag: x moves by 200/w of the image width, in world units.
+  const want = x0 - (200 / img.w) * (16 / 9);
+  await expect.poll(camX).toBeCloseTo(want, 6);
 });
 
 test("two viewers hold the same state at the same version", async ({ browser }) => {
@@ -227,15 +252,21 @@ test("auto-relaunch is one shared setting: every viewer sees who set it and the 
   await openWall(page, 15);
   const other = await (await browser.newContext()).newPage();
   await openWall(other, 15);
+  const before = await page.evaluate(() => window.__fleet!.client.getState().accepted!.actions.length);
   await page.getByLabel("Auto-relaunch, shared").selectOption({ label: "Every 2 minutes" });
-  const setter = await page.evaluate(() => {
-    const a = window.__fleet!.client.getState().accepted!.actions.filter((x) => x.name === "set_auto_relaunch").pop();
-    return a?.by ?? "";
-  });
+  // The coordinator's own record of who set it, once the snapshot carries it.
+  let setter = "";
+  await expect
+    .poll(async () => {
+      setter = await page.evaluate((n) => {
+        const a = window.__fleet!.client.getState().accepted!.actions.slice(n).filter((x) => x.name === "set_auto_relaunch" && x.outcome !== "refused").pop();
+        return a?.by ?? "";
+      }, before);
+      return setter;
+    })
+    .not.toBe("");
   await expect(other.getByLabel("Auto-relaunch, shared")).toHaveValue("120");
-  await expect(other.getByTestId("auto-note")).toHaveText(/^set by [a-z]+ [a-z]+ · next in 1:\d\d$/);
-  const by = (await other.getByTestId("auto-note").textContent())!.match(/^set by (.+) · /)![1];
-  expect(setter === "" || by === setter).toBe(true);
+  await expect(other.getByTestId("auto-note")).toHaveText(new RegExp(`^set by ${setter} · next in 1:\\d\\d$`));
   await other.getByLabel("Auto-relaunch, shared").selectOption({ label: "Off" });
   await expect(page.getByLabel("Auto-relaunch, shared")).toHaveValue("off");
   await expect(page.getByTestId("auto-note")).toHaveText("");

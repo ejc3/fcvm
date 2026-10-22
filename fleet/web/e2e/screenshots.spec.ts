@@ -27,14 +27,15 @@ test("screenshots", async ({ page, browser }) => {
   }
   await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 15.5 }));
   await page.waitForTimeout(1500);
-  await page.mouse.move(720, 895);
+  const bar = { x: page.viewportSize()!.width / 2, y: page.viewportSize()!.height - 5 };
+  await page.mouse.move(bar.x, bar.y);
   await shot(page, "wall-desktop");
 
   const b = await tileBox(page, "slot-3");
   await page.mouse.move(b.x + b.w / 2, b.y + b.h / 2);
   await page.waitForTimeout(400);
   await shot(page, "wall-hover");
-  await page.mouse.move(720, 895);
+  await page.mouse.move(bar.x, bar.y);
 
   await page.getByTestId("stats-switch").click();
   await page.waitForTimeout(1200);
@@ -48,7 +49,7 @@ test("screenshots", async ({ page, browser }) => {
 
   const o = await tileBox(page, "slot-6");
   await page.mouse.click(o.x + o.w / 2, o.y + o.h / 2);
-  await expect(page.getByTestId("focus-stream")).toContainText(/^(540|720|1080)p/, { timeout: 15_000 });
+  await expect(page.getByTestId("focus-stream")).toContainText(/^\d+p · \d+ fps/, { timeout: 15_000 });
   await page.waitForTimeout(1500);
   await shot(page, "tile-opened");
   await page.getByRole("button", { name: "Back to the wall" }).click();

@@ -11,6 +11,7 @@ import {
   NOTICE_MS,
   reconnectDelayMs,
   reduce,
+  shouldPing,
   type ClientEvent,
   type ClientState,
   type DrawPlan,
@@ -112,8 +113,10 @@ export class WallClient {
     const ws = this.ws;
     if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const at = now();
-    this.dispatch({ type: "ping-sent", at });
-    ws.send(JSON.stringify({ type: "ping", client_unix_ms: at }));
+    if (shouldPing(this.state.clock, at)) {
+      this.dispatch({ type: "ping-sent", at });
+      ws.send(JSON.stringify({ type: "ping", client_unix_ms: at }));
+    }
     this.pingTimer = setTimeout(() => this.ping(), nextPingDelay(this.state.clock));
   }
 

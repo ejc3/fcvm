@@ -146,3 +146,35 @@ describe("camera", () => {
     expect(r.args).toEqual({ drag: { yaw_deg: -4.5, pitch_deg: 0.5, dive: 0 } });
   });
 });
+
+describe("review findings, pinned", () => {
+  const b = (id: string, ts: number[]) => ({ id, ts });
+
+  it("does not leave a keeping-up tile black behind a slow one whose frames it no longer holds", () => {
+    const fast = [0.75, 0.8, 0.85, 0.9, 0.95, 1];
+    const slow = [0.45, 0.5, 0.55, 0.6, 0.65, 0.7];
+    const c = chooseCommonT([b("fast", fast), b("slow", slow)], null);
+    expect(c.show.get("fast")).toEqual({ kind: "sync", t: 1 });
+    expect(c.show.get("slow")).toEqual({ kind: "behind", t: 0.7 });
+  });
+
+  it("does not depend on the order of the tiles", () => {
+    const tiles = [b("new", [3.15]), b("a", [3, 3.05]), b("b", [3, 3.1])];
+    for (const order of [tiles, [tiles[1]!, tiles[2]!, tiles[0]!], [tiles[2]!, tiles[0]!, tiles[1]!]]) {
+      const c = chooseCommonT(order, null);
+      expect(c.T).toBe(3);
+      expect(c.show.get("a")).toEqual({ kind: "sync", t: 3 });
+      expect(c.show.get("b")).toEqual({ kind: "sync", t: 3 });
+    }
+  });
+
+  it("leaves no gap between neighbours with seven columns a half", () => {
+    const st = fleet(7, 7);
+    const L = layoutMosaic({ x: 0, y: 0, w: 707, h: 1080 }, st.tiles, 1);
+    for (const a of L.tiles) {
+      const right = a.box.x + a.box.w;
+      const next = L.tiles.find((o) => Math.abs(o.box.y - a.box.y) < 0.01 && o.box.x > a.box.x && o.box.x - right < 1.5);
+      if (next) expect(next.box.x, `${a.id} | ${next.id}`).toBe(right);
+    }
+  });
+});

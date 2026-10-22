@@ -8,8 +8,15 @@ import {
   BUFFER_FRAMES,
   chooseCommonT,
   codecFromSps,
+  admitChunk,
   heightMessage,
+  heightSent,
+  heightToSend,
   nalType,
+  newStream,
+  streamOpened,
+  wantHeight,
+  type StreamCtl,
   NAL_SPS,
   parseFrame,
   parseStreamHeader,
@@ -40,6 +47,8 @@ class TileStream {
   baseUrl: string;
   url: string;
   height: number;
+  /** What height this socket was opened with and has been sent. */
+  ctl: StreamCtl;
   ws: WebSocket | null = null;
   decoder: VideoDecoder | null = null;
   codec: string | null = null;
@@ -63,7 +72,16 @@ class TileStream {
     this.baseUrl = baseUrl;
     this.url = url;
     this.height = height;
+    this.ctl = newStream(height);
     this.open();
+  }
+
+  /** Send the wanted height if the open socket does not have it yet. */
+  private syncHeight(): void {
+    const h = heightToSend(this.ctl);
+    if (h === null || !this.ws) return;
+    this.ws.send(heightMessage(h));
+    this.ctl = heightSent(this.ctl, h);
   }
 
   open(): void {
@@ -71,6 +89,12 @@ class TileStream {
     const ws = new WebSocket(this.url);
     ws.binaryType = "arraybuffer";
     this.ws = ws;
+    this.ctl = { ...newStream(this.height), wanted: this.height };
+    ws.onopen = () => {
+      if (this.ws !== ws) return;
+      this.ctl = streamOpened(this.ctl, true);
+      this.syncHeight();
+    };
     ws.onmessage = (e) => {
       if (typeof e.data === "string") this.onHeader(e.data);
       else this.onFrame(new Uint8Array(e.data as ArrayBuffer));
@@ -90,10 +114,10 @@ class TileStream {
   }
 
   setHeight(height: number, url: string): void {
-    if (height === this.height) return;
     this.height = height;
     this.url = url;
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(heightMessage(height));
+    this.ctl = wantHeight(this.ctl, height);
+    this.syncHeight();
   }
 
   private onHeader(text: string): void {
@@ -128,8 +152,9 @@ class TileStream {
       if (codec) this.configure(codec, f.width, f.height);
     }
     if (!this.decoder || this.decoder.state !== "configured") return;
-    if (this.waitingKey && !f.keyframe) return;
-    this.waitingKey = false;
+    const admit = admitChunk({ waitingKey: this.waitingKey }, { keyframe: f.keyframe, queueSize: this.decoder.decodeQueueSize });
+    this.waitingKey = admit.waitingKey;
+    if (!admit.decode) return;
     this.attempt = 0;
     const ts = Math.round(f.t * 1e6);
     this.decodeStart.set(ts, performance.now());

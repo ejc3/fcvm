@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { clockReceived, initialClock, pingSent, serverNow } from "../clock.ts";
+import { clockReceived, initialClock, pingSent, serverNow, shouldPing, PING_TIMEOUT_MS } from "../clock.ts";
+import { admitChunk, heightSent, heightToSend, MAX_DECODE_QUEUE, newStream, streamOpened, wantHeight } from "../stream.ts";
 import { buildFrame, codecFromSps, parseFrame, parseStreamHeader, splitNals, nalType } from "../frame.ts";
 import { frameSocketUrl, reconnectDelayMs, urlHost } from "../net.ts";
 
@@ -87,5 +88,37 @@ describe("connections", () => {
   it("finds the host of an IPv6 URL", () => {
     expect(urlHost("wss://[2001:db8::3]:443/frames")).toBe("[2001:db8::3]");
     expect(urlHost("wss://slot-3.example.test/frames")).toBe("slot-3.example.test");
+  });
+});
+
+describe("review findings, pinned (clock and streams)", () => {
+  it("sends no second ping while one is unanswered, unless it timed out", () => {
+    let c = pingSent(initialClock(), 1000);
+    expect(shouldPing(c, 1250)).toBe(false);
+    c = clockReceived(c, 1150 + 50_000, 1300);
+    expect(shouldPing(c, 1300)).toBe(true);
+    const lost = pingSent(initialClock(), 1000);
+    expect(shouldPing(lost, 1000 + PING_TIMEOUT_MS + 1)).toBe(true);
+  });
+
+  it("sends a height asked for while the frame socket was still opening, once it opens", () => {
+    let s = streamOpened(newStream(144), false);
+    s = wantHeight(s, 720);
+    expect(heightToSend(s)).toBeNull();
+    s = streamOpened(s, true);
+    expect(heightToSend(s)).toBe(720);
+    s = heightSent(s, 720);
+    expect(heightToSend(s)).toBeNull();
+  });
+
+  it("drops chunks while the decoder is backed up, then waits for a keyframe", () => {
+    let r = admitChunk({ waitingKey: false }, { keyframe: false, queueSize: 2 });
+    expect(r).toEqual({ decode: true, waitingKey: false });
+    r = admitChunk(r, { keyframe: false, queueSize: MAX_DECODE_QUEUE + 1 });
+    expect(r).toEqual({ decode: false, waitingKey: true });
+    r = admitChunk(r, { keyframe: false, queueSize: 0 });
+    expect(r).toEqual({ decode: false, waitingKey: true });
+    r = admitChunk(r, { keyframe: true, queueSize: 0 });
+    expect(r).toEqual({ decode: true, waitingKey: false });
   });
 });

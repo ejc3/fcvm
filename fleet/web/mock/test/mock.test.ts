@@ -226,3 +226,59 @@ describe("pattern", () => {
     expect(diff / a.length).toBeGreaterThan(3);
   });
 });
+
+describe("mock coordinator, review findings", () => {
+  it("never shows two viewers different state under one version", async () => {
+    const a = await live();
+    await a.next((m) => m["type"] === "snapshot");
+    const id = `tod-${Date.now()}`;
+    a.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 18.25 } }));
+    // B connects while that change waits for its flush.
+    await new Promise((r) => setTimeout(r, 2));
+    const b = await live();
+    await a.next((m) => m["type"] === "receipt" && m["id"] === id);
+    await new Promise((r) => setTimeout(r, 100));
+    const byVersion = (msgs: Record<string, unknown>[]) => {
+      const out = new Map<number, string>();
+      for (const m of msgs) {
+        if (m["type"] !== "snapshot") continue;
+        const st = structuredClone(m["state"]) as { viewers: unknown };
+        st.viewers = null; // the viewer count is part of the state too; compare the rest
+        out.set(m["version"] as number, JSON.stringify(st));
+      }
+      return out;
+    };
+    const va = byVersion(a.msgs);
+    const vb = byVersion(b.msgs);
+    let shared = 0;
+    for (const [v, s] of vb) {
+      if (!va.has(v)) continue;
+      shared++;
+      expect(s, `version ${v}`).toBe(va.get(v));
+    }
+    expect(shared).toBeGreaterThan(0);
+    a.ws.close();
+    b.ws.close();
+  });
+
+  it("adds up camera drags that arrive together", async () => {
+    const c = await live();
+    const t0 = coord.patternScene().camera;
+    const start = t0[t0.length - 1] as unknown as { x: number };
+    c.ws.send(JSON.stringify({ type: "intent", id: `cam-a-${Date.now()}`, name: "camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: `cam-b-${Date.now()}`, name: "camera", args: { drag: { yaw_deg: 9, pitch_deg: 0, dive: 0 } } }));
+    await c.next(() => c.msgs.filter((m) => m["type"] === "receipt").length === 2);
+    const keys = coord.patternScene().camera as unknown as { x: number }[];
+    expect(keys[keys.length - 1]!.x - start.x).toBeCloseTo(2 * (9 / 90) * (16 / 9), 9);
+    c.ws.close();
+  });
+
+  it("answers a JSON null with an error and keeps serving", async () => {
+    const c = await live();
+    c.ws.send("null");
+    c.ws.send(JSON.stringify({ type: "ping", client_unix_ms: 1 }));
+    expect(await c.next((m) => m["type"] === "error")).toMatchObject({ type: "error" });
+    expect(await c.next((m) => m["type"] === "clock")).toMatchObject({ type: "clock" });
+    c.ws.close();
+  });
+});

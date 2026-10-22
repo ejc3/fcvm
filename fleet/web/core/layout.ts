@@ -34,12 +34,21 @@ export function snap(v: number, dpr: number): number {
   return Math.round(v * dpr) / dpr;
 }
 
+/**
+ * An edge as a fraction of the image, rounded so that one tile's `x + w` and its
+ * neighbour's `x` (equal in exact arithmetic, a few ulps apart in floating
+ * point) snap to the same device pixel.
+ */
+function edge(f: number): number {
+  return Math.round(f * 1e9) / 1e9;
+}
+
 /** The screen box of an image rectangle, edges snapped to device pixels. */
 export function rectOnScreen(image: Box, r: Rect, dpr: number): Box {
-  const x0 = snap(image.x + r.x * image.w, dpr);
-  const y0 = snap(image.y + r.y * image.h, dpr);
-  const x1 = snap(image.x + (r.x + r.w) * image.w, dpr);
-  const y1 = snap(image.y + (r.y + r.h) * image.h, dpr);
+  const x0 = snap(image.x + edge(r.x) * image.w, dpr);
+  const y0 = snap(image.y + edge(r.y) * image.h, dpr);
+  const x1 = snap(image.x + edge(r.x + r.w) * image.w, dpr);
+  const y1 = snap(image.y + edge(r.y + r.h) * image.h, dpr);
   return { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
 }
 

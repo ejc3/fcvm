@@ -25,6 +25,8 @@ export const CLOCK_SAMPLES_KEPT = 8;
 export const CLOCK_FAST_PINGS = 5;
 export const CLOCK_FAST_INTERVAL_MS = 250;
 export const PING_INTERVAL_MS = 2000;
+/** A ping unanswered this long is given up, and another may go. */
+export const PING_TIMEOUT_MS = 5000;
 
 export function initialClock(): ClockState {
   return { outstanding: null, samples: [], offsetMs: null, rttMs: null };
@@ -54,6 +56,14 @@ export function clockReceived(
 /** The coordinator's time for a local time. Before any sample, the local time. */
 export function serverNow(c: ClockState, localNow: number): number {
   return localNow + (c.offsetMs ?? 0);
+}
+
+/**
+ * Whether a ping may go now. Only one is in flight at a time, so an answer
+ * without an echo pairs with the right ping.
+ */
+export function shouldPing(c: ClockState, localNow: number): boolean {
+  return c.outstanding === null || localNow - c.outstanding > PING_TIMEOUT_MS;
 }
 
 /** How long to wait before the next ping, given how many samples exist. */

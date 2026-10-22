@@ -265,6 +265,11 @@ fn fleet_web_changes_run_the_fleet_web_job() {
         summary_needs.contains(&"fleet-web"),
         "`summary` does not depend on `fleet-web`, so a failing page suite would not fail it"
     );
+    // A change to ci.yml can break the fleet-web job itself, so it runs it.
+    assert!(
+        text.contains(".github/workflows/ci.yml) code=true; web=true"),
+        "a ci.yml-only change does not run `fleet-web`, so a broken fleet-web job merges green"
+    );
     // Every fail-open branch opens the web gate too.
     assert_eq!(
         text.matches("echo \"web=true\" >> \"$GITHUB_OUTPUT\"")

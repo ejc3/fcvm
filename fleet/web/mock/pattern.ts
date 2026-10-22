@@ -133,26 +133,67 @@ export function frameCtx(t: number, scene: PatternScene): FrameCtx {
 }
 
 /** Linear RGB 0..1 of the image at (u, v) for one frame. Pure. */
-export function shade(u: number, v: number, f: FrameCtx, out: Float64Array | number[] = [0, 0, 0]): typeof out {
+/**
+ * The terms of the picture that are sums of a part in X and a part in Y. A
+ * renderer computes those parts once per column and once per row (`renderI420`);
+ * one pixel on its own computes them here. Either way the value is the same.
+ */
+export interface Separable {
+  w1: number;
+  w2: number;
+  grain: number;
+  swell: number;
+}
+
+function separableAt(X: number, Y: number, t: number): Separable {
+  return {
+    w1: Math.sin(X * 1.3 + t * 0.35) + Math.sin(Y * 1.7 - t * 0.25),
+    w2: Math.sin(X * 0.9 - t * 0.2 + Y * 1.1) + Math.cos(Y * 2.1 + t * 0.3),
+    grain: Math.sin(X * 3.1 + t * 0.6 - Y * 2.3),
+    swell: Math.sin(2.0 * X - 1.9 * t + 0.7 * Y),
+  };
+}
+
+const C21 = Math.cos(2.1);
+const S21 = Math.sin(2.1);
+const C42 = Math.cos(4.2);
+const S42 = Math.sin(4.2);
+
+/** The last star cell looked up, so a row of pixels in one cell hashes once. */
+export interface StarCache {
+  sx: number;
+  sy: number;
+  hf: number;
+}
+
+export function shade(
+  u: number,
+  v: number,
+  f: FrameCtx,
+  out: Float64Array | number[] = [0, 0, 0],
+  sep?: Separable,
+  stars?: StarCache,
+): typeof out {
   const t = f.t;
   const X = ((u - 0.5) * f.aspect) / f.zoom + f.camX;
   const Y = (v - 0.5) / f.zoom + f.camY;
+  const S = sep ?? separableAt(X, Y, t);
 
   // A nebula: two domain warps feeding a cosine palette that drifts with t,
   // over deep space.
-  const w1 = Math.sin(X * 1.3 + t * 0.35) + Math.sin(Y * 1.7 - t * 0.25);
-  const w2 = Math.sin(X * 0.9 - t * 0.2 + Y * 1.1) + Math.cos(Y * 2.1 + t * 0.3);
-  const p = Math.sin((X + 0.55 * w1) * 2.2 + t * 0.4) * Math.cos((Y + 0.55 * w2) * 2.6 - t * 0.3);
+  const p = Math.sin((X + 0.55 * S.w1) * 2.2 + t * 0.4) * Math.cos((Y + 0.55 * S.w2) * 2.6 - t * 0.3);
   const q = 0.5 + 0.5 * p;
   const k = TAU * (q * 0.7 + f.hue);
-  const dens = 0.24 + 0.76 * q * q * (0.75 + 0.25 * Math.sin(X * 3.1 - Y * 2.3 + t * 0.6));
+  const ck = Math.cos(k);
+  const sk = Math.sin(k);
+  const dens = 0.24 + 0.76 * q * q * (0.75 + 0.25 * S.grain);
   // A slow swell of light that travels across the whole image; it is what makes
   // a tile drawn at the wrong t stand out against its neighbours.
-  const swell = 1 + 0.32 * Math.sin(2.0 * X + 0.7 * Y - 1.9 * t);
+  const swell = 1 + 0.32 * S.swell;
   const night = (0.45 + 0.55 * f.day) * swell;
-  let r = 0.015 + dens * night * (0.5 + 0.45 * Math.cos(k + 0.0));
-  let g = 0.02 + dens * night * (0.42 + 0.4 * Math.cos(k + 2.1));
-  let b = 0.06 + dens * night * (0.6 + 0.4 * Math.cos(k + 4.2));
+  let r = 0.015 + dens * night * (0.5 + 0.45 * ck);
+  let g = 0.02 + dens * night * (0.42 + 0.4 * (ck * C21 - sk * S21));
+  let b = 0.06 + dens * night * (0.6 + 0.4 * (ck * C42 - sk * S42));
 
   // A ringed planet straddling the line between the halves, lit by a sun whose
   // angle follows the time of day.
@@ -208,8 +249,18 @@ export function shade(u: number, v: number, f: FrameCtx, out: Float64Array | num
   // Stars, fixed in the world.
   const sx = Math.floor(X * 28);
   const sy = Math.floor(Y * 28);
-  const h = Math.sin(sx * 127.1 + sy * 311.7) * 43758.5453;
-  const hf = h - Math.floor(h);
+  let hf: number;
+  if (stars && stars.sx === sx && stars.sy === sy) {
+    hf = stars.hf;
+  } else {
+    const h = Math.sin(sx * 127.1 + sy * 311.7) * 43758.5453;
+    hf = h - Math.floor(h);
+    if (stars) {
+      stars.sx = sx;
+      stars.sy = sy;
+      stars.hf = hf;
+    }
+  }
   if (hf > 0.965 && d > R && ringBand === 0) {
     const cx = (sx + 0.5) / 28 - X;
     const cy = (sy + 0.5) / 28 - Y;
@@ -296,11 +347,48 @@ export function renderI420(rect: TileRect, width: number, height: number, f: Fra
   const out = new Uint8Array(ySize + 2 * cw * ch);
   const rgb = new Float32Array(ySize * 3);
   const px = new Float64Array(3);
+  // Column and row parts of the separable terms (see Separable).
+  const t = f.t;
+  const us = new Float64Array(width);
+  const c1 = new Float64Array(width);
+  const cS = new Float64Array(width);
+  const cC = new Float64Array(width);
+  const gS = new Float64Array(width);
+  const gC = new Float64Array(width);
+  const wS = new Float64Array(width);
+  const wC = new Float64Array(width);
+  for (let i = 0; i < width; i++) {
+    const u = rect.x + ((i + 0.5) / width) * rect.w;
+    const X = ((u - 0.5) * f.aspect) / f.zoom + f.camX;
+    us[i] = u;
+    c1[i] = Math.sin(X * 1.3 + t * 0.35);
+    cS[i] = Math.sin(X * 0.9 - t * 0.2);
+    cC[i] = Math.cos(X * 0.9 - t * 0.2);
+    gS[i] = Math.sin(X * 3.1 + t * 0.6);
+    gC[i] = Math.cos(X * 3.1 + t * 0.6);
+    wS[i] = Math.sin(2.0 * X - 1.9 * t);
+    wC[i] = Math.cos(2.0 * X - 1.9 * t);
+  }
+  const sep: Separable = { w1: 0, w2: 0, grain: 0, swell: 0 };
+  const stars: StarCache = { sx: NaN, sy: NaN, hf: 0 };
   for (let j = 0; j < height; j++) {
     const v = rect.y + ((j + 0.5) / height) * rect.h;
+    const Y = (v - 0.5) / f.zoom + f.camY;
+    const r1 = Math.sin(Y * 1.7 - t * 0.25);
+    const rS = Math.sin(Y * 1.1);
+    const rC = Math.cos(Y * 1.1);
+    const r2 = Math.cos(Y * 2.1 + t * 0.3);
+    const gs = Math.sin(Y * 2.3);
+    const gc = Math.cos(Y * 2.3);
+    const ws = Math.sin(0.7 * Y);
+    const wc = Math.cos(0.7 * Y);
     for (let i = 0; i < width; i++) {
-      const u = rect.x + ((i + 0.5) / width) * rect.w;
-      shade(u, v, f, px);
+      const u = us[i]!;
+      sep.w1 = c1[i]! + r1;
+      sep.w2 = cS[i]! * rC + cC[i]! * rS + r2;
+      sep.grain = gS[i]! * gc - gC[i]! * gs;
+      sep.swell = wS[i]! * wc + wC[i]! * ws;
+      shade(u, v, f, px, sep, stars);
       const k = (j * width + i) * 3;
       rgb[k] = px[0]!;
       rgb[k + 1] = px[1]!;

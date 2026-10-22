@@ -50,13 +50,14 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 76 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 18 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 85 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 19 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
-The mock needs `ffmpeg` with libx264. Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
+On a small machine, `FLEET_E2E_VIEW=1024x640 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
+makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264. Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_FPS`, ...) are listed at the top of `mock/main.ts`.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
 
@@ -80,10 +81,11 @@ sample with the smallest round trip of the last eight. Race clocks, dark-tile cl
 the auto-relaunch countdown and frame age all use the coordinator's time.
 
 **One common t.** Each tile keeps up to six decoded frames. Every draw picks T, the
-latest frame time every keeping-up tile holds, and draws each tile's frame at exactly T.
-A tile more than 0.35 s behind the newest stops holding the image and is drawn dimmed
-from its newest frame before T; a tile that just joined stays dark until the image
-reaches its first frame; T never goes back. Two different times are never drawn side by
+frame time held by the most keeping-up tiles (the latest, on a tie), and draws each
+tile's frame at exactly T. A tile more than 0.35 s behind the newest, or whose frames the
+others no longer hold, is drawn dimmed from its newest frame before T; a tile that just
+joined stays dark until the image reaches its first frame; T never goes back. A decoder
+holding more than eight undecoded chunks drops input until the next keyframe. Two different times are never drawn side by
 side undimmed. Draws happen only when T or the plan changes, so the canvas redraws at
 the renderers' rate, not the display's.
 

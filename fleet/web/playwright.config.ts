@@ -9,6 +9,9 @@ if (!Number.isInteger(base) || base <= 0) {
   throw new Error("FLEET_TEST_BASE_PORT is not set. Put it in fleet/web/.env.ports (see README.md).");
 }
 export const PORTS = { web: base, coord: base + 1, render: base + 2 };
+// A smaller screen and frame rate let a small CI runner draw the whole mock fleet.
+const [vw, vh] = (process.env.FLEET_E2E_VIEW ?? "1440x900").split("x").map(Number) as [number, number];
+const viewport = { width: vw, height: vh };
 process.env.FLEET_E2E_COORD_PORT = String(PORTS.coord);
 
 export default defineConfig({
@@ -21,7 +24,7 @@ export default defineConfig({
   reporter: [["list"]],
   use: {
     baseURL: `http://localhost:${PORTS.web}`,
-    viewport: { width: 1440, height: 900 },
+    viewport,
     deviceScaleFactor: 1,
     trace: "retain-on-failure",
   },
@@ -29,7 +32,7 @@ export default defineConfig({
     {
       name: "chromium",
       testIgnore: /screenshots\.spec\.ts/,
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 },
+      use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
     // WebKit (Playwright's Linux build, not Apple's Safari) runs the tests tagged
     // @engines: the mosaic, the seams and hover.
@@ -38,14 +41,14 @@ export default defineConfig({
       grep: /@engines/,
       testIgnore: /screenshots\.spec\.ts/,
       dependencies: ["chromium"],
-      use: { ...devices["Desktop Safari"], viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 },
+      use: { ...devices["Desktop Safari"], viewport, deviceScaleFactor: 1 },
     },
     // Last, because it writes words and lights into the shared scene.
     {
       name: "screenshots",
       testMatch: /screenshots\.spec\.ts/,
       dependencies: ["chromium", "webkit"],
-      use: { ...devices["Desktop Chrome"], viewport: { width: 1440, height: 900 }, deviceScaleFactor: 1 },
+      use: { ...devices["Desktop Chrome"], viewport, deviceScaleFactor: 1 },
     },
   ],
   webServer: {
@@ -61,6 +64,8 @@ export default defineConfig({
       FLEET_MOCK_EC2_MS: "12000",
       FLEET_MOCK_TILES: "8",
       FLEET_MOCK_EC2_SHORT: "1",
+      FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "20",
+      FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "12",
     },
   },
 });
