@@ -163,6 +163,15 @@ def read_meminfo():
     return mi
 
 
+def process_state(pid):
+    """The state letter in /proc/<pid>/stat, or None when the process is gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[1].split()[0]
+    except (OSError, IndexError):
+        return None
+
+
 def pss_kb_of_pid(pid):
     """PSS of one process, from its smaps_rollup.
 
@@ -189,9 +198,13 @@ def pss_kb_of_pid(pid):
                 f"{result.stderr.strip()}") from exc
         text = result.stdout
     except (ProcessLookupError, FileNotFoundError) as exc:
-        # The process exited during the read: its /proc entry is gone, or it
-        # is a zombie with no address space (ESRCH). Its cgroup's set is
-        # changing, so the caller reads the cgroup again.
+        # A zombie has released its address space, so it holds no pages and
+        # its PSS is zero: smaps_rollup answers ESRCH while it waits to be
+        # reaped, which can outlast every re-read (2026-10-22: one zombie in
+        # a clone's cgroup failed 20 reads over a second). Any other exit
+        # means the set is changing, and the caller reads the cgroup again.
+        if process_state(pid) in ("Z", "X"):
+            return 0
         raise ProcessGone(f"cannot read {path}: {exc}") from exc
     except OSError as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc

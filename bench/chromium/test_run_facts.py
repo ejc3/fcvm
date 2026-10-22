@@ -790,13 +790,33 @@ class MovingProcessSet(unittest.TestCase):
         real_open = builtins.open
 
         def gone(path, *args, **kwargs):
-            if str(path) == "/proc/4242/smaps_rollup":
+            if str(path) in ("/proc/4242/smaps_rollup", "/proc/4242/stat"):
                 raise ProcessLookupError(3, "No such process", path)
             return real_open(path, *args, **kwargs)
 
         with mock.patch("builtins.open", gone):
             with self.assertRaises(report.ProcessGone):
                 report.pss_kb_of_pid(4242)
+
+    def test_a_zombie_holds_no_memory(self):
+        """RED BEFORE THE FIX: a zombie in a clone's cgroup answered ESRCH to
+        every smaps_rollup read for a second, and the sample refused after its
+        20 re-reads: "cannot read /proc/3843212/smaps_rollup: [Errno 3] No
+        such process" (2026-10-22, the same cell twice). A zombie has no
+        address space, so its PSS is zero."""
+        import builtins
+        import report
+        real_open = builtins.open
+
+        def zombie(path, *args, **kwargs):
+            if str(path) == "/proc/4242/smaps_rollup":
+                raise ProcessLookupError(3, "No such process", path)
+            if str(path) == "/proc/4242/stat":
+                return io.StringIO("4242 (fcvm) Z 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1 0 0")
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", zombie):
+            self.assertEqual(report.pss_kb_of_pid(4242), 0)
 
     def test_a_set_that_never_settles_still_refuses(self):
         import report
