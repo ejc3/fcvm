@@ -104,9 +104,8 @@ with a mixed instances policy over both bare-metal GPU types (g4dn.metal: x86, e
 g5g.metal: arm64, two T4G; fcvm needs `/dev/kvm`, so nothing smaller qualifies), every AZ
 the region offers, and the `price-capacity-optimized` allocation strategy. The groups run
 in us-east-2, us-west-2 and us-east-1, so one region losing spot capacity leaves the
-others. Each group's desired capacity is 1. With `fcvm_tiles` = 8, one g4dn.metal carries
-the whole fcvm half and the other hosts are standby; with three hosts up the wall survives
-losing any one of them, and with one host up it still shows every tile. The account's G spot quota is 96 vCPUs per
+others. Each group's desired capacity is 1, so up to three hosts render at once; one host is
+enough to show the whole image, at coarser tiles. The account's G spot quota is 96 vCPUs per
 region (64 in us-east-1), which is one g4dn.metal or one g5g.metal, so three regions give
 up to three hosts; a quota increase raises it.
 
@@ -176,16 +175,15 @@ agent that dies takes its VMs with it, and the next agent starts from nothing.
 
 ### Slots and addressing
 
-**DECIDED (2026-10-22): the wall shows a fixed number of tiles; extra spot capacity is
-buffer.** The fcvm half has exactly `fcvm_tiles` slots, `slot-1` ... `slot-n`, each with a
-fixed rectangle of the image. The coordinator places each slot on a free GPU, filling one
-host before the next, so the fleet's other GPUs stay free as standby. Standby GPUs run
-nothing. When a host is reclaimed (or fails), its slots are placed on standby GPUs on the
-surviving hosts and relaunch there: the tiles go dark and come back in the same place of
-the image, under the same names, at new addresses (the coordinator rewrites their AAAA
-records). Only when the fleet has fewer GPUs than tiles does a tile stay dark, labelled
-"waiting for capacity", until a replacement host joins; the image keeps its shape. The EC2
-half works the same way, its buffer being EC2's own spot capacity.
+**DECIDED (2026-10-22): every GPU the fleet has renders, and the fleet's size sets the
+granularity.** Every GPU is a slot (`slot-1` ... `slot-n`), and every slot renders. When a
+host joins, the coordinator adds its GPUs as slots and re-tiles the image in one event;
+every renderer gets its new rectangle through `POST /scene` without a relaunch, so the
+picture changes from coarser to finer tiles at one frame `t`. When a host is reclaimed (a
+two-minute spot notice) the coordinator re-tiles onto the remaining GPUs at once, before
+the host disappears, so the image never shows a hole for a lost host. Slot names are
+reused lowest-first, so a stable fleet keeps stable names. The EC2 half is re-tiled in the
+same event and launches or terminates instances to match the new count.
 
 Within a host's life a slot keeps its address across relaunches, so a browser reconnects
 to the same address. Two fcvm changes make that possible:
@@ -243,11 +241,13 @@ dark until its first frame at the current `t`.
 occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
 detail view for 1080p.
 
-**The mosaic never changes shape.** The wall has a fixed number of tiles, set in the
-coordinator's configuration: `fcvm_tiles` on the left and `ec2_tiles` on the right
-(day to day 8 and 8, one g4dn.metal's worth; larger for the launch event). Each tile has a
-fixed rectangle. Spot capacity above that is a standby buffer, not more tiles; see "Slots
-and addressing".
+**The image is fixed; its tiling follows the fleet.** The picture is always the same
+frame of the same scene. The coordinator splits each half into as many rectangles as that
+half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
+(more pixels and more ray-marching steps per pixel in total). The EC2 half mirrors the
+fcvm half: the coordinator runs as many EC2 tiles as the fcvm side has GPUs, so both
+halves always have the same grid. Every viewer sees the same tiling, because the tiling
+is part of the shared state.
 
 ### Web
 
