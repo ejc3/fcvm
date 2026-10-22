@@ -103,6 +103,8 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             f.viewers.remove(viewer);
             f.last_word_at.remove(viewer);
             f.last_light_at.remove(viewer);
+            f.last_relaunch_at.remove(viewer);
+            f.last_relaunch_all_at.remove(viewer);
             None
         }
         Event::Tick { .. } => {
@@ -173,6 +175,13 @@ fn intent_effect(
             let (half, n) = state
                 .find_slot(tile)
                 .ok_or_else(|| format!("no GPU behind {tile}"))?;
+            rate(
+                &state.fleet.last_relaunch_at,
+                viewer,
+                at,
+                state.config.relaunch_interval_ms,
+                "relaunch",
+            )?;
             let f = &mut state.fleet;
             let slot = match half {
                 Half::Fcvm => f.slots.get_mut(&n),
@@ -183,10 +192,20 @@ fn intent_effect(
                 return Err(format!("{} is on a draining host", slot.id));
             }
             bump(slot, &by, at);
-            Ok(format!("relaunch {}", slot.id))
+            let summary = format!("relaunch {}", slot.id);
+            f.last_relaunch_at.insert(viewer.to_string(), at);
+            Ok(summary)
         }
         Intent::RelaunchAll => {
+            rate(
+                &state.fleet.last_relaunch_all_at,
+                viewer,
+                at,
+                state.config.relaunch_all_interval_ms,
+                "relaunch_all",
+            )?;
             let f = &mut state.fleet;
+            f.last_relaunch_all_at.insert(viewer.to_string(), at);
             let mut fcvm_pending = std::collections::BTreeMap::new();
             let mut ec2_pending = std::collections::BTreeMap::new();
             let hosts = f.hosts.clone();
@@ -256,7 +275,7 @@ fn intent_effect(
         }
         Intent::TimeOfDay { v } => {
             state.fleet.scene.time_of_day = *v;
-            Ok(format!("time of day {v:.1} h"))
+            Ok(format!("time of day {v:.3}"))
         }
         Intent::Word { text } => {
             word_rate(state, viewer, at)?;
@@ -301,6 +320,23 @@ fn intent_effect(
             }
             Ok("light".into())
         }
+    }
+}
+
+/// Refuse when `viewer`'s last committed intent of this kind is less than `interval_ms` old.
+fn rate(
+    last: &std::collections::BTreeMap<String, u64>,
+    viewer: &str,
+    at: u64,
+    interval_ms: u64,
+    what: &str,
+) -> Result<(), String> {
+    match last.get(viewer) {
+        Some(&t) if at < t + interval_ms => Err(format!(
+            "one {what} per {} s per viewer",
+            interval_ms.div_ceil(1000)
+        )),
+        _ => Ok(()),
     }
 }
 

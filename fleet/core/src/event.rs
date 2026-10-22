@@ -214,8 +214,8 @@ impl Intent {
             }
             "time_of_day" => {
                 let v = num(args, "v")?;
-                if !(0.0..24.0).contains(&v) {
-                    return Err("args.v must be hours in [0, 24)".into());
+                if !(0.0..=1.0).contains(&v) {
+                    return Err("args.v must be a fraction of the day in [0, 1]".into());
                 }
                 Ok(Intent::TimeOfDay { v })
             }

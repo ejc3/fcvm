@@ -213,6 +213,8 @@ async fn reconcile_starts_every_assigned_slot_and_reports_its_timings() {
             Some(format!("ws://gpu-host.example:{}/frames", f.base + i as u16).as_str())
         );
         for key in [
+            "renderer_gpu_ready_ms",
+            "renderer_first_frame_ms",
             "teardown_ms",
             "restore_ms",
             "ack_ms",

@@ -109,6 +109,11 @@ pub struct FleetCoordArgs {
     /// Where EC2 tiles come from
     #[arg(long, value_enum, default_value_t = FleetEc2::None)]
     pub ec2: FleetEc2,
+
+    /// A browser origin (scheme://host[:port]) allowed to open /live besides the
+    /// coordinator's own. Repeatable. Other cross-origin WebSockets are refused with 403.
+    #[arg(long = "allowed-origin")]
+    pub allowed_origins: Vec<String>,
 }
 
 #[derive(Args, Debug)]

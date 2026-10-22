@@ -16,9 +16,10 @@ Conventions:
   width, `y` and `h` of its height, origin top left. The fcvm half is `x` in [0, 0.5), the
   EC2 half `x` in [0.5, 1). `image_aspect` is the whole image's width / height (default
   32/9, two 16:9 halves).
-- Camera `pos` is the camera position and `look` the world point it looks at, in renderer
-  world units; `fov_deg` is the vertical field of view. `time_of_day` is hours in [0, 24).
-  Light `color` is linear RGB in [0, 1].
+- Camera `pos` is the camera position and `look` the world point it looks at, as
+  `[x, altitude, z]` in kilometres (the renderer's world units); `fov_deg` is the vertical
+  field of view. `time_of_day` is a fraction of the day in [0, 1] (0.25 sunrise, 0.5 noon,
+  0.75 sunset). Light `color` is linear RGB in [0, 1].
 
 ## Coordinator
 
@@ -76,12 +77,12 @@ Intents:
 
 | name | args | effect |
 |------|------|--------|
-| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile or a draining host |
-| `relaunch_all` | `{}` | bumps every slot's generation in one event (draining hosts excepted) and starts `relaunch_all` |
+| `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, or a second relaunch from the viewer within 2 s |
+| `relaunch_all` | `{}` | bumps every slot's generation in one event (draining hosts excepted) and starts `relaunch_all`; one per viewer per 30 s |
 | `set_auto_relaunch` | `{"secs": 60}` or `{"secs": null}` | shared interval; on each tick a slot whose last relaunch (or creation) is that old is relaunched. 10 to 86400 s |
 | `camera` | `{"keyframes": [{"t", "pos", "look", "fov_deg"}, ...]}` | replaces the path (1 to 64 keyframes, in time order, fov 10 to 120) |
 | `camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns the current camera by yaw (about world up) and pitch, moves it `dive` units along its view, easing over 0.3 s |
-| `time_of_day` | `{"v": 18.5}` | hours in [0, 24) |
+| `time_of_day` | `{"v": 0.3}` | a fraction of the day in [0, 1] |
 | `word` | `{"text": "hello"}` | 1 to 24 characters after collapsing whitespace, no control characters, one per viewer per 5 s; checked by the text check first (below) |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per viewer per second; the scene keeps the latest 32 |
 
@@ -116,7 +117,7 @@ started without a text check (`--text-check none`) refuses it. The scene keeps t
   ],
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
             "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": []},
-  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 10.0, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
+  "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 3.5555555555555554,
   "settings": {"auto_relaunch_secs": null},
   "relaunch_all": {"started_at", "by", "fcvm_done_at", "ec2_done_at", "fcvm_last", "ec2_last", "fcvm_pending", "ec2_pending"},
@@ -148,8 +149,11 @@ started without a text check (`--text-check none`) refuses it. The scene keeps t
 ```
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
-                 [--max-tiles 100] [--ec2 none|fake]
+                 [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
 ```
+
+A viewer is one `/live` connection: the per-viewer limits (one word per 5 s, one light per
+second, one relaunch per 2 s, one relaunch_all per 30 s) count per connection.
 
 - `--agent-cmd` starts an agent as a child process and talks to it over its stdin and
   stdout: `fcvm fleet agent --stdio ...` locally, `ssh <host> fcvm fleet agent --stdio ...`
@@ -157,9 +161,15 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   slots leave the tiling in that event) and restarted after a backoff of 1 s doubling to
   30 s.
 - `--state-file` keeps the state as JSON, rewritten atomically (temporary file, fsync,
-  rename) at most once a second while it changes; a restarted coordinator resumes its version, settings, scene,
+  rename) at most once a second while it changes, and once more on shutdown; a restarted
+  coordinator resumes its version, settings, scene,
   receipts and action log from it. Hosts and slots are rebuilt as agents say hello.
 - `GET /healthz` answers `ok`.
+- `/live` refuses a cross-origin browser with `403`: a request whose `Origin` is neither
+  the coordinator's own (`Origin` naming the request's `Host`) nor one given with
+  `--allowed-origin`. A request without `Origin` (not a browser) is served.
+- SIGTERM or SIGINT stops the coordinator after it has written the last state to
+  `--state-file`; its agents' commands then end, and their VMs with them.
 
 ## Agent
 
@@ -207,7 +217,11 @@ first frame), and `failed` (`error` says why; the agent retries with backoff).
 | `ack_ms` | fcvm's own restore clock (the record's `ack_ms`): restore call to the guest's ACK |
 | `gpu_ms` | the guest's GPU attach (the record's `guest_phases.gpu_ms`) |
 | `container_ms` | the `restored` record | the renderer's `GET /health` first answers |
-| `first_frame_ms` | `/health` first answers (the scene is posted then) | `/health` reports a frame: its `t` (the scene time of the latest frame) is a number |
+| `first_frame_ms` | `/health` first answers (the scene is posted then) | `/health` reports a frame drawn after the scene was posted: `ready` is not false and `frame` is above its value in the reply read just before the post (for a renderer without `frame`, a numeric `t`) |
+| `renderer_gpu_ready_ms` | the renderer process starts | CUDA is ready (`/health` `startup_ms.gpu_ready`) |
+| `renderer_first_frame_ms` | the renderer process starts | its first frame is drawn (`startup_ms.first_frame_drawn`) |
+
+A `/health` reply carrying `error` (the renderer failed) fails the relaunch at once.
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 ```json
@@ -248,7 +262,7 @@ changes. For each slot the agent reconciles:
 
 ```json
 {"type": "scene", "epoch_unix_ms": 1761134400000, "image_aspect": 3.5555555555555554,
- "camera": [{"t": 0, "pos": [0, 2, 0], "look": [0, 1.5, -10], "fov_deg": 60}], "time_of_day": 10,
+ "camera": [{"t": 0, "pos": [-32, 1.9, -55], "look": [-60, 1.9, -100], "fov_deg": 62}], "time_of_day": 0.3,
  "words": [{"text": "hello", "t": 12.5}], "lights": [{"pos": [1, 2, 3], "color": [1, 0.5, 0], "t": 14.0}]}
 ```
 

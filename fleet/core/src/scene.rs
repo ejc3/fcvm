@@ -4,7 +4,8 @@
 use serde::{Deserialize, Serialize};
 
 /// One point on the camera path. `pos` is the camera position and `look` the world point it
-/// looks at, both in renderer world units; `t` is scene seconds.
+/// looks at, `[x, altitude, z]` in kilometres (the renderer's world units); `t` is scene
+/// seconds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     pub t: f64,
@@ -32,7 +33,7 @@ pub struct Light {
 pub struct Scene {
     pub epoch_unix_ms: u64,
     pub camera: Vec<Keyframe>,
-    /// Hours, [0, 24).
+    /// Fraction of the day in [0, 1]: 0.25 sunrise, 0.5 noon, 0.75 sunset.
     pub time_of_day: f64,
     pub words: Vec<Word>,
     pub lights: Vec<Light>,
@@ -56,11 +57,11 @@ impl Scene {
             epoch_unix_ms,
             camera: vec![Keyframe {
                 t: 0.0,
-                pos: [0.0, 2.0, 0.0],
-                look: [0.0, 1.5, -10.0],
-                fov_deg: 60.0,
+                pos: [-32.0, 1.9, -55.0],
+                look: [-60.0, 1.9, -100.0],
+                fov_deg: 62.0,
             }],
-            time_of_day: 10.0,
+            time_of_day: 0.30,
             words: Vec::new(),
             lights: Vec::new(),
         }

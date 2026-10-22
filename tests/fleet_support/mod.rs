@@ -36,6 +36,7 @@ pub fn consecutive_listeners(count: usize) -> (u16, Vec<std::net::TcpListener>) 
 
 #[derive(Clone)]
 struct Renderer {
+    frames: Arc<std::sync::atomic::AtomicU64>,
     marker: PathBuf,
     scenes: Arc<Mutex<Vec<serde_json::Value>>>,
 }
@@ -50,6 +51,7 @@ pub fn start_renderers(dir: &Path, base: u16, listeners: Vec<std::net::TcpListen
     for (i, l) in listeners.into_iter().enumerate() {
         l.set_nonblocking(true).unwrap();
         let state = Renderer {
+            frames: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             marker: dir.join(format!("port-{}.up", base + i as u16)),
             scenes: Arc::new(Mutex::new(Vec::new())),
         };
@@ -68,9 +70,13 @@ async fn health(State(r): State<Renderer>) -> Result<Json<serde_json::Value>, St
     if !r.marker.exists() {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
-    Ok(Json(
-        serde_json::json!({"fps": 30.0, "t": 1.5, "gpu": {"name": "fake", "temp_c": 40}}),
-    ))
+    // Like the fleet renderer: a frame counter that moves while it is up.
+    let frame = r.frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Ok(Json(serde_json::json!({
+        "fps": 30.0, "t": 1.5, "frame": frame, "ready": true,
+        "gpu": {"name": "fake", "temp_c": 40},
+        "startup_ms": {"gpu_ready": 1500, "first_frame_drawn": 1600, "first_frame_sent": -1}
+    })))
 }
 
 async fn scene(State(r): State<Renderer>, Json(body): Json<serde_json::Value>) -> StatusCode {

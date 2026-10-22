@@ -147,9 +147,22 @@ impl SlotCtx {
     }
 }
 
-/// A renderer has drawn a frame once its `/health` carries the frame's scene time `t`.
-pub fn has_frame(health: &serde_json::Value) -> bool {
-    health.get("t").is_some_and(|t| t.is_number())
+/// Has the renderer drawn a frame since `baseline`, the frame counter in the `/health` reply
+/// read just before the scene was posted? A reply with `ready: false` has not. A renderer
+/// without a frame counter has drawn once its reply carries a scene time `t`.
+pub fn has_frame(health: &serde_json::Value, baseline: Option<u64>) -> bool {
+    if health.get("ready").and_then(|r| r.as_bool()) == Some(false) {
+        return false;
+    }
+    match (health.get("frame").and_then(|f| f.as_u64()), baseline) {
+        (Some(f), Some(b)) => f > b,
+        (Some(_), None) => false,
+        (None, _) => health.get("t").is_some_and(|t| t.is_number()),
+    }
+}
+
+fn frame_counter(health: &serde_json::Value) -> Option<u64> {
+    health.get("frame").and_then(|f| f.as_u64())
 }
 
 /// The body to post for `rect`, marking the scene read.
@@ -356,6 +369,7 @@ async fn relaunch(
     let mut poll = tokio::time::interval(Duration::from_millis(100));
     let mut starting_at: Option<Instant> = None;
     let mut health_at: Option<Instant> = None;
+    let mut baseline: Option<u64> = None;
     let mut posted: Option<RendererScene> = None;
     let fail = |vm: &Vm, why: String| Failure::Failed(format!("{why}; fcvm said: {}", vm.tail()));
 
@@ -374,6 +388,11 @@ async fn relaunch(
             }
             _ = poll.tick() => {
                 let Some(h) = ctx.health().await else { continue };
+                if let Some(e) = h.get("error").and_then(|e| e.as_str()) {
+                    let e = fail(&vm, format!("the renderer failed: {e}"));
+                    vm.stop(ctx.cfg.stop_grace).await;
+                    return Err(e);
+                }
                 if health_at.is_none() {
                     let now = Instant::now();
                     health_at = Some(now);
@@ -392,8 +411,24 @@ async fn relaunch(
                         continue;
                     }
                     posted = Some(body);
+                    // Frames counted from here were drawn with this scene.
+                    baseline = frame_counter(&h);
+                    continue;
                 }
-                if has_frame(&h) {
+                if baseline.is_none() {
+                    baseline = frame_counter(&h);
+                    if baseline.is_some() {
+                        continue;
+                    }
+                }
+                if has_frame(&h, baseline) {
+                    let startup = |k: &str| h.pointer(&format!("/startup_ms/{k}")).and_then(|v| v.as_f64()).filter(|v| *v >= 0.0);
+                    if let Some(v) = startup("gpu_ready") {
+                        timings.insert("renderer_gpu_ready_ms".into(), v as u64);
+                    }
+                    if let Some(v) = startup("first_frame_drawn") {
+                        timings.insert("renderer_first_frame_ms".into(), v as u64);
+                    }
                     break Instant::now();
                 }
             }
@@ -439,10 +474,26 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_is_a_health_reply_with_a_scene_time() {
-        assert!(has_frame(&serde_json::json!({"fps": 30, "t": 12.5})));
-        assert!(!has_frame(&serde_json::json!({"fps": 0, "t": null})));
-        assert!(!has_frame(&serde_json::json!({"fps": 0})));
+    fn a_frame_is_a_counter_past_the_baseline_or_a_scene_time() {
+        use serde_json::json;
+        // The fleet renderer: a frame counter that moved past the baseline, and ready.
+        assert!(has_frame(
+            &json!({"t": 1.0, "frame": 8, "ready": true}),
+            Some(7)
+        ));
+        assert!(!has_frame(
+            &json!({"t": 1.0, "frame": 7, "ready": true}),
+            Some(7)
+        ));
+        assert!(!has_frame(
+            &json!({"t": 0.0, "frame": 9, "ready": false}),
+            Some(7)
+        ));
+        assert!(!has_frame(&json!({"t": 1.0, "frame": 9}), None));
+        // A renderer without a counter: a scene time is a frame.
+        assert!(has_frame(&json!({"fps": 30, "t": 12.5}), None));
+        assert!(!has_frame(&json!({"fps": 0, "t": null}), None));
+        assert!(!has_frame(&json!({"fps": 0}), None));
     }
 
     #[test]

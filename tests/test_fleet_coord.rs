@@ -3,11 +3,11 @@
 //! connection driven by browser intents.
 
 use fcvm::fleet::coord::text_check::{FakeCheck, TextChecker};
-use fcvm::fleet::coord::{agents, live, start, Handle};
+use fcvm::fleet::coord::{agents, live, start, store, Handle};
 use fcvm::fleet::lines::{spawn_writer, LineReader};
 use fleet_core::protocol::{AgentMsg, CoordMsg, SlotReport};
 use fleet_core::state::Gpu;
-use fleet_core::{Config, State};
+use fleet_core::{Config, Event, State};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -23,7 +23,11 @@ async fn coordinator(checker: Arc<dyn TextChecker>) -> (String, Handle) {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/live", listener.local_addr().unwrap());
     let h = handle.clone();
-    tokio::spawn(async move { live::serve(listener, h, checker).await.unwrap() });
+    tokio::spawn(async move {
+        live::serve(listener, h, checker, vec!["https://wall.example".into()])
+            .await
+            .unwrap()
+    });
     (url, handle)
 }
 
@@ -134,7 +138,7 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
         assert!(first["state"].get(key).is_some(), "snapshot lacks {key}");
     }
     let mut last = 0;
-    for (i, v) in [3.0, 6.5, 12.0].iter().enumerate() {
+    for (i, v) in [0.125, 0.25, 0.5].iter().enumerate() {
         let id = format!("t-{i}");
         a.intent(&id, "time_of_day", json!({"v": v})).await;
         let r = a.receipt(&id).await;
@@ -153,10 +157,13 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
         "snapshot versions went back: {:?}",
         a.order
     );
-    a.intent("bad-1", "time_of_day", json!({"v": 30})).await;
+    a.intent("bad-1", "time_of_day", json!({"v": 1.5})).await;
     let r = a.receipt("bad-1").await;
     assert_eq!(r["outcome"], "refused");
-    assert_eq!(r["reason"], "args.v must be hours in [0, 24)");
+    assert_eq!(
+        r["reason"],
+        "args.v must be a fraction of the day in [0, 1]"
+    );
 }
 
 #[tokio::test]
@@ -164,11 +171,11 @@ async fn a_repeated_intent_id_returns_its_first_receipt_and_applies_once() {
     let (url, _h) = coordinator(allow_all()).await;
     let mut a = Viewer::connect(&url).await;
     a.recv().await;
-    a.intent("same", "time_of_day", json!({"v": 4.0})).await;
+    a.intent("same", "time_of_day", json!({"v": 0.25})).await;
     let first = a.receipt("same").await;
     // The retry carries a different value; it must change nothing.
-    a.intent("same", "time_of_day", json!({"v": 9.0})).await;
-    a.intent("marker", "time_of_day", json!({"v": 4.5})).await;
+    a.intent("same", "time_of_day", json!({"v": 0.75})).await;
+    a.intent("marker", "time_of_day", json!({"v": 0.375})).await;
     let marker = a.receipt("marker").await;
     let repeats: Vec<&Value> = a.receipts.iter().filter(|r| r["id"] == "same").collect();
     assert_eq!(repeats.len(), 2);
@@ -192,7 +199,8 @@ async fn a_repeated_intent_id_returns_its_first_receipt_and_applies_once() {
     a.intent("w", "word", json!({"text": "hello"})).await;
     let w1 = a.receipt("w").await;
     a.intent("w", "word", json!({"text": "hello"})).await;
-    a.intent("marker2", "time_of_day", json!({"v": 5.0})).await;
+    a.intent("marker2", "time_of_day", json!({"v": 0.625}))
+        .await;
     a.receipt("marker2").await;
     let ws: Vec<&Value> = a.receipts.iter().filter(|r| r["id"] == "w").collect();
     assert_eq!(ws.len(), 2);
@@ -213,7 +221,8 @@ async fn two_viewers_see_the_same_state_at_every_version_both_saw() {
         } else {
             (&mut b, format!("b-{i}"))
         };
-        who.intent(&id, "time_of_day", json!({"v": i as f64})).await;
+        who.intent(&id, "time_of_day", json!({"v": i as f64 / 32.0}))
+            .await;
         who.intent(
             &format!("{id}-l"),
             "camera",
@@ -240,7 +249,7 @@ async fn two_viewers_see_the_same_state_at_every_version_both_saw() {
     assert_eq!(va, vb);
     assert_eq!(sa, sb);
     assert_eq!(sa["viewers"]["count"], 2);
-    assert_eq!(sa["scene"]["time_of_day"], 19.0);
+    assert_eq!(sa["scene"]["time_of_day"], 19.0 / 32.0);
     for v in [&a, &b] {
         assert!(v.order.windows(2).all(|w| w[0] < w[1]), "{:?}", v.order);
     }
@@ -451,4 +460,81 @@ async fn browser_intents_reach_the_agent_as_assignments() {
         }
         v.recv().await;
     }
+}
+
+/// A cross-origin browser is refused unless its origin is configured; same-origin pages
+/// and clients that send no Origin (not browsers) are served.
+#[tokio::test]
+async fn live_refuses_origins_it_was_not_given() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let (url, _h) = coordinator(allow_all()).await;
+    let host = url
+        .trim_start_matches("ws://")
+        .trim_end_matches("/live")
+        .to_string();
+    let with_origin = |o: &str| {
+        let mut r = url.as_str().into_client_request().unwrap();
+        r.headers_mut().insert("origin", o.parse().unwrap());
+        r
+    };
+    match tokio_tungstenite::connect_async(with_origin("https://evil.example")).await {
+        Err(tokio_tungstenite::tungstenite::Error::Http(resp)) => {
+            assert_eq!(resp.status(), 403)
+        }
+        Err(e) => panic!("a foreign origin must get 403, got {e}"),
+        Ok(_) => panic!("a foreign origin must get 403, got a socket"),
+    }
+    let tricky =
+        tokio_tungstenite::connect_async(with_origin(&format!("http://{host}.evil.example"))).await;
+    assert!(tricky.is_err(), "a look-alike origin must be refused");
+    for ok in ["https://wall.example".to_string(), format!("http://{host}")] {
+        let (mut ws, _) = tokio_tungstenite::connect_async(with_origin(&ok))
+            .await
+            .unwrap_or_else(|e| panic!("{ok} must be allowed: {e}"));
+        let first = ws.next().await.unwrap().unwrap();
+        assert!(first.to_text().unwrap().contains("snapshot"));
+    }
+    let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
+        .await
+        .unwrap();
+    assert!(ws.next().await.unwrap().is_ok());
+}
+
+/// Stopping the coordinator writes the newest state, even when it changed less than a
+/// write interval (1 s) ago.
+#[tokio::test]
+async fn shutdown_writes_the_last_state_to_the_state_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("fleet.json");
+    let (handle, actor) = start(
+        State::new(Config::default(), 1_000),
+        Some(store::spawn_writer(path.clone())),
+        None,
+    );
+    let mut last = 0;
+    for i in 0..5 {
+        let r = handle
+            .apply(Event::Intent {
+                at: 0,
+                viewer: "v-1".into(),
+                id: format!("t-{i}"),
+                name: "time_of_day".into(),
+                args: json!({"v": 0.1 * i as f64}),
+                check: None,
+            })
+            .await
+            .unwrap();
+        last = r.version;
+    }
+    handle.shutdown().await;
+    let saved = store::load(&path).unwrap().expect("a state file");
+    assert_eq!(
+        saved.version, last,
+        "the state file misses the last changes"
+    );
+    assert!(saved.receipts.contains_key("t-4"));
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
 }

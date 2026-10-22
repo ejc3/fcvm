@@ -21,6 +21,10 @@ pub struct Config {
     pub word_interval_ms: u64,
     /// Minimum milliseconds between two lights from one viewer.
     pub light_interval_ms: u64,
+    /// Minimum milliseconds between two committed `relaunch` intents from one viewer.
+    pub relaunch_interval_ms: u64,
+    /// Minimum milliseconds between two committed `relaunch_all` intents from one viewer.
+    pub relaunch_all_interval_ms: u64,
     /// Bounds on `set_auto_relaunch`.
     pub auto_relaunch_min_secs: u64,
     pub auto_relaunch_max_secs: u64,
@@ -35,6 +39,8 @@ impl Default for Config {
             ec2_max: 0,
             word_interval_ms: 5_000,
             light_interval_ms: 1_000,
+            relaunch_interval_ms: 2_000,
+            relaunch_all_interval_ms: 30_000,
             auto_relaunch_min_secs: 10,
             auto_relaunch_max_secs: 86_400,
         }
@@ -185,6 +191,8 @@ pub struct Fleet {
     /// Per viewer, the time of its last accepted word and light.
     pub last_word_at: BTreeMap<String, u64>,
     pub last_light_at: BTreeMap<String, u64>,
+    pub last_relaunch_at: BTreeMap<String, u64>,
+    pub last_relaunch_all_at: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -213,6 +221,8 @@ impl State {
                 actions: VecDeque::new(),
                 last_word_at: BTreeMap::new(),
                 last_light_at: BTreeMap::new(),
+                last_relaunch_at: BTreeMap::new(),
+                last_relaunch_all_at: BTreeMap::new(),
             },
             receipts: BTreeMap::new(),
             receipt_order: VecDeque::new(),
@@ -233,6 +243,8 @@ impl State {
         f.viewers.clear();
         f.last_word_at.clear();
         f.last_light_at.clear();
+        f.last_relaunch_at.clear();
+        f.last_relaunch_all_at.clear();
         self.version += 1;
         self
     }

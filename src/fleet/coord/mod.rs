@@ -65,6 +65,10 @@ pub enum Cmd {
     AgentClosed {
         conn: u64,
     },
+    /// Stop: publish the last snapshot, write the state file, then answer.
+    Shutdown {
+        ack: oneshot::Sender<()>,
+    },
 }
 
 struct AgentConn {
@@ -78,7 +82,7 @@ struct AgentConn {
 pub struct Outputs {
     pub snapshot: watch::Sender<Arc<Snapshot>>,
     pub ec2: watch::Sender<Vec<AssignSlot>>,
-    pub store: Option<watch::Sender<Arc<Vec<u8>>>>,
+    pub store: Option<store::StoreTx>,
 }
 
 /// Minimum time between two browser snapshots; versions in between are skipped.
@@ -176,19 +180,32 @@ impl Actor {
         }
     }
 
-    fn store(&mut self) {
+    /// Queue the state for the writer if it changed; the returned receiver resolves once it
+    /// is on disk (at once when nothing needed writing).
+    fn store(&mut self) -> oneshot::Receiver<()> {
+        let (ack, done) = oneshot::channel();
+        let Some(tx) = &self.out.store else {
+            let _ = ack.send(());
+            return done;
+        };
         if self.state.version == self.stored {
-            return;
+            let _ = ack.send(());
+            return done;
         }
-        if let Some(tx) = &self.out.store {
-            match serde_json::to_vec(&self.state) {
-                Ok(bytes) => {
-                    tx.send_replace(Arc::new(bytes));
-                    self.stored = self.state.version;
-                }
-                Err(e) => tracing::error!(error = %e, "cannot serialize the state"),
+        match serde_json::to_vec(&self.state) {
+            Ok(bytes) => {
+                let _ = tx.send(store::StoreCmd {
+                    bytes: Arc::new(bytes),
+                    ack: Some(ack),
+                });
+                self.stored = self.state.version;
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "cannot serialize the state");
+                let _ = ack.send(());
             }
         }
+        done
     }
 
     pub fn handle(&mut self, cmd: Cmd) {
@@ -255,6 +272,10 @@ impl Actor {
                 };
                 self.apply(Event::Agent { at: 0, host, msg });
             }
+            Cmd::Shutdown { ack } => {
+                // `run` handles shutdown; a direct call only acknowledges.
+                let _ = ack.send(());
+            }
             Cmd::AgentClosed { conn } => {
                 if let Some(a) = self.agents.remove(&conn) {
                     tracing::info!(host = %a.host, "agent gone");
@@ -273,18 +294,25 @@ impl Actor {
         snap_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut store_tick = tokio::time::interval(STORE_INTERVAL);
         store_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
+        let ack = loop {
             tokio::select! {
                 cmd = rx.recv() => match cmd {
+                    Some(Cmd::Shutdown { ack }) => break Some(ack),
                     Some(c) => self.handle(c),
-                    None => break,
+                    None => break None,
                 },
                 _ = snap_tick.tick() => self.publish(),
-                _ = store_tick.tick() => self.store(),
+                _ = store_tick.tick() => {
+                    drop(self.store());
+                }
             }
-        }
+        };
         self.publish();
-        self.store();
+        let written = self.store();
+        let _ = written.await;
+        if let Some(ack) = ack {
+            let _ = ack.send(());
+        }
     }
 }
 
@@ -318,6 +346,14 @@ impl Handle {
             .await
             .ok()?;
         rx.await.ok().flatten()
+    }
+
+    /// Stop the actor; returns once the last state is on disk.
+    pub async fn shutdown(&self) {
+        let (ack, done) = oneshot::channel();
+        if self.cmds.send(Cmd::Shutdown { ack }).await.is_ok() {
+            let _ = done.await;
+        }
     }
 
     pub async fn send(&self, event: Event) {
@@ -354,7 +390,7 @@ impl Handle {
 /// use and the actor task.
 pub fn start(
     state: State,
-    store: Option<watch::Sender<Arc<Vec<u8>>>>,
+    store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
@@ -434,9 +470,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
                 }
                 None => State::new(config, now_ms()),
             };
-            let (tx, rx) = watch::channel(Arc::new(Vec::new()));
-            tokio::spawn(store::writer(path.clone(), rx));
-            (state, Some(tx))
+            (state, Some(store::spawn_writer(path.clone())))
         }
         None => (State::new(config, now_ms()), None),
     };
@@ -461,5 +495,17 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         .with_context(|| format!("listening on {}", args.listen))?;
     tracing::info!(listen = %args.listen, "coordinator serving /live");
     eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
-    live::serve(listener, handle, checker).await
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    let origins = args.allowed_origins;
+    tokio::select! {
+        r = live::serve(listener, handle.clone(), checker, origins) => r?,
+        _ = term.recv() => tracing::info!("SIGTERM"),
+        _ = int.recv() => tracing::info!("SIGINT"),
+    }
+    // The state file holds the last state before the process exits; the agents' commands
+    // are killed when their handles drop, and their VMs follow them (PR_SET_PDEATHSIG).
+    handle.shutdown().await;
+    tracing::info!("coordinator stopped; state written");
+    Ok(())
 }

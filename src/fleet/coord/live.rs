@@ -11,7 +11,8 @@ use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{State, WebSocketUpgrade};
-use axum::response::IntoResponse;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use fleet_core::protocol::{ClientMsg, ServerMsg};
@@ -31,16 +32,23 @@ const DIRECT_QUEUE: usize = 256;
 pub struct App {
     pub handle: Handle,
     pub checker: Arc<dyn TextChecker>,
+    /// Browser origins allowed besides the coordinator's own.
+    pub allowed_origins: Arc<Vec<String>>,
     next_viewer: Arc<AtomicU64>,
 }
 
-pub fn router(handle: Handle, checker: Arc<dyn TextChecker>) -> Router {
+pub fn router(
+    handle: Handle,
+    checker: Arc<dyn TextChecker>,
+    allowed_origins: Vec<String>,
+) -> Router {
     Router::new()
         .route("/live", get(live))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(App {
             handle,
             checker,
+            allowed_origins: Arc::new(allowed_origins),
             next_viewer: Arc::new(AtomicU64::new(1)),
         })
 }
@@ -49,14 +57,43 @@ pub async fn serve(
     listener: tokio::net::TcpListener,
     handle: Handle,
     checker: Arc<dyn TextChecker>,
+    allowed_origins: Vec<String>,
 ) -> Result<()> {
-    axum::serve(listener, router(handle, checker)).await?;
+    axum::serve(listener, router(handle, checker, allowed_origins)).await?;
     Ok(())
 }
 
-async fn live(ws: WebSocketUpgrade, State(app): State<App>) -> impl IntoResponse {
+async fn live(ws: WebSocketUpgrade, headers: HeaderMap, State(app): State<App>) -> Response {
+    let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
+    if !origin_allowed(origin, host, &app.allowed_origins) {
+        tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
+        return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
+    }
     ws.max_message_size(MAX_CLIENT_MESSAGE)
         .on_upgrade(move |socket| viewer(socket, app))
+        .into_response()
+}
+
+/// A browser always sends `Origin` on a WebSocket; a page on another site must not be able
+/// to drive the wall from its visitors' browsers. Allowed: no `Origin` (not a browser), an
+/// origin on the configured list, or the coordinator's own (`Origin` names the `Host` the
+/// request was sent to).
+pub fn origin_allowed(origin: Option<&str>, host: Option<&str>, allowed: &[String]) -> bool {
+    let Some(origin) = origin else {
+        return true;
+    };
+    let origin = origin.trim_end_matches('/');
+    if allowed
+        .iter()
+        .any(|a| a.trim_end_matches('/').eq_ignore_ascii_case(origin))
+    {
+        return true;
+    }
+    let authority = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"));
+    matches!((authority, host), (Some(a), Some(h)) if a.eq_ignore_ascii_case(h))
 }
 
 fn text(msg: &ServerMsg) -> String {
@@ -236,4 +273,42 @@ async fn word(
         })
         .await
         .map(|r| ServerMsg::receipt(&r))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::origin_allowed;
+
+    #[test]
+    fn only_listed_or_own_origins_pass() {
+        let allowed = vec!["https://wall.example".to_string()];
+        assert!(origin_allowed(None, Some("coord:1"), &allowed));
+        assert!(origin_allowed(
+            Some("https://wall.example"),
+            Some("coord:1"),
+            &allowed
+        ));
+        assert!(origin_allowed(
+            Some("https://WALL.example/"),
+            Some("coord:1"),
+            &allowed
+        ));
+        assert!(origin_allowed(
+            Some("http://coord:1"),
+            Some("coord:1"),
+            &allowed
+        ));
+        assert!(!origin_allowed(
+            Some("https://evil.example"),
+            Some("coord:1"),
+            &allowed
+        ));
+        assert!(!origin_allowed(
+            Some("http://coord:1.evil.example"),
+            Some("coord:1"),
+            &allowed
+        ));
+        assert!(!origin_allowed(Some("null"), Some("coord:1"), &allowed));
+        assert!(!origin_allowed(Some("http://coord:1"), None, &[]));
+    }
 }

@@ -3,7 +3,7 @@
   "events": [
     {
       "args": {
-        "v": 25
+        "v": 1.5
       },
       "at": 1000,
       "id": "t1",
@@ -13,7 +13,7 @@
     },
     {
       "args": {
-        "v": 18.5
+        "v": 0.75
       },
       "at": 1100,
       "id": "t2",
@@ -130,13 +130,13 @@
     {
       "after": 0,
       "checks": {
-        "/receipts/t1/reason": "args.v must be hours in [0, 24)"
+        "/receipts/t1/reason": "args.v must be a fraction of the day in [0, 1]"
       }
     },
     {
       "after": 1,
       "checks": {
-        "/view/scene/time_of_day": 18.5
+        "/view/scene/time_of_day": 0.75
       }
     },
     {
@@ -190,14 +190,14 @@
         "by": "v1",
         "name": "time_of_day",
         "outcome": "refused",
-        "summary": "args.v must be hours in [0, 24)"
+        "summary": "args.v must be a fraction of the day in [0, 1]"
       },
       {
         "at": 1100,
         "by": "v1",
         "name": "time_of_day",
         "outcome": "committed",
-        "summary": "time of day 18.5 h"
+        "summary": "time of day 0.750"
       },
       {
         "at": 1200,
@@ -307,7 +307,7 @@
           "t": 1.2
         }
       ],
-      "time_of_day": 18.5,
+      "time_of_day": 0.75,
       "words": []
     },
     "settings": {

@@ -6,7 +6,7 @@ use fleet_core::State;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::watch;
+use tokio::sync::{mpsc, oneshot};
 
 pub fn load(path: &Path) -> Result<Option<State>> {
     match std::fs::read(path) {
@@ -34,19 +34,41 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Write each new state the actor publishes. Only this task writes the file.
-pub async fn writer(path: PathBuf, mut rx: watch::Receiver<Arc<Vec<u8>>>) {
-    while rx.changed().await.is_ok() {
-        let bytes = rx.borrow_and_update().clone();
-        let p = path.clone();
-        match tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::error!(path = %path.display(), error = %format!("{e:#}"), "state file not written")
+/// One state to write; `ack` is answered once that write (and every earlier one) is done.
+pub struct StoreCmd {
+    pub bytes: Arc<Vec<u8>>,
+    pub ack: Option<oneshot::Sender<()>>,
+}
+
+pub type StoreTx = mpsc::UnboundedSender<StoreCmd>;
+
+/// Start the one task that writes `path`. States are written in the order sent; when
+/// several are queued only the newest is written, and every ack among them is answered
+/// after that write.
+pub fn spawn_writer(path: PathBuf) -> StoreTx {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StoreCmd>();
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut bytes = first.bytes;
+            let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
+            while let Ok(more) = rx.try_recv() {
+                bytes = more.bytes;
+                acks.extend(more.ack);
             }
-            Err(e) => tracing::error!(error = %e, "state writer panicked"),
+            let p = path.clone();
+            match tokio::task::spawn_blocking(move || write_atomic(&p, &bytes)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::error!(path = %path.display(), error = %format!("{e:#}"), "state file not written")
+                }
+                Err(e) => tracing::error!(error = %e, "state writer panicked"),
+            }
+            for a in acks {
+                let _ = a.send(());
+            }
         }
-    }
+    });
+    tx
 }
 
 #[cfg(test)]
