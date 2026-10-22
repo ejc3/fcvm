@@ -1,6 +1,7 @@
 #include "nvenc.h"
 
 #include <dlfcn.h>
+#include <stdlib.h>
 
 #include <cstdio>
 #include <cstring>
@@ -136,12 +137,13 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
   cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
   cfg.frameIntervalP = 1;  // no B-frames
-  // About 0.3 bits per pixel at 30 fps: each tile is encoded on its own, and
-  // coding error at a tile's border shows as a seam against its neighbour, so
-  // tiles get more bits than one image of their size would. The VBV holds half
+  // About 0.8 bits per pixel at 30 fps (ENC_BPP): each tile is encoded on its
+  // own, and coding error that differs on the two sides of a tile edge shows as
+  // a seam, so tiles get more bits than one image of their size would. The VBV holds half
   // a second, so the keyframe every 2 s can be several times a P-frame's size
   // instead of being squeezed into one frame's share (which smeared every keyframe).
-  double bpp = 0.3;
+  const char* bpp_env = getenv("ENC_BPP");
+  double bpp = bpp_env && atof(bpp_env) > 0 ? atof(bpp_env) : 0.8;
   uint32_t rate = (uint32_t)std::max(600000.0, std::min(20000000.0, (double)w * h * fps * bpp));
   cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   cfg.rcParams.averageBitRate = rate;

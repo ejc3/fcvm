@@ -93,12 +93,15 @@ dec = bytearray(W * H * 3)
 for (meta, _), (hdr, fr) in zip(tiles, streams):
     idx = [i for i, (m, _) in enumerate(fr) if m["t"] == T][0]
     img = fc.decode([a for _, a in fr[:idx + 1]], hdr["width"], hdr["height"])[idx]
-    for y in range(hdr["height"]):
+    c = hdr.get("crop", {"left": 0, "top": 0, "right": 0, "bottom": 0})  # the inner rectangle, as a page draws it
+    iw, ih = hdr["width"] - c["left"] - c["right"], hdr["height"] - c["top"] - c["bottom"]
+    for y in range(ih):
         Y = hdr["y0"] + y
         if Y >= H:
             continue
-        n = min(hdr["width"], W - hdr["x0"])
-        dec[(Y * W + hdr["x0"]) * 3:(Y * W + hdr["x0"] + n) * 3] = img[y * hdr["width"] * 3:(y * hdr["width"] + n) * 3]
+        n = min(iw, W - hdr["x0"])
+        row = (y + c["top"]) * hdr["width"] + c["left"]
+        dec[(Y * W + hdr["x0"]) * 3:(Y * W + hdr["x0"] + n) * 3] = img[row * 3:(row + n) * 3]
 open(out + "-decoded.ppm", "wb").write(b"P6\n%d %d\n255\n" % (W, H) + bytes(dec))
 s = dict(scene)
 s["rect"] = {"x": 0, "y": 0, "w": 1, "h": 1}

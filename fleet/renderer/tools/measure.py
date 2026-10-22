@@ -15,13 +15,18 @@ import fleetclient as fc
 host, port = sys.argv[1], int(sys.argv[2])
 secs = float(sys.argv[3]) if len(sys.argv) > 3 else 10
 heights = [int(h) for h in sys.argv[4:]] or [136, 180, 240, 360, 1080]
+# rows: (height, rect); a wall tile is 1/16 x 1/9 of a 16:9 image, the detail
+# view opens one tile at 1080, and 720 and 1080 are also drawn as the whole image
+tile_rect = {"x": 0.5, "y": 0.333, "w": 0.0625, "h": 1 / 9}
+whole_rect = {"x": 0, "y": 0, "w": 1, "h": 1}
+rows = [(h, tile_rect, "tile") for h in heights if h <= 400]
+rows += [(h, whole_rect, "whole") for h in heights if h > 400]
+rows += [(1080, tile_rect, "detail")] if 1080 in heights else []
 now = int(time.time() * 1000)
 cam = [{"t": float(i * 20), "pos": [-12 - 2.0 * i, 0.4 + 0.25 * i, -8 - 6.0 * i],
         "look": [-40 - 2.0 * i, 1.2, -80 - 6.0 * i], "fov_deg": 60.0} for i in range(400)]
-print("height,width,rect,frames,client_fps,spp,render_ms,encode_ms,gpu_util_pct,power_w")
-for h in heights:
-    # wall tiles are 1/16 x 1/9 of a 16:9 image; the detail view is the whole image
-    rect = {"x": 0.5, "y": 0.333, "w": 0.0625, "h": 1 / 9} if h <= 400 else {"x": 0, "y": 0, "w": 1, "h": 1}
+print("inner_height,inner_width,stream,rect,frames,client_fps,spp,render_ms,encode_ms,gpu_util_pct,power_w")
+for h, rect, kind in rows:
     fc.post_scene(host, port, {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
                                "time_of_day": 0.3, "words": [], "lights": []})
     st = fc.Stream(host, port, h)
@@ -48,5 +53,7 @@ for h in heights:
     fps = (len(got) - 1) / (got[-1] - got[0]) if len(got) > 1 else 0
     avg = lambda k: sum(s[k] for s in samples) / max(1, len(samples))
     gavg = lambda k: sum((s["gpu"][k] or 0) for s in samples) / max(1, len(samples))
-    print(f"{hdr['height']},{hdr['width']},{'tile' if h <= 400 else 'whole'},{len(got)},{fps:.1f},{avg('spp'):.1f},"
+    c = hdr.get("crop", {"left": 0, "top": 0, "right": 0, "bottom": 0})
+    iw, ih = hdr["width"] - c["left"] - c["right"], hdr["height"] - c["top"] - c["bottom"]
+    print(f"{ih},{iw},{hdr['width']}x{hdr['height']},{kind},{len(got)},{fps:.1f},{avg('spp'):.1f},"
           f"{avg('render_ms'):.1f},{avg('encode_ms'):.2f},{gavg('util_pct'):.0f},{gavg('power_w'):.0f}", flush=True)

@@ -37,13 +37,16 @@ struct Subscriber {
 struct Options {
   int port = 8080;
   int fps = 30;
-  double budget = 5.0e5;  // pixel-samples per frame (drawn pixels x samples)
+  double budget = 2.5e5;  // pixel-samples per frame (drawn pixels x samples)
   // Adjust the budget so a frame's GPU time fits its slot. Off by default:
   // with it, tiles of one image draw different sample counts, and moving
   // frames stop matching across tile edges.
   bool adapt = false;
   int idle_h = 144;
   bool accumulate = true;
+  // Pixels encoded past each side of the tile (inside the image); the client
+  // crops them, so no tile edge is an edge of an encoded picture.
+  int margin = 16;
 };
 
 class Pipeline {
@@ -70,7 +73,9 @@ class Pipeline {
     std::unique_ptr<H264Encoder> enc;
     void* nv12 = nullptr;
     size_t pitch = 0;
-    Tile geo{};
+    Tile geo{};           // the inner rectangle (the tile)
+    int left = 0, top = 0, right = 0, bottom = 0;  // overlap encoded around it
+    int ew = 0, eh = 0;   // encoded size
     double last_idr = -1e9;
     bool want_idr = true;
     std::vector<std::shared_ptr<Subscriber>> subs;

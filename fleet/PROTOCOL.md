@@ -94,14 +94,32 @@ field. A scene replaces the previous one whole.
 "Tile geometry". The first message is text:
 
 ```json
-{"codec":"avc1.64001f","width":480,"height":540,
- "full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30}
+{"codec":"avc1.64001f","width":512,"height":556,
+ "full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30,
+ "crop":{"left":16,"top":0,"right":16,"bottom":16}}
 ```
 
-`codec`, `width`, `height` are the contract. The renderer adds `full_width`,
-`full_height` (the whole image's pixel grid at this height), `x0`, `y0` (this
-tile's top-left pixel in that grid) and `fps`, so a client can place a tile
-exactly.
+`codec`, `width`, `height` are the contract: the size of the delivered
+(decoded) pictures. The renderer adds `full_width`, `full_height` (the whole
+image's pixel grid at this height), `x0`, `y0` (the tile's top-left pixel in
+that grid) and `fps`.
+
+**`crop` (addition, round 3).** Each picture is the tile plus an overlap of up
+to 16 pixels (`MARGIN`) on every side that lies inside the image (none past the image's
+own edges; one side is one pixel short where that keeps the size even). The
+client draws only the inner rectangle:
+
+```
+source x = crop.left,  y = crop.top,
+       w = width - crop.left - crop.right,  h = height - crop.top - crop.bottom
+destination (in the whole image grid) = (x0, y0), same w x h
+```
+
+The overlap pixels are the neighbours' pixels, drawn under the same rules, so
+the encoder codes each tile edge from both sides of it like any other pixels
+inside its picture; a tile edge is never an edge of an encoded picture, where
+H.264 neither deblocks nor predicts across. A client that ignores `crop` sees
+each tile 16 pixels too large on its inner sides.
 
 Then binary messages, each one access unit:
 
@@ -110,15 +128,15 @@ Then binary messages, each one access unit:
 | 0-3 | ASCII `FCVF` |
 | 4 | version, 1 |
 | 5 | flags: bit 0 keyframe |
-| 6-7 | width, u16 LE |
+| 6-7 | width, u16 LE (the delivered picture, overlap included) |
 | 8-9 | height, u16 LE |
 | 10-17 | `t`, f64 LE |
 | 18-21 | frame number, u32 LE (the renderer's own count; it skips numbers for frames a subscriber did not get) |
 | 22- | one H.264 Annex-B access unit; SPS and PPS precede every keyframe |
 
 - H.264 High profile, no B-frames, NVENC with ultra-low-latency tuning,
-  BT.709 limited range (signalled in the VUI). CBR at about 0.2 bits per pixel
-  at 30 fps, at least 0.6 Mbit/s.
+  BT.709 limited range (signalled in the VUI). CBR at about 0.8 bits per pixel
+  of the delivered picture at 30 fps (`ENC_BPP`), at least 0.6 Mbit/s.
 - The first binary message is a keyframe. Keyframes follow at least every 2 s.
 - The client may send text `{"h": <height>}`. The renderer then sends a new
   text header and continues from a keyframe at the new size.
@@ -126,9 +144,9 @@ Then binary messages, each one access unit:
   dropped and resumes at the next keyframe (which the renderer then forces).
 - **Minimum size:** NVENC's H.264 encoder on a T4 takes nothing narrower than
   145 px or shorter than 49 px. When the requested height gives a smaller
-  tile, the stream is the smallest larger even height that fits (a 1/16 x 1/9
-  rect of a 16:9 image asked at `h=136` streams at 146 x 146). The header
-  says the actual size; the client scales.
+  tile, the tile is drawn at the smallest larger even height that fits (a
+  1/16 x 1/9 rect of a 16:9 image asked at `h=136` has a 146 x 146 inner
+  rectangle). The header says the actual sizes; the client scales.
 - The renderer draws once per frame at the largest height any subscriber
   wants, scales it down (area filter) for the smaller ones, and encodes only
   heights that have subscribers.
@@ -155,7 +173,7 @@ pixel in both, drawn identically.
 {"fps":30.0,"heights":[240],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
  "t":1234.5,"frame":5678,
- "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":9,"hold":false,"hold_samples":0,"slots_missed":0,
+ "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
 
@@ -177,10 +195,11 @@ value is reduced across pixels, so a pixel's samples are the same wherever it
 is drawn.
 
 **Budget.** Each frame spends a fixed number of pixel-samples (the scene's
-`budget`, else `BUDGET`, default 500,000) over the pixels it draws: its rect plus a guard band (below),
-counted before clipping to the image. The samples per pixel are
+`budget`, else `BUDGET`, default 250,000) over the pixels it draws: its rect
+plus the stream overlap plus a guard band (below), counted before clipping to
+the image. The samples per pixel are
 `round(BUDGET / drawn pixels)`, clamped to 1..64, so every tile of a grid draws
-the same number: a 180 px wall tile of a 16 x 9 grid draws 9, a whole 1080p
+the same number: a 180 px wall tile of a 16 x 9 grid draws 3, a whole 1080p
 image 1. Moving frames match across tiles only if every renderer draws every
 slot, so the budget must leave the slowest tile inside its 33 ms; `/health`
 counts `slots_missed`, and the coordinator can lower `budget` for all tiles at
@@ -212,7 +231,7 @@ counts, so moving frames no longer match across tile edges.
 
 **While the camera moves:** frame `k` (at `t = k/30`) draws its samples at
 its own `t`, seeded by (pixel, `t`, sample index), over its rect **plus a guard
-band** of `g + 4` pixels on each side, where `g = ceil(0.015 * full_h)`
+band** of `g + 4` pixels past the stream overlap on each side, where `g = ceil(0.015 * full_h)`
 (clipped to the image). It keeps the last 8 frames it drew. Each pixel of the
 rect is then the sample-weighted average of
 
@@ -224,7 +243,8 @@ rect is then the sample-weighted average of
   point moved at most `g` pixels in x and in y. A frame weighs its sample
   count, at most 64.
 
-This is computed for the rect plus 2 pixels on each side. Where a pixel's
+This is computed for the rect plus the stream overlap (16 pixels) plus 2
+pixels on each side. Where a pixel's
 total weight is under 48 samples (fast motion, a fresh renderer, a 1080p view)
 it is then filtered: a 5 x 5 edge-aware average of those resolved pixels with
 the same hit kind, a depth within 3% and similar brightness, blended in fully
@@ -232,7 +252,7 @@ below 16 samples and not at all from 48. Converged holds are not filtered.
 
 Every input of that rule is a whole-image pixel, a frame time or the scene, and
 every pixel it can read lies inside the drawing renderer's guard band (the
-filter reads 2 pixels past the rect, whose reprojection reads `g + 1` past
+filter reads 2 pixels past the overlap, whose reprojection reads `g + 1` past
 those), so:
 **two renderers that drew the same frames `k-7 .. k` give identical pixels for
 frame `k`**, whatever their rects. A renderer that started (or missed a slot)
@@ -273,5 +293,5 @@ compared pixel for pixel with the same frame drawn whole
   stays current; a new subscriber wakes it at once.
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
-- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (500000), `ADAPT` (0),
+- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (0), `MARGIN` (16), `ENC_BPP` (0.8),
   `ACCUMULATE` (1).

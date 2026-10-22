@@ -240,27 +240,45 @@ __device__ __forceinline__ V3 sun_at(V3 p) {
 
 __device__ __forceinline__ float cloud_tex(V3 q) { return tex3D<float>(cG.cloud, q.x, q.y, q.z); }
 
+// Test for the coarse march: false only where cloud_density is zero (it skips
+// the height profile and the detail erosion, which only remove density).
+__device__ bool cloud_maybe(V3 p) {
+  float h = alt_flat(p);
+  float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
+  if (h01 <= 0.0f || h01 >= 1.0f) return false;
+  V2 wp = v2(p.x, p.z) * (1.0f / 42.0f);
+  float cov = fbm(wp + v2(31.7f, 4.1f), 2, cG.noise) * 0.5f + 0.5f;
+  cov = smoothstepf(0.27f, 0.64f, cov) * 0.97f;
+  if (cov <= 0.01f) return false;
+  V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 6.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
+  float base = 0.7f * cloud_tex(q) + 0.3f * cloud_tex(v3(q.x * 3.0f + 0.17f, q.y * 2.0f, q.z * 3.0f + 0.41f));
+  return base > 1.0f - cov;
+}
+
 __device__ float cloud_density(V3 p, bool detail) {
   float h = alt_flat(p);
   float h01 = (h - CLOUD_BASE) * (1.0f / (CLOUD_TOP - CLOUD_BASE));
   if (h01 <= 0.0f || h01 >= 1.0f) return 0.0f;
   V2 wp = v2(p.x, p.z) * (1.0f / 42.0f);  // where clouds form; fixed to the ground
-  float cov = fbm(wp + v2(31.7f, 4.1f), 3, cG.noise) * 0.5f + 0.5f;
-  cov = smoothstepf(0.3f, 0.66f, cov) * 0.95f;
+  float cov = fbm(wp + v2(31.7f, 4.1f), 2, cG.noise) * 0.5f + 0.5f;
+  cov = smoothstepf(0.27f, 0.64f, cov) * 0.97f;
   if (cov <= 0.01f) return 0.0f;
-  // flat bases, rounded tops that narrow upward
-  float prof = smoothstepf(0.0f, 0.06f, h01) * smoothstepf(1.0f, 0.3f, h01);
   V3 q = v3((p.x + cP.wind.x) * (1.0f / CLOUD_TILE_KM), h * (1.0f / 6.0f), (p.z + cP.wind.y) * (1.0f / CLOUD_TILE_KM));
-  float base = cloud_tex(q);
-  float thr = 1.0f - cov * prof;
-  float d = (base - thr) / fmaxf(1.0f - thr, 1e-3f);
+  // two octaves of the volume for the body: cells of ~3.5 and ~1.2 km
+  float base = 0.7f * cloud_tex(q) + 0.3f * cloud_tex(v3(q.x * 3.0f + 0.17f, q.y * 2.0f, q.z * 3.0f + 0.41f));
+  // coverage picks where the volume is cloud; the height profile then gives
+  // flat bases and lets denser cores rise higher, so tops round into towers
+  // instead of every cloud being cut into a lens by one height threshold
+  float d0 = (base - (1.0f - cov)) / fmaxf(cov, 1e-3f);
+  if (d0 <= 0.0f) return 0.0f;
+  float d = d0 * smoothstepf(0.0f, 0.05f, h01) * smoothstepf(1.0f, 0.55f, h01 + 0.6f * (1.0f - sat(d0 * 1.6f)));
   if (d <= 0.0f) return 0.0f;
   if (detail) {
     // erode the edges with finer noise: billows at the top, wisps below
     V3 q2 = v3(q.x * 9.0f + 0.31f, q.y * 7.0f, q.z * 9.0f + 0.57f);
     V3 q3 = v3(q.x * 31.0f + 0.71f, q.y * 23.0f, q.z * 31.0f + 0.13f);
     float det = 0.65f * cloud_tex(q2) + 0.35f * cloud_tex(q3);
-    float e = 0.6f * mixf(1.0f - det, det, sat(h01 * 2.5f)) * (1.0f - 0.65f * sat(d));
+    float e = 0.65f * mixf(1.0f - det, det, sat(h01 * 2.5f)) * (1.0f - 0.35f * sat(d));
     d = (d - e) / (1.0f - e);
     if (d <= 0.0f) return 0.0f;
   }
@@ -269,7 +287,7 @@ __device__ float cloud_density(V3 p, bool detail) {
 
 // Optical depth from p toward the sun through the cloud layer.
 __device__ float cloud_light_od(V3 p, int n) {
-  const float steps[6] = {0.06f, 0.12f, 0.22f, 0.4f, 0.7f, 1.2f};
+  const float steps[6] = {0.08f, 0.18f, 0.4f, 0.9f, 0.7f, 1.2f};
   float od = 0.0f, s = 0.0f;
   for (int k = 0; k < n; k++) {
     float ds = steps[k];
@@ -321,19 +339,46 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
   tb = fminf(tb, ta + 45.0f);
   float fade_start = 70.0f;
   if (ta >= tb || ta > 160.0f) return out;
+  // Two step sizes: coarse through empty air (the shape only), fine inside
+  // clouds, 1.5% of the distance (120 to 600 m), so the
+  // eroded edges are sampled at their own scale at any distance. A uniform
+  // step over the whole segment (up to 1 km) averaged the edge detail away,
+  // which made distant clouds smooth gray lenses.
   float seg = tb - ta;
-  float ds = seg / N;
+  float ds_c = fmaxf(seg / N, 0.15f);
   float c = dot(d, cP.sun_dir);
   V3 amb_top = sky_lookup(v3(0, 1, 0)) * 1.1f;
   V3 amb_bot = sky_lookup(normalize(v3(0.3f, 0.15f, 0.2f))) * 0.5f;
   float wsum = 0.0f, dsum = 0.0f;
-  for (int k = 0; k < N; k++) {
-    float s = ta + (k + jitter) * ds;
+  float s = ta + jitter * ds_c;
+  bool fine = false;
+  int empty = 0, lit_age = 0;
+  float od = 0.0f;
+  const int max_fine = cheap ? 40 : 64;  // fine steps; coarse steps are bounded by the segment
+  int nfine = 0;
+  for (int k = 0; k < N + max_fine + 2 && s < tb && nfine < max_fine; k++) {
     V3 p = o + d * s;
+    if (!fine) {
+      if (!cloud_maybe(p)) { s += ds_c; continue; }
+      // entered a cloud: back up one coarse step and walk in finely
+      s = fmaxf(ta, s - ds_c);
+      fine = true;
+      empty = 0;
+      continue;
+    }
+    float ds = cheap ? fmaxf(0.06f, 0.012f * s) : clampf(0.015f * s, 0.12f, 0.6f);
+    nfine++;
     float sig = cloud_density(p, !cheap && out.T > 0.15f);
     if (s > fade_start) sig *= __expf(-(s - fade_start) * (1.0f / 40.0f));
-    if (sig <= 0.0f) continue;
-    float od = cloud_light_od(p, cheap ? 3 : 6);
+    if (sig <= 0.0f) {
+      if (++empty > 4) fine = false;  // left the cloud
+      s += ds;
+      continue;
+    }
+    empty = 0;
+    // the light march is the expensive part; inside a cloud it changes
+    // slowly, so take it on every third fine step
+    if (lit_age++ % 3 == 0) od = cloud_light_od(p, 3);
     // several orders of scattering, each softer and less directional
     float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
     for (int o2 = 0; o2 < 3; o2++) {
@@ -351,7 +396,8 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     wsum += out.T * (1.0f - st);
     dsum += out.T * (1.0f - st) * s;
     out.T *= st;
-    if (out.T < 0.01f) break;
+    if (out.T < 0.03f) break;
+    s += ds;
   }
   out.depth = wsum > 0.0f ? dsum / wsum : ta;
   return out;
@@ -965,15 +1011,15 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
   resolved[idx] = make_float4(color.x, color.y, color.z, fminf(wtot, (float)HOLD_MAX_SAMPLES));
 }
 
-// Finish the tile's pixels: where few samples are in (fast motion, a fresh
+// Finish the out region (the tile plus the stream margin): where few samples are in (fast motion, a fresh
 // renderer), an edge-aware 5x5 filter over the resolved region (which reaches
 // DENOISE_R pixels past the tile, drawn under the same rules, so the filter
 // matches across tile edges); then the overlays, tone mapping and dither.
 __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, const float2* aux) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
-  if (i >= cP.w || j >= cP.h) return;
-  int X = cP.x0 + i, Y = cP.y0 + j;
-  int idx = j * cP.w + i;
+  if (i >= cP.ow || j >= cP.oh) return;
+  int X = cP.ox0 + i, Y = cP.oy0 + j;
+  int idx = j * cP.ow + i;
   const GCam& cam = cP.cam;
   float pix = 2.0f * cam.tan_half / cP.full_h;
   V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
@@ -1037,14 +1083,19 @@ __device__ V3 area_sample(const uint8_t* src, int sw, int sh, float x0, float y0
   return acc / fmaxf(wsum, 1e-6f);
 }
 
-__global__ void k_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, size_t pitch, int dw, int dh) {
+__global__ void k_nv12(const uint8_t* src, int sw, int sh, uint8_t* dst, size_t pitch, int dw, int dh, float fx0, float fy0,
+                       float sc) {
   int bx = blockIdx.x * blockDim.x + threadIdx.x, by = blockIdx.y * blockDim.y + threadIdx.y;
   if (2 * bx >= dw || 2 * by >= dh) return;
-  float sx = (float)sw / dw, sy = (float)sh / dh;
   V3 rgb4[4];
   for (int k = 0; k < 4; k++) {
     int x = 2 * bx + (k & 1), y = 2 * by + (k >> 1);
-    rgb4[k] = area_sample(src, sw, sh, x * sx, y * sy, (x + 1) * sx, (y + 1) * sy);
+    // the source box of this pixel, clamped into the source (edge pixels repeat)
+    float x0 = fx0 + x * sc, y0 = fy0 + y * sc;
+    float x1 = x0 + sc, y1 = y0 + sc;
+    x0 = clampf(x0, 0.0f, sw - 1.0f); y0 = clampf(y0, 0.0f, sh - 1.0f);
+    x1 = clampf(x1, x0 + 0.5f, (float)sw); y1 = clampf(y1, y0 + 0.5f, (float)sh);
+    rgb4[k] = area_sample(src, sw, sh, x0, y0, x1, y1);
     // BT.709, limited range
     float Yv = 16.0f + (0.2126f * rgb4[k].x + 0.7152f * rgb4[k].y + 0.0722f * rgb4[k].z) * (219.0f / 255.0f);
     dst[y * pitch + x] = (uint8_t)clampf(Yv + 0.5f, 0.0f, 255.0f);
@@ -1211,33 +1262,43 @@ bool Renderer::init(std::string* err) {
   return true;
 }
 
-double Renderer::drawn_pixels(const Tile& t) {
-  int g = (int)ceilf(GUARD_FRAC * t.full_h) + 2 + DENOISE_R;
+double Renderer::drawn_pixels(const Tile& t) const {
+  int g = (int)ceilf(GUARD_FRAC * t.full_h) + 2 + DENOISE_R + margin_;
   return (double)(t.w + 2 * g) * (t.h + 2 * g);
+}
+
+void Renderer::set_margin(int m) {
+  if (m == margin_) return;
+  margin_ = m;
+  have_tile_ = false;  // regions change: reallocate on the next frame
 }
 
 void Renderer::ensure_buffers(const Tile& t) {
   if (have_tile_ && t.w == tile_.w && t.h == tile_.h && t.full_w == tile_.full_w && t.full_h == tile_.full_h &&
       t.x0 == tile_.x0 && t.y0 == tile_.y0)
     return;
+  // Regions, each inside the image (a tile may overhang it by its rounding
+  // pixel; the regions then keep the tile):
+  //   out      = tile + margin_      finished, tone-mapped, what streams encode
+  //   resolved = out + DENOISE_R     temporal resolve, read by the finishing filter
+  //   drawn    = resolved + g + 2    samples; reprojection taps reach g + 1 past resolved
+  auto grow = [&](int x0, int y0, int x1, int y1, int m, int* a0, int* b0, int* a1, int* b1) {
+    *a0 = std::max(0, x0 - m); *b0 = std::max(0, y0 - m);
+    *a1 = std::max(std::min(t.full_w, x1 + m), x1); *b1 = std::max(std::min(t.full_h, y1 + m), y1);
+  };
   int g = (int)ceilf(GUARD_FRAC * t.full_h);
-  int m = g + 2 + DENOISE_R;  // resolved pixels reach DENOISE_R past the tile, their taps one past the guard
-  int ex0 = std::max(0, t.x0 - m), ey0 = std::max(0, t.y0 - m);
-  int ex1 = std::min(t.full_w, t.x0 + t.w + m), ey1 = std::min(t.full_h, t.y0 + t.h + m);
-  // a tile may overhang the image by its rounding pixel; keep it inside the drawn region
-  ex1 = std::max(ex1, t.x0 + t.w);
-  ey1 = std::max(ey1, t.y0 + t.h);
-  int rx0 = std::max(0, t.x0 - DENOISE_R), ry0 = std::max(0, t.y0 - DENOISE_R);
-  int rx1 = std::max(std::min(t.full_w, t.x0 + t.w + DENOISE_R), t.x0 + t.w);
-  int ry1 = std::max(std::min(t.full_h, t.y0 + t.h + DENOISE_R), t.y0 + t.h);
-  size_t n = (size_t)t.w * t.h;
+  int ox0, oy0, ox1, oy1, rx0, ry0, rx1, ry1, ex0, ey0, ex1, ey1;
+  grow(t.x0, t.y0, t.x0 + t.w, t.y0 + t.h, margin_, &ox0, &oy0, &ox1, &oy1);
+  grow(ox0, oy0, ox1, oy1, DENOISE_R, &rx0, &ry0, &rx1, &ry1);
+  grow(rx0, ry0, rx1, ry1, g + 2, &ex0, &ey0, &ex1, &ey1);
+  size_t no = (size_t)(ox1 - ox0) * (oy1 - oy0);
   size_t nr = (size_t)(rx1 - rx0) * (ry1 - ry0);
   size_t ne = (size_t)(ex1 - ex0) * (ey1 - ey0);
   cudaFree(rgba_); cudaFree(hdr_); cudaFree(display_); cudaFree(hold_blend_);
   cudaFree(hold_sum_); cudaFree(hold_aux_);
   for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); }
-  CK(cudaMalloc(&rgba_, n * 4));
-  CK(cudaMalloc(&hdr_, n * sizeof(float4)));
+  CK(cudaMalloc(&rgba_, no * 4));
+  CK(cudaMalloc(&hdr_, no * sizeof(float4)));
   CK(cudaMalloc(&display_, nr * sizeof(float4)));
   CK(cudaMalloc(&hold_blend_, nr * sizeof(float4)));
   CK(cudaMalloc(&hold_sum_, ne * sizeof(float4)));
@@ -1249,6 +1310,7 @@ void Renderer::ensure_buffers(const Tile& t) {
   tile_ = t;
   ex0_ = ex0; ey0_ = ey0; ew_ = ex1 - ex0; eh_ = ey1 - ey0; guard_ = g;
   rx0_ = rx0; ry0_ = ry0; rw_ = rx1 - rx0; rh_ = ry1 - ry0;
+  ox0_ = ox0; oy0_ = oy0; ow_ = ox1 - ox0; oh_ = oy1 - oy0;
   have_tile_ = true;
   reset_history();
 }
@@ -1273,6 +1335,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   p.spp = spp;
   p.ex0 = ex0_; p.ey0 = ey0_; p.ew = ew_; p.eh = eh_; p.guard = guard_;
   p.rx0 = rx0_; p.ry0 = ry0_; p.rw = rw_; p.rh = rh_;
+  p.ox0 = ox0_; p.oy0 = oy0_; p.ow = ow_; p.oh = oh_;
   size_t nr = (size_t)rw_ * rh_, ne = (size_t)ew_ * eh_;
   long long k = std::llround(t * fps_);
   int ri = (int)(((k % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW);
@@ -1319,7 +1382,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
                                                                 (const float4*)hold_sum_, (const float2*)hold_aux_,
                                                                 (const float4*)ring_[ri], (const float2*)ring_aux_[ri], ring);
   CK(cudaGetLastError());
-  k_finish<<<dim3((tile.w + 7) / 8, (tile.h + 7) / 8), bs, 0, st>>>(
+  k_finish<<<dim3((ow_ + 7) / 8, (oh_ + 7) / 8), bs, 0, st>>>(
       (uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_, held ? (const float2*)hold_aux_ : (const float2*)ring_aux_[ri]);
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)ev1_, st));
@@ -1351,17 +1414,25 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
 
 void Renderer::download_rgba(std::vector<uint8_t>* out) const {
   out->resize((size_t)tile_.w * tile_.h * 4);
-  CK(cudaMemcpy(out->data(), rgba_, out->size(), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy2D(out->data(), (size_t)tile_.w * 4,
+                  (const uint8_t*)rgba_ + ((size_t)(tile_.y0 - oy0_) * ow_ + (tile_.x0 - ox0_)) * 4, (size_t)ow_ * 4,
+                  (size_t)tile_.w * 4, tile_.h, cudaMemcpyDeviceToHost));
 }
 void Renderer::download_hdr(std::vector<float>* out) const {
   out->resize((size_t)tile_.w * tile_.h * 4);
-  CK(cudaMemcpy(out->data(), hdr_, out->size() * sizeof(float), cudaMemcpyDeviceToHost));
+  CK(cudaMemcpy2D(out->data(), (size_t)tile_.w * 16,
+                  (const uint8_t*)hdr_ + ((size_t)(tile_.y0 - oy0_) * ow_ + (tile_.x0 - ox0_)) * 16, (size_t)ow_ * 16,
+                  (size_t)tile_.w * 16, tile_.h, cudaMemcpyDeviceToHost));
 }
 
-void Renderer::to_nv12(void* dst, size_t pitch, int dw, int dh) {
+void Renderer::to_nv12(void* dst, size_t pitch, int dw, int dh, int sx0, int sy0, int sfull_h) {
   cudaStream_t st = (cudaStream_t)stream_;
+  // stream pixel (u, v) covers whole-image stream pixels [sx0+u, sx0+u+1); in
+  // this renderer's grid that is scale times as many, offset by the out region
+  double scale = (double)tile_.full_h / sfull_h;
+  float fx0 = (float)(sx0 * scale - ox0_), fy0 = (float)(sy0 * scale - oy0_);
   dim3 bs(16, 8), gs((dw / 2 + 15) / 16, (dh / 2 + 7) / 8);
-  k_nv12<<<gs, bs, 0, st>>>((const uint8_t*)rgba_, tile_.w, tile_.h, (uint8_t*)dst, pitch, dw, dh);
+  k_nv12<<<gs, bs, 0, st>>>((const uint8_t*)rgba_, ow_, oh_, (uint8_t*)dst, pitch, dw, dh, fx0, fy0, (float)scale);
   CK(cudaGetLastError());
   CK(cudaStreamSynchronize(st));
 }
