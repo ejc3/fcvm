@@ -6335,6 +6335,16 @@ if os.environ.get("STUB_UNADDRESSED") == "1":
     rows.append({"request_id": "r5", "url": url + "late.js", "remote_ip": "",
                  "status": None, "failed": False, "pending_at_load": True,
                  "error_text": "", "from_cache": False, "from_service_worker": False})
+    # STUB_ACCESS_LOG=<path>: the replay's access log, with a line saying it
+    # answered that request now (or, with STUB_ACCESS_TS, at that time).
+    if os.environ.get("STUB_ACCESS_LOG"):
+        import time, urllib.parse
+        parts = urllib.parse.urlsplit(url + "late.js")
+        line = {"ts": float(os.environ.get("STUB_ACCESS_TS") or time.time()),
+                "peer": "127.0.0.1:1", "method": "POST", "host": parts.netloc,
+                "path": parts.path, "status": 404, "bytes": 0, "duration_ms": 0.2}
+        with open(os.environ["STUB_ACCESS_LOG"], "a") as log:
+            log.write(json.dumps(line) + "\n")
 if os.environ.get("STUB_CACHED") == "1":
     rows.append({"request_id": "r6", "url": url + "logo.png", "remote_ip": "",
                  "status": 200, "failed": False, "pending_at_load": False,
@@ -6569,6 +6579,33 @@ exec __PYTHON__ "$@"
             for data in summary["urls"].values():
                 self.assertEqual(data["errors"], {"net::ERR_NAME_NOT_RESOLVED": 2})
                 self.assertEqual(data["max_pending_at_load"], 3)
+
+    def test_an_unaddressed_request_the_replay_logged_answering_is_not_a_violation(self):
+        """#1137: the replay answers an uncaptured beacon POST with a 404 and
+        then closes with the body unread, which the kernel turns into a RST,
+        so Chromium's trace row names no remote address. The replay's own
+        access log names where that request went: it logs every request it
+        answers, after answering. A row with no address whose URL the access
+        log shows answered during that rep's render is the replay's; one the
+        log does not show, or shows outside the rep, is still a violation.
+        On 2026-10-22 these resets failed most diags on one host.
+
+        RED BEFORE THE FIX: the logged request still failed the diag."""
+        for when, passes in (("", True), ("1.0", False)):
+            with tempfile.TemporaryDirectory() as d:
+                env, _state_dir = self._diag_fixture(d, reps="1", STUB_UNADDRESSED="1")
+                os.makedirs(env["RESULTS"], exist_ok=True)
+                env["STUB_ACCESS_LOG"] = os.path.join(env["RESULTS"], "corpus-access.log")
+                env["STUB_ACCESS_TS"] = when
+                result = self._diag(env)
+                summary = self._diag_summary(env)
+                if passes:
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr[-2000:])
+                    self.assertIs(summary["passed"], True, summary["violations"])
+                    self.assertEqual(sum(u["answered_by_replay"] for u in summary["urls"].values()), 2)
+                else:
+                    self.assertIs(summary["passed"], False)
+                    self.assertEqual({v["kind"] for v in summary["violations"]}, {"no_remote_ip"})
 
     def test_a_traced_request_with_no_allowed_address_is_a_violation(self):
         """DIAG_EXPECT_IPS passed on `addressed > 0`: one request with an

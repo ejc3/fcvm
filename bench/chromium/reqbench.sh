@@ -1717,7 +1717,7 @@ diag_write_summary() {
     python3 - "$RESULTS/diag" "$ENGINE" "$TAG" "$BACKEND" "$mode" "$prefetch" \
         "$DIAG_REPS" "$DIAG_EXPECT_IPS" "$DIAG_MAX_LOAD_MS" "$teardown_failures" \
         "$bundle_ok" "$generation" "$config_sha" "$bundle_sha" "$@" <<'PY'
-import json, os, sys, tempfile, time, uuid
+import json, os, sys, tempfile, time, urllib.parse, uuid
 from collections import Counter
 
 (diag_dir, engine, tag, backend, uffd_mode, uffd_prefetch, reps_raw,
@@ -1765,12 +1765,61 @@ def by_count(item):
     return (-item[1], item[0])
 
 
+# The replay's access log (corpus_serve.py --access-log), when this phase ran
+# against it: one line per request it answered, written after the answer.
+# A traced row with no remote address whose request the log shows answered
+# during that rep's render went to the replay, whatever the trace could say:
+# the replay closes an uncaptured POST with its body unread, the kernel turns
+# that close into a RST, and the browser reports the request as reset with no
+# address (#1137). Each logged answer accounts for one row at most.
+access = []
+access_path = os.path.join(os.path.dirname(diag_dir), "corpus-access.log")
+try:
+    with open(access_path) as source:
+        for line in source:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if (isinstance(entry, dict) and number(entry.get("ts"))
+                    and isinstance(entry.get("host"), str) and isinstance(entry.get("path"), str)):
+                access.append([float(entry["ts"]), entry["host"].split(":")[0].lower(),
+                               entry["path"], False])
+except FileNotFoundError:
+    pass
+
+
+def answered_by_replay(url, window):
+    """Whether an unused access-log line answers url inside window, marking it used."""
+    if window is None:
+        return False
+    parts = urllib.parse.urlsplit(url)
+    host = (parts.hostname or "").lower()
+    target = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+    start, end = window
+    for entry in access:
+        if not entry[3] and entry[1] == host and entry[2] == target and start <= entry[0] <= end:
+            entry[3] = True
+            return True
+    return False
+
+
+def read_window(path):
+    try:
+        with open(path) as source:
+            start, end = (float(x) for x in source.read().split())
+        return (start, end) if end >= start else None
+    except (OSError, ValueError):
+        return None
+
+
 urls = {}
 violations = []
 for i in range(0, len(pairs), 2):
     url, stem = pairs[i], pairs[i + 1]
     remote_ips = Counter()
     errors = Counter()
+    answered = 0
     renders_ok = 0
     max_load = None
     max_pending = None
@@ -1848,6 +1897,11 @@ for i in range(0, len(pairs), 2):
             if row.get("pending_at_load"):
                 pending += 1
         max_pending = pending if max_pending is None else max(max_pending, pending)
+        if unaddressed and access:
+            window = read_window(base + ".window")
+            kept = [u for u in unaddressed if not answered_by_replay(u, window)]
+            answered += len(unaddressed) - len(kept)
+            unaddressed = kept
         for ip, hit in sorted(foreign.items()):
             violation("remote_ip", f"{ip} served {len(hit)} request(s), first {hit[0]}")
         if expect_ips is not None and addressed == 0:
@@ -1871,6 +1925,7 @@ for i in range(0, len(pairs), 2):
     urls[url] = {
         "reps": reps,
         "renders_ok": renders_ok,
+        "answered_by_replay": answered,
         "max_load_ms": max_load,
         "max_pending_at_load": max_pending,
         "remote_ips": dict(sorted(remote_ips.items(), key=by_count)),
@@ -2027,10 +2082,17 @@ cmd_diag() {
             record="$base.json"
             trace="$base.trace.json"
             cname="cb-req-diag-$n-$RUNID"
-            rm -f "$record" "$record.tmp" "$trace"
+            rm -f "$record" "$record.tmp" "$trace" "$base.window"
             if start_clone "$SERVE_PID" "$cname" "$RESULTS/logs/diag-clone-$stem-$rep.log"; then
                 if [ -n "$CLONE_IP" ]; then
-                    if diag_render "$url" "$record" "$trace" "$CLONE_PID" "$CLONE_IP"; then
+                    # The render's wall-clock window, for the summary to find in
+                    # the replay's access log what it answered for this rep.
+                    local rep_start
+                    rep_start=$(date +%s.%N)
+                    local render_ok=0
+                    diag_render "$url" "$record" "$trace" "$CLONE_PID" "$CLONE_IP" || render_ok=$?
+                    printf '%s %s\n' "$rep_start" "$(date +%s.%N)" >"$base.window"
+                    if [ "$render_ok" -eq 0 ]; then
                         log "diag: $url rep $rep rendered ($record)"
                     else
                         log "diag: $url rep $rep render FAILED ($record)"
