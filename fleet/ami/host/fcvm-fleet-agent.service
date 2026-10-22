@@ -1,0 +1,25 @@
+# The host agent. DISABLED in the AMI: `fcvm fleet agent` speaks only --stdio today
+# (fleet-control, #1146), so it runs as the coordinator's child, not as a service. Once
+# the agent can dial the coordinator (wss://fleet-api-stage.fcvm.dev/agent with the Access
+# service token from fcvm-fleet/agent-access-token), set its arguments in
+# /etc/fcvm-fleet/agent.env and enable this unit.
+[Unit]
+Description=fcvm fleet agent: one GPU VM per slot this host owns
+Requires=fcvm-fleet-vfio.service fcvm-fleet-store.service
+After=fcvm-fleet-vfio.service fcvm-fleet-store.service network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/fcvm-fleet/agent.env
+
+[Service]
+User=ubuntu
+EnvironmentFile=/etc/fcvm-fleet/agent.env
+ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS
+LimitMEMLOCK=infinity
+LimitNOFILE=65536
+Restart=on-failure
+RestartSec=5
+KillMode=mixed
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
