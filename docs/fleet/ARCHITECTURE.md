@@ -242,7 +242,8 @@ dark until its first frame at the current `t`.
 ray-march steps at its target frame rate) and spends all of it on its own rectangle, so a
 smaller rectangle gets more detail: more steps, deeper fractal iterations, more samples per
 pixel. More GPUs in the fleet means smaller rectangles and a finer whole image. Detail per
-unit of scene is that budget divided by the scene area a GPU covers. Opening a tile
+unit of scene is that budget divided by the scene area a GPU covers. **DECIDED
+(2026-10-22):** opening a tile
 magnifies the same rectangle: the scene area is unchanged, so the detail per unit of scene
 is too; the GPU spends the budget on more pixels and fewer steps per pixel, so the region
 is drawn larger and sharper. A view that showed more of the scene through one GPU would
