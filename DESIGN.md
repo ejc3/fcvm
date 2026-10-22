@@ -2382,7 +2382,7 @@ one nvidia-container-toolkit version (1.20.1), each by URL and SHA-256.
 (`src/setup/nvidia.rs`) holding:
 
 ```
-lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko
+lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko, nvidia.params
 lib/firmware/nvidia/<version>/gsp_{tu10x,ga10x}.bin
 usr/lib/<triplet>/lib*.so.<version> and their soname links
 usr/bin/{nvidia-smi,nvidia-persistenced,nvidia-debugdump,nvidia-cuda-mps-*}
@@ -2391,10 +2391,31 @@ usr/bin/{nvidia-ctk,nvidia-cdi-hook}
 
 The build configures and builds the profile's kernel tree from the same
 inputs as the kernel artifact (`make <image> modules`, so `Module.symvers`
-exists and modpost checks every symbol), then builds `kernel-open/` from the
+exists and modpost checks every symbol), then builds the modules from the
 driver's `.run` against it. Modules, libraries and firmware come from that one
 `.run`, and the build refuses a module whose `modinfo` version is not the
-pinned version or whose vermagic is not this kernel. The image is named
+pinned version or whose vermagic is not this kernel.
+
+The table's `module_type` picks the modules:
+
+| `module_type` | Sources | nvidia.ko parameters | GPU initialisation on a T4 |
+|---|---|---|---|
+| `open` (default) | `kernel-open/` | none | boots the GSP firmware: 1,113 to 1,156 ms |
+| `proprietary` | `kernel/` | `NVreg_EnableGpuFirmware=0` | resource manager on the CPU: 576 to 623 ms |
+
+The times are `nvidia-persistenced`'s start in a gpu VM with the driver
+unloaded and the GPU removed and rescanned, two rounds per variant, twice; the
+proprietary modules with the GSP firmware left on took 1,111 to 1,223 ms. The
+stage writes the parameters to `nvidia.params` beside the modules and fc-agent
+passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and
+`open` on arm64, which no g5g.metal run has measured yet. The proprietary
+modules support Turing and Ampere only.
+
+The stage also lets nvidia.ko load with no GPU on the bus. `nvidia_init_module`
+refuses an empty bus unless an NVSwitch is present, and all three refusals
+test one local, `is_nvswitch_present`; the stage sets it to `NV_TRUE` in the
+chosen sources' `nv.c` and fails the build if the declaration is not there
+exactly once. The image is named
 `nvidia-<version>-<profile>-<kernel version>-<arch>-<key>.ext4` under
 `<assets_dir>/nvidia/`, where the key hashes the kernel's identity, the pinned
 table and the build stage. It is not in the rootfs: VMs without a GPU do not
@@ -2407,7 +2428,11 @@ carry it, and a driver bump does not rebuild the rootfs.
    read-only virtio-blk drive and names it in the container plan:
    `"gpu_driver": {"device": "/dev/vdX"}`. fc-agent mounts it read-only at
    `/run/fcvm-gpu/driver` with the extra disks, before the pre-start snapshot,
-   so every clone has it. It is not mounted into the container. The image path
+   so every clone has it. It is not mounted into the container. Right after
+   the mount, fc-agent points `firmware_class.path` at the image's firmware
+   and loads `nvidia.ko` and `nvidia-uvm.ko` with no GPU present, so the
+   snapshot carries the loaded driver. A failure there is logged and not
+   fatal: the attach loads what is not loaded. The image path
    belongs in the snapshot cache key (it is content-addressed). It cannot be a
    pmem device: a restore with device passthrough refuses pmem.
 2. **Restore.** The restore metadata document (the vsock `latest` document and
@@ -2424,17 +2449,22 @@ carry it, and a driver bump does not rebuild the rootfs.
    - writes `/sys/bus/pci/rescan` and waits up to 10s for that many NVIDIA
      display functions (vendor 0x10de, class 0x03xxxx);
    - points `firmware_class.path` at the image's firmware and `insmod`s
-     `nvidia.ko` and `nvidia-uvm.ko`;
+     `nvidia.ko` and `nvidia-uvm.ko` if the boot did not load them (when it
+     did, the rescan's synchronous probe binds the GPU to the loaded driver);
    - checks `/proc/driver/nvidia/gpus` lists every GPU and creates
      `/dev/nvidiactl`, `/dev/nvidia<minor>`, `/dev/nvidia-uvm{,-tools}`;
    - starts `nvidia-persistenced` from the image, which initialises the GPU and
      keeps it open, so later processes do not initialise it again;
-   - runs `nvidia-smi -L` from the image and requires one line per GPU;
-   - runs `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
-     into `/var/run/cdi/nvidia.yaml`.
+   - runs, together, `nvidia-smi -L` from the image, requiring one line per
+     GPU, and `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
+     into `/var/run/cdi/nvidia.yaml`. The spec cannot be generated before
+     the GPU is there: it names each GPU by index and by UUID.
 4. **Container start.** The container starts after the restore is
    acknowledged, as for any warm start, with `--device nvidia.com/gpu=all`.
-   The ACK's phase record carries `gpu_ms` and `gpus`.
+   The ACK's phase record carries `gpu_ms`, `gpus` and `gpu_steps`, the
+   milliseconds of each attach step (`check_ms`, `rescan_ms`, `nvidia_ms`,
+   `uvm_ms`, `nodes_ms`, `persistenced_ms`, `smi_ms`, `cdi_ms`; the last two
+   overlap). fc-agent also logs each as `gpu: step=<name> elapsed_ms=<ms>`.
 
 Any failure is fatal to the clone before the ACK: fc-agent prints
 `FATAL: clone restore failed closed ... restore phase gpu-attach: <cause>` and
@@ -2472,6 +2502,30 @@ A second run on another g4dn.metal the same day:
 - Without `nvidia-persistenced` every process that opens the GPU initialises it:
   `nvidia-smi -L` in the container took 1.490, 1.436 and 1.447 s; with the daemon
   running, 0.031, 0.026 and 0.023 s. fc-agent now starts the daemon during the attach.
+
+### Attach time
+
+Measured on a g4dn.metal (T4) on 2026-10-22: a cache-hit `fcvm podman run --gpu <sbdf>
+ubuntu:24.04 nvidia-smi -L`, relaunched in sequence on one GPU. "Relaunch" is process
+start to exit; "ACK" is the host's `ack_ms`; the rest are the guest's `gpu_ms` and
+`gpu_steps`. Medians, with the range in parentheses.
+
+| | runs | relaunch (s) | ACK (ms) | gpu_ms | insmod nvidia + uvm | rescan | persistenced | smi / cdi |
+|---|---|---|---|---|---|---|---|---|
+| #1141 (daemon), open modules | 12 | 3.41 (3.33-3.48) | 2,370 | 1,362 (1,308-1,475) | 126 + 12 | 8 | 1,073 | 41 / 73, in sequence |
+| + nvidia-smi and CDI together | 6 | 3.39 (3.30-3.41) | 2,356 | 1,318 (1,315-1,467) | 116 + 11 | 13 | 1,091 | 50 / 87, together |
+| + driver loaded at boot | 12 | 3.38 (3.31-3.43) | 2,341 | 1,289 (1,233-1,405) | 0 | 65 | 1,140 | 48 / 85 |
+| + proprietary modules, GSP off | 24 | 2.83 (2.75-2.93) | 1,791 | 724 (701-776) | 0 | 64 | 576 | 46 / 82 |
+| the same without the boot load | 12 | 3.03 (2.90-3.16) | 1,987 | 951 (918-1,017) | 310 + 11 | 10 | 537 | 46 / 80 |
+
+With the driver loaded at boot the rescan carries the PCI probe. The proprietary
+nvidia.ko takes 280 to 340 ms to load at restore, so the boot load matters most with
+it. Before #1141, `nvidia-smi -L` and `nvidia-ctk cdi generate` each initialised the
+GPU, and `gpu_ms` was the 3,028 to 3,337 ms above.
+
+The rest of the ACK is the host: Firecracker's `/snapshot/load` with the GPU in
+`device_passthrough` took 955 ms in a debug-logged relaunch, almost all of it after
+the load attached the PCI segment.
 
 Not yet checked:
 
