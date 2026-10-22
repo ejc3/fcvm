@@ -196,7 +196,49 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 self.send_header("Vary", "Origin")
         super().end_headers()
 
+    # A request body larger than this is not read through; the connection
+    # closes with the rest unread, as before. Beacons are a few KiB.
+    MAX_DRAIN = 64 * 1024 * 1024
+
+    def _drain_body(self):
+        """Read and discard the request body, so the close after the answer is
+        a FIN. Left unread, the body sits in the socket's receive queue when the
+        HTTP/1.0 connection closes, the kernel sends a RST, and Chromium reports
+        the request as net::ERR_CONNECTION_RESET (#1137)."""
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return
+        if "chunked" in (headers.get("Transfer-Encoding") or "").lower():
+            left = self.MAX_DRAIN
+            while left > 0:
+                size_line = self.rfile.readline(1024)
+                try:
+                    size = int(size_line.split(b";")[0].strip() or b"0", 16)
+                except ValueError:
+                    return
+                if size == 0:
+                    while self.rfile.readline(1024) not in (b"\r\n", b"\n", b""):
+                        pass
+                    return
+                if size > left:
+                    return
+                self.rfile.read(size + 2)
+                left -= size
+            return
+        try:
+            length = int(headers.get("Content-Length") or 0)
+        except ValueError:
+            return
+        if length <= 0 or length > self.MAX_DRAIN:
+            return
+        while length > 0:
+            chunk = self.rfile.read(min(length, 1 << 16))
+            if not chunk:
+                return
+            length -= len(chunk)
+
     def _serve(self, body=True):
+        self._drain_body()
         host = (self.headers.get("Host") or "").split(":")[0]
         u = urllib.parse.urlparse(self.path)
         entry = self.exact.get((host, u.path, u.query)) or \
