@@ -3616,8 +3616,11 @@ async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_direc
     .await
     .context("spawning clone with --map")?;
     let healthy = common::poll_health_by_pid(clone_pid, 120).await;
+    // The guest takes a cached file's size and mtime from the host only once the attribute
+    // timeout (1 s) has passed since it last asked, counted in guest time, which stood still
+    // while the snapshot sat. Read after that, as for a host file that changes under a VM.
     let seen = if healthy.is_ok() {
-        common::exec_in_container(clone_pid, &["cat", "/data/marker"]).await
+        common::exec_in_container(clone_pid, &["sleep 2; cat /data/marker"]).await
     } else {
         Err(anyhow::anyhow!("clone never turned healthy"))
     };

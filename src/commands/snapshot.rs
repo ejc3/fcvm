@@ -1277,15 +1277,18 @@ fn clone_volumes(
                 }
             );
         };
-        if volume.read_only != mapping.read_only {
+        if !volume.read_only {
             bail!(
-                "--map {spec}: the snapshot mapped {} {}; give the same flag",
-                volume.guest_path,
-                if volume.read_only {
-                    "read-only (:ro)"
-                } else {
-                    "read-write"
-                }
+                "--map {spec}: only a read-only map can be moved. The guest keeps a read-write \
+                 map's file sizes, modification times and cached pages as its own (the writeback \
+                 cache), so it would go on serving what it cached from {} over the new directory.",
+                volume.host_path.display()
+            );
+        }
+        if !mapping.read_only {
+            bail!(
+                "--map {spec}: the snapshot mapped {} read-only; give :ro",
+                volume.guest_path
             );
         }
         volume.host_path = mapping.host_path;
@@ -4898,7 +4901,8 @@ mod tests {
         );
     }
 
-    /// --map cannot add a mount, change one's read-only flag, or name one twice.
+    /// --map cannot add a mount, change one's read-only flag, move a read-write map, or
+    /// name one twice.
     #[test]
     fn a_map_the_snapshot_cannot_serve_is_refused() {
         let recorded = tempfile::tempdir().unwrap();
@@ -4913,6 +4917,14 @@ mod tests {
         );
         let flag = clone_volumes(&snapshot, &requested(&[&format!("{h}:/var/creds")])).unwrap_err();
         assert!(format!("{flag:#}").contains("read-only"), "{flag:#}");
+        let writable = vec![volume(recorded.path(), "/data", false, 5001)];
+        for spec in [format!("{h}:/data"), format!("{h}:/data:ro")] {
+            let rw = clone_volumes(&writable, &requested(&[&spec])).unwrap_err();
+            assert!(
+                format!("{rw:#}").contains("only a read-only map can be moved"),
+                "{spec}: {rw:#}"
+            );
+        }
         let twice = clone_volumes(
             &snapshot,
             &requested(&[&format!("{h}:/var/creds:ro"), &format!("{h}:/var/creds:ro")]),
