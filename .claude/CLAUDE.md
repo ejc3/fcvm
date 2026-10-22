@@ -143,6 +143,24 @@ after ingress opened;
 `the_restore_hook_runs_after_the_nfs_remount_and_the_proxy_waits` pins the
 source order of `handle_clone_restore`.
 
+### Opening the gate costs no grace period on the restore path
+
+Each half of the gate opens with one nf_tables commit covering both families,
+sent by fc-agent over nfnetlink (`fc-agent/src/nftables.rs`), not with an
+`iptables-restore` per family. Releasing a NETLINK_NETFILTER socket after a
+commit that deleted rules waits one RCU grace period (`nft_rcv_nl_event`
+flushes the pending destruction, which starts with `synchronize_rcu()`) while
+holding the namespace's commit mutex; so does releasing any AF_PACKET socket
+(`packet_release()` calls `synchronize_net()`). Measured in restored clones,
+that wait was 26, 46 and 79 ms at 2, 4 and 8 vCPUs, and it was the whole
+110-260 ms the gate used to cost (#1151). So the gate keeps one socket for
+both halves and releases it off-thread after publication, and the ARP and
+neighbour announcements release theirs off-thread too
+(`network::release_off_path`). The receive barrier is the one release that
+must stay synchronous: its grace period is the barrier.
+`both_halves_share_one_socket_released_off_the_callers_thread` and
+`opening_each_half_is_one_transaction_for_both_families` pin it.
+
 ## MAXIMUM REUSE / CACHEABILITY
 
 **The whole goal of fcvm is to cache and reuse as much as humanly possible.** Kernels,
