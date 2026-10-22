@@ -286,6 +286,23 @@ is drawn larger and sharper. A view that showed more of the scene through one GP
 spread the same budget over more area and lose detail, so the opened view never widens
 the rectangle.
 
+**Two ways to receive the image. DECIDED (2026-10-22).** Each viewer chooses (the page
+suggests one from its measured bandwidth); the choice is per viewer, not shared.
+
+- **Direct:** one stream per tile, straight from its VM, at a quality that keeps the total
+  within the viewer's bandwidth (about 100 lower-quality streams for a full wall).
+- **Aggregated:** an aggregator (`fcvm fleet aggregate`) pulls tiles at near-lossless quality
+  over the host's internal network, joins them at one common `t`, and encodes the joined
+  region once, so there are no tile edges inside it and the viewer receives a few
+  higher-quality streams. One aggregator runs on each GPU host for that host's tiles (the
+  coordinator places a host's tiles as one contiguous region), and one serves the EC2 half.
+
+Hover outlines and labels, dark tiles, phases and clocks are drawn by the page from the
+shared state in both modes, so they behave identically. Switching never hitches: the page
+opens the other mode's streams in the background, waits until it has a decoded frame for
+every region at a `t` it is already showing, swaps in one draw, and only then closes the
+old streams.
+
 **Resolution follows the viewer.** The page asks each tile for the height its rectangle
 occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
 detail view for 1080p.
