@@ -7,6 +7,7 @@ pub mod spot;
 pub mod vm;
 
 use crate::cli::FleetAgentArgs;
+use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{Context, Result};
 use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, SharedScene};
@@ -28,6 +29,9 @@ pub struct Agent {
     pub spot_notice_url: Option<String>,
     /// How often the spot notice URL is polled.
     pub spot_poll: Duration,
+    /// Run an aggregator for this host's band on this port, with this command
+    /// (`fcvm fleet aggregate ...`; `--listen` is added).
+    pub aggregate: Option<(u16, Vec<String>)>,
 }
 
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
@@ -71,6 +75,17 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         },
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
+        aggregate: args.aggregate_port.map(|p| {
+            let mut argv = vec![
+                std::env::current_exe()
+                    .map(|e| e.to_string_lossy().into_owned())
+                    .unwrap_or_else(|_| "fcvm".into()),
+                "fleet".into(),
+                "aggregate".into(),
+            ];
+            argv.extend(args.aggregate_args.iter().cloned());
+            (p, argv)
+        }),
     };
     serve(agent, tokio::io::stdin(), tokio::io::stdout()).await
 }
@@ -124,6 +139,25 @@ where
 
     let cfg = Arc::new(agent.cfg);
     let (scene_tx, scene_rx) = watch::channel::<Option<SharedScene>>(None);
+    // The aggregator's layout follows the assignment and the scene.
+    let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
+    let aggregator = agent.aggregate.clone().map(|(port, argv)| {
+        let listen = format!("{}:{port}", cfg.publish_ip);
+        let url = slot::frame_url(&cfg.frame_host, port);
+        let out = out.clone();
+        tokio::spawn(crate::fleet::aggregate::child::supervise(
+            argv,
+            listen,
+            layout_rx,
+            move || {
+                let _ = out.send(AgentMsg::Aggregate {
+                    frame_url: url.clone(),
+                });
+            },
+        ))
+    });
+    let mut region: Option<fleet_core::tiling::Rect> = None;
+    let mut placed: Vec<AssignSlot> = Vec::new();
     let gpu_locks: HashMap<String, Arc<Mutex<()>>> = agent
         .gpus
         .iter()
@@ -146,7 +180,12 @@ where
             CoordMsg::Scene(s) => {
                 scene_tx.send_replace(Some(s));
             }
-            CoordMsg::Assign { slots: list } => {
+            CoordMsg::Assign {
+                slots: list,
+                region: r,
+            } => {
+                region = r;
+                placed = list.iter().filter(|a| a.rect.is_some()).cloned().collect();
                 assign(
                     &list,
                     &mut slots,
@@ -161,6 +200,34 @@ where
                 tracing::debug!(slots = list.len(), "assignment applied");
             }
         }
+        let layout = match (region, scene_rx.borrow().as_ref()) {
+            (Some(region), Some(scene)) => Some(Layout {
+                epoch_unix_ms: scene.epoch_unix_ms,
+                image_aspect: scene.image_aspect,
+                region,
+                tiles: placed
+                    .iter()
+                    .filter_map(|a| {
+                        Some(TileSpec {
+                            id: a.id.clone(),
+                            rect: a.rect?,
+                            url: ports
+                                .get(&a.sbdf)
+                                .map(|p| format!("ws://{}:{p}/frames", cfg.health_host())),
+                        })
+                    })
+                    .collect(),
+            }),
+            _ => None,
+        };
+        layout_tx.send_if_modified(|cur| {
+            let changed = *cur != layout;
+            *cur = layout.clone();
+            changed
+        });
+    }
+    if let Some(a) = aggregator {
+        a.abort();
     }
 
     tracing::info!(

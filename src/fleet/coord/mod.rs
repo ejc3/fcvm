@@ -16,10 +16,12 @@ pub mod store;
 pub mod text_check;
 
 use crate::cli::{FleetCoordArgs, FleetEc2, FleetTextCheck};
+use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
 use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, ServerMsg, SharedScene};
-use fleet_core::view::{ec2_assignment, host_assignments, shared_scene};
+use fleet_core::tiling::{half_rect, Half, Rect};
+use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -74,7 +76,7 @@ pub enum Cmd {
 struct AgentConn {
     host: String,
     tx: mpsc::UnboundedSender<CoordMsg>,
-    last_assign: Option<Vec<AssignSlot>>,
+    last_assign: Option<(Vec<AssignSlot>, Option<Rect>)>,
     last_scene: Option<SharedScene>,
 }
 
@@ -82,6 +84,8 @@ struct AgentConn {
 pub struct Outputs {
     pub snapshot: watch::Sender<Arc<Snapshot>>,
     pub ec2: watch::Sender<Vec<AssignSlot>>,
+    /// The EC2 half's aggregator layout.
+    pub ec2_layout: watch::Sender<Option<Layout>>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -147,9 +151,13 @@ impl Actor {
     /// Send each agent its assignment and the scene when they differ from what it last got.
     fn dispatch_agents(&mut self) {
         let assignments = host_assignments(&self.state);
+        let regions = host_regions(&self.state);
         let scene = shared_scene(&self.state);
         for conn in self.agents.values_mut() {
-            let mine = assignments.get(&conn.host).cloned().unwrap_or_default();
+            let mine = (
+                assignments.get(&conn.host).cloned().unwrap_or_default(),
+                regions.get(&conn.host).copied().flatten(),
+            );
             // The scene goes first, so a slot's first scene post has it.
             if conn.last_scene.as_ref() != Some(&scene) {
                 let _ = conn.tx.send(CoordMsg::Scene(scene.clone()));
@@ -157,11 +165,34 @@ impl Actor {
             }
             if conn.last_assign.as_ref() != Some(&mine) {
                 let _ = conn.tx.send(CoordMsg::Assign {
-                    slots: mine.clone(),
+                    slots: mine.0.clone(),
+                    region: mine.1,
                 });
                 conn.last_assign = Some(mine);
             }
         }
+        let f = &self.state.fleet;
+        let ec2_layout = Layout {
+            epoch_unix_ms: f.scene.epoch_unix_ms,
+            image_aspect: self.state.config.image_aspect,
+            region: half_rect(Half::Ec2),
+            tiles: f
+                .ec2
+                .values()
+                .filter_map(|s| {
+                    Some(TileSpec {
+                        id: s.id.clone(),
+                        rect: s.rect?,
+                        url: s.observed.frame_url.clone(),
+                    })
+                })
+                .collect(),
+        };
+        self.out.ec2_layout.send_if_modified(|cur| {
+            let changed = cur.as_ref() != Some(&ec2_layout);
+            *cur = Some(ec2_layout.clone());
+            changed
+        });
         let ec2 = ec2_assignment(&self.state);
         self.out.ec2.send_if_modified(|cur| {
             if *cur == ec2 {
@@ -333,6 +364,7 @@ fn set_at(event: &mut Event, t: u64) {
 pub struct Handle {
     pub cmds: mpsc::Sender<Cmd>,
     pub snapshot: watch::Receiver<Arc<Snapshot>>,
+    pub ec2_layout: watch::Receiver<Option<Layout>>,
 }
 
 impl Handle {
@@ -399,11 +431,13 @@ pub fn start(
         text: String::new(),
     }));
     let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
+    let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let actor = Actor::new(
         state,
         Outputs {
             snapshot: snap_tx,
             ec2: ec2_tx,
+            ec2_layout: ec2_layout_tx,
             store,
         },
         Box::new(now_ms),
@@ -412,6 +446,7 @@ pub fn start(
     let handle = Handle {
         cmds,
         snapshot: snap_rx,
+        ec2_layout: ec2_layout_rx,
     };
     let tick = handle.clone();
     tokio::spawn(async move {
@@ -444,6 +479,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             FleetEc2::None => 0,
             FleetEc2::Fake => args.max_tiles,
         },
+        ec2_aggregate_url: args.ec2_aggregate_url.clone(),
         ..Config::default()
     };
     if config.max_tiles == 0 {
@@ -482,6 +518,23 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         ))),
     };
     let (handle, _actor) = start(state, store_tx, ec2);
+    if let Some(listen) = &args.ec2_aggregate_listen {
+        let mut argv = vec![
+            std::env::current_exe()
+                .context("locating this fcvm binary")?
+                .to_string_lossy()
+                .into_owned(),
+            "fleet".into(),
+            "aggregate".into(),
+        ];
+        argv.extend(args.aggregate_args.iter().cloned());
+        tokio::spawn(crate::fleet::aggregate::child::supervise(
+            argv,
+            listen.clone(),
+            handle.ec2_layout.clone(),
+            || {},
+        ));
+    }
     for cmd in args.agent_cmds {
         let argv =
             shell_words::split(&cmd).with_context(|| format!("splitting --agent-cmd {cmd:?}"))?;

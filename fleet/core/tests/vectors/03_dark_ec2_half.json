@@ -32,6 +32,19 @@
       "after": 0,
       "checks": {
         "/ec2_assign": [],
+        "/view/aggregates/0/id": "agg:h1",
+        "/view/aggregates/0/rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/aggregates/0/tiles": [
+          "fcvm:1",
+          "fcvm:2",
+          "fcvm:3"
+        ],
+        "/view/aggregates/1": null,
         "/view/fleet/ec2_instances": 0,
         "/view/fleet/n": 3,
         "/view/tiles/0/rect": {
@@ -55,6 +68,25 @@
   ],
   "final_view": {
     "actions": [],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2",
+          "fcvm:3"
+        ]
+      }
+    ],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 3,
@@ -84,7 +116,7 @@
       "n": 3,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [

@@ -124,6 +124,9 @@ impl Viewer {
 async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions() {
     let (url, _h) = coordinator(allow_all()).await;
     let mut a = Viewer::connect(&url).await;
+    let hello = a.recv().await;
+    assert_eq!(hello["type"], "hello", "the first message names the viewer");
+    assert!(hello["viewer"].as_str().unwrap().starts_with("v-"));
     let first = a.recv().await;
     assert_eq!(first["type"], "snapshot");
     for key in [
@@ -151,6 +154,13 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
         last = version;
         let s = a.at_least(version).await;
         assert_eq!(s["scene"]["time_of_day"], *v);
+        let mine = s["actions"].as_array().unwrap().last().unwrap().clone();
+        assert_eq!(
+            mine["viewer"], hello["viewer"],
+            "the action names this viewer"
+        );
+        assert_eq!(mine["id"], id.as_str());
+        assert_eq!(mine["args"]["v"], *v);
     }
     assert!(
         a.order.windows(2).all(|w| w[0] < w[1]),
@@ -162,7 +172,7 @@ async fn a_viewer_gets_a_snapshot_on_connect_and_receipts_with_rising_versions()
     assert_eq!(r["outcome"], "refused");
     assert_eq!(
         r["reason"],
-        "args.v must be a fraction of the day in [0, 1]"
+        "args.v must be a fraction of the day in [0, 1)"
     );
 }
 
@@ -311,7 +321,7 @@ async fn pings_get_the_server_clock_and_garbage_gets_an_error() {
     a.send(json!({"type": "ping", "client_unix_ms": 123.5}))
         .await;
     a.send(json!({"type": "nonsense"})).await;
-    while a.other.len() < 2 {
+    while a.other.len() < 3 {
         a.recv().await;
     }
     let clock = a.other.iter().find(|m| m["type"] == "clock").unwrap();
@@ -365,7 +375,7 @@ impl FakeAgent {
 
     async fn assign(&mut self) -> Vec<fleet_core::protocol::AssignSlot> {
         loop {
-            if let CoordMsg::Assign { slots } = self.next().await {
+            if let CoordMsg::Assign { slots, .. } = self.next().await {
                 return slots;
             }
         }
@@ -492,7 +502,7 @@ async fn live_refuses_origins_it_was_not_given() {
             .await
             .unwrap_or_else(|e| panic!("{ok} must be allowed: {e}"));
         let first = ws.next().await.unwrap().unwrap();
-        assert!(first.to_text().unwrap().contains("snapshot"));
+        assert!(first.to_text().unwrap().contains("hello"));
     }
     let (mut ws, _) = tokio_tungstenite::connect_async(url.as_str())
         .await

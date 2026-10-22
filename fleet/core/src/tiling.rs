@@ -77,10 +77,20 @@ pub fn row_counts(n: usize, rows: usize) -> Vec<usize> {
         .collect()
 }
 
-/// The `n` rectangles of one half, row-major from the top left, in whole-image
-/// coordinates. `image_aspect` is the whole image's width / height.
-pub fn half_rects(half: Half, n: usize, image_aspect: f64, tile_aspect: f64) -> Vec<Rect> {
-    let rows = rows_for(n, image_aspect / 2.0, tile_aspect);
+/// A whole half of the image.
+pub fn half_rect(half: Half) -> Rect {
+    Rect {
+        x: half.x_offset(),
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    }
+}
+
+/// `n` rectangles exactly covering `area` (whole-image coordinates), row-major from its
+/// top left. `image_aspect` is the whole image's width / height.
+pub fn grid_in(area: Rect, n: usize, image_aspect: f64, tile_aspect: f64) -> Vec<Rect> {
+    let rows = rows_for(n, area.w * image_aspect / area.h, tile_aspect);
     let counts = row_counts(n, rows);
     let mut rects = Vec::with_capacity(n);
     for (i, &cols) in counts.iter().enumerate() {
@@ -90,14 +100,47 @@ pub fn half_rects(half: Half, n: usize, image_aspect: f64, tile_aspect: f64) -> 
             let x0 = j as f64 / cols as f64;
             let x1 = (j + 1) as f64 / cols as f64;
             rects.push(Rect {
-                x: half.x_offset() + x0 * 0.5,
-                y: y0,
-                w: (x1 - x0) * 0.5,
-                h: y1 - y0,
+                x: area.x + area.w * x0,
+                y: area.y + area.h * y0,
+                w: area.w * (x1 - x0),
+                h: area.h * (y1 - y0),
             });
         }
     }
     rects
+}
+
+/// The `n` rectangles of one half as one grid.
+pub fn half_rects(half: Half, n: usize, image_aspect: f64, tile_aspect: f64) -> Vec<Rect> {
+    grid_in(half_rect(half), n, image_aspect, tile_aspect)
+}
+
+/// One half cut into full-width bands stacked top to bottom, band `i` holding `counts[i]`
+/// tiles and as tall as its share of all of them, each band cut into its own grid.
+/// Returns each band's rectangle and its tiles. A GPU host's tiles are one band, so they
+/// cover one rectangle its aggregator can encode whole.
+pub fn bands(
+    half: Half,
+    counts: &[usize],
+    image_aspect: f64,
+    tile_aspect: f64,
+) -> Vec<(Rect, Vec<Rect>)> {
+    let total: usize = counts.iter().sum();
+    let mut out = Vec::with_capacity(counts.len());
+    let mut before = 0;
+    for &c in counts {
+        let y0 = before as f64 / total as f64;
+        let y1 = (before + c) as f64 / total as f64;
+        let band = Rect {
+            x: half.x_offset(),
+            y: y0,
+            w: 0.5,
+            h: y1 - y0,
+        };
+        out.push((band, grid_in(band, c, image_aspect, tile_aspect)));
+        before += c;
+    }
+    out
 }
 
 #[cfg(test)]
@@ -140,6 +183,65 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    fn assert_partition(area: Rect, rects: &[Rect], what: &str) {
+        let mut sum = 0.0;
+        for r in rects {
+            assert!(r.w > 0.0 && r.h > 0.0, "{what}: empty {r:?}");
+            assert!(
+                r.x >= area.x - EPS && r.x + r.w <= area.x + area.w + EPS,
+                "{what}: {r:?} outside {area:?}"
+            );
+            assert!(
+                r.y >= area.y - EPS && r.y + r.h <= area.y + area.h + EPS,
+                "{what}: {r:?} outside {area:?}"
+            );
+            sum += r.w * r.h;
+        }
+        assert!((sum - area.w * area.h).abs() < 1e-9, "{what}: area {sum}");
+        for (i, a) in rects.iter().enumerate() {
+            for b in &rects[i + 1..] {
+                assert_eq!(overlap(a, b), 0.0, "{what}: {a:?} overlaps {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn host_bands_partition_the_half_and_each_band_is_one_rectangle() {
+        for total in 1..=40usize {
+            for a in 0..=total {
+                for b in 0..=(total - a) {
+                    let counts: Vec<usize> = [a, b, total - a - b]
+                        .into_iter()
+                        .filter(|c| *c > 0)
+                        .collect();
+                    let bs = bands(Half::Fcvm, &counts, 16.0 / 9.0, 16.0 / 9.0);
+                    let band_rects: Vec<Rect> = bs.iter().map(|(r, _)| *r).collect();
+                    assert_partition(
+                        half_rect(Half::Fcvm),
+                        &band_rects,
+                        &format!("bands {counts:?}"),
+                    );
+                    let mut all = Vec::new();
+                    for ((band, tiles), c) in bs.iter().zip(&counts) {
+                        assert_eq!(tiles.len(), *c);
+                        assert_partition(*band, tiles, &format!("band of {c} in {counts:?}"));
+                        all.extend_from_slice(tiles);
+                    }
+                    assert_partition(half_rect(Half::Fcvm), &all, &format!("tiles {counts:?}"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn one_band_is_the_plain_grid() {
+        for n in 1..=100 {
+            let bs = bands(Half::Ec2, &[n], 16.0 / 9.0, 16.0 / 9.0);
+            assert_eq!(bs[0].0, half_rect(Half::Ec2));
+            assert_eq!(bs[0].1, half_rects(Half::Ec2, n, 16.0 / 9.0, 16.0 / 9.0));
         }
     }
 

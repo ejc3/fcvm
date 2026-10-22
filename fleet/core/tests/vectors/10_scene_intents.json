@@ -3,7 +3,7 @@
   "events": [
     {
       "args": {
-        "v": 1.5
+        "v": 1.0
       },
       "at": 1000,
       "id": "t1",
@@ -130,7 +130,7 @@
     {
       "after": 0,
       "checks": {
-        "/receipts/t1/reason": "args.v must be a fraction of the day in [0, 1]"
+        "/receipts/t1/reason": "args.v must be a fraction of the day in [0, 1)"
       }
     },
     {
@@ -186,55 +186,138 @@
   "final_view": {
     "actions": [
       {
+        "args": {
+          "v": 1.0
+        },
         "at": 1000,
-        "by": "v1",
+        "id": "t1",
         "name": "time_of_day",
         "outcome": "refused",
-        "summary": "args.v must be a fraction of the day in [0, 1]"
+        "summary": "args.v must be a fraction of the day in [0, 1)",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "v": 0.75
+        },
         "at": 1100,
-        "by": "v1",
+        "id": "t2",
         "name": "time_of_day",
         "outcome": "committed",
-        "summary": "time of day 0.750"
+        "summary": "time of day 0.750",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "color": [
+            1,
+            0.5,
+            0
+          ],
+          "pos": [
+            1,
+            2,
+            3
+          ]
+        },
         "at": 1200,
-        "by": "v1",
+        "id": "l1",
         "name": "light",
         "outcome": "committed",
-        "summary": "light"
+        "summary": "light",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "color": [
+            1,
+            0.5,
+            0
+          ],
+          "pos": [
+            1,
+            2,
+            3
+          ]
+        },
         "at": 1300,
-        "by": "v1",
+        "id": "l2",
         "name": "light",
         "outcome": "refused",
-        "summary": "too many lights; wait a moment"
+        "summary": "too many lights; wait a moment",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "keyframes": [
+            {
+              "fov_deg": 70,
+              "look": [
+                0,
+                10,
+                -1
+              ],
+              "pos": [
+                0,
+                10,
+                0
+              ],
+              "t": 4
+            },
+            {
+              "fov_deg": 70,
+              "look": [
+                0,
+                20,
+                -1
+              ],
+              "pos": [
+                0,
+                20,
+                0
+              ],
+              "t": 8
+            }
+          ]
+        },
         "at": 4000,
-        "by": "v1",
+        "id": "c1",
         "name": "camera",
         "outcome": "committed",
-        "summary": "camera path"
+        "summary": "camera path",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "drag": {
+            "dive": 0,
+            "pitch_deg": 0,
+            "yaw_deg": 0
+          }
+        },
         "at": 6000,
-        "by": "v1",
+        "id": "c2",
         "name": "camera",
         "outcome": "committed",
-        "summary": "camera"
+        "summary": "camera",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "drag": {
+            "pitch_deg": 0,
+            "yaw_deg": 1000000000.0
+          }
+        },
         "at": 6100,
-        "by": "v1",
+        "id": "c3",
         "name": "camera",
         "outcome": "refused",
-        "summary": "drag is out of range"
+        "summary": "drag is out of range",
+        "viewer": "v1"
       }
     ],
+    "aggregates": [],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 0,
@@ -244,12 +327,13 @@
       "n": 0,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [
         {
           "fov_deg": 70.0,
+          "intent": "c1",
           "look": [
             0.0,
             10.0,
@@ -278,6 +362,7 @@
         },
         {
           "fov_deg": 70.0,
+          "intent": "c2",
           "look": [
             0.0,
             15.0,

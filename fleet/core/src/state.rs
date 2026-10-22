@@ -25,6 +25,9 @@ pub struct Config {
     pub relaunch_interval_ms: u64,
     /// Minimum milliseconds between two committed `relaunch_all` intents from one viewer.
     pub relaunch_all_interval_ms: u64,
+    /// The EC2 half's aggregator frame WebSocket, when the coordinator runs one.
+    #[serde(default)]
+    pub ec2_aggregate_url: Option<String>,
     /// Bounds on `set_auto_relaunch`.
     pub auto_relaunch_min_secs: u64,
     pub auto_relaunch_max_secs: u64,
@@ -34,13 +37,14 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             max_tiles: 100,
-            image_aspect: 32.0 / 9.0,
+            image_aspect: 16.0 / 9.0,
             tile_aspect: 16.0 / 9.0,
             ec2_max: 0,
             word_interval_ms: 5_000,
             light_interval_ms: 1_000,
             relaunch_interval_ms: 2_000,
             relaunch_all_interval_ms: 30_000,
+            ec2_aggregate_url: None,
             auto_relaunch_min_secs: 10,
             auto_relaunch_max_secs: 86_400,
         }
@@ -61,6 +65,12 @@ pub struct Host {
     pub capacity: usize,
     pub draining: bool,
     pub joined_at: u64,
+    /// The rectangle this host's tiles cover (its band), when any of them is placed.
+    #[serde(default)]
+    pub region: Option<Rect>,
+    /// The host aggregator's frame WebSocket, once the agent reports it.
+    #[serde(default)]
+    pub aggregate_url: Option<String>,
 }
 
 /// What an agent (or the EC2 driver) last said about one slot.
@@ -157,8 +167,13 @@ pub struct Receipt {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Action {
     pub at: u64,
-    pub by: String,
+    /// The viewer that sent it (its `/live` connection id).
+    pub viewer: String,
+    /// The intent's client id.
+    pub id: String,
     pub name: String,
+    /// The intent's args, except a refused word's (`{}`).
+    pub args: serde_json::Value,
     pub summary: String,
     pub outcome: Outcome,
 }
@@ -183,6 +198,10 @@ pub struct Fleet {
     pub ec2: BTreeMap<u32, Slot>,
     /// Rectangles per half.
     pub n: usize,
+    /// The fcvm half's rectangles by position (the EC2 half's are the same, 0.5 to the
+    /// right).
+    #[serde(default)]
+    pub layout: Vec<Rect>,
     pub scene: Scene,
     pub settings: Settings,
     pub relaunch_all: Option<RelaunchAll>,
@@ -214,6 +233,7 @@ impl State {
                 slots: BTreeMap::new(),
                 ec2: BTreeMap::new(),
                 n: 0,
+                layout: Vec::new(),
                 scene: Scene::new(now_ms),
                 settings: Settings::default(),
                 relaunch_all: None,
@@ -239,6 +259,7 @@ impl State {
         f.slots.clear();
         f.ec2.clear();
         f.n = 0;
+        f.layout.clear();
         f.relaunch_all = None;
         f.viewers.clear();
         f.last_word_at.clear();

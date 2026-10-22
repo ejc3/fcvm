@@ -77,8 +77,8 @@
         "/assign/hA/1/id": "slot-2",
         "/view/fleet/n": 2,
         "/view/tiles/0/rect": {
-          "h": 1.0,
-          "w": 0.25,
+          "h": 0.5,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         }
@@ -88,25 +88,44 @@
       "after": 1,
       "checks": {
         "/assign/hA/0/rect": {
-          "h": 0.5,
+          "h": 0.4,
           "w": 0.25,
           "x": 0.0,
           "y": 0.0
         },
         "/assign/hB/0/id": "slot-3",
         "/assign/hB/2/id": "slot-5",
+        "/view/aggregates/0/id": "agg:hA",
+        "/view/aggregates/0/rect": {
+          "h": 0.4,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/aggregates/1/id": "agg:hB",
+        "/view/aggregates/1/rect": {
+          "h": 0.6,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.4
+        },
+        "/view/aggregates/1/tiles": [
+          "fcvm:3",
+          "fcvm:4",
+          "fcvm:5"
+        ],
         "/view/fleet/n": 5,
         "/view/tiles/0/rect": {
-          "h": 0.5,
+          "h": 0.4,
           "w": 0.25,
           "x": 0.0,
           "y": 0.0
         },
         "/view/tiles/2/rect": {
-          "h": 0.5,
-          "w": 0.16666666666666666,
+          "h": 0.3,
+          "w": 0.5,
           "x": 0.0,
-          "y": 0.5
+          "y": 0.4
         }
       }
     },
@@ -130,8 +149,21 @@
       "after": 3,
       "checks": {
         "/assign/hC/0/id": "slot-1",
+        "/view/aggregates/0/id": "agg:hC",
+        "/view/aggregates/1/rect": {
+          "h": 0.75,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
+        },
         "/view/fleet/n": 4,
         "/view/tiles/0/host": "hC",
+        "/view/tiles/0/rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
         "/view/tiles/0/slot": "slot-1",
         "/view/tiles/1/slot": "slot-3"
       }
@@ -139,6 +171,40 @@
   ],
   "final_view": {
     "actions": [],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "hC",
+        "id": "agg:hC",
+        "rect": {
+          "h": 0.25,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1"
+        ]
+      },
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "hB",
+        "id": "agg:hB",
+        "rect": {
+          "h": 0.75,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
+        },
+        "tiles": [
+          "fcvm:2",
+          "fcvm:3",
+          "fcvm:4"
+        ]
+      }
+    ],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 4,
@@ -179,7 +245,7 @@
       "n": 4,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [
@@ -223,8 +289,8 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
+          "h": 0.25,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -247,10 +313,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
-          "x": 0.25,
-          "y": 0.0
+          "h": 0.375,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.25
         },
         "slot": "slot-3",
         "vm": null
@@ -271,10 +337,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
+          "h": 0.375,
           "w": 0.25,
           "x": 0.0,
-          "y": 0.5
+          "y": 0.625
         },
         "slot": "slot-4",
         "vm": null
@@ -295,10 +361,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
+          "h": 0.375,
           "w": 0.25,
           "x": 0.25,
-          "y": 0.5
+          "y": 0.625
         },
         "slot": "slot-5",
         "vm": null
@@ -316,8 +382,8 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
+          "h": 0.25,
+          "w": 0.5,
           "x": 0.5,
           "y": 0.0
         },
@@ -337,10 +403,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
-          "x": 0.75,
-          "y": 0.0
+          "h": 0.375,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.25
         },
         "slot": null,
         "vm": null
@@ -358,10 +424,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
+          "h": 0.375,
           "w": 0.25,
           "x": 0.5,
-          "y": 0.5
+          "y": 0.625
         },
         "slot": null,
         "vm": null
@@ -379,10 +445,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
+          "h": 0.375,
           "w": 0.25,
           "x": 0.75,
-          "y": 0.5
+          "y": 0.625
         },
         "slot": null,
         "vm": null

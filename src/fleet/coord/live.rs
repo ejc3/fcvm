@@ -109,6 +109,25 @@ async fn viewer(socket: WebSocket, app: App) {
         })
         .await;
     let (mut sink, mut stream) = socket.split();
+    // Tell the viewer who it is before anything else, so it can find its own actions.
+    if sink
+        .send(Message::Text(
+            text(&ServerMsg::Hello {
+                viewer: viewer.clone(),
+            })
+            .into(),
+        ))
+        .await
+        .is_err()
+    {
+        app.handle
+            .send(Event::ViewerLeft {
+                at: 0,
+                viewer: viewer.clone(),
+            })
+            .await;
+        return;
+    }
     let (direct, mut direct_rx) = mpsc::channel::<ServerMsg>(DIRECT_QUEUE);
     let mut snapshots = app.handle.snapshot.clone();
     let writer = tokio::spawn(async move {

@@ -46,6 +46,8 @@ pub enum ServerMsg {
         server_unix_ms: u64,
         client_unix_ms: f64,
     },
+    /// First message on every connection: this viewer's id, as `actions[].viewer` names it.
+    Hello { viewer: String },
     /// A message the coordinator could not read; nothing was applied.
     Error { reason: String },
 }
@@ -106,6 +108,10 @@ pub enum AgentMsg {
     Draining {
         reason: String,
     },
+    /// The host's aggregator is serving the host's region at this frame WebSocket.
+    Aggregate {
+        frame_url: String,
+    },
 }
 
 /// One slot an agent must run.
@@ -159,9 +165,12 @@ impl SharedScene {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum CoordMsg {
-    /// The complete set of slots the host must run. A slot missing from it is torn down.
+    /// The complete set of slots the host must run (a slot missing from it is torn down),
+    /// and the rectangle its placed slots cover together (its aggregator's region).
     Assign {
         slots: Vec<AssignSlot>,
+        #[serde(default)]
+        region: Option<Rect>,
     },
     Scene(SharedScene),
 }
@@ -206,10 +215,11 @@ mod tests {
                 generation: 1,
                 rect: None,
             }],
+            region: None,
         };
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
-            json!({"type":"assign","slots":[{"id":"slot-1","sbdf":"0000:01:00.0","generation":1,"rect":null}]})
+            json!({"type":"assign","slots":[{"id":"slot-1","sbdf":"0000:01:00.0","generation":1,"rect":null}],"region":null})
         );
         let s = CoordMsg::Scene(SharedScene::new(&Scene::new(5), 2.0));
         let v = serde_json::to_value(&s).unwrap();

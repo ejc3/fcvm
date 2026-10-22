@@ -76,10 +76,10 @@
       "after": 0,
       "checks": {
         "/assign/h1/3/rect": {
-          "h": 0.5,
+          "h": 0.33333333333333337,
           "w": 0.25,
           "x": 0.25,
-          "y": 0.5
+          "y": 0.6666666666666666
         },
         "/assign/h1/4/rect": null,
         "/view/fleet/n": 4,
@@ -106,6 +106,26 @@
   ],
   "final_view": {
     "actions": [],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2",
+          "fcvm:3",
+          "fcvm:4"
+        ]
+      }
+    ],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 8,
@@ -167,7 +187,7 @@
         "slot-8"
       ]
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [
@@ -211,8 +231,8 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
+          "h": 0.3333333333333333,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -235,10 +255,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
-          "x": 0.25,
-          "y": 0.0
+          "h": 0.3333333333333333,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.3333333333333333
         },
         "slot": "slot-2",
         "vm": null
@@ -259,10 +279,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
+          "h": 0.33333333333333337,
           "w": 0.25,
           "x": 0.0,
-          "y": 0.5
+          "y": 0.6666666666666666
         },
         "slot": "slot-3",
         "vm": null
@@ -283,10 +303,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 0.5,
+          "h": 0.33333333333333337,
           "w": 0.25,
           "x": 0.25,
-          "y": 0.5
+          "y": 0.6666666666666666
         },
         "slot": "slot-4",
         "vm": null
@@ -304,8 +324,8 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
+          "h": 0.3333333333333333,
+          "w": 0.5,
           "x": 0.5,
           "y": 0.0
         },
@@ -325,10 +345,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
-          "w": 0.25,
-          "x": 0.75,
-          "y": 0.0
+          "h": 0.3333333333333333,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.3333333333333333
         },
         "slot": null,
         "vm": null
@@ -346,10 +366,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
+          "h": 0.33333333333333337,
           "w": 0.25,
           "x": 0.5,
-          "y": 0.5
+          "y": 0.6666666666666666
         },
         "slot": null,
         "vm": null
@@ -367,10 +387,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 0.5,
+          "h": 0.33333333333333337,
           "w": 0.25,
           "x": 0.75,
-          "y": 0.5
+          "y": 0.6666666666666666
         },
         "slot": null,
         "vm": null

@@ -4,7 +4,7 @@
 use crate::protocol::{AssignSlot, SharedScene};
 use crate::scene::Scene;
 use crate::state::*;
-use crate::tiling::{half_rects, Half, Rect};
+use crate::tiling::{Half, Rect};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -73,6 +73,20 @@ pub struct RelaunchAllView {
     pub ec2_pending: usize,
 }
 
+/// A region an aggregator encodes as one stream: a GPU host's band, or the EC2 half.
+#[derive(Debug, Clone, Serialize)]
+pub struct AggregateView {
+    /// `agg:<host>` or `agg:ec2`.
+    pub id: String,
+    pub half: Half,
+    pub host: Option<String>,
+    pub rect: Rect,
+    /// The aggregator's frame WebSocket; null until it is serving.
+    pub frame_url: Option<String>,
+    /// The tiles inside the region, by tile id.
+    pub tiles: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ViewersView {
     pub count: usize,
@@ -81,6 +95,7 @@ pub struct ViewersView {
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
     pub tiles: Vec<TileView>,
+    pub aggregates: Vec<AggregateView>,
     pub fleet: FleetView,
     pub scene: Scene,
     pub image_aspect: f64,
@@ -146,7 +161,12 @@ pub fn view(state: &State) -> View {
     let c = &state.config;
     let mut tiles = Vec::with_capacity(f.n * 2);
     for half in [Half::Fcvm, Half::Ec2] {
-        let rects = half_rects(half, f.n, c.image_aspect, c.tile_aspect);
+        let dx = if half == Half::Ec2 { 0.5 } else { 0.0 };
+        let rects: Vec<Rect> = f
+            .layout
+            .iter()
+            .map(|r| Rect { x: r.x + dx, ..*r })
+            .collect();
         let units = match half {
             Half::Fcvm => &f.slots,
             Half::Ec2 => &f.ec2,
@@ -177,8 +197,43 @@ pub fn view(state: &State) -> View {
                 .is_some_and(|h| !h.draining)
         })
         .count();
+    let tile_id = |half: Half, s: &Slot| s.position.map(|k| format!("{}:{}", half.as_str(), k + 1));
+    let mut aggregates: Vec<AggregateView> = f
+        .hosts
+        .values()
+        .filter_map(|h| {
+            let rect = h.region?;
+            let mut placed: Vec<(usize, String)> = f
+                .slots
+                .values()
+                .filter(|s| s.host.as_deref() == Some(h.name.as_str()))
+                .filter_map(|s| Some((s.position?, tile_id(Half::Fcvm, s)?)))
+                .collect();
+            placed.sort();
+            Some(AggregateView {
+                id: format!("agg:{}", h.name),
+                half: Half::Fcvm,
+                host: Some(h.name.clone()),
+                rect,
+                frame_url: h.aggregate_url.clone(),
+                tiles: placed.into_iter().map(|(_, id)| id).collect(),
+            })
+        })
+        .collect();
+    aggregates.sort_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
+    if let Some(url) = &c.ec2_aggregate_url {
+        aggregates.push(AggregateView {
+            id: "agg:ec2".into(),
+            half: Half::Ec2,
+            host: None,
+            rect: crate::tiling::half_rect(Half::Ec2),
+            frame_url: Some(url.clone()),
+            tiles: (1..=f.n).map(|k| format!("ec2:{k}")).collect(),
+        });
+    }
     View {
         tiles,
+        aggregates,
         fleet: FleetView {
             hosts: f
                 .hosts
@@ -239,6 +294,16 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
         }
     }
     out
+}
+
+/// Each host's region (its aggregator's rectangle), when any of its slots is placed.
+pub fn host_regions(state: &State) -> BTreeMap<String, Option<Rect>> {
+    state
+        .fleet
+        .hosts
+        .iter()
+        .map(|(n, h)| (n.clone(), h.region))
+        .collect()
 }
 
 /// The EC2 tiles the driver must run.

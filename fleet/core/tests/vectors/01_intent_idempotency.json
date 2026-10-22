@@ -121,25 +121,53 @@
   "final_view": {
     "actions": [
       {
+        "args": {
+          "tile": "slot-1"
+        },
         "at": 2000,
-        "by": "v1",
+        "id": "i-1",
         "name": "relaunch",
         "outcome": "committed",
-        "summary": "relaunch slot-1"
+        "summary": "relaunch slot-1",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "tile": "fcvm:9"
+        },
         "at": 2200,
-        "by": "v1",
+        "id": "i-2",
         "name": "relaunch",
         "outcome": "refused",
-        "summary": "no GPU behind fcvm:9"
+        "summary": "no GPU behind fcvm:9",
+        "viewer": "v1"
       },
       {
+        "args": {},
         "at": 2300,
-        "by": "v1",
+        "id": "i-3",
         "name": "bogus",
         "outcome": "refused",
-        "summary": "unknown intent \"bogus\""
+        "summary": "unknown intent \"bogus\"",
+        "viewer": "v1"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2"
+        ]
       }
     ],
     "fleet": {
@@ -167,7 +195,7 @@
       "n": 2,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [
@@ -216,8 +244,8 @@
         },
         "phase": "pending",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
+          "h": 0.5,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -240,10 +268,10 @@
         "last_relaunch": null,
         "phase": "pending",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
-          "x": 0.25,
-          "y": 0.0
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.5
         },
         "slot": "slot-2",
         "vm": null
@@ -261,8 +289,8 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
+          "h": 0.5,
+          "w": 0.5,
           "x": 0.5,
           "y": 0.0
         },
@@ -282,10 +310,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
-          "x": 0.75,
-          "y": 0.0
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.5
         },
         "slot": null,
         "vm": null

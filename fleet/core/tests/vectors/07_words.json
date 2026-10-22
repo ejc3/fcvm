@@ -79,7 +79,7 @@
     },
     {
       "args": {
-        "text": "aaaaaaaaaaaaaaaaaaaaaaaaa"
+        "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
       },
       "at": 9150,
       "check": {
@@ -152,7 +152,7 @@
     {
       "after": 7,
       "checks": {
-        "/receipts/w6/reason": "text is 25 characters; the limit is 24"
+        "/receipts/w6/reason": "text is 29 characters; the limit is 28"
       }
     },
     {
@@ -167,55 +167,74 @@
   "final_view": {
     "actions": [
       {
+        "args": {
+          "text": "hello"
+        },
         "at": 2000,
-        "by": "v1",
+        "id": "w1",
         "name": "word",
         "outcome": "committed",
-        "summary": "word \"hello\""
+        "summary": "word \"hello\"",
+        "viewer": "v1"
       },
       {
+        "args": {},
         "at": 3000,
-        "by": "v1",
+        "id": "w2",
         "name": "word",
         "outcome": "refused",
-        "summary": "one word per 5 s per viewer"
+        "summary": "one word per 5 s per viewer",
+        "viewer": "v1"
       },
       {
+        "args": {},
         "at": 3000,
-        "by": "v2",
+        "id": "w3",
         "name": "word",
         "outcome": "refused",
-        "summary": "the text check refused it: not suitable"
+        "summary": "the text check refused it: not suitable",
+        "viewer": "v2"
       },
       {
+        "args": {},
         "at": 9000,
-        "by": "v2",
+        "id": "w4",
         "name": "word",
         "outcome": "refused",
-        "summary": "the text check failed: text check unavailable"
+        "summary": "the text check failed: text check unavailable",
+        "viewer": "v2"
       },
       {
+        "args": {},
         "at": 9100,
-        "by": "v2",
+        "id": "w5",
         "name": "word",
         "outcome": "refused",
-        "summary": "the text check did not run"
+        "summary": "the text check did not run",
+        "viewer": "v2"
       },
       {
+        "args": {},
         "at": 9150,
-        "by": "v2",
+        "id": "w6",
         "name": "word",
         "outcome": "refused",
-        "summary": "text is 25 characters; the limit is 24"
+        "summary": "text is 29 characters; the limit is 28",
+        "viewer": "v2"
       },
       {
+        "args": {
+          "text": "  two   words "
+        },
         "at": 9200,
-        "by": "v2",
+        "id": "w7",
         "name": "word",
         "outcome": "committed",
-        "summary": "word \"two words\""
+        "summary": "word \"two words\"",
+        "viewer": "v2"
       }
     ],
+    "aggregates": [],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 0,
@@ -225,7 +244,7 @@
       "n": 0,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": null,
     "scene": {
       "camera": [

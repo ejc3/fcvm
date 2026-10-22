@@ -5,13 +5,16 @@ use serde::{Deserialize, Serialize};
 
 /// One point on the camera path. `pos` is the camera position and `look` the world point it
 /// looks at, `[x, altitude, z]` in kilometres (the renderer's world units); `t` is scene
-/// seconds.
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+/// seconds. `intent` is the id of the camera intent that created the keyframe, so a page
+/// can tell when the frames reflect its own input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Keyframe {
     pub t: f64,
     pub pos: [f64; 3],
     pub look: [f64; 3],
     pub fov_deg: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intent: Option<String>,
 }
 
 /// A viewer's word, placed at scene time `t`.
@@ -43,7 +46,7 @@ pub struct Scene {
 pub const MAX_KEYFRAMES: usize = 64;
 pub const MAX_WORDS: usize = 16;
 pub const MAX_LIGHTS: usize = 32;
-pub const MAX_WORD_CHARS: usize = 24;
+pub const MAX_WORD_CHARS: usize = 28;
 /// Coordinates beyond this are refused, so a viewer cannot send the camera to infinity.
 pub const MAX_COORD: f64 = 1.0e6;
 /// How far ahead of now a drag places its keyframe, in scene seconds.
@@ -60,6 +63,7 @@ impl Scene {
                 pos: [-32.0, 1.9, -55.0],
                 look: [-60.0, 1.9, -100.0],
                 fov_deg: 62.0,
+                intent: None,
             }],
             time_of_day: 0.30,
             words: Vec::new(),
@@ -77,13 +81,17 @@ impl Scene {
     pub fn camera_at(&self, t: f64) -> Keyframe {
         let k = &self.camera;
         if k.is_empty() {
-            return Scene::new(0).camera[0];
+            return Scene::new(0).camera[0].clone();
         }
         if t <= k[0].t {
-            return Keyframe { t, ..k[0] };
+            return Keyframe {
+                t,
+                intent: None,
+                ..k[0].clone()
+            };
         }
         for w in k.windows(2) {
-            let (a, b) = (w[0], w[1]);
+            let (a, b) = (&w[0], &w[1]);
             if t <= b.t {
                 let span = b.t - a.t;
                 let f = if span > 0.0 { (t - a.t) / span } else { 1.0 };
@@ -92,12 +100,14 @@ impl Scene {
                     pos: lerp3(a.pos, b.pos, f),
                     look: lerp3(a.look, b.look, f),
                     fov_deg: a.fov_deg + (b.fov_deg - a.fov_deg) * f,
+                    intent: None,
                 };
             }
         }
         Keyframe {
             t,
-            ..*k.last().unwrap()
+            intent: None,
+            ..k.last().unwrap().clone()
         }
     }
 
@@ -137,7 +147,7 @@ fn lerp3(a: [f64; 3], b: [f64; 3], f: f64) -> [f64; 3] {
 /// Turn the camera by `yaw_deg` about the world up axis and `pitch_deg` up or down, then
 /// move it `dive` world units along its view direction. Pitch is clamped short of straight
 /// up or down so the look direction never degenerates.
-pub fn drag(from: Keyframe, yaw_deg: f64, pitch_deg: f64, dive: f64) -> Keyframe {
+pub fn drag(from: &Keyframe, yaw_deg: f64, pitch_deg: f64, dive: f64) -> Keyframe {
     let d = [
         from.look[0] - from.pos[0],
         from.look[1] - from.pos[1],
@@ -167,6 +177,7 @@ pub fn drag(from: Keyframe, yaw_deg: f64, pitch_deg: f64, dive: f64) -> Keyframe
             pos[2] + dir[2] * len,
         ],
         fov_deg: from.fov_deg,
+        intent: None,
     }
 }
 
@@ -183,12 +194,14 @@ mod tests {
                 pos: [0.0; 3],
                 look: [0.0, 0.0, -1.0],
                 fov_deg: 60.0,
+                intent: None,
             },
             Keyframe {
                 t: 2.0,
                 pos: [2.0, 0.0, 0.0],
                 look: [2.0, 0.0, -1.0],
                 fov_deg: 80.0,
+                intent: None,
             },
         ];
         assert_eq!(s.camera_at(1.0).pos, [1.0, 0.0, 0.0]);
@@ -204,10 +217,11 @@ mod tests {
             pos: [0.0; 3],
             look: [0.0, 0.0, -10.0],
             fov_deg: 60.0,
+            intent: None,
         };
-        let m = drag(k, 0.0, 0.0, 5.0);
+        let m = drag(&k, 0.0, 0.0, 5.0);
         assert!((m.pos[2] + 5.0).abs() < 1e-9 && m.pos[0].abs() < 1e-9);
-        let turned = drag(k, 90.0, 0.0, 0.0);
+        let turned = drag(&k, 90.0, 0.0, 0.0);
         assert!((turned.look[0] - 10.0).abs() < 1e-9, "{turned:?}");
     }
 
@@ -216,7 +230,7 @@ mod tests {
         let mut s = Scene::new(0);
         for i in 0..1000 {
             let now = i as f64 * 0.05;
-            let to = drag(s.camera_at(now), 1.0, 0.0, 0.1);
+            let to = drag(&s.camera_at(now), 1.0, 0.0, 0.1);
             s.steer(now, to);
             assert!(s.camera.len() <= MAX_KEYFRAMES);
         }

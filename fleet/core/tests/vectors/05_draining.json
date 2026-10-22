@@ -135,25 +135,50 @@
   "final_view": {
     "actions": [
       {
+        "args": {},
         "at": 2500,
-        "by": "v1",
+        "id": "ra1",
         "name": "relaunch_all",
         "outcome": "committed",
-        "summary": "relaunch all (3 tiles)"
+        "summary": "relaunch all (3 tiles)",
+        "viewer": "v1"
       },
       {
+        "args": {
+          "tile": "slot-1"
+        },
         "at": 4500,
-        "by": "v1",
+        "id": "r1",
         "name": "relaunch",
         "outcome": "refused",
-        "summary": "slot-1 is on a draining host"
+        "summary": "slot-1 is on a draining host",
+        "viewer": "v1"
       },
       {
+        "args": {},
         "at": 5000,
-        "by": "v2",
+        "id": "ra2",
         "name": "relaunch_all",
         "outcome": "committed",
-        "summary": "relaunch all (1 tiles)"
+        "summary": "relaunch all (1 tiles)",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h2",
+        "id": "agg:h2",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1"
+        ]
       }
     ],
     "fleet": {
@@ -195,7 +220,7 @@
         "slot-2"
       ]
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": {
       "by": "viewer:v2",
       "ec2_done_at": null,

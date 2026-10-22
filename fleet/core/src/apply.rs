@@ -3,9 +3,9 @@
 
 use crate::event::{CameraMove, Event, Intent};
 use crate::protocol::{AgentMsg, HealthReport, SlotReport};
-use crate::scene::{drag, Light, Word, MAX_LIGHTS, MAX_WORDS};
+use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
-use crate::tiling::{half_rects, Half};
+use crate::tiling::{bands, Half, Rect};
 
 /// Apply one event. The version moves exactly when the state changed; an intent id seen
 /// before changes nothing (its first receipt stays in `state.receipts`).
@@ -70,18 +70,26 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                 return None;
             }
             let result = Intent::parse(name, args)
-                .and_then(|intent| intent_effect(state, viewer, &intent, check.as_ref(), at));
+                .and_then(|intent| intent_effect(state, viewer, id, &intent, check.as_ref(), at));
             let (outcome, reason, summary) = match result {
                 Ok(summary) => (Outcome::Committed, None, summary),
                 Err(reason) => (Outcome::Refused, Some(reason.clone()), reason),
             };
-            // A refused word's text is never shown: the summary is the reason only.
+            // A refused word's text is never shown: its args are left out and the summary
+            // is the reason only.
+            let shown_args = if name == "word" && outcome == Outcome::Refused {
+                serde_json::json!({})
+            } else {
+                args.clone()
+            };
             push_action(
                 &mut state.fleet,
                 Action {
                     at,
-                    by: viewer.clone(),
+                    viewer: viewer.clone(),
+                    id: id.clone(),
                     name: name.clone(),
+                    args: shown_args,
                     summary,
                     outcome,
                 },
@@ -130,6 +138,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     }
                 }
                 AgentMsg::Health(h) => health(&mut state.fleet, host, h, at),
+                AgentMsg::Aggregate { frame_url } => {
+                    if let Some(h) = state.fleet.hosts.get_mut(host) {
+                        h.aggregate_url = Some(frame_url.clone());
+                    }
+                }
                 AgentMsg::Draining { .. } => {
                     if let Some(h) = state.fleet.hosts.get_mut(host) {
                         h.draining = true;
@@ -165,6 +178,7 @@ fn push_action(f: &mut Fleet, a: Action) {
 fn intent_effect(
     state: &mut State,
     viewer: &str,
+    id: &str,
     intent: &Intent,
     check: Option<&TextCheck>,
     at: u64,
@@ -258,7 +272,13 @@ fn intent_effect(
             let now = scene.t_at(at);
             match mv {
                 CameraMove::Keyframes(k) => {
-                    scene.camera = k.clone();
+                    scene.camera = k
+                        .iter()
+                        .map(|k| Keyframe {
+                            intent: Some(id.to_string()),
+                            ..k.clone()
+                        })
+                        .collect();
                     scene.trim_history(now);
                     Ok("camera path".into())
                 }
@@ -267,7 +287,10 @@ fn intent_effect(
                     pitch_deg,
                     dive,
                 } => {
-                    let to = drag(scene.camera_at(now), *yaw_deg, *pitch_deg, *dive);
+                    let to = Keyframe {
+                        intent: Some(id.to_string()),
+                        ..drag(&scene.camera_at(now), *yaw_deg, *pitch_deg, *dive)
+                    };
                     scene.steer(now, to);
                     Ok("camera".into())
                 }
@@ -427,6 +450,8 @@ fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, a
             capacity,
             draining: false,
             joined_at: at,
+            region: None,
+            aggregate_url: None,
         },
     );
     drop_missing_pending(f, at);
@@ -579,21 +604,54 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     let instances = f.ec2.values().filter(|s| s.observed.vm.is_some()).count();
     let n = c.max_tiles.min(active.len().max(instances));
     f.n = n;
-    let left = half_rects(Half::Fcvm, n, c.image_aspect, c.tile_aspect);
-    let right = half_rects(Half::Ec2, n, c.image_aspect, c.tile_aspect);
+    // The placed slots (the first n by number) grouped by host, hosts ordered by their
+    // lowest placed slot; one band per host, then one band of dark tiles if EC2 has more
+    // instances than the fcvm half has GPUs.
+    let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
+    for num in active.iter().take(n) {
+        let host = f.slots[num].host.clone().expect("active slots have a host");
+        match groups.iter_mut().find(|(h, _)| *h == host) {
+            Some((_, v)) => v.push(*num),
+            None => groups.push((host, vec![*num])),
+        }
+    }
+    let placed: usize = groups.iter().map(|(_, v)| v.len()).sum();
+    let mut counts: Vec<usize> = groups.iter().map(|(_, v)| v.len()).collect();
+    if n > placed {
+        counts.push(n - placed);
+    }
+    let bands = if n == 0 {
+        Vec::new()
+    } else {
+        bands(Half::Fcvm, &counts, c.image_aspect, c.tile_aspect)
+    };
+    f.layout = bands
+        .iter()
+        .flat_map(|(_, tiles)| tiles.iter().copied())
+        .collect();
     for s in f.slots.values_mut() {
         s.position = None;
         s.rect = None;
     }
-    for (k, num) in active.iter().take(n).enumerate() {
-        let s = f.slots.get_mut(num).unwrap();
-        s.position = Some(k);
-        s.rect = Some(left[k]);
+    for h in f.hosts.values_mut() {
+        h.region = None;
+    }
+    let mut k = 0;
+    for (gi, (host, nums)) in groups.iter().enumerate() {
+        if let Some(h) = f.hosts.get_mut(host) {
+            h.region = Some(bands[gi].0);
+        }
+        for num in nums {
+            let s = f.slots.get_mut(num).unwrap();
+            s.position = Some(k);
+            s.rect = Some(f.layout[k]);
+            k += 1;
+        }
     }
     for (num, s) in f.ec2.iter_mut() {
         let k = (*num - 1) as usize;
         s.position = (k < n).then_some(k);
-        s.rect = right.get(k).copied();
+        s.rect = f.layout.get(k).map(|r| Rect { x: r.x + 0.5, ..*r });
     }
     drop_missing_pending(f, at);
 }

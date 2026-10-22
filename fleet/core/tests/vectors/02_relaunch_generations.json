@@ -222,18 +222,42 @@
   "final_view": {
     "actions": [
       {
+        "args": {
+          "tile": "slot-2"
+        },
         "at": 10000,
-        "by": "v1",
+        "id": "r1",
         "name": "relaunch",
         "outcome": "committed",
-        "summary": "relaunch slot-2"
+        "summary": "relaunch slot-2",
+        "viewer": "v1"
       },
       {
+        "args": {},
         "at": 20000,
-        "by": "v2",
+        "id": "ra",
         "name": "relaunch_all",
         "outcome": "committed",
-        "summary": "relaunch all (2 tiles)"
+        "summary": "relaunch all (2 tiles)",
+        "viewer": "v2"
+      }
+    ],
+    "aggregates": [
+      {
+        "frame_url": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "agg:h1",
+        "rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "tiles": [
+          "fcvm:1",
+          "fcvm:2"
+        ]
       }
     ],
     "fleet": {
@@ -261,7 +285,7 @@
       "n": 2,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": {
       "by": "viewer:v2",
       "ec2_done_at": null,
@@ -319,8 +343,8 @@
         },
         "phase": "running",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
+          "h": 0.5,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -354,10 +378,10 @@
         },
         "phase": "running",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
-          "x": 0.25,
-          "y": 0.0
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.5
         },
         "slot": "slot-2",
         "vm": "fleet-slot-2"
@@ -375,8 +399,8 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
+          "h": 0.5,
+          "w": 0.5,
           "x": 0.5,
           "y": 0.0
         },
@@ -396,10 +420,10 @@
         "last_relaunch": null,
         "phase": "waiting_capacity",
         "rect": {
-          "h": 1.0,
-          "w": 0.25,
-          "x": 0.75,
-          "y": 0.0
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.5
         },
         "slot": null,
         "vm": null

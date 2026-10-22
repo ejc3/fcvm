@@ -15,11 +15,11 @@ Conventions:
 - A rectangle `{"x","y","w","h"}` is a fraction of the whole image: `x` and `w` of its
   width, `y` and `h` of its height, origin top left. The fcvm half is `x` in [0, 0.5), the
   EC2 half `x` in [0.5, 1). `image_aspect` is the whole image's width / height (default
-  32/9, two 16:9 halves).
+  16/9, the renderer's: each half is 8:9).
 - Camera `pos` is the camera position and `look` the world point it looks at, as
   `[x, altitude, z]` in kilometres (the renderer's world units); `fov_deg` is the vertical
-  field of view. `time_of_day` is a fraction of the day in [0, 1] (0.25 sunrise, 0.5 noon,
-  0.75 sunset). Light `color` is linear RGB in [0, 1].
+  field of view. `time_of_day` is a fraction of the day in [0, 1) (0.25 sunrise, 0.5 noon,
+  0.75 sunset), in intents and in the scene alike. Light `color` is linear RGB in [0, 1].
 
 ## Coordinator
 
@@ -30,6 +30,13 @@ I/O and no randomness, so every viewer sees the same sequence.
 ### `GET /live` (WebSocket)
 
 **Server to browser**
+
+```json
+{"type": "hello", "viewer": "v-17"}
+```
+
+The first message on every connection: the id this connection acts as. `actions[].viewer`
+names it, so a page can find its own intents in the shared list.
 
 ```json
 {"type": "snapshot", "version": 42, "state": { ... }}
@@ -80,10 +87,10 @@ Intents:
 | `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, or a second relaunch from the viewer within 2 s |
 | `relaunch_all` | `{}` | bumps every slot's generation in one event (draining hosts excepted) and starts `relaunch_all`; one per viewer per 30 s |
 | `set_auto_relaunch` | `{"secs": 60}` or `{"secs": null}` | shared interval; on each tick a slot whose last relaunch (or creation) is that old is relaunched. 10 to 86400 s |
-| `camera` | `{"keyframes": [{"t", "pos", "look", "fov_deg"}, ...]}` | replaces the path (1 to 64 keyframes, in time order, fov 10 to 120) |
-| `camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns the current camera by yaw (about world up) and pitch, moves it `dive` units along its view, easing over 0.3 s |
-| `time_of_day` | `{"v": 0.3}` | a fraction of the day in [0, 1] |
-| `word` | `{"text": "hello"}` | 1 to 24 characters after collapsing whitespace, no control characters, one per viewer per 5 s; checked by the text check first (below) |
+| `camera` | `{"keyframes": [{"t", "pos", "look", "fov_deg"}, ...]}` | replaces the path (1 to 64 keyframes, in time order, fov 10 to 120); every keyframe gets `"intent": <this intent's id>` |
+| `camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns the current camera by yaw (about world up) and pitch, moves it `dive` units along its view, easing over 0.3 s; the keyframe it eases to gets `"intent": <id>` |
+| `time_of_day` | `{"v": 0.3}` | a fraction of the day in [0, 1) |
+| `word` | `{"text": "hello"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per viewer per 5 s; checked by the text check first (below) |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per viewer per second; the scene keeps the latest 32 |
 
 **Viewer text** (`word`). Before the event is applied the coordinator asks Claude Haiku on
@@ -115,19 +122,30 @@ started without a text check (`--text-check none`) refuses it. The scene keeps t
     },
     {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": null, ...}
   ],
+  "aggregates": [
+    {"id": "agg:<host>", "half": "fcvm", "host": "<host>", "rect": {"x": 0, "y": 0, "w": 0.5, "h": 1},
+     "frame_url": "ws://<host>:<port>/frames", "tiles": ["fcvm:1", "fcvm:2", ...]},
+    {"id": "agg:ec2", "half": "ec2", "host": null, "rect": {"x": 0.5, "y": 0, "w": 0.5, "h": 1},
+     "frame_url": "wss://...", "tiles": ["ec2:1", ...]}
+  ],
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
             "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": []},
   "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
-  "image_aspect": 3.5555555555555554,
+  "image_aspect": 1.7777777777777777,
   "settings": {"auto_relaunch_secs": null},
   "relaunch_all": {"started_at", "by", "fcvm_done_at", "ec2_done_at", "fcvm_last", "ec2_last", "fcvm_pending", "ec2_pending"},
   "viewers": {"count": 3},
-  "actions": [{"at", "by", "name", "summary", "outcome"}]
+  "actions": [{"at", "viewer", "id", "name", "args", "summary", "outcome"}]
 }
 ```
 
-- `tiles` lists the fcvm half then the EC2 half, each N tiles row-major from the top
-  left; N = `fleet.n` = min(`max_tiles`, max(fcvm GPUs, EC2 instances)). Tile ids
+- `tiles` lists the fcvm half then the EC2 half, N tiles each; N = `fleet.n` =
+  min(`max_tiles`, max(fcvm GPUs, EC2 instances)). The fcvm half is cut into full-width
+  bands, one per GPU host (hosts in the order of their lowest slot number), as tall as
+  the host's share of the N tiles, plus a band of dark tiles when EC2 has more instances;
+  each band is its own grid, row-major. So a host's tiles cover one rectangle, which its
+  aggregator encodes whole. The EC2 half repeats the fcvm half's rectangles, 0.5 to the
+  right. Tile ids
   `fcvm:<k>` and `ec2:<k>` (1-based) name places; `slot` names the GPU behind the place,
   which can change when the fleet re-tiles. Slot ids are `slot-<n>` (fcvm, reused lowest
   first) and `ec2-<n>`.
@@ -142,7 +160,14 @@ started without a text check (`--text-check none`) refuses it. The scene keeps t
 - `relaunch_all.fcvm_done_at - started_at` is the fcvm half's click-to-last-first-frame
   time; `fcvm_last` names the slot that finished last. A half with nothing to relaunch
   keeps `*_done_at` null. `*_pending` count tiles still to reach their first frame.
-- `actions` holds the latest 50 intents, committed and refused, oldest first.
+- `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
+  that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
+  runs its aggregator. `frame_url` is null until the host's aggregator is serving. A page
+  in aggregated mode opens one stream per region and draws dark tiles, phases and labels
+  from `tiles` as in direct mode.
+- `actions` holds the latest 50 intents, committed and refused, oldest first: the
+  `viewer` that sent it, the intent `id`, its `args` (a refused word's are `{}`, so its
+  text appears nowhere), and the outcome.
 
 ### Running it
 
@@ -150,6 +175,7 @@ started without a text check (`--text-check none`) refuses it. The scene keeps t
 fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file <path>]
                  [--text-check bedrock --text-check-model <id> --text-check-region <region> | --text-check none]
                  [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
+                 [--ec2-aggregate-listen <addr:port> --ec2-aggregate-url <ws url>] [--aggregate-arg <arg>]...
 ```
 
 A viewer is one `/live` connection: the per-viewer limits (one word per 5 s, one light per
@@ -242,11 +268,13 @@ until the host stops.
 ### Coordinator to agent
 
 ```json
-{"type": "assign", "slots": [{"id": "slot-3", "sbdf": "0000:01:00.0", "generation": 4, "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}}]}
+{"type": "assign", "slots": [{"id": "slot-3", "sbdf": "0000:01:00.0", "generation": 4, "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}}],
+ "region": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}}
 ```
 
 The complete set of slots the host runs, sent after the hello and whenever any of them
-changes. For each slot the agent reconciles:
+changes, and `region`, the rectangle the host's placed slots cover together (null when
+none is placed). For each slot the agent reconciles:
 
 - no VM, or a VM below `generation`: tear the old one down, wait until its fcvm process
   has exited and no process holds the GPU's VFIO group, start a new one, wait for the
@@ -277,7 +305,7 @@ agent posts `scene` plus the slot's `rect` to each running renderer as
 fcvm fleet agent --stdio --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
-                 [--spot-notice-url <url>]
+                 [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>
@@ -287,3 +315,41 @@ frame URL is `ws://<frame host>:<port>/frames` (one function, `frame_url`, to be
 by the slot's routed IPv6 name and TLS once fcvm has `--ipv6-address`). `--gpus` replaces
 the sysfs inventory (tests and hosts without vfio-pci). `--spot-notice-url` polls an EC2
 metadata URL (IMDSv2) for `spot/instance-action` every 5 s.
+
+With `--aggregate-port` the agent runs `fcvm fleet aggregate --listen <publish ip>:<port>`
+as a child (it dies with the agent, and is restarted with backoff if it exits), posts it
+the layout (`region`, every placed slot's rect and renderer URL, the scene's epoch) after
+every assignment or scene change, and reports it once it answers:
+
+```json
+{"type": "aggregate", "frame_url": "ws://<frame host>:<port>/frames"}
+```
+
+## Aggregator
+
+`fcvm fleet aggregate` joins one region's tiles into one stream: the agent runs one per
+GPU host for its band, the coordinator one for the EC2 half. It subscribes to every tile
+(`<renderer url>?h=<tile height>&q=hi`, near-lossless; the renderer's highest bitrate
+until `q=hi` exists), decodes each frame, and for each slot `k` (t = k/30) waits until
+every streaming tile has its frame for `k` or 150 ms past the slot's time. It then draws
+each tile's inner rectangle (crop margins dropped) at its place in the region, a tile
+with no frame within the last 3 slots black (relaunching, dark, down), and encodes the
+region once (libx264, zero-latency tuning, no B-frames, a keyframe every 2 s, High
+profile 4:2:0, BT.709 limited range). Decoding and encoding run in `ffmpeg` child
+processes; the host needs the `ffmpeg` CLI with libx264.
+
+- `GET /frames` (WebSocket): the renderer's frame protocol. The header is
+  `{"codec","width","height","full_width","full_height","x0","y0","fps":30,
+  "crop":{"left":0,"top":0,"right":0,"bottom":0},"aggregate":true,"tiles":[...]}`,
+  `x0, y0` the region's top-left pixel in the whole image; then FCVF frames, each at the
+  slot's `t`. A viewer that joins gets the header and every frame since the last
+  keyframe, then live frames; one that falls behind resumes at the next keyframe. A
+  layout change sends a new header and a keyframe.
+- The region's size is its share of a whole image `--image-height` tall (default 1080):
+  the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
+- `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
+  "tiles":[{"id","rect","url"}]}`; `GET /layout` returns it.
+- `GET /stats`: frames out, the output bitrate over the last 10 s, and percentiles of
+  `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
+  `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall
+  clock minus the slot's scene time), and per tile whether it is streaming.

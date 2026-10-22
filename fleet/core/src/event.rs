@@ -186,6 +186,7 @@ impl Intent {
                                 MAX_COORD,
                             )?,
                             fov_deg: fov,
+                            intent: None,
                         });
                     }
                     if out.windows(2).any(|w| w[1].t < w[0].t) {
@@ -214,8 +215,8 @@ impl Intent {
             }
             "time_of_day" => {
                 let v = num(args, "v")?;
-                if !(0.0..=1.0).contains(&v) {
-                    return Err("args.v must be a fraction of the day in [0, 1]".into());
+                if !(0.0..1.0).contains(&v) {
+                    return Err("args.v must be a fraction of the day in [0, 1)".into());
                 }
                 Ok(Intent::TimeOfDay { v })
             }

@@ -103,6 +103,7 @@ impl Coord {
             cfg,
             spot_notice_url,
             spot_poll: Duration::from_millis(50),
+            aggregate: None,
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -129,6 +130,7 @@ impl Coord {
                     rect: *rect,
                 })
                 .collect(),
+            region: None,
         });
     }
 
@@ -514,6 +516,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     rect: rect(0.25),
                 },
             ],
+            region: None,
         },
     ] {
         let mut l = serde_json::to_vec(&m).unwrap();
@@ -622,6 +625,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             generation: 1,
             rect: rect(x),
         }],
+        region: None,
     };
     stdin.write_all(&send(scene())).await.unwrap();
     stdin.write_all(&send(assign(0.0))).await.unwrap();
@@ -695,4 +699,161 @@ async fn a_spot_notice_is_reported_as_draining() {
     }
     assert!(polls.load(Ordering::SeqCst) >= 4);
     c.close().await;
+}
+
+/// With an aggregator port the agent runs `fcvm fleet aggregate` for its band, reports its
+/// frame URL, and gives it the layout: the assigned region and every placed slot's renderer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_runs_and_feeds_its_aggregator() {
+    let f = fake(2, &[]);
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let (coord_side, agent_side) = tokio::io::duplex(1 << 20);
+    let (agent_in, agent_out) = tokio::io::split(agent_side);
+    let (coord_in, coord_out) = tokio::io::split(coord_side);
+    let agent = Agent {
+        host: "gpu-host".into(),
+        gpus: gpus(2),
+        capacity: 2,
+        base_port: f.base,
+        cfg: cfg(&f.fcvm),
+        spot_notice_url: None,
+        spot_poll: Duration::from_millis(50),
+        aggregate: Some((
+            port,
+            vec![
+                env!("CARGO_BIN_EXE_fcvm").to_string(),
+                "fleet".into(),
+                "aggregate".into(),
+                "--codec".into(),
+                "raw".into(),
+            ],
+        )),
+    };
+    let task = tokio::spawn(serve(agent, agent_in, agent_out));
+    let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
+    let mut from_agent = LineReader::new(coord_in, "agent");
+    let region = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.5,
+        h: 0.5,
+    };
+    to_agent.send(scene()).unwrap();
+    to_agent
+        .send(CoordMsg::Assign {
+            slots: vec![
+                AssignSlot {
+                    id: "slot-1".into(),
+                    sbdf: "0000:01:00.0".into(),
+                    generation: 1,
+                    rect: Some(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 0.25,
+                        h: 0.5,
+                    }),
+                },
+                AssignSlot {
+                    id: "slot-2".into(),
+                    sbdf: "0000:02:00.0".into(),
+                    generation: 1,
+                    rect: None,
+                },
+            ],
+            region: Some(region),
+        })
+        .unwrap();
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(30), from_agent.next::<AgentMsg>())
+            .await
+            .expect("an agent message")
+            .unwrap()
+            .unwrap();
+        if let AgentMsg::Aggregate { frame_url } = m {
+            assert_eq!(frame_url, format!("ws://gpu-host.example:{port}/frames"));
+            break;
+        }
+    }
+    let layout_url = format!("http://127.0.0.1:{port}/layout");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let layout = loop {
+        let l: serde_json::Value = reqwest::get(&layout_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if !l.is_null() {
+            break l;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no layout reached the aggregator"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    assert_eq!(layout["region"], serde_json::to_value(region).unwrap());
+    assert_eq!(layout["epoch_unix_ms"], 1_000);
+    // Only placed slots are in the region; slot-2 is on standby.
+    assert_eq!(layout["tiles"].as_array().unwrap().len(), 1);
+    assert_eq!(layout["tiles"][0]["id"], "slot-1");
+    assert_eq!(
+        layout["tiles"][0]["url"],
+        format!("ws://127.0.0.1:{}/frames", f.base)
+    );
+
+    // A new region reaches it too.
+    let wider = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    };
+    to_agent
+        .send(CoordMsg::Assign {
+            slots: vec![AssignSlot {
+                id: "slot-1".into(),
+                sbdf: "0000:01:00.0".into(),
+                generation: 1,
+                rect: Some(wider),
+            }],
+            region: Some(wider),
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let l: serde_json::Value = reqwest::get(&layout_url)
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if l["region"] == serde_json::to_value(wider).unwrap() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the new region did not reach the aggregator"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Closing the agent stops the aggregator.
+    drop(to_agent);
+    tokio::time::timeout(Duration::from_secs(30), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while reqwest::get(&layout_url).await.is_ok() {
+        assert!(
+            Instant::now() < deadline,
+            "the aggregator outlived its agent"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }

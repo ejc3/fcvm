@@ -127,13 +127,16 @@
   "final_view": {
     "actions": [
       {
+        "args": {},
         "at": 3000,
-        "by": "v1",
+        "id": "ra",
         "name": "relaunch_all",
         "outcome": "committed",
-        "summary": "relaunch all (6 tiles)"
+        "summary": "relaunch all (6 tiles)",
+        "viewer": "v1"
       }
     ],
+    "aggregates": [],
     "fleet": {
       "ec2_instances": 0,
       "fcvm_gpus": 0,
@@ -143,7 +146,7 @@
       "n": 0,
       "standby": []
     },
-    "image_aspect": 3.5555555555555554,
+    "image_aspect": 1.7777777777777777,
     "relaunch_all": {
       "by": "viewer:v1",
       "ec2_done_at": 5000,

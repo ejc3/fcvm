@@ -56,6 +56,58 @@ pub enum FleetCommand {
     Coord(FleetCoordArgs),
     /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
     Agent(FleetAgentArgs),
+    /// Join a region's tile streams into one stream (POST /layout, GET /frames)
+    Aggregate(FleetAggregateArgs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetAggregateCodec {
+    /// H.264 through the ffmpeg CLI (decode; libx264 encode)
+    Ffmpeg,
+    /// Uncompressed pictures (tests)
+    Raw,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetAggregateArgs {
+    /// Address to serve /frames, /layout, /stats and /healthz on
+    #[arg(long)]
+    pub listen: String,
+
+    /// Height of the whole image in pixels; the region is encoded at its share of it
+    #[arg(long, default_value_t = 1080)]
+    pub image_height: u32,
+
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub codec: FleetAggregateCodec,
+
+    /// ffmpeg binary
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
+
+    /// libx264 constant rate factor of the region stream
+    #[arg(long, default_value_t = 20)]
+    pub crf: u32,
+
+    /// libx264 preset
+    #[arg(long, default_value = "veryfast")]
+    pub preset: String,
+
+    /// Bitrate cap of the region stream, kbit/s
+    #[arg(long, default_value_t = 20000)]
+    pub maxrate_kbps: u32,
+
+    /// Query added to every tile subscription
+    #[arg(long, default_value = "q=hi")]
+    pub tile_query: String,
+
+    /// How long past a slot's time the region waits for late tiles, ms
+    #[arg(long, default_value_t = 150)]
+    pub late_ms: u64,
+
+    /// Initial layout (JSON), instead of waiting for POST /layout
+    #[arg(long)]
+    pub layout: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -114,6 +166,18 @@ pub struct FleetCoordArgs {
     /// coordinator's own. Repeatable. Other cross-origin WebSockets are refused with 403.
     #[arg(long = "allowed-origin")]
     pub allowed_origins: Vec<String>,
+
+    /// Run the EC2 half's aggregator on this address
+    #[arg(long, requires = "ec2_aggregate_url")]
+    pub ec2_aggregate_listen: Option<String>,
+
+    /// The EC2 half's aggregator frame WebSocket as browsers reach it
+    #[arg(long, requires = "ec2_aggregate_listen")]
+    pub ec2_aggregate_url: Option<String>,
+
+    /// Extra argument for the EC2 half's aggregator. Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
 }
 
 #[derive(Args, Debug)]
@@ -166,6 +230,15 @@ pub struct FleetAgentArgs {
     /// Seconds a relaunch may take from fcvm start to the renderer's first frame
     #[arg(long, default_value_t = 300)]
     pub start_timeout_secs: u64,
+
+    /// Run this host's aggregator on this port (published on --publish-ip): it joins the
+    /// host's tiles into one stream
+    #[arg(long)]
+    pub aggregate_port: Option<u16>,
+
+    /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
+    #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
+    pub aggregate_args: Vec<String>,
 
     /// sysfs root for the GPU inventory and VFIO group lookup (tests)
     #[arg(long, default_value = "/sys", hide = true)]
