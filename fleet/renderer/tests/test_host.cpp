@@ -3,7 +3,9 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include "../src/jpeg.h"
 #include "../src/json.h"
 #include "../src/nvenc.h"
 #include "../src/proto.h"
@@ -61,6 +63,15 @@ int main() {
     long off = find_sps(au, sizeof au, &len);
     CHECK(off == 4 && len == 6, "find_sps off=%ld len=%zu", off, len);
     CHECK(avc_codec_string(au + off, len) == "avc1.640028", "%s", avc_codec_string(au + off, len).c_str());
+  }
+
+  // --- JPEG: markers, and a flat image codes small (the decode is checked with ffmpeg in the PR)
+  {
+    std::vector<uint8_t> px(37 * 21 * 4, 128);
+    std::string j = jpeg_encode(px.data(), 37, 21, 90);
+    CHECK(j.size() > 600 && (uint8_t)j[0] == 0xFF && (uint8_t)j[1] == 0xD8 && (uint8_t)j[j.size() - 2] == 0xFF &&
+              (uint8_t)j[j.size() - 1] == 0xD9 && j.size() < 1200,
+          "SOI/EOI and size %zu", j.size());
   }
 
   // --- scene parsing

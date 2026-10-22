@@ -13,7 +13,7 @@ NVFLAGS := -O3 -std=c++17 --use_fast_math $(GENCODE) -Xcompiler -Wall
 LDLIBS := -L$(CUDA)/lib64/stubs -lcuda -ldl -lpthread
 
 CORE := json scene font proto
-HOST := $(CORE) nvenc gpustats pipeline server
+HOST := $(CORE) nvenc gpustats pipeline server jpeg
 CORE_O := $(addprefix $(OUT)/,$(addsuffix .o,$(CORE)))
 HOST_O := $(addprefix $(OUT)/,$(addsuffix .o,$(HOST)))
 
@@ -38,7 +38,7 @@ $(OUT)/fleet-renderer-test: tests/test_gpu.cpp tests/check.h $(CORE_O) $(OUT)/re
 # Host-only tests need no CUDA: g++ and the NVENC header.
 $(OUT)/test-host: tests/test_host.cpp tests/check.h src/*.cpp src/*.h
 	@mkdir -p $(OUT)
-	$(CXX) -O1 -std=c++17 -Wall -I$(NVCH) -o $@ tests/test_host.cpp src/json.cpp src/scene.cpp src/font.cpp src/proto.cpp src/nvenc.cpp -ldl
+	$(CXX) -O1 -std=c++17 -Wall -I$(NVCH) -o $@ tests/test_host.cpp src/json.cpp src/scene.cpp src/font.cpp src/proto.cpp src/nvenc.cpp src/jpeg.cpp -ldl
 
 test-host: $(OUT)/test-host
 	$(OUT)/test-host

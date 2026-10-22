@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -14,6 +15,9 @@
 #include <vector>
 
 #include "gpustats.h"
+
+// how long one GET /still keeps the renderer drawing every slot at its height
+#define STILL_HOLD_S 30
 #include "nvenc.h"
 #include "render.h"
 #include "scene.h"
@@ -65,6 +69,12 @@ class Pipeline {
   // Debug: the unencoded tile of the frame at time t (a future frame slot), as
   // a binary PPM. Waits for that frame; false if this renderer skipped it.
   bool raw_frame(double t, std::string* ppm, std::string* tile_json);
+  // The next frame drawn, unencoded (RGBA, w x h), for GET /still. While
+  // nothing streams, the renderer then draws every slot as for a stream of
+  // tile height `still_h` (the `h` of GET /frames) for STILL_HOLD_S, so a hold
+  // converges between requests; the frame returned is drawn that way. While a stream runs, the frame is
+  // the stream's.
+  bool next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json);
   std::string health_json();
   bool ready() const { return ready_; }
   std::string fatal() const;
@@ -86,11 +96,17 @@ class Pipeline {
   int min_w_ = 0, min_h_ = 0;
   std::string header_json(const Enc& e, int q);
   struct RawReq {
-    long long k;
+    long long k;  // the frame slot wanted; LLONG_MIN: the next frame drawn
+    int want_h = 0;  // with no stream, only a frame drawn for this tile height (0: any)
     bool done = false;
     bool ok = false;
-    std::string ppm, tile;
+    std::vector<uint8_t> rgba;
+    int w = 0, h = 0;
+    std::string tile;
   };
+  int still_h_ = 0;                                 // under mu_
+  std::chrono::steady_clock::time_point still_until_{};  // under mu_
+  bool capture(long long k, int want_h, std::vector<uint8_t>* rgba, int* w, int* h, std::string* tile_json);
   std::vector<std::shared_ptr<RawReq>> raw_reqs_;  // under mu_
   std::condition_variable raw_cv_;
 
