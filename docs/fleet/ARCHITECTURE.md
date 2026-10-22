@@ -241,9 +241,13 @@ dark until its first frame at the current `t`.
 **Detail follows the rectangle.** Each renderer has a fixed budget per frame (pixels times
 ray-march steps at its target frame rate) and spends all of it on its own rectangle, so a
 smaller rectangle gets more detail: more steps, deeper fractal iterations, more samples per
-pixel. More GPUs in the fleet means smaller rectangles and a finer whole image. Opening one
-tile asks its GPU for its rectangle at full resolution, which shows detail the whole image
-cannot: the click-to-zoom is a real increase in rendered detail, not an upscale.
+pixel. More GPUs in the fleet means smaller rectangles and a finer whole image. Detail per
+unit of scene is that budget divided by the scene area a GPU covers. Opening a tile
+magnifies the same rectangle: the scene area is unchanged, so the detail per unit of scene
+is too; the GPU spends the budget on more pixels and fewer steps per pixel, so the region
+is drawn larger and sharper. A view that showed more of the scene through one GPU would
+spread the same budget over more area and lose detail, so the opened view never widens
+the rectangle.
 
 **Resolution follows the viewer.** The page asks each tile for the height its rectangle
 occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
