@@ -183,7 +183,8 @@ picture changes from coarser to finer tiles at one frame `t`. When a host is rec
 two-minute spot notice) the coordinator re-tiles onto the remaining GPUs at once, before
 the host disappears, so the image never shows a hole for a lost host. Slot names are
 reused lowest-first, so a stable fleet keeps stable names. The EC2 half is re-tiled in the
-same event and launches or terminates instances to match the new count.
+same event (N is recomputed from both counts) and launches or terminates instances to
+match the fcvm count.
 
 Within a host's life a slot keeps its address across relaunches, so a browser reconnects
 to the same address. Two fcvm changes make that possible:
@@ -244,9 +245,12 @@ detail view for 1080p.
 **The image is fixed; its tiling follows the fleet.** The picture is always the same
 frame of the same scene. The coordinator splits each half into as many rectangles as that
 half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
-(more pixels and more ray-marching steps per pixel in total). The EC2 half mirrors the
-fcvm half: the coordinator runs as many EC2 tiles as the fcvm side has GPUs, so both
-halves always have the same grid. Every viewer sees the same tiling, because the tiling
+(more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-22): the halves are symmetrical.** Both halves are cut into the same
+grid of N rectangles, N = max(fcvm GPUs, EC2 instances running). The coordinator asks EC2
+for as many instances as the fcvm side has GPUs; whichever side ends up with fewer GPUs
+(spot capacity decides) gives some of its GPUs two rectangles, assigned so no GPU has more
+than one extra. A GPU with two rectangles renders both, and relaunching it darkens both;
+the detail view says which tiles share a GPU. Every viewer sees the same tiling, because the tiling
 is part of the shared state.
 
 ### Web
