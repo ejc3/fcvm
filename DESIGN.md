@@ -2441,38 +2441,33 @@ the guest saw: the PCI functions present after a rescan, the kernel release
 the image was built for, the kernel log's NVRM lines after a failed `insmod`
 or `nvidia-smi`.
 
-### Not verified without GPU hardware
+### Verified on hardware
 
-Built and tested without a GPU: both kernel configs (the modules build
-against 6.18.50 on arm64 natively and x86_64 cross-compiled, with no
-unresolved symbols), the arm64 kernel and driver image through `make
-setup-gpu`, and fc-agent's parsing, waiting, error text, podman arguments and
-restore ordering (unit tests in `fc-agent/src/gpu.rs` and `restore.rs`). No
-gpu-profile VM has booted yet. The hardware test (g5g.metal with a T4G first)
-must check:
+On 2026-10-22, on a g4dn.metal (x86_64, eight NVIDIA T4, each bound to vfio-pci), with
+the gpu profile built by `make setup-gpu`:
 
-- [ ] A gpu-profile VM boots under `--enable-pci`, mounts the driver image
-      from `gpu_driver`, and takes the pre-start snapshot.
+- A gpu-profile VM boots under `--enable-pci`, mounts the driver image from
+  `gpu_driver`, takes the pre-start snapshot, and is restored with `--gpu <sbdf>`
+  attached through `device_passthrough`; in the container `nvidia-smi` lists a
+  `Tesla T4` with driver 580.196.07.
+- The restore's `gpu_ms` (rescan, module load, device nodes, `nvidia-smi -L`, CDI
+  generation) was 3,337, 3,220, 3,028, 3,078 and 3,061 ms over five restores; the
+  restore ACK came 4,157 to 4,569 ms after the load.
+- A cache-hit `fcvm podman run --gpu ... nvidia-smi -L`, process start to exit, took
+  6.7 s; two at once, on two GPUs from one snapshot, each saw its own T4 (different
+  UUIDs) and finished in 6.9 s together.
+- NVIDIA's CUDA vector-add sample (`nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0`)
+  passes in a gpu VM with the default guest memory, so `nvidia-uvm`, its device nodes
+  and the CDI injection work for a CUDA process.
 
-- [ ] After restore with `device_passthrough`, the rescan finds the T4G and
-      `lspci -vv` in the guest shows MSI-X enabled and both BARs assigned
-      (BAR1 is 256 MiB; check the guest's PCI window fits it).
-- [ ] `nvidia.ko` loads, GSP firmware boots (`dmesg | grep NVRM`), and
-      `nvidia-smi -L` lists the GPU within the restore ACK.
-- [ ] `/proc/devices` names `nvidia-uvm` as fc-agent expects, and the device
-      nodes it creates work for an unprivileged process.
-- [ ] `nvidia-ctk cdi generate --driver-root` finds the libraries in the image
-      without an `ld.so.cache` there, and the spec's container paths are the
-      standard `/usr/lib/<triplet>` ones.
-- [ ] Rootless podman in the guest (`--user` set) and root podman both start a
-      container with `--device nvidia.com/gpu=all`, the CDI hooks run, and
-      `nvidia-smi` and a CUDA sample (`deviceQuery`, a vector add) succeed in it.
-- [ ] Two clones of one golden snapshot, each with its own GPU, run at once.
-- [ ] Driver load time (`gpu_ms` in the ACK) on the measured box, and whether
-      the GPU re-initialises on every container process start without a
-      persistence daemon (if so, start `nvidia-persistenced` from the image).
-- [ ] Guest memory: driver load and a CUDA context in the default 1 GiB guest.
-- [ ] The same on an x86_64 host with a T4.
+Not yet checked:
+
+- The same on arm64 (g5g.metal, T4G).
+- `lspci -vv` in the guest (MSI-X, BAR sizes) and the GSP firmware lines in `dmesg`;
+  the driver and a CUDA kernel run, which needs both, but the output was not kept.
+- Root versus rootless podman in the guest: only the default was run.
+- Whether the GPU re-initialises on every container process start without
+  `nvidia-persistenced`.
 
 ## Known Limitations
 
