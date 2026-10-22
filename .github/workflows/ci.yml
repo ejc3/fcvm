@@ -205,8 +205,18 @@ jobs:
       - uses: pnpm/action-setup@0977fd99725f1db4007ccb2928dbb4e90d06cc86 # v6
         with:
           version: 10.34.7
+      # The mirror has stalled a whole install for 13 and 30 minutes on these
+      # runners (2026-10-22): bound each request and each attempt, and retry.
       - name: Install ffmpeg
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends ffmpeg
+        run: |
+          set -u
+          opts=(-o Acquire::Retries=5 -o Acquire::http::Timeout=20)
+          sudo apt-get "${opts[@]}" update
+          for attempt in 1 2 3; do
+            if timeout 300 sudo apt-get "${opts[@]}" install -y --no-install-recommends ffmpeg; then break; fi
+            echo "ffmpeg install attempt $attempt failed or timed out" >&2
+          done
+          ffmpeg -hide_banner -encoders | grep -q libx264
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
       - name: Lint and typecheck
