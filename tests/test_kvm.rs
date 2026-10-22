@@ -1499,12 +1499,12 @@ async fn run_nested_n_levels(
             .output()
             .await?;
         let route_output = String::from_utf8_lossy(&output.stdout);
-        // Parse "8.8.8.8 via X.X.X.X dev eth0 src 10.0.1.103 ..."
+        // Parse "8.8.8.8 via X.X.X.X dev eth0 src 192.0.2.10 ..."
         route_output
             .split_whitespace()
             .skip_while(|s| *s != "src")
             .nth(1)
-            .unwrap_or("10.0.1.103")
+            .unwrap_or("192.0.2.10")
             .to_string()
     } else {
         String::new()

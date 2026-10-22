@@ -397,9 +397,9 @@ fn normalized_zone(domain: &str) -> String {
 ///
 /// | query | verdict |
 /// |---|---|
-/// | `ip-10-0-1-49.us-west-1.compute.internal` | NOERROR, A 10.0.1.49 |
+/// | `ip-192-0-2-10.us-west-1.compute.internal` | NOERROR, A 192.0.2.10 |
 /// | `foo.compute.internal` | NXDOMAIN, no authority |
-/// | `ip-10-0-1-49.eu-west-1.compute.internal` | NXDOMAIN, no authority |
+/// | `ip-192-0-2-10.eu-west-1.compute.internal` | NXDOMAIN, no authority |
 /// | `db.corp.example` | NXDOMAIN carrying the root SOA |
 /// | `secret-host.internal.example.com` | NOERROR carrying example.com's SOA at Cloudflare |
 ///
@@ -410,7 +410,7 @@ fn normalized_zone(domain: &str) -> String {
 /// recursed into the public DNS, which discloses the private label to AWS's
 /// resolver and then to the parent zone's authoritative servers (CWE-200), and
 /// still does not resolve. The kept zone is private to that resolver: the same
-/// `ip-10-0-1-49.us-west-1.compute.internal` is NXDOMAIN at 1.1.1.1.
+/// `ip-192-0-2-10.us-west-1.compute.internal` is NXDOMAIN at 1.1.1.1.
 ///
 /// Read off the search list, with no lookup of any kind.
 /// `GuestBootInputs::for_launch` runs before `RoutedNetwork::setup` probes, and
@@ -898,7 +898,7 @@ mod tests {
     /// Two AWS VPC internal zones on one host: its own, and another VPC's
     /// arriving over a VPN link or a merged systemd-resolved list. Exactly one
     /// is this host's and the probed resolver answers NXDOMAIN for the other,
-    /// measured in us-west-1 as `ip-10-0-1-49.eu-west-1.compute.internal`
+    /// measured in us-west-1 as `ip-192-0-2-10.eu-west-1.compute.internal`
     /// NXDOMAIN with no authority. Nothing in the snapshot says which is which.
     ///
     /// Order does not, which is what this test holds: it runs the same pair
@@ -1113,7 +1113,7 @@ mod tests {
             "us-west.compute.internal",
             "us-west-.compute.internal",
             "us-west-1a.compute.internal",
-            "ip-10-0-1-49.us-west-1.compute.internal",
+            "ip-192-0-2-10.us-west-1.compute.internal",
             "us-east-1.compute.internal",
         ];
         // Shaped like a region and not one. `is_aws_region_label` admits these
@@ -1285,7 +1285,7 @@ mod tests {
             "us-west.compute.internal",
             "us-west-.compute.internal",
             "us-west-1a.compute.internal",
-            "ip-10-0-1-49.us-west-1.compute.internal",
+            "ip-192-0-2-10.us-west-1.compute.internal",
         ] {
             let narrowed = search_narrowed_to_sole_aws_vpc_zone(vec![ResolverGroup {
                 servers: vec!["10.0.0.2".to_string()],

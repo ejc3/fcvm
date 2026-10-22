@@ -2382,7 +2382,7 @@ mod tests {
     /// the AWS VPC resolver.
     ///
     /// Measured on an EC2 instance in us-west-1: that resolver answers
-    /// `ip-10-0-1-49.us-west-1.compute.internal` with A 10.0.1.49, identically
+    /// `ip-192-0-2-10.us-west-1.compute.internal` with A 192.0.2.10, identically
     /// to the host's own 10.0.0.2 and to 169.254.169.253, and returns NXDOMAIN
     /// for `db.corp.example` carrying the root SOA, meaning it recursed the
     /// private label into the public DNS on the way. So the host's own VPC
@@ -2460,7 +2460,7 @@ mod tests {
     /// The probe path on a host carrying a second AWS VPC internal zone. AWS
     /// gives an instance exactly one, so one of these came from another link,
     /// and measured on an EC2 instance in us-west-1
-    /// `ip-10-0-1-49.eu-west-1.compute.internal` comes back NXDOMAIN with no
+    /// `ip-192-0-2-10.eu-west-1.compute.internal` comes back NXDOMAIN with no
     /// authority, the same verdict that resolver gives `db.corp.example`.
     ///
     /// Which of the two is this host's is not in the resolv.conf snapshot, and
