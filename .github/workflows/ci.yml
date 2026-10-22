@@ -194,6 +194,8 @@ jobs:
     timeout-minutes: 30
     defaults:
       run:
+        # A container job's default shell is sh, which has no pipefail.
+        shell: bash
         working-directory: fleet/web
     env:
       # Ports for the mock fleet and the page under test: this runner runs nothing else.
