@@ -174,6 +174,20 @@ void Server::handle(int fd) {
     if (!p_.post_scene(body, &err)) return respond(fd, 400, "Bad Request", "{\"error\":\"" + json_escape(err) + "\"}");
     return respond(fd, 200, "OK", "{\"ok\":true}");
   }
+  if (path == "/raw" && method == "GET") {  // debug: one unencoded frame, see PROTOCOL.md
+    size_t tp = query.find("t=");
+    if (tp == std::string::npos) return respond(fd, 400, "Bad Request", "{\"error\":\"t required\"}");
+    double t = atof(query.c_str() + tp + 2);
+    std::string ppm, tile;
+    if (!p_.raw_frame(t, &ppm, &tile)) return respond(fd, 404, "Not Found", "{\"error\":\"that frame was not drawn\"}");
+    char h[512];
+    snprintf(h, sizeof h,
+             "HTTP/1.1 200 OK\r\nContent-Type: image/x-portable-pixmap\r\nContent-Length: %zu\r\nX-Fleet-Tile: %s\r\nConnection: close\r\n\r\n",
+             ppm.size(), tile.c_str());
+    std::string out = std::string(h) + ppm;
+    write_all(fd, out.data(), out.size());
+    return;
+  }
   if (path == "/frames" && method == "GET") {
     if (lower(hdr["upgrade"]) != "websocket" || hdr["sec-websocket-key"].empty())
       return respond(fd, 426, "Upgrade Required", "{\"error\":\"WebSocket upgrade required\"}");

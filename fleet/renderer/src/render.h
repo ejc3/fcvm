@@ -21,8 +21,13 @@ class Renderer {
   ~Renderer();
   // Creates the CUDA context and the tables. Returns false with a message.
   bool init(std::string* err);
-  // Pixel-samples spent per frame (pixels x samples); spp = budget / pixels, 1..64.
+  // Pixel-samples spent per frame (drawn pixels x samples); spp = budget / pixels, 1..64.
   void set_budget(double pixel_samples) { budget_ = pixel_samples; }
+  // Frames are drawn at t = k / fps; the history ring is indexed by k.
+  void set_fps(int fps) { fps_ = fps; }
+  // Pixels drawn per frame for a tile (the tile plus its guard band, before
+  // clipping to the image), so the sample count is the same for every tile of a grid.
+  static double drawn_pixels(const Tile& t);
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -47,29 +52,34 @@ class Renderer {
 
  private:
   void ensure_buffers(const Tile& t);
-  double budget_ = 2.0e6;
+  double budget_ = 1.0e6;
+  int fps_ = 30;
   Tile tile_{};
+  int ex0_ = 0, ey0_ = 0, ew_ = 0, eh_ = 0, guard_ = 0;  // drawn region and reprojection reach
+  int rx0_ = 0, ry0_ = 0, rw_ = 0, rh_ = 0;               // resolved region
   bool have_tile_ = false;
   void* ctx_ = nullptr;
   std::string gpu_name_, pci_bus_id_;
-  // device buffers
+  // device tables
   void* noise_ = nullptr;
   void* trans_ = nullptr;
   void* sky_ = nullptr;
   void* cloud_arr_ = nullptr;
   unsigned long long cloud_tex_ = 0;
+  // per tile (core region)
   void* rgba_ = nullptr;
-  void* hdr_ = nullptr;        // final linear color (debug/test)
-  void* hold_sum_ = nullptr;   // float4 rgb sum + count
-  void* hold_aux_ = nullptr;   // float2 depth + id of the hold's first sample
-  void* taa_[2] = {nullptr, nullptr};      // float4 rgb + count
-  void* taa_aux_[2] = {nullptr, nullptr};  // float2 depth + id
-  int cur_ = 0;         // index of the newest motion history
-  int hold_src_ = 0;    // motion history frozen at the start of the hold
+  void* hdr_ = nullptr;         // final linear color (tests)
+  void* display_ = nullptr;     // float4 over the resolved region: last resolved color and its weight
+  void* hold_blend_ = nullptr;  // display_ as it was when the current hold began
+  // per drawn region (tile plus guard band)
+  void* hold_sum_ = nullptr;    // float4 rgb sum + count
+  void* hold_aux_ = nullptr;    // float2 depth + id of the hold's first sample
+  void* ring_[TEMPORAL_WINDOW] = {};      // float4: frame's mean color + sample count
+  void* ring_aux_[TEMPORAL_WINDOW] = {};  // float2: first hit distance + kind
+  long long ring_slot_[TEMPORAL_WINDOW];  // frame slot held by each ring entry, or LLONG_MIN
+  GCam ring_cam_[TEMPORAL_WINDOW];
   uint64_t hold_key_ = 0;
   int hold_n_ = 0;
-  bool have_prev_ = false;
-  GCam prev_cam_{};
   void* stream_ = nullptr;
   void* ev0_ = nullptr;
   void* ev1_ = nullptr;

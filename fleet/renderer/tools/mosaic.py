@@ -30,6 +30,7 @@ for k, (h, p) in enumerate(ends):
     fc.post_scene(h, p, s)
 
 results = [None] * len(ends)
+rates = [0.0] * len(ends)
 
 
 def run(k):
@@ -45,6 +46,7 @@ def run(k):
     finally:
         st.close()
     results[k] = (hdr, fr)
+    rates[k] = sum(len(a) for _, a in fr) * 8 / max(1e-3, (fr[-1][0]["t"] - fr[0][0]["t"])) if len(fr) > 1 else 0
 
 
 ths = [threading.Thread(target=run, args=(k,)) for k in range(len(ends))]
@@ -67,7 +69,7 @@ for k, (hdr, fr) in enumerate(results):
     hl = fc.health(*ends[k])
     meta.append({"cell": k, "x0": hdr["x0"], "y0": hdr["y0"], "w": hdr["width"], "h": hdr["height"],
                  "t": t_pick, "frame": fr[idx][0]["frame"], "gpu": hl["gpu"], "fps": hl["fps"],
-                 "spp": hl["spp"], "hold_samples": hl["hold_samples"]})
+                 "spp": hl["spp"], "hold_samples": hl["hold_samples"], "bits_per_s": round(rates[k])})
 canvas.save(out + ".png")
 json.dump({"t": t_pick, "epoch_unix_ms": scene["epoch_unix_ms"], "tiles": meta}, open(out + ".json", "w"), indent=1)
 print(f"stitched {len(ends)} tiles at t={t_pick} into {out}.png ({canvas.size[0]}x{canvas.size[1]})")

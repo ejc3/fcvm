@@ -52,6 +52,7 @@ grants. The body is at most 1 MiB.
 | `time_of_day` | sun position: 0.25 sunrise, 0.5 noon, 0.75 sunset | 0 to 1 |
 | `words` | viewer text | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
+| `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
 
 Answers `200 {"ok":true}`, or `400 {"error":"<what is wrong>"}` naming the
 field. A scene replaces the previous one whole.
@@ -81,8 +82,11 @@ field. A scene replaces the previous one whole.
   above the horizon.
 - A **light** appears at its `t` as a glowing sphere (35 m) of its `color`, and
   lights the terrain within 3 km. At most 32.
-- Words, the clock and the light spheres are drawn every frame at that frame's
-  `t`, without sampling noise, on top of the accumulated image (below).
+- Words and the clock are glowing glass tubes in the world: lit by the sun and
+  the sky, with an emissive core, a bright rim and a soft halo. They, and the
+  light spheres, are drawn every frame at that frame's `t`, without sampling
+  noise, on top of the accumulated image (below), and are hidden where terrain
+  is in front of them.
 
 ## `GET /frames?h=<height>` (WebSocket)
 
@@ -151,7 +155,7 @@ pixel in both, drawn identically.
 {"fps":30.0,"heights":[240],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
  "t":1234.5,"frame":5678,
- "ready":true,"render_ms":23.2,"encode_ms":0.5,"spp":38,"hold":false,"hold_samples":0,
+ "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":9,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
 
@@ -159,7 +163,8 @@ The first six keys are the contract. GPU numbers come from NVML, sampled once
 a second; a value NVML does not give is `null`. The rest: `ready` (the GPU is
 initialized), `error` (only when the renderer has failed), `render_ms` and
 `encode_ms` of the last frame, `spp` (samples per pixel drawn in it),
-`hold`/`hold_samples` (see below), and `startup_ms`, milliseconds from the
+`hold`/`hold_samples` (see below), `slots_missed` (frame slots skipped while a
+subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
 `Access-Control-Allow-Origin: *` is set on this route only.
@@ -171,11 +176,18 @@ Every pixel is a path-traced estimate. Its random numbers are seeded by
 value is reduced across pixels, so a pixel's samples are the same wherever it
 is drawn.
 
-**Budget.** Each frame spends a GPU-time budget: the renderer draws as many
-samples per pixel (1 to 64) as keep a frame's GPU time near 70% of its 33 ms
-slot, adjusting after every frame (`ADAPT=0` fixes it at `BUDGET`
-pixel-samples per frame, default 1,000,000). A small tile therefore gets many
-samples per frame and a 1080p view one.
+**Budget.** Each frame spends a fixed number of pixel-samples (the scene's
+`budget`, else `BUDGET`, default 500,000) over the pixels it draws: its rect plus a guard band (below),
+counted before clipping to the image. The samples per pixel are
+`round(BUDGET / drawn pixels)`, clamped to 1..64, so every tile of a grid draws
+the same number: a 180 px wall tile of a 16 x 9 grid draws 9, a whole 1080p
+image 1. Moving frames match across tiles only if every renderer draws every
+slot, so the budget must leave the slowest tile inside its 33 ms; `/health`
+counts `slots_missed`, and the coordinator can lower `budget` for all tiles at
+once when any tile reports misses. `ADAPT=1`
+instead adjusts the budget so a frame's GPU time stays near 70% of its slot,
+which keeps the frame rate on a slow view but gives tiles different sample
+counts, so moving frames no longer match across tile edges.
 
 **While the camera holds** (see "Camera interpolation and holds"):
 
@@ -187,40 +199,71 @@ samples per frame and a 1080p view one.
   Each frame adds the next samples to a per-pixel sum in order, so the sum
   after `n` samples does not depend on how they were split across frames.
 - Accumulation stops at 1024 samples per pixel.
-- While fewer than 256 samples are in, the motion history from before the hold
-  (below) is blended in with a weight that falls linearly to zero at 256
-  samples, so the switch from motion to hold does not flash noisy.
+- While fewer than 256 samples are in, the last moving frame's output (below)
+  is blended in, weighing up to 16 samples and falling linearly to zero at 256
+  samples, so the switch from motion to hold does not flash noisy. From 256
+  samples on, a held pixel is the hold's own path-traced average and nothing
+  else.
 - **Result:** once a renderer has at least 256 samples of a hold, its pixels
   depend only on (scene, hold, sample count, whole-image pixel) and, for the
   overlays, on `t`. Two renderers with the same sample count give identical
   pixels; at 1024 every renderer gives the same image. A relaunched renderer
   starts at 0 and catches up, showing as a noisier patch that heals.
 
-**While the camera moves:** every frame draws fresh samples at its own `t`
-seeded by (pixel, `t`, sample index) and blends them into a history
-reprojected from the previous frame this renderer drew (as in TAA): the
-pixel's first hit is projected into the previous camera, the four history
-texels around it are used where their hit kind (sky, land, water) matches and
-their depth is within 4%, and the history counts as at most 16 samples. History
-from outside this renderer's own rect does not exist, so pixels whose
-reprojection leaves the tile start fresh.
+**While the camera moves:** frame `k` (at `t = k/30`) draws its samples at
+its own `t`, seeded by (pixel, `t`, sample index), over its rect **plus a guard
+band** of `g + 4` pixels on each side, where `g = ceil(0.015 * full_h)`
+(clipped to the image). It keeps the last 8 frames it drew. Each pixel of the
+rect is then the sample-weighted average of
 
-This part is not identical across GPUs, and it is impractical to make it so:
-the history depends on which frames a renderer drew (a slower one skips slots)
-and on pixels it never had (next to a tile edge, motion brings in pixels from
-the neighbour's rect). What holds is that each frame's own samples are the
-same function everywhere, so tiles differ only in how much noise is left, not
-in what they show; at the next hold they converge to identical pixels.
+- this frame's samples, and
+- for each of the frames `k-1 .. k-7` this renderer drew: that frame's color
+  at the point where this pixel's first hit was in that frame's camera
+  (bilinear over four pixels), counted only where the four pixels' hit kind
+  (sky, land, water) matches, their hit distance agrees within 4%, and the
+  point moved at most `g` pixels in x and in y. A frame weighs its sample
+  count, at most 64.
+
+This is computed for the rect plus 2 pixels on each side. Where a pixel's
+total weight is under 48 samples (fast motion, a fresh renderer, a 1080p view)
+it is then filtered: a 5 x 5 edge-aware average of those resolved pixels with
+the same hit kind, a depth within 3% and similar brightness, blended in fully
+below 16 samples and not at all from 48. Converged holds are not filtered.
+
+Every input of that rule is a whole-image pixel, a frame time or the scene, and
+every pixel it can read lies inside the drawing renderer's guard band (the
+filter reads 2 pixels past the rect, whose reprojection reads `g + 1` past
+those), so:
+**two renderers that drew the same frames `k-7 .. k` give identical pixels for
+frame `k`**, whatever their rects. A renderer that started (or missed a slot)
+less than 8 frames ago differs only until 8 frames have passed. History older
+than 8 frames contributes nothing. Motion faster than `g` pixels over the
+window simply uses fewer frames, the same way on every renderer.
+
+During a hold, each frame's entry in those 8 is the hold's current average, so
+the first moving frames after a hold reproject the converged image instead of
+starting from noise.
 
 **Accumulation off** (`ACCUMULATE=0`, and the seam test): each frame is the
-average of its own samples, a pure function of (scene, `t`, samples per pixel,
-whole-image pixel).
+filtered average of its own samples, a pure function of (scene, `t`, samples
+per pixel, whole-image pixel).
 
 **The seam test** (`fleet-renderer test`, run inside the container on a GPU)
 draws a 960 x 540 image whole and as a 2 x 2 grid of tiles and compares them
-pixel for pixel, 8-bit and float: once with accumulation off on a moving frame,
-and once in a hold with 16 samples split 4 x 4 for the whole image and 2 x 8 for
-the tiles. Two controls (a tile drawn one pixel off, another `t`) must differ.
+pixel for pixel, 8-bit and float: with accumulation off on a moving frame; in a
+hold with 16 samples split 4 x 4 for the whole image and 2 x 8 for the tiles;
+and on the 12th of 12 consecutive moving frames with history. Two controls (a
+tile drawn one pixel off, another `t`) must differ.
+
+## `GET /raw?t=<t>` (debug)
+
+Waits for the frame at `t` (a future slot, at most 15 s ahead) and returns this
+renderer's tile of it unencoded, as a binary PPM at the height being drawn,
+with a header `X-Fleet-Tile: {"t":..,"x0":..,"y0":..,"width":..,"height":..,
+"full_width":..,"full_height":..,"spp":..}`; `404` if the renderer skipped that
+slot. `tools/rawmosaic.py` uses it to stitch an unencoded mosaic that can be
+compared pixel for pixel with the same frame drawn whole
+(`fleet-renderer still --seq 12`). Not for browsers.
 
 ## Process
 
@@ -230,5 +273,5 @@ the tiles. Two controls (a tile drawn one pixel off, another `t`) must differ.
   stays current; a new subscriber wakes it at once.
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
-- Environment: `PORT` (8080), `FPS` (30), `BUDGET`, `ADAPT` (1),
+- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (500000), `ADAPT` (0),
   `ACCUMULATE` (1).

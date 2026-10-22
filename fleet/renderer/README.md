@@ -16,29 +16,38 @@ pure function of `t`, the scene and its whole-image coordinates:
   more octaves for shading normals as the pixel footprint shrinks. The
   large-scale fields (land, massif, warp) are baked once at start into a
   filtered 2048 x 2048 texture over +-512 km, which halves the cost of a march
-  step; outside it they are computed directly.
+  step; outside it they are computed directly. Shading reads the same fields
+  through a quadratic B-spline, because the hardware's bilinear filter is not
+  smooth enough for normals.
 - **Materials** by height, slope and noise: rock, meadow, dry grass, forest,
-  beach, snow on flatter high ground; Lambert plus GGX.
+  beach, snow on flatter high ground, with albedo detail down to tens of
+  metres; Lambert plus GGX.
 - **Water** at sea level with animated wave normals, Fresnel reflection of
   terrain, sky and clouds, sun glitter, depth-tinted seabed and shore foam.
 - **Atmosphere**: Rayleigh, Mie and ozone single scattering over a precomputed
   transmittance table, a cheap multiple-scattering term, aerial perspective on
   everything, the sun's disc with limb darkening, stars at night.
-- **Clouds**: a cumulus layer (2.3 to 4.9 km) ray marched through a tileable
-  Perlin-Worley volume (128^3, generated at start), lit by a light march toward
-  the sun with three scattering orders, dual-lobe phase and sky ambient; they
-  drift with the wind and cast shadows on the ground.
+- **Clouds**: a cumulus layer (2.7 to 5.6 km) ray marched through a tileable
+  Perlin-Worley volume (128^3, generated at start) with two finer octaves
+  eroding the edges (billows on top, wisps below), flat bases and rounded tops;
+  lit by a six-step light march toward the sun with three scattering orders, a
+  strong forward lobe (silver lining) and a back lobe, a powder term and sky
+  ambient that darkens toward the base; they drift with the wind and cast
+  shadows on the ground.
 - **Light transport**: per sample a soft sun shadow (a random point of the
   sun's disc), cloud shadow, and one bounce of sky or ground light; viewers'
   lights add point lighting.
-- **Overlays**: the UTC clock and viewers' words as glowing stroke-font
-  letters, and viewers' lights as glowing spheres, drawn exactly (no sampling)
-  every frame.
+- **Words and the clock**: glowing glass tubes along a stroke font, ray
+  marched as 3D distance fields, lit by the sun and the sky with a specular
+  highlight, an emissive core, a bright rim and a halo; viewers' lights are
+  glowing spheres. All drawn exactly (no sampling) every frame.
 - ACES-like tone mapping, sRGB, a dither seeded by the whole-image pixel.
 
-Convergence: exact accumulation while the camera holds, reprojected history
-while it moves; the rules are in PROTOCOL.md, "Sampling, accumulation and
-determinism".
+Convergence: exact accumulation while the camera holds; while it moves, each
+frame averages itself with its last 7 frames reprojected through a guard band
+the renderer draws around its rect, and pixels with few samples get an
+edge-aware 5 x 5 filter over pixels drawn under the same rules, so moving
+frames also match across tile edges. The rules are in PROTOCOL.md, "Sampling, accumulation and determinism".
 
 ## Layout
 
@@ -52,7 +61,7 @@ src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-co
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
 tests/test_host.cpp  scene parsing, splines and holds, tile geometry, wire formats (no GPU)
 tests/test_gpu.cpp   the seam test (GPU)
-tools/             Python clients: smoke, measure, relaunch, mosaic
+tools/             Python clients: smoke, measure, relaunch, mosaic, rawmosaic
 ```
 
 ## Build and run
@@ -86,27 +95,36 @@ python3 tools/smoke.py HOST 8080                     # health, 60 frames, decode
 python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving camera
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame
 python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST8:8080
+python3 tools/rawmosaic.py out 4 2 540 tools/scene-move.json HOST1:8080 ...   # unencoded tiles of one frame (GET /raw)
 ```
 
 ## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
 
 Moving camera over the mountains, `tools/measure.py`, 8 s per row after 2 s
-to settle; wall tiles are a 1/16 x 1/9 rect of a 16:9 image:
+to settle, default budget (500,000 pixel-samples per frame); wall tiles are a
+1/16 x 1/9 rect of a 16:9 image. Each moving pixel also averages up to 7
+earlier frames, so its effective sample count is up to 8 times the per-frame
+one.
 
-| stream | fps | samples/pixel/frame | GPU ms/frame (render) | encode ms |
-|--------|-----|---------------------|-----------------------|-----------|
-| 146 x 146 (asked 136) | 30.0 | 60.6 | 23.4 | 0.40 |
-| 180 x 180 | 30.0 | 57.8 | 23.3 | 0.53 |
-| 240 x 240 | 30.0 | 38.5 | 23.5 | 0.49 |
-| 360 x 360 | 30.0 | 20.0 | 23.8 | 0.62 |
-| 1280 x 720 whole image | 30.0 | 1 | 23.9 | 1.74 |
-| 1920 x 1080 whole image | 15.0 | 1 | 51.1 | 3.74 |
+| stream | fps | samples/pixel/frame | render ms | encode ms |
+|--------|-----|---------------------|-----------|-----------|
+| 146 x 146 (asked 136) | 30.0 | 13 | 12.7 | 0.55 |
+| 180 x 180 | 30.0 | 9 | 12.8 | 0.84 |
+| 240 x 240 | 30.0 | 5 | 13.0 | 0.80 |
+| 360 x 360 | 30.0 | 2 | 10.5 | 1.08 |
+| 1280 x 720 whole image | 30.0 | 1 | 26.6 | 2.76 |
+| 1920 x 1080 whole image | 15.0 | 1 | 55.8 | 4.56 |
 
-Relaunch (`tools/relaunch.py`, cache-hit `fcvm podman run`, four runs): 6.07
-to 6.27 s from the command to the first frame at the client. Inside that, the
-renderer's own process start to first frame sent is 1.91 to 1.97 s, of which
-CUDA initialization is 1.51 to 1.56 s (the GPU is not held initialized between
-fc-agent's `nvidia-smi` and the renderer).
+Startup, process start to first encoded frame (`fleet-renderer startup`, three
+runs each, in one VM): 1441 to 1663 ms as fcvm's main branch leaves the GPU
+(CUDA ready at 1349 to 1557 ms); 307 to 330 ms with `nvidia-persistenced`
+running in the guest (CUDA ready at 230 to 233 ms).
 
-The seam test passes in VMs on three different T4s, and the three print the
-same image hashes. Shots stitched from eight VMs on eight GPUs are in `shots/`.
+Relaunch (`tools/relaunch.py`, cache-hit `fcvm podman run`, four runs): 6.15
+to 6.28 s from the command to the first frame at the client, of which the
+renderer's own process start to first frame sent is 1.90 to 1.97 s.
+
+Seams: the seam test passes in VMs on three different T4s with the same
+hashes. A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
+equals the same frame drawn whole in another VM in all 2,073,600 pixels. Shots
+stitched from eight VMs on eight GPUs are in `shots/`.

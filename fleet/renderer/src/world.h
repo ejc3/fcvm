@@ -77,7 +77,7 @@ HD Macro macro_direct(V2 pw, const V4* tab) {
 // `oct` sets the detail octaves of the eroded layer: more for shading normals,
 // fewer for distant marching.
 HD float terrain_from(V2 pw, Macro m, int oct, const V4* tab) {
-  V2 q = pw * (1.0f / 4.5f) + m.w * 2.2f;
+  V2 q = pw * (1.0f / 4.5f) + m.w * 1.2f;
   // Eroded fbm: octaves are damped where the accumulated slope is steep, so
   // detail gathers in valleys and ridges stay sharp.
   float a = 0.0f, amp = 1.0f;
