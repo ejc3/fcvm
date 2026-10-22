@@ -698,6 +698,31 @@ class ReapDiskPathGuard(unittest.TestCase):
             self.assertTrue(any("vm-disks" in e for e in out.get("disk_errors", [])),
                             f"the refusal must be recorded: {out}")
 
+    def test_a_lock_already_removed_by_someone_else_is_not_an_error(self):
+        """Under concurrent clones another fcvm's stale-state cleanup can delete
+        this clone's lock between reap_disk's lexists and its remove.
+
+        RED BEFORE THE FIX: the ENOENT was recorded as a disk error, the fast
+        teardown raised SurvivedTeardown with left=[], and the scale harness
+        refused a 2,015-request run over that one request (2026-10-22, s12).
+        """
+        with tempfile.TemporaryDirectory() as root:
+            vm_id = "vm-66666666666666666666666666666666"
+            state = os.path.join(root, f"{vm_id}.json")
+            with open(state, "w") as f:
+                json.dump({"vm_id": vm_id}, f)
+            lock = f"{state}.lock"
+            real_lexists = os.path.lexists
+            # The lock is there when checked and gone by the remove.
+            from unittest import mock
+            with mock.patch.object(reqbench.os.path, "lexists",
+                                   lambda p: True if p == lock else real_lexists(p)):
+                out: dict = {}
+                reaped = reqbench.reap_disk(out, root, state, "")
+            self.assertNotIn("disk_errors", out)
+            self.assertEqual(reaped, [state])
+            self.assertFalse(os.path.lexists(state))
+
     def test_a_real_per_vm_dir_is_still_reaped(self):
         """The guard must not disarm the ordinary reap."""
         with tempfile.TemporaryDirectory() as root:

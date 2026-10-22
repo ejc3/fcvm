@@ -2195,10 +2195,15 @@ def reap_disk(
                 fcntl.flock(state_lock, fcntl.LOCK_UN)
                 os.close(state_lock)
             return reaped
+    # A removal that finds the file already gone has nothing left to do: under
+    # concurrent clones another fcvm's stale-state cleanup can delete this
+    # clone's state or lock between the check and the remove.
     if state_path and os.path.lexists(state_path):
         try:
             os.remove(state_path)
             reaped.append(state_path)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{state_path}: {e}")
     # cleanup_stale_state removes `<vm_id>.json.lock` alongside the state file;
@@ -2213,6 +2218,8 @@ def reap_disk(
         try:
             os.remove(lock)
             reaped.append(lock)
+        except FileNotFoundError:
+            pass
         except OSError as e:
             out.setdefault("disk_errors", []).append(f"{lock}: {e}")
     elif state_lock is not None:
