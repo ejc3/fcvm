@@ -24,6 +24,13 @@ half stamps the time its last tile came back. Viewers steer one shared camera (d
 turn, scroll to dive) and appear in the scene as small lights; clicking a square relaunches
 the GPU behind it, for everyone. The per-tile view below is the detail view, one click away.
 
+**Hover shows the seams. DECIDED (2026-10-22).** The image reads as one picture until the
+pointer is over it: then every tile boundary fades in as a faint line, and the tile under
+the pointer is outlined in its half's color with a label naming the tile, its kind, its GPU,
+its host and its last relaunch time. A long press does the same on touch screens, and a
+focusable tile grid does it for keyboard users. The page draws these over the frames; the
+renderers never draw them.
+
 **Proof that it is live, not recorded.** Several things on the page could not exist in a
 recording:
 
