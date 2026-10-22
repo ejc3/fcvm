@@ -212,6 +212,11 @@ pub struct KernelProfile {
     /// Host kernel configuration (for EC2 instances running fcvm)
     #[serde(default)]
     pub host_kernel: Option<HostKernelConfig>,
+
+    /// Pinned NVIDIA driver and container toolkit. A profile with this table
+    /// gets a driver image built against its kernel (src/setup/nvidia.rs).
+    #[serde(default)]
+    pub nvidia: Option<super::nvidia::NvidiaDriverConfig>,
 }
 
 /// Host kernel build configuration.
