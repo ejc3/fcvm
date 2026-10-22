@@ -32,11 +32,12 @@ I/O and no randomness, so every viewer sees the same sequence.
 **Server to browser**
 
 ```json
-{"type": "hello", "viewer": "v-17"}
+{"type": "hello", "viewer": "v-17", "turnstile": "<site key>"}
 ```
 
-The first message on every connection: the id this connection acts as. `actions[].viewer`
-names it, so a page can find its own intents in the shared list.
+The first message on every connection: the id this connection acts as (`actions[].viewer`
+names it, so a page can find its own intents in the shared list), and the Turnstile site
+key when intents need a `verify` first (`null` when they do not).
 
 ```json
 {"type": "snapshot", "version": 42, "state": { ... }}
@@ -61,7 +62,8 @@ its refusal in `actions`). An intent id the coordinator has seen before, from an
 returns that id's first receipt again and changes nothing. `check` is present on `word`
 intents that reached the text check: `verdict` is `allow`, `refuse` or `error`, and `sky`
 the words the new one was judged together with. A refusal with `version: 0` was not
-recorded (the connection has not passed Turnstile yet); the same id may be sent again.
+recorded (`"verify first"`: the connection has not passed Turnstile yet); the same id may
+be sent again.
 
 ```json
 {"type": "verified", "ok": true, "reason": null}
@@ -70,12 +72,21 @@ recorded (the connection has not passed Turnstile yet); the same id may be sent 
 The answer to a `verify`.
 
 ```json
-{"type": "claim", "session": "claim-3", "token": "<secret>", "slot": "slot-5",
- "frame_url": "ws://<host>:<port>/frames", "expires_at": 1761134460000, "click_to_first_frame_ms": 5400}
+{"type": "claim", "claim": {"id": "claim-3", "tile": "fcvm:5", "phase": "running",
+ "frame_url": "ws://<host>:<port>/frames", "token": "<secret>",
+ "clicked_at": 1761134400000, "first_frame_at": 1761134405400, "expires_at": 1761134465400,
+ "gpu": "Tesla T4", "phases": {"teardown_ms": 310, "restore_ms": 4300, "gpu_ms": 3100, "total_ms": 5400},
+ "camera": [{"t": 812.0, "pos": [...], "look": [...], "fov_deg": 60, "intent": "<id>"}], "ended": null}}
 ```
 
-Sent only to the viewer whose `claim_gpu` committed, once its private VM has drawn its
-first frame (the frame URL and the token appear in no snapshot).
+Sent only to the connection whose `claim_gpu` committed, whenever the claim changes:
+first with `phase: "restoring"` (no frame URL yet), then `running` once the private VM
+has drawn its first frame (its `frame_url`, `first_frame_at - clicked_at` the click to
+first frame, `phases` the agent's timings of the restore), again when `claim_camera`
+moves its camera, and a last time with `phase: "ended"` and `ended` saying why
+(`expired`, or `released`: `release_gpu`, the viewer leaving, or the GPU leaving the
+fleet). The frame URL and the token appear in no snapshot. `tile` is the wall tile it
+borrowed, null for a standby GPU.
 
 ```json
 {"type": "clock", "server_unix_ms": 1761134400123, "client_unix_ms": 1761134400100.5}
@@ -97,9 +108,10 @@ A message the coordinator could not read; nothing was applied.
 {"type": "ping", "client_unix_ms": 1761134400100.5}
 ```
 
-With a Turnstile secret configured, every intent is refused (`"verify with Turnstile
-first"`, not recorded) until the connection has sent a token that Cloudflare's siteverify
-accepts. Without one (local runs) every connection counts as verified.
+With Turnstile configured (`hello.turnstile` is the site key), every intent is refused
+(`"verify first"`, not recorded) until the connection has sent a token that Cloudflare's
+siteverify accepts; the answer is `verified`. Without it (local runs) every connection
+counts as verified.
 
 Intents:
 
@@ -107,16 +119,23 @@ Intents:
 |------|------|--------|
 | `restart_now` | `{}` | starts a race now (below); refused while the global cooldown runs (`race.cooldown_until`) |
 | `relaunch` | `{"tile": "fcvm:3"}` (a tile id) or `{"tile": "slot-3"}` / `{"tile": "ec2-2"}` (a slot id) | bumps that slot's generation; refused for a dark tile, a draining host, a borrowed GPU, or a second relaunch from the client within 2 s |
-| `nudge` | `{"target": "<viewpoint>"}` | a vote for the next camera hold, among `director.offer`; one vote per client, the latest counts; refused once the vote has closed |
+| `nudge` | `{"target": "<viewpoint>"}` | a vote for the next camera hold, among `nudges.targets`; one vote per client, the latest counts; refused once the vote has closed |
 | `word` | `{"text": "hello"}` | 1 to 28 characters (the renderer's limit) after collapsing whitespace, no control characters, one per client per 5 s; checked together with every word in the sky first (below) |
 | `light` | `{"pos": [x, y, z], "color": [r, g, b]}` | one per client per second; each client keeps its latest 3 (its oldest goes); `color` components are clamped to [0, 1], then scaled so they add up to at most 2; the scene keeps the latest 32 |
 | `claim_gpu` | `{}` | a GPU of your own for 60 s (below) |
-| `release_gpu` | `{}` | ends your claim early |
-| `steer` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim). Yaw within 360, pitch within 180, dive within 50 |
+| `release_gpu` | `{"claim": "claim-3"}` (or `{}`) | ends your claim early; a `claim` that is not yours is refused |
+| `claim_camera` | `{"drag": {"yaw_deg", "pitch_deg", "dive"}}` | turns and moves your claimed GPU's camera (only yours; refused without a claim), easing over 0.3 s; the keyframe it eases to gets `"intent": <id>`. Yaw within 360, pitch within 180, dive within 50 |
 
 There is no intent to move the wall's camera, set its time of day, relaunch every tile
 on a viewer's schedule, or change the race cadence: the director and the owner's
-configuration own those.
+configuration own those. Two names differ from what the page (#1143) assumed:
+
+- The race button's intent is `restart_now`, the owner's name for it in the second
+  design review, not `relaunch_all`. The race it starts is still reported as the
+  snapshot's `relaunch_all`.
+- There is no `time_of_day` intent. Each hold's viewpoint sets the time of day (the
+  low-sun holds are viewpoints), so a viewer's setting would undo the director's next
+  hold or be undone by it within seconds.
 
 **Clients and limits.** Every limit counts per client address, not per connection: the
 `CF-Connecting-IP` header when the coordinator runs with `--trust-cf-connecting-ip`
@@ -155,8 +174,8 @@ running its current generation (not relaunching, not still racing). The tile kee
 place in the layout, its `phase` becomes `borrowed` and its frame URL is withheld; its
 host's aggregator draws it black. The agent tears the tile's VM down and restores a
 private VM on that GPU drawing the whole image with the session's own camera, which only
-its viewer can `steer`. The coordinator times the click to that VM's first frame and
-sends the viewer, alone, a `claim` message. After 60 s (`claim_secs`), on `release_gpu`, or
+its viewer can move (`claim_camera`). The coordinator times the click to that VM's first frame and
+sends the viewer, alone, `claim` messages. After 60 s (`claim_secs`), on `release_gpu`, or
 when the viewer disconnects, the private VM is destroyed and the tile's VM restores back
 into the wall, timed like any relaunch (`last_relaunch.by` is `return:<session>`). Refused:
 a second claim from a client that holds one, a claim within 120 s of the client's last one
@@ -180,12 +199,15 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
       "fps": 30.0,
       "gpu_stats": { ... },
       "error": null,
+      "failure": null,
       "last_relaunch": {"clicked_at": 1761134400000, "by": "viewer:v-4", "first_frame_at": 1761134405200,
                         "phases": {"teardown_ms": 310, "restore_ms": 4300, "gpu_ms": 3100, "container_ms": 600, "first_frame_ms": 250, "total_ms": 5200}},
       "borrowed": null
     },
     {"id": "fcvm:2", "phase": "borrowed", "frame_url": null,
      "borrowed": {"session": "claim-3", "viewer": "v-9", "since": 1761134400000, "until": 1761134460000}, ...},
+    {"id": "fcvm:3", "phase": "failed", "error": "...",
+     "failure": {"kind": "relaunch_failed", "message": "fcvm exited ...", "retry_at": 1761134402000}, ...},
     {"id": "ec2:1", "half": "ec2", "rect": {"x": 0.5, "y": 0, "w": 0.25, "h": 0.5}, "phase": "waiting_capacity", "slot": null, ...}
   ],
   "aggregates": [
@@ -195,29 +217,33 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
      "frame_url": "wss://...", "tiles": ["ec2:1", ...]}
   ],
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
-            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": [], "borrowed": 1, "borrow_cap": 1},
+            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": []},
   "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 1.7777777777777777,
-  "race": {"interval_secs": 300, "next_race_at": 1761134700000, "cooldown_until": 1761134460000, "cooldown_secs": 60, "running": 12},
+  "next_race_at": 1761134700000,
+  "cooldown_until": 1761134460000,
+  "relaunch_all": {"race": 12, "started_at": 1761134400000, "by": "schedule",
+                   "fcvm_done_at": 1761134407530, "ec2_done_at": null, "fcvm_pending": 0, "ec2_pending": 3,
+                   "fcvm_gpus": 7, "ec2_gpus": 8, "fcvm_ms": 7530, "ec2_ms": null,
+                   "ec2_capacity_wait_ms": 0, "ec2_waiting_since": 1761134402000},
   "scoreboard": {
-    "fcvm": {"last_ms": 7530, "last_race": 11, "last_measured_on": 8, "last_capacity_wait_ms": 0,
-             "median_ms": 7410, "races": 11, "measured_on_min": 7, "measured_on_max": 8},
-    "ec2": {"last_ms": null, "last_race": null, "last_measured_on": null, "last_capacity_wait_ms": null,
-            "median_ms": null, "races": 0, "measured_on_min": null, "measured_on_max": null}
+    "fcvm": {"median_ms": 7410, "last_ms": 7530, "races": 11, "measured_on": 7, "last_capacity_wait_ms": 0, "last_race": 12},
+    "ec2": null
   },
   "races": [{"id": 12, "started_at": 1761134400000, "by": "schedule",
              "fcvm": {"tiles": {"slot-1": {"tile": "fcvm:1", "generation": 4, "first_frame_at": 1761134407400,
-                                            "phases": { ... }, "capacity_wait_ms": 0}},
+                                            "phases": { ... }, "capacity_wait_ms": 0, "waiting_since": null}},
                       "dropped": 0, "done_at": 1761134407530, "time_ms": 7530, "last": "slot-6",
                       "capacity_wait_ms": 0, "sitting_out": ["fcvm:2"]},
              "ec2": { ... }}],
-  "director": {"viewpoint": "peak-seam", "arrived_t": 812.0, "hold_until_t": 819.0, "decide_at_t": 817.0,
-               "next": null, "arrive_next_t": null, "offer": ["coast", "horizon", "dawn-valley"],
-               "votes": {"coast": 2, "horizon": 0, "dawn-valley": 1}, "seed": 1},
+  "nudges": {"targets": [{"id": "coast", "label": "From the coast", "votes": 2},
+                         {"id": "horizon", "label": "High above: the curve of the horizon", "votes": 0},
+                         {"id": "dawn-valley", "label": "Dawn in the valley", "votes": 1}],
+             "holding": "peak-seam", "next_hold_at": 1761134407000, "next": null, "arrive_next_at": null},
+  "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134460000},
   "failures": [
     {"kind": "host_reclaimed", "host": "<host>", "since": 1761134400000, "retiling": true},
-    {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000},
-    {"kind": "tile_failed", "tile": "fcvm:3", "slot": "slot-3", "error": "...", "retry_at": 1761134402000}
+    {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000}
   ],
   "claims": [{"session": "claim-3", "viewer": "v-9", "slot": "slot-2", "gpu": {...}, "host": "<host>",
               "claimed_at": 1761134400000, "expires_at": 1761134460000, "first_frame_at": 1761134405400,
@@ -245,18 +271,35 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   `running` again.
 - `last_relaunch.first_frame_at - clicked_at` is the tile's relaunch time; `phases` are
   the agent's timings for that relaunch (see Agent).
-- `scoreboard` holds only measured numbers. A half's race time is the coordinator's
-  click time to the last of its tiles' first frames as the coordinator saw them reported,
-  less that tile's EC2 capacity wait (`capacity_wait_ms`, reported on its own). `last_*`
-  is the latest race whose half finished; `median_ms` the median of the last 20 finished;
-  `*_measured_on*` count the tiles timed (a race with no tiles in a half does not count
-  for it). `races` keeps the last 10 races with every tile's phases; tiles whose host was
+- `next_race_at` is when the owner's cadence races next (null without one);
+  `cooldown_until` is when `restart_now` is accepted again (null before any race).
+- `relaunch_all` is the latest race (null before the first): who started it (`schedule`
+  or `viewer:<id>`), each half's tiles timed (`*_gpus`), still to reach their first frame
+  (`*_pending`), when the half finished and its time (`*_ms`, click to the last tile's
+  first frame as the coordinator saw it, less EC2 capacity waits). `ec2_capacity_wait_ms`
+  is the capacity waits finished so far; `ec2_waiting_since` is when the half's current
+  wait began (null when none runs), so a page can draw the wait as it grows.
+- `scoreboard` holds only measured numbers; a half is null until one of its races has
+  finished. `last_ms` is the latest finished race's time, `median_ms` the median of the
+  last 20 finished, `races` how many that median is over, `measured_on` the tiles the last
+  race timed, `last_capacity_wait_ms` its EC2 wait (left out of `last_ms`), `last_race`
+  its id. A race with no tiles in a half does not count for it.
+- `races` keeps the last 10 races with every tile's phases; tiles whose host was
   reclaimed mid-race are `dropped`, borrowed ones `sitting_out`.
-- `failures` names each problem with its own `kind`, so the page can label it:
-  `host_reclaimed` (a spot notice or the agent went away; `retiling` while the host is
-  still listed, kept for a minute after it is gone), `coordinator_degraded` (a component
-  such as the text check is failing), `tile_failed` (the agent's error and when it tries
-  again).
+- `nudges` is the directed camera: `targets` are the viewpoints `nudge` may name now
+  (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
+  while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
+  the vote has closed, `arrive_next_at` when the camera gets there.
+- `borrow`: at most `cap` wall tiles are lent at once, `lent` are now, and the next comes
+  back at `next_return_at`.
+- A tile whose VM did not come back carries `failure` (`kind: "relaunch_failed"`, the
+  agent's message, `retry_at` when the agent tries again). `failures` lists what is not
+  one tile's, each with its own `kind`: `host_reclaimed` (a spot notice or the agent went
+  away; kept for a minute after the host is gone) and `coordinator_degraded` (a component
+  such as the text check is failing). A reclaimed host's tiles leave the tiling in the
+  event that reports it (its slots are re-tiled onto the other hosts at once), so there is
+  no `draining` tile phase and no tile-level `host_reclaimed`; `fleet.hosts[].draining`
+  and `failures` carry it.
 - `aggregates` lists the regions an aggregator serves (see Aggregator): one per GPU host
   that has placed tiles, with the tiles inside it, and the EC2 half when the coordinator
   runs its aggregator. `frame_url` is null until the host's aggregator is serving.
@@ -270,8 +313,8 @@ The latest converged still of the whole image, for link previews and the page's 
 paint. Once per camera hold, 5.5 s into it, the coordinator subscribes to every aggregator
 (each host's band and the EC2 half), decodes the first frame at or after that scene time,
 places each region in the whole image and encodes one JPEG (through the `ffmpeg` CLI).
-Served with `Cache-Control: public, max-age=10`; `404` with `no-store` until the first
-poster exists. A hold whose capture does not finish before the flight keeps the previous
+Served with `Cache-Control: public, max-age=10` and `Access-Control-Allow-Origin: *` (the
+page reads it from its own origin); `404` with `no-store` until the first poster exists. A hold whose capture does not finish before the flight keeps the previous
 poster. Borrowed tiles are black in it, as on the wall.
 
 ### Running it
@@ -282,7 +325,8 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--max-tiles 100] [--ec2 none|fake] [--allowed-origin <scheme://host[:port]>]...
                  [--ec2-aggregate-listen <addr:port> --ec2-aggregate-url <ws url>] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
-                 [--trust-cf-connecting-ip] [--turnstile-secret <secret>] [--ffmpeg ffmpeg]
+                 [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
+                 [--ffmpeg ffmpeg]
 ```
 
 - `--agent-cmd` starts an agent as a child process and talks to it over its stdin and
@@ -296,9 +340,11 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
   it. Hosts, slots, claims and viewers are rebuilt as agents and browsers connect.
 - `--race-every` (also `FLEET_RACE_EVERY`) is the owner's race cadence; without it races
   run only on `restart_now`.
-- `--turnstile-secret` (also `FLEET_TURNSTILE_SECRET`) turns on Turnstile verification
-  (`POST https://challenges.cloudflare.com/turnstile/v0/siteverify` with the secret, the
-  token and the client address).
+- `--turnstile-secret` and `--turnstile-site-key` (also `FLEET_TURNSTILE_SECRET`,
+  `FLEET_TURNSTILE_SITE_KEY`) turn on Turnstile verification: the site key goes out in
+  each hello, and a `verify` token is checked with
+  `POST https://challenges.cloudflare.com/turnstile/v0/siteverify` (the secret, the token
+  and the client address).
 - `GET /healthz` answers `ok`.
 - `/live` refuses a cross-origin browser with `403`: a request whose `Origin` is neither
   the coordinator's own (`Origin` naming the request's `Host`) nor one given with
