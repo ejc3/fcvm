@@ -131,7 +131,7 @@ CELL_FIELDS = (
     "ws_url_prewired",
     "allow_busy",
     "quiet_loadavg1_limit",
-    "host_boot_id",
+    "host_boot_sha256",
     "host_kernel_release",
     "host_machine",
 )
@@ -437,8 +437,8 @@ def _cell_from_meta(meta, source):
         "backend", "uffd_mode", "url", "format", "image", "image_id", "snapshot",
         "snapshot_generation_id", "snapshot_config_sha256", "snapshot_created_at",
         "snapshot_vm_id", "fcvm_sha256", "harness_sha256",
-        "runtime_bundle_sha256", "source_revision", "network_mode", "rust_log", "host_boot_id",
-        "host_kernel_release", "host_machine",
+        "runtime_bundle_sha256", "source_revision", "network_mode", "rust_log",
+        "host_boot_sha256", "host_kernel_release", "host_machine",
     }
     positive_int_fields = {"quality", "cdp_port", "cpu", "memory_mib"}
     positive_number_fields = {"quiet_loadavg1_limit"}
@@ -626,7 +626,7 @@ def _cell_from_meta(meta, source):
             errors.append(f"{source} metadata has duplicate port mappings")
     for field in (
         "snapshot_config_sha256", "fcvm_sha256", "harness_sha256",
-        "runtime_bundle_sha256",
+        "runtime_bundle_sha256", "host_boot_sha256",
     ):
         value = cell.get(field, "")
         if len(value) != 64 or any(character not in "0123456789abcdef" for character in value):

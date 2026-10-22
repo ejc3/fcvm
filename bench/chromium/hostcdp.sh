@@ -491,11 +491,18 @@ host_resource_finalizer_sha256=$(sha256sum "$HERE/host_resource_finalizer.py" | 
         && "$phase_supervisor_sha256" =~ ^[0-9a-f]{64}$ \
         && "$host_resource_finalizer_sha256" =~ ^[0-9a-f]{64}$ ]] \
     || { log "REFUSING: source seal produced an invalid digest"; exit 2; }
-read -r host_boot_id < /proc/sys/kernel/random/boot_id \
+# Records name the boot by a digest, never by the raw boot id: the same function
+# as reqbench.host_boot_sha256 (SHA-256 of "fcvm-bench-boot", NUL, the boot id).
+read -r boot_identity < /proc/sys/kernel/random/boot_id \
     || { log "REFUSING: cannot read host boot identity"; exit 2; }
+[ -n "$boot_identity" ] || { log "REFUSING: host boot identity is empty"; exit 2; }
+host_boot_sha256=$(printf 'fcvm-bench-boot\0%s' "$boot_identity" | sha256sum | cut -d' ' -f1)
+unset boot_identity
+[[ "$host_boot_sha256" =~ ^[0-9a-f]{64}$ ]] \
+    || { log "REFUSING: cannot hash host boot identity"; exit 2; }
 host_machine=$(uname -m) || { log "REFUSING: cannot read host machine"; exit 2; }
 host_kernel=$(uname -r) || { log "REFUSING: cannot read host kernel"; exit 2; }
-if [ -z "$host_boot_id" ] || [ -z "$host_machine" ] || [ -z "$host_kernel" ]; then
+if [ -z "$host_boot_sha256" ] || [ -z "$host_machine" ] || [ -z "$host_kernel" ]; then
     log "REFUSING: host identity is incomplete"
     exit 2
 fi
@@ -998,7 +1005,7 @@ log "warm marker up after $((SECONDS - t0))s; measuring $REPS reps after $WARMUP
 # different run's image, resolver, corpus, or count metadata by co-location.
 python3 - "$RESULTS/run.json" "$RUNID" "$IMAGE" "$runtime_image_id" "$REPS" "$WARMUP" \
         "$URL" "$CDP_PORT" "$urls_json" "$cpus_json" "$resolve_json" "$la" \
-        "$host_boot_id" "$host_machine" "$host_kernel" "$source_revision" \
+        "$host_boot_sha256" "$host_machine" "$host_kernel" "$source_revision" \
         "$harness_sha256" "$hostcdp_sha256" "$phase_supervisor_sha256" \
         "$host_resource_finalizer_sha256" \
         "$runtime_bundle_sha256" \
@@ -1010,7 +1017,7 @@ import sys
 import tempfile
 
 (output_path, run_id, image, image_id, reps, warmup, url, cdp_port,
- urls_json, cpus_json, resolve_json, loadavg, host_boot_id, host_machine,
+ urls_json, cpus_json, resolve_json, loadavg, host_boot_sha256, host_machine,
  host_kernel, source_revision, harness_sha256, hostcdp_sha256,
  phase_supervisor_sha256, host_resource_finalizer_sha256,
  runtime_bundle_sha256, corpus_extra_runtime_bundle_sha256,
@@ -1036,7 +1043,7 @@ record = {
     "driver_process": "in-process",
     "network": "host (no VM, no DNAT)",
     "resolve_all_to": json.loads(resolve_json),
-    "host_boot_id": host_boot_id,
+    "host_boot_sha256": host_boot_sha256,
     "host_machine": host_machine,
     "host_kernel": host_kernel,
     "source_revision": source_revision,

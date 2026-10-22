@@ -385,6 +385,35 @@ pub struct SnapshotLoad {
     /// Omitted when None, so older binaries never see the field.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
+    /// Host PCI devices the load attaches to the paused VM before any vCPU runs
+    /// (ejc3/firecracker agent/vfio-hotplug-v1.17.0). Omitted when None, so a
+    /// Firecracker without the field never sees it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_passthrough: Option<Vec<DevicePassthrough>>,
+}
+
+/// One passthrough device in a snapshot load.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DevicePassthrough {
+    pub id: String,
+    /// Host PCI address, `SSSS:BB:DD.F`.
+    pub sbdf: String,
+}
+
+impl DevicePassthrough {
+    /// The load's device list for these host addresses, or None for none.
+    pub fn for_gpus(sbdfs: &[String]) -> Option<Vec<DevicePassthrough>> {
+        (!sbdfs.is_empty()).then(|| {
+            sbdfs
+                .iter()
+                .enumerate()
+                .map(|(i, sbdf)| DevicePassthrough {
+                    id: format!("gpu{i}"),
+                    sbdf: sbdf.clone(),
+                })
+                .collect()
+        })
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

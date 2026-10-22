@@ -268,7 +268,7 @@ class WebkitAnalyzerSchema(unittest.TestCase):
             "memory_mib": 1024,
             "rust_log": "fcvm=debug", "ws_url_prewired": False,
             "allow_busy": False,
-            "host_boot_id": "00000000-0000-0000-0000-000000000001",
+            "host_boot_sha256": "1" * 64,
             "host_kernel_release": "6.18.0-fixture", "host_machine": "aarch64",
             "loadavg": [0.5, 0.5, 0.5], "quiet_loadavg1_limit": 2.0,
             "quiet_vm_processes": 0, "quiet_guard_loadavg1": 0.5,

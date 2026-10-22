@@ -2306,6 +2306,7 @@ patches_dir = "kernel/patches"
 | `firecracker_args` | No | Extra Firecracker CLI args |
 | `boot_args` | No | Extra kernel boot parameters |
 | `rootfs_type` | No | Root filesystem type: `"ext4"` (default) or `"btrfs"` (converts via btrfs-convert) |
+| `nvidia` | No | Table pinning an NVIDIA driver and container toolkit; setup builds a driver image for the profile's kernel (see GPU Passthrough) |
 
 ### How It Works
 
@@ -2343,6 +2344,130 @@ my custom config
 After changing the config, run `fcvm setup` to rebuild the rootfs with the new SHA.
 
 ---
+
+## GPU Passthrough (guest side)
+
+A container in an fcvm clone can use an NVIDIA GPU passed through to the VM
+with VFIO. The golden snapshot is taken with Firecracker's PCI transport
+(`--enable-pci`) and no GPU. Each clone restores from it, Firecracker attaches
+the GPU to the paused VM (`device_passthrough` in the LoadSnapshot body), and
+the guest makes it usable before the container starts. This section covers the
+guest: the `gpu` kernel profile, the NVIDIA driver image, and fc-agent.
+
+### Kernel: the `gpu` profile
+
+`[kernel_profiles.gpu.{arm64,amd64}]` builds the default kernel plus
+`kernel/gpu.conf` (`kernel/gpu-x86.conf`):
+
+| Option | Why |
+|--------|-----|
+| `CONFIG_PCI`, `CONFIG_PCI_MSI`, `CONFIG_PCI_HOST_GENERIC` / `CONFIG_PCI_MMCONFIG`, `CONFIG_ARM_GIC_V3_ITS` | Firecracker's PCI transport: ECAM config space and MSI-X only (no INTx). All are in Firecracker's base config; declaring them makes the build fail if a base-config change drops one. |
+| `CONFIG_MODULES`, `CONFIG_MODULE_UNLOAD` | The NVIDIA driver is out of tree. |
+| `CONFIG_FW_LOADER` | GSP firmware, which the open modules boot on Turing and later. |
+| `CONFIG_MMU_NOTIFIER` | nvidia-uvm calls `__mmu_notifier_register()`. The option has no prompt upstream and nothing in this kernel selects it, so `kernel/patches-gpu` carries a one-line Kconfig patch giving it one. |
+
+It is a separate profile, not the default, because module support and the
+Kconfig patch would change the default kernel's release identity and every
+default snapshot cache key for VMs that never see a GPU, and because GPU VMs
+need the device-passthrough Firecracker build and `--enable-pci`, which the
+profile carries (`firecracker_branch = "agent/vfio-hotplug-v1.17.0"`). No
+release is published for it yet; `make setup-gpu` builds it locally.
+
+### The NVIDIA driver image
+
+`[kernel_profiles.gpu.<arch>.nvidia]` pins one driver version (580.196.07, the
+R580 long-term branch, which supports Turing T4/T4G with the open modules) and
+one nvidia-container-toolkit version (1.20.1), each by URL and SHA-256.
+`fcvm setup --kernel-profile gpu` builds a read-only ext4 image
+(`src/setup/nvidia.rs`) holding:
+
+```
+lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko
+lib/firmware/nvidia/<version>/gsp_{tu10x,ga10x}.bin
+usr/lib/<triplet>/lib*.so.<version> and their soname links
+usr/bin/{nvidia-smi,nvidia-persistenced,nvidia-debugdump,nvidia-cuda-mps-*}
+usr/bin/{nvidia-ctk,nvidia-cdi-hook}
+```
+
+The build configures and builds the profile's kernel tree from the same
+inputs as the kernel artifact (`make <image> modules`, so `Module.symvers`
+exists and modpost checks every symbol), then builds `kernel-open/` from the
+driver's `.run` against it. Modules, libraries and firmware come from that one
+`.run`, and the build refuses a module whose `modinfo` version is not the
+pinned version or whose vermagic is not this kernel. The image is named
+`nvidia-<version>-<profile>-<kernel version>-<arch>-<key>.ext4` under
+`<assets_dir>/nvidia/`, where the key hashes the kernel's identity, the pinned
+table and the build stage. It is not in the rootfs: VMs without a GPU do not
+carry it, and a driver bump does not rebuild the rootfs.
+
+### Interface with the host
+
+1. **Golden VM boot.** The host attaches the driver image
+   (`crate::setup::ensure_nvidia_driver_image("gpu", allow_create)`) as a
+   read-only virtio-blk drive and names it in the container plan:
+   `"gpu_driver": {"device": "/dev/vdX"}`. fc-agent mounts it read-only at
+   `/run/fcvm-gpu/driver` with the extra disks, before the pre-start snapshot,
+   so every clone has it. It is not mounted into the container. The image path
+   belongs in the snapshot cache key (it is content-addressed). It cannot be a
+   pmem device: a restore with device passthrough refuses pmem.
+2. **Restore.** The restore metadata document (the vsock `latest` document and
+   its MMDS mirror) carries `"gpus": ["0000:01:00.0", ...]`, the host PCI
+   addresses in attach order, and omits the key without GPUs. fc-agent only
+   compares the count with what the guest bus shows; guest addresses are the
+   VMM's.
+3. **Before the ACK.** With a non-empty `gpus`, `handle_clone_restore` starts
+   `gpu::attach` at the top of the restore sequence, concurrent with the
+   network phases, and awaits it before publication. `attach`:
+   - refuses if the container is already running (a clone of a snapshot taken
+     after the container started cannot give the container a device);
+   - checks the driver image holds modules for the running kernel release;
+   - writes `/sys/bus/pci/rescan` and waits up to 10s for that many NVIDIA
+     display functions (vendor 0x10de, class 0x03xxxx);
+   - points `firmware_class.path` at the image's firmware and `insmod`s
+     `nvidia.ko` and `nvidia-uvm.ko`;
+   - checks `/proc/driver/nvidia/gpus` lists every GPU and creates
+     `/dev/nvidiactl`, `/dev/nvidia<minor>`, `/dev/nvidia-uvm{,-tools}`;
+   - runs `nvidia-smi -L` from the image and requires one line per GPU;
+   - runs `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
+     into `/var/run/cdi/nvidia.yaml`.
+4. **Container start.** The container starts after the restore is
+   acknowledged, as for any warm start, with `--device nvidia.com/gpu=all`.
+   The ACK's phase record carries `gpu_ms` and `gpus`.
+
+Any failure is fatal to the clone before the ACK: fc-agent prints
+`FATAL: clone restore failed closed ... restore phase gpu-attach: <cause>` and
+shuts the VM down with status 1. Each cause names what was expected and what
+the guest saw: the PCI functions present after a rescan, the kernel release
+the image was built for, the kernel log's NVRM lines after a failed `insmod`
+or `nvidia-smi`.
+
+### Verified on hardware
+
+On 2026-10-22, on a g4dn.metal (x86_64, eight NVIDIA T4, each bound to vfio-pci), with
+the gpu profile built by `make setup-gpu`:
+
+- A gpu-profile VM boots under `--enable-pci`, mounts the driver image from
+  `gpu_driver`, takes the pre-start snapshot, and is restored with `--gpu <sbdf>`
+  attached through `device_passthrough`; in the container `nvidia-smi` lists a
+  `Tesla T4` with driver 580.196.07.
+- The restore's `gpu_ms` (rescan, module load, device nodes, `nvidia-smi -L`, CDI
+  generation) was 3,337, 3,220, 3,028, 3,078 and 3,061 ms over five restores; the
+  restore ACK came 4,157 to 4,569 ms after the load.
+- A cache-hit `fcvm podman run --gpu ... nvidia-smi -L`, process start to exit, took
+  6.7 s; two at once, on two GPUs from one snapshot, each saw its own T4 (different
+  UUIDs) and finished in 6.9 s together.
+- NVIDIA's CUDA vector-add sample (`nvcr.io/nvidia/k8s/cuda-sample:vectoradd-cuda12.5.0`)
+  passes in a gpu VM with the default guest memory, so `nvidia-uvm`, its device nodes
+  and the CDI injection work for a CUDA process.
+
+Not yet checked:
+
+- The same on arm64 (g5g.metal, T4G).
+- `lspci -vv` in the guest (MSI-X, BAR sizes) and the GSP firmware lines in `dmesg`;
+  the driver and a CUDA kernel run, which needs both, but the output was not kept.
+- Root versus rootless podman in the guest: only the default was run.
+- Whether the GPU re-initialises on every container process start without
+  `nvidia-persistenced`.
 
 ## Known Limitations
 

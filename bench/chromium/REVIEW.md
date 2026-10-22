@@ -96,7 +96,7 @@ Evidence, from the runs' own `reqbench.jsonl` (paths under fcvm-main):
   vs 44.8 ms, resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot
   82.8 vs 80.3, navigate 598.4 vs 409.1. The two runs were measured on
   different hosts (`cell.host_kernel_release` 7.0.14-fcvm-cd6cd2b4b52e, boot
-  80bfe10d, for the withdrawn series; 6.17.0-1019-aws, boot 291f8bad, for the
+  hash acac488d, for the withdrawn series; 6.17.0-1019-aws, boot hash 34dd09df, for the
   verified run), on their own goldens and binaries, so no stage difference is
   attributed to the DNS fix. The withdrawn 982.9 is 37.9% above the verified
   712.6 across that host change; how much of the gap is DNS is not measured.

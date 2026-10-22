@@ -1,4 +1,5 @@
 pub mod kernel;
+pub mod nvidia;
 pub mod pasta;
 pub mod rootfs;
 pub mod storage;
@@ -205,6 +206,9 @@ pub use kernel::{
     get_configured_firecracker_for_profile, get_firecracker_for_profile, get_kernel_path,
     get_kernel_url_hash, get_profile_firecracker_path, install_host_kernel,
     newest_cached_cloud_hypervisor, rebuild_kernel_from_source,
+};
+pub use nvidia::{
+    ensure_nvidia_driver_image, get_nvidia_driver_image_path, profile_nvidia_driver_image,
 };
 pub use pasta::{ensure_pasta, get_pasta_for_config};
 pub use rootfs::{

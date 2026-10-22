@@ -1,6 +1,7 @@
 pub mod cli;
 pub mod commands;
 pub mod firecracker;
+pub mod gpu;
 pub mod health;
 pub mod hypervisor;
 pub mod kvm_trace;
