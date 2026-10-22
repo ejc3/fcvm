@@ -169,12 +169,14 @@ class EngineDispatch(unittest.TestCase):
         self.assertIn("webkit", text)
 
     def test_the_webkit_branch_exists_and_is_reached_by_engine(self):
-        """Structural pin on the dispatch itself: run_cdp_request must consult
-        args.engine and route webkit to wddrive. The behavioural half (a full
-        fake clone) needs a VM; the routing decision does not.
+        """Structural pin on the dispatch itself: run_cdp_request renders
+        through _drive_clone, which must consult args.engine and route webkit
+        to wddrive. The behavioural half (a full fake clone) needs a VM; the
+        routing decision does not.
         """
         import inspect
-        src = inspect.getsource(reqbench.run_cdp_request)
+        self.assertIn("_drive_clone(", inspect.getsource(reqbench.run_cdp_request))
+        src = inspect.getsource(reqbench._drive_clone)
         self.assertIn('== "webkit"', src)
         self.assertIn("wddrive.drive", src)
         self.assertIn("discover_wd_session", src)

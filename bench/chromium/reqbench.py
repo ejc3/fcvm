@@ -3759,6 +3759,62 @@ def discover_wd_session(args, fcvm_pid: int, deadline: float) -> str:
     return session
 
 
+def _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec):
+    """Render one page on a ready clone: WebDriver for WebKit, CDP otherwise."""
+    import cdpdrive
+
+    if getattr(args, "engine", "chromium") == "webkit":
+        # Classic WebDriver has NO session discovery: the warm session
+        # id is written by entry-webkit.sh to /run/bench-session-id
+        # BEFORE the golden snapshot, so it is snapshot state --
+        # identical across clones for exactly the reason cdpdrive's
+        # target id is. Captured ONCE via fcvm exec on the first clone
+        # and pinned for every later rep (discovery-once, same pattern
+        # as --prewire; warmups run first, so the exec cost lands on a
+        # discarded rep).
+        if not getattr(args, "wd_session_id", ""):
+            args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
+        rec["session_prewired"] = True
+        import wddrive
+
+        result = wddrive.drive(argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            timeout=max(1.0, deadline - time.monotonic()),
+            session_id=args.wd_session_id,
+            out_prefix="",
+        ))
+    else:
+        ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
+        rec["ws_url_prewired"] = bool(ws_url)
+        drive_args = argparse.Namespace(
+            cdp_host=endpoint,
+            url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
+            format=args.format,
+            quality=args.quality,
+            timeout=max(1.0, deadline - time.monotonic()),
+            idle_wait_ms=0.0,
+            out_prefix="",
+            ws_url=ws_url,
+            connect_retries=200,
+            nav_timing=True,
+            print_target=False,
+            # This Namespace is an explicit, CLOSED field list, so every flag
+            # cdpdrive grows has to be added here too or `drive()` raises
+            # AttributeError — which is not in its except tuple, escapes it,
+            # and is swallowed by the `except Exception` below, failing every
+            # cdp rep. cdpdrive also reads it with getattr; both halves.
+            host_header="",
+            op=op,
+            # getattr: failure-path fixtures drive this function with
+            # bare Namespaces that predate the knob.
+            resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
+            render_module=os.path.join(HERE, "render.py"),
+        )
+        result = cdpdrive.drive(drive_args)
+    return result
+
+
 def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screenshot") -> dict:
     import cdpdrive
 
@@ -3773,7 +3829,12 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
     log = os.path.join(args.out_dir, f"{name}.log")
     rec: dict = {"arm": arm_name, "rep": rep, "name": name}
 
-    cmd = [args.fcvm, "snapshot", "run"] + clone_backend_args(args) + [
+    # reqscale places each clone in its backend's cgroup through a guard that
+    # execs fcvm (same pid), so the FILE and UFFD cgroups account their own
+    # clones. Without the prefix every clone ran in the driver's cgroup.
+    cmd = list(getattr(args, "spawn_prefix", ())) + [
+        args.fcvm, "snapshot", "run",
+    ] + clone_backend_args(args) + [
         "--name", name, "--no-dirty-tracking", "--no-swap",
     ]
     env = dict(os.environ, RUST_LOG=args.rust_log)
@@ -3821,55 +3882,20 @@ def run_cdp_request(args, rep: int, fast: bool, probe=None, op: str = "screensho
             rec["state_to_port_ms"] = wait_port(endpoint, deadline, proc, log)
             rec["spawn_to_port_ms"] = (time.monotonic() - t_spawn) * 1000
 
-            if getattr(args, "engine", "chromium") == "webkit":
-                # Classic WebDriver has NO session discovery: the warm session
-                # id is written by entry-webkit.sh to /run/bench-session-id
-                # BEFORE the golden snapshot, so it is snapshot state --
-                # identical across clones for exactly the reason cdpdrive's
-                # target id is. Captured ONCE via fcvm exec on the first clone
-                # and pinned for every later rep (discovery-once, same pattern
-                # as --prewire; warmups run first, so the exec cost lands on a
-                # discarded rep).
-                if not getattr(args, "wd_session_id", ""):
-                    args.wd_session_id = discover_wd_session(args, fcvm_pid, deadline)
-                rec["session_prewired"] = True
-                import wddrive
-
-                result = wddrive.drive(argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    session_id=args.wd_session_id,
-                    out_prefix="",
-                ))
-            else:
-                ws_url = clone_ws_url(args.ws_url, endpoint) if args.ws_url else ""
-                rec["ws_url_prewired"] = bool(ws_url)
-                drive_args = argparse.Namespace(
-                    cdp_host=endpoint,
-                    url=url_for_rep(getattr(args, "urls", None) or [args.url], rep),
-                    format=args.format,
-                    quality=args.quality,
-                    timeout=max(1.0, deadline - time.monotonic()),
-                    idle_wait_ms=0.0,
-                    out_prefix="",
-                    ws_url=ws_url,
-                    connect_retries=200,
-                    nav_timing=True,
-                    print_target=False,
-                    # This Namespace is an explicit, CLOSED field list, so every flag
-                    # cdpdrive grows has to be added here too or `drive()` raises
-                    # AttributeError — which is not in its except tuple, escapes it,
-                    # and is swallowed by the `except Exception` below, failing every
-                    # cdp rep. cdpdrive also reads it with getattr; both halves.
-                    host_header="",
-                    op=op,
-                    # getattr: failure-path fixtures drive this function with
-                    # bare Namespaces that predate the knob.
-                    resolve_poll_ms=getattr(args, "resolve_poll_ms", 50.0),
-                    render_module=os.path.join(HERE, "render.py"),
-                )
-                result = cdpdrive.drive(drive_args)
+            # reqscale hands each request a private probe that pins this clone's
+            # Firecracker child and reads its fault counters from endpoint-ready
+            # to the answer. A probe failure is a request failure and still goes
+            # through the teardown below.
+            fault_probe = getattr(args, "firecracker_fault_probe", None)
+            fault_probe_started = False
+            if fault_probe is not None:
+                fault_probe.begin(fcvm_pid)
+                fault_probe_started = True
+            try:
+                result = _drive_clone(args, rep, op, endpoint, deadline, fcvm_pid, rec)
+            finally:
+                if fault_probe_started:
+                    rec["firecracker_process_faults_ready_to_artifact"] = fault_probe.finish()
             raise_if_harness_interrupted()
             rec["render"] = result
             rec["ok"] = bool(result.get("ok"))

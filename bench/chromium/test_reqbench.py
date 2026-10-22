@@ -1045,6 +1045,100 @@ class CdpFailureIsLabelledOnTheRecord(unittest.TestCase):
             self.assertFalse(os.path.lexists(state_path))
             self.assertFalse(os.path.lexists(data_dir))
 
+    def test_scale_request_hooks_place_the_clone_and_sample_its_faults(self):
+        """reqscale passes spawn_prefix (its cgroup guard) and a per-request
+        firecracker_fault_probe; run_cdp_request must use both.
+
+        RED BEFORE THE FIX: it ignored both. Every clone of a scale run ran in
+        the driver's cgroup (2026-10-22: the FILE cgroup's cpu.stat stayed at 0
+        while the driver's held 739 s), and no request carried
+        firecracker_process_faults_ready_to_artifact, which reqscale_analyze
+        requires of every row, so no scale run could be analyzed.
+        """
+        import cdpdrive
+        import socket
+
+        with tempfile.TemporaryDirectory() as d:
+            state_dir = os.path.join(d, "state")
+            vm_id = "vm-33333333333333333333333333333333"
+            state_path = os.path.join(state_dir, f"{vm_id}.json")
+            os.makedirs(state_dir)
+            os.makedirs(os.path.join(d, "vm-disks", vm_id))
+            child_ready = os.path.join(d, "child-ready")
+            guard_ran = os.path.join(d, "guard-ran")
+            stub = os.path.join(d, "fcvm-stub")
+            guard = os.path.join(d, "guard")
+
+            server = socket.socket()
+            server.bind(("127.0.0.1", 0))
+            server.listen(8)
+            port = server.getsockname()[1]
+            name = "rb-test-run-0-fast"
+            ready = json.dumps({
+                "vm_id": vm_id,
+                "name": name,
+                "pid": "PID",
+                "pid_start_time": "START",
+                "lifecycle_ready": True,
+                "config": {"network": {"loopback_ip": "127.0.0.1"}},
+            })
+            with open(guard, "w") as f:
+                f.write(f"#!/bin/bash\necho $$ > {guard_ran}\nexec \"$@\"\n")
+            os.chmod(guard, 0o755)
+            with open(stub, "w") as f:
+                f.write(
+                    "#!/bin/bash\n"
+                    f"python3 -c 'import ctypes,signal,time; ctypes.CDLL(\"libc.so.6\").prctl(1, signal.SIGKILL); open(\"{child_ready}\", \"w\").close(); time.sleep(600)' &\n"
+                    f"while [ ! -e {child_ready} ]; do sleep 0.01; done\n"
+                    "read -r proc_stat < /proc/$$/stat; proc_stat=${proc_stat##*) }; "
+                    "read -ra proc_fields <<< \"$proc_stat\"; start=${proc_fields[19]}\n"
+                    f"printf '%s\\n' '{ready}' | sed -e \"s/\\\"PID\\\"/$$/\" -e \"s/\\\"START\\\"/$start/\" > {state_path}\n"
+                    f": > {state_path}.lock\n"
+                    "wait\n"
+                )
+            os.chmod(stub, 0o755)
+
+            calls = []
+
+            class Probe:
+                def begin(self, pid):
+                    calls.append(("begin", pid))
+
+                def finish(self):
+                    calls.append(("finish",))
+                    return {"pid": 7, "minor_faults": 3, "major_faults": 0}
+
+            def drive(_args):
+                calls.append(("drive",))
+                return {"ok": True, "stages": {}}
+
+            real_drive = cdpdrive.drive
+            cdpdrive.drive = drive
+            args = argparse.Namespace(
+                fcvm=stub, out_dir=d, url="http://x/", format="jpeg", quality=80,
+                snapshot_tag="", serve_pid=1, rust_log="off",
+                timeout=5.0, teardown_timeout=5.0, cdp_port=port,
+                state_dir=state_dir, data_root=d, ws_url="", run_id="test-run",
+                spawn_prefix=[guard], firecracker_fault_probe=Probe(),
+            )
+            try:
+                rec = reqbench.run_cdp_request(args, 0, fast=True)
+            finally:
+                cdpdrive.drive = real_drive
+                server.close()
+
+            self.assertTrue(rec["ok"], rec)
+            # The guard execs fcvm, so it ran as the very process whose pid
+            # the state file names and the probe pins.
+            self.assertTrue(os.path.exists(guard_ran), "spawn_prefix was not run")
+            with open(guard_ran) as f:
+                guard_pid = int(f.read())
+            self.assertEqual(rec["state_owner_pid"], guard_pid)
+            self.assertEqual(calls, [("begin", guard_pid), ("drive",), ("finish",)])
+            self.assertEqual(
+                rec["firecracker_process_faults_ready_to_artifact"],
+                {"pid": 7, "minor_faults": 3, "major_faults": 0})
+
 
 class ExecArmTimeoutDoesNotReapALiveClone(unittest.TestCase):
     """The exec arm's timeout path must not delete a live microVM's only record.
