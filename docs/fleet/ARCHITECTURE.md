@@ -246,11 +246,11 @@ detail view for 1080p.
 frame of the same scene. The coordinator splits each half into as many rectangles as that
 half has GPUs, so more hosts make each GPU's rectangle smaller and the whole image finer
 (more pixels and more ray-marching steps per pixel in total). **DECIDED (2026-10-22): the halves are symmetrical.** Both halves are cut into the same
-grid of N rectangles, N = max(fcvm GPUs, EC2 instances running). The coordinator asks EC2
-for as many instances as the fcvm side has GPUs; whichever side ends up with fewer GPUs
-(spot capacity decides) gives some of its GPUs two rectangles, assigned so no GPU has more
-than one extra. A GPU with two rectangles renders both, and relaunching it darkens both;
-the detail view says which tiles share a GPU. Every viewer sees the same tiling, because the tiling
+grid of N rectangles, N = max(fcvm GPUs, EC2 instances running). One GPU renders one
+rectangle, never more. The coordinator asks EC2 for as many instances as the fcvm side
+has GPUs; whichever side ends up with fewer GPUs (spot capacity decides) shows its missing
+rectangles dark, labelled "waiting for capacity", until a GPU arrives. An EC2 side short
+of spot capacity therefore shows as dark tiles, which is part of the comparison. Every viewer sees the same tiling, because the tiling
 is part of the shared state.
 
 ### Web
