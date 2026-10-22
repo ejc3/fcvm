@@ -108,6 +108,12 @@ desired generation, and makes the host match:
   address and GPU are free, then restores a new VM from the gold snapshot with the slot's
   name, GPU and address. One relaunch per slot at a time; a newer generation that arrives
   mid-relaunch waits for the current one to finish and then runs once.
+- **Relaunch all, as fast as the hosts allow.** "Relaunch all" is one intent that bumps
+  every slot's generation in one event. Each agent then relaunches all of its slots at
+  once, not one after another: teardowns run in parallel, and restores start as each
+  slot's old VM has exited. The snapshot is served to every clone from one memory server
+  per host, so the restores share the page cache. The header shows the time from the click
+  to the last tile's first frame, and that number is the one the demo is tuned for.
 - **Report.** Phase changes (`stopping`, `restoring`, `attaching_gpu`, `starting`,
   `running`, `failed`), the timings fcvm logs for the restore (including `gpu_ms` from the
   restore acknowledgement), and the renderer's own health, read from its control port.
@@ -228,7 +234,8 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 - relaunch time from click to first new frame, per slot, and its parts (teardown, restore,
   GPU attach, container start, first frame);
 - renderer frames per second at each height on a T4;
-- relaunch time for every slot of a host at once.
+- relaunch-all time across the fleet, click to the last first frame, and which phase of
+  which slot was the last to finish.
 
 ## Open questions
 
