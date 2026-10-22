@@ -15,6 +15,17 @@ tile show the same clock, so the difference is on screen.
 
 ## What a viewer sees
 
+**DECIDED (2026-10-22): the wall is one image.** Every GPU renders its own rectangle of a
+single real-time scene, a flight through a ray-marched fractal world, so the whole wall
+reads as one picture. The left half of the picture is rendered by fcvm GPUs and the right
+half by EC2 GPUs, with a line between them. "Relaunch all" turns the whole picture black;
+the fcvm half heals back tile by tile in seconds while the EC2 half stays dark, and each
+half stamps the time its last tile came back. Viewers steer one shared camera (drag to
+turn, scroll to dive) and appear in the scene as small lights; clicking a square relaunches
+the GPU behind it, for everyone. The per-tile view below is the detail view, one click away.
+
+The detail view:
+
 - A grid of tiles. The viewer picks how many tiles fit on the screen; that choice sets each
   tile's pixel size, and the tile asks its VM for frames at that size. Clicking a tile opens
   it large and asks for a high resolution stream.
@@ -197,17 +208,35 @@ Locally there is no Cloudflare: the page connects to the slot's address directly
 
 ### Renderer (the workload)
 
-A container in each VM, the same image everywhere. It renders a scene on the GPU with CUDA,
-encodes H.264 with NVENC, and serves:
+A container in each VM, the same image everywhere. The scene is a pure function of time,
+camera and the rectangle being drawn: `frame(t, camera, rect)`. Each renderer is told its
+rectangle of the whole image (its place in the mosaic) and follows the camera path the
+coordinator publishes against a shared clock, so all renderers draw the same frame `t`
+without talking to each other. It renders with CUDA (kernels compiled ahead of time, so a
+first frame needs no compile), encodes H.264 with NVENC, and serves:
 
-- `GET /frames?h=<height>` (WebSocket): encoded frames at that height. The renderer draws
-  once at the largest height anyone is watching and scales down for smaller ones, and it
-  encodes only the heights that have a subscriber. The browser decodes with WebCodecs.
-- `POST /scene`: scene parameters (from the coordinator, through the agent, never from a
-  browser directly), so a scene change is ordered like any other action.
-- `GET /health`: frames per second, the heights being encoded, GPU name and memory.
+- `GET /frames?h=<height>` (WebSocket): encoded frames of its rectangle at that height,
+  each stamped with its `t`. The renderer draws once at the largest height anyone is
+  watching and scales down for smaller ones, and encodes only the heights with a
+  subscriber. The browser decodes with WebCodecs.
+- `POST /scene`: the camera path, the clock offset and its rectangle (from the coordinator,
+  through the agent, never from a browser), so a camera move is ordered like any other
+  action.
+- `GET /health`: frames per second, the heights being encoded, GPU name and memory, and the
+  `t` of its latest frame.
 
-The first scene is recommended below; the renderer is built so a scene is one module.
+**No seams.** The browser shows every tile at one common `t`, holding each stream in a
+short buffer (a few frames) until all visible tiles have that frame; a tile that falls
+behind shows its last frame dimmed rather than tearing the image. A relaunched tile is
+dark until its first frame at the current `t`.
+
+**Resolution follows the viewer.** The page asks each tile for the height its rectangle
+occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
+detail view for 1080p.
+
+**The mosaic follows the fleet.** When spot capacity adds or removes GPUs, the coordinator
+recomputes the grid (fcvm GPUs on the left, EC2 GPUs on the right, each half as square as
+its count allows) and republishes every renderer's rectangle in one event.
 
 ### Web
 
@@ -265,6 +294,21 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
 9. Infrastructure (ejc3/aws): the coordinator service, the regional host groups, the AMI
    pipeline, DNS and certificates, and the staging deploy.
 
+## The target
+
+Relaunch all, click to the last tile's first frame, under 3 s on the fcvm half. The
+phases a GPU relaunch spends time in are teardown, restore, GPU attach (driver load and
+the GPU's firmware boot), container start and first frame; each is measured, and the
+largest is attacked first. A GPU VM cannot be snapshotted after it warms up (the device's
+state is not saved), so the driver and first-frame work happen on every relaunch and are
+where the work is.
+
+## The launch event
+
+Day to day the fleet runs on whatever spot capacity gives it. For the announcement, a
+one-hour run on ten g4dn.metal for the fcvm half (80 GPUs) against 80 g4dn.xlarge for the
+EC2 half, recorded in one take: a 160-tile image going dark and healing on one side.
+
 ## Measurements to take
 
 None of these exist yet; each is taken on a parallel box, never on a shared host:
@@ -277,9 +321,8 @@ None of these exist yet; each is taken on a parallel box, never on a shared host
 
 ## Open questions
 
-1. **Scene.** Recommended: a ray-marched fractal fly-through, one seed and palette per
-   slot, because it is GPU-bound, looks different on every tile and needs no assets.
-   Alternatives: a fluid simulation viewers can stir; an image model generating frames.
+1. **Scene. DECIDED (2026-10-22):** one ray-marched fractal world shared by every tile,
+   each GPU rendering its rectangle (see "What a viewer sees").
 2. **Hardware.** Recommended: g4dn.metal, eight T4 per host and NVENC on each, so one host
    fills a grid. g5g.metal has two T4G per host at a sixth of the price.
 3. **Zone. DECIDED (2026-10-22): `fcvm.dev`**, bought through Cloudflare Registrar so the
