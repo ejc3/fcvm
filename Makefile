@@ -1426,7 +1426,7 @@ setup-lint-tools: cargo-target-link
 	@which cargo-deny > /dev/null || (echo "Installing cargo-deny..." && $(CARGO) install cargo-deny@$(CARGO_DENY_VERSION) --locked)
 
 lint: setup-lint-tools
-	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint --check
+	$(CARGO) fmt -p fcvm -p fuse-pipe -p fc-agent -p failpoint -p fleet-core --check
 	$(MAKE) clippy
 	$(CARGO) audit
 	$(CARGO) deny check

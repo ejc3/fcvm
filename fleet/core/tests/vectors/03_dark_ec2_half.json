@@ -1,0 +1,256 @@
+{
+  "description": "With no EC2 tiles the right half has as many rectangles as the left, all dark and waiting for capacity.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/ec2_assign": [],
+        "/view/fleet/ec2_instances": 0,
+        "/view/fleet/n": 3,
+        "/view/tiles/0/rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/tiles/3/id": "ec2:1",
+        "/view/tiles/3/phase": "waiting_capacity",
+        "/view/tiles/3/rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "/view/tiles/5/phase": "waiting_capacity",
+        "/view/tiles/6": null
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 3,
+      "gpus": 3,
+      "hosts": [
+        {
+          "arch": "x86_64",
+          "draining": false,
+          "gpus": [
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:01:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:02:00.0"
+            },
+            {
+              "name": "Tesla T4",
+              "sbdf": "0000:03:00.0"
+            }
+          ],
+          "name": "h1"
+        }
+      ],
+      "max_tiles": 100,
+      "n": 3,
+      "standby": []
+    },
+    "image_aspect": 3.5555555555555554,
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            0.0,
+            1.5,
+            -10.0
+          ],
+          "pos": [
+            0.0,
+            2.0,
+            0.0
+          ],
+          "t": 0.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 10.0,
+      "words": []
+    },
+    "settings": {
+      "auto_relaunch_secs": null
+    },
+    "tiles": [
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:01:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:1",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "slot-1",
+        "vm": null
+      },
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:02:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:2",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.0,
+          "y": 0.5
+        },
+        "slot": "slot-2",
+        "vm": null
+      },
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": 1,
+        "gpu": {
+          "name": "Tesla T4",
+          "sbdf": "0000:03:00.0"
+        },
+        "gpu_stats": null,
+        "half": "fcvm",
+        "host": "h1",
+        "id": "fcvm:3",
+        "last_relaunch": null,
+        "phase": "pending",
+        "rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.25,
+          "y": 0.5
+        },
+        "slot": "slot-3",
+        "vm": null
+      },
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:1",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:2",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.5,
+          "y": 0.5
+        },
+        "slot": null,
+        "vm": null
+      },
+      {
+        "error": null,
+        "fps": null,
+        "frame_url": null,
+        "generation": null,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:3",
+        "last_relaunch": null,
+        "phase": "waiting_capacity",
+        "rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.5
+        },
+        "slot": null,
+        "vm": null
+      }
+    ],
+    "viewers": {
+      "count": 0
+    }
+  },
+  "start_ms": 0
+}

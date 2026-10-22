@@ -36,6 +36,135 @@ pub enum Commands {
     Serve(ServeArgs),
     /// Generate shell completions
     Completions(CompletionsArgs),
+    /// The GPU wall's control plane: coordinator and host agent (docs/fleet/ARCHITECTURE.md)
+    Fleet(FleetArgs),
+}
+
+// ============================================================================
+// Fleet Command
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct FleetArgs {
+    #[command(subcommand)]
+    pub cmd: FleetCommand,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum FleetCommand {
+    /// Run the coordinator: the fleet state, the browser WebSocket and the agents
+    Coord(FleetCoordArgs),
+    /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
+    Agent(FleetAgentArgs),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetTextCheck {
+    /// Claude Haiku on Amazon Bedrock (needs --text-check-model and --text-check-region)
+    Bedrock,
+    /// No text check: every viewer word is refused
+    None,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum FleetEc2 {
+    /// No EC2 tiles: the EC2 half stays dark
+    None,
+    /// Fake EC2 instances that come up after a delay and render nothing (dark tiles)
+    Fake,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetCoordArgs {
+    /// Address to serve the browser WebSocket (/live) and /healthz on, e.g. 127.0.0.1:20000
+    #[arg(long, env = "FLEET_COORD_LISTEN")]
+    pub listen: String,
+
+    /// Command that starts an agent speaking the agent protocol on its stdin and stdout,
+    /// e.g. "fcvm fleet agent --stdio ..." or "ssh gpu-host fcvm fleet agent --stdio ...".
+    /// Split like a shell would. Repeatable.
+    #[arg(long = "agent-cmd")]
+    pub agent_cmds: Vec<String>,
+
+    /// Keep the state in this JSON file (rewritten atomically) and resume from it
+    #[arg(long)]
+    pub state_file: Option<std::path::PathBuf>,
+
+    /// How viewer text is checked before it enters the scene
+    #[arg(long, value_enum, default_value_t = FleetTextCheck::None)]
+    pub text_check: FleetTextCheck,
+
+    /// Bedrock model id (or inference profile id) for the text check
+    #[arg(long, env = "FLEET_TEXT_CHECK_MODEL")]
+    pub text_check_model: Option<String>,
+
+    /// AWS region of the text check's Bedrock endpoint
+    #[arg(long, env = "FLEET_TEXT_CHECK_REGION")]
+    pub text_check_region: Option<String>,
+
+    /// The most tiles per half
+    #[arg(long, default_value_t = 100)]
+    pub max_tiles: usize,
+
+    /// Where EC2 tiles come from
+    #[arg(long, value_enum, default_value_t = FleetEc2::None)]
+    pub ec2: FleetEc2,
+}
+
+#[derive(Args, Debug)]
+pub struct FleetAgentArgs {
+    /// Speak the agent protocol on stdin and stdout (the only transport today)
+    #[arg(long, required = true)]
+    pub stdio: bool,
+
+    /// Host name reported to the coordinator (default: the system host name)
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Renderer container image every slot runs
+    #[arg(long)]
+    pub image: String,
+
+    /// First host port; the slot on GPU index i publishes the renderer on base + i
+    #[arg(long, env = "FLEET_AGENT_BASE_PORT")]
+    pub base_port: u16,
+
+    /// Host address the renderer ports are published on
+    #[arg(long, default_value = "127.0.0.1")]
+    pub publish_ip: String,
+
+    /// Host name or address browsers use to reach the published ports (default: --publish-ip)
+    #[arg(long)]
+    pub frame_host: Option<String>,
+
+    /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
+    #[arg(long)]
+    pub gpus: Option<String>,
+
+    /// VMs this host runs at once (default: one per GPU)
+    #[arg(long)]
+    pub capacity: Option<usize>,
+
+    /// fcvm binary that runs the VMs (default: this executable)
+    #[arg(long)]
+    pub fcvm: Option<std::path::PathBuf>,
+
+    /// Extra argument for every `fcvm podman run`, before the image. Repeatable.
+    #[arg(long = "fcvm-arg", allow_hyphen_values = true)]
+    pub fcvm_args: Vec<String>,
+
+    /// EC2 metadata base URL to poll for spot interruption notices (IMDSv2), e.g.
+    /// http://169.254.169.254
+    #[arg(long)]
+    pub spot_notice_url: Option<String>,
+
+    /// Seconds a relaunch may take from fcvm start to the renderer's first frame
+    #[arg(long, default_value_t = 300)]
+    pub start_timeout_secs: u64,
+
+    /// sysfs root for the GPU inventory and VFIO group lookup (tests)
+    #[arg(long, default_value = "/sys", hide = true)]
+    pub sysfs_root: std::path::PathBuf,
 }
 
 // ============================================================================

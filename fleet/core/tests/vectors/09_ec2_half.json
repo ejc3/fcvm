@@ -1,0 +1,188 @@
+{
+  "config": {
+    "ec2_max": 10
+  },
+  "description": "EC2 tiles follow the fcvm GPU count; a tile EC2 has no capacity for stays dark, and fewer fcvm GPUs drop the extra EC2 tiles.",
+  "events": [
+    {
+      "at": 1000,
+      "host": "h1",
+      "msg": {
+        "arch": "x86_64",
+        "capacity": 8,
+        "gpus": [
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:01:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:02:00.0"
+          },
+          {
+            "name": "Tesla T4",
+            "sbdf": "0000:03:00.0"
+          }
+        ],
+        "host": "h1",
+        "type": "hello"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2000,
+      "report": {
+        "frame_url": "ws://ec2-1.example:443/frames",
+        "generation": 1,
+        "id": "ec2-1",
+        "phase": "running",
+        "timings": {},
+        "vm": "instance-1"
+      },
+      "type": "ec2"
+    },
+    {
+      "at": 2100,
+      "report": {
+        "frame_url": null,
+        "generation": 1,
+        "id": "ec2-2",
+        "phase": "waiting_capacity",
+        "timings": {},
+        "vm": null
+      },
+      "type": "ec2"
+    },
+    {
+      "args": {},
+      "at": 3000,
+      "id": "ra",
+      "name": "relaunch_all",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "at": 4000,
+      "report": {
+        "frame_url": "ws://ec2-1.example:443/frames",
+        "generation": 2,
+        "id": "ec2-1",
+        "phase": "running",
+        "timings": {},
+        "vm": "instance-2"
+      },
+      "type": "ec2"
+    },
+    {
+      "at": 5000,
+      "host": "h1",
+      "type": "agent_gone"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/ec2_assign/2/id": "ec2-3",
+        "/view/tiles/3/phase": "pending",
+        "/view/tiles/3/slot": "ec2-1"
+      }
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/view/fleet/ec2_instances": 1,
+        "/view/tiles/3/frame_url": "ws://ec2-1.example:443/frames",
+        "/view/tiles/3/phase": "running"
+      }
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/view/tiles/4/phase": "waiting_capacity"
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/ec2_assign/0/generation": 2,
+        "/view/relaunch_all/ec2_pending": 3
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/relaunch_all/ec2_pending": 2
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/ec2_assign": [],
+        "/view/fleet/n": 0,
+        "/view/tiles": []
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "at": 3000,
+        "by": "v1",
+        "name": "relaunch_all",
+        "outcome": "committed",
+        "summary": "relaunch all (6 tiles)"
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "standby": []
+    },
+    "image_aspect": 3.5555555555555554,
+    "relaunch_all": {
+      "by": "viewer:v1",
+      "ec2_done_at": 5000,
+      "ec2_last": null,
+      "ec2_pending": 0,
+      "fcvm_done_at": 5000,
+      "fcvm_last": null,
+      "fcvm_pending": 0,
+      "started_at": 3000
+    },
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            0.0,
+            1.5,
+            -10.0
+          ],
+          "pos": [
+            0.0,
+            2.0,
+            0.0
+          ],
+          "t": 0.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 10.0,
+      "words": []
+    },
+    "settings": {
+      "auto_relaunch_secs": null
+    },
+    "tiles": [],
+    "viewers": {
+      "count": 0
+    }
+  },
+  "start_ms": 0
+}

@@ -67,8 +67,8 @@ async fn run() -> Result<()> {
             // Setup handles its own path initialization after loading config
             // Don't pre-initialize here since setup may create storage first
         }
-        Commands::Completions(_) => {
-            // Shell completions don't need config
+        Commands::Completions(_) | Commands::Fleet(_) => {
+            // Shell completions and the fleet control plane don't need config
             paths::init_with_defaults();
         }
         _ => {
@@ -127,6 +127,7 @@ async fn run() -> Result<()> {
             commands::cmd_completions(args);
             Ok(())
         }
+        Commands::Fleet(args) => fcvm::fleet::cmd_fleet(args).await,
     };
 
     // Handle errors

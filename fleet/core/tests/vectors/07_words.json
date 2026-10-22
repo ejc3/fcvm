@@ -1,0 +1,270 @@
+{
+  "description": "A word reaches the scene only when the text check allowed it; refused, failed or missing checks, long text and a second word within the interval are refused, and a refused word's text is not shown.",
+  "events": [
+    {
+      "at": 1000,
+      "type": "viewer_joined",
+      "viewer": "v1"
+    },
+    {
+      "at": 1000,
+      "type": "viewer_joined",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "hello"
+      },
+      "at": 2000,
+      "check": {
+        "reason": "ok",
+        "verdict": "allow"
+      },
+      "id": "w1",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "text": "again"
+      },
+      "at": 3000,
+      "check": {
+        "reason": "ok",
+        "verdict": "allow"
+      },
+      "id": "w2",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "text": "nasty"
+      },
+      "at": 3000,
+      "check": {
+        "reason": "not suitable",
+        "verdict": "refuse"
+      },
+      "id": "w3",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "x"
+      },
+      "at": 9000,
+      "check": {
+        "reason": "text check unavailable",
+        "verdict": "error"
+      },
+      "id": "w4",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "y"
+      },
+      "at": 9100,
+      "id": "w5",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "aaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "at": 9150,
+      "check": {
+        "reason": "ok",
+        "verdict": "allow"
+      },
+      "id": "w6",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    },
+    {
+      "args": {
+        "text": "  two   words "
+      },
+      "at": 9200,
+      "check": {
+        "reason": "ok",
+        "verdict": "allow"
+      },
+      "id": "w7",
+      "name": "word",
+      "type": "intent",
+      "viewer": "v2"
+    }
+  ],
+  "expect": [
+    {
+      "after": 2,
+      "checks": {
+        "/receipts/w1/check/verdict": "allow",
+        "/receipts/w1/outcome": "committed",
+        "/view/scene/words": [
+          {
+            "t": 2.0,
+            "text": "hello"
+          }
+        ]
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts/w2/outcome": "refused",
+        "/receipts/w2/reason": "one word per 5 s per viewer"
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/receipts/w3/check/verdict": "refuse",
+        "/receipts/w3/outcome": "refused",
+        "/receipts/w3/reason": "the text check refused it: not suitable",
+        "/view/actions/2/summary": "the text check refused it: not suitable",
+        "/view/scene/words/1": null
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/receipts/w4/reason": "the text check failed: text check unavailable"
+      }
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/w5/reason": "the text check did not run"
+      }
+    },
+    {
+      "after": 7,
+      "checks": {
+        "/receipts/w6/reason": "text is 25 characters; the limit is 24"
+      }
+    },
+    {
+      "after": 8,
+      "checks": {
+        "/receipts/w7/outcome": "committed",
+        "/view/scene/words/1/text": "two words",
+        "/view/viewers/count": 2
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "at": 2000,
+        "by": "v1",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"hello\""
+      },
+      {
+        "at": 3000,
+        "by": "v1",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "one word per 5 s per viewer"
+      },
+      {
+        "at": 3000,
+        "by": "v2",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check refused it: not suitable"
+      },
+      {
+        "at": 9000,
+        "by": "v2",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check failed: text check unavailable"
+      },
+      {
+        "at": 9100,
+        "by": "v2",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "the text check did not run"
+      },
+      {
+        "at": 9150,
+        "by": "v2",
+        "name": "word",
+        "outcome": "refused",
+        "summary": "text is 25 characters; the limit is 24"
+      },
+      {
+        "at": 9200,
+        "by": "v2",
+        "name": "word",
+        "outcome": "committed",
+        "summary": "word \"two words\""
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "standby": []
+    },
+    "image_aspect": 3.5555555555555554,
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 60.0,
+          "look": [
+            0.0,
+            1.5,
+            -10.0
+          ],
+          "pos": [
+            0.0,
+            2.0,
+            0.0
+          ],
+          "t": 0.0
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [],
+      "time_of_day": 10.0,
+      "words": [
+        {
+          "t": 2.0,
+          "text": "hello"
+        },
+        {
+          "t": 9.2,
+          "text": "two words"
+        }
+      ]
+    },
+    "settings": {
+      "auto_relaunch_secs": null
+    },
+    "tiles": [],
+    "viewers": {
+      "count": 2
+    }
+  },
+  "start_ms": 0
+}

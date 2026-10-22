@@ -1,0 +1,322 @@
+{
+  "description": "Camera, time of day and lights change the shared scene; out-of-range values and a second light within the interval are refused.",
+  "events": [
+    {
+      "args": {
+        "v": 25
+      },
+      "at": 1000,
+      "id": "t1",
+      "name": "time_of_day",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "v": 18.5
+      },
+      "at": 1100,
+      "id": "t2",
+      "name": "time_of_day",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "color": [
+          1,
+          0.5,
+          0
+        ],
+        "pos": [
+          1,
+          2,
+          3
+        ]
+      },
+      "at": 1200,
+      "id": "l1",
+      "name": "light",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "color": [
+          1,
+          0.5,
+          0
+        ],
+        "pos": [
+          1,
+          2,
+          3
+        ]
+      },
+      "at": 1300,
+      "id": "l2",
+      "name": "light",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "keyframes": [
+          {
+            "fov_deg": 70,
+            "look": [
+              0,
+              10,
+              -1
+            ],
+            "pos": [
+              0,
+              10,
+              0
+            ],
+            "t": 4
+          },
+          {
+            "fov_deg": 70,
+            "look": [
+              0,
+              20,
+              -1
+            ],
+            "pos": [
+              0,
+              20,
+              0
+            ],
+            "t": 8
+          }
+        ]
+      },
+      "at": 4000,
+      "id": "c1",
+      "name": "camera",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "drag": {
+          "dive": 0,
+          "pitch_deg": 0,
+          "yaw_deg": 0
+        }
+      },
+      "at": 6000,
+      "id": "c2",
+      "name": "camera",
+      "type": "intent",
+      "viewer": "v1"
+    },
+    {
+      "args": {
+        "drag": {
+          "pitch_deg": 0,
+          "yaw_deg": 1000000000.0
+        }
+      },
+      "at": 6100,
+      "id": "c3",
+      "name": "camera",
+      "type": "intent",
+      "viewer": "v1"
+    }
+  ],
+  "expect": [
+    {
+      "after": 0,
+      "checks": {
+        "/receipts/t1/reason": "args.v must be hours in [0, 24)"
+      }
+    },
+    {
+      "after": 1,
+      "checks": {
+        "/view/scene/time_of_day": 18.5
+      }
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/view/scene/lights/0/t": 1.2
+      }
+    },
+    {
+      "after": 3,
+      "checks": {
+        "/receipts/l2/outcome": "refused",
+        "/view/scene/lights/1": null
+      }
+    },
+    {
+      "after": 4,
+      "checks": {
+        "/view/scene/camera/1/pos": [
+          0.0,
+          20.0,
+          0.0
+        ]
+      }
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/scene/camera/1/pos": [
+          0.0,
+          15.0,
+          0.0
+        ],
+        "/view/scene/camera/1/t": 6.0,
+        "/view/scene/camera/2/t": 6.3,
+        "/view/scene/camera/3": null
+      },
+      "note": "a drag holds the current point and eases to the new one"
+    },
+    {
+      "after": 6,
+      "checks": {
+        "/receipts/c3/reason": "drag is out of range"
+      }
+    }
+  ],
+  "final_view": {
+    "actions": [
+      {
+        "at": 1000,
+        "by": "v1",
+        "name": "time_of_day",
+        "outcome": "refused",
+        "summary": "args.v must be hours in [0, 24)"
+      },
+      {
+        "at": 1100,
+        "by": "v1",
+        "name": "time_of_day",
+        "outcome": "committed",
+        "summary": "time of day 18.5 h"
+      },
+      {
+        "at": 1200,
+        "by": "v1",
+        "name": "light",
+        "outcome": "committed",
+        "summary": "light"
+      },
+      {
+        "at": 1300,
+        "by": "v1",
+        "name": "light",
+        "outcome": "refused",
+        "summary": "too many lights; wait a moment"
+      },
+      {
+        "at": 4000,
+        "by": "v1",
+        "name": "camera",
+        "outcome": "committed",
+        "summary": "camera path"
+      },
+      {
+        "at": 6000,
+        "by": "v1",
+        "name": "camera",
+        "outcome": "committed",
+        "summary": "camera"
+      },
+      {
+        "at": 6100,
+        "by": "v1",
+        "name": "camera",
+        "outcome": "refused",
+        "summary": "drag is out of range"
+      }
+    ],
+    "fleet": {
+      "ec2_instances": 0,
+      "fcvm_gpus": 0,
+      "gpus": 0,
+      "hosts": [],
+      "max_tiles": 100,
+      "n": 0,
+      "standby": []
+    },
+    "image_aspect": 3.5555555555555554,
+    "relaunch_all": null,
+    "scene": {
+      "camera": [
+        {
+          "fov_deg": 70.0,
+          "look": [
+            0.0,
+            10.0,
+            -1.0
+          ],
+          "pos": [
+            0.0,
+            10.0,
+            0.0
+          ],
+          "t": 4.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            0.0,
+            15.0,
+            -1.0
+          ],
+          "pos": [
+            0.0,
+            15.0,
+            0.0
+          ],
+          "t": 6.0
+        },
+        {
+          "fov_deg": 70.0,
+          "look": [
+            0.0,
+            15.0,
+            -1.0
+          ],
+          "pos": [
+            0.0,
+            15.0,
+            0.0
+          ],
+          "t": 6.3
+        }
+      ],
+      "epoch_unix_ms": 0,
+      "lights": [
+        {
+          "color": [
+            1.0,
+            0.5,
+            0.0
+          ],
+          "pos": [
+            1.0,
+            2.0,
+            3.0
+          ],
+          "t": 1.2
+        }
+      ],
+      "time_of_day": 18.5,
+      "words": []
+    },
+    "settings": {
+      "auto_relaunch_secs": null
+    },
+    "tiles": [],
+    "viewers": {
+      "count": 0
+    }
+  },
+  "start_ms": 0
+}
