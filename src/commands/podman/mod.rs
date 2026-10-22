@@ -1709,10 +1709,14 @@ async fn prepare_vm_for_lifecycle(
 
     // The VM's first state is written here, under its name, and refused when a live
     // VM already has that name. Every error from here on removes the state again.
-    state_manager
+    if let Err(e) = state_manager
         .claim_name(&mut vm_state)
         .await
-        .context("claiming the VM name")?;
+        .context("claiming the VM name")
+    {
+        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        return Err(e);
+    }
 
     // Bridged and routed re-derive this from the namespace they reserve (see
     // network::names); read the settled name back from network_config.
@@ -3467,6 +3471,24 @@ mod tests {
         args.network = NetworkMode::Rootless;
         let restore = snapshot_restore_args(&args, "key", None, (None, None));
         assert_eq!(restore.ipv6_prefix, None);
+    }
+
+    /// A refused name claim must remove what the launch created before it, the runtime
+    /// directory among them, as every later setup error does.
+    #[test]
+    fn a_refused_name_claim_cleans_up_the_launch() {
+        let source = include_str!("mod.rs");
+        let claim = source
+            .find(".claim_name(&mut vm_state)")
+            .expect("podman run claims the VM's name");
+        let next_step = claim
+            + source[claim..]
+                .find("let tap_device")
+                .expect("the network is set up after the claim");
+        assert!(
+            source[claim..next_step].contains("cleanup_failed_prepare("),
+            "the claim's error path does not call cleanup_failed_prepare"
+        );
     }
 
     /// A cache hit gives the restored VM this run's --ipv6-address.

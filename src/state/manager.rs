@@ -165,11 +165,16 @@ impl StateManager {
         );
 
         // Clean up any stale state files that claim our PID
-        // This happens when a VM crashes and its PID is later reused
+        // This happens when a VM crashes and its PID is later reused. A state with our PID
+        // whose owner is live is another VM of this same process (`fcvm serve`, the
+        // library API), not a stale one.
         if let Some(pid) = state.pid {
             if let Ok(existing_vms) = self.list_vms().await {
                 for existing in existing_vms {
-                    if existing.pid == Some(pid) && existing.vm_id != state.vm_id {
+                    if existing.pid == Some(pid)
+                        && existing.vm_id != state.vm_id
+                        && !owner_is_live(&existing)
+                    {
                         tracing::warn!(
                             stale_vm_id = %existing.vm_id,
                             pid = pid,
@@ -1063,6 +1068,34 @@ mod tests {
         );
         let mut other = named_state("vm-other", "slot-4");
         manager.claim_name(&mut other).await.unwrap();
+    }
+
+    /// Several VMs of one process (`fcvm serve`, the library API) share a PID. Claiming
+    /// one must not delete another's state, which holds its name and its loopback IP.
+    #[tokio::test]
+    async fn vms_of_one_process_keep_their_names_and_loopback_ips() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = StateManager::new(dir.path().to_path_buf());
+        let mut first = named_state("vm-first", "slot-1");
+        manager.claim_name(&mut first).await.unwrap();
+        let first_ip = manager.allocate_loopback_ip(&mut first).await.unwrap();
+        let mut second = named_state("vm-second", "slot-2");
+        manager.claim_name(&mut second).await.unwrap();
+        let second_ip = manager.allocate_loopback_ip(&mut second).await.unwrap();
+
+        assert_ne!(first_ip, second_ip);
+        assert_eq!(
+            manager
+                .load_state("vm-first")
+                .await
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("slot-1"),
+            "claiming slot-2 deleted slot-1's state"
+        );
+        let mut again = named_state("vm-again", "slot-1");
+        assert!(manager.claim_name(&mut again).await.is_err());
     }
 
     /// A VM whose process exited, or whose PID now belongs to another process, does not

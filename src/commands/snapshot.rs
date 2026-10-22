@@ -2078,32 +2078,7 @@ async fn cmd_snapshot_run_inner(
     // `--vsock-dir` puts clone_vsock_base in a caller-owned directory so the clone's
     // listener lands at a predictable path; cache hits and clones honor the flag rather
     // than silently ignoring it.
-    let clone_vsock_base = match args.vsock_dir.as_deref() {
-        Some(dir) => {
-            let current_dir =
-                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
-            let socket_path = super::podman::resolve_custom_vsock_socket_path(
-                std::path::Path::new(dir),
-                &current_dir,
-            );
-            let parent = socket_path
-                .parent()
-                .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating vsock dir: {:?}", parent))?;
-            // A caller-owned directory can hold a stale socket from a previous
-            // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
-            // reusing one --vsock-dir across runs leaves the old file behind.
-            // Firecracker's restore bind — unlike every host-side listener —
-            // does not unlink first, and the failed hit would fall back to a
-            // cold boot, silently throwing the cache away. Same semantics as
-            // the cold-boot set_vsock.
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            socket_path
-        }
-        None => data_dir.join("vsock.sock"),
-    };
+    let clone_vsock_base = setup_try!(clone_vsock_base(args.vsock_dir.as_deref(), &data_dir).await);
     // Persist the clone's actual host-side socket before restore publishes its
     // state; snapshot control must address this socket. The recorded source
     // starts as the snapshot's embedded path, and the restore replaces it with
@@ -4014,6 +3989,41 @@ fn run_args_from_snapshot_metadata(
     }
 }
 
+/// The clone's vsock socket: in its runtime directory, or at `--vsock-dir`.
+async fn clone_vsock_base(vsock_dir: Option<&str>, data_dir: &Path) -> Result<PathBuf> {
+    let Some(dir) = vsock_dir else {
+        return Ok(data_dir.join("vsock.sock"));
+    };
+    let current_dir =
+        std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+    let socket_path =
+        super::podman::resolve_custom_vsock_socket_path(std::path::Path::new(dir), &current_dir);
+    let parent = socket_path
+        .parent()
+        .expect("a custom vsock socket path always has a parent");
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating vsock dir: {:?}", parent))?;
+    // A caller-owned directory can hold a stale socket from a previous
+    // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
+    // reusing one --vsock-dir across runs leaves the old file behind.
+    // Firecracker's restore bind, unlike every host-side listener, does
+    // not unlink first, and the failed hit would fall back to a cold
+    // boot, silently throwing the cache away. Same semantics as the
+    // cold-boot set_vsock.
+    let _ = tokio::fs::remove_file(&socket_path).await;
+    Ok(socket_path)
+}
+
+/// The name of a disk-only clone run without `--name`: unique per run, since names are
+/// unique among live VMs and several clones of one tag may run at once.
+fn default_disk_only_clone_name(snapshot_name: &str) -> String {
+    format!(
+        "{snapshot_name}-clone-{}",
+        truncate_id(&generate_vm_id()[3..], 6)
+    )
+}
+
 /// Cold-boot a clone from a disk-only snapshot.
 ///
 /// A disk-only tag has no memory image, so there is nothing to resume — the
@@ -4062,7 +4072,7 @@ async fn cmd_snapshot_run_disk_only(
     let vm_name = args
         .name
         .clone()
-        .unwrap_or_else(|| format!("{}-clone", snapshot_name));
+        .unwrap_or_else(|| default_disk_only_clone_name(&snapshot_name));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
     let run_args = run_args_from_snapshot_metadata(
@@ -5704,6 +5714,40 @@ mod watchdog_exit_classification_tests {
 
     /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`
     /// out of the arm would skip; it is recorded as the clone's failure instead (Codex on #1004).
+    /// Two unnamed disk-only clones of one tag must not share a name, or the second is
+    /// refused while the first runs.
+    #[test]
+    fn unnamed_disk_only_clones_get_distinct_names() {
+        let first = crate::commands::snapshot::default_disk_only_clone_name("tag");
+        let second = crate::commands::snapshot::default_disk_only_clone_name("tag");
+        assert_ne!(first, second);
+        assert!(first.starts_with("tag-clone-"), "{first}");
+        crate::state::validate_vm_name(&first).unwrap();
+    }
+
+    /// Every error after the clone claims its name must go through `setup_try!`, which
+    /// deletes the claimed state; a bare `?` there would leave the name held by a VM that
+    /// never started.
+    #[test]
+    fn clone_setup_errors_after_the_name_claim_go_through_cleanup() {
+        let source = include_str!("snapshot.rs");
+        let start = source
+            .find(".claim_name(&mut vm_state)")
+            .expect("snapshot run claims the clone's name");
+        let end = start
+            + source[start..]
+                .find("failpoint::hit_async(\"restore.pre_resume\")")
+                .expect("the restore.pre_resume failpoint follows the claim");
+        let bare: Vec<&str> = source[start..end]
+            .lines()
+            .filter(|line| {
+                let code = line.split("//").next().unwrap_or("");
+                code.trim_end().ends_with("?;") && !code.contains("setup_try!")
+            })
+            .collect();
+        assert!(bare.is_empty(), "bare `?` after the name claim: {bare:#?}");
+    }
+
     #[test]
     fn a_failed_watchdog_kill_goes_through_cleanup() {
         let source = include_str!("snapshot.rs");

@@ -126,21 +126,27 @@ fn check_requested_address(
     Ok(())
 }
 
-/// The host's /128 route for `address`, or None when there is none.
+/// The host's /128 route for `address` in any routing table, or None when there is
+/// none. Every table, not only main: an address the host itself holds has its /128 only
+/// in table `local`.
 async fn host_route_for(address: &str) -> Result<Option<String>> {
     let output = tokio::process::Command::new("ip")
-        .args(["-6", "route", "show", &format!("{address}/128")])
+        .args(HOST_ROUTE_QUERY)
+        .arg(format!("{address}/128"))
         .output()
         .await
         .context("running `ip -6 route show`")?;
     anyhow::ensure!(
         output.status.success(),
-        "`ip -6 route show {address}/128` failed: {}",
+        "`ip -6 route show table all {address}/128` failed: {}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
     let route = String::from_utf8_lossy(&output.stdout).trim().to_string();
     Ok((!route.is_empty()).then_some(route))
 }
+
+/// `ip` arguments that list the routes for one exact prefix, appended, in every table.
+const HOST_ROUTE_QUERY: [&str; 5] = ["-6", "route", "show", "table", "all"];
 
 /// Which live VM, if any, this data directory records at `address`: for the error that
 /// refuses an address another VM holds.
@@ -617,9 +623,9 @@ impl NetworkManager for RoutedNetwork {
             if let Some(route) = host_route_for(&candidate).await? {
                 anyhow::bail!(
                     "--ipv6-address {address} already has a host route ({route}) that no \
-                     live fcvm VM holds: a VM that exited without cleanup leaves one, as \
-                     can another program. Remove it (ip -6 route del {address}/128) or \
-                     choose another address"
+                     live fcvm VM holds: the host's own address, a route left by a VM that \
+                     exited without cleanup, or another program's. Choose another address, \
+                     or remove a stale route (ip -6 route del {address}/128)"
                 );
             }
             (candidate, lease)
@@ -1599,6 +1605,31 @@ mod tests {
         holder.kill().unwrap();
         holder.wait().unwrap();
         assert!(lease_address(dir.path(), address).unwrap().is_some());
+    }
+
+    /// An address the host itself holds has its /128 only in table `local`, and the
+    /// collision check must see it, or `--ipv6-address` could give a VM the host's own
+    /// address. Gated on privileged-tests: the lanes that run it run routed VMs, so the
+    /// host has a global IPv6 address.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn the_hosts_own_address_counts_as_routed() {
+        let output = std::process::Command::new("ip")
+            .args(["-6", "addr", "show", "scope", "global"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let own = listing
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("inet6 "))
+            .and_then(|rest| rest.split('/').next())
+            .expect("a host that runs routed VMs has a global IPv6 address")
+            .to_string();
+        assert!(
+            host_route_for(&own).await.unwrap().is_some(),
+            "the host's own address was not found as a route"
+        );
+        assert!(host_route_for("2001:db8:ffff::77").await.unwrap().is_none());
     }
 
     // --- parse_ipv6_prefix tests ---
