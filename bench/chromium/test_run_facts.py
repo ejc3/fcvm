@@ -262,6 +262,54 @@ class RestoreAckExtraction(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(d, "restore-ack.jsonl")))
 
 
+class MemoryRenderOperation(unittest.TestCase):
+    """The memory phase renders each fcvm clone with a chosen operation.
+
+    Cloudflare publishes memory for a screenshot and for HTML extraction; the
+    memory phase rendered every clone with a screenshot, with no way to ask for
+    the other. Its host containers render with the image's render.py, which
+    takes the screenshot and the DOM both, and the record says so."""
+
+    def test_the_driver_cli_takes_the_operation(self):
+        seen = {}
+
+        def drive(args):
+            seen["op"] = args.op
+            return {"ok": True}
+
+        argv = ["cdpdrive.py", "127.0.0.1:9222", "https://example.com/", "--op", "html"]
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(cdpdrive, "drive", drive), \
+                redirect_stdout(io.StringIO()):
+            self.assertEqual(cdpdrive.main(), 0)
+        self.assertEqual(seen["op"], "html")
+
+    def test_the_memory_render_passes_it_to_the_driver(self):
+        import corpus_mem
+        calls = []
+
+        def sh(cmd, **_kw):
+            calls.append(cmd)
+            return types.SimpleNamespace(returncode=0, stdout="{}", stderr="")
+
+        with mock.patch.object(corpus_mem, "sh", sh):
+            corpus_mem.render("127.0.0.1:9222", "https://example.com/", op="html")
+            corpus_mem.render("127.0.0.1:9222", "https://example.com/")
+        self.assertEqual(calls[0][-2:], ["--op", "html"])
+        self.assertEqual(calls[1][-2:], ["--op", "screenshot"])
+
+    def test_the_phase_records_and_forwards_it(self):
+        with open(os.path.join(HERE, "corpus_mem.py")) as f:
+            mem = f.read()
+        with open(os.path.join(HERE, "corpus_extra.sh")) as f:
+            extra = f.read()
+        self.assertIn('parser.add_argument("--op", choices=("screenshot", "html"), default="screenshot")', mem)
+        self.assertIn('"render_op": args.op', mem)
+        self.assertIn('render(c["endpoint"], url, op=self.args.op)', mem)
+        self.assertIn('"container_render": ', mem)
+        self.assertIn('MEM_OP="${MEM_OP:-screenshot}"', extra)
+        self.assertIn('--op "$MEM_OP"', extra)
+
+
 class RestoreMarkSourcePin(unittest.TestCase):
     """Every marker is an info! line fcvm writes on the restore path."""
 
