@@ -77,7 +77,8 @@ build)
   # One GPU VM to first frame, as fleet/tools/gpurun.sh warms a host: exports the renderer
   # image into the store and leaves the pre-start snapshot that later starts restore from.
   G0=$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1)
-  as_user "cd $SRC && bash fleet/ami/host/warm.sh $G0 /var/log/fleet-ami/warm.log"
+  install -o "$U" -g "$U" -m 0644 /dev/null "$L/warm.log"
+  as_user "bash $HERE/warm.sh $G0 $L/warm.log"
   # The tile AMI loads this export; build-ami.sh uploads it with a fresh presigned URL.
   as_user "podman save --format oci-archive localhost/fcvm-renderer:fleet -o /mnt/fcvm-btrfs/renderer.oci.tar"
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
@@ -86,6 +87,7 @@ build)
   ;;
 bake)
   pkill -TERM -x fcvm || true; sleep 2
+  install -m 0755 "$HERE/warm.sh" /usr/local/lib/fcvm-fleet/
   # What a host needs to run GPU VMs without building: everything in the store except
   # per-VM and per-run state, build caches and downloads that only setup reads.
   cd /mnt/fcvm-btrfs
