@@ -516,6 +516,92 @@ class HtmlFastArm(unittest.TestCase):
         self.assertTrue(reqbench.publication_arms_ok({"noop", "html-fast"}))
 
 
+class Subreaper(unittest.TestCase):
+    """A fast teardown reads every child's final CPU, then collects it.
+
+    Each scenario runs in a child Python, so this test runner never becomes a
+    subreaper. The fake fcvm forks two children armed with PR_SET_PDEATHSIG,
+    as fcvm arms Firecracker, the holder and pasta; a SIGKILL to it kills them.
+    """
+
+    SCRIPT = r"""
+import ctypes, json, os, signal, subprocess, sys, time
+sys.path.insert(0, sys.argv[1])
+import reqbench
+d = sys.argv[2]
+assert reqbench.become_child_subreaper()
+fake = (
+    "import ctypes, os, signal, time\n"
+    "libc = ctypes.CDLL('libc.so.6')\n"
+    "for _ in range(2):\n"
+    "    if os.fork() == 0:\n"
+    "        libc.prctl(1, signal.SIGKILL)\n"
+    "        end = time.monotonic() + 0.05\n"
+    "        while time.monotonic() < end: pass\n"
+    "        os.execvp('sleep', ['sleep', '300'])\n"
+    "time.sleep(300)\n"
+)
+vm_id = "vm-" + "1" * 32
+state = os.path.join(d, vm_id + ".json")
+data = os.path.join(d, "vm-disks", vm_id)
+os.makedirs(os.path.join(data, "disks"))
+with open(state, "w") as f:
+    json.dump({"vm_id": vm_id}, f)
+proc = subprocess.Popen([sys.executable, "-c", fake])
+deadline = time.monotonic() + 10
+while len(reqbench.children_of(proc.pid)) < 2 and time.monotonic() < deadline:
+    time.sleep(0.01)
+time.sleep(0.2)  # let the children exec sleep
+out = reqbench.teardown_fast(proc.pid, d, state, data, 5.0)
+proc.wait()
+me = os.getpid()
+zombies = []
+for entry in os.listdir("/proc"):
+    if entry.isdigit():
+        try:
+            fields = open(f"/proc/{entry}/stat").read().rsplit(")", 1)[1].split()
+        except OSError:
+            continue
+        if fields[0] == "Z" and int(fields[1]) == me:
+            zombies.append(int(entry))
+print(json.dumps({
+    "complete": {k: v["complete"] for k, v in out["per_child_cpu"].items()},
+    "reaped": out.get("children_reaped"),
+    "zombies": zombies,
+}))
+"""
+
+    def run_scenario(self):
+        import subprocess
+        with tempfile.TemporaryDirectory() as d:
+            result = subprocess.run([sys.executable, "-c", self.SCRIPT, HERE, d],
+                                    capture_output=True, text=True, timeout=120)
+        self.assertEqual(result.returncode, 0, result.stderr[-2000:])
+        return json.loads(result.stdout.strip().splitlines()[-1])
+
+    def test_every_child_reading_is_complete_and_no_zombie_is_left(self):
+        for attempt in range(5):
+            with self.subTest(attempt=attempt):
+                got = self.run_scenario()
+                self.assertEqual(len(got["complete"]), 3, got)
+                self.assertTrue(all(got["complete"].values()), got)
+                self.assertEqual(sorted(got["reaped"].values()), ["reaped", "reaped"], got)
+                self.assertEqual(got["zombies"], [], got)
+
+    def test_main_becomes_the_subreaper_and_says_so(self):
+        calls = []
+        with tempfile.TemporaryDirectory() as d:
+            server = test_reqbench.ServeAcknowledgement.FakeServer(os.path.join(d, "serve.log"))
+            RunMetaFacts._drive_main(
+                RunMetaFacts("test_the_meta_names_the_host_prefetch_and_poll_interval"),
+                d, server, extra_patches={"become_child_subreaper": lambda: calls.append(1) or True})
+            with open(os.path.join(d, "results", "reqbench.jsonl")) as handle:
+                rows = [json.loads(line) for line in handle]
+        self.assertEqual(calls, [1])
+        self.assertIs(rows[0]["child_subreaper"], True)
+        self.assertTrue(all(row.get("adopted_zombies_reaped") == 0 for row in rows[1:]), rows[1:])
+
+
 class HostControlArms(unittest.TestCase):
     """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
 
