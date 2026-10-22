@@ -59,6 +59,7 @@ Pipeline::Pipeline(const Options& o) : opt_(o) {
   scene_ = std::make_shared<const Scene>(default_scene());
   budget_ = o.budget;
   r_.set_fps(o.fps);
+  r_.set_margin(o.margin);
 }
 
 void Pipeline::stop() {
@@ -106,8 +107,10 @@ static int even_h(int h) { return std::clamp(h, 16, 2160) & ~1; }
 std::string Pipeline::header_json(const Enc& e) {
   char b[384];
   snprintf(b, sizeof b,
-           "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"x0\":%d,\"y0\":%d,\"fps\":%d}",
-           e.enc->codec().c_str(), e.geo.w, e.geo.h, e.geo.full_w, e.geo.full_h, e.geo.x0, e.geo.y0, opt_.fps);
+           "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"x0\":%d,\"y0\":%d,\"fps\":%d,"
+           "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d}}",
+           e.enc->codec().c_str(), e.ew, e.eh, e.geo.full_w, e.geo.full_h, e.geo.x0, e.geo.y0, opt_.fps, e.left, e.top,
+           e.right, e.bottom);
   return b;
 }
 
@@ -237,7 +240,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   int render_h = opt_.idle_h;
   if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first).h;
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
-  double px = Renderer::drawn_pixels(rt);
+  double px = r_.drawn_pixels(rt);
   double budget = (sc->budget > 0 && !opt_.adapt) ? sc->budget : budget_;
   int spp = (int)std::lround(budget / px);
   spp = std::clamp(spp, 1, 64);
@@ -288,14 +291,30 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     bool same = e.enc && g.w == e.geo.w && g.h == e.geo.h && g.full_w == e.geo.full_w && g.full_h == e.geo.full_h &&
                 g.x0 == e.geo.x0 && g.y0 == e.geo.y0;
     if (!same) {
+      // overlap: up to `margin` pixels on each side that lie inside the image,
+      // trimmed by one where needed to keep the encoded size even (4:2:0)
+      int M = opt_.margin;
+      int l = std::min(M, g.x0), r = std::max(0, std::min(M, g.full_w - (g.x0 + g.w)));
+      int tp = std::min(M, g.y0), b = std::max(0, std::min(M, g.full_h - (g.y0 + g.h)));
+      auto even = [M](int* a, int* c) {
+        if ((*a + *c) & 1) {
+          if (*c > 0 && *c < M) (*c)--;
+          else if (*a > 0) (*a)--;
+          else (*c)--;
+        }
+      };
+      even(&l, &r);
+      even(&tp, &b);
       e.enc.reset();
       if (e.nv12) r_.free_dev(e.nv12);
-      e.nv12 = r_.alloc_nv12(g.w, g.h, &e.pitch);
-      e.enc = std::make_unique<H264Encoder>();
       e.geo = g;
+      e.left = l; e.right = r; e.top = tp; e.bottom = b;
+      e.ew = g.w + l + r; e.eh = g.h + tp + b;
+      e.nv12 = r_.alloc_nv12(e.ew, e.eh, &e.pitch);
+      e.enc = std::make_unique<H264Encoder>();
       std::string err;
-      if (!e.enc->open(r_.cu_context(), e.nv12, e.pitch, g.w, g.h, opt_.fps, &err)) {
-        fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", g.w, g.h, err.c_str());
+      if (!e.enc->open(r_.cu_context(), e.nv12, e.pitch, e.ew, e.eh, opt_.fps, &err)) {
+        fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", e.ew, e.eh, err.c_str());
         for (auto& s : e.subs) s->close();
         e.enc.reset();
         continue;
@@ -313,20 +332,20 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       }
     }
     double t0 = mono_s();
-    r_.to_nv12(e.nv12, e.pitch, g.w, g.h);
+    r_.to_nv12(e.nv12, e.pitch, e.ew, e.eh, g.x0 - e.left, g.y0 - e.top, g.full_h);
     bool force = e.want_idr || (t0 - e.last_idr) >= 2.0;
     std::vector<uint8_t> au;
     bool key = false;
     std::string err;
     if (!e.enc->encode(force, &au, &key, &err)) {
-      fprintf(stderr, "fleet-renderer: encode %dx%d: %s\n", g.w, g.h, err.c_str());
+      fprintf(stderr, "fleet-renderer: encode %dx%d: %s\n", e.ew, e.eh, err.c_str());
       e.want_idr = true;
       continue;
     }
     enc_ms += (mono_s() - t0) * 1000.0;
     if (key) { e.last_idr = t0; e.want_idr = false; }
     std::string payload(FCVF_HEADER_BYTES, '\0');
-    fcvf_header((uint8_t*)&payload[0], key, g.w, g.h, t, frame_no);
+    fcvf_header((uint8_t*)&payload[0], key, e.ew, e.eh, t, frame_no);
     payload.append((const char*)au.data(), au.size());
     auto msg = std::make_shared<const std::string>(ws_frame(2, payload.data(), payload.size()));
     for (auto& s : e.subs) {

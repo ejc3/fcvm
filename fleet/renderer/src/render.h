@@ -27,7 +27,10 @@ class Renderer {
   void set_fps(int fps) { fps_ = fps; }
   // Pixels drawn per frame for a tile (the tile plus its guard band, before
   // clipping to the image), so the sample count is the same for every tile of a grid.
-  static double drawn_pixels(const Tile& t);
+  double drawn_pixels(const Tile& t) const;
+  // Pixels finished past each side of the tile (inside the image), for streams
+  // that encode an overlap the client crops. Same value on every renderer.
+  void set_margin(int m);
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -37,8 +40,10 @@ class Renderer {
   void download_rgba(std::vector<uint8_t>* out) const;  // w*h*4 bytes, row-major
   // Debug: the accumulated linear radiance (w*h*4 floats) of the last frame.
   void download_hdr(std::vector<float>* out) const;
-  // Scale the last frame to dst_w x dst_h and write BT.709 limited-range NV12.
-  void to_nv12(void* dst, size_t pitch, int dst_w, int dst_h);
+  // Write BT.709 limited-range NV12 of dst_w x dst_h pixels whose top-left is
+  // whole-image pixel (sx0, sy0) of a grid sfull_h pixels tall, area-sampled
+  // from the last frame's out region (pixels beyond it repeat its edge).
+  void to_nv12(void* dst, size_t pitch, int dst_w, int dst_h, int sx0, int sy0, int sfull_h);
   void sync();
   // Device NV12 buffer for an encoder input (luma rows then chroma rows).
   void* alloc_nv12(int w, int h, size_t* pitch);
@@ -57,6 +62,8 @@ class Renderer {
   Tile tile_{};
   int ex0_ = 0, ey0_ = 0, ew_ = 0, eh_ = 0, guard_ = 0;  // drawn region and reprojection reach
   int rx0_ = 0, ry0_ = 0, rw_ = 0, rh_ = 0;               // resolved region
+  int ox0_ = 0, oy0_ = 0, ow_ = 0, oh_ = 0;               // out region
+  int margin_ = 0;
   bool have_tile_ = false;
   void* ctx_ = nullptr;
   std::string gpu_name_, pci_bus_id_;

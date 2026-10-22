@@ -42,7 +42,8 @@ struct FrameParams {
   int full_w, full_h;  // whole image in pixels
   int x0, y0, w, h;    // this tile in whole-image pixels
   int ex0, ey0, ew, eh;  // the drawn region: the tile plus a guard band, clipped to the image
-  int rx0, ry0, rw, rh;  // the resolved region: the tile plus DENOISE_R, clipped to the image
+  int rx0, ry0, rw, rh;  // the resolved region: the out region plus DENOISE_R, clipped to the image
+  int ox0, oy0, ow, oh;  // the out region: the tile plus the stream margin, clipped to the image
   int guard;             // largest reprojection displacement accepted, whole-image pixels
   GCam hist_cam[TEMPORAL_WINDOW];  // cameras of frames k-1, k-2, ... (moving reprojection)
   int spp;             // samples per pixel this frame

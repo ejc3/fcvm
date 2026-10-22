@@ -28,12 +28,14 @@ pure function of `t`, the scene and its whole-image coordinates:
   transmittance table, a cheap multiple-scattering term, aerial perspective on
   everything, the sun's disc with limb darkening, stars at night.
 - **Clouds**: a cumulus layer (2.7 to 5.6 km) ray marched through a tileable
-  Perlin-Worley volume (128^3, generated at start) with two finer octaves
-  eroding the edges (billows on top, wisps below), flat bases and rounded tops;
-  lit by a six-step light march toward the sun with three scattering orders, a
-  strong forward lobe (silver lining) and a back lobe, a powder term and sky
-  ambient that darkens toward the base; they drift with the wind and cast
-  shadows on the ground.
+  Perlin-Worley volume (128^3, generated at start): two octaves for the body,
+  two finer ones eroding the edges (billows on top, wisps below), flat bases,
+  denser cores rising higher. The march takes coarse steps through empty air
+  and steps of 1.5% of the distance (120 to 600 m) inside clouds, so edges stay
+  sharp at any distance; lit by a three-step light march toward the sun with
+  three scattering orders, a strong forward lobe (silver lining) and a back
+  lobe, a powder term and sky ambient that darkens toward the base. They drift
+  with the wind and cast shadows on the ground.
 - **Light transport**: per sample a soft sun shadow (a random point of the
   sun's disc), cloud shadow, and one bounce of sky or ground light; viewers'
   lights add point lighting.
@@ -47,7 +49,10 @@ Convergence: exact accumulation while the camera holds; while it moves, each
 frame averages itself with its last 7 frames reprojected through a guard band
 the renderer draws around its rect, and pixels with few samples get an
 edge-aware 5 x 5 filter over pixels drawn under the same rules, so moving
-frames also match across tile edges. The rules are in PROTOCOL.md, "Sampling, accumulation and determinism".
+frames also match across tile edges. Each stream encodes its tile plus 16
+pixels of overlap and the client crops them, so a tile edge is never the edge
+of an encoded picture. The rules are in PROTOCOL.md, "Sampling, accumulation
+and determinism", and "crop".
 
 ## Layout
 
@@ -61,7 +66,7 @@ src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-co
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)
 tests/test_host.cpp  scene parsing, splines and holds, tile geometry, wire formats (no GPU)
 tests/test_gpu.cpp   the seam test (GPU)
-tools/             Python clients: smoke, measure, relaunch, mosaic, rawmosaic
+tools/             Python clients: smoke, measure, relaunch, mosaic, rawmosaic, seam_metric
 ```
 
 ## Build and run
@@ -96,35 +101,35 @@ python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving ca
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame
 python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST8:8080
 python3 tools/rawmosaic.py out 4 2 540 tools/scene-move.json HOST1:8080 ...   # unencoded tiles of one frame (GET /raw)
+python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile boundary
 ```
 
 ## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
 
-Moving camera over the mountains, `tools/measure.py`, 8 s per row after 2 s
-to settle, default budget (500,000 pixel-samples per frame); wall tiles are a
-1/16 x 1/9 rect of a 16:9 image. Each moving pixel also averages up to 7
-earlier frames, so its effective sample count is up to 8 times the per-frame
-one.
+Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
+budget (250,000 pixel-samples per frame over the drawn region); wall tiles are
+a 1/16 x 1/9 rect of a 16:9 image, the detail view is one such tile at 1080.
+Each moving pixel also averages up to 7 earlier frames.
 
-| stream | fps | samples/pixel/frame | render ms | encode ms |
-|--------|-----|---------------------|-----------|-----------|
-| 146 x 146 (asked 136) | 30.0 | 13 | 12.7 | 0.55 |
-| 180 x 180 | 30.0 | 9 | 12.8 | 0.84 |
-| 240 x 240 | 30.0 | 5 | 13.0 | 0.80 |
-| 360 x 360 | 30.0 | 2 | 10.5 | 1.08 |
-| 1280 x 720 whole image | 30.0 | 1 | 26.6 | 2.76 |
-| 1920 x 1080 whole image | 15.0 | 1 | 55.8 | 4.56 |
+| inner size | stream (with overlap) | fps | samples/pixel/frame | render ms | encode ms |
+|---|---|---|---|---|---|
+| 146 x 146 (asked 136) | 178 x 178 | 30.0 | 5 | 14.9 | 0.57 |
+| 180 x 180 | 212 x 212 | 30.0 | 3 | 10.9 | 0.77 |
+| 240 x 240 | 272 x 272 | 30.0 | 2 | 10.5 | 0.78 |
+| 360 x 360 | 392 x 392 | 30.0 | 1 | 8.7 | 1.22 |
+| 1080 x 1080 detail view | 1112 x 1112 | 15.0 | 1 | 35.2 | 5.00 |
+| 1280 x 720 whole image | 1280 x 720 | 15.0 | 1 | 42.2 | 2.99 |
+| 1920 x 1080 whole image | 1920 x 1080 | 10.0 | 1 | 91.3 | 5.04 |
 
 Startup, process start to first encoded frame (`fleet-renderer startup`, three
-runs each, in one VM): 1441 to 1663 ms as fcvm's main branch leaves the GPU
-(CUDA ready at 1349 to 1557 ms); 307 to 330 ms with `nvidia-persistenced`
-running in the guest (CUDA ready at 230 to 233 ms).
-
-Relaunch (`tools/relaunch.py`, cache-hit `fcvm podman run`, four runs): 6.15
-to 6.28 s from the command to the first frame at the client, of which the
-renderer's own process start to first frame sent is 1.90 to 1.97 s.
+runs each, in one VM, round 2): 1441 to 1663 ms as fcvm's main branch leaves
+the GPU; 307 to 330 ms with `nvidia-persistenced` running in the guest.
+Relaunch (round 2, cache-hit `fcvm podman run`): 6.15 to 6.28 s from the
+command to the first frame at the client.
 
 Seams: the seam test passes in VMs on three different T4s with the same
 hashes. A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
-equals the same frame drawn whole in another VM in all 2,073,600 pixels. Shots
+equals the same frame drawn whole in another VM in all 2,073,600 pixels. The
+seam ratio (`tools/seam_metric.py`) of that frame is 0.63 to 1.22 unencoded and
+0.77 to 1.35 as the eight streams decode it, cropped as a page crops it. Shots
 stitched from eight VMs on eight GPUs are in `shots/`.
