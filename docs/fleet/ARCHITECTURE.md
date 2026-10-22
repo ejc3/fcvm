@@ -360,6 +360,29 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
 - **Testing before the fleet exists:** `pbox up N kvm-gpu-96 --open` gives one host with a
   delegated prefix, and the local transports drive it.
 
+## Decisions from the second design review (2026-10-22)
+
+- **The race is the permanent hero. DECIDED.** A global relaunch-all runs on a cadence only
+  the owner sets; every visitor sees a large countdown ("next restart in 0:41") and a
+  two-bar scoreboard, fcvm against EC2, that is always on screen. Viewers may press
+  "restart now" under a global cooldown shown to everyone. This replaces the
+  viewer-changeable auto-relaunch setting.
+- **Only measured numbers. DECIDED.** Every figure on the page comes from the coordinator's
+  measurements, timed for both halves by the same clock (click to first frame seen by the
+  coordinator), and says how many GPUs it was measured on.
+- **EC2 capacity waits are shown, not counted. DECIDED.** A wait for spot capacity is drawn
+  hatched and labelled "AWS had no spot GPU", and kept out of EC2's headline time.
+- **Directed camera with nudges. DECIDED.** The camera flies a choreographed path with
+  scenic holds, where the path-traced image converges; viewers vote or queue where the
+  next hold goes instead of steering continuously.
+- **Your own GPU. DECIDED.** Any viewer can claim a standby GPU: a private VM restores for
+  them in seconds, with their own camera, full screen, timed from click to first frame,
+  and returns to the pool after 60 seconds.
+- **The gpu profile uses NVIDIA's proprietary kernel modules with the GPU firmware off on
+  x86 (#1149). DECIDED.** GPU setup takes about 0.58 s instead of 1.07 s with the open
+  modules; the profile setting keeps `open` available for GPUs the proprietary modules do
+  not support.
+
 ## Stack of PRs
 
 1. This document.
