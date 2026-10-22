@@ -11,6 +11,7 @@
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
 //   FLEET_MOCK_REFUSED       comma-separated words the fake text check refuses (forbidden)
+//   FLEET_FFMPEG             the ffmpeg binary, with libx264 (ffmpeg on the PATH)
 //
 // Prints one JSON line with the bound ports when ready.
 

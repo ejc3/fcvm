@@ -57,7 +57,7 @@ pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
 On a small machine, `FLEET_E2E_VIEW=1024x640 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
-makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264. Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
+makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_FPS`, ...) are listed at the top of `mock/main.ts`.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
 

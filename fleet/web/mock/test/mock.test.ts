@@ -3,6 +3,7 @@ import WebSocket from "ws";
 import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
 import { MockCoordinator, halfGrid } from "../coordinator.ts";
 import { MockRenderers } from "../renderer.ts";
+import { FFMPEG } from "../encoder.ts";
 import { spawnSync } from "node:child_process";
 import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
 
@@ -190,7 +191,7 @@ describe("mock renderer, height change", () => {
     expect(headers).toBe(2);
     // Decode them and compare each frame with the picture at its t.
     const stream = Buffer.concat(after.map((f) => Buffer.from(f.data)));
-    const out = spawnSync("ffmpeg", ["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], { input: stream, maxBuffer: 1 << 26 });
+    const out = spawnSync(FFMPEG, ["-hide_banner", "-loglevel", "error", "-f", "h264", "-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"], { input: stream, maxBuffer: 1 << 26 });
     expect(out.status).toBe(0);
     // The delivered frame holds the 320 x 180 tile inside its margin.
     const hdr = last!;

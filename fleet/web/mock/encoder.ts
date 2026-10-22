@@ -29,6 +29,9 @@ export interface EncoderOptions {
 
 const START = new Uint8Array([0, 0, 0, 1]);
 
+/** The ffmpeg to run: FLEET_FFMPEG, or `ffmpeg` on the PATH. */
+export const FFMPEG = process.env.FLEET_FFMPEG ?? "ffmpeg";
+
 function concat(parts: Uint8Array[]): Uint8Array {
   const n = parts.reduce((a, p) => a + p.byteLength, 0);
   const out = new Uint8Array(n);
@@ -65,7 +68,7 @@ export class Encoder {
       "-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709", "-color_range", "tv",
       "-flush_packets", "1", "-f", "flv", "pipe:1",
     ];
-    this.child = spawn("ffmpeg", args, { stdio: ["pipe", "pipe", "pipe"] });
+    this.child = spawn(FFMPEG, args, { stdio: ["pipe", "pipe", "pipe"] });
     this.child.stdout.on("data", (d: Buffer) => this.onData(d));
     this.child.stderr.on("data", (d: Buffer) => {
       if (this.stderr.length < 4000) this.stderr += d.toString();
