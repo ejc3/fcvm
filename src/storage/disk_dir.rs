@@ -13,7 +13,7 @@ use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileTypeExt, MetadataExt};
+use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 /// What a launch resolved its `--disk` and `--disk-dir` specs to, once, before the
@@ -151,6 +151,9 @@ impl DiskDirStaging {
     /// directory of a VM whose launch failed before creating anything else there).
     pub fn remove(&mut self) {
         if self.present {
+            // `cp -a` keeps directory modes, and a directory without owner write blocks
+            // the removal of what it holds. The copy is being deleted, so its modes go.
+            make_removable(&self.root);
             if let Err(error) = std::fs::remove_dir_all(&self.root) {
                 if error.kind() != std::io::ErrorKind::NotFound {
                     tracing::warn!(root = %self.root.display(), %error, "removing --disk-dir staging");
@@ -191,6 +194,26 @@ impl DiskDirStaging {
 impl Drop for DiskDirStaging {
     fn drop(&mut self) {
         self.remove();
+    }
+}
+
+/// Give owner read, write and search to every directory under `dir`, not following
+/// symlinks. Errors are left to the removal that follows, which reports them.
+fn make_removable(dir: &Path) {
+    let Ok(md) = std::fs::symlink_metadata(dir) else {
+        return;
+    };
+    if !md.is_dir() {
+        return;
+    }
+    let mode = md.mode() & 0o7777;
+    if mode & 0o700 != 0o700 {
+        let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(mode | 0o700));
+    }
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            make_removable(&entry.path());
+        }
     }
 }
 
@@ -273,8 +296,8 @@ fn disk_image_identity(path: &Path) -> Result<String> {
 /// Timestamps are left out, so a directory recreated with the same content hashes the
 /// same. The hash covers what a copy by this process carries into the image: as root,
 /// `cp -a` keeps owners and every attribute, so uid, gid and every listable attribute
-/// count; a non-root copy belongs to the copier and keeps only `user.` attributes (the
-/// rest it drops silently), so only those count.
+/// count; a non-root copy belongs to the copier and keeps only the attributes a file's
+/// owner may set ([`carried_xattr`]), so only those count.
 pub fn hash_tree(root: &Path) -> Result<String> {
     hash_tree_with(root, nix::unistd::geteuid().is_root())
 }
@@ -347,6 +370,17 @@ fn extended_attributes(path: &Path) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
     Ok(xattrs)
 }
 
+/// Whether the staging copy carries attribute `name` into the image. A root copy
+/// carries every attribute. A non-root copy owns every file it makes and carries what a
+/// file's owner may set: `user.` attributes and the POSIX ACLs. It drops `trusted.` and
+/// `security.` attributes, which need privilege, without an error.
+fn carried_xattr(name: &[u8], keep_owners: bool) -> bool {
+    keep_owners
+        || name.starts_with(b"user.")
+        || name == b"system.posix_acl_access"
+        || name == b"system.posix_acl_default"
+}
+
 fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update((bytes.len() as u64).to_le_bytes());
     hasher.update(bytes);
@@ -388,9 +422,7 @@ fn hash_entry(
         hasher.update(md.gid().to_le_bytes());
     }
     let mut xattrs = extended_attributes(path)?;
-    if !keep_owners {
-        xattrs.retain(|(name, _)| name.starts_with(b"user."));
-    }
+    xattrs.retain(|(name, _)| carried_xattr(name, keep_owners));
     hasher.update((xattrs.len() as u64).to_le_bytes());
     for (name, value) in xattrs {
         hash_bytes(hasher, &name);
@@ -671,11 +703,27 @@ mod tests {
         value
     }
 
-    /// Without kept owners (a non-root copy) only `user.` attributes reach the copy, so
-    /// only they enter the hash: a tree with a `user.` attribute and an ACL hashes like
-    /// a copy carrying only the `user.` one. With kept owners every attribute counts.
+    /// A non-root copy carries `user.` attributes and POSIX ACLs, which a file's owner
+    /// may set, and not `trusted.` or `security.` ones, which need privilege. A root
+    /// copy carries every attribute.
     #[test]
-    fn only_user_xattrs_enter_the_hash_when_owners_are_not_kept() {
+    fn a_copy_without_kept_owners_carries_user_attributes_and_acls() {
+        for name in [
+            "user.x",
+            "system.posix_acl_access",
+            "system.posix_acl_default",
+        ] {
+            assert!(carried_xattr(name.as_bytes(), false), "{name}");
+        }
+        for name in ["trusted.x", "security.selinux", "security.capability"] {
+            assert!(!carried_xattr(name.as_bytes(), false), "{name}");
+            assert!(carried_xattr(name.as_bytes(), true), "{name}");
+        }
+    }
+
+    /// An ACL a non-root copy carries changes the hash with or without kept owners.
+    #[test]
+    fn an_acl_changes_the_hash_when_owners_are_not_kept() {
         // An ACL is an attribute outside `user.` that the file's owner can set; tmpfs and
         // btrfs take one. Fail, never pass, where neither candidate does.
         let candidates = [
@@ -716,10 +764,10 @@ mod tests {
             &acl_value(),
         )
         .unwrap();
-        assert_eq!(
+        assert_ne!(
             hash_tree_with(&source, false).unwrap(),
             hash_tree_with(&copy, false).unwrap(),
-            "an attribute a non-root copy cannot carry changed the hash"
+            "an ACL a non-root copy carries did not change the hash"
         );
         assert_ne!(
             hash_tree_with(&source, true).unwrap(),
@@ -889,6 +937,34 @@ mod tests {
         let args = cp_args(false);
         assert!(args.contains(&"--no-preserve=ownership"), "{args:?}");
         assert!(!cp_args(true).contains(&"--no-preserve=ownership"));
+    }
+
+    /// `cp -a` keeps a directory's mode, so a copy holding a 0555 directory must still
+    /// be removable by the user who made it.
+    #[test]
+    fn a_read_only_directory_in_the_copy_does_not_block_its_removal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("data");
+        std::fs::create_dir_all(dir.join("locked/inner")).unwrap();
+        std::fs::write(dir.join("locked/inner/f"), b"x").unwrap();
+        std::fs::set_permissions(
+            dir.join("locked/inner"),
+            std::fs::Permissions::from_mode(0o555),
+        )
+        .unwrap();
+        std::fs::set_permissions(dir.join("locked"), std::fs::Permissions::from_mode(0o555))
+            .unwrap();
+        let root = tmp.path().join("vm/disk-dir-staging");
+        let (mut staging, _) =
+            DiskDirStaging::resolve(&root, &[], &[format!("{}:/data:ro", dir.display())]).unwrap();
+        staging.stage().unwrap();
+        assert!(root.exists());
+        staging.remove();
+        let left = root.exists();
+        for path in [dir.join("locked"), dir.join("locked/inner")] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        assert!(!left, "the copy of a 0555 directory was left behind");
     }
 
     /// Without a resolution the list is the raw specs, in device order.
