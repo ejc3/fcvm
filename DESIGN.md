@@ -2427,6 +2427,8 @@ carry it, and a driver bump does not rebuild the rootfs.
      `nvidia.ko` and `nvidia-uvm.ko`;
    - checks `/proc/driver/nvidia/gpus` lists every GPU and creates
      `/dev/nvidiactl`, `/dev/nvidia<minor>`, `/dev/nvidia-uvm{,-tools}`;
+   - starts `nvidia-persistenced` from the image, which initialises the GPU and
+     keeps it open, so later processes do not initialise it again;
    - runs `nvidia-smi -L` from the image and requires one line per GPU;
    - runs `nvidia-ctk cdi generate --driver-root=/run/fcvm-gpu/driver`
      into `/var/run/cdi/nvidia.yaml`.
@@ -2460,14 +2462,24 @@ the gpu profile built by `make setup-gpu`:
   passes in a gpu VM with the default guest memory, so `nvidia-uvm`, its device nodes
   and the CDI injection work for a CUDA process.
 
+A second run on another g4dn.metal the same day:
+
+- Rootless podman in the guest (`--user 1000:1000`): `nvidia-smi -L` lists the T4 and
+  the CUDA vector-add sample passes, as it does with root podman.
+- In the guest the T4 is `0000:00:06.0`, class 0x030200, with BAR0 16 MiB, BAR1
+  256 MiB and BAR3 32 MiB assigned. `dmesg` shows the open kernel module 580.196.07
+  loading.
+- Without `nvidia-persistenced` every process that opens the GPU initialises it:
+  `nvidia-smi -L` in the container took 1.490, 1.436 and 1.447 s; with the daemon
+  running, 0.031, 0.026 and 0.023 s. fc-agent now starts the daemon during the attach.
+
 Not yet checked:
 
-- The same on arm64 (g5g.metal, T4G).
-- `lspci -vv` in the guest (MSI-X, BAR sizes) and the GSP firmware lines in `dmesg`;
-  the driver and a CUDA kernel run, which needs both, but the output was not kept.
-- Root versus rootless podman in the guest: only the default was run.
-- Whether the GPU re-initialises on every container process start without
-  `nvidia-persistenced`.
+- arm64 (g5g.metal, T4G): #1139.
+- MSI-X in use: the idle guest had no MSI vectors allocated, since the driver
+  allocates them only while a process holds the GPU open. A CUDA kernel completing
+  implies interrupts work (Firecracker's PCI transport has no INTx), but no
+  `/proc/interrupts` reading was taken under load.
 
 ## Known Limitations
 
