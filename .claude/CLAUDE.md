@@ -855,7 +855,7 @@ then on "Custom firecracker not found", because a hand-rolled runner called
 | `bench-chromium-request-build` | `build` | container image only |
 | `bench-chromium-request-golden` | `bench-chromium-request-build` + `setup-default` | `TAG=`, `HUGEPAGES=1`, `NETMODE=`, `CPU=`, `MEM=`, `GUEST_ENV=` (own `TAG=`) |
 | `bench-chromium-request-verify` | none (sealed bundle) | `TAG=` |
-| `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESULTS=` |
+| `bench-chromium-request-run` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `UFFD_PREFETCH=`, `REPS=`, `WARMUP=`, `ARMS=`, `RESOLVE_POLL_MS=`, `RESULTS=` |
 | `bench-chromium-request-diag` | none (sealed bundle) | `TAG=`, `BACKEND=`, `UFFD_MODE=`, `DIAG_URLS=`, `DIAG_REPS=` (default 3), `DIAG_EXPECT_IPS=`, `DIAG_MAX_LOAD_MS=`, `RESULTS=`. The serve always runs with `--uffd-prefetch off`, and `UFFD_PREFETCH=` set to anything but `off` is refused |
 | `bench-webkit-request-diag` | none (sealed bundle) | the diag knobs above except `DIAG_EXPECT_IPS=` (refused); the recipe sets `ENGINE=webkit`, default `TAG=cb-req-webkit` |
 | `bench-chromium-request-all` | `build` + `setup-default` | the build, golden, verify and run knobs above, one seal. It runs no diag phase, and it defaults `SETTLE_WAIT_SECS=120`, so the run's quiet gate re-samples for up to 120 s before it refuses |

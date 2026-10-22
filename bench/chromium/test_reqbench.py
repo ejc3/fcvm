@@ -29,6 +29,7 @@ import sys
 import tempfile
 import threading
 import time
+import tomllib
 import types
 import unittest
 import urllib.request
@@ -37,6 +38,7 @@ from contextlib import contextmanager, redirect_stderr, redirect_stdout
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
+REPO_ROOT = os.path.dirname(os.path.dirname(HERE))
 
 import campaign_summary  # noqa: E402
 import reqanalyze  # noqa: E402
@@ -5181,6 +5183,8 @@ exec /bin/bash "$@"
                         f'echo "sudo-saw FCVM_NO_SNAPSHOT=${{FCVM_NO_SNAPSHOT:-<unset>}}" >> {seen}\n'
                         f'exec env -i PATH="$PATH" HOME="$HOME" "$@"\n')
             self._write(os.path.join(binx, "podman"), '''#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
     exit 0
@@ -5215,6 +5219,8 @@ exit 1
             fcvm = os.path.join(d, "fcvm")
             self._write(fcvm, "#!/bin/bash\nexit 42\n")
             self._write(os.path.join(binx, "podman"), '''#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
     exit 0
@@ -5272,6 +5278,8 @@ esac
 ''')
         self._write(os.path.join(d, "fc-agent"), "#!/bin/bash\nexit 0\n")
         self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
     exit 0
@@ -5308,6 +5316,15 @@ exit 1
             self.assertEqual(provenance["image_id"], "sha256:" + image_id)
             self.assertEqual(provenance["image_digest"], "sha256:" + digest)
             self.assertEqual(provenance["image_cache_key"], digest)
+            # The browser build the image's own `chromium --version` printed,
+            # and the Firecracker pin at the staged source revision.
+            self.assertEqual(provenance["browser_version"], "Chromium 151.0.0.0 fixture")
+            pin = tomllib.loads(subprocess.run(
+                ["git", "-C", REPO_ROOT, "show", "HEAD:rootfs-config.toml"],
+                capture_output=True, text=True, check=True).stdout)["firecracker"]
+            self.assertEqual(
+                {k: provenance["firecracker"][k] for k in ("repo", "branch")},
+                {"repo": pin["repo"], "branch": pin["branch"]})
             self.assertEqual(
                 provenance["snapshot_generation_id"],
                 "12345678-1234-4234-8234-123456789abc",
@@ -5335,6 +5352,8 @@ exit 1
             digest = "a" * 64
             image_id = "b" * 64
             self._write(os.path.join(binx, "podman"), f'''#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{{"Digest":"sha256:{digest}","Id":"{image_id}"}}]'
     exit 0
@@ -5396,6 +5415,8 @@ esac
             with self.subTest(fcvm_log=good), tempfile.TemporaryDirectory() as d:
                 env, binx = self._env(d, FCVM_LOG=good, REQBENCH_STAGED="1")
                 self._write(os.path.join(binx, "podman"), """#!/bin/bash
+# The golden records the browser build: `podman run ... --version`.
+if [ "$1" = run ]; then echo "Chromium 151.0.0.0 fixture"; exit 0; fi
 if [ "$1 $2" = "image inspect" ]; then
     echo '[{"Digest":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","Id":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}]'
     exit 0
