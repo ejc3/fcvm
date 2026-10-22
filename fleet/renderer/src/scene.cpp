@@ -359,7 +359,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     V3 fl = normalize(v3(p.cam.fwd.x, 0.0f, p.cam.fwd.z) + v3(0, 1e-4f, 0));
     V3 c = p.cam.pos + fl * 12.0f + v3(0, 1.75f, 0);
     billboard(g, c, p.cam.pos, 0.30f);
-    g.color = v3(1.0f, 0.62f, 0.25f) * 6.0f;
+    g.color = v3(1.0f, 0.55f, 0.18f) * 2.6f;
     g.alpha = 1.0f;
   }
   int first = std::max(0, (int)s.words.size() - (MAX_TEXTS - 1));
@@ -382,11 +382,11 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     float ground = fmaxf(0.0f, terrain_h(v2(c.x, c.z), 7, host_noise().tab.data()));
     float base_y = fmaxf(alt_flat(wc.pos), ground) + rise;
     c.y = base_y - (c.x * c.x + c.z * c.z) * (0.5f / PLANET_R);
-    billboard(g, c, p.cam.pos, 0.22f);
+    billboard(g, c, p.cam.pos, 0.3f);
     float hue = u01(hash_u32(h ^ 0xABCDu));
     V3 col = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
                 0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
-    g.color = (col * 0.7f + v3(0.3f)) * 7.0f;
+    g.color = (col * 0.85f + v3(0.15f)) * 2.6f;
     g.alpha = (float)(std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0));
   }
 
