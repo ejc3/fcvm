@@ -405,6 +405,57 @@ class AccessLog(ReplayFixture, unittest.TestCase):
             self.assertEqual(sorted(os.listdir(d)), ["corpus"])
 
 
+    def test_a_post_body_is_read_so_the_close_is_not_a_reset(self):
+        """#1137: the replay answered an uncaptured POST with its 404 without
+        reading the body, then closed the connection (HTTP/1.0) with the body
+        still in the socket's receive queue, which the kernel turns into a
+        RST. Chromium reported the beacon as net::ERR_CONNECTION_RESET with
+        no remote address, and the corpus diag refused the golden for it
+        (no_remote_ip), 2026-10-22. A body bigger than the handler's 8 KiB
+        read buffer is what leaves bytes in the kernel queue.
+
+        Red: ConnectionResetError on the read after the 404."""
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            body = b"x" * (256 * 1024)
+            sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            self.addCleanup(sock.close)
+            sock.sendall(b"POST /beacon HTTP/1.1\r\nHost: telemetry.test\r\n"
+                         + f"Content-Length: {len(body)}\r\n\r\n".encode() + body)
+            received = b""
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                received += chunk
+            self.assertTrue(received.startswith(b"HTTP/1.0 404"), received[:80])
+            # The FIN can reach the client ahead of the RST, so the reset shows
+            # as the socket's pending error once it has arrived.
+            time.sleep(0.2)
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR), 0,
+                             "the server reset the connection after its 404")
+
+    def test_a_chunked_post_body_is_read_too(self):
+        """The same reset for a body sent with Transfer-Encoding: chunked."""
+        with tempfile.TemporaryDirectory() as d:
+            server = self._server(d, None)
+            chunk = b"y" * 65536
+            payload = b"".join(b"%x\r\n" % len(chunk) + chunk + b"\r\n" for _ in range(4)) + b"0\r\n\r\n"
+            sock = socket.create_connection(("127.0.0.1", server.server_port), timeout=5)
+            self.addCleanup(sock.close)
+            sock.sendall(b"POST /beacon HTTP/1.1\r\nHost: telemetry.test\r\n"
+                         b"Transfer-Encoding: chunked\r\n\r\n" + payload)
+            received = b""
+            while True:
+                part = sock.recv(65536)
+                if not part:
+                    break
+                received += part
+            self.assertTrue(received.startswith(b"HTTP/1.0 404"), received[:80])
+            time.sleep(0.2)
+            self.assertEqual(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR), 0,
+                             "the server reset the connection after its 404")
+
     class BreaksAfter:
         """A JsonlLog that writes its first `n` rows and fails every one
         after, as a disk that fills part way through a run would."""
