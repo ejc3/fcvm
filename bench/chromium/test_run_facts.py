@@ -669,6 +669,36 @@ class RequestBundleManifestPin(unittest.TestCase):
                          "corpus_extra.sh hashes a reqbench source it never staged")
 
 
+class MemoryPoolHealthcheck(unittest.TestCase):
+    """The memory phase's host containers run without the image's healthcheck."""
+
+    def test_pool_containers_are_created_without_healthchecks(self):
+        import subprocess
+        import corpus_mem
+        args = argparse.Namespace(image="image",
+                                  urls=["https://example.com/", "https://example.org/"],
+                                  container_owner_token="c" * 32)
+        side = corpus_mem.ContainerSide(args, "a" * 32)
+        created = []
+
+        def shell(cmd, *_args, **_kwargs):
+            if cmd[:3] == ["podman", "inspect", "--format"]:
+                return subprocess.CompletedProcess(cmd, 0, "c" * 64 + " " + "c" * 32 + "\n", "")
+            return subprocess.CompletedProcess(cmd, 0, "c" * 64 + "\n", "")
+
+        def create(command, *_args):
+            created.append(command)
+            return None, subprocess.CompletedProcess(command, 0, "c" * 64 + "\n", "")
+
+        with mock.patch.object(corpus_mem, "sh", shell), \
+                mock.patch.object(corpus_mem, "sh_bounded", shell), \
+                mock.patch.object(corpus_mem, "start_container_create", create):
+            side.bring_up(2, "host2r1", [0, 1])
+        self.assertEqual(len(created), 2)
+        for command in created:
+            self.assertEqual(command[:3], ["podman", "create", "--no-healthcheck"])
+
+
 class HostControlArms(unittest.TestCase):
     """corpus_extra.sh's host arms: free, or cpuN for each ladder rung."""
 
