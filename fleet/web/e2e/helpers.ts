@@ -114,7 +114,20 @@ export async function seamReport(page: Page): Promise<SeamReport> {
   // Browsers convert the decoded YUV to RGB in their own way (matrix, range,
   // rounding), so compare up to one colour transform fitted over every sample:
   // what is left is what differs between tiles.
-  const map = fitColour(pairs.flat());
+  // Fit once, then again without tiles far off the rest, so one wrong tile
+  // cannot bend the transform toward itself.
+  const residual = (m: (e: [number, number, number]) => [number, number, number], x: Sample) => {
+    const v = m(x.e);
+    return (Math.abs(x.o[0] - v[0]) + Math.abs(x.o[1] - v[1]) + Math.abs(x.o[2] - v[2])) / 3;
+  };
+  const first = fitColour(pairs.flat());
+  const byTile = new Map<string, number[]>();
+  for (const x of pairs.flat()) byTile.set(x.tile, [...(byTile.get(x.tile) ?? []), residual(first, x)]);
+  const tileMeans = [...byTile.entries()].map(([t, rs]) => [t, rs.reduce((a, b) => a + b, 0) / rs.length] as const);
+  const sorted = tileMeans.map(([, m]) => m).sort((a, b) => a - b);
+  const med = sorted[Math.floor(sorted.length / 2)] ?? 0;
+  const outliers = new Set(tileMeans.filter(([, m]) => m > Math.max(2 * med, 1)).map(([t]) => t));
+  const map = fitColour(pairs.flat().filter((x) => !outliers.has(x.tile)));
   const sums: Record<string, { s: number; n: number }> = {};
   const pairSums: Record<string, { s: number; n: number }> = {};
   const samples = pairs.length;
