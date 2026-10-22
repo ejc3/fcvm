@@ -376,6 +376,20 @@ impl std::fmt::Display for ImageMode {
     }
 }
 
+/// The kernel command line a launch passes: the static (keyed) arguments, then the
+/// per-instance ones. With the PCI transport on, `pci=off` is left out, because it
+/// stops an x86 guest from probing the bus the passthrough devices sit on.
+/// Firecracker adds `pci=off` itself when its PCI transport is off, so leaving the
+/// static arguments as they are keeps every existing snapshot key.
+pub fn launch_boot_args(static_args: &str, runtime_args: &str, pci_transport: bool) -> String {
+    static_args
+        .split_whitespace()
+        .chain(runtime_args.split_whitespace())
+        .filter(|arg| !(pci_transport && *arg == "pci=off"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Static boot arguments that affect cached VM state.
 /// Does NOT include per-instance values like IP addresses.
 /// Architecture-specific because reboot method differs (ARM64=k, x86=t).
@@ -426,18 +440,20 @@ impl FirecrackerConfig {
     /// Should be true when creating a snapshot cache (need accurate diffs),
     /// false when snapshots are disabled (avoids splitting hugepage 2MB Stage 2
     /// block mappings to 4K).
+    ///
+    /// `pci_transport`: Firecracker was started with its PCI transport on.
     pub async fn apply(
         &self,
         client: &super::api::FirecrackerClient,
         runtime_boot_args: &str,
         track_dirty_pages: bool,
+        pci_transport: bool,
     ) -> Result<()> {
-        // Build full boot args: static (cached) + runtime (per-instance)
-        let full_boot_args = if runtime_boot_args.is_empty() {
-            self.boot_source.boot_args.clone()
-        } else {
-            format!("{} {}", self.boot_source.boot_args, runtime_boot_args)
-        };
+        let full_boot_args = launch_boot_args(
+            &self.boot_source.boot_args,
+            runtime_boot_args,
+            pci_transport,
+        );
 
         // Set boot source
         client
@@ -595,6 +611,26 @@ pub struct MmdsRuntime {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A guest booted with the PCI transport on must not get `pci=off`: on x86 it stops
+    /// the kernel probing the bus, so a passed-through GPU is never enumerated. Without
+    /// the transport the command line is the static and runtime arguments, unchanged.
+    #[test]
+    fn a_pci_transport_launch_leaves_out_pci_off() {
+        let pci = launch_boot_args(static_boot_args(), "fuse_readers=8", true);
+        assert!(
+            !pci.split_whitespace().any(|arg| arg == "pci=off"),
+            "pci=off reaches a guest whose devices are on PCI: {pci}"
+        );
+        assert!(pci.ends_with("fuse_readers=8"), "{pci}");
+
+        let mmio = launch_boot_args(static_boot_args(), "fuse_readers=8", false);
+        assert_eq!(mmio, format!("{} fuse_readers=8", static_boot_args()));
+        assert_eq!(
+            launch_boot_args(static_boot_args(), "", false),
+            static_boot_args()
+        );
+    }
 
     /// Helper to create a default test config with optional overrides
     fn test_config() -> FirecrackerConfig {

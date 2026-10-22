@@ -122,15 +122,19 @@ pub fn check_host_device(sysfs: &Path, dev: &Path, sbdf: &str) -> Result<PathBuf
     Ok(group_node)
 }
 
-/// A kernel profile's Firecracker arguments must turn on the PCI transport.
-pub fn require_pci_transport(firecracker_args: Option<&str>) -> Result<()> {
-    let on = firecracker_args
+/// Whether these Firecracker arguments turn on the PCI transport.
+pub fn pci_transport_enabled(firecracker_args: Option<&str>) -> bool {
+    firecracker_args
         .map(|args| {
             args.split_whitespace()
                 .any(|arg| arg == PCI_FIRECRACKER_ARG)
         })
-        .unwrap_or(false);
-    if !on {
+        .unwrap_or(false)
+}
+
+/// A kernel profile's Firecracker arguments must turn on the PCI transport.
+pub fn require_pci_transport(firecracker_args: Option<&str>) -> Result<()> {
+    if !pci_transport_enabled(firecracker_args) {
         bail!(
             "--gpu needs Firecracker's PCI transport ({PCI_FIRECRACKER_ARG}) and a Firecracker \
              that attaches passthrough devices on restore: use --kernel-profile gpu"
