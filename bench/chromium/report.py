@@ -188,6 +188,11 @@ def pss_kb_of_pid(pid):
                 f"cannot read {path}: {exc}; sudo cat exited {result.returncode}: "
                 f"{result.stderr.strip()}") from exc
         text = result.stdout
+    except (ProcessLookupError, FileNotFoundError) as exc:
+        # The process exited during the read: its /proc entry is gone, or it
+        # is a zombie with no address space (ESRCH). Its cgroup's set is
+        # changing, so the caller reads the cgroup again.
+        raise ProcessGone(f"cannot read {path}: {exc}") from exc
     except OSError as exc:
         raise CgroupReadError(f"cannot read {path}: {exc}") from exc
     for line in text.splitlines():
@@ -215,6 +220,10 @@ class CgroupReadError(RuntimeError):
 
 class CgroupMoved(CgroupReadError):
     """The process set changed while it was read."""
+
+
+class ProcessGone(CgroupReadError):
+    """A process exited while its memory was read."""
 
 
 def cgroup_bytes(cg_path):
@@ -326,7 +335,7 @@ def _measure_complete_cgroup_once(cg_path, with_stat):
     try:
         pss = sum(pss_kb_of_pid(pid) for pid in before)
     except CgroupReadError as exc:
-        if sorted(cgroup_procs(cg_path)) != sorted(before):
+        if isinstance(exc, ProcessGone) or sorted(cgroup_procs(cg_path)) != sorted(before):
             raise CgroupMoved(
                 f"process set changed in {cg_path} while it was sampled: {exc}") from exc
         raise

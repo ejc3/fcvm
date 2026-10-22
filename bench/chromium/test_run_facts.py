@@ -762,6 +762,42 @@ class MovingProcessSet(unittest.TestCase):
         procs, current, pss, _stat = self.read([[1, 2, 3, 4], [1, 2, 3, 4, 5], [1, 2, 3, 4]])
         self.assertEqual((sorted(procs), current, pss), ([1, 2, 3, 4], 4096, 40))
 
+    def test_a_process_that_exits_mid_read_is_read_around(self):
+        """RED BEFORE THE FIX: a health check that exited between the set read
+        and its smaps_rollup read left a zombie in the set, and the read
+        failed with ESRCH: "cannot read /proc/1081429/smaps_rollup: [Errno 3]
+        No such process" (2026-10-22, 48 clones, after 102 of 140 cells)."""
+        import report
+        calls = []
+
+        def pss(pid):
+            calls.append(pid)
+            if pid == 5 and calls.count(5) == 1:
+                raise report.ProcessGone("cannot read /proc/5/smaps_rollup: [Errno 3] No such process")
+            return 10
+
+        with tempfile.TemporaryDirectory() as cg, \
+                mock.patch.object(report, "cgroup_procs", lambda _p: [1, 2, 5]), \
+                mock.patch.object(report, "cgroup_bytes", lambda _p: 4096), \
+                mock.patch.object(report, "pss_kb_of_pid", pss), \
+                mock.patch.object(report, "STABLE_READ_PAUSE_S", 0.0):
+            procs, _current, total, _stat = report.measure_complete_cgroup(cg, with_stat=False)
+        self.assertEqual(total, 30)
+
+    def test_an_exited_process_reads_as_gone(self):
+        import builtins
+        import report
+        real_open = builtins.open
+
+        def gone(path, *args, **kwargs):
+            if str(path) == "/proc/4242/smaps_rollup":
+                raise ProcessLookupError(3, "No such process", path)
+            return real_open(path, *args, **kwargs)
+
+        with mock.patch("builtins.open", gone):
+            with self.assertRaises(report.ProcessGone):
+                report.pss_kb_of_pid(4242)
+
     def test_a_set_that_never_settles_still_refuses(self):
         import report
         flip = [[1, 2], [1, 2, 3]] * report.STABLE_READ_ATTEMPTS
