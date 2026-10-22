@@ -19,7 +19,7 @@
 static void usage() {
   fprintf(stderr,
           "usage: fleet-renderer [serve]                      serve on $PORT (8080)\n"
-          "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N]\n"
+          "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N] [--checker 0|2|4]\n"
           "       fleet-renderer bench [--h H]... [--frames N]   time render + encode per height\n"
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
@@ -42,7 +42,7 @@ static int cmd_still(int argc, char** argv) {
   if (argc < 3) { usage(); return 2; }
   std::string out = argv[2];
   double t = 20;
-  int h = 720, spp = 0, frames = 1, seq = 0;
+  int h = 720, spp = 0, frames = 1, seq = 0, checker = -1;
   Scene sc = default_scene();
   for (int i = 3; i + 1 < argc; i += 2) {
     std::string k = argv[i];
@@ -51,11 +51,13 @@ static int cmd_still(int argc, char** argv) {
     else if (k == "--spp") spp = atoi(argv[i + 1]);
     else if (k == "--frames") frames = atoi(argv[i + 1]);
     else if (k == "--seq") seq = atoi(argv[i + 1]);
+    else if (k == "--checker") checker = atoi(argv[i + 1]);
     else if (k == "--scene") sc = parse_scene(read_file(argv[i + 1]));
     else { usage(); return 2; }
   }
   Renderer r;
   r.set_budget(envd("BUDGET", 2.5e5));
+  r.set_checkerboard(checker);
   std::string err;
   if (!r.init(&err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
   Tile tile = tile_geometry(sc.rect, sc.image_aspect, h);
@@ -96,7 +98,7 @@ static int cmd_startup(int argc, char** argv) {
   size_t pitch = 0;
   void* nv = r.alloc_nv12(tl.w, tl.h, &pitch);
   H264Encoder enc;
-  if (!enc.open(r.cu_context(), nv, pitch, tl.w, tl.h, 30, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
+  if (!enc.open(r.cu_context(), nv, pitch, tl.w, tl.h, 30, 1, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
   r.to_nv12(nv, pitch, tl.w, tl.h, tl.x0, tl.y0, tl.full_h);
   std::vector<uint8_t> au;
   bool key;
@@ -180,7 +182,7 @@ static int cmd_bench(int argc, char** argv) {
       size_t pitch = 0;
       void* nv = r.alloc_nv12(tl.w, tl.h, &pitch);
       H264Encoder enc;
-      if (!enc.open(r.cu_context(), nv, pitch, tl.w, tl.h, 30, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
+      if (!enc.open(r.cu_context(), nv, pitch, tl.w, tl.h, 30, 1, &err)) { fprintf(stderr, "encoder: %s\n", err.c_str()); return 1; }
       r.reset_history();
       double rsum = 0, esum = 0;
       int spp = 0;

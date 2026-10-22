@@ -13,7 +13,7 @@ class Server {
 
  private:
   void handle(int fd);
-  void websocket(int fd, int h, const std::string& key);
+  void websocket(int fd, int h, int q, const std::string& key);
   Pipeline& p_;
   int lfd_ = -1;
 };

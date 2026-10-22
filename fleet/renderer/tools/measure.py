@@ -25,7 +25,7 @@ rows += [(1080, tile_rect, "detail")] if 1080 in heights else []
 now = int(time.time() * 1000)
 cam = [{"t": float(i * 20), "pos": [-12 - 2.0 * i, 0.4 + 0.25 * i, -8 - 6.0 * i],
         "look": [-40 - 2.0 * i, 1.2, -80 - 6.0 * i], "fov_deg": 60.0} for i in range(400)]
-print("inner_height,inner_width,stream,rect,frames,client_fps,spp,render_ms,encode_ms,gpu_util_pct,power_w")
+print("inner_height,inner_width,stream,rect,frames,client_fps,spp,checkerboard,render_ms,encode_ms,gpu_util_pct,power_w")
 for h, rect, kind in rows:
     fc.post_scene(host, port, {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
                                "time_of_day": 0.3, "words": [], "lights": []})
@@ -55,5 +55,5 @@ for h, rect, kind in rows:
     gavg = lambda k: sum((s["gpu"][k] or 0) for s in samples) / max(1, len(samples))
     c = hdr.get("crop", {"left": 0, "top": 0, "right": 0, "bottom": 0})
     iw, ih = hdr["width"] - c["left"] - c["right"], hdr["height"] - c["top"] - c["bottom"]
-    print(f"{ih},{iw},{hdr['width']}x{hdr['height']},{kind},{len(got)},{fps:.1f},{avg('spp'):.1f},"
+    print(f"{ih},{iw},{hdr['width']}x{hdr['height']},{kind},{len(got)},{fps:.1f},{avg('spp'):.1f},{samples[-1].get('checkerboard') if samples else ''},"
           f"{avg('render_ms'):.1f},{avg('encode_ms'):.2f},{gavg('util_pct'):.0f},{gavg('power_w'):.0f}", flush=True)

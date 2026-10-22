@@ -21,6 +21,7 @@
 struct Subscriber {
   int id = 0;
   std::atomic<int> want_h{0};
+  std::atomic<int> want_q{1};  // 0 lo, 1 std, 2 hi
   // filled by the render thread, drained by the connection's writer
   std::mutex mu;
   std::condition_variable cv;
@@ -28,7 +29,7 @@ struct Subscriber {
   size_t queued = 0;
   bool closed = false;
   // render-thread state
-  int cur_h = 0;
+  int cur_h = 0;  // encoder key the header was sent for (0: header pending)
   bool need_key = true;
   void push(std::shared_ptr<const std::string> m);
   void close();
@@ -57,7 +58,7 @@ class Pipeline {
   void run();  // the render thread; returns only on a fatal error
   void stop();
 
-  std::shared_ptr<Subscriber> subscribe(int h);
+  std::shared_ptr<Subscriber> subscribe(int h, int q);
   void unsubscribe(const std::shared_ptr<Subscriber>& s);
   void wake();
   bool post_scene(const std::string& body, std::string* err);
@@ -83,7 +84,7 @@ class Pipeline {
   void frame_once(double t, uint32_t frame_no);
   Tile encode_geometry(const Scene& sc, int h);
   int min_w_ = 0, min_h_ = 0;
-  std::string header_json(const Enc& e);
+  std::string header_json(const Enc& e, int q);
   struct RawReq {
     long long k;
     bool done = false;
@@ -114,6 +115,7 @@ class Pipeline {
   uint32_t frame_ = 0;
   double fps_ = 0;
   std::vector<int> heights_;
+  std::vector<std::pair<int, int>> streams_;  // (height, quality) being encoded
   RenderStats rstats_;
   double encode_ms_ = 0;
   uint64_t slots_missed_ = 0;  // frame slots skipped while someone was subscribed

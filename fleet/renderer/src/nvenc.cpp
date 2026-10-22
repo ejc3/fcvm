@@ -113,7 +113,15 @@ H264Encoder::~H264Encoder() {
   g_fl.nvEncDestroyEncoder(enc_);
 }
 
-bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int fps, std::string* err) {
+int quality_from_name(const std::string& n) {
+  if (n == "lo") return 0;
+  if (n == "std") return 1;
+  if (n == "hi") return 2;
+  return -1;
+}
+const char* quality_name(int q) { return q == 0 ? "lo" : q == 2 ? "hi" : "std"; }
+
+bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int fps, int q, std::string* err) {
   if (!load(err)) return false;
   w_ = w; h_ = h; pitch_ = pitch;
   NV_ENC_OPEN_ENCODE_SESSION_EX_PARAMS op;
@@ -129,7 +137,19 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   memset(&pc, 0, sizeof pc);
   pc.version = NV_ENC_PRESET_CONFIG_VER;
   pc.presetCfg.version = NV_ENC_CONFIG_VER;
-  s = g_fl.nvEncGetEncodePresetConfigEx(enc_, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P6_GUID,
+  // Rate per quality, in bits per pixel of the delivered picture at 30 fps:
+  //   lo   0.25 (floor 0.15 Mbit/s): many small tiles straight to a browser
+  //   std  0.8  (floor 0.6 Mbit/s): each tile is encoded on its own, and coding
+  //        error that differs on the two sides of a tile edge shows as a seam,
+  //        so tiles get more bits than one image of their size would
+  //   hi   4    (floor 2, cap 160 Mbit/s): near-lossless, for an aggregator on
+  //        the same host that decodes and re-encodes once; preset P4 keeps the
+  //        encoder fast at that rate
+  // ENC_BPP overrides std. The VBV holds half a second, so the keyframe every
+  // 2 s can be several times a P-frame's size instead of being squeezed into
+  // one frame's share (which smeared every keyframe).
+  GUID preset = q == 2 ? NV_ENC_PRESET_P4_GUID : NV_ENC_PRESET_P6_GUID;
+  s = g_fl.nvEncGetEncodePresetConfigEx(enc_, NV_ENC_CODEC_H264_GUID, preset,
                                         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &pc);
   if (s != NV_ENC_SUCCESS) { *err = st("nvEncGetEncodePresetConfigEx", s); return false; }
   NV_ENC_CONFIG cfg = pc.presetCfg;
@@ -137,14 +157,12 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
   cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
   cfg.frameIntervalP = 1;  // no B-frames
-  // About 0.8 bits per pixel at 30 fps (ENC_BPP): each tile is encoded on its
-  // own, and coding error that differs on the two sides of a tile edge shows as
-  // a seam, so tiles get more bits than one image of their size would. The VBV holds half
-  // a second, so the keyframe every 2 s can be several times a P-frame's size
-  // instead of being squeezed into one frame's share (which smeared every keyframe).
   const char* bpp_env = getenv("ENC_BPP");
-  double bpp = bpp_env && atof(bpp_env) > 0 ? atof(bpp_env) : 0.8;
-  uint32_t rate = (uint32_t)std::max(600000.0, std::min(20000000.0, (double)w * h * fps * bpp));
+  double bpp = q == 0 ? 0.25 : q == 2 ? 4.0 : (bpp_env && atof(bpp_env) > 0 ? atof(bpp_env) : 0.8);
+  double floor_bps = q == 0 ? 150000.0 : q == 2 ? 2000000.0 : 600000.0;
+  double cap_bps = q == 2 ? 160000000.0 : 20000000.0;
+  uint32_t rate = (uint32_t)std::max(floor_bps, std::min(cap_bps, (double)w * h * fps * bpp));
+  rate_ = rate;
   cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   cfg.rcParams.averageBitRate = rate;
   cfg.rcParams.maxBitRate = rate;
@@ -171,7 +189,7 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   memset(&ip, 0, sizeof ip);
   ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
   ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
-  ip.presetGUID = NV_ENC_PRESET_P6_GUID;
+  ip.presetGUID = preset;
   ip.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
   ip.encodeWidth = w; ip.encodeHeight = h;
   ip.darWidth = w; ip.darHeight = h;

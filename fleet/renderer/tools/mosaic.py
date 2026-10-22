@@ -8,6 +8,7 @@ latest frame time t that every stream delivered, decodes each stream up to that
 frame and pastes every tile at its whole-image pixel offset (x0, y0 from the
 stream header), drawing only each stream's inner rectangle (its `crop`). Writes OUT_PREFIX.png and OUT_PREFIX.json (per tile: t, frame,
 GPU, size).
+Q=hi|std|lo in the environment selects the stream quality (default std).
 """
 import json
 import sys
@@ -71,7 +72,7 @@ for k, (hdr, fr) in enumerate(results):
     hl = fc.health(*ends[k])
     meta.append({"cell": k, "x0": hdr["x0"], "y0": hdr["y0"], "w": hdr["width"], "h": hdr["height"], "crop": c,
                  "t": t_pick, "frame": fr[idx][0]["frame"], "gpu": hl["gpu"], "fps": hl["fps"],
-                 "spp": hl["spp"], "hold_samples": hl["hold_samples"], "bits_per_s": round(rates[k])})
+                 "spp": hl["spp"], "hold_samples": hl["hold_samples"], "bits_per_s": round(rates[k]), "q": hdr.get("q")})
 canvas.save(out + ".png")
 json.dump({"t": t_pick, "epoch_unix_ms": scene["epoch_unix_ms"], "tiles": meta}, open(out + ".json", "w"), indent=1)
 print(f"stitched {len(ends)} tiles at t={t_pick} into {out}.png ({canvas.size[0]}x{canvas.size[1]})")

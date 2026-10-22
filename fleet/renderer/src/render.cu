@@ -32,6 +32,12 @@
 #define CLOUD_TOP 5.6f
 #define PI_F 3.14159265f
 
+// Checkerboard frames: does whole-image pixel (X, Y) draw a sample in the
+// frame of slot parity `k` (cP.parity holds k & 3)? Stride 2: half the pixels,
+// alternating. Stride 4: one pixel of each 2 x 2 block, in the order
+// top-left, bottom-right, top-right, bottom-left over four slots.
+__device__ __forceinline__ bool draws_here(uint32_t X, uint32_t Y);
+
 struct Globals {
   const V4* noise;
   const V4* trans;
@@ -882,6 +888,13 @@ __device__ __forceinline__ float srgb(float x) {
   return x <= 0.0031308f ? 12.92f * x : 1.055f * powf(x, 1.0f / 2.4f) - 0.055f;
 }
 
+__device__ __forceinline__ bool draws_here(uint32_t X, uint32_t Y) {
+  if (cP.half <= 1) return true;
+  if (cP.half == 2) return ((X + Y + (uint32_t)cP.parity) & 1u) == 0u;
+  const uint32_t order[4] = {0u, 3u, 1u, 2u};
+  return ((X & 1u) + 2u * (Y & 1u)) == order[cP.parity & 3];
+}
+
 // Draw this frame's samples over the drawn region (tile plus guard band) into
 // the ring entry for the frame: the mean of `spp` samples seeded by (pixel,
 // frame seed, s), the first sample's hit distance and kind.
@@ -889,6 +902,12 @@ __global__ void k_moving(float4* ring, float2* ring_aux) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
   if (i >= cP.ew || j >= cP.eh) return;
   uint32_t X = (uint32_t)(cP.ex0 + i), Y = (uint32_t)(cP.ey0 + j);
+  int idx = j * cP.ew + i;
+  if (!draws_here(X, Y)) {  // another part of the checkerboard
+    ring[idx] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    ring_aux[idx] = make_float2(0.0f, -1.0f);
+    return;
+  }
   const GCam& cam = cP.cam;
   float pix = 2.0f * cam.tan_half / cP.full_h;
   V3 sum = v3(0.0f);
@@ -901,7 +920,6 @@ __global__ void k_moving(float4* ring, float2* ring_aux) {
     if (s == 0) { depth = hh.dist; id = hh.id; }
   }
   sum = sum / (float)cP.spp;
-  int idx = j * cP.ew + i;
   ring[idx] = make_float4(sum.x, sum.y, sum.z, (float)cP.spp);
   ring_aux[idx] = make_float2(depth, id);
 }
@@ -918,8 +936,12 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
   int idx = j * cP.ew + i;
   float4 acc = hold_sum[idx];
   float2 aux = hold_aux[idx];
-  for (int s = 0; s < cP.spp; s++) {
-    int k = cP.sample_base + s;
+  // A pixel's next sample index is its own count, so the sum after n samples
+  // is the same however frames (and the checkerboard) split them.
+  int base = (int)acc.w;
+  bool draw = draws_here(X, Y);
+  for (int s = 0; draw && s < cP.spp; s++) {
+    int k = base + s;
     if (k >= HOLD_MAX_SAMPLES) break;
     Rng rng{hash4(X, Y, cP.seed, (uint32_t)k)};
     float jx = rng.next(), jy = rng.next();
@@ -931,7 +953,52 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
   hold_aux[idx] = aux;
   float inv = 1.0f / fmaxf(acc.w, 1.0f);
   ring[idx] = make_float4(acc.x * inv, acc.y * inv, acc.z * inv, acc.w);
-  ring_aux[idx] = aux;
+  ring_aux[idx] = acc.w > 0.0f ? aux : make_float2(0.0f, -1.0f);
+}
+
+// Checkerboard frames: fill each pixel that has no samples (hit kind -1)
+// from its 8 neighbours that do, those of the first one's hit kind (in the
+// order left, right, up, down, then the diagonals), at half their weight. Only pixels of the
+// drawn region whose neighbours all lie in it are ever read afterwards, and
+// the image's edges are the same for every renderer, so the fill matches
+// across tiles.
+__global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
+  if (i >= cP.ew || j >= cP.eh) return;
+  int idx = j * cP.ew + i;
+  float2 me = a[idx];
+  if (me.y >= 0.0f) {
+    co[idx] = c[idx];
+    ao[idx] = me;
+    return;
+  }
+  // the 4 edge neighbours first, then the 4 diagonal ones (a stride-4 frame
+  // can leave a pixel with only a diagonal neighbour that drew)
+  const int dx[8] = {-1, 1, 0, 0, -1, 1, -1, 1}, dy[8] = {0, 0, -1, 1, -1, -1, 1, 1};
+  float id = -1.0f, n = 0.0f, dsum = 0.0f, wsum = 0.0f;
+  V3 col = v3(0.0f);
+  for (int k = 0; k < 8; k++) {
+    int ii = i + dx[k], jj = j + dy[k];
+    if (ii < 0 || jj < 0 || ii >= cP.ew || jj >= cP.eh) continue;
+    int nidx = jj * cP.ew + ii;
+    float2 na = a[nidx];
+    if (na.y < 0.0f) continue;
+    if (id < 0.0f) id = na.y;
+    if (na.y != id) continue;
+    float4 nc = c[nidx];
+    col += v3(nc.x, nc.y, nc.z);
+    wsum += nc.w;
+    dsum += na.x;
+    n += 1.0f;
+  }
+  if (n == 0.0f) {
+    co[idx] = c[idx];
+    ao[idx] = me;
+    return;
+  }
+  col = col / n;
+  co[idx] = make_float4(col.x, col.y, col.z, 0.5f * wsum / n);
+  ao[idx] = make_float2(dsum / n, id);
 }
 
 struct Ring {
@@ -958,7 +1025,11 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
   V3 d0 = ray_dir(cam, X + 0.5f, Y + 0.5f);
   V3 color;
   float depth, wtot;
-  if (cP.hold) {
+  if (cP.hold && hold_sum[eidx].w == 0.0f) {
+    float4 c0 = cur[eidx];  // no samples here yet (checkerboard): the filled value
+    color = v3(c0.x, c0.y, c0.z);
+    wtot = c0.w;
+  } else if (cP.hold) {
     float4 acc = hold_sum[eidx];
     float4 hb = hold_blend[idx];
     float m = fminf(hb.w, (float)TAA_MAX_HISTORY) * fmaxf(0.0f, 1.0f - acc.w / HOLD_BLEND_OUT);
@@ -1297,6 +1368,9 @@ void Renderer::ensure_buffers(const Tile& t) {
   cudaFree(rgba_); cudaFree(hdr_); cudaFree(display_); cudaFree(hold_blend_);
   cudaFree(hold_sum_); cudaFree(hold_aux_);
   for (int i = 0; i < TEMPORAL_WINDOW; i++) { cudaFree(ring_[i]); cudaFree(ring_aux_[i]); }
+  cudaFree(fill_c_); cudaFree(fill_a_);
+  CK(cudaMalloc(&fill_c_, ne * sizeof(float4)));
+  CK(cudaMalloc(&fill_a_, ne * sizeof(float2)));
   CK(cudaMalloc(&rgba_, no * 4));
   CK(cudaMalloc(&hdr_, no * sizeof(float4)));
   CK(cudaMalloc(&display_, nr * sizeof(float4)));
@@ -1319,6 +1393,7 @@ void Renderer::reset_history() {
   for (int i = 0; i < TEMPORAL_WINDOW; i++) ring_slot_[i] = LLONG_MIN;
   hold_key_ = 0;
   hold_n_ = 0;
+  hold_frames_ = 0;
   if (!have_tile_) return;
   size_t nr = (size_t)rw_ * rh_;
   CK(cudaMemsetAsync(display_, 0, nr * sizeof(float4), (cudaStream_t)stream_));
@@ -1330,15 +1405,27 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   uint64_t key = 0;
   bool held = false;
   FrameParams p = build_frame(s, tile, t, &key, &held);
-  if (spp <= 0) spp = (int)(budget_ / drawn_pixels(tile));
+  // Under 0.5 samples per drawn pixel, draw a checkerboard: one sample on
+  // half the pixels per frame, or on a quarter under 0.3. (A checkerboard
+  // frame is noisier, which costs bits and seams in the encoder, so wall tiles
+  // stay at one or more samples on every pixel.)
+  int stride = checker_ > 0 ? checker_ : 1;
+  if (spp <= 0) {
+    double per_px = budget_ / drawn_pixels(tile);
+    if (checker_ < 0) stride = per_px < 0.3 ? 4 : per_px < 0.5 ? 2 : 1;
+    spp = stride > 1 ? 1 : (int)std::lround(per_px);
+  }
   spp = spp < 1 ? 1 : spp > 64 ? 64 : spp;
+  bool half = stride > 1;
   p.spp = spp;
+  p.half = stride;
   p.ex0 = ex0_; p.ey0 = ey0_; p.ew = ew_; p.eh = eh_; p.guard = guard_;
   p.rx0 = rx0_; p.ry0 = ry0_; p.rw = rw_; p.rh = rh_;
   p.ox0 = ox0_; p.oy0 = oy0_; p.ow = ow_; p.oh = oh_;
   size_t nr = (size_t)rw_ * rh_, ne = (size_t)ew_ * eh_;
   long long k = std::llround(t * fps_);
   int ri = (int)(((k % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW);
+  p.parity = (int)(k & 3);
   if (!accumulate) {
     held = false;
     p.hold = 0;
@@ -1349,13 +1436,19 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
       CK(cudaMemsetAsync(hold_aux_, 0, ne * sizeof(float2), st));
       CK(cudaMemcpyAsync(hold_blend_, display_, nr * sizeof(float4), cudaMemcpyDeviceToDevice, st));
       hold_key_ = key;
-      hold_n_ = 0;
+      hold_frames_ = 0;
     }
-    p.sample_base = hold_n_;
-    hold_n_ = hold_n_ + spp > HOLD_MAX_SAMPLES ? HOLD_MAX_SAMPLES : hold_n_ + spp;
+    // the fewest samples any pixel has before this frame (each pixel draws
+    // every frame, or every other frame on a checkerboard)
+    long long before = (hold_frames_ / stride) * (long long)spp;
+    p.sample_base = (int)std::min<long long>(before, HOLD_MAX_SAMPLES);
+    hold_frames_++;
+    long long after = (hold_frames_ / stride) * (long long)spp;
+    hold_n_ = (int)std::min<long long>(after, HOLD_MAX_SAMPLES);
   } else {
     hold_key_ = 0;
     hold_n_ = 0;
+    hold_frames_ = 0;
   }
   // previous frames k-1 .. k-W+1 that this renderer drew
   Ring ring;
@@ -1378,12 +1471,19 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri]);
   }
   CK(cudaGetLastError());
+  if (half && !(held && p.sample_base >= HOLD_MAX_SAMPLES)) {
+    k_fill<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((const float4*)ring_[ri], (const float2*)ring_aux_[ri],
+                                                               (float4*)fill_c_, (float2*)fill_a_);
+    CK(cudaGetLastError());
+    std::swap(ring_[ri], fill_c_);
+    std::swap(ring_aux_[ri], fill_a_);
+  }
   k_resolve<<<dim3((rw_ + 7) / 8, (rh_ + 7) / 8), bs, 0, st>>>((float4*)display_, (const float4*)hold_blend_,
                                                                 (const float4*)hold_sum_, (const float2*)hold_aux_,
                                                                 (const float4*)ring_[ri], (const float2*)ring_aux_[ri], ring);
   CK(cudaGetLastError());
   k_finish<<<dim3((ow_ + 7) / 8, (oh_ + 7) / 8), bs, 0, st>>>(
-      (uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_, held ? (const float2*)hold_aux_ : (const float2*)ring_aux_[ri]);
+      (uint8_t*)rgba_, (float4*)hdr_, (const float4*)display_, (const float2*)ring_aux_[ri]);
   CK(cudaGetLastError());
   CK(cudaEventRecord((cudaEvent_t)ev1_, st));
   CK(cudaEventSynchronize((cudaEvent_t)ev1_));
@@ -1391,6 +1491,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   cudaEventElapsedTime(&ms, (cudaEvent_t)ev0_, (cudaEvent_t)ev1_);
   stats_.render_ms = ms;
   stats_.spp = (held && p.sample_base >= HOLD_MAX_SAMPLES) ? 0 : spp;
+  stats_.half = stride;
   stats_.hold = held;
   stats_.hold_samples = held ? hold_n_ : 0;
   if (accumulate) {
