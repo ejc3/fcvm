@@ -24,6 +24,22 @@ half stamps the time its last tile came back. Viewers steer one shared camera (d
 turn, scroll to dive) and appear in the scene as small lights; clicking a square relaunches
 the GPU behind it, for everyone. The per-tile view below is the detail view, one click away.
 
+**Proof that it is live, not recorded.** Several things on the page could not exist in a
+recording:
+
+- **Your words in the world.** A viewer types a word and it is written into the scene, lit
+  by the scene's sun, on every viewer's screen within a few frames (bounded length,
+  filtered, rate limited per viewer).
+- **The time, rendered.** A clock in the world shows the current UTC time to the second,
+  rendered by the GPUs from `t`, continuous across tile seams.
+- **Input to pixels, measured.** After a camera drag the page shows the time from the
+  viewer's input to the first frame that reflects it.
+- **A stats switch.** It overlays each tile with frames per second, frame age (now minus
+  the frame's `t`, against a clock the page syncs with the coordinator), the GPU's
+  temperature, power draw and utilization (`nvidia-smi`, sampled by the renderer once a
+  second), and the VM's name and time since its last relaunch.
+- **Kill one.** Clicking a tile relaunches its VM; the square goes dark for everyone.
+
 The detail view:
 
 - A grid of tiles. The viewer picks how many tiles fit on the screen; that choice sets each
@@ -230,8 +246,11 @@ first frame needs no compile), encodes H.264 with NVENC, and serves:
 - `POST /scene`: the camera path, the clock offset and its rectangle (from the coordinator,
   through the agent, never from a browser), so a camera move is ordered like any other
   action.
-- `GET /health`: frames per second, the heights being encoded, GPU name and memory, and the
-  `t` of its latest frame.
+- `GET /health`: frames per second, the heights being encoded, GPU name and memory, the
+  `t` of its latest frame, and the GPU's temperature, power draw and utilization.
+
+Scene inputs also include the viewers' words (placed in the world by the coordinator) and
+the dropped lights; both are part of the camera-and-scene state every renderer follows.
 
 **No seams.** The browser shows every tile at one common `t`, holding each stream in a
 short buffer (a few frames) until all visible tiles have that frame; a tile that falls
