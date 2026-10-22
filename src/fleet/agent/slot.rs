@@ -10,6 +10,7 @@
 use super::inventory::{holders, vfio_node};
 use super::vm::{wait_restored, Vm, VmSpec};
 use fleet_core::protocol::{AgentMsg, HealthReport, RendererScene, SharedScene, SlotReport};
+use fleet_core::scene::Keyframe;
 use fleet_core::tiling::Rect;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -64,7 +65,17 @@ pub fn frame_url(frame_host: &str, port: u16) -> String {
 pub struct Desired {
     pub generation: u64,
     pub rect: Option<Rect>,
+    /// A private session (`claim_gpu`): draw the whole image with this camera.
+    pub private_camera: Option<Vec<Keyframe>>,
 }
+
+/// The whole image, which a private session draws.
+pub const FULL_IMAGE: Rect = Rect {
+    x: 0.0,
+    y: 0.0,
+    w: 1.0,
+    h: 1.0,
+};
 
 pub struct SlotCtx {
     pub id: String,
@@ -101,6 +112,7 @@ impl SlotCtx {
         generation: u64,
         timings: &BTreeMap<String, u64>,
         error: Option<String>,
+        retry_in: Option<Duration>,
     ) {
         let _ = self.out.send(AgentMsg::Slot(SlotReport {
             id: self.id.clone(),
@@ -110,6 +122,7 @@ impl SlotCtx {
             frame_url: Some(frame_url(&self.cfg.frame_host, self.port)),
             timings: timings.clone(),
             error,
+            retry_in_ms: retry_in.map(ms),
         }));
     }
 
@@ -165,14 +178,21 @@ fn frame_counter(health: &serde_json::Value) -> Option<u64> {
     health.get("frame").and_then(|f| f.as_u64())
 }
 
-/// The body to post for `rect`, marking the scene read.
+/// The body to post for what the slot should draw, marking the scene read: its tile of
+/// the shared scene, or for a private session the whole image with that session's camera.
 fn renderer_body(
     scene: &mut watch::Receiver<Option<SharedScene>>,
-    rect: Option<Rect>,
+    want: &Desired,
 ) -> Option<RendererScene> {
     let s = scene.borrow_and_update();
-    let rect = rect?;
-    s.as_ref().map(|s| s.for_renderer(rect))
+    let s = s.as_ref()?;
+    match &want.private_camera {
+        Some(camera) => Some(RendererScene {
+            camera: camera.clone(),
+            ..s.for_renderer(FULL_IMAGE)
+        }),
+        None => want.rect.map(|r| s.for_renderer(r)),
+    }
 }
 
 /// Resolves when the slot's desired-state sender is dropped (the slot was unassigned).
@@ -239,8 +259,15 @@ pub async fn supervise(
                 Err(Failure::Removed) => break,
                 Err(Failure::Failed(e)) => {
                     tracing::warn!(slot = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
-                    ctx.report("failed", want.generation, &BTreeMap::new(), Some(e));
-                    retry_after = Some(backoff.take());
+                    let delay = backoff.take();
+                    ctx.report(
+                        "failed",
+                        want.generation,
+                        &BTreeMap::new(),
+                        Some(e),
+                        Some(delay),
+                    );
+                    retry_after = Some(delay);
                 }
             }
             continue;
@@ -266,11 +293,12 @@ pub async fn supervise(
                 let ran = r.started.elapsed();
                 let error = format!("fcvm exited ({status}) after {} s: {}", ran.as_secs(), r.vm.tail());
                 tracing::warn!(slot = %ctx.id, %error, "VM died");
-                ctx.report("failed", r.generation, &BTreeMap::new(), Some(error));
                 if ran >= ctx.cfg.stable_after {
                     backoff.reset();
                 }
-                retry_after = Some(backoff.take());
+                let delay = backoff.take();
+                ctx.report("failed", r.generation, &BTreeMap::new(), Some(error), Some(delay));
+                retry_after = Some(delay);
                 // With no VM the next pass relaunches at the desired generation.
                 running = None;
             }
@@ -296,7 +324,8 @@ async fn post_if_changed(
     desired: &watch::Receiver<Desired>,
     scene: &mut watch::Receiver<Option<SharedScene>>,
 ) {
-    let body = renderer_body(scene, desired.borrow().rect);
+    let want = desired.borrow().clone();
+    let body = renderer_body(scene, &want);
     let Some(body) = body.filter(|b| Some(b) != r.posted.as_ref()) else {
         return;
     };
@@ -346,13 +375,13 @@ async fn relaunch(
     let t0 = Instant::now();
     let mut timings = BTreeMap::new();
     if let Some(mut old) = running.take() {
-        ctx.report("stopping", generation, &timings, None);
+        ctx.report("stopping", generation, &timings, None, None);
         old.vm.stop(ctx.cfg.stop_grace).await;
     }
     wait_gpu_free(ctx).await.map_err(Failure::Failed)?;
     timings.insert("teardown_ms".to_string(), ms(t0.elapsed()));
 
-    ctx.report("restoring", generation, &timings, None);
+    ctx.report("restoring", generation, &timings, None, None);
     let spec = VmSpec {
         fcvm: ctx.cfg.fcvm.clone(),
         name: ctx.vm_name(),
@@ -380,7 +409,7 @@ async fn relaunch(
                 if let Some(a) = r.ack_ms { timings.insert("ack_ms".into(), a); }
                 if let Some(g) = r.gpu_ms { timings.insert("gpu_ms".into(), g); }
                 starting_at = Some(r.at);
-                ctx.report("starting", generation, &timings, None);
+                ctx.report("starting", generation, &timings, None, None);
             }
             status = vm.exited() => {
                 let e = fail(&vm, format!("fcvm exited ({status}) before the renderer's first frame"));
@@ -399,12 +428,13 @@ async fn relaunch(
                     // Without a restore record (an fcvm path that prints none), the
                     // renderer answering is where `starting` begins.
                     let from = *starting_at.get_or_insert_with(|| {
-                        ctx.report("starting", generation, &timings, None);
+                        ctx.report("starting", generation, &timings, None, None);
                         now
                     });
                     timings.insert("container_ms".into(), ms(now - from));
                 }
-                let want = renderer_body(scene, desired.borrow().rect);
+                let want = desired.borrow().clone();
+                let want = renderer_body(scene, &want);
                 if let Some(body) = want.filter(|w| Some(w) != posted.as_ref()) {
                     if let Err(e) = ctx.post_scene(&body).await {
                         tracing::debug!(slot = %ctx.id, error = %e, "scene not posted yet");
@@ -446,7 +476,7 @@ async fn relaunch(
     let health_at = health_at.expect("a frame was read from /health");
     timings.insert("first_frame_ms".into(), ms(first_frame - health_at));
     timings.insert("total_ms".into(), ms(t0.elapsed()));
-    ctx.report("running", generation, &timings, None);
+    ctx.report("running", generation, &timings, None, None);
     *running = Some(Running {
         vm,
         generation,

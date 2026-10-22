@@ -178,6 +178,42 @@ pub struct FleetCoordArgs {
     /// Extra argument for the EC2 half's aggregator. Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
+
+    /// The owner's race cadence: relaunch every tile this many seconds after the last race.
+    /// Viewers cannot change it.
+    #[arg(long, env = "FLEET_RACE_EVERY")]
+    pub race_every: Option<u64>,
+
+    /// After any race, `restart_now` is refused for everyone for this many seconds
+    #[arg(long, default_value_t = 60)]
+    pub restart_cooldown: u64,
+
+    /// Seed of the directed camera's path
+    #[arg(long, default_value_t = 1)]
+    pub camera_seed: u64,
+
+    /// Key per-client limits by the CF-Connecting-IP header (set by Cloudflare in front of
+    /// the coordinator); without this flag, by the connection's peer address
+    #[arg(long)]
+    pub trust_cf_connecting_ip: bool,
+
+    /// Cloudflare Turnstile secret: a connection must pass `verify` before its first
+    /// intent. Without it no verification is asked for (local runs).
+    #[arg(long, env = "FLEET_TURNSTILE_SECRET", hide_env_values = true)]
+    pub turnstile_secret: Option<String>,
+
+    /// Decoder for the poster frame (`raw` for tests)
+    #[arg(long, value_enum, default_value_t = FleetAggregateCodec::Ffmpeg, hide = true)]
+    pub poster_codec: FleetAggregateCodec,
+
+    /// Wall tiles that may be lent to visitors at once (default: 2 or a tenth of the
+    /// tiles, rounded up, whichever is smaller)
+    #[arg(long)]
+    pub max_borrowed: Option<usize>,
+
+    /// ffmpeg binary for the poster frame (decode, then JPEG)
+    #[arg(long, default_value = "ffmpeg")]
+    pub ffmpeg: String,
 }
 
 #[derive(Args, Debug)]

@@ -104,3 +104,34 @@ async fn x264_out_and_h264_in_keep_every_frame_its_t() {
     }
     feeder.await.unwrap();
 }
+
+/// The poster's JPEG: ffmpeg encodes the composed picture, and decoding it back gives the
+/// colours that went in.
+#[tokio::test]
+async fn the_poster_is_a_jpeg_of_the_picture() {
+    use fcvm::fleet::coord::poster::StillEncoder;
+    let mut p = Picture::filled(64, 32, [63, 102, 240]); // red
+    p.fill_rect(32, 0, 32, 32, [32, 240, 118]); // blue
+    let enc = StillEncoder::Jpeg {
+        ffmpeg: "ffmpeg".into(),
+    };
+    let (ct, jpeg) = enc.encode(&p).await.unwrap();
+    assert_eq!(ct, "image/jpeg");
+    assert!(jpeg.starts_with(&[0xff, 0xd8]));
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("p.jpg");
+    std::fs::write(&path, &jpeg).unwrap();
+    let out = std::process::Command::new("ffmpeg")
+        .args(["-loglevel", "error", "-i"])
+        .arg(&path)
+        .args(["-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let rgb = out.stdout;
+    assert_eq!(rgb.len(), 64 * 32 * 3);
+    let px = |x: usize, y: usize| &rgb[(y * 64 + x) * 3..(y * 64 + x) * 3 + 3];
+    let near = |got: &[u8], want: [u8; 3]| got.iter().zip(want).all(|(g, w)| g.abs_diff(w) <= 12);
+    assert!(near(px(8, 16), [255, 0, 0]), "{:?}", px(8, 16));
+    assert!(near(px(56, 16), [0, 0, 255]), "{:?}", px(56, 16));
+}

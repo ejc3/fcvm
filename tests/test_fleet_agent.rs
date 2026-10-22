@@ -128,6 +128,7 @@ impl Coord {
                     sbdf: format!("0000:{:02x}:00.0", gpu + 1),
                     generation: *generation,
                     rect: *rect,
+                    private_camera: None,
                 })
                 .collect(),
             region: None,
@@ -370,6 +371,59 @@ async fn a_new_rect_is_posted_without_a_relaunch() {
     c.close().await;
 }
 
+/// A borrowed GPU (`private_camera` in its assignment) relaunches and draws the whole
+/// image with the private camera; when the claim ends it relaunches again and draws its
+/// tile of the shared scene.
+#[tokio::test]
+async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
+    let f = fake(1, &[]);
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.25))]);
+    c.until(&["slot-1"], "running", 1).await;
+    let private = vec![fleet_core::scene::Keyframe {
+        t: 3.0,
+        pos: [1.0, 2.0, 3.0],
+        look: [4.0, 2.0, 3.0],
+        fov_deg: 50.0,
+        intent: Some("claim-intent".into()),
+    }];
+    let slot =
+        |generation: u64, rect: Option<Rect>, camera: Option<Vec<fleet_core::scene::Keyframe>>| {
+            CoordMsg::Assign {
+                slots: vec![AssignSlot {
+                    id: "slot-1".into(),
+                    sbdf: "0000:01:00.0".into(),
+                    generation,
+                    rect,
+                    private_camera: camera,
+                }],
+                region: None,
+            }
+        };
+    c.send(slot(2, None, Some(private.clone())));
+    c.until(&["slot-1"], "running", 2).await;
+    let body = f.scenes[0].lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        body["rect"],
+        serde_json::json!({"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}),
+        "a private session draws the whole image"
+    );
+    assert_eq!(body["camera"], serde_json::to_value(&private).unwrap());
+    c.send(slot(3, rect(0.25), None));
+    c.until(&["slot-1"], "running", 3).await;
+    let body = f.scenes[0].lock().unwrap().last().unwrap().clone();
+    assert_eq!(body["rect"]["x"], 0.25);
+    assert_ne!(body["camera"], serde_json::to_value(&private).unwrap());
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 3, "the claim and its end each restore a fresh VM");
+    c.close().await;
+}
+
 #[tokio::test]
 async fn a_dying_vm_is_relaunched_with_doubling_backoff() {
     let f = fake(
@@ -391,11 +445,14 @@ async fn a_dying_vm_is_relaunched_with_doubling_backoff() {
     while failed < 6 {
         if let AgentMsg::Slot(r) = c.next().await {
             if r.phase == "failed" {
-                failed += 1;
                 assert!(
                     r.error.as_deref().unwrap_or("").contains("fcvm exited"),
                     "{r:?}"
                 );
+                // Each failure says when the agent tries again.
+                let want = [200u64, 400, 800, 800, 800, 800][failed];
+                assert_eq!(r.retry_in_ms, Some(want), "{r:?}");
+                failed += 1;
             }
         }
     }
@@ -508,12 +565,14 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     sbdf: "0000:01:00.0".into(),
                     generation: 1,
                     rect: rect(0.0),
+                    private_camera: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
                     sbdf: "0000:02:00.0".into(),
                     generation: 1,
                     rect: rect(0.25),
+                    private_camera: None,
                 },
             ],
             region: None,
@@ -624,6 +683,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             sbdf: "0000:01:00.0".into(),
             generation: 1,
             rect: rect(x),
+            private_camera: None,
         }],
         region: None,
     };
@@ -756,12 +816,14 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                         w: 0.25,
                         h: 0.5,
                     }),
+                    private_camera: None,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
                     sbdf: "0000:02:00.0".into(),
                     generation: 1,
                     rect: None,
+                    private_camera: None,
                 },
             ],
             region: Some(region),
@@ -820,6 +882,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 sbdf: "0000:01:00.0".into(),
                 generation: 1,
                 rect: Some(wider),
+                private_camera: None,
             }],
             region: Some(wider),
         })

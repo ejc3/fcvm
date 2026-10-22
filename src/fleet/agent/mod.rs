@@ -281,6 +281,7 @@ fn assign(
         let want = Desired {
             generation: a.generation,
             rect: a.rect,
+            private_camera: a.private_camera.clone(),
         };
         if let Some(h) = slots.get(&a.id) {
             h.desired.send_if_modified(|d| {
@@ -288,6 +289,7 @@ fn assign(
                 let next = Desired {
                     generation: d.generation.max(want.generation),
                     rect: want.rect,
+                    private_camera: want.private_camera.clone(),
                 };
                 let changed = *d != next;
                 *d = next;
@@ -305,6 +307,7 @@ fn assign(
                 frame_url: None,
                 timings: Default::default(),
                 error: Some(format!("GPU {} is not on this host", a.sbdf)),
+                retry_in_ms: None,
             }));
             continue;
         };

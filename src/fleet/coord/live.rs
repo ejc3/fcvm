@@ -1,26 +1,35 @@
-//! The browser side: `GET /live` (WebSocket) and `GET /healthz`.
+//! The browser side: `GET /live` (WebSocket), `GET /poster.jpg` and `GET /healthz`.
 //!
-//! Each socket has a reader (intents, pings) and a writer. The writer sends the current
-//! snapshot on connect and the latest one whenever the version moves; receipts, clock
-//! replies and errors reach it through a bounded channel. A client that stops reading
-//! until that channel is full is disconnected.
+//! Each socket has a reader (intents, pings, verification) and a writer. The writer sends
+//! the viewer's id, the current snapshot on connect and the latest one whenever the
+//! version moves; receipts, clock replies, verification results and the viewer's own claim
+//! reach it through a bounded channel. A client that stops reading until that channel is
+//! full is disconnected.
+//!
+//! Every intent carries the connection's client address (`CF-Connecting-IP` when trusted,
+//! else the peer address), which the per-client limits are keyed by. With a Turnstile
+//! secret configured, a connection's intents are refused until it has passed `verify`.
 
+use super::poster::Poster;
 use super::text_check::{check_text, TextChecker};
+use super::turnstile::Verifier;
 use super::Handle;
 use crate::fleet::now_ms;
 use anyhow::Result;
 use axum::extract::ws::{Message, WebSocket};
-use axum::extract::{State, WebSocketUpgrade};
+use axum::extract::{ConnectInfo, State, WebSocketUpgrade};
 use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
 use fleet_core::protocol::{ClientMsg, ServerMsg};
-use fleet_core::state::TextCheck;
+use fleet_core::state::{Outcome, TextCheck};
 use fleet_core::Event;
 use futures_util::{SinkExt, StreamExt};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::sync::mpsc;
 
 /// The largest message a browser may send.
@@ -28,27 +37,31 @@ const MAX_CLIENT_MESSAGE: usize = 64 * 1024;
 /// Receipts and clock replies a socket may have queued before it is dropped.
 const DIRECT_QUEUE: usize = 256;
 
+pub struct LiveConfig {
+    pub checker: Arc<dyn TextChecker>,
+    /// Browser origins allowed besides the coordinator's own.
+    pub allowed_origins: Vec<String>,
+    pub verifier: Arc<dyn Verifier>,
+    /// Key clients by `CF-Connecting-IP` (only behind Cloudflare, which sets it).
+    pub trust_cf_connecting_ip: bool,
+    pub poster: Arc<Poster>,
+}
+
 #[derive(Clone)]
 pub struct App {
     pub handle: Handle,
-    pub checker: Arc<dyn TextChecker>,
-    /// Browser origins allowed besides the coordinator's own.
-    pub allowed_origins: Arc<Vec<String>>,
+    pub cfg: Arc<LiveConfig>,
     next_viewer: Arc<AtomicU64>,
 }
 
-pub fn router(
-    handle: Handle,
-    checker: Arc<dyn TextChecker>,
-    allowed_origins: Vec<String>,
-) -> Router {
+pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
     Router::new()
         .route("/live", get(live))
+        .route("/poster.jpg", get(poster))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(App {
             handle,
-            checker,
-            allowed_origins: Arc::new(allowed_origins),
+            cfg: Arc::new(cfg),
             next_viewer: Arc::new(AtomicU64::new(1)),
         })
 }
@@ -56,29 +69,70 @@ pub fn router(
 pub async fn serve(
     listener: tokio::net::TcpListener,
     handle: Handle,
-    checker: Arc<dyn TextChecker>,
-    allowed_origins: Vec<String>,
+    cfg: LiveConfig,
 ) -> Result<()> {
-    axum::serve(listener, router(handle, checker, allowed_origins)).await?;
+    axum::serve(
+        listener,
+        router(handle, cfg).into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 
-async fn live(ws: WebSocketUpgrade, headers: HeaderMap, State(app): State<App>) -> Response {
+/// The latest converged still of the whole image. Cached briefly: it changes at most once
+/// per camera hold.
+async fn poster(State(app): State<App>) -> Response {
+    match app.cfg.poster.latest() {
+        Some(still) => (
+            [
+                (header::CONTENT_TYPE, still.content_type),
+                (header::CACHE_CONTROL, "public, max-age=10"),
+            ],
+            still.bytes.clone(),
+        )
+            .into_response(),
+        None => (
+            StatusCode::NOT_FOUND,
+            [(header::CACHE_CONTROL, "no-store")],
+            "no poster yet",
+        )
+            .into_response(),
+    }
+}
+
+/// The address the per-client limits use.
+pub fn client_address(headers: &HeaderMap, peer: SocketAddr, trust_cf: bool) -> String {
+    if trust_cf {
+        if let Some(ip) = headers
+            .get("cf-connecting-ip")
+            .and_then(|v| v.to_str().ok())
+            .map(str::trim)
+            .filter(|v| v.parse::<std::net::IpAddr>().is_ok())
+        {
+            return ip.to_string();
+        }
+    }
+    peer.ip().to_string()
+}
+
+async fn live(
+    ws: WebSocketUpgrade,
+    headers: HeaderMap,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    State(app): State<App>,
+) -> Response {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok());
-    if !origin_allowed(origin, host, &app.allowed_origins) {
+    if !origin_allowed(origin, host, &app.cfg.allowed_origins) {
         tracing::info!(origin = ?origin, "refusing /live from a foreign origin");
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
+    let client = client_address(&headers, peer, app.cfg.trust_cf_connecting_ip);
     ws.max_message_size(MAX_CLIENT_MESSAGE)
-        .on_upgrade(move |socket| viewer(socket, app))
+        .on_upgrade(move |socket| viewer(socket, app, client))
         .into_response()
 }
 
-/// A browser always sends `Origin` on a WebSocket; a page on another site must not be able
-/// to drive the wall from its visitors' browsers. Allowed: no `Origin` (not a browser), an
-/// origin on the configured list, or the coordinator's own (`Origin` names the `Host` the
-/// request was sent to).
 pub fn origin_allowed(origin: Option<&str>, host: Option<&str>, allowed: &[String]) -> bool {
     let Some(origin) = origin else {
         return true;
@@ -100,12 +154,25 @@ fn text(msg: &ServerMsg) -> String {
     serde_json::to_string(msg).expect("server messages serialize")
 }
 
-async fn viewer(socket: WebSocket, app: App) {
+/// A refusal that is not recorded (the intent was never applied), so the client may send
+/// the same id again once the reason is gone.
+fn unrecorded_refusal(id: String, reason: &str) -> ServerMsg {
+    ServerMsg::Receipt {
+        id,
+        outcome: Outcome::Refused,
+        reason: Some(reason.into()),
+        version: 0,
+        check: None,
+    }
+}
+
+async fn viewer(socket: WebSocket, app: App, client: String) {
     let viewer = format!("v-{}", app.next_viewer.fetch_add(1, Ordering::Relaxed));
     app.handle
         .send(Event::ViewerJoined {
             at: 0,
             viewer: viewer.clone(),
+            client: Some(client.clone()),
         })
         .await;
     let (mut sink, mut stream) = socket.split();
@@ -163,8 +230,10 @@ async fn viewer(socket: WebSocket, app: App) {
         }
     });
 
+    let verified = Arc::new(AtomicBool::new(!app.cfg.verifier.required()));
     // The one `word` this viewer has at the text check, if any.
     let checking: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let mut tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
     while let Some(Ok(msg)) = stream.next().await {
         let body = match msg {
             Message::Text(t) => t.to_string(),
@@ -184,40 +253,66 @@ async fn viewer(socket: WebSocket, app: App) {
         };
         let reply = match serde_json::from_str::<ClientMsg>(&body) {
             Err(e) => Some(ServerMsg::Error {
-                reason: format!("message is not a ping or an intent: {e}"),
+                reason: format!("message is not a ping, a verify or an intent: {e}"),
             }),
             Ok(ClientMsg::Ping { client_unix_ms }) => Some(ServerMsg::Clock {
                 server_unix_ms: now_ms(),
                 client_unix_ms,
             }),
+            Ok(ClientMsg::Verify { token }) => {
+                let r = app.cfg.verifier.verify(&token, &client).await;
+                let (ok, reason) = match r {
+                    Ok(None) => (true, None),
+                    Ok(Some(why)) => (false, Some(why)),
+                    Err(e) => (false, Some(format!("{e:#}"))),
+                };
+                if ok {
+                    verified.store(true, Ordering::SeqCst);
+                }
+                Some(ServerMsg::Verified { ok, reason })
+            }
             Ok(ClientMsg::Intent { id, name, args }) => {
                 if id.is_empty() || id.len() > 128 {
                     Some(ServerMsg::Error {
                         reason: "an intent id must be 1 to 128 bytes".into(),
                     })
+                } else if !verified.load(Ordering::SeqCst) {
+                    Some(unrecorded_refusal(id, "verify with Turnstile first"))
                 } else if name == "word" {
                     let app = app.clone();
                     let viewer = viewer.clone();
+                    let client = client.clone();
                     let direct = direct.clone();
                     let checking = checking.clone();
-                    tokio::spawn(async move {
-                        if let Some(r) = word(&app, &viewer, id, args, &checking).await {
+                    tasks.push(tokio::spawn(async move {
+                        if let Some(r) = word(&app, &viewer, &client, id, args, &checking).await {
                             let _ = direct.try_send(r);
                         }
-                    });
+                    }));
                     None
                 } else {
-                    app.handle
+                    let claim = name == "claim_gpu";
+                    let r = app
+                        .handle
                         .apply(Event::Intent {
                             at: 0,
                             viewer: viewer.clone(),
+                            client: Some(client.clone()),
                             id,
                             name,
                             args,
                             check: None,
+                            secret: claim.then(|| uuid::Uuid::new_v4().simple().to_string()),
                         })
-                        .await
-                        .map(|r| ServerMsg::receipt(&r))
+                        .await;
+                    if claim && r.as_ref().is_some_and(|r| r.outcome == Outcome::Committed) {
+                        tasks.push(tokio::spawn(tell_claim(
+                            app.handle.clone(),
+                            viewer.clone(),
+                            direct.clone(),
+                        )));
+                    }
+                    r.map(|r| ServerMsg::receipt(&r))
                 }
             }
         };
@@ -228,6 +323,9 @@ async fn viewer(socket: WebSocket, app: App) {
             }
         }
     }
+    for t in tasks {
+        t.abort();
+    }
     writer.abort();
     app.handle
         .send(Event::ViewerLeft {
@@ -237,12 +335,37 @@ async fn viewer(socket: WebSocket, app: App) {
         .await;
 }
 
+/// Tell the claiming viewer, and only it, its GPU's frame URL and session token once the
+/// private VM has drawn its first frame.
+async fn tell_claim(handle: Handle, viewer: String, direct: mpsc::Sender<ServerMsg>) {
+    for _ in 0..(90 * 5) {
+        match handle.claim_for(&viewer).await {
+            None => return,
+            Some(c) if c.frame_url.is_some() => {
+                let _ = direct
+                    .send(ServerMsg::Claim {
+                        session: c.session,
+                        token: c.token,
+                        slot: c.slot,
+                        frame_url: c.frame_url.unwrap(),
+                        expires_at: c.expires_at,
+                        click_to_first_frame_ms: c.click_to_first_frame_ms,
+                    })
+                    .await;
+                return;
+            }
+            Some(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+}
+
 /// A `word` intent: its first receipt if the id is known; otherwise the pre-checks, then
-/// the text check, then the event with the verdict. Returns the receipt to send, or `None`
-/// when another task already holds this id (that task sends the receipt).
+/// the text check of the whole sky, then the event with the verdict. Returns the receipt
+/// to send, or `None` when another task already holds this id (that task sends it).
 async fn word(
     app: &App,
     viewer: &str,
+    client: &str,
     id: String,
     args: serde_json::Value,
     checking: &Mutex<Option<String>>,
@@ -250,7 +373,7 @@ async fn word(
     if let Some(r) = app.handle.receipt(&id).await {
         return Some(ServerMsg::receipt(&r));
     }
-    let check = if app.handle.precheck_word(viewer, &args).await.is_some() {
+    let check = if app.handle.precheck_word(client, &args).await.is_some() {
         // `apply` refuses it for the same reason without a check.
         None
     } else {
@@ -269,6 +392,7 @@ async fn word(
             Some(TextCheck {
                 verdict: "error".into(),
                 reason: "another word from this viewer is being checked".into(),
+                sky: app.handle.sky().await,
             })
         } else {
             let text = args
@@ -276,8 +400,17 @@ async fn word(
                 .and_then(|t| t.as_str())
                 .unwrap_or_default();
             let normalised = fleet_core::event::normalise_word(text).unwrap_or_default();
-            let verdict = check_text(app.checker.as_ref(), &normalised).await;
+            let sky = app.handle.sky().await;
+            let verdict = check_text(app.cfg.checker.as_ref(), &sky, &normalised).await;
             *checking.lock().unwrap() = None;
+            // A check that cannot run degrades the coordinator until one runs again.
+            app.handle
+                .send(Event::Degraded {
+                    at: 0,
+                    component: "text_check".into(),
+                    reason: (verdict.verdict == "error").then(|| verdict.reason.clone()),
+                })
+                .await;
             Some(verdict)
         }
     };
@@ -285,10 +418,12 @@ async fn word(
         .apply(Event::Intent {
             at: 0,
             viewer: viewer.to_string(),
+            client: Some(client.to_string()),
             id,
             name: "word".into(),
             args,
             check,
+            secret: None,
         })
         .await
         .map(|r| ServerMsg::receipt(&r))

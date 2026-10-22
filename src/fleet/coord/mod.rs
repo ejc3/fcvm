@@ -11,11 +11,14 @@ pub mod agents;
 pub mod aws;
 pub mod ec2;
 pub mod live;
+pub mod poster;
 pub mod sigv4;
 pub mod store;
 pub mod text_check;
+pub mod turnstile;
 
-use crate::cli::{FleetCoordArgs, FleetEc2, FleetTextCheck};
+use crate::cli::{FleetAggregateCodec, FleetCoordArgs, FleetEc2, FleetTextCheck};
+use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
@@ -27,6 +30,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, watch};
+
+/// What the claiming viewer alone is told about its GPU.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ClaimInfo {
+    pub session: String,
+    pub token: String,
+    pub slot: String,
+    pub expires_at: u64,
+    pub frame_url: Option<String>,
+    pub click_to_first_frame_ms: Option<u64>,
+}
 
 /// The latest browser snapshot, serialized once for every socket.
 #[derive(Debug)]
@@ -49,9 +63,22 @@ pub enum Cmd {
     },
     /// Would a `word` be refused before its text check? (`fleet_core::precheck_word`)
     PrecheckWord {
-        viewer: String,
+        client: String,
         args: serde_json::Value,
         reply: oneshot::Sender<Option<String>>,
+    },
+    /// The words in the sky now (a new word is checked together with them).
+    Sky {
+        reply: oneshot::Sender<Vec<String>>,
+    },
+    /// The claim a viewer holds and, once its renderer runs, its frame URL.
+    ClaimFor {
+        viewer: String,
+        reply: oneshot::Sender<Option<ClaimInfo>>,
+    },
+    /// The current camera hold and the aggregators to take its poster from.
+    PosterPlan {
+        reply: oneshot::Sender<Option<poster::Plan>>,
     },
     /// An agent connection's hello. Replies whether the connection may name that host.
     AgentHello {
@@ -96,6 +123,8 @@ const STORE_INTERVAL: Duration = Duration::from_secs(1);
 
 pub struct Actor {
     state: State,
+    /// The EC2 aggregator as the coordinator reaches it (it runs as our child).
+    ec2_aggregate_local: Option<String>,
     out: Outputs,
     agents: HashMap<u64, AgentConn>,
     last_at: u64,
@@ -120,6 +149,7 @@ impl Actor {
         let published = state.version;
         out.snapshot.send_replace(snapshot_of(&state));
         Actor {
+            ec2_aggregate_local: None,
             stored: state.version,
             state,
             out,
@@ -255,12 +285,62 @@ impl Actor {
                 let _ = reply.send(self.state.receipt(&id).cloned());
             }
             Cmd::PrecheckWord {
-                viewer,
+                client,
                 args,
                 reply,
             } => {
                 let at = self.stamp();
-                let _ = reply.send(fleet_core::precheck_word(&self.state, &viewer, &args, at));
+                let _ = reply.send(fleet_core::precheck_word(&self.state, &client, &args, at));
+            }
+            Cmd::Sky { reply } => {
+                let _ = reply.send(fleet_core::apply::sky(&self.state));
+            }
+            Cmd::PosterPlan { reply } => {
+                let f = &self.state.fleet;
+                let d = &f.director;
+                let mut sources: Vec<String> = f
+                    .hosts
+                    .values()
+                    .filter_map(|h| h.aggregate_url.clone())
+                    .collect();
+                if let Some(u) = self
+                    .ec2_aggregate_local
+                    .clone()
+                    .or_else(|| self.state.config.ec2_aggregate_url.clone())
+                {
+                    sources.push(u);
+                }
+                let plan = poster::Plan {
+                    step: d.step,
+                    arrive_t: d.arrive_t,
+                    hold_until_t: d.hold_until(),
+                    viewpoint: fleet_core::director::viewpoints()[d.current]
+                        .name
+                        .to_string(),
+                    epoch_unix_ms: f.scene.epoch_unix_ms,
+                    sources,
+                };
+                let _ = reply.send(Some(plan));
+            }
+            Cmd::ClaimFor { viewer, reply } => {
+                let info = self.state.fleet.slots.values().find_map(|s| {
+                    let c = s.claim.as_ref().filter(|c| c.viewer == viewer)?;
+                    let ready =
+                        s.observed.phase == "running" && s.observed.generation >= c.generation;
+                    Some(ClaimInfo {
+                        session: c.session.clone(),
+                        token: c.token.clone(),
+                        slot: s.id.clone(),
+                        expires_at: c.expires_at,
+                        frame_url: if ready {
+                            s.observed.frame_url.clone()
+                        } else {
+                            None
+                        },
+                        click_to_first_frame_ms: c.first_frame_at.map(|t| t - c.claimed_at),
+                    })
+                });
+                let _ = reply.send(info);
             }
             Cmd::AgentHello {
                 conn,
@@ -355,7 +435,8 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::Tick { at }
         | Event::Agent { at, .. }
         | Event::AgentGone { at, .. }
-        | Event::Ec2 { at, .. } => *at = t,
+        | Event::Ec2 { at, .. }
+        | Event::Degraded { at, .. } => *at = t,
     }
 }
 
@@ -404,11 +485,37 @@ impl Handle {
         rx.await.ok().flatten()
     }
 
-    pub async fn precheck_word(&self, viewer: &str, args: &serde_json::Value) -> Option<String> {
+    pub async fn sky(&self) -> Vec<String> {
+        let (tx, rx) = oneshot::channel();
+        if self.cmds.send(Cmd::Sky { reply: tx }).await.is_err() {
+            return Vec::new();
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn poster_plan(&self) -> Option<poster::Plan> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds.send(Cmd::PosterPlan { reply: tx }).await.ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn claim_for(&self, viewer: &str) -> Option<ClaimInfo> {
+        let (tx, rx) = oneshot::channel();
+        self.cmds
+            .send(Cmd::ClaimFor {
+                viewer: viewer.to_string(),
+                reply: tx,
+            })
+            .await
+            .ok()?;
+        rx.await.ok().flatten()
+    }
+
+    pub async fn precheck_word(&self, client: &str, args: &serde_json::Value) -> Option<String> {
         let (tx, rx) = oneshot::channel();
         self.cmds
             .send(Cmd::PrecheckWord {
-                viewer: viewer.to_string(),
+                client: client.to_string(),
                 args: args.clone(),
                 reply: tx,
             })
@@ -424,6 +531,7 @@ pub fn start(
     state: State,
     store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
+    ec2_aggregate_local: Option<String>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
@@ -442,6 +550,10 @@ pub fn start(
         },
         Box::new(now_ms),
     );
+    let actor = Actor {
+        ec2_aggregate_local,
+        ..actor
+    };
     let task = tokio::spawn(actor.run(rx));
     let handle = Handle {
         cmds,
@@ -480,6 +592,10 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             FleetEc2::Fake => args.max_tiles,
         },
         ec2_aggregate_url: args.ec2_aggregate_url.clone(),
+        race_interval_secs: args.race_every,
+        restart_cooldown_secs: args.restart_cooldown,
+        camera_seed: args.camera_seed,
+        max_borrowed: args.max_borrowed,
         ..Config::default()
     };
     if config.max_tiles == 0 {
@@ -502,7 +618,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             let state = match store::load(path)? {
                 Some(s) => {
                     tracing::info!(path = %path.display(), version = s.version, "resuming from the state file");
-                    s.resumed(config)
+                    s.resumed(config, now_ms())
                 }
                 None => State::new(config, now_ms()),
             };
@@ -517,7 +633,13 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             Duration::from_secs(20),
         ))),
     };
-    let (handle, _actor) = start(state, store_tx, ec2);
+    let ec2_local = args.ec2_aggregate_listen.as_ref().map(|l| {
+        format!(
+            "ws://{}/frames",
+            crate::fleet::aggregate::child::connect_addr(l)
+        )
+    });
+    let (handle, _actor) = start(state, store_tx, ec2, ec2_local);
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
             std::env::current_exe()
@@ -550,9 +672,37 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    let origins = args.allowed_origins;
+    let verifier: Arc<dyn turnstile::Verifier> = match args.turnstile_secret {
+        Some(secret) => Arc::new(turnstile::Siteverify::new(secret, None)?),
+        None => Arc::new(turnstile::Off),
+    };
+    let poster = Arc::new(poster::Poster::default());
+    let (decoder, encoder): (Arc<dyn Codec>, poster::StillEncoder) = match args.poster_codec {
+        FleetAggregateCodec::Ffmpeg => (
+            Arc::new(Ffmpeg {
+                bin: args.ffmpeg.clone(),
+            }),
+            poster::StillEncoder::Jpeg {
+                ffmpeg: args.ffmpeg.clone(),
+            },
+        ),
+        FleetAggregateCodec::Raw => (Arc::new(Raw), poster::StillEncoder::Ppm),
+    };
+    tokio::spawn(poster::run(
+        handle.clone(),
+        poster.clone(),
+        decoder,
+        encoder,
+    ));
+    let cfg = live::LiveConfig {
+        checker,
+        allowed_origins: args.allowed_origins,
+        verifier,
+        trust_cf_connecting_ip: args.trust_cf_connecting_ip,
+        poster,
+    };
     tokio::select! {
-        r = live::serve(listener, handle.clone(), checker, origins) => r?,
+        r = live::serve(listener, handle.clone(), cfg) => r?,
         _ = term.recv() => tracing::info!("SIGTERM"),
         _ = int.recv() => tracing::info!("SIGINT"),
     }

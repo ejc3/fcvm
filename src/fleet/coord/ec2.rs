@@ -6,7 +6,9 @@
 //! A relaunch launches the replacement first and terminates the old instance once the
 //! launch is accepted, so termination stays out of the measured time. The timings it
 //! reports: `launch_ms` (request to accepted), `ready_ms` (accepted to the renderer's
-//! health), `total_ms`.
+//! health), `total_ms`, and `capacity_wait_ms`: how long the tile's generation waited for
+//! EC2 to have capacity before the launch that was accepted. The race scoreboard leaves
+//! that wait out of the EC2 half's time and reports it on its own.
 
 use super::Handle;
 use anyhow::Result;
@@ -18,6 +20,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::watch;
+
+/// How long a tile waits before asking EC2 again after a capacity refusal.
+const CAPACITY_RETRY: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone)]
 pub struct Launched {
@@ -40,6 +45,10 @@ pub trait Ec2Driver: Send + Sync {
     /// Resolves when the instance's renderer answers its health check.
     async fn ready(&self, instance: &str) -> Result<()>;
     async fn terminate(&self, instance: &str) -> Result<()>;
+    /// How long a tile waits before asking again after a capacity refusal.
+    fn capacity_retry(&self) -> Duration {
+        CAPACITY_RETRY
+    }
 }
 
 /// Instances that exist only in memory: a launch is accepted after `launch_delay` and
@@ -119,8 +128,13 @@ async fn report(
     generation: u64,
     l: Option<&Launched>,
     timings: &BTreeMap<String, u64>,
-    error: Option<String>,
+    // What went wrong, and when the tile tries again.
+    problem: Option<(String, Option<Duration>)>,
 ) {
+    let (error, retry_in) = match problem {
+        Some((e, r)) => (Some(e), r),
+        None => (None, None),
+    };
     handle
         .send(Event::Ec2 {
             at: 0,
@@ -132,6 +146,7 @@ async fn report(
                 frame_url: l.and_then(|l| l.frame_url.clone()),
                 timings: timings.clone(),
                 error,
+                retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
             },
         })
         .await;
@@ -145,11 +160,22 @@ async fn tile(
 ) {
     let mut current: Option<(Launched, u64)> = None;
     let mut retry = Duration::from_secs(1);
+    // The generation that is waiting for capacity, and since when.
+    let mut waiting: Option<(u64, Instant)> = None;
     loop {
         let generation = *want.borrow_and_update();
         if current.as_ref().is_none_or(|(_, g)| *g < generation) {
             let t0 = Instant::now();
             let mut timings = BTreeMap::new();
+            if waiting.is_some_and(|(g, _)| g != generation) {
+                waiting = None;
+            }
+            if let Some((_, since)) = waiting {
+                timings.insert(
+                    "capacity_wait_ms".into(),
+                    t0.duration_since(since).as_millis() as u64,
+                );
+            }
             report(
                 &handle,
                 &id,
@@ -162,6 +188,7 @@ async fn tile(
             .await;
             match driver.launch(&id).await {
                 Ok(l) => {
+                    waiting = None;
                     timings.insert("launch_ms".into(), t0.elapsed().as_millis() as u64);
                     if let Some((old, _)) = current.take() {
                         let d = driver.clone();
@@ -207,7 +234,7 @@ async fn tile(
                                 generation,
                                 Some(&l),
                                 &timings,
-                                Some(format!("{e:#}")),
+                                Some((format!("{e:#}"), None)),
                             )
                             .await;
                         }
@@ -215,6 +242,11 @@ async fn tile(
                     current = Some((l, generation));
                 }
                 Err(LaunchError::NoCapacity(why)) => {
+                    let since = waiting.get_or_insert((generation, t0)).1;
+                    timings.insert(
+                        "capacity_wait_ms".into(),
+                        since.elapsed().as_millis() as u64,
+                    );
                     report(
                         &handle,
                         &id,
@@ -222,15 +254,17 @@ async fn tile(
                         generation,
                         current.as_ref().map(|c| &c.0),
                         &timings,
-                        Some(why),
+                        Some((why, Some(driver.capacity_retry()))),
                     )
                     .await;
-                    if wait_or_removed(&mut want, Duration::from_secs(10)).await {
+                    if wait_or_removed(&mut want, driver.capacity_retry()).await {
                         break;
                     }
                     continue;
                 }
                 Err(LaunchError::Failed(e)) => {
+                    let wait = retry;
+                    retry = (retry * 2).min(Duration::from_secs(30));
                     report(
                         &handle,
                         &id,
@@ -238,11 +272,9 @@ async fn tile(
                         generation,
                         current.as_ref().map(|c| &c.0),
                         &timings,
-                        Some(format!("{e:#}")),
+                        Some((format!("{e:#}"), Some(wait))),
                     )
                     .await;
-                    let wait = retry;
-                    retry = (retry * 2).min(Duration::from_secs(30));
                     if wait_or_removed(&mut want, wait).await {
                         break;
                     }

@@ -83,12 +83,12 @@ mod tests {
         assert!(load(&path).unwrap().is_none());
         let mut s = State::new(Config::default(), 1000);
         s.version = 41;
-        s.fleet.settings.auto_relaunch_secs = Some(60);
+        s.fleet.race_count = 7;
         write_atomic(&path, &serde_json::to_vec(&s).unwrap()).unwrap();
         let back = load(&path).unwrap().unwrap();
         assert_eq!(back, s);
-        let resumed = back.resumed(Config::default());
+        let resumed = back.resumed(Config::default(), 2000);
         assert_eq!(resumed.version, 42);
-        assert_eq!(resumed.fleet.settings.auto_relaunch_secs, Some(60));
+        assert_eq!(resumed.fleet.race_count, 7);
     }
 }
