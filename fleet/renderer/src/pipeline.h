@@ -1,0 +1,106 @@
+// The render loop and its subscribers: one frame per 1/fps slot of the shared
+// clock, drawn once at the largest height any subscriber wants, scaled and
+// encoded once per height that has a subscriber.
+#pragma once
+#include <stdint.h>
+
+#include <atomic>
+#include <condition_variable>
+#include <deque>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
+
+#include "gpustats.h"
+#include "nvenc.h"
+#include "render.h"
+#include "scene.h"
+
+struct Subscriber {
+  int id = 0;
+  std::atomic<int> want_h{0};
+  // filled by the render thread, drained by the connection's writer
+  std::mutex mu;
+  std::condition_variable cv;
+  std::deque<std::shared_ptr<const std::string>> q;  // complete WebSocket frames
+  size_t queued = 0;
+  bool closed = false;
+  // render-thread state
+  int cur_h = 0;
+  bool need_key = true;
+  void push(std::shared_ptr<const std::string> m);
+  void close();
+};
+
+struct Options {
+  int port = 8080;
+  int fps = 30;
+  double budget = 1.0e6;  // pixel-samples per frame to start from
+  bool adapt = true;      // adjust the samples so a frame's GPU time fits its slot
+  int idle_h = 144;
+  bool accumulate = true;
+};
+
+class Pipeline {
+ public:
+  explicit Pipeline(const Options& o);
+  // Process start, as CLOCK_BOOTTIME seconds (for start-to-first-frame timing).
+  void set_process_start(double boottime_s) { proc_start_ = boottime_s; }
+  void run();  // the render thread; returns only on a fatal error
+  void stop();
+
+  std::shared_ptr<Subscriber> subscribe(int h);
+  void unsubscribe(const std::shared_ptr<Subscriber>& s);
+  void wake();
+  bool post_scene(const std::string& body, std::string* err);
+  std::string health_json();
+  bool ready() const { return ready_; }
+  std::string fatal() const;
+
+ private:
+  struct Enc {
+    std::unique_ptr<H264Encoder> enc;
+    void* nv12 = nullptr;
+    size_t pitch = 0;
+    Tile geo{};
+    double last_idr = -1e9;
+    bool want_idr = true;
+    std::vector<std::shared_ptr<Subscriber>> subs;
+  };
+  void frame_once(double t, uint32_t frame_no);
+  Tile encode_geometry(const Scene& sc, int h);
+  int min_w_ = 0, min_h_ = 0;
+  std::string header_json(const Enc& e);
+
+  Options opt_;
+  Renderer r_;
+  GpuStats gpu_;
+  std::mutex mu_;
+  std::condition_variable cv_;
+  std::shared_ptr<const Scene> scene_;
+  uint64_t scene_version_ = 0;
+  std::vector<std::shared_ptr<Subscriber>> subs_;
+  int next_id_ = 1;
+  std::map<int, Enc> encs_;
+  std::atomic<bool> stop_{false};
+  std::atomic<bool> ready_{false};
+  std::string fatal_;
+  double proc_start_ = 0;
+  double budget_ = 1.0e6;  // current pixel-samples per frame
+  // health
+  std::mutex hmu_;
+  double last_t_ = 0;
+  uint32_t frame_ = 0;
+  double fps_ = 0;
+  std::vector<int> heights_;
+  RenderStats rstats_;
+  double encode_ms_ = 0;
+  double startup_ready_ms_ = -1, first_frame_ms_ = -1, first_sent_ms_ = -1;
+  std::string gpu_name_;
+};
+
+double now_unix_ms();
+double boottime_s();
+double process_start_boottime_s();
