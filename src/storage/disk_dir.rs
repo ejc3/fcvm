@@ -11,6 +11,7 @@
 
 use anyhow::{bail, Context, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileTypeExt, MetadataExt};
 use std::path::{Path, PathBuf};
@@ -216,6 +217,18 @@ fn stage_one(host: &Path, dest: &Path) -> Result<StagedDiskDir> {
     })
 }
 
+/// The arguments of the staging copy. A copy that does not keep owners (not root) also
+/// drops the groups: `cp -a` keeps any group the caller belongs to, and [`hash_tree`]
+/// leaves owners out of such a copy's hash.
+fn cp_args(keep_owners: bool) -> Vec<&'static str> {
+    let mut args = vec!["-a", "--reflink=auto"];
+    if !keep_owners {
+        args.push("--no-preserve=ownership");
+    }
+    args.extend(["--no-target-directory", "--"]);
+    args
+}
+
 /// `cp -a --reflink=auto host dest`: a reflink copy where the filesystem allows one.
 fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
     if let Some(parent) = dest.parent() {
@@ -223,7 +236,7 @@ fn copy_tree(host: &Path, dest: &Path) -> Result<()> {
             .with_context(|| format!("creating --disk-dir staging {}", parent.display()))?;
     }
     let output = std::process::Command::new("cp")
-        .args(["-a", "--reflink=auto", "--no-target-directory", "--"])
+        .args(cp_args(nix::unistd::geteuid().is_root()))
         .arg(host)
         .arg(dest)
         .output()
@@ -254,7 +267,9 @@ fn disk_image_identity(path: &Path) -> Result<String> {
 
 /// SHA-256 over a sorted walk of `root`. Each entry contributes its path relative to
 /// `root`, file type, permission bits, its extended attributes (names and values,
-/// sorted), then a regular file's bytes, a symlink's target, or a device's number.
+/// sorted), then a regular file's bytes, a symlink's target, or a device's number. A
+/// regular file with more than one link that the walk met before contributes the path it
+/// was first met at instead of its bytes, because the copy keeps hard links.
 /// Timestamps are left out, so a directory recreated with the same content hashes the
 /// same. The hash covers what a copy by this process carries into the image: as root,
 /// `cp -a` keeps owners and every attribute, so uid, gid and every listable attribute
@@ -268,7 +283,13 @@ pub fn hash_tree(root: &Path) -> Result<String> {
 /// every attribute, passed in.
 fn hash_tree_with(root: &Path, keep_owners: bool) -> Result<String> {
     let mut hasher = Sha256::new();
-    hash_entry(root, Path::new(""), keep_owners, &mut hasher)?;
+    hash_entry(
+        root,
+        Path::new(""),
+        keep_owners,
+        &mut HashMap::new(),
+        &mut hasher,
+    )?;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -331,7 +352,15 @@ fn hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
-fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha256) -> Result<()> {
+/// `links` maps a multiply linked file's (device, inode) to the relative path the walk
+/// first met it at.
+fn hash_entry(
+    path: &Path,
+    relative: &Path,
+    keep_owners: bool,
+    links: &mut HashMap<(u64, u64), PathBuf>,
+    hasher: &mut Sha256,
+) -> Result<()> {
     let md = std::fs::symlink_metadata(path).with_context(|| format!("stat {}", path.display()))?;
     let ft = md.file_type();
     let kind: u8 = if ft.is_dir() {
@@ -368,7 +397,14 @@ fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha2
         hash_bytes(hasher, &value);
     }
     match kind {
+        b'f' if md.nlink() > 1 && links.contains_key(&(md.dev(), md.ino())) => {
+            hasher.update([b'h']);
+            hash_bytes(hasher, links[&(md.dev(), md.ino())].as_os_str().as_bytes());
+        }
         b'f' => {
+            if md.nlink() > 1 {
+                links.insert((md.dev(), md.ino()), relative.to_path_buf());
+            }
             hasher.update(md.len().to_le_bytes());
             let mut file =
                 std::fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
@@ -397,6 +433,7 @@ fn hash_entry(path: &Path, relative: &Path, keep_owners: bool, hasher: &mut Sha2
                     &path.join(&name),
                     &relative.join(&name),
                     keep_owners,
+                    links,
                     hasher,
                 )?;
             }
@@ -811,6 +848,47 @@ mod tests {
             key(),
             "a same-size rewrite with its mtime restored kept the key"
         );
+    }
+
+    /// A copy preserves hard links, so two trees with the same names and bytes, one with
+    /// a hard link and one with two independent files, are different images.
+    #[test]
+    fn hard_link_topology_changes_the_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let linked = dir.path().join("linked");
+        let separate = dir.path().join("separate");
+        for root in [&linked, &separate] {
+            std::fs::create_dir(root).unwrap();
+            std::fs::write(root.join("a"), b"same").unwrap();
+        }
+        std::fs::hard_link(linked.join("a"), linked.join("b")).unwrap();
+        std::fs::write(separate.join("b"), b"same").unwrap();
+        for keep_owners in [false, true] {
+            assert_ne!(
+                hash_tree_with(&linked, keep_owners).unwrap(),
+                hash_tree_with(&separate, keep_owners).unwrap(),
+                "keep_owners={keep_owners}: a hard link hashed like an independent copy"
+            );
+        }
+        // The first path of a link group carries the bytes, so the same topology under
+        // the same names hashes the same.
+        let again = dir.path().join("again");
+        std::fs::create_dir(&again).unwrap();
+        std::fs::write(again.join("a"), b"same").unwrap();
+        std::fs::hard_link(again.join("a"), again.join("b")).unwrap();
+        assert_eq!(
+            hash_tree_with(&linked, false).unwrap(),
+            hash_tree_with(&again, false).unwrap()
+        );
+    }
+
+    /// The hash leaves owners out when the copy does not keep them, so such a copy must
+    /// not keep a group either: `cp -a` keeps any group the caller belongs to.
+    #[test]
+    fn a_copy_that_does_not_keep_owners_keeps_no_group() {
+        let args = cp_args(false);
+        assert!(args.contains(&"--no-preserve=ownership"), "{args:?}");
+        assert!(!cp_args(true).contains(&"--no-preserve=ownership"));
     }
 
     /// Without a resolution the list is the raw specs, in device order.
