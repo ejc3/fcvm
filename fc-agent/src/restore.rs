@@ -706,6 +706,60 @@ mod tests {
         );
     }
 
+    /// A GPU restore's ACK, with every phase and every GPU attach step at a value whose
+    /// shortest round-trip rendering is 17 significant digits (as measured timings
+    /// often are, e.g. `79.74971599999999`), still fits the frame budget beside a UUID
+    /// epoch, so the host keeps the GPU step timings rather than an empty `{}`.
+    #[test]
+    fn a_gpu_restore_ack_keeps_its_step_timings_within_the_frame_budget() {
+        let long = 12_345.678_901_234_567_f64;
+        assert_eq!(format!("{long}").len(), 18, "{long}");
+        let phases = RestorePhases {
+            clock_ms: long,
+            ipv6_ms: long,
+            tcp_cleanup_ms: long,
+            tcp_verified: true,
+            tcp_verify_ms: long,
+            tcp_reassert_ms: long,
+            tcp_destroy_ms: long,
+            tcp_reopen_ms: long,
+            tcp_egress_open_ms: long,
+            tcp_hook_ms: long,
+            tcp_destroyed: 999_999,
+            tcp_already_gone: 999_999,
+            tcp_destroy_datagrams: 999_999,
+            neighbor_ms: long,
+            nfs_ms: long,
+            exec_wait_ms: long,
+            egress_wait_ms: long,
+            total_ms: long,
+            ack_connect_ms: long,
+            gpu_ms: long,
+            gpus: 8,
+            gpu_steps: None,
+        };
+        let mut phases = phases;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            check_ms: long,
+            rescan_ms: long,
+            nvidia_ms: long,
+            uvm_ms: long,
+            nodes_ms: long,
+            persistenced_ms: long,
+            smi_ms: long,
+            cdi_ms: long,
+        });
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"gpu_steps\":{") && frame.contains("\"persistenced_ms\""),
+            "the GPU step timings were dropped from the ACK ({} bytes of telemetry): {frame}",
+            phases.to_frame_json().len()
+        );
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn exec_rebind_timeout_is_a_restore_readiness_error() {
         let done = AtomicBool::new(false);
