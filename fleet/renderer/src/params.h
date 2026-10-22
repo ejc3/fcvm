@@ -47,6 +47,8 @@ struct FrameParams {
   int guard;             // largest reprojection displacement accepted, whole-image pixels
   GCam hist_cam[TEMPORAL_WINDOW];  // cameras of frames k-1, k-2, ... (moving reprojection)
   int spp;             // samples per pixel this frame
+  int half;            // checkerboard stride: 1 every pixel draws, 2 half, 4 a quarter (see draws_here)
+  int parity;          // the frame slot k & 3
   int hold;            // 1: camera held, exact accumulation; 0: moving, reprojection
   int sample_base;     // hold: index of the first sample drawn this frame
   uint32_t seed;       // hold: the hold's seed; moving: the frame's seed

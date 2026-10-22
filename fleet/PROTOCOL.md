@@ -88,15 +88,16 @@ field. A scene replaces the previous one whole.
   noise, on top of the accumulated image (below), and are hidden where terrain
   is in front of them.
 
-## `GET /frames?h=<height>` (WebSocket)
+## `GET /frames?h=<height>&q=<quality>` (WebSocket)
 
-`h` is 16 to 2160. The tile's size follows from `h` and the rect; see
+`h` is 16 to 2160. `q` is optional: `hi`, `std` (the default) or `lo`; see
+"Stream quality". The tile's size follows from `h` and the rect; see
 "Tile geometry". The first message is text:
 
 ```json
 {"codec":"avc1.64001f","width":512,"height":556,
  "full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30,
- "crop":{"left":16,"top":0,"right":16,"bottom":16}}
+ "crop":{"left":16,"top":0,"right":16,"bottom":16},"q":"std","bitrate":6830899}
 ```
 
 `codec`, `width`, `height` are the contract: the size of the delivered
@@ -135,8 +136,8 @@ Then binary messages, each one access unit:
 | 22- | one H.264 Annex-B access unit; SPS and PPS precede every keyframe |
 
 - H.264 High profile, no B-frames, NVENC with ultra-low-latency tuning,
-  BT.709 limited range (signalled in the VUI). CBR at about 0.8 bits per pixel
-  of the delivered picture at 30 fps (`ENC_BPP`), at least 0.6 Mbit/s.
+  BT.709 limited range (signalled in the VUI), CBR at the quality's rate (the
+  header's `bitrate`, bits per second).
 - The first binary message is a keyframe. Keyframes follow at least every 2 s.
 - The client may send text `{"h": <height>}`. The renderer then sends a new
   text header and continues from a keyframe at the new size.
@@ -148,8 +149,19 @@ Then binary messages, each one access unit:
   1/16 x 1/9 rect of a 16:9 image asked at `h=136` has a 146 x 146 inner
   rectangle). The header says the actual sizes; the client scales.
 - The renderer draws once per frame at the largest height any subscriber
-  wants, scales it down (area filter) for the smaller ones, and encodes only
-  heights that have subscribers.
+  wants, scales it down (area filter) for the smaller ones, and encodes each
+  (height, quality) pair that has subscribers, once.
+
+### Stream quality (addition, round 4)
+
+| `q` | bits per pixel of the delivered picture, at 30 fps | floor | cap | preset | for |
+|---|---|---|---|---|---|
+| `hi` | 4 | 2 Mbit/s | 160 Mbit/s | P4 | an aggregator on the same host that decodes and re-encodes once: near-lossless, so its own encode sees no tile edges |
+| `std` | 0.8 (`ENC_BPP`) | 0.6 Mbit/s | 20 Mbit/s | P6 | the default; tile edges decode within the seam ratio of the unencoded image |
+| `lo` | 0.25 | 0.15 Mbit/s | 20 Mbit/s | P6 | direct mode at high tile counts, where a browser receives many small tiles |
+
+All three are CBR with no B-frames and the same keyframe rules. Measured
+seam ratios and rates per quality are in the PR and `fleet/renderer/README.md`.
 
 ### Tile geometry
 
@@ -170,17 +182,18 @@ pixel in both, drawn identically.
 ## `GET /health`
 
 ```json
-{"fps":30.0,"heights":[240],
+{"fps":30.0,"heights":[240],"streams":[{"h":240,"q":"std"}],
  "gpu":{"name":"Tesla T4","temp_c":38,"power_w":64.2,"util_pct":70,"mem_used_mb":648.3},
  "t":1234.5,"frame":5678,
- "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"hold":false,"hold_samples":0,"slots_missed":0,
+ "ready":true,"render_ms":13.0,"encode_ms":0.5,"spp":3,"checkerboard":1,"hold":false,"hold_samples":0,"slots_missed":0,
  "startup_ms":{"gpu_ready":1515,"first_frame_drawn":1845,"first_frame_sent":1899}}
 ```
 
 The first six keys are the contract. GPU numbers come from NVML, sampled once
 a second; a value NVML does not give is `null`. The rest: `ready` (the GPU is
 initialized), `error` (only when the renderer has failed), `render_ms` and
-`encode_ms` of the last frame, `spp` (samples per pixel drawn in it),
+`encode_ms` of the last frame, `streams` (each height and quality being
+encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 `hold`/`hold_samples` (see below), `slots_missed` (frame slots skipped while a
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
@@ -207,6 +220,20 @@ once when any tile reports misses. `ADAPT=1`
 instead adjusts the budget so a frame's GPU time stays near 70% of its slot,
 which keeps the frame rate on a slow view but gives tiles different sample
 counts, so moving frames no longer match across tile edges.
+
+**Checkerboard (round 4).** Where the budget gives under 0.5 samples per
+drawn pixel, a frame draws one sample on half its pixels (stride 2: those
+whose whole-image `X + Y + k` is even, `k` the frame slot), and under 0.3 on
+a quarter (stride 4: one pixel of each 2 x 2 block, top-left, bottom-right,
+top-right, bottom-left over four slots). At the default budget that is a 720p
+or 1080p view; wall tiles keep a sample on every pixel. Every pixel that drew
+nothing is filled from its 8 neighbours that did (those of the first one's hit
+kind, edge neighbours first), at half their weight, and the history below does
+the rest. In a hold, a pixel's next sample index is its own sample count, so a
+hold's sum is still independent of how frames split it. The pattern, the fill
+and the rule for when to use it name only whole-image pixels, slots and the
+budget, so the matching rules below hold unchanged. `/health` reports the
+stride as `checkerboard` (1 when every pixel draws).
 
 **While the camera holds** (see "Camera interpolation and holds"):
 
@@ -272,8 +299,9 @@ per pixel, whole-image pixel).
 draws a 960 x 540 image whole and as a 2 x 2 grid of tiles and compares them
 pixel for pixel, 8-bit and float: with accumulation off on a moving frame; in a
 hold with 16 samples split 4 x 4 for the whole image and 2 x 8 for the tiles;
-and on the 12th of 12 consecutive moving frames with history. Two controls (a
-tile drawn one pixel off, another `t`) must differ.
+on the 12th of 12 consecutive moving frames with history; and the same two with
+checkerboard frames of stride 2 and 4. Two controls (a tile drawn one pixel off, another `t`)
+must differ.
 
 ## `GET /raw?t=<t>` (debug)
 

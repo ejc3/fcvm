@@ -119,7 +119,37 @@ int main(int argc, char** argv) {
     fprintf(stderr, "moving whole: fnv64 %016llx\n", (unsigned long long)fnv(wmv.rgba));
   }
 
-  // 4. Controls: the comparison can fail. A tile drawn one pixel to the right
+  // 4. Checkerboard frames (stride 2: half the pixels draw a sample per frame;
+  // stride 4: a quarter; the rest are filled and come from history): moving
+  // with history, and a hold whose samples per pixel come from 2x the slots at
+  // spp 1 for the whole image and from the slots at spp 2 for the tiles.
+  for (int stride : {2, 4}) {
+    r.set_checkerboard(stride);
+    std::vector<std::pair<double, int>> seq;
+    const long k0 = 37 * 30;
+    for (int k = 0; k < 12; k++) seq.push_back({(k0 + k) / 30.0, 1});
+    Img wc = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    CHECK(r.stats().half == stride && !r.stats().hold, "stride %d: a moving checkerboard", stride);
+    Img qc[4];
+    quads(r, s, h, seq, true, qc);
+    d = compare(wc, qc, &hd);
+    CHECK(d == 0 && hd == 0, "stride %d, moving with history: %ld pixels differ (8-bit), %ld (float)", stride, d, hd);
+    const long kh = 55 * 30;  // inside the hold 50..60
+    std::vector<std::pair<double, int>> hw, ht;
+    for (int k = 2 * stride - 1; k >= 0; k--) hw.push_back({(kh - k) / 30.0, 1});
+    for (int k = stride - 1; k >= 0; k--) ht.push_back({(kh - k) / 30.0, 2});
+    Img wh2 = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, hw, true);
+    CHECK(r.stats().hold && r.stats().hold_samples == 2, "stride %d hold, 2 samples (hold=%d samples=%d)", stride,
+          (int)r.stats().hold, r.stats().hold_samples);
+    Img qh[4];
+    quads(r, s, h, ht, true, qh);
+    d = compare(wh2, qh, &hd);
+    CHECK(d == 0 && hd == 0, "stride %d hold, 2 samples in different batches: %ld pixels differ (8-bit), %ld (float)",
+          stride, d, hd);
+  }
+  r.set_checkerboard(-1);
+
+  // 5. Controls: the comparison can fail. A tile drawn one pixel to the right
   // but placed where the true tile goes, and another t.
   Img off = draw(r, s, Rect{0.5 + 1.0 / whole.tile.full_w, 0.5, 0.5, 0.5}, h, {{tm, 2}}, false);
   off.tile.x0 -= 1;

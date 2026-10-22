@@ -15,7 +15,9 @@ class H264Encoder {
 
   // Encodes w x h NV12 frames read from `nv12` (device memory, `pitch` bytes per
   // row, luma rows then interleaved chroma rows) in the CUDA context `cu_ctx`.
-  bool open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int fps, std::string* err);
+  // q: 0 lo, 1 std, 2 hi (see PROTOCOL.md, "Stream quality").
+  bool open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int fps, int q, std::string* err);
+  uint32_t bitrate() const { return rate_; }
   // Smallest frame NVENC accepts for H.264 on this GPU (queried once).
   static bool min_size(void* cu_ctx, int* w, int* h, std::string* err);
   // Encode the frame currently in the input buffer: one Annex-B access unit.
@@ -33,7 +35,12 @@ class H264Encoder {
   size_t pitch_ = 0;
   uint64_t n_ = 0;
   std::string codec_;
+  uint32_t rate_ = 0;
 };
+
+// Quality names for the q parameter; -1 for an unknown name.
+int quality_from_name(const std::string& n);
+const char* quality_name(int q);
 
 // The codec string for an SPS NAL unit (first byte is the NAL header).
 std::string avc_codec_string(const uint8_t* sps, size_t n);

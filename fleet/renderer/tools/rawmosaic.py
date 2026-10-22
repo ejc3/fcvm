@@ -8,6 +8,7 @@ the stitched image can be compared pixel for pixel with a whole image drawn in
 one piece (fleet-renderer still --seq). Streams at TILE_H stay subscribed the
 whole time so every renderer draws at that height. Writes OUT_PREFIX.ppm and
 OUT_PREFIX.json (scene with its epoch, t, per-tile geometry and spp).
+Q=hi|std|lo in the environment selects the stream quality (default std).
 """
 import json
 import sys

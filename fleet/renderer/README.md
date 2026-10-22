@@ -49,7 +49,9 @@ Convergence: exact accumulation while the camera holds; while it moves, each
 frame averages itself with its last 7 frames reprojected through a guard band
 the renderer draws around its rect, and pixels with few samples get an
 edge-aware 5 x 5 filter over pixels drawn under the same rules, so moving
-frames also match across tile edges. Each stream encodes its tile plus 16
+frames also match across tile edges. Views that would get under half a sample
+per pixel (720p and 1080p at the default budget) draw a checkerboard, half or
+a quarter of the pixels per frame, and fill the rest. Each stream encodes its tile plus 16
 pixels of overlap and the client crops them, so a tile edge is never the edge
 of an encoded picture. The rules are in PROTOCOL.md, "Sampling, accumulation
 and determinism", and "crop".
@@ -97,6 +99,7 @@ decoding):
 
 ```bash
 python3 tools/smoke.py HOST 8080                     # health, 60 frames, decode
+Q=lo python3 tools/mosaic.py ...                     # any tool: Q=hi|std|lo picks the stream quality
 python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving camera
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame
 python3 tools/mosaic.py out 4 2 540 25 tools/scene-hold.json HOST1:8080 ... HOST8:8080
@@ -107,19 +110,36 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 ## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
 
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
-budget (250,000 pixel-samples per frame over the drawn region); wall tiles are
-a 1/16 x 1/9 rect of a 16:9 image, the detail view is one such tile at 1080.
-Each moving pixel also averages up to 7 earlier frames.
+budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
+tiles are a 1/16 x 1/9 rect of a 16:9 image, the detail view is one such tile
+at 1080. Each moving pixel also averages up to 7 earlier frames; "checker" is
+the checkerboard stride (1: every pixel draws).
 
-| inner size | stream (with overlap) | fps | samples/pixel/frame | render ms | encode ms |
-|---|---|---|---|---|---|
-| 146 x 146 (asked 136) | 178 x 178 | 30.0 | 5 | 14.9 | 0.57 |
-| 180 x 180 | 212 x 212 | 30.0 | 3 | 10.9 | 0.77 |
-| 240 x 240 | 272 x 272 | 30.0 | 2 | 10.5 | 0.78 |
-| 360 x 360 | 392 x 392 | 30.0 | 1 | 8.7 | 1.22 |
-| 1080 x 1080 detail view | 1112 x 1112 | 15.0 | 1 | 35.2 | 5.00 |
-| 1280 x 720 whole image | 1280 x 720 | 15.0 | 1 | 42.2 | 2.99 |
-| 1920 x 1080 whole image | 1920 x 1080 | 10.0 | 1 | 91.3 | 5.04 |
+| inner size | stream (with overlap) | fps | samples/pixel/frame | checker | render ms | encode ms |
+|---|---|---|---|---|---|---|
+| 146 x 146 (asked 136) | 178 x 178 | 30.0 | 5 | 1 | 14.8 | 0.51 |
+| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 10.9 | 0.68 |
+| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.5 | 0.75 |
+| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 8.7 | 1.16 |
+| 1080 x 1080 detail view | 1112 x 1112 | 30.0 | 1 | 4 | 24.5 | 3.93 |
+| 1280 x 720 whole image | 1280 x 720 | 30.0 | 1 | 4 | 27.9 | 2.52 |
+| 1920 x 1080 whole image | 1920 x 1080 | 14.9 | 1 | 4 | 58.8 | 4.02 |
+
+Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
+delivered; one moving frame unencoded and as the eight streams decode it,
+cropped; `tools/seam_metric.py`):
+
+| q | Mbit/s per tile (mean of 8) | seam ratio, decoded | largest increase over unencoded at one boundary |
+|---|---|---|---|
+| unencoded | | 0.51 to 1.57 | |
+| `hi` | 3.99 | 0.58 to 1.61 | 0.13 |
+| `std` | 0.86 | 0.64 to 1.60 | 0.43 |
+| `lo` | 0.27 | 0.57 to 2.00 | 0.59 |
+
+Eight `hi` subscribers at 540 px, one per VM on one host: 15 to 30 Mbit/s per
+stream, every renderer at 29.9 fps with no slot missed after the first second,
+render 10.2 to 13.0 ms, encode 1.4 to 2.0 ms per frame (std: 6.6 to 7.0 Mbit/s,
+encode 1.1 to 1.9 ms).
 
 Startup, process start to first encoded frame (`fleet-renderer startup`, three
 runs each, in one VM, round 2): 1441 to 1663 ms as fcvm's main branch leaves
@@ -129,7 +149,8 @@ command to the first frame at the client.
 
 Seams: the seam test passes in VMs on three different T4s with the same
 hashes. A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
-equals the same frame drawn whole in another VM in all 2,073,600 pixels. The
-seam ratio (`tools/seam_metric.py`) of that frame is 0.63 to 1.22 unencoded and
-0.77 to 1.35 as the eight streams decode it, cropped as a page crops it. Shots
-stitched from eight VMs on eight GPUs are in `shots/`.
+equals the same frame drawn whole in another VM in all 2,073,600 pixels, with
+every pixel drawing and with stride-4 checkerboard frames. At 540 px tiles its
+seam ratio is 0.63 to 1.22 unencoded and 0.76 to 1.34 as the eight `std`
+streams decode it, cropped. Shots stitched from eight VMs on eight GPUs are in
+`shots/`.

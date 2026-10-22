@@ -16,6 +16,7 @@
 #include <thread>
 
 #include "json.h"
+#include "nvenc.h"
 #include "proto.h"
 
 namespace {
@@ -61,6 +62,18 @@ std::string lower(std::string s) {
 std::string trim(const std::string& s) {
   size_t a = s.find_first_not_of(" \t"), b = s.find_last_not_of(" \t\r");
   return a == std::string::npos ? "" : s.substr(a, b - a + 1);
+}
+std::string query_str(const std::string& q, const std::string& k, const std::string& def) {
+  size_t p = 0;
+  while (p < q.size()) {
+    size_t amp = q.find('&', p);
+    std::string kv = q.substr(p, amp == std::string::npos ? std::string::npos : amp - p);
+    size_t eq = kv.find('=');
+    if (eq != std::string::npos && kv.substr(0, eq) == k) return kv.substr(eq + 1);
+    if (amp == std::string::npos) break;
+    p = amp + 1;
+  }
+  return def;
 }
 int query_int(const std::string& q, const std::string& k, int def) {
   size_t p = 0;
@@ -193,12 +206,15 @@ void Server::handle(int fd) {
       return respond(fd, 426, "Upgrade Required", "{\"error\":\"WebSocket upgrade required\"}");
     int h = query_int(query, "h", 0);
     if (h < 16 || h > 2160) return respond(fd, 400, "Bad Request", "{\"error\":\"h must be 16..2160\"}");
-    return websocket(fd, h, hdr["sec-websocket-key"]);
+    std::string qs = query_str(query, "q", "std");
+    int q = quality_from_name(qs);
+    if (q < 0) return respond(fd, 400, "Bad Request", "{\"error\":\"q must be hi, std or lo\"}");
+    return websocket(fd, h, q, hdr["sec-websocket-key"]);
   }
   respond(fd, 404, "Not Found", "{\"error\":\"not found\"}");
 }
 
-void Server::websocket(int fd, int h, const std::string& key) {
+void Server::websocket(int fd, int h, int q, const std::string& key) {
   std::string resp = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " +
                      ws_accept(key) + "\r\n\r\n";
   if (!write_all(fd, resp.data(), resp.size())) return;
@@ -206,7 +222,7 @@ void Server::websocket(int fd, int h, const std::string& key) {
   setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
   int sndbuf = 1 << 20;
   setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof sndbuf);
-  auto sub = p_.subscribe(h);
+  auto sub = p_.subscribe(h, q);
   // writer: drains the subscriber's queue
   std::thread writer([fd, sub] {
     while (true) {
@@ -257,11 +273,15 @@ void Server::websocket(int fd, int h, const std::string& key) {
     } else if (op == 1) {
       try {
         Json j = Json::parse(pl);
-        int nh = (int)j.at("h").number("h");
-        if (nh >= 16 && nh <= 2160) {
-          sub->want_h = nh;
-          p_.wake();
+        if (j.has("h")) {
+          int nh = (int)j.at("h").number("h");
+          if (nh >= 16 && nh <= 2160) sub->want_h = nh;
         }
+        if (j.has("q")) {
+          int nq = quality_from_name(j.at("q").string("q"));
+          if (nq >= 0) sub->want_q = nq;
+        }
+        p_.wake();
       } catch (const std::exception&) {
         // ignore malformed control messages
       }

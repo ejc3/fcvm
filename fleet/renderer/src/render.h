@@ -13,6 +13,7 @@ struct RenderStats {
   int spp = 0;          // samples drawn per pixel in the last frame
   int hold_samples = 0; // samples accumulated in the current hold (0 while moving)
   bool hold = false;
+  int half = 1;          // checkerboard stride: 1 every pixel drew, 2 half, 4 a quarter
 };
 
 class Renderer {
@@ -31,6 +32,9 @@ class Renderer {
   // Pixels finished past each side of the tile (inside the image), for streams
   // that encode an overlap the client crops. Same value on every renderer.
   void set_margin(int m);
+  // Checkerboard frames: -1 by the budget (the default: stride 2 under 0.5
+  // samples per drawn pixel, 4 under 0.3), 0 never, 2 or 4 always.
+  void set_checkerboard(int mode) { checker_ = mode; }
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -87,6 +91,10 @@ class Renderer {
   GCam ring_cam_[TEMPORAL_WINDOW];
   uint64_t hold_key_ = 0;
   int hold_n_ = 0;
+  long long hold_frames_ = 0;
+  int checker_ = -1;  // -1 by budget, 0 never, 2 or 4 always
+  void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
+  void* fill_a_ = nullptr;
   void* stream_ = nullptr;
   void* ev0_ = nullptr;
   void* ev1_ = nullptr;

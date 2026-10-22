@@ -69,9 +69,10 @@ void Pipeline::stop() {
 
 std::string Pipeline::fatal() const { return fatal_; }
 
-std::shared_ptr<Subscriber> Pipeline::subscribe(int h) {
+std::shared_ptr<Subscriber> Pipeline::subscribe(int h, int q) {
   auto s = std::make_shared<Subscriber>();
   s->want_h = h;
+  s->want_q = q;
   {
     std::lock_guard<std::mutex> l(mu_);
     s->id = next_id_++;
@@ -103,14 +104,16 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
 }
 
 static int even_h(int h) { return std::clamp(h, 16, 2160) & ~1; }
+// encoders are keyed by height and quality; ordered by height first
+static int enc_key(const Subscriber& s) { return even_h(s.want_h) * 4 + std::clamp(s.want_q.load(), 0, 2); }
 
-std::string Pipeline::header_json(const Enc& e) {
+std::string Pipeline::header_json(const Enc& e, int q) {
   char b[384];
   snprintf(b, sizeof b,
            "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"x0\":%d,\"y0\":%d,\"fps\":%d,"
-           "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d}}",
+           "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},\"q\":\"%s\",\"bitrate\":%u}",
            e.enc->codec().c_str(), e.ew, e.eh, e.geo.full_w, e.geo.full_h, e.geo.x0, e.geo.y0, opt_.fps, e.left, e.top,
-           e.right, e.bottom);
+           e.right, e.bottom, quality_name(q), e.enc->bitrate());
   return b;
 }
 
@@ -214,13 +217,12 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   for (auto& [h, e] : encs_) {
     e.subs.erase(std::remove_if(e.subs.begin(), e.subs.end(),
                                 [&](const std::shared_ptr<Subscriber>& s) {
-                                  return std::find(subs.begin(), subs.end(), s) == subs.end() || even_h(s->want_h) != h;
+                                  return std::find(subs.begin(), subs.end(), s) == subs.end() || enc_key(*s) != h;
                                 }),
                  e.subs.end());
   }
   for (auto& s : subs) {
-    int h = even_h(s->want_h);
-    Enc& e = encs_[h];
+    Enc& e = encs_[enc_key(*s)];
     if (std::find(e.subs.begin(), e.subs.end(), s) == e.subs.end()) {
       e.subs.push_back(s);
       s->cur_h = 0;  // header pending
@@ -238,12 +240,13 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     }
   }
   int render_h = opt_.idle_h;
-  if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first).h;
+  if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
   double px = r_.drawn_pixels(rt);
   double budget = (sc->budget > 0 && !opt_.adapt) ? sc->budget : budget_;
-  int spp = (int)std::lround(budget / px);
-  spp = std::clamp(spp, 1, 64);
+  int spp = 0;  // the renderer derives it (or a checkerboard) from the budget
+  r_.set_budget(budget);
+  if (opt_.adapt) spp = std::clamp((int)std::lround(budget / px), 1, 64);
   r_.render(*sc, rt, t, opt_.accumulate, spp);
   if (opt_.adapt && r_.stats().spp > 0 && r_.stats().render_ms > 0) {
     // Keep the GPU time of a frame near 70% of its slot (encoding and the
@@ -270,8 +273,8 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       rq->ppm.reserve(rq->ppm.size() + px.size() / 4 * 3);
       for (size_t i = 0; i < px.size(); i += 4) rq->ppm.append((const char*)&px[i], 3);
       char tj[192];
-      snprintf(tj, sizeof tj, "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"spp\":%d}",
-               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp);
+      snprintf(tj, sizeof tj, "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"spp\":%d,\"checkerboard\":%d}",
+               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half);
       rq->tile = tj;
       rq->ok = true;
     }
@@ -285,8 +288,11 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   }
   double enc_ms = 0;
   std::vector<int> heights;
-  for (auto& [h, e] : encs_) {
-    heights.push_back(h);
+  std::vector<std::pair<int, int>> streams;
+  for (auto& [ekey, e] : encs_) {
+    int h = ekey / 4, q = ekey % 4;
+    if (heights.empty() || heights.back() != h) heights.push_back(h);
+    streams.push_back({h, q});
     Tile g = encode_geometry(*sc, h);
     bool same = e.enc && g.w == e.geo.w && g.h == e.geo.h && g.full_w == e.geo.full_w && g.full_h == e.geo.full_h &&
                 g.x0 == e.geo.x0 && g.y0 == e.geo.y0;
@@ -313,7 +319,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       e.nv12 = r_.alloc_nv12(e.ew, e.eh, &e.pitch);
       e.enc = std::make_unique<H264Encoder>();
       std::string err;
-      if (!e.enc->open(r_.cu_context(), e.nv12, e.pitch, e.ew, e.eh, opt_.fps, &err)) {
+      if (!e.enc->open(r_.cu_context(), e.nv12, e.pitch, e.ew, e.eh, opt_.fps, q, &err)) {
         fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", e.ew, e.eh, err.c_str());
         for (auto& s : e.subs) s->close();
         e.enc.reset();
@@ -322,12 +328,12 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       for (auto& s : e.subs) s->cur_h = 0;
       e.want_idr = true;
     }
-    std::string hdr = header_json(e);
+    std::string hdr = header_json(e, q);
     auto hmsg = std::make_shared<const std::string>(ws_frame(1, hdr.data(), hdr.size()));
     for (auto& s : e.subs) {
-      if (s->cur_h != h) {
+      if (s->cur_h != ekey) {
         s->push(hmsg);
-        s->cur_h = h;
+        s->cur_h = ekey;
         s->need_key = true;
       }
     }
@@ -373,6 +379,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   last_t_ = t;
   frame_ = frame_no;
   heights_ = heights;
+  streams_ = streams;
   rstats_ = r_.stats();
   encode_ms_ = enc_ms;
 }
@@ -397,6 +404,9 @@ std::string Pipeline::health_json() {
   o.precision(6);
   o << "{\"fps\":" << std::round(fps_ * 10) / 10 << ",\"heights\":[";
   for (size_t i = 0; i < heights_.size(); i++) o << (i ? "," : "") << heights_[i];
+  o << "],\"streams\":[";
+  for (size_t i = 0; i < streams_.size(); i++)
+    o << (i ? "," : "") << "{\"h\":" << streams_[i].first << ",\"q\":\"" << quality_name(streams_[i].second) << "\"}";
   o << "],\"gpu\":{\"name\":\"" << json_escape(g.ok ? g.name : gpu_name_) << "\"";
   auto num = [&](const char* k, double v) {
     o << ",\"" << k << "\":";
@@ -414,7 +424,7 @@ std::string Pipeline::health_json() {
   o << ",\"ready\":" << (ready_ ? "true" : "false");
   if (!fatal_.empty()) o << ",\"error\":\"" << json_escape(fatal_) << "\"";
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
-    << ",\"spp\":" << rstats_.spp << ",\"hold\":" << (rstats_.hold ? "true" : "false")
+    << ",\"spp\":" << rstats_.spp << ",\"checkerboard\":" << rstats_.half << ",\"hold\":" << (rstats_.hold ? "true" : "false")
     << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
   o << ",\"startup_ms\":{\"gpu_ready\":" << std::round(startup_ready_ms_) << ",\"first_frame_drawn\":"
     << std::round(first_frame_ms_) << ",\"first_frame_sent\":" << std::round(first_sent_ms_) << "}}";

@@ -22,10 +22,11 @@ def _recv_exact(s, n):
 
 
 class Stream:
-    def __init__(self, host, port, h, timeout=30.0):
+    def __init__(self, host, port, h, timeout=30.0, q=None):
         self.s = socket.create_connection((host, port), timeout=timeout)
         key = base64.b64encode(os.urandom(16)).decode()
-        req = (f"GET /frames?h={h} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
+        q = q or os.environ.get("Q")  # stream quality: hi, std or lo
+        req = (f"GET /frames?h={h}{'&q=' + q if q else ''} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n")
         self.s.sendall(req.encode())
         head = b""
@@ -73,8 +74,8 @@ def parse_fcvf(p):
     return {"key": bool(p[5] & 1), "w": w, "h": h, "t": t, "frame": n}, p[22:]
 
 
-def frames(host, port, h, count=None, until_t=None, timeout=30.0):
-    st = Stream(host, port, h, timeout)
+def frames(host, port, h, count=None, until_t=None, timeout=30.0, q=None):
+    st = Stream(host, port, h, timeout, q)
     header, out = None, []
     try:
         while True:
