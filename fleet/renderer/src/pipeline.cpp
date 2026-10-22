@@ -58,6 +58,7 @@ void Subscriber::close() {
 Pipeline::Pipeline(const Options& o) : opt_(o) {
   scene_ = std::make_shared<const Scene>(default_scene());
   budget_ = o.budget;
+  r_.set_fps(o.fps);
 }
 
 void Pipeline::stop() {
@@ -157,6 +158,10 @@ void Pipeline::run() {
       k = std::max(k, last_k + 1);
     }
     double t = (double)k / opt_.fps;
+    if (any && last_k != LLONG_MIN && k > last_k + 1) {
+      std::lock_guard<std::mutex> l(hmu_);
+      slots_missed_ += (uint64_t)(k - last_k - 1);
+    }
     try {
       frame_once(t, frame_no);
     } catch (const std::exception& e) {
@@ -232,8 +237,9 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   int render_h = opt_.idle_h;
   if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first).h;
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
-  double px = (double)rt.w * rt.h;
-  int spp = (int)std::lround(budget_ / px);
+  double px = Renderer::drawn_pixels(rt);
+  double budget = (sc->budget > 0 && !opt_.adapt) ? sc->budget : budget_;
+  int spp = (int)std::lround(budget / px);
   spp = std::clamp(spp, 1, 64);
   r_.render(*sc, rt, t, opt_.accumulate, spp);
   if (opt_.adapt && r_.stats().spp > 0 && r_.stats().render_ms > 0) {
@@ -242,6 +248,31 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     double per_sample = r_.stats().render_ms / (px * r_.stats().spp);
     double target = 0.70 * 1000.0 / opt_.fps / per_sample;
     budget_ = std::clamp(budget_ + (target - budget_) / 3.0, 1.0e5, 3.2e7);
+  }
+  {
+    // debug captures of this frame
+    long long k = std::llround(t * opt_.fps);
+    std::lock_guard<std::mutex> l(mu_);
+    bool any = false;
+    for (auto& rq : raw_reqs_) {
+      if (rq->done || rq->k > k) continue;
+      rq->done = true;
+      any = true;
+      if (rq->k < k) continue;  // that slot was skipped
+      std::vector<uint8_t> px;
+      r_.download_rgba(&px);
+      char h[64];
+      snprintf(h, sizeof h, "P6\n%d %d\n255\n", rt.w, rt.h);
+      rq->ppm = h;
+      rq->ppm.reserve(rq->ppm.size() + px.size() / 4 * 3);
+      for (size_t i = 0; i < px.size(); i += 4) rq->ppm.append((const char*)&px[i], 3);
+      char tj[192];
+      snprintf(tj, sizeof tj, "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"spp\":%d}",
+               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp);
+      rq->tile = tj;
+      rq->ok = true;
+    }
+    if (any) raw_cv_.notify_all();
   }
   double since_start = (boottime_s() - proc_start_) * 1000.0;
   if (first_frame_ms_ < 0) {
@@ -327,6 +358,19 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   encode_ms_ = enc_ms;
 }
 
+bool Pipeline::raw_frame(double t, std::string* ppm, std::string* tile_json) {
+  auto r = std::make_shared<RawReq>();
+  r->k = std::llround(t * opt_.fps);
+  std::unique_lock<std::mutex> l(mu_);
+  raw_reqs_.push_back(r);
+  raw_cv_.wait_for(l, std::chrono::seconds(15), [&] { return r->done; });
+  raw_reqs_.erase(std::remove(raw_reqs_.begin(), raw_reqs_.end(), r), raw_reqs_.end());
+  if (!r->ok) return false;
+  *ppm = std::move(r->ppm);
+  *tile_json = r->tile;
+  return true;
+}
+
 std::string Pipeline::health_json() {
   GpuSample g = gpu_.latest();
   std::lock_guard<std::mutex> l(hmu_);
@@ -352,7 +396,7 @@ std::string Pipeline::health_json() {
   if (!fatal_.empty()) o << ",\"error\":\"" << json_escape(fatal_) << "\"";
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
     << ",\"spp\":" << rstats_.spp << ",\"hold\":" << (rstats_.hold ? "true" : "false")
-    << ",\"hold_samples\":" << rstats_.hold_samples;
+    << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
   o << ",\"startup_ms\":{\"gpu_ready\":" << std::round(startup_ready_ms_) << ",\"first_frame_drawn\":"
     << std::round(first_frame_ms_) << ",\"first_frame_sent\":" << std::round(first_sent_ms_) << "}}";
   return o.str();

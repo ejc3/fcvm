@@ -37,6 +37,7 @@ struct Scene {
   std::vector<SceneWord> words;    // sorted by t
   std::vector<SceneLight> lights;  // sorted by t
   double loop_s = 0;  // > 0 only for the built-in demo scene: t wraps
+  double budget = 0;  // pixel-samples per frame for every tile; 0: the renderer's BUDGET
 };
 
 // Throws std::runtime_error with a message naming the bad field.

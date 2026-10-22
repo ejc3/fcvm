@@ -128,7 +128,7 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   memset(&pc, 0, sizeof pc);
   pc.version = NV_ENC_PRESET_CONFIG_VER;
   pc.presetCfg.version = NV_ENC_CONFIG_VER;
-  s = g_fl.nvEncGetEncodePresetConfigEx(enc_, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P4_GUID,
+  s = g_fl.nvEncGetEncodePresetConfigEx(enc_, NV_ENC_CODEC_H264_GUID, NV_ENC_PRESET_P6_GUID,
                                         NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY, &pc);
   if (s != NV_ENC_SUCCESS) { *err = st("nvEncGetEncodePresetConfigEx", s); return false; }
   NV_ENC_CONFIG cfg = pc.presetCfg;
@@ -136,10 +136,12 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   cfg.profileGUID = NV_ENC_H264_PROFILE_HIGH_GUID;
   cfg.gopLength = NVENC_INFINITE_GOPLENGTH;
   cfg.frameIntervalP = 1;  // no B-frames
-  // About 0.2 bits per pixel at 30 fps. The VBV holds half a second, so the
-  // keyframe every 2 s can be several times a P-frame's size instead of being
-  // squeezed into one frame's share (which smeared every keyframe).
-  double bpp = 0.2;
+  // About 0.3 bits per pixel at 30 fps: each tile is encoded on its own, and
+  // coding error at a tile's border shows as a seam against its neighbour, so
+  // tiles get more bits than one image of their size would. The VBV holds half
+  // a second, so the keyframe every 2 s can be several times a P-frame's size
+  // instead of being squeezed into one frame's share (which smeared every keyframe).
+  double bpp = 0.3;
   uint32_t rate = (uint32_t)std::max(600000.0, std::min(20000000.0, (double)w * h * fps * bpp));
   cfg.rcParams.rateControlMode = NV_ENC_PARAMS_RC_CBR;
   cfg.rcParams.averageBitRate = rate;
@@ -167,7 +169,7 @@ bool H264Encoder::open(void* cu_ctx, void* nv12, size_t pitch, int w, int h, int
   memset(&ip, 0, sizeof ip);
   ip.version = NV_ENC_INITIALIZE_PARAMS_VER;
   ip.encodeGUID = NV_ENC_CODEC_H264_GUID;
-  ip.presetGUID = NV_ENC_PRESET_P4_GUID;
+  ip.presetGUID = NV_ENC_PRESET_P6_GUID;
   ip.tuningInfo = NV_ENC_TUNING_INFO_ULTRA_LOW_LATENCY;
   ip.encodeWidth = w; ip.encodeHeight = h;
   ip.darWidth = w; ip.darHeight = h;

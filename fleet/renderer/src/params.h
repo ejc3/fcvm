@@ -8,8 +8,12 @@
 #define MAX_LIGHTS 32
 #define HOLD_MAX_SAMPLES 1024  // a hold stops adding samples here
 #define HOLD_BLEND_OUT 256     // motion history fades out of a hold by this sample count
-#define TAA_MAX_HISTORY 16
-#define CLOUD_TILE_KM 14.0f      // the cloud volume repeats every this many km     // motion history is an average of at most this many samples
+#define TAA_MAX_HISTORY 16     // the last moving output weighs at most this many samples in a hold's blend-in
+#define TEMPORAL_WINDOW 8      // a moving frame averages itself and its 7 predecessors
+#define TEMPORAL_FRAME_CAP 64  // a previous frame weighs at most this many samples
+#define GUARD_FRAC 0.015f      // reprojection reach: 1.5% of the whole image's height
+#define DENOISE_R 2            // the finishing filter's radius, pixels
+#define CLOUD_TILE_KM 14.0f    // the cloud volume repeats every this many km
 
 struct GCam {
   V3 pos, fwd, right, up;
@@ -35,13 +39,15 @@ struct GLight {
 
 struct FrameParams {
   GCam cam;
-  GCam prev;  // camera of the previous frame this renderer drew (motion reprojection)
   int full_w, full_h;  // whole image in pixels
   int x0, y0, w, h;    // this tile in whole-image pixels
+  int ex0, ey0, ew, eh;  // the drawn region: the tile plus a guard band, clipped to the image
+  int rx0, ry0, rw, rh;  // the resolved region: the tile plus DENOISE_R, clipped to the image
+  int guard;             // largest reprojection displacement accepted, whole-image pixels
+  GCam hist_cam[TEMPORAL_WINDOW];  // cameras of frames k-1, k-2, ... (moving reprojection)
   int spp;             // samples per pixel this frame
   int hold;            // 1: camera held, exact accumulation; 0: moving, reprojection
   int sample_base;     // hold: index of the first sample drawn this frame
-  int have_prev;       // moving: the previous frame's history is usable
   uint32_t seed;       // hold: the hold's seed; moving: the frame's seed
   float layer_t;       // scene time of the accumulated layer (clouds, water)
   V3 sun_dir;          // unit vector toward the sun
