@@ -330,11 +330,27 @@ largest is attacked first. A GPU VM cannot be snapshotted after it warms up (the
 state is not saved), so the driver and first-frame work happen on every relaunch and are
 where the work is.
 
-## The launch event
+## The launch event: 1,000 GPUs
 
-Day to day the fleet runs on whatever spot capacity gives it. For the announcement, a
-one-hour run on ten g4dn.metal for the fcvm half (80 GPUs) against 80 g4dn.xlarge for the
-EC2 half, recorded in one take: a 160-tile image going dark and healing on one side.
+Day to day the fleet runs on whatever spot capacity gives it. For the announcement, 1,000
+GPU VMs in one image: 500 fcvm GPUs (63 g4dn.metal) against 500 EC2 GPUs (500 g4dn.xlarge),
+relaunched all at once and recorded in one take. At current spot prices an hour costs
+about $250 for the fcvm half and $125 for the EC2 half. It needs a G spot quota of about
+6,000 vCPUs for the fcvm half plus 2,000 for EC2, spread over the regions.
+
+What changes at that scale:
+
+- **Transport.** A browser cannot hold 1,000 video streams. Each host runs a compositor
+  that receives its VMs' rectangles and sends one stream for the host, so the wall view
+  opens one stream per host (about 125); each rectangle is still rendered by its own GPU.
+  Opening a tile connects straight to that VM, as at any scale.
+- **Relaunch all.** Hosts relaunch their slots independently and in parallel, each serving
+  all its restores from one snapshot memory server, so the total is the slowest host. The
+  page shows the slowest host's phase breakdown after every relaunch all.
+- **EC2.** The coordinator launches the EC2 half with `CreateFleet` across every AZ and
+  both instance types; what spot cannot place shows dark.
+- **Coordinator.** 1,000 agents and tiles are a few hundred kilobytes of state; the camera
+  and clock are one broadcast per change, not per frame.
 
 ## Measurements to take
 
