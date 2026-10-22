@@ -114,13 +114,19 @@ we build (Ubuntu, the NVIDIA driver, the container toolkit, the renderer image a
 pulled, a systemd unit that starts it), with nothing done at boot that the AMI could have
 done, so the comparison is against EC2 at its best rather than a cold install.
 
-The coordinator drives these tiles itself, through the EC2 API with its task role: a
-relaunch terminates the instance and launches a new one from the same launch template, and
-the tile is running when the renderer's health check answers. The tile keeps its name; its
+The coordinator drives these tiles itself, through the EC2 API with its task role. A
+relaunch launches the replacement from the same launch template first and terminates the
+old instance at the same time, since nothing but the DNS name ties a tile to an instance;
+the tile is running when the new renderer's health check answers. That keeps termination
+out of the clock, which is EC2's best case. It needs quota for both instances at once: a
+terminating instance counts against the spot vCPU quota until it is gone. Pending,
+terminating and refused instances are not billed, so this churn costs only running time. The tile keeps its name; its
 address is the new instance's IPv6, which the coordinator writes to the tile's AAAA record
 (TTL 60 s). The renderer gets the same certificate from Secrets Manager at boot. The
-timings it reports are the same parts where they apply: terminate, launch accepted,
-instance running, renderer first frame.
+timings it reports are the parts that apply: launch requested, launch accepted, instance
+running, renderer first frame. When EC2 refuses a launch for lack of spot capacity, the
+coordinator retries the next AZ or instance type, and that relaunch's time includes the
+wait, marked on that relaunch only; with enough quota and capacity the wait is zero.
 
 The EC2 tiles share the fleet's regions where quota allows. The G spot quota counts their
 vCPUs (4 each) against the same 96 per region that one g4dn.metal fills, so they need
