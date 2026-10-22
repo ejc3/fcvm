@@ -262,6 +262,13 @@ first frame needs no compile), encodes H.264 with NVENC, and serves:
 Scene inputs also include the viewers' words (placed in the world by the coordinator) and
 the dropped lights; both are part of the camera-and-scene state every renderer follows.
 
+**Convergence. DECIDED (2026-10-22).** A path-traced frame averages a few random light
+paths per pixel and is grainy; averaging the same pixel over many frames removes the grain,
+but only while nothing in the view changes. So the camera path holds at viewpoints for a
+few seconds, where each tile converges toward noise-free and a relaunched tile shows as a
+grainy patch healing in; and while the camera moves, each renderer reuses its previous
+frames' samples by reprojection (temporal accumulation), so motion is clean too.
+
 **No seams.** The browser shows every tile at one common `t`, holding each stream in a
 short buffer (a few frames) until all visible tiles have that frame; a tile that falls
 behind shows its last frame dimmed rather than tearing the image. A relaunched tile is
