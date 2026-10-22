@@ -782,6 +782,8 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
 
+    ensure_no_passthrough_in_memory_snapshot(&vm_state.config.gpus, args.disk_only)?;
+
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
         .config
@@ -1224,6 +1226,20 @@ fn clone_port_mappings(
     Ok(mappings)
 }
 
+/// A passthrough device's state lives on the device, outside the memory image, so a
+/// VM with one cannot be memory-snapshotted. A disk-only capture takes no memory image.
+fn ensure_no_passthrough_in_memory_snapshot(gpus: &[String], disk_only: bool) -> Result<()> {
+    if !disk_only && !gpus.is_empty() {
+        bail!(
+            "Cannot create snapshot: VM has passthrough GPU(s) {} attached. Snapshot the VM \
+             it was restored from instead (fcvm attaches GPUs to a restore of a snapshot \
+             taken without them), or use --disk-only",
+            gpus.join(", ")
+        );
+    }
+    Ok(())
+}
+
 /// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
 /// path fails loud instead of silently dropping them.
 fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
@@ -1237,6 +1253,12 @@ fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
         bail!(
             "--firecracker-bin does not apply to disk-only snapshots: they cold-boot on the \
              kernel profile's Firecracker"
+        );
+    }
+    if !args.gpu.is_empty() {
+        bail!(
+            "--gpu is not supported for disk-only clones: fcvm attaches GPUs only while it \
+             restores a memory snapshot"
         );
     }
     Ok(())
@@ -1950,6 +1972,21 @@ async fn cmd_snapshot_run_inner(
     // The clone runs the same VMM that created the snapshot (the memory image format is
     // VMM-specific). Recorded so `fcvm ls` and any later snapshot of the clone are correct.
     vm_state.config.hypervisor = snapshot_config.metadata.hypervisor;
+    // --gpu devices are attached by the snapshot load. The host side is checked before
+    // any side effects, so a host that is not ready fails with what to fix.
+    let gpus = crate::gpu::canonical_sbdfs(&args.gpu)?;
+    if !gpus.is_empty() {
+        anyhow::ensure!(
+            snapshot_config.metadata.hypervisor == crate::hypervisor::Backend::Firecracker,
+            "--gpu is not supported for a Cloud Hypervisor snapshot: fcvm attaches GPUs only \
+             on a Firecracker restore"
+        );
+        crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        for sbdf in &gpus {
+            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+        }
+    }
+    vm_state.config.gpus = gpus.clone();
 
     // Setup paths
     let data_dir = paths::vm_runtime_dir(&vm_id);
@@ -2640,6 +2677,12 @@ async fn cmd_snapshot_run_inner(
     if let Some(ref hook) = vm_state.config.restore_hook {
         restore_latest["restore-hook"] = serde_json::Value::String(hook.clone());
     }
+    // The GPUs the snapshot load attaches. The guest kernel is not told of them, so
+    // fc-agent rescans PCI, loads the driver and writes the CDI spec before it
+    // acknowledges this restore (fc-agent `gpu::attach`).
+    if !gpus.is_empty() {
+        restore_latest["gpus"] = serde_json::json!(gpus);
+    }
     let bootplan_socket = format!(
         "{}_{}",
         clone_vsock_base.display(),
@@ -2676,6 +2719,7 @@ async fn cmd_snapshot_run_inner(
         track_dirty_pages: needs_dirty_tracking,
         firecracker_choice,
         balloon_target_mib: args.balloon,
+        gpus: &gpus,
     };
     // Restore via the backend that created the snapshot. Both are boxed as `dyn Hypervisor`
     // so the downstream health/exit/cleanup handling is backend-agnostic.
@@ -3300,7 +3344,9 @@ async fn cmd_snapshot_run_inner(
                         // build_clone_reboot_plan is FC-specific; Cloud Hypervisor clones
                         // don't support reboot-in-place yet — a guest reboot terminates
                         // them (same as TTY clones). Tracked for a future increment.
-                        let reboot_plan = if is_ch {
+                        // A --gpu clone neither: a cold boot would come back without
+                        // the devices the restore attached.
+                        let reboot_plan = if is_ch || !gpus.is_empty() {
                             None
                         } else {
                             match build_clone_reboot_plan(
@@ -3873,6 +3919,7 @@ fn run_args_from_snapshot_metadata(
         // The recorded pmem store entries, which are never rewritten, so a cold boot
         // attaches them again as they are and keeps the images they were copied from.
         pmem: meta.pmem_devices.iter().map(|d| d.spec()).collect(),
+        gpu: vec![],
         nfs,
         // fc-agent derives the rootless username from env USER; without it a --user
         // clone would set up "fcvm-user" and diverge from the captured passwd entry.
@@ -4728,6 +4775,29 @@ mod tests {
     }
 
     #[test]
+    fn a_gpu_vm_refuses_a_memory_snapshot_but_not_a_disk_only_one() {
+        let gpus = vec!["0000:01:00.0".to_string()];
+        let err = format!(
+            "{:#}",
+            ensure_no_passthrough_in_memory_snapshot(&gpus, false).unwrap_err()
+        );
+        assert!(err.contains("passthrough GPU(s) 0000:01:00.0"), "{err}");
+        assert!(ensure_no_passthrough_in_memory_snapshot(&gpus, true).is_ok());
+        assert!(ensure_no_passthrough_in_memory_snapshot(&[], false).is_ok());
+    }
+
+    #[test]
+    fn a_disk_only_clone_refuses_gpus() {
+        let mut args = snapshot_runtime_args_without_overrides();
+        args.gpu = vec!["0000:01:00.0".to_string()];
+        let err = format!("{:#}", ensure_disk_only_run_supports(&args).unwrap_err());
+        assert!(
+            err.contains("--gpu is not supported for disk-only clones"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn ensure_not_disk_only_rejects_disk_only_and_allows_full() {
         // Memory-restore paths must refuse a disk-only tag (no memory image)...
         assert!(ensure_not_disk_only(SnapshotKind::DiskOnly, "snapshot serve").is_err());
@@ -4827,6 +4897,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            gpu: vec![],
         };
 
         let (runtime, choice) = snapshot_restore_runtime_config_with(
@@ -4900,6 +4971,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            gpu: vec![],
         }
     }
 
