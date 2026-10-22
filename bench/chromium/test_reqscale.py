@@ -533,6 +533,17 @@ class PerFirecrackerFaults(unittest.TestCase):
         self.assertEqual(out["minor_faults"], 27)
         self.assertEqual(out["major_faults"], 2)
 
+    def test_the_content_addressed_firecracker_is_found(self):
+        """fcvm runs firecracker-default-<hash>.bin, whose comm is
+        "firecracker-def"; the probe matched only "firecracker" and failed
+        every request with "0 firecracker children"."""
+        proc = FakeProcReader()
+        proc.comms[200] = "firecracker-def"
+        proc.comms[202] = "pasta-4707649d2"
+        probe = reqscale.FirecrackerFaultProbe(proc, FakeAudit())
+        probe.begin(100)
+        self.assertEqual(probe.finish()["pid"], 200)
+
     def test_zero_or_multiple_firecrackers_fails_closed(self):
         proc = FakeProcReader()
         proc.comms[201] = "firecracker"

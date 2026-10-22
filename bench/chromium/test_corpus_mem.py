@@ -10409,11 +10409,14 @@ class CorpusExtraRuntimeBundle(unittest.TestCase):
         "render.py", "corpus_serve.py", "report.py", "reqbench.py",
         "reqbench.sh", "reqanalyze.py", "wddrive.py", "owned_process.py",
         "phase_supervisor.py", "host_resource_finalizer.py", "serve_guardian.py",
-        "corpus_campaign.sh",
+        "corpus_campaign.sh", "reqscale.py", "reqscale_analyze.py",
+        "faulttrace.bt", "guardexec.py", "guardsupervise.py",
     )
+    # reqbench.sh's sealed bundle, in its order (test_run_facts pins the two).
     REQBENCH_SOURCES = (
         "fcvm", "fc-agent", "reqbench.sh", "reqbench.py", "reqanalyze.py",
-        "cdpdrive.py", "render.py", "wddrive.py",
+        "cdpdrive.py", "render.py", "wddrive.py", "reqscale.py",
+        "reqscale_analyze.py", "faulttrace.bt", "guardexec.py", "guardsupervise.py",
     )
 
     def stage_function(self):

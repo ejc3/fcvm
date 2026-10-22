@@ -490,6 +490,35 @@ class AnalysisCarriesTheFacts(unittest.TestCase):
                         "a noop-fast teardown escaped the fast-teardown checks")
 
 
+    def test_cpu_is_read_under_the_comm_names_fcvm_s_binaries_carry(self):
+        """teardown_fast keys children by /proc comm. fcvm runs
+        content-addressed binaries, so Firecracker shows as "firecracker-def"
+        and pasta as "pasta-<hash>", and the holder as "sleep". The reducer
+        looked for the key "firecracker" and withheld every figure of the
+        first fast-arm corpus run (202 of 202 requests "without a complete
+        reading")."""
+        def real_names(rows):
+            for row in rows:
+                if row.get("arm") != "cdp-fast":
+                    continue
+                row["teardown"].update(
+                    lifetime_cpu_ms_by_child={"fcvm": 50.0, "firecracker-def": 1690.0,
+                                              "pasta-4707649d2": 20.0, "sleep": 0.0},
+                    reaped_children_cpu_ms_by_child={"fcvm": 230.0, "firecracker-def": 0.0,
+                                                     "pasta-4707649d2": 0.0, "sleep": 0.0},
+                    per_child_cpu={name: {"reclaim_cpu_ms": cpu, "complete": True}
+                                   for name, cpu in (("fcvm", 40.0), ("firecracker-def", 0.0),
+                                                     ("pasta-4707649d2", 0.0), ("sleep", 0.0))},
+                    tick_ms=10.0)
+        with tempfile.TemporaryDirectory() as d:
+            _rc, analysis = self.analyze(d, real_names, **self.FACTS)
+        block = analysis["arms"]["cdp-fast"]["request_cpu_ms"]
+        self.assertEqual(block["missing_records"], 0, block)
+        self.assertEqual(block["clone_mean_ms"]["mean"], 50.0 + 1690.0 + 20.0 + 230.0 + 40.0)
+        self.assertEqual(block["by_child_at_kill_mean_ms"],
+                         {"fcvm": 50.0, "firecracker": 1690.0, "pasta": 20.0, "holder": 0.0})
+
+
 class HtmlFastArm(unittest.TestCase):
     """reqbench routes html-fast to the html op with the fast teardown."""
 
@@ -600,6 +629,44 @@ print(json.dumps({
         self.assertEqual(calls, [1])
         self.assertIs(rows[0]["child_subreaper"], True)
         self.assertTrue(all(row.get("adopted_zombies_reaped") == 0 for row in rows[1:]), rows[1:])
+
+
+class ContentAddressedFirecracker(unittest.TestCase):
+    """faultbench finds Firecracker under its content-addressed comm."""
+
+    def test_faultbench_finds_firecracker_def(self):
+        import faultbench
+        with tempfile.TemporaryDirectory() as proc:
+            for pid, comm in ((11, "firecracker-def"), (12, "pasta-4707649d2"), (13, "bash")):
+                write(proc, f"/{pid}/comm", comm + "\n")
+            self.assertEqual(faultbench.firecracker_pids(proc), {11})
+
+
+class RequestBundleManifestPin(unittest.TestCase):
+    """corpus_extra.sh seals reqbench's runtime exactly as reqbench.sh does.
+
+    The memory phase refuses a golden whose creator_runtime_bundle_sha256 is
+    not the bundle it staged itself. reqbench.sh added the scale harness to its
+    sealed bundle (418b7683) and corpus_extra.sh kept the old list, so every
+    golden reqbench.sh made after that was refused: "snapshot
+    creator_runtime_bundle_sha256 ... does not match current staged runtime".
+    """
+
+    def test_both_manifests_list_the_same_files_in_the_same_order(self):
+        with open(os.path.join(HERE, "reqbench.sh")) as handle:
+            sh = handle.read()
+        sealed = ["fcvm", "fc-agent"] + re.search(
+            r"runtime_sources=\(([^)]+)\)", sh).group(1).split()
+        with open(os.path.join(HERE, "corpus_extra.sh")) as handle:
+            extra = handle.read()
+        block = re.search(r"sha256sum fcvm fc-agent (.*?)\) > \"\$reqbench_manifest_temp\"",
+                          extra, re.S).group(0)
+        listed = re.sub(r"#[^\n]*", "", block).replace("\\\n", " ").split()
+        listed = listed[1:listed.index(")")]
+        self.assertEqual(listed, sealed)
+        staged = re.search(r"local sources=\(([^)]+)\)", extra).group(1).split()
+        self.assertEqual(sorted(set(sealed[2:]) - set(staged)), [],
+                         "corpus_extra.sh hashes a reqbench source it never staged")
 
 
 class HostControlArms(unittest.TestCase):

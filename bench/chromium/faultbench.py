@@ -286,14 +286,15 @@ def ftrace_lost_events(stats_text):
 # ---------------------------------------------------------------------------
 
 
-def firecracker_pids():
+def firecracker_pids(proc="/proc"):
     out = set()
-    for d in os.listdir("/proc"):
+    for d in os.listdir(proc):
         if not d.isdigit():
             continue
         try:
-            with open(f"/proc/{d}/comm") as f:
-                if f.read().strip() == "firecracker":
+            with open(f"{proc}/{d}/comm") as f:
+                # Content-addressed binaries: the comm is "firecracker-def".
+                if f.read().strip().startswith("firecracker"):
                     out.add(int(d))
         except OSError:
             pass

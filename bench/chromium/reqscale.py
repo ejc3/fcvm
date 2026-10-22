@@ -1528,7 +1528,9 @@ class FirecrackerFaultProbe:
                     comm = identity.comm()
                     self.audit.observe_identity(identity, comm or "unnamed-child")
                     observed.append((pid, comm))
-                    if comm == "firecracker":
+                    # fcvm runs content-addressed binaries, so the comm is
+                    # "firecracker-def" (cut to 15 bytes), not "firecracker".
+                    if comm.startswith("firecracker"):
                         named.append(identity)
                         identity = None
                 finally:
