@@ -563,6 +563,11 @@ fn gpu_driver_drive_index(disks: usize, disk_dirs: usize, has_image_disk: bool) 
     disks + disk_dirs + usize::from(has_image_disk)
 }
 
+/// Firecracker drive id of the NVIDIA driver image. Firecracker refuses an id with
+/// anything but ASCII letters, digits and underscores (400 "API Resource IDs can only
+/// contain alphanumeric characters and underscores").
+const GPU_DRIVER_DRIVE_ID: &str = "gpu_driver";
+
 /// Attach the NVIDIA driver image read-only as virtio-blk drive `index` (after the
 /// extra disks and the image disk, so their device names do not move) and return
 /// its guest device. fc-agent mounts it at boot (`Plan.gpu_driver`).
@@ -574,7 +579,7 @@ async fn attach_gpu_driver_image(
     let device = virtio_blk_device(index)?;
     info!(image = %image.display(), %device, "attaching the NVIDIA driver image read-only");
     hv.add_drive(&crate::hypervisor::DriveSpec {
-        drive_id: "gpu-driver".to_string(),
+        drive_id: GPU_DRIVER_DRIVE_ID.to_string(),
         path_on_host: image.to_path_buf(),
         is_root_device: false,
         is_read_only: true,
@@ -1847,6 +1852,15 @@ async fn run_vm_setup_inner(
 mod tests {
     /// The driver image is the last drive: after two --disk drives, one --disk-dir and
     /// the image disk it is drive 4, /dev/vdf, and no earlier drive changes name.
+    #[test]
+    fn the_driver_image_drive_id_is_one_firecracker_accepts() {
+        let id = super::GPU_DRIVER_DRIVE_ID;
+        assert!(
+            !id.is_empty() && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "Firecracker refuses drive id {id:?}: only letters, digits and underscores"
+        );
+    }
+
     #[test]
     fn the_driver_image_is_the_last_drive() {
         use super::{gpu_driver_drive_index, virtio_blk_device};
