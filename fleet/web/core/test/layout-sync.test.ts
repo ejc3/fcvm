@@ -1,0 +1,148 @@
+import { describe, expect, it } from "vitest";
+import {
+  fitContain,
+  layoutMosaic,
+  neighbour,
+  seamSegments,
+  streamHeightFor,
+  streamWidthFor,
+  tileAt,
+} from "../layout.ts";
+import { chooseCommonT } from "../sync.ts";
+import { addDrag, cameraAt, emptyDrag, takeDrag } from "../scene.ts";
+import { fleet } from "./fixtures.ts";
+
+describe("layout", () => {
+  it("fits the image inside the area, centred", () => {
+    expect(fitContain({ x: 0, y: 0, w: 1600, h: 1000 }, 16 / 9)).toEqual({ x: 0, y: 50, w: 1600, h: 900 });
+    expect(fitContain({ x: 0, y: 0, w: 1000, h: 300 }, 2)).toEqual({ x: 200, y: 0, w: 600, h: 300 });
+  });
+
+  it.each([1, 1.25, 1.5, 2, 3])("tiles share edges exactly at dpr %s: no gap, no overlap", (dpr) => {
+    const st = fleet(5, 10); // 100 tiles
+    const L = layoutMosaic({ x: 0.3, y: 7.1, w: 1333.7, h: 777.7 }, st.tiles, dpr);
+    // Every device pixel of the image belongs to exactly one tile.
+    const W = Math.round(L.image.w * dpr);
+    const H = Math.round(L.image.h * dpr);
+    const owners = new Uint16Array(W * H);
+    for (const p of L.tiles) {
+      const x0 = Math.round((p.box.x - L.image.x) * dpr);
+      const y0 = Math.round((p.box.y - L.image.y) * dpr);
+      const x1 = Math.round((p.box.x + p.box.w - L.image.x) * dpr);
+      const y1 = Math.round((p.box.y + p.box.h - L.image.y) * dpr);
+      // Edges land on device pixels.
+      expect(Math.abs(p.box.x * dpr - Math.round(p.box.x * dpr))).toBeLessThan(1e-6);
+      for (let y = y0; y < y1; y++) for (let x = x0; x < x1; x++) owners[y * W + x]! += 1;
+    }
+    let bad = 0;
+    for (const o of owners) if (o !== 1) bad++;
+    expect(bad).toBe(0);
+  });
+
+  it("rounds the stream height up to the set and caps it", () => {
+    expect(streamHeightFor(70)).toBe(72);
+    expect(streamHeightFor(72.2)).toBe(72);
+    expect(streamHeightFor(181)).toBe(216);
+    expect(streamHeightFor(5000)).toBe(1080);
+  });
+
+  it("asks a tile for its on-screen device height", () => {
+    const st = fleet(2, 4); // 8 per half, tiles 1/4 of the image tall
+    const L = layoutMosaic({ x: 0, y: 0, w: 1920, h: 1080 }, st.tiles, 2);
+    expect(L.tiles[0]!.streamHeight).toBe(540); // 270 css px * 2
+  });
+
+  it("gives an even width with the tile's aspect", () => {
+    expect(streamWidthFor({ x: 0, y: 0, w: 0.25, h: 0.25 }, 180)).toBe(320);
+    expect(streamWidthFor({ x: 0, y: 0, w: 0.1, h: 0.1 }, 91) % 2).toBe(0);
+  });
+
+  it("finds the tile under a point and its neighbours", () => {
+    const st = fleet(2, 2);
+    const t = tileAt(st.tiles, 0.3, 0.2)!;
+    expect(t.id).toBe("fcvm:2");
+    expect(neighbour(st.tiles, t, "right")!.id).toBe("ec2:1");
+    expect(neighbour(st.tiles, t, "down")!.id).toBe("fcvm:4");
+    expect(neighbour(st.tiles, t, "up")).toBeNull();
+  });
+
+  it("lists every internal boundary once", () => {
+    const st = fleet(2, 2); // 4 columns, 2 rows: 3 vertical lines x 2 rows + 1 horizontal x 4 columns
+    const L = layoutMosaic({ x: 0, y: 0, w: 1600, h: 900 }, st.tiles, 1);
+    const segs = seamSegments(L.tiles, L.image, 1);
+    expect(segs.filter((s) => s.x0 === s.x1)).toHaveLength(6);
+    expect(segs.filter((s) => s.y0 === s.y1)).toHaveLength(4);
+    expect(segs.every((s) => s.x0 % 1 === 0.5 || s.y0 % 1 === 0.5)).toBe(true);
+  });
+});
+
+describe("one common t", () => {
+  const b = (id: string, ts: number[]) => ({ id, ts });
+
+  it("shows the latest t every tile holds", () => {
+    const c = chooseCommonT([b("a", [1, 1.05, 1.1]), b("b", [1, 1.05])], null);
+    expect(c.T).toBe(1.05);
+    expect(c.show.get("a")).toEqual({ kind: "sync", t: 1.05 });
+    expect(c.show.get("b")).toEqual({ kind: "sync", t: 1.05 });
+  });
+
+  it("steps over a frame one tile skipped", () => {
+    const c = chooseCommonT([b("a", [1, 1.1]), b("b", [1, 1.05, 1.1])], null);
+    expect(c.T).toBe(1.1);
+  });
+
+  it("dims a tile that fell behind instead of holding the image", () => {
+    const c = chooseCommonT([b("a", [2, 2.05, 2.1]), b("b", [2, 2.05, 2.1]), b("slow", [1.0])], null, 0.35);
+    expect(c.T).toBe(2.1);
+    expect(c.show.get("slow")).toEqual({ kind: "behind", t: 1.0 });
+  });
+
+  it("keeps a tile that just joined dark until the image reaches its first frame", () => {
+    const c = chooseCommonT([b("a", [3, 3.05]), b("b", [3, 3.05]), b("new", [3.1])], null);
+    expect(c.T).toBe(3.05);
+    expect(c.show.get("new")).toEqual({ kind: "waiting" });
+  });
+
+  it("never goes back in time", () => {
+    const c = chooseCommonT([b("a", [4, 4.05])], 4.1);
+    expect(c.T).toBe(4.1);
+    expect(c.show.get("a")).toEqual({ kind: "behind", t: 4.05 });
+  });
+
+  it("never draws two different times undimmed", () => {
+    // A brute check over many random-looking buffers (deterministic).
+    let seed = 7;
+    const rnd = () => ((seed = (seed * 1103515245 + 12345) % 2 ** 31) / 2 ** 31);
+    for (let trial = 0; trial < 500; trial++) {
+      const bufs = Array.from({ length: 6 }, (_, i) => {
+        const start = Math.floor(rnd() * 8);
+        const ts: number[] = [];
+        for (let k = start; k < start + 1 + Math.floor(rnd() * 6); k++) if (rnd() > 0.15) ts.push(k * 0.05);
+        return b(`t${i}`, ts);
+      });
+      const c = chooseCommonT(bufs, null);
+      const synced = [...c.show.values()].filter((s) => s.kind === "sync").map((s) => (s as { t: number }).t);
+      expect(new Set(synced).size).toBeLessThanOrEqual(1);
+    }
+  });
+});
+
+describe("camera", () => {
+  it("interpolates numeric fields between keys and holds at the ends", () => {
+    const keys = [{ t: 0, x: 0, zoom: 1 }, { t: 2, x: 1, zoom: 2 }];
+    expect(cameraAt(keys, 1)).toEqual({ x: 0.5, zoom: 1.5 });
+    expect(cameraAt(keys, -1)).toEqual({ x: 0, zoom: 1 });
+    expect(cameraAt(keys, 9)).toEqual({ x: 1, zoom: 2 });
+  });
+
+  it("coalesces drag deltas into one intent per interval", () => {
+    let acc = addDrag(emptyDrag(), 0.01, 0);
+    let r = takeDrag(acc, 1000);
+    expect(r.args).toEqual({ drag: { yaw_deg: -0.9, pitch_deg: 0, dive: 0 } });
+    acc = addDrag(addDrag(r.acc, 0.02, 0.01), 0.03, 0);
+    r = takeDrag(acc, 1020);
+    expect(r.args).toBeNull();
+    r = takeDrag(r.acc, 1050);
+    expect(r.args).toEqual({ drag: { yaw_deg: -4.5, pitch_deg: 0.5, dive: 0 } });
+  });
+});
