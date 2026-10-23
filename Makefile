@@ -823,6 +823,7 @@ setup-gpu: build setup-btrfs
 # Cross-tenant GPU memory residue (scripts/gpu-residue/run.sh): one VM fills a
 # GPU's memory with a marker and ends, the next VM on that GPU counts the marker
 # in fresh allocations. Needs a host with the GPU on vfio-pci.
+gpu-residue-test: private SHELL := $(TARGET_LEASE_SHELL)
 gpu-residue-test: setup-gpu
 	@test -n "$(GPU)" || { echo "usage: make gpu-residue-test GPU=<pci address> [RESIDUE_OUT=<dir>]" >&2; exit 2; }
 	FCVM=./target/release/fcvm ./scripts/gpu-residue/run.sh "$(GPU)" $(RESIDUE_OUT)
