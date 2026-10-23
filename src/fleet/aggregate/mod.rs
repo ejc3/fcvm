@@ -290,6 +290,11 @@ struct Held {
     decoded: Instant,
 }
 
+/// Frames each tile of a warming pipeline keeps (half a second): the new composite starts at
+/// the first frame every tile still holds, so tiles up to this far apart in time still let
+/// it start at the generation's frame.
+const WARM_FRAMES: usize = 15;
+
 /// A running pipeline and the controls the swap uses.
 struct Live {
     token: CancellationToken,
@@ -454,6 +459,8 @@ async fn pipeline(
     let mut frames: Vec<BTreeMap<i64, Held>> = (0..n).map(|_| BTreeMap::new()).collect();
     let mut live = vec![false; n];
     let mut next: Option<i64> = None;
+    // Until this slot the compositor does not skip ahead (the backlog of a takeover).
+    let mut catch_up_until = i64::MIN;
     let mut tick = tokio::time::interval(Duration::from_millis(5));
     // A warming pipeline gives up waiting for a silent tile at this wall time.
     let swap_by = (now_ms() as f64).max(wall_of(layout.epoch_unix_ms, layout.from_frame, opts.fps))
@@ -474,9 +481,6 @@ async fn pipeline(
                 Some(TileEvent::Frame { tile, k, pic, header, arrived, arrived_unix_ms }) => {
                     // Frames before the generation's frame belong to the old rectangles.
                     if k >= layout.from_frame {
-                        if next.is_none() && *gate.publish.borrow() {
-                            next = Some(k);
-                        }
                         frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms, decoded: Instant::now() });
                     }
                 }
@@ -535,10 +539,11 @@ async fn pipeline(
             _ = tick.tick() => {}
         }
         if !*gate.publish.borrow() {
-            // Warming: keep each tile's newest frames, and tell the swap once every tile has
-            // one at or after the generation's frame.
+            // Warming: keep each tile's frames from the generation's frame on (at most
+            // WARM_FRAMES, so a slow tile does not make the others skip ahead), and tell the
+            // swap once every tile has one.
             for f in frames.iter_mut() {
-                while f.len() as i64 > opts.hold_slots + 1 {
+                while f.len() > WARM_FRAMES {
                     f.pop_first();
                 }
             }
@@ -551,12 +556,16 @@ async fn pipeline(
             continue;
         }
         if next.is_none() {
-            // Taking over: from the first slot every tile still holds.
+            // Taking over: from the first slot every tile still holds, composing what was
+            // kept while warming without skipping ahead over it.
             next = frames
                 .iter()
                 .filter_map(|f| f.keys().next().copied())
                 .max()
                 .map(|k| k.max(layout.from_frame));
+            if let Some(k) = next {
+                catch_up_until = k + WARM_FRAMES as i64;
+            }
         }
         // With no tile streaming, keep the region going in black on the slot clock.
         if next.is_none() && !live.iter().any(|l| *l) {
@@ -638,7 +647,9 @@ async fn pipeline(
                 .filter_map(|f| f.keys().next_back().copied())
                 .max();
             next = Some(match newest {
-                Some(m) if m - (k + 1) > 2 * opts.hold_slots => m - opts.hold_slots,
+                Some(m) if m - (k + 1) > 2 * opts.hold_slots && k >= catch_up_until => {
+                    m - opts.hold_slots
+                }
                 _ => k + 1,
             });
         }

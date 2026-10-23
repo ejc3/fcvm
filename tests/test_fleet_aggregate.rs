@@ -35,6 +35,8 @@ struct FakeTile {
     /// From this slot on it draws another rectangle: a new header (a new size) mid-stream,
     /// as a renderer does at a re-tile's frame.
     switch: Option<(i64, Header)>,
+    /// Milliseconds each frame goes out after its slot's wall time (a slower renderer).
+    lag_ms: f64,
 }
 
 fn now_ms() -> u64 {
@@ -80,7 +82,7 @@ async fn serve_tile(mut s: WebSocket, mut t: FakeTile) {
     }
     let mut k = (((now_ms() - t.epoch) as f64 * FPS as f64 / 1000.0).ceil() as i64).max(t.from_k);
     loop {
-        let due = t.epoch as f64 + k as f64 * 1000.0 / FPS as f64;
+        let due = t.epoch as f64 + k as f64 * 1000.0 / FPS as f64 + t.lag_ms;
         let wait = due - now_ms() as f64;
         if wait > 0.0 {
             tokio::time::sleep(Duration::from_micros((wait * 1000.0) as u64)).await;
@@ -157,6 +159,7 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
             queries: queries.clone(),
             from_k: i64::MIN,
             switch: None,
+            lag_ms: 0.0,
         }
     };
     let urls = [
@@ -442,6 +445,7 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
         queries: queries.clone(),
         from_k,
         switch,
+        lag_ms: 0.0,
     };
     let region = Rect {
         x: 0.0,
@@ -570,6 +574,124 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
     assert!(
         hs.contains(&"72".to_string()) && hs.contains(&"36".to_string()),
         "{hs:?}"
+    );
+    cancel.cancel();
+}
+
+/// A re-tile whose tiles all stream already starts the new composite at the generation's
+/// frame exactly, the frame after the old composite's last, even when one renderer runs
+/// 200 ms behind the others: no slot of the image is skipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
+    let epoch = now_ms() - 10_000;
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let head = |x0: u32, w: u32| Header {
+        codec: "raw".into(),
+        width: w,
+        height: 72,
+        full_width: 128,
+        full_height: 72,
+        x0,
+        y0: 0,
+        fps: FPS,
+        crop: Crop {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
+        },
+    };
+    let tile = |header: Header, id_u: u8, lag_ms: f64| FakeTile {
+        header,
+        id_u,
+        epoch,
+        queries: queries.clone(),
+        from_k: i64::MIN,
+        switch: None,
+        lag_ms,
+    };
+    let region = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    };
+    let half = |x: f64| Rect {
+        x,
+        y: 0.0,
+        w: 0.25,
+        h: 1.0,
+    };
+    let a = start_tile(tile(head(0, 32), 60, 0.0)).await;
+    let b = start_tile(tile(head(32, 32), 90, 200.0)).await;
+    let spec = |id: &str, rect: Rect, url: &str| TileSpec {
+        id: id.into(),
+        rect,
+        url: Some(url.into()),
+    };
+    let shared = Shared::new();
+    shared.set_layout(Layout {
+        epoch_unix_ms: epoch,
+        image_aspect: 16.0 / 9.0,
+        region,
+        tiles: vec![
+            spec("slot-a", half(0.0), &a),
+            spec("slot-b", half(0.25), &b),
+        ],
+        generation: 1,
+        from_frame: 0,
+    });
+    let cancel = CancellationToken::new();
+    let opts = Options {
+        image_height: 72,
+        encode: EncodeParams {
+            keyint: 15,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let s2 = shared.clone();
+    tokio::spawn(async move { axum::serve(l, router(s2)).await.unwrap() });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+        .await
+        .unwrap();
+    assert!(matches!(next_msg(&mut ws).await, Message::Text(_)));
+    // The same tiles in a new generation (as a re-tile elsewhere on the wall makes one).
+    let f = ((now_ms() - epoch) as f64 * FPS as f64 / 1000.0) as i64 + 45;
+    shared.set_layout(Layout {
+        epoch_unix_ms: epoch,
+        image_aspect: 16.0 / 9.0,
+        region,
+        tiles: vec![
+            spec("slot-a", half(0.0), &a),
+            spec("slot-b", half(0.25), &b),
+        ],
+        generation: 2,
+        from_frame: f,
+    });
+    let k_of = |t: f64| (t * FPS as f64).round() as i64;
+    let mut last_old = None;
+    loop {
+        match next_msg(&mut ws).await {
+            Message::Binary(bytes) => last_old = Some(k_of(Frame::parse(&bytes).unwrap().t)),
+            _ => break,
+        }
+    }
+    let Message::Binary(bytes) = next_msg(&mut ws).await else {
+        panic!("a frame after the new header")
+    };
+    let first_new = k_of(Frame::parse(&bytes).unwrap().t);
+    assert_eq!(
+        last_old,
+        Some(f - 1),
+        "the old composite runs to the frame before"
+    );
+    assert_eq!(
+        first_new, f,
+        "the new composite starts at the generation's frame"
     );
     cancel.cancel();
 }
