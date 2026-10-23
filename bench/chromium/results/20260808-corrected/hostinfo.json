@@ -1,10 +1,8 @@
 {
- "uname": "Linux ip-10-0-1-49 6.18.3-fcvm-8ee6c35df0e1 #1 SMP Sun Jan 25 07:45:02 UTC 2026 aarch64 aarch64",
+ "uname": "Linux 6.18.3-fcvm-8ee6c35df0e1 #1 SMP Sun Jan 25 07:45:02 UTC 2026 aarch64 aarch64",
  "nproc": 64,
  "mem_total_kb": 131622204,
  "cpu_model": "0xd40",
- "host_ipv4": "10.0.1.49",
- "host_ipv6": "2600:1f1c:494:201::5643",
  "reps": 12,
  "vm_cpu": 2,
  "vm_mem_mib": 2048,

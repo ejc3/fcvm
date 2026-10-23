@@ -193,6 +193,9 @@ pub struct RestorePhases {
     pub gpu_ms: f64,
     /// GPUs the driver initialised.
     pub gpus: usize,
+    /// Each attach step's milliseconds; absent without GPUs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_steps: Option<crate::gpu::AttachSteps>,
 }
 
 impl RestorePhases {
@@ -274,8 +277,8 @@ pub async fn handle_clone_restore(
         let gpus = gpus.to_vec();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let ready = crate::gpu::attach(&gpus).await?;
-            Ok::<_, anyhow::Error>((elapsed_ms(started), ready))
+            let report = crate::gpu::attach(&gpus).await?;
+            Ok::<_, anyhow::Error>((elapsed_ms(started), report))
         })
     });
 
@@ -455,13 +458,17 @@ pub async fn handle_clone_restore(
     eprintln!("[fc-agent] exec re-registered after restore");
 
     if let Some(job) = gpu_attach {
-        let (gpu_ms, ready) = job
+        let (gpu_ms, report) = job
             .await
             .context("joining the GPU attach")?
             .context("restore phase gpu-attach")?;
         phases.gpu_ms = gpu_ms;
-        phases.gpus = ready;
-        eprintln!("[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={ready} elapsed_ms={gpu_ms:.3}");
+        phases.gpus = report.gpus;
+        phases.gpu_steps = Some(report.steps);
+        eprintln!(
+            "[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={} elapsed_ms={gpu_ms:.3}",
+            phases.gpus
+        );
     }
 
     // Publication, last: the plan's restore hook runs now, with egress open,
@@ -689,13 +696,143 @@ mod tests {
         phases.egress_wait_ms = 99_999.999;
         phases.total_ms = 99_999.999;
         phases.ack_connect_ms = 99_999.999;
+        phases.gpu_ms = 99_999.999;
+        phases.gpus = 8;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            scrub_ms: 99_999.999,
+            ..Default::default()
+        });
         let frame = exec_proto::restore_complete_frame(
             "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
             &phases.to_frame_json(),
         );
         assert!(
-            frame.contains("\"ack_connect_ms\":99999.999"),
+            frame.contains("\"ack_connect_ms\":99999.999")
+                && frame.contains("\"scrub_ms\":99999.999"),
             "the ACK telemetry was dropped from the frame: {frame}"
+        );
+    }
+
+    /// The ACK names the GPU memory scrub's duration, and says nothing about
+    /// GPU steps without GPUs.
+    #[test]
+    fn the_ack_carries_the_gpu_scrub_time() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            scrub_ms: 61.5,
+            ..Default::default()
+        });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert_eq!(frame["gpu_steps"]["scrub_ms"], 61.5, "{frame}");
+    }
+
+    /// A GPU restore's ACK, with every phase and every GPU attach step at a value whose
+    /// shortest round-trip rendering is 17 significant digits (as measured timings
+    /// often are, e.g. `79.74971599999999`), still fits the frame budget beside a UUID
+    /// epoch, so the host keeps the GPU step timings rather than an empty `{}`.
+    #[test]
+    fn a_gpu_restore_ack_keeps_its_step_timings_within_the_frame_budget() {
+        let long = 12_345.678_901_234_567_f64;
+        assert_eq!(format!("{long}").len(), 18, "{long}");
+        let phases = RestorePhases {
+            clock_ms: long,
+            ipv6_ms: long,
+            tcp_cleanup_ms: long,
+            tcp_verified: true,
+            tcp_verify_ms: long,
+            tcp_reassert_ms: long,
+            tcp_destroy_ms: long,
+            tcp_reopen_ms: long,
+            tcp_egress_open_ms: long,
+            tcp_hook_ms: long,
+            tcp_destroyed: 999_999,
+            tcp_already_gone: 999_999,
+            tcp_destroy_datagrams: 999_999,
+            neighbor_ms: long,
+            nfs_ms: long,
+            exec_wait_ms: long,
+            egress_wait_ms: long,
+            total_ms: long,
+            ack_connect_ms: long,
+            gpu_ms: long,
+            gpus: 8,
+            gpu_steps: None,
+        };
+        let mut phases = phases;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            check_ms: long,
+            rescan_ms: long,
+            nvidia_ms: long,
+            uvm_ms: long,
+            nodes_ms: long,
+            persistenced_ms: long,
+            smi_ms: long,
+            cdi_ms: long,
+            ..Default::default()
+        });
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"gpu_steps\":{") && frame.contains("\"persistenced_ms\""),
+            "the GPU step timings were dropped from the ACK ({} bytes of telemetry): {frame}",
+            phases.to_frame_json().len()
+        );
+    }
+
+    /// The scrub's time rides in `gpu_steps` with every other attach step: a GPU
+    /// restore's ACK with all of them, and every phase, at 17 significant digits
+    /// still fits the frame budget beside a UUID epoch, so the host gets the scrub
+    /// time and the step timings rather than an empty `{}`.
+    #[test]
+    fn a_gpu_restore_ack_keeps_the_scrub_time_with_its_step_timings_within_the_frame_budget() {
+        let long = 12_345.678_901_234_567_f64;
+        assert_eq!(format!("{long}").len(), 18, "{long}");
+        let phases = RestorePhases {
+            clock_ms: long,
+            ipv6_ms: long,
+            tcp_cleanup_ms: long,
+            tcp_verified: true,
+            tcp_verify_ms: long,
+            tcp_reassert_ms: long,
+            tcp_destroy_ms: long,
+            tcp_reopen_ms: long,
+            tcp_egress_open_ms: long,
+            tcp_hook_ms: long,
+            tcp_destroyed: 999_999,
+            tcp_already_gone: 999_999,
+            tcp_destroy_datagrams: 999_999,
+            neighbor_ms: long,
+            nfs_ms: long,
+            exec_wait_ms: long,
+            egress_wait_ms: long,
+            total_ms: long,
+            ack_connect_ms: long,
+            gpu_ms: long,
+            gpus: 8,
+            gpu_steps: Some(crate::gpu::AttachSteps {
+                check_ms: long,
+                rescan_ms: long,
+                nvidia_ms: long,
+                uvm_ms: long,
+                nodes_ms: long,
+                persistenced_ms: long,
+                scrub_ms: long,
+                smi_ms: long,
+                cdi_ms: long,
+            }),
+        };
+        let telemetry = phases.to_frame_json();
+        let frame =
+            exec_proto::restore_complete_frame("8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f", &telemetry);
+        assert!(
+            frame.contains("\"scrub_ms\":12345.678901234567")
+                && frame.contains("\"persistenced_ms\""),
+            "the scrub time was dropped from the ACK ({} bytes of telemetry): {frame}",
+            telemetry.len()
         );
     }
 
@@ -806,6 +943,35 @@ mod tests {
     /// publishes the clone then, so the GPU must be usable before either. The
     /// attach is joined, with its error propagated, before the boundary
     /// publishes and therefore before `apply_restore_epoch` sends the ACK.
+    /// The ACK's phase record names each GPU attach step, so a slow attach is
+    /// attributed to its step in the host's log; without GPUs it says nothing.
+    #[test]
+    fn the_ack_carries_each_gpu_attach_step() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            rescan_ms: 1.5,
+            persistenced_ms: 900.0,
+            ..Default::default()
+        });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        let steps = &frame["gpu_steps"];
+        assert_eq!(steps["rescan_ms"], 1.5, "{frame}");
+        assert_eq!(steps["persistenced_ms"], 900.0, "{frame}");
+        for step in [
+            "check_ms",
+            "nvidia_ms",
+            "uvm_ms",
+            "nodes_ms",
+            "smi_ms",
+            "cdi_ms",
+        ] {
+            assert!(steps.get(step).is_some(), "{step} missing from {frame}");
+        }
+    }
+
     #[test]
     fn gpu_attach_completes_before_the_clone_is_published() {
         let source = include_str!("restore.rs");

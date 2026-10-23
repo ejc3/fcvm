@@ -488,7 +488,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.
@@ -761,7 +761,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.
@@ -1043,7 +1043,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.

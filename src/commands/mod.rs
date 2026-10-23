@@ -2,6 +2,7 @@ pub mod balloon;
 pub mod common;
 pub mod completions;
 pub mod exec;
+pub mod gpu;
 pub mod ls;
 pub mod podman;
 pub mod serve;
@@ -14,6 +15,7 @@ pub mod tty;
 pub use balloon::cmd_balloon;
 pub use completions::cmd_completions;
 pub use exec::cmd_exec;
+pub use gpu::cmd_gpu;
 pub use ls::cmd_ls;
 pub use podman::cmd_podman;
 pub use podman::{

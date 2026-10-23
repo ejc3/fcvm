@@ -29,7 +29,8 @@ class RunnerAcceptanceTests(unittest.TestCase):
         instance = 'i-0123456789abcdef0'
         service = f'actions.runner.ejc3-fcvm.runner-{instance}.service'
         return {
-            'identity': {'accountId': '928413605543', 'region': 'us-west-1',
+            'expected_account': '123456789012',
+            'identity': {'accountId': '123456789012', 'region': 'us-west-1',
                          'instanceId': instance, 'architecture': 'arm64'},
             'runner_name': f'runner-{instance}', 'machine': 'aarch64',
             'settings': {'agentName': f'runner-{instance}', 'ephemeral': True},

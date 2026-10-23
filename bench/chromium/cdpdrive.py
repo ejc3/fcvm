@@ -6,7 +6,7 @@ Protocol endpoint is already a fully specified request server that returns the
 screenshot as base64 inside the CDP response, so the only thing that needs
 writing is a client.
 
-    cdpdrive.py 127.0.0.19:9222 http://10.0.1.49:18578/medium.html --format jpeg
+    cdpdrive.py 127.0.0.19:9222 http://192.0.2.10:18578/medium.html --format jpeg
 
 Prints one machine-parsable JSON line. Every hop of the connection is timed
 separately, because with the resident-render design the connection IS the
