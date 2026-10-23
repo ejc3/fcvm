@@ -22,6 +22,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import statistics
 import subprocess
 import sys
@@ -2967,3 +2968,121 @@ class CampaignSummary(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ReplayLogsKeptInTheRecordsRepository(unittest.TestCase):
+    """A replay log moved to ejc3/fcvm-bench-records is verified there or not at all.
+
+    The run keeps the log's sha256 in dns-evidence.json and a pointer
+    (repository, path, commit) in external-logs.json. With FCVM_BENCH_RECORDS
+    naming a checkout the index reads the file from that commit; without one,
+    or with a checkout that lacks the commit, the run is refused and the
+    refusal says NOT VERIFIED. RED WITHOUT THE FAIL-CLOSED BRANCH: an index
+    that accepted the pointer's sha256 in place of the file reported a run
+    clean on a log it never read.
+    """
+
+    def _summarize(self, out, run_dirs, records=None):
+        stdout, stderr = io.StringIO(), io.StringIO()
+        env = {k: v for k, v in os.environ.items() if k != campaign_summary.RECORDS_ENV}
+        if records is not None:
+            env[campaign_summary.RECORDS_ENV] = records
+        with unittest.mock.patch.dict(os.environ, env, clear=True), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            rc = campaign_summary.main_with(["--out", out] + list(run_dirs))
+        return rc, stdout.getvalue() + stderr.getvalue()
+
+    def _move_out(self, d, run_dir, name="corpus-access.log"):
+        """Commit run_dir/name into a records repository at the same relative
+        path, remove it from the run, and write the run's pointer."""
+        records = os.path.join(d, "records")
+        relative = os.path.join("bench", "chromium", "results", os.path.basename(run_dir), name)
+        os.makedirs(os.path.dirname(os.path.join(records, relative)))
+        shutil.move(os.path.join(run_dir, name), os.path.join(records, relative))
+        git = ["git", "-C", records, "-c", "user.name=t", "-c", "user.email=t@example.com"]
+        subprocess.run(["git", "init", "-q", records], check=True)
+        subprocess.run(git + ["add", "."], check=True)
+        subprocess.run(git + ["commit", "-q", "-m", "logs"], check=True)
+        commit = subprocess.run(git + ["rev-parse", "HEAD"], check=True,
+                                capture_output=True, text=True).stdout.strip()
+        data = open(os.path.join(records, relative), "rb").read()
+        pointer = {"schema": 1, "repository": "ejc3/fcvm-bench-records", "files": {name: {
+            "path": relative, "commit": commit,
+            "sha256": hashlib.sha256(data).hexdigest(), "size": len(data)}}}
+        with open(os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS), "w") as handle:
+            json.dump(pointer, handle)
+        return records, commit
+
+    def test_without_a_checkout_the_run_is_refused_as_not_verified(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            self._move_out(d, run_dir)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir])
+            self.assertNotEqual(rc, 0, text)
+            self.assertFalse(os.path.exists(out), "an index was written for an unread log")
+            self.assertIn("NOT VERIFIED", text)
+            self.assertIn("ejc3/fcvm-bench-records@", text)
+            self.assertIn(campaign_summary.RECORDS_ENV, text)
+
+    def test_with_the_checkout_the_log_is_read_from_the_named_commit(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, commit = self._move_out(d, run_dir)
+            # The working tree moving on does not change what the commit holds.
+            path = os.path.join(records, "bench", "chromium", "results",
+                                os.path.basename(run_dir), "corpus-access.log")
+            with open(path, "a") as handle:
+                handle.write("changed after the commit\n")
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertEqual(rc, 0, text)
+            with open(out) as handle:
+                index = json.load(handle)
+            self.assertIn(f"ejc3/fcvm-bench-records@{commit}:bench/chromium/results/"
+                          f"{os.path.basename(run_dir)}/corpus-access.log",
+                          {entry["path"] for entry in index["generated_from"]})
+
+    def test_a_checkout_without_the_commit_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            self._move_out(d, run_dir)
+            empty = os.path.join(d, "empty")
+            subprocess.run(["git", "init", "-q", empty], check=True)
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=empty)
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("NOT VERIFIED", text)
+
+    def test_a_pointer_to_other_bytes_is_refused(self):
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            records, _commit = self._move_out(d, run_dir)
+            pointer_path = os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS)
+            pointer = json.load(open(pointer_path))
+            pointer["files"]["corpus-access.log"]["sha256"] = "0" * 64
+            json.dump(pointer, open(pointer_path, "w"))
+            out = os.path.join(d, "campaign-x-summary.json")
+            rc, text = self._summarize(out, [run_dir], records=records)
+            self.assertNotEqual(rc, 0, text)
+            self.assertIn("not the", text)
+
+    def test_the_lint_reader_marks_the_cell_it_read_without_the_logs(self):
+        """load_cell(replay_logs=False) is how the report lint reads a run in
+        CI. It must say the logs were not read, and the index must not use it."""
+        with tempfile.TemporaryDirectory() as d:
+            run_dir = os.path.join(d, "reqbench-20261022-corpus-x")
+            write_run(run_dir)
+            self._move_out(d, run_dir)
+            cell, _sources = campaign_summary.load_cell(run_dir, replay_logs=False)
+            self.assertIs(cell["replay_logs_verified"], False)
+            with self.assertRaisesRegex(campaign_summary.RunError, "NOT VERIFIED"):
+                with unittest.mock.patch.dict(os.environ, {}, clear=False):
+                    os.environ.pop(campaign_summary.RECORDS_ENV, None)
+                    campaign_summary.load_cell(run_dir)
+        import inspect
+        self.assertNotIn("replay_logs=False", inspect.getsource(campaign_summary.build_index))

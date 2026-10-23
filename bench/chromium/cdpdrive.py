@@ -802,6 +802,8 @@ def main() -> int:
                    help="with --net-trace: keep collecting events this long after "
                         "Page.loadEventFired")
     p.add_argument("--render-module", default=os.path.join(HERE, "render.py"))
+    p.add_argument("--op", choices=("screenshot", "html"), default="screenshot",
+                   help="capture a screenshot, or extract document.documentElement.outerHTML")
     args = p.parse_args()
     if args.print_target:
         # The docstring above has promised this flag since the file was written,

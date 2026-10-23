@@ -43,3 +43,32 @@ results/**
 !results/**/cpuprobe-*-curated.json
 !results/**/webkit-host-probe.json
 __pycache__/
+# fc-agent's restore phases, read out of the per-request clone logs
+# (restore_ack.py), and the memory server's log of the measured run, which
+# holds each clone's fault count and what replay mapped into it.
+!results/**/restore-ack.jsonl
+!results/**/logs/serve.log
+# A corpus_extra run's own provenance and completion markers, and the memory
+# phase's raw samples, from which summary.json's fits are recomputed.
+!results/**/provenance.json
+!results/**/campaign-complete.json
+!results/**/memory/complete.json
+!results/**/memory/samples.jsonl
+# An open-loop scale run's inputs, from which reqscale_analyze recomputes
+# its analysis.json (provenance.json is listed above).
+!results/**/scale-*/requests.jsonl
+!results/**/scale-*/bursts.jsonl
+!results/**/scale-*/schedule.json
+!results/**/scale-*/status.json
+!results/**/scale-*/uffd-serve.json
+!results/**/scale-*/host-control.jsonl
+!results/**/scale-*/host-control-warmup.json
+!results/**/scale-*/host-samples.jsonl
+# A corpus_extra run's replay logs are not part of any of its records
+# (campaign-complete.json and the phase summaries do not name them), and the
+# memory phase's run to 50 MB each.
+results/corpusextra-*/corpus-access.log
+results/corpusextra-*/corpus-dns.log
+# The pointer from a run to the replay logs kept in ejc3/fcvm-bench-records
+# (campaign_summary.py EXTERNAL_LOGS).
+!results/**/external-logs.json

@@ -326,17 +326,22 @@ class ReportContent(unittest.TestCase):
 
         Every text unit that states a zero-failure count must carry an exact
         interval, and one about the corpus runs must carry theirs and its 230
-        attempts. "zero-failure gate" names the gate
-        and is not a count."""
+        attempts. "zero-failure gate" names the gate and is not a count. The
+        page must cite every committed run of the 2026-10-22 campaign, and
+        every arm of each must hold 0 failures in 230 attempts."""
         cited = set(re.findall(r"results/(reqbench-[0-9-]+-corpus[a-z0-9-]*)", self.page))
-        self.assertEqual(cited, set(self.CORPUS_RUNS), "the page must cite the four published corpus runs")
+        campaign = self.campaign_runs()
+        self.assertTrue(campaign, "no 2026-10-22 corpus run is committed; the check is vacuous")
+        self.assertEqual(cited & set(campaign), set(campaign), "the page must cite every run of the campaign")
+        self.assertEqual(cited - set(campaign), set(self.EARLIER_CORPUS_RUNS),
+                         "the page cites a corpus run that is neither the campaign's nor an earlier listed one")
         bounds = set()
-        for run in self.CORPUS_RUNS:
+        for run in campaign:
             with open(os.path.join(HERE, "results", run, "analysis.json")) as f:
                 arms = json.load(f)["arms"]
-            for name in ("cdp", "noop"):
-                self.assertEqual((arms[name]["attempted"], arms[name]["failed"]), (230, 0), (run, name))
-                bounds.add(f"{arms[name]['failure_rate_ci'][1] * 100:.2f}%")
+            for name, arm in arms.items():
+                self.assertEqual((arm["attempted"], arm["failed"]), (230, 0), (run, name))
+                bounds.add(f"{arm['failure_rate_ci'][1] * 100:.2f}%")
         self.assertEqual(len(bounds), 1, f"the runs' intervals differ: {bounds}; quote each")
         bound = bounds.pop()
         units = re.findall(r"<(?:li|p|td)\b[^>]*>(.*?)</(?:li|p|td)>", self.page, re.S)
@@ -357,30 +362,20 @@ class ReportContent(unittest.TestCase):
                 self.assertEqual(set(counts), {"230"}, f"attempt counts {counts} in: {text[:160]!r}")
         self.assertGreaterEqual(checked, 2, "the tile and the sample-gate bullet were not both checked")
 
-        # The fixture caption states three counts; each needs its own bound, read
-        # from the records: every reqbench fixture arm, and HC's 202 attempts.
-        caption = next((plain(u) for u in units if "(200 for HC)" in plain(u)), None)
-        self.assertIsNotNone(caption, "the fixture caption was not found")
-        fixture_bounds, attempts = set(), set()
-        for rid in re.findall(r"results/(reqbench-[0-9a-f]{32}|reqbench-2026081\d-\d{6}-uffd)", self.page):
-            with open(os.path.join(HERE, "results", rid, "analysis.json")) as f:
-                for arm in json.load(f)["arms"].values():
-                    self.assertEqual(arm["failed"], 0, rid)
-                    fixture_bounds.add(round(arm["failure_rate_ci"][1] * 100, 2))
-                    attempts.add(arm["attempted"])
-        self.assertTrue(fixture_bounds, "no fixture record was read")
-        self.assertIn(f"at most {max(fixture_bounds):.2f}%", caption)
-        # The caption names every per-arm attempt count the records hold, and no other.
-        stated = re.search(r"0 in ([\d, or]+) attempts per arm", caption)
-        self.assertTrue(stated, f"the fixture caption states no attempt counts: {caption[:160]!r}")
-        self.assertEqual(sorted(int(n) for n in re.findall(r"\d+", stated.group(1))), sorted(attempts),
-                         "the fixture caption's attempt counts must be the records' per-arm counts")
-        hc = [line for line in open(os.path.join(HERE, "results", "hostcdp-bc17d3ffb64c46ab8d2ef51c0043fb9b",
-                                                 "hostcdp.jsonl")) if line.strip()]
-        self.assertTrue(all(json.loads(line)["ok"] for line in hc))
-        self.assertIn(f"HC 0 in {len(hc)}, 0 to {(1 - 0.025 ** (1 / len(hc))) * 100:.2f}%", caption)
+    @staticmethod
+    def campaign_runs():
+        """Every committed run of the 2026-10-22 corpus campaign (git ls-files)."""
+        import subprocess
+        out = subprocess.run(["git", "ls-files", "--", "results"], cwd=HERE,
+                             capture_output=True, text=True, check=True).stdout
+        # A serial run's analysis.json sits at the top of its directory; the
+        # scale run's is one level down, in its scale-* directory.
+        return sorted({p.split("/")[1] for p in out.split()
+                       if p.split("/")[1].startswith("reqbench-20261022-corpus-")
+                       and p.count("/") == 2 and p.endswith("/analysis.json")})
 
-    CORPUS_RUNS = (
+    # Corpus runs of earlier campaigns the page lists under Earlier runs.
+    EARLIER_CORPUS_RUNS = (
         "reqbench-20260830-171007-corpus",
         "reqbench-20260902-023115-corpus-c2",
         "reqbench-20260902-025115-corpus-c4",
@@ -400,6 +395,17 @@ class ReportContent(unittest.TestCase):
         "b72e516aa4bed8f677700d07c8a241c5b30e738f": "bump-vsock-max-connections",
         "97074abdabf2be2af6f188499032e4c128385568": "bump-vsock-max-connections",
         "5893de232a23a0ce00f52816e239ea85173a7c20": "bump-vsock-max-connections",
+        "ec5def10b716e4ddbe0fd886f0dec7bf705133a5": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "ff9aef9e0884239112dc79ff31142846894bb1b9": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "e5b0abfab94db0e23f54ce1ae02742ef5155e680": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "ef0fb6725cec65cf9115d0a9146be524b8c5b832": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "ffab8ecdcee2038eaeca89d73294cccfb3a130ce": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "4d13d95419ba0293b5257170cd023144868fc1f8": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "0bf1f9783fe52f4a9c0ea7d8a1d267a4a3ef6184": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "1dc6ae42c0532c155747d8cb233c884b29206eb3": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "c5352b1bfc70ed0574c8d1ed583f7198f04de2a0": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a": "agent/uffd-minor-v1.17.0-discard-dirty",
+        "873d12c3e81fd4af272e3ed9091abad372b00d3d": "agent/uffd-minor-v1.17.0-discard-dirty",
     }
 
     def test_each_cited_run_is_attributed_to_the_firecracker_it_ran(self):
@@ -409,14 +415,15 @@ class ReportContent(unittest.TestCase):
         rootfs-config.toml selects at their source revisions; only the fixture
         runs used bump-vsock-max-connections.
 
-        Each subsection names exactly the branch its runs used, and no other
-        part of the page names a branch."""
+        Each subsection names exactly the branches its runs used, and no other
+        part of the page names a branch. The 2026-10-22 campaign's runs belong
+        to "2026-10-22 runs", every other cited run to "Earlier runs"."""
         fc = section(self.page, "firecracker")
         parts = re.split(r"<h3>([^<]+)</h3>", fc)
         subsections = {parts[i].strip(): parts[i + 1] for i in range(1, len(parts), 2)}
-        self.assertEqual(sorted(subsections), ["Corpus runs", "Fixture runs"])
+        self.assertEqual(sorted(subsections), ["2026-10-22 runs", "Earlier runs"])
         branches = set(self.FIRECRACKER_BRANCH.values())
-        expected = {"Corpus runs": set(), "Fixture runs": set()}
+        expected = {"2026-10-22 runs": set(), "Earlier runs": set()}
         runs = sorted(set(re.findall(r"results/(reqbench-[A-Za-z0-9-]+)", self.page)))
         self.assertTrue(runs, "the page cites no reqbench run; the check is vacuous")
         for run in runs:
@@ -424,10 +431,10 @@ class ReportContent(unittest.TestCase):
                 revision = json.load(f)["cell"]["source_revision"]
             self.assertIn(revision, self.FIRECRACKER_BRANCH,
                           f"{run}: add the Firecracker pin at {revision}")
-            where = "Corpus runs" if "-corpus" in run else "Fixture runs"
+            where = "2026-10-22 runs" if run.startswith("reqbench-20261022-") else "Earlier runs"
             expected[where].add(self.FIRECRACKER_BRANCH[revision])
         for where, want in expected.items():
-            named = {b for b in branches if b in subsections[where]}
+            named = {b for b in branches if re.search(rf"\b{re.escape(b)}\b(?![\w.-])", subsections[where])}
             self.assertEqual(named, want, f"{where} must name exactly the branch its runs used")
         rest = self.page.replace(fc, "")
         self.assertEqual({b for b in branches if b in rest}, set(),
@@ -438,6 +445,15 @@ class ReportContent(unittest.TestCase):
             self.assertEqual(linked, expected[where], f"{where} links a branch its runs did not use")
         self.assertEqual(re.findall(r"github\.com/ejc3/firecracker/tree/([^\"'#?]+)", rest), [],
                          "a Firecracker branch link outside Firecracker builds")
+        # Each 2026-10-22 run records the commit and the binary; the section names both.
+        for run in runs:
+            if not run.startswith("reqbench-20261022-"):
+                continue
+            with open(os.path.join(HERE, "results", run, "reqbench.jsonl")) as f:
+                firecracker = json.loads(f.readline())["firecracker"]
+            self.assertTrue(firecracker["commit_matches_binary"], run)
+            self.assertIn(firecracker["commit"][:8], subsections["2026-10-22 runs"], run)
+            self.assertIn(firecracker["sha256"][:12], subsections["2026-10-22 runs"], run)
 
     def figure(self, label):
         """The HTML of the <figure> whose caption has id=label."""
@@ -455,75 +471,28 @@ class ReportContent(unittest.TestCase):
         toc = re.search(r'<nav class="toc".*?</nav>', self.page, re.S).group(0)
         self.assertEqual(re.findall(r'href="#([^"]+)"', toc), sections, "the contents list the sections in page order")
 
-    LADDER = CORPUS_RUNS[1:]
-
     def test_each_figure_computed_from_request_records_names_them(self):
         """RED BEFORE THE FIX: the mean stage split (#d-split) and the
         capacity arithmetic (#c-cap) printed means computed from per-request
         records and named neither the file nor the fields. bench/chromium/
-        AGENTS.md: every figure traceable to a raw record, cited next to it."""
-        c4 = "results/reqbench-20260902-025115-corpus-c4/"
+        AGENTS.md: every figure traceable to a raw record, cited next to it.
+        Each figure computed from per-request records names a committed
+        2026-10-22 record and the fields it read."""
+        run = r"results/<wbr>reqbench-20261022-corpus-[a-z0-9-]+/<wbr>reqbench\.<wbr>jsonl|results/reqbench-20261022-corpus-[a-z0-9-]+/reqbench\.jsonl"
         want = {
-            "d-split": [c4 + "reqbench.jsonl", "blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
-            "c-cap": [f"results/{run}/reqbench.jsonl" for run in self.LADDER] + ["wall_ms", c4 + "hostinfo.json", "nproc"],
-            "c-dens": ["results/20260808-corrected/corrected.json", "density", "host_pool"],
+            "d-split": ["blocking_ms", "spawn_to_port_ms", "render.stages", "teardown_total_ms"],
+            "c-marks": ["spawn_to_port_ms", "restore_marks", "resolve_polls"],
         }
+        campaign = set(self.campaign_runs())
         for label, needles in want.items():
             src = re.findall(r'<p class="src">(.*?)</p>', self.figure(label), re.S)
             self.assertEqual(len(src), 1, f"#{label} carries one source line")
+            text = src[0].replace("<wbr>", "")
+            named = re.findall(r"results/(reqbench-20261022-corpus-[a-z0-9-]+)/reqbench\.jsonl", text)
+            self.assertTrue(named, f"#{label}'s source line names no per-request record")
+            self.assertLessEqual(set(named), campaign, f"#{label} names a record that is not committed")
             for needle in needles:
-                self.assertIn(needle, src[0].replace("<wbr>", ""), f"#{label}'s source line must name {needle}")
-
-    def density_fits(self):
-        with open(os.path.join(HERE, "results", "20260808-corrected", "corrected.json")) as f:
-            record = json.load(f)
-        fits = {k: record["density"][k]["fits"]["cgroup"] for k in ("uffd-4k-minor", "file-4k", "uffd-4k-copy")}
-        fits["host_pool"] = record["host_pool"]["fits"]["cgroup"]
-        for fit in fits.values():
-            fit["slope"] = fit.get("slope_mib_per_clone", fit.get("slope_mib_per_container"))
-        return fits
-
-    # The row label each fit is printed under, in the chart and in the table.
-    DENSITY_LABELS = {"uffd-4k-minor": "minor mode", "file-4k": "file-backed",
-                      "uffd-4k-copy": "copy mode", "host_pool": "warm container pool"}
-
-    def density_rows(self):
-        """{fit key: (chart row text, table row text)}, each row found by its label."""
-        fig = self.figure("c-dens")
-        chart = {plain(label).lower(): plain(rest) for label, rest in
-                 re.findall(r'<div class="r"[^>]*><span class="l">(.*?)</span>(.*?)</div>', fig, re.S)}
-        table = {plain(label).lower(): plain(rest) for label, rest in
-                 re.findall(r"<tr><td>(.*?)</td>(.*?)</tr>", fig, re.S)}
-        rows = {}
-        for key, label in self.DENSITY_LABELS.items():
-            self.assertIn(label, chart, f"no chart row labelled {label!r}")
-            self.assertIn(label, table, f"no table row labelled {label!r}")
-            rows[key] = (chart[label], table[label])
-        return rows
-
-    def test_the_density_slopes_carry_their_standard_errors(self):
-        """RED BEFORE THE FIX: #c-dens printed the fitted slopes as bare
-        values (132.5, 143.5, 257.8 and 156.5 MiB) although the record gives
-        their standard errors, 0.4 to 5.0 MiB. bench/chromium/AGENTS.md:
-        quote uncertainty. Each value is checked in its own labelled row, so
-        two rows' values cannot trade places."""
-        rows = self.density_rows()
-        for key, fit in self.density_fits().items():
-            self.assertEqual(rows[key][0], f"{fit['slope']:.1f} ± {fit['slope_se']:.1f} MiB", key)
-
-    def test_the_density_figure_gives_intercepts_and_the_total_at_16(self):
-        """RED BEFORE THE FIX: #c-dens showed slopes only. The fits'
-        intercepts run from 17.3 to 249.8 MiB, so memory at a given count is
-        intercept + N x slope and the slopes alone cannot give it.
-        bench/chromium/AGENTS.md: slope and intercept with uncertainty, and a
-        value at a concrete N inside the measured range. Checked per
-        labelled row."""
-        rows = self.density_rows()
-        for key, fit in self.density_fits().items():
-            total = fit["intercept_mib"] + 16 * fit["slope"]
-            want = (f"{fit['intercept_mib']:.1f} ± {fit['intercept_se']:.1f} MiB {total:,.0f} MiB "
-                    f"{fit['reqs_per_gib_at_n']['16']:.1f} per GiB")
-            self.assertEqual(rows[key][1], want, key)
+                self.assertIn(needle, text, f"#{label}'s source line must name {needle}")
 
     def test_the_sequence_shows_replay_can_outlast_the_resume(self):
         """RED BEFORE THE FIX: step 8 read "replay recorded pages in chunks

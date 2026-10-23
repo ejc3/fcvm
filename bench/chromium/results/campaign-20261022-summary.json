@@ -1,0 +1,3165 @@
+{
+  "generated_from": [
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/analysis.json",
+      "sha256": "a272b9723d71934f16b6dc884a5b77ddabba726d2e4671c3f45dccb181fb71e7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/dns-evidence.json",
+      "sha256": "de4871738ab56ebc157c25348e43206468af805468634e6faf0f0bafc8dc8632"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/dns-owner.log",
+      "sha256": "2d46a52296b8ebb58ca415374184de36dbd405f6899c8f514b0a088b4891ac6d"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/verify-dns-pre.json",
+      "sha256": "82deb6c3ec076e2f9a63ef92cd6d388f75bcb5105bb8dcec29bf695cd50bc432"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/verify-dns-before-run.json",
+      "sha256": "7bc00e48cc13880053d9a0373feceb30264c030b7f33a2b27e1fc81b057ff249"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/verify-dns-after-run.json",
+      "sha256": "6bf805e3021777a380efbee69c9539530d166152b1060b125cf80ace4f971b4a"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/external-logs.json",
+      "sha256": "2662e616b027dfedeabd24b3707bc68b11beb5a10298966a11b0502b91afd3f0"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-dns.log",
+      "sha256": "1ae63ac33f4fbad780e1e345203ef5aecfed2904d3ac217a88af7a4b0d1c29c5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/external-logs.json",
+      "sha256": "2662e616b027dfedeabd24b3707bc68b11beb5a10298966a11b0502b91afd3f0"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-access.log",
+      "sha256": "c069d4818bdb11859e725b0bbf21f29b2d30edb715fa1df02ed411731525901c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/replay-queries.log",
+      "sha256": "911a04addf1f291c3d16290bf887ea7fa35fb3587b98bbead5b9024b3e812a25"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/diag/summary.json",
+      "sha256": "3fdf471d768a8a9abad5b278b9a30bc1bcab23c2acfa2130ae2a2713f7a49e47"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/reqbench.jsonl",
+      "sha256": "a974b54cc7f96ef7f7607e5ff8639c669cc5981e255653531529adc6644dc44c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/analysis.json",
+      "sha256": "2c75886484158d08cdf7559503f85a6755b34b52267a7cd7c5e9dbc4729bc0cc"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/dns-evidence.json",
+      "sha256": "6611f47f7b67b7edac088b2de6ccb9850c8317dc685c4d8a46fc1c9aca2e4475"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/dns-owner.log",
+      "sha256": "408c5d358401803201390147ff37d9231a73f6dd6b7f5031532e83669827eca6"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/verify-dns-pre.json",
+      "sha256": "675e92b98bc0ba7ad7b608cb87eec31aab7d6cd916d392075a28929a398291e8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/verify-dns-before-run.json",
+      "sha256": "0f037edce8b0f9d6f6aae27977928daba4ad5e866fe3fd78141bda1f62d6921a"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/verify-dns-after-run.json",
+      "sha256": "4b7d1a7905e3c41321aa00916677da5206a319b4ff449bf9c4bfa97c4dcc7f7e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/external-logs.json",
+      "sha256": "737a031a2138001768eef85fc395fb2909e33574c69578c394d29ee7896c425d"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-dns.log",
+      "sha256": "b7cac0f6a7a2613ced13a8ff97d5c33ac68c039ae21fa0bd08f2634e0558af67"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/external-logs.json",
+      "sha256": "737a031a2138001768eef85fc395fb2909e33574c69578c394d29ee7896c425d"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-access.log",
+      "sha256": "6c539b11140b8a1cd820fe3c9eefca414d1a5802947e94e05f48d28a70949a13"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/replay-queries.log",
+      "sha256": "33d4a2be0ad7877f1ff279a80d6241e53d3e9498bfeeffc7dc24ae251a877c2f"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/diag/summary.json",
+      "sha256": "7b711778353bd29f9b468703c428282e9648580923469a1198dce8e859769c08"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/reqbench.jsonl",
+      "sha256": "3f7c1dce4fe7f5863975065fbab408f3ff67415f68515b77408dcc1dfada22dd"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/analysis.json",
+      "sha256": "c741e088855b3cc0ac4390e6fbd89ab433ff7c6e90b8faa6a3df8c333f8065a7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/dns-evidence.json",
+      "sha256": "cd08f7d04da1fea885cd59711b2235e2cfc5cd70ed7fe542ef277b37180ae9a4"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/dns-owner.log",
+      "sha256": "a752394ea2a6c1746611f77119c1752f25db54d3b19368c594f082b956e49ded"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/verify-dns-pre.json",
+      "sha256": "156ac2e40796ecf8ac0dcf79274c87676378ae87c214e10c683c95f50c4fe3bb"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/verify-dns-before-run.json",
+      "sha256": "d701db7dff18bc25ab3e5e9bfa577a83337088da93abd4df4f7dda11e9b03689"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/verify-dns-after-run.json",
+      "sha256": "318b95c0b58183326f4401290c06aa0d21a36ba4f5b48c68aa9897cd11b5c80a"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/external-logs.json",
+      "sha256": "be090b5eba4a1010284e4eea3d6a08af553769375fd7d76017c8b4e86520a351"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-dns.log",
+      "sha256": "e15000b5ad3837a8a4e997a06fdc9395285cb3c00ad6be69682f761ef6165818"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/external-logs.json",
+      "sha256": "be090b5eba4a1010284e4eea3d6a08af553769375fd7d76017c8b4e86520a351"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-access.log",
+      "sha256": "e4811df820f6721aa276f2dc18f0f90cc04612c25515495870885753a7b3a6f8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/replay-queries.log",
+      "sha256": "652e75ab55301dd3249b7cd0ffe683da63b50faaac2cba354d23b248d3baf0a1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/diag/summary.json",
+      "sha256": "270f5b0959e2e484199f7afbada15a6f455e6e5428a2bbb9264c59de7643c889"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/reqbench.jsonl",
+      "sha256": "f16a3deec4b49c2d90a5dc10750f748198e7a1e1ad5f143d3b9809996e13db74"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/analysis.json",
+      "sha256": "067e0ccc5b6ac05b111807b0322ac92ced1c85ce918d60acab4dd0a9c1a988b8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/dns-evidence.json",
+      "sha256": "e1e0f7429683fd0a9777c11bd57cb5a72f6bb7ad06441450b3cafbb72c0fcdcc"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/dns-owner.log",
+      "sha256": "f92f79d4641cd47cd78abffad8ab2c1813427c86059bfabe61a45fe2027b1ef0"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/verify-dns-pre.json",
+      "sha256": "61b72b28908bba61e0a1082d29de8179a2d22d524e7b741ebfe1da7ba77fa005"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/verify-dns-before-run.json",
+      "sha256": "2c94dc961f221ee7e695123640522907ed9ea42a18ea376a8c1a7664f9ecb5fc"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/verify-dns-after-run.json",
+      "sha256": "1f0c5e4228c1a7b6fe30555915b0a265b4ef3adec59ac327daee0a1d86642473"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/external-logs.json",
+      "sha256": "accaaee9db93daa3ff3af504ad43216e60bbed05055f252963519d818bf28a9b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-dns.log",
+      "sha256": "3d299d38fa28998f95c71afbf50e65381657d692f81d6d5e1716c75db935aca1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/external-logs.json",
+      "sha256": "accaaee9db93daa3ff3af504ad43216e60bbed05055f252963519d818bf28a9b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-access.log",
+      "sha256": "78ed784b26c67aaf23d9b4ac12b5b3648bfd2819fea464039a2d0159293e5e35"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/replay-queries.log",
+      "sha256": "0847eae01182e2c16e56a6e14c7610033f2436668cdc0a59f301e27ac8b42f01"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/diag/summary.json",
+      "sha256": "3b90273393ad30e3c575b00d05265047f667079084735c959806011cae8f5c5d"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/reqbench.jsonl",
+      "sha256": "b1eb656b56dffb9ae1e1cfa3c26a947988eba981be8b96fb3bee8840f1d3e1f6"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/analysis.json",
+      "sha256": "91ddb1ac635a3a712e2e6edea5e1c2001daa70301a69cefe27a1fc5bbd82074e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/dns-evidence.json",
+      "sha256": "71c0396ad9e1ce77702368ff880de85a345939b79db381fceea039df40a500b3"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/dns-owner.log",
+      "sha256": "c409d7062656c41fb982225d2333ecb04a2c2426686272c118dfc22996f2a759"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/verify-dns-pre.json",
+      "sha256": "3bc025b34d32d8e113ed0a9d9a0c064b037180d111e3684caa2af09174ba5152"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/verify-dns-before-run.json",
+      "sha256": "116760cc363762efd457414356d669fa15a86a9df3e3d4ca305888004c592fb7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/verify-dns-after-run.json",
+      "sha256": "5e6412e6f375c06c588ca19bebd7e81ae49ccb415b3997c9d575e3c8e20ec34e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/external-logs.json",
+      "sha256": "8d59eff2babaa97f57ba7fcef7b0b75b757eb425e4c97416fafce54bfddd56f1"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-dns.log",
+      "sha256": "75620c58b219fa61961a8ccaa4ab8a4a60785b039219fb8efb03383c5b92fd3b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/external-logs.json",
+      "sha256": "8d59eff2babaa97f57ba7fcef7b0b75b757eb425e4c97416fafce54bfddd56f1"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-access.log",
+      "sha256": "d507e55afaa245e09c1a08b75c9e5af9886c1c2a743903e91542b5c12e29139b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/replay-queries.log",
+      "sha256": "0cb22c333400fabe954cac6c54e6d9409858c4c46c3f5f81f49d5c18a2e9475e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/diag/summary.json",
+      "sha256": "1a922486290a41f6b2d16fabbe241c16c8ea71cfa895ac3f62dc3f59b67f9a41"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/reqbench.jsonl",
+      "sha256": "a03cf240e436cec53fdbf2f18e3334bb0956a5ab91ae771b3cbb08026ad8c37e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/analysis.json",
+      "sha256": "d5cf820be5b45ae23031ade3f6781cce7e34bae00dfc7aeb647bf33c713f29e9"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/dns-evidence.json",
+      "sha256": "00b74de3cde0af459ac2fb5d30f91c9e1c560d933f2234634dcf0c00a3786027"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/dns-owner.log",
+      "sha256": "6cf1b84ff2c6c650395e372e9ee09e8b10c33002918d06c3d5cac2629a965f3e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/verify-dns-pre.json",
+      "sha256": "36ccf3e56b8c7973a434e4e5da561fb653670e9865c298f1d87108fc9c93e4cd"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/verify-dns-before-run.json",
+      "sha256": "86b2092e64be5627137d9e535467f93c7ea840c54c0ba7f6c1b711811456b55b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/verify-dns-after-run.json",
+      "sha256": "24abe34b59c2992e5781c966b53c9712afb38da99532248db413b084121c99d3"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/external-logs.json",
+      "sha256": "cf9b805113127524021777fefd17f90b4c9550e043120a891fb26b3642e67878"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-dns.log",
+      "sha256": "c0cdb99dcae4df57c212b3dde33ae2aec60bc17f590b84ade49d9698fad0070e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/external-logs.json",
+      "sha256": "cf9b805113127524021777fefd17f90b4c9550e043120a891fb26b3642e67878"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-access.log",
+      "sha256": "01e3c83c2e6a563a1130af577bffe31d90a9bce54192e5f0b977dde9e52c4603"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/replay-queries.log",
+      "sha256": "e4d10f3f7c1f67e476b48e8ddb8e9d040326b898b893efabf20f848146d4185b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/diag/summary.json",
+      "sha256": "2fe7f2b53ca7c25b22538be7c27cfecdc4ad118b1b16d78e921e04dd29186f10"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/reqbench.jsonl",
+      "sha256": "8f23ccfc1c52f33ff5dfcf2421f41e334db30e47602e80ac3aa0c98b93d5c068"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/analysis.json",
+      "sha256": "74bcd30d7e9e17688a251531102e5090fee7845062c6c4b05acf6907dad513f1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/dns-evidence.json",
+      "sha256": "0b21434ff87235105765b9a733c952a132bd16cfd85348dd5ef47c8adec8d1c8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/dns-owner.log",
+      "sha256": "b9e80fc99f6f7716b304fa9fd324cb820fbcb4161d46ad6d812e2ba51fc5fe5e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/verify-dns-pre.json",
+      "sha256": "b09a1f095f48d03cd01081141fd37e3a699fd36f25ad957d7a763cfd6d249857"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/verify-dns-before-run.json",
+      "sha256": "8fc80add6e2d551506d2286863f00ac2d4be7d30b34294db39e795574ef0fbac"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/verify-dns-after-run.json",
+      "sha256": "562454deaf889f0422d2f22cdb9c84640eac619c488090c4433d65e190421909"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/external-logs.json",
+      "sha256": "c4a8f3bc5f1aacf71182a3edc782aa3c23b11b79dc0b7dbf6da666585d6cf2d3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-dns.log",
+      "sha256": "1551e62bf0bb5113893584e2c722dd0aaff93c0bf4bd3f137785c47889432318"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/external-logs.json",
+      "sha256": "c4a8f3bc5f1aacf71182a3edc782aa3c23b11b79dc0b7dbf6da666585d6cf2d3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-access.log",
+      "sha256": "e12d8e178d5b13bd1b3b622c7123061fea7fb7b720a46b2938059624c569ceb5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/replay-queries.log",
+      "sha256": "2ac72b938b6519bc80924010f34dfaffb2902481543900a8416c2681585c30b1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/diag/summary.json",
+      "sha256": "08993154d8bcfb86c22673214fa20fd355bff0661fe9a97b708def70bcb1f7da"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/reqbench.jsonl",
+      "sha256": "b8537f66ff9d422866ba0309944b5225ec81510e468241aef5c19188bbc22fe8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/analysis.json",
+      "sha256": "e2d0064f974baeb7e7096a4b80dd624822567a31d49140a13ec8e0724d05cb28"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/dns-evidence.json",
+      "sha256": "e5a8f891194da2c3d99fb3470c62aafd1633320c09ac7035cdab3bd5edac3411"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/dns-owner.log",
+      "sha256": "da7c866ddf44ba141d07039fe05806dfcd35bc4bed79f81e509c69d3ce5bf4ea"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/verify-dns-pre.json",
+      "sha256": "2845e0057d234270fa07371e09d732c9bf4c24ee541a94844f3f26b3d36a2170"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/verify-dns-before-run.json",
+      "sha256": "2319de3ab0298575c829ee0986a036757260d0cd7d29780f5d830d9db2ab3f23"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/verify-dns-after-run.json",
+      "sha256": "e61ddd451778716dc4b4b8d3b148cbe82185295cb82c794e242167bfb6ecbfdb"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/external-logs.json",
+      "sha256": "687242a1240a58ab8abddd892dd8f614ac2bac3064de2c34f1304b576b5ed850"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-dns.log",
+      "sha256": "07140db34cf6aaf5826123621fadfbbea4dac3312b74f6d5a38b5b55179aaed8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/external-logs.json",
+      "sha256": "687242a1240a58ab8abddd892dd8f614ac2bac3064de2c34f1304b576b5ed850"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-access.log",
+      "sha256": "800f24990110b057357e2227ec4c1d7604028ef12495f53d3a98c719031d6484"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/replay-queries.log",
+      "sha256": "f258e99deac55751859b891c0ac903e4d743a3ccaa2c70a807fd1298b2f4871c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/diag/summary.json",
+      "sha256": "3e877f39437f89716675612dac4fc233a0fc1935947ba0f946bfd8249d6ce1e8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/reqbench.jsonl",
+      "sha256": "268ec371b76fe6ba84ab29e62ac38cd9ba92333ffd769c2d3f2c08fdadb6b5a2"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/analysis.json",
+      "sha256": "c78267788580f467acebe93208350789a0c5d80e3a7b3665ee861a0af11b2962"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/dns-evidence.json",
+      "sha256": "b3763d25362474cc49c44a340a2ebcedb80ba97a91f6a11629224946ec14e91a"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/dns-owner.log",
+      "sha256": "39d1d2a0d6e07db49ec5ba436c9cc8d121f0c245ccccb03236f82c2fd2e8ae4f"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/verify-dns-pre.json",
+      "sha256": "a34596f2a9f1a9916b2428f1c1351a899ef9085b2c7afad76a041e64d1705865"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/verify-dns-before-run.json",
+      "sha256": "ca4e9dec38b2b8005a62c22db10215ec85d97b09e5a706e568bd429258be60ef"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/verify-dns-after-run.json",
+      "sha256": "e2e4312636a819ad86849d1cba6e416c3d60b1230053c55b558baa14cb4a5932"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/external-logs.json",
+      "sha256": "f9e6d3e33a0e9e372b0b7347c96272a87000fe6e6f6287be6af3e8d1124254bf"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-dns.log",
+      "sha256": "0df498f96f4933cca705bfc257e3deeb78b73d5702cfc4a7014b4fc854e07731"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/external-logs.json",
+      "sha256": "f9e6d3e33a0e9e372b0b7347c96272a87000fe6e6f6287be6af3e8d1124254bf"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-access.log",
+      "sha256": "6ea1cb8f3dce25a5b3e12a167c404b3ee818cb25d1e864e05517126f5fc21a66"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/replay-queries.log",
+      "sha256": "3c3d8187a179a0fa13414f898e5f9183695d6b9ef0bfe976081c4c44cc1e645e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/diag/summary.json",
+      "sha256": "7de322a819bbb844567b879b6b929cf6e1757fe82a0257f40b6f0540c6461e0d"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/reqbench.jsonl",
+      "sha256": "b2c54b95f583455abd3385478f646a906bc8bce4c0315829df6d25e98c726300"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/analysis.json",
+      "sha256": "ceeca9ba49cfe04a55f7584fc11890c5c716e58f4cdc0c53da8f79b012befab2"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/dns-evidence.json",
+      "sha256": "2d72b9c6c29f3c44fc4078ab3b2e7d0f58f0af7896344dcc3948fbe33d76adfe"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/dns-owner.log",
+      "sha256": "79a7a7063bc860072509f47653428c6dc54a2fc2c533c030c2b8d1c1d7c65e0c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/verify-dns-pre.json",
+      "sha256": "59ca5c09fefb5e20b235a3a8e07739230896a9d10ac9684cdee91baf4a047ae7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/verify-dns-before-run.json",
+      "sha256": "ceba461fce2b7c98ae1c79057e3635fa0340d48c4b026cb592cc87db35a4dfa5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/verify-dns-after-run.json",
+      "sha256": "b95b08a5b1d72ea7c77b12f9af3ee410d78b465ae436402b60a0d7daf0b24096"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/external-logs.json",
+      "sha256": "3928b78a0852b5c52e0f1e39b295d74c7c61cfed4134a73951546b5fcef668de"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-dns.log",
+      "sha256": "141cbebba16b107948183642ae7e2237f7e8c292dffd09696561d7a4305a5bb1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/external-logs.json",
+      "sha256": "3928b78a0852b5c52e0f1e39b295d74c7c61cfed4134a73951546b5fcef668de"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-access.log",
+      "sha256": "cbf7c95bff12456192875f12406a209e8babf00e36da163f3e298d0a0ac1a384"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/replay-queries.log",
+      "sha256": "7d29f3fc984937e26ceba7f4f5d0b0c1cfd0a844839b623232c580230a5302f1"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/diag/summary.json",
+      "sha256": "de67739a51dfa5d067f2ca18c6445f3a0685518609361a8608a4aa25b848fe88"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/reqbench.jsonl",
+      "sha256": "33f9d059463e90e3bfb93950f9a68771b80fed68e56dfb1e924a970285157f16"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/analysis.json",
+      "sha256": "176777e1b9f470ea212f5238959a5f97b68cfc5d24b65f83988ae19e2b8d5969"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/dns-evidence.json",
+      "sha256": "fbb04c5d310a1b5a543df6ded906b3f838e1a7e9c53bd44d5109c3c66eef5592"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/dns-owner.log",
+      "sha256": "f0b0c1821e335d5faf040bae445318910b2c84af1deb5f30429d55e54853dd7c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/verify-dns-pre.json",
+      "sha256": "3c809b3efaf1a40ee344e463bf3958c90eea59663823e6e164765047b5f901ef"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/verify-dns-before-run.json",
+      "sha256": "d82a3ac3c36b426ee7c0ca44cde0d47a83bd2223abb105c8c041c67a850a2954"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/verify-dns-after-run.json",
+      "sha256": "bdd2eeb539ad85483c528a48a6bcefd2fed527af5b76cb46a5fd55e5140544b3"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/external-logs.json",
+      "sha256": "d13e1ccdf5d3d6d5a0d8cc7bcc5a8fa90df6f91bde083de7e08d966cf8609b4b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-dns.log",
+      "sha256": "fea6886ef9dd75430a622939a6f3654f4aa6e4d8e852fa8da1ceae256cb39d07"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/external-logs.json",
+      "sha256": "d13e1ccdf5d3d6d5a0d8cc7bcc5a8fa90df6f91bde083de7e08d966cf8609b4b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-access.log",
+      "sha256": "02b8ff4ccb5b2f5d46f9cd1cc3be86b7ff3f5fd2da24e05e6b35b817504b65e7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/replay-queries.log",
+      "sha256": "e4d10f3f7c1f67e476b48e8ddb8e9d040326b898b893efabf20f848146d4185b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/diag/summary.json",
+      "sha256": "c5ff4b27a1fdcc5d8d6f7206aaab323648f4696d4eef967715a07a98097ada26"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/reqbench.jsonl",
+      "sha256": "d96bf1cbe4cd1eda8da0846ef6da6c9f39e820bf91d53f647dc26cf9351cb359"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/analysis.json",
+      "sha256": "708055a652f09b9c316331289d86df19d32a7762c6530de08089794881051a24"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/dns-evidence.json",
+      "sha256": "7c42af4c720bbd5a40decf085a44843c03ea6aa92da795c2e7dec9d8302027f0"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/dns-owner.log",
+      "sha256": "994cb94faaac0c458c2222c0e4466d8c6c9d922e286104fdcf454e3daabcb91c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/verify-dns-pre.json",
+      "sha256": "163592d5b61d6653cc38299f8b1ec334178bcece24bc2edc7642e75d7a61c5b9"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/verify-dns-before-run.json",
+      "sha256": "0fe6b7a7f24ca89dc4b966f24e52c1cb4595833deacafb468d18f1547c77c04e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/verify-dns-after-run.json",
+      "sha256": "30ca544ad57b7675acb4f8d323d8a3da45d072170f68680a23e1fdb298fa0439"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/external-logs.json",
+      "sha256": "dd26c7591c535669fdd7a1be66b2448cfe0f863b55c5c7cb7d63ac800e7ee56a"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-dns.log",
+      "sha256": "45b96f05d1dd2e514bbb07c03e1b9203434698a6b4a22660955d91826c0b94f5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/external-logs.json",
+      "sha256": "dd26c7591c535669fdd7a1be66b2448cfe0f863b55c5c7cb7d63ac800e7ee56a"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-access.log",
+      "sha256": "df9f199fff698701641ddefcfd15576e80928f35e38b53c4ce4ae5e23ad754c4"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/replay-queries.log",
+      "sha256": "ca8f356b363020de6db23d9166e726f4a22e547caf7a63516f2edaf00eaf35c4"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/diag/summary.json",
+      "sha256": "b34ef7a67dbf726914df7d7cc1a0d24e865c8b802a0178015eea2481761b6e3e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/reqbench.jsonl",
+      "sha256": "088e8d69f72a25978080a53f2d906138177d739b3427e2e6944caacb50def7a7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/analysis.json",
+      "sha256": "4bae978877fc05c66fd92753b9134ad8f05913d5a42250faf19d6865538965bf"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/dns-evidence.json",
+      "sha256": "291a70b55732eb1a8a37955b46e353f18f772e4a9ee0bf84b9b1249189d79db4"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/dns-owner.log",
+      "sha256": "12bf10369394f66eaec73c82555aaba2ecec03984501b7222d1e80d5698ff441"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/verify-dns-pre.json",
+      "sha256": "57154c2f94f1fda898e852e07741502832d96ad8ec2eef5bc3c020ce8f1b2b2f"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/verify-dns-before-run.json",
+      "sha256": "741bf40f979074209e98ecb5d369904c0fc111738d45abe20cec9d51813147d9"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/verify-dns-after-run.json",
+      "sha256": "db2afd36dc842f76539c44ef88505af8a5f8f8f9cae4eeacf8c69a908010f457"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/external-logs.json",
+      "sha256": "f17acb8ab848b13630f372721543581c40eeca9f3dd2ccda87d5b4bf81d6fce4"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-dns.log",
+      "sha256": "ee2d94ab2a6cf837f3db05acacd095ef5155f9496779832f846fbb3348b4e2c0"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/external-logs.json",
+      "sha256": "f17acb8ab848b13630f372721543581c40eeca9f3dd2ccda87d5b4bf81d6fce4"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-access.log",
+      "sha256": "9e32ab11d7eb656a7228a3f52093c9e2106e36b66444ef0529146bb052fc1aa6"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/replay-queries.log",
+      "sha256": "3eadc07d05882e066f35cf7a244595190edf9dcde5759213948705d8a82e46d6"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/diag/summary.json",
+      "sha256": "da560cf7bf154086b82f5cf73b8df48166eb2afde1def97c29cda1c843e7bdd2"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/reqbench.jsonl",
+      "sha256": "0618a437e5cdcb7d6fc128250709cbae245bb2ef494edc8b1dc13339b07d694f"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/analysis.json",
+      "sha256": "86417caee7c2728a8a7d36b36b7c022c59c91021be9a429663fe244260733f35"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/dns-evidence.json",
+      "sha256": "a5d55749424823605b7a4a5e3866fc7cb82bea44613c0dab65219b3162d6e6b5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/dns-owner.log",
+      "sha256": "7e3d92bea5cbc93a61e84eafa1b0fd82f2184c27eddd073e171296fede58bb1c"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/verify-dns-pre.json",
+      "sha256": "a22c09434134107b93fc837c1bea6ce02b767659b77c2bad11a6370a3a703e9a"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/verify-dns-before-run.json",
+      "sha256": "cbe5fc3776e00969d4dcbbfd60b36bef9b358e160d685595b90bf898ad5a1669"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/verify-dns-after-run.json",
+      "sha256": "7352b0842e10ed0cd326d098fbb9477e18c0615e3386257ad8ff53d2a84c21b5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/external-logs.json",
+      "sha256": "4ea14a967617b36721476e63d2270ef2a47b2f383956a2b6b2127613474bb2b3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-dns.log",
+      "sha256": "3abbb340c58ab20d4b1577e9d11d7e38209fd7d928c104a68ccf415c1b873896"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/external-logs.json",
+      "sha256": "4ea14a967617b36721476e63d2270ef2a47b2f383956a2b6b2127613474bb2b3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-access.log",
+      "sha256": "f702e7e2fdb397c5d52b1ddd01f3a5211f9403b74c430aa9db344ace2f7346f7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/replay-queries.log",
+      "sha256": "27ee320de9ba0c2d359636b496a14e81f13a16978e4973dbe49cbe9c7338735b"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/diag/summary.json",
+      "sha256": "bee0749063478cdd4d2ac6ef98929642cc7adba639552d9fafbe66d4124b1b60"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/reqbench.jsonl",
+      "sha256": "66ca03aa7137c19041564ddd6048daa730282433fb77cf93f35acb8ddbcdf720"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/analysis.json",
+      "sha256": "f8a9a6709682d0920995bbec267a3111addeabbfbf5e1d511e8d41f8f31d11a7"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/dns-evidence.json",
+      "sha256": "34efe16481300c096e4496cdc5592021b67c0cb4410937903dfc3e3a32689e38"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/dns-owner.log",
+      "sha256": "b15f05d5d719b375155bf8a0427ed2a5a595c1ff5ebecfe20250d1c241fb6f8e"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/verify-dns-pre.json",
+      "sha256": "97d0ffdd1ffd3f5bcbfd5deb62136ca6801efd0163c975f978ca53695c5ecee8"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/verify-dns-before-run.json",
+      "sha256": "83f2f452b6aea995be734a73c5d3fc5c4d79d9219500b1e92e9eb05b4395d5fb"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/verify-dns-after-run.json",
+      "sha256": "e695f14670cc7a24a2065bb92585f4835d1190efde49683f9bc8e5137ec51ae5"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/external-logs.json",
+      "sha256": "a8db678b2f23f5432a83491ed3363329ffd28b8ee9ef6cf25a87b871db7f2204"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-dns.log",
+      "sha256": "015419cf3626d06dbe39ce9cb7027cebee70f7af4e9076dc6dee01acc3bc5127"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/external-logs.json",
+      "sha256": "a8db678b2f23f5432a83491ed3363329ffd28b8ee9ef6cf25a87b871db7f2204"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-access.log",
+      "sha256": "b223ad71ed5ad87cf8736e7289b5647e4e554013e8c02559638822ffb4467936"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/replay-queries.log",
+      "sha256": "e8ab65e81fa62a3705cb9684af388d267933f622c32584530d33b9f998603df6"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/diag/summary.json",
+      "sha256": "3abbc46f51ff7d9c67f06ab64cc28db96f233a628649822ab891cce38c5eb2dd"
+    },
+    {
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/reqbench.jsonl",
+      "sha256": "0044e358207a68ddf2a3028026a636fe9810ce50aafae368496a86e3a8ea1fcd"
+    }
+  ],
+  "cells": [
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c2a",
+      "run_id": "b2ec04853721404b844476d50438ec86",
+      "engine": "chromium",
+      "cpu": 2,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "076e2e1e-4e66-4cae-b87c-c41f308ffacd",
+        "snapshot_config_sha256": "3ea6d2b919ec3871bb8be6c87f11846fa635186aad2d6905ab7f74c6c73ff770"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 2.02,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c2a/dns-owner.log",
+          "samples": 129,
+          "min": 1.0,
+          "median": 1.67,
+          "max": 2.02,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c2a/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.39,
+          "median": 1.75,
+          "max": 2.02,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.39,
+              "median": 1.76,
+              "max": 2.02
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 1.76,
+              "max": 2.02
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.4,
+              "median": 1.745,
+              "max": 2.02
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.39,
+              "median": 1.745,
+              "max": 2.02
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.39,
+              "median": 1.755,
+              "max": 2.02
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 805.2908059999027,
+          "blocking_ms_ci": [
+            625.2601369997137,
+            849.5665565005766
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 797.1781694996025,
+          "blocking_ms_ci": [
+            631.6072919998987,
+            844.3012679999811
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 746.1972925002556,
+          "blocking_ms_ci": [
+            561.795779998647,
+            782.0457210000313
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 53.055769999446056,
+          "blocking_ms_ci": [
+            53.01053850052995,
+            53.11420799989719
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 53.01275299916597,
+          "blocking_ms_ci": [
+            52.95383400061837,
+            53.07931099923735
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 689.459220999197,
+          "https://developer.mozilla.org/en-US/": 621.8337939990306,
+          "https://developers.cloudflare.com/": 765.1593339996907,
+          "https://en.wikipedia.org/": 553.9846829997259,
+          "https://example.com/": 817.9953369999566,
+          "https://news.ycombinator.com/": 282.11681799984945,
+          "https://todomvc.com/examples/angular/dist/browser/": 408.09091799928865,
+          "https://todomvc.com/examples/javascript-es6/dist/": 309.8805669997091,
+          "https://todomvc.com/examples/preact/dist/": 309.40676200043526,
+          "https://todomvc.com/examples/react/dist/index.html": 336.42668399988906,
+          "https://todomvc.com/examples/vue/dist/": 327.5322530007543,
+          "https://www.elmundo.es/": 3832.387288000973,
+          "https://www.rtp.pt/noticias/": 3452.308379999522,
+          "https://www.theguardian.com/international": 1343.3234889998857
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 8
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c2b",
+      "run_id": "72340d0e48cb415e9eed3b69c87facf8",
+      "engine": "chromium",
+      "cpu": 2,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "e0536ccc-4fab-4f76-a027-e98de28aeb38",
+        "snapshot_config_sha256": "e977666d192a1a7db67108579f3b6b297ec820569d83ef150c7f320a83b596b3"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 10.95,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c2b/dns-owner.log",
+          "samples": 128,
+          "min": 1.01,
+          "median": 1.66,
+          "max": 10.95,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c2b/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.19,
+          "median": 1.74,
+          "max": 10.95,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.22,
+              "median": 1.74,
+              "max": 10.95
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.22,
+              "median": 1.74,
+              "max": 10.95
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.19,
+              "median": 1.74,
+              "max": 10.95
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.19,
+              "median": 1.75,
+              "max": 10.95
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.19,
+              "median": 1.75,
+              "max": 10.95
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 777.0039464994625,
+          "blocking_ms_ci": [
+            634.2124704988237,
+            835.5400455002382
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 808.8090735000151,
+          "blocking_ms_ci": [
+            622.0016640018002,
+            850.4986469997675
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 727.8022404989315,
+          "blocking_ms_ci": [
+            580.5409694985428,
+            773.8811320014065
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 52.88545049916138,
+          "blocking_ms_ci": [
+            52.775529999053106,
+            53.03437650036358
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.911518499968224,
+          "blocking_ms_ci": [
+            52.80335250063217,
+            53.07835950225126
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 586.6597460008052,
+          "https://developer.mozilla.org/en-US/": 523.0900669994298,
+          "https://developers.cloudflare.com/": 615.9566310016089,
+          "https://en.wikipedia.org/": 618.6323539986915,
+          "https://example.com/": 639.4916239987651,
+          "https://news.ycombinator.com/": 434.0668660006486,
+          "https://todomvc.com/examples/angular/dist/browser/": 341.84939300030237,
+          "https://todomvc.com/examples/javascript-es6/dist/": 259.87203600016073,
+          "https://todomvc.com/examples/preact/dist/": 244.3679019997944,
+          "https://todomvc.com/examples/react/dist/index.html": 267.6815339982568,
+          "https://todomvc.com/examples/vue/dist/": 272.79177400123444,
+          "https://www.elmundo.es/": 3587.4737199992524,
+          "https://www.rtp.pt/noticias/": 2523.579418000736,
+          "https://www.theguardian.com/international": 1195.8805920003215
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 9
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4a",
+      "run_id": "e02c3ce48295448494c2905e6ddd6853",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ec5def10b716e4ddbe0fd886f0dec7bf705133a5",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "745f03d2-3678-4e56-9f5e-030794b37a14",
+        "snapshot_config_sha256": "db6a67079e9c1fd996bb7f0e599294bc327e29bc2f9208aad3170d8609313ba2"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 17.57,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4a/dns-owner.log",
+          "samples": 122,
+          "min": 1.04,
+          "median": 2.065,
+          "max": 17.57,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4a/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.42,
+          "median": 2.295,
+          "max": 17.57,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 2.31,
+              "max": 17.57
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 2.295,
+              "max": 17.57
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 2.285,
+              "max": 17.57
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 2.295,
+              "max": 17.57
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 2.3,
+              "max": 17.57
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 683.6107420001554,
+          "blocking_ms_ci": [
+            584.0404629998375,
+            736.246938000022
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 673.9678259998527,
+          "blocking_ms_ci": [
+            594.0181839998786,
+            725.1300445000197
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 624.4713795001644,
+          "blocking_ms_ci": [
+            517.7916920001735,
+            669.523513000513
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 52.78759750012796,
+          "blocking_ms_ci": [
+            52.680290000353125,
+            52.85320549978678
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.775513500137095,
+          "blocking_ms_ci": [
+            52.710593000028894,
+            52.8740080001171
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 421.2561250001272,
+          "https://developer.mozilla.org/en-US/": 362.10962599989216,
+          "https://developers.cloudflare.com/": 482.1154060000481,
+          "https://en.wikipedia.org/": 447.60743799997726,
+          "https://example.com/": 187.50134599986268,
+          "https://news.ycombinator.com/": 294.9908069999765,
+          "https://todomvc.com/examples/angular/dist/browser/": 262.678735999998,
+          "https://todomvc.com/examples/javascript-es6/dist/": 171.149018000051,
+          "https://todomvc.com/examples/preact/dist/": 168.4934219997558,
+          "https://todomvc.com/examples/react/dist/index.html": 195.85049300030732,
+          "https://todomvc.com/examples/vue/dist/": 182.79380200010564,
+          "https://www.elmundo.es/": 2755.0632219999898,
+          "https://www.rtp.pt/noticias/": 2450.9133860001384,
+          "https://www.theguardian.com/international": 1004.4264379998822
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 47,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4b",
+      "run_id": "6782968279d34c888cf23d72ea48e014",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "39a072b1-8b7e-4246-ac9b-9ecadc92cb3a",
+        "snapshot_config_sha256": "d9bdc5172ff0e8728816a81781082713b810c0503b7f12c443d79acfb8346b6d"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 2.73,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4b/dns-owner.log",
+          "samples": 122,
+          "min": 1.02,
+          "median": 1.93,
+          "max": 2.73,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4b/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.41,
+          "median": 1.96,
+          "max": 2.79,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.41,
+              "median": 1.96,
+              "max": 2.79
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 1.96,
+              "max": 2.79
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 1.98,
+              "max": 2.79
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.41,
+              "median": 1.96,
+              "max": 2.79
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.42,
+              "median": 1.96,
+              "max": 2.79
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 683.7536760003786,
+          "blocking_ms_ci": [
+            576.1357929986843,
+            733.7225954997848
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 688.7986920000913,
+          "blocking_ms_ci": [
+            603.14263950022,
+            734.042433000468
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 623.8624484994943,
+          "blocking_ms_ci": [
+            529.4733005002854,
+            661.6420270001981
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 52.87320950083085,
+          "blocking_ms_ci": [
+            52.79331049950997,
+            52.957488499487226
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.89862650079158,
+          "blocking_ms_ci": [
+            52.808422499765584,
+            53.02459450012975
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 519.692447000125,
+          "https://developer.mozilla.org/en-US/": 468.36621399961587,
+          "https://developers.cloudflare.com/": 571.7752460004704,
+          "https://en.wikipedia.org/": 532.914911998887,
+          "https://example.com/": 132.22281500020472,
+          "https://news.ycombinator.com/": 238.01331099821255,
+          "https://todomvc.com/examples/angular/dist/browser/": 324.17443899976206,
+          "https://todomvc.com/examples/javascript-es6/dist/": 224.09406599945214,
+          "https://todomvc.com/examples/preact/dist/": 218.680800000584,
+          "https://todomvc.com/examples/react/dist/index.html": 249.75518999963242,
+          "https://todomvc.com/examples/vue/dist/": 239.3128199983039,
+          "https://www.elmundo.es/": 2725.195752000218,
+          "https://www.rtp.pt/noticias/": 2460.789298000236,
+          "https://www.theguardian.com/international": 1160.0767179988907
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4b-off",
+      "run_id": "e2d42301592b45eebae31b87e0cad358",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "39a072b1-8b7e-4246-ac9b-9ecadc92cb3a",
+        "snapshot_config_sha256": "d9bdc5172ff0e8728816a81781082713b810c0503b7f12c443d79acfb8346b6d"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 16.54,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/dns-owner.log",
+          "samples": 139,
+          "min": 1.02,
+          "median": 2.23,
+          "max": 16.54,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.65,
+          "median": 2.4,
+          "max": 16.54,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.7,
+              "median": 2.4050000000000002,
+              "max": 16.54
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.7,
+              "median": 2.39,
+              "max": 16.54
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.65,
+              "median": 2.37,
+              "max": 15.21
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.65,
+              "median": 2.4050000000000002,
+              "max": 16.54
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.65,
+              "median": 2.4050000000000002,
+              "max": 15.21
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 925.7746240000415,
+          "blocking_ms_ci": [
+            865.5612969996582,
+            957.4685130010039
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 926.0843974989257,
+          "blocking_ms_ci": [
+            862.3364610002682,
+            956.4856460001465
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 847.0283404994916,
+          "blocking_ms_ci": [
+            766.2306575002731,
+            888.2163279995439
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 53.122145499401086,
+          "blocking_ms_ci": [
+            53.01399299969489,
+            53.245355000399286
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 53.16712700005155,
+          "blocking_ms_ci": [
+            53.07542599985027,
+            53.332182000303874
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 417.42000299927895,
+          "https://developer.mozilla.org/en-US/": 390.7272060005198,
+          "https://developers.cloudflare.com/": 478.5139079995133,
+          "https://en.wikipedia.org/": 431.35172099937336,
+          "https://example.com/": 188.91262000033748,
+          "https://news.ycombinator.com/": 368.9299809993827,
+          "https://todomvc.com/examples/angular/dist/browser/": 249.2252419997385,
+          "https://todomvc.com/examples/javascript-es6/dist/": 166.32653399938135,
+          "https://todomvc.com/examples/preact/dist/": 178.32636200000707,
+          "https://todomvc.com/examples/react/dist/index.html": 189.85566799892695,
+          "https://todomvc.com/examples/vue/dist/": 192.47563300086767,
+          "https://www.elmundo.es/": 2892.0549760005088,
+          "https://www.rtp.pt/noticias/": 2398.9009149991034,
+          "https://www.theguardian.com/international": 1014.7530530011863
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 7
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4c",
+      "run_id": "821a21d1fb85469ca13399fd6b4978ad",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "259ac203-80e7-44ab-9634-a784e4a31de1",
+        "snapshot_config_sha256": "8c916c5e42e721b456bdcf7b9c7ff928d5f5b99dea8915677104a635fd898695"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 116.73,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4c/dns-owner.log",
+          "samples": 121,
+          "min": 1.24,
+          "median": 2.01,
+          "max": 116.73,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4c/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.24,
+          "median": 1.88,
+          "max": 2.85,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 1.88,
+              "max": 2.85
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 1.87,
+              "max": 2.85
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 1.88,
+              "max": 2.85
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 1.875,
+              "max": 2.85
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 1.88,
+              "max": 2.85
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 683.4329275000073,
+          "blocking_ms_ci": [
+            600.2803414999107,
+            717.2410350001428
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 658.9722574999541,
+          "blocking_ms_ci": [
+            571.874507000075,
+            708.8031885000419
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 615.3068099999928,
+          "blocking_ms_ci": [
+            502.2330689998853,
+            657.8395785002158
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 53.02672250013529,
+          "blocking_ms_ci": [
+            52.953844000285244,
+            53.07274550000329
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.951987999904304,
+          "blocking_ms_ci": [
+            52.90830499984622,
+            53.01760699967417
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 435.5539409998528,
+          "https://developer.mozilla.org/en-US/": 396.51955700037433,
+          "https://developers.cloudflare.com/": 1010.89149299969,
+          "https://en.wikipedia.org/": 449.190155999986,
+          "https://example.com/": 269.96873799998866,
+          "https://news.ycombinator.com/": 358.9979690000291,
+          "https://todomvc.com/examples/angular/dist/browser/": 245.0825259998055,
+          "https://todomvc.com/examples/javascript-es6/dist/": 171.10048399990774,
+          "https://todomvc.com/examples/preact/dist/": 164.02902899972105,
+          "https://todomvc.com/examples/react/dist/index.html": 187.57325800015678,
+          "https://todomvc.com/examples/vue/dist/": 178.87307099999816,
+          "https://www.elmundo.es/": 2806.8260450004345,
+          "https://www.rtp.pt/noticias/": 1893.5892059998878,
+          "https://www.theguardian.com/international": 948.9202879999539
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 48,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3",
+      "run_id": "b3f8279bd3fb4fc4914c97b697be05cd",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "259ac203-80e7-44ab-9634-a784e4a31de1",
+        "snapshot_config_sha256": "8c916c5e42e721b456bdcf7b9c7ff928d5f5b99dea8915677104a635fd898695"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 185.26,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/dns-owner.log",
+          "samples": 144,
+          "min": 0.99,
+          "median": 3.135,
+          "max": 185.26,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.24,
+          "median": 2.92,
+          "max": 18.62,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 2.915,
+              "max": 18.62
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 2.88,
+              "max": 18.62
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 2.935,
+              "max": 18.62
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 2.9050000000000002,
+              "max": 18.62
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.24,
+              "median": 2.92,
+              "max": 18.62
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 921.4728949998516,
+          "blocking_ms_ci": [
+            877.6631724999788,
+            966.2687325001116
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 911.0895930000424,
+          "blocking_ms_ci": [
+            884.2657684999722,
+            984.4804685001236
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 843.4017424998501,
+          "blocking_ms_ci": [
+            762.745543499932,
+            908.0945134999183
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 52.8766379999297,
+          "blocking_ms_ci": [
+            52.81373200023154,
+            52.92324150002514
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.92918049997297,
+          "blocking_ms_ci": [
+            52.861210000060055,
+            52.97121600005994
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 526.4619929999981,
+          "https://developer.mozilla.org/en-US/": 460.9070270000757,
+          "https://developers.cloudflare.com/": 605.1844180000217,
+          "https://en.wikipedia.org/": 532.0839240000623,
+          "https://example.com/": 199.06180499992843,
+          "https://news.ycombinator.com/": 321.1279829999967,
+          "https://todomvc.com/examples/angular/dist/browser/": 318.9771940001265,
+          "https://todomvc.com/examples/javascript-es6/dist/": 221.56011900005979,
+          "https://todomvc.com/examples/preact/dist/": 227.92581099997733,
+          "https://todomvc.com/examples/react/dist/index.html": 249.55748499996844,
+          "https://todomvc.com/examples/vue/dist/": 238.61018799993872,
+          "https://www.elmundo.es/": 2842.8278950000276,
+          "https://www.rtp.pt/noticias/": 2230.1139490000423,
+          "https://www.theguardian.com/international": 1109.689426000159
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 52,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 7
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4e",
+      "run_id": "9a8dcf721e7a4344bb2de55082e7d253",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:c1390cb9dea977b4c45a8724f7b7ea22cb28351783dc85f1efa6487c651a50cc",
+        "snapshot_generation_id": "b5d5357e-add5-467f-913d-804c1384c75e",
+        "snapshot_config_sha256": "af3ff173bec4efd9c8b83ef6a9a71bed76a62805332b9b687e927ebe070c0eb0"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 2.87,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e/dns-owner.log",
+          "samples": 121,
+          "min": 1.02,
+          "median": 1.82,
+          "max": 2.87,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.34,
+          "median": 1.92,
+          "max": 2.87,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.34,
+              "median": 1.93,
+              "max": 2.87
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.34,
+              "median": 1.93,
+              "max": 2.87
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.34,
+              "median": 1.92,
+              "max": 2.87
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.34,
+              "median": 1.92,
+              "max": 2.87
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.34,
+              "median": 1.915,
+              "max": 2.87
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 689.5359900000813,
+          "blocking_ms_ci": [
+            565.4513670001506,
+            726.2119490001169
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 683.1166730000859,
+          "blocking_ms_ci": [
+            577.4277159998746,
+            728.8464420000764
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 622.7174359999026,
+          "blocking_ms_ci": [
+            512.8512415000159,
+            672.6398460000382
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 51.07827999995607,
+          "blocking_ms_ci": [
+            51.05589599997984,
+            51.147970000329224
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 51.104775499879906,
+          "blocking_ms_ci": [
+            51.06194899985894,
+            51.187931499953265
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 415.6035029998293,
+          "https://developer.mozilla.org/en-US/": 376.7003319999276,
+          "https://developers.cloudflare.com/": 505.27757100007875,
+          "https://en.wikipedia.org/": 462.36059399984697,
+          "https://example.com/": 198.39696600001844,
+          "https://news.ycombinator.com/": 291.9566489999852,
+          "https://todomvc.com/examples/angular/dist/browser/": 251.4738719999059,
+          "https://todomvc.com/examples/javascript-es6/dist/": 170.51361400012865,
+          "https://todomvc.com/examples/preact/dist/": 173.44980300003954,
+          "https://todomvc.com/examples/react/dist/index.html": 196.89253100000315,
+          "https://todomvc.com/examples/vue/dist/": 176.0645909998857,
+          "https://www.elmundo.es/": 3094.044181000072,
+          "https://www.rtp.pt/noticias/": 1929.56011199999,
+          "https://www.theguardian.com/international": 1004.152465000061
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5",
+      "run_id": "1de4a735992846749c1f4ad6cdaff88a",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:c1390cb9dea977b4c45a8724f7b7ea22cb28351783dc85f1efa6487c651a50cc",
+        "snapshot_generation_id": "b5d5357e-add5-467f-913d-804c1384c75e",
+        "snapshot_config_sha256": "af3ff173bec4efd9c8b83ef6a9a71bed76a62805332b9b687e927ebe070c0eb0"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 21.04,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/dns-owner.log",
+          "samples": 119,
+          "min": 0.96,
+          "median": 2.49,
+          "max": 21.04,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.89,
+          "median": 3.55,
+          "max": 22.7,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.89,
+              "median": 3.5,
+              "max": 22.7
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.94,
+              "median": 3.505,
+              "max": 21.04
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.89,
+              "median": 3.56,
+              "max": 22.7
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.89,
+              "median": 3.55,
+              "max": 21.04
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.89,
+              "median": 3.5549999999999997,
+              "max": 21.04
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 660.5875454999932,
+          "blocking_ms_ci": [
+            556.314243000088,
+            698.6204119994
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 663.9368055002706,
+          "blocking_ms_ci": [
+            562.427069000023,
+            711.1629229993923
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 603.9760655003192,
+          "blocking_ms_ci": [
+            493.55959550007356,
+            645.8932065002045
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 50.73974550009552,
+          "blocking_ms_ci": [
+            50.660576999916884,
+            50.899529999696824
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 51.31953450018045,
+          "blocking_ms_ci": [
+            50.82788749973588,
+            52.432474499710224
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 485.5565529996966,
+          "https://developer.mozilla.org/en-US/": 423.7233929998183,
+          "https://developers.cloudflare.com/": 525.8919749999222,
+          "https://en.wikipedia.org/": 1144.3803970000772,
+          "https://example.com/": 136.42080999989048,
+          "https://news.ycombinator.com/": 275.00111300014396,
+          "https://todomvc.com/examples/angular/dist/browser/": 307.8187619998971,
+          "https://todomvc.com/examples/javascript-es6/dist/": 215.28022100028466,
+          "https://todomvc.com/examples/preact/dist/": 213.89182000029905,
+          "https://todomvc.com/examples/react/dist/index.html": 245.5058839996127,
+          "https://todomvc.com/examples/vue/dist/": 228.80120599984366,
+          "https://www.elmundo.es/": 2864.0843749999476,
+          "https://www.rtp.pt/noticias/": 2058.040799000082,
+          "https://www.theguardian.com/international": 1132.3497289999978
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b",
+      "run_id": "3d35926805404fdb8102f31f9f58e0a8",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:c1390cb9dea977b4c45a8724f7b7ea22cb28351783dc85f1efa6487c651a50cc",
+        "snapshot_generation_id": "b5d5357e-add5-467f-913d-804c1384c75e",
+        "snapshot_config_sha256": "af3ff173bec4efd9c8b83ef6a9a71bed76a62805332b9b687e927ebe070c0eb0"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 2.74,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/dns-owner.log",
+          "samples": 122,
+          "min": 0.91,
+          "median": 1.97,
+          "max": 2.74,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.25,
+          "median": 2.14,
+          "max": 2.79,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.25,
+              "median": 2.14,
+              "max": 2.79
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.25,
+              "median": 2.14,
+              "max": 2.79
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.25,
+              "median": 2.1550000000000002,
+              "max": 2.79
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.25,
+              "median": 2.14,
+              "max": 2.79
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.25,
+              "median": 2.14,
+              "max": 2.79
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 700.397354499728,
+          "blocking_ms_ci": [
+            578.3553999995092,
+            732.8256149999106
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 662.3890619998747,
+          "blocking_ms_ci": [
+            589.5389499992234,
+            729.1335134996189
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 622.9699310006254,
+          "blocking_ms_ci": [
+            510.3745490005167,
+            661.6836234998118
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 52.874540500397416,
+          "blocking_ms_ci": [
+            52.79078500007017,
+            52.94163100006699
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 52.82157149986233,
+          "blocking_ms_ci": [
+            52.75805549990764,
+            52.91557350028597
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 497.5072690003799,
+          "https://developer.mozilla.org/en-US/": 470.5208870000206,
+          "https://developers.cloudflare.com/": 581.1970999993719,
+          "https://en.wikipedia.org/": 522.4921690005431,
+          "https://example.com/": 165.01010000047245,
+          "https://news.ycombinator.com/": 225.56369900030404,
+          "https://todomvc.com/examples/angular/dist/browser/": 320.0924169996142,
+          "https://todomvc.com/examples/javascript-es6/dist/": 222.54000500015536,
+          "https://todomvc.com/examples/preact/dist/": 226.46165399964957,
+          "https://todomvc.com/examples/react/dist/index.html": 239.32410799989157,
+          "https://todomvc.com/examples/vue/dist/": 246.08773899944936,
+          "https://www.elmundo.es/": 2859.1509400002906,
+          "https://www.rtp.pt/noticias/": 2089.072976999887,
+          "https://www.theguardian.com/international": 1166.138200000205
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 48,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4f",
+      "run_id": "8be31564fee64fc8b53585d4916fb40f",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "643b4591f01a00fd72fb9a2e543c4363a66110e7b624ca4f703f85adf18025f9",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "f10098d2d0b2622a464661378230576ec67505fc7f41cd26ad74c1d3f3c994c8",
+        "source_revision": "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a",
+        "image_id": "sha256:57b44fa0b65a5e09499f6991d5e8af0a6b4fed5a5dbf728a3ff49e6c618b4f9e",
+        "snapshot_generation_id": "c2ec495d-7fcf-4a45-8c7f-ad62bf72a27a",
+        "snapshot_config_sha256": "127ac72263d342e1907424556e423ed8d3176d1dad54d18dbb241e2959587f31"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 3.13,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f/dns-owner.log",
+          "samples": 137,
+          "min": 1.0,
+          "median": 1.94,
+          "max": 3.13,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.43,
+          "median": 2.19,
+          "max": 3.13,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.43,
+              "median": 2.215,
+              "max": 3.13
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.54,
+              "median": 2.2,
+              "max": 3.13
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.47,
+              "median": 2.2,
+              "max": 3.13
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.43,
+              "median": 2.185,
+              "max": 3.13
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.43,
+              "median": 2.18,
+              "max": 3.13
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 715.5114249999315,
+          "blocking_ms_ci": [
+            611.6945350004244,
+            759.8986605007667
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 706.2460995002766,
+          "blocking_ms_ci": [
+            624.155368999709,
+            762.2279334991617
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 658.4027699991566,
+          "blocking_ms_ci": [
+            562.4233785001707,
+            702.1290474986017
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 67.29089699911128,
+          "blocking_ms_ci": [
+            67.20955199853051,
+            67.582551499072
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 67.25332199857803,
+          "blocking_ms_ci": [
+            67.1513720008079,
+            67.42420249793213
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 396.6006810005638,
+          "https://developer.mozilla.org/en-US/": 376.56942200192134,
+          "https://developers.cloudflare.com/": 438.201751003362,
+          "https://en.wikipedia.org/": 447.368003999145,
+          "https://example.com/": 71.69065400012187,
+          "https://news.ycombinator.com/": 161.19909699773416,
+          "https://todomvc.com/examples/angular/dist/browser/": 255.59509600134334,
+          "https://todomvc.com/examples/javascript-es6/dist/": 361.15089599843486,
+          "https://todomvc.com/examples/preact/dist/": 168.02824299884378,
+          "https://todomvc.com/examples/react/dist/index.html": 482.91125900141196,
+          "https://todomvc.com/examples/vue/dist/": 193.57037599911564,
+          "https://www.elmundo.es/": 2703.3834070025478,
+          "https://www.rtp.pt/noticias/": 4165.918352999142,
+          "https://www.theguardian.com/international": 1604.8510059990804
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 46,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 8,
+            "net::ERR_CONNECTION_RESET": 1
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy",
+      "run_id": "a1bd60bfb01f49089c5a2016e19327e0",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "copy",
+      "seal": {
+        "runtime_bundle_sha256": "643b4591f01a00fd72fb9a2e543c4363a66110e7b624ca4f703f85adf18025f9",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "f10098d2d0b2622a464661378230576ec67505fc7f41cd26ad74c1d3f3c994c8",
+        "source_revision": "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a",
+        "image_id": "sha256:57b44fa0b65a5e09499f6991d5e8af0a6b4fed5a5dbf728a3ff49e6c618b4f9e",
+        "snapshot_generation_id": "c2ec495d-7fcf-4a45-8c7f-ad62bf72a27a",
+        "snapshot_config_sha256": "127ac72263d342e1907424556e423ed8d3176d1dad54d18dbb241e2959587f31"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 15.94,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/dns-owner.log",
+          "samples": 136,
+          "min": 1.0,
+          "median": 2.215,
+          "max": 15.94,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.51,
+          "median": 2.4,
+          "max": 16.98,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.51,
+              "median": 2.41,
+              "max": 16.98
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.51,
+              "median": 2.355,
+              "max": 16.98
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.51,
+              "median": 2.4,
+              "max": 16.98
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.51,
+              "median": 2.4,
+              "max": 16.98
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.51,
+              "median": 2.365,
+              "max": 16.98
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 618.5552600018127,
+          "blocking_ms_ci": [
+            554.2732840003737,
+            674.1250390005007
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 625.7841839997127,
+          "blocking_ms_ci": [
+            567.2492390003754,
+            676.1740230031137
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 591.3386380016163,
+          "blocking_ms_ci": [
+            503.624826500527,
+            630.7715870025277
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 68.74090050041559,
+          "blocking_ms_ci": [
+            68.16106699989177,
+            69.38471049943473
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 68.99151399920811,
+          "blocking_ms_ci": [
+            68.13433749812248,
+            69.61661399873265
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 942.4970180007222,
+          "https://developer.mozilla.org/en-US/": 316.8824210006278,
+          "https://developers.cloudflare.com/": 1363.0151200013643,
+          "https://en.wikipedia.org/": 514.4994020010927,
+          "https://example.com/": 65.56683800226892,
+          "https://news.ycombinator.com/": 119.21850600265316,
+          "https://todomvc.com/examples/angular/dist/browser/": 236.70125400167308,
+          "https://todomvc.com/examples/javascript-es6/dist/": 158.30963000189513,
+          "https://todomvc.com/examples/preact/dist/": 139.1284599994833,
+          "https://todomvc.com/examples/react/dist/index.html": 160.3931930003455,
+          "https://todomvc.com/examples/vue/dist/": 164.80007100108196,
+          "https://www.elmundo.es/": 2870.9126760004438,
+          "https://www.rtp.pt/noticias/": 1698.097073000099,
+          "https://www.theguardian.com/international": 821.1803250014782
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {
+            "net::ERR_CONNECTION_RESET": 6
+          },
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {
+            "net::ERR_CONNECTION_RESET": 1
+          },
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 7
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb",
+      "run_id": "6d19040518fa45758bf8e1092d8ed8e0",
+      "engine": "chromium",
+      "cpu": 4,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "643b4591f01a00fd72fb9a2e543c4363a66110e7b624ca4f703f85adf18025f9",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "f10098d2d0b2622a464661378230576ec67505fc7f41cd26ad74c1d3f3c994c8",
+        "source_revision": "fcbeec9ef767b0ffc8dbc52528f7648c28fdf22a",
+        "image_id": "sha256:57b44fa0b65a5e09499f6991d5e8af0a6b4fed5a5dbf728a3ff49e6c618b4f9e",
+        "snapshot_generation_id": "c2ec495d-7fcf-4a45-8c7f-ad62bf72a27a",
+        "snapshot_config_sha256": "127ac72263d342e1907424556e423ed8d3176d1dad54d18dbb241e2959587f31"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 16.59,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/dns-owner.log",
+          "samples": 138,
+          "min": 1.02,
+          "median": 2.1950000000000003,
+          "max": 16.59,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.57,
+          "median": 2.36,
+          "max": 17.69,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.66,
+              "median": 2.35,
+              "max": 17.69
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.57,
+              "median": 2.365,
+              "max": 17.69
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.57,
+              "median": 2.37,
+              "max": 17.69
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.57,
+              "median": 2.36,
+              "max": 17.69
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.66,
+              "median": 2.37,
+              "max": 16.59
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 704.7461185011343,
+          "blocking_ms_ci": [
+            627.2470990006696,
+            768.6105824996048
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 698.7373444990226,
+          "blocking_ms_ci": [
+            626.033673499478,
+            754.0539239998907
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 633.5233944992069,
+          "blocking_ms_ci": [
+            545.9715440010768,
+            706.675201001417
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 69.78702699780115,
+          "blocking_ms_ci": [
+            69.66647800072678,
+            69.881195000562
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 69.9060359984287,
+          "blocking_ms_ci": [
+            69.80093550191668,
+            70.02123600250343
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 941.6780040010053,
+          "https://developer.mozilla.org/en-US/": 370.9934329999669,
+          "https://developers.cloudflare.com/": 1057.380528000067,
+          "https://en.wikipedia.org/": 578.1332580008893,
+          "https://example.com/": 70.04348000191385,
+          "https://news.ycombinator.com/": 539.0170879982179,
+          "https://todomvc.com/examples/angular/dist/browser/": 258.4248339990154,
+          "https://todomvc.com/examples/javascript-es6/dist/": 167.93247000168776,
+          "https://todomvc.com/examples/preact/dist/": 165.02000100081204,
+          "https://todomvc.com/examples/react/dist/index.html": 186.82700499994098,
+          "https://todomvc.com/examples/vue/dist/": 190.6388120005431,
+          "https://www.elmundo.es/": 2716.921427996567,
+          "https://www.rtp.pt/noticias/": 1905.5899009981658,
+          "https://www.theguardian.com/international": 950.8783930032223
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {
+            "net::ERR_CONNECTION_RESET": 5
+          },
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {
+            "net::ERR_CONNECTION_RESET": 2
+          },
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 7
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c8a",
+      "run_id": "06686a4517c140e3bfe716d76f817c34",
+      "engine": "chromium",
+      "cpu": 8,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "b1028f3d-8c21-45c5-8b32-e7116642a472",
+        "snapshot_config_sha256": "64a9d1ef59ec4f630c50c87ce4e5639eccef6004ff8adb52a7ed3661b484f403"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 11.39,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c8a/dns-owner.log",
+          "samples": 131,
+          "min": 1.03,
+          "median": 2.51,
+          "max": 11.39,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c8a/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.28,
+          "median": 2.995,
+          "max": 11.39,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.28,
+              "median": 2.975,
+              "max": 11.39
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.28,
+              "median": 2.995,
+              "max": 11.39
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.28,
+              "median": 3.0199999999999996,
+              "max": 11.39
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.28,
+              "median": 2.975,
+              "max": 11.39
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.28,
+              "median": 2.98,
+              "max": 11.39
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 704.622704999565,
+          "blocking_ms_ci": [
+            647.1443604996239,
+            749.7515730001396
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 688.3605169996372,
+          "blocking_ms_ci": [
+            645.0612200005708,
+            741.0869764989911
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 646.1255740005072,
+          "blocking_ms_ci": [
+            581.3285679996625,
+            704.9338550004904
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 53.095972500159405,
+          "blocking_ms_ci": [
+            53.02815250070125,
+            53.161632499723055
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 53.103974500118056,
+          "blocking_ms_ci": [
+            53.006521999122924,
+            53.16476549978688
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 425.70554799931415,
+          "https://developer.mozilla.org/en-US/": 326.3361410008656,
+          "https://developers.cloudflare.com/": 423.09445699902426,
+          "https://en.wikipedia.org/": 417.3922350000794,
+          "https://example.com/": 201.00083200122754,
+          "https://news.ycombinator.com/": 332.19876300063333,
+          "https://todomvc.com/examples/angular/dist/browser/": 246.33402400104387,
+          "https://todomvc.com/examples/javascript-es6/dist/": 158.06902399890532,
+          "https://todomvc.com/examples/preact/dist/": 160.32283200001984,
+          "https://todomvc.com/examples/react/dist/index.html": 186.67443800040928,
+          "https://todomvc.com/examples/vue/dist/": 179.1883690002578,
+          "https://www.elmundo.es/": 2651.295942001525,
+          "https://www.rtp.pt/noticias/": 1811.984575999304,
+          "https://www.theguardian.com/international": 938.4657020000304
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 45,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    },
+    {
+      "run_dir": "bench/chromium/results/reqbench-20261022-corpus-c8b",
+      "run_id": "6ec46b093c1243338542aaa7e0b6b817",
+      "engine": "chromium",
+      "cpu": 8,
+      "memory_mib": 1024,
+      "guest_dns": "10.0.2.2",
+      "guest_env": [],
+      "backend": "uffd",
+      "uffd_mode": "minor",
+      "seal": {
+        "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+        "fcvm_sha256": "654487302cc09e0b04ab95b646fed4db504aed2f62bddc51e91ac40518b0af9a",
+        "harness_sha256": "2c23d14d9044d72c46b422132821e17896f89f99bf1cd7f70ad34ce922a44f25",
+        "source_revision": "ff9aef9e0884239112dc79ff31142846894bb1b9",
+        "image_id": "sha256:2b9b98b85be80e7d9c7150ec0b2bacfe75ed7f0919d5706531d5511d28de3177",
+        "snapshot_generation_id": "62c1b7b3-0c3e-404f-b20b-f794aa476c08",
+        "snapshot_config_sha256": "9d98bd91a9ba949ea9ba4e1b7fcf10c757614bbf921b086b499d39888264b0fb"
+      },
+      "publishable": true,
+      "stall_gate_passed": true,
+      "dns_verdict": "clean",
+      "load_max_1min": 3.46,
+      "load_evidence": {
+        "continuous_owner_log": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c8b/dns-owner.log",
+          "samples": 128,
+          "min": 1.04,
+          "median": 2.14,
+          "max": 3.46,
+          "interval_seconds": 10
+        },
+        "measured_requests": {
+          "artifact": "bench/chromium/results/reqbench-20261022-corpus-c8b/reqbench.jsonl",
+          "samples": 1010,
+          "min": 1.52,
+          "median": 2.35,
+          "max": 3.67,
+          "per_arm": {
+            "cdp": {
+              "samples": 202,
+              "min": 1.52,
+              "median": 2.3449999999999998,
+              "max": 3.46
+            },
+            "cdp-fast": {
+              "samples": 202,
+              "min": 1.56,
+              "median": 2.36,
+              "max": 3.67
+            },
+            "html-fast": {
+              "samples": 202,
+              "min": 1.52,
+              "median": 2.37,
+              "max": 3.67
+            },
+            "noop": {
+              "samples": 202,
+              "min": 1.52,
+              "median": 2.3449999999999998,
+              "max": 3.46
+            },
+            "noop-fast": {
+              "samples": 202,
+              "min": 1.52,
+              "median": 2.335,
+              "max": 3.67
+            }
+          }
+        }
+      },
+      "headline": {
+        "cdp": {
+          "blocking_ms": 671.5819885012024,
+          "blocking_ms_ci": [
+            632.0434725002997,
+            755.3790960009792
+          ],
+          "n": 202
+        },
+        "cdp-fast": {
+          "blocking_ms": 697.6302265011327,
+          "blocking_ms_ci": [
+            627.8848839974671,
+            741.0802470003546
+          ],
+          "n": 202
+        },
+        "html-fast": {
+          "blocking_ms": 646.9583684993268,
+          "blocking_ms_ci": [
+            574.2787745002715,
+            692.4257709979429
+          ],
+          "n": 202
+        },
+        "noop": {
+          "blocking_ms": 54.720758000257774,
+          "blocking_ms_ci": [
+            54.64646599830303,
+            54.812889498862205
+          ],
+          "n": 202
+        },
+        "noop-fast": {
+          "blocking_ms": 54.740350000429316,
+          "blocking_ms_ci": [
+            54.4849140005681,
+            54.82046100041771
+          ],
+          "n": 202
+        }
+      },
+      "diag": {
+        "diag_passed": true,
+        "violations_count": 0,
+        "max_load_ms": {
+          "https://blog.cloudflare.com/": 415.6160029997409,
+          "https://developer.mozilla.org/en-US/": 353.1519739990472,
+          "https://developers.cloudflare.com/": 406.46966499843984,
+          "https://en.wikipedia.org/": 414.7654180014797,
+          "https://example.com/": 147.963441999309,
+          "https://news.ycombinator.com/": 267.9587159982475,
+          "https://todomvc.com/examples/angular/dist/browser/": 255.09511900236248,
+          "https://todomvc.com/examples/javascript-es6/dist/": 176.13214299854008,
+          "https://todomvc.com/examples/preact/dist/": 155.88832199864555,
+          "https://todomvc.com/examples/react/dist/index.html": 187.03543200172135,
+          "https://todomvc.com/examples/vue/dist/": 190.0730819979799,
+          "https://www.elmundo.es/": 2696.6852330006077,
+          "https://www.rtp.pt/noticias/": 1807.058157002757,
+          "https://www.theguardian.com/international": 974.1997759992955
+        },
+        "errors": {
+          "https://blog.cloudflare.com/": {},
+          "https://developer.mozilla.org/en-US/": {},
+          "https://developers.cloudflare.com/": {},
+          "https://en.wikipedia.org/": {},
+          "https://example.com/": {},
+          "https://news.ycombinator.com/": {},
+          "https://todomvc.com/examples/angular/dist/browser/": {},
+          "https://todomvc.com/examples/javascript-es6/dist/": {},
+          "https://todomvc.com/examples/preact/dist/": {},
+          "https://todomvc.com/examples/react/dist/index.html": {},
+          "https://todomvc.com/examples/vue/dist/": {},
+          "https://www.elmundo.es/": {
+            "net::ERR_ABORTED": 46,
+            "net::ERR_CONNECTION_RESET": 3
+          },
+          "https://www.rtp.pt/noticias/": {
+            "net::ERR_ABORTED": 6
+          },
+          "https://www.theguardian.com/international": {
+            "net::ERR_ABORTED": 27
+          }
+        }
+      }
+    }
+  ]
+}
