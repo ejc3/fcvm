@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Disk-capacity preflight + cleanup for fcvm CI runners.
 #
-# One script, two invocation layers (2026-08-06: runner-i-0ea78b39da373fcca
+# One script, two invocation layers (2026-08-06: runner-<id>
 # filled its disk and killed every job it picked up at "Set up job" —
 # "No space left on device: /opt/actions-runner/_diag/..." — until it was
 # manually deregistered; neither layer alone can prevent a repeat):

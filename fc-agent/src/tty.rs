@@ -79,7 +79,12 @@ pub struct SessionSpec {
 /// Connect to the host's TTY listener and run `command` on that connection.
 ///
 /// Used by `podman run -it`, where fc-agent initiates the connection.
-pub async fn run_with_pty(command: &[String], tty: bool, interactive: bool) -> i32 {
+pub async fn run_with_pty(
+    command: &[String],
+    env: Vec<(String, String)>,
+    tty: bool,
+    interactive: bool,
+) -> i32 {
     if command.is_empty() {
         eprintln!("[fc-agent] tty: empty command");
         return 1;
@@ -93,7 +98,7 @@ pub async fn run_with_pty(command: &[String], tty: bool, interactive: bool) -> i
     };
     let spec = SessionSpec {
         argv: command.to_vec(),
-        env: Vec::new(),
+        env,
         tty,
         interactive,
         // A host with a terminal on stdin sends its size as the first frame.
