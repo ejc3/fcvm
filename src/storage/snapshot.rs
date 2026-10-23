@@ -296,6 +296,16 @@ pub struct SnapshotMetadata {
     /// device.
     #[serde(default)]
     pub balloon_free_page_reporting: bool,
+    /// GPUs the source parked for this snapshot (`snapshot create --gpu-warm`): its
+    /// CUDA processes are checkpointed into guest memory and wait to be restored onto
+    /// this many GPUs. A restore must attach exactly this many (`--gpu`); 0 for every
+    /// other snapshot.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub parked_gpus: usize,
+}
+
+fn is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 impl SnapshotMetadata {
@@ -750,6 +760,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                parked_gpus: 0,
             },
         };
 
@@ -951,6 +962,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                parked_gpus: 0,
             },
         };
 
@@ -1037,6 +1049,7 @@ mod tests {
                     firecracker_bin: None,
                     balloon_mib: None,
                     balloon_free_page_reporting: false,
+                    parked_gpus: 0,
                 },
             };
             manager.save_snapshot(config).await.unwrap();
@@ -1110,6 +1123,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                parked_gpus: 0,
             },
         };
         manager.save_snapshot(config).await.unwrap();
@@ -1307,6 +1321,7 @@ mod tests {
                 firecracker_bin: None,
                 balloon_mib: None,
                 balloon_free_page_reporting: false,
+                parked_gpus: 0,
             },
         };
 
@@ -1461,6 +1476,7 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
+            parked_gpus: 0,
         };
 
         let json = serde_json::to_string(&metadata).unwrap();

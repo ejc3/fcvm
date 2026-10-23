@@ -2380,7 +2380,7 @@ It is a separate profile, not the default, because module support and the
 Kconfig patch would change the default kernel's release identity and every
 default snapshot cache key for VMs that never see a GPU, and because GPU VMs
 need the device-passthrough Firecracker build and `--enable-pci`, which the
-profile carries (`firecracker_branch = "agent/vfio-hotplug-v1.17.0"`). No
+profile carries (`firecracker_branch = "agent/vfio-passthrough-hotplug"`). No
 release is published for it yet; `make setup-gpu` builds it locally.
 
 ### The NVIDIA driver image
@@ -2452,6 +2452,97 @@ shuts the VM down with status 1. Each cause names what was expected and what
 the guest saw: the PCI functions present after a rescan, the kernel release
 the image was built for, the kernel log's NVRM lines after a failed `insmod`
 or `nvidia-smi`.
+
+### Warm GPU snapshots
+
+A restore ends at an empty GPU, so a model server in a clone loads its weights,
+compiles and allocates again before it answers. `fcvm snapshot create --gpu-warm`
+takes a snapshot of a VM that has its GPUs attached and its CUDA processes running,
+with their GPU memory in the snapshot. Firecracker cannot save a passthrough
+device, so the GPU state leaves the GPU first, through NVIDIA's cuda-checkpoint
+(`cuCheckpointProcess*`, R550 and later; `--device-map` from R580), which the driver
+image carries at `usr/bin/cuda-checkpoint`.
+
+The sequence (`crate::gpu::warm_gpu_snapshot`, fc-agent/src/gpu_park.rs):
+
+1. **Park** (`fc-agent --gpu-park` over the exec channel). fc-agent finds every
+   process with a `/dev/nvidia*` descriptor open, other than nvidia-persistenced,
+   and refuses unless cuda-checkpoint reports each one `running`. It locks all of
+   them, then checkpoints all of them: the driver copies each process's device
+   memory into the process's own memory and closes its GPU handles. It stops
+   nvidia-persistenced, checks that nothing holds an NVIDIA device, removes each GPU
+   from the guest's PCI bus (`/sys/bus/pci/devices/<addr>/remove`) and writes
+   `/run/fcvm-gpu/parked.json` (pids, GPU UUIDs, guest addresses). /run is a tmpfs,
+   so the record is in the snapshot. A failure undoes every step taken.
+2. **Detach.** `DELETE /device-passthrough/gpu<i>` for each GPU (Firecracker fork
+   branch `agent/vfio-passthrough-hotplug`): off the PCI and MMIO buses, device
+   reset, BAR mappings and MSI-X routes removed, group out of the container; the
+   container goes with the last device, which unpins guest memory.
+3. **Snapshot**, as for any VM. Its metadata records `parked_gpus`.
+4. **Re-attach** each GPU to the source (`PUT /device-passthrough/gpu<i>` after
+   boot, which the fork now accepts) and **unpark** (`fc-agent --gpu-unpark`): the
+   same bring-up a restore does (rescan, device nodes, nvidia-persistenced,
+   `nvidia-smi -L`), then `cuda-checkpoint --action restore` for each parked
+   process and `--action unlock`. The source keeps its GPUs; its CUDA work is
+   stopped from the lock to the unlock. Once the park succeeded, step 4 runs
+   whatever steps 2 and 3 did, and a failure there is reported with the
+   snapshot's own result.
+
+A clone is restored with as many `--gpu` addresses as the snapshot parked
+(`snapshot run` refuses any other count before it starts anything). The GPUs are
+attached by the load as for any GPU restore, and the restore's GPU step finds the
+parked record: instead of the launch gate (which refuses a GPU for a running
+container) it brings the GPUs up and restores each process onto them, with
+`--device-map <snapshot UUID>=<clone UUID>` when the clone has other GPUs than the
+source (each list sorted). The kernel modules stay loaded through the park, so the
+container's device nodes keep their numbers. The guest needs memory for the GPU
+state it holds: a process's device memory is in guest RAM from the park on.
+
+GPU restores load with Firecracker's File backend. Through a UFFD server (`snapshot
+serve`, then `snapshot run --pid`) the load fails: VFIO pins all guest memory for
+DMA, and pinning memory registered with userfaultfd returns `Bad address`
+(`failed to add guest memory map into iommu table`). That is so for any GPU
+restore, warm or not.
+
+Measured on 2026-10-23 on a g4dn.metal (eight T4) with Qwen2.5-0.5B-Instruct and two
+servers: vLLM 0.32.0 (`vllm/vllm-openai:v0.32.0-cu129`, fp16, TRITON_ATTN,
+`--gpu-memory-utilization 0.2`, torch.compile and CUDA graphs on, 8 vCPU and 12 GiB
+guests) and llama.cpp's CUDA server (`ghcr.io/ggml-org/llama.cpp:server-cuda`,
+fp16 GGUF, 8 vCPU and 6 GiB guests). The weights are in the image. Time to first
+token is from the start of the fcvm command to the first streamed token of a
+16-token completion that the host retries every 20 ms. Each clone took the next of
+the GPUs other than the source's, so every warm restore used `--device-map`. 20 runs
+each, nearest-rank percentiles:
+
+| server | path | p50 | p95 | min | max |
+|--------|------|-----|-----|-----|-----|
+| vLLM | warm: `snapshot run --snapshot <warm> --gpu X` | 10.30 s | 10.50 s | 9.94 s | 12.26 s |
+| vLLM | cold: cache-hit `podman run --gpu X`, server start, model load | 108.08 s | 111.16 s | 104.49 s | 113.02 s |
+| llama.cpp | warm | 5.90 s | 6.00 s | 5.77 s | 6.09 s |
+| llama.cpp | cold | 52.63 s | 54.18 s | 50.86 s | 54.20 s |
+
+vLLM's warm restores (p50): load 6,926 ms (12 GiB pinned), GPU step 3,266 ms, of
+which bring-up 1,132 ms and cuda-checkpoint's restore of its two CUDA processes (the
+API server and the engine core, 2,896 MiB of device memory) 2,096 ms; ACK 10,268 ms. Its cold start: ACK
+8.2 s, model load 4.9 s, engine init 52.4 s (15.9 s of it torch.compile, the rest
+profiling and CUDA graph capture), first token at about 106 s. Taking the vLLM
+snapshot took 33.9 s.
+
+Every answer was its source's at temperature 0 (vLLM: " Paris. It was founded in 789
+AD by Charlemagne,"; llama.cpp: " Paris. It is the largest city in Europe and the
+second largest city in the"). In llama.cpp's warm restores (p50, min to max):
+the snapshot load took 3,718 ms (3,594 to 3,841) and vLLM's 12 GiB guests' 6,926 ms:
+the load attaches the GPU, which pins all guest memory for DMA, and pinning the File
+backend's private mapping for writing copies every page; the GPU step 2,083 ms, of which the bring-up (rescan, nvidia-persistenced
+initialising the GPU, `nvidia-smi -L`) 1,140 ms and cuda-checkpoint's restore and
+unlock of 1,124 MiB of device memory 918 ms; the ACK 5,881 ms. In the cold path the
+restore ACK came at 4.9 s, llama-server loaded the model in 1.8 s, then spent 31 s
+before it reported ready (its warm-up decode), and the first 16 tokens took 12 s,
+against 0.15 s in a warm clone.
+
+Taking a warm snapshot of a running warm llama.cpp clone took 9.1 s: park 1,066 ms,
+detach 573 ms, snapshot 4,363 ms, attach 639 ms, unpark 2,466 ms. The clone kept
+answering afterwards, and a clone of that snapshot answered on yet another GPU.
 
 ### Verified on hardware
 
