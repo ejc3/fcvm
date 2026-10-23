@@ -242,6 +242,23 @@ pub async fn run() -> Result<()> {
         Vec::new()
     };
 
+    // Load the NVIDIA driver now, before the pre-start snapshot, so a restore
+    // that attaches a GPU only probes it. Not fatal: the attach loads what is
+    // not loaded and fails closed there.
+    if plan.gpu_driver.is_some() {
+        let started = std::time::Instant::now();
+        match crate::gpu::preload(std::path::Path::new(crate::gpu::DRIVER_ROOT)).await {
+            Ok(()) => eprintln!(
+                "[fc-agent] gpu: NVIDIA driver loaded at boot in {:.0} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(error) => eprintln!(
+                "[fc-agent] WARNING: gpu: the NVIDIA driver did not load at boot ({error:#}); \
+                 a restore that attaches a GPU loads it then"
+            ),
+        }
+    }
+
     // pmem mounts are guest kernel state carried in the snapshot, as extra disks
     // are, so a restore does not mount them again.
     let mounted_pmem_paths = if !plan.pmem_mounts.is_empty() {
@@ -917,8 +934,10 @@ impl PidFd {
     /// Returns true if it exited. A pidfd becomes readable on exit, so this is
     /// an epoll wakeup rather than a poll loop.
     async fn wait_for_exit(&self, timeout: Duration) -> bool {
-        use std::os::fd::AsRawFd;
-        let Ok(async_fd) = tokio::io::unix::AsyncFd::new(self.0.as_raw_fd()) else {
+        use std::os::fd::AsFd;
+        // SAFETY: the `BorrowedFd` borrows `self.0`, so the pidfd stays open and unchanged
+        // for as long as this local `AsyncFd` lives.
+        let Ok(async_fd) = (unsafe { tokio::io::unix::AsyncFd::register(self.0.as_fd()) }) else {
             return false;
         };
         tokio::time::timeout(timeout, async_fd.readable())
@@ -987,6 +1006,31 @@ async fn chronyc_sources() -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The NVIDIA driver loads at boot, once its image is mounted and before the
+    /// pre-start snapshot is offered, so every clone of that snapshot already
+    /// holds it and a GPU restore only probes the device.
+    #[test]
+    fn the_gpu_driver_loads_after_its_image_mounts_and_before_the_snapshot() {
+        let source = include_str!("agent.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("agent.rs has no test module")];
+        let mount = body
+            .find("mounts::mount_extra_disks(&boot_disks")
+            .expect("the driver image is no longer mounted with the extra disks");
+        let preload = body
+            .find("crate::gpu::preload(")
+            .expect("fc-agent no longer loads the NVIDIA driver at boot");
+        let snapshot = body
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("fc-agent no longer offers the pre-start snapshot");
+        assert!(
+            mount < preload && preload < snapshot,
+            "the driver must load after its image mounts ({mount}) and before the \
+             snapshot is offered ({snapshot}); it loads at {preload}"
+        );
+    }
+
     /// fc-agent opens its exec server only after storage.conf names the overlay
     /// driver, storage setup has run, and the container user and podman command
     /// prefix exist.

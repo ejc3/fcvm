@@ -346,7 +346,7 @@ pub struct SnapshotExtraDisk {
 
 /// Volume configuration saved in snapshot metadata.
 /// Used to start VolumeServers when serving snapshot for clones.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotVolumeConfig {
     /// Path on host filesystem
     pub host_path: PathBuf,

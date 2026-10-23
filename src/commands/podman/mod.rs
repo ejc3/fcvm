@@ -893,6 +893,7 @@ fn snapshot_restore_args(
         no_swap: false,
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
+        map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
@@ -1494,8 +1495,21 @@ async fn prepare_vm_for_lifecycle(
         validate_gpu_run(&args, &lifecycle, no_snapshot)?;
         args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+        let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
+            crate::gpu::check_driver_supports_device(
+                Path::new("/sys"),
+                sbdf,
+                profile_name,
+                module_type,
+            )?;
         }
     }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
