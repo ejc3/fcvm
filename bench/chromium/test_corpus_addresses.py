@@ -101,7 +101,7 @@ class CaptureScrub(unittest.TestCase):
     OWN_ANY_FORM = re.compile(rb"(?<![0-9])34[.-]201[.-]17[.-]86(?![0-9])")
 
     def test_capture_replaces_own_address_in_every_stored_file(self):
-        body = (b'{"client_ip": "34.201.17.86", "rdns": "ec2-34-201-17-86.example", '
+        body = (b'{"client_ip": "34.201.17.86", "rdns": "host-34-201-17-86.example", '
                 b'"other": "134.201.17.86"}')
         resources = [
             ("https://ads.example/geo?ip=34.201.17.86", body, 200, "application/json"),
@@ -120,7 +120,7 @@ class CaptureScrub(unittest.TestCase):
             entry = index["resources"]["https://ads.example/geo?ip=198.51.100.1"]
             scrubbed = (dest / entry["file"]).read_bytes()
             self.assertEqual(scrubbed, b'{"client_ip": "198.51.100.1", "rdns": '
-                             b'"ec2-198-51-100-1.example", "other": "134.201.17.86"}')
+                             b'"host-198-51-100-1.example", "other": "134.201.17.86"}')
             self.assertEqual(len(scrubbed), len(body))
             self.assertEqual(entry["bytes"], len(scrubbed))
             self.assertEqual(disallowed_addresses(dest), [(entry["file"], scrubbed.index(b"134."))])
