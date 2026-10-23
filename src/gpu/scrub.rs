@@ -7,11 +7,14 @@
 //! before the GPU is handed to another VM: `fcvm gpu scrub <sbdf>`.
 //!
 //! On Turing, Ampere and Ada the GPU clears its own memory after a secondary
-//! bus reset, and reports in BAR0 when that clear has finished. This is what
-//! NVIDIA's gpu-admin-tools does for `--reset-with-sbr --clear-memory`: reset
-//! the bus, wait for boot (`0x118234 & 0x3ff == 0x3ff`), then wait for the
-//! clear (`0x100b20 & 1`). Hopper and later report both elsewhere and are
-//! refused, as is anything older than Turing.
+//! bus reset, and reports in BAR0 when that clear has finished. This follows
+//! NVIDIA's gpu-admin-tools for `--reset-with-sbr --clear-memory`: hold the
+//! GPU in D0 (`power/control` on; an idle GPU on vfio-pci is in D3, where BAR0
+//! reads all ones), set a scratch register the reset clears (VBIOS scratch 22,
+//! `0x1458`), reset the bus, require the scratch to read 0, then wait for boot
+//! (`0x118234 & 0x3ff == 0x3ff`) and for the clear (`0x100b20 & 1`). Hopper
+//! and later report both elsewhere and are refused, as is anything older
+//! than Turing.
 //!
 //! While it runs, the scrub holds the GPU's VFIO group open. A group has one
 //! opener at a time, so no VM can open the GPU in the middle of a scrub, and a
@@ -43,6 +46,8 @@ pub fn state_dir() -> PathBuf {
 const NVIDIA_VENDOR: &str = "0x10de";
 /// `NV_PMC_BOOT_0`: bits 28:24 are the architecture.
 const PMC_BOOT_0: u64 = 0x0;
+/// VBIOS scratch 22: set before the reset, it must read 0 after it.
+const RESET_SCRATCH: u64 = 0x1458;
 const BOOT_COMPLETE: u64 = 0x118234;
 const BOOT_COMPLETE_MASK: u32 = 0x3ff;
 const MEMORY_CLEAR_FINISHED: u64 = 0x100b20;
@@ -97,27 +102,56 @@ fn ms(since: Instant) -> f64 {
     (since.elapsed().as_secs_f64() * 1e6).round() / 1e3
 }
 
-/// BAR0, mapped read-only through sysfs `resource0`.
+/// The first 2 MiB of BAR0, mapped through sysfs `resource0`.
 struct Bar0 {
-    map: memmap2::Mmap,
+    map: memmap2::MmapMut,
 }
 
 impl Bar0 {
     fn open(path: &Path) -> Result<Self> {
-        let file = std::fs::File::open(path)
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
             .with_context(|| format!("opening {} (needs root)", path.display()))?;
-        // SAFETY: a device BAR, read with volatile 32-bit loads only; nothing
-        // else in this process maps it.
-        let map = unsafe { memmap2::MmapOptions::new().len(BAR0_MAP_BYTES).map(&file) }
-            .with_context(|| format!("mapping {}", path.display()))?;
+        // SAFETY: a device BAR, accessed with volatile 32-bit loads and stores
+        // only; nothing else in this process maps it.
+        let map = unsafe {
+            memmap2::MmapOptions::new()
+                .len(BAR0_MAP_BYTES)
+                .map_mut(&file)
+        }
+        .with_context(|| format!("mapping {}", path.display()))?;
         Ok(Self { map })
     }
 
-    fn read32(&self, offset: u64) -> u32 {
+    fn word(&self, offset: u64) -> *mut u32 {
         let offset = offset as usize;
         assert!(offset.is_multiple_of(4) && offset + 4 <= self.map.len());
         // SAFETY: in bounds and aligned (checked above).
-        unsafe { std::ptr::read_volatile(self.map.as_ptr().add(offset) as *const u32) }
+        unsafe { self.map.as_ptr().add(offset) as *mut u32 }
+    }
+
+    fn read32(&self, offset: u64) -> u32 {
+        // SAFETY: `word` returns an in-bounds, aligned pointer into the map.
+        unsafe { std::ptr::read_volatile(self.word(offset)) }
+    }
+
+    fn write32(&self, offset: u64, value: u32) {
+        // SAFETY: as for read32; the map is writable.
+        unsafe { std::ptr::write_volatile(self.word(offset), value) }
+    }
+
+    /// The register's first readable value within `timeout`, or the last read.
+    fn wait_readable(&self, offset: u64, timeout: Duration) -> u32 {
+        let started = Instant::now();
+        loop {
+            let value = self.read32(offset);
+            if !unreadable(value) || started.elapsed() >= timeout {
+                return value;
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
     }
 
     /// Wait until `read32(offset) & mask == mask` from a readable register.
@@ -154,6 +188,26 @@ impl Drop for CommandRestore {
                 .write_all_at(&original.to_le_bytes(), PCI_COMMAND);
         }
     }
+}
+
+/// Restores `power/control` on drop. vfio-pci lets an idle GPU suspend to D3
+/// (`auto`), where its BAR0 reads all ones; the scrub holds it in D0 (`on`).
+struct PowerRestore {
+    path: PathBuf,
+    original: String,
+}
+
+impl Drop for PowerRestore {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.original);
+    }
+}
+
+fn hold_in_d0(device: &Path) -> Result<PowerRestore> {
+    let path = device.join("power/control");
+    let original = read_trimmed(&path)?;
+    std::fs::write(&path, "on").with_context(|| format!("writing 'on' to {}", path.display()))?;
+    Ok(PowerRestore { path, original })
 }
 
 fn enable_memory_decoding(config_path: &Path) -> Result<CommandRestore> {
@@ -200,6 +254,21 @@ pub fn scrub_device(
     dev: &Path,
     sbdf: &str,
     timeout: Duration,
+) -> Result<ScrubTimings> {
+    scrub_device_with(sysfs, dev, sbdf, timeout, &|device: &Path| {
+        let reset = device.join("reset");
+        std::fs::write(&reset, "1").with_context(|| format!("writing {}", reset.display()))
+    })
+}
+
+/// [`scrub_device`] with the reset supplied, so a test can stand in for the
+/// hardware.
+pub fn scrub_device_with(
+    sysfs: &Path,
+    dev: &Path,
+    sbdf: &str,
+    timeout: Duration,
+    reset: &dyn Fn(&Path) -> Result<()>,
 ) -> Result<ScrubTimings> {
     let started = Instant::now();
     let device = sysfs.join("bus/pci/devices").join(sbdf);
@@ -254,20 +323,13 @@ pub fn scrub_device(
         }
     };
 
-    let reset_started = Instant::now();
-    std::fs::write(device.join("reset"), "1").with_context(|| {
-        format!(
-            "resetting GPU {sbdf} (writing {})",
-            device.join("reset").display()
-        )
-    })?;
-    let reset_ms = ms(reset_started);
-
+    // Dropped in reverse order: memory decoding, then power control.
+    let _power = hold_in_d0(&device)?;
     let _command = enable_memory_decoding(&device.join("config"))?;
     let bar0 = Bar0::open(&device.join("resource0"))?;
     let boot0 = bar0.read32(PMC_BOOT_0);
     if unreadable(boot0) {
-        bail!("GPU {sbdf} does not answer on BAR0 after the reset (PMC_BOOT_0 = {boot0:#010x})");
+        bail!("GPU {sbdf} does not answer on BAR0 (PMC_BOOT_0 = {boot0:#010x})");
     }
     let Some(architecture) = architecture(boot0) else {
         bail!(
@@ -276,6 +338,25 @@ pub fn scrub_device(
             (boot0 >> 24) & 0x1f
         );
     };
+    bar0.write32(RESET_SCRATCH, 1);
+    let scratch = bar0.read32(RESET_SCRATCH);
+    if scratch != 1 {
+        bail!(
+            "GPU {sbdf}: the reset scratch register ({RESET_SCRATCH:#x}) reads {scratch:#x} \
+             after writing 1, so the reset could not be confirmed"
+        );
+    }
+
+    let reset_started = Instant::now();
+    reset(&device).with_context(|| format!("resetting GPU {sbdf}"))?;
+    let reset_ms = ms(reset_started);
+    let scratch = bar0.wait_readable(RESET_SCRATCH, timeout);
+    if scratch != 0 {
+        bail!(
+            "GPU {sbdf} was not reset: the scratch register ({RESET_SCRATCH:#x}) set before the \
+             reset still reads {scratch:#x}"
+        );
+    }
     let boot_ms = bar0.poll("boot complete", BOOT_COMPLETE, BOOT_COMPLETE_MASK, timeout)?;
     let clear_ms = bar0.poll("memory clear finished", MEMORY_CLEAR_FINISHED, 1, timeout)?;
     Ok(ScrubTimings {
@@ -425,6 +506,8 @@ mod tests {
             std::fs::write(root.path().join("dev/vfio/81"), b"").unwrap();
             std::fs::write(device.join("vendor"), "0x10de\n").unwrap();
             std::fs::write(device.join("reset_method"), "bus\n").unwrap();
+            std::fs::create_dir_all(device.join("power")).unwrap();
+            std::fs::write(device.join("power/control"), "auto\n").unwrap();
             std::fs::write(device.join("reset"), "").unwrap();
             // Command register with memory decoding off, as vfio-pci leaves an
             // idle device.
@@ -450,13 +533,26 @@ mod tests {
             bar.write_all_at(&value.to_le_bytes(), offset).unwrap();
         }
 
-        fn scrub(&self) -> Result<ScrubTimings> {
-            scrub_device(
+        /// Scrub with a reset that, like the hardware, clears the scratch
+        /// register, unless `clears_scratch` is false.
+        fn scrub_resetting(&self, clears_scratch: bool) -> Result<ScrubTimings> {
+            scrub_device_with(
                 &self.root.path().join("sys"),
                 &self.root.path().join("dev"),
                 "0000:18:00.0",
                 Duration::from_millis(50),
+                &|device: &Path| {
+                    std::fs::write(device.join("reset"), "1")?;
+                    if clears_scratch {
+                        self.set(RESET_SCRATCH, 0);
+                    }
+                    Ok(())
+                },
             )
+        }
+
+        fn scrub(&self) -> Result<ScrubTimings> {
+            self.scrub_resetting(true)
         }
     }
 
@@ -476,6 +572,43 @@ mod tests {
             0,
             "the command register must be restored after the scrub"
         );
+        assert_eq!(
+            std::fs::read_to_string(fake.device().join("power/control")).unwrap(),
+            "auto",
+            "power control must be restored after the scrub"
+        );
+    }
+
+    /// A reset that did not happen leaves the scratch register set, and the
+    /// scrub must not then report the GPU's stale "cleared" bit as a clear.
+    #[test]
+    fn a_reset_that_did_not_happen_fails_the_scrub() {
+        let fake = Fake::new();
+        let error = format!("{:#}", fake.scrub_resetting(false).unwrap_err());
+        assert!(error.contains("was not reset"), "{error}");
+    }
+
+    /// The scrub holds the GPU in D0 while it reads BAR0: in D3 every read is
+    /// all ones.
+    #[test]
+    fn the_scrub_holds_the_gpu_in_d0() {
+        let fake = Fake::new();
+        let control = fake.device().join("power/control");
+        let seen = std::cell::RefCell::new(String::new());
+        scrub_device_with(
+            &fake.root.path().join("sys"),
+            &fake.root.path().join("dev"),
+            "0000:18:00.0",
+            Duration::from_millis(50),
+            &|device: &Path| {
+                *seen.borrow_mut() = std::fs::read_to_string(&control)?;
+                std::fs::write(device.join("reset"), "1")?;
+                fake.set(RESET_SCRATCH, 0);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(*seen.borrow(), "on");
     }
 
     #[test]

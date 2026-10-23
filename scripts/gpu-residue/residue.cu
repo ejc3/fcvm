@@ -10,7 +10,9 @@
 //       Allocate as much as fill did (cudaMalloc, cuMemAlloc, or
 //       cudaMallocManaged up to the free memory), write nothing, and count in
 //       a GPU kernel the 8-byte words equal to MARKER and the words that are
-//       not zero. Prints one "RESULT ..." line.
+//       not zero. Prints one "RESULT ..." line. Then, as a control, it writes
+//       one marker into its own memory and fails unless a second scan counts
+//       exactly one more.
 //
 // The fraction of memory holding the previous tenant's data is
 // marker_words * 16 / bytes: each record is one marker word in 16 bytes.
@@ -168,14 +170,35 @@ int main(int argc, char **argv) {
     // device memory; the kernel's first touch places it on the GPU.
     size_t limit = !strcmp(mode, "managed") ? free_b - (64ull << 20) : (size_t)-1;
     std::vector<Chunk> chunks = allocate_all(mode, limit);
-    for (auto &c : chunks)
-      scan_kernel<<<4096, 256>>>((const uint64_t *)c.ptr, c.bytes / 8,
-                                 counters, counters + 1);
-    CHECK(cudaGetLastError());
-    CHECK(cudaDeviceSynchronize());
+    auto scan_all = [&](unsigned long long out[2]) {
+      CHECK(cudaMemset(counters, 0, 2 * sizeof(unsigned long long)));
+      for (auto &c : chunks)
+        scan_kernel<<<4096, 256>>>((const uint64_t *)c.ptr, c.bytes / 8,
+                                   counters, counters + 1);
+      CHECK(cudaGetLastError());
+      CHECK(cudaDeviceSynchronize());
+      CHECK(cudaMemcpy(out, counters, 2 * sizeof(unsigned long long),
+                       cudaMemcpyDeviceToHost));
+    };
     unsigned long long host[2];
-    CHECK(cudaMemcpy(host, counters, sizeof host, cudaMemcpyDeviceToHost));
+    scan_all(host);
     size_t bytes = sum(chunks);
+    // Positive control, after the count: write one marker into the last
+    // allocation and scan again. The scan must see exactly one more, or a 0
+    // above says nothing about this allocation path.
+    if (chunks.empty()) {
+      fprintf(stderr, "allocated nothing\n");
+      return 3;
+    }
+    CHECK(cudaMemcpy(chunks.back().ptr, &MARKER, sizeof MARKER,
+                     cudaMemcpyHostToDevice));
+    unsigned long long again[2];
+    scan_all(again);
+    if (again[0] != host[0] + 1) {
+      fprintf(stderr, "control: wrote 1 marker, scan went from %llu to %llu\n",
+              host[0], again[0]);
+      return 3;
+    }
     printf("RESULT mode=%s gpu=\"%s\" bytes=%zu total=%zu free_before=%zu "
            "marker_words=%llu nonzero_words=%llu marker_fraction=%.6f "
            "nonzero_fraction=%.6f\n",
