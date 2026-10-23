@@ -143,6 +143,97 @@ pub fn require_pci_transport(firecracker_args: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// The steps of a warm GPU snapshot (`snapshot create --gpu-warm`), each one call
+/// to the guest or the VMM. [`warm_gpu_snapshot`] fixes their order and recovery.
+#[allow(async_fn_in_trait)]
+pub trait WarmGpuSteps {
+    /// What a successful snapshot returns.
+    type Snapshot;
+    /// `fc-agent --gpu-park` in the guest: checkpoint the CUDA processes into guest
+    /// memory, stop nvidia-persistenced and remove the GPUs from the guest's bus.
+    /// The guest undoes its own steps when it fails.
+    async fn park(&mut self) -> Result<()>;
+    /// Detach one GPU from the VMM (`DELETE /device-passthrough/{id}`).
+    async fn detach(&mut self, id: &str) -> Result<()>;
+    /// Take the memory snapshot (pause, save, resume).
+    async fn snapshot(&mut self) -> Result<Self::Snapshot>;
+    /// Attach one GPU to the VMM again (`PUT /device-passthrough/{id}`).
+    async fn attach(&mut self, device: &crate::firecracker::api::DevicePassthrough) -> Result<()>;
+    /// `fc-agent --gpu-unpark` in the guest: bring the GPUs up and restore the
+    /// checkpointed processes onto them.
+    async fn unpark(&mut self) -> Result<()>;
+}
+
+/// Take a snapshot whose memory holds the guest's GPU state.
+///
+/// A passthrough device cannot be saved, so the GPUs leave the VM first: the guest
+/// parks them, the VMM detaches them, the snapshot is taken, and the source gets
+/// them back (attach, then unpark) whatever the snapshot did. Once the park has
+/// succeeded the source is always given its GPUs back; a failure there is reported
+/// with the snapshot's own result rather than replacing it.
+pub async fn warm_gpu_snapshot<S: WarmGpuSteps>(
+    steps: &mut S,
+    devices: &[crate::firecracker::api::DevicePassthrough],
+) -> Result<S::Snapshot> {
+    anyhow::ensure!(
+        !devices.is_empty(),
+        "a warm GPU snapshot needs a GPU to park"
+    );
+    steps.park().await.context("parking the guest's GPUs")?;
+
+    let mut detached = Vec::new();
+    let mut result: Result<S::Snapshot> = Err(anyhow::anyhow!("no GPU was detached"));
+    let mut all_detached = true;
+    for device in devices {
+        match steps.detach(&device.id).await {
+            Ok(()) => detached.push(device),
+            Err(error) => {
+                result = Err(error.context(format!("detaching {} from the VMM", device.id)));
+                all_detached = false;
+                break;
+            }
+        }
+    }
+    if all_detached {
+        result = steps
+            .snapshot()
+            .await
+            .context("taking the snapshot with the GPUs parked");
+    }
+
+    // Give the source its GPUs back.
+    let mut recovery: Vec<String> = Vec::new();
+    for device in &detached {
+        if let Err(error) = steps.attach(device).await {
+            recovery.push(format!(
+                "re-attaching {} ({}): {error:#}",
+                device.id, device.sbdf
+            ));
+        }
+    }
+    if recovery.is_empty() {
+        if let Err(error) = steps.unpark().await {
+            recovery.push(format!("unparking the source's GPUs: {error:#}"));
+        }
+    } else {
+        recovery.push(
+            "the source's CUDA processes stay checkpointed: a GPU could not be attached again"
+                .to_string(),
+        );
+    }
+    match (result, recovery.is_empty()) {
+        (result, true) => result,
+        (Ok(_), false) => Err(anyhow::anyhow!(
+            "the snapshot was taken, but the source VM did not get its GPUs back: {}",
+            recovery.join("; ")
+        )),
+        (Err(error), false) => Err(error.context(format!(
+            "and the source VM did not get its GPUs back: {}",
+            recovery.join("; ")
+        ))),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -236,5 +327,163 @@ mod tests {
         assert!(require_pci_transport(Some("--enable-nv2")).is_err());
         assert!(require_pci_transport(Some("--enable-pcix")).is_err());
         assert!(require_pci_transport(None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod warm_tests {
+    use super::*;
+    use crate::firecracker::api::DevicePassthrough;
+
+    /// Records every step and fails the ones named in `fail`.
+    #[derive(Default)]
+    struct Recorder {
+        log: Vec<String>,
+        fail: Vec<&'static str>,
+    }
+
+    impl Recorder {
+        fn step(&mut self, name: String) -> Result<()> {
+            let failed = self.fail.iter().any(|f| *f == name);
+            self.log.push(name.clone());
+            if failed {
+                bail!("{name} failed");
+            }
+            Ok(())
+        }
+    }
+
+    impl WarmGpuSteps for Recorder {
+        type Snapshot = &'static str;
+        async fn park(&mut self) -> Result<()> {
+            self.step("park".into())
+        }
+        async fn detach(&mut self, id: &str) -> Result<()> {
+            self.step(format!("detach {id}"))
+        }
+        async fn snapshot(&mut self) -> Result<&'static str> {
+            self.step("snapshot".into()).map(|()| "snap")
+        }
+        async fn attach(&mut self, device: &DevicePassthrough) -> Result<()> {
+            self.step(format!("attach {}", device.id))
+        }
+        async fn unpark(&mut self) -> Result<()> {
+            self.step("unpark".into())
+        }
+    }
+
+    fn two_gpus() -> Vec<DevicePassthrough> {
+        DevicePassthrough::for_gpus(&["0000:01:00.0".to_string(), "0000:02:00.0".to_string()])
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn the_gpus_leave_before_the_snapshot_and_come_back_after() {
+        let mut steps = Recorder::default();
+        assert_eq!(
+            warm_gpu_snapshot(&mut steps, &two_gpus()).await.unwrap(),
+            "snap"
+        );
+        assert_eq!(
+            steps.log,
+            [
+                "park",
+                "detach gpu0",
+                "detach gpu1",
+                "snapshot",
+                "attach gpu0",
+                "attach gpu1",
+                "unpark"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_park_touches_nothing_else() {
+        let mut steps = Recorder {
+            fail: vec!["park"],
+            ..Default::default()
+        };
+        let error = warm_gpu_snapshot(&mut steps, &two_gpus())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("parking"), "{error:#}");
+        assert_eq!(steps.log, ["park"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_snapshot_still_gives_the_source_its_gpus_back() {
+        let mut steps = Recorder {
+            fail: vec!["snapshot"],
+            ..Default::default()
+        };
+        let error = warm_gpu_snapshot(&mut steps, &two_gpus())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("snapshot failed"),
+            "{error:#}"
+        );
+        assert_eq!(
+            steps.log,
+            [
+                "park",
+                "detach gpu0",
+                "detach gpu1",
+                "snapshot",
+                "attach gpu0",
+                "attach gpu1",
+                "unpark"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_detach_skips_the_snapshot_and_reattaches_what_left() {
+        let mut steps = Recorder {
+            fail: vec!["detach gpu1"],
+            ..Default::default()
+        };
+        let error = warm_gpu_snapshot(&mut steps, &two_gpus())
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("detaching gpu1"), "{error:#}");
+        assert_eq!(
+            steps.log,
+            [
+                "park",
+                "detach gpu0",
+                "detach gpu1",
+                "attach gpu0",
+                "unpark"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_reattach_is_reported_and_leaves_the_processes_parked() {
+        let mut steps = Recorder {
+            fail: vec!["attach gpu0"],
+            ..Default::default()
+        };
+        let error = warm_gpu_snapshot(&mut steps, &two_gpus())
+            .await
+            .unwrap_err();
+        let text = format!("{error:#}");
+        assert!(
+            text.contains("snapshot was taken") && text.contains("stay checkpointed"),
+            "{text}"
+        );
+        assert_eq!(
+            steps.log,
+            [
+                "park",
+                "detach gpu0",
+                "detach gpu1",
+                "snapshot",
+                "attach gpu0",
+                "attach gpu1"
+            ]
+        );
     }
 }

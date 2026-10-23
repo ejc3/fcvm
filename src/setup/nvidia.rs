@@ -11,7 +11,10 @@
 //! - `usr/lib/<triplet>/lib*.so.<version>` and `usr/bin/nvidia-smi` and
 //!   friends, from the same `.run`;
 //! - `usr/bin/nvidia-ctk` and `usr/bin/nvidia-cdi-hook` from the pinned
-//!   nvidia-container-toolkit release.
+//!   nvidia-container-toolkit release;
+//! - `usr/bin/cuda-checkpoint`, NVIDIA's pinned checkpoint utility, which
+//!   fc-agent uses to park a GPU's CUDA processes for a warm GPU snapshot
+//!   (fc-agent/src/gpu_park.rs).
 //!
 //! The modules and the user-space libraries come from one archive, so their
 //! versions match by construction, and the build checks it (`modinfo` version
@@ -53,6 +56,12 @@ pub struct NvidiaDriverConfig {
     pub toolkit_url: String,
     /// SHA-256 of that archive, lowercase hex.
     pub toolkit_sha256: String,
+    /// NVIDIA's `cuda-checkpoint` binary for this architecture, at a fixed commit
+    /// of github.com/NVIDIA/cuda-checkpoint. It drives the driver's checkpoint API
+    /// through `libcuda.so.1`, so the image's driver decides what it supports.
+    pub cuda_checkpoint_url: String,
+    /// SHA-256 of that binary, lowercase hex.
+    pub cuda_checkpoint_sha256: String,
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -85,6 +94,7 @@ impl NvidiaDriverConfig {
         for (name, value) in [
             ("driver_sha256", &self.driver_sha256),
             ("toolkit_sha256", &self.toolkit_sha256),
+            ("cuda_checkpoint_sha256", &self.cuda_checkpoint_sha256),
         ] {
             if !is_sha256(value) {
                 bail!("nvidia.{name} must be 64 lowercase hexadecimal characters, got {value:?}");
@@ -93,6 +103,7 @@ impl NvidiaDriverConfig {
         for (name, value) in [
             ("driver_url", &self.driver_url),
             ("toolkit_url", &self.toolkit_url),
+            ("cuda_checkpoint_url", &self.cuda_checkpoint_url),
         ] {
             let safe = value.starts_with("https://")
                 && value
@@ -166,6 +177,7 @@ fetch_verified() {
 }
 fetch_verified "$NV_DRIVER_URL" "$NV_DRIVER_SHA256" "$NV_DIR/driver-$NV_DRIVER_VERSION.run"
 fetch_verified "$NV_TOOLKIT_URL" "$NV_TOOLKIT_SHA256" "$NV_DIR/toolkit-$NV_TOOLKIT_VERSION.tar.gz"
+fetch_verified "$NV_CUDA_CHECKPOINT_URL" "$NV_CUDA_CHECKPOINT_SHA256" "$NV_DIR/cuda-checkpoint-$NV_CUDA_CHECKPOINT_SHA256"
 
 rm -rf "$NV_DIR/driver" "$NV_DIR/toolkit" "$NV_ROOT"
 sh "$NV_DIR/driver-$NV_DRIVER_VERSION.run" --extract-only --target "$NV_DIR/driver" >/dev/null
@@ -220,11 +232,15 @@ fi
 dpkg-deb -x "${debs[0]}" "$NV_DIR/toolkit/base"
 install -m 0755 "$NV_DIR/toolkit/base/usr/bin/nvidia-ctk" "$NV_DIR/toolkit/base/usr/bin/nvidia-cdi-hook" "$NV_ROOT/usr/bin/"
 
+# cuda-checkpoint, for warm GPU snapshots.
+install -m 0755 "$NV_DIR/cuda-checkpoint-$NV_CUDA_CHECKPOINT_SHA256" "$NV_ROOT/usr/bin/cuda-checkpoint"
+
 for required in \
     "$MODDIR/nvidia.ko" "$MODDIR/nvidia-uvm.ko" \
     "$LIBDIR/libcuda.so.$NV_DRIVER_VERSION" "$LIBDIR/libcuda.so.1" \
     "$LIBDIR/libnvidia-ml.so.$NV_DRIVER_VERSION" "$LIBDIR/libnvidia-ml.so.1" \
-    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook"; do
+    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook" \
+    "$NV_ROOT/usr/bin/cuda-checkpoint"; do
     if [[ ! -e "$required" ]]; then
         echo "ERROR: driver image is missing $required" >&2
         exit 1
@@ -271,6 +287,7 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
     format!(
         "NV_DRIVER_VERSION=\"{}\"\nNV_DRIVER_URL=\"{}\"\nNV_DRIVER_SHA256=\"{}\"\n\
          NV_TOOLKIT_VERSION=\"{}\"\nNV_TOOLKIT_URL=\"{}\"\nNV_TOOLKIT_SHA256=\"{}\"\n\
+         NV_CUDA_CHECKPOINT_URL=\"{}\"\nNV_CUDA_CHECKPOINT_SHA256=\"{}\"\n\
          NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n",
         config.driver_version,
         config.driver_url,
@@ -278,6 +295,8 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
         config.toolkit_version,
         config.toolkit_url,
         config.toolkit_sha256,
+        config.cuda_checkpoint_url,
+        config.cuda_checkpoint_sha256,
         triplet,
         image_tmp.display(),
     )
@@ -304,6 +323,8 @@ pub fn driver_image_key(
         &config.toolkit_version,
         &config.toolkit_url,
         &config.toolkit_sha256,
+        &config.cuda_checkpoint_url,
+        &config.cuda_checkpoint_sha256,
         DRIVER_IMAGE_STAGE,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
@@ -591,6 +612,9 @@ mod tests {
             toolkit_url: "https://example.invalid/v1.20.1/toolkit_1.20.1_deb_arm64.tar.gz"
                 .to_string(),
             toolkit_sha256: "b".repeat(64),
+            cuda_checkpoint_url: "https://example.invalid/0123abc/bin/x86_64_Linux/cuda-checkpoint"
+                .to_string(),
+            cuda_checkpoint_sha256: "e".repeat(64),
         }
     }
 
@@ -641,6 +665,12 @@ mod tests {
             ("toolkit url for another version", |c| {
                 c.toolkit_version = "1.20.2".to_string()
             }),
+            ("short cuda-checkpoint sha", |c| {
+                c.cuda_checkpoint_sha256 = "e".repeat(63)
+            }),
+            ("quote in cuda-checkpoint url", |c| {
+                c.cuda_checkpoint_url.push('"')
+            }),
         ];
         for (what, mutate) in cases {
             let mut config = pinned();
@@ -666,6 +696,8 @@ mod tests {
             |c: &mut NvidiaDriverConfig| c.toolkit_version.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_url.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_sha256 = "d".repeat(64),
+            |c: &mut NvidiaDriverConfig| c.cuda_checkpoint_url.push('1'),
+            |c: &mut NvidiaDriverConfig| c.cuda_checkpoint_sha256 = "f".repeat(64),
         ] {
             let mut config = pinned();
             mutate(&mut config);

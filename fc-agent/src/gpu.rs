@@ -376,7 +376,7 @@ fn kernel_release() -> Result<String> {
 }
 
 /// The last NVRM lines of the kernel log, for an error message.
-async fn nvrm_log_tail() -> String {
+pub(crate) async fn nvrm_log_tail() -> String {
     let output = tokio::process::Command::new("dmesg").output().await;
     let Ok(output) = output else {
         return "(dmesg could not run)".to_string();
@@ -395,7 +395,7 @@ async fn nvrm_log_tail() -> String {
 }
 
 /// Run a command with a deadline and return its combined output on success.
-async fn run_checked(
+pub(crate) async fn run_checked(
     what: &str,
     mut command: tokio::process::Command,
     timeout: Duration,
@@ -496,13 +496,40 @@ fn create_device_nodes(nodes: &[DeviceNode]) -> Result<()> {
 /// only its length is compared with what the guest sees, because the guest
 /// address of a passed-through device is assigned by the VMM.
 /// Returns the number of GPUs the driver initialised.
+///
+/// A clone of a warm GPU snapshot (`fc-agent --gpu-park` ran before it was taken)
+/// already runs its container, with its CUDA processes checkpointed into their
+/// memory: for it the GPUs are brought up again and those processes restored
+/// onto them ([`crate::gpu_park::unpark`]) instead of going through the launch
+/// gate, which refuses a GPU for a running container.
 pub async fn attach(announced: &[String]) -> Result<usize> {
     anyhow::ensure!(!announced.is_empty(), "attach called with no GPUs");
+    if let Some(parked) = crate::gpu_park::Parked::load(Path::new(crate::gpu_park::PARKED_RECORD))?
+    {
+        return crate::gpu_park::unpark(&parked, announced).await;
+    }
     GATE.attach(announced.len(), || attach_devices(announced))
         .await
 }
 
 async fn attach_devices(announced: &[String]) -> Result<usize> {
+    let up = bring_up(announced).await?;
+    write_cdi_spec(Path::new(DRIVER_ROOT)).await?;
+    Ok(up.initialised)
+}
+
+/// What [`bring_up`] found.
+pub struct BroughtUp {
+    /// GPUs `nvidia-smi -L` lists.
+    pub initialised: usize,
+    /// Their UUIDs, in `nvidia-smi -L` order.
+    pub uuids: Vec<String>,
+}
+
+/// Rescan for the announced GPUs, load the driver if it is not loaded, create
+/// the device nodes, start nvidia-persistenced and check that `nvidia-smi -L`
+/// lists every GPU.
+pub async fn bring_up(announced: &[String]) -> Result<BroughtUp> {
     eprintln!(
         "[fc-agent] gpu: host attached {} device(s): {}",
         announced.len(),
@@ -550,15 +577,35 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
         );
     }
     eprintln!("[fc-agent] gpu: {}", listed.trim().replace('\n', "; "));
+    Ok(BroughtUp {
+        initialised,
+        uuids: parse_smi_uuids(&listed),
+    })
+}
 
+/// Write the CDI spec for every GPU from the driver image.
+async fn write_cdi_spec(driver_root: &Path) -> Result<()> {
     std::fs::create_dir_all(Path::new(CDI_SPEC).parent().unwrap())
         .context("creating the CDI spec directory")?;
     let mut ctk = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-ctk"));
     ctk.args(cdi_generate_args(driver_root))
-        .env("LD_LIBRARY_PATH", &libraries);
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
     run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
     eprintln!("[fc-agent] gpu: wrote CDI spec {CDI_SPEC}");
-    Ok(initialised)
+    Ok(())
+}
+
+/// The GPU UUIDs in `nvidia-smi -L` output (`GPU 0: Tesla T4 (UUID: GPU-...)`), in order.
+pub fn parse_smi_uuids(listed: &str) -> Vec<String> {
+    listed
+        .lines()
+        .filter(|line| line.starts_with("GPU "))
+        .filter_map(|line| {
+            let start = line.find("(UUID: ")? + "(UUID: ".len();
+            let rest = &line[start..];
+            Some(rest[..rest.find(')')?].trim().to_string())
+        })
+        .collect()
 }
 
 /// Start nvidia-persistenced from the driver image. Without it nothing holds the
@@ -567,7 +614,7 @@ async fn attach_devices(announced: &[String]) -> Result<usize> {
 /// 0.023 to 0.031 s with the daemon running. It starts before `nvidia-smi -L`,
 /// so that check opens a GPU the daemon has initialised, and before the CDI spec
 /// is generated, which then mounts the daemon's socket into the container.
-async fn start_persistenced(driver_root: &Path) -> Result<()> {
+pub(crate) async fn start_persistenced(driver_root: &Path) -> Result<()> {
     run_checked(
         "nvidia-persistenced",
         persistenced_command(driver_root),
@@ -632,19 +679,28 @@ mod tests {
     fn persistenced_starts_after_the_device_nodes_and_before_the_cdi_spec() {
         let source = include_str!("gpu.rs");
         let code = source.split("#[cfg(test)]").next().unwrap();
-        let body = &code[code
-            .find("async fn attach_devices(")
-            .expect("no attach_devices")..];
+        let body = &code[code.find("pub async fn bring_up(").expect("no bring_up")..];
         let nodes = body.find("create_device_nodes(").expect("no device nodes");
         let daemon = body
             .find("start_persistenced(driver_root)")
-            .expect("attach_devices does not start nvidia-persistenced");
+            .expect("bring_up does not start nvidia-persistenced");
         let smi = body.find("\"nvidia-smi -L\"").expect("no nvidia-smi -L");
-        let cdi = body.find("cdi_generate_args(").expect("no CDI generation");
         assert!(
-            nodes < daemon && daemon < smi && daemon < cdi,
+            nodes < daemon && daemon < smi,
             "nvidia-persistenced must start after the device nodes ({nodes}) and before \
-             nvidia-smi -L ({smi}) and the CDI spec ({cdi}); it starts at {daemon}"
+             nvidia-smi -L ({smi}); it starts at {daemon}"
+        );
+        let attach = &code[code
+            .find("async fn attach_devices(")
+            .expect("no attach_devices")..];
+        let up = attach
+            .find("bring_up(announced)")
+            .expect("attach_devices does not bring up");
+        let cdi = attach.find("write_cdi_spec(").expect("no CDI generation");
+        assert!(
+            up < cdi,
+            "the CDI spec ({cdi}) must be written after the bring-up ({up}), which \
+             starts the daemon whose socket it mounts"
         );
     }
 

@@ -783,7 +783,16 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     // Fail fast: the disk-only capture path (freeze -> reflink -> unfreeze, no
     // memory dump) is dispatched below when args.disk_only is set.
 
-    ensure_no_passthrough_in_memory_snapshot(&vm_state.config.gpus, args.disk_only)?;
+    ensure_gpu_snapshot_mode(&vm_state.config.gpus, args.disk_only, args.gpu_warm)?;
+    if args.gpu_warm {
+        anyhow::ensure!(
+            matches!(
+                vm_state.config.hypervisor,
+                crate::hypervisor::Backend::Firecracker
+            ),
+            "--gpu-warm needs a Firecracker VM: fcvm attaches GPUs only to Firecracker"
+        );
+    }
 
     // Block snapshots when VM has read-write extra disks
     let rw_disks: Vec<_> = vm_state
@@ -873,6 +882,9 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
     )?;
     if args.disk_only {
         snapshot_config.kind = crate::storage::SnapshotKind::DiskOnly;
+    }
+    if args.gpu_warm {
+        snapshot_config.metadata.parked_gpus = vm_state.config.gpus.len();
     }
 
     // Snapshot generation locks are acquired BEFORE the per-VM lock. The target is held
@@ -983,7 +995,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                 let has_portable = snapshot_config.metadata.volumes.iter().any(|v| v.portable);
                 let table_vsock = vsock_socket_path.clone();
                 let fetch_tables = move || crate::volume::fetch_inode_tables(&table_vsock);
-                Some(
+                let core = || {
                     super::common::create_snapshot_core(
                         &client,
                         snapshot_config.clone(),
@@ -997,8 +1009,30 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
                         },
                         super::common::SnapshotSourceDisposition::Resume,
                     )
-                    .await?,
-                )
+                };
+                if args.gpu_warm {
+                    let devices =
+                        crate::firecracker::api::DevicePassthrough::for_gpus(&vm_state.config.gpus)
+                            .unwrap_or_default();
+                    let mut steps = FirecrackerWarmGpu {
+                        client: &client,
+                        vsock_socket: &vsock_socket_path,
+                        vm_id: &vm_state.vm_id,
+                        core: Some(core),
+                        timings: Vec::new(),
+                    };
+                    let published = crate::gpu::warm_gpu_snapshot(&mut steps, &devices).await;
+                    info!(
+                        snapshot = %snapshot_name,
+                        gpus = devices.len(),
+                        steps = %steps.timings.join(" "),
+                        ok = published.is_ok(),
+                        "warm GPU snapshot"
+                    );
+                    Some(published?)
+                } else {
+                    Some(core().await?)
+                }
             }
             crate::hypervisor::Backend::CloudHypervisor => {
                 let client =
@@ -1228,17 +1262,103 @@ fn clone_port_mappings(
 }
 
 /// A passthrough device's state lives on the device, outside the memory image, so a
-/// VM with one cannot be memory-snapshotted. A disk-only capture takes no memory image.
-fn ensure_no_passthrough_in_memory_snapshot(gpus: &[String], disk_only: bool) -> Result<()> {
-    if !disk_only && !gpus.is_empty() {
+/// VM with one is memory-snapshotted only with `--gpu-warm`, which takes the GPUs out
+/// first. A disk-only capture takes no memory image.
+fn ensure_gpu_snapshot_mode(gpus: &[String], disk_only: bool, gpu_warm: bool) -> Result<()> {
+    if gpu_warm && gpus.is_empty() {
+        bail!("--gpu-warm parks the VM's GPUs, and this VM has none attached");
+    }
+    if !disk_only && !gpu_warm && !gpus.is_empty() {
         bail!(
-            "Cannot create snapshot: VM has passthrough GPU(s) {} attached. Snapshot the VM \
-             it was restored from instead (fcvm attaches GPUs to a restore of a snapshot \
-             taken without them), or use --disk-only",
+            "Cannot create snapshot: VM has passthrough GPU(s) {} attached. Use --gpu-warm to \
+             snapshot it with its GPU state, snapshot the VM it was restored from (fcvm \
+             attaches GPUs to a restore of a snapshot taken without them), or use --disk-only",
             gpus.join(", ")
         );
     }
     Ok(())
+}
+
+/// A warm GPU snapshot's CUDA processes wait, checkpointed, for as many GPUs as the
+/// source parked; a restore with another count would leave them stuck, so it is refused
+/// before any side effect.
+fn check_parked_gpus(parked: usize, gpus: &[String]) -> Result<()> {
+    if parked != 0 && gpus.len() != parked {
+        bail!(
+            "this is a warm GPU snapshot: its source parked {parked} GPU(s) and its CUDA \
+             processes are waiting to be restored onto them. Restore it with {parked} --gpu \
+             address(es); {} given",
+            gpus.len()
+        );
+    }
+    Ok(())
+}
+
+/// [`crate::gpu::WarmGpuSteps`] for a Firecracker VM: the guest steps are fc-agent
+/// one-shots over the exec channel, the device steps are the VMM's passthrough API,
+/// and the snapshot is `create_snapshot_core`.
+struct FirecrackerWarmGpu<'a, F> {
+    client: &'a crate::firecracker::FirecrackerClient,
+    vsock_socket: &'a Path,
+    vm_id: &'a str,
+    core: Option<F>,
+    /// `step=ms` for each step taken, for the log line.
+    timings: Vec<String>,
+}
+
+impl<F, Fut> crate::gpu::WarmGpuSteps for FirecrackerWarmGpu<'_, F>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<super::common::PublishedMemoryFile>>,
+{
+    type Snapshot = super::common::PublishedMemoryFile;
+
+    async fn park(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result =
+            super::common::run_fc_agent_one_shot(self.vsock_socket, self.vm_id, "--gpu-park").await;
+        self.timings
+            .push(format!("park_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn detach(&mut self, id: &str) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.client.detach_passthrough(id).await;
+        self.timings
+            .push(format!("detach_{id}_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn snapshot(&mut self) -> Result<super::common::PublishedMemoryFile> {
+        let core = self.core.take().context("the snapshot step runs once")?;
+        let started = std::time::Instant::now();
+        let result = core().await;
+        self.timings
+            .push(format!("snapshot_ms={}", started.elapsed().as_millis()));
+        result
+    }
+
+    async fn attach(&mut self, device: &crate::firecracker::api::DevicePassthrough) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result = self.client.attach_passthrough(device).await;
+        self.timings.push(format!(
+            "attach_{}_ms={}",
+            device.id,
+            started.elapsed().as_millis()
+        ));
+        result
+    }
+
+    async fn unpark(&mut self) -> Result<()> {
+        let started = std::time::Instant::now();
+        let result =
+            super::common::run_fc_agent_one_shot(self.vsock_socket, self.vm_id, "--gpu-unpark")
+                .await;
+        self.timings
+            .push(format!("unpark_ms={}", started.elapsed().as_millis()));
+        result
+    }
 }
 
 /// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
@@ -2010,6 +2130,7 @@ async fn cmd_snapshot_run_inner(
             crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
         }
     }
+    check_parked_gpus(snapshot_config.metadata.parked_gpus, &gpus)?;
     vm_state.config.gpus = gpus.clone();
 
     // Setup paths
@@ -4557,6 +4678,7 @@ mod tests {
             firecracker_bin: None,
             balloon_mib: None,
             balloon_free_page_reporting: false,
+            parked_gpus: 0,
         }
     }
 
@@ -4864,15 +4986,37 @@ mod tests {
     }
 
     #[test]
-    fn a_gpu_vm_refuses_a_memory_snapshot_but_not_a_disk_only_one() {
+    fn a_gpu_vm_refuses_a_plain_memory_snapshot_but_not_a_disk_only_or_warm_one() {
         let gpus = vec!["0000:01:00.0".to_string()];
         let err = format!(
             "{:#}",
-            ensure_no_passthrough_in_memory_snapshot(&gpus, false).unwrap_err()
+            ensure_gpu_snapshot_mode(&gpus, false, false).unwrap_err()
         );
         assert!(err.contains("passthrough GPU(s) 0000:01:00.0"), "{err}");
-        assert!(ensure_no_passthrough_in_memory_snapshot(&gpus, true).is_ok());
-        assert!(ensure_no_passthrough_in_memory_snapshot(&[], false).is_ok());
+        assert!(err.contains("--gpu-warm"), "{err}");
+        assert!(ensure_gpu_snapshot_mode(&gpus, true, false).is_ok());
+        assert!(ensure_gpu_snapshot_mode(&gpus, false, true).is_ok());
+        assert!(ensure_gpu_snapshot_mode(&[], false, false).is_ok());
+        let err = format!(
+            "{:#}",
+            ensure_gpu_snapshot_mode(&[], false, true).unwrap_err()
+        );
+        assert!(err.contains("has none attached"), "{err}");
+    }
+
+    #[test]
+    fn a_warm_gpu_snapshot_restores_only_with_as_many_gpus_as_it_parked() {
+        let one = vec!["0000:01:00.0".to_string()];
+        assert!(check_parked_gpus(0, &[]).is_ok());
+        assert!(check_parked_gpus(0, &one).is_ok());
+        assert!(check_parked_gpus(1, &one).is_ok());
+        let err = format!("{:#}", check_parked_gpus(1, &[]).unwrap_err());
+        assert!(
+            err.contains("parked 1 GPU(s)") && err.contains("--gpu"),
+            "{err}"
+        );
+        let two = vec!["0000:01:00.0".to_string(), "0000:02:00.0".to_string()];
+        assert!(check_parked_gpus(1, &two).is_err());
     }
 
     #[test]

@@ -233,6 +233,32 @@ impl FirecrackerClient {
     }
 
     /// Configure vsock device for host-guest communication
+    /// Attach a passthrough device to the running VM (`PUT /device-passthrough/{id}`
+    /// after boot, ejc3/firecracker agent/vfio-passthrough-hotplug). The guest must
+    /// rescan its PCI bus to find it.
+    pub async fn attach_passthrough(&self, device: &DevicePassthrough) -> Result<()> {
+        self.put(&format!("/device-passthrough/{}", device.id), device)
+            .await
+            .with_context(|| {
+                format!(
+                    "attaching passthrough device {} ({})",
+                    device.id, device.sbdf
+                )
+            })
+    }
+
+    /// Detach a passthrough device from the running VM (`DELETE /device-passthrough/{id}`).
+    /// The guest must have removed the device first.
+    pub async fn detach_passthrough(&self, id: &str) -> Result<()> {
+        let path = format!("/device-passthrough/{id}");
+        let (status, reply) = self.request(Method::DELETE, &path, None).await?;
+        if status != StatusCode::NO_CONTENT && status != StatusCode::OK {
+            return Err(anyhow::Error::from(ApiRefusal::new(status, &reply))
+                .context(format!("detaching passthrough device {id}")));
+        }
+        Ok(())
+    }
+
     pub async fn set_vsock(&self, config: Vsock) -> Result<()> {
         self.put("/vsock", &config).await
     }
@@ -386,7 +412,7 @@ pub struct SnapshotLoad {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vsock_override: Option<VsockOverride>,
     /// Host PCI devices the load attaches to the paused VM before any vCPU runs
-    /// (ejc3/firecracker agent/vfio-hotplug-v1.17.0). Omitted when None, so a
+    /// (ejc3/firecracker agent/vfio-hotplug-v1.17.0 and later). Omitted when None, so a
     /// Firecracker without the field never sees it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub device_passthrough: Option<Vec<DevicePassthrough>>,
