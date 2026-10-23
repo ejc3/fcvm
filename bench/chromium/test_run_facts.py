@@ -17,8 +17,10 @@ import io
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
+import time
 import tomllib
 import types
 import unittest
@@ -785,6 +787,18 @@ class HtmlFastArm(unittest.TestCase):
         self.assertTrue(reqbench.publication_arms_ok({"noop", "html-fast"}))
 
 
+
+def reap_leftover_children():
+    """Reap every exited child of the test process, so a test that counts
+    reaped zombies counts only its own."""
+    while True:
+        try:
+            pid, _ = os.waitpid(-1, os.WNOHANG)
+        except ChildProcessError:
+            return
+        if pid == 0:
+            return
+
 class Subreaper(unittest.TestCase):
     """A fast teardown reads every child's final CPU, then collects it.
 
@@ -858,6 +872,19 @@ print(json.dumps({
                 self.assertEqual(got["zombies"], [], got)
 
     def test_main_becomes_the_subreaper_and_says_so(self):
+        # main reaps every zombie child of its process and charges it to the
+        # first request. The test process can hold zombies left by earlier
+        # tests (2026-10-23 CI: 3, after tests whose stub fcvm's children were
+        # reparented to it), which are not this run's. Leave one on purpose so
+        # the drain below is exercised every run, then reap them all.
+        leftover = subprocess.Popen(["true"])
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            with open(f"/proc/{leftover.pid}/stat") as stat:
+                if stat.read().rsplit(") ", 1)[1].startswith("Z"):
+                    break
+            time.sleep(0.01)
+        reap_leftover_children()
         calls = []
         with tempfile.TemporaryDirectory() as d:
             server = test_reqbench.ServeAcknowledgement.FakeServer(os.path.join(d, "serve.log"))
