@@ -147,6 +147,19 @@ class SealedRecordsIndexFromThisCheckout(unittest.TestCase):
             "no sealed record in the legacy absolute form is left under results/, "
             "so only the fixture above covers that form")
         for run_dir in runs:
+            scale = glob.glob(os.path.join(run_dir, "scale-*", "analysis.json"))
+            if not os.path.exists(os.path.join(run_dir, "analysis.json")) and scale:
+                # A corpus scale record: its analysis is the scale run's own,
+                # which reqscale_analyze publishes only against this evidence
+                # (corpus_dns_gate). campaign_summary indexes serial runs, so
+                # hold the scale record to that binding instead.
+                with self.subTest(run=os.path.basename(run_dir)):
+                    self.assertEqual(len(scale), 1, scale)
+                    with open(scale[0]) as handle:
+                        analysis = json.load(handle)
+                    self.assertIs(analysis.get("publishable"), True, scale[0])
+                    self.assertEqual(analysis.get("run_id"), runs[run_dir].get("run_id"), scale[0])
+                continue
             with self.subTest(run=os.path.basename(run_dir)), \
                     tempfile.TemporaryDirectory() as d:
                 out = os.path.join(d, "campaign-x-summary.json")

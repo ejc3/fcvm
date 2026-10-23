@@ -20,6 +20,7 @@ the table below records why.
 | `results/reqbench-20260816-*-corpus` (14 runs), `results/reqbench-20260814-042319-uffd`, `results/cpuprobe-20260816` | 2026-08-14 to 2026-08-16 | **WITHDRAWN IN FULL** on 2026-09-02, live-DNS contamination; see "The 2026-08-16 corpus series" below. Each directory carries a `WITHDRAWN` marker with its evidence and stays in the tree. `results/campaign-20260816-summary.json` is a hand-written index of these cells, not a record. |
 | `results/reqbench-20260830-171007-corpus` | 2026-08-30 | DNS-verified corpus record (`dns-evidence.json` verdict clean); 712.6 ms [610.5, 808.5] cdp p50 at 2 vCPU. Still verified; the headline moved to the 4 vCPU rung of the ladder below. |
 | `results/reqbench-20260902-023115-corpus-c2`, `results/reqbench-20260902-025115-corpus-c4`, `results/reqbench-20260902-031115-corpus-c8` | 2026-09-02 | DNS-verified 2/4/8 vCPU ladder, one golden per rung on one runtime bundle (each `dns-evidence.json` verdict clean, first_mismatch null, diag violations none); cdp p50 770.3 [596.2, 807.8], 549.4 [467.9, 632.4] and 580.2 [520.8, 645.9] ms, n=202 each. 549.4 at 4 vCPU is the current corpus headline. Each rung ran once: from 2 to 4 vCPUs the median fell 220.9 ms, the 4 and 8 vCPU medians each sit inside the other's interval, and the stage where 8 loses (the wait for the target, +53.1 ms in the mean) moves in 50 ms poll steps, so these runs do not show that 4 is faster than 8 or locate a knee. Indexed by `results/campaign-20260902-box2-ladder-summary.json`. |
+| `results/reqbench-20261022-corpus-*` (serial runs), `results/reqbench-20261022-corpus-s13/scale-*`, `results/corpusextra-2026102[23]-*` | 2026-10-22 to 10-23 | The corpus campaign the report now quotes, on one c8g.metal-48xl (spot; reclaimed once, resumed on a replacement): serial runs at 2, 4 and 8 vCPUs, prefetch pairs, the poll-interval and copy-mode A/B/As, memory with many clones (screenshot and HTML), host Chromium controls, and an open-loop throughput run. Every serial run DNS-verified clean with 0 failures in 230 attempts per arm. Records carry `host_boot_sha256` (#1153). Harness defects found on the way are items 1 to 19 of "Harness bugs the 2026-10-22 campaign's first runs exposed" below. |
 
 ---
 
@@ -235,7 +236,9 @@ change mid-run (sha256 in `hostinfo.json`).
   run-to-run variance dominates within-run SE by ~6x.
 - **The ANGLE race** was not re-amplified in this run.
 - **`minor` sustained-throughput ceiling** was observed but not root-caused (single serve process
-  suspected; not proven).
+  suspected; not proven). The 2026-10-22 corpus scale attempts collapsed at 2.8 requests per
+  second per restore path, FILE and UFFD alike (harness bug 15 below), so the limit is not the
+  memory server alone; what limits it is still not identified.
 - **Hugepage `minor` at 4K-equivalent page counts** — the hugepage win conflates page size with
   sharing mode; a 4K `minor` vs 2 MiB `minor` decomposition would separate them.
 - **Teardown** (175 ms, post-artifact) was not moved off the response path in this run.
@@ -243,7 +246,9 @@ change mid-run (sha256 in `hostinfo.json`).
   returns and excludes teardown (median 63.7 ms at 4 vCPUs in
   `results/reqbench-20260902-025115-corpus-c4`), and `wall_ms` includes it. The AGENTS.md
   reclaim measurements suggest the moved teardown converts to throughput cost rather than
-  disappearing; no run here measures that cost.
+  disappearing. Since 2026-10-22 the fast arms' `request_cpu_ms` includes the CPU each clone
+  process spent freeing its memory at exit (`reclaim`); kernel-thread work such as deleting
+  the clone's disk is still in no figure.
 
 ## Harness bugs found in `reqbench.py` / `reqanalyze.py` / `reqbench.sh` (2026-08-08)
 
@@ -296,6 +301,162 @@ These were live defects in the harness, not in fcvm:
    Fixed by bracing `${f}`.
 5. **A bare `wait` hung phase 5 for 20+ minutes** — it waited on the (infinite) load sampler as
    well as the podman job. Fixed to wait on the specific PID.
+
+## Harness bugs the 2026-10-22 campaign's first runs exposed
+
+Each was fixed before any figure the report quotes was measured, with a test
+that fails on the commit before the fix (`test_run_facts.py` names them).
+Records of the runs that hit them are not committed.
+
+1. **Every fast-arm CPU figure was a lower bound.** fcvm's children die by
+   pdeathsig after the SIGKILL; init reaped them before the 200 us sampler
+   read their final CPU from the zombie. The harness is now their subreaper
+   and collects each pinned child after the read (`d8986477`).
+2. **Every fast-arm CPU figure was withheld.** The reducer looked for the key
+   `firecracker`; fcvm's content-addressed binaries show as
+   `firecracker-def` and `pasta-<hash>`. Children are read by role, and the
+   scale probe and faultbench match the prefix (`ec5def10`).
+3. **The memory phase refused every golden reqbench made** after the scale
+   files joined reqbench's sealed bundle; corpus_extra hashed the old list
+   (`ec5def10`).
+4. **The memory phase's `podman ps` timed out at 48 containers**: the image
+   healthcheck, run per container by systemd timers, held podman's locks
+   (7.7 to 23.6 s per `ps`). Pool containers run without it (`05b6ce9b`).
+5. **pasta's PSS was unreadable** to the owning user (pasta is
+   non-dumpable); the sampler reads it through `sudo -n cat` (`a3530101`).
+6. **The measured run refused itself after the before-run verify**, whose
+   two clones lifted the 1-minute load over the run's 2.0 gate; the campaign
+   settles again before the run (`ff9aef9e`).
+7. **A memory read refused on fcvm's own health checks**, which run in each
+   clone's cgroup every 10 s; a read whose process set moved, or one of
+   whose processes exited mid-read, is repeated, and a zombie counts as zero
+   (`cc1e0eed`, `c17cbe49`, `9043868d`).
+8. **The scale run recorded the host name**; it records the instance type
+   (`33936a18`).
+
+Later in the campaign, each with a test that fails on the commit before
+the fix:
+
+9. **fc-agent's restore phases reached no record.** fcvm prints them in its
+   one-line restored record, which only the uncommitted per-request clone
+   logs held. Requests now record it (`restore_ack`), and `restore_ack.py`
+   reads it out of an earlier run's clone logs into `restore-ack.jsonl`
+   (`19b9c21c`).
+10. **The memory phase could not render with HTML extraction**, so
+    Cloudflare's HTML memory row had no fcvm figure (`MEM_OP=html`,
+    `a92ead87`).
+11. **The memory phase removed each pool container with podman's 10 s
+    SIGTERM grace**, serially; one removal on a host loaded by other jobs
+    took 72 s and failed the phase after 110 of 140 cells. Containers are
+    removed with `--time=0` (`e5b0abfa`).
+12. **The replay reset beacon connections** (#1137): it answered an
+    uncaptured POST without reading the body, and the close with the body
+    unread was a RST, which the diag refused as a request with no remote
+    address. Four diags in a row failed on it on one host while another
+    project's jobs loaded it. PR #1138 reads the body first, but no run here
+    uses it: with bodies read, the first diag on it failed on a different
+    request, an iframe on www.elmundo.es that the page itself canceled
+    (`net::ERR_ABORTED`) before it named an address, in two of three renders.
+    Reading bodies changes how that page behaves, so the campaign kept the
+    replay it started with. The diag instead counts a traced row with no
+    address as the replay's when the replay's own access log shows it
+    answered that request inside the render's window (`ffab8ecd`, with the
+    request target matched as sent in `1775f3c3`); the runs measured after
+    those commits record them as their `source_revision`.
+
+13. **The memory phase refused itself on a state file another clone was
+    deleting**: it lists the state directory and reads each file, and an
+    exiting clone's fcvm removes its own; the read raised and the phase
+    stopped after 101 of its 140 cells. A file deleted between the listing
+    and the read is skipped (`ef0fb672`).
+
+14. **The corpus scale run refused itself twice before measuring
+    anything.** Its clean-tree check counted the run's own results, which
+    the corpus campaign writes under `bench/chromium/results/` before the
+    scale phase, as uncommitted harness (`ed2fbe51`); and it reads three
+    monotonic stamps from each request record that `run_cdp_request` never
+    set, so it refused every request (`4d13d954`). The corpus scale path had
+    not run end to end before; its unit tests stubbed the request function.
+    Its first complete attempt then failed at 25.2 requests per second:
+    each in-flight request holds an inotify instance, and the host's limit
+    of 128 refused most of that burst with EMFILE. The host's
+    `fs.inotify.max_user_instances` was raised to 8192 and the run repeated
+    at 1.4 to 11.2 requests per second; the harness does not check the limit
+    before it starts.
+
+15. **The scale run's clones ran outside their backend cgroups and carried
+    no fault counters.** reqscale hands `run_cdp_request` a cgroup guard and
+    a per-request Firecracker fault probe, and it used neither: every clone
+    of the 2026-10-22 attempts ran in the driver's cgroup (the FILE cgroup's
+    `cpu.stat` read 0 while the driver's read 739 s), and no request carried
+    `firecracker_process_faults_ready_to_artifact`, which the scale analyzer
+    requires of every row, so no attempt could have been analyzed. Both are
+    wired in `0bf1f978`.
+
+    Those two attempts, at `4d13d954`, also stopped at 2.8 requests per
+    second per restore path (5.6 in all). Of each 420-request burst at that
+    rate, 37 and then 168 requests timed out, 9 and 17 failed navigation
+    with a reset, and 3 and 1 left state the fast teardown could not reap;
+    at 1.4 both completed all 210. The harness refuses a run on any failed
+    request, so the throughput run was repeated at lower rates. Their
+    `requests.jsonl` (each failure's `error`), `status.json` and
+    `bursts.jsonl` are kept under `results/reqbench-20261022-corpus-s7/` and
+    `-s7-r2/`; `error_details.failed` in `status.json` holds the totals, 49
+    and 186.
+
+16. **Wiring the fault probe exposed a race in it.** It lists fcvm's
+    children and opens each one's `/proc` directory, and fcvm's short-lived
+    helpers exit in between; at `0bf1f978` only 7 and 12 of 84 requests per
+    path completed at 1.4 req/s (from the campaign's step log; that
+    attempt's records were not kept). The probe now skips a child that is gone
+    and still requires exactly one Firecracker (`1dc6ae42`). Two attempts
+    before that were refused at startup because their rates broke the
+    schedule's rules, which the harness checks only once the campaign has
+    built its golden: each 15 s ramp must hold a whole number of requests
+    and each 60 s window whole cycles of the 14 pages, so the rates must be
+    multiples of 7/15 per second.
+
+17. **The fast teardown counted a file someone else had already removed as
+    a failure.** `reap_disk` checks that the clone's state and lock exist,
+    then removes them; under concurrent clones another fcvm's stale-state
+    cleanup can delete them in between, and the ENOENT became
+    `SurvivedTeardown` with nothing left on disk. One request of 2,015 at
+    `1dc6ae42` did that, and the harness refused the run (stamp `s12`; that
+    attempt's records were not kept, and its repeat `s12-r2` below completed
+    without it). A removal that
+    finds the file gone now counts as done (`c5352b1b`).
+
+18. **The scale analyzer could not read what the harness records.** The
+    first corpus scale run to complete every burst with no failed request
+    (stamp `s12-r2`, at `1dc6ae42`) was refused at analysis: fcvm writes
+    each snapshot port mapping as an object and the analyzer took only
+    strings such as `"9222:9222"`, its fixtures' shape; and the cgroup audit
+    names Firecracker by its comm, `firecracker-def`, where the analyzer
+    looked for `firecracker`. Both are fixed in `fcbeec9e`. With the
+    analysis refused, that run's DNS evidence was bound to no run id and
+    read unclean, so the run was repeated rather than re-bound by hand
+    (`results/reqbench-20261022-corpus-s12-r2/`: `bursts.jsonl`, every
+    burst passed, and `dns-evidence.json` with its `reason`). The
+    harness's tests had covered each side against its own fixtures; nothing
+    ran a real scale record through the analyzer before this campaign.
+
+19. **The WebKit golden could not record its browser version.** The golden
+    records the browser build by running a command in its image, and for
+    WebKit that was `WebKitWebDriver --version`; WebKitWebDriver has no such
+    flag (it prints its usage to stderr and exits 1), so the golden refused
+    itself and no WebKit run could start. The version now comes from the
+    `webkit2gtk-driver` package (`873d12c3`). This came in with the
+    `browser_version` record itself (`5b94b566`); no WebKit run had used it.
+
+Also seen and not a harness defect: an unattended package upgrade ran
+during one serial run (its DNS-owner sample read `dnsmasq=unknown`, so the
+run was refused as unclean and rerun); the hosts' apt timers were disabled
+for the rest of the campaign. One 96-clone memory cell failed when one
+clone's published DevTools port reset every connect for 30 s while fcvm's
+own probe reached the guest (#1135); the published memory fit stops at 48
+clones. Two spot hosts were terminated mid-run by the parallel-box idle
+watchdog, which reads a measured run of one request at a time on a
+192-vCPU host as idle; their unfinished runs are not records.
 
 ## Binding requirements for any future run
 

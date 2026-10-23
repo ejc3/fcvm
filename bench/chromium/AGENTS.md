@@ -164,7 +164,11 @@ diagnosed, and `runtime_bundle_sha256`, the sealed runtime it rendered from
 (the hash the measured run records; `null` when the phase ran outside a
 staged bundle). The phase exits non-zero, and `passed` is false, on any remote IP
 outside `DIAG_EXPECT_IPS=` (comma-separated, when set), a trace naming no
-remote address at all while it is set, any `net::ERR_NAME_NOT_RESOLVED` in a
+remote address at all while it is set, any HTTP(S) row naming no address
+while it is set, unless it was a cache or service-worker hit or the replay's
+`corpus-access.log` shows the replay answered that host and request target
+inside the render's wall-clock window (`<stem>-<rep>.window`; counted per
+URL as `answered_by_replay`), any `net::ERR_NAME_NOT_RESOLVED` in a
 trace, any load event over `DIAG_MAX_LOAD_MS=` (when set), any failed render
 (a record for another URL, one not saying ok, one written under a non-zero
 driver exit status, or one without a load event timing), any clone whose

@@ -22,6 +22,7 @@ import os
 import random
 import re
 import signal
+import statistics
 import shlex
 import shutil
 import subprocess
@@ -7968,15 +7969,16 @@ class DocLint(unittest.TestCase):
         return values, runs
 
     def _record_values(self, run):
-        """Every median, lo and hi under arms and per_url of a committed
-        run's analysis.json."""
+        """Every median, mean, lo and hi under arms and per_url of a committed
+        run's analysis.json. The means are the CPU figures (request_cpu_ms),
+        which the analyzer publishes as a mean with its interval."""
         values = set()
         with open(os.path.join(self._results(), run, "analysis.json")) as f:
             analysis = json.load(f)
 
         def walk(node):
             if isinstance(node, dict):
-                for key in ("median", "lo", "hi"):
+                for key in ("median", "mean", "lo", "hi"):
                     v = node.get(key)
                     if isinstance(v, (int, float)) and not isinstance(v, bool):
                         values.add(float(v))
@@ -7987,7 +7989,31 @@ class DocLint(unittest.TestCase):
                     walk(v)
         walk(analysis.get("arms"))
         walk(analysis.get("per_url"))
-        return values
+        return values | self._ack_values(run)
+
+    def _ack_values(self, run):
+        """The per-arm medians of fc-agent's restore phases and of the ACK time
+        over a run's measured requests, from restore-ack.jsonl (restore_ack.py,
+        which reads them out of the clone logs) joined to reqbench.jsonl by
+        record_id. A run without the file contributes nothing."""
+        path = os.path.join(self._results(), run, "restore-ack.jsonl")
+        if not os.path.isfile(path):
+            return set()
+        with open(path) as f:
+            acks = [json.loads(line) for line in f if line.strip()][1:]
+        by_id = {a["record_id"]: a["restore_ack"] for a in acks}
+        with open(os.path.join(self._results(), run, "reqbench.jsonl")) as f:
+            records = [json.loads(line) for line in f if line.strip()][1:]
+        samples = {}
+        for r in records:
+            if r.get("warmup") is not False or not r.get("ok"):
+                continue
+            ack = by_id.get(r.get("record_id")) or {}
+            phases = ack.get("guest_phases") if isinstance(ack.get("guest_phases"), dict) else {}
+            for key, v in list(phases.items()) + [("ack_ms", ack.get("ack_ms"))]:
+                if isinstance(v, (int, float)) and not isinstance(v, bool):
+                    samples.setdefault((r.get("arm"), key), []).append(float(v))
+        return {statistics.median(v) for v in samples.values()}
 
     def _blocking_values(self, run):
         """(headline, everything) for one committed run: blocking_ms
@@ -8109,12 +8135,14 @@ class DocLint(unittest.TestCase):
         text = self._read(name)
         tables = []
         if name.endswith(".html"):
-            for body in re.findall(r"<table>(.*?)</table>", text, re.S):
+            for body in re.findall(r"<table\b[^>]*>(.*?)</table>", text, re.S):
                 rows = [re.findall(r"<t[hd][^>]*>(.*?)</t[hd]>", r, re.S)
                         for r in re.findall(r"<tr>(.*?)</tr>", body, re.S)]
                 if rows:
                     tables.append((" | ".join(rows[0]), rows[1:]))
-            card = re.search(r'<div class="verdict">(.*?)</div>\s*\n', text, re.S)
+            # The card's own closing tag is the first `</div>` alone on its
+            # line; each tile's closes on the tile's line.
+            card = re.search(r'<div class="verdict">(.*?)\n</div>', text, re.S)
             if card:
                 nums = re.findall(r'<span class="num">(.*?)</span>', card.group(1))
                 tables.append(("verdict card", [["verdict"] + nums]))
@@ -8138,9 +8166,25 @@ class DocLint(unittest.TestCase):
         ladder ("direct CDP p50" over run ids) is optimisation evidence
         under this document's own publication rule and is not one."""
         head = header.lower()
-        if head == "verdict card" or "vcpu" in head or "cdp median" in head:
+        if (head == "verdict card" or "vcpu" in head or "cdp median" in head
+                or "screenshot median" in head):
             return True
         return "cdp p50" in head and any("vcpu" in row[0].lower() for row in rows if row)
+
+    def test_the_verdict_card_check_reads_every_tile(self):
+        """RED BEFORE THE FIX: _figure_tables cut the verdict card at the first
+        `</div>` followed by a newline, which is the end of the FIRST tile, so
+        only that tile's figure was checked and the CPU, prefetch and failure
+        tiles were never compared with a record (found by a review of the
+        2026-10-22 page: one of five tiles read)."""
+        page = self._read("report/shared-nothing-renders.html")
+        region = page[page.index('<div class="verdict">'):page.index('<nav class="toc"')]
+        tiles = re.findall(r'<span class="num">(.*?)</span>', region)
+        self.assertGreater(len(tiles), 1, "the verdict card has one tile; the check is vacuous")
+        cards = [rows for header, rows in self._figure_tables("report/shared-nothing-renders.html")
+                 if header == "verdict card"]
+        self.assertEqual(len(cards), 1)
+        self.assertEqual(cards[0][0][1:], tiles)
 
     def test_every_corpus_figure_in_the_ladder_is_a_verified_headline(self):
         """RED BEFORE THE FIX: report/README.md's ladder quoted 982.9, 695.7
@@ -8428,17 +8472,19 @@ class DocLint(unittest.TestCase):
         HTML-extraction rows' fcvm cells reading "included in the same single
         op as the screenshot" and "same single-op value".
 
-        No record holds a DOM extraction. Across the DNS-verified corpus runs
-        every ok cdp render carries image_sha256 and stages.screenshot_ms, and
-        none carries html_bytes, html_sha256 or stages.extract_ms; cdpdrive.py's
-        html branch is reachable only through an `op` attribute no caller sets.
+        No cdp render holds a DOM extraction. Across the DNS-verified corpus
+        runs every ok cdp render carries image_sha256 and stages.screenshot_ms,
+        and none carries html_bytes, html_sha256 or stages.extract_ms. At the
+        time cdpdrive.py's html branch was reachable only through an `op`
+        attribute no caller set; the html-fast arm now runs it as an arm of its
+        own, whose records are not cdp renders.
 
         Cloudflare publishes "Wall time: screenshot" and "Wall time: HTML
         extraction" as separate rows. So the row label was right and the prose
-        was wrong: what we measured is their screenshot operation, and the
-        HTML-extraction operation is unmeasured on our side. A claim that we do
-        both in one op turns a like-for-like row into a combined operation set
-        against a single-operation number.
+        was wrong: the cdp arm measures their screenshot operation, and the
+        HTML-extraction operation is a separate arm. A claim that we do both in
+        one op turns a like-for-like row into a combined operation set against
+        a single-operation number.
 
         Observed on that tree: AssertionError: Lists differ:
         ["report/shared-nothing-renders.html: credits the measured render with
@@ -8472,15 +8518,46 @@ class DocLint(unittest.TestCase):
                                f"extraction no record holds ({m.group(0)!r})")
         self.assertEqual(bad, [], "\n".join(bad))
 
-        # And the rows for the operation we do not run say so where the reader
-        # looks for our number, not only in a footnote.
-        rows = [line for line in self._read("report/shared-nothing-renders.html").splitlines()
-                if line.lstrip().startswith("<tr") and "HTML extraction" in line]
-        self.assertEqual(len(rows), 3, "the comparator lost its HTML-extraction rows")
-        for row in rows:
-            self.assertIn("not measured", self._plain(row),
-                          f"an HTML-extraction row does not say the operation is "
-                          f"unmeasured on our side: {self._plain(row).strip()[:160]!r}")
+        # Since 2026-10-22 the html-fast arm runs Cloudflare's other operation
+        # (outerHTML in place of the screenshot, with the CPU-reading teardown),
+        # so the comparator's HTML-extraction rows carry its figures. Each figure
+        # in the fcvm cell of the wall row must be an html-fast blocking_ms
+        # median, and each in the CPU row an html-fast request_cpu_ms total
+        # mean, of a DNS-verified run, at the printed precision. RED on the
+        # page before that campaign, whose three rows read "not measured".
+        page = self._read("report/shared-nothing-renders.html")
+        start = page.index("Cloudflare&#8217;s published table, with fcvm&#8217;s figures")
+        table = page[start:page.index("</table>", start)]
+        rows = {}
+        for tr in re.findall(r"<tr>(.*?)</tr>", table, re.S):
+            cells = dict(re.findall(r'<td data-label="([^"]+)">(.*?)</td>', tr, re.S))
+            metric = self._plain(cells.get("Metric", "")).strip()
+            if "HTML extraction" in metric:
+                rows[metric] = cells.get("fcvm", "")
+        self.assertEqual(sorted(rows), ["CPU, HTML extraction", "Memory, HTML extraction",
+                                        "Wall, HTML extraction"],
+                         "the comparator lost its HTML-extraction rows")
+        wall, cpu = set(), set()
+        for run in self._verified_runs():
+            with open(os.path.join(self._results(), run, "analysis.json")) as f:
+                arm = json.load(f)["arms"].get("html-fast")
+            if not arm:
+                continue
+            wall.add(arm["blocking_ms"]["median"])
+            total = (arm.get("request_cpu_ms") or {}).get("total_mean_ms") or {}
+            if isinstance(total.get("mean"), (int, float)):
+                cpu.add(total["mean"])
+        self.assertTrue(wall and cpu, "no verified run carries the html-fast arm")
+        for metric, pool in (("Wall, HTML extraction", wall), ("CPU, HTML extraction", cpu)):
+            cell = rows[metric]
+            self.assertNotIn("not measured", self._plain(cell), metric)
+            figures = [(raw, value, decimals) for raw, value, _scale, decimals
+                       in self._figures_in(cell) if value >= 100]
+            self.assertTrue(figures, f"{metric}: the fcvm cell quotes no figure")
+            for raw, value, decimals in figures:
+                self.assertTrue(any(abs(round(v, decimals) - value) < 1e-9 for v in pool),
+                                f"{metric}: {raw} is no html-fast figure of a verified run")
+        self.assertNotIn("not measured", self._plain(rows["Memory, HTML extraction"]))
 
     def test_no_comparison_with_a_published_median_quotes_a_within_run_interval(self):
         """RED BEFORE THE FIX: three sentences derived a verdict against

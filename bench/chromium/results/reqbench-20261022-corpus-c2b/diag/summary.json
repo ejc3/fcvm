@@ -1,0 +1,171 @@
+{
+  "backend": "uffd",
+  "engine": "chromium",
+  "limits": {
+    "expect_ips": [
+      "10.0.2.2"
+    ],
+    "max_load_ms": 15000
+  },
+  "passed": true,
+  "reps": 3,
+  "runtime_bundle_intact": true,
+  "runtime_bundle_sha256": "1737eeff704f1bf59f77c3d7103175c2d18dfd6a483838b3c8705987b0094da0",
+  "snapshot_config_sha256": "e977666d192a1a7db67108579f3b6b297ec820569d83ef150c7f320a83b596b3",
+  "snapshot_generation_id": "e0536ccc-4fab-4f76-a027-e98de28aeb38",
+  "tag": "cb-req-corpus",
+  "teardown_failures": 0,
+  "timestamp": "2026-10-22T09:38:34Z",
+  "uffd_mode": "minor",
+  "uffd_prefetch": "off",
+  "urls": {
+    "https://blog.cloudflare.com/": {
+      "errors": {},
+      "max_load_ms": 586.6597460008052,
+      "max_pending_at_load": 2,
+      "remote_ips": {
+        "10.0.2.2": 174
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developer.mozilla.org/en-US/": {
+      "errors": {},
+      "max_load_ms": 523.0900669994298,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 222
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://developers.cloudflare.com/": {
+      "errors": {},
+      "max_load_ms": 615.9566310016089,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 93
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://en.wikipedia.org/": {
+      "errors": {},
+      "max_load_ms": 618.6323539986915,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 107
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://example.com/": {
+      "errors": {},
+      "max_load_ms": 639.4916239987651,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 3
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://news.ycombinator.com/": {
+      "errors": {},
+      "max_load_ms": 434.0668660006486,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 21
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/angular/dist/browser/": {
+      "errors": {},
+      "max_load_ms": 341.84939300030237,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 27
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/javascript-es6/dist/": {
+      "errors": {},
+      "max_load_ms": 259.87203600016073,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/preact/dist/": {
+      "errors": {},
+      "max_load_ms": 244.3679019997944,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/react/dist/index.html": {
+      "errors": {},
+      "max_load_ms": 267.6815339982568,
+      "max_pending_at_load": 0,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://todomvc.com/examples/vue/dist/": {
+      "errors": {},
+      "max_load_ms": 272.79177400123444,
+      "max_pending_at_load": 1,
+      "remote_ips": {
+        "10.0.2.2": 24
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.elmundo.es/": {
+      "errors": {
+        "net::ERR_ABORTED": 45,
+        "net::ERR_CONNECTION_RESET": 3
+      },
+      "max_load_ms": 3587.4737199992524,
+      "max_pending_at_load": 5,
+      "remote_ips": {
+        "10.0.2.2": 551
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.rtp.pt/noticias/": {
+      "errors": {
+        "net::ERR_ABORTED": 9
+      },
+      "max_load_ms": 2523.579418000736,
+      "max_pending_at_load": 4,
+      "remote_ips": {
+        "10.0.2.2": 601
+      },
+      "renders_ok": 3,
+      "reps": 3
+    },
+    "https://www.theguardian.com/international": {
+      "errors": {
+        "net::ERR_ABORTED": 27
+      },
+      "max_load_ms": 1195.8805920003215,
+      "max_pending_at_load": 3,
+      "remote_ips": {
+        "10.0.2.2": 255
+      },
+      "renders_ok": 3,
+      "reps": 3
+    }
+  },
+  "violations": []
+}
