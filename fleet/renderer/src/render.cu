@@ -550,7 +550,7 @@ __device__ float terrain_shadow(V3 p, V3 l) {
     V3 q = p + l * t;
     float a = alt_flat(q);
     if (a > TERRAIN_MAX) break;
-    float dh = a - ground_h(v2(q.x, q.z), t < 0.3f ? 9 : t < 2.0f ? 7 : 5);
+    float dh = a - ground_h(v2(q.x, q.z), t < 0.6f ? 7 : 5);
     if (dh < 0.0f) return 0.0f;
     t += fmaxf(dh * 0.55f, 0.004f + 0.006f * t);
     if (t > 40.0f) break;
@@ -700,7 +700,7 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   // the bounce ray starts with the octaves the surface was found with (a
   // coarser surface lies above it in places, and every bounce from there hit
   // at once: black patches); farther out march_oct lowers them
-  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 32, 9, 0.004f) : -1.0f;
+  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 20, 9, 0.004f) : -1.0f;
   if (th < 0.0f) {
     Lin = sky_lookup(bd);
   } else {
