@@ -213,6 +213,24 @@ Then binary messages, each one access unit:
   BT.709 limited range (signalled in the VUI), CBR at the quality's rate (the
   header's `bitrate`, bits per second).
 - The first binary message is a keyframe. Keyframes follow at least every 2 s.
+- **A stream's first frames (round 10).** A moving frame averages the 7
+  frames before it, so a tile whose stream starts must have those 7 or its
+  first frames differ from a neighbour whose stream started at another slot.
+  When a tile starts drawing at a new size (a stream starts or changes
+  height; not at a layout switch, where every tile starts its history at the
+  same frame, and not for a whole-image renderer), it draws the current slot
+  and the following ones back to back, unsent, until it has drawn 7 and is at least a
+  slot ahead of the clock (at most 90 slots), then continues on the
+  clock. Its first frame sent has all 7 behind it. The encoder opens on a
+  second thread meanwhile, and NVENC's minimum frame size is asked once at
+  start on that thread (opening a session to ask took about 250 ms on the
+  render thread). Measured on a 2 x 2 grid at 270 px: priming took 111 to
+  392 ms (7 to 13 slots; a GPU clocking up from idle draws its first frames
+  slower than later ones) at 353,553 pixel-samples, so a stream's first frame
+  arrived 0.1 to 0.4 s after it subscribed. At 500,000, where one cell drew a
+  frame in about a slot, priming took up to 1.9 s (57 slots) and that cell
+  still skipped a slot right after it, as any tile that slow does at any
+  time; the controller's 70% target keeps tiles clear of that.
 - The client may send text `{"h": <height>}`. The renderer then sends a new
   text header and continues from a keyframe at the new size.
 - A subscriber that falls more than 90 messages or 16 MiB behind has its queue

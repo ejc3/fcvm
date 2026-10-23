@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 #include <atomic>
+#include <climits>
 #include <chrono>
 #include <condition_variable>
 #include <deque>
@@ -99,8 +100,17 @@ class Pipeline {
     int ew = 0, eh = 0;   // encoded size
     double last_idr = -1e9;
     bool want_idr = true;
+    bool opening = false;  // an encoder for open_geo is being opened on the aux thread
+    Tile open_geo{};
+    bool failed = false;   // (an aux open's result) the encoder did not open
     std::vector<std::shared_ptr<Subscriber>> subs;
   };
+  static constexpr long long kOpenNow = -2;
+  void open_async(std::shared_ptr<std::vector<std::pair<int, Enc>>> list, long long gen);
+  std::condition_variable min_cv_;
+  bool min_known_ = false;     // render thread
+  long long primed_through_ = LLONG_MIN;  // render thread: the last slot drawn ahead by this frame
+  static constexpr long long PRIME_MAX = 90;  // slots a tile draws ahead at most when it primes
   void frame_once(double t, uint32_t frame_no);
   // overlap and encoded size of an encoder for tile g
   void enc_layout(Enc& e, const Tile& g) const;
@@ -123,7 +133,7 @@ class Pipeline {
   long long prep_open_gen_ = -1;  // under aux_mu_: the generation whose encoders may still be added
   void prepare_layout(const std::shared_ptr<const Scene>& sc, const std::vector<std::pair<int, int>>& hq, long long gen);
   Tile encode_geometry(const Scene& sc, int h);
-  int min_w_ = 0, min_h_ = 0;
+  int min_w_ = 0, min_h_ = 0;  // under aux_mu_ until min_known_
   std::string header_json(const Enc& e, int q);
   struct RawReq {
     long long k;  // the frame slot wanted; LLONG_MIN: the next frame drawn
