@@ -102,8 +102,7 @@ impl Vm {
         cmd.args(spec.args())
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+            .stderr(Stdio::piped());
         arm_pdeathsig(cmd.as_std_mut());
         let mut child = cmd
             .spawn()
@@ -200,6 +199,22 @@ impl Vm {
     }
 }
 
+/// A Vm dropped while fcvm runs (the agent returning, a slot task ending) sends it
+/// SIGTERM, which tears the VM down, and does not wait. Not SIGKILL (tokio's
+/// `kill_on_drop`): a SIGKILLed fcvm leaves a routed VM's namespace, veth and host route
+/// behind, and the next VM given that address is refused.
+impl Drop for Vm {
+    fn drop(&mut self) {
+        // try_wait reaps an exited child, so the pid signalled below is still fcvm's.
+        if self.exit.is_none() && matches!(self.child.try_wait(), Ok(None)) {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(self.pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+    }
+}
+
 fn push_tail(tail: &Mutex<VecDeque<String>>, line: String) {
     let mut t = tail.lock().unwrap();
     t.push_back(line);
@@ -250,6 +265,48 @@ mod tests {
         assert_eq!((bare.ack_ms, bare.gpu_ms), (Some(10), None));
         assert!(parse_restored("✓ VM 'x' cloned from snapshot 'y'", now).is_none());
         assert!(parse_restored(r#"{"status":"ready"}"#, now).is_none());
+    }
+
+    /// A Vm dropped without `stop` (the agent returning, a slot task ending) must give
+    /// fcvm SIGTERM, which tears the VM down, not SIGKILL: a SIGKILLed routed fcvm leaves
+    /// its namespace, veth and host route, and the next VM at that address is refused.
+    #[tokio::test]
+    async fn dropping_a_vm_gives_fcvm_sigterm() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mark = dir.path().join("term");
+        let script = dir.path().join("fake-fcvm");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ntrap 'echo term > {}; exit 0' TERM\necho ready\nwhile :; do sleep 0.05; done\n",
+                mark.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let spec = VmSpec {
+            fcvm: script,
+            name: "fleet-slot-1".into(),
+            sbdf: "0000:02:00.0".into(),
+            publish: "127.0.0.1:20001:8080".into(),
+            extra_args: vec![],
+            image: "renderer:1".into(),
+        };
+        let vm = Vm::spawn(&spec, "slot-1").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !vm.tail().contains("ready") {
+            assert!(Instant::now() < deadline, "the fake fcvm never started");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        drop(vm);
+        while !mark.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "fcvm got no SIGTERM when its Vm was dropped"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
     }
 
     #[test]
