@@ -1,10 +1,9 @@
 {
   "captured_at": "2026-09-02T02:43:03Z",
-  "box": "parallel-box-2",
-  "instance_id": "i-0b8def825d4e9bcc2",
+  "instance_sha256": "bb28b8ba9f74897e97129109de80b7d5120b15cc1d4438973c8f176d3f82053b",
   "instance_type": "c8g.metal-48xl",
   "availability_zone": "us-west-2d",
-  "uname": "Linux ip-172-31-62-119 6.17.0-1019-aws #19~24.04.1-Ubuntu SMP Tue Jun 23 18:34:05 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux",
+  "uname": "Linux 6.17.0-1019-aws #19~24.04.1-Ubuntu SMP Tue Jun 23 18:34:05 UTC 2026 aarch64 aarch64 aarch64 GNU/Linux",
   "kernel_release": "6.17.0-1019-aws",
   "machine": "aarch64",
   "cpu_model": "Neoverse-V2",

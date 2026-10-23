@@ -1489,7 +1489,7 @@
                 "login": "ejc3",
                 "__typename": "User"
               },
-              "body": "CI on 55892ace: Host-Root-arm64-SnapshotEnabled failed (11 failed, 4 timed out in the warm pass; the cold pass was 1185/1185). Not this diff: the runner (runner-i-066ffbdeef2c172d4) wedged 3 minutes into the warm pass with firecracker processes in D-state inside `synchronize_srcu` under `mmu_notifier_unregister`/`kvm_destroy_vm`, 153 firecracker processes and 22 in D an hour later, and the post-job guard counted 161 stray process groups. Evidence and stacks in #871. The same lane passed for #869 at 12:10Z on a healthy runner. The wedged host was rebooted at 12:58Z (D-state is not killable); the next head of this PR gets a fresh run.",
+              "body": "CI on 55892ace: Host-Root-arm64-SnapshotEnabled failed (11 failed, 4 timed out in the warm pass; the cold pass was 1185/1185). Not this diff: the runner (runner-<id>) wedged 3 minutes into the warm pass with firecracker processes in D-state inside `synchronize_srcu` under `mmu_notifier_unregister`/`kvm_destroy_vm`, 153 firecracker processes and 22 in D an hour later, and the post-job guard counted 161 stray process groups. Evidence and stacks in #871. The same lane passed for #869 at 12:10Z on a healthy runner. The wedged host was rebooted at 12:58Z (D-state is not killable); the next head of this PR gets a fresh run.",
               "createdAt": "2026-08-28T12:59:22Z",
               "updatedAt": "2026-08-28T12:59:22Z"
             },
@@ -1647,7 +1647,7 @@
                   "login": "ejc3",
                   "__typename": "User"
                 },
-                "body": "CI on 55892ace: Host-Root-arm64-SnapshotEnabled failed (11 failed, 4 timed out in the warm pass; the cold pass was 1185/1185). Not this diff: the runner (runner-i-066ffbdeef2c172d4) wedged 3 minutes into the warm pass with firecracker processes in D-state inside `synchronize_srcu` under `mmu_notifier_unregister`/`kvm_destroy_vm`, 153 firecracker processes and 22 in D an hour later, and the post-job guard counted 161 stray process groups. Evidence and stacks in #871. The same lane passed for #869 at 12:10Z on a healthy runner. The wedged host was rebooted at 12:58Z (D-state is not killable); the next head of this PR gets a fresh run.",
+                "body": "CI on 55892ace: Host-Root-arm64-SnapshotEnabled failed (11 failed, 4 timed out in the warm pass; the cold pass was 1185/1185). Not this diff: the runner (runner-<id>) wedged 3 minutes into the warm pass with firecracker processes in D-state inside `synchronize_srcu` under `mmu_notifier_unregister`/`kvm_destroy_vm`, 153 firecracker processes and 22 in D an hour later, and the post-job guard counted 161 stray process groups. Evidence and stacks in #871. The same lane passed for #869 at 12:10Z on a healthy runner. The wedged host was rebooted at 12:58Z (D-state is not killable); the next head of this PR gets a fresh run.",
                 "createdAt": "2026-08-28T12:59:22Z",
                 "updatedAt": "2026-08-28T12:59:22Z"
               },

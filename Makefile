@@ -1486,8 +1486,9 @@ fmt: cargo-target-link
 	$(CARGO) fmt
 
 # SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)
-JUMPBOX_IP := 54.193.62.221
+JUMPBOX_IP ?=
 ssh:
+	@test -n "$(JUMPBOX_IP)" || { echo "set JUMPBOX_IP (terraform output jumpbox_ssh_command)" >&2; exit 2; }
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$(JUMPBOX_IP)
 
 # Kernel patch helpers - generates properly formatted patches
