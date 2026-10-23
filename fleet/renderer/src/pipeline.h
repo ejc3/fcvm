@@ -178,7 +178,7 @@ class Pipeline {
   BudgetSchedule sched_;   // under mu_
   // health: the budget the last frame used, where it came from, and this
   // renderer's fit (budget at 70% of a slot, smoothed)
-  double used_budget_ = 0, fit_ = 0, fit_px_ = 0, fit_scale_ = 1.0;
+  double used_budget_ = 0, fit_ = 0, fit_now_ = 0, fit_px_ = 0, fit_scale_ = 1.0;
   CostModel cost_;
   struct FrameLog {
     std::chrono::steady_clock::time_point at;

@@ -274,6 +274,31 @@ Round 10, layout generations (`tools/retile.py`, four VMs):
   first frame all four drew differed in 162,911 pixels and the next four in
   99,194 to 131,044, and the slowest cell skipped every other slot.
 
+Round 10, from the end-to-end run on eight T4s:
+
+- **A renderer rejoining the wall** (`tools/rejoin.py`, four VMs, a moving
+  2 x 2 grid, 270 px streams; one VM is killed and a fresh one started, sent
+  the scene and the budget, then streamed). A fresh VM's GPU sits at its idle
+  clock (585 MHz on a T4, against 1590; it takes about 1.5 s under load to
+  reach full speed), so its first frames were slow: priming stopped after 7
+  slots, the next slots were skipped, and frames F to F+6 of its stream
+  differed from the frame drawn whole in about 55,000 of 129,600 pixels.
+  Now a posted scene keeps the renderer drawing every slot (warming it), and
+  priming goes on while its frames are still getting faster. At 707,107
+  pixel-samples: first frame 0.28 s after subscribing, frames F to F+7 equal
+  the whole frame's region in all pixels, in 3 runs; 2 runs skipped no slot
+  in 5 s and 1 skipped one slot 1.6 s after the first frame (that budget is
+  75% of a slot at full clock, above the controller's 70%). At 353,553: 2
+  runs, 0 pixels different, no slot skipped.
+- **The grid budget** (`tools/pathrun.py`: eight VMs as a 4 x 2 wall at 540 px
+  tiles, fleet-control's directed camera with seed 1, `budgetctl.py` every
+  2 s, 7 minutes). With the fit from the latest frames the slowest tile's
+  fit swung 444 k to 716 k and the budget changed 7 times (420,448 and
+  500,000 in turn). With the fit from a 180 s window's 95th percentile it
+  stayed within 448 k to 489 k and the budget changed once (353,553 to
+  420,448 at 225 s), 0 times in the last 3 minutes; the latest frames' fit on
+  the same run still swung 447 k to 711 k. No frame took over 27.0 ms.
+
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
 cropped; `tools/seam_metric.py`):

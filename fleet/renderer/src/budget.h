@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <utility>
+#include <deque>
 #include <vector>
 
 // Budgets that take effect from a frame slot: every tile is given the same
@@ -96,24 +97,80 @@ inline double local_budget(double fit, double px) {
 // drew. The fit is the largest budget whose predicted frame takes `frac` of a
 // slot: on the fast path below HQ_SPP samples per drawn pixel, on the
 // high-quality path from it, whichever allows more.
+//
+// The costs come from a window: the 95th percentile of each over the frames
+// of the last `window_s` seconds, so the fit holds over what the camera has
+// shown in that time rather than following the last few frames (on a moving
+// camera the latest frames' cost swung 2x, and the fit with it). Until the
+// window spans `ready_s`, fit() is 0 (not known yet) and fit_now() follows
+// the latest frames (smoothed over about five). The first `settle_s` seconds
+// stay out of the window: a GPU coming up from idle clocks draws them slower,
+// and they would hold the fit down until they left it.
 struct CostModel {
-  double fixed_ms = -1, c_fast = -1, c_hq = -1;  // -1: not seen yet
+  double fixed_ms = -1, c_fast = -1, c_hq = -1;  // smoothed latest; -1: not seen yet
   double hq_prior = 1.0;                          // c_hq / c_fast before a high-quality frame is seen
-  void observe(bool hq, double samples, double trace_ms, double render_ms) {
+  double window_s = 180.0, ready_s = 60.0, pct = 0.95;
+  double settle_s = 5.0;  // the first seconds after a reset stay out of the window (a GPU leaving idle clocks)
+  struct Obs {
+    double t;
+    bool hq;
+    double c, fixed;
+  };
+  std::deque<Obs> obs;
+  double first_t = -1;
+  // percentiles over the window, refreshed at most once a second
+  double w_fixed = -1, w_fast = -1, w_hq = -1, w_at = -1e18;
+
+  void observe(bool hq, double samples, double trace_ms, double render_ms, double now_s = -1) {
     if (samples <= 0 || trace_ms <= 0) return;
     auto ew = [](double& v, double x) { v = v < 0 ? x : v + (x - v) * 0.2; };
-    ew(fixed_ms, std::max(0.0, render_ms - trace_ms));
-    ew(hq ? c_hq : c_fast, trace_ms / samples);
+    double fx = std::max(0.0, render_ms - trace_ms), c = trace_ms / samples;
+    ew(fixed_ms, fx);
+    ew(hq ? c_hq : c_fast, c);
+    if (now_s < 0) return;
+    if (first_t < 0) first_t = now_s;
+    if (now_s - first_t < settle_s) return;
+    obs.push_back({now_s, hq, c, fx});
+    while (!obs.empty() && obs.front().t < now_s - window_s) obs.pop_front();
+    if (now_s - w_at >= 1.0) {
+      w_at = now_s;
+      std::vector<double> f, a, b;
+      for (const Obs& o : obs) {
+        f.push_back(o.fixed);
+        (o.hq ? b : a).push_back(o.c);
+      }
+      auto q = [this](std::vector<double>& v) {
+        if (v.size() < 30) return -1.0;
+        size_t n = std::min(v.size() - 1, (size_t)(pct * v.size()));
+        std::nth_element(v.begin(), v.begin() + n, v.end());
+        return v[n];
+      };
+      w_fixed = q(f);
+      w_fast = q(a);
+      w_hq = q(b);
+    }
   }
-  // px: drawn pixels; hq_spp: samples per drawn pixel where the high-quality path starts
-  double fit(double px, double hq_spp, double slot_ms, double frac = 0.70) const {
-    if (fixed_ms < 0 || (c_fast < 0 && c_hq < 0)) return 0;
-    double avail = frac * slot_ms - fixed_ms;
+  bool ready(double now_s) const { return first_t >= 0 && now_s - first_t >= ready_s && w_fixed >= 0; }
+  static double fit_from(double fixed, double cfast, double chq, double prior, double px, double hq_spp, double slot_ms,
+                         double frac) {
+    if (fixed < 0 || (cfast < 0 && chq < 0)) return 0;
+    double avail = frac * slot_ms - fixed;
     if (avail <= 0) return 1e4;
-    double cf = c_fast > 0 ? c_fast : c_hq / hq_prior;
-    double ch = c_hq > 0 ? c_hq : c_fast * hq_prior;
+    double cf = cfast > 0 ? cfast : chq / prior;
+    double ch = chq > 0 ? chq : cfast * prior;
     double b_fast = std::min(avail / cf, hq_spp * px * 0.999);
     double b_hq = avail / ch;
     return b_hq >= hq_spp * px ? std::max(b_hq, b_fast) : b_fast;
+  }
+  // from the latest frames (px: drawn pixels; hq_spp: samples per drawn pixel
+  // where the high-quality path starts)
+  double fit_now(double px, double hq_spp, double slot_ms, double frac = 0.70) const {
+    return fit_from(fixed_ms, c_fast, c_hq, hq_prior, px, hq_spp, slot_ms, frac);
+  }
+  // from the window; 0 until it is ready. A path the window has not seen
+  // takes the other's cost (times the prior).
+  double fit(double px, double hq_spp, double slot_ms, double now_s, double frac = 0.70) const {
+    if (!ready(now_s)) return 0;
+    return fit_from(w_fixed, w_fast, w_hq, hq_prior, px, hq_spp, slot_ms, frac);
   }
 };
