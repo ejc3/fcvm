@@ -39,13 +39,16 @@ case "$ENGINE" in
 chromium)
     IMAGE="${IMAGE:-localhost/chromium-bench-req}"
     CONTAINERFILE="Containerfile.chromium-bench"
-    # The program whose `--version` the golden records as browser_version.
-    BROWSER_BIN="chromium"
+    # The command (entrypoint, then arguments) whose first output line the
+    # golden records as browser_version.
+    BROWSER_VERSION_CMD=(chromium --version)
     ;;
 webkit)
     IMAGE="${IMAGE:-localhost/webkit-bench-req}"
     CONTAINERFILE="Containerfile.webkit-bench"
-    BROWSER_BIN="WebKitWebDriver"
+    # WebKitWebDriver has no --version flag (it prints its usage to stderr
+    # and exits 1), so the version comes from the package that ships it.
+    BROWSER_VERSION_CMD=(dpkg-query -W -f 'WebKitGTK ${Version}\n' webkit2gtk-driver)
     CDP_PORT="${CDP_PORT:-9515}"
     # cdp-fast is CDP WebSocket prewiring; exec's guest driver is CDP-only.
     ARMS="${ARMS:-cdp,noop}"
@@ -683,10 +686,10 @@ cmd_golden() {
     # unpinned, so without this line no record says which browser a run drove.
     # The image is the exact ID the snapshot was built from, run offline.
     local browser_version
-    browser_version=$(podman run --rm --network none --entrypoint "$BROWSER_BIN" \
-        "$image_id" --version 2>/dev/null | head -1) || browser_version=""
+    browser_version=$(podman run --rm --network none --entrypoint "${BROWSER_VERSION_CMD[0]}" \
+        "$image_id" "${BROWSER_VERSION_CMD[@]:1}" 2>/dev/null | head -1) || browser_version=""
     [ -n "$browser_version" ] \
-        || { log "golden: '$BROWSER_BIN --version' printed nothing in $image_id"; return 1; }
+        || { log "golden: '${BROWSER_VERSION_CMD[*]}' printed nothing in $image_id"; return 1; }
     # The Firecracker pin in rootfs-config.toml at the source revision this
     # golden was built from; empty outside a revision-stamped run.
     local firecracker_config=""
