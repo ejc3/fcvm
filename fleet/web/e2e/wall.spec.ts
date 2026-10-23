@@ -56,8 +56,11 @@ test("the seam check catches a renderer that draws another t than it stamps", as
   await openWall(page, 15);
   await setSkew("slot-2", 0.6);
   try {
-    await page.waitForTimeout(1500);
-    const r = await seamReport(page);
+    // How much a 0.6 s skew changes the smooth pixels at fcvm:2's edges rises
+    // and falls with t as the nebula moves (3.8 to 18 over ten runs, 1.9 once),
+    // so measure while it shows: within 20 s the picture moves enough.
+    let r = await seamReport(page);
+    await expect.poll(async () => (r = await seamReport(page)).perTile["fcvm:2"] ?? 0, { timeout: 20_000, intervals: [500] }).toBeGreaterThan(TILE_ERR_MAX);
     console.log(`skewed: fcvm:2 ${r.perTile["fcvm:2"]?.toFixed(2)}, others worst ${Math.max(...Object.entries(r.perTile).filter(([id]) => id !== "fcvm:2").map(([, e]) => e)).toFixed(2)}`);
     expect(r.perTile["fcvm:2"]!).toBeGreaterThan(TILE_ERR_MAX);
     for (const [id, e] of Object.entries(r.perTile)) if (id !== "fcvm:2") expect(e, id).toBeLessThan(TILE_ERR_MAX);
@@ -693,6 +696,7 @@ test("your own GPU: a wall tile's GPU is lent, streams full screen with its own 
   await expect.poll(() => page.evaluate(() => Object.entries(window.__fleet!.client.getState().frames?.tiles ?? {}).some(([k, v]) => k.startsWith("o:") && v.newestT !== null)), { timeout: 15_000 }).toBe(true);
   // Its own camera: a drag moves it, and the page measures input to pixels.
   const shot = await page.getByTestId("own-shot").boundingBox();
+  const dragStart = Date.now();
   await page.mouse.move(shot!.x + shot!.width / 2, shot!.y + shot!.height / 2);
   await page.mouse.down();
   for (let i = 1; i <= 8; i++) {
@@ -700,7 +704,14 @@ test("your own GPU: a wall tile's GPU is lent, streams full screen with its own 
     await page.waitForTimeout(25);
   }
   await page.mouse.up();
-  await expect(page.getByTestId("own-latency")).toHaveText(/^input to pixels: \d+ ms$/, { timeout: 10_000 });
+  // A real measurement: at least the 50 ms the mock puts a drag's camera key
+  // ahead (no frame showing the drag exists sooner) and at most the time since
+  // the drag began. No upper bound beyond that: on the mock it is the CPU the
+  // software encoder and decoder get (about 300 ms on 4 cores, 1.1 s on 2).
+  await expect(page.getByTestId("own-latency")).toHaveText(/^input to pixels: (\d+ ms|\d+(\.\d)? s)$/, { timeout: 10_000 });
+  const latencyMs = await page.evaluate(() => window.__fleet!.client.getState().lastInputLatencyMs);
+  expect(latencyMs).toBeGreaterThanOrEqual(50);
+  expect(latencyMs).toBeLessThanOrEqual(Date.now() - dragStart);
   // The minute ends: back to the wall on its own, watching the borrowed tile restore.
   await expect(page.getByTestId("own-status")).toHaveText("Your minute is up. The GPU went back to the pool.", { timeout: 15_000 });
   await expect(page.getByTestId("own")).toHaveCount(0, { timeout: 5000 });
