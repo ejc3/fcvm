@@ -233,7 +233,7 @@ pub async fn cmd_snapshot(args: SnapshotArgs) -> Result<()> {
     match args.cmd {
         SnapshotCommands::Create(create_args) => cmd_snapshot_create(create_args).await,
         SnapshotCommands::Serve(serve_args) => cmd_snapshot_serve(serve_args).await,
-        SnapshotCommands::Run(run_args) => cmd_snapshot_run(run_args).await,
+        SnapshotCommands::Run(run_args) => cmd_snapshot_run(*run_args).await,
         SnapshotCommands::Ls => cmd_snapshot_ls().await,
     }
 }
@@ -1954,6 +1954,7 @@ async fn cmd_snapshot_run_inner(
     vm_state.config.snapshot_name = Some(snapshot_name.clone());
     vm_state.config.process_type = Some(crate::state::ProcessType::Clone);
     vm_state.config.serve_pid = serve_pid; // Track which serve spawned us (None for direct mode)
+    vm_state.config.labels = super::podman::parse_labels(&args.label);
 
     // Carry the snapshot's volume metadata into the clone's state so a `snapshot create`
     // taken from this clone records the same volumes as the baseline.
@@ -4973,6 +4974,7 @@ mod tests {
             exec: None,
             startup_snapshot_base_key: None,
             cpu: None,
+            label: vec![],
             mem: None,
             balloon: None,
             firecracker_bin: Some("/opt/firecracker-profile".to_string()),
@@ -5048,6 +5050,7 @@ mod tests {
             exec: None,
             startup_snapshot_base_key: None,
             cpu: None,
+            label: vec![],
             mem: None,
             balloon: None,
             firecracker_bin: None,

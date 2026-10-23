@@ -51,9 +51,22 @@ async fn wait_for_listen_port(log_path: &Path, timeout: Duration) -> Result<u16>
 }
 
 async fn create(client: &reqwest::Client, base: &str) -> Result<String> {
+    create_with(
+        client,
+        base,
+        serde_json::json!({ "image": common::TEST_IMAGE }),
+    )
+    .await
+}
+
+async fn create_with(
+    client: &reqwest::Client,
+    base: &str,
+    body: serde_json::Value,
+) -> Result<String> {
     let resp: serde_json::Value = client
         .post(format!("{base}/v1/sandboxes"))
-        .json(&serde_json::json!({ "image": common::TEST_IMAGE }))
+        .json(&body)
         .timeout(Duration::from_secs(300))
         .send()
         .await?
@@ -177,7 +190,14 @@ async fn serve_restores_sandboxes_from_the_snapshot_cache() -> Result<()> {
     let first = create(&client, &base).await?;
     destroy(&client, &base, &first).await?;
 
-    let second = create(&client, &base).await?;
+    // Labels are not in the snapshot key: the second create still hits the cache, and its
+    // state carries its own labels.
+    let second = create_with(
+        &client,
+        &base,
+        serde_json::json!({ "image": common::TEST_IMAGE, "labels": { "suite": "serve-cache" } }),
+    )
+    .await?;
     let state = state_of(&second).await?;
     assert_eq!(state.health_status, HealthStatus::Healthy);
     assert_eq!(
@@ -189,6 +209,12 @@ async fn serve_restores_sandboxes_from_the_snapshot_cache() -> Result<()> {
         state.config.snapshot_name
     );
     assert!(state.config.snapshot_name.is_some());
+    assert_eq!(
+        state.config.labels.get("suite").map(String::as_str),
+        Some("serve-cache"),
+        "a sandbox restored from the cache lost its labels: {:?}",
+        state.config.labels
+    );
 
     let out = run_command(&client, &base, &second, "echo serve-ok").await?;
     assert_eq!(out.trim(), "serve-ok");

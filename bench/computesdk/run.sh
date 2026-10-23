@@ -40,7 +40,15 @@ OUT=${OUT:-$WORK/results/$(date -u +%Y%m%dT%H%M%SZ)}
 for tool in node git curl jq python3; do
   command -v "$tool" >/dev/null || { echo "BLOCKED: $tool missing" >&2; exit 2; }
 done
+# A run never mixes with another: one at a time per WORK (the harness checkout is shared),
+# and OUT must be new or empty so the summary covers this run's bursts only.
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then
+  echo "OUT=$OUT already holds results; pick a new OUT" >&2
+  exit 2
+fi
 mkdir -p "$OUT" "$WORK"
+exec 9>"$WORK/.lock"
+flock -n 9 || { echo "another bench-computesdk run holds $WORK/.lock" >&2; exit 2; }
 
 # 1. The harness at the pinned commit, with the fcvm participant added.
 H=$WORK/benchmarks

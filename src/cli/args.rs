@@ -515,7 +515,7 @@ pub enum SnapshotCommands {
     /// Serve snapshot memory for cloning
     Serve(SnapshotServeArgs),
     /// Run a clone from a snapshot
-    Run(SnapshotRunArgs),
+    Run(Box<SnapshotRunArgs>),
     /// List running snapshot servers
     Ls,
 }
@@ -710,6 +710,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]
     pub cpu: Option<u8>,
+
+    /// KEY=VALUE labels for the clone's state (internal use only).
+    /// Passed from podman run's --label when restoring from a snapshot; labels are not in
+    /// the snapshot key, so a cache hit takes the run's own.
+    #[arg(skip)]
+    pub label: Vec<String>,
 
     /// Memory in MiB (internal use only).
     /// Passed from podman run's --mem when restoring from a snapshot.
@@ -1264,7 +1270,7 @@ mod tests {
         let SnapshotCommands::Run(run) = snapshot.cmd else {
             panic!("expected `snapshot run` command");
         };
-        run
+        *run
     }
 
     #[test]
