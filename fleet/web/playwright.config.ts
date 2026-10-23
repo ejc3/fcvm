@@ -62,8 +62,8 @@ export default defineConfig({
       FLEET_MOCK_RENDER_PORT: String(PORTS.render),
       FLEET_MOCK_FCVM_MS: "3000",
       FLEET_MOCK_EC2_MS: "12000",
-      FLEET_MOCK_TILES: "8",
-      FLEET_MOCK_EC2_SHORT: "1",
+      FLEET_MOCK_FCVM_GPUS: "8",
+      FLEET_MOCK_EC2_GPUS: "7",
       FLEET_MOCK_GPUS_PER_HOST: "4",
       // Races only when a test starts one; no cooldown or capacity wait unless a test asks.
       FLEET_MOCK_RACE_EVERY_S: "0",

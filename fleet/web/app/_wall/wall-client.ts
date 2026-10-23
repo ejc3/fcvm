@@ -217,6 +217,8 @@ export class WallClient {
           requestAnimationFrame(tick);
         };
         requestAnimationFrame(tick);
+      } else if (m.type === "gen-shown") {
+        this.dispatch({ type: "gen-shown", gen: m.gen });
       } else if (m.type === "painted") {
         this.painted = true;
         for (const fn of this.paintedListeners) fn();

@@ -1,7 +1,7 @@
 # fleet/web: the GPU wall page
 
 The page for `docs/fleet/ARCHITECTURE.md`: one image tiled across every GPU, fcvm on the
-left half and EC2 on the right, live from each tile's own renderer. It is a stage, not a
+left and EC2 on the right, each side as wide as the GPUs it has live, live from each tile's own renderer. It is a stage, not a
 dashboard: the image sits letterboxed between the race (a countdown to the next restart
 and two bars, fcvm against EC2) and one button, "Restart all N GPUs". Everything else
 (the camera's next stop, words, lights, the time of day, how the streams arrive, stream
@@ -69,7 +69,7 @@ pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
 On a small machine, `FLEET_E2E_VIEW=1280x800 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
-makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
+makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_FCVM_GPUS`, `FLEET_MOCK_EC2_GPUS`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_RACE_EVERY_S`, `FLEET_MOCK_TURNSTILE`, ...) are listed at the top of `mock/main.ts`.
 By default it restarts every GPU 20 s after start and every 5 minutes after that, holds
 "restart now" for 60 s after each restart, and a quarter of races wait 10 to 30 s for EC2
@@ -124,6 +124,20 @@ so nothing blank is ever shown. The wake, as measured, appears once under the co
 "Last wake: 128 GPUs from zero in 2:07". The page reads the media from `FLEET_MEDIA_URL`
 (default `/media` on its own origin, Workers static assets: a 720p reel stays well under
 the 25 MiB per-file limit); the mock serves a generated 4 s test clip.
+
+**Each side as wide as its GPUs, and re-tiling without a hitch.** The coordinator gives
+every tile its rectangle, and the sides are as wide as the GPUs each has live (fcvm 100
+against EC2 12 puts the line at 100/112); there are no places waiting for capacity. When
+GPUs join or leave, the snapshot carries a new `layout.gen` and the frame (`at_frame`, on
+the renderers' t = k/30) from which the renderers draw the new rectangles. The page opens
+the new generation's streams at once and keeps drawing the old tiles, from frames before
+`at_frame`, until every tile of the new generation has a frame at or after it; then it
+swaps them all in one draw (after 4 s it swaps anyway, so a renderer that never answers
+cannot hold the image). The seams, hover labels, keyboard grid and dark tiles follow the
+tiling on screen, switching in the same moment; an opened VM and Aggregated mode take the
+new rectangles. A frame is placed by the stream header it was encoded under, and a place
+that moves to another GPU keeps its old stream until the swap. A side with no GPUs gives
+the other the full width and says "EC2: no GPUs live right now" (or fcvm).
 
 **Words on the stage.** One sentence under the title says what the page is, "fcvm" and
 "EC2" sit on backplates either side of the seam, and one line under each half says what a
@@ -323,6 +337,8 @@ yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` ma
 - `GET /poster.jpg` on the `/live` origin, readable from the page's origin (CORS).
 - state: `counters: {restores_total, scrubs_total, restores_last_hour}` and `security:
   {gpu_scrub}`; without `security` the page says nothing about a scrub.
+- `layout: {gen, at_frame}` with each tile's `rect` for that generation (the coordinator is
+  adding it to PROTOCOL.md); without it the page reads generation 0.
 - `fleet.power: {state, asleep_since, woke_at, hosts: [{host, phases: [{phase, at}]}],
   last_wake: {started_at, awake_at, gpus}}`: `woke_at` is when the wake began, phases are
   `instance_pending`, `booted`, `store_ready`, `agent_connected`, `tiles_rendering`;
@@ -338,7 +354,9 @@ GPU, from a drag to the first draw at or past the claim's camera key tagged with
 intent. The renderer's `q=hi|std|lo` goes on the frame URL only when it is not `std`.
 
 The mock encodes H.264 baseline with libx264 (`q` as constant quality 14, 18 or 26)
-rather than High with NVENC, runs one aggregator per fcvm host and one for the EC2 half
+rather than High with NVENC, lays each side out in proportion to its GPUs (the fcvm side
+in one full-width band per host, `FLEET_MOCK_FCVM_GPUS`, `FLEET_MOCK_EC2_GPUS`, and
+`/mock/fault {fcvm_gpus, ec2_gpus}` to re-tile), runs one aggregator per fcvm host and one for the EC2 side
 (each draws its region whole and blacks out tiles that are not running), draws the UTC
 clock once in each half, renders a viewer's own GPU as the whole image from its own
 camera, and shows `relaunching` for 150 ms before a tile's first reported phase.

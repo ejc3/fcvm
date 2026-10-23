@@ -246,7 +246,22 @@ export interface Aggregate {
   tiles: string[];
 }
 
+/**
+ * Which tiling of the image this is (assumed until PROTOCOL.md has it): a new
+ * generation each time GPUs join or leave and the image is re-tiled, and the
+ * frame number (on the renderers' t = k/30 grid) from which the renderers draw
+ * the new rectangles. Frames before it are drawn with the old ones.
+ */
+export interface Layout {
+  gen: number;
+  at_frame: number;
+}
+
+/** Renderer frames per second: frame k is drawn at t = k / FRAME_RATE. */
+export const FRAME_RATE = 30;
+
 export interface FleetState {
+  layout: Layout;
   tiles: Tile[];
   /** Width over height of the whole image. */
   image_aspect: number;
@@ -612,7 +627,9 @@ function parseState(o: Obj): FleetState {
   const aspect = numOrNull(o, "image_aspect", "state") ?? DEFAULT_IMAGE_ASPECT;
   if (aspect <= 0) throw new ProtocolError("image_aspect is not positive");
   const sb = isObj(o["scoreboard"]) ? o["scoreboard"] : {};
+  const lay = isObj(o["layout"]) ? o["layout"] : null;
   return {
+    layout: lay ? { gen: num(lay, "gen", "layout"), at_frame: num(lay, "at_frame", "layout") } : { gen: 0, at_frame: 0 },
     tiles,
     image_aspect: aspect,
     fleet: {

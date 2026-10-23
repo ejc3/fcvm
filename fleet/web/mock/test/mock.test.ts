@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import WebSocket from "ws";
 import { innerRect, parseFrame, parseStreamHeader, splitNals, nalType, NAL_SPS, NAL_IDR } from "../../core/frame.ts";
-import { MockCoordinator, halfGrid } from "../coordinator.ts";
+import { MockCoordinator } from "../coordinator.ts";
+import { gridIn, mockLayout } from "../layout.ts";
 import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
 import { tileGeometry } from "../../core/layout.ts";
@@ -20,7 +21,7 @@ beforeAll(async () => {
   renderers = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 2, maxHeight: 360, epochUnixMs, scene: () => coord.patternScene() });
   await renderers.listen();
   coord = new MockCoordinator({
-    port: 0, perHalf: 2, ec2Short: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
+    port: 0, fcvmGpus: 2, ec2Gpus: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
     raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
     borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
     sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
@@ -73,8 +74,29 @@ function live(): Promise<{ ws: WebSocket; msgs: Record<string, unknown>[]; next:
 
 describe("mock coordinator", () => {
   it("lays out a half on a grid close to 16:9 tiles", () => {
-    expect(halfGrid(8)).toEqual({ cols: 2, rows: 4 });
-    expect(halfGrid(25)).toEqual({ cols: 5, rows: 5 });
+    // Eight in a half of a 16:9 image: 2 x 4. Seven: rows of 2, the last one stretched.
+    const half = { x: 0, y: 0, w: 0.5, h: 1 };
+    expect(gridIn(half, 8, 16 / 9).map((r) => [r.w, r.h])).toEqual(Array(8).fill([0.25, 0.25]));
+    const seven = gridIn(half, 7, 16 / 9);
+    expect(seven).toHaveLength(7);
+    expect(seven.at(-1)).toMatchObject({ w: 0.5, h: 0.25 });
+    expect(seven.reduce((a, r) => a + r.w * r.h, 0)).toBeCloseTo(0.5, 9);
+    // Every count, in a narrow and a wide region, gives exactly that many tiles covering it.
+    for (const region of [{ x: 0, y: 0, w: 7 / 17, h: 1 }, { x: 0, y: 0, w: 1, h: 0.25 }]) {
+      for (let n = 1; n <= 40; n++) {
+        const g = gridIn(region, n, 16 / 9);
+        expect(g, `${n} in ${region.w}x${region.h}`).toHaveLength(n);
+        expect(g.reduce((a, r) => a + r.w * r.h, 0)).toBeCloseTo(region.w * region.h, 9);
+      }
+    }
+    // Sides as wide as their GPUs: 100 fcvm against 12 EC2.
+    const lay = mockLayout([{ host: "a", gpus: 50 }, { host: "b", gpus: 50 }], 12, 16 / 9);
+    expect(lay.split).toBeCloseTo(100 / 112, 9);
+    expect(lay.hosts.map((h) => [h.band.y, h.band.h])).toEqual([[0, 0.5], [0.5, 0.5]]);
+    expect(lay.hosts[0]!.band.w).toBeCloseTo(100 / 112, 9);
+    expect(lay.ec2Region!.x).toBeCloseTo(100 / 112, 9);
+    expect(lay.ec2Region!.w).toBeCloseTo(12 / 112, 9);
+    expect(mockLayout([{ host: "a", gpus: 4 }], 0, 16 / 9)).toMatchObject({ split: 1, ec2Region: null, ec2: [] });
   });
 
   it("applies a repeated intent id once and answers both with the same receipt", async () => {
@@ -146,7 +168,8 @@ describe("mock coordinator", () => {
 
 describe("mock renderer", () => {
   it("speaks the frame protocol: a header, then FCVF frames on the shared clock, keyframe first", async () => {
-    const url = `${coord.fleetState().tiles.find((t) => t.slot === "slot-2")!.frame_url}?h=90`;
+    const tile = coord.fleetState().tiles.find((t) => t.slot === "slot-2")!;
+    const url = `${tile.frame_url}?h=90`;
     const ws = new WebSocket(url);
     const texts: string[] = [];
     const frames: ReturnType<typeof parseFrame>[] = [];
@@ -160,9 +183,12 @@ describe("mock renderer", () => {
     ws.close();
     const header = parseStreamHeader(texts[0]!);
     expect(header).not.toBeNull();
-    // The tile is 160 x 90 (1/4 x 1/2 of a 16:9 image at 90 high), sent with a
-    // margin of 8 px on its inner sides and a crop that says so.
-    expect(innerRect(header!)).toMatchObject({ sw: 160, sh: 90 });
+    // The tile is the renderer's geometry for its rectangle at 90 high (214 x 90: two
+    // thirds of the width, a host band half the height), sent with a margin on its
+    // inner sides and a crop that says so.
+    const g = tileGeometry(tile.rect, 16 / 9, 90);
+    expect(innerRect(header!)).toMatchObject({ sw: g.width, sh: 90 });
+    expect(g.width).toBe(214);
     expect(header!.crop.left + header!.crop.right + header!.crop.top + header!.crop.bottom).toBeGreaterThan(0);
     const ok = frames.map((f) => { if (!f.ok) throw new Error(f.error); return f.frame; });
     expect(ok[0]!.keyframe).toBe(true);
@@ -313,6 +339,9 @@ describe("mock aggregates", () => {
   it("lists one aggregate per fcvm host and one for EC2, covering the image, each serving the frame protocol", async () => {
     const st = coord.fleetState();
     expect(st.aggregates.map((a) => a.id)).toEqual(["agg:mock-host-1", "agg:mock-host-2", "agg:ec2"]);
+    expect(st.layout).toEqual({ gen: 1, at_frame: 0 });
+    // Two fcvm GPUs and one EC2: the fcvm side is two thirds of the image.
+    expect(st.aggregates[2]!.rect.x).toBeCloseTo(2 / 3, 9);
     expect(st.aggregates[0]!.tiles).toEqual(["fcvm:1"]);
     const area = st.aggregates.reduce((s, a) => s + a.rect.w * a.rect.h, 0);
     expect(area).toBeCloseTo(1, 9);
@@ -570,6 +599,58 @@ describe("mock race, second design review", () => {
     await admin("/mock/media", { missing: false });
   });
 
+  it("re-tiles when GPUs join or leave: a new generation whose rectangles start at a frame, and streams switch there", async () => {
+    const st0 = coord.fleetState();
+    const tile0 = st0.tiles.find((t) => t.id === "fcvm:1")!;
+    const ws = new WebSocket(`${tile0.frame_url}?h=90`);
+    const headers: { at: number; grid: unknown }[] = [];
+    const frames: { t: number; afterHeaders: number }[] = [];
+    ws.on("message", (d, bin) => {
+      if (!bin) headers.push({ at: frames.length, grid: parseStreamHeader(d.toString())!.grid });
+      else {
+        const f = parseFrame(new Uint8Array(d as Buffer));
+        if (f.ok) frames.push({ t: f.frame.t, afterHeaders: headers.length });
+      }
+    });
+    await until(() => frames.length > 3);
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 3 });
+    const st = coord.fleetState();
+    expect(st.layout.gen).toBe(st0.layout.gen + 1);
+    const atT = st.layout.at_frame / 30;
+    // Ahead of now, on the renderers' t = k/30 grid.
+    expect(atT * 1000).toBeGreaterThan(Date.now() - coord.patternScene().epoch_unix_ms);
+    // Two fcvm against three EC2: the fcvm side is two fifths of the image.
+    const r1 = st.tiles.find((t) => t.id === "fcvm:1")!.rect;
+    expect(r1.w).toBeCloseTo(2 / 5, 9);
+    expect(st.tiles.filter((t) => t.half === "ec2").map((t) => t.id)).toEqual(["ec2:1", "ec2:2", "ec2:3"]);
+    await until(() => frames.some((f) => f.t >= atT + 0.2));
+    ws.close();
+    // A new header for the new rectangle, and every frame after it at or after the re-tile's frame.
+    const g = tileGeometry(r1, 16 / 9, 90);
+    const h = headers.findIndex((x) => JSON.stringify(x.grid) === JSON.stringify({ fullWidth: g.fullWidth, fullHeight: g.fullHeight, x0: g.x0, y0: g.y0 }));
+    expect(h).toBeGreaterThan(0);
+    for (const f of frames) {
+      if (f.afterHeaders > h) expect(f.t).toBeGreaterThanOrEqual(atT - 1e-9);
+      else expect(f.t).toBeLessThan(atT - 1e-9);
+    }
+    // A GPU that leaves and comes back before its stream is retired keeps serving.
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 1 });
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 3 });
+    await sleep(6500);
+    const back = coord.fleetState().tiles.find((t) => t.id === "ec2:3")!;
+    await until(() => coord.fleetState().tiles.find((t) => t.id === "ec2:3")!.phase === "running", 25_000);
+    const status = await new Promise<number>((res) => {
+      const w = new WebSocket(`${back.frame_url}?h=90`);
+      w.on("open", () => {
+        w.close();
+        res(101);
+      });
+      w.on("unexpected-response", (_q, resp) => res(resp.statusCode ?? 0));
+    });
+    expect(status).toBe(101);
+    await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 1 });
+  }, 60_000);
+
   it("fails a tile with a retry time, and reclaims a host: draining, then no GPU behind its places", async () => {
     await admin("/mock/fault", { fail: "fcvm:1", message: "GPU did not come back", retry_ms: 300 });
     let t = coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!;
@@ -583,11 +664,14 @@ describe("mock race, second design review", () => {
     expect(t.phase).toBe("draining");
     expect(t.failure?.kind).toBe("host_reclaimed");
     expect(coord.fleetState().fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(true);
-    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!.phase === "waiting_capacity");
-    t = coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!;
-    expect(t.slot).toBeNull();
+    const gen = coord.fleetState().layout.gen;
+    // Its GPU leaves and the image is re-tiled onto the GPUs left: no dark place stays behind.
+    await until(() => coord.fleetState().tiles.every((x) => x.id !== "fcvm:2"));
+    expect(coord.fleetState().layout.gen).toBe(gen + 1);
     expect(coord.fleetState().fleet.hosts.map((h) => h.name)).toEqual(["mock-host-1"]);
+    expect(coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.rect).toMatchObject({ x: 0, w: 0.5, h: 1 });
     await admin("/mock/fault", { replace_host: "mock-host-2" });
-    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!.phase === "running");
+    expect(coord.fleetState().layout.gen).toBe(gen + 2);
+    await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")?.phase === "running");
   });
 });

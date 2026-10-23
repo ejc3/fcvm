@@ -107,6 +107,7 @@ h1, h2, h3, p { margin: 0; }
 
 .half-line { position: absolute; width: 2px; margin-left: -1px; background: rgba(255, 255, 255, 0.4); }
 .seam-label { position: absolute; font: 600 15px var(--mono); }
+.empty-side { position: absolute; font-size: 14px; color: var(--muted); }
 .seam-label.fcvm { color: var(--fcvm); }
 .seam-label.ec2 { color: var(--ec2); }
 .caption { position: absolute; font-size: 14px; line-height: 18px; color: var(--muted); margin: 0; }

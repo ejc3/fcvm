@@ -9,6 +9,7 @@ import {
   layoutMosaic,
   rectOnScreen,
   snap,
+  splitOf,
   streamHeightFor,
   seamSegments,
   type Box,
@@ -19,7 +20,7 @@ import {
 import { frameSocketUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
 import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
@@ -885,6 +886,13 @@ export interface DrawPlan {
   suspended: boolean;
   /** The fleet is asleep or waking: the poster fills the image again, under tiles as they arrive. */
   posterFull: boolean;
+  /**
+   * The layout generation this plan is, and the scene t from which its tiles are
+   * drawn. A plan of a newer generation is drawn once every one of its regions has
+   * a frame at or after `atT`; until then the drawer keeps drawing the previous one.
+   */
+  gen: number;
+  atT: number;
 }
 
 /** The source a tile's pixels come from in a mode: its own stream, or the aggregate holding it. */
@@ -1003,26 +1011,99 @@ function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[]
 export interface StageLabels {
   /** "fcvm" and "EC2" on backplates either side of the seam, top of the image. */
   seam: { half: Half; text: string; x: number; y: number; align: "right" | "left" }[];
-  /** One line under each half. */
-  captions: { half: Half; tag: string; text: string; box: Box }[];
+  /** One line under each side, side by side, or one under the other when a side is narrow. */
+  captions: { half: Half; tag: string; text: string; box: Box; align: "left" | "right" }[];
+  /** A side with no GPUs live: a small label where it would be, or null. */
+  empty: { half: Half; text: string; x: number; y: number; align: "right" | "left" } | null;
 }
 
-/** Height kept under the image for the captions. */
+/** Least height kept under the image for the captions. */
 export const CAPTION_BAND = 44;
+/** A side narrower than this puts the captions one under the other, full width. */
+export const CAPTION_MIN_W = 260;
+
+export const EMPTY_SIDE: Record<Half, string> = {
+  fcvm: "fcvm: no GPUs live right now",
+  ec2: "EC2: no GPUs live right now",
+};
+
+/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
+const CAPTION_CHAR_PX = 7.4;
+const CAPTION_LINE_PX = 18;
+
+function captionLines(half: Half, width: number): number {
+  return Math.max(1, Math.ceil(((CAPTIONS[half].length + 6) * CAPTION_CHAR_PX) / Math.max(1, width)));
+}
+
+/**
+ * The captions' boxes for an image and where its fcvm side ends: each under its
+ * side, or stacked full width when a side is too narrow; a side with no tiles has none.
+ */
+function captionBoxes(img: Box, split: number): { half: Half; box: Box }[] {
+  const y = img.y + img.h + 6;
+  const sides: Half[] = split <= 0 ? ["ec2"] : split >= 1 ? ["fcvm"] : ["fcvm", "ec2"];
+  if (sides.length === 1) return [{ half: sides[0]!, box: { x: img.x, y, w: img.w, h: 0 } }];
+  const mid = img.x + img.w * split;
+  const fw = mid - img.x - 8;
+  const ew = img.x + img.w - mid - 8;
+  if (Math.min(fw, ew) >= CAPTION_MIN_W) {
+    return [
+      { half: "fcvm", box: { x: img.x, y, w: fw, h: 0 } },
+      { half: "ec2", box: { x: mid + 8, y, w: ew, h: 0 } },
+    ];
+  }
+  const first = captionLines("fcvm", img.w) * CAPTION_LINE_PX;
+  return [
+    { half: "fcvm", box: { x: img.x, y, w: img.w, h: 0 } },
+    { half: "ec2", box: { x: img.x, y: y + first, w: img.w, h: 0 } },
+  ];
+}
+
+/** Height the captions take under an image of this width. */
+function captionBand(imgW: number, split: number): number {
+  const boxes = captionBoxes({ x: 0, y: 0, w: imgW, h: 0 }, split);
+  const stacked = boxes.length === 2 && boxes[1]!.box.y > boxes[0]!.box.y;
+  const lines = boxes.map((b) => captionLines(b.half, b.box.w));
+  const total = stacked ? lines.reduce((a, b) => a + b, 0) : Math.max(...lines);
+  return Math.max(CAPTION_BAND, total * CAPTION_LINE_PX + 8);
+}
 
 function stageLabels(layout: MosaicLayout | null): StageLabels {
-  if (!layout) return { seam: [], captions: [] };
+  if (!layout) return { seam: [], captions: [], empty: null };
   const img = layout.image;
   const mid = layout.halfLineX;
+  const captions = captionBoxes(img, layout.split).map((c) => ({
+    half: c.half,
+    tag: KIND_TAG[c.half],
+    text: CAPTIONS[c.half],
+    box: c.box,
+    // Under its own side, the EC2 caption keeps to the right edge.
+    align: (c.half === "ec2" && c.box.x > img.x ? "right" : "left") as "left" | "right",
+  }));
+  if (mid === null) {
+    // One side has every GPU: it takes the whole width, and the other says it is empty.
+    const present: Half = layout.split >= 1 ? "fcvm" : "ec2";
+    const absent: Half = present === "fcvm" ? "ec2" : "fcvm";
+    return {
+      seam: [
+        present === "fcvm"
+          ? { half: "fcvm", text: "fcvm", x: img.x + 10, y: img.y + 10, align: "left" }
+          : { half: "ec2", text: "EC2", x: img.x + img.w - 10, y: img.y + 10, align: "right" },
+      ],
+      captions,
+      empty:
+        absent === "ec2"
+          ? { half: "ec2", text: EMPTY_SIDE.ec2, x: img.x + img.w - 10, y: img.y + 10, align: "right" }
+          : { half: "fcvm", text: EMPTY_SIDE.fcvm, x: img.x + 10, y: img.y + 10, align: "left" },
+    };
+  }
   return {
     seam: [
       { half: "fcvm", text: "fcvm", x: mid - 8, y: img.y + 10, align: "right" },
       { half: "ec2", text: "EC2", x: mid + 8, y: img.y + 10, align: "left" },
     ],
-    captions: [
-      { half: "fcvm", tag: "fcvm", text: CAPTIONS.fcvm, box: { x: img.x, y: img.y + img.h + 6, w: mid - img.x - 8, h: 0 } },
-      { half: "ec2", tag: "EC2", text: CAPTIONS.ec2, box: { x: mid + 8, y: img.y + img.h + 6, w: img.x + img.w - mid - 8, h: 0 } },
-    ],
+    captions,
+    empty: null,
   };
 }
 
@@ -1073,27 +1154,34 @@ export interface WallView {
   bandwidth: string;
 }
 
+/**
+ * The tiles the canvas draws now: the shown generation's places and rectangles,
+ * each with its latest state when the newest snapshot still has it.
+ */
+export function drawnTiles(s: ClientState): Tile[] {
+  const st = s.accepted;
+  if (!st) return [];
+  const shown = s.shownLayout;
+  if (!shown || shown.gen === st.layout.gen) return st.tiles;
+  const now = new Map(st.tiles.map((t) => [t.id, t]));
+  return shown.tiles.map((old) => {
+    const cur = now.get(old.id);
+    return cur ? { ...cur, rect: old.rect } : old;
+  });
+}
+
 export function pendingIntents(s: ClientState): IntentMsg[] {
   return s.pending.map((p) => p.intent);
 }
 
-/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
-const CAPTION_CHAR_PX = 7.4;
-const CAPTION_LINE_PX = 18;
-
 /**
- * The image's area: the stage less the band its captions sit in, tall enough
- * for the longer caption at the width half the image will have.
+ * The image's area: the stage less the band its captions sit in, tall enough for
+ * the captions at the widths the two sides will have (`split`: where fcvm ends).
  */
-export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9): Box {
+export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9, split = 0.5): Box {
   if (phone) return stage;
   let band = CAPTION_BAND;
-  for (let i = 0; i < 3; i++) {
-    const half = Math.min(stage.w, (stage.h - band) * aspect) / 2 - 8;
-    const chars = Math.max(...Object.values(CAPTIONS).map((c) => c.length + 6));
-    const lines = Math.max(1, Math.ceil((chars * CAPTION_CHAR_PX) / Math.max(1, half)));
-    band = Math.max(CAPTION_BAND, lines * CAPTION_LINE_PX + 8);
-  }
+  for (let i = 0; i < 3; i++) band = captionBand(Math.min(stage.w, (stage.h - band) * aspect), split);
   return { x: stage.x, y: stage.y, w: stage.w, h: Math.max(0, stage.h - band) };
 }
 
@@ -1136,8 +1224,12 @@ export function wallView(input: WallInput): WallView {
     darkFadeMs: input.reducedMotion ? REDUCED_MOTION_DARK_FADE_MS : 0,
     suspended: s.ui.suspended,
     posterFull: false,
+    gen: s.accepted?.layout.gen ?? 0,
+    atT: 0,
   };
-  const area = input.mosaicArea ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect) : null;
+  const area = input.mosaicArea
+    ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect, s.accepted ? splitOf(input.canDecode ? drawnTiles(s) : s.accepted.tiles) : 0.5)
+    : null;
   const common = {
     title: TITLE,
     site: SITE,
@@ -1159,7 +1251,7 @@ export function wallView(input: WallInput): WallView {
       layout: null,
       tiles: [],
       score: null,
-      labels: { seam: [], captions: [] },
+      labels: { seam: [], captions: [], empty: null },
       play: null,
       feed: [],
       counter: null,
@@ -1180,13 +1272,18 @@ export function wallView(input: WallInput): WallView {
     };
   }
   const pend = pendingIntents(s);
-  const layout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
-  const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
   const sleep = sleepView(st, srvNow);
+  // Two tilings while a re-tile settles: the plan is the newest generation (its
+  // streams open now), and the overlays follow the one the canvas still draws.
+  const shownTiles = input.canDecode ? drawnTiles(s) : st.tiles;
+  const planLayout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
+  const layout = shownTiles === st.tiles ? planLayout : area ? layoutMosaic(area, shownTiles, input.dpr, st.image_aspect) : null;
+  const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
+  const placedPlan = new Map<string, PlacedTile>(planLayout?.tiles.map((p) => [p.id, p]) ?? []);
   // Asleep or waking, a tile that is not rendering yet shows the poster, not a dark square.
-  const tiles = st.tiles
-    .map((t) => tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend))
-    .map((tv) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv));
+  const asleepFix = (tv: TileView) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv);
+  const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
+  const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
   const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
   const focus = focusTile ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online) : null;
   const own = ownView(s, st, srvNow, input);
@@ -1199,7 +1296,7 @@ export function wallView(input: WallInput): WallView {
   const opened = focus && focus.placed && !own ? focusTile : null;
   const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
     const focused = opened !== null && opened.id === t.id;
-    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
+    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedPlan.get(t.id)?.streamHeight ?? 144;
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
@@ -1211,14 +1308,14 @@ export function wallView(input: WallInput): WallView {
       url: frameSocketUrl(t.frame_url!, height, q),
       baseUrl: t.frame_url,
       height,
-      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedById.get(t.id)?.box ?? null,
+      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
     };
   });
   // Aggregated: each region is one big tile; it asks for the height it covers.
   const aggregated: DrawSource[] = st.aggregates
     .filter((g) => g.frame_url !== null)
     .map((g) => {
-      const box = layout ? rectOnScreen(layout.image, g.rect, input.dpr) : null;
+      const box = planLayout ? rectOnScreen(planLayout.image, g.rect, input.dpr) : null;
       const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
       return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: covered ? null : box };
     });
@@ -1236,11 +1333,13 @@ export function wallView(input: WallInput): WallView {
     aggregated,
     focus: focusSource,
     estimatedBps: fitted.bps,
-    image: covered ? null : layout?.image ?? null,
+    image: covered ? null : planLayout?.image ?? null,
     posterFull: sleep !== null,
+    gen: st.layout.gen,
+    atT: st.layout.at_frame / FRAME_RATE,
     tiles: st.tiles.map((t, i) => {
-      const tv = tiles[i]!;
-      return { id: t.id, half: t.half, box: covered ? null : placedById.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
+      const tv = planViews[i]!;
+      return { id: t.id, half: t.half, box: covered ? null : placedPlan.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
     }),
   };
 

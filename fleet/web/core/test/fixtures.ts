@@ -37,6 +37,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     }
   }
   return {
+    layout: { gen: 1, at_frame: 0 },
     tiles,
     image_aspect: 16 / 9,
     fleet: {
@@ -64,4 +65,28 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
 
 export function snapshotText(version: number, state: FleetState): string {
   return JSON.stringify({ type: "snapshot", version, state });
+}
+
+/**
+ * A fleet with `nf` fcvm and `ne` EC2 GPUs in layout generation `gen`: each
+ * side as wide as its share of the GPUs, one row per side, as a re-tile gives it.
+ */
+export function fleetSplit(nf: number, ne: number, gen: number, over: Partial<FleetState> = {}): FleetState {
+  const base = fleet(1, 1);
+  const proto = base.tiles[0]!;
+  const split = nf / Math.max(1, nf + ne);
+  const tiles: Tile[] = [];
+  for (const [half, n, x0, w] of [["fcvm", nf, 0, split], ["ec2", ne, split, 1 - split]] as const) {
+    for (let i = 0; i < n; i++) {
+      tiles.push({
+        ...structuredClone(proto),
+        id: `${half}:${i + 1}`,
+        half,
+        slot: half === "fcvm" ? `slot-${i + 1}` : `ec2-${i + 1}`,
+        rect: { x: x0 + (i * w) / n, y: 0, w: w / n, h: 1 },
+        frame_url: `ws://example-host:1/frames/${half}-${i + 1}`,
+      });
+    }
+  }
+  return { ...base, layout: { gen, at_frame: gen * 300 }, tiles, ...over };
 }

@@ -17,7 +17,7 @@ import {
 import { suggestMode } from "../mode.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
 import type { Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
-import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
+import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
   let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
@@ -665,5 +665,106 @@ describe("the recording", () => {
     expect(reelView({ ...base, power: "waking", allLive: true })).toMatchObject({ show: true, leaving: false });
     expect(reelView({ ...base, power: "awake", allLive: true })).toMatchObject({ show: true, leaving: true });
     expect(reelView({ ...base, power: "awake", reelOn: false }).show).toBe(false);
+  });
+});
+
+describe("re-tiling: each side as wide as the GPUs it has", () => {
+  const snap = (s: ClientState, version: number, st: FleetState) => msg(s, { type: "snapshot", version, state: st });
+  const shownIds = (v: ReturnType<typeof view>) => v.tiles.map((t) => t.id).sort();
+  const planIds = (v: ReturnType<typeof view>) => v.plan.direct.map((d) => d.id.slice(2)).sort();
+
+  // A join and a leave on each side: [fcvm before, ec2 before, fcvm after, ec2 after].
+  for (const [nf0, ne0, nf1, ne1, what] of [
+    [4, 4, 5, 4, "a GPU joins the fcvm side"],
+    [4, 4, 3, 4, "a GPU leaves the fcvm side"],
+    [4, 4, 4, 5, "a GPU joins the EC2 side"],
+    [4, 4, 4, 3, "a GPU leaves the EC2 side"],
+  ] as const) {
+    it(`${what}: the plan opens the new tiling at once, the overlays keep the drawn one until the drawer swaps`, () => {
+      let s = stateWith(fleetSplit(nf0, ne0, 1));
+      const before = view(s, EPOCH);
+      expect(before.layout!.split).toBeCloseTo(nf0 / (nf0 + ne0), 9);
+      s = snap(s, 2, fleetSplit(nf1, ne1, 2));
+      let v = view(s, EPOCH);
+      // The plan is generation 2 from the start, with its first frame.
+      expect(v.plan.gen).toBe(2);
+      expect(v.plan.atT).toBe(600 / 30);
+      expect(planIds(v)).toEqual(fleetSplit(nf1, ne1, 2).tiles.map((t) => t.id).sort());
+      // The overlays (seams, hover, keyboard grid, dark tiles) stay on generation 1 until it is drawn.
+      expect(shownIds(v)).toEqual(shownIds(before));
+      expect(v.layout!.split).toBeCloseTo(nf0 / (nf0 + ne0), 9);
+      expect(v.tiles.find((t) => t.id === "fcvm:1")!.box).toEqual(before.tiles.find((t) => t.id === "fcvm:1")!.box);
+      // A gen-shown for another generation changes nothing.
+      expect(reduce(s, { type: "gen-shown", gen: 1 }).shownLayout!.gen).toBe(1);
+      s = reduce(s, { type: "gen-shown", gen: 2 });
+      v = view(s, EPOCH);
+      expect(shownIds(v)).toEqual(planIds(v));
+      expect(v.layout!.split).toBeCloseTo(nf1 / (nf1 + ne1), 9);
+      expect(v.layout!.halfLineX).toBe(Math.round(v.layout!.image.x + v.layout!.image.w * (nf1 / (nf1 + ne1))));
+      expect(v.seams.segments.length).toBeGreaterThan(0);
+    });
+  }
+
+  it("keeps the latest state of a tile that stays, on its drawn rectangle", () => {
+    let s = stateWith(fleetSplit(4, 4, 1));
+    const next = fleetSplit(5, 4, 2);
+    next.tiles.find((t) => t.id === "fcvm:2")!.phase = "restoring";
+    s = snap(s, 2, next);
+    const v = view(s, EPOCH);
+    const tv = v.tiles.find((t) => t.id === "fcvm:2")!;
+    expect(tv.dark).toBe(true);
+    expect(tv.box!.w).toBeCloseTo(v.layout!.image.w / 8, 0);
+  });
+
+  it("gives one side the full width when the other has no GPUs, and says that side is empty", () => {
+    for (const [nf, ne, empty] of [[6, 0, "ec2"], [0, 6, "fcvm"]] as const) {
+      const v = view(stateWith(fleetSplit(nf, ne, 1)), EPOCH);
+      expect(v.layout!.halfLineX).toBeNull();
+      expect(v.layout!.split).toBe(nf === 0 ? 0 : 1);
+      const xs = v.tiles.map((t) => t.box!);
+      expect(Math.min(...xs.map((b) => b.x))).toBeCloseTo(v.layout!.image.x, 0);
+      expect(Math.max(...xs.map((b) => b.x + b.w))).toBeCloseTo(v.layout!.image.x + v.layout!.image.w, 0);
+      expect(v.labels.empty).toMatchObject({ half: empty, text: empty === "ec2" ? "EC2: no GPUs live right now" : "fcvm: no GPUs live right now" });
+      expect(v.labels.captions.map((c) => c.half)).toEqual([nf === 0 ? "ec2" : "fcvm"]);
+      expect(v.labels.captions[0]!.box.w).toBe(v.layout!.image.w);
+      expect(v.labels.seam).toHaveLength(1);
+    }
+    const both = view(stateWith(fleetSplit(10, 2, 1)), EPOCH);
+    expect(both.labels.empty).toBeNull();
+    // EC2's side is a sixth of the image: too narrow for its caption, so they stack.
+    expect(both.labels.captions[1]!.box.y).toBeGreaterThan(both.labels.captions[0]!.box.y);
+  });
+
+  it("a generation change mid-magnify: the opened VM's stream follows its new rectangle, and a VM that left closes", () => {
+    const area = { focusArea: { x: 0, y: 0, w: 1400, h: 800 } };
+    let s = reduce(stateWith(fleetSplit(4, 4, 1)), { type: "ui", patch: { focusId: "fcvm:2" } });
+    let v = view(s, EPOCH, area);
+    const r1 = fleetSplit(4, 4, 1).tiles.find((t) => t.id === "fcvm:2")!.rect;
+    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r1.w * 16) / 9 / r1.h, 1);
+    s = snap(s, 2, fleetSplit(2, 4, 2));
+    v = view(s, EPOCH, area);
+    const r2 = fleetSplit(2, 4, 2).tiles.find((t) => t.id === "fcvm:2")!.rect;
+    expect(v.focus!.title).toBe("fcvm VM 2");
+    expect(v.plan.gen).toBe(2);
+    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r2.w * 16) / 9 / r2.h, 1);
+    // The VM leaves in the next generation: nothing is opened any more.
+    s = snap(s, 3, fleetSplit(1, 4, 3));
+    v = view(s, EPOCH, area);
+    expect(v.focus).toBeNull();
+    expect(v.plan.focus).toBeNull();
+  });
+
+  it("Aggregated mode takes the new regions with the new generation", () => {
+    const agg = (st: FleetState) => [
+      { id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: st.tiles.filter((t) => t.half === "fcvm").reduce((a, t) => Math.max(a, t.rect.x + t.rect.w), 0), h: 1 }, frame_url: "ws://example-host:2/frames/agg-a", tiles: st.tiles.filter((t) => t.half === "fcvm").map((t) => t.id) },
+    ];
+    const g1 = fleetSplit(4, 4, 1);
+    g1.aggregates = agg(g1);
+    const g2 = fleetSplit(6, 2, 2);
+    g2.aggregates = agg(g2);
+    let s = reduce(stateWith(g1), { type: "ui", patch: { mode: "aggregated" } });
+    s = snap(s, 2, g2);
+    const v = view(s, EPOCH);
+    expect(v.plan.aggregated[0]!.box!.w / v.layout!.image.w).toBeCloseTo(0.75, 2);
   });
 });

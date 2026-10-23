@@ -27,18 +27,18 @@ const drawnT = (page: Page) => page.evaluate(async () => (await window.__fleet!.
 
 test.describe.configure({ mode: "serial" });
 
-test("the mosaic draws 16 tiles, 15 of them live at one common t", { tag: "@engines" }, async ({ page }) => {
+test("the mosaic draws every GPU live, 15 tiles at one common t, each side as wide as its GPUs", { tag: "@engines" }, async ({ page }) => {
   await openWall(page, 15);
   const v = await view(page);
-  expect(v.tiles).toHaveLength(16);
-  expect(v.tiles.filter((t) => t.box !== null)).toHaveLength(16);
+  expect(v.tiles).toHaveLength(15);
+  expect(v.tiles.filter((t) => t.box !== null)).toHaveLength(15);
   const bench = await page.evaluate(() => window.__fleet!.client.bench!);
   expect(bench.tilesSynced).toBe(15);
   expect(bench.tilesBehind).toBe(0);
-  await expect(page.getByTestId("dark-ec2:8")).toHaveAttribute("data-kind", "capacity");
-  // Written on the tile when it is large enough, and always in its accessible name.
-  await expect(page.locator(".key-grid button[aria-label^='EC2 VM 8,']")).toHaveAttribute("aria-label", /AWS had no spot GPU/);
-  await expect(page.getByTestId("dark-ec2:8")).toHaveAttribute("data-kind", "capacity");
+  // Eight fcvm GPUs against seven EC2: the line between them at 8/15 of the image.
+  const line = await page.evaluate(() => window.__fleet!.view().layout!);
+  expect((line.halfLineX! - line.image.x) / line.image.w).toBeCloseTo(8 / 15, 2);
+  await expect(page.locator(".dark-tile")).toHaveCount(0);
 });
 
 test("no seam: pixels on both sides of every boundary match the picture at the drawn t", { tag: "@engines" }, async ({ page }) => {
@@ -142,6 +142,103 @@ test("the owner's schedule: a shared countdown, a restart by the schedule, a coo
   await admin("/mock/schedule", { cooldown_s: 0, clear_cooldown: true });
   await expect(other.getByTestId("restart-all")).toBeEnabled();
   await other.context().close();
+});
+
+/**
+ * Re-tile the mock to these GPU counts and record every draw until the page has
+ * swapped to the new generation and every tile is live again.
+ */
+async function retile(page: Page, fcvm: number, ec2: number, live: number) {
+  const gen0 = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.gen);
+  await page.evaluate(() => window.__fleet!.client.traceStart());
+  await admin("/mock/fault", { fcvm_gpus: fcvm, ec2_gpus: ec2 });
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().shownLayout?.gen), { timeout: 15_000 }).toBe(gen0 + 1);
+  const atT = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.at_frame / 30);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBe(live);
+  const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
+  return { gen0, atT, trace };
+}
+
+/** No draw without a frame, t never going back, the old tiling until frames at its first frame, then the new one. */
+function expectNoHitch(r: Awaited<ReturnType<typeof retile>>): void {
+  const { gen0, atT, trace } = r;
+  // Around the swap no region is ever drawn without a frame. (A GPU that joined
+  // starts its VM first, about 3 s, and fades in when its stream starts.)
+  expect(trace.filter((e) => e.missing > 0 && e.T! < atT + 1.5)).toEqual([]);
+  for (let i = 1; i < trace.length; i++) expect(trace[i]!.T!, `draw ${i}`).toBeGreaterThanOrEqual(trace[i - 1]!.T!);
+  const first = trace.findIndex((e) => e.gen === gen0 + 1);
+  expect(first).toBeGreaterThan(0);
+  expect(trace.slice(0, first).every((e) => e.gen === gen0 && e.T! < atT)).toBe(true);
+  expect(trace.slice(first).every((e) => e.gen === gen0 + 1 && e.T! >= atT - 1e-6)).toBe(true);
+}
+
+test("GPUs join and leave on each side: the old tiles keep drawing until the new ones have frames at the re-tile's frame, then all swap at once", { tag: "@engines" }, async ({ page }) => {
+  await openWall(page, 15);
+  // Two join the fcvm side (a new host): the line moves right, every new tile live after its VM starts.
+  let r = await retile(page, 10, 7, 17);
+  expectNoHitch(r);
+  let L = await page.evaluate(() => window.__fleet!.view().layout!);
+  expect((L.halfLineX! - L.image.x) / L.image.w).toBeCloseTo(10 / 17, 2);
+  expect(await page.evaluate(() => window.__fleet!.view().tiles.length)).toBe(17);
+  // Three leave the EC2 side.
+  r = await retile(page, 10, 4, 14);
+  expectNoHitch(r);
+  L = await page.evaluate(() => window.__fleet!.view().layout!);
+  expect((L.halfLineX! - L.image.x) / L.image.w).toBeCloseTo(10 / 14, 2);
+  // The hover seams follow the new tiling.
+  const t = await tileBox(page, "ec2:2");
+  await page.mouse.move(t.x + t.w / 2, t.y + t.h / 2);
+  await expect(page.getByTestId("hover-outline")).toHaveAttribute("data-tile", "EC2 VM 2");
+  const outline = await page.getByTestId("hover-outline").evaluate((el) => el.getBoundingClientRect().width);
+  expect(outline).toBeCloseTo(t.w, 0);
+  // Back to eight and seven.
+  r = await retile(page, 8, 7, 15);
+  expectNoHitch(r);
+});
+
+test("a re-tile the page hears of after its frame has passed still draws nothing in the wrong place", async ({ page }) => {
+  // Hold back every snapshot of the new generation for 1.5 s, three times the
+  // mock's half-second lead: frames of the new tiling arrive before the page knows.
+  let late: number | null = null;
+  await page.routeWebSocket(/\/live$/, (ws) => {
+    const server = ws.connectToServer();
+    server.onMessage((m) => {
+      const text = String(m);
+      if (late !== null && text.includes('"type":"snapshot"') && (JSON.parse(text) as { state: { layout: { gen: number } } }).state.layout.gen >= late) {
+        setTimeout(() => ws.send(text), 1500);
+        return;
+      }
+      ws.send(m);
+    });
+    ws.onMessage((m) => server.send(m));
+  });
+  await openWall(page, 15);
+  late = (await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.gen)) + 1;
+  try {
+    const r = await retile(page, 10, 7, 17);
+    expectNoHitch(r);
+  } finally {
+    late = null;
+  }
+  await retile(page, 8, 7, 15);
+});
+
+test("one side with no GPUs: the other takes the full width, and a small label says the side is empty", async ({ page }) => {
+  await openWall(page, 15);
+  try {
+    const r = await retile(page, 8, 0, 8);
+    expectNoHitch(r);
+    const L = await page.evaluate(() => window.__fleet!.view().layout!);
+    expect(L.halfLineX).toBeNull();
+    const boxes = await page.evaluate(() => window.__fleet!.view().tiles.map((t) => t.box!));
+    expect(Math.max(...boxes.map((b) => b.x + b.w))).toBeCloseTo(L.image.x + L.image.w, 0);
+    await expect(page.getByTestId("empty-ec2")).toHaveText("EC2: no GPUs live right now");
+    await expect(page.getByTestId("caption-ec2")).toHaveCount(0);
+    await expect(page.locator(".half-line")).toHaveCount(0);
+  } finally {
+    await retile(page, 8, 7, 15);
+  }
+  await expect(page.getByTestId("empty-ec2")).toHaveCount(0);
 });
 
 test("hovering the image fades in every seam, outlines the tile and labels it, off every label", { tag: "@engines" }, async ({ page }) => {
@@ -399,12 +496,6 @@ test("aggregated is the default: no seam, and tile state drawn exactly as in dir
   expect(Object.keys(r.shown).every((k) => k.startsWith("a:") || r.shown[k] === "dark")).toBe(true);
   for (const [id, e] of Object.entries(r.perTile)) expect(e, `tile ${id}`).toBeLessThan(TILE_ERR_MAX);
   for (const b of r.boundaries) expect(b.err, `${b.a} | ${b.b}`).toBeLessThan(ACROSS_ERR_MAX);
-  await expect(page.getByTestId("dark-ec2:8")).toHaveAttribute("data-kind", "capacity");
-  // Written on the tile when it is large enough, and always in its accessible name.
-  await expect(page.locator(".key-grid button[aria-label^='EC2 VM 8,']")).toHaveAttribute("aria-label", /AWS had no spot GPU/);
-  const box = await tileBox(page, "ec2:8");
-  const res = await page.evaluate((p) => window.__fleet!.client.capture(p), [{ x: box.x + box.w / 2, y: box.y + box.h / 3 }]);
-  expect(res.pixels[0]!.slice(0, 3)).toEqual([6, 8, 11]);
   await page.getByTestId("play").click();
   await expect(page.getByTestId("streams-switch")).toHaveAttribute("aria-checked", "false");
   await expect(page.getByTestId("streams-switch")).toHaveText("See every VM's own stream");
@@ -496,10 +587,12 @@ test("failure states: a failed VM with its retry, a reclaimed host re-tiling, th
   await expect(page.getByTestId("banner-reclaimed")).toHaveText("AWS reclaimed an fcvm host. Its squares stay dark while the image is re-tiled onto the GPUs left.");
   await expect(page.getByTestId("dark-fcvm:5")).toHaveAttribute("data-kind", "reclaimed");
   await expect(says(page, "fcvm VM 5")).toHaveAttribute("aria-label", /host reclaimed by AWS, re-tiling/);
-  await expect(says(page, "fcvm VM 5")).toHaveAttribute("aria-label", /no GPU here yet/, { timeout: 8000 });
+  // Its GPUs leave and the image is re-tiled onto the GPUs left: no dark places stay.
+  await expect(says(page, "fcvm VM 5")).toHaveCount(0, { timeout: 15_000 });
   await expect(page.getByTestId("banner-reclaimed")).toHaveCount(0);
   await expect(page.getByTestId("restart-all")).toHaveText("Restart all 11 GPUs");
   await admin("/mock/fault", { replace_host: "mock-host-2" });
+  await expect(says(page, "fcvm VM 5")).toHaveCount(1, { timeout: 15_000 });
   await expect(page.getByTestId("dark-fcvm:5")).toHaveCount(0, { timeout: 15_000 });
   await expect(page.getByTestId("dark-fcvm:2")).toHaveCount(0, { timeout: 15_000 });
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 20_000 }).toBe(15);
