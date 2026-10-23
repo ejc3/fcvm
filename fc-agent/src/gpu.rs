@@ -556,7 +556,8 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
 
     // Zero the memory the previous VM on these GPUs left, before anything can
     // hand them to the container.
-    steps.scrub_ms = scrub_gpus(scrub_command(driver_root), announced.len()).await?;
+    let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
+    steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
 
     let libraries = library_dir(driver_root);
     let mut smi = tokio::process::Command::new(driver_root.join("usr/bin/nvidia-smi"));
@@ -588,11 +589,36 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     })
 }
 
-/// The scrub tool command: the image's binary with the image's libraries.
-pub fn scrub_command(driver_root: &Path) -> tokio::process::Command {
+/// The scrub tool command: the image's binary with the image's libraries,
+/// scrubbing at most `parallel` GPUs at a time.
+pub fn scrub_command(driver_root: &Path, parallel: usize) -> tokio::process::Command {
     let mut command = tokio::process::Command::new(driver_root.join(SCRUB_TOOL));
-    command.env("LD_LIBRARY_PATH", library_dir(driver_root));
     command
+        .args(["--parallel", &parallel.to_string()])
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    command
+}
+
+/// How many GPUs the scrub may hold a CUDA context on at once, given the
+/// guest's `MemAvailable` in KiB. Measured on a T4 in a 1 GiB guest with eight
+/// GPUs (MemAvailable 345 to 364 MiB): the first context took about 185 MiB
+/// and each further one about 35 MiB; four at once left 54 MiB, eight were
+/// OOM-killed. So 256 MiB for the first and 64 MiB for each further one. At
+/// least 1: a guest too small for even that fails the scrub, and the attach.
+pub fn scrub_parallelism(mem_available_kib: u64, gpus: usize) -> usize {
+    let mib = mem_available_kib / 1024;
+    let extra = mib.saturating_sub(256) / 64;
+    (1 + extra as usize).clamp(1, gpus.max(1))
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in KiB.
+fn mem_available_kib() -> Result<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .context("/proc/meminfo has no MemAvailable")
 }
 
 /// Zero the memory of every GPU before the container can use them, and
@@ -755,7 +781,7 @@ mod tests {
             .find("start_persistenced(driver_root)")
             .expect("no nvidia-persistenced");
         let scrub = body
-            .find("scrub_gpus(scrub_command(driver_root), announced.len())")
+            .find("scrub_gpus(scrub_command(driver_root, parallel), announced.len())")
             .expect("attach_devices does not scrub the GPUs' memory");
         let smi = body.find("\"nvidia-smi -L\"").expect("no nvidia-smi -L");
         let cdi = body.find("cdi_generate_args(").expect("no CDI generation");
@@ -765,8 +791,9 @@ mod tests {
              nvidia-smi -L ({smi}) and the CDI spec ({cdi})"
         );
         assert!(
-            body[scrub..]
-                .starts_with("scrub_gpus(scrub_command(driver_root), announced.len()).await?"),
+            body[scrub..].starts_with(
+                "scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?"
+            ),
             "a failed scrub must fail the attach"
         );
     }
@@ -830,6 +857,21 @@ mod tests {
             format!("{missing:#}").contains("no-such-tool"),
             "{missing:#}"
         );
+    }
+
+    /// Eight GPUs in a 1 GiB guest (about 350 MiB available) were OOM-killed
+    /// at four contexts at once; the scrub must take them two at a time there,
+    /// all at once only with room for every context, and never zero at a time.
+    #[test]
+    fn the_scrub_holds_only_as_many_contexts_as_the_guest_has_memory_for() {
+        assert_eq!(scrub_parallelism(353 * 1024, 8), 2);
+        assert_eq!(scrub_parallelism(100 * 1024, 8), 1);
+        assert_eq!(scrub_parallelism(0, 1), 1);
+        assert_eq!(scrub_parallelism(4096 * 1024, 8), 8);
+        assert_eq!(scrub_parallelism(4096 * 1024, 1), 1);
+        let command = scrub_command(Path::new(DRIVER_ROOT), 2);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["--parallel", "2"]);
     }
 
     #[test]
