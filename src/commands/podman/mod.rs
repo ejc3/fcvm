@@ -335,15 +335,37 @@ fn validate_balloon_target(balloon: Option<u32>, mem: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether a run takes a startup snapshot (memory and disk of the running container) at
+/// its first Healthy, so the next identical run restores the container already running
+/// instead of starting it with `podman run`.
+///
+/// Healthy is the HTTP check with `--health-check`, podman's healthcheck for an image that
+/// defines one, and otherwise the container's start notification (#1161) confirmed over
+/// exec (see `health::check_health_once`). The key is the pre-start key, which already
+/// holds what a restore cannot change about a running container (image, command,
+/// environment, volumes, ...); the name and labels stay restore-time.
+///
+/// A plain run takes none unless it asks (`--startup-snapshot`, which `fcvm serve` passes,
+/// or `--health-check`): an app that makes unique state when it starts (keys, IDs, random
+/// seeds, a registration with a server) would otherwise share it, silently, with every run
+/// restored from the snapshot.
 fn should_arm_startup_snapshot(
     skip_snapshot_creation: bool,
     has_snapshot_key: bool,
-    has_explicit_http_health_check: bool,
+    takes_startup_snapshot: bool,
     lifecycle: &PodmanLifecycle,
 ) -> bool {
     !skip_snapshot_creation
         && has_snapshot_key
-        && (lifecycle.is_prepare() || has_explicit_http_health_check)
+        && (lifecycle.is_prepare() || takes_startup_snapshot)
+}
+
+/// Whether a `podman run` with these arguments takes a startup snapshot once healthy, and
+/// restores one that exists, see [`should_arm_startup_snapshot`]. A run that did not ask
+/// must not restore one either: a snapshot another run took under the same key holds that
+/// run's startup state.
+fn run_takes_startup_snapshot(args: &RunArgs) -> bool {
+    args.health_check.is_some() || args.startup_snapshot
 }
 
 /// Whether this invocation must stay out of the snapshot cache entirely — no
@@ -871,6 +893,7 @@ fn snapshot_restore_args(
         no_swap: false,
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
+        map: Vec::new(),
         ipv6_prefix: launch_ipv6_prefix(args),
         ipv6_address: args.ipv6_address,
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
@@ -1472,8 +1495,21 @@ async fn prepare_vm_for_lifecycle(
         validate_gpu_run(&args, &lifecycle, no_snapshot)?;
         args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+        let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
+            crate::gpu::check_driver_supports_device(
+                Path::new("/sys"),
+                sbdf,
+                profile_name,
+                module_type,
+            )?;
         }
     }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
@@ -1536,6 +1572,7 @@ async fn prepare_vm_for_lifecycle(
         // GPU. It restores the pre-start snapshot, which is taken before the container runs.
         if !lifecycle.is_prepare()
             && args.gpu.is_empty()
+            && run_takes_startup_snapshot(&args)
             && check_podman_snapshot(&startup_key).await.is_some()
         {
             info!(
@@ -1571,12 +1608,11 @@ async fn prepare_vm_for_lifecycle(
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
             // Call snapshot run with startup snapshot creation enabled
-            // (if health_check_url is set)
+            // (see should_arm_startup_snapshot)
             let snapshot_args = snapshot_restore_args(
                 &args,
                 &key,
-                // Create startup snapshot if this config has a health check URL
-                args.health_check.as_ref().map(|_| key.clone()),
+                run_takes_startup_snapshot(&args).then(|| key.clone()),
                 snapshot_run_firecracker_overrides(&runtime_config),
             );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
@@ -1936,17 +1972,14 @@ async fn prepare_vm_for_lifecycle(
     });
 
     // Create startup snapshot channel for health-triggered snapshot creation
-    // Only create startup snapshots if:
-    // - Not skipping snapshots (no --no-snapshot)
-    // - Have a snapshot key
-    // - Have a health_check URL configured (HTTP health check, not just container-ready)
+    // (see should_arm_startup_snapshot).
     let (startup_tx, startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     ) = if should_arm_startup_snapshot(
         skip_snapshot_creation,
         snapshot_key.is_some(),
-        args.health_check.is_some(),
+        run_takes_startup_snapshot(&args),
         &lifecycle,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3151,7 +3184,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         snapshot_restore_args(
             &ctx.args,
             key,
-            ctx.args.health_check.as_ref().map(|_| key.clone()),
+            run_takes_startup_snapshot(&ctx.args).then(|| key.clone()),
             (None, None),
         )
     });
@@ -3279,6 +3312,7 @@ mod tests {
             network: NetworkMode::Rootless,
             hypervisor: crate::cli::args::Hypervisor::Firecracker,
             health_check: None,
+            startup_snapshot: false,
             health_check_timeout: 5,
             on_restore: None,
             privileged: false,
@@ -4573,6 +4607,26 @@ mod tests {
             true,
             &PodmanLifecycle::Run
         ));
+        assert!(!should_arm_startup_snapshot(
+            true,
+            true,
+            true,
+            &PodmanLifecycle::Run
+        ));
+    }
+
+    /// A plain run takes (and restores) no startup snapshot; --startup-snapshot or
+    /// --health-check asks for one.
+    #[test]
+    fn a_run_takes_a_startup_snapshot_only_when_it_asks() {
+        let mut args = test_args();
+        assert!(args.health_check.is_none() && !args.startup_snapshot);
+        assert!(!run_takes_startup_snapshot(&args));
+        args.startup_snapshot = true;
+        assert!(run_takes_startup_snapshot(&args));
+        args.startup_snapshot = false;
+        args.health_check = Some("http://localhost/".to_string());
+        assert!(run_takes_startup_snapshot(&args));
     }
 
     #[test]

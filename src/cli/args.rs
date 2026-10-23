@@ -30,6 +30,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Print a VM's balloon target and size as one JSON line; with MIB, set the target first
     Balloon(BalloonArgs),
+    /// Host-side GPU pool operations: scrub a GPU's memory between VMs, show quarantines
+    Gpu(GpuArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
     /// Run HTTP/WebSocket API server for ComputeSDK integration
@@ -372,6 +374,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub health_check: Option<String>,
 
+    /// Take a startup snapshot of the running container at its first Healthy, and restore
+    /// one when it exists, so an identical later run starts with the container already
+    /// running instead of starting it with `podman run`. Without --health-check, Healthy is
+    /// the container's start (or its image's HEALTHCHECK). Off by default: every run
+    /// restored from the snapshot shares whatever the container made when it started
+    /// (keys, IDs, random seeds, a registration with a server). `fcvm serve` passes it.
+    #[arg(long)]
+    pub startup_snapshot: bool,
+
     /// Timeout in seconds for HTTP health check requests. Default: 5.
     #[arg(long, default_value = "5")]
     pub health_check_timeout: u64,
@@ -681,6 +692,25 @@ pub struct SnapshotRunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
     pub publish: Vec<String>,
 
+    /// Serve a directory the snapshot mapped read-only from this host directory instead of
+    /// the one it recorded. Grammar: HOST:GUEST:ro, as for `podman run --map`, repeated.
+    /// Each GUEST must be a path the snapshot mapped read-only with --portable-volumes:
+    /// the guest mounted it when it booted and the restore keeps that mount. A read-write
+    /// map cannot be moved, since the guest treats the sizes and pages it cached from one
+    /// as its own, and neither can one without portable volumes, whose open files the guest
+    /// names by host inode numbers. Files the guest
+    /// held open are found again by their path under the mount, so the new directory
+    /// should hold the same tree. What the guest cached from the recorded directory it
+    /// checks against the new one once the map's attribute timeout (1 s of guest time)
+    /// passes, by each file's size and modification time, as it does when a host file
+    /// changes under a running VM: a file whose size and mtime both match keeps the
+    /// guest's cached pages. Use it to give a
+    /// clone this host's copy of what the snapshot read from its own: certificates,
+    /// credentials, a checkout. Without this flag the clone serves the recorded host
+    /// directories.
+    #[arg(long = "map", action = clap::ArgAction::Append)]
+    pub map: Vec<String>,
+
     /// Routable IPv6 prefix to derive a routed clone's address from, in the forms
     /// `podman run --ipv6-prefix` takes. Without it the clone's address comes from the
     /// host's own /64, as for `podman run`. The prefix the snapshot was created under is
@@ -770,6 +800,45 @@ pub struct SnapshotRunArgs {
     /// this run did not, and a hook the caller never named must not run in its clone.
     #[arg(skip = true)]
     pub inherit_recorded_hook: bool,
+}
+
+// ============================================================================
+// GPU pool commands (host-side scrub and quarantine)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct GpuArgs {
+    #[command(subcommand)]
+    pub cmd: GpuCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuCommands {
+    /// Reset each GPU and wait until it reports its memory cleared, before the GPU
+    /// goes to another VM. Run as root after the previous VM's Firecracker has
+    /// exited. Prints one JSON line per GPU; a GPU whose scrub fails is quarantined
+    /// (`--gpu` refuses it) until a later scrub succeeds. Exits 0 only if every GPU
+    /// was scrubbed.
+    Scrub(GpuScrubArgs),
+    /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
+    Status(GpuStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuScrubArgs {
+    /// GPU PCI addresses (SSSS:BB:DD.F or BB:DD.F), scrubbed in parallel
+    #[arg(required = true, value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
+    /// Seconds to wait for each of the GPU's boot and its memory clear
+    #[arg(long, default_value_t = 5)]
+    pub timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuStatusArgs {
+    /// GPU PCI addresses; every recorded GPU when none are given
+    #[arg(value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
 }
 
 // ============================================================================

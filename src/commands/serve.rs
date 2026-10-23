@@ -522,6 +522,9 @@ fn podman_run_args(
         mem_mib.to_string(),
         "--network".into(),
         "rootless".into(),
+        // Sandboxes of one image are identical by design, so a create restores the
+        // container already running rather than starting it in the guest.
+        "--startup-snapshot".into(),
     ];
     if no_snapshot {
         args.push("--no-snapshot".into());
@@ -1688,6 +1691,26 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A sandbox create asks for the startup snapshot: sandboxes of one image are identical
+    /// by design, while a plain `podman run` takes none unless asked.
+    #[test]
+    fn sandboxes_take_the_startup_snapshot() {
+        use clap::Parser;
+        let args = podman_run_args("sb", "node:22-slim", 2, 2048, &[], &[], false);
+        let cli = crate::cli::Cli::try_parse_from(
+            std::iter::once("fcvm".to_string()).chain(args.iter().cloned()),
+        )
+        .unwrap();
+        let crate::cli::Commands::Podman(podman) = cli.cmd else {
+            panic!("not a podman command: {args:?}");
+        };
+        let crate::cli::PodmanCommands::Run(run) = podman.cmd else {
+            panic!("not podman run: {args:?}");
+        };
+        assert!(run.startup_snapshot, "{args:?}");
+        assert!(run.health_check.is_none(), "{args:?}");
+    }
 
     #[test]
     fn key_value_flags_are_sorted_whatever_the_map_order() {

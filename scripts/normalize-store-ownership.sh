@@ -4,7 +4,7 @@
 # A root-invoked `fcvm setup` that failed mid-build used to leave a root-owned
 # store directory and 0600 lock file behind, after which every rootless setup
 # on the same machine died with EACCES opening the lock (the Build Btrfs
-# Kernel / Host-arm64 pair on runner i-0d8e07f6732c331cc). fcvm now hands
+# Kernel / Host-arm64 pair on one runner). fcvm now hands
 # entries back to the sudo invoker as it creates them; this script heals
 # stores poisoned before that fix, covering the ordering fcvm cannot: a
 # rootless job scheduled onto the machine before any root run touches the

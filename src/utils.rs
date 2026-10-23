@@ -47,7 +47,10 @@ impl DirWatch {
             )
             .map_err(|e| anyhow::anyhow!("inotify_add_watch {}: {e}", dir.display()))?;
         let raw = std::os::fd::AsFd::as_fd(&inotify).as_raw_fd();
-        let async_fd = tokio::io::unix::AsyncFd::new(raw)
+        // SAFETY: `raw` belongs to `inotify`, which `Self` stores beside the `AsyncFd`, never
+        // replaces, and drops after it (field order), so the fd stays open and unchanged for
+        // the `AsyncFd`'s lifetime.
+        let async_fd = unsafe { tokio::io::unix::AsyncFd::register(raw) }
             .map_err(|e| anyhow::anyhow!("registering inotify fd with tokio: {e}"))?;
         Ok(Self { async_fd, inotify })
     }
@@ -184,7 +187,10 @@ impl ProcessWatch {
             return Ok(None);
         }
 
-        let async_fd = tokio::io::unix::AsyncFd::new(fd)
+        // SAFETY: the `AsyncFd` owns the pidfd, which closes only on drop, and `ProcessWatch`
+        // never replaces it through `get_mut`.
+        let async_fd = unsafe { tokio::io::unix::AsyncFd::register(fd) }
+            .map_err(std::io::Error::from)
             .with_context(|| format!("registering pidfd for PID {pid} with the reactor"))?;
         Ok(Some(Self { async_fd, pid }))
     }

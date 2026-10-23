@@ -1241,6 +1241,69 @@ fn ensure_no_passthrough_in_memory_snapshot(gpus: &[String], disk_only: bool) ->
     Ok(())
 }
 
+/// The directories a clone serves to the guest's mounts.
+///
+/// Without `--map` they are the snapshot's. With it, each requested `HOST:GUEST:ro`
+/// replaces the host side of the snapshot's mapping of GUEST, which must be a read-only,
+/// portable map: the guest mounted every mapping when it booted, the restore keeps those
+/// mounts, and a clone cannot add or drop one. The vsock port stays the snapshot's. A
+/// portable volume's inode table names files by their path under the mount, so the guest's
+/// open files are found again in the new directory when it holds the same tree; a
+/// non-portable one holds host inode numbers, which name nothing there.
+fn clone_volumes(
+    snapshot: &[crate::storage::snapshot::SnapshotVolumeConfig],
+    requested: &[String],
+) -> Result<Vec<crate::storage::snapshot::SnapshotVolumeConfig>> {
+    let mut volumes = snapshot.to_vec();
+    let mut replaced = std::collections::BTreeSet::new();
+    for spec in requested {
+        let mapping = super::podman::VolumeMapping::parse(spec)?;
+        if !replaced.insert(mapping.guest_path.clone()) {
+            bail!("--map {spec}: {} is given twice", mapping.guest_path);
+        }
+        let Some(volume) = volumes
+            .iter_mut()
+            .find(|v| v.guest_path == mapping.guest_path)
+        else {
+            let mapped: Vec<&str> = snapshot.iter().map(|v| v.guest_path.as_str()).collect();
+            bail!(
+                "--map {spec}: the snapshot did not map {} ({}). --map moves where a directory \
+                 the snapshot mapped is served from on the host. It cannot add a mount.",
+                mapping.guest_path,
+                if mapped.is_empty() {
+                    "it mapped none".to_string()
+                } else {
+                    format!("it mapped {}", mapped.join(", "))
+                }
+            );
+        };
+        if !volume.read_only {
+            bail!(
+                "--map {spec}: only a read-only map can be moved. The guest keeps a read-write \
+                 map's file sizes, modification times and cached pages as its own (the writeback \
+                 cache), so it would go on serving what it cached from {} over the new directory.",
+                volume.host_path.display()
+            );
+        }
+        if !mapping.read_only {
+            bail!(
+                "--map {spec}: the snapshot mapped {} read-only; give :ro",
+                volume.guest_path
+            );
+        }
+        if !volume.portable {
+            bail!(
+                "--map {spec}: the snapshot did not map {} with --portable-volumes. Its guest \
+                 holds the recorded directory's host inode numbers, which name nothing in \
+                 another directory, so files it has open would answer EIO.",
+                volume.guest_path
+            );
+        }
+        volume.host_path = mapping.host_path;
+    }
+    Ok(volumes)
+}
+
 /// Refuse the `snapshot run` flags a disk-only clone cannot honour, so the cold-boot
 /// path fails loud instead of silently dropping them.
 fn ensure_disk_only_run_supports(args: &SnapshotRunArgs) -> Result<()> {
@@ -1843,11 +1906,16 @@ async fn cmd_snapshot_run_inner(
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
-    let (snapshot_config, snapshot_generation) = snapshot_manager
+    let (mut snapshot_config, snapshot_generation) = snapshot_manager
         .load_snapshot_with_generation(&snapshot_name)
         .await
         .context("loading snapshot configuration")?;
     *attempted_generation = Some(snapshot_generation);
+
+    // Which host directories this clone serves, settled before anything is allocated and
+    // applied to the config every later step reads: the volume servers, the clone's own
+    // state (so a snapshot of the clone records them), and a reboot plan.
+    snapshot_config.metadata.volumes = clone_volumes(&snapshot_config.metadata.volumes, &args.map)?;
 
     // Where this clone publishes its ports, settled before anything is allocated: a
     // --publish the snapshot cannot serve fails here with nothing to clean up.
@@ -2007,8 +2075,16 @@ async fn cmd_snapshot_run_inner(
              on a Firecracker restore"
         );
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        // Whether the snapshot's driver image runs these GPUs is not checked here: the
+        // clone restores the image recorded in the snapshot, whose module type the
+        // current profile does not determine. The guest's attach fails closed instead.
         for sbdf in &gpus {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
         }
     }
     vm_state.config.gpus = gpus.clone();
@@ -3043,15 +3119,14 @@ async fn cmd_snapshot_run_inner(
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 
-    // Create startup snapshot channel if:
-    // - startup_snapshot_base_key is set (passed from podman run on cache hit)
-    // - snapshot has a health check URL (needed to know when VM is fully initialized)
+    // Create the startup snapshot channel when podman run passed startup_snapshot_base_key:
+    // it decides whether a run takes one (`run_takes_startup_snapshot`). The trigger is
+    // the clone's first Healthy, whatever decides it (HTTP check, podman healthcheck, or
+    // the container start notification).
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
-    ) = if args.startup_snapshot_base_key.is_some()
-        && snapshot_config.metadata.health_check_url.is_some()
-    {
+    ) = if args.startup_snapshot_base_key.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {
@@ -3956,6 +4031,8 @@ fn run_args_from_snapshot_metadata(
         // fail outright on a CH-only host). meta.hypervisor is recorded at snapshot create.
         hypervisor: meta.hypervisor.into(),
         health_check: meta.health_check_url.clone(),
+        // A cold boot of a captured disk takes no startup snapshot of its own.
+        startup_snapshot: false,
         on_restore: restore_hook,
         health_check_timeout: meta.health_check_timeout,
         privileged: false,
@@ -4808,6 +4885,93 @@ mod tests {
         specs.iter().map(|spec| spec.to_string()).collect()
     }
 
+    fn volume(
+        host: &std::path::Path,
+        guest: &str,
+        read_only: bool,
+        port: u32,
+    ) -> crate::storage::snapshot::SnapshotVolumeConfig {
+        crate::storage::snapshot::SnapshotVolumeConfig {
+            host_path: host.to_path_buf(),
+            guest_path: guest.to_string(),
+            read_only,
+            vsock_port: port,
+            portable: true,
+        }
+    }
+
+    /// Without --map a clone serves the snapshot's host directories. With it, a requested
+    /// directory replaces only the host side of the snapshot's mapping of that guest path.
+    #[test]
+    fn a_clone_serves_the_snapshots_directories_or_the_requested_host_side() {
+        let recorded = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        let snapshot = vec![
+            volume(recorded.path(), "/var/creds", true, 5000),
+            volume(recorded.path(), "/data", false, 5001),
+        ];
+        assert_eq!(clone_volumes(&snapshot, &[]).unwrap(), snapshot);
+
+        let spec = format!("{}:/var/creds:ro", here.path().display());
+        let chosen = clone_volumes(&snapshot, &requested(&[spec.as_str()])).unwrap();
+        assert_eq!(
+            chosen[0],
+            volume(here.path(), "/var/creds", true, 5000),
+            "only the host side moves"
+        );
+        assert_eq!(
+            chosen[1], snapshot[1],
+            "an unnamed mapping keeps the snapshot's directory"
+        );
+    }
+
+    /// --map cannot add a mount, change one's read-only flag, move a read-write map, or
+    /// name one twice.
+    #[test]
+    fn a_map_the_snapshot_cannot_serve_is_refused() {
+        let recorded = tempfile::tempdir().unwrap();
+        let here = tempfile::tempdir().unwrap();
+        let snapshot = vec![volume(recorded.path(), "/var/creds", true, 5000)];
+        let h = here.path().display();
+        let unknown =
+            clone_volumes(&snapshot, &requested(&[&format!("{h}:/elsewhere:ro")])).unwrap_err();
+        assert!(
+            format!("{unknown:#}").contains("did not map /elsewhere (it mapped /var/creds)"),
+            "{unknown:#}"
+        );
+        let flag = clone_volumes(&snapshot, &requested(&[&format!("{h}:/var/creds")])).unwrap_err();
+        assert!(format!("{flag:#}").contains("read-only"), "{flag:#}");
+        let writable = vec![volume(recorded.path(), "/data", false, 5001)];
+        let mut nonportable = volume(recorded.path(), "/var/creds", true, 5000);
+        nonportable.portable = false;
+        let host_inodes =
+            clone_volumes(&[nonportable], &requested(&[&format!("{h}:/var/creds:ro")]))
+                .unwrap_err();
+        assert!(
+            format!("{host_inodes:#}").contains("--portable-volumes"),
+            "{host_inodes:#}"
+        );
+        for spec in [format!("{h}:/data"), format!("{h}:/data:ro")] {
+            let rw = clone_volumes(&writable, &requested(&[&spec])).unwrap_err();
+            assert!(
+                format!("{rw:#}").contains("only a read-only map can be moved"),
+                "{spec}: {rw:#}"
+            );
+        }
+        let twice = clone_volumes(
+            &snapshot,
+            &requested(&[&format!("{h}:/var/creds:ro"), &format!("{h}:/var/creds:ro")]),
+        )
+        .unwrap_err();
+        assert!(format!("{twice:#}").contains("given twice"), "{twice:#}");
+        let missing =
+            clone_volumes(&snapshot, &requested(&["/no/such/dir:/var/creds:ro"])).unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("does not exist"),
+            "{missing:#}"
+        );
+    }
+
     /// Without --publish a clone has the snapshot's mappings. With it the clone has the
     /// requested ones and nothing else, on the host addresses and ports they name.
     #[test]
@@ -4993,6 +5157,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,
             gpu: vec![],
@@ -5069,6 +5234,7 @@ mod tests {
             no_swap: false,
             vsock_dir: None,
             publish: vec![],
+            map: vec![],
             ipv6_prefix: None,
             ipv6_address: None,
             gpu: vec![],
