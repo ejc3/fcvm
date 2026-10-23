@@ -158,9 +158,13 @@ old instance at the same time, since nothing but the DNS name ties a tile to an 
 the tile is running when the new renderer's health check answers. That keeps termination
 out of the clock, which is EC2's best case. It needs quota for both instances at once: a
 terminating instance counts against the spot vCPU quota until it is gone. Pending,
-terminating and refused instances are not billed, so this churn costs only running time. The tile keeps its name; its
-address is the new instance's IPv6, which the coordinator writes to the tile's AAAA record
-(TTL 60 s). The renderer gets the same certificate from Secrets Manager at boot. The
+terminating and refused instances are not billed, so this churn costs only running time. The tile keeps its name, but
+each instance gets a host name of its own, `<tile>-g<generation>.<zone>`, an AAAA record
+for the new instance's IPv6 that the coordinator writes before it reports the tile running
+and deletes once the old instance is gone. The tile's `frame_url` in fleet state names that
+host, so a browser reconnecting after a relaunch resolves a name it has never cached: reusing
+one name would leave a browser or resolver on the terminated address for up to the record's
+TTL. The renderer gets the same wildcard certificate from Secrets Manager at boot. The
 timings it reports are the parts that apply: launch requested, launch accepted, instance
 running, renderer first frame. When EC2 refuses a launch for lack of spot capacity, the
 coordinator retries the next AZ or instance type, and that relaunch's time includes the
@@ -196,8 +200,12 @@ desired generation, and makes the host match:
   capped at 30 s), never in a loop.
 
 The agent drives fcvm through its CLI, one `fcvm snapshot run` child per slot, so it owns
-the child's PID and sees its exit. fcvm already arms `PR_SET_PDEATHSIG` on every hop, so an
-agent that dies takes its VMs with it, and the next agent starts from nothing.
+the child's PID and sees its exit. fcvm arms `PR_SET_PDEATHSIG` on the processes it spawns
+(Firecracker, the namespace holder, pasta), but not on itself, so the agent arms it on each
+fcvm child: `PR_SET_PDEATHSIG(SIGKILL)` in the child's `pre_exec`, then a `getppid()` check
+that exits if the agent already died between fork and exec, as
+`tests/common/mod.rs::set_test_pdeathsig` does for tests. With that hop, an agent that dies
+takes its VMs with it, and the next agent starts from nothing.
 
 ### Slots and addressing
 
