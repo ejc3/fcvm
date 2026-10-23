@@ -126,6 +126,23 @@ describe("input to pixels", () => {
   });
 });
 
+describe("a viewer's own GPU across a reconnect", () => {
+  const running = JSON.stringify({ type: "claim", claim: { id: "claim-1", tile: "fcvm:4", phase: "running", frame_url: "ws://example-host:2/frames/claim-1", clicked_at: EPOCH, first_frame_at: EPOCH + 2900, expires_at: EPOCH + 62_900, gpu: "Tesla T4", phases: {}, camera: [], ended: null } });
+
+  it("ends the claim when a new connection says hello: the coordinator ended it when the old one closed (PROTOCOL.md)", () => {
+    let s = feed(initialState(), snapshotText(1, fleet()));
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-1" }));
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("own", "claim_gpu"), at: EPOCH });
+    s = feed(s, running);
+    expect(s.own.claim?.phase).toBe("running");
+    // The socket dropped; the replacement connection is a new viewer with no claim.
+    s = feed(s, JSON.stringify({ type: "hello", viewer: "v-2" }), EPOCH + 10_000);
+    expect(s.own.claim?.phase).toBe("ended");
+    expect(s.own.claim?.frame_url).toBeNull();
+    expect(s.own.claim?.ended).toBeTruthy();
+  });
+});
+
 describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
   // Shapes as the coordinator writes them: hosts as a list, GPU readings apart from
   // the GPU, lights as world arrays, timings as <part>_ms, actions with summaries.

@@ -361,13 +361,22 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           return { ...s, clock: clockReceived(s.clock, msg.server_unix_ms, e.at, msg.client_unix_ms) };
         case "error":
           return { ...s, serverError: msg.reason };
-        case "hello":
+        case "hello": {
           // A new connection: verification belongs to the connection, so it starts over.
+          // So does a claim: the coordinator ended it when the old connection closed, and
+          // its last claim message went to that closed socket (PROTOCOL.md, "the viewer leaving").
+          const c = s.own.claim;
+          const own =
+            c !== null && c.phase !== "ended"
+              ? { ...s.own, claim: { ...c, phase: "ended", frame_url: null, ended: "The connection dropped, so the GPU went back to the pool." } }
+              : s.own;
           return {
             ...s,
             you: msg.viewer,
+            own,
             turnstile: { ...s.turnstile, sitekey: msg.turnstile, verified: false, verifying: false, error: null },
           };
+        }
         case "verified":
           return {
             ...s,

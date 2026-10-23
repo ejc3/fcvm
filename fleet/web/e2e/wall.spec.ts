@@ -534,6 +534,29 @@ test("over the bandwidth budget, small direct tiles ask for q=lo", async ({ page
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
 });
 
+test("a resize that moves tiles to q=lo reopens their streams at q=lo", async ({ page }) => {
+  const stats = async () => (await (await fetch(`${COORD}/mock/render-stats`)).json()) as { subscribersByQuality: Record<string, number> };
+  const plan = () => page.evaluate(() => window.__fleet!.view().plan);
+  await page.addInitScript(() => window.localStorage.setItem("fleet-wall.mode", "direct"));
+  // 15 streams cost 9 Mbit/s at 1280x800 and 27 Mbit/s at 1920x1080 (both at the default quality).
+  await page.setViewportSize({ width: 1280, height: 800 });
+  await page.goto("/?debug=1&budget=20");
+  await page.waitForFunction(() => window.__fleet !== undefined && window.__fleet.view().plan.direct.length > 0);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+  const before = await plan();
+  expect(before.direct.some((d) => d.url!.includes("q=lo"))).toBe(false);
+  await expect.poll(async () => (await stats()).subscribersByQuality.std ?? 0).toBeGreaterThanOrEqual(15);
+  // A bigger screen asks for more pixels: the same budget now puts small tiles at lo, on the same streams.
+  await page.setViewportSize({ width: 1920, height: 1080 });
+  await expect.poll(async () => (await plan()).direct.filter((d) => d.url!.includes("q=lo")).length, { timeout: 15_000 }).toBeGreaterThan(0);
+  const after = await plan();
+  const lo = after.direct.filter((d) => d.url!.includes("q=lo")).length;
+  console.log(`bps ${before.estimatedBps} -> ${after.estimatedBps}; ${lo} of ${after.direct.length} tiles asked for q=lo`);
+  // The renderer reads q only when a socket opens, so these tiles are served at lo only if their sockets were reopened.
+  await expect.poll(async () => (await stats()).subscribersByQuality.lo ?? 0, { timeout: 15_000 }).toBe(lo);
+  await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBeGreaterThanOrEqual(15);
+});
+
 test("first load paints the coordinator's poster at once, before any stream arrives", async ({ page }) => {
   // No renderer answers: the poster is all there is to show.
   await admin("/mock/fault", { renderers_silent: true });
@@ -580,6 +603,35 @@ test("pause holds the picture; resume moves it again", async ({ page }) => {
   expect(await drawnT(page)).toBe(t0);
   await page.getByTestId("pause").click();
   await expect.poll(() => drawnT(page)).toBeGreaterThan(t0!);
+});
+
+test("a paused picture survives frames arriving and a redraw: no tile goes dark", async ({ page }) => {
+  await openWall(page, 15);
+  await page.getByTestId("pause").click();
+  await expect(page.getByTestId("pause")).toHaveAttribute("aria-pressed", "true");
+  const t0 = await drawnT(page);
+  // Streams keep sending while paused: far more than the ten frames a stream buffers.
+  await page.waitForTimeout(3500);
+  // A new size redraws the paused picture from the frozen choice.
+  const vp = page.viewportSize()!;
+  await page.setViewportSize({ width: vp.width - 160, height: vp.height - 100 });
+  await expect.poll(() => page.evaluate(() => window.__fleet!.view().layout!.image.w)).toBeLessThan(vp.width - 100);
+  // A 5x5 grid of points inside each live tile.
+  const pts = await page.evaluate(() =>
+    window.__fleet!.view().tiles.filter((t) => !t.dark && t.box).flatMap((t) =>
+      Array.from({ length: 25 }, (_, k) => ({ id: t.id, x: t.box!.x + (t.box!.w * (1 + (k % 5))) / 6, y: t.box!.y + (t.box!.h * (1 + Math.floor(k / 5))) / 6 })),
+    ),
+  );
+  expect(pts.length).toBeGreaterThan(0);
+  const res = await page.evaluate((p) => window.__fleet!.client.capture(p), pts.map(({ x, y }) => ({ x, y })));
+  expect(res.T).toBe(t0);
+  // A tile with no frame is one flat fill (the dark fill, 6,8,11); the picture, even a night sky, varies across a tile.
+  const flat = new Map<string, number>();
+  pts.forEach((pt, i) => {
+    const px = res.pixels[i]!;
+    if (px[0] === 6 && px[1] === 8 && px[2] === 11) flat.set(pt.id, (flat.get(pt.id) ?? 0) + 1);
+  });
+  for (const id of new Set(pts.map((pt) => pt.id))) expect(flat.get(id) ?? 0, `tile ${id}: points drawn as the empty fill, of 25`).toBeLessThan(13);
 });
 
 test("with less motion asked for, a tile going dark fades instead of flashing", async ({ page }) => {

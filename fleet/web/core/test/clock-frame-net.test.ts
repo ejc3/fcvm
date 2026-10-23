@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { clockReceived, initialClock, pingSent, serverNow, shouldPing, PING_TIMEOUT_MS } from "../clock.ts";
 import { admitChunk, heightSent, heightToSend, MAX_DECODE_QUEUE, newStream, streamOpened, wantHeight } from "../stream.ts";
 import { buildFrame, codecFromSps, innerRect, NO_CROP, parseFrame, parseStreamHeader, splitNals, nalType } from "../frame.ts";
-import { frameSocketUrl, reconnectDelayMs, urlHost } from "../net.ts";
+import { frameSocketUrl, reconnectDelayMs, sameStreamAtAnyHeight, urlHost } from "../net.ts";
 
 describe("clock sync", () => {
   it("estimates the offset from a symmetric round trip", () => {
@@ -85,6 +85,15 @@ describe("connections", () => {
     expect(frameSocketUrl("ws://a/frames?x=1&h=90", 240)).toBe("ws://a/frames?x=1&h=240");
     expect(frameSocketUrl("ws://a/frames?h=90&q=lo", 90, "lo")).toBe("ws://a/frames?h=90&q=lo");
     expect(frameSocketUrl("ws://a/frames?h=90&q=lo", 90)).toBe("ws://a/frames?h=90");
+  });
+
+  it("tells a height change, which a message carries, from any other change, which needs a new socket", () => {
+    expect(sameStreamAtAnyHeight("ws://a/frames?h=90", "ws://a/frames?h=180")).toBe(true);
+    expect(sameStreamAtAnyHeight("ws://a/frames?x=1&h=90&q=lo", "ws://a/frames?x=1&h=180&q=lo")).toBe(true);
+    expect(sameStreamAtAnyHeight("ws://a/frames?h=90", "ws://a/frames?h=90&q=lo")).toBe(false);
+    expect(sameStreamAtAnyHeight("ws://a/frames?h=90&q=lo", "ws://a/frames?h=90")).toBe(false);
+    expect(sameStreamAtAnyHeight("ws://a/frames?h=90&q=lo", "ws://a/frames?h=90&q=hi")).toBe(false);
+    expect(sameStreamAtAnyHeight("ws://a/frames?h=90", "ws://b/frames?h=90")).toBe(false);
   });
 
   it("finds the host of an IPv6 URL", () => {

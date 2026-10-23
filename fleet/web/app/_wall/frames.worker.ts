@@ -21,10 +21,12 @@ import {
   wantHeight,
   type Crop,
   type StreamCtl,
+  type TileShow,
   NAL_SPS,
   parseFrame,
   parseStreamHeader,
   reconnectDelayMs,
+  sameStreamAtAnyHeight,
   releaseBefore,
   SAME_T_EPS,
   splitNals,
@@ -133,10 +135,32 @@ class TileStream {
   }
 
   setHeight(height: number, url: string): void {
+    const reopen = !sameStreamAtAnyHeight(this.url, url);
     this.height = height;
     this.url = url;
+    if (reopen) {
+      this.reopen();
+      return;
+    }
     this.ctl = wantHeight(this.ctl, height);
     this.syncHeight();
+  }
+
+  /**
+   * The renderer reads the quality from the URL when a socket opens and takes
+   * only a height afterwards, so a new quality needs a new socket. The frames
+   * already decoded stay up until the new stream's frames replace them.
+   */
+  private reopen(): void {
+    if (this.retry) clearTimeout(this.retry);
+    this.retry = null;
+    this.attempt = 0;
+    const old = this.ws;
+    // Detached first: the old socket's onclose ignores a socket that is no longer this.ws.
+    this.ws = null;
+    old?.close();
+    this.resetDecoder();
+    this.open();
   }
 
   private onHeader(text: string): void {
@@ -220,8 +244,12 @@ class TileStream {
       this.frames.push({ t, frame, crop, grid });
     }
     // While a re-tile waits, the frame on screen is kept: the old tiles are drawn from it.
+    // While paused, so is the frame the frozen choice shows for this stream: a resize or a new plan redraws from it.
+    const heldT = plan.paused ? shownT(lastChoice.show.get(this.id)) : null;
+    const keeps = (h: Held) => (pinT !== null && Math.abs(h.t - pinT) <= SAME_T_EPS) || (heldT !== null && Math.abs(h.t - heldT) <= SAME_T_EPS);
     while (this.frames.length > BUFFER_FRAMES) {
-      const i = pinT !== null && this.frames.length > 1 && Math.abs(this.frames[0]!.t - pinT) <= SAME_T_EPS ? 1 : 0;
+      const i = this.frames.findIndex((h) => !keeps(h));
+      if (i < 0) break;
       this.frames.splice(i, 1)[0]!.frame.close();
     }
   }
@@ -367,6 +395,11 @@ function wantedSources(): Map<string, DrawSource> {
     if (nextPlan.focus) out.set(keyOf(nextPlan.focus), nextPlan.focus);
   }
   return out;
+}
+
+/** The t a tile's choice draws, or null when it draws no frame. */
+function shownT(show: TileShow | undefined): number | null {
+  return show && (show.kind === "sync" || show.kind === "behind") ? show.t : null;
 }
 
 /**

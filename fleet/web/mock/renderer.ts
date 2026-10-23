@@ -71,6 +71,8 @@ interface Sub {
 
 export interface RendererStats {
   subscribers: number;
+  /** Open frame sockets by the quality they were opened with (q is read from the URL at connection time only). */
+  subscribersByQuality: Record<string, number>;
   framesSent: number;
   framesSkipped: number;
   renderBacklog: number;
@@ -87,7 +89,7 @@ export class MockRenderers {
   private wss: WebSocketServer;
   private timer: NodeJS.Timeout | null = null;
   private lastFrame = -1;
-  readonly stats: RendererStats = { subscribers: 0, framesSent: 0, framesSkipped: 0, renderBacklog: 0 };
+  readonly stats: RendererStats = { subscribers: 0, subscribersByQuality: {}, framesSent: 0, framesSkipped: 0, renderBacklog: 0 };
 
   constructor(opts: RendererOptions) {
     this.opts = opts;
@@ -202,7 +204,7 @@ export class MockRenderers {
   private subscribe(ws: WebSocket, tile: string, h: number, q: string): void {
     const sub: Sub = { q, ws, tile, width: 0, height: 0, geometry: null, reqH: h, geomKey: "", encoder: null, stamps: [], sentKey: false };
     this.subs.add(sub);
-    this.stats.subscribers = this.subs.size;
+    this.countSubs();
     this.resize(sub, h);
     ws.on("message", (data, isBinary) => {
       if (isBinary) return;
@@ -219,9 +221,16 @@ export class MockRenderers {
     ws.on("close", () => {
       sub.encoder?.close();
       this.subs.delete(sub);
-      this.stats.subscribers = this.subs.size;
+      this.countSubs();
     });
     ws.on("error", () => {});
+  }
+
+  private countSubs(): void {
+    this.stats.subscribers = this.subs.size;
+    const by: Record<string, number> = {};
+    for (const s of this.subs) by[s.q] = (by[s.q] ?? 0) + 1;
+    this.stats.subscribersByQuality = by;
   }
 
   private resize(sub: Sub, h: number): void {

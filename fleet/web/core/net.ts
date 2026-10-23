@@ -16,6 +16,19 @@ export function frameSocketUrl(frameUrl: string, height: number, quality: "hi" |
   return `${base}?${kept.join("&")}`;
 }
 
+/**
+ * Whether a socket opened on `a` already serves what `b` asks for, once the
+ * height is set with a message. The renderer reads every other query parameter
+ * (q, and any the frame URL carries) at connection time only.
+ */
+export function sameStreamAtAnyHeight(a: string, b: string): boolean {
+  const strip = (u: string): string => {
+    const [base, query = ""] = u.split("?", 2) as [string, string?];
+    return `${base}?${query.split("&").filter((p) => p !== "" && !p.startsWith("h=")).join("&")}`;
+  };
+  return strip(a) === strip(b);
+}
+
 /** The text message that changes a live frame socket's height. */
 export function heightMessage(height: number): string {
   return JSON.stringify({ h: Math.round(height) });
