@@ -50,10 +50,25 @@ pub async fn lease_mount_targets(dirs: &[PathBuf]) -> Result<MountTargetLease> {
 }
 
 async fn lease_one(dir: &Path) -> Result<std::fs::File> {
+    lease_one_with(dir, |dir| std::fs::create_dir_all(dir)).await
+}
+
+/// `create` is `std::fs::create_dir_all` outside tests.
+async fn lease_one_with(
+    dir: &Path,
+    mut create: impl FnMut(&Path) -> std::io::Result<()>,
+) -> Result<std::fs::File> {
     for _ in 0..MAX_LEASE_ATTEMPTS {
-        tokio::fs::create_dir_all(dir)
-            .await
-            .with_context(|| format!("creating mount target {}", dir.display()))?;
+        match create(dir) {
+            Ok(()) => {}
+            // mkdir found the directory, and a teardown removed it before the check that
+            // it is one.
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating mount target {}", dir.display()))
+            }
+        }
         let file = match std::fs::File::open(dir) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -184,13 +199,30 @@ mod tests {
         remove_runtime_dir(&source).await.unwrap();
     }
 
+    /// `create_dir_all` answers `mkdir`'s EEXIST by checking that the path is a
+    /// directory, and returns AlreadyExists when a teardown removed it in between.
+    #[tokio::test]
+    async fn a_lease_retries_a_directory_removed_while_it_was_created() {
+        let root = tempfile::tempdir().unwrap();
+        let source = root.path().join("source");
+        let mut raced = false;
+        let leased = lease_one_with(&source, |dir| {
+            if !raced {
+                raced = true;
+                return Err(std::io::ErrorKind::AlreadyExists.into());
+            }
+            std::fs::create_dir_all(dir)
+        })
+        .await
+        .expect("a mount target removed during its creation failed the lease");
+        assert_eq!(leased.metadata().unwrap().ino(), ino(&source));
+    }
+
     #[tokio::test]
     async fn a_lease_that_waited_behind_a_teardown_holds_the_recreated_directory() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         std::fs::create_dir_all(&source).unwrap();
-        let removed_ino = ino(&source);
-
         // The teardown's exclusive lock, taken by hand so the removal can be ordered
         // between the lease's open and its lock.
         let teardown = std::fs::File::open(&source).unwrap();
@@ -212,12 +244,10 @@ mod tests {
             .expect("the lease did not finish after the teardown")
             .unwrap()
             .unwrap();
-        let leased = lease._dirs[0].metadata().unwrap().ino();
-        assert_eq!(
-            leased,
-            ino(&source),
-            "the lease holds a directory that no longer has a name"
-        );
-        assert_ne!(leased, removed_ino);
+        // The removed directory's inode number can be reused for the new one, so compare
+        // the link count: a removed directory has none.
+        let leased = lease._dirs[0].metadata().unwrap();
+        assert!(leased.nlink() > 0, "the lease holds a removed directory");
+        assert_eq!(leased.ino(), ino(&source));
     }
 }
