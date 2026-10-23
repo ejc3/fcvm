@@ -1462,8 +1462,16 @@ async fn prepare_vm_for_lifecycle(
         validate_gpu_run(&args, &lifecycle, no_snapshot)?;
         args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+        let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
             crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_driver_supports_device(
+                Path::new("/sys"),
+                sbdf,
+                profile_name,
+                module_type,
+            )?;
         }
     }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
