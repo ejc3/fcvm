@@ -141,12 +141,10 @@ python3 tools/rawmosaic.py out 4 2 540 tools/scene-move.json HOST1:8080 ...   # 
 python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile boundary
 ```
 
-## Measured (2026-10-22, g4dn.metal, one T4 per fcvm VM, driver 580.196.07)
+## Measured (2026-10-23, g4dn.metal from the fleet host AMI, one T4 per fcvm VM)
 
-The fps table and the seam numbers are from round 5; the stream-quality and
-subscriber numbers are from round 4. Round 5's scene costs 10% more per
-sample than round 4's (`fleet-renderer bench --h 720`, one sample per pixel,
-on the host: 29.1 ms before, 31.9 ms after; the low sun alone is about 1 ms).
+The fps table, seams, shots and TLS numbers are from round 6; the
+stream-quality and subscriber numbers are from round 4.
 
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
 budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
@@ -156,13 +154,25 @@ the checkerboard stride (1: every pixel draws).
 
 | inner size | stream (with overlap) | fps | samples/pixel/frame | checker | render ms | encode ms |
 |---|---|---|---|---|---|---|
-| 146 x 146 (asked 136) | 178 x 178 | 31.5 | 5 | 1 | 12.4 | 0.53 |
-| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 10.7 | 0.74 |
-| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.7 | 0.74 |
-| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 9.4 | 1.18 |
-| 1080 x 1080 detail view | 1112 x 1112 | 30.0 | 1 | 4 | 26.9 | 4.06 |
-| 1280 x 720 whole image | 1280 x 720 | 29.9 | 1 | 4 | 29.5 | 2.52 |
-| 1920 x 1080 whole image | 1920 x 1080 | 12.5 | 1 | 4 | 61.3 | 4.05 |
+| 146 x 146 (asked 136) | 178 x 178 | 30.2 | 5 | 1 | 12.8 | 0.59 |
+| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 11.0 | 0.73 |
+| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.8 | 0.79 |
+| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 9.5 | 1.16 |
+| 1080 x 1080 detail view | 1112 x 1112 | 27.9 | 1 | 4 | 27.8 | 4.15 |
+| 1280 x 720 whole image | 1280 x 720 | 25.4 | 1 | 4 | 30.1 | 2.58 |
+| 1920 x 1080 whole image | 1920 x 1080 | 12.2 | 1 | 4 | 62.4 | 4.45 |
+
+The 720p whole image and the detail view sit at the slot's edge: render plus
+encode is 31 to 33 ms of the 33.3 ms slot, and a frame over it costs a slot.
+A second run in one VM gave 720p at 23.1 fps (29.6 ms) and the detail view
+at 30.0 (26.1 ms). Round 5 measured 29.5 and 26.9 ms on another box. A lower
+`budget` does not help these two: they already draw a quarter of the pixels
+with one sample, the floor. Per frame, the trace is nearly all of it (720p,
+moving, per-kernel events: trace 31 ms; sky 0.1, fill 0.2, resolve 0.2,
+finish 0.4); within the trace the cloud march took 5.3 ms, the bounce ray
+2.7 and the sun's shadow march 2.6 before both marches were shortened (20
+bounce steps, round 4's shadow octaves), which took that frame's trace from
+30.9 to 29.5 ms; the table above is after that change.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
@@ -186,24 +196,39 @@ the GPU; 307 to 330 ms with `nvidia-persistenced` running in the guest.
 Relaunch (round 2, cache-hit `fcvm podman run`): 6.15 to 6.28 s from the
 command to the first frame at the client.
 
-Seams (round 5): the seam test passes in VMs on three different T4s with the
-same hashes (`fnv64 1fee6f746d08e12d`, `b6c76adc254cc36b`, `9785fc0b8858b93b`).
+Seams (round 6): the seam test passes in VMs on three different T4s with the
+same hashes (`fnv64 d29502859cc7552a`, `a6dabe4b727ac567`, `19c1b42fb6c2c616`).
 A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
 equals the same frame drawn whole in another VM in all 2,073,600 pixels, with
 every pixel drawing and with stride-4 checkerboard frames. At 540 px tiles its
-seam ratio is 0.72 to 3.72 unencoded and 0.82 to 3.81 as the eight `std`
-streams decode it, cropped. The 3.72 is the clock: it is centred, so a digit's
-stroke lies on the middle boundary in the unencoded frame too. The largest
-increase from encoding, 1.00 to 1.76, is at a boundary in flat, dark forest,
-where the metric divides by a near-zero gradient; a 2x crop shows no line.
-Golden-hour hold 0.93 to 1.41, high-altitude hold 0.63 to 1.16 (decoded).
+seam ratio is 0.75 to 1.26 unencoded and 0.81 to 1.35 as the eight `std`
+streams decode it, cropped (largest increase from encoding 0.33, at a boundary
+in flat forest). In the holds the centred clock puts a digit's edge on the
+middle boundary, which reads 6.3 (golden hour) and 7.6 (80 km) there and 0.61
+to 1.41 everywhere else; a 4x crop shows the digit, no line.
+
+TLS (round 6, one renderer VM, `tools/tlscost.py`, 15 s per arm, camera
+moving, the same streams over `ws://` and then `wss://`; the renderer's CPU
+from `/health cpu_s`, delay = arrival minus the frame's slot time):
+
+| streams | per stream | renderer CPU, ws -> wss (% of one core) | added per stream | delay p50, ws -> wss |
+|---|---|---|---|---|
+| 8 x `hi` 540 px | 21.7 Mbit/s | 38.6 -> 44.0 | 0.67% | 15.4 -> 16.3 ms |
+| 8 x `std` 180 px | 0.83 Mbit/s | 40.2 -> 40.5 | 0.04% | 14.2 -> 14.1 ms |
+| 1 x `hi` 540 px | 21.7 Mbit/s | 39.3 -> 41.2 | 1.9% | 15.5 -> 16.0 ms |
+
+A TLS connection's first request took 3.2 ms against 0.5 ms plain (one
+stream, handshake included). A WSS stream carried on across a certificate
+replacement (450 frames, 352 after the swap, largest gap 42 ms) and new
+handshakes got the new certificate; a TLS 1.1 client is refused.
 
 `GET /still?h=540` from the eight VMs, 12 s after the first request with no
-stream running, in the 80 km hold: 360 to 381 samples per pixel, stitched in
+stream running, in the 80 km hold: 359 to 382 samples per pixel, stitched in
 `shots/still-high-8gpu.jpg`.
 
 Shots stitched from eight VMs on eight GPUs are in `shots/`:
 `mosaic-hold-8gpu.jpg` (golden hour, held), `mosaic-high-8gpu.jpg` (80 km
-up, held), `mosaic-move-8gpu.jpg` (moving), the two holds at 180 px tiles,
+up, held), `mosaic-move-8gpu.jpg` (moving), `mosaic-fast-8gpu.jpg`
+(`tools/scene-fast.json`, 1.2 km/s in the cloud layer), the two holds at 180 px tiles,
 `raw-move-8gpu.jpg` and `decoded-move-8gpu.jpg` (one moving frame, unencoded
 and decoded).

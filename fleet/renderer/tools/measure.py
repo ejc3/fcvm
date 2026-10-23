@@ -7,6 +7,7 @@ expensive case), subscribes at each height in turn, and prints one CSV row per
 height from what the client received and what /health reports.
 """
 import json
+import os
 import sys
 import time
 
@@ -27,8 +28,11 @@ cam = [{"t": float(i * 20), "pos": [-12 - 2.0 * i, 0.4 + 0.25 * i, -8 - 6.0 * i]
         "look": [-40 - 2.0 * i, 1.2, -80 - 6.0 * i], "fov_deg": 60.0} for i in range(400)]
 print("inner_height,inner_width,stream,rect,frames,client_fps,spp,checkerboard,render_ms,encode_ms,gpu_util_pct,power_w")
 for h, rect, kind in rows:
-    fc.post_scene(host, port, {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
-                               "time_of_day": 0.3, "words": [], "lights": []})
+    scene = {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
+             "time_of_day": 0.3, "words": [], "lights": []}
+    if os.environ.get("BUDGET"):  # the scene's per-frame budget (pixel-samples) instead of the renderer's
+        scene["budget"] = int(os.environ["BUDGET"])
+    fc.post_scene(host, port, scene)
     st = fc.Stream(host, port, h)
     hdr, got, t0 = None, [], None
     samples = []
