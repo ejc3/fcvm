@@ -9,10 +9,14 @@
 
 pub mod agents;
 pub mod aws;
+pub mod cert;
+pub mod dns;
 pub mod ec2;
+pub mod ec2_aws;
 pub mod live;
 pub mod poster;
 pub mod scale;
+pub mod secrets;
 pub mod sigv4;
 pub mod store;
 pub mod text_check;
@@ -24,7 +28,7 @@ use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
 use fleet_core::protocol::{AgentMsg, AssignSlot, ClaimMsg, CoordMsg, ServerMsg, SharedScene};
-use fleet_core::tiling::{half_rect, Half, Rect};
+use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
 use std::collections::HashMap;
@@ -105,6 +109,10 @@ pub struct Outputs {
     pub ec2_layout: watch::Sender<Option<Layout>>,
     /// The fleet's power state (`awake`, `asleep`, `waking`).
     pub power: watch::Sender<String>,
+    /// The shared scene, for the EC2 tiles' renderers.
+    pub scene: watch::Sender<Option<SharedScene>>,
+    /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
+    pub dns: Option<(String, watch::Sender<dns::Wanted>)>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -175,6 +183,11 @@ impl Actor {
         let assignments = host_assignments(&self.state);
         let regions = host_regions(&self.state);
         let scene = shared_scene(&self.state);
+        self.out.scene.send_if_modified(|cur| {
+            let changed = cur.as_ref() != Some(&scene);
+            *cur = Some(scene.clone());
+            changed
+        });
         for conn in self.agents.values_mut() {
             let mine = (
                 assignments.get(&conn.host).cloned().unwrap_or_default(),
@@ -194,10 +207,10 @@ impl Actor {
             }
         }
         let f = &self.state.fleet;
-        let ec2_layout = Layout {
+        let ec2_layout = f.layout.ec2.map(|region| Layout {
             epoch_unix_ms: f.scene.epoch_unix_ms,
             image_aspect: self.state.config.image_aspect,
-            region: half_rect(Half::Ec2),
+            region,
             tiles: f
                 .ec2
                 .values()
@@ -209,10 +222,10 @@ impl Actor {
                     })
                 })
                 .collect(),
-        };
+        });
         self.out.ec2_layout.send_if_modified(|cur| {
-            let changed = cur.as_ref() != Some(&ec2_layout);
-            *cur = Some(ec2_layout.clone());
+            let changed = *cur != ec2_layout;
+            *cur = ec2_layout.clone();
             changed
         });
         let power = self.state.fleet.power.state.clone();
@@ -221,6 +234,14 @@ impl Actor {
             *cur = power.clone();
             changed
         });
+        if let Some((zone, tx)) = &self.out.dns {
+            let want = dns::wanted(&self.state, zone);
+            tx.send_if_modified(|cur| {
+                let changed = *cur != want;
+                *cur = want;
+                changed
+            });
+        }
         let ec2 = ec2_assignment(&self.state);
         self.out.ec2.send_if_modified(|cur| {
             if *cur == ec2 {
@@ -549,6 +570,7 @@ pub fn start(
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
     power: Option<scale::PowerConfig>,
+    dns_writer: Option<dns::Cloudflare>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
@@ -558,6 +580,11 @@ pub fn start(
     let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
+    let (scene_tx, scene_rx) = watch::channel(None);
+    let dns_out = dns_writer.map(|cf| {
+        let (tx, rx) = watch::channel(dns::wanted(&state, &cf.zone));
+        (cf, tx, rx)
+    });
     let actor = Actor::new(
         state,
         Outputs {
@@ -565,6 +592,10 @@ pub fn start(
             ec2: ec2_tx,
             ec2_layout: ec2_layout_tx,
             power: power_tx,
+            scene: scene_tx,
+            dns: dns_out
+                .as_ref()
+                .map(|(cf, tx, _)| (cf.zone.clone(), tx.clone())),
             store,
         },
         Box::new(now_ms),
@@ -598,10 +629,13 @@ pub fn start(
         }
     });
     if let Some(driver) = ec2 {
-        tokio::spawn(ec2::run(driver, ec2_rx, handle.clone()));
+        tokio::spawn(ec2::run(driver, ec2_rx, scene_rx, handle.clone()));
     }
     if let Some(cfg) = power {
         tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
+    }
+    if let Some((cf, _, rx)) = dns_out {
+        tokio::spawn(dns::run(cf, rx));
     }
     (handle, task)
 }
@@ -639,7 +673,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         max_tiles: args.max_tiles,
         ec2_max: match args.ec2 {
             FleetEc2::None => 0,
-            FleetEc2::Fake => args.max_tiles,
+            FleetEc2::Fake | FleetEc2::Aws => args.ec2_tiles.min(args.max_tiles),
         },
         ec2_aggregate_url: args.ec2_aggregate_url.clone(),
         race_interval_secs: args.race_every,
@@ -676,7 +710,25 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             };
             (state, Some(store::spawn_writer(path.clone())))
         }
-        None => (State::new(config, now_ms()), None),
+        None => match &args.state_bucket {
+            Some(bucket) => {
+                let region = args
+                    .state_region
+                    .clone()
+                    .or_else(|| std::env::var("AWS_REGION").ok())
+                    .context("--state-bucket needs --state-region or AWS_REGION")?;
+                let obj = store::S3Object::new(bucket, &args.state_key, &region)?;
+                let state = match obj.load().await? {
+                    Some(s) => {
+                        tracing::info!(bucket = %bucket, key = %args.state_key, version = s.version, "resuming from the state object");
+                        s.resumed(config, now_ms())
+                    }
+                    None => State::new(config, now_ms()),
+                };
+                (state, Some(store::spawn_s3_writer(obj)))
+            }
+            None => (State::new(config, now_ms()), None),
+        },
     };
     let ec2: Option<Arc<dyn ec2::Ec2Driver>> = match args.ec2 {
         FleetEc2::None => None,
@@ -684,6 +736,12 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             Duration::from_secs(2),
             Duration::from_secs(20),
         ))),
+        FleetEc2::Aws => Some(Arc::new(ec2_aws::AwsEc2::new(
+            args.ec2_regions.clone(),
+            args.ec2_template.clone(),
+            args.ec2_on_demand_template.clone(),
+            args.dns_zone.clone(),
+        )?)),
     };
     let ec2_local = args.ec2_aggregate_listen.as_ref().map(|l| {
         format!(
@@ -701,7 +759,48 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             poll: Duration::from_secs(5),
         })
     };
-    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power);
+    let secrets_region = || {
+        args.secrets_region
+            .clone()
+            .or_else(|| std::env::var("AWS_REGION").ok())
+            .context("reading a secret needs --secrets-region or AWS_REGION")
+    };
+    let dns_token = match &args.dns_token_secret {
+        Some(name) => Some(
+            secrets::Secrets::new(&secrets_region()?)?
+                .get(name)
+                .await?
+                .trim()
+                .to_string(),
+        ),
+        None => None,
+    };
+    let cloudflare = |token: &str| {
+        dns::Cloudflare::new(
+            token.to_string(),
+            args.dns_zone.clone(),
+            args.dns_zone_id.clone(),
+        )
+    };
+    let dns_writer = match &dns_token {
+        Some(t) => Some(cloudflare(t)?),
+        None => None,
+    };
+    if let Some(secret) = &args.tls_secret {
+        let token = dns_token
+            .as_deref()
+            .context("--tls-secret needs --dns-token-secret (DNS-01 challenges)")?;
+        let mut renewal = cert::Renewal::new(secret.clone(), args.dns_zone.clone());
+        if let Some(d) = &args.acme_directory {
+            renewal.directory = d.clone();
+        }
+        tokio::spawn(cert::run(
+            renewal,
+            secrets::Secrets::new(&secrets_region()?)?,
+            cloudflare(token)?,
+        ));
+    }
+    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power, dns_writer);
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
             std::env::current_exe()

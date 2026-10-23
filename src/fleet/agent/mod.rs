@@ -1,9 +1,11 @@
 //! `fcvm fleet agent`: runs one fcvm GPU VM per assigned slot on this host and reports
 //! to the coordinator over newline-delimited JSON on stdin and stdout.
 
+pub mod dial;
 pub mod inventory;
 pub mod slot;
 pub mod spot;
+pub mod tls;
 pub mod vm;
 
 use crate::cli::FleetAgentArgs;
@@ -46,6 +48,9 @@ fn mtime_ms(path: &std::path::Path) -> Option<u64> {
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
     let host = match args.host {
         Some(h) => h,
+        None if args.host_from_imds => crate::fleet::coord::aws::imds("instance-id")
+            .await
+            .context("reading the instance id")?,
         None => std::fs::read_to_string("/proc/sys/kernel/hostname")
             .context("reading the host name")?
             .trim()
@@ -57,6 +62,20 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
     };
     if gpus.is_empty() {
         tracing::warn!("no NVIDIA GPU is bound to vfio-pci; this host will run no slot");
+    }
+    // The renderers' certificate: fetched once before any VM starts, then kept current.
+    let mut fcvm_args = args.fcvm_args.clone();
+    if let Some(secret) = &args.tls_secret {
+        let region = match &args.secret_region {
+            Some(r) => r.clone(),
+            None => crate::fleet::coord::aws::imds("placement/region")
+                .await
+                .context("reading the instance's region (or pass --secret-region)")?,
+        };
+        let secrets = crate::fleet::coord::secrets::Secrets::new(&region)?;
+        tls::refresh(&secrets, secret, &args.tls_dir).await?;
+        fcvm_args.extend(tls::vm_args(&args.tls_dir));
+        tokio::spawn(tls::run(secrets, secret.clone(), args.tls_dir.clone()));
     }
     let fcvm = match args.fcvm {
         Some(p) => p,
@@ -70,7 +89,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         cfg: AgentCfg {
             fcvm,
             image: args.image,
-            extra_args: args.fcvm_args,
+            extra_args: fcvm_args,
             frame_host: args.frame_host.unwrap_or_else(|| args.publish_ip.clone()),
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
@@ -100,7 +119,45 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             (p, argv)
         }),
     };
-    serve(agent, tokio::io::stdin(), tokio::io::stdout()).await
+    let Some(url) = args.dial else {
+        return serve(agent, tokio::io::stdin(), tokio::io::stdout()).await;
+    };
+    let mut headers = Vec::new();
+    if let Some(secret) = &args.access_secret {
+        let region = match &args.secret_region {
+            Some(r) => r.clone(),
+            None => crate::fleet::coord::aws::imds("placement/region")
+                .await
+                .context("reading the instance's region (or pass --secret-region)")?,
+        };
+        let v: serde_json::Value = serde_json::from_str(
+            &crate::fleet::coord::secrets::Secrets::new(&region)?
+                .get(secret)
+                .await?,
+        )
+        .with_context(|| format!("secret {secret} is not JSON"))?;
+        let field = |k: &str| {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(str::to_string)
+                .with_context(|| format!("secret {secret} has no {k}"))
+        };
+        headers.push(("CF-Access-Client-Id".to_string(), field("client_id")?));
+        headers.push((
+            "CF-Access-Client-Secret".to_string(),
+            field("client_secret")?,
+        ));
+    }
+    dial::run(
+        agent,
+        dial::DialCfg {
+            url,
+            headers,
+            backoff_min: Duration::from_secs(1),
+            backoff_max: Duration::from_secs(30),
+        },
+    )
+    .await
 }
 
 struct SlotHandle {
@@ -297,6 +354,9 @@ fn assign(
             rect: a.rect,
             private_camera: a.private_camera.clone(),
             standby: a.standby,
+            layout_generation: a.layout_generation,
+            rect_from_frame: a.rect_from_frame,
+            previous_rect: a.previous_rect,
         };
         if let Some(h) = slots.get(&a.id) {
             h.desired.send_if_modified(|d| {
@@ -306,6 +366,9 @@ fn assign(
                     rect: want.rect,
                     private_camera: want.private_camera.clone(),
                     standby: want.standby,
+                    layout_generation: want.layout_generation,
+                    rect_from_frame: want.rect_from_frame,
+                    previous_rect: want.previous_rect,
                 };
                 let changed = *d != next;
                 *d = next;
@@ -324,6 +387,8 @@ fn assign(
                 timings: Default::default(),
                 error: Some(format!("GPU {} is not on this host", a.sbdf)),
                 retry_in_ms: None,
+                ipv6: None,
+                ipv4: None,
             }));
             continue;
         };

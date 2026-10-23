@@ -71,6 +71,137 @@ pub fn spawn_writer(path: PathBuf) -> StoreTx {
     tx
 }
 
+/// The state as one S3 object (the coordinator's task has no writable disk). One PUT
+/// replaces it whole, which S3 makes atomic; the bucket keeps versions.
+pub struct S3Object {
+    pub bucket: String,
+    pub key: String,
+    pub region: String,
+    base: String,
+    chain: super::aws::CredentialChain,
+    http: reqwest::Client,
+}
+
+impl S3Object {
+    pub fn new(bucket: &str, key: &str, region: &str) -> Result<Self> {
+        S3Object::with_endpoint(
+            bucket,
+            key,
+            region,
+            &format!("https://s3.{region}.amazonaws.com"),
+        )
+    }
+
+    /// Against another endpoint (tests).
+    pub fn with_endpoint(bucket: &str, key: &str, region: &str, base: &str) -> Result<Self> {
+        let plain = |s: &str| {
+            !s.is_empty()
+                && s.bytes().all(|b| {
+                    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~' | b'/')
+                })
+        };
+        anyhow::ensure!(
+            plain(bucket) && plain(key),
+            "the state bucket and key may use letters, digits, - _ . ~ and / only"
+        );
+        Ok(S3Object {
+            bucket: bucket.into(),
+            key: key.into(),
+            region: region.into(),
+            base: base.into(),
+            chain: super::aws::CredentialChain::new()?,
+            http: reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()?,
+        })
+    }
+
+    fn path(&self) -> String {
+        format!("/{}/{}", self.bucket, self.key)
+    }
+
+    /// The stored state, or `None` when there is none yet. S3 answers 404 for a missing key
+    /// only to a caller that may list the bucket; a 403 is an error, never "no state".
+    pub async fn load(&self) -> Result<Option<State>> {
+        let (status, bytes) = super::aws::signed(
+            &self.chain,
+            &self.http,
+            &self.base,
+            reqwest::Method::GET,
+            &self.path(),
+            "",
+            &self.region,
+            "s3",
+            &[],
+            Vec::new(),
+        )
+        .await?;
+        match status.as_u16() {
+            200 => Ok(Some(serde_json::from_slice(&bytes).with_context(|| {
+                format!("parsing s3://{}/{}", self.bucket, self.key)
+            })?)),
+            404 => Ok(None),
+            403 => anyhow::bail!(
+                "reading s3://{}/{} was refused (403): a missing object reads as 403 without s3:ListBucket, so the coordinator will not start from an empty state",
+                self.bucket,
+                self.key
+            ),
+            s => anyhow::bail!("reading s3://{}/{} answered {s}", self.bucket, self.key),
+        }
+    }
+
+    pub async fn put(&self, bytes: &[u8]) -> Result<()> {
+        let (status, body) = super::aws::signed(
+            &self.chain,
+            &self.http,
+            &self.base,
+            reqwest::Method::PUT,
+            &self.path(),
+            "",
+            &self.region,
+            "s3",
+            &[("content-type", "application/json".into())],
+            bytes.to_vec(),
+        )
+        .await?;
+        if !status.is_success() {
+            anyhow::bail!(
+                "writing s3://{}/{} answered {status}: {}",
+                self.bucket,
+                self.key,
+                String::from_utf8_lossy(&body)
+                    .chars()
+                    .take(300)
+                    .collect::<String>()
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Start the one task that writes the S3 object, with the file writer's ordering and acks.
+/// A failed write is logged and the next state is written in full.
+pub fn spawn_s3_writer(obj: S3Object) -> StoreTx {
+    let (tx, mut rx) = mpsc::unbounded_channel::<StoreCmd>();
+    tokio::spawn(async move {
+        while let Some(first) = rx.recv().await {
+            let mut bytes = first.bytes;
+            let mut acks: Vec<oneshot::Sender<()>> = first.ack.into_iter().collect();
+            while let Ok(more) = rx.try_recv() {
+                bytes = more.bytes;
+                acks.extend(more.ack);
+            }
+            if let Err(e) = obj.put(&bytes).await {
+                tracing::error!(bucket = %obj.bucket, key = %obj.key, error = %format!("{e:#}"), "state not written");
+            }
+            for a in acks {
+                let _ = a.send(());
+            }
+        }
+    });
+    tx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

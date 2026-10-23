@@ -59,6 +59,7 @@ pub struct App {
 pub fn router(handle: Handle, cfg: LiveConfig) -> Router {
     Router::new()
         .route("/live", get(live))
+        .route("/agent", get(agent_socket))
         .route("/poster.jpg", get(poster))
         .route("/healthz", get(|| async { "ok" }))
         .with_state(App {
@@ -104,6 +105,50 @@ async fn poster(State(app): State<App>) -> Response {
         )
             .into_response(),
     }
+}
+
+/// An agent that dials in (`fcvm fleet agent --dial`): the agent protocol with one JSON
+/// message per text frame. Cloudflare Access admits only the agents' service token on this
+/// path before a request reaches the coordinator.
+async fn agent_socket(ws: WebSocketUpgrade, State(app): State<App>) -> Response {
+    ws.max_message_size(crate::fleet::lines::MAX_LINE)
+        .on_upgrade(move |socket| async move {
+            use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+            let (mut to_serve, serve_in) = tokio::io::duplex(1 << 20);
+            let (serve_out, from_serve) = tokio::io::duplex(1 << 20);
+            let (mut sink, mut stream) = socket.split();
+            let inbound = tokio::spawn(async move {
+                while let Some(Ok(m)) = stream.next().await {
+                    match m {
+                        Message::Text(t) => {
+                            let mut line = t.as_bytes().to_vec();
+                            line.push(b'\n');
+                            if to_serve.write_all(&line).await.is_err() {
+                                return;
+                            }
+                        }
+                        Message::Close(_) => return,
+                        _ => {}
+                    }
+                }
+            });
+            let outbound = tokio::spawn(async move {
+                let mut lines = tokio::io::BufReader::new(from_serve).lines();
+                while let Ok(Some(l)) = lines.next_line().await {
+                    if sink.send(Message::Text(l.into())).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = sink.close().await;
+            });
+            if let Err(e) = super::agents::serve_connection(serve_in, serve_out, &app.handle).await
+            {
+                tracing::warn!(error = %format!("{e:#}"), "agent connection ended");
+            }
+            inbound.abort();
+            let _ = outbound.await;
+        })
+        .into_response()
 }
 
 /// The address the per-client limits use.

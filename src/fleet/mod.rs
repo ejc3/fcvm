@@ -17,8 +17,8 @@ use anyhow::Result;
 
 pub async fn cmd_fleet(args: FleetArgs) -> Result<()> {
     match args.cmd {
-        FleetCommand::Coord(a) => coord::run(a).await,
-        FleetCommand::Agent(a) => agent::run(a).await,
+        FleetCommand::Coord(a) => coord::run(*a).await,
+        FleetCommand::Agent(a) => agent::run(*a).await,
         FleetCommand::Aggregate(a) => aggregate::cmd(a).await,
     }
 }

@@ -2,7 +2,7 @@
 //! while the fleet is asleep, the configured target otherwise; while it wakes it polls
 //! their instances for the page's progress.
 
-use super::aws::CredentialChain;
+use super::aws::{xml_tag as tag, CredentialChain};
 use super::sigv4::{authorization, uri_encode};
 use super::Handle;
 use anyhow::{bail, Context, Result};
@@ -220,15 +220,6 @@ impl ScaleDriver for AwsAutoScaling {
             .await?;
         Ok(parse_instances(&xml))
     }
-}
-
-/// The text of the first `<name>` element in `xml`.
-fn tag(xml: &str, name: &str) -> Option<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&close)? + start;
-    Some(xml[start..end].trim().to_string())
 }
 
 /// The instances of a DescribeAutoScalingGroups answer: each `<member>` of `<Instances>`

@@ -133,6 +133,9 @@ impl Coord {
                     generation: *generation,
                     rect: *rect,
                     private_camera: None,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 })
                 .collect(),
@@ -403,6 +406,9 @@ async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
                     generation,
                     rect,
                     private_camera: camera,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 }],
                 region: None,
@@ -572,6 +578,9 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     generation: 1,
                     rect: rect(0.0),
                     private_camera: None,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 },
                 AssignSlot {
@@ -580,6 +589,9 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     generation: 1,
                     rect: rect(0.25),
                     private_camera: None,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 },
             ],
@@ -692,6 +704,9 @@ async fn a_rect_change_right_after_running_is_posted() {
             generation: 1,
             rect: rect(x),
             private_camera: None,
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
             standby: false,
         }],
         region: None,
@@ -827,6 +842,9 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                         h: 0.5,
                     }),
                     private_camera: None,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 },
                 AssignSlot {
@@ -835,6 +853,9 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     generation: 1,
                     rect: None,
                     private_camera: None,
+                    layout_generation: 0,
+                    rect_from_frame: 0,
+                    previous_rect: None,
                     standby: false,
                 },
             ],
@@ -895,6 +916,9 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 generation: 1,
                 rect: Some(wider),
                 private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
                 standby: false,
             }],
             region: Some(wider),
@@ -942,6 +966,9 @@ fn standby_slot(generation: u64, standby: bool, rect: Option<Rect>) -> CoordMsg 
             generation,
             rect,
             private_camera: None,
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
             standby,
         }],
         region: None,
@@ -1105,4 +1132,215 @@ async fn the_hello_reports_when_the_store_was_ready() {
         other => panic!("first message {other:?}"),
     }
     task.abort();
+}
+
+type Seen = std::sync::Arc<std::sync::Mutex<Option<String>>>;
+
+async fn accept_agent(
+    listener: &tokio::net::TcpListener,
+    seen: &Seen,
+) -> tokio_tungstenite::WebSocketStream<tokio::net::TcpStream> {
+    let seen = seen.clone();
+    let (tcp, _) = listener.accept().await.unwrap();
+    tokio_tungstenite::accept_hdr_async(
+        tcp,
+        move |req: &tokio_tungstenite::tungstenite::handshake::server::Request, resp| {
+            *seen.lock().unwrap() = req
+                .headers()
+                .get("cf-access-client-id")
+                .map(|v| v.to_str().unwrap().to_string());
+            Ok(resp)
+        },
+    )
+    .await
+    .unwrap()
+}
+
+async fn next_agent_msg(
+    ws: &mut tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>,
+) -> AgentMsg {
+    use futures_util::StreamExt;
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(30), ws.next())
+            .await
+            .expect("a message")
+            .unwrap()
+            .unwrap();
+        if let tokio_tungstenite::tungstenite::Message::Text(t) = m {
+            return serde_json::from_str(&t).unwrap();
+        }
+    }
+}
+
+/// `--dial`: the agent connects with its headers, and after the connection drops it
+/// reconnects and starts with its hello and each slot's latest report, while the VM it
+/// started keeps running.
+#[tokio::test]
+async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms() {
+    use fcvm::fleet::agent::dial::{run as dial, DialCfg};
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let f = fake(1, &[]);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/agent", listener.local_addr().unwrap());
+    let agent = Agent {
+        host: "gpu-host".into(),
+        gpus: gpus(1),
+        capacity: 1,
+        base_port: f.base,
+        cfg: cfg(&f.fcvm),
+        spot_notice_url: None,
+        spot_poll: Duration::from_millis(50),
+        aggregate: None,
+        store_ready_file: None,
+    };
+    let task = tokio::spawn(dial(
+        agent,
+        DialCfg {
+            url,
+            headers: vec![("CF-Access-Client-Id".into(), "id-for-tests".into())],
+            backoff_min: Duration::from_millis(50),
+            backoff_max: Duration::from_millis(200),
+        },
+    ));
+    let seen_header = std::sync::Arc::new(std::sync::Mutex::new(None));
+    let mut ws = accept_agent(&listener, &seen_header).await;
+    assert_eq!(seen_header.lock().unwrap().as_deref(), Some("id-for-tests"));
+    assert!(matches!(
+        next_agent_msg(&mut ws).await,
+        AgentMsg::Hello { .. }
+    ));
+    for m in [
+        scene(),
+        CoordMsg::Assign {
+            slots: vec![AssignSlot {
+                id: "slot-1".into(),
+                sbdf: "0000:01:00.0".into(),
+                generation: 1,
+                rect: rect(0.0),
+                private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
+                standby: false,
+            }],
+            region: None,
+        },
+    ] {
+        ws.send(Message::Text(serde_json::to_string(&m).unwrap().into()))
+            .await
+            .unwrap();
+    }
+    loop {
+        if let AgentMsg::Slot(r) = next_agent_msg(&mut ws).await {
+            if r.phase == "running" {
+                break;
+            }
+        }
+    }
+    drop(ws);
+    let mut ws = accept_agent(&listener, &seen_header).await;
+    assert!(matches!(
+        next_agent_msg(&mut ws).await,
+        AgentMsg::Hello { .. }
+    ));
+    match next_agent_msg(&mut ws).await {
+        AgentMsg::Slot(r) => assert_eq!(
+            (r.id.as_str(), r.phase.as_str(), r.generation),
+            ("slot-1", "running", 1)
+        ),
+        other => panic!("expected the slot's replayed report, got {other:?}"),
+    }
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 1, "the VM kept running across the reconnect");
+    task.abort();
+}
+
+/// The renderers' certificate: written from the secret (mode 0600), left alone while the
+/// secret is unchanged, rewritten after a renewal; each VM gets the directory and the paths.
+#[tokio::test]
+async fn the_agent_writes_the_certificate_for_its_renderers() {
+    use fcvm::fleet::agent::tls;
+    use fcvm::fleet::coord::secrets::Secrets;
+    use std::os::unix::fs::PermissionsExt;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let doc = std::sync::Arc::new(std::sync::Mutex::new(
+        serde_json::json!({"cert": "CHAIN-1", "key": "KEY-1", "domains": [], "not_after": "", "issued_at": "", "issuer": ""}),
+    ));
+    let d2 = doc.clone();
+    let app = axum::Router::new().fallback(move |headers: axum::http::HeaderMap, body: String| {
+        let d2 = d2.clone();
+        async move {
+            assert_eq!(headers["x-amz-target"], "secretsmanager.GetSecretValue");
+            assert!(body.contains("fcvm-fleet/tls-wildcard"));
+            axum::Json(serde_json::json!({"SecretString": d2.lock().unwrap().to_string()}))
+        }
+    });
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    let secrets = Secrets::with_endpoint("us-east-2", &base).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let tls_dir = dir.path().join("tls");
+    assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
+        .await
+        .unwrap());
+    let key = tls_dir.join("key.pem");
+    assert_eq!(std::fs::read_to_string(&key).unwrap(), "KEY-1");
+    assert_eq!(
+        std::fs::read_to_string(tls_dir.join("fullchain.pem")).unwrap(),
+        "CHAIN-1"
+    );
+    assert_eq!(
+        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert!(!tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
+        .await
+        .unwrap());
+    doc.lock().unwrap()["key"] = serde_json::json!("KEY-2");
+    assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
+        .await
+        .unwrap());
+    assert_eq!(std::fs::read_to_string(&key).unwrap(), "KEY-2");
+    let args = tls::vm_args(&tls_dir);
+    assert_eq!(args[0], "--map");
+    assert_eq!(args[1], format!("{}:/run/fleet-tls", tls_dir.display()));
+    assert!(args.contains(&"TLS_KEY_FILE=/run/fleet-tls/key.pem".to_string()));
+}
+
+/// A moved tile's renderer is told the new rectangle, the layout generation, the frame it
+/// takes effect at and the rectangle before, so it switches at that frame.
+#[tokio::test]
+async fn the_renderer_gets_the_layout_generation_with_its_rect() {
+    let f = fake(1, &[]);
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    let before = rect(0.0).unwrap();
+    c.send(CoordMsg::Assign {
+        slots: vec![AssignSlot {
+            id: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            generation: 1,
+            rect: rect(0.25),
+            private_camera: None,
+            layout_generation: 3,
+            rect_from_frame: 1234,
+            previous_rect: Some(before),
+            standby: false,
+        }],
+        region: None,
+    });
+    c.until(&["slot-1"], "running", 1).await;
+    let body = f.scenes[0].lock().unwrap().last().unwrap().clone();
+    assert_eq!(body["rect"]["x"], 0.25);
+    assert_eq!(body["layout_generation"], 3);
+    assert_eq!(body["rect_from_frame"], 1234);
+    assert_eq!(body["previous_rect"]["x"], 0.0);
+    c.close().await;
 }

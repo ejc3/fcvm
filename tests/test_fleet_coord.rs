@@ -62,6 +62,7 @@ async fn coordinator_with(o: Opts) -> Coord {
         None,
         o.ec2_local,
         None,
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -629,6 +630,8 @@ impl FakeAgent {
                 timings: [("gpu_ms".to_string(), 3000u64)].into_iter().collect(),
                 error: None,
                 retry_in_ms: None,
+                ipv6: None,
+                ipv4: None,
             }))
             .unwrap();
     }
@@ -863,6 +866,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         None,
         Some(ec2_agg),
         None,
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -993,6 +997,7 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
         None,
         None,
         None,
+        None,
     );
     let mut last = 0;
     for i in 0..5 {
@@ -1040,12 +1045,22 @@ impl ec2::Ec2Driver for ScarceEc2 {
         Ok(ec2::Launched {
             instance: format!("i-test-{n}"),
             frame_url: None,
+            ipv6: None,
+            ipv4: None,
         })
     }
-    async fn ready(&self, _instance: &str) -> anyhow::Result<()> {
-        Ok(())
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
     }
     async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
         Ok(())
     }
     fn capacity_retry(&self) -> Duration {
@@ -1064,7 +1079,14 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(ScarceEc2 {
         calls: Default::default(),
     });
-    let (handle, _actor) = start(State::new(config, now_ms()), None, Some(driver), None, None);
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        Some(driver),
+        None,
+        None,
+        None,
+    );
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
     agent.report("slot-1", "running", 1);
@@ -1130,7 +1152,7 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
         max_tiles: 1,
         ..Config::default()
     };
-    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None);
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
     let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_url = format!("http://{}", admin.local_addr().unwrap());
     let h = handle.clone();
@@ -1211,7 +1233,14 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
         awake_capacity: 2,
         poll: Duration::from_millis(100),
     };
-    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, Some(power));
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        None,
+        None,
+        Some(power),
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}/live", listener.local_addr().unwrap());
     let cfg = live::LiveConfig {
@@ -1267,7 +1296,7 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
         restart_cooldown_secs: 0,
         ..Config::default()
     };
-    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None);
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None, None);
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
     agent
@@ -1323,4 +1352,533 @@ async fn no_poster_is_planned_while_tiles_start_or_race() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
+}
+
+/// An agent that dials in over `/agent` speaks the same messages, one per text frame: its
+/// hello brings the scene and the assignment, and closing the socket takes the host out.
+#[tokio::test]
+async fn an_agent_can_dial_the_agent_websocket() {
+    let c = coordinator_with(Opts::default()).await;
+    let agent_url = c.url.replace("/live", "/agent");
+    let (mut ws, _) = tokio_tungstenite::connect_async(agent_url.as_str())
+        .await
+        .unwrap();
+    let hello = json!({"type": "hello", "host": "gpu-dial", "arch": "x86_64",
+        "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 1});
+    ws.send(Message::Text(hello.to_string().into()))
+        .await
+        .unwrap();
+    let mut kinds = Vec::new();
+    while kinds.len() < 2 {
+        let m = tokio::time::timeout(Duration::from_secs(10), ws.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if let Message::Text(t) = m {
+            let v: Value = serde_json::from_str(&t).unwrap();
+            kinds.push(v["type"].as_str().unwrap().to_string());
+        }
+    }
+    assert_eq!(kinds, vec!["scene", "assign"]);
+    let mut v = Viewer::connect(&c.url).await;
+    v.until(|s| s["fleet"]["n"] == 1).await;
+    ws.close(None).await.unwrap();
+    v.until(|s| s["fleet"]["n"] == 0).await;
+}
+
+/// A fake S3: PUT stores the body at the path, GET returns it or 404, and every request
+/// must be SigV4-signed with the payload's hash. `deny` answers 403 to everything.
+#[derive(Clone, Default)]
+struct FakeS3 {
+    objects: Arc<std::sync::Mutex<BTreeMap<String, Vec<u8>>>>,
+    deny: Arc<std::sync::atomic::AtomicBool>,
+}
+
+async fn fake_s3(s3: FakeS3) -> String {
+    use axum::body::Bytes;
+    use axum::http::{HeaderMap, Method, StatusCode, Uri};
+    let app = axum::Router::new()
+        .fallback(
+            |axum::extract::State(s3): axum::extract::State<FakeS3>,
+             method: Method,
+             uri: Uri,
+             headers: HeaderMap,
+             body: Bytes| async move {
+                use sha2::Digest;
+                if s3.deny.load(std::sync::atomic::Ordering::SeqCst) {
+                    return (StatusCode::FORBIDDEN, Vec::new());
+                }
+                let auth = headers
+                    .get("authorization")
+                    .map(|v| v.to_str().unwrap().to_string());
+                assert!(
+                    auth.as_deref().is_some_and(|a| a
+                        .starts_with("AWS4-HMAC-SHA256 Credential=AKIDFORTESTS/")
+                        && a.contains("/s3/aws4_request")),
+                    "{auth:?}"
+                );
+                assert_eq!(
+                    headers["x-amz-content-sha256"].to_str().unwrap(),
+                    hex::encode(sha2::Sha256::digest(&body))
+                );
+                let mut o = s3.objects.lock().unwrap();
+                match method {
+                    Method::PUT => {
+                        o.insert(uri.path().to_string(), body.to_vec());
+                        (StatusCode::OK, Vec::new())
+                    }
+                    Method::GET => match o.get(uri.path()) {
+                        Some(b) => (StatusCode::OK, b.clone()),
+                        None => (StatusCode::NOT_FOUND, Vec::new()),
+                    },
+                    _ => (StatusCode::METHOD_NOT_ALLOWED, Vec::new()),
+                }
+            },
+        )
+        .with_state(s3);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+/// With --state-bucket the state is one S3 object: none at first, the last state written
+/// at shutdown, read back whole; a refused read is an error, never an empty state.
+#[tokio::test]
+async fn the_state_lives_in_s3_and_a_refused_read_is_an_error() {
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    let s3 = FakeS3::default();
+    let base = fake_s3(s3.clone()).await;
+    let obj =
+        || store::S3Object::with_endpoint("fleet-state", "state.json", "us-east-2", &base).unwrap();
+    assert!(obj().load().await.unwrap().is_none(), "no object yet");
+    let (handle, actor) = start(
+        State::new(
+            Config {
+                light_interval_ms: 0,
+                ..Config::default()
+            },
+            1_000,
+        ),
+        Some(store::spawn_s3_writer(obj())),
+        None,
+        None,
+        None,
+        None,
+    );
+    let mut last = 0;
+    for i in 0..3 {
+        last = handle
+            .apply(Event::Intent {
+                at: 0,
+                viewer: "v-1".into(),
+                client: Some("198.51.100.9".into()),
+                id: format!("l-{i}"),
+                name: "light".into(),
+                args: light(i as f64),
+                check: None,
+                secret: None,
+            })
+            .await
+            .unwrap()
+            .version;
+    }
+    handle.shutdown().await;
+    tokio::time::timeout(Duration::from_secs(5), actor)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(s3
+        .objects
+        .lock()
+        .unwrap()
+        .contains_key("/fleet-state/state.json"));
+    let back = obj().load().await.unwrap().expect("the state object");
+    assert_eq!(back.version, last);
+    assert!(back.receipts.contains_key("l-2"));
+    s3.deny.store(true, std::sync::atomic::Ordering::SeqCst);
+    let e = obj().load().await.unwrap_err();
+    assert!(format!("{e:#}").contains("403"), "{e:#}");
+}
+
+/// One EC2 API call: its region and its parameters.
+type Ec2Call = (String, BTreeMap<String, String>);
+
+/// A fake EC2 query API. `spot_capacity` lists the regions with spot capacity; on-demand
+/// launches always succeed. Calls are recorded as (region, params).
+#[derive(Clone, Default)]
+struct FakeEc2Api {
+    spot_capacity: Vec<String>,
+    calls: Arc<std::sync::Mutex<Vec<Ec2Call>>>,
+}
+
+async fn fake_ec2_api(api: FakeEc2Api) -> String {
+    use axum::http::{HeaderMap, StatusCode};
+    let app = axum::Router::new()
+        .fallback(
+            |axum::extract::State(api): axum::extract::State<FakeEc2Api>,
+             headers: HeaderMap,
+             body: String| async move {
+                let auth = headers["authorization"].to_str().unwrap().to_string();
+                let region = auth.split('/').nth(2).unwrap().to_string();
+                let params: BTreeMap<String, String> = body
+                    .split('&')
+                    .filter_map(|kv| kv.split_once('='))
+                    .map(|(k, v)| {
+                        let dec = |s: &str| {
+                            let mut out = Vec::new();
+                            let b = s.as_bytes();
+                            let mut i = 0;
+                            while i < b.len() {
+                                if b[i] == b'%' {
+                                    out.push(u8::from_str_radix(&s[i + 1..i + 3], 16).unwrap());
+                                    i += 3;
+                                } else {
+                                    out.push(b[i]);
+                                    i += 1;
+                                }
+                            }
+                            String::from_utf8(out).unwrap()
+                        };
+                        (dec(k), dec(v))
+                    })
+                    .collect();
+                api.calls.lock().unwrap().push((region.clone(), params.clone()));
+                let action = params["Action"].as_str();
+                let error = |code: &str| {
+                    (
+                        StatusCode::BAD_REQUEST,
+                        format!("<Response><Errors><Error><Code>{code}</Code><Message>none here</Message></Error></Errors></Response>"),
+                    )
+                };
+                match action {
+                    "RunInstances" => {
+                        let spot = params["LaunchTemplate.LaunchTemplateName"] == "fcvm-fleet-tile-x86_64";
+                        if spot && !api.spot_capacity.contains(&region) {
+                            return error("InsufficientInstanceCapacity");
+                        }
+                        (StatusCode::OK, "<RunInstancesResponse><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId></item></instancesSet></RunInstancesResponse>".into())
+                    }
+                    "DescribeInstances" => (StatusCode::OK, "<DescribeInstancesResponse><reservationSet><item><instancesSet><item><instanceId>i-0123456789abcdef0</instanceId><instanceState><code>16</code><name>running</name></instanceState><ipAddress>127.0.0.1</ipAddress><ipv6Address>2001:db8::5</ipv6Address></item></instancesSet></item></reservationSet></DescribeInstancesResponse>".into()),
+                    "TerminateInstances" => (StatusCode::OK, "<TerminateInstancesResponse/>".into()),
+                    _ => error("InvalidAction"),
+                }
+            },
+        )
+        .with_state(api);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+/// The AWS tile driver: a spot launch from the template, tagged, in the first region with
+/// capacity; ready once the instance runs and its renderer answers at `<tile>.<zone>`
+/// (resolved to the instance itself); terminate by id in its region. With no spot capacity
+/// anywhere it uses the on-demand template, and without one it reports no capacity.
+#[tokio::test]
+async fn the_aws_tile_driver_launches_waits_and_terminates() {
+    use fcvm::fleet::coord::ec2::{Ec2Driver, LaunchError};
+    use fcvm::fleet::coord::ec2_aws::AwsEc2;
+    std::env::set_var("AWS_ACCESS_KEY_ID", "AKIDFORTESTS");
+    std::env::set_var("AWS_SECRET_ACCESS_KEY", "secret-for-tests");
+    // The tile's renderer, which must be asked for by the tile's name.
+    let hosts = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let h2 = hosts.clone();
+    let scenes = Arc::new(std::sync::Mutex::new(Vec::<Value>::new()));
+    let s2 = scenes.clone();
+    let renderer = axum::Router::new()
+        .route(
+            "/health",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let h2 = h2.clone();
+                async move {
+                    h2.lock()
+                        .unwrap()
+                        .push(headers["host"].to_str().unwrap().to_string());
+                    "ok"
+                }
+            }),
+        )
+        .route(
+            "/scene",
+            axum::routing::post(move |axum::Json(b): axum::Json<Value>| {
+                let s2 = s2.clone();
+                async move {
+                    s2.lock().unwrap().push(b);
+                    "ok"
+                }
+            }),
+        );
+    let rl = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rport = rl.local_addr().unwrap().port();
+    tokio::spawn(async move { axum::serve(rl, renderer).await.unwrap() });
+    let regions = vec!["us-east-1".to_string(), "us-west-2".to_string()];
+    let driver = |api: &FakeEc2Api, base: &str, od: Option<&str>| {
+        let mut d = AwsEc2::new(
+            regions.clone(),
+            "fcvm-fleet-tile-x86_64".into(),
+            od.map(str::to_string),
+            "fcvm.example".into(),
+        )
+        .unwrap();
+        for r in &regions {
+            d.endpoints.insert(r.clone(), base.to_string());
+        }
+        d.health_scheme = "http".into();
+        d.health_port = rport;
+        d.poll = Duration::from_millis(20);
+        d.ready_timeout = Duration::from_secs(5);
+        let _ = api;
+        d
+    };
+
+    let api = FakeEc2Api {
+        spot_capacity: vec!["us-west-2".into()],
+        ..Default::default()
+    };
+    let base = fake_ec2_api(api.clone()).await;
+    let d = driver(&api, &base, None);
+    let l = d.launch("ec2-1").await.unwrap();
+    assert_eq!(l.instance, "us-west-2/i-0123456789abcdef0");
+    assert_eq!(
+        l.frame_url.as_deref(),
+        Some("wss://ec2-1.fcvm.example/frames")
+    );
+    {
+        let calls = api.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "us-east-1", "the first region is tried first");
+        let (region, p) = &calls[1];
+        assert_eq!(region, "us-west-2");
+        assert_eq!(p["LaunchTemplate.Version"], "$Latest");
+        assert_eq!(p["TagSpecification.1.Tag.1.Key"], "Purpose");
+        assert_eq!(p["TagSpecification.1.Tag.1.Value"], "fcvm-fleet-tile");
+        assert_eq!(p["TagSpecification.1.Tag.2.Value"], "ec2-1");
+    }
+    let up = d.ready("ec2-1", &l).await.unwrap();
+    assert_eq!(up.ipv4.as_deref(), Some("127.0.0.1"));
+    assert_eq!(up.ipv6.as_deref(), Some("2001:db8::5"));
+    assert_eq!(
+        hosts.lock().unwrap()[0],
+        format!("ec2-1.fcvm.example:{rport}")
+    );
+    // The tile's renderer gets its scene body, layout generation included.
+    let mut body =
+        fleet_core::protocol::SharedScene::new(&fleet_core::scene::Scene::new(1_000), 16.0 / 9.0)
+            .for_renderer(fleet_core::tiling::Rect {
+                x: 0.5,
+                y: 0.0,
+                w: 0.5,
+                h: 1.0,
+            });
+    body.layout_generation = 7;
+    body.rect_from_frame = 900;
+    d.post_scene("ec2-1", &up, &body).await.unwrap();
+    let got = scenes.lock().unwrap()[0].clone();
+    assert_eq!(got["layout_generation"], json!(7));
+    assert_eq!(got["rect_from_frame"], json!(900));
+    assert_eq!(got["rect"]["x"], 0.5);
+    d.terminate(&l.instance).await.unwrap();
+    {
+        let calls = api.calls.lock().unwrap();
+        let (region, p) = calls.last().unwrap();
+        assert_eq!(
+            (region.as_str(), p["Action"].as_str()),
+            ("us-west-2", "TerminateInstances")
+        );
+        assert_eq!(p["InstanceId.1"], "i-0123456789abcdef0");
+    }
+
+    // No spot capacity anywhere: the on-demand template, else no capacity.
+    let api = FakeEc2Api::default();
+    let base = fake_ec2_api(api.clone()).await;
+    let l = driver(&api, &base, Some("fcvm-fleet-tile-od-x86_64"))
+        .launch("ec2-2")
+        .await
+        .unwrap();
+    assert_eq!(l.instance, "us-east-1/i-0123456789abcdef0");
+    assert_eq!(
+        api.calls.lock().unwrap().last().unwrap().1["LaunchTemplate.LaunchTemplateName"],
+        "fcvm-fleet-tile-od-x86_64"
+    );
+    match driver(&api, &base, None).launch("ec2-3").await {
+        Err(LaunchError::NoCapacity(why)) => {
+            assert!(
+                why.contains("us-east-1") && why.contains("us-west-2"),
+                "{why}"
+            )
+        }
+        other => panic!("expected no capacity, got {other:?}"),
+    }
+}
+
+/// A fake Cloudflare DNS API for one zone: records by id, and every write recorded.
+#[derive(Clone, Default)]
+struct FakeCf {
+    records: Arc<std::sync::Mutex<BTreeMap<String, Value>>>,
+    writes: Arc<std::sync::Mutex<Vec<String>>>,
+    next: Arc<std::sync::atomic::AtomicU64>,
+}
+
+async fn fake_cloudflare(cf: FakeCf) -> String {
+    use axum::extract::{Path, State as St};
+    use axum::routing::{get, put};
+    let app = axum::Router::new()
+        .route(
+            "/zones/{zid}/dns_records",
+            get(
+                |St(cf): St<FakeCf>, headers: axum::http::HeaderMap| async move {
+                    assert_eq!(headers["authorization"], "Bearer dns-token-for-tests");
+                    let all: Vec<Value> = cf.records.lock().unwrap().values().cloned().collect();
+                    axum::Json(
+                        json!({"success": true, "result": all, "result_info": {"total_pages": 1}}),
+                    )
+                },
+            )
+            .post(
+                |St(cf): St<FakeCf>, axum::Json(mut r): axum::Json<Value>| async move {
+                    let id = format!(
+                        "r{}",
+                        cf.next.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    );
+                    r["id"] = json!(id);
+                    cf.writes.lock().unwrap().push(format!(
+                        "create {} {} {}",
+                        r["type"], r["name"], r["content"]
+                    ));
+                    cf.records.lock().unwrap().insert(id.clone(), r.clone());
+                    axum::Json(json!({"success": true, "result": r}))
+                },
+            ),
+        )
+        .route(
+            "/zones/{zid}/dns_records/{id}",
+            put(
+                |St(cf): St<FakeCf>,
+                 Path((_z, id)): Path<(String, String)>,
+                 axum::Json(mut r): axum::Json<Value>| async move {
+                    r["id"] = json!(id);
+                    cf.writes
+                        .lock()
+                        .unwrap()
+                        .push(format!("update {} {}", r["name"], r["content"]));
+                    cf.records.lock().unwrap().insert(id, r.clone());
+                    axum::Json(json!({"success": true, "result": r}))
+                },
+            )
+            .delete(
+                |St(cf): St<FakeCf>, Path((_z, id)): Path<(String, String)>| async move {
+                    let r = cf.records.lock().unwrap().remove(&id).unwrap();
+                    cf.writes
+                        .lock()
+                        .unwrap()
+                        .push(format!("delete {}", r["name"]));
+                    axum::Json(json!({"success": true, "result": {"id": id}}))
+                },
+            ),
+        )
+        .with_state(cf);
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", l.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+    base
+}
+
+/// A slot that reports its addresses gets `slot-<n>` AAAA (unproxied, TTL 60) and
+/// `slot-<n>-v4` A (proxied); a stale record of that shape is deleted, other names are
+/// left alone, and nothing is written while the wanted records stay the same.
+#[tokio::test]
+async fn slot_dns_records_follow_the_reported_addresses() {
+    use fcvm::fleet::coord::dns::Cloudflare;
+    let cf = FakeCf::default();
+    for (id, name) in [
+        ("keep", "stage.fcvm.example"),
+        ("stale", "slot-9.fcvm.example"),
+    ] {
+        cf.records.lock().unwrap().insert(
+            id.into(),
+            json!({"id": id, "type": "AAAA", "name": name, "content": "2001:db8::99", "proxied": false}),
+        );
+    }
+    let base = fake_cloudflare(cf.clone()).await;
+    let writer = Cloudflare::with_endpoint(
+        "dns-token-for-tests".into(),
+        "fcvm.example".into(),
+        Some("zone-for-tests".into()),
+        &base,
+    )
+    .unwrap();
+    let (handle, _actor) = start(
+        State::new(Config::default(), now_ms()),
+        None,
+        None,
+        None,
+        None,
+        Some(writer),
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    let report = |v6: &str| {
+        AgentMsg::Slot(SlotReport {
+            id: "slot-1".into(),
+            phase: "running".into(),
+            generation: 1,
+            ipv6: Some(v6.into()),
+            ipv4: Some("192.0.2.10".into()),
+            ..Default::default()
+        })
+    };
+    agent.to_coord.send(report("2001:db8::1")).unwrap();
+    let wait_writes = |n: usize| {
+        let cf = cf.clone();
+        async move {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while cf.writes.lock().unwrap().len() < n {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{:?}",
+                    cf.writes.lock().unwrap()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            cf.writes.lock().unwrap().clone()
+        }
+    };
+    let w = wait_writes(3).await;
+    assert!(
+        w.contains(&"delete \"slot-9.fcvm.example\"".to_string()),
+        "{w:?}"
+    );
+    assert!(
+        w.contains(&"create \"AAAA\" \"slot-1.fcvm.example\" \"2001:db8::1\"".to_string()),
+        "{w:?}"
+    );
+    assert!(
+        w.contains(&"create \"A\" \"slot-1-v4.fcvm.example\" \"192.0.2.10\"".to_string()),
+        "{w:?}"
+    );
+    let recs = cf.records.lock().unwrap().clone();
+    let aaaa = recs
+        .values()
+        .find(|r| r["name"] == "slot-1.fcvm.example")
+        .unwrap();
+    assert_eq!(
+        (aaaa["proxied"].clone(), aaaa["ttl"].clone()),
+        (json!(false), json!(60))
+    );
+    let a = recs
+        .values()
+        .find(|r| r["name"] == "slot-1-v4.fcvm.example")
+        .unwrap();
+    assert_eq!(a["proxied"], json!(true));
+    assert!(recs.values().any(|r| r["name"] == "stage.fcvm.example"));
+    // The same report again changes nothing; a new address is one update.
+    agent.to_coord.send(report("2001:db8::1")).unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(cf.writes.lock().unwrap().len(), 3);
+    agent.to_coord.send(report("2001:db8::2")).unwrap();
+    let w = wait_writes(4).await;
+    assert_eq!(w[3], "update \"slot-1.fcvm.example\" \"2001:db8::2\"");
 }

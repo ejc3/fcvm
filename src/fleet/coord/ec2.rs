@@ -13,7 +13,7 @@
 use super::Handle;
 use anyhow::Result;
 use async_trait::async_trait;
-use fleet_core::protocol::{AssignSlot, SlotReport};
+use fleet_core::protocol::{AssignSlot, RendererScene, SharedScene, SlotReport};
 use fleet_core::Event;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,6 +29,9 @@ pub struct Launched {
     pub instance: String,
     /// The renderer's frame URL, once the instance has an address.
     pub frame_url: Option<String>,
+    /// Its public addresses, once known (for its DNS names).
+    pub ipv6: Option<String>,
+    pub ipv4: Option<String>,
 }
 
 #[derive(Debug)]
@@ -42,9 +45,13 @@ pub enum LaunchError {
 pub trait Ec2Driver: Send + Sync {
     /// Launch one instance for `tile` from its launch template.
     async fn launch(&self, tile: &str) -> Result<Launched, LaunchError>;
-    /// Resolves when the instance's renderer answers its health check.
-    async fn ready(&self, instance: &str) -> Result<()>;
+    /// Resolves when the instance's renderer answers its health check, with what is known
+    /// of the instance by then (its addresses and frame URL).
+    async fn ready(&self, tile: &str, launched: &Launched) -> Result<Launched>;
     async fn terminate(&self, instance: &str) -> Result<()>;
+    /// Post the renderer's scene body (its rectangle and the shared scene) to the tile.
+    async fn post_scene(&self, tile: &str, launched: &Launched, body: &RendererScene)
+        -> Result<()>;
     /// How long a tile waits before asking again after a capacity refusal.
     fn capacity_retry(&self) -> Duration {
         CAPACITY_RETRY
@@ -76,14 +83,71 @@ impl Ec2Driver for FakeEc2 {
         Ok(Launched {
             instance: format!("fake-{}", self.next.fetch_add(1, Ordering::Relaxed)),
             frame_url: None,
+            ipv6: None,
+            ipv4: None,
         })
     }
-    async fn ready(&self, _instance: &str) -> Result<()> {
+    async fn ready(&self, _tile: &str, launched: &Launched) -> Result<Launched> {
         tokio::time::sleep(self.ready_delay).await;
-        Ok(())
+        Ok(launched.clone())
     }
     async fn terminate(&self, _instance: &str) -> Result<()> {
         Ok(())
+    }
+    async fn post_scene(&self, _tile: &str, _l: &Launched, _body: &RendererScene) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// The running instance of each tile, for the scene poster.
+type Running = Arc<std::sync::Mutex<HashMap<String, Launched>>>;
+
+/// Post every running tile its renderer body whenever its rectangle, the layout or the
+/// scene changes (and retry a failed post once a second).
+async fn post_scenes(
+    driver: Arc<dyn Ec2Driver>,
+    mut assign: watch::Receiver<Vec<AssignSlot>>,
+    mut scene: watch::Receiver<Option<SharedScene>>,
+    running: Running,
+) {
+    let mut posted: HashMap<String, (String, RendererScene)> = HashMap::new();
+    let mut tick = tokio::time::interval(Duration::from_secs(1));
+    loop {
+        let list = assign.borrow_and_update().clone();
+        let shared = scene.borrow_and_update().clone();
+        let now: Vec<(AssignSlot, Launched)> = {
+            let r = running.lock().unwrap();
+            list.into_iter()
+                .filter_map(|a| r.get(&a.id).cloned().map(|l| (a, l)))
+                .collect()
+        };
+        if let Some(shared) = &shared {
+            for (a, l) in now {
+                let Some(rect) = a.rect else { continue };
+                let body = RendererScene {
+                    layout_generation: a.layout_generation,
+                    rect_from_frame: a.rect_from_frame,
+                    previous_rect: a.previous_rect,
+                    ..shared.for_renderer(rect)
+                };
+                if posted.get(&a.id) == Some(&(l.instance.clone(), body.clone())) {
+                    continue;
+                }
+                match driver.post_scene(&a.id, &l, &body).await {
+                    Ok(()) => {
+                        posted.insert(a.id.clone(), (l.instance.clone(), body));
+                    }
+                    Err(e) => {
+                        tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "scene not posted yet")
+                    }
+                }
+            }
+        }
+        tokio::select! {
+            r = assign.changed() => if r.is_err() { return },
+            r = scene.changed() => if r.is_err() { return },
+            _ = tick.tick() => {}
+        }
     }
 }
 
@@ -92,8 +156,16 @@ impl Ec2Driver for FakeEc2 {
 pub async fn run(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
+    scene: watch::Receiver<Option<SharedScene>>,
     handle: Handle,
 ) {
+    let running: Running = Arc::default();
+    tokio::spawn(post_scenes(
+        driver.clone(),
+        assign.clone(),
+        scene,
+        running.clone(),
+    ));
     let mut tiles: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {
         let list = assign.borrow_and_update().clone();
@@ -110,7 +182,13 @@ pub async fn run(
                 }
                 None => {
                     let (tx, rx) = watch::channel(generation);
-                    tokio::spawn(tile(driver.clone(), id.clone(), rx, handle.clone()));
+                    tokio::spawn(tile(
+                        driver.clone(),
+                        id.clone(),
+                        rx,
+                        handle.clone(),
+                        running.clone(),
+                    ));
                     tiles.insert(id, tx);
                 }
             }
@@ -147,6 +225,8 @@ async fn report(
                 timings: timings.clone(),
                 error,
                 retry_in_ms: retry_in.map(|d| d.as_millis() as u64),
+                ipv6: l.and_then(|l| l.ipv6.clone()),
+                ipv4: l.and_then(|l| l.ipv4.clone()),
             },
         })
         .await;
@@ -157,6 +237,7 @@ async fn tile(
     id: String,
     mut want: watch::Receiver<u64>,
     handle: Handle,
+    running: Running,
 ) {
     let mut current: Option<(Launched, u64)> = None;
     let mut retry = Duration::from_secs(1);
@@ -165,6 +246,7 @@ async fn tile(
     loop {
         let generation = *want.borrow_and_update();
         if current.as_ref().is_none_or(|(_, g)| *g < generation) {
+            running.lock().unwrap().remove(&id);
             let t0 = Instant::now();
             let mut timings = BTreeMap::new();
             if waiting.is_some_and(|(g, _)| g != generation) {
@@ -209,8 +291,9 @@ async fn tile(
                     )
                     .await;
                     let accepted = Instant::now();
-                    match driver.ready(&l.instance).await {
-                        Ok(()) => {
+                    let l = match driver.ready(&id, &l).await {
+                        Ok(l) => {
+                            running.lock().unwrap().insert(id.clone(), l.clone());
                             timings
                                 .insert("ready_ms".into(), accepted.elapsed().as_millis() as u64);
                             timings.insert("total_ms".into(), t0.elapsed().as_millis() as u64);
@@ -225,6 +308,7 @@ async fn tile(
                             )
                             .await;
                             retry = Duration::from_secs(1);
+                            l
                         }
                         Err(e) => {
                             report(
@@ -237,8 +321,9 @@ async fn tile(
                                 Some((format!("{e:#}"), None)),
                             )
                             .await;
+                            l
                         }
-                    }
+                    };
                     current = Some((l, generation));
                 }
                 Err(LaunchError::NoCapacity(why)) => {
@@ -286,6 +371,7 @@ async fn tile(
             break;
         }
     }
+    running.lock().unwrap().remove(&id);
     if let Some((l, _)) = current {
         if let Err(e) = driver.terminate(&l.instance).await {
             tracing::warn!(instance = %l.instance, error = %e, "terminate failed");

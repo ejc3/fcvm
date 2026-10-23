@@ -53,9 +53,9 @@ pub struct FleetArgs {
 #[derive(Subcommand, Debug)]
 pub enum FleetCommand {
     /// Run the coordinator: the fleet state, the browser WebSocket and the agents
-    Coord(FleetCoordArgs),
+    Coord(Box<FleetCoordArgs>),
     /// Run the agent on a GPU host: one fcvm GPU VM per assigned slot
-    Agent(FleetAgentArgs),
+    Agent(Box<FleetAgentArgs>),
     /// Join a region's tile streams into one stream (POST /layout, GET /frames)
     Aggregate(FleetAggregateArgs),
 }
@@ -124,6 +124,8 @@ pub enum FleetEc2 {
     None,
     /// Fake EC2 instances that come up after a delay and render nothing (dark tiles)
     Fake,
+    /// Real EC2 instances from the tile launch template (--ec2-template)
+    Aws,
 }
 
 #[derive(Args, Debug)]
@@ -139,8 +141,21 @@ pub struct FleetCoordArgs {
     pub agent_cmds: Vec<String>,
 
     /// Keep the state in this JSON file (rewritten atomically) and resume from it
-    #[arg(long)]
+    #[arg(long, conflicts_with = "state_bucket")]
     pub state_file: Option<std::path::PathBuf>,
+
+    /// Keep the state as an S3 object in this bucket instead (read at start, rewritten
+    /// whole after changes and at shutdown)
+    #[arg(long, env = "FLEET_STATE_BUCKET")]
+    pub state_bucket: Option<String>,
+
+    /// The state object's key
+    #[arg(long, env = "FLEET_STATE_KEY", default_value = "state.json")]
+    pub state_key: String,
+
+    /// The state bucket's region (default: AWS_REGION)
+    #[arg(long, env = "FLEET_STATE_REGION")]
+    pub state_region: Option<String>,
 
     /// How viewer text is checked before it enters the scene
     #[arg(long, value_enum, default_value_t = FleetTextCheck::None)]
@@ -239,16 +254,85 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub admin_listen: Option<String>,
 
+    /// EC2 tiles the EC2 side runs (each side shows the GPUs it has live)
+    #[arg(long, default_value_t = 8)]
+    pub ec2_tiles: usize,
+
+    /// Regions to launch EC2 tiles in, tried in order (comma separated)
+    #[arg(long, env = "FLEET_REGIONS", value_delimiter = ',')]
+    pub ec2_regions: Vec<String>,
+
+    /// The EC2 tile launch template (one-time spot)
+    #[arg(long, default_value = "fcvm-fleet-tile-x86_64")]
+    pub ec2_template: String,
+
+    /// An on-demand tile launch template, tried when every region refuses spot capacity
+    #[arg(long)]
+    pub ec2_on_demand_template: Option<String>,
+
+    /// The DNS zone tiles and slots are named in (`ec2-<n>.<zone>`, `slot-<n>.<zone>`)
+    #[arg(long, default_value = "fcvm.dev")]
+    pub dns_zone: String,
+
+    /// Write the slots' DNS records with the Cloudflare token in this Secrets Manager secret
+    #[arg(long)]
+    pub dns_token_secret: Option<String>,
+
+    /// The zone's Cloudflare id (default: looked up by name)
+    #[arg(long)]
+    pub dns_zone_id: Option<String>,
+
+    /// Keep the wildcard certificate in this secret renewed (30 days before expiry, ACME
+    /// DNS-01 through the DNS token)
+    #[arg(long, requires = "dns_token_secret")]
+    pub tls_secret: Option<String>,
+
+    /// The ACME directory (default: Let's Encrypt production)
+    #[arg(long)]
+    pub acme_directory: Option<String>,
+
+    /// Region of the fleet's secrets (default: AWS_REGION)
+    #[arg(long)]
+    pub secrets_region: Option<String>,
+
     /// ffmpeg binary for the poster frame (decode, then JPEG)
     #[arg(long, default_value = "ffmpeg")]
     pub ffmpeg: String,
 }
 
 #[derive(Args, Debug)]
+#[command(group(clap::ArgGroup::new("transport").required(true).args(["stdio", "dial"])))]
 pub struct FleetAgentArgs {
-    /// Speak the agent protocol on stdin and stdout (the only transport today)
-    #[arg(long, required = true)]
+    /// Speak the agent protocol on stdin and stdout (the coordinator runs this agent)
+    #[arg(long)]
     pub stdio: bool,
+
+    /// Dial the coordinator's agent WebSocket (e.g. wss://<api host>/agent) and keep
+    /// reconnecting; the VMs keep running while it is away
+    #[arg(long)]
+    pub dial: Option<String>,
+
+    /// Secrets Manager secret holding the Cloudflare Access service token for --dial
+    /// (JSON with client_id and client_secret), read with the instance role
+    #[arg(long, requires = "dial")]
+    pub access_secret: Option<String>,
+
+    /// Region of --access-secret (default: the instance's region)
+    #[arg(long)]
+    pub secret_region: Option<String>,
+
+    /// The fleet's wildcard certificate secret, handed to every renderer (written into
+    /// --tls-dir and mapped into each VM)
+    #[arg(long)]
+    pub tls_secret: Option<String>,
+
+    /// Where the renderers' certificate files are kept on the host
+    #[arg(long, default_value = "/run/fcvm-fleet/tls")]
+    pub tls_dir: std::path::PathBuf,
+
+    /// Name the host by its EC2 instance id (from the instance metadata service)
+    #[arg(long, conflicts_with = "host")]
+    pub host_from_imds: bool,
 
     /// Host name reported to the coordinator (default: the system host name)
     #[arg(long)]

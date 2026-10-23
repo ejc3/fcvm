@@ -150,3 +150,111 @@ impl CredentialChain {
         Ok(r.cached())
     }
 }
+
+/// One signed AWS request. `base` is `https://<host>` (or a test server's `http://` URL);
+/// the `host` header is taken from it. S3 wants its payload hash in a header
+/// (`x-amz-content-sha256`), which is added for every service, harmlessly.
+#[allow(clippy::too_many_arguments)]
+pub async fn signed(
+    chain: &CredentialChain,
+    http: &reqwest::Client,
+    base: &str,
+    method: reqwest::Method,
+    path: &str,
+    query: &str,
+    region: &str,
+    service: &str,
+    extra: &[(&str, String)],
+    body: Vec<u8>,
+) -> Result<(reqwest::StatusCode, Vec<u8>)> {
+    use sha2::{Digest, Sha256};
+    let host = base
+        .split_once("://")
+        .map(|(_, h)| h)
+        .unwrap_or(base)
+        .trim_end_matches('/')
+        .to_string();
+    let creds = chain.get().await?;
+    let amz_date = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let mut headers = vec![
+        ("host".to_string(), host),
+        ("x-amz-date".to_string(), amz_date.clone()),
+        (
+            "x-amz-content-sha256".to_string(),
+            hex::encode(Sha256::digest(&body)),
+        ),
+    ];
+    for (k, v) in extra {
+        headers.push((k.to_ascii_lowercase(), v.clone()));
+    }
+    if let Some(t) = &creds.session_token {
+        headers.push(("x-amz-security-token".to_string(), t.clone()));
+    }
+    let auth = super::sigv4::authorization(
+        &creds,
+        method.as_str(),
+        path,
+        query,
+        &headers,
+        &body,
+        region,
+        service,
+        &amz_date,
+    );
+    let url = if query.is_empty() {
+        format!("{}{path}", base.trim_end_matches('/'))
+    } else {
+        format!("{}{path}?{query}", base.trim_end_matches('/'))
+    };
+    let mut req = http.request(method, url).header("authorization", auth);
+    for (k, v) in &headers {
+        if k != "host" {
+            req = req.header(k, v);
+        }
+    }
+    let r = req
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("calling {service}"))?;
+    let status = r.status();
+    let bytes = r.bytes().await?.to_vec();
+    Ok((status, bytes))
+}
+
+/// A value from the instance metadata service (IMDSv2), e.g. `instance-id`.
+pub async fn imds(path: &str) -> Result<String> {
+    const IMDS: &str = "http://169.254.169.254";
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(3))
+        .build()?;
+    let token = http
+        .put(format!("{IMDS}/latest/api/token"))
+        .header("X-aws-ec2-metadata-token-ttl-seconds", "300")
+        .send()
+        .await
+        .context("reaching the instance metadata service")?
+        .error_for_status()?
+        .text()
+        .await?;
+    Ok(http
+        .get(format!("{IMDS}/latest/meta-data/{path}"))
+        .header("X-aws-ec2-metadata-token", &token)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?
+        .trim()
+        .to_string())
+}
+
+/// The text of the first `<name>` element in an AWS XML answer.
+pub fn xml_tag(xml: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = xml.find(&open)? + open.len();
+    let end = xml[start..].find(&close)? + start;
+    Some(xml[start..end].trim().to_string())
+}

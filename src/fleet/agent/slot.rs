@@ -74,6 +74,11 @@ pub struct Desired {
     pub private_camera: Option<Vec<Keyframe>>,
     /// In the standby pool: no VM; the GPU reset, scrubbed and ready.
     pub standby: bool,
+    /// The layout generation of `rect`, the frame it takes effect at, and the rectangle
+    /// before; passed to the renderer, which switches at that frame.
+    pub layout_generation: u64,
+    pub rect_from_frame: i64,
+    pub previous_rect: Option<Rect>,
 }
 
 /// The whole image, which a private session draws.
@@ -132,6 +137,8 @@ impl SlotCtx {
             timings: timings.clone(),
             error,
             retry_in_ms: retry_in.map(ms),
+            ipv6: None,
+            ipv4: None,
         }));
     }
 
@@ -241,7 +248,12 @@ fn renderer_body(
             camera: camera.clone(),
             ..s.for_renderer(FULL_IMAGE)
         }),
-        None => want.rect.map(|r| s.for_renderer(r)),
+        None => want.rect.map(|r| RendererScene {
+            layout_generation: want.layout_generation,
+            rect_from_frame: want.rect_from_frame,
+            previous_rect: want.previous_rect,
+            ..s.for_renderer(r)
+        }),
     }
 }
 

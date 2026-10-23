@@ -70,7 +70,10 @@ fuse-pipe = { path = "fuse-pipe", default-features = false }
 exec-proto = { path = "exec-proto" }
 fleet-core = { path = "fleet/core" }
 futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
-tokio-tungstenite = "0.29"
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-webpki-roots"] }
+instant-acme = { version = "0.8", default-features = false, features = ["ring", "hyper-rustls", "rcgen"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring", "x509-parser"] }
+x509-parser = "0.18"
 failpoint = { path = "failpoint" }
 url = "2"
 axum = { version = "0.8", features = ["ws"] }
