@@ -21,6 +21,7 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
                 })
                 .collect(),
             capacity: 8,
+            store_ready_at: None,
         },
     }
 }

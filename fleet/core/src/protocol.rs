@@ -147,6 +147,9 @@ pub enum AgentMsg {
         arch: String,
         gpus: Vec<Gpu>,
         capacity: usize,
+        /// When the host's store was ready (Unix ms), if the host marks it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        store_ready_at: Option<u64>,
     },
     Slot(SlotReport),
     Health(HealthReport),

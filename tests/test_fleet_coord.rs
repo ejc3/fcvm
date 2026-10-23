@@ -592,6 +592,7 @@ impl FakeAgent {
                     })
                     .collect(),
                 capacity: gpus,
+                store_ready_at: None,
             })
             .unwrap();
         FakeAgent {
@@ -1232,7 +1233,7 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     );
     v.send(json!({"type": "visibility", "visible": false}))
         .await;
-    let s = v.until(|s| s["power"]["state"] == "asleep").await;
+    let s = v.until(|s| s["fleet"]["power"]["state"] == "asleep").await;
     assert_eq!(s["viewers"]["active"], 0);
     assert_eq!(s["viewers"]["count"], 1);
     let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -1243,9 +1244,74 @@ async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
     assert_eq!(calls()[1], ("fleet-hosts".to_string(), 0));
     v.send(json!({"type": "visibility", "visible": true})).await;
     let s = v
-        .until(|s| s["power"]["state"] == "waking" && s["power"]["hosts"][0]["phase"] == "pending")
+        .until(|s| {
+            s["fleet"]["power"]["state"] == "waking"
+                && s["fleet"]["power"]["hosts"][0]["phases"][0]["phase"] == "instance_pending"
+        })
         .await;
-    assert_eq!(s["power"]["hosts"][0]["instance"], "i-0123456789abcdef0");
-    assert!(s["power"]["woke_at"].is_u64());
+    assert_eq!(
+        s["fleet"]["power"]["hosts"][0]["host"],
+        "i-0123456789abcdef0"
+    );
+    assert!(s["fleet"]["power"]["woke_at"].is_u64());
     assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
+}
+
+/// No poster is taken while a race relaunches the tiles: their regions would be black.
+/// (On a GPU host the first posters of a run were black frames taken mid-race.)
+#[tokio::test]
+async fn no_poster_is_planned_while_a_race_runs() {
+    let config = Config {
+        restart_cooldown_secs: 0,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None);
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent
+        .to_coord
+        .send(AgentMsg::Aggregate {
+            frame_url: "ws://gpu-host.example:20200/frames".into(),
+        })
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle
+        .poster_plan()
+        .await
+        .is_none_or(|p| p.sources.is_empty())
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no plan before the race"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let r = handle
+        .apply(Event::Intent {
+            at: 0,
+            viewer: "v-1".into(),
+            client: Some("198.51.100.9".into()),
+            id: "race".into(),
+            name: "restart_now".into(),
+            args: json!({}),
+            check: None,
+            secret: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(r.outcome, fleet_core::state::Outcome::Committed);
+    assert!(
+        handle.poster_plan().await.is_none(),
+        "a poster planned during a race"
+    );
+    agent.report("slot-1", "running", 2);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while handle.poster_plan().await.is_none() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no plan after the race"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }

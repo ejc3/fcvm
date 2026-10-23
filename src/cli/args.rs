@@ -304,6 +304,11 @@ pub struct FleetAgentArgs {
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
 
+    /// A file the host's boot writes once its store is mounted; its modification time is
+    /// reported in the hello (the wake's `store_ready` phase)
+    #[arg(long)]
+    pub store_ready_file: Option<std::path::PathBuf>,
+
     /// Scrub each standby GPU with `<fcvm> gpu scrub <sbdf>` before reporting it ready; a
     /// failed scrub quarantines the GPU
     #[arg(long)]

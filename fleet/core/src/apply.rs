@@ -212,6 +212,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     arch,
                     gpus,
                     capacity,
+                    store_ready_at,
                 } => {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
@@ -220,6 +221,12 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         if p.state == "waking" {
                             let w = p.hosts.entry(host.clone()).or_default();
                             w.agent_at.get_or_insert(at);
+                            // The host's own clock: kept only when it falls inside this wake.
+                            if let Some(t) = store_ready_at
+                                .filter(|t| p.woke_at.is_some_and(|w| *t >= w) && *t <= at)
+                            {
+                                w.store_ready_at.get_or_insert(t);
+                            }
                         }
                     }
                 }
@@ -303,7 +310,7 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
 }
 
 /// A race whose halves are not all done.
-fn race_running(f: &Fleet) -> bool {
+pub fn race_running(f: &Fleet) -> bool {
     f.races.back().is_some_and(|r| {
         r.fcvm.done_at.is_none() && !r.fcvm.tiles.is_empty()
             || r.ec2.done_at.is_none() && !r.ec2.tiles.is_empty()
@@ -377,9 +384,16 @@ fn power_step(state: &mut State, at: u64) {
         }
         if image_complete(f) {
             let started = f.power.woke_at.unwrap_or(at);
+            let gpus = f
+                .slots
+                .values()
+                .chain(f.ec2.values())
+                .filter(|s| s.position.is_some())
+                .count();
             f.power.wakes.push_back(Wake {
                 started_at: started,
-                complete_at: at,
+                awake_at: at,
+                gpus,
                 ms: at - started,
             });
             while f.power.wakes.len() > MAX_WAKES {

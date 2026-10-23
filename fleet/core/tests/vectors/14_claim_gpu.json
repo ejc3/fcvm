@@ -440,6 +440,15 @@
       ],
       "max_tiles": 2,
       "n": 2,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
       "standby": [
         "slot-3"
       ],
@@ -469,15 +478,6 @@
           "votes": 0
         }
       ]
-    },
-    "power": {
-      "asleep_since": null,
-      "hosts": [],
-      "idle_since": null,
-      "last_wake_ms": null,
-      "state": "awake",
-      "wakes": [],
-      "woke_at": null
     },
     "races": [],
     "relaunch_all": null,

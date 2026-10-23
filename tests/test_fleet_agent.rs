@@ -107,6 +107,7 @@ impl Coord {
             spot_notice_url,
             spot_poll: Duration::from_millis(50),
             aggregate: None,
+            store_ready_file: None,
         };
         let task = tokio::spawn(serve(agent, agent_in, agent_out));
         let (to_agent, _w) = spawn_writer::<CoordMsg, _>(coord_out, "agent");
@@ -790,6 +791,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         cfg: cfg(&f.fcvm),
         spot_notice_url: None,
         spot_poll: Duration::from_millis(50),
+        store_ready_file: None,
         aggregate: Some((
             port,
             vec![
@@ -1060,4 +1062,47 @@ async fn a_failure_naming_the_gpu_quarantines_it_at_once() {
         .count();
     assert_eq!(starts, 1);
     c.close().await;
+}
+
+/// The hello carries the modification time of the host's store-ready marker, so the
+/// coordinator can show when the store was ready during a wake.
+#[tokio::test]
+async fn the_hello_reports_when_the_store_was_ready() {
+    let dir = tempfile::tempdir().unwrap();
+    let marker = dir.path().join("store-ready");
+    std::fs::write(&marker, "").unwrap();
+    let want = std::fs::metadata(&marker)
+        .unwrap()
+        .modified()
+        .unwrap()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let f = fake(1, &[]);
+    let (agent_side, coord_side) = tokio::io::duplex(1 << 20);
+    let (agent_in, agent_out) = tokio::io::split(agent_side);
+    let (coord_in, _coord_out) = tokio::io::split(coord_side);
+    let agent = Agent {
+        host: "gpu-host".into(),
+        gpus: gpus(1),
+        capacity: 1,
+        base_port: f.base,
+        cfg: cfg(&f.fcvm),
+        spot_notice_url: None,
+        spot_poll: Duration::from_millis(50),
+        aggregate: None,
+        store_ready_file: Some(marker),
+    };
+    let task = tokio::spawn(serve(agent, agent_in, agent_out));
+    let mut from_agent = LineReader::new(coord_in, "agent");
+    let hello = tokio::time::timeout(Duration::from_secs(10), from_agent.next::<AgentMsg>())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    match hello {
+        AgentMsg::Hello { store_ready_at, .. } => assert_eq!(store_ready_at, Some(want)),
+        other => panic!("first message {other:?}"),
+    }
+    task.abort();
 }

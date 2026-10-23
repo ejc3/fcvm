@@ -83,6 +83,7 @@ pub struct FleetView {
     /// VM, and how many of them have reported ready.
     pub standby: Vec<String>,
     pub standby_ready: usize,
+    pub power: PowerView,
 }
 
 /// Totals since the fleet was first started.
@@ -247,15 +248,18 @@ pub struct ViewersView {
 }
 
 #[derive(Debug, Clone, Serialize)]
+pub struct WakePhase {
+    /// `instance_pending`, `booted`, `store_ready`, `agent_connected`, `tiles_rendering`.
+    pub phase: String,
+    pub at: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
 pub struct HostWakeView {
     /// The EC2 instance id (the host's name once its agent connects).
-    pub instance: String,
-    /// `pending`, `booted`, `agent_connected` or `rendering`.
-    pub phase: String,
-    pub pending_at: Option<u64>,
-    pub booted_at: Option<u64>,
-    pub agent_at: Option<u64>,
-    pub rendering_at: Option<u64>,
+    pub host: String,
+    /// The phases reached so far, in order.
+    pub phases: Vec<WakePhase>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,11 +268,12 @@ pub struct PowerView {
     pub state: String,
     pub idle_since: Option<u64>,
     pub asleep_since: Option<u64>,
+    /// When the current (or last) wake began: the first active viewer.
     pub woke_at: Option<u64>,
     /// While waking: each GPU host's progress.
     pub hosts: Vec<HostWakeView>,
-    /// The last wake, first active viewer to the complete image.
-    pub last_wake_ms: Option<u64>,
+    /// The last completed wake, and the last 20.
+    pub last_wake: Option<Wake>,
     pub wakes: Vec<Wake>,
 }
 
@@ -292,7 +297,6 @@ pub struct View {
     pub failures: Vec<FailureView>,
     pub claims: Vec<ClaimView>,
     pub counters: CountersView,
-    pub power: PowerView,
     pub viewers: ViewersView,
     pub actions: Vec<Action>,
 }
@@ -472,6 +476,7 @@ pub fn view(state: &State) -> View {
             max_tiles: c.max_tiles,
             standby,
             standby_ready,
+            power: power_view(&f.power),
         },
         scene: f.scene.clone(),
         image_aspect: c.image_aspect,
@@ -515,36 +520,7 @@ pub fn view(state: &State) -> View {
             count: f.viewers.len(),
             active: f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count(),
         },
-        power: PowerView {
-            state: f.power.state.clone(),
-            idle_since: f.power.idle_since,
-            asleep_since: f.power.asleep_since,
-            woke_at: f.power.woke_at,
-            hosts: f
-                .power
-                .hosts
-                .iter()
-                .map(|(id, w)| HostWakeView {
-                    instance: id.clone(),
-                    phase: if w.rendering_at.is_some() {
-                        "rendering"
-                    } else if w.agent_at.is_some() {
-                        "agent_connected"
-                    } else if w.booted_at.is_some() {
-                        "booted"
-                    } else {
-                        "pending"
-                    }
-                    .into(),
-                    pending_at: w.pending_at,
-                    booted_at: w.booted_at,
-                    agent_at: w.agent_at,
-                    rendering_at: w.rendering_at,
-                })
-                .collect(),
-            last_wake_ms: f.power.wakes.back().map(|w| w.ms),
-            wakes: f.power.wakes.iter().cloned().collect(),
-        },
+
         actions: f.actions.iter().cloned().collect(),
     }
 }
@@ -572,6 +548,39 @@ fn score<'a>(halves: impl DoubleEndedIterator<Item = (u64, &'a HalfRace)>) -> Op
         last_capacity_wait_ms: last.capacity_wait_ms,
         last_race: last_id,
     })
+}
+
+fn power_view(p: &Power) -> PowerView {
+    PowerView {
+        state: p.state.clone(),
+        idle_since: p.idle_since,
+        asleep_since: p.asleep_since,
+        woke_at: p.woke_at,
+        hosts: p
+            .hosts
+            .iter()
+            .map(|(id, w)| HostWakeView {
+                host: id.clone(),
+                phases: [
+                    ("instance_pending", w.pending_at),
+                    ("booted", w.booted_at),
+                    ("store_ready", w.store_ready_at),
+                    ("agent_connected", w.agent_at),
+                    ("tiles_rendering", w.rendering_at),
+                ]
+                .into_iter()
+                .filter_map(|(phase, at)| {
+                    Some(WakePhase {
+                        phase: phase.into(),
+                        at: at?,
+                    })
+                })
+                .collect(),
+            })
+            .collect(),
+        last_wake: p.wakes.back().cloned(),
+        wakes: p.wakes.iter().cloned().collect(),
+    }
 }
 
 fn relaunch_all(r: &Race) -> RelaunchAllView {

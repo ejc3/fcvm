@@ -139,6 +139,7 @@
           }
         ],
         "host": "h1",
+        "store_ready_at": 455000,
         "type": "hello"
       },
       "type": "agent"
@@ -235,21 +236,21 @@
     {
       "after": 0,
       "checks": {
-        "/view/power/idle_since": 1000,
-        "/view/power/state": "awake"
+        "/view/fleet/power/idle_since": 1000,
+        "/view/fleet/power/state": "awake"
       }
     },
     {
       "after": 3,
       "checks": {
-        "/view/power/idle_since": null,
+        "/view/fleet/power/idle_since": null,
         "/view/viewers/active": 1
       }
     },
     {
       "after": 4,
       "checks": {
-        "/view/power/idle_since": 3000,
+        "/view/fleet/power/idle_since": 3000,
         "/view/viewers/active": 0,
         "/view/viewers/count": 1
       },
@@ -258,16 +259,16 @@
     {
       "after": 5,
       "checks": {
-        "/view/power/state": "awake"
+        "/view/fleet/power/state": "awake"
       }
     },
     {
       "after": 6,
       "checks": {
         "/ec2_assign": [],
-        "/view/next_race_at": null,
-        "/view/power/asleep_since": 63000,
-        "/view/power/state": "asleep"
+        "/view/fleet/power/asleep_since": 63000,
+        "/view/fleet/power/state": "asleep",
+        "/view/next_race_at": null
       }
     },
     {
@@ -294,21 +295,22 @@
       "checks": {
         "/ec2_assign/1/id": "ec2-2",
         "/ec2_assign/2": null,
-        "/view/power/state": "waking",
-        "/view/power/woke_at": 400000
+        "/view/fleet/power/state": "waking",
+        "/view/fleet/power/woke_at": 400000
       }
     },
     {
       "after": 11,
       "checks": {
-        "/view/power/hosts": [
+        "/view/fleet/power/hosts": [
           {
-            "agent_at": null,
-            "booted_at": null,
-            "instance": "h1",
-            "pending_at": 401000,
-            "phase": "pending",
-            "rendering_at": null
+            "host": "h1",
+            "phases": [
+              {
+                "at": 401000,
+                "phase": "instance_pending"
+              }
+            ]
           }
         ]
       }
@@ -316,38 +318,49 @@
     {
       "after": 12,
       "checks": {
-        "/view/power/hosts/0/booted_at": 450000,
-        "/view/power/hosts/0/phase": "booted"
+        "/view/fleet/power/hosts/0/phases/1": {
+          "at": 450000,
+          "phase": "booted"
+        }
       }
     },
     {
       "after": 13,
       "checks": {
-        "/view/power/hosts/0/agent_at": 460000,
-        "/view/power/hosts/0/phase": "agent_connected"
-      }
+        "/view/fleet/power/hosts/0/phases/2": {
+          "at": 455000,
+          "phase": "store_ready"
+        },
+        "/view/fleet/power/hosts/0/phases/3": {
+          "at": 460000,
+          "phase": "agent_connected"
+        },
+        "/view/fleet/power/hosts/0/phases/4": null
+      },
+      "note": "the host marked its store ready before the agent connected"
     },
     {
       "after": 15,
       "checks": {
-        "/view/power/hosts/0/phase": "rendering",
-        "/view/power/hosts/0/rendering_at": 471000,
-        "/view/power/state": "waking"
+        "/view/fleet/power/hosts/0/phases/4": {
+          "at": 471000,
+          "phase": "tiles_rendering"
+        },
+        "/view/fleet/power/state": "waking"
       }
     },
     {
       "after": 17,
       "checks": {
-        "/view/next_race_at": 781000,
-        "/view/power/last_wake_ms": 81000,
-        "/view/power/state": "awake",
-        "/view/power/wakes": [
-          {
-            "complete_at": 481000,
-            "ms": 81000,
-            "started_at": 400000
-          }
-        ]
+        "/view/fleet/power/last_wake": {
+          "awake_at": 481000,
+          "gpus": 4,
+          "ms": 81000,
+          "started_at": 400000
+        },
+        "/view/fleet/power/state": "awake",
+        "/view/fleet/power/woke_at": 400000,
+        "/view/next_race_at": 781000
       }
     },
     {
@@ -359,7 +372,7 @@
     {
       "after": 22,
       "checks": {
-        "/view/power/state": "awake"
+        "/view/fleet/power/state": "awake"
       },
       "note": "idle long enough, but a claim is active"
     },
@@ -367,7 +380,7 @@
       "after": 23,
       "checks": {
         "/view/claims": [],
-        "/view/power/state": "asleep"
+        "/view/fleet/power/state": "asleep"
       },
       "note": "the claim expired in this tick"
     }
@@ -448,6 +461,27 @@
       ],
       "max_tiles": 100,
       "n": 2,
+      "power": {
+        "asleep_since": 620200,
+        "hosts": [],
+        "idle_since": 500300,
+        "last_wake": {
+          "awake_at": 481000,
+          "gpus": 4,
+          "ms": 81000,
+          "started_at": 400000
+        },
+        "state": "asleep",
+        "wakes": [
+          {
+            "awake_at": 481000,
+            "gpus": 4,
+            "ms": 81000,
+            "started_at": 400000
+          }
+        ],
+        "woke_at": null
+      },
       "standby": [],
       "standby_ready": 0
     },
@@ -475,21 +509,6 @@
           "votes": 0
         }
       ]
-    },
-    "power": {
-      "asleep_since": 620200,
-      "hosts": [],
-      "idle_since": 500300,
-      "last_wake_ms": 81000,
-      "state": "asleep",
-      "wakes": [
-        {
-          "complete_at": 481000,
-          "ms": 81000,
-          "started_at": 400000
-        }
-      ],
-      "woke_at": null
     },
     "races": [],
     "relaunch_all": null,

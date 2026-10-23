@@ -32,6 +32,15 @@ pub struct Agent {
     /// Run an aggregator for this host's band on this port, with this command
     /// (`fcvm fleet aggregate ...`; `--listen` is added).
     pub aggregate: Option<(u16, Vec<String>)>,
+    /// A file the host's boot writes once its store is mounted; its modification time is
+    /// reported in the hello.
+    pub store_ready_file: Option<std::path::PathBuf>,
+}
+
+/// The modification time of `path` in Unix milliseconds, if it exists.
+fn mtime_ms(path: &std::path::Path) -> Option<u64> {
+    let t = std::fs::metadata(path).ok()?.modified().ok()?;
+    Some(t.duration_since(std::time::UNIX_EPOCH).ok()?.as_millis() as u64)
 }
 
 pub async fn run(args: FleetAgentArgs) -> Result<()> {
@@ -78,6 +87,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         },
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
+        store_ready_file: args.store_ready_file.clone(),
         aggregate: args.aggregate_port.map(|p| {
             let mut argv = vec![
                 std::env::current_exe()
@@ -121,6 +131,7 @@ where
         arch: std::env::consts::ARCH.to_string(),
         gpus: agent.gpus.clone(),
         capacity: agent.capacity,
+        store_ready_at: agent.store_ready_file.as_deref().and_then(mtime_ms),
     })
     .ok();
     let http = reqwest::Client::builder()

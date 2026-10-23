@@ -61,6 +61,9 @@ pub struct HostWake {
     /// The auto scaling group reported it pending, then in service.
     pub pending_at: Option<u64>,
     pub booted_at: Option<u64>,
+    /// The host marked its store ready (reported in the agent's hello).
+    #[serde(default)]
+    pub store_ready_at: Option<u64>,
     /// Its agent said hello (the agent starts once the host's store is mounted).
     pub agent_at: Option<u64>,
     /// Every one of its slots reported running.
@@ -71,7 +74,10 @@ pub struct HostWake {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Wake {
     pub started_at: u64,
-    pub complete_at: u64,
+    /// Every placed tile of both halves was rendering.
+    pub awake_at: u64,
+    /// The tiles placed then, both halves.
+    pub gpus: usize,
     pub ms: u64,
 }
 

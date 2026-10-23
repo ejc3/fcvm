@@ -203,6 +203,15 @@
       ],
       "max_tiles": 100,
       "n": 1,
+      "power": {
+        "asleep_since": null,
+        "hosts": [],
+        "idle_since": null,
+        "last_wake": null,
+        "state": "awake",
+        "wakes": [],
+        "woke_at": null
+      },
       "standby": [],
       "standby_ready": 0
     },
@@ -230,15 +239,6 @@
           "votes": 0
         }
       ]
-    },
-    "power": {
-      "asleep_since": null,
-      "hosts": [],
-      "idle_since": null,
-      "last_wake_ms": null,
-      "state": "awake",
-      "wakes": [],
-      "woke_at": null
     },
     "races": [],
     "relaunch_all": null,
