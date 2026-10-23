@@ -175,3 +175,47 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
         last = now;
     }
 }
+
+/// A tick that only forgets per-client limits (here a light's) changes nothing anyone sees,
+/// so it keeps the version; a coordinator ticking between two intents must not move it.
+#[test]
+fn forgetting_a_rate_limit_keeps_the_version() {
+    let mut s = State::new(Config::default(), 0);
+    s = apply(s, &hello(1, "h", 1));
+    s = apply(
+        s,
+        &Event::ViewerJoined {
+            at: 2,
+            viewer: "v".into(),
+            client: Some("192.0.2.7".into()),
+        },
+    );
+    s = apply(
+        s,
+        &Event::Intent {
+            at: 100,
+            viewer: "v".into(),
+            client: Some("192.0.2.7".into()),
+            id: "l".into(),
+            name: "light".into(),
+            args: serde_json::json!({"pos": [1.0, 2.0, -90.0], "color": [1.0, 0.5, 0.0]}),
+            check: None,
+            secret: None,
+        },
+    );
+    assert_eq!(
+        s.receipt("l").map(|r| r.outcome),
+        Some(fleet_core::state::Outcome::Committed)
+    );
+    let before = (s.version, serde_json::to_value(view(&s)).unwrap());
+    s = apply(s, &Event::Tick { at: 1_200 });
+    assert_eq!(
+        serde_json::to_value(view(&s)).unwrap(),
+        before.1,
+        "the tick changed the view"
+    );
+    assert_eq!(
+        s.version, before.0,
+        "a tick that only forgot a limit moved the version"
+    );
+}

@@ -369,8 +369,21 @@ pub struct LayoutGen {
     pub ec2: Option<Rect>,
 }
 
-/// Frames a new layout waits before it takes effect, so it reaches every renderer first.
-pub const LAYOUT_LEAD_FRAMES: i64 = 45;
+/// Frames allowed for a new layout's scene posts (coordinator to agent to renderer, or the
+/// coordinator to an EC2 tile) to reach every renderer.
+pub const POST_DELIVERY_FRAMES: i64 = 30;
+/// Frames a renderer needs between the post's arrival and the layout's frame, to open the
+/// new rectangle's encoders off its render thread (the renderer's round 10: at least 0.5 s).
+pub const ENCODER_LEAD_FRAMES: i64 = 15;
+/// Frames a new layout waits before it takes effect.
+pub const LAYOUT_LEAD_FRAMES: i64 = POST_DELIVERY_FRAMES + ENCODER_LEAD_FRAMES;
+
+/// The frame a layout made at scene time `t` takes effect at: the first frame at or after
+/// `t`, plus the delivery allowance and the renderer's encoder lead, so a post that arrives
+/// within `POST_DELIVERY_FRAMES` leaves the renderer at least 0.5 s.
+pub fn layout_from_frame(t: f64) -> i64 {
+    (t * 30.0).ceil() as i64 + LAYOUT_LEAD_FRAMES
+}
 
 /// Totals since the fleet was first started (kept across coordinator restarts).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
@@ -580,4 +593,25 @@ pub fn slot_number(id: &str) -> Option<u32> {
 
 pub fn ec2_number(id: &str) -> Option<u32> {
     id.strip_prefix("ec2-")?.parse().ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_layout_leaves_every_renderer_half_a_second_after_its_post() {
+        for t in [0.0, 0.004, 0.01, 0.034, 12.345, 861.999, 3600.5] {
+            let k = layout_from_frame(t);
+            let at = k as f64 / 30.0;
+            // A post that left at `t` and arrived within the delivery allowance.
+            let arrived = t + POST_DELIVERY_FRAMES as f64 / 30.0;
+            assert!(
+                at - arrived >= 0.5 - 1e-9,
+                "t {t}: frame {k} is {} s after arrival",
+                at - arrived
+            );
+        }
+        assert_eq!(layout_from_frame(10.0), 345);
+    }
 }

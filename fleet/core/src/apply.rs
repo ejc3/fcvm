@@ -15,6 +15,21 @@ pub const RECLAIMED_KEEP_MS: u64 = 60_000;
 /// Races counted in the scoreboard's medians.
 pub const SCOREBOARD_RACES: usize = 20;
 
+/// Give `before` the bookkeeping of `after`: state that nobody sees and that a tick moves on
+/// its own (the per-client limits it forgets, the budget's round clock, smoothed fit and
+/// count of rounds), so a tick that only moves it keeps the version. Each of these changes
+/// with a visible change or a receipt when it matters (an intent records its client's time
+/// with its receipt; a budget change is in the view).
+fn same_bookkeeping(before: &mut Fleet, after: &Fleet) {
+    before.last_word_at = after.last_word_at.clone();
+    before.last_light_at = after.last_light_at.clone();
+    before.last_relaunch_at = after.last_relaunch_at.clone();
+    before.last_claim_end = after.last_claim_end.clone();
+    before.budget.next_round_at = after.budget.next_round_at;
+    before.budget.smoothed = after.budget.smoothed;
+    before.budget.up_rounds = after.budget.up_rounds;
+}
+
 /// Apply one event. The version moves exactly when the state changed; an intent id seen
 /// before changes nothing (its first receipt stays in `state.receipts`).
 pub fn apply(mut state: State, event: &Event) -> State {
@@ -28,13 +43,8 @@ pub fn apply(mut state: State, event: &Event) -> State {
     if state.fleet.power.state != power {
         retile(&mut state.fleet, &state.config, event.at());
     }
-    // The budget's round bookkeeping (when the next round is due, the smoothed fit, rounds
-    // that allowed a raise)
-    // is not a change anyone sees; a tick that only moves it keeps the version.
     let mut before = before;
-    before.budget.next_round_at = state.fleet.budget.next_round_at;
-    before.budget.smoothed = state.fleet.budget.smoothed;
-    before.budget.up_rounds = state.fleet.budget.up_rounds;
+    same_bookkeeping(&mut before, &state.fleet);
     let changed = receipt.is_some() || state.fleet != before;
     if changed {
         state.version += 1;
@@ -1321,7 +1331,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     if changed {
         f.layout = LayoutGen {
             generation,
-            from_frame: (f.scene.t_at(at) * 30.0).round() as i64 + LAYOUT_LEAD_FRAMES,
+            from_frame: crate::state::layout_from_frame(f.scene.t_at(at)),
             fcvm: (f.n > 0).then_some(fcvm_side),
             ec2: (f.ec2_n > 0).then_some(ec2_side),
         };
