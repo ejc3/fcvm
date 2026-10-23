@@ -1241,9 +1241,13 @@ fn drop_missing_from_races(f: &mut Fleet, at: u64) {
 ///   into one band per host, the EC2 half repeats the layout, and the rest of each half is
 ///   dark. fcvm slots beyond N are standby.
 fn retile(f: &mut Fleet, c: &Config, at: u64) {
+    // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
+    // EC2 side's tiles go away, whether or not their hosts scale down with them.
+    let asleep = f.power.state == "asleep";
     let active: Vec<u32> = f
         .slots
         .iter()
+        .filter(|_| !asleep)
         .filter(|(_, s)| {
             s.claim.as_ref().is_none_or(|c| c.borrowed.is_some())
                 && !is_quarantined(f, s)
@@ -1257,7 +1261,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         .collect();
     // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
     // the GPUs it has live); asleep it has none.
-    let want_ec2 = if f.power.state == "asleep" {
+    let want_ec2 = if asleep {
         0
     } else {
         c.ec2_max.min(c.max_tiles) as u32

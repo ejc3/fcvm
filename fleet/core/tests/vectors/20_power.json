@@ -265,11 +265,17 @@
     {
       "after": 6,
       "checks": {
+        "/assign/h1/0/rect": null,
+        "/assign/h1/0/standby": true,
+        "/assign/h1/1/standby": true,
         "/ec2_assign": [],
+        "/view/fleet/n": 0,
         "/view/fleet/power/asleep_since": 63000,
         "/view/fleet/power/state": "asleep",
-        "/view/next_race_at": null
-      }
+        "/view/next_race_at": null,
+        "/view/tiles": []
+      },
+      "note": "asleep, the fcvm GPUs leave the wall and their VMs stop (standby) though their host stays"
     },
     {
       "after": 7,
@@ -406,26 +412,9 @@
         "viewer": "v2"
       }
     ],
-    "aggregates": [
-      {
-        "frame_url": null,
-        "half": "fcvm",
-        "host": "h1",
-        "id": "agg:h1",
-        "rect": {
-          "h": 1.0,
-          "w": 1.0,
-          "x": 0.0,
-          "y": 0.0
-        },
-        "tiles": [
-          "fcvm:1",
-          "fcvm:2"
-        ]
-      }
-    ],
+    "aggregates": [],
     "borrow": {
-      "cap": 1,
+      "cap": 0,
       "lent": 0,
       "next_return_at": null
     },
@@ -464,7 +453,7 @@
         }
       ],
       "max_tiles": 100,
-      "n": 2,
+      "n": 0,
       "power": {
         "asleep_since": 620200,
         "hosts": [],
@@ -486,18 +475,16 @@
         ],
         "woke_at": null
       },
-      "standby": [],
+      "standby": [
+        "slot-1",
+        "slot-2"
+      ],
       "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
     "layout": {
       "ec2": null,
-      "fcvm": {
-        "h": 1.0,
-        "w": 1.0,
-        "x": 0.0,
-        "y": 0.0
-      },
+      "fcvm": null,
       "from_frame": 18651,
       "from_t": 621.7,
       "generation": 6
@@ -610,77 +597,7 @@
       "ec2": null,
       "fcvm": null
     },
-    "tiles": [
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": "ws://h1:20001/frames",
-        "generation": 1,
-        "gpu": {
-          "name": "Tesla T4",
-          "sbdf": "0000:01:00.0"
-        },
-        "gpu_stats": null,
-        "half": "fcvm",
-        "host": "h1",
-        "id": "fcvm:1",
-        "last_relaunch": null,
-        "phase": "running",
-        "previous_rect": {
-          "h": 0.5,
-          "w": 0.5,
-          "x": 0.0,
-          "y": 0.0
-        },
-        "rect": {
-          "h": 1.0,
-          "w": 0.5,
-          "x": 0.0,
-          "y": 0.0
-        },
-        "slot": "slot-1",
-        "vm": "fleet-slot-1"
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": "ws://h1:20002/frames",
-        "generation": 3,
-        "gpu": {
-          "name": "Tesla T4",
-          "sbdf": "0000:02:00.0"
-        },
-        "gpu_stats": null,
-        "half": "fcvm",
-        "host": "h1",
-        "id": "fcvm:2",
-        "last_relaunch": {
-          "by": "return:claim-1",
-          "clicked_at": 620200,
-          "first_frame_at": null,
-          "phases": {}
-        },
-        "phase": "relaunching",
-        "previous_rect": {
-          "h": 0.5,
-          "w": 0.5,
-          "x": 0.0,
-          "y": 0.5
-        },
-        "rect": {
-          "h": 1.0,
-          "w": 0.5,
-          "x": 0.5,
-          "y": 0.0
-        },
-        "slot": "slot-2",
-        "vm": "fleet-slot-2"
-      }
-    ],
+    "tiles": [],
     "viewers": {
       "active": 0,
       "count": 1

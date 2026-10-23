@@ -330,11 +330,13 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
 - `fleet.power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts'
-  auto scaling groups (`--scale-group`; without any it stays `awake`). After
+  auto scaling groups (`--scale-group`), or with `--sleep-when-idle` on hosts it does not
+  scale (a fixed host, a test box); without either it stays `awake`. After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
   never while a claim is active or a race is running, the fleet goes `asleep`
-  (`asleep_since`): every group is set to desired capacity 0, the EC2 half has no tiles
-  (their instances are terminated), no race is scheduled (`next_race_at` null) and
+  (`asleep_since`): every group is set to desired capacity 0, nothing is placed (every fcvm
+  GPU still connected goes to standby, so its VM stops; the EC2 half's instances are
+  terminated), no race is scheduled (`next_race_at` null) and
   `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
   arrives it is `waking` from `woke_at`, the moment the wake began: every group goes back
   to `--awake-capacity` (default 1) and the EC2 half launches as many tiles as the fcvm
