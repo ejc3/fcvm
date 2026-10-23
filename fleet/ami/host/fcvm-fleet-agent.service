@@ -10,8 +10,12 @@ After=fcvm-fleet-vfio.service fcvm-fleet-store.service network-online.target
 Wants=network-online.target
 ConditionPathExists=/etc/fcvm-fleet/agent.env
 
+#
+# It runs as root: each slot's VM gets its own public IPv6 address in fcvm's routed mode
+# (--ipv6-prefix-from-imds), which needs root, and the agent refuses a prefix otherwise.
+# The renderer image is in root's podman store and fcvm's config in /root/.config/fcvm
+# (build.sh puts both there).
 [Service]
-User=ubuntu
 EnvironmentFile=/etc/fcvm-fleet/agent.env
 ExecStart=/usr/local/bin/fcvm fleet agent $FLEET_AGENT_ARGS
 LimitMEMLOCK=infinity

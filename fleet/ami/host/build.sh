@@ -91,6 +91,10 @@ build)
   as_user "bash $HERE/warm.sh $G0 $L/warm.log"
   # The tile AMI loads this export; build-ami.sh uploads it with a fresh presigned URL.
   as_user "podman save --format oci-archive localhost/fcvm-renderer:fleet -o /mnt/fcvm-btrfs/renderer.oci.tar"
+  # The agent runs as root (routed VMs): root's podman store needs the image, and root's fcvm
+  # the same config as the build user's.
+  podman load -q -i /mnt/fcvm-btrfs/renderer.oci.tar
+  install -D -m 0644 "$UH/.config/fcvm/rootfs-config.toml" /root/.config/fcvm/rootfs-config.toml
   zstd -q -T0 -f --rm /mnt/fcvm-btrfs/renderer.oci.tar -o /mnt/fcvm-btrfs/renderer.oci.tar.zst
   sha256sum /mnt/fcvm-btrfs/renderer.oci.tar.zst | tee "$S/renderer.sha256"
   as_user "podman image inspect localhost/fcvm-renderer:fleet --format '{{.Id}}'" | tee "$S/renderer.id"
