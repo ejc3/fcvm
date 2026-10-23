@@ -445,8 +445,13 @@ pub fn read_records(state_dir: &Path) -> Result<Vec<GpuRecord>> {
 /// from before it touches the GPU until its outcome is written.
 fn lock_gpu(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
     use fs2::FileExt as _;
+    use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
+    // Root writes the records and rootless launches read them, whatever
+    // root's umask.
+    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o755))
+        .with_context(|| format!("making {} readable", state_dir.display()))?;
     let path = state_dir.join(format!("{sbdf}.lock"));
     let lock = std::fs::OpenOptions::new()
         .create(true)
@@ -468,6 +473,7 @@ fn write_record(state_dir: &Path, record: &GpuRecord) -> Result<()> {
     let mut file =
         std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     file.write_all(serde_json::to_string_pretty(record)?.as_bytes())?;
+    file.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o644))?;
     file.sync_all()?;
     std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
     std::fs::File::open(state_dir)
@@ -887,6 +893,23 @@ mod tests {
             !reset.get(),
             "the GPU was reset with no record saying a scrub had started"
         );
+    }
+
+    /// Root writes the records and rootless launches read them, so a record
+    /// and its directory are readable by everyone whatever root's umask.
+    #[test]
+    fn records_are_readable_by_rootless_launches_under_any_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("gpu");
+        // nextest runs each test in its own process, so the umask is ours.
+        let old = unsafe { libc::umask(0o077) };
+        let recorded = record_outcome(&state, "0000:18:00.0", &Ok(ScrubTimings::default()));
+        unsafe { libc::umask(old) };
+        recorded.unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&state), 0o755, "state directory");
+        assert_eq!(mode(&state.join("0000:18:00.0.json")), 0o644, "record");
     }
 
     /// A record is published by rename, and the directory is synced after
