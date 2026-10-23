@@ -257,13 +257,18 @@ bool TlsFront::load(const std::string& path, std::string* err) {
 }
 
 void TlsFront::watch(const std::string& path, int period_ms) {
-  watcher_ = std::thread([this, path, period_ms] {
-    // A file is loaded once per version (inode, size, modification time): a
-    // rename into place or a rewrite is a new version. One read halfway
-    // through a rewrite fails to parse, and the writer's last write makes a
-    // newer version that is read again.
-    struct stat last {};
-    bool have = loaded() && stat(path.c_str(), &last) == 0;
+  // A file is loaded once per version (inode, size, modification time): a
+  // rename into place or a rewrite is a new version. One read halfway
+  // through a rewrite fails to parse, and the writer's last write makes a
+  // newer version that is read again. The version already loaded is taken
+  // here, before watch() returns: taken in the thread, a file replaced
+  // before the thread first ran was taken as the loaded one and never read.
+  struct stat last0 {};
+  bool have0 = loaded() && stat(path.c_str(), &last0) == 0;
+  watcher_ = std::thread([this, path, period_ms, last0, have0] {
+    struct stat last = last0;
+    bool have = have0;
+    if (test_watch_delay_ms > 0) usleep(test_watch_delay_ms * 1000);
     while (!stop_) {
       struct stat st {};
       if (stat(path.c_str(), &st) == 0 &&

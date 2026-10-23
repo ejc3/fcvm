@@ -221,6 +221,9 @@ static void run() {
 
   // Reload: replace the file; new connections get the new certificate and
   // the open one keeps working.
+  // the watcher thread starts late (a busy host): a file replaced before it
+  // first looks is still read
+  front.test_watch_delay_ms = 300;
   front.watch(path, 100);
   write_secret(path, c2, k2);
   for (int i = 0; i < 100 && front.generation() < 2; i++) std::this_thread::sleep_for(std::chrono::milliseconds(50));
