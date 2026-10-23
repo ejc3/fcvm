@@ -12,6 +12,7 @@ pub mod aws;
 pub mod ec2;
 pub mod live;
 pub mod poster;
+pub mod scale;
 pub mod sigv4;
 pub mod store;
 pub mod text_check;
@@ -102,6 +103,8 @@ pub struct Outputs {
     pub ec2: watch::Sender<Vec<AssignSlot>>,
     /// The EC2 half's aggregator layout.
     pub ec2_layout: watch::Sender<Option<Layout>>,
+    /// The fleet's power state (`awake`, `asleep`, `waking`).
+    pub power: watch::Sender<String>,
     pub store: Option<store::StoreTx>,
 }
 
@@ -210,6 +213,12 @@ impl Actor {
         self.out.ec2_layout.send_if_modified(|cur| {
             let changed = cur.as_ref() != Some(&ec2_layout);
             *cur = Some(ec2_layout.clone());
+            changed
+        });
+        let power = self.state.fleet.power.state.clone();
+        self.out.power.send_if_modified(|cur| {
+            let changed = *cur != power;
+            *cur = power.clone();
             changed
         });
         let ec2 = ec2_assignment(&self.state);
@@ -436,7 +445,9 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::AgentGone { at, .. }
         | Event::Ec2 { at, .. }
         | Event::Degraded { at, .. }
-        | Event::ReleaseQuarantine { at, .. } => *at = t,
+        | Event::ReleaseQuarantine { at, .. }
+        | Event::Visibility { at, .. }
+        | Event::ScaleInstances { at, .. } => *at = t,
     }
 }
 
@@ -532,6 +543,7 @@ pub fn start(
     store: Option<store::StoreTx>,
     ec2: Option<Arc<dyn ec2::Ec2Driver>>,
     ec2_aggregate_local: Option<String>,
+    power: Option<scale::PowerConfig>,
 ) -> (Handle, tokio::task::JoinHandle<()>) {
     let (cmds, rx) = mpsc::channel(4096);
     let (snap_tx, snap_rx) = watch::channel(Arc::new(Snapshot {
@@ -540,12 +552,14 @@ pub fn start(
     }));
     let (ec2_tx, ec2_rx) = watch::channel(Vec::new());
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
+    let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
     let actor = Actor::new(
         state,
         Outputs {
             snapshot: snap_tx,
             ec2: ec2_tx,
             ec2_layout: ec2_layout_tx,
+            power: power_tx,
             store,
         },
         Box::new(now_ms),
@@ -580,6 +594,9 @@ pub fn start(
     });
     if let Some(driver) = ec2 {
         tokio::spawn(ec2::run(driver, ec2_rx, handle.clone()));
+    }
+    if let Some(cfg) = power {
+        tokio::spawn(scale::run(cfg, power_rx, handle.clone()));
     }
     (handle, task)
 }
@@ -624,6 +641,8 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         restart_cooldown_secs: args.restart_cooldown,
         camera_seed: args.camera_seed,
         max_borrowed: args.max_borrowed,
+        power_managed: !args.scale_groups.is_empty(),
+        idle_scale_down_secs: args.idle_scale_down,
         ..Config::default()
     };
     if config.max_tiles == 0 {
@@ -667,7 +686,17 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
             crate::fleet::aggregate::child::connect_addr(l)
         )
     });
-    let (handle, _actor) = start(state, store_tx, ec2, ec2_local);
+    let power = if args.scale_groups.is_empty() {
+        None
+    } else {
+        Some(scale::PowerConfig {
+            driver: Arc::new(scale::AwsAutoScaling::new()?),
+            groups: args.scale_groups.clone(),
+            awake_capacity: args.awake_capacity,
+            poll: Duration::from_secs(5),
+        })
+    };
+    let (handle, _actor) = start(state, store_tx, ec2, ec2_local, power);
     if let Some(listen) = &args.ec2_aggregate_listen {
         let mut argv = vec![
             std::env::current_exe()

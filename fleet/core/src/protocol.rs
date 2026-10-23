@@ -28,6 +28,10 @@ pub enum ClientMsg {
     Verify {
         token: String,
     },
+    /// Whether the page is visible; a hidden page is not an active viewer.
+    Visibility {
+        visible: bool,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

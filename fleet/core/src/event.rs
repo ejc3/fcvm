@@ -71,6 +71,25 @@ pub enum Event {
         host: String,
         sbdf: String,
     },
+    /// A viewer's page reported whether it is visible.
+    Visibility {
+        at: u64,
+        viewer: String,
+        visible: bool,
+    },
+    /// The GPU hosts' auto scaling groups, polled while the fleet wakes.
+    ScaleInstances {
+        at: u64,
+        instances: Vec<ScaleInstance>,
+    },
+}
+
+/// One instance in a GPU host auto scaling group.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ScaleInstance {
+    pub id: String,
+    /// The group's lifecycle state (`Pending`, `InService`, ...).
+    pub lifecycle: String,
 }
 
 impl Event {
@@ -84,7 +103,9 @@ impl Event {
             | Event::AgentGone { at, .. }
             | Event::Ec2 { at, .. }
             | Event::Degraded { at, .. }
-            | Event::ReleaseQuarantine { at, .. } => *at,
+            | Event::ReleaseQuarantine { at, .. }
+            | Event::Visibility { at, .. }
+            | Event::ScaleInstances { at, .. } => *at,
         }
     }
 }

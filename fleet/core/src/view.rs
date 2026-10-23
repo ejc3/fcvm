@@ -242,6 +242,34 @@ pub struct AggregateView {
 #[derive(Debug, Clone, Serialize)]
 pub struct ViewersView {
     pub count: usize,
+    /// Connected viewers whose page is visible (or has not said).
+    pub active: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct HostWakeView {
+    /// The EC2 instance id (the host's name once its agent connects).
+    pub instance: String,
+    /// `pending`, `booted`, `agent_connected` or `rendering`.
+    pub phase: String,
+    pub pending_at: Option<u64>,
+    pub booted_at: Option<u64>,
+    pub agent_at: Option<u64>,
+    pub rendering_at: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PowerView {
+    /// `awake`, `asleep` or `waking`.
+    pub state: String,
+    pub idle_since: Option<u64>,
+    pub asleep_since: Option<u64>,
+    pub woke_at: Option<u64>,
+    /// While waking: each GPU host's progress.
+    pub hosts: Vec<HostWakeView>,
+    /// The last wake, first active viewer to the complete image.
+    pub last_wake_ms: Option<u64>,
+    pub wakes: Vec<Wake>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -264,6 +292,7 @@ pub struct View {
     pub failures: Vec<FailureView>,
     pub claims: Vec<ClaimView>,
     pub counters: CountersView,
+    pub power: PowerView,
     pub viewers: ViewersView,
     pub actions: Vec<Action>,
 }
@@ -484,6 +513,37 @@ pub fn view(state: &State) -> View {
             .collect(),
         viewers: ViewersView {
             count: f.viewers.len(),
+            active: f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count(),
+        },
+        power: PowerView {
+            state: f.power.state.clone(),
+            idle_since: f.power.idle_since,
+            asleep_since: f.power.asleep_since,
+            woke_at: f.power.woke_at,
+            hosts: f
+                .power
+                .hosts
+                .iter()
+                .map(|(id, w)| HostWakeView {
+                    instance: id.clone(),
+                    phase: if w.rendering_at.is_some() {
+                        "rendering"
+                    } else if w.agent_at.is_some() {
+                        "agent_connected"
+                    } else if w.booted_at.is_some() {
+                        "booted"
+                    } else {
+                        "pending"
+                    }
+                    .into(),
+                    pending_at: w.pending_at,
+                    booted_at: w.booted_at,
+                    agent_at: w.agent_at,
+                    rendering_at: w.rendering_at,
+                })
+                .collect(),
+            last_wake_ms: f.power.wakes.back().map(|w| w.ms),
+            wakes: f.power.wakes.iter().cloned().collect(),
         },
         actions: f.actions.iter().cloned().collect(),
     }

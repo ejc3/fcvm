@@ -43,6 +43,69 @@ pub struct Config {
     /// (rounded up), whichever is smaller.
     #[serde(default)]
     pub max_borrowed: Option<usize>,
+    /// The coordinator can scale the GPU hosts (it has auto scaling groups to set): the
+    /// fleet sleeps after `idle_scale_down_secs` with no active viewer and wakes on one.
+    #[serde(default)]
+    pub power_managed: bool,
+    #[serde(default = "ten_minutes")]
+    pub idle_scale_down_secs: u64,
+}
+
+fn ten_minutes() -> u64 {
+    600
+}
+
+/// One GPU host's way back up while the fleet wakes, by its EC2 instance id.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct HostWake {
+    /// The auto scaling group reported it pending, then in service.
+    pub pending_at: Option<u64>,
+    pub booted_at: Option<u64>,
+    /// Its agent said hello (the agent starts once the host's store is mounted).
+    pub agent_at: Option<u64>,
+    /// Every one of its slots reported running.
+    pub rendering_at: Option<u64>,
+}
+
+/// One wake, measured from the first active viewer to the complete image.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Wake {
+    pub started_at: u64,
+    pub complete_at: u64,
+    pub ms: u64,
+}
+
+pub const MAX_WAKES: usize = 20;
+
+/// Whether the GPU capacity is up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Power {
+    /// `awake`, `asleep` (scaled to zero) or `waking`.
+    pub state: String,
+    /// Since when no viewer has been active.
+    pub idle_since: Option<u64>,
+    pub asleep_since: Option<u64>,
+    pub woke_at: Option<u64>,
+    pub hosts: BTreeMap<String, HostWake>,
+    pub wakes: VecDeque<Wake>,
+    /// fcvm GPUs the fleet had when it fell asleep: the EC2 half launches that many tiles
+    /// at once when it wakes, instead of waiting for the hosts.
+    #[serde(default)]
+    pub gpus_before_sleep: usize,
+}
+
+impl Default for Power {
+    fn default() -> Self {
+        Power {
+            state: "awake".into(),
+            idle_since: None,
+            asleep_since: None,
+            woke_at: None,
+            hosts: BTreeMap::new(),
+            wakes: VecDeque::new(),
+            gpus_before_sleep: 0,
+        }
+    }
 }
 
 impl Config {
@@ -70,6 +133,8 @@ impl Default for Config {
             claim_secs: 60,
             claim_cooldown_secs: 120,
             max_borrowed: None,
+            power_managed: false,
+            idle_scale_down_secs: 600,
         }
     }
 }
@@ -342,6 +407,11 @@ pub struct Fleet {
     /// Quarantined GPUs by `gpu_key`.
     #[serde(default)]
     pub quarantined: BTreeMap<String, Quarantined>,
+    /// Viewers whose page reported it is hidden; they do not count as active.
+    #[serde(default)]
+    pub hidden: std::collections::BTreeSet<String>,
+    #[serde(default)]
+    pub power: Power,
     /// Coordinator components that are degraded: reason and since when.
     pub degraded: BTreeMap<String, (String, u64)>,
 }
@@ -387,6 +457,8 @@ impl State {
                 degraded: BTreeMap::new(),
                 counters: Counters::default(),
                 quarantined: BTreeMap::new(),
+                hidden: Default::default(),
+                power: Power::default(),
             },
             config,
             receipts: BTreeMap::new(),

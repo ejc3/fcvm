@@ -56,7 +56,13 @@ struct Coord {
 }
 
 async fn coordinator_with(o: Opts) -> Coord {
-    let (handle, _actor) = start(State::new(o.config, now_ms()), None, None, o.ec2_local);
+    let (handle, _actor) = start(
+        State::new(o.config, now_ms()),
+        None,
+        None,
+        o.ec2_local,
+        None,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let cfg = live::LiveConfig {
@@ -855,6 +861,7 @@ async fn the_poster_is_the_whole_image_at_a_hold() {
         None,
         None,
         Some(ec2_agg),
+        None,
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
@@ -983,6 +990,7 @@ async fn shutdown_writes_the_last_state_to_the_state_file() {
         Some(store::spawn_writer(path.clone())),
         None,
         None,
+        None,
     );
     let mut last = 0;
     for i in 0..5 {
@@ -1054,7 +1062,7 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     let driver: Arc<dyn ec2::Ec2Driver> = Arc::new(ScarceEc2 {
         calls: Default::default(),
     });
-    let (handle, _actor) = start(State::new(config, now_ms()), None, Some(driver), None);
+    let (handle, _actor) = start(State::new(config, now_ms()), None, Some(driver), None, None);
     let mut agent = FakeAgent::connect(&handle, "gpu-a", 1);
     agent.assign().await;
     agent.report("slot-1", "running", 1);
@@ -1120,7 +1128,7 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
         max_tiles: 1,
         ..Config::default()
     };
-    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None);
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, None);
     let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let admin_url = format!("http://{}", admin.local_addr().unwrap());
     let h = handle.clone();
@@ -1174,4 +1182,70 @@ async fn a_quarantined_gpu_returns_only_by_the_operator() {
     };
     assert_eq!(slots[0].id, "slot-1");
     assert!(slots[0].rect.is_some() && slots[1].standby, "{slots:?}");
+}
+
+/// With scale groups, the fleet scales them to zero after the idle time with no active
+/// viewer (a hidden page does not count), and back up when a viewer's page is visible
+/// again; while it wakes, the groups' instances show in the snapshot.
+#[tokio::test]
+async fn no_active_viewer_scales_the_gpus_to_zero_and_one_wakes_them() {
+    use fcvm::fleet::coord::scale::{FakeScale, Group, PowerConfig};
+    let config = Config {
+        power_managed: true,
+        idle_scale_down_secs: 1,
+        ..Config::default()
+    };
+    let fake = Arc::new(FakeScale::default());
+    *fake.instances.lock().unwrap() = vec![fleet_core::event::ScaleInstance {
+        id: "i-0123456789abcdef0".into(),
+        lifecycle: "Pending".into(),
+    }];
+    let power = PowerConfig {
+        driver: fake.clone(),
+        groups: vec![Group {
+            region: "us-east-1".into(),
+            name: "fleet-hosts".into(),
+        }],
+        awake_capacity: 2,
+        poll: Duration::from_millis(100),
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None, Some(power));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}/live", listener.local_addr().unwrap());
+    let cfg = live::LiveConfig {
+        checker: allow_all(),
+        allowed_origins: vec![],
+        verifier: Arc::new(turnstile::Off),
+        trust_cf_connecting_ip: false,
+        turnstile_site_key: None,
+        poster: Arc::new(poster::Poster::default()),
+    };
+    let h = handle.clone();
+    tokio::spawn(async move { live::serve(listener, h, cfg).await.unwrap() });
+    let calls = || fake.calls.lock().unwrap().clone();
+    let mut v = Viewer::connect(&url).await;
+    v.until(|s| s["viewers"]["active"] == 1).await;
+    assert_eq!(
+        calls(),
+        vec![("fleet-hosts".to_string(), 2)],
+        "awake at start"
+    );
+    v.send(json!({"type": "visibility", "visible": false}))
+        .await;
+    let s = v.until(|s| s["power"]["state"] == "asleep").await;
+    assert_eq!(s["viewers"]["active"], 0);
+    assert_eq!(s["viewers"]["count"], 1);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while calls().len() < 2 {
+        assert!(std::time::Instant::now() < deadline, "{:?}", calls());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(calls()[1], ("fleet-hosts".to_string(), 0));
+    v.send(json!({"type": "visibility", "visible": true})).await;
+    let s = v
+        .until(|s| s["power"]["state"] == "waking" && s["power"]["hosts"][0]["phase"] == "pending")
+        .await;
+    assert_eq!(s["power"]["hosts"][0]["instance"], "i-0123456789abcdef0");
+    assert!(s["power"]["woke_at"].is_u64());
+    assert_eq!(calls()[2], ("fleet-hosts".to_string(), 2));
 }

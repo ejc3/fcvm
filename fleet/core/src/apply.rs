@@ -20,6 +20,7 @@ pub const SCOREBOARD_RACES: usize = 20;
 pub fn apply(mut state: State, event: &Event) -> State {
     let before = state.fleet.clone();
     let receipt = apply_inner(&mut state, event);
+    power_step(&mut state, event.at());
     retile(&mut state.fleet, &state.config, event.at());
     let changed = receipt.is_some() || state.fleet != before;
     if changed {
@@ -158,8 +159,35 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             state.fleet.viewers.insert(viewer.clone(), key);
             None
         }
+        Event::Visibility {
+            viewer, visible, ..
+        } => {
+            let f = &mut state.fleet;
+            if f.viewers.contains_key(viewer) {
+                if *visible {
+                    f.hidden.remove(viewer);
+                } else {
+                    f.hidden.insert(viewer.clone());
+                }
+            }
+            None
+        }
+        Event::ScaleInstances { instances, .. } => {
+            let p = &mut state.fleet.power;
+            if p.state == "waking" {
+                for i in instances {
+                    let w = p.hosts.entry(i.id.clone()).or_default();
+                    w.pending_at.get_or_insert(at);
+                    if i.lifecycle == "InService" {
+                        w.booted_at.get_or_insert(at);
+                    }
+                }
+            }
+            None
+        }
         Event::ViewerLeft { viewer, .. } => {
             state.fleet.viewers.remove(viewer);
+            state.fleet.hidden.remove(viewer);
             // A viewer that leaves gives its GPU back.
             let mine: Vec<u32> = state
                 .fleet
@@ -188,6 +216,11 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                     // The connection names the host; a hello naming another is ignored.
                     if named == host {
                         hello(&mut state.fleet, host, arch, gpus, *capacity, at);
+                        let p = &mut state.fleet.power;
+                        if p.state == "waking" {
+                            let w = p.hosts.entry(host.clone()).or_default();
+                            w.agent_at.get_or_insert(at);
+                        }
                     }
                 }
                 AgentMsg::Slot(r) => {
@@ -234,7 +267,10 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             let f = &mut state.fleet;
             f.hosts.remove(host);
             f.slots.retain(|_, s| s.host.as_deref() != Some(host));
-            f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
+            // A host the coordinator scaled away is not a reclaimed one.
+            if f.power.state != "asleep" || f.reclaimed.contains_key(host) {
+                f.reclaimed.entry(host.clone()).or_insert((at, None)).1 = Some(at);
+            }
             drop_missing_from_races(f, at);
             None
         }
@@ -262,6 +298,95 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
         Event::ReleaseQuarantine { host, sbdf, .. } => {
             state.fleet.quarantined.remove(&gpu_key(host, sbdf));
             None
+        }
+    }
+}
+
+/// A race whose halves are not all done.
+fn race_running(f: &Fleet) -> bool {
+    f.races.back().is_some_and(|r| {
+        r.fcvm.done_at.is_none() && !r.fcvm.tiles.is_empty()
+            || r.ec2.done_at.is_none() && !r.ec2.tiles.is_empty()
+    })
+}
+
+/// Every placed tile of both halves runs its current generation.
+fn image_complete(f: &Fleet) -> bool {
+    let done = |s: &Slot| {
+        s.position.is_none()
+            || (s.observed.phase == "running" && s.observed.generation >= s.generation)
+    };
+    f.n > 0 && f.slots.values().all(done) && f.ec2.values().all(done)
+}
+
+/// Sleep after `idle_scale_down_secs` with no active viewer (never during a claim or a
+/// race), wake on an active viewer, and be awake once the image is complete.
+fn power_step(state: &mut State, at: u64) {
+    if !state.config.power_managed {
+        return;
+    }
+    let idle_ms = state.config.idle_scale_down_secs * 1000;
+    let interval = state.config.race_interval_secs;
+    let f = &mut state.fleet;
+    let active = f.viewers.keys().filter(|v| !f.hidden.contains(*v)).count();
+    if active > 0 {
+        f.power.idle_since = None;
+    } else {
+        f.power.idle_since.get_or_insert(at);
+    }
+    let claims = f.slots.values().any(|s| s.claim.is_some());
+    let racing = race_running(f);
+    if f.power.state == "asleep" {
+        if active > 0 {
+            f.power.state = "waking".into();
+            f.power.woke_at = Some(at);
+            f.power.asleep_since = None;
+            f.power.hosts.clear();
+        }
+        return;
+    }
+    let idle = f.power.idle_since.is_some_and(|t| at >= t + idle_ms);
+    if active == 0 && idle && !claims && !racing {
+        f.power.gpus_before_sleep = f.slots.values().filter(|s| s.position.is_some()).count();
+        f.power.state = "asleep".into();
+        f.power.asleep_since = Some(at);
+        f.power.woke_at = None;
+        f.power.hosts.clear();
+        f.next_race_at = None;
+        return;
+    }
+    if f.power.state == "waking" {
+        let hosts = f.hosts.clone();
+        for (id, w) in f.power.hosts.iter_mut() {
+            if w.rendering_at.is_some() || !hosts.contains_key(id) {
+                continue;
+            }
+            let mine: Vec<&Slot> = f
+                .slots
+                .values()
+                .filter(|s| s.host.as_deref() == Some(id))
+                .collect();
+            if mine.iter().any(|s| s.position.is_some())
+                && mine.iter().all(|s| {
+                    s.position.is_none()
+                        || (s.observed.phase == "running" && s.observed.generation >= s.generation)
+                })
+            {
+                w.rendering_at = Some(at);
+            }
+        }
+        if image_complete(f) {
+            let started = f.power.woke_at.unwrap_or(at);
+            f.power.wakes.push_back(Wake {
+                started_at: started,
+                complete_at: at,
+                ms: at - started,
+            });
+            while f.power.wakes.len() > MAX_WAKES {
+                f.power.wakes.pop_front();
+            }
+            f.power.state = "awake".into();
+            f.next_race_at = interval.map(|s| at + s * 1000);
         }
     }
 }
@@ -368,6 +493,9 @@ fn intent_effect(
             Ok(summary)
         }
         Intent::RestartNow => {
+            if state.fleet.power.state == "asleep" {
+                return Err("the GPUs are asleep".into());
+            }
             if let Some(until) = state.fleet.cooldown_until.filter(|u| *u > at) {
                 return Err(format!(
                     "restart is cooling down for another {} s",
@@ -703,7 +831,7 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
 }
 
 fn tick(state: &mut State, at: u64) {
-    if state.fleet.next_race_at.is_some_and(|t| at >= t) {
+    if state.fleet.power.state != "asleep" && state.fleet.next_race_at.is_some_and(|t| at >= t) {
         start_race(state, "schedule", at);
     }
     let f = &mut state.fleet;
@@ -1018,7 +1146,13 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         })
         .map(|(n, _)| *n)
         .collect();
-    let want_ec2 = c.ec2_max.min(c.max_tiles).min(active.len()) as u32;
+    // Asleep, the EC2 half has no tiles; waking, it launches as many as the fcvm half had.
+    let fcvm_gpus = match f.power.state.as_str() {
+        "asleep" => 0,
+        "waking" => active.len().max(f.power.gpus_before_sleep),
+        _ => active.len(),
+    };
+    let want_ec2 = c.ec2_max.min(c.max_tiles).min(fcvm_gpus) as u32;
     f.ec2.retain(|n, _| *n <= want_ec2);
     for n in 1..=want_ec2 {
         f.ec2

@@ -271,6 +271,16 @@ async fn viewer(socket: WebSocket, app: App, client: String) {
                 server_unix_ms: now_ms(),
                 client_unix_ms,
             }),
+            Ok(ClientMsg::Visibility { visible }) => {
+                app.handle
+                    .send(Event::Visibility {
+                        at: 0,
+                        viewer: viewer.clone(),
+                        visible,
+                    })
+                    .await;
+                None
+            }
             Ok(ClientMsg::Verify { token }) => {
                 let r = app.cfg.verifier.verify(&token, &client).await;
                 let (ok, reason) = match r {

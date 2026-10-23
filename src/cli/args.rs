@@ -220,6 +220,20 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub max_borrowed: Option<usize>,
 
+    /// A GPU host auto scaling group the coordinator owns (`<region>:<name>`, repeatable).
+    /// With any, the fleet scales them to 0 after --idle-scale-down seconds with no active
+    /// viewer and back to --awake-capacity when one arrives.
+    #[arg(long = "scale-group")]
+    pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
+
+    /// Desired capacity of each scale group while the fleet is awake
+    #[arg(long, default_value_t = 1)]
+    pub awake_capacity: u32,
+
+    /// Seconds with no active viewer before the fleet scales down
+    #[arg(long, default_value_t = 600)]
+    pub idle_scale_down: u64,
+
     /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
     /// or a private network. Off without it.
     #[arg(long)]

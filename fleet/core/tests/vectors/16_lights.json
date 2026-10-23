@@ -345,6 +345,15 @@
         }
       ]
     },
+    "power": {
+      "asleep_since": null,
+      "hosts": [],
+      "idle_since": null,
+      "last_wake_ms": null,
+      "state": "awake",
+      "wakes": [],
+      "woke_at": null
+    },
     "races": [],
     "relaunch_all": null,
     "scene": {
@@ -442,6 +451,7 @@
     },
     "tiles": [],
     "viewers": {
+      "active": 0,
       "count": 0
     }
   },
