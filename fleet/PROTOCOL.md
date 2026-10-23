@@ -191,9 +191,12 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 
 ```json
 {
+  "layout": {"generation": 14, "from_frame": 25845, "from_t": 861.5,
+             "fcvm": {"x": 0, "y": 0, "w": 0.8928571428571429, "h": 1}, "ec2": {"x": 0.8928571428571429, "y": 0, "w": 0.10714285714285714, "h": 1}},
   "tiles": [
     {
-      "id": "fcvm:1", "half": "fcvm", "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5},
+      "id": "fcvm:1", "half": "fcvm", "rect": {"x": 0, "y": 0, "w": 0.0893, "h": 0.1},
+      "previous_rect": {"x": 0, "y": 0, "w": 0.0909, "h": 0.1},
       "phase": "running",
       "slot": "slot-1",
       "frame_url": "ws://<host>:<port>/frames",
@@ -268,15 +271,31 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 }
 ```
 
-- `tiles` lists the fcvm half then the EC2 half, N tiles each; N = `fleet.n` =
-  min(`max_tiles`, max(fcvm GPUs, EC2 instances)). The fcvm half is cut into full-width
-  bands, one per GPU host (hosts in the order of their lowest slot number), as tall as
-  the host's share of the N tiles, plus a band of dark tiles when EC2 has more instances;
-  each band is its own grid, row-major. So a host's tiles cover one rectangle, which its
-  aggregator encodes whole. The EC2 half repeats the fcvm half's rectangles, 0.5 to the
-  right. Tile ids `fcvm:<k>` and `ec2:<k>` (1-based) name places; `slot` names the GPU
-  behind the place, which can change when the fleet re-tiles. Slot ids are `slot-<n>`
-  (fcvm, reused lowest first) and `ec2-<n>`. A borrowed GPU keeps its tile's place.
+- `tiles` lists one tile per live GPU, the fcvm side then the EC2 side: `fleet.n` fcvm
+  tiles (fcvm GPUs on hosts that are not draining, at most `max_tiles`) and `fleet.ec2_n`
+  EC2 tiles (EC2 tiles with an instance, at most `max_tiles`). Each side is as wide as its
+  share of the live GPUs (`layout.fcvm`, `layout.ec2`: fcvm 100 and EC2 12 give the fcvm
+  side 100/112 of the width); a side with none has no rectangle (null) and the other takes
+  the whole width; with none on either side there are no tiles. There are no dark tiles:
+  an EC2 tile still waiting for capacity is not on the wall (`fleet.ec2_waiting` counts
+  them, and the race's `relaunch_all` shows the wait). The fcvm side is cut into
+  full-width bands, one per GPU host (hosts in the order of their lowest slot number), as
+  tall as the host's share of its tiles, each band its own grid, row-major, so a host's
+  tiles cover one rectangle, which its aggregator encodes whole; the EC2 side is one grid.
+  Tile ids `fcvm:<k>` and `ec2:<k>` (1-based) name places; `slot` names the GPU behind the
+  place. A GPU keeps its slot (and its addresses) when the fleet re-tiles: only its
+  rectangle changes. Slot ids are `slot-<n>` (fcvm, reused lowest first) and `ec2-<n>`. A
+  borrowed GPU keeps its tile's place.
+- `layout` is the current layout generation. Every change of the tiling (a GPU joining or
+  leaving either side) makes a new `generation` that takes effect at frame `from_frame`
+  (frames fall on scene time k/30; `from_t` is that time), 45 frames (1.5 s) after the
+  change, so it reaches every renderer first. Each renderer draws its old rectangle up to
+  that frame and its new one from it. A tile the change moved carries `previous_rect`
+  (null for a new tile, or one that did not move). The page reads `layout.generation`,
+  `layout.from_t` (or `from_frame`), `layout.fcvm`, `layout.ec2`, and each tile's `rect`
+  and `previous_rect`: it keeps the old tiles on screen until every tile of the new
+  generation has delivered its first frame at or after `from_t`, then swaps them all at
+  once.
 - `phase`: `waiting_capacity` (dark: no GPU behind the tile, or EC2 refused capacity),
   `borrowed` (lent to a visitor, drawn black), `pending` (assigned, nothing reported yet),
   `relaunching` (a newer generation is wanted than the agent has reported), or what the
@@ -375,7 +394,46 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
                  [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
+                 [--state-bucket <bucket> [--state-key state.json] [--state-region <region>]]
+                 [--ec2 aws --ec2-tiles 8 --ec2-regions <r1,r2,...> [--ec2-template fcvm-fleet-tile-x86_64]
+                  [--ec2-on-demand-template <name>]] [--dns-zone fcvm.dev]
+                 [--dns-token-secret <secret> [--dns-zone-id <id>]] [--tls-secret <secret>] [--secrets-region <region>]
 ```
+
+- `--state-bucket` (also `FLEET_STATE_BUCKET`, `FLEET_STATE_KEY`) keeps the state as one S3
+  object instead of a file: read at start, rewritten whole (one PUT, atomic; the bucket
+  keeps versions) at most once a second while it changes and at shutdown. A missing object
+  is no state; a refused read (403, which S3 also answers for a missing object to a caller
+  without `s3:ListBucket`) stops the coordinator rather than start it empty.
+- `--ec2 aws` runs `--ec2-tiles` EC2 tiles, whatever the fcvm side has. Each is one
+  instance from the tile launch template (one-time spot), tagged `Purpose=fcvm-fleet-tile`
+  and `FleetTile=<tile>` at launch, in the first of `--ec2-regions` (`FLEET_REGIONS`) with
+  capacity; when every region refuses for capacity it tries `--ec2-on-demand-template`,
+  and without one the tile waits for capacity (recorded on its own) and asks again every
+  10 s. A tile is ready once its instance runs and its renderer answers
+  `https://ec2-<n>.<zone>/health` (the name resolved to the instance); it is terminated by
+  id. A relaunch launches the replacement first and terminates the old instance once the
+  new launch is accepted.
+- `--dns-token-secret` writes the slots' names in `--dns-zone` with the zone's Cloudflare
+  token: for every fcvm slot and EC2 tile that reported a public address,
+  `slot-<n>.<zone>` / `ec2-<n>.<zone>` AAAA (unproxied, TTL 60) and `slot-<n>-v4.<zone>` /
+  `ec2-<n>-v4.<zone>` A (proxied). Records are written only when the wanted set changes,
+  and records of that shape nobody wants are deleted; other names in the zone are left
+  alone.
+- `--tls-secret` keeps the wildcard certificate renewed (see "Certificate").
+
+### Certificate
+
+The wildcard certificate (`*.<zone>` and `<zone>`) lives in one Secrets Manager secret,
+a JSON object: `cert` (PEM full chain), `key` (PEM private key), `domains`, `not_after` and
+`issued_at` (RFC 3339 UTC) and `issuer` (fleet/tools/issue-cert.sh writes the first one).
+Twice a day the coordinator reads it; within 30 days of `not_after` (or when it is missing
+or does not cover the zone) it orders a new certificate from Let's Encrypt
+(`--acme-directory` for another CA), answers DNS-01 with `_acme-challenge` TXT records
+through the DNS token, waits until public DNS shows them, stores the new version and
+removes the records. Its key is PKCS#8 (`PRIVATE KEY`), where issue-cert.sh wrote SEC 1;
+both are PEM that nginx and rustls read. Renderers get it from their agent
+(`--tls-secret`), tiles from their own instance role.
 
 - `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
   one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
@@ -414,9 +472,20 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
 `fcvm fleet agent` runs on a GPU host, one per host. It speaks newline-delimited JSON:
 one message per line, UTF-8, on stdin (coordinator to agent) and stdout (agent to
 coordinator); its logs go to stderr. The same lines run over a local pipe, over
-`ssh <host> fcvm fleet agent --stdio`, and later over a WebSocket the agent dials.
+`ssh <host> fcvm fleet agent --stdio`, and over the WebSocket the agent dials (`--dial`).
 
-When its input closes, the agent tears down every VM it started and exits. If the agent
+With `--dial wss://<api host>/agent` the agent dials the coordinator instead and sends the
+same messages, one per WebSocket text frame, with the Cloudflare Access service token's
+`CF-Access-Client-Id` and `CF-Access-Client-Secret` headers (from `--access-secret`, read
+with the instance role). The VMs keep running while the connection is down; the agent
+reconnects (1 s doubling to 30 s) and starts each new connection with its hello and the
+latest of every state message (each slot's report, the aggregator, a draining notice,
+quarantines), so a coordinator that lost the host learns where each slot is without a
+restart. A reported generation above the coordinator's is adopted, so the next relaunch
+goes past it. The coordinator serves `/agent` on its `/live` listener; Cloudflare Access
+admits only the agents' service token there.
+
+When its input closes (`--stdio`), the agent tears down every VM it started and exits. If the agent
 is killed outright, each VM's fcvm gets SIGTERM from the kernel (the agent arms
 `PR_SET_PDEATHSIG` on every fcvm it starts, and fcvm arms it on every process below).
 
@@ -438,7 +507,7 @@ the same host.
 
 ```json
 {"type": "slot", "id": "slot-3", "phase": "running", "generation": 4, "vm": "fleet-slot-3",
- "frame_url": "ws://<host>:<port>/frames",
+ "frame_url": "ws://<host>:<port>/frames", "ipv6": "2001:db8::3", "ipv4": null,
  "timings": {"teardown_ms": 310, "restore_ms": 4300, "ack_ms": 4300, "gpu_ms": 3100, "container_ms": 600, "first_frame_ms": 250, "total_ms": 5200},
  "error": null, "retry_in_ms": null}
 ```
@@ -502,7 +571,8 @@ still held. Failures after the restore (the container or the renderer) do not co
 
 ```json
 {"type": "assign", "slots": [{"id": "slot-3", "sbdf": "0000:01:00.0", "generation": 4, "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}},
-                             {"id": "slot-9", "sbdf": "0000:09:00.0", "generation": 1, "rect": null, "standby": true},
+                             {"id": "slot-9", "sbdf": "0000:09:00.0", "generation": 1, "rect": null, "standby": true,
+                              "layout_generation": 14, "rect_from_frame": 25845},
                              {"id": "slot-4", "sbdf": "0000:02:00.0", "generation": 7, "rect": null,
                               "private_camera": [{"t": 812.0, "pos": [-100, 0.35, -90], "look": [-63.5, 2.2, -87], "fov_deg": 60, "intent": "<claim id>"}]}],
  "region": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}}
@@ -539,16 +609,33 @@ none is placed). For each slot the agent reconciles:
 The scene shared by every renderer, sent after the hello and whenever it changes. The
 agent posts `scene` plus the slot's `rect` to each running renderer as
 `POST http://<publish ip>:<port>/scene`, with the body
-`{"epoch_unix_ms", "rect", "image_aspect", "camera", "time_of_day", "words", "lights"}`.
+`{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
+"image_aspect", "camera", "time_of_day", "words", "lights"}`: the renderer draws
+`previous_rect` (when present) for frames before `rect_from_frame` and `rect` from it. The
+coordinator posts the same body to each EC2 tile's renderer
+(`POST https://ec2-<n>.<zone>/scene`).
 
 ### Running it
 
 ```
-fcvm fleet agent --stdio --image <renderer image> --base-port <port>
+fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
                  [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
-                 [--scrub] [--store-ready-file <path>]
+                 [--scrub] [--store-ready-file <path>] [--host-from-imds] [--secret-region <region>]
+                 [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
+```
+
+`--host-from-imds` names the host by its EC2 instance id. `--tls-secret` hands the fleet's
+wildcard certificate to every renderer: the agent reads the secret (the format below,
+"Certificate") with the instance role, writes `fullchain.pem` and `key.pem` (mode 0600)
+into `--tls-dir`, maps that directory into each VM at `/run/fleet-tls` with
+`TLS_CERT_FILE` and `TLS_KEY_FILE` set, and reads the secret again every hour. The host
+AMI's unit (`fcvm-fleet-agent.service`, `ExecStart=/usr/local/bin/fcvm fleet agent
+$FLEET_AGENT_ARGS`) takes, in `/etc/fcvm-fleet/agent.env`:
+
+```
+FLEET_AGENT_ARGS=--dial wss://fleet-api-stage.fcvm.dev/agent --access-secret fcvm-fleet/agent-access-token --host-from-imds --image localhost/fcvm-renderer:fleet --base-port 20100 --publish-ip 0.0.0.0 --tls-secret fcvm-fleet/tls-wildcard --store-ready-file /var/lib/fcvm-fleet/store-ready
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>
