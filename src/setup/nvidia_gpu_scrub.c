@@ -149,7 +149,16 @@ int main(int argc, char **argv) {
     double started = now_ms();
     int parallel = MAX_DEVICES;
     if (argc == 3 && strcmp(argv[1], "--parallel") == 0) {
-        parallel = atoi(argv[2]);
+        /* Parsed by hand: atoi and strtol bind to __isoc23_strtol@GLIBC_2.38
+         * when built against glibc 2.38 or later headers. */
+        parallel = 0;
+        for (const char *c = argv[2]; *c; c++) {
+            if (*c < '0' || *c > '9' || parallel > MAX_DEVICES) {
+                parallel = -1;
+                break;
+            }
+            parallel = parallel * 10 + (*c - '0');
+        }
     } else if (argc != 1) {
         fprintf(stderr, "usage: %s [--parallel N]\n", argv[0]);
         return 2;

@@ -819,6 +819,27 @@ __attribute__((destructor)) static void report(void) {
             tool.to_str().unwrap(),
             source.to_str().unwrap(),
         ]);
+        // The stage refuses a binary that needs a glibc newer than 2.34; check
+        // the same here, so a source change that pulls in a newer symbol fails
+        // this test rather than the next image build.
+        let symbols = std::process::Command::new("objdump")
+            .arg("-T")
+            .arg(&tool)
+            .output()
+            .unwrap();
+        let symbols = String::from_utf8_lossy(&symbols.stdout);
+        let too_new: Vec<&str> = symbols
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .filter_map(|word| word.strip_prefix("GLIBC_"))
+            .filter(|version| {
+                let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+                (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) > (2, 34)
+            })
+            .collect();
+        assert!(
+            too_new.is_empty(),
+            "fcvm-gpu-scrub needs glibc {too_new:?}, newer than the stage allows (2.34)"
+        );
         let lib = dir.path().join("lib");
         std::fs::create_dir(&lib).unwrap();
         if !env.iter().any(|(k, _)| *k == "NO_FAKE") {
