@@ -454,6 +454,22 @@ int main() {
     build_frame(scene_with(R"({"text":"Hello","t":100,"text_style":"landmark"})"), tl, 50.0, &k1, &held);
     build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"landmark"})"), tl, 50.0, &k2, &held);
     CHECK(held && k1 != k2, "a landmark word changes the hold key");
+    // a landmark that appears on a frame slot inside a hold shades the terrain
+    // the same way on every frame of that hold: tiles that start rendering at
+    // the appearance frame and one frame later must accumulate the same samples
+    {
+      Scene sw = scene_with(R"({"text":"Hello","t":50,"text_style":"landmark"})");
+      uint64_t ka, kb;
+      bool ha, hb;
+      FrameParams fa = build_frame(sw, tl, 50.0, &ka, &ha);
+      FrameParams fb = build_frame(sw, tl, 50.0 + 1.0 / 30.0, &kb, &hb);
+      int sa = 0, sb = 0;
+      for (int i = 0; i < fa.n_text; i++) sa += casts_landmark_shadow(fa.text[i]);
+      for (int i = 0; i < fb.n_text; i++) sb += casts_landmark_shadow(fb.text[i]);
+      CHECK(ha && hb && ka == kb && sa == 1 && sb == 1,
+            "a landmark appearing inside a hold casts its shadow from the hold's first frame (held %d %d, same key %d, shadows %d %d)",
+            ha, hb, ka == kb, sa, sb);
+    }
   }
   // --- review round: tile width, re-tile height, layout switch, words, wrapped lockup, pipeline locking
   {

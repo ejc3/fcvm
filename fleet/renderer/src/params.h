@@ -52,6 +52,14 @@ struct GText {
   float shade;           // type: how strongly the shade behind it holds bright backgrounds down (0..1)
 };
 
+// Whether a text's letters shade the terrain (render.cu landmark_vis). The
+// hold key covers exactly these texts (scene.cpp build_frame), so the answer
+// must not depend on the fade: a landmark casts its whole shadow on every frame
+// it is in the scene, including the one it appears on (age 0, alpha 0).
+// Otherwise two tiles of one hold, one starting at the appearance frame and one
+// a frame later, accumulate different samples under the same key.
+HD bool casts_landmark_shadow(const GText& g) { return g.style == GTEXT_LANDMARK; }
+
 struct GLight {
   V3 pos;
   V3 color;  // emitted radiance of the sphere

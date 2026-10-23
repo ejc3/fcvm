@@ -751,7 +751,7 @@ __device__ bool landmark_box(const GText& g, V3 ol, V3 dl, float* ta, float* tb)
 __device__ float landmark_vis(V3 p, V3 l) {
   for (int i = 0; i < cP.n_text; i++) {
     const GText& g = cP.text[i];
-    if (g.style != GTEXT_LANDMARK || g.alpha <= 0.0f) continue;
+    if (!casts_landmark_shadow(g)) continue;
     V3 ol, dl;
     landmark_ray(g, p, l, &ol, &dl);
     float ta, tb;

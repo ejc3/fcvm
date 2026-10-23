@@ -758,7 +758,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     // landmark letters shade the terrain in the accumulated samples: a new
     // landmark word starts a new hold
     for (int i = 0; i < p.n_text; i++)
-      if (p.text[i].style == GTEXT_LANDMARK) {
+      if (casts_landmark_shadow(p.text[i])) {
         key = mix64(key, 0x1A2D);
         for (int c = 0; c < p.text[i].len; c++) key = mix64(key, p.text[i].ch[c]);
         key = mix64(key, dbits(p.text[i].center.x));
