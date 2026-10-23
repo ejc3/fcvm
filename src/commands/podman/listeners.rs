@@ -50,6 +50,7 @@ const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration =
 /// - "reboot\n" - Guest is rebooting; set the reboot flag and stay alive so the
 ///   relaunched fc-agent's fresh status connections are accepted (the listener must
 ///   NOT exit or remove its socket, unlike the "exit:" path).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_status_listener(
     socket_path: &str,
     runtime_dir: &std::path::Path,
