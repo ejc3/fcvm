@@ -159,23 +159,23 @@ and the VM is torn down. Per run it records:
 - **gpu_ms**: the guest's GPU attach phase (rescan, modules, device nodes,
   `nvidia-persistenced`, `nvidia-smi -L`, CDI spec).
 
-Host: one AWS g4dn.metal (x86_64, 96 vCPUs, 8 NVIDIA T4, 377 GiB), Ubuntu 24.04, host kernel
-7.0.0-1013-aws, fcvm main at `3e9773e8` (main's next commit, `8b009baa`, changes only
-comments and test fixtures). 104 runs over 7 of the 8 GPUs, all exited 0, all restored with
-the `file` memory backend.
+Host: one AWS g4dn.metal (x86_64, 96 vCPUs, 8 NVIDIA T4, 377 GiB), on-demand, used by this
+run alone; Ubuntu 24.04, host kernel 7.0.0-1014-aws; fcvm at `12e0f0ca` (this branch, built on
+the host with `make build` and `make setup-gpu`). `make bench-gpu-restore N=104`: 104 runs, 13
+on each of the 8 GPUs, all exited 0, all restored with the `file` memory backend.
 
 | metric (ms) | n | min | p50 | p90 | p95 | p99 | max |
 |---|---|---|---|---|---|---|---|
-| wall | 104 | 3401 | 3516 | 3610 | 3642 | 3664 | 3685 |
-| ack_ms | 104 | 2360 | 2420 | 2477 | 2493 | 2505 | 2515 |
-| gpu_ms | 104 | 1310 | 1342 | 1377 | 1379 | 1399 | 1409 |
+| wall | 104 | 3256 | 3310 | 3343 | 3356 | 3375 | 3377 |
+| ack_ms | 104 | 2316 | 2351 | 2374 | 2377 | 2391 | 2396 |
+| gpu_ms | 104 | 1289 | 1339 | 1373 | 1383 | 1398 | 1404 |
 
-The host was not quiet. Another job used the eighth GPU and kept about 27 of the 96 vCPUs
-busy for the whole run: CPU idle was 70 to 72 percent in every 5 s `sar` sample, and the
-1-minute load average was 27 to 35. The run used a copy of `run.sh` that would wait while
-that job cycled through all eight GPUs; it never had to (104 runs in 6 min 15 s, 3.6 s
-apiece, the wall time). These numbers can include some contention from that job; they are not
-from an idle host.
+The host was idle around the run. Captured just before it: 1-minute load 0.49 (0.84 after
+the 5 s `pidstat` that followed, the start gate being at most 1.0), no process other than
+`pidstat` itself above 1% CPU, no `fcvm` or Firecracker process, and all 8 T4s bound to
+vfio-pci with no process holding any of their `/dev/vfio` groups. Captured just after: the
+same, with a 1-minute load of 1.08 left by the run's own VMs (one at a time) and no
+`/dev/vfio` group held.
 
 DESIGN.md's measurements of 2026-10-22, before `nvidia-persistenced` was started during the
 attach, had gpu_ms of 3,028 to 3,337 ms over five restores and a cache-hit run of 6.7 s.
