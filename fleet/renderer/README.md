@@ -61,7 +61,8 @@ scene is at golden hour (sun about 7 degrees up):
   the cloud layer, letting 14% through as diffuse light), and one bounce of
   sky or ground light; viewers' lights add point lighting.
 - **Words and the clock**: tubes along a stroke font, ray marched as 3D
-  distance fields and laid out on the screen (the clock centred near the top,
+  distance fields and laid out on the screen (the clock, in Pacific time
+  with PDT or PST, centred near the top,
   words in a grid below it, inside a safe area). Words are glowing glass; the
   clock is solid dark metal with a bright rim and a dark halo, readable over
   cloud and sky. Viewers' lights are glowing spheres. All drawn exactly (no
@@ -143,8 +144,8 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 
 ## Measured (2026-10-23, g4dn.metal from the fleet host AMI, one T4 per fcvm VM)
 
-The fps table, seams, shots and TLS numbers are from round 6; the
-stream-quality and subscriber numbers are from round 4.
+The fps table, seams and shots are from round 7; the TLS numbers from round
+6; the stream-quality and subscriber numbers from round 4.
 
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
 budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
@@ -154,25 +155,24 @@ the checkerboard stride (1: every pixel draws).
 
 | inner size | stream (with overlap) | fps | samples/pixel/frame | checker | render ms | encode ms |
 |---|---|---|---|---|---|---|
-| 146 x 146 (asked 136) | 178 x 178 | 30.2 | 5 | 1 | 12.8 | 0.59 |
-| 180 x 180 | 212 x 212 | 30.0 | 3 | 1 | 11.0 | 0.73 |
-| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 10.8 | 0.79 |
-| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 9.5 | 1.16 |
-| 1080 x 1080 detail view | 1112 x 1112 | 27.9 | 1 | 4 | 27.8 | 4.15 |
-| 1280 x 720 whole image | 1280 x 720 | 25.4 | 1 | 4 | 30.1 | 2.58 |
-| 1920 x 1080 whole image | 1920 x 1080 | 12.2 | 1 | 4 | 62.4 | 4.45 |
+| 146 x 146 (asked 136) | 178 x 178 | 32.5 | 5 | 1 | 11.5 | 0.82 |
+| 180 x 180 | 212 x 212 | 30.2 | 3 | 1 | 9.6 | 0.71 |
+| 240 x 240 | 272 x 272 | 30.0 | 2 | 1 | 8.8 | 0.75 |
+| 360 x 360 | 392 x 392 | 30.0 | 1 | 1 | 7.9 | 1.12 |
+| 1080 x 1080 detail view | 1112 x 1112 | 30.0 | 1 | 4 | 23.7 | 3.89 |
+| 1280 x 720 whole image | 1280 x 720 | 30.0 | 1 | 4 | 27.6 | 2.54 |
+| 1920 x 1080 whole image | 1920 x 1080 | 15.0 | 1 | 4 | 57.9 | 3.99 |
 
-The 720p whole image and the detail view sit at the slot's edge: render plus
-encode is 31 to 33 ms of the 33.3 ms slot, and a frame over it costs a slot.
-A second run in one VM gave 720p at 23.1 fps (29.6 ms) and the detail view
-at 30.0 (26.1 ms). Round 5 measured 29.5 and 26.9 ms on another box. A lower
-`budget` does not help these two: they already draw a quarter of the pixels
-with one sample, the floor. Per frame, the trace is nearly all of it (720p,
-moving, per-kernel events: trace 31 ms; sky 0.1, fill 0.2, resolve 0.2,
-finish 0.4); within the trace the cloud march took 5.3 ms, the bounce ray
-2.7 and the sun's shadow march 2.6 before both marches were shortened (20
-bounce steps, round 4's shadow octaves), which took that frame's trace from
-30.9 to 29.5 ms; the table above is after that change.
+Two
+more runs in one VM: 720p whole 30.0 and 30.0 fps (27.3 and 27.5 ms), the
+detail view 30.0 and 30.0 (22.4 and 22.5 ms). In round 6 those two views sat
+at the slot's edge (25.4 and 27.9 fps): round 7 ends the cloud march at a
+transmittance of 0.1 (the rest of the cloud added from that step's light),
+takes the light march every fourth fine step, steps 2% of the distance
+inside clouds, and shortens the sun shadow march (32 steps), the bounce ray
+(14 steps over 6 km) and the aerial perspective over a hit (8 steps). On the
+measure scene's 720p frame the trace went from 29.6 to 27.2 ms, and on the
+1080 detail tile from 95.2 to 82.8 ms (`still --seq 12`, per-kernel events).
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
@@ -196,16 +196,15 @@ the GPU; 307 to 330 ms with `nvidia-persistenced` running in the guest.
 Relaunch (round 2, cache-hit `fcvm podman run`): 6.15 to 6.28 s from the
 command to the first frame at the client.
 
-Seams (round 6): the seam test passes in VMs on three different T4s with the
-same hashes (`fnv64 d29502859cc7552a`, `a6dabe4b727ac567`, `19c1b42fb6c2c616`).
+Seams (round 7): the seam test passes in VMs on three different T4s with the
+same hashes (`fnv64 7bcd6010e2391cb4`, `99df125930c40c0f`, `81b124346d058065`).
 A moving frame captured unencoded from eight VMs (`tools/rawmosaic.py`)
 equals the same frame drawn whole in another VM in all 2,073,600 pixels, with
 every pixel drawing and with stride-4 checkerboard frames. At 540 px tiles its
-seam ratio is 0.75 to 1.26 unencoded and 0.81 to 1.35 as the eight `std`
-streams decode it, cropped (largest increase from encoding 0.33, at a boundary
-in flat forest). In the holds the centred clock puts a digit's edge on the
-middle boundary, which reads 6.3 (golden hour) and 7.6 (80 km) there and 0.61
-to 1.41 everywhere else; a 4x crop shows the digit, no line.
+seam ratio is 0.75 to 1.32 unencoded and 0.81 to 1.40 as the eight `std`
+streams decode it, cropped (largest increase from encoding 0.28). Holds,
+decoded: golden hour 0.87 to 1.39, 80 km 0.65 to 1.55. In the fast-move shot
+the clock puts a digit's edge on the middle top boundary (6.8 there).
 
 TLS (round 6, one renderer VM, `tools/tlscost.py`, 15 s per arm, camera
 moving, the same streams over `ws://` and then `wss://`; the renderer's CPU
@@ -223,7 +222,7 @@ replacement (450 frames, 352 after the swap, largest gap 42 ms) and new
 handshakes got the new certificate; a TLS 1.1 client is refused.
 
 `GET /still?h=540` from the eight VMs, 12 s after the first request with no
-stream running, in the 80 km hold: 359 to 382 samples per pixel, stitched in
+stream running, in the 80 km hold: 363 to 382 samples per pixel, stitched in
 `shots/still-high-8gpu.jpg`.
 
 Shots stitched from eight VMs on eight GPUs are in `shots/`:
