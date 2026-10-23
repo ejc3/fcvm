@@ -280,7 +280,7 @@ double curvature(const double p[3]) { return (p[0] * p[0] + p[2] * p[2]) / (2.0 
 // Keep the eye at least 60 m above ground and sea, then convert to world y.
 void clamp_above_ground(double p[3]) {
   const V4* tab = host_noise().tab.data();
-  double ground = std::max(0.0, (double)terrain_h(v2((float)p[0], (float)p[2]), 9, tab));
+  double ground = std::max(0.0, (double)surface_h(v2((float)p[0], (float)p[2]), 9, tab));
   if (p[1] < ground + 0.06) p[1] = ground + 0.06;
   p[1] -= curvature(p);
 }

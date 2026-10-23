@@ -10,7 +10,9 @@
 #include "../src/nvenc.h"
 #include "../src/proto.h"
 #include "../src/scene.h"
+#include "../src/world.h"
 #include "check.h"
+#include "tls_check.h"
 
 static const char* kContractExample =
     R"({"epoch_unix_ms": 1761100000000, "rect": {"x":0.5,"y":0.0,"w":0.0625,"h":0.111},
@@ -179,5 +181,31 @@ int main() {
     CHECK(!hm && km == 0 && pm.hold == 0, "moving camera is not a hold");
     (void)pc;
   }
+  {
+    // Lakes: somewhere in the basins around the golden-hour view the water
+    // stands above the carved floor, and an eye placed at the lake's level is
+    // lifted 60 m above the water, not above the lake bed.
+    const V4* tab = host_noise().tab.data();
+    float bx = 0, bz = 0, bw = 0, bg = 0;
+    bool found = false;
+    for (float z = -120.0f; z <= -60.0f && !found; z += 0.25f)
+      for (float x = -60.0f; x <= 0.0f && !found; x += 0.25f) {
+        float w;
+        float g = terrain_from(v2(x, z), macro_direct(v2(x, z), tab), 9, tab, &w);
+        if (w > 0.0f && g < w - 0.005f) { found = true; bx = x; bz = z; bw = w; bg = g; }
+      }
+    CHECK(found, "a lake (water above its bed, above sea level) near the golden-hour view");
+    CHECK(surface_h(v2(bx, bz), 9, tab) == bw, "the surface over a lake is its water");
+    Scene s;
+    s.rect = {0, 0, 1, 1};
+    s.camera.push_back(Keyframe{0, {bx, bg, bz}, {bx + 5, bg, bz + 5}, 60});
+    uint64_t k;
+    bool held;
+    Tile t = tile_geometry(s.rect, 16.0 / 9, 180);
+    FrameParams p = build_frame(s, t, 0.0, &k, &held);
+    double alt = p.cam.pos.y + (bx * bx + bz * bz) / (2.0 * PLANET_R);
+    CHECK(alt >= bw + 0.0599, "an eye at a lake is lifted 60 m above its water");
+  }
+  tlscheck::run();
   DONE();
 }

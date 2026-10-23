@@ -162,5 +162,24 @@ int main(int argc, char** argv) {
   quads(r, s, h, {{tm + 1.0 / 30, 2}}, false, q2);
   dc = compare(wm, q2, &hd);
   CHECK(dc > 1000, "control: another frame t must differ (%ld pixels differ)", dc);
+
+  // 6. No sample is NaN. The golden-hour view looks toward pixels where the
+  // sun is straight behind the eye: GGX's Fresnel term then took the
+  // fast-math powf of a value just below zero, about one sample in a frame.
+  {
+    Scene g = s;
+    g.camera.clear();
+    g.camera.push_back(Keyframe{0, {-15, 2.2, -100}, {-70, 1.4, -70}, 62});
+    g.time_of_day = 0.245;
+    g.rect = Rect{0, 0, 1, 1};
+    Tile gt = tile_geometry(g.rect, g.image_aspect, 1080);
+    r.reset_history();
+    unsigned bad = 0;
+    for (int f = 0; f < 4; f++) {
+      r.render(g, gt, 25.0, true, 16);
+      bad += r.stats().bad_samples;
+    }
+    CHECK(bad == 0 && r.stats().hold_samples == 64, "golden-hour hold at 1080, 64 samples: %u non-finite samples", bad);
+  }
   DONE();
 }

@@ -1,5 +1,6 @@
 #include "pipeline.h"
 
+#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -461,6 +462,15 @@ std::string Pipeline::health_json() {
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
     << ",\"spp\":" << rstats_.spp << ",\"checkerboard\":" << rstats_.half << ",\"hold\":" << (rstats_.hold ? "true" : "false")
     << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
+  {
+    // CPU seconds this process has used (user + system), for cost per stream
+    rusage ru;
+    getrusage(RUSAGE_SELF, &ru);
+    double cpu = ru.ru_utime.tv_sec + ru.ru_utime.tv_usec * 1e-6 + ru.ru_stime.tv_sec + ru.ru_stime.tv_usec * 1e-6;
+    char b[32];
+    snprintf(b, sizeof b, "%.3f", cpu);
+    o << ",\"cpu_s\":" << b;
+  }
   o << ",\"startup_ms\":{\"gpu_ready\":" << std::round(startup_ready_ms_) << ",\"first_frame_drawn\":"
     << std::round(first_frame_ms_) << ",\"first_frame_sent\":" << std::round(first_sent_ms_) << "}}";
   return o.str();

@@ -15,6 +15,7 @@
 #include "render.h"
 #include "scene.h"
 #include "server.h"
+#include "tls.h"
 
 static void usage() {
   fprintf(stderr,
@@ -24,7 +25,8 @@ static void usage() {
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
           "       fleet-renderer sleep                          wait forever without using the GPU\n"
-          "env: PORT, FPS (30), BUDGET pixel-samples per frame (250000), ADAPT (0), MARGIN (16), ACCUMULATE (1)\n");
+          "env: PORT, FPS (30), BUDGET pixel-samples per frame (250000), ADAPT (0), MARGIN (16), ACCUMULATE (1),\n"
+          "     TLS_CERT_FILE (JSON {cert, key}; enables HTTPS/WSS), TLS_PORT (443)\n");
 }
 
 static double envd(const char* k, double d) {
@@ -150,6 +152,20 @@ int main(int argc, char** argv) {
   }
   fprintf(stderr, "fleet-renderer: listening on :%d (%.0f ms after process start)\n", o.port,
           (boottime_s() - start) * 1000.0);
+  // HTTPS and WSS for browsers, when the host hands over a certificate file
+  TlsFront tls;
+  const char* cert_file = getenv("TLS_CERT_FILE");
+  if (cert_file && *cert_file) {
+    int tport = (int)envd("TLS_PORT", 443);
+    if (!tls.load(cert_file, &err)) fprintf(stderr, "fleet-renderer: TLS certificate not loaded yet: %s\n", err.c_str());
+    tls.watch(cert_file, 2000);
+    if (!s.listen_tls(tport, &tls, &err)) {
+      fprintf(stderr, "fleet-renderer: %s\n", err.c_str());
+      return 1;
+    }
+    fprintf(stderr, "fleet-renderer: TLS on :%d, certificate %s (expires %s)\n", tport,
+            tls.loaded() ? "loaded" : "not loaded", tls.not_after().c_str());
+  }
   std::thread rt([&] { p.run(); });
   s.serve();
   rt.join();
