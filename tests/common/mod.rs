@@ -2584,7 +2584,7 @@ pub async fn get_host_primary_ip() -> anyhow::Result<String> {
         .context("running ip route get")?;
 
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // Output: "8.8.8.8 via 172.31.0.1 dev enp3s0 src 172.31.15.123 uid 0"
+    // Output: "8.8.8.8 via 192.0.2.1 dev enp3s0 src 192.0.2.10 uid 0"
     for part in stdout.split_whitespace().collect::<Vec<_>>().windows(2) {
         if part[0] == "src" {
             return Ok(part[1].to_string());

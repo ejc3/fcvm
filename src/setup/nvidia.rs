@@ -4,14 +4,18 @@
 //! read-only ext4 image holding, for that profile's exact kernel build:
 //!
 //! - `lib/modules/<release>/extra/{nvidia,nvidia-uvm}.ko`, built from the
-//!   `kernel-open/` sources inside the pinned driver `.run` against a tree
-//!   configured and built from the same inputs as the profile's kernel;
+//!   `kernel-open/` sources (or, with `module_type = "proprietary"`, the
+//!   proprietary `kernel/` sources) inside the pinned driver `.run` against a
+//!   tree configured and built from the same inputs as the profile's kernel,
+//!   and `nvidia.params`, the parameters fc-agent loads nvidia.ko with;
 //! - `lib/firmware/nvidia/<version>/gsp_*.bin`, the GSP firmware the open
 //!   modules boot on Turing and later;
 //! - `usr/lib/<triplet>/lib*.so.<version>` and `usr/bin/nvidia-smi` and
 //!   friends, from the same `.run`;
 //! - `usr/bin/nvidia-ctk` and `usr/bin/nvidia-cdi-hook` from the pinned
-//!   nvidia-container-toolkit release.
+//!   nvidia-container-toolkit release;
+//! - `usr/bin/fcvm-gpu-scrub`, built here from [`GPU_SCRUB_SOURCE`], which
+//!   fc-agent runs to zero the GPUs' memory before a container gets them.
 //!
 //! The modules and the user-space libraries come from one archive, so their
 //! versions match by construction, and the build checks it (`modinfo` version
@@ -53,6 +57,81 @@ pub struct NvidiaDriverConfig {
     pub toolkit_url: String,
     /// SHA-256 of that archive, lowercase hex.
     pub toolkit_sha256: String,
+    /// Which of the `.run`'s kernel modules the image carries.
+    #[serde(default)]
+    pub module_type: ModuleType,
+}
+
+/// The NVIDIA kernel modules a driver image carries. Both come from the same
+/// `.run` and work with the same user-space driver.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ModuleType {
+    /// `kernel-open/`. The driver's resource manager runs on the GPU's GSP, so
+    /// every GPU initialisation boots the GSP firmware first.
+    #[default]
+    Open,
+    /// `kernel/`, the proprietary modules, loaded with `NVreg_EnableGpuFirmware=0`
+    /// so the resource manager runs on the CPU and no GSP firmware is booted.
+    /// On a T4 in a gpu VM that halved the GPU initialisation (nvidia-persistenced
+    /// start 576 to 623 ms against 1,113 to 1,156 ms with the open modules).
+    /// Turing and Ampere only: later GPUs have no proprietary module support.
+    Proprietary,
+}
+
+impl ModuleType {
+    /// The `.run`'s directory holding these modules' sources.
+    fn source_dir(self) -> &'static str {
+        match self {
+            ModuleType::Open => "kernel-open",
+            ModuleType::Proprietary => "kernel",
+        }
+    }
+
+    /// The parameters nvidia.ko is loaded with (fc-agent reads them from
+    /// `nvidia.params` beside the module).
+    fn nvidia_params(self) -> &'static str {
+        match self {
+            ModuleType::Open => "",
+            ModuleType::Proprietary => "NVreg_EnableGpuFirmware=0",
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            ModuleType::Open => "open",
+            ModuleType::Proprietary => "proprietary",
+        }
+    }
+
+    /// Whether these modules can run the NVIDIA device `device` (PCI device ID).
+    ///
+    /// The open modules run every GPU this driver supports (Turing and later). The
+    /// proprietary modules are loaded with the GSP firmware off, which this
+    /// configuration was measured with on Turing only; they are allowed on Turing
+    /// and Ampere, and refused on anything later (Blackwell has no proprietary
+    /// module support at all). The ranges cover exactly the Turing and Ampere
+    /// entries of the driver's `supported-gpus.json` (580.196.07): Turing
+    /// 0x1E00-0x1FFF and 0x2180-0x21FF, Ampere 0x2080-0x20FF, 0x2200-0x22FF and
+    /// 0x2400-0x25FF. Volta (0x1Dxx), Hopper (0x23xx), Ada (0x26xx-0x28xx) and
+    /// Blackwell (0x29xx and up) fall outside them.
+    pub fn supports_device(self, device: u16) -> bool {
+        match self {
+            ModuleType::Open => true,
+            ModuleType::Proprietary => matches!(
+                device,
+                0x1E00..=0x1FFF | 0x2180..=0x21FF | 0x2080..=0x20FF | 0x2200..=0x22FF | 0x2400..=0x25FF
+            ),
+        }
+    }
+}
+
+/// The module type of `profile_name`'s NVIDIA driver image on this architecture,
+/// or `None` when the profile builds no driver image.
+pub fn profile_module_type(profile_name: &str) -> Result<Option<ModuleType>> {
+    Ok(get_kernel_profile(profile_name)?
+        .and_then(|profile| profile.nvidia)
+        .map(|nvidia| nvidia.module_type))
 }
 
 fn is_sha256(value: &str) -> bool {
@@ -170,12 +249,31 @@ fetch_verified "$NV_TOOLKIT_URL" "$NV_TOOLKIT_SHA256" "$NV_DIR/toolkit-$NV_TOOLK
 rm -rf "$NV_DIR/driver" "$NV_DIR/toolkit" "$NV_ROOT"
 sh "$NV_DIR/driver-$NV_DRIVER_VERSION.run" --extract-only --target "$NV_DIR/driver" >/dev/null
 
-# Kernel modules, from the .run's own open sources, against this tree.
-make -C "$NV_DIR/driver/kernel-open" SYSSRC="$PWD" SYSOUT="$PWD" ARCH="$KERNEL_ARCH" -j"$NPROC" modules
+# Let nvidia.ko load with no GPU on the bus, as it already does when an NVSwitch
+# is present: nvidia_init_module refuses an empty bus only behind this local.
+# fc-agent loads the modules at boot, before the pre-start snapshot, so a
+# restore that attaches a GPU only probes it (PCI rescan) instead of loading
+# and initialising the driver.
+NV_C="$NV_DIR/driver/$NV_MODULE_SRC/nvidia/nv.c"
+NV_NOGPU_FROM='const NvBool is_nvswitch_present = os_is_nvswitch_present();'
+NV_NOGPU_TO='const NvBool is_nvswitch_present = NV_TRUE;'
+if [[ $(grep -cF "$NV_NOGPU_FROM" "$NV_C") -ne 1 ]]; then
+    echo "ERROR: $NV_C does not declare is_nvswitch_present once as expected; cannot let the driver load without a GPU" >&2
+    exit 1
+fi
+sed -i "s/$NV_NOGPU_FROM/$NV_NOGPU_TO/" "$NV_C"
+if [[ $(grep -cF "$NV_NOGPU_TO" "$NV_C") -ne 1 ]]; then
+    echo "ERROR: patching $NV_C to load without a GPU failed" >&2
+    exit 1
+fi
+
+# Kernel modules, from the .run's own sources (kernel-open/ or the proprietary
+# kernel/), against this tree.
+make -C "$NV_DIR/driver/$NV_MODULE_SRC" SYSSRC="$PWD" SYSOUT="$PWD" ARCH="$KERNEL_ARCH" -j"$NPROC" modules
 MODDIR="$NV_ROOT/lib/modules/$KREL/extra"
 mkdir -p "$MODDIR"
 for module in nvidia nvidia-uvm; do
-    ko="$NV_DIR/driver/kernel-open/$module.ko"
+    ko="$NV_DIR/driver/$NV_MODULE_SRC/$module.ko"
     version=$(modinfo -F version "$ko")
     vermagic=$(modinfo -F vermagic "$ko")
     if [[ "$version" != "$NV_DRIVER_VERSION" ]]; then
@@ -188,6 +286,8 @@ for module in nvidia nvidia-uvm; do
     fi
     install -m 0644 "$ko" "$MODDIR/$module.ko"
 done
+# The parameters fc-agent loads nvidia.ko with, one line, possibly empty.
+printf '%s\n' "$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params"
 
 # GSP firmware, where the firmware loader looks for nvidia/<version>/.
 install -d "$NV_ROOT/lib/firmware/nvidia/$NV_DRIVER_VERSION"
@@ -220,11 +320,23 @@ fi
 dpkg-deb -x "${debs[0]}" "$NV_DIR/toolkit/base"
 install -m 0755 "$NV_DIR/toolkit/base/usr/bin/nvidia-ctk" "$NV_DIR/toolkit/base/usr/bin/nvidia-cdi-hook" "$NV_ROOT/usr/bin/"
 
+# The memory scrub fc-agent runs before a container gets the GPUs. It loads
+# libcuda.so.1 with dlopen, so it needs only a C compiler. It runs on the guest's
+# glibc: refuse a build that needs a version newer than 2.34, where dlopen and
+# pthread_create moved into libc, rather than ship one the guest cannot load.
+gcc -O2 -Wall -Wextra -Werror -pthread -o "$NV_ROOT/usr/bin/fcvm-gpu-scrub" "$NV_SCRUB_SOURCE"
+newest_glibc=$(objdump -T "$NV_ROOT/usr/bin/fcvm-gpu-scrub" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+if [[ "$(printf '%s\nGLIBC_2.34\n' "$newest_glibc" | sort -V | tail -1)" != "GLIBC_2.34" ]]; then
+    echo "ERROR: fcvm-gpu-scrub needs $newest_glibc, newer than GLIBC_2.34" >&2
+    exit 1
+fi
+
 for required in \
     "$MODDIR/nvidia.ko" "$MODDIR/nvidia-uvm.ko" \
     "$LIBDIR/libcuda.so.$NV_DRIVER_VERSION" "$LIBDIR/libcuda.so.1" \
     "$LIBDIR/libnvidia-ml.so.$NV_DRIVER_VERSION" "$LIBDIR/libnvidia-ml.so.1" \
-    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook"; do
+    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook" \
+    "$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do
     if [[ ! -e "$required" ]]; then
         echo "ERROR: driver image is missing $required" >&2
         exit 1
@@ -266,12 +378,22 @@ e2fsck -fn "$NV_IMAGE_TMP" >/dev/null
 echo "Driver image: $NV_IMAGE_TMP (${size_mib} MiB)"
 "##;
 
+/// The source of `usr/bin/fcvm-gpu-scrub`, compiled by the stage. Part of the
+/// image's key like the stage text.
+pub(crate) const GPU_SCRUB_SOURCE: &str = include_str!("nvidia_gpu_scrub.c");
+
 /// The header that hands the stage its inputs.
-fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) -> String {
+fn stage_header(
+    config: &NvidiaDriverConfig,
+    triplet: &str,
+    image_tmp: &Path,
+    scrub_source: &Path,
+) -> String {
     format!(
         "NV_DRIVER_VERSION=\"{}\"\nNV_DRIVER_URL=\"{}\"\nNV_DRIVER_SHA256=\"{}\"\n\
          NV_TOOLKIT_VERSION=\"{}\"\nNV_TOOLKIT_URL=\"{}\"\nNV_TOOLKIT_SHA256=\"{}\"\n\
-         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n",
+         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n\
+         NV_MODULE_SRC=\"{}\"\nNV_MODULE_PARAMS=\"{}\"\nNV_SCRUB_SOURCE=\"{}\"\n",
         config.driver_version,
         config.driver_url,
         config.driver_sha256,
@@ -280,11 +402,15 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
         config.toolkit_sha256,
         triplet,
         image_tmp.display(),
+        config.module_type.source_dir(),
+        config.module_type.nvidia_params(),
+        scrub_source.display(),
     )
 }
 
 /// The image's content key: the kernel's identity, the pinned versions and
-/// hashes, and the stage text. Not the paths the build writes to.
+/// hashes, the stage text and the scrub tool's source. Not the paths the build
+/// writes to.
 pub fn driver_image_key(
     profile_name: &str,
     kernel_version: &str,
@@ -304,7 +430,9 @@ pub fn driver_image_key(
         &config.toolkit_version,
         &config.toolkit_url,
         &config.toolkit_sha256,
+        config.module_type.as_str(),
         DRIVER_IMAGE_STAGE,
+        GPU_SCRUB_SOURCE,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -517,9 +645,12 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
     let kernel_tmp = build_dir.join("kernel-image.discard");
     let _ = std::fs::remove_file(&kernel_tmp);
 
+    // Beside the script, unique to this invocation like it.
+    let scrub_source = script_path.with_extension("c");
+    write_scrub_source(&scrub_source)?;
     let stage = format!(
         "{}{}",
-        stage_header(config, lib_triplet(arch)?, &image_tmp),
+        stage_header(config, lib_triplet(arch)?, &image_tmp, &scrub_source),
         DRIVER_IMAGE_STAGE
     );
     let script = crate::setup::kernel::generate_vm_kernel_build_script(
@@ -543,6 +674,7 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
     super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_streaming(cmd, "nvidia_build").await;
     let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&scrub_source);
     let status = match status {
         Ok(status) => status,
         Err(error) => {
@@ -565,6 +697,14 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
         }
     }
     published
+}
+
+/// Write the scrub source for the build, which may run as the sudo invoker
+/// rather than as this process.
+fn write_scrub_source(path: &Path) -> Result<()> {
+    std::fs::write(path, GPU_SCRUB_SOURCE).context("writing the GPU scrub source")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+        .context("making the GPU scrub source readable")
 }
 
 /// The build tree and script of one driver image build, unique to the invocation
@@ -591,6 +731,7 @@ mod tests {
             toolkit_url: "https://example.invalid/v1.20.1/toolkit_1.20.1_deb_arm64.tar.gz"
                 .to_string(),
             toolkit_sha256: "b".repeat(64),
+            module_type: ModuleType::Open,
         }
     }
 
@@ -666,6 +807,7 @@ mod tests {
             |c: &mut NvidiaDriverConfig| c.toolkit_version.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_url.push('1'),
             |c: &mut NvidiaDriverConfig| c.toolkit_sha256 = "d".repeat(64),
+            |c: &mut NvidiaDriverConfig| c.module_type = ModuleType::Proprietary,
         ] {
             let mut config = pinned();
             mutate(&mut config);
@@ -690,7 +832,12 @@ mod tests {
 
     #[test]
     fn the_stage_reads_every_input_the_header_sets() {
-        let header = stage_header(&pinned(), "aarch64-linux-gnu", Path::new("/x/img.tmp"));
+        let header = stage_header(
+            &pinned(),
+            "aarch64-linux-gnu",
+            Path::new("/x/img.tmp"),
+            Path::new("/x/scrub.c"),
+        );
         for line in header.lines() {
             let name = line.split('=').next().unwrap();
             assert!(
@@ -709,6 +856,295 @@ mod tests {
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$version" != "$NV_DRIVER_VERSION" ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$vermagic" != "$KREL "* ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#""$LIBDIR/libcuda.so.$NV_DRIVER_VERSION""#));
+    }
+
+    /// A stand-in for libcuda.so.1: each GPU has `free` bytes, an allocation
+    /// larger than what is left is refused as out of memory, and at exit it
+    /// reports per GPU what was allocated, zeroed, freed and left.
+    const FAKE_LIBCUDA: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+static size_t avail[2] = {(1ul << 30) + (3ul << 20) + 4096, 5ul << 20};
+static size_t allocated[2], zeroed[2];
+static int allocs[2], frees[2];
+static __thread int cur = -1;
+int cuInit(unsigned f) { (void)f; return 0; }
+int cuDeviceGetCount(int *c) { *c = getenv("FAKE_GPUS") ? atoi(getenv("FAKE_GPUS")) : 2; return 0; }
+int cuDeviceGet(int *d, int o) { *d = o; return 0; }
+int cuCtxCreate_v2(void **c, unsigned f, int d) { (void)f; cur = d; *c = &avail[d]; return 0; }
+int cuCtxDestroy_v2(void *c) { (void)c; return 0; }
+int cuCtxSynchronize(void) { return 0; }
+int cuMemGetInfo_v2(size_t *f, size_t *t) { *f = avail[cur]; *t = 16ul << 30; return 0; }
+int cuMemAlloc_v2(unsigned long long *p, size_t n) {
+    if (n > avail[cur]) return 2;
+    avail[cur] -= n; allocated[cur] += n; allocs[cur]++;
+    *p = ((unsigned long long)cur << 40) | allocated[cur];
+    return 0;
+}
+int cuMemFree_v2(unsigned long long p) { frees[p >> 40]++; return 0; }
+int cuMemsetD32Async(unsigned long long p, unsigned v, size_t n, void *s) {
+    (void)s;
+    if (getenv("FAKE_MEMSET_FAILS")) return 700;
+    if (v == 0) zeroed[p >> 40] += 4 * n;
+    return 0;
+}
+int cuGetErrorString(int r, const char **s) { (void)r; *s = "fake error"; return 0; }
+__attribute__((destructor)) static void report(void) {
+    for (int d = 0; d < 2; d++)
+        fprintf(stderr, "fake device=%d allocated=%zu zeroed=%zu allocs=%d frees=%d left=%zu\n",
+                d, allocated[d], zeroed[d], allocs[d], frees[d], avail[d]);
+}
+"#;
+
+    fn gcc(args: &[&str]) {
+        let output = std::process::Command::new("gcc")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "gcc {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Build fcvm-gpu-scrub with the stage's flags and the fake libcuda, and
+    /// run it with `env`; returns (exit code, stdout, stderr).
+    fn run_scrub_against_fake(env: &[(&str, &str)]) -> (i32, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("scrub.c");
+        let tool = dir.path().join("fcvm-gpu-scrub");
+        std::fs::write(&source, GPU_SCRUB_SOURCE).unwrap();
+        assert!(
+            DRIVER_IMAGE_STAGE.contains(
+                r#"gcc -O2 -Wall -Wextra -Werror -pthread -o "$NV_ROOT/usr/bin/fcvm-gpu-scrub" "$NV_SCRUB_SOURCE""#
+            ),
+            "the stage builds the scrub with other flags than this test"
+        );
+        gcc(&[
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-o",
+            tool.to_str().unwrap(),
+            source.to_str().unwrap(),
+        ]);
+        // The stage refuses a binary that needs a glibc newer than 2.34; check
+        // the same here, so a source change that pulls in a newer symbol fails
+        // this test rather than the next image build.
+        let symbols = std::process::Command::new("objdump")
+            .arg("-T")
+            .arg(&tool)
+            .output()
+            .unwrap();
+        let symbols = String::from_utf8_lossy(&symbols.stdout);
+        let too_new: Vec<&str> = symbols
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
+            .filter_map(|word| word.strip_prefix("GLIBC_"))
+            .filter(|version| {
+                let mut parts = version.split('.').map(|p| p.parse::<u32>().unwrap_or(0));
+                (parts.next().unwrap_or(0), parts.next().unwrap_or(0)) > (2, 34)
+            })
+            .collect();
+        assert!(
+            too_new.is_empty(),
+            "fcvm-gpu-scrub needs glibc {too_new:?}, newer than the stage allows (2.34)"
+        );
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        if !env.iter().any(|(k, _)| *k == "NO_FAKE") {
+            let fake = dir.path().join("fake.c");
+            std::fs::write(&fake, FAKE_LIBCUDA).unwrap();
+            gcc(&[
+                "-shared",
+                "-fPIC",
+                "-o",
+                lib.join("libcuda.so.1").to_str().unwrap(),
+                fake.to_str().unwrap(),
+            ]);
+        }
+        let output = std::process::Command::new(&tool)
+            .env("LD_LIBRARY_PATH", &lib)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// Run the stage's no-GPU patch against an `nv.c` holding `source`.
+    fn run_no_gpu_patch(module_src: &str, source: &str) -> (bool, String, String) {
+        let start = DRIVER_IMAGE_STAGE
+            .find("NV_C=")
+            .expect("the stage no longer patches nv.c");
+        let end = DRIVER_IMAGE_STAGE[start..]
+            .find("# Kernel modules,")
+            .expect("the no-GPU patch must come before the module build")
+            + start;
+        let dir = tempfile::tempdir().unwrap();
+        let nvidia = dir.path().join("driver").join(module_src).join("nvidia");
+        std::fs::create_dir_all(&nvidia).unwrap();
+        std::fs::write(nvidia.join("nv.c"), source).unwrap();
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(&DRIVER_IMAGE_STAGE[start..end])
+            .env("NV_DIR", dir.path())
+            .env("NV_MODULE_SRC", module_src)
+            .output()
+            .unwrap();
+        (
+            output.status.success(),
+            std::fs::read_to_string(nvidia.join("nv.c")).unwrap(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// The scrub takes every allocation a GPU grants, down to 2 MiB, zeroes
+    /// all of it and frees all of it, on every GPU.
+    #[test]
+    fn the_gpu_scrub_zeroes_everything_it_can_allocate_on_every_gpu() {
+        let (code, stdout, stderr) = run_scrub_against_fake(&[]);
+        assert_eq!(code, 0, "{stdout}{stderr}");
+        assert!(stdout.contains("scrubbed devices=2 "), "{stdout}");
+        for (device, allocated) in [(0, (1u64 << 30) + (2 << 20)), (1, 4 << 20)] {
+            let line = stderr
+                .lines()
+                .find(|l| l.starts_with(&format!("fake device={device} ")))
+                .unwrap_or_else(|| panic!("no report for device {device}: {stderr}"));
+            assert!(
+                line.contains(&format!("allocated={allocated} zeroed={allocated} ")),
+                "device {device} was not zeroed in full: {line}"
+            );
+            let field = |name: &str| -> u64 {
+                line.split_whitespace()
+                    .find_map(|f| f.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            assert_eq!(field("allocs"), field("frees"), "{line}");
+            assert!(field("left") < 2 << 20, "{line}");
+        }
+    }
+
+    /// A GPU it cannot zero, or a missing driver, fails the scrub; what it
+    /// allocated is still freed.
+    #[test]
+    fn the_gpu_scrub_fails_when_it_cannot_zero_a_gpu() {
+        let (code, stdout, stderr) = run_scrub_against_fake(&[("FAKE_MEMSET_FAILS", "1")]);
+        assert_eq!(code, 1, "{stdout}{stderr}");
+        assert!(stderr.contains("cuMemsetD32Async: fake error"), "{stderr}");
+        assert!(!stdout.contains("scrubbed devices="), "{stdout}");
+        assert!(stderr.contains("allocs=2 frees=2"), "{stderr}");
+
+        let (code, stdout, stderr) = run_scrub_against_fake(&[("FAKE_GPUS", "0")]);
+        assert_eq!(code, 1, "{stdout}{stderr}");
+        assert!(stderr.contains("reports 0 GPU(s)"), "{stderr}");
+
+        let (code, _, stderr) = run_scrub_against_fake(&[("NO_FAKE", "1")]);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("libcuda.so.1"), "{stderr}");
+    }
+
+    /// The build drops to the sudo invoker, so the source must be readable by
+    /// another user whatever this process's umask.
+    #[test]
+    fn the_scrub_source_is_readable_by_the_build_user_under_any_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.c");
+        // nextest runs each test in its own process, so the umask is ours.
+        let old = unsafe { libc::umask(0o077) };
+        let written = write_scrub_source(&path);
+        unsafe { libc::umask(old) };
+        written.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "mode {mode:o}");
+    }
+
+    /// fc-agent runs the scrub from the path the stage installs it at.
+    #[test]
+    fn fc_agent_runs_the_scrub_the_image_carries() {
+        let agent = include_str!("../../fc-agent/src/gpu.rs");
+        assert!(
+            agent.contains(r#"pub const SCRUB_TOOL: &str = "usr/bin/fcvm-gpu-scrub";"#),
+            "fc-agent's SCRUB_TOOL no longer names usr/bin/fcvm-gpu-scrub"
+        );
+        assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do"#));
+    }
+
+    /// nvidia.ko must load with no GPU on the bus, so fc-agent can load it
+    /// before the pre-start snapshot. The open module's init refuses an empty
+    /// bus unless `is_nvswitch_present`; the stage makes that local true, and
+    /// fails the build when the driver source no longer has the line.
+    #[test]
+    fn the_stage_lets_the_driver_load_without_a_gpu() {
+        let declared = "    const NvBool is_nvswitch_present = os_is_nvswitch_present();\n";
+        let refusal = "    if ((count == 0) && (!is_nvswitch_present))\n";
+        for module_type in [ModuleType::Open, ModuleType::Proprietary] {
+            let src = module_type.source_dir();
+            let (ok, patched, stderr) = run_no_gpu_patch(src, &format!("{declared}{refusal}"));
+            assert!(ok, "{src}: {stderr}");
+            assert_eq!(
+                patched,
+                format!("    const NvBool is_nvswitch_present = NV_TRUE;\n{refusal}"),
+                "{src}"
+            );
+
+            let (ok, unchanged, stderr) = run_no_gpu_patch(src, refusal);
+            assert!(
+                !ok,
+                "{src}: a driver without the declaration must fail the build"
+            );
+            assert_eq!(unchanged, refusal);
+            assert!(stderr.contains("is_nvswitch_present"), "{stderr}");
+        }
+    }
+
+    /// The module type picks the `.run` directory the stage builds and the
+    /// parameters it records for fc-agent; an unset type is the open modules.
+    #[test]
+    fn the_module_type_picks_the_sources_and_the_load_parameters() {
+        let parse = |extra: &str| -> Result<NvidiaDriverConfig, toml::de::Error> {
+            toml::from_str(&format!(
+                "driver_version = \"1\"\ndriver_url = \"u\"\ndriver_sha256 = \"s\"\n\
+                 toolkit_version = \"1\"\ntoolkit_url = \"u\"\ntoolkit_sha256 = \"s\"\n{extra}"
+            ))
+        };
+        assert_eq!(parse("").unwrap().module_type, ModuleType::Open);
+        assert_eq!(
+            parse("module_type = \"proprietary\"").unwrap().module_type,
+            ModuleType::Proprietary
+        );
+        assert!(parse("module_type = \"closed\"").is_err());
+
+        let mut config = pinned();
+        let open = stage_header(
+            &config,
+            "x86_64-linux-gnu",
+            Path::new("/x/img.tmp"),
+            Path::new("/x/scrub.c"),
+        );
+        assert!(open.contains("NV_MODULE_SRC=\"kernel-open\"\n"), "{open}");
+        assert!(open.contains("NV_MODULE_PARAMS=\"\"\n"), "{open}");
+        config.module_type = ModuleType::Proprietary;
+        let closed = stage_header(
+            &config,
+            "x86_64-linux-gnu",
+            Path::new("/x/img.tmp"),
+            Path::new("/x/scrub.c"),
+        );
+        assert!(closed.contains("NV_MODULE_SRC=\"kernel\"\n"), "{closed}");
+        assert!(
+            closed.contains("NV_MODULE_PARAMS=\"NVreg_EnableGpuFirmware=0\"\n"),
+            "{closed}"
+        );
+        assert!(DRIVER_IMAGE_STAGE.contains(r#"make -C "$NV_DIR/driver/$NV_MODULE_SRC""#));
+        assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_MODULE_PARAMS" > "$MODDIR/nvidia.params""#));
     }
 
     #[test]

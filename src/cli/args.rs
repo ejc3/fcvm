@@ -30,6 +30,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Print a VM's balloon target and size as one JSON line; with MIB, set the target first
     Balloon(BalloonArgs),
+    /// Host-side GPU pool operations: scrub a GPU's memory between VMs, show quarantines
+    Gpu(GpuArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
     /// Run HTTP/WebSocket API server for ComputeSDK integration
@@ -346,6 +348,14 @@ pub struct RunArgs {
     /// The other network modes ignore it, and their snapshot keys do not include it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
+
+    /// The VM's IPv6 address in routed mode, instead of one derived from its random VM
+    /// id. It must lie inside the prefix in use (--ipv6-prefix, FCVM_IPV6_PREFIX or the
+    /// detected /64) and must not be the prefix's address 0 or 1. An address another
+    /// live VM holds is refused. Only valid with --network routed. Not part of any
+    /// snapshot key: a VM restored from a snapshot takes the address it is given.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
     /// The probe is plain HTTP for the URL's port, path and query, and the URL hostname is
@@ -676,6 +686,13 @@ pub struct SnapshotRunArgs {
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
 
+    /// The clone's IPv6 address, for a routed snapshot only: the guest's address is
+    /// swapped to it on restore, instead of one derived from the clone's random VM id.
+    /// The same rules as `podman run --ipv6-address` apply: inside the prefix in use,
+    /// not its address 0 or 1, and not held by another live VM.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
+
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
     // ========================================================================
@@ -743,6 +760,45 @@ pub struct SnapshotRunArgs {
     /// this run did not, and a hook the caller never named must not run in its clone.
     #[arg(skip = true)]
     pub inherit_recorded_hook: bool,
+}
+
+// ============================================================================
+// GPU pool commands (host-side scrub and quarantine)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct GpuArgs {
+    #[command(subcommand)]
+    pub cmd: GpuCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuCommands {
+    /// Reset each GPU and wait until it reports its memory cleared, before the GPU
+    /// goes to another VM. Run as root after the previous VM's Firecracker has
+    /// exited. Prints one JSON line per GPU; a GPU whose scrub fails is quarantined
+    /// (`--gpu` refuses it) until a later scrub succeeds. Exits 0 only if every GPU
+    /// was scrubbed.
+    Scrub(GpuScrubArgs),
+    /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
+    Status(GpuStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuScrubArgs {
+    /// GPU PCI addresses (SSSS:BB:DD.F or BB:DD.F), scrubbed in parallel
+    #[arg(required = true, value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
+    /// Seconds to wait for each of the GPU's boot and its memory clear
+    #[arg(long, default_value_t = 5)]
+    pub timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuStatusArgs {
+    /// GPU PCI addresses; every recorded GPU when none are given
+    #[arg(value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
 }
 
 // ============================================================================

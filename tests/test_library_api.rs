@@ -56,6 +56,7 @@ fn test_run_args(name: &str) -> RunArgs {
         health_check_timeout: 5,
         on_restore: None,
         ipv6_prefix: None,
+        ipv6_address: None,
         dns: None,
         image: common::TEST_IMAGE.to_string(),
         command_args: vec![],

@@ -2656,7 +2656,6 @@ def collect_provenance(args, schedule: dict, snapshot: dict) -> dict:
             "held_from_identity_read_through_terminal_verification": True,
         },
         "host": {
-            "hostname": platform.node(),
             "kernel": platform.release(),
             "machine": platform.machine(),
             "python": platform.python_version(),
