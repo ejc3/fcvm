@@ -2,7 +2,7 @@
   "config": {
     "max_tiles": 2
   },
-  "description": "GPUs beyond max_tiles form the standby pool: assigned with standby and no VM, counted ready once they report standby. A quarantined GPU leaves the tiling (a standby GPU takes its place) and the assignment, stays out when its agent reconnects, and returns only when an operator releases it.",
+  "description": "GPUs beyond max_tiles form the standby pool: assigned with standby and no VM, counted ready once they report standby. A quarantined GPU leaves the tiling and the assignment; a standby GPU warms (its VM runs off the wall) and takes the place once it renders. The quarantined GPU stays out when its agent reconnects and returns only when an operator releases it; it then warms while the tile it displaces keeps its place, which goes back to standby once the returning GPU joins.",
   "events": [
     {
       "at": 1000,
@@ -83,6 +83,20 @@
       "type": "agent"
     },
     {
+      "at": 2500,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
       "at": 3000,
       "host": "h1",
       "type": "agent_gone"
@@ -117,6 +131,20 @@
       "host": "h1",
       "sbdf": "0000:01:00.0",
       "type": "release_quarantine"
+    },
+    {
+      "at": 5500,
+      "host": "h1",
+      "msg": {
+        "frame_url": "ws://h1:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
     }
   ],
   "expect": [
@@ -146,6 +174,7 @@
         "/assign/h1/0/id": "slot-2",
         "/assign/h1/1/id": "slot-3",
         "/assign/h1/1/standby": null,
+        "/assign/h1/1/warm": true,
         "/assign/h1/2": null,
         "/view/failures": [
           {
@@ -157,12 +186,23 @@
           }
         ],
         "/view/fleet/standby": [],
+        "/view/fleet/warming": [
+          "slot-3"
+        ],
         "/view/tiles/0/slot": "slot-2",
+        "/view/tiles/1": null
+      },
+      "note": "the standby GPU warms before it takes the place"
+    },
+    {
+      "after": 5,
+      "checks": {
+        "/view/fleet/warming": [],
         "/view/tiles/1/slot": "slot-3"
       }
     },
     {
-      "after": 6,
+      "after": 7,
       "checks": {
         "/assign/h1/0/id": "slot-2",
         "/assign/h1/2": null,
@@ -171,12 +211,26 @@
       "note": "the agent reconnected; the GPU stays out"
     },
     {
-      "after": 7,
+      "after": 8,
       "checks": {
         "/assign/h1/0/id": "slot-1",
-        "/assign/h1/2/standby": true,
+        "/assign/h1/0/warm": true,
         "/view/failures": [],
-        "/view/tiles/0/slot": "slot-1"
+        "/view/fleet/warming": [
+          "slot-1"
+        ],
+        "/view/tiles/0/slot": "slot-2",
+        "/view/tiles/1/slot": "slot-3"
+      },
+      "note": "released: it warms, the tile it displaces keeps its place"
+    },
+    {
+      "after": 9,
+      "checks": {
+        "/assign/h1/2/standby": true,
+        "/view/fleet/warming": [],
+        "/view/tiles/0/slot": "slot-1",
+        "/view/tiles/1/slot": "slot-2"
       }
     }
   ],
@@ -210,8 +264,8 @@
     "claims": [],
     "cooldown_until": null,
     "counters": {
-      "restores": 2,
-      "restores_last_hour": 2,
+      "restores": 4,
+      "restores_last_hour": 4,
       "scrub_failures": 0,
       "scrubs": 0
     },
@@ -257,7 +311,8 @@
       "standby": [
         "slot-3"
       ],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {
@@ -268,9 +323,9 @@
         "x": 0.0,
         "y": 0.0
       },
-      "from_frame": 195,
-      "from_t": 6.5,
-      "generation": 5
+      "from_frame": 210,
+      "from_t": 7.0,
+      "generation": 6
     },
     "next_race_at": null,
     "nudges": {
@@ -344,7 +399,7 @@
         "error": null,
         "failure": null,
         "fps": null,
-        "frame_url": null,
+        "frame_url": "ws://h1:20001/frames",
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -355,7 +410,7 @@
         "host": "h1",
         "id": "fcvm:1",
         "last_relaunch": null,
-        "phase": "pending",
+        "phase": "running",
         "previous_rect": null,
         "rect": {
           "h": 1.0,
@@ -364,7 +419,7 @@
           "y": 0.0
         },
         "slot": "slot-1",
-        "vm": null
+        "vm": "fleet-slot-1"
       },
       {
         "borrowed": null,

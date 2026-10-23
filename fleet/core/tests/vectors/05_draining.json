@@ -43,6 +43,20 @@
       "type": "agent"
     },
     {
+      "at": 2200,
+      "host": "h2",
+      "msg": {
+        "frame_url": "ws://h2:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
       "args": {},
       "at": 2500,
       "id": "ra1",
@@ -94,14 +108,14 @@
   ],
   "expect": [
     {
-      "after": 2,
+      "after": 3,
       "checks": {
         "/view/races/0/fcvm/tiles/slot-1/tile": "fcvm:1",
         "/view/races/0/fcvm/tiles/slot-3/tile": "fcvm:3"
       }
     },
     {
-      "after": 3,
+      "after": 4,
       "checks": {
         "/assign/h1/0/generation": 2,
         "/assign/h1/0/rect": null,
@@ -120,7 +134,7 @@
       }
     },
     {
-      "after": 4,
+      "after": 5,
       "checks": {
         "/view/races/0/fcvm/done_at": 4000,
         "/view/races/0/fcvm/last": "slot-3",
@@ -129,14 +143,14 @@
       }
     },
     {
-      "after": 5,
+      "after": 6,
       "checks": {
         "/receipts/r1/outcome": "refused",
         "/receipts/r1/reason": "slot-1 is on a draining host"
       }
     },
     {
-      "after": 6,
+      "after": 7,
       "checks": {
         "/assign/h1/0/generation": 2,
         "/assign/h1/1/generation": 2,
@@ -263,7 +277,8 @@
         "woke_at": null
       },
       "standby": [],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {

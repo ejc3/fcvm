@@ -142,6 +142,7 @@ impl Coord {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 })
                 .collect(),
             region: None,
@@ -449,6 +450,7 @@ async fn the_grid_budget_is_posted_to_wall_tiles_after_every_scene() {
             rect_from_frame: 0,
             previous_rect: None,
             standby: false,
+            warm: false,
         }],
         region: None,
     });
@@ -506,6 +508,7 @@ async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 }],
                 region: None,
             }
@@ -678,6 +681,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -689,6 +693,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 },
             ],
             region: None,
@@ -804,6 +809,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             rect_from_frame: 0,
             previous_rect: None,
             standby: false,
+            warm: false,
         }],
         region: None,
     };
@@ -942,6 +948,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -953,6 +960,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     rect_from_frame: 0,
                     previous_rect: None,
                     standby: false,
+                    warm: false,
                 },
             ],
             region: Some(region),
@@ -1016,6 +1024,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 rect_from_frame: 0,
                 previous_rect: None,
                 standby: false,
+                warm: false,
             }],
             region: Some(wider),
         })
@@ -1066,6 +1075,7 @@ fn standby_slot(generation: u64, standby: bool, rect: Option<Rect>) -> CoordMsg 
             rect_from_frame: 0,
             previous_rect: None,
             standby,
+            warm: false,
         }],
         region: None,
     }
@@ -1319,6 +1329,7 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
                 rect_from_frame: 0,
                 previous_rect: None,
                 standby: false,
+                warm: false,
             }],
             region: None,
         },
@@ -1444,6 +1455,7 @@ async fn the_renderer_gets_the_layout_generation_with_its_rect() {
             rect_from_frame: 1234,
             previous_rect: Some(before),
             standby: false,
+            warm: false,
         }],
         region: None,
     });
@@ -1504,5 +1516,50 @@ async fn a_slot_publishes_its_tls_port_when_not_routed() {
     );
     let args = std::fs::read_to_string(f.dir.path().join("args-fleet-slot-2")).unwrap();
     assert!(args.contains("--publish\n127.0.0.1:40101:443\n"), "{args}");
+    c.close().await;
+}
+
+/// A warming slot runs its VM and draws the whole image (it is not on the wall yet); placed
+/// at the same generation, it takes its rectangle without a relaunch.
+#[tokio::test]
+async fn a_warming_slot_draws_the_whole_image_then_takes_its_place() {
+    let f = fake(1, &[]);
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    let slot = |rect: Option<Rect>, warm: bool| CoordMsg::Assign {
+        slots: vec![AssignSlot {
+            id: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            generation: 1,
+            rect,
+            private_camera: None,
+            layout_generation: 2,
+            rect_from_frame: 900,
+            previous_rect: None,
+            standby: false,
+            warm,
+        }],
+        region: None,
+    };
+    c.send(slot(None, true));
+    c.until(&["slot-1"], "running", 1).await;
+    let body = f.scenes[0].lock().unwrap().last().unwrap().clone();
+    assert_eq!(
+        body["rect"],
+        serde_json::json!({"x": 0.0, "y": 0.0, "w": 1.0, "h": 1.0}),
+        "a warming slot draws the whole image"
+    );
+    c.send(slot(rect(0.25), false));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while f.scenes[0].lock().unwrap().last().unwrap()["rect"]["x"] != 0.25 {
+        assert!(Instant::now() < deadline, "the placed rect was not posted");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 1, "joining the wall must not relaunch");
     c.close().await;
 }

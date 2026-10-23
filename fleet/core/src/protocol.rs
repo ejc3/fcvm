@@ -231,6 +231,10 @@ pub struct AssignSlot {
     /// `standby` when it is ready.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub standby: bool,
+    /// Warming before it joins the wall: run the VM and draw the whole image with the shared
+    /// camera (not part of the host's band), then take `rect` when it is placed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub warm: bool,
 }
 
 /// The scene shared by every renderer; the agent adds each slot's rect to make the
@@ -365,6 +369,7 @@ mod tests {
                 rect_from_frame: 0,
                 previous_rect: None,
                 standby: false,
+                warm: false,
             }],
             region: None,
         };

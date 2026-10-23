@@ -360,6 +360,13 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   keeps them reset, scrubbed and bound, and `standby_ready` counts those that reported
   ready. A claim takes a standby GPU before it borrows a wall tile, and a standby GPU takes
   the place of a quarantined or reclaimed one when the fleet re-tiles.
+- `fleet.warming` lists GPUs whose VM is starting before they join the wall. A GPU joins a
+  wall that already has tiles only once its VM renders: a new host, a standby GPU taking a
+  place, a GPU released from quarantine. Until then it warms off the wall (assignment
+  `warm`), the wall keeps its tiling, and the tile a returning GPU will displace keeps its
+  place; once it reports `running` at its generation the fleet re-tiles with it, so no
+  re-tile waits on a VM that is still starting. With no tile on the wall (a cold start, a
+  wake) every GPU joins at once.
 - A GPU whose reset, scrub or attach fails is quarantined by its agent (Agent: `quarantine`):
   it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`,
   and it stays out (also when its agent reconnects or the coordinator restarts with its state
@@ -604,6 +611,10 @@ none is placed). For each slot the agent reconciles:
   relaunch. `rect: null` (the host drains): keep the VM, post nothing.
 - `standby: true` (the standby pool): stop any VM, wait until the GPU is free, scrub it
   with `--scrub`, report `standby`, and run nothing until the slot is placed again.
+- `warm: true` (with `rect: null`): the GPU is joining. Run its VM as for a placed slot and
+  post the whole image (`rect` `{"x": 0, "y": 0, "w": 1, "h": 1}`) with the shared camera,
+  outside the host's aggregator layout. When it is placed (same generation, `warm` gone,
+  `rect` set) post its rectangle; no relaunch.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
   backoff resets once a VM has run for 60 s.

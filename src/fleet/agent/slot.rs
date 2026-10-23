@@ -85,6 +85,9 @@ pub struct Desired {
     pub private_camera: Option<Vec<Keyframe>>,
     /// In the standby pool: no VM; the GPU reset, scrubbed and ready.
     pub standby: bool,
+    /// Warming before it joins the wall: run the VM and draw the whole image with the shared
+    /// camera.
+    pub warm: bool,
     /// The layout generation of `rect`, the frame it takes effect at, and the rectangle
     /// before; passed to the renderer, which switches at that frame.
     pub layout_generation: u64,
@@ -291,6 +294,7 @@ fn renderer_body(
             camera: camera.clone(),
             ..s.for_renderer(FULL_IMAGE)
         }),
+        None if want.rect.is_none() && want.warm => Some(s.for_renderer(FULL_IMAGE)),
         None => want.rect.map(|r| RendererScene {
             layout_generation: want.layout_generation,
             rect_from_frame: want.rect_from_frame,

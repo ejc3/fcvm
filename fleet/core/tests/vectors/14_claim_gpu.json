@@ -456,7 +456,8 @@
       "standby": [
         "slot-3"
       ],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {

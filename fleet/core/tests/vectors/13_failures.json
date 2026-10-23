@@ -36,6 +36,20 @@
       "type": "agent"
     },
     {
+      "at": 1500,
+      "host": "h2",
+      "msg": {
+        "frame_url": "ws://h2:20002/frames",
+        "generation": 1,
+        "id": "slot-2",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-2"
+      },
+      "type": "agent"
+    },
+    {
       "at": 2000,
       "host": "h2",
       "msg": {
@@ -94,7 +108,7 @@
   ],
   "expect": [
     {
-      "after": 2,
+      "after": 3,
       "checks": {
         "/view/failures": [],
         "/view/tiles/0/failure": null,
@@ -106,7 +120,7 @@
       }
     },
     {
-      "after": 4,
+      "after": 5,
       "checks": {
         "/view/failures/0": {
           "component": "text_check",
@@ -118,7 +132,7 @@
       "note": "the second report keeps the first since"
     },
     {
-      "after": 5,
+      "after": 6,
       "checks": {
         "/view/failures/0": {
           "host": "h1",
@@ -132,20 +146,20 @@
       }
     },
     {
-      "after": 7,
+      "after": 8,
       "checks": {
         "/view/failures/0/kind": "host_reclaimed",
         "/view/failures/1": null
       }
     },
     {
-      "after": 8,
+      "after": 9,
       "checks": {
         "/view/failures/0/kind": "host_reclaimed"
       }
     },
     {
-      "after": 9,
+      "after": 10,
       "checks": {
         "/view/failures": []
       }
@@ -180,8 +194,8 @@
     "claims": [],
     "cooldown_until": null,
     "counters": {
-      "restores": 0,
-      "restores_last_hour": 0,
+      "restores": 1,
+      "restores_last_hour": 1,
       "scrub_failures": 0,
       "scrubs": 0
     },
@@ -217,7 +231,8 @@
         "woke_at": null
       },
       "standby": [],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {

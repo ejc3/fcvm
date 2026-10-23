@@ -1245,7 +1245,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
     // Asleep, nothing is placed: the fcvm side's GPUs go to standby (their VMs stop) as the
     // EC2 side's tiles go away, whether or not their hosts scale down with them.
     let asleep = f.power.state == "asleep";
-    let active: Vec<u32> = f
+    let mut wall: Vec<u32> = f
         .slots
         .iter()
         .filter(|_| !asleep)
@@ -1258,8 +1258,31 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
                     .is_some_and(|h| !h.draining)
         })
         .map(|(n, _)| *n)
-        .take(c.max_tiles)
         .collect();
+    // A GPU joins the wall only once its VM renders (it warms first, drawing the whole image
+    // off the wall), so a re-tile never waits on a VM that is still starting. While none of
+    // the side is on the wall (a cold start, a wake) every GPU joins at once.
+    let placed = |n: &u32| f.slots[n].position.is_some();
+    let any_placed = wall.iter().any(placed);
+    let beyond = wall.split_off(wall.len().min(c.max_tiles));
+    let (mut active, warming): (Vec<u32>, Vec<u32>) = wall.into_iter().partition(|n| {
+        let s = &f.slots[n];
+        !any_placed
+            || s.position.is_some()
+            || (s.observed.phase == "running" && s.observed.generation >= s.generation)
+    });
+    // A tile already on the wall keeps its place while a GPU that would displace it (a lower
+    // slot back from quarantine) warms; it goes to standby once that one joins.
+    for n in beyond {
+        if active.len() >= c.max_tiles {
+            break;
+        }
+        if placed(&n) {
+            active.push(n);
+        }
+    }
+    active.sort_unstable();
+    f.warming = warming.into_iter().collect();
     // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
     // the GPUs it has live); asleep it has none.
     let want_ec2 = if asleep {

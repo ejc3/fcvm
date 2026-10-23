@@ -459,6 +459,9 @@ pub struct Fleet {
     /// Viewers whose page reported it is hidden; they do not count as active.
     #[serde(default)]
     pub hidden: std::collections::BTreeSet<String>,
+    /// fcvm slots whose VM is starting before they join the wall.
+    #[serde(default)]
+    pub warming: std::collections::BTreeSet<u32>,
     #[serde(default)]
     pub power: Power,
     /// The grid's render budget.
@@ -511,6 +514,7 @@ impl State {
                 counters: Counters::default(),
                 quarantined: BTreeMap::new(),
                 hidden: Default::default(),
+                warming: Default::default(),
                 power: Power::default(),
                 budget: Default::default(),
             },

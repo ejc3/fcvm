@@ -57,6 +57,20 @@
       "type": "agent"
     },
     {
+      "at": 3100,
+      "host": "h2",
+      "msg": {
+        "frame_url": "ws://h2:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
       "at": 4000,
       "host": "h2",
       "type": "agent_gone"
@@ -184,7 +198,7 @@
       "note": "an EC2 GPU joins: the fcvm side narrows to 2/3"
     },
     {
-      "after": 2,
+      "after": 3,
       "checks": {
         "/view/layout/ec2": {
           "h": 1.0,
@@ -215,10 +229,10 @@
         "/view/tiles/2/slot": "slot-3",
         "/view/tiles/3/id": "ec2:1"
       },
-      "note": "an fcvm GPU joins on another host"
+      "note": "an fcvm GPU joins on another host, once it renders"
     },
     {
-      "after": 3,
+      "after": 4,
       "checks": {
         "/view/layout/fcvm": {
           "h": 1.0,
@@ -239,7 +253,7 @@
       "note": "it leaves; the others keep their slots"
     },
     {
-      "after": 4,
+      "after": 5,
       "checks": {
         "/view/fleet/ec2_n": 0,
         "/view/layout/ec2": null,
@@ -255,7 +269,7 @@
       "note": "the EC2 GPU leaves: the fcvm side takes the whole width"
     },
     {
-      "after": 5,
+      "after": 6,
       "checks": {
         "/view/layout/ec2": null,
         "/view/layout/fcvm": null,
@@ -265,7 +279,7 @@
       "note": "no fcvm GPU and no EC2 GPU"
     },
     {
-      "after": 6,
+      "after": 7,
       "checks": {
         "/view/layout/ec2": {
           "h": 1.0,
@@ -285,14 +299,14 @@
       "note": "only EC2: it takes the whole width"
     },
     {
-      "after": 7,
+      "after": 8,
       "checks": {
         "/view/layout/generation": 7
       },
       "note": "a viewer arriving changes no layout"
     },
     {
-      "after": 9,
+      "after": 10,
       "checks": {
         "/ec2_assign": [],
         "/view/fleet/power/state": "asleep",
@@ -317,8 +331,8 @@
     "claims": [],
     "cooldown_until": null,
     "counters": {
-      "restores": 0,
-      "restores_last_hour": 0,
+      "restores": 1,
+      "restores_last_hour": 1,
       "scrub_failures": 0,
       "scrubs": 0
     },
@@ -342,7 +356,8 @@
         "woke_at": null
       },
       "standby": [],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {

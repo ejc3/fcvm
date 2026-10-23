@@ -1,5 +1,5 @@
 {
-  "description": "Hosts joining and leaving re-tile both halves in one event without changing any generation; slot names are reused lowest first.",
+  "description": "Hosts joining and leaving re-tile both halves in one event without changing any generation; slot names are reused lowest first. A GPU joining a wall that already has tiles warms first: its VM runs, drawing the whole image off the wall (assignment warm), and it joins the tiling once it reports running, so a re-tile never waits on a starting VM.",
   "events": [
     {
       "at": 1000,
@@ -48,6 +48,48 @@
       "type": "agent"
     },
     {
+      "at": 2100,
+      "host": "hB",
+      "msg": {
+        "frame_url": "ws://hB:20003/frames",
+        "generation": 1,
+        "id": "slot-3",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-3"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2100,
+      "host": "hB",
+      "msg": {
+        "frame_url": "ws://hB:20004/frames",
+        "generation": 1,
+        "id": "slot-4",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-4"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 2100,
+      "host": "hB",
+      "msg": {
+        "frame_url": "ws://hB:20005/frames",
+        "generation": 1,
+        "id": "slot-5",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-5"
+      },
+      "type": "agent"
+    },
+    {
       "at": 3000,
       "host": "hA",
       "type": "agent_gone"
@@ -68,6 +110,20 @@
         "type": "hello"
       },
       "type": "agent"
+    },
+    {
+      "at": 4100,
+      "host": "hC",
+      "msg": {
+        "frame_url": "ws://hC:20001/frames",
+        "generation": 1,
+        "id": "slot-1",
+        "phase": "running",
+        "timings": {},
+        "type": "slot",
+        "vm": "fleet-slot-1"
+      },
+      "type": "agent"
     }
   ],
   "expect": [
@@ -76,16 +132,54 @@
       "checks": {
         "/assign/hA/1/id": "slot-2",
         "/view/fleet/n": 2,
+        "/view/fleet/warming": [],
         "/view/tiles/0/rect": {
           "h": 1.0,
           "w": 0.5,
           "x": 0.0,
           "y": 0.0
         }
-      }
+      },
+      "note": "a cold start: every GPU joins at once"
     },
     {
       "after": 1,
+      "checks": {
+        "/assign/hA/0/rect": {
+          "h": 1.0,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/assign/hB/0/id": "slot-3",
+        "/assign/hB/0/rect": null,
+        "/assign/hB/0/standby": null,
+        "/assign/hB/0/warm": true,
+        "/view/fleet/n": 2,
+        "/view/fleet/standby": [],
+        "/view/fleet/warming": [
+          "slot-3",
+          "slot-4",
+          "slot-5"
+        ],
+        "/view/layout/generation": 1
+      },
+      "note": "hB's GPUs warm: the wall keeps its tiling"
+    },
+    {
+      "after": 2,
+      "checks": {
+        "/view/fleet/n": 3,
+        "/view/fleet/warming": [
+          "slot-4",
+          "slot-5"
+        ],
+        "/view/layout/generation": 2
+      },
+      "note": "one is running: it joins"
+    },
+    {
+      "after": 4,
       "checks": {
         "/assign/hA/0/rect": {
           "h": 0.4,
@@ -94,6 +188,7 @@
           "y": 0.0
         },
         "/assign/hB/0/id": "slot-3",
+        "/assign/hB/0/warm": null,
         "/assign/hB/2/id": "slot-5",
         "/view/aggregates/0/id": "agg:hA",
         "/view/aggregates/0/rect": {
@@ -115,6 +210,7 @@
           "fcvm:5"
         ],
         "/view/fleet/n": 5,
+        "/view/fleet/warming": [],
         "/view/tiles/0/rect": {
           "h": 0.4,
           "w": 0.5,
@@ -130,7 +226,7 @@
       }
     },
     {
-      "after": 2,
+      "after": 5,
       "checks": {
         "/assign/hA": null,
         "/assign/hB/0/generation": 1,
@@ -146,7 +242,17 @@
       }
     },
     {
-      "after": 3,
+      "after": 6,
+      "checks": {
+        "/assign/hC/0/warm": true,
+        "/view/fleet/n": 3,
+        "/view/fleet/warming": [
+          "slot-1"
+        ]
+      }
+    },
+    {
+      "after": 7,
       "checks": {
         "/assign/hC/0/id": "slot-1",
         "/view/aggregates/0/id": "agg:hC",
@@ -215,8 +321,8 @@
     "claims": [],
     "cooldown_until": null,
     "counters": {
-      "restores": 0,
-      "restores_last_hour": 0,
+      "restores": 4,
+      "restores_last_hour": 4,
       "scrub_failures": 0,
       "scrubs": 0
     },
@@ -278,7 +384,8 @@
         "woke_at": null
       },
       "standby": [],
-      "standby_ready": 0
+      "standby_ready": 0,
+      "warming": []
     },
     "image_aspect": 1.7777777777777777,
     "layout": {
@@ -289,9 +396,9 @@
         "x": 0.0,
         "y": 0.0
       },
-      "from_frame": 165,
-      "from_t": 5.5,
-      "generation": 4
+      "from_frame": 168,
+      "from_t": 5.6,
+      "generation": 6
     },
     "next_race_at": null,
     "nudges": {
@@ -365,7 +472,7 @@
         "error": null,
         "failure": null,
         "fps": null,
-        "frame_url": null,
+        "frame_url": "ws://hC:20001/frames",
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -376,7 +483,7 @@
         "host": "hC",
         "id": "fcvm:1",
         "last_relaunch": null,
-        "phase": "pending",
+        "phase": "running",
         "previous_rect": null,
         "rect": {
           "h": 0.25,
@@ -385,14 +492,14 @@
           "y": 0.0
         },
         "slot": "slot-1",
-        "vm": null
+        "vm": "fleet-slot-1"
       },
       {
         "borrowed": null,
         "error": null,
         "failure": null,
         "fps": null,
-        "frame_url": null,
+        "frame_url": "ws://hB:20003/frames",
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -403,7 +510,7 @@
         "host": "hB",
         "id": "fcvm:2",
         "last_relaunch": null,
-        "phase": "pending",
+        "phase": "running",
         "previous_rect": {
           "h": 0.5,
           "w": 1.0,
@@ -417,14 +524,14 @@
           "y": 0.25
         },
         "slot": "slot-3",
-        "vm": null
+        "vm": "fleet-slot-3"
       },
       {
         "borrowed": null,
         "error": null,
         "failure": null,
         "fps": null,
-        "frame_url": null,
+        "frame_url": "ws://hB:20004/frames",
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -435,7 +542,7 @@
         "host": "hB",
         "id": "fcvm:3",
         "last_relaunch": null,
-        "phase": "pending",
+        "phase": "running",
         "previous_rect": {
           "h": 0.5,
           "w": 0.5,
@@ -449,14 +556,14 @@
           "y": 0.625
         },
         "slot": "slot-4",
-        "vm": null
+        "vm": "fleet-slot-4"
       },
       {
         "borrowed": null,
         "error": null,
         "failure": null,
         "fps": null,
-        "frame_url": null,
+        "frame_url": "ws://hB:20005/frames",
         "generation": 1,
         "gpu": {
           "name": "Tesla T4",
@@ -467,7 +574,7 @@
         "host": "hB",
         "id": "fcvm:4",
         "last_relaunch": null,
-        "phase": "pending",
+        "phase": "running",
         "previous_rect": {
           "h": 0.5,
           "w": 0.5,
@@ -481,7 +588,7 @@
           "y": 0.625
         },
         "slot": "slot-5",
-        "vm": null
+        "vm": "fleet-slot-5"
       }
     ],
     "viewers": {

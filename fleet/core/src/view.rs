@@ -102,6 +102,8 @@ pub struct FleetView {
     /// VM, and how many of them have reported ready.
     pub standby: Vec<String>,
     pub standby_ready: usize,
+    /// GPUs starting their VM before they join the wall (slot ids).
+    pub warming: Vec<String>,
     pub power: PowerView,
 }
 
@@ -222,11 +224,17 @@ fn moved_from(state: &State, s: &Slot) -> Option<Rect> {
         .flatten()
 }
 
+/// Starting its VM before it joins the wall.
+fn is_warming(state: &State, s: &Slot) -> bool {
+    crate::state::slot_number(&s.id).is_some_and(|n| state.fleet.warming.contains(&n))
+}
+
 /// In the standby pool: an unplaced, unclaimed GPU on a host that is not draining, and not
 /// quarantined.
 fn in_standby(state: &State, s: &Slot) -> bool {
     let f = &state.fleet;
-    s.position.is_none()
+    !is_warming(state, s)
+        && s.position.is_none()
         && s.claim.is_none()
         && !crate::apply::is_quarantined(f, s)
         && s.host
@@ -515,6 +523,11 @@ pub fn view(state: &State) -> View {
             max_tiles: c.max_tiles,
             standby,
             standby_ready,
+            warming: f
+                .warming
+                .iter()
+                .map(|n| crate::state::slot_name(*n))
+                .collect(),
             power: power_view(&f.power),
         },
         scene: f.scene.clone(),
@@ -764,6 +777,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 rect_from_frame: state.fleet.layout.from_frame,
                 previous_rect: moved_from(state, s),
                 standby: in_standby(state, s),
+                warm: is_warming(state, s),
             });
         }
     }
@@ -796,6 +810,7 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             rect_from_frame: state.fleet.layout.from_frame,
             previous_rect: moved_from(state, s),
             standby: false,
+            warm: false,
         })
         .collect()
 }

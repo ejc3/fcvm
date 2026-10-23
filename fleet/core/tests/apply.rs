@@ -26,6 +26,19 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
     }
 }
 
+fn running(at: u64, host: &str, slot: &str) -> Event {
+    Event::Agent {
+        at,
+        host: host.into(),
+        msg: AgentMsg::Slot(SlotReport {
+            id: slot.into(),
+            phase: "running".into(),
+            generation: 1,
+            ..Default::default()
+        }),
+    }
+}
+
 /// The tiles exactly cover the image (each side as wide as its share of the live GPUs, one
 /// tile per GPU), every host's tiles lie inside its region and the regions do not overlap,
 /// every positioned slot holds a distinct tile, and no GPU backs two slots.
@@ -110,8 +123,18 @@ fn hosts_joining_one_by_one_retile_every_n_up_to_max_tiles() {
     };
     let mut s = State::new(config, 0);
     for i in 1..=110u64 {
-        s = apply(s, &hello(i * 10, &format!("host-{i}"), 1));
+        let host = format!("host-{i}");
+        s = apply(s, &hello(i * 10, &host, 1));
+        if (2..=100).contains(&i) {
+            // A GPU joining a wall that has tiles warms until its VM renders.
+            let v = view(&s);
+            assert_eq!(v.fleet.n, i as usize - 1);
+            assert_eq!(v.fleet.warming, vec![format!("slot-{i}")]);
+            assert!(host_assignments(&s)[&host][0].warm);
+        }
+        s = apply(s, &running(i * 10 + 1, &host, &format!("slot-{i}")));
         let v = view(&s);
+        assert!(v.fleet.warming.is_empty());
         assert_eq!(v.fleet.n, (i as usize).min(100));
         assert_eq!(v.fleet.standby.len(), (i as usize).saturating_sub(100));
         // No EC2 instance has reported, so the right half is all dark EC2 tiles.
