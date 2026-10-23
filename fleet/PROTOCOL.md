@@ -221,7 +221,8 @@ Then binary messages, each one access unit:
   same frame, and not for a whole-image renderer), it draws the current slot
   and the following ones back to back, unsent, until it has drawn 7 and is at least a
   slot ahead of the clock (at most 90 slots), then continues on the
-  clock. Its first frame sent has all 7 behind it. The encoder opens on a
+  clock. A tile that took more than 90% of a slot for its last frame stops
+  after 7: it cannot get ahead, and skips slots on the clock as before. Its first frame sent has all 7 behind it. The encoder opens on a
   second thread meanwhile, and NVENC's minimum frame size is asked once at
   start on that thread (opening a session to ask took about 250 ms on the
   render thread). Measured on a 2 x 2 grid at 270 px: priming took 111 to
