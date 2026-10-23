@@ -7096,6 +7096,25 @@ async fn clone_disks_are_subvolume_snapshots_of_the_snapshot_directory() -> anyh
     Ok(())
 }
 
+/// Wait, up to two minutes, until the log at `path` contains `marker`.
+#[cfg(feature = "privileged-tests")]
+async fn wait_for_log(path: &std::path::Path, marker: &str) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(marker)
+        {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            Instant::now() < deadline,
+            "{path:?} never logged {marker:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
 /// One HTTP request to `address`:80 that must answer; returns how long it took.
 #[cfg(feature = "privileged-tests")]
 async fn http_get_v6(address: std::net::Ipv6Addr, limit: Duration) -> Result<Duration> {
@@ -7124,8 +7143,12 @@ async fn http_get_v6(address: std::net::Ipv6Addr, limit: Duration) -> Result<Dur
 /// That client's Neighbor Solicitations reach the guest before it holds its
 /// new address, which leaves the host's neighbour entry INCOMPLETE until the
 /// next solicitation, a second later; measured, the first connection after
-/// the ACK then took 787 to 893 ms. The guest announces the address with an
+/// the ACK then took 684 to 893 ms. The guest announces the address with an
 /// unsolicited Neighbor Advertisement right after taking it.
+///
+/// The clone is held before its VMM resumes (`restore.post_network_pre_resume`)
+/// until the early client has made the host's entry INCOMPLETE, so the test
+/// always reaches that state instead of depending on when the client starts.
 #[cfg(feature = "privileged-tests")]
 #[tokio::test]
 async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
@@ -7173,8 +7196,14 @@ async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
             .context("spawning memory server")?;
     common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
 
+    let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
+    let _ = std::fs::remove_file(&go_file);
+    let failpoint = format!(
+        "restore.post_network_pre_resume:block_until_file:{}",
+        go_file.display()
+    );
     let serve_pid_str = serve_pid.to_string();
-    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_log_path(
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
         &[
             "snapshot",
             "run",
@@ -7183,29 +7212,26 @@ async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
             "--name",
             &clone_name,
         ],
-        &clone_name,
+        &[("FCVM_FAILPOINT", &failpoint)],
     )
     .await
-    .context("spawning clone")?;
+    .context("spawning clone held before VMM resume")?;
+    wait_for_log(
+        &clone_log,
+        "FAILPOINT restore.post_network_pre_resume reached",
+    )
+    .await?;
+    // Routed setup logs the clone's address before the hold.
+    let log = std::fs::read_to_string(&clone_log).context("reading the clone log")?;
+    let address: std::net::Ipv6Addr = log
+        .split("vm_ipv6=")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .context("the clone did not log its vm_ipv6")?
+        .parse()
+        .context("vm_ipv6 is not an IPv6 address")?;
 
-    // The early client: dial the clone's address from the moment its state
-    // names it until the ACK.
-    let address: std::net::Ipv6Addr = {
-        let deadline = Instant::now() + Duration::from_secs(60);
-        loop {
-            if let Ok(value) = common::get_network_field(clone_pid, "guest_ipv6").await {
-                let bare = value.split('/').next().unwrap_or(&value).to_string();
-                break bare
-                    .parse()
-                    .with_context(|| format!("guest_ipv6 {value:?}"))?;
-            }
-            anyhow::ensure!(
-                Instant::now() < deadline,
-                "the clone never recorded guest_ipv6"
-            );
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-    };
+    // The early client dials the held clone, whose guest is not running.
     let acked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let early = {
         let acked = acked.clone();
@@ -7218,27 +7244,30 @@ async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
             attempts
         })
     };
-    let deadline = Instant::now() + Duration::from_secs(120);
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        let log = std::fs::read_to_string(&clone_log).unwrap_or_default();
-        if log.contains("acknowledged exact restore generation") {
+        let neigh = tokio::process::Command::new("ip")
+            .args(["-6", "neigh", "show", "to", &address.to_string()])
+            .output()
+            .await
+            .context("running ip -6 neigh")?;
+        if String::from_utf8_lossy(&neigh.stdout).contains("INCOMPLETE") {
             break;
         }
         anyhow::ensure!(
             Instant::now() < deadline,
-            "the clone never acknowledged its restore"
+            "the early client never left the host's neighbour entry for {address} INCOMPLETE"
         );
-        tokio::time::sleep(Duration::from_millis(2)).await;
+        tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    std::fs::write(&go_file, b"go").context("releasing the held clone")?;
+    wait_for_log(&clone_log, "acknowledged exact restore generation").await?;
     acked.store(true, std::sync::atomic::Ordering::Release);
     let first = http_get_v6(address, Duration::from_secs(5)).await;
     let attempts = early.await?;
+    let _ = std::fs::remove_file(&go_file);
     println!("early client made {attempts} attempts; first connection after the ACK: {first:?}");
     let first = first.context("the first connection after the ACK failed")?;
-    anyhow::ensure!(
-        attempts > 0,
-        "the early client never dialled; the test proved nothing"
-    );
     // A healthy connection takes about a millisecond; the stall this pins was
     // a neighbour retransmit, about one second.
     anyhow::ensure!(

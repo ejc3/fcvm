@@ -234,9 +234,22 @@ impl RestorePhases {
         self.tcp_gate_ingress_commit_ms = gate.ingress_commit_ms;
     }
 
-    /// Compact single-line JSON for the ACK frame.
+    /// Compact single-line JSON for the ACK frame, every timing rounded to
+    /// the microsecond. Unrounded, `as_secs_f64() * 1000.0` prints up to 17
+    /// significant digits, and a record of such values passed the frame's
+    /// 1024 bytes, which drops the whole record.
     pub fn to_frame_json(&self) -> String {
-        serde_json::to_string(self).unwrap_or_else(|_| "{}".to_string())
+        let Ok(mut value) = serde_json::to_value(self) else {
+            return "{}".to_string();
+        };
+        if let Some(fields) = value.as_object_mut() {
+            for field in fields.values_mut() {
+                if let Some(ms) = field.as_f64().filter(|_| field.is_f64()) {
+                    *field = serde_json::json!((ms * 1000.0).round() / 1000.0);
+                }
+            }
+        }
+        serde_json::to_string(&value).unwrap_or_else(|_| "{}".to_string())
     }
 }
 
@@ -733,6 +746,55 @@ mod tests {
         assert!(
             frame.contains("\"ack_connect_ms\":99999.999"),
             "the ACK telemetry was dropped from the frame: {frame}"
+        );
+    }
+
+    /// The timings are `as_secs_f64() * 1000.0`, which prints with up to 17
+    /// significant digits (`0.000032999999999999996` was seen in a real ACK).
+    /// With every field that long the record passed 1024 bytes and the frame
+    /// dropped all of it for `{}`.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn long_decimal_timings_still_fit_the_frame_budget() {
+        let long = 10_000.000_001_999_999_f64;
+        let mut phases = RestorePhases::default();
+        phases.clock_ms = long;
+        phases.ipv6_ms = long;
+        phases.tcp_cleanup_ms = long;
+        phases.tcp_verified = true;
+        phases.tcp_verify_ms = long;
+        phases.tcp_reassert_ms = long;
+        phases.tcp_destroy_ms = long;
+        phases.tcp_reopen_ms = long;
+        phases.tcp_egress_open_ms = long;
+        phases.tcp_hook_ms = long;
+        phases.tcp_destroyed = 999_999;
+        phases.tcp_already_gone = 999_999;
+        phases.tcp_destroy_datagrams = 999_999;
+        phases.tcp_gate_verify_ipv4_ms = long;
+        phases.tcp_gate_verify_ipv6_ms = long;
+        phases.tcp_gate_udp_ipv4_ms = long;
+        phases.tcp_gate_udp_ipv6_ms = long;
+        phases.tcp_gate_egress_read_ms = long;
+        phases.tcp_gate_egress_commit_ms = long;
+        phases.tcp_gate_ingress_read_ms = long;
+        phases.tcp_gate_ingress_commit_ms = long;
+        phases.neighbor_ms = long;
+        phases.nfs_ms = long;
+        phases.exec_wait_ms = long;
+        phases.egress_wait_ms = long;
+        phases.total_ms = long;
+        phases.ack_connect_ms = long;
+        phases.gpu_ms = long;
+        phases.gpus = 999_999;
+        let frame = exec_proto::restore_complete_frame(
+            "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
+            &phases.to_frame_json(),
+        );
+        assert!(
+            frame.contains("\"ack_connect_ms\":10000.0"),
+            "the ACK telemetry was dropped from the frame ({} bytes): {frame}",
+            frame.len()
         );
     }
 
