@@ -15,6 +15,11 @@
 #      much (runtime: cudaMalloc, driver: cuMemAlloc, managed:
 #      cudaMallocManaged up to the free memory) and counts the marker words.
 #
+# The control case runs fill and then scan as two processes in one VM, with no
+# reset between them. Its runtime and driver scans must find the marker; if
+# they do not, the scan cannot see residue and every 0 means nothing, so the
+# run fails.
+#
 # residue = marker_words * 16 / bytes allocated by B: the fraction of B's
 # memory that still holds A's records. With fc-agent's scrub
 # (fc-agent/src/gpu.rs) every case must be 0. The summary is written to $OUT/summary.tsv.
@@ -31,7 +36,7 @@ OUT=${2:-/tmp/gpu-residue-$(date +%Y%m%d-%H%M%S)}
 FCVM=${FCVM:-./target/release/fcvm}
 CUDA_IMAGE=${CUDA_IMAGE:-docker.io/nvidia/cuda:12.6.3-devel-ubuntu24.04}
 RUN_IMAGE=${RUN_IMAGE:-docker.io/library/ubuntu:24.04}
-CASES=${CASES:-exit kill}
+CASES=${CASES:-control exit kill}
 MODES=${MODES:-runtime driver managed}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
@@ -50,10 +55,12 @@ podman run --rm -v "$HERE:/src:ro" -v "$OUT/tools:/out" "$CUDA_IMAGE" \
 [ -x "$OUT/tools/gpu-residue" ] || { echo "the build produced no gpu-residue" >&2; exit 1; }
 
 # Wait until no process holds the GPU's VFIO group, so B gets the device only
-# after A's Firecracker is gone.
+# after A's Firecracker is gone. A group has one opener at a time, so an open
+# that succeeds (and is closed at once) proves it is free. fuser cannot be used:
+# unprivileged, it does not see the fds of a VMM inside the VM's user namespace.
 wait_gpu_released() {
   for _ in $(seq 1 120); do
-    if ! fuser -s "/dev/vfio/$GROUP" 2>/dev/null; then return 0; fi
+    if (exec 3<>"/dev/vfio/$GROUP") 2>/dev/null; then return 0; fi
     sleep 0.5
   done
   echo "the GPU's VFIO group $GROUP is still open after 60 s" >&2
@@ -71,8 +78,13 @@ for case in $CASES; do
     alog="$OUT/$case-$mode-A.log"
     blog="$OUT/$case-$mode-B.log"
     wait_gpu_released
-    echo "== $case/$mode: A fills"
-    if [ "$case" = exit ]; then
+    clear_s=-
+    if [ "$case" = control ]; then
+      echo "== $case/$mode: one VM, fill then scan"
+      "$FCVM" "${VM[@]}" --name "$tag-a" "$RUN_IMAGE" \
+        sh -c "/tools/gpu-residue fill && /tools/gpu-residue scan $mode" > "$blog" 2>&1
+      cp "$blog" "$alog"
+    elif [ "$case" = exit ]; then
       "$FCVM" "${VM[@]}" --name "$tag-a" "$RUN_IMAGE" /tools/gpu-residue fill > "$alog" 2>&1
     else
       # Started directly, so $! is the fcvm process itself.
@@ -89,24 +101,31 @@ for case in $CASES; do
     fi
     grep -o 'FILLED.*' "$alog" | head -1
     wait_gpu_released
-    clear_s=-
-    if [ -n "${HOST_CLEAR:-}" ]; then
+    if [ "$case" != control ] && [ -n "${HOST_CLEAR:-}" ]; then
       started=$(date +%s.%N)
       bash -c "$HOST_CLEAR" > "$OUT/$case-$mode-clear.log" 2>&1 || { echo "HOST_CLEAR failed; see $OUT/$case-$mode-clear.log" >&2; exit 1; }
       clear_s=$(echo "$(date +%s.%N) - $started" | bc)
       echo "   host clear: $clear_s s"
     fi
-    echo "== $case/$mode: B scans"
-    "$FCVM" "${VM[@]}" --name "$tag-b" "$RUN_IMAGE" /tools/gpu-residue scan "$mode" > "$blog" 2>&1
+    if [ "$case" != control ]; then
+      echo "== $case/$mode: B scans"
+      "$FCVM" "${VM[@]}" --name "$tag-b" "$RUN_IMAGE" /tools/gpu-residue scan "$mode" > "$blog" 2>&1
+    fi
     result=$(grep -o 'RESULT .*' "$blog" | head -1)
     [ -n "$result" ] || { echo "B printed no RESULT; see $blog" >&2; exit 1; }
     echo "   $result"
     field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<"$result"; }
     # The restore ACK's gpu_steps.scrub_ms, when fc-agent scrubbed the GPU.
-    scrub=$(grep -o '"scrub_ms":[0-9.]*' "$blog" | head -1 | cut -d: -f2)
+    scrub=$(grep -o '"scrub_ms":[0-9.]*' "$blog" | head -1 | cut -d: -f2 || true)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$case" "$mode" "$(field bytes)" \
       "$(field marker_words)" "$(field marker_fraction)" "$(field nonzero_fraction)" \
       "${scrub:--}" "$clear_s" >> "$OUT/summary.tsv"
+    # Managed memory comes from nvidia-uvm, which may zero pages itself, so
+    # only the cudaMalloc and cuMemAlloc controls must see the marker.
+    if [ "$case" = control ] && [ "$mode" != managed ] && [ "$(field marker_words)" = 0 ]; then
+      echo "CONTROL FAILED: a scan after a fill in the same VM found no marker, so this scan cannot see residue" >&2
+      exit 1
+    fi
   done
 done
 echo "== summary ($OUT/summary.tsv)"
