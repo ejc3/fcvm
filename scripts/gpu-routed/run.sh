@@ -30,15 +30,18 @@ check() { # name, address suffix
     kill -0 "$runner" 2>/dev/null || break
     sleep 1
   done
-  if [ -z "$pid" ]; then echo "FAIL $name: never healthy (log $LOGS/$name.log)"; fail=1; kill -TERM "$runner" 2>/dev/null; wait "$runner" || true; return; fi
-  local has; has=$("$F" exec --pid "$pid" --vm -- ip -6 -o addr show dev eth0 scope global 2>&1 | awk '{print $4}' | paste -sd' ' || true)
-  if [[ " $has " == *" $want/128 "* ]]; then echo "ok   $name: eth0 holds its address"; else echo "FAIL $name: eth0 holds '$has', not $want/128"; fail=1; fi
+  if [ -z "$pid" ]; then echo "FAIL $name: never healthy (log $LOGS/$name.log)"; fail=1; kill -TERM "$runner" 2>/dev/null || true; wait "$runner" || true; return; fi
+  local out has; out=$("$F" exec --pid "$pid" --vm -- ip -6 -o addr show dev eth0 scope global 2>&1 || true)
+  has=$(awk '$2 == "eth0" {print $4}' <<< "$out" | paste -sd' ')
+  if [[ " $has " == *" $want/128 "* ]]; then echo "ok   $name: eth0 holds its address"
+  else echo "FAIL $name: eth0 does not hold $want/128: ${has:-$out}"; fail=1; fi
   if "$F" exec --pid "$pid" --vm -- ping -6 -c 2 -W 3 "$TARGET" > "$LOGS/$name.ping" 2>&1; then
     echo "ok   $name: reaches $TARGET over IPv6"
   else
-    echo "FAIL $name: no IPv6 reply from $TARGET: $(tail -1 "$LOGS/$name.ping")"; fail=1
+    "$F" exec --pid "$pid" --vm -- sh -c 'ip -6 addr; ip -6 route; ip -6 neigh' > "$LOGS/$name.net" 2>&1 || true
+    echo "FAIL $name: no IPv6 reply from $TARGET: $(grep 'packet loss' "$LOGS/$name.ping") (guest routes in $LOGS/$name.net)"; fail=1
   fi
-  kill -TERM "$runner" 2>/dev/null; wait "$runner" || true
+  kill -TERM "$runner" 2>/dev/null || true; wait "$runner" || true
 }
 # The first run creates the pre-start snapshot (or restores one); the second restores it
 # at another address.
