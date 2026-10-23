@@ -303,6 +303,45 @@ void set_text(GText& g, const std::string& s) {
 }
 }  // namespace
 
+namespace {
+// Days from 1970-01-01 to a civil date (proleptic Gregorian), after Howard
+// Hinnant's days_from_civil.
+int64_t days_from_civil(int64_t y, int m, int d) {
+  y -= m <= 2;
+  int64_t era = (y >= 0 ? y : y - 399) / 400;
+  int64_t yoe = y - era * 400;
+  int64_t doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  int64_t doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + doe - 719468;
+}
+// The day of the month of the n-th Sunday of a month.
+int nth_sunday(int64_t y, int m, int n) {
+  int64_t first = days_from_civil(y, m, 1);
+  int wd = (int)(((first % 7) + 11) % 7);  // 0 = Sunday (1970-01-01 was a Thursday)
+  return 1 + (7 - wd) % 7 + 7 * (n - 1);
+}
+}  // namespace
+
+// The clock's text: America/Los_Angeles, from the US rule (daylight time
+// from 2:00 local on the second Sunday in March, 10:00 UTC, to 2:00 local on
+// the first Sunday in November, 9:00 UTC), so no time zone data is needed and
+// every tile draws the same digits.
+std::string pacific_clock(int64_t unix_s) {
+  time_t ts = (time_t)unix_s;
+  struct tm u;
+  gmtime_r(&ts, &u);
+  int64_t y = u.tm_year + 1900;
+  int64_t start = days_from_civil(y, 3, nth_sunday(y, 3, 2)) * 86400 + 10 * 3600;
+  int64_t end = days_from_civil(y, 11, nth_sunday(y, 11, 1)) * 86400 + 9 * 3600;
+  bool dst = unix_s >= start && unix_s < end;
+  time_t local = (time_t)(unix_s + (dst ? -7 : -8) * 3600);
+  struct tm l;
+  gmtime_r(&local, &l);
+  char buf[32];
+  snprintf(buf, sizeof buf, "%02d:%02d:%02d %s", l.tm_hour, l.tm_min, l.tm_sec, dst ? "PDT" : "PST");
+  return buf;
+}
+
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held) {
   FrameParams p;
   memset(&p, 0, sizeof p);
@@ -359,12 +398,7 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
   };
   {
     GText& g = p.text[p.n_text++];
-    time_t secs = (time_t)std::floor(s.epoch_unix_ms / 1000.0 + t);
-    struct tm tmv;
-    gmtime_r(&secs, &tmv);
-    char buf[32];
-    snprintf(buf, sizeof buf, "%02d:%02d:%02d UTC", tmv.tm_hour, tmv.tm_min, tmv.tm_sec);
-    set_text(g, buf);
+    set_text(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)));
     place(g, 0.0f, 0.66f, 2.0f, 0.075f);
     g.color = v3(1.0f, 0.86f, 0.62f) * 3.2f;  // the rim's light
     g.style = 1;

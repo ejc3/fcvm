@@ -206,6 +206,22 @@ int main() {
     double alt = p.cam.pos.y + (bx * bx + bz * bz) / (2.0 * PLANET_R);
     CHECK(alt >= bw + 0.0599, "an eye at a lake is lifted 60 m above its water");
   }
+  {
+    // The sky clock in Pacific time across both changes of 2026 and 2027, at
+    // the exact seconds (values from tzdata's America/Los_Angeles).
+    struct { int64_t t; const char* want; } c[] = {
+        {1772963999, "01:59:59 PST"}, {1772964000, "03:00:00 PDT"},   // 2026-03-08 10:00 UTC
+        {1793523599, "01:59:59 PDT"}, {1793523600, "01:00:00 PST"},   // 2026-11-01 09:00 UTC
+        {1805018399, "01:59:59 PST"}, {1805018400, "03:00:00 PDT"},   // 2027-03-14
+        {1825577999, "01:59:59 PDT"}, {1825578000, "01:00:00 PST"},   // 2027-11-07
+        {1767225600, "16:00:00 PST"},                                 // 2026-01-01 00:00 UTC
+        {1784160000, "17:00:00 PDT"},                                 // 2026-07-16 00:00 UTC
+    };
+    for (auto& k : c) {
+      std::string got = pacific_clock(k.t);
+      CHECK(got == k.want, "pacific_clock(%lld) = %s, want %s", (long long)k.t, got.c_str(), k.want);
+    }
+  }
   tlscheck::run();
   DONE();
 }

@@ -93,8 +93,13 @@ field. A scene replaces the previous one whole.
   fixed distance in front of it, so it keeps its place in the frame while the
   camera moves, and every tile computes the same layout from the same camera.
   Changed in round 5; before, they were anchored in the world.
-- **The clock** is always drawn: the UTC time of the frame
-  (`epoch_unix_ms / 1000 + t`, to the second), centred, its middle at 66% of
+- **The clock** is always drawn: the time of the frame
+  (`epoch_unix_ms / 1000 + t`, to the second) in America/Los_Angeles,
+  labelled `PDT` or `PST` (round 7; it was UTC). Daylight time runs from
+  2:00 local on the second Sunday in March (10:00 UTC) to 2:00 local on the
+  first Sunday in November (9:00 UTC); the renderer applies that rule in code,
+  so the guest needs no time zone data and every tile draws the same digits.
+  Centred, its middle at 66% of
   the half-height above the image centre, 7.5% of the image height tall.
   Its letters are solid and dark with a bright rim and a dark halo, so it
   reads over cloud, sky and terrain (at 180 px tiles too), and nothing in the
