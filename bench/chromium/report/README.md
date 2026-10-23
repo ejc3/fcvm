@@ -15,9 +15,10 @@ and the status of historical evidence.
   open-loop throughput, working-set prefetch on and off, the poll interval,
   copy against minor mode, and a warm host Chromium without a VM. The WebKit
   run and a 2 MiB-page A/B/A were dropped for host time (the page's Limits).
-  Every run records the host's instance type, the
-  Chromium version, the Firecracker commit and binary, and the memory
-  server's prefetch setting.
+  Every serial run records the host's instance type, the Chromium version,
+  the Firecracker commit and binary, and the memory server's prefetch
+  setting; the memory, host-control and throughput records hold less, as the
+  page's Setup says.
 - The 2026-09-02 ladder and the 2026-08-30 run remain verified records. The
   page lists them under "Earlier runs" and no longer quotes them; the sections
   below on them are kept as their history.
@@ -67,7 +68,7 @@ corpus run, not a fixture run.
 
 ## The 2026-10-22 campaign
 
-Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records. Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run.
+Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run.
 
 | run | configuration | golden | fcvm source | record |
 |---|---|---|---|---|
