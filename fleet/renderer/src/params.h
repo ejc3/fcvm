@@ -6,6 +6,7 @@
 #define MAX_TEXTS 17   // the clock plus the 16 newest words
 #define MAX_CHARS 28
 #define MAX_LIGHTS 32
+#define HQ_COST_PRIOR 1.0  // cost per sample of the high-quality path over the fast path, until one is measured
 #define HQ_SPP 8  // samples per drawn pixel from which a frame takes the high-quality path
 #define HOLD_MAX_SAMPLES 1024  // a hold stops adding samples here
 #define HOLD_BLEND_OUT 256     // motion history fades out of a hold by this sample count

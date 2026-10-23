@@ -196,7 +196,12 @@ void Pipeline::run() {
       slots_missed_ += (uint64_t)(k - last_k - 1);
     }
     try {
+      auto f0 = std::chrono::steady_clock::now();
       frame_once(t, frame_no);
+      double fms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - f0).count();
+      std::lock_guard<std::mutex> l(hmu_);
+      frame_log_.push_back({std::chrono::steady_clock::now(), fms, rstats_.render_ms, encode_ms_});
+      while (frame_log_.size() > 300) frame_log_.pop_front();
     } catch (const std::exception& e) {
       fatal_ = std::string("frame failed: ") + e.what();
       fprintf(stderr, "fleet-renderer: %s\n", fatal_.c_str());
@@ -290,14 +295,14 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   r_.set_budget(budget);
   r_.render(*sc, rt, t, opt_.accumulate);
   {
-    // this renderer's fit, from the samples it drew and their GPU time
+    // this renderer's fit, from its cost model (the fixed part of a frame and
+    // the cost per sample of each path, from the frames it drew)
     const RenderStats& rs = r_.stats();
-    double drawn = px / rs.half * rs.spp;
-    double f = budget_fit(drawn, rs.render_ms, 1000.0 / opt_.fps) * fit_scale_;
     std::lock_guard<std::mutex> l(hmu_);
-    // a fit belongs to one drawn size: a new size starts it again
-    if (std::fabs(px - fit_px_) > 0.01 * px) { fit_ = 0; fit_px_ = px; budget_ = opt_.budget; }
-    if (rs.spp > 0 && f > 0) fit_ = fit_ > 0 ? fit_ + (f - fit_) * 0.2 : f;
+    // a model belongs to one drawn size: a new size starts it again
+    if (std::fabs(px - fit_px_) > 0.01 * px) { cost_ = CostModel(); cost_.hq_prior = HQ_COST_PRIOR; fit_px_ = px; budget_ = opt_.budget; }
+    if (rs.spp > 0) cost_.observe(rs.hq, px / rs.half * rs.spp, rs.trace_ms, rs.render_ms);
+    fit_ = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
     used_budget_ = budget;
     budget_source_ = source;
     // a whole-image renderer alone follows its own fit, on the ladder
@@ -500,6 +505,20 @@ std::string Pipeline::health_json() {
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
     << ",\"spp\":" << rstats_.spp << ",\"checkerboard\":" << rstats_.half << ",\"hold\":" << (rstats_.hold ? "true" : "false")
     << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
+  {
+    // the last 2 s of frames: whole frame (render, encode, send) and its parts
+    auto now = std::chrono::steady_clock::now();
+    std::vector<double> f;
+    double rmax = 0, emax = 0;
+    for (auto& e : frame_log_)
+      if (now - e.at < std::chrono::seconds(2)) { f.push_back(e.frame_ms); rmax = std::max(rmax, e.render_ms); emax = std::max(emax, e.encode_ms); }
+    std::sort(f.begin(), f.end());
+    auto pct = [&](double q) { return f.empty() ? 0.0 : f[std::min(f.size() - 1, (size_t)(q * f.size()))]; };
+    o << ",\"frames_2s\":{\"n\":" << f.size() << ",\"frame_ms_p50\":" << std::round(pct(0.5) * 10) / 10
+      << ",\"frame_ms_p99\":" << std::round(pct(0.99) * 10) / 10 << ",\"frame_ms_max\":" << std::round((f.empty() ? 0 : f.back()) * 10) / 10
+      << ",\"render_ms_max\":" << std::round(rmax * 10) / 10 << ",\"encode_ms_max\":" << std::round(emax * 10) / 10 << "}";
+  }
+  o << ",\"trace_ms\":" << std::round(rstats_.trace_ms * 10) / 10;
   o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
     << "\",\"budget_fit\":" << std::round(fit_) << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {

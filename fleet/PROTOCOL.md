@@ -265,18 +265,32 @@ next hold.
 
 **Adapting a grid.** Each renderer reports in `/health`: `budget` (the last
 frame's), `budget_source` (`schedule`, `scene`, `local` or `default`),
-`budget_fit` (the budget at which its frame's GPU time would be 70% of a slot:
-pixel-samples drawn x 0.7 x slot / render ms, smoothed over about five
-frames) and `hq` (below). One controller sets one budget for all tiles of a
-grid: every 2 s it reads every tile's `budget_fit`, takes the smallest (the
-slowest tile governs), rounds it down to the ladder `250,000 x 2^(n/4)` (n
-from -8 to 40), and posts it to every tile with one `t`, at least a second
-past the newest frame any tile has drawn, so every tile switches at the same
-slot. A lower rung is taken at once; a higher one only after two rounds in a
-row ask for at least that much. The budget in force is posted every round
-(so it survives a scene change), and only when every tile has reported.
-Tiles never adapt on their own. `tools/budgetctl.py` is the reference
-controller; the fleet coordinator is to run the same rule.
+`budget_fit`, `hq` (below), `trace_ms` (the part of `render_ms` spent drawing
+samples) and `frames_2s` (over the last 2 s: `n`, `frame_ms_p50`,
+`frame_ms_p99`, `frame_ms_max` for a whole frame including encoding and
+sending, `render_ms_max`, `encode_ms_max`). `budget_fit` comes from a cost
+model of the frames the renderer drew: the fixed part of a frame
+(`render_ms - trace_ms`) and the cost per sample of each path (`trace_ms` /
+samples drawn), smoothed over about five frames, started again when the drawn
+size changes. It is the largest budget whose predicted frame takes 70% of a
+slot, on the fast path below `HQ_SPP` samples per drawn pixel or on the
+high-quality path from it; until a renderer has drawn a high-quality frame it
+assumes that path costs `HQ_COST_PRIOR` (1.0) times the fast one per sample.
+So a tile that cannot afford the high-quality path reports a fit just under
+`HQ_SPP` samples per pixel.
+
+One controller sets one budget for all tiles of a grid. Every 2 s it reads
+every tile's `budget_fit`, takes the smallest (the slowest tile governs) and
+smooths it over rounds (half the way each round), and posts the budget in
+force to every tile with one `t`, at least a second past the newest frame any
+tile has drawn, so every tile switches at the same slot. The budget moves on
+the ladder `250,000 x 2^(n/4)` (n from -8 to 40) with hysteresis: down, to the
+rung under the fit, when the budget exceeds the smoothed fit by more than 5%,
+and by at least a rung at once when any tile's `render_ms_max` is over 90% of
+a slot; up, to the rung under fit / 1.15, after three rounds in a row that
+allow it. It posts only when every tile has reported. Tiles never adapt on
+their own. `tools/budgetctl.py` is the reference controller; the fleet
+coordinator is to run the same rule.
 
 **The high-quality path.** From `HQ_SPP` (8) samples per drawn pixel, with
 every pixel drawing, a frame takes the high-quality path: the full cloud march
