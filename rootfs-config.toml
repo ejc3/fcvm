@@ -263,7 +263,7 @@ base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecra
 # all from one pinned driver version. No release is published for this
 # profile yet, so setup builds the kernel locally (--build-kernels).
 [kernel_profiles.gpu.arm64]
-description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA open kernel modules)"
+description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules)"
 kernel_version = "6.18.50"
 kernel_repo = "ejc3/fcvm"
 build_inputs = [
@@ -286,7 +286,13 @@ firecracker_args = "--enable-pci"
 # libraries match exactly. SHA-256 values match the .sha256sum files NVIDIA
 # publishes beside the same files under download.nvidia.com/XFree86/; the
 # toolkit's match its release's checksums.txt.
+#
+# The proprietary modules with the GSP firmware off, as on amd64: on a
+# g5g.metal (T4G) nvidia-persistenced's start at restore took 609 ms against
+# 1,285 ms with the open modules, and gpu_ms 1,026 against 1,823 (medians of
+# eight restores; DESIGN.md "arm64: g5g.metal").
 [kernel_profiles.gpu.arm64.nvidia]
+module_type = "proprietary"
 driver_version = "580.196.07"
 driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-aarch64-580.196.07.run"
 driver_sha256 = "5b7d2319a1e5228cb47a67e07733a5abfb614cd8d4350a750211022343d27eed"
@@ -312,8 +318,7 @@ firecracker_args = "--enable-pci"
 
 # The proprietary modules with the GSP firmware off: a T4's initialisation on
 # every restore takes half as long as with the open modules (see
-# module_type in src/setup/nvidia.rs). arm64 keeps the open modules until a
-# g5g.metal run measures the same there.
+# module_type in src/setup/nvidia.rs).
 [kernel_profiles.gpu.amd64.nvidia]
 module_type = "proprietary"
 driver_version = "580.196.07"
