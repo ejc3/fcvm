@@ -47,6 +47,10 @@ prep)
 kernel.unprivileged_userns_clone=1
 kernel.apparmor_restrict_unprivileged_userns=0
 vm.unprivileged_userfaultfd=1
+# Routed VMs: the host forwards every packet between a VM's veth and the uplink, and the
+# kernel forwards IPv6 only with this set. systemd-networkd handles the uplink's router
+# advertisements itself (the kernel's accept_ra is 0 there), so its default route stays.
+net.ipv6.conf.all.forwarding=1
 X
   sysctl -p /etc/sysctl.d/99-fcvm.conf
   grep -Eq '^[[:space:]]*user_allow_other[[:space:]]*$' /etc/fuse.conf || echo user_allow_other >> /etc/fuse.conf
