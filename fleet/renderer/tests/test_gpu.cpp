@@ -211,22 +211,21 @@ int main(int argc, char** argv) {
     CHECK(bad == 0 && r.stats().hold_samples == 64, "golden-hour hold at 1080, 64 samples: %u non-finite samples", bad);
   }
 
-  // 7. The text styles (lockup, skywriting, inworld): every one stitches, moving
-  // (accumulation off) and as a hold in different batches, and draws the
-  // newest word.
-  for (int style = TEXT_STYLE_LOCKUP; style <= TEXT_STYLE_INWORLD; style++) {
-    const char* name[] = {"classic", "lockup", "skywriting", "inworld"};
-    // skywriting and the sign stay where the camera saw them when the word
-    // came, so these use views that keep them in frame: the shots' moving
-    // path (word at 0, frame at 10) and its golden-hour hold (word at 5, frames
-    // at 22..25)
+  // 7. The text styles: a word in each style stitches, moving (accumulation
+  // off) and as a hold in different batches, and is drawn. Skywriting and the
+  // landmark stay where the camera saw them when the word came, so these use
+  // views that keep them in frame: the shots' moving path (word at 0, frame at
+  // 10) and its golden-hour hold (word at 5, frames at 22..25).
+  const Keyframe kMove0{0, {-22, 0.7, -30}, {-45, 1.2, -85}, 60}, kMove1{60, {-40, 2.4, -70}, {-20, 0.8, -40}, 64};
+  const Keyframe kHold{0, {-15, 2.2, -100}, {-70, 1.4, -70}, 62};
+  for (int style = TEXT_STYLE_LOCKUP; style <= TEXT_STYLE_LANDMARK; style++) {
+    const char* name[] = {"lockup", "skywriting", "landmark"};
     Scene ts = s;
-    ts.text_style = style;
-    ts.camera = {Keyframe{0, {-22, 0.7, -30}, {-45, 1.2, -85}, 60}, Keyframe{60, {-40, 2.4, -70}, {-20, 0.8, -40}, 64}};
-    ts.words = {{"Hello FLEET", 0.0}};
+    ts.camera = {kMove0, kMove1};
+    ts.words = {{"Hello FLEET", 0.0, style}};
     Scene th2 = ts;
-    th2.camera = {Keyframe{0, {-15, 2.2, -100}, {-70, 1.4, -70}, 62}};
-    th2.words = {{"Seams hold", 5.0}};
+    th2.camera = {kHold};
+    th2.words = {{"Seams hold", 5.0, style}};
     const double tmv = 10.0, thd = 25.0;
     Img w1 = draw(r, ts, Rect{0, 0, 1, 1}, 2 * h, {{tmv, 2}}, false);
     quads(r, ts, h, {{tmv, 2}}, false, q);
@@ -243,6 +242,76 @@ int main(int argc, char** argv) {
     for (size_t p = 0; p < w1.rgba.size(); p += 4) dw += memcmp(&w1.rgba[p], &w3.rgba[p], 3) != 0;
     CHECK(dw > 300, "%s draws the word (%ld pixels)", name[style], dw);
     fprintf(stderr, "%s moving whole: fnv64 %016llx\n", name[style], (unsigned long long)fnv(w1.rgba));
+  }
+
+  // 8. Landmark letters cast shadows in the path-traced samples: with the
+  // overlay off (the letters themselves not drawn), the hold still darkens
+  // where they shade the terrain.
+  {
+    Scene a = s;
+    a.camera = {kHold};
+    a.words = {{"Seams hold", 5.0, TEXT_STYLE_LANDMARK}};
+    Scene b = a;
+    b.words.clear();
+    r.set_text_overlay(false);
+    std::vector<std::pair<double, int>> hold = {{22, 4}, {23, 4}, {24, 4}, {25, 4}};
+    Img wa = draw(r, a, Rect{0, 0, 1, 1}, 2 * h, hold, true);
+    Img wb = draw(r, b, Rect{0, 0, 1, 1}, 2 * h, hold, true);
+    r.set_text_overlay(true);
+    long darker = 0;
+    for (size_t p = 0; p < wa.rgba.size(); p += 4) {
+      float la = 0.2126f * wa.rgba[p] + 0.7152f * wa.rgba[p + 1] + 0.0722f * wa.rgba[p + 2];
+      float lb = 0.2126f * wb.rgba[p] + 0.7152f * wb.rgba[p + 1] + 0.0722f * wb.rgba[p + 2];
+      darker += la < lb - 6.0f;
+    }
+    CHECK(darker > 200, "landmark letters shade the terrain (%ld pixels darker)", darker);
+  }
+
+  // 9. The clock reads over cloud: the shots' moving path at 10 s, where a
+  // bright cloud passes behind the clock. In the clock's box, its letters are
+  // brighter than the pixels around them by at least 0.3 (8-bit luminance /
+  // 255), and the box is mostly cloud.
+  {
+    Scene c = s;
+    c.camera = {kMove0, kMove1};
+    c.words.clear();
+    c.rect = Rect{0, 0, 1, 1};
+    const double tc = 10.0;
+    std::vector<std::pair<double, int>> seq;
+    for (int k = 0; k < 8; k++) seq.push_back({(tc * 30 - 7 + k) / 30.0, 2});
+    Img on = draw(r, c, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    r.set_text_overlay(false);
+    Img off = draw(r, c, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    r.set_text_overlay(true);
+    uint64_t key;
+    bool held;
+    FrameParams fp = build_frame(c, on.tile, tc, &key, &held);
+    const GText& g = fp.text[0];
+    auto px = [&](V3 w, float* X, float* Y) {
+      V3 dd = w - fp.cam.pos;
+      float z = dot(dd, fp.cam.fwd);
+      *X = (dot(dd, fp.cam.right) / (z * fp.cam.tan_half * fp.cam.aspect) + 1.0f) * 0.5f * on.tile.w;
+      *Y = (1.0f - dot(dd, fp.cam.up) / (z * fp.cam.tan_half)) * 0.5f * on.tile.h;
+    };
+    float x0, y0, x1, y1;
+    px(g.center + g.up * (-0.3f * g.height) + g.right * (-0.3f * g.height), &x0, &y1);
+    px(g.center + g.up * (1.0f * g.height) + g.right * ((g.width + 0.3f) * g.height), &x1, &y0);
+    double core = 0, rest = 0, back = 0;
+    long nc = 0, nr = 0, nb = 0;
+    for (int y = (int)y0; y <= (int)y1; y++)
+      for (int x = (int)x0; x <= (int)x1; x++) {
+        if (x < 0 || y < 0 || x >= on.tile.w || y >= on.tile.h) continue;
+        size_t p = 4 * ((size_t)y * on.tile.w + x);
+        float la = (0.2126f * on.rgba[p] + 0.7152f * on.rgba[p + 1] + 0.0722f * on.rgba[p + 2]) / 255.0f;
+        float lb = (0.2126f * off.rgba[p] + 0.7152f * off.rgba[p + 1] + 0.0722f * off.rgba[p + 2]) / 255.0f;
+        back += lb;
+        nb++;
+        if (la > lb + 0.1f) { core += la; nc++; } else { rest += la; nr++; }
+      }
+    double contrast = nc && nr ? core / nc - rest / nr : 0.0;
+    double behind = nb ? back / nb : 0.0;
+    CHECK(behind > 0.5, "the clock's box is over cloud (mean luminance behind it %.2f)", behind);
+    CHECK(nc > 150 && contrast >= 0.3, "the clock reads over cloud: %ld letter pixels, contrast %.2f", nc, contrast);
   }
   DONE();
 }

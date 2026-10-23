@@ -343,46 +343,84 @@ int main() {
     CHECK(none.size() == 0, "nothing in force, nothing carried");
     CHECK(schedule_after_scene(s2, true, true, 200).size() == 0, "a scene budget clears the schedule");
   }
-  // --- text styles
+  // --- text styles (words[].text_style)
   {
-    const char* base = R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
-        "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"words":[{"text":"AVA hi","t":1}])";
-    auto with = [&](const std::string& extra) { return parse_scene(std::string(base) + extra + "}"); };
-    CHECK(with("").text_style == TEXT_STYLE_CLASSIC, "text_style absent: classic");
-    CHECK(with(R"(,"text_style":"lockup")").text_style == TEXT_STYLE_LOCKUP &&
-              with(R"(,"text_style":"skywriting")").text_style == TEXT_STYLE_SKYWRITING &&
-              with(R"(,"text_style":"inworld")").text_style == TEXT_STYLE_INWORLD &&
-              with(R"(,"text_style":null)").text_style == TEXT_STYLE_CLASSIC,
+    auto scene_with = [](const std::string& word) {
+      return parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":62}],"time_of_day":0.245,"words":[)" + word +
+                         "]}");
+    };
+    CHECK(scene_with(R"({"text":"AVA hi","t":1})").words[0].style == TEXT_STYLE_LOCKUP, "text_style absent: lockup");
+    CHECK(scene_with(R"({"text":"a","t":1,"text_style":"skywriting"})").words[0].style == TEXT_STYLE_SKYWRITING &&
+              scene_with(R"({"text":"a","t":1,"text_style":"landmark"})").words[0].style == TEXT_STYLE_LANDMARK &&
+              scene_with(R"({"text":"a","t":1,"text_style":"lockup"})").words[0].style == TEXT_STYLE_LOCKUP &&
+              scene_with(R"({"text":"a","t":1,"text_style":null})").words[0].style == TEXT_STYLE_LOCKUP,
           "text_style names");
     bool threw = false;
-    try { with(R"(,"text_style":"wordart")"); } catch (const std::exception&) { threw = true; }
-    CHECK(threw, "an unknown text_style is refused");
+    try { scene_with(R"({"text":"a","t":1,"text_style":"classic"})"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "an unknown text_style (classic is gone) is refused");
     Tile tl = tile_geometry(Rect{0, 0, 1, 1}, 16.0 / 9, 540);
     uint64_t key;
     bool held;
-    FrameParams pc = build_frame(with(""), tl, 2.0, &key, &held);
-    CHECK(pc.n_text == 2 && pc.text[1].style == GTEXT_TUBE && memcmp(pc.text[1].ch, "AVA HI", 6) == 0,
-          "classic draws the word in capitals");
-    FrameParams pl = build_frame(with(R"(,"text_style":"lockup")"), tl, 2.0, &key, &held);
+    FrameParams pl = build_frame(scene_with(R"({"text":"AVA hi","t":1})"), tl, 2.0, &key, &held);
     CHECK(pl.n_text == 2 && pl.text[0].style == GTEXT_TYPE && pl.text[1].style == GTEXT_TYPE &&
               memcmp(pl.text[1].ch, "AVA hi", 6) == 0,
           "lockup: the clock and the word as type, case kept");
+    CHECK(pl.text[0].occlude == 0 && pl.text[1].occlude == 1, "nothing hides the clock; terrain hides the word");
     // kerning: V tucks under A, so V starts before A's advance ends
     CHECK(pl.text[1].gx[1] < pl.text[1].gx[0] + 0.69f - 0.02f, "A V kerned (V at %.3f em)", pl.text[1].gx[1]);
-    // the clock's digits sit on one advance: 11:11 and 08:08 are as wide
-    GText a1, a2;
-    FrameParams p1 = build_frame(with(R"(,"text_style":"lockup")"), tl, 2.0, &key, &held);
-    a1 = p1.text[0];
-    FrameParams p2 = build_frame(with(R"(,"text_style":"lockup")"), tl, 3.0, &key, &held);
-    a2 = p2.text[0];
-    CHECK(fabsf(a1.width - a2.width) < 1e-6f && a1.width > 3.0f, "the clock's width does not change as it counts (%.4f, %.4f)",
-          a1.width, a2.width);
+    // the clock's digits sit on one advance: its width does not change as it counts
+    FrameParams p2 = build_frame(scene_with(R"({"text":"AVA hi","t":1})"), tl, 3.0, &key, &held);
+    CHECK(fabsf(pl.text[0].width - p2.text[0].width) < 1e-6f && pl.text[0].width > 3.0f,
+          "the clock's width does not change as it counts (%.4f, %.4f)", pl.text[0].width, p2.text[0].width);
     // the message sits above the clock, both from one left edge
-    V3 dm = pl.text[1].center - pl.cam.pos, dc = pl.text[0].center - pl.cam.pos;
-    float um = dot(dm, pl.cam.right) / dot(dm, pl.cam.fwd), uc = dot(dc, pl.cam.right) / dot(dc, pl.cam.fwd);
-    float vm = dot(dm, pl.cam.up) / dot(dm, pl.cam.fwd), vc = dot(dc, pl.cam.up) / dot(dc, pl.cam.fwd);
+    auto screen = [](const FrameParams& f, const GText& g, float* u, float* v) {
+      V3 d = g.center - f.cam.pos;
+      *u = dot(d, f.cam.right) / dot(d, f.cam.fwd);
+      *v = dot(d, f.cam.up) / dot(d, f.cam.fwd);
+    };
+    float um, vm, uc, vc;
+    screen(pl, pl.text[1], &um, &vm);
+    screen(pl, pl.text[0], &uc, &vc);
     CHECK(fabsf(um - uc) < 1e-4f && vm > vc && um < 0, "left-aligned lockup, message above the clock (u %.4f %.4f, v %.4f %.4f)",
           um, uc, vm, vc);
+    // the clock keeps its place whatever the word's style, or with no word
+    FrameParams ps = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 2.0, &key, &held);
+    FrameParams pk = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"landmark"})"), tl, 2.0, &key, &held);
+    FrameParams pn = build_frame(scene_with(R"({"text":"Hello","t":100})"), tl, 2.0, &key, &held);
+    float u2, v2_, u3, v3_, u4, v4_;
+    screen(ps, ps.text[0], &u2, &v2_);
+    screen(pk, pk.text[0], &u3, &v3_);
+    screen(pn, pn.text[0], &u4, &v4_);
+    CHECK(pn.n_text == 1 && fabsf(u2 - uc) < 1e-5f && fabsf(u3 - uc) < 1e-5f && fabsf(u4 - uc) < 1e-5f &&
+              fabsf(v2_ - vc) < 1e-5f && fabsf(v3_ - vc) < 1e-5f && fabsf(v4_ - vc) < 1e-5f,
+          "the clock does not move with the word's style");
+    CHECK(ps.text[1].style == GTEXT_SMOKE && pk.text[1].style == GTEXT_LANDMARK, "each word in its own style");
+    // skywriting stays up about 25 s after the last letter, then fades
+    FrameParams ps1 = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 26.0, &key, &held);
+    FrameParams ps2 = build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"skywriting"})"), tl, 50.0, &key, &held);
+    CHECK(ps1.text[1].alpha == 1.0f && ps2.text[1].alpha == 0.0f, "skywriting: up at 25 s, gone at 49 s (%.2f, %.2f)",
+          ps1.text[1].alpha, ps2.text[1].alpha);
+    // landmark letters stand on the ground under their middles, facing where the camera was
+    const GText& lg = pk.text[1];
+    V3 nz = cross(lg.right, lg.up);
+    float dcam = length(lg.center - pk.cam.pos);
+    CHECK(dot(nz, pk.cam.pos - lg.center) > 0 && dcam > 2.0f && dcam < 15.0f, "landmark faces the camera, %.2f km out", dcam);
+    int on = 0;
+    for (int k = 0; k < lg.len; k++) {
+      if (lg.ch[k] == ' ') continue;
+      V3 base = lg.center + lg.right * ((lg.gx[k] + 0.25f) * lg.height) + lg.up * (lg.gy[k] * lg.height);
+      double bp[3] = {base.x, base.y, base.z};
+      double ground = std::max(0.0, (double)surface_h(v2(base.x, base.z), 9, host_noise().tab.data())) -
+                      (bp[0] * bp[0] + bp[2] * bp[2]) / (2.0 * PLANET_R);
+      on += fabs(base.y - ground) < 0.25 * lg.height;
+    }
+    CHECK(on >= lg.len - 1, "landmark letters stand on the ground (%d of %d)", on, lg.len);
+    // a landmark word starts a new hold (its letters shade the terrain)
+    uint64_t k1, k2;
+    build_frame(scene_with(R"({"text":"Hello","t":100,"text_style":"landmark"})"), tl, 50.0, &k1, &held);
+    build_frame(scene_with(R"({"text":"Hello","t":1,"text_style":"landmark"})"), tl, 50.0, &k2, &held);
+    CHECK(held && k1 != k2, "a landmark word changes the hold key");
   }
   tlscheck::run();
   DONE();

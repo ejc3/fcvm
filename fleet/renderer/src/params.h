@@ -3,7 +3,7 @@
 #pragma once
 #include "vec.h"
 
-#define MAX_TEXTS 17   // the clock plus the 16 newest words
+#define MAX_TEXTS 4    // the clock and the newest word (up to two lines)
 #define MAX_CHARS 28
 #define MAX_LIGHTS 32
 #define HQ_COST_PRIOR 1.0  // cost per sample of the high-quality path over the fast path, until one is measured
@@ -23,34 +23,33 @@ struct GCam {
   float aspect;    // whole-image width / height
 };
 
-// Text styles (the scene's text_style): classic draws the stroke font as
-// tubes; the others draw Inter from a signed distance atlas.
-#define TEXT_STYLE_CLASSIC 0
-#define TEXT_STYLE_LOCKUP 1      // emissive type at depth, upper left
-#define TEXT_STYLE_SKYWRITING 2  // the message as smoke in the sky
-#define TEXT_STYLE_INWORLD 3     // the message as a lit sign standing on the ground
+// A message's text_style (words[].text_style); the clock is always type.
+#define TEXT_STYLE_LOCKUP 0      // emissive type at depth, upper left, above the clock (the default)
+#define TEXT_STYLE_SKYWRITING 1  // smoke puffs written across the sky
+#define TEXT_STYLE_LANDMARK 2    // big solid letters standing on a ridge
 
 // GText.style
-#define GTEXT_TUBE 0    // classic words
-#define GTEXT_RIM 1     // classic clock
-#define GTEXT_TYPE 2    // emissive SDF type in a plane facing the camera
-#define GTEXT_SMOKE 3   // SDF letters as a smoke volume
-#define GTEXT_SIGN 4    // SDF letters lit on a board standing in the world
+#define GTEXT_TYPE 0      // emissive type in a plane facing the camera
+#define GTEXT_SMOKE 1     // smoke puffs along the glyphs' centrelines
+#define GTEXT_LANDMARK 2  // extruded letters standing in the world
 
 struct GText {
-  // Classic: the centre of the text. SDF styles: the left end of the
-  // baseline. right and up are unit vectors spanning the text's plane.
+  // The left end of the baseline; right and up are unit vectors spanning the
+  // text's plane.
   V3 center, right, up;
-  float height;          // classic: glyph cell height; SDF styles: the em, in km
+  float height;          // the em, in km
   float alpha;           // fade in/out
-  V3 color;              // emitted radiance
+  V3 color;              // type: emitted radiance after exposure; landmark: the dusk edge light
   int style;             // GTEXT_*
   int occlude;           // 1: hidden behind nearer terrain
   int len;
   unsigned char ch[MAX_CHARS];
-  float gx[MAX_CHARS];   // SDF styles: each glyph's origin along the baseline, em (kerned)
-  float width;           // SDF styles: the advance of the whole line, em
+  float gx[MAX_CHARS];   // each glyph's origin along the baseline, em (kerned)
+  float gy[MAX_CHARS];   // each glyph's origin above the baseline, em (landmark letters follow the ground)
+  float width;           // the advance of the whole line, em
+  float ylo, yhi;        // the glyphs' extent above the baseline, em
   float age;             // smoke: seconds since the message appeared
+  float shade;           // type: how strongly the shade behind it holds bright backgrounds down (0..1)
 };
 
 struct GLight {
@@ -73,6 +72,7 @@ struct FrameParams {
   int hq;              // 1: the high-quality path (budget >= HQ_SPP samples per drawn pixel; see PROTOCOL.md)
   int half;            // checkerboard stride: 1 every pixel draws, 2 half, 4 a quarter (see draws_here)
   int parity;          // the frame slot k & 3
+  int text_overlay;    // 1: draw the clock and words over the image (0 only in tests)
   int hold;            // 1: camera held, exact accumulation; 0: moving, reprojection
   int sample_base;     // hold: index of the first sample drawn this frame
   uint32_t seed;       // hold: the hold's seed; moving: the frame's seed

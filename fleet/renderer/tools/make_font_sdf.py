@@ -3,13 +3,17 @@ fonts/OFL.txt) for printable ASCII, with advances and kerning.
 
     python3 tools/make_font_sdf.py INTER_VARIABLE_TTF > src/font_sdf.h
 
-Needs fonttools, pillow, numpy, scipy and uharfbuzz (the build does not: the
-header is committed). The variable font is instanced at weight 600, optical
+Needs fonttools, pillow, numpy, scipy, scikit-image and uharfbuzz (the
+build does not: the header is committed). The variable font is instanced at weight 600, optical
 size 32. Each glyph is rendered at 8x the atlas resolution, its exact
 Euclidean distance transform taken inside and outside, and the distance at
 each atlas texel centre stored as a byte: 128 + d / SPREAD * 127, d in em,
 positive outside. Kerning is every pair whose shaped advance (HarfBuzz, with
 the font's kern feature) differs from the sum of the two advances.
+
+It also lays smoke puffs (skywriting) along each glyph's centreline: the
+skeleton of the high-resolution glyph, sampled greedily so no two puffs are
+closer than PUFF_STEP em, each with the stroke's half-width there.
 """
 import base64
 import io
@@ -21,10 +25,12 @@ from fontTools.ttLib import TTFont
 from fontTools.varLib import instancer
 from PIL import Image, ImageDraw, ImageFont
 from scipy.ndimage import distance_transform_edt
+from skimage.morphology import skeletonize
 
 PX_PER_EM = 36   # atlas texels per em
 OVER = 8         # supersampling of the source render
 SPREAD = 0.35    # em: distances are stored out to this far from an edge
+PUFF_STEP = 0.055  # em between smoke puffs along a centreline
 ATLAS_W = 1024
 CHARS = [chr(c) for c in range(32, 127)]
 
@@ -60,6 +66,7 @@ size = PX_PER_EM * OVER
 pil = ImageFont.truetype(io.BytesIO(data), size)
 pad = int(np.ceil(SPREAD * PX_PER_EM)) + 1  # texels around the ink
 cells = []
+puffs = {}
 for c in CHARS:
     if c == " ":
         cells.append((c, None, 0, 0))
@@ -81,6 +88,15 @@ for c in CHARS:
     s = sd[np.ix_(ys, xs)]
     q = np.clip(np.round(128 + s / SPREAD * 127), 0, 255).astype(np.uint8)
     cells.append((c, q, tx0, ty0))
+    # smoke puffs along the centreline: (x, y up, half-width), em from the origin
+    sk = np.argwhere(skeletonize(ink))  # (row, col)
+    pts = []
+    for r, col in sorted(sk.tolist(), key=lambda e: (e[1], e[0])):
+        x = (col + tx0 * OVER + 0.5) / (OVER * PX_PER_EM)
+        y = -(r + ty0 * OVER + 0.5) / (OVER * PX_PER_EM)
+        if all((x - a) ** 2 + (y - b) ** 2 >= PUFF_STEP ** 2 for a, b, _ in pts):
+            pts.append((x, y, d_in[r, col] / (OVER * PX_PER_EM)))
+    puffs[c] = sorted(pts)
 
 # shelf packing
 atlas_rows = []
@@ -131,9 +147,24 @@ for a, b, d in sorted(kern):
     out.write(f"    {{{a}, {b}, {d:.6f}f}},\n")
 out.write("};\n\n")
 b64 = base64.b64encode(atlas.tobytes()).decode()
+allp, start, count = [], [], []
+for c in CHARS:
+    start.append(len(allp))
+    count.append(len(puffs.get(c, [])))
+    allp += puffs.get(c, [])
+out.write("// smoke puffs along each glyph's centreline, ordered by x: x, y (up), the\n")
+out.write("// stroke's half-width, in 1/4096 em from the glyph origin\n")
+out.write(f"#define SDF_PUFFS {len(allp)}\n")
+out.write("static const short kSdfPuffStart[95] = {" + ", ".join(map(str, start)) + "};\n")
+out.write("static const unsigned char kSdfPuffCount[95] = {" + ", ".join(map(str, count)) + "};\n")
+out.write("#ifdef SDF_WITH_ATLAS\n")
+out.write("static const short kSdfPuffs[SDF_PUFFS][3] = {\n")
+for x, y, w in allp:
+    out.write(f"    {{{round(x * 4096)}, {round(y * 4096)}, {round(w * 4096)}}},\n")
+out.write("};\n#endif\n\n")
 out.write("#ifdef SDF_WITH_ATLAS\n")
 out.write(f"// the atlas, SDF_ATLAS_W x SDF_ATLAS_H bytes, base64\nstatic const char kSdfAtlasB64[] =\n")
 for i in range(0, len(b64), 120):
     out.write(f'    "{b64[i:i + 120]}"\n')
 out.write(";\n#endif\n")
-sys.stderr.write(f"atlas {ATLAS_W}x{ATLAS_H}, {len(kern)} kerning pairs\n")
+sys.stderr.write(f"atlas {ATLAS_W}x{ATLAS_H}, {len(kern)} kerning pairs, {len(allp)} puffs, at most {max(count)} per glyph\n")

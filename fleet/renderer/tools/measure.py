@@ -31,10 +31,9 @@ print("inner_height,inner_width,stream,rect,frames,client_fps,spp,checkerboard,r
 for h, rect, kind in rows:
     scene = {"epoch_unix_ms": now, "rect": rect, "image_aspect": 16 / 9, "camera": cam,
              "time_of_day": 0.3, "words": [], "lights": []}
-    if os.environ.get("TEXT_STYLE"):  # how the clock and words are drawn
-        scene["text_style"] = os.environ["TEXT_STYLE"]
-    if os.environ.get("WORD"):  # a word on screen for the whole row
-        scene["words"] = [{"text": os.environ["WORD"], "t": (time.time() * 1000 - now) / 1000 - 10}]
+    if os.environ.get("WORD"):  # a word on screen for the whole row, in TEXT_STYLE
+        scene["words"] = [{"text": os.environ["WORD"], "t": (time.time() * 1000 - now) / 1000 - 10,
+                           "text_style": os.environ.get("TEXT_STYLE", "lockup")}]
     if os.environ.get("BUDGET"):  # the scene's per-frame budget (pixel-samples) instead of the renderer's
         scene["budget"] = int(os.environ["BUDGET"])
     fc.post_scene(host, port, scene)
