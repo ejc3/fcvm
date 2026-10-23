@@ -489,6 +489,18 @@ fn sandbox_url(port: u16, id: &str) -> String {
 // Gateway handlers
 // ============================================================================
 
+/// `KEY=VALUE` strings sorted by key. The environment is part of the snapshot key, in the
+/// order given, and a HashMap iterates in a different order for every request: unsorted,
+/// two identical requests could miss each other's snapshot.
+fn key_value_flags(map: HashMap<String, String>) -> Vec<String> {
+    let mut pairs: Vec<(String, String)> = map.into_iter().collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{}={}", k, v))
+        .collect()
+}
+
 /// The `fcvm podman run` arguments for one sandbox.
 fn podman_run_args(
     name: &str,
@@ -556,16 +568,8 @@ async fn create_sandbox(
             );
         }
     }
-    let env: Vec<String> = env_map
-        .into_iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
-    let labels: Vec<String> = req
-        .labels
-        .unwrap_or_default()
-        .into_iter()
-        .map(|(k, v)| format!("{}={}", k, v))
-        .collect();
+    let env = key_value_flags(env_map);
+    let labels = key_value_flags(req.labels.unwrap_or_default());
     let args = podman_run_args(
         &name,
         &image,
@@ -1678,6 +1682,18 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_value_flags_are_sorted_whatever_the_map_order() {
+        let keys: Vec<String> = (0..16).map(|i| format!("K{i:02}")).collect();
+        let map: HashMap<String, String> = keys
+            .iter()
+            .rev()
+            .map(|k| (k.clone(), format!("v-{k}")))
+            .collect();
+        let expected: Vec<String> = keys.iter().map(|k| format!("{k}=v-{k}")).collect();
+        assert_eq!(key_value_flags(map), expected);
+    }
 
     #[test]
     fn test_language_to_run_command_go_uses_go_toolchain() {

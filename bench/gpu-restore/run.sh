@@ -54,9 +54,9 @@ for i in $(seq 1 "$N"); do
   rc=0
   wall=$(run_one "gpu-$i" "$g" "$log") || rc=$?
   load1=$(cut -d' ' -f1 /proc/loadavg)
-  # The restored record is the one JSON line on stdout whose status is "restored".
-  rec=$(grep '^{' "$log" | jq -c 'select(.status == "restored")' 2>/dev/null | head -1)
-  [ -n "$rec" ] || rec='{}'
+  # The restored record is the JSON line on stdout whose status is "restored"; a run that
+  # failed before printing one gets {} and keeps its row.
+  rec=$(jq -cR 'fromjson? | objects | select(.status == "restored")' "$log" | jq -cs '.[0] // {}')
 
   echo "$i,$g,$wall,$rc,$(jq -r '.ack_ms // ""' <<<"$rec"),$(jq -r '.guest_phases.gpu_ms // ""' <<<"$rec"),$(jq -r '.backend // ""' <<<"$rec"),$load1" >>"$OUT/runs.csv"
 done
