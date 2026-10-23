@@ -99,6 +99,12 @@ pub struct ServeArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8090)]
     pub port: u16,
+
+    /// Start every sandbox with `--no-snapshot`: a cold boot that neither restores from
+    /// nor creates the snapshot cache. By default each sandbox is an
+    /// `fcvm podman run` that restores from the cache when its snapshot exists.
+    #[arg(long)]
+    pub no_snapshot: bool,
 }
 
 // ============================================================================
