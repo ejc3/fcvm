@@ -906,8 +906,10 @@ impl PidFd {
     /// Returns true if it exited. A pidfd becomes readable on exit, so this is
     /// an epoll wakeup rather than a poll loop.
     async fn wait_for_exit(&self, timeout: Duration) -> bool {
-        use std::os::fd::AsRawFd;
-        let Ok(async_fd) = tokio::io::unix::AsyncFd::new(self.0.as_raw_fd()) else {
+        use std::os::fd::AsFd;
+        // SAFETY: the `BorrowedFd` borrows `self.0`, so the pidfd stays open and unchanged
+        // for as long as this local `AsyncFd` lives.
+        let Ok(async_fd) = (unsafe { tokio::io::unix::AsyncFd::register(self.0.as_fd()) }) else {
             return false;
         };
         tokio::time::timeout(timeout, async_fd.readable())

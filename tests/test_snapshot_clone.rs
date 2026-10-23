@@ -6151,7 +6151,10 @@ async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
                 .with_context(|| format!("watching test log {}", log_path.display()));
         }
 
-        let async_inotify = tokio::io::unix::AsyncFd::new(inotify)
+        // SAFETY: the `AsyncFd` owns the inotify fd, which closes only on drop, and this
+        // function never replaces it.
+        let async_inotify = unsafe { tokio::io::unix::AsyncFd::register(inotify) }
+            .map_err(std::io::Error::from)
             .context("registering test-log inotify fd with the reactor")?;
         let wait = async {
             loop {
