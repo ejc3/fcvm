@@ -75,5 +75,7 @@ void fill_noise_table(V4* tab);  // deterministic
 
 // Build the kernel parameters for frame time t. `hold_key` receives a value that
 // changes whenever the accumulated layer must restart.
+// "HH:MM:SS PDT" or "HH:MM:SS PST" for a Unix time (the sky clock).
+std::string pacific_clock(int64_t unix_s);
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held);
 GCam make_cam(const double pos[3], const double look[3], double fov_deg, double aspect);
