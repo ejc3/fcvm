@@ -1322,6 +1322,14 @@ fn path_classification_holds_on_both_sides_of_the_bench_arm() {
         ("src/main.rs", true, false),
         ("scripts/scan-test-log.sh", true, false),
         (".github/workflows/ci.yml", true, false),
+        // fcvm builds fleet/core; the rest of fleet/ is outside the matrix.
+        ("fleet/core/src/protocol.rs", true, false),
+        ("fleet/core/Cargo.toml", true, false),
+        ("fleet/renderer/src/render.cu", false, false),
+        ("fleet/renderer/Makefile", false, false),
+        ("fleet/tools/gpubox.sh", false, false),
+        ("fleet/PROTOCOL.md", false, false),
+        ("src/fleet/mod.rs", true, false),
     ] {
         let (code, bench) = classify_changed_path(path);
         assert_eq!(
