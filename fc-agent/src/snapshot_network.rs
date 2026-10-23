@@ -3846,6 +3846,34 @@ mod tests {
         );
     }
 
+    /// A routed clone's IPv6 gateway is pinned after the neighbour flush and
+    /// before the IPv6 swap (#1160). A resolution of the gateway in flight
+    /// across the swap is sourced from the snapshot-time address the swap
+    /// deletes; the bridge's answer to it was then not delivered and every
+    /// reply waited a second for the retransmit. A pin before the flush would
+    /// survive it only because the flush skips permanent entries, which is
+    /// the wrong thing to depend on; a pin after the swap leaves the window
+    /// open.
+    #[test]
+    fn the_routed_gateway_is_pinned_before_the_ipv6_swap() {
+        let source = include_str!("restore.rs");
+        let start = source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is in restore.rs");
+        let body = &source[start..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        let flush = at("network::flush_stale_neighbours().await");
+        let pin = at("network::pin_routed_gateway_neighbour().await");
+        let swap = at("network::reconfigure_ipv6(");
+        assert!(
+            flush < pin && pin < swap,
+            "flush={flush} pin={pin} swap={swap}"
+        );
+    }
+
     /// A failed NFS remount fails the restore. The remount runs before the hook
     /// so that a hook can use the share; a remount that failed and was only
     /// logged left the mount point an ordinary directory, so a hook writing

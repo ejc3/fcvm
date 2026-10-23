@@ -7292,3 +7292,161 @@ async fn test_routed_clone_ipv6_ingress_is_clear_at_the_ack() -> Result<()> {
     common::kill_process(serve_pid).await;
     Ok(())
 }
+
+/// A restored routed clone answers a new IPv6 connection without resolving its
+/// IPv6 gateway (#1160).
+///
+/// The clone inherits a correct neighbour entry for `fd00::1` and flushes it;
+/// re-resolving it raced the IPv6 swap. A solicitation sourced from the
+/// snapshot-time address got its answer after the swap had deleted that
+/// address, the answer was not delivered, and every reply, the SYN-ACK
+/// included, waited for the retransmit a second later: about 6 restores in
+/// 1000 with a client dialling during the restore. The guest now pins the
+/// gateway's entry before the swap.
+///
+/// The losing interleaving is held, not hoped for: from before the clone
+/// resumes until 100 ms after the first request is sent, the VM namespace
+/// drops its Neighbor Advertisements, so a guest that resolves its gateway in
+/// that time gets no answer, as the guest in the race did. A guest that
+/// solicited waits for its retransmit, about a second; one that never needs
+/// to answers at once.
+#[cfg(feature = "privileged-tests")]
+#[tokio::test]
+async fn test_routed_clone_answers_without_resolving_its_ipv6_gateway() -> Result<()> {
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("v6-gateway");
+    let fcvm_path = common::find_fcvm_binary()?;
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "routed",
+            "--health-check",
+            "http://localhost:80",
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+    let (_serve_child, serve_pid) =
+        common::spawn_fcvm_with_logs(&["snapshot", "serve", &snapshot_name], "uffd-server")
+            .await
+            .context("spawning memory server")?;
+    common::poll_serve_ready(&snapshot_name, serve_pid, 30).await?;
+
+    let go_file = std::path::PathBuf::from(format!("/tmp/fcvm-{clone_name}.go"));
+    let _ = std::fs::remove_file(&go_file);
+    let failpoint = format!(
+        "restore.post_network_pre_resume:block_until_file:{}",
+        go_file.display()
+    );
+    let serve_pid_str = serve_pid.to_string();
+    let (_clone_child, clone_pid, clone_log) = common::spawn_fcvm_with_env_and_log_path(
+        &[
+            "snapshot",
+            "run",
+            "--pid",
+            &serve_pid_str,
+            "--name",
+            &clone_name,
+        ],
+        &[("FCVM_FAILPOINT", &failpoint)],
+    )
+    .await
+    .context("spawning clone held before VMM resume")?;
+    wait_for_log(
+        &clone_log,
+        "FAILPOINT restore.post_network_pre_resume reached",
+    )
+    .await?;
+    let log = std::fs::read_to_string(&clone_log).context("reading the clone log")?;
+    let field = |key: &str| {
+        log.split(key)
+            .nth(1)
+            .and_then(|rest| rest.split_whitespace().next())
+            .map(str::to_string)
+            .with_context(|| format!("the clone did not log {key}"))
+    };
+    let address: std::net::Ipv6Addr = field("vm_ipv6=")?
+        .parse()
+        .context("vm_ipv6 is not an IPv6 address")?;
+    let namespace = field("namespace=")?;
+    let advertisements = [
+        "-w",
+        "OUTPUT",
+        "-p",
+        "icmpv6",
+        "--icmpv6-type",
+        "neighbour-advertisement",
+        "-j",
+        "DROP",
+    ];
+    let in_namespace = |action: &'static str| {
+        let namespace = namespace.clone();
+        async move {
+            let mut args = vec!["netns", "exec", namespace.as_str(), "ip6tables"];
+            args.push(advertisements[0]);
+            args.push(action);
+            args.extend(&advertisements[1..]);
+            let output = tokio::process::Command::new("ip")
+                .args(&args)
+                .output()
+                .await
+                .context("running ip6tables in the VM namespace")?;
+            anyhow::ensure!(
+                output.status.success(),
+                "ip6tables {action} in {namespace}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            Ok::<(), anyhow::Error>(())
+        }
+    };
+
+    // From before the guest runs until the first request is in flight, nothing
+    // the guest solicits from the bridge is answered.
+    in_namespace("-I").await?;
+    std::fs::write(&go_file, b"go").context("releasing the held clone")?;
+    wait_for_log(&clone_log, "acknowledged exact restore generation").await?;
+    let _ = std::fs::remove_file(&go_file);
+    let request = tokio::spawn(http_get_v6(address, Duration::from_secs(5)));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    in_namespace("-D").await?;
+    let answered = request.await?;
+    println!(
+        "first connection after the ACK, gateway unanswered for its first 100 ms: {answered:?}"
+    );
+    let answered = answered.context("the first connection after the ACK failed")?;
+    // Answered at once it takes milliseconds; a guest waiting for its
+    // gateway's retransmit takes about a second.
+    anyhow::ensure!(
+        answered < Duration::from_millis(300),
+        "the first connection after the ACK took {answered:?}: the clone resolved its IPv6 gateway"
+    );
+
+    common::kill_process(clone_pid).await;
+    common::kill_process(serve_pid).await;
+    Ok(())
+}

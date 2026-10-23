@@ -11,6 +11,11 @@ use super::{NetworkConfig, NetworkManager, PortMapping, Protocol};
 /// Guest network addressing (same as pasta/bridged for Firecracker compatibility)
 const GUEST_IP: &str = "10.0.2.100";
 const GUEST_GATEWAY: &str = "10.0.2.1";
+/// The namespace bridge's IPv6 address and the guest's IPv6 default gateway.
+/// The bridge's MAC is `NAMESPACE_MAC`, and a restored guest pins its
+/// neighbour entry for this address to it (fc-agent's `ROUTED_GATEWAY_IPV6`,
+/// kept equal by `routed_gateway_matches_the_guests_pinned_neighbour`).
+const ROUTED_GATEWAY_IPV6: &str = "fd00::1";
 
 /// Host loopback alias for `--forward-localhost`. fc-agent's guest-side relay
 /// connects to this address (pasta maps it to host loopback in rootless mode).
@@ -618,7 +623,7 @@ impl NetworkManager for RoutedNetwork {
                 "-6",
                 "addr",
                 "add",
-                "fd00::1/64",
+                &format!("{ROUTED_GATEWAY_IPV6}/64"),
                 "dev",
                 BRIDGE_DEVICE,
                 "nodad",
@@ -907,7 +912,7 @@ impl NetworkManager for RoutedNetwork {
             // fd00::1 is on the bridge inside the namespace. The VM uses it as IPv6 gateway.
             // NDP resolves it on the VM's local link (TAP → bridge → fd00::1 responds).
             // The namespace kernel then forwards to the veth → host.
-            host_ipv6: Some("fd00::1".to_string()),
+            host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string()),
             dns_search: None,
             // Override proxy to use the gateway relay (TCP proxy on host side
             // goes through BPF hooks for client cert injection).
@@ -1260,6 +1265,27 @@ async fn detect_default_ipv6_interface() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restored routed guest pins its neighbour entry for its IPv6 gateway
+    /// to `NAMESPACE_MAC` (#1160). That is right only while the gateway is
+    /// this bridge's address and the bridge carries that MAC.
+    #[test]
+    fn routed_gateway_matches_the_guests_pinned_neighbour() {
+        let agent = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fc-agent/src/network.rs"),
+        )
+        .expect("reading fc-agent/src/network.rs");
+        assert!(
+            agent.contains(&format!(
+                "const ROUTED_GATEWAY_IPV6: &str = \"{ROUTED_GATEWAY_IPV6}\";"
+            )),
+            "fc-agent pins a different IPv6 gateway than routed mode gives its guests"
+        );
+        let routed = include_str!("routed.rs");
+        assert!(routed.contains("host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string())"));
+        assert!(routed.contains("&format!(\"{ROUTED_GATEWAY_IPV6}/64\")"));
+        assert!(routed.contains("crate::network::pasta::NAMESPACE_MAC"));
+    }
 
     const NET_2600: u128 = 0x2600_1f1c_0494_0201 << 64;
     const NET_2803: u128 = 0x2803_6084_7058_46f6 << 64;

@@ -116,6 +116,16 @@ touches the link, so there are no routes and no neighbours to reinstate.
    clone inheriting the source's neighbour table holds entries that are correct
    in its own namespace. fc-agent hardcodes the same constant; the pair is
    asserted by `namespace_neighbour_matches_host_constants`.
+4. **A restored clone resolves none of its gateways.** fc-agent pins 10.0.2.1
+   and, in routed mode, the IPv6 gateway `fd00::1` to that MAC (permanent)
+   right after flushing the inherited neighbours and before the IPv6 swap. A
+   resolution of `fd00::1` in flight across the swap was sourced from the
+   address the swap deletes, its answer was not delivered, and every reply
+   waited a second for the retransmit (#1160, about 6 restores in 1000 with a
+   client dialling during the restore).
+   `test_routed_clone_answers_without_resolving_its_ipv6_gateway` holds that
+   interleaving; `the_routed_gateway_is_pinned_before_the_ipv6_swap` pins the
+   order.
 
 **Enforcement:** `snapshot_leaves_the_source_network_untouched`
 (`tests/test_snapshot_clone.rs`) diffs the guest's routes, neighbours and

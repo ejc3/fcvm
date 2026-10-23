@@ -426,7 +426,7 @@ fn delete_request(record: &[u8], sequence: u32) -> Vec<u8> {
 fn replace_neighbour<C: NetlinkChannel>(
     channel: &mut C,
     index: u32,
-    address: Ipv4Addr,
+    address: std::net::IpAddr,
     lladdr: [u8; 6],
 ) -> anyhow::Result<()> {
     let sequence = NEXT_NETLINK_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -444,7 +444,10 @@ fn replace_neighbour<C: NetlinkChannel>(
     append_neighbour_message(
         &mut request,
         NeighbourMessage {
-            family: libc::AF_INET as u8,
+            family: match address {
+                std::net::IpAddr::V4(_) => libc::AF_INET as u8,
+                std::net::IpAddr::V6(_) => libc::AF_INET6 as u8,
+            },
             pad1: 0,
             pad2: 0,
             index: i32::try_from(index).context("interface index out of range")?,
@@ -453,7 +456,10 @@ fn replace_neighbour<C: NetlinkChannel>(
             kind: 0,
         },
     );
-    append_attribute(&mut request, NDA_DST, &address.octets());
+    match address {
+        std::net::IpAddr::V4(v4) => append_attribute(&mut request, NDA_DST, &v4.octets()),
+        std::net::IpAddr::V6(v6) => append_attribute(&mut request, NDA_DST, &v6.octets()),
+    }
     append_attribute(&mut request, NDA_LLADDR, &lladdr);
     request_acknowledged(channel, &with_length(request), sequence, RTM_NEWNEIGH)
 }
@@ -515,12 +521,54 @@ where
             .parse()
             .context("NAMESPACE_IP is not an IPv4 address")?;
         let lladdr = parse_mac(NAMESPACE_MAC).context("NAMESPACE_MAC is not a MAC address")?;
-        replace_neighbour(&mut channel, index, address, lladdr)
+        replace_neighbour(&mut channel, index, address.into(), lladdr)
     })
     .await;
     match pinned {
         Ok(()) => eprintln!("[fc-agent] pinned {NAMESPACE_IP} to {NAMESPACE_MAC} (permanent)"),
         Err(error) => eprintln!("[fc-agent] WARNING: could not pin {NAMESPACE_IP}: {error:#}"),
+    }
+}
+
+/// The routed namespace bridge's IPv6 address, the guest's IPv6 default
+/// gateway in routed mode, on the bridge whose MAC is `NAMESPACE_MAC`. Kept in
+/// sync with `ROUTED_GATEWAY_IPV6` in src/network/routed.rs by
+/// `routed_gateway_matches_the_guests_pinned_neighbour` there.
+pub(crate) const ROUTED_GATEWAY_IPV6: &str = "fd00::1";
+
+/// Pin the routed IPv6 gateway's neighbour entry to the bridge MAC. RESTORE
+/// ONLY, routed clones only (the ones that take a new IPv6).
+///
+/// A restored clone inherits a correct entry for `fd00::1` (the bridge MAC is
+/// pinned on the host side), and `flush_stale_neighbours` deletes it with the
+/// rest. The next packet then solicits the gateway sourced from the
+/// snapshot-time address, and the address swap that follows deletes that
+/// address; when the bridge's advertisement arrives after the deletion it is
+/// not delivered, the entry stays INCOMPLETE, and every reply waits for the
+/// retransmit a second later. Captured in a routed clone's namespace: the
+/// solicitation from the old address at +56.5 ms, the bridge's answer to it at
+/// +56.5 ms, the swap's announcement at +57.3 ms, and the clone's SYN-ACKs
+/// only after the next solicitation, about one second on. A permanent entry
+/// is never resolved, so no solicitation can straddle the swap. Runs after the
+/// flush, which would otherwise delete nothing permanent anyway, and before
+/// the swap.
+pub async fn pin_routed_gateway_neighbour() {
+    let pinned = off_the_runtime("the IPv6 gateway pin", move || {
+        let (mut channel, index) = eth0_route_channel()?;
+        let address: Ipv6Addr = ROUTED_GATEWAY_IPV6
+            .parse()
+            .context("ROUTED_GATEWAY_IPV6 is not an IPv6 address")?;
+        let lladdr = parse_mac(NAMESPACE_MAC).context("NAMESPACE_MAC is not a MAC address")?;
+        replace_neighbour(&mut channel, index, address.into(), lladdr)
+    })
+    .await;
+    match pinned {
+        Ok(()) => {
+            eprintln!("[fc-agent] pinned {ROUTED_GATEWAY_IPV6} to {NAMESPACE_MAC} (permanent)")
+        }
+        Err(error) => {
+            eprintln!("[fc-agent] WARNING: could not pin {ROUTED_GATEWAY_IPV6}: {error:#}")
+        }
     }
 }
 
@@ -2232,6 +2280,16 @@ mod neighbour_tests {
         0x01, 0x00, 0x00,
     ];
 
+    /// `ip -6 neigh replace fd00::1 lladdr 02:fc:00:00:02:01 dev eth0 nud
+    /// permanent` (iproute2 6.1, eth0 index 2), captured with
+    /// `strace -e trace=sendmsg -e write=3`.
+    const IP6_NEIGH_REPLACE: [u8; 60] = [
+        0x3c, 0x00, 0x00, 0x00, 0x1c, 0x00, 0x05, 0x05, 0xea, 0xd3, 0xda, 0x6a, 0x00, 0x00, 0x00,
+        0x00, 0x0a, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x14, 0x00,
+        0x01, 0x00, 0xfd, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x00, 0x00, 0x01, 0x0a, 0x00, 0x02, 0x00, 0x02, 0xfc, 0x00, 0x00, 0x02, 0x01, 0x00, 0x00,
+    ];
+
     #[derive(Clone, Debug, PartialEq, Eq)]
     struct Neighbour {
         family: u8,
@@ -2764,7 +2822,13 @@ mod neighbour_tests {
             ..Default::default()
         };
         let address: Ipv4Addr = NAMESPACE_IP.parse().unwrap();
-        replace_neighbour(&mut model, 2, address, parse_mac(NAMESPACE_MAC).unwrap()).unwrap();
+        replace_neighbour(
+            &mut model,
+            2,
+            address.into(),
+            parse_mac(NAMESPACE_MAC).unwrap(),
+        )
+        .unwrap();
         assert_eq!(model.sent.len(), 1);
         assert_eq!(
             sequences_zeroed(&model.sent[0]),
@@ -2773,6 +2837,24 @@ mod neighbour_tests {
         assert_eq!(model.table.len(), 1);
         assert_eq!(model.table[0].state, NUD_PERMANENT);
         assert_eq!(Some(model.table[0].lladdr), parse_mac(NAMESPACE_MAC));
+    }
+
+    #[test]
+    fn the_routed_gateway_pin_sends_the_request_ip_sent() {
+        let mut model = ModelNeighbours::default();
+        let address: Ipv6Addr = ROUTED_GATEWAY_IPV6.parse().unwrap();
+        replace_neighbour(
+            &mut model,
+            2,
+            address.into(),
+            parse_mac(NAMESPACE_MAC).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(model.sent.len(), 1);
+        assert_eq!(
+            sequences_zeroed(&model.sent[0]),
+            sequences_zeroed(&IP6_NEIGH_REPLACE)
+        );
     }
 }
 

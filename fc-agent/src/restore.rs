@@ -367,6 +367,13 @@ pub async fn handle_clone_restore(
     // `inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced`.
     network::flush_stale_neighbours().await;
     network::pin_namespace_neighbour().await;
+    // A routed clone's IPv6 gateway is pinned too, before the swap below: a
+    // resolution of it in flight across the swap lost its answer to the
+    // deleted snapshot-time address and held every reply for a second
+    // (#1160). Pinned by `the_routed_gateway_is_pinned_before_the_ipv6_swap`.
+    if clone_ipv6.is_some() {
+        network::pin_routed_gateway_neighbour().await;
+    }
 
     // Reconfigure IPv6, then announce it: before any network traffic can use
     // the old address. The link is UP throughout (the boundary no longer takes
