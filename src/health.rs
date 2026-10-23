@@ -665,7 +665,12 @@ pub(crate) fn read_container_start(runtime_dir: &std::path::Path) -> ContainerSt
                 "unexpected container-ready content; asking podman for the healthcheck");
             ContainerStart::Running { healthcheck: true }
         }),
-        Err(_) => ContainerStart::NotYet,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ContainerStart::NotYet,
+        Err(e) => {
+            warn!(target: "health-monitor", path = %path.display(), error = %e,
+                "reading container-ready failed; treating the container as not started");
+            ContainerStart::NotYet
+        }
     }
 }
 
@@ -745,7 +750,8 @@ async fn check_health_once(
 
             // Two modes:
             // 1. health_check_url = Some(url) -> HTTP check (app responds to HTTP)
-            // 2. health_check_url = None -> Check if container is running via podman inspect
+            // 2. health_check_url = None -> the container start notification (and the
+            //    podman healthcheck, for an image that defines one)
             let status = match &state.config.health_check_url {
                 None => {
                     // No HTTP check: the container is running once fc-agent says podman

@@ -1766,9 +1766,7 @@ impl StartNotify {
             send_container_started(healthcheck).await;
         })
     }
-}
 
-impl StartNotify {
     /// Return once a datagram says `READY=1`.
     async fn wait_ready(&self) -> std::io::Result<()> {
         let mut buf = [0u8; 4096];
