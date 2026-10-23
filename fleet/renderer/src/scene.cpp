@@ -612,23 +612,31 @@ static void text_layout(const Scene& s, FrameParams& p, double st, double t, dou
   if (w->style == TEXT_STYLE_LOCKUP) {
     auto lines = wrap2(w->text, MSG_EM * 2.0f / asp, 1.15f);
     // The last line keeps the one-line baseline, above the clock; the lines
-    // above it go up. Wrapped, the first line's cap top must stay inside the
-    // image (below MSG_TOP, projected), so a wrapped message gets a smaller em
-    // where the full one would cross it.
-    const float MSG_TOP = 0.96f;
+    // above it go up. Every line must stay inside the image, projected: the
+    // first line's cap top below MSG_TOP, and each line's right end left of
+    // MSG_RIGHT (a message with no space to wrap at, or wrapped into a line
+    // still too wide). A message that would cross either gets a smaller em.
+    const float MSG_TOP = 0.96f, MSG_RIGHT = 0.96f;
     auto base_of = [&](size_t li, float em) { return msg_base + (float)(lines.size() - 1 - li) * 1.2f * em * 2.0f; };
-    auto cap_top = [&](float em) {
-      GText g{};
-      place_type(g, cam, asp, U0, base_of(0, em), TYPE_KM, em);
-      V3 d = g.center + g.up * (SDF_CAP_HEIGHT * g.height) - cam.pos;
-      return dot(d, cam.up) / (dot(d, cam.fwd) * cam.tan_half);
+    std::vector<GText> laid(lines.size());
+    for (size_t li = 0; li < lines.size(); li++) sdf_layout(laid[li], lines[li], false);
+    auto fits = [&](float em) {
+      for (size_t li = 0; li < lines.size(); li++) {
+        GText g = laid[li];
+        place_type(g, cam, asp, U0, base_of(li, em), TYPE_KM, em);
+        V3 top = g.center + g.up * (SDF_CAP_HEIGHT * g.height) - cam.pos;
+        V3 end = g.center + g.right * (g.width * g.height) - cam.pos;
+        if (dot(top, cam.up) / (dot(top, cam.fwd) * cam.tan_half) > MSG_TOP) return false;
+        if (dot(end, cam.right) / (dot(end, cam.fwd) * cam.tan_half * asp) > MSG_RIGHT) return false;
+      }
+      return true;
     };
     float em = MSG_EM;
-    if (lines.size() > 1 && cap_top(em) > MSG_TOP) {
-      float lo = 0.5f * MSG_EM, hi = MSG_EM;
+    if (!fits(em)) {
+      float lo = 0.1f * MSG_EM, hi = MSG_EM;
       for (int i = 0; i < 24; i++) {
         float mid = 0.5f * (lo + hi);
-        if (cap_top(mid) > MSG_TOP) hi = mid; else lo = mid;
+        if (fits(mid)) lo = mid; else hi = mid;
       }
       em = lo;
     }

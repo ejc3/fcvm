@@ -515,6 +515,23 @@ int main() {
       CHECK(top2 < base1 && clock_top < base2, "lines apart and above the clock (%.3f < %.3f, %.3f < %.3f)", top2, base1,
             clock_top, base2);
     }
+    // a lockup message wider than the image, with no space to wrap at or wrapped
+    // into lines still too wide, ends inside the image
+    auto right_u = [](const FrameParams& f, const GText& g) {
+      V3 d = g.center + g.right * (g.width * g.height) - f.cam.pos;
+      return dot(d, f.cam.right) / (dot(d, f.cam.fwd) * f.cam.tan_half * (16.0f / 9));
+    };
+    for (const char* text : {"WWWWWWWWWWWWWWWWWWWWWWWWWWWW",
+                             "W WWWWWWWWWWWWWWWWWWWWWWWWWW"}) {
+      Scene ww = parse_scene(std::string(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+          "camera":[{"t":0,"pos":[-15,2.2,-100],"look":[-70,1.4,-70],"fov_deg":60}],"time_of_day":0.245,
+          "words":[{"text":")") + text + R"(","t":1}]})");
+      FrameParams pw2 = build_frame(ww, whole, 3.0, &key, &held);
+      float worst = -1e9f;
+      for (int i = 1; i < pw2.n_text; i++) worst = std::max(worst, right_u(pw2, pw2.text[i]));
+      CHECK(pw2.n_text >= 2 && worst < 1.0f, "a long lockup message ends inside the image (%zu chars, right edge u %.3f)",
+            strlen(text), worst);
+    }
     // pipeline.cpp: the fields health_json and fatal() read on server threads are
     // written under hmu_, and a failed encoder open gives its buffer back
     std::vector<std::string> src = source_lines("../src/pipeline.cpp");
