@@ -264,6 +264,16 @@ through the three verify brackets and every rep of every arm of the measured
 run, so it is the biggest record in the directory and a short one means the
 server was not serving the whole run.
 
+From the 2026-10-22 campaign on, those two logs are kept in the separate
+repository `ejc3/fcvm-bench-records`, at the same path under
+`bench/chromium/results/`, and the run directory keeps `external-logs.json`:
+the repository, the path and the commit there that holds each file, with its
+sha256. `campaign_summary.py` reads a pointed-to log from that commit in the
+checkout `FCVM_BENCH_RECORDS` names, and refuses the run, saying NOT VERIFIED,
+when the variable is unset or the checkout lacks the commit. So does the
+scale analyzer's DNS gate, which uses the same check. CI has no checkout, so
+there the committed 2026-10-22 runs are expected to refuse.
+
 The evidence is only as good as the checks behind it, and six of them are
 easy to get wrong:
 

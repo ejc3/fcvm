@@ -68,7 +68,7 @@ corpus run, not a fixture run.
 
 ## The 2026-10-22 campaign
 
-Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run.
+Every run below is a corpus run of `make bench-chromium-corpus` (or, for the memory, host-control and throughput records, `make bench-chromium-corpus-extra` and `MEASURE=scale`) on an AWS c8g.metal-48xl, with the knobs its meta line records (the serial runs' meta lines name the instance type; the other records do not all do so). Goldens are named G1, G2, ... in the order they appear; runs that share one are A/B or A/B/A comparisons. `restore-ack.jsonl` beside each run's `reqbench.jsonl` was read out of the run's clone logs by `restore_ack.py`; `logs/serve.log` is the memory server's log of the measured run. The replay server's two logs, `corpus-access.log` and `corpus-dns.log`, are kept in the separate repository `ejc3/fcvm-bench-records` at the same paths; each run's `external-logs.json` names the commit there, and `campaign_summary.py` verifies them only with `FCVM_BENCH_RECORDS` set to a checkout of it.
 
 | run | configuration | golden | fcvm source | record |
 |---|---|---|---|---|

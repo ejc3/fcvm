@@ -25,11 +25,19 @@
       "sha256": "6bf805e3021777a380efbee69c9539530d166152b1060b125cf80ace4f971b4a"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/external-logs.json",
+      "sha256": "2662e616b027dfedeabd24b3707bc68b11beb5a10298966a11b0502b91afd3f0"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-dns.log",
       "sha256": "1ae63ac33f4fbad780e1e345203ef5aecfed2904d3ac217a88af7a4b0d1c29c5"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2a/external-logs.json",
+      "sha256": "2662e616b027dfedeabd24b3707bc68b11beb5a10298966a11b0502b91afd3f0"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2a/corpus-access.log",
       "sha256": "c069d4818bdb11859e725b0bbf21f29b2d30edb715fa1df02ed411731525901c"
     },
     {
@@ -69,11 +77,19 @@
       "sha256": "4b7d1a7905e3c41321aa00916677da5206a319b4ff449bf9c4bfa97c4dcc7f7e"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/external-logs.json",
+      "sha256": "737a031a2138001768eef85fc395fb2909e33574c69578c394d29ee7896c425d"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-dns.log",
       "sha256": "b7cac0f6a7a2613ced13a8ff97d5c33ac68c039ae21fa0bd08f2634e0558af67"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c2b/external-logs.json",
+      "sha256": "737a031a2138001768eef85fc395fb2909e33574c69578c394d29ee7896c425d"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c2b/corpus-access.log",
       "sha256": "6c539b11140b8a1cd820fe3c9eefca414d1a5802947e94e05f48d28a70949a13"
     },
     {
@@ -113,11 +129,19 @@
       "sha256": "318b95c0b58183326f4401290c06aa0d21a36ba4f5b48c68aa9897cd11b5c80a"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/external-logs.json",
+      "sha256": "be090b5eba4a1010284e4eea3d6a08af553769375fd7d76017c8b4e86520a351"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-dns.log",
       "sha256": "e15000b5ad3837a8a4e997a06fdc9395285cb3c00ad6be69682f761ef6165818"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4a/external-logs.json",
+      "sha256": "be090b5eba4a1010284e4eea3d6a08af553769375fd7d76017c8b4e86520a351"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4a/corpus-access.log",
       "sha256": "e4811df820f6721aa276f2dc18f0f90cc04612c25515495870885753a7b3a6f8"
     },
     {
@@ -157,11 +181,19 @@
       "sha256": "1f0c5e4228c1a7b6fe30555915b0a265b4ef3adec59ac327daee0a1d86642473"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/external-logs.json",
+      "sha256": "accaaee9db93daa3ff3af504ad43216e60bbed05055f252963519d818bf28a9b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-dns.log",
       "sha256": "3d299d38fa28998f95c71afbf50e65381657d692f81d6d5e1716c75db935aca1"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b/external-logs.json",
+      "sha256": "accaaee9db93daa3ff3af504ad43216e60bbed05055f252963519d818bf28a9b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b/corpus-access.log",
       "sha256": "78ed784b26c67aaf23d9b4ac12b5b3648bfd2819fea464039a2d0159293e5e35"
     },
     {
@@ -201,11 +233,19 @@
       "sha256": "5e6412e6f375c06c588ca19bebd7e81ae49ccb415b3997c9d575e3c8e20ec34e"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/external-logs.json",
+      "sha256": "8d59eff2babaa97f57ba7fcef7b0b75b757eb425e4c97416fafce54bfddd56f1"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-dns.log",
       "sha256": "75620c58b219fa61961a8ccaa4ab8a4a60785b039219fb8efb03383c5b92fd3b"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4b-off/external-logs.json",
+      "sha256": "8d59eff2babaa97f57ba7fcef7b0b75b757eb425e4c97416fafce54bfddd56f1"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4b-off/corpus-access.log",
       "sha256": "d507e55afaa245e09c1a08b75c9e5af9886c1c2a743903e91542b5c12e29139b"
     },
     {
@@ -245,11 +285,19 @@
       "sha256": "24abe34b59c2992e5781c966b53c9712afb38da99532248db413b084121c99d3"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/external-logs.json",
+      "sha256": "cf9b805113127524021777fefd17f90b4c9550e043120a891fb26b3642e67878"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-dns.log",
       "sha256": "c0cdb99dcae4df57c212b3dde33ae2aec60bc17f590b84ade49d9698fad0070e"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c/external-logs.json",
+      "sha256": "cf9b805113127524021777fefd17f90b4c9550e043120a891fb26b3642e67878"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c/corpus-access.log",
       "sha256": "01e3c83c2e6a563a1130af577bffe31d90a9bce54192e5f0b977dde9e52c4603"
     },
     {
@@ -289,11 +337,19 @@
       "sha256": "562454deaf889f0422d2f22cdb9c84640eac619c488090c4433d65e190421909"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/external-logs.json",
+      "sha256": "c4a8f3bc5f1aacf71182a3edc782aa3c23b11b79dc0b7dbf6da666585d6cf2d3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-dns.log",
       "sha256": "1551e62bf0bb5113893584e2c722dd0aaff93c0bf4bd3f137785c47889432318"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4c-off3/external-logs.json",
+      "sha256": "c4a8f3bc5f1aacf71182a3edc782aa3c23b11b79dc0b7dbf6da666585d6cf2d3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@2ce79b3e51da885bcf58b8aa98f158e8f2a27674:bench/chromium/results/reqbench-20261022-corpus-c4c-off3/corpus-access.log",
       "sha256": "e12d8e178d5b13bd1b3b622c7123061fea7fb7b720a46b2938059624c569ceb5"
     },
     {
@@ -333,11 +389,19 @@
       "sha256": "e61ddd451778716dc4b4b8d3b148cbe82185295cb82c794e242167bfb6ecbfdb"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/external-logs.json",
+      "sha256": "687242a1240a58ab8abddd892dd8f614ac2bac3064de2c34f1304b576b5ed850"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-dns.log",
       "sha256": "07140db34cf6aaf5826123621fadfbbea4dac3312b74f6d5a38b5b55179aaed8"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e/external-logs.json",
+      "sha256": "687242a1240a58ab8abddd892dd8f614ac2bac3064de2c34f1304b576b5ed850"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e/corpus-access.log",
       "sha256": "800f24990110b057357e2227ec4c1d7604028ef12495f53d3a98c719031d6484"
     },
     {
@@ -377,11 +441,19 @@
       "sha256": "e2e4312636a819ad86849d1cba6e416c3d60b1230053c55b558baa14cb4a5932"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/external-logs.json",
+      "sha256": "f9e6d3e33a0e9e372b0b7347c96272a87000fe6e6f6287be6af3e8d1124254bf"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-dns.log",
       "sha256": "0df498f96f4933cca705bfc257e3deeb78b73d5702cfc4a7014b4fc854e07731"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p5/external-logs.json",
+      "sha256": "f9e6d3e33a0e9e372b0b7347c96272a87000fe6e6f6287be6af3e8d1124254bf"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p5/corpus-access.log",
       "sha256": "6ea1cb8f3dce25a5b3e12a167c404b3ee818cb25d1e864e05517126f5fc21a66"
     },
     {
@@ -421,11 +493,19 @@
       "sha256": "b95b08a5b1d72ea7c77b12f9af3ee410d78b465ae436402b60a0d7daf0b24096"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/external-logs.json",
+      "sha256": "3928b78a0852b5c52e0f1e39b295d74c7c61cfed4134a73951546b5fcef668de"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-dns.log",
       "sha256": "141cbebba16b107948183642ae7e2237f7e8c292dffd09696561d7a4305a5bb1"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/external-logs.json",
+      "sha256": "3928b78a0852b5c52e0f1e39b295d74c7c61cfed4134a73951546b5fcef668de"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4e-p50b/corpus-access.log",
       "sha256": "cbf7c95bff12456192875f12406a209e8babf00e36da163f3e298d0a0ac1a384"
     },
     {
@@ -465,11 +545,19 @@
       "sha256": "bdd2eeb539ad85483c528a48a6bcefd2fed527af5b76cb46a5fd55e5140544b3"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/external-logs.json",
+      "sha256": "d13e1ccdf5d3d6d5a0d8cc7bcc5a8fa90df6f91bde083de7e08d966cf8609b4b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-dns.log",
       "sha256": "fea6886ef9dd75430a622939a6f3654f4aa6e4d8e852fa8da1ceae256cb39d07"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f/external-logs.json",
+      "sha256": "d13e1ccdf5d3d6d5a0d8cc7bcc5a8fa90df6f91bde083de7e08d966cf8609b4b"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f/corpus-access.log",
       "sha256": "02b8ff4ccb5b2f5d46f9cd1cc3be86b7ff3f5fd2da24e05e6b35b817504b65e7"
     },
     {
@@ -509,11 +597,19 @@
       "sha256": "30ca544ad57b7675acb4f8d323d8a3da45d072170f68680a23e1fdb298fa0439"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/external-logs.json",
+      "sha256": "dd26c7591c535669fdd7a1be66b2448cfe0f863b55c5c7cb7d63ac800e7ee56a"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-dns.log",
       "sha256": "45b96f05d1dd2e514bbb07c03e1b9203434698a6b4a22660955d91826c0b94f5"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-copy/external-logs.json",
+      "sha256": "dd26c7591c535669fdd7a1be66b2448cfe0f863b55c5c7cb7d63ac800e7ee56a"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-copy/corpus-access.log",
       "sha256": "df9f199fff698701641ddefcfd15576e80928f35e38b53c4ce4ae5e23ad754c4"
     },
     {
@@ -553,11 +649,19 @@
       "sha256": "db2afd36dc842f76539c44ef88505af8a5f8f8f9cae4eeacf8c69a908010f457"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/external-logs.json",
+      "sha256": "f17acb8ab848b13630f372721543581c40eeca9f3dd2ccda87d5b4bf81d6fce4"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-dns.log",
       "sha256": "ee2d94ab2a6cf837f3db05acacd095ef5155f9496779832f846fbb3348b4e2c0"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/external-logs.json",
+      "sha256": "f17acb8ab848b13630f372721543581c40eeca9f3dd2ccda87d5b4bf81d6fce4"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c4f-minorb/corpus-access.log",
       "sha256": "9e32ab11d7eb656a7228a3f52093c9e2106e36b66444ef0529146bb052fc1aa6"
     },
     {
@@ -597,11 +701,19 @@
       "sha256": "7352b0842e10ed0cd326d098fbb9477e18c0615e3386257ad8ff53d2a84c21b5"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/external-logs.json",
+      "sha256": "4ea14a967617b36721476e63d2270ef2a47b2f383956a2b6b2127613474bb2b3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-dns.log",
       "sha256": "3abbb340c58ab20d4b1577e9d11d7e38209fd7d928c104a68ccf415c1b873896"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8a/external-logs.json",
+      "sha256": "4ea14a967617b36721476e63d2270ef2a47b2f383956a2b6b2127613474bb2b3"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8a/corpus-access.log",
       "sha256": "f702e7e2fdb397c5d52b1ddd01f3a5211f9403b74c430aa9db344ace2f7346f7"
     },
     {
@@ -641,11 +753,19 @@
       "sha256": "e695f14670cc7a24a2065bb92585f4835d1190efde49683f9bc8e5137ec51ae5"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-dns.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/external-logs.json",
+      "sha256": "a8db678b2f23f5432a83491ed3363329ffd28b8ee9ef6cf25a87b871db7f2204"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-dns.log",
       "sha256": "015419cf3626d06dbe39ce9cb7027cebee70f7af4e9076dc6dee01acc3bc5127"
     },
     {
-      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-access.log",
+      "path": "bench/chromium/results/reqbench-20261022-corpus-c8b/external-logs.json",
+      "sha256": "a8db678b2f23f5432a83491ed3363329ffd28b8ee9ef6cf25a87b871db7f2204"
+    },
+    {
+      "path": "ejc3/fcvm-bench-records@63c74a45b22139d3b111b42f1d3c8b497536bae2:bench/chromium/results/reqbench-20261022-corpus-c8b/corpus-access.log",
       "sha256": "b223ad71ed5ad87cf8736e7289b5647e4e554013e8c02559638822ffb4467936"
     },
     {

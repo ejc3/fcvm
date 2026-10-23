@@ -7732,12 +7732,28 @@ class DocLint(unittest.TestCase):
             os.path.join(self._results(), run, campaign_summary.WITHDRAWN_MARKER))
 
     def _verified_cell(self, run):
-        """load_cell's cell for a committed run, or the RunError text."""
+        """load_cell's cell for a committed run, or the RunError text.
+
+        A run whose replay logs are kept in ejc3/fcvm-bench-records
+        (external-logs.json) is fully verified when FCVM_BENCH_RECORDS names a
+        checkout. Without one (CI), campaign_summary refuses it as NOT
+        VERIFIED, and the lint reads every other record of it with
+        replay_logs=False: the figures it checks are in analysis.json, and the
+        logs' sha256 stays the index's to check where the logs are."""
+        run_dir = os.path.join(self._results(), run)
         try:
-            cell, _sources = campaign_summary.load_cell(
-                os.path.join(self._results(), run))
+            cell, _sources = campaign_summary.load_cell(run_dir)
         except campaign_summary.RunError as error:
-            return None, str(error)
+            if not (
+                "NOT VERIFIED" in str(error)
+                and not os.environ.get(campaign_summary.RECORDS_ENV)
+                and os.path.isfile(os.path.join(run_dir, campaign_summary.EXTERNAL_LOGS))
+            ):
+                return None, str(error)
+            try:
+                cell, _sources = campaign_summary.load_cell(run_dir, replay_logs=False)
+            except campaign_summary.RunError as second:
+                return None, str(second)
         return cell, None
 
     def _resolve_cite(self, token, ellipsis, names):
@@ -7932,6 +7948,23 @@ class DocLint(unittest.TestCase):
             run = parts[anchors[-1]] if anchors else ""
             rel = "/".join(parts[anchors[-1] + 1:]) if anchors else ""
             committed = os.path.join(self._results(), run, rel)
+            path = str(entry.get("path") or "")
+            if re.match(r"[\w.-]+/[\w.-]+@[0-9a-f]{40}:", path):
+                # A log kept in the records repository: the run's pointer must
+                # name this commit, path and sha256 (campaign_summary read it there).
+                pointer_path = os.path.join(self._results(), run, campaign_summary.EXTERNAL_LOGS)
+                pointed = None
+                if os.path.isfile(pointer_path):
+                    with open(pointer_path) as f:
+                        pointer = json.load(f)
+                    for entry_name, ext in pointer.get("files", {}).items():
+                        if path == f"{pointer.get('repository')}@{ext.get('commit')}:{ext.get('path')}":
+                            pointed = ext
+                if pointed is None or pointed.get("sha256") != entry.get("sha256"):
+                    bad.append(f"{name}: results/{token} generated_from names {path}, "
+                               f"which results/{run}/{campaign_summary.EXTERNAL_LOGS} does not point at "
+                               "with that sha256")
+                continue
             if run not in files or rel not in files[run]:
                 bad.append(f"{name}: results/{token} generated_from names "
                            f"results/{run}/{rel}, not committed")
