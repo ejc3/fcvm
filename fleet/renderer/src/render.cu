@@ -391,7 +391,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
   float fade_start = 70.0f + 1.5f * fmaxf(ho - CLOUD_TOP, 0.0f);  // seen from high up, clouds are far but not grazing
   if (ta >= tb || ta > 160.0f + 2.0f * fmaxf(ho, 0.0f)) return out;
   // Two step sizes: coarse through empty air (the shape only), fine inside
-  // clouds, 1.5% of the distance (120 to 600 m), so the
+  // clouds, 2% of the distance (120 to 800 m), so the
   // eroded edges are sampled at their own scale at any distance. A uniform
   // step over the whole segment (up to 1 km) averaged the edge detail away,
   // which made distant clouds smooth gray lenses.
@@ -417,7 +417,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
       empty = 0;
       continue;
     }
-    float ds = cheap ? fmaxf(0.06f, 0.012f * s) : clampf(0.015f * s, 0.12f, 0.6f);
+    float ds = cheap ? fmaxf(0.06f, 0.012f * s) : clampf(0.02f * s, 0.12f, 0.8f);
     nfine++;
     float sig = cloud_density(p, !cheap && out.T > 0.15f);
     if (s > fade_start) sig *= __expf(-(s - fade_start) * (1.0f / 40.0f));
@@ -428,8 +428,8 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     }
     empty = 0;
     // the light march is the expensive part; inside a cloud it changes
-    // slowly, so take it on every third fine step
-    if (lit_age++ % 3 == 0) od = cloud_light_od(p, 3);
+    // slowly, so take it on every fourth fine step
+    if (lit_age++ % 4 == 0) od = cloud_light_od(p, 3);
     // several orders of scattering, each softer and less directional
     float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
     for (int o2 = 0; o2 < 3; o2++) {
@@ -447,7 +447,15 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     wsum += out.T * (1.0f - st);
     dsum += out.T * (1.0f - st) * s;
     out.T *= st;
-    if (out.T < 0.03f) break;
+    // nearly opaque: the rest of the cloud adds what this step's light would,
+    // and the march ends (cheaper than walking on to T < 0.03)
+    if (out.T < 0.1f) {
+      out.L += Lin * out.T;
+      wsum += out.T;
+      dsum += out.T * s;
+      out.T = 0.0f;
+      break;
+    }
     s += ds;
   }
   out.depth = wsum > 0.0f ? dsum / wsum : ta;
@@ -546,7 +554,7 @@ __device__ float ring_cover(V3 o, V3 d);  // the orbital ring's opacity along a 
 
 __device__ float terrain_shadow(V3 p, V3 l) {
   float t = 0.004f;
-  for (int i = 0; i < 44; i++) {
+  for (int i = 0; i < 32; i++) {
     V3 q = p + l * t;
     float a = alt_flat(q);
     if (a > TERRAIN_MAX) break;
@@ -700,7 +708,7 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   // the bounce ray starts with the octaves the surface was found with (a
   // coarser surface lies above it in places, and every bounce from there hit
   // at once: black patches); farther out march_oct lowers them
-  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 20, 9, 0.004f) : -1.0f;
+  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 6.0f, 14, 9, 0.004f) : -1.0f;
   if (th < 0.0f) {
     Lin = sky_lookup(bd);
   } else {
@@ -960,7 +968,7 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
       hres.id = 1.0f;
     }
     V3 T;
-    V3 ins = scatter(o, d, th, 12, &T);
+    V3 ins = scatter(o, d, th, 8, &T);
     L = L * T + ins;
     hres.dist = th;
   } else {
