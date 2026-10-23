@@ -169,6 +169,8 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     expect(st.scoreboard).toEqual({ fcvm: null, ec2: null });
     expect(st.next_race_at).toBeNull();
     expect(st.borrow).toBeNull();
+    expect(st.counters).toBeNull();
+    expect(st.security).toEqual({ gpu_scrub: false });
   });
 
   it("takes a committed receipt as applied and an error message as the coordinator's error", () => {

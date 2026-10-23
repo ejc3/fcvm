@@ -1,5 +1,5 @@
 import { expect, test, devices, type Page } from "@playwright/test";
-import { seconds } from "../core/format.ts";
+import { seconds, thousands } from "../core/format.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew } from "./helpers.ts";
 
 const view = (page: Page) =>
@@ -271,6 +271,39 @@ test("viewers choose the directed camera's next stop", async ({ page }) => {
   await expect(page.getByTestId("nudge-stars")).toContainText("holding now");
   expect((await fleetNow()).nudges.holding).toBe("stars");
   await admin("/mock/schedule", { hold_in_ms: 600_000 });
+});
+
+test("the count of GPU VMs restored ticks as VMs restore; the isolation panel says how a square is isolated", async ({ page }) => {
+  await openWall(page, 15);
+  const counters = async () => ((await mockState()).state as unknown as { counters: { restores_total: number } }).counters;
+  const n0 = (await counters()).restores_total;
+  await expect(page.getByTestId("counter")).toContainText("GPU VMs restored:");
+  await expect(page.getByTestId("counter-value")).toHaveText(thousands(n0));
+  await expect(page.getByTestId("counter-scrubs")).toHaveCount(0);
+  await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:1" }));
+  await expect(page.getByTestId("counter-value")).toHaveText(thousands(n0 + 1), { timeout: 10_000 });
+  // The new total arrives highlighted: it ticks.
+  expect(await page.getByTestId("counter-value").evaluate((el) => getComputedStyle(el).animationName)).toBe("tick");
+  await page.getByTestId("isolation-link").click();
+  await expect(page.getByTestId("drawer")).toBeVisible();
+  await expect(page.locator("#isolation-title")).toBeFocused();
+  const panel = page.getByTestId("isolation");
+  await expect(panel.locator("p")).toHaveText([
+    "Each square is its own virtual machine with its own Linux kernel.",
+    "Its GPU is handed to that virtual machine alone by the hardware's IOMMU (VFIO passthrough), not shared through a proxy in the host kernel.",
+    "A restart throws the old virtual machine away, restores a fresh one from a snapshot, and attaches the GPU as it restores.",
+  ]);
+  await expect(page.getByTestId("isolation-repo")).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
+  await expect(panel.locator("a")).toHaveCount(1);
+  // Once the scrub has shipped, the page says so, and counts scrubs.
+  await admin("/mock/schedule", { gpu_scrub: true });
+  try {
+    await expect(panel.locator("p").last()).toHaveText("GPU memory is cleared before a GPU moves to the next virtual machine.");
+    await expect(page.getByTestId("counter-scrubs")).toHaveText(/^GPU memory scrubs: [\d,]+$/);
+  } finally {
+    await admin("/mock/schedule", { gpu_scrub: false });
+  }
+  await expect(panel.locator("p")).toHaveCount(3);
 });
 
 test("a dropped light lands in the world where it was clicked", async ({ page }) => {

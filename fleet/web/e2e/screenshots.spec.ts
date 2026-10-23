@@ -50,6 +50,11 @@ test("screenshots", async ({ page, browser }) => {
   await admin("/mock/schedule", { clear_cooldown: true, cooldown_s: 0, next_in_ms: 41_000 });
   await page.waitForTimeout(1500);
   await shot(page, "wall-desktop");
+  await page.getByTestId("isolation-link").click();
+  await expect(page.locator("#isolation-title")).toBeFocused();
+  await page.waitForTimeout(300);
+  await shot(page, "isolation");
+  await page.getByRole("button", { name: "Close" }).click();
 
   const b = await tileBox(page, "ec2:3");
   await page.mouse.move(b.x + b.w / 2, b.y + b.h / 2);

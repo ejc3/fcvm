@@ -3,6 +3,8 @@ import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
 import {
   BORROW_FADE_MS,
+  REPOSITORY_URL,
+  isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
   needsVerify,
   nativePlacement,
@@ -532,5 +534,32 @@ describe("streaming modes", () => {
     expect(suggestMode({ aggregators: 2, downlinkMbps: 10, directBps: 30e6, lateShare: null }).mode).toBe("direct");
     expect(suggestMode({ aggregators: 2, downlinkMbps: null, directBps: 30e6, lateShare: 0.25 }).mode).toBe("aggregated");
     expect(suggestMode({ aggregators: 0, downlinkMbps: 1, directBps: 30e6, lateShare: 0.9 }).mode).toBe("direct");
+  });
+});
+
+describe("counters and isolation", () => {
+  it("counts GPU VMs restored, and scrubs only once the scrub has shipped", () => {
+    expect(fmt.thousands(1284)).toBe("1,284");
+    expect(fmt.thousands(1_234_567)).toBe("1,234,567");
+    expect(fmt.thousands(12)).toBe("12");
+    let v = view(stateWith(fleet()), EPOCH);
+    expect(v.counter).toEqual({ label: "GPU VMs restored", value: "1,284", total: 1284, lastHour: "37 in the last hour", scrubs: "" });
+    v = view(stateWith(fleet(2, 2, { security: { gpu_scrub: true } })), EPOCH);
+    expect(v.counter!.scrubs).toBe("GPU memory scrubs: 1,201");
+    expect(view(stateWith(fleet(2, 2, { counters: null })), EPOCH).counter).toBeNull();
+  });
+
+  it("says how a square is isolated, the scrub only when it has shipped, with one link to the repository", () => {
+    const off = isolationView(fleet());
+    expect(off.sentences).toEqual([
+      "Each square is its own virtual machine with its own Linux kernel.",
+      "Its GPU is handed to that virtual machine alone by the hardware's IOMMU (VFIO passthrough), not shared through a proxy in the host kernel.",
+      "A restart throws the old virtual machine away, restores a fresh one from a snapshot, and attaches the GPU as it restores.",
+    ]);
+    expect(off.link).toEqual({ label: "The fcvm repository", href: REPOSITORY_URL });
+    expect(REPOSITORY_URL).toBe("https://github.com/ejc3/fcvm");
+    const on = isolationView(fleet(2, 2, { security: { gpu_scrub: true } }));
+    expect(on.sentences.at(-1)).toBe("GPU memory is cleared before a GPU moves to the next virtual machine.");
+    expect(isolationView(null).sentences).toHaveLength(3);
   });
 });

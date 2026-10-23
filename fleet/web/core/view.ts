@@ -304,6 +304,64 @@ function tileView(
   };
 }
 
+// ---- counters and isolation ------------------------------------------------------
+
+export interface CounterView {
+  label: string;
+  value: string;
+  /** The raw total, so the page can mark a change. */
+  total: number;
+  lastHour: string;
+  /** "GPU memory scrubs: 1,284", or "" until the scrub has shipped. */
+  scrubs: string;
+}
+
+function counterView(st: FleetState): CounterView | null {
+  const c = st.counters;
+  if (c === null) return null;
+  return {
+    label: "GPU VMs restored",
+    value: fmt.thousands(c.restores_total),
+    total: c.restores_total,
+    lastHour: `${fmt.thousands(c.restores_last_hour)} in the last hour`,
+    scrubs: st.security.gpu_scrub ? `GPU memory scrubs: ${fmt.thousands(c.scrubs_total)}` : "",
+  };
+}
+
+export const REPOSITORY_URL = "https://github.com/ejc3/fcvm";
+
+export interface IsolationView {
+  title: string;
+  /** The link that opens it, under the scoreboard. */
+  open: string;
+  sentences: string[];
+  link: { label: string; href: string };
+}
+
+/**
+ * How a square is isolated, in plain words. Each sentence is what
+ * docs/fleet/ARCHITECTURE.md describes: one Firecracker microVM per slot with
+ * its own guest kernel, hosts with the IOMMU on and every GPU bound to
+ * vfio-pci, a fresh VM restored from the gold snapshot with the slot's GPU
+ * (`fcvm snapshot run --snapshot <gold> --gpu <sbdf>`, the GPU attached during
+ * the restore). The scrub sentence appears only when the coordinator says the
+ * scrub has shipped.
+ */
+export function isolationView(st: FleetState | null): IsolationView {
+  const sentences = [
+    "Each square is its own virtual machine with its own Linux kernel.",
+    "Its GPU is handed to that virtual machine alone by the hardware's IOMMU (VFIO passthrough), not shared through a proxy in the host kernel.",
+    "A restart throws the old virtual machine away, restores a fresh one from a snapshot, and attaches the GPU as it restores.",
+  ];
+  if (st?.security.gpu_scrub) sentences.push("GPU memory is cleared before a GPU moves to the next virtual machine.");
+  return {
+    title: "How it's isolated",
+    open: "How it's isolated",
+    sentences,
+    link: { label: "The fcvm repository", href: REPOSITORY_URL },
+  };
+}
+
 // ---- the Play drawer -----------------------------------------------------------
 
 export const WORD_MAX = 28;
@@ -911,6 +969,8 @@ export interface WallView {
   playButton: { label: string; open: boolean };
   pause: { label: string; on: boolean };
   feed: FeedItem[];
+  counter: CounterView | null;
+  isolation: IsolationView;
   focus: FocusView | null;
   own: OwnView | null;
   ownButton: OwnButton | null;
@@ -1017,6 +1077,8 @@ export function wallView(input: WallInput): WallView {
       labels: { seam: [], captions: [] },
       play: null,
       feed: [],
+      counter: null,
+      isolation: isolationView(null),
       focus: null,
       own: null,
       ownButton: null,
@@ -1101,6 +1163,8 @@ export function wallView(input: WallInput): WallView {
     labels: stageLabels(covered ? null : layout),
     play,
     feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
+    counter: counterView(st),
+    isolation: isolationView(st),
     focus,
     own,
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),

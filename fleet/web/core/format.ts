@@ -84,3 +84,9 @@ export function mbps(bps: number): string {
   const m = bps / 1e6;
   return m < 10 ? `${m.toFixed(1)} Mbit/s` : `${Math.round(m)} Mbit/s`;
 }
+
+/** A whole number with thousands separated: "1,284". */
+export function thousands(n: number): string {
+  const s = String(Math.max(0, Math.round(n)));
+  return s.replace(/\B(?=(\d{3})+(?!\d))/g, ",");
+}

@@ -27,20 +27,27 @@ export function VerifyBox({ client, view }: { client: WallClient; view: WallView
   );
 }
 
-export function PlayDrawer({ client, view, onClose }: { client: WallClient; view: WallView; onClose: () => void }) {
+export function PlayDrawer({ client, view, onClose, section }: { client: WallClient; view: WallView; onClose: () => void; section: string | null }) {
   const p = view.play!;
   const [word, setWord] = useState("");
   const panel = useRef<HTMLElement | null>(null);
+  const iso = view.isolation;
   const todTimer = useRef<{ last: number; pending: number | null; timer: ReturnType<typeof setTimeout> | null }>({ last: 0, pending: null, timer: null });
 
   useEffect(() => {
-    panel.current?.querySelector<HTMLElement>("button, input")?.focus();
+    const target = section ? panel.current?.querySelector<HTMLElement>(`#${section}-title`) : null;
+    if (target) {
+      target.scrollIntoView({ block: "start" });
+      target.focus();
+    } else {
+      panel.current?.querySelector<HTMLElement>("button, input")?.focus();
+    }
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") onClose();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
+  }, [onClose, section]);
 
   const sendTod = (v: number) => {
     const s = todTimer.current;
@@ -177,6 +184,17 @@ export function PlayDrawer({ client, view, onClose }: { client: WallClient; view
           <span className="switch" aria-hidden="true" />
           {p.stats.label}
         </button>
+      </section>
+      <section className="isolation" aria-labelledby="isolation-title" data-testid="isolation">
+        <h3 id="isolation-title" tabIndex={-1}>
+          {iso.title}
+        </h3>
+        {iso.sentences.map((t) => (
+          <p key={t}>{t}</p>
+        ))}
+        <a href={iso.link.href} target="_blank" rel="noopener noreferrer" data-testid="isolation-repo">
+          {iso.link.label}
+        </a>
       </section>
     </aside>
   );

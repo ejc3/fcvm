@@ -201,8 +201,10 @@ jobs:
       # Ports for the mock fleet and the page under test: this runner runs nothing else.
       FLEET_TEST_BASE_PORT: "24100"
       # The mock renders every pixel in JavaScript. On a 4-vCPU runner it keeps up
-      # with 16 tiles at a 1024x640 screen and 10 frames per second.
-      FLEET_E2E_VIEW: "1024x640"
+      # with 16 tiles at 10 frames per second on a 1280x800 screen, where the stage
+      # letterboxes the image to about 700x390 (smaller screens leave tiles too few
+      # pixels for the seam checks' colour fit).
+      FLEET_E2E_VIEW: "1280x800"
       FLEET_MOCK_FPS: "10"
       FLEET_MOCK_THREADS: "3"
     steps:

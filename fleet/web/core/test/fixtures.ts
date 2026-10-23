@@ -41,6 +41,8 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     image_aspect: 16 / 9,
     fleet: { hosts: [{ name: "example-host", draining: false }], gpus: tiles.length, n: cols * rows, max_tiles: 100 },
     borrow: { cap: 2, lent: 0, next_return_at: null },
+    counters: { restores_total: 1284, scrubs_total: 1201, restores_last_hour: 37 },
+    security: { gpu_scrub: false },
     scene: { epoch_unix_ms: EPOCH, camera: [{ t: 0, x: 0, y: 0, zoom: 1 }], time_of_day: 0.5, words: [], lights: [] },
     relaunch_all: null,
     next_race_at: null,

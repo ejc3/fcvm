@@ -116,6 +116,8 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
   const [areas, setAreas] = useState<Areas>({ mosaic: null, focus: null, own: null });
   const [avoid, setAvoid] = useState<Box[]>([]);
   const [labelSize, setLabelSize] = useState<{ w: number; h: number } | undefined>(undefined);
+  /** The drawer section to show when it opens (the isolation link), or null for its top. */
+  const [drawerSection, setDrawerSection] = useState<string | null>(null);
   const phone = useMedia("(max-width: 700px)");
   const reducedMotion = useMedia("(prefers-reduced-motion: reduce)");
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
@@ -504,7 +506,7 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
             <h1>{view.title}</h1>
             <p className="sentence">{view.sentence}</p>
           </header>
-          {score ? <Countdown score={score} /> : null}
+          {score ? <Countdown score={score} counter={view.counter} /> : null}
           {score ? <Scoreboard score={score} compact /> : null}
           {stage}
           <p className="rotate-hint" data-testid="rotate-hint">
@@ -531,7 +533,10 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
                   type="button"
                   className="btn"
                   aria-expanded={view.playButton.open}
-                  onClick={() => client.ui({ drawer: !view.playButton.open, lightMode: false })}
+                  onClick={() => {
+                    setDrawerSection(null);
+                    client.ui({ drawer: !view.playButton.open, lightMode: false });
+                  }}
                   data-testid="play"
                 >
                   {view.playButton.label}
@@ -549,7 +554,17 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
           </header>
           {score ? (
             <section className="score" aria-label="The race">
-              <Countdown score={score} />
+              <Countdown
+                score={score}
+                counter={view.counter}
+                isolation={{
+                  label: view.isolation.open,
+                  onOpen: () => {
+                    setDrawerSection("isolation");
+                    client.ui({ drawer: true, lightMode: false });
+                  },
+                }}
+              />
               <Scoreboard score={score} compact={false} />
             </section>
           ) : (
@@ -571,7 +586,7 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
       )}
       <Overlays view={view} phone={phone} />
       {keyGrid}
-      {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} /> : null}
+      {state.ui.drawer && view.play && !covered ? <PlayDrawer client={client} view={view} onClose={closeDrawer} section={drawerSection} /> : null}
       {needsVerifyPrompt ? (
         <div className="verify-pop" role="dialog" aria-label={view.play!.verify.title}>
           <VerifyBox client={client} view={view} />

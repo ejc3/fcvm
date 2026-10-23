@@ -16,6 +16,7 @@
 //   FLEET_MOCK_CLAIM_S       how long a claimed GPU lasts (60)
 //   FLEET_MOCK_HOLD_S        how long the directed camera holds on a stop (20)
 //   FLEET_MOCK_TURNSTILE     a Turnstile site key: actions need the check (unset: none)
+//   FLEET_MOCK_GPU_SCRUB     1: the GPU memory scrub has shipped (counted, and said on the page)
 //   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
@@ -84,6 +85,7 @@ export async function startMock() {
     holdSecs: int("FLEET_MOCK_HOLD_S", 20),
     travelSecs: 4,
     turnstileSitekey: process.env.FLEET_MOCK_TURNSTILE || null,
+    gpuScrub: process.env.FLEET_MOCK_GPU_SCRUB === "1",
     refusedWords: env("FLEET_MOCK_REFUSED", "forbidden").split(",").filter(Boolean),
     checkMs: 250,
     epochUnixMs,

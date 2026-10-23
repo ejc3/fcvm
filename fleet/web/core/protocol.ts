@@ -158,6 +158,18 @@ export interface Borrow {
   next_return_at: number | null;
 }
 
+/** Running totals the coordinator keeps (assumed): VMs restored, GPU memory scrubs, restores in the last hour. */
+export interface Counters {
+  restores_total: number;
+  scrubs_total: number;
+  restores_last_hour: number;
+}
+
+/** What the fleet's isolation does today (assumed): the GPU memory scrub has shipped or not. */
+export interface Security {
+  gpu_scrub: boolean;
+}
+
 export interface Action {
   at: number;
   /** The viewer id of the connection that acted (`schedule` for the owner's cadence). */
@@ -188,6 +200,8 @@ export interface FleetState {
   image_aspect: number;
   fleet: { hosts: Host[]; gpus: number; n: number; max_tiles: number | null };
   borrow: Borrow | null;
+  counters: Counters | null;
+  security: Security;
   scene: Scene;
   relaunch_all: RelaunchAll | null;
   /** When the owner's cadence restarts everything next (assumed). */
@@ -560,6 +574,15 @@ function parseState(o: Obj): FleetState {
           next_return_at: numOrNull(o["borrow"], "next_return_at", "borrow"),
         }
       : null,
+    counters: isObj(o["counters"])
+      ? {
+          restores_total: num(o["counters"], "restores_total", "counters"),
+          scrubs_total: numOrNull(o["counters"], "scrubs_total", "counters") ?? 0,
+          restores_last_hour: numOrNull(o["counters"], "restores_last_hour", "counters") ?? 0,
+        }
+      : null,
+    // Absent means not shipped: the page never claims a scrub it was not told about.
+    security: { gpu_scrub: isObj(o["security"]) && o["security"]["gpu_scrub"] === true },
     scene: parseScene(obj(o, "scene", "state")),
     relaunch_all: parseRelaunchAll(o["relaunch_all"]),
     next_race_at: numOrNull(o, "next_race_at", "state"),

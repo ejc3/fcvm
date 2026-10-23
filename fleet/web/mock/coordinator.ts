@@ -42,6 +42,8 @@ export interface CoordinatorOptions {
   travelSecs: number;
   /** Turnstile site key; null: actions need no check. The mock accepts the token `mock-pass`. */
   turnstileSitekey: string | null;
+  /** The GPU memory scrub has shipped: every GPU moving to the next VM is scrubbed and counted. */
+  gpuScrub?: boolean;
   /** Words the fake text check refuses. */
   refusedWords: string[];
   /** Delay of the fake text check. */
@@ -247,6 +249,11 @@ export class MockCoordinator {
   private sitekey: string | null;
   private poster: { at: number; jpeg: Promise<Buffer> } | null = null;
   private scheduleCount = 0;
+  private restoresTotal = 0;
+  private scrubsTotal = 0;
+  /** Unix ms of each restore in the last hour. */
+  private restoreTimes: number[] = [];
+  private gpuScrub: boolean;
   /** Races already added to the scoreboard. */
   private recorded = new WeakSet<Race>();
 
@@ -255,6 +262,7 @@ export class MockCoordinator {
     this.now = opts.now ?? Date.now;
     this.rand = rng(opts.seed ?? 1136);
     this.sitekey = opts.turnstileSitekey;
+    this.gpuScrub = opts.gpuScrub ?? false;
     const { cols, rows } = halfGrid(opts.perHalf);
     const hostCount = Math.ceil(opts.perHalf / opts.gpusPerHost);
     for (let h = 1; h <= hostCount; h++) this.hosts.push({ name: `mock-host-${h}`, draining: false });
@@ -434,6 +442,12 @@ export class MockCoordinator {
         fcvm_pending: this.pending("fcvm"),
         ec2_pending: this.pending("ec2"),
       },
+      counters: {
+        restores_total: this.restoresTotal,
+        scrubs_total: this.scrubsTotal,
+        restores_last_hour: this.restoreTimes.filter((t) => t > now - 3_600_000).length,
+      },
+      security: { gpu_scrub: this.gpuScrub },
       next_race_at: this.nextRaceAt,
       cooldown_until: this.cooldownUntil !== null && this.cooldownUntil > now ? this.cooldownUntil : null,
       scoreboard: this.scoreboard(),
@@ -779,6 +793,7 @@ export class MockCoordinator {
       this.opts.renderers.setAvailable(r.slot!, true);
       r.phase = "running";
       r.lastRelaunch = { clicked_at: clickedAt, by, first_frame_at: done, phases: { ...phases } };
+      if (fc) this.countRestore(done);
       this.checkRace(r);
       this.markDirty();
     };
@@ -823,6 +838,13 @@ export class MockCoordinator {
         },
       ].slice(-RACES_KEPT);
     }
+  }
+
+  /** A GPU VM restored: its GPU came from the VM before it, so with the scrub shipped it was scrubbed on the way. */
+  private countRestore(at: number): void {
+    this.restoresTotal += 1;
+    if (this.gpuScrub) this.scrubsTotal += 1;
+    this.restoreTimes = [...this.restoreTimes.filter((t) => t > at - 3_600_000), at];
   }
 
   // ---- the clock: the owner's cadence, the directed camera, retries ----------------
@@ -960,6 +982,7 @@ export class MockCoordinator {
       };
       cl.phase = "running";
       cl.first_frame_at = done;
+      this.countRestore(done);
       cl.expires_at = done + this.opts.claimSecs * 1000;
       if (tile.borrowed?.claim === cl) tile.borrowed.until = cl.expires_at;
       this.opts.renderers.setAvailable(cl.id, true);
@@ -1137,6 +1160,7 @@ export class MockCoordinator {
           if (b["clear_cooldown"] === true) this.cooldownUntil = null;
           if (typeof b["capacity_wait_ms"] === "number") this.forcedWaitMs = b["capacity_wait_ms"];
           if (typeof b["hold_in_ms"] === "number") this.nudge.nextHoldAt = this.now() + b["hold_in_ms"];
+          if (typeof b["gpu_scrub"] === "boolean") this.gpuScrub = b["gpu_scrub"];
           this.markDirty();
           return { ok: true };
         });

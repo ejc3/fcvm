@@ -17,7 +17,7 @@ deployed.
 | ![Hovering a tile](docs/screenshots/wall-hover.jpg) | ![The Play drawer](docs/screenshots/play-drawer.jpg) |
 | ![An opened VM](docs/screenshots/tile-opened.jpg) | ![A viewer's own GPU](docs/screenshots/own-gpu.jpg) |
 | ![The borrowed tile, as another viewer sees it](docs/screenshots/own-gpu-borrowed-tile.jpg) | ![A failed VM and a reclaimed host](docs/screenshots/failure-failed-and-reclaimed.jpg) |
-| ![The coordinator offline, the picture still live](docs/screenshots/failure-offline.jpg) | |
+| ![The coordinator offline, the picture still live](docs/screenshots/failure-offline.jpg) | ![How it's isolated](docs/screenshots/isolation.jpg) |
 
 <img src="docs/screenshots/phone.jpg" alt="The wall on a phone" width="260">
 
@@ -61,13 +61,13 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 128 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 34 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 131 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 35 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
-On a small machine, `FLEET_E2E_VIEW=1024x640 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
+On a small machine, `FLEET_E2E_VIEW=1280x800 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
 makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_RACE_EVERY_S`, `FLEET_MOCK_TURNSTILE`, ...) are listed at the top of `mock/main.ts`.
 By default it restarts every GPU 20 s after start and every 5 minutes after that, holds
@@ -89,6 +89,21 @@ spot GPU", and left out of EC2's time. At rest the bars are each half's median, 
 mark at the last race and how many GPUs it was measured on. Every figure is the
 coordinator's (`scoreboard`, `relaunch_all`, `last_relaunch`); the page computes no
 timing of its own. When a half is back a polite live region says so in a sentence.
+
+**What it has done.** Under the countdown, "GPU VMs restored: N" and how many in the last
+hour, from the coordinator's `counters`; the number is highlighted each time it moves, so
+a race or a borrowed GPU visibly adds to it. GPU memory scrubs are counted beside it once
+the scrub has shipped.
+
+**How it's isolated.** A link under the countdown opens the Play drawer at a short panel
+in plain words: each square is its own virtual machine with its own Linux kernel; its GPU
+is handed to that VM alone by the IOMMU (VFIO passthrough), not shared through a proxy in
+the host kernel; a restart restores a fresh VM from a snapshot and attaches the GPU as it
+restores; and, only when the snapshot's `security.gpu_scrub` is true, GPU memory is
+cleared before a GPU moves to the next VM. Each sentence is what
+`docs/fleet/ARCHITECTURE.md` describes (hosts with the IOMMU on and every GPU bound to
+vfio-pci; `fcvm snapshot run --snapshot <gold> --gpu <sbdf>`; GPU attach as a restore
+phase). One link goes to the fcvm repository; no other product is named.
 
 **Words on the stage.** One sentence under the title says what the page is, "fcvm" and
 "EC2" sit on backplates either side of the seam, and one line under each half says what a
@@ -286,6 +301,8 @@ yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` ma
   `{"type": "verify", "token"}` and the coordinator answers `{"type": "verified", "ok",
   "reason"}`; until then intents are refused with "verify first".
 - `GET /poster.jpg` on the `/live` origin, readable from the page's origin (CORS).
+- state: `counters: {restores_total, scrubs_total, restores_last_hour}` and `security:
+  {gpu_scrub}`; without `security` the page says nothing about a scrub.
 
 The wall no longer sends camera drags or `set_auto_relaunch`: the camera is directed,
 with nudges, and the owner's cadence replaces the viewer setting. A dropped light is

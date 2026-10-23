@@ -386,6 +386,25 @@ describe("mock race, second design review", () => {
     await sleep(1000);
   });
 
+  it("counts every GPU VM restored, and scrubs only once the scrub has shipped", async () => {
+    const before = coord.fleetState().counters;
+    expect(coord.fleetState().security).toEqual({ gpu_scrub: false });
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: `cnt-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
+    await c.next((m) => m["type"] === "receipt");
+    await until(() => coord.fleetState().counters.restores_total === before.restores_total + 1);
+    expect(coord.fleetState().counters.scrubs_total).toBe(before.scrubs_total);
+    expect(coord.fleetState().counters.restores_last_hour).toBe(before.restores_last_hour + 1);
+    await admin("/mock/schedule", { gpu_scrub: true });
+    expect(coord.fleetState().security).toEqual({ gpu_scrub: true });
+    c.ws.send(JSON.stringify({ type: "intent", id: `cnt2-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
+    await c.next((m) => m["type"] === "receipt" && String(m["id"]).startsWith("cnt2"));
+    await until(() => coord.fleetState().counters.restores_total === before.restores_total + 2);
+    expect(coord.fleetState().counters.scrubs_total).toBe(before.scrubs_total + 1);
+    await admin("/mock/schedule", { gpu_scrub: false });
+    c.ws.close();
+  });
+
   it("chooses the next camera stop by the viewers' votes", async () => {
     const c = await live();
     c.ws.send(JSON.stringify({ type: "intent", id: `n-${Date.now()}`, name: "nudge", args: { target: "stars" } }));
