@@ -32,6 +32,30 @@ struct SnapshotInfo {
     size_bytes: u64,
     size_human: String,
     memory_size_bytes: u64,
+    /// The directories the snapshot maps into the guest. `snapshot run --map` serves a
+    /// read-only, portable one from another host directory.
+    maps: Vec<SnapshotMapInfo>,
+}
+
+/// A directory a snapshot maps into the guest, as `snapshot run --map` names it.
+#[derive(Debug, Serialize, PartialEq, Eq)]
+struct SnapshotMapInfo {
+    guest_path: String,
+    read_only: bool,
+    portable: bool,
+}
+
+fn snapshot_maps(config: &SnapshotConfig) -> Vec<SnapshotMapInfo> {
+    config
+        .metadata
+        .volumes
+        .iter()
+        .map(|v| SnapshotMapInfo {
+            guest_path: v.guest_path.clone(),
+            read_only: v.read_only,
+            portable: v.portable,
+        })
+        .collect()
 }
 
 /// List all snapshots
@@ -170,6 +194,7 @@ async fn build_snapshot_info(
         size_bytes,
         size_human,
         memory_size_bytes,
+        maps: snapshot_maps(config),
     }
 }
 
@@ -454,6 +479,38 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// `snapshots ls --json` names each directory a snapshot maps and whether it is
+    /// read-only, so a caller can tell which `snapshot run --map` the snapshot takes
+    /// without reading its config.
+    #[test]
+    fn the_listing_names_the_directories_a_snapshot_maps() {
+        let mut snapshot = config(SnapshotType::User, "nginx:alpine");
+        snapshot.metadata.volumes = vec![
+            crate::storage::SnapshotVolumeConfig {
+                host_path: "/host/creds".into(),
+                guest_path: "/var/creds".to_string(),
+                read_only: true,
+                vsock_port: 5000,
+                portable: true,
+            },
+            crate::storage::SnapshotVolumeConfig {
+                host_path: "/host/data".into(),
+                guest_path: "/data".to_string(),
+                read_only: false,
+                vsock_port: 5001,
+                portable: true,
+            },
+        ];
+        let listed = serde_json::to_value(snapshot_maps(&snapshot)).unwrap();
+        assert_eq!(
+            listed,
+            serde_json::json!([
+                {"guest_path": "/var/creds", "read_only": true, "portable": true},
+                {"guest_path": "/data", "read_only": false, "portable": true},
+            ])
+        );
     }
 
     #[test]

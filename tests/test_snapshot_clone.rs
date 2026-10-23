@@ -3542,6 +3542,126 @@ async fn snapshot_run_direct_test_impl(network: &str) -> Result<()> {
     }
 }
 
+/// `snapshot run --map HOST:GUEST` serves a directory the snapshot mapped from another host
+/// directory. The baseline maps one directory at /data; its clone, given another at the same
+/// guest path, reads the other directory's file through the mount the guest made at boot.
+#[tokio::test]
+async fn test_snapshot_run_map_serves_a_mapped_directory_from_another_host_directory() -> Result<()>
+{
+    let (baseline_name, clone_name, snapshot_name, _) = common::unique_names("mapover");
+    let fcvm_path = common::find_fcvm_binary()?;
+    let recorded = tempfile::tempdir()?;
+    let replacement = tempfile::tempdir()?;
+    std::fs::write(recorded.path().join("marker"), "from-A\n")?;
+    // A different length: the guest revalidates a cached file by its size and mtime, and
+    // two files written this close together can share an mtime.
+    std::fs::write(
+        replacement.path().join("marker"),
+        "from-B, the replacement\n",
+    )?;
+    let recorded_map = format!("{}:/data:ro", recorded.path().display());
+    let replacement_map = format!("{}:/data:ro", replacement.path().display());
+
+    let (_baseline_child, baseline_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "podman",
+            "run",
+            "--name",
+            &baseline_name,
+            "--network",
+            "rootless",
+            "--portable-volumes",
+            "--map",
+            &recorded_map,
+            common::TEST_IMAGE,
+        ],
+        &baseline_name,
+    )
+    .await
+    .context("spawning baseline VM")?;
+    common::poll_health_by_pid(baseline_pid, 120).await?;
+    let seen = common::exec_in_container(baseline_pid, &["cat", "/data/marker"]).await?;
+    assert_eq!(
+        seen.trim(),
+        "from-A",
+        "the baseline reads the recorded directory"
+    );
+
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args([
+            "snapshot",
+            "create",
+            "--pid",
+            &baseline_pid.to_string(),
+            "--tag",
+            &snapshot_name,
+        ])
+        .output()
+        .await
+        .context("running snapshot create")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "snapshot create failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    common::kill_process(baseline_pid).await;
+
+    // The listing names the directory, so a caller can tell which --map the snapshot takes.
+    let listing = tokio::process::Command::new(&fcvm_path)
+        .args(["snapshots", "ls", "--json"])
+        .output()
+        .await
+        .context("running snapshots ls")?;
+    anyhow::ensure!(
+        listing.status.success(),
+        "snapshots ls failed: {}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let listed: Vec<serde_json::Value> = serde_json::from_slice(&listing.stdout)?;
+    let maps = listed
+        .iter()
+        .find(|s| s["name"] == snapshot_name.as_str())
+        .map(|s| s["maps"].clone());
+    assert_eq!(
+        maps,
+        Some(serde_json::json!([{"guest_path": "/data", "read_only": true, "portable": true}])),
+        "snapshots ls names the snapshot's map"
+    );
+
+    let (_clone_child, clone_pid) = common::spawn_fcvm_with_logs(
+        &[
+            "snapshot",
+            "run",
+            "--snapshot",
+            &snapshot_name,
+            "--name",
+            &clone_name,
+            "--map",
+            &replacement_map,
+        ],
+        &clone_name,
+    )
+    .await
+    .context("spawning clone with --map")?;
+    let healthy = common::poll_health_by_pid(clone_pid, 120).await;
+    // The guest takes a cached file's size and mtime from the host only once the attribute
+    // timeout (1 s) has passed since it last asked, counted in guest time, which stood still
+    // while the snapshot sat. Read after that, as for a host file that changes under a VM.
+    let seen = if healthy.is_ok() {
+        common::exec_in_container(clone_pid, &["sleep 2; cat /data/marker"]).await
+    } else {
+        Err(anyhow::anyhow!("clone never turned healthy"))
+    };
+    common::kill_process(clone_pid).await;
+    healthy?;
+    assert_eq!(
+        seen?.trim(),
+        "from-B, the replacement",
+        "the clone reads the directory --map named"
+    );
+    Ok(())
+}
+
 /// The guest-armed burn every test VM boots with in `a_slow_ack_connect_still_completes_the_restore`.
 const SLOW_ACK_BURN: &str = "restore.pre_ack_connect:burn:4000";
 
