@@ -255,6 +255,32 @@ class RestoreAckExtraction(unittest.TestCase):
         self.assertEqual(lines[1]["log_sha256"], hashlib.sha256(good.encode()).hexdigest())
         self.assertIn("error", lines[2]["restore_ack"])
 
+    def test_two_extractions_into_one_run_do_not_share_a_temporary_file(self):
+        """RED BEFORE THE FIX: both wrote `restore-ack.jsonl.tmp`. A second
+        extraction that ran between the first's write and its rename renamed
+        the shared file away, and the first's rename then failed with
+        FileNotFoundError (Codex review of #1172)."""
+        import restore_ack
+        good = RestoreMarks.LOG + json.dumps(RestoreAck.RECORD) + "\n"
+        with tempfile.TemporaryDirectory() as d:
+            self.run_dir(d, [good, good])
+            real_replace = os.replace
+            nested = []
+
+            def replace(src, dst):
+                if not nested:
+                    nested.append(1)
+                    with redirect_stdout(io.StringIO()):
+                        self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+                return real_replace(src, dst)
+
+            with mock.patch.object(restore_ack.os, "replace", replace), redirect_stdout(io.StringIO()):
+                self.assertEqual(restore_ack.main(["restore_ack.py", d]), 0)
+            with open(os.path.join(d, "restore-ack.jsonl")) as f:
+                lines = [json.loads(line) for line in f]
+            self.assertEqual([x.get("record_id") for x in lines[1:]], ["r1:cdp:0:0", "r1:cdp:1:0"])
+            self.assertEqual([n for n in os.listdir(d) if n.endswith(".tmp")], [])
+
     def test_a_missing_log_writes_nothing(self):
         import restore_ack
         with tempfile.TemporaryDirectory() as d:

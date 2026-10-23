@@ -17,6 +17,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -66,11 +67,21 @@ def main(argv):
     except (OSError, ValueError) as error:
         print(f"restore_ack: {error}; nothing written", file=sys.stderr)
         return 2
-    tmp = out + ".tmp"
-    with open(tmp, "w") as handle:
-        for line in lines:
-            handle.write(json.dumps(line, sort_keys=True) + "\n")
-    os.replace(tmp, out)
+    # A temporary file of this invocation's own, so two extractions into one
+    # run directory cannot write into each other's file before the rename.
+    fd, tmp = tempfile.mkstemp(prefix=os.path.basename(out) + ".", suffix=".tmp",
+                               dir=os.path.dirname(os.path.abspath(out)))
+    try:
+        with os.fdopen(fd, "w") as handle:
+            for line in lines:
+                handle.write(json.dumps(line, sort_keys=True) + "\n")
+        os.replace(tmp, out)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
     errors = sum(1 for line in lines[1:] if "error" in line["restore_ack"])
     print(f"restore_ack: {len(lines) - 1} records, {errors} without a restored record -> {out}")
     return 0
