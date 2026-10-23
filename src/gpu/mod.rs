@@ -152,6 +152,44 @@ pub fn require_pci_transport(firecracker_args: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+/// Refuse, before `podman run` launches, a passthrough device the profile's NVIDIA
+/// driver image cannot run: with `module_type = "proprietary"` only Turing and
+/// Ampere GPUs ([`ModuleType::supports_device`]). Without this the restore would load the
+/// driver, fail to initialise the GPU and shut the clone down. A device that is
+/// not NVIDIA, or a profile without a driver image, is not checked here.
+pub fn check_driver_supports_device(
+    sysfs: &Path,
+    sbdf: &str,
+    profile_name: &str,
+    module_type: Option<crate::setup::ModuleType>,
+) -> Result<()> {
+    let Some(module_type) = module_type else {
+        return Ok(());
+    };
+    let device = sysfs.join("bus/pci/devices").join(sbdf);
+    let read = |name: &str| -> Result<u16> {
+        let file = device.join(name);
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("reading {}", file.display()))?;
+        let text = text.trim();
+        u16::from_str_radix(text.strip_prefix("0x").unwrap_or(text), 16)
+            .with_context(|| format!("{} is not a 16-bit hex ID: {text:?}", file.display()))
+    };
+    if read("vendor")? != 0x10de {
+        return Ok(());
+    }
+    let id = read("device")?;
+    if !module_type.supports_device(id) {
+        bail!(
+            "PCI device {sbdf} [10de:{id:04x}] is not a Turing or Ampere GPU, and kernel profile \
+             {profile_name:?} builds the proprietary NVIDIA modules with the GSP firmware off \
+             (module_type = \"proprietary\"), which run only those. Set module_type = \"open\" \
+             in [kernel_profiles.{profile_name}.<arch>.nvidia] to use this GPU"
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -254,6 +292,78 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err:#}").contains("no PCI device 0000:02:00.0"));
+    }
+
+    fn nvidia_function(device: &str) -> tempfile::TempDir {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("bus/pci/devices/0000:01:00.0");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vendor"), "0x10de\n").unwrap();
+        std::fs::write(dir.join("device"), format!("{device}\n")).unwrap();
+        root
+    }
+
+    /// The proprietary modules with the GSP firmware off run Turing and Ampere GPUs
+    /// only, so a profile that builds them refuses any other NVIDIA GPU before
+    /// launch, naming the device and the setting that runs it. The open modules,
+    /// and a profile without a driver image, take any GPU.
+    #[test]
+    fn a_gpu_the_proprietary_modules_cannot_run_is_refused_before_launch() {
+        use crate::setup::ModuleType;
+        // Tesla T4 (Turing), A10G and A100 (Ampere): allowed.
+        for device in ["0x1eb8", "0x2237", "0x20b5"] {
+            let root = nvidia_function(device);
+            check_driver_supports_device(
+                root.path(),
+                "0000:01:00.0",
+                "gpu",
+                Some(ModuleType::Proprietary),
+            )
+            .unwrap_or_else(|e| panic!("{device}: {e:#}"));
+        }
+        // V100 (Volta), H100 (Hopper), L4 (Ada), RTX 5090 (Blackwell): refused.
+        for device in ["0x1db4", "0x2330", "0x27b8", "0x2b85"] {
+            let root = nvidia_function(device);
+            let err = check_driver_supports_device(
+                root.path(),
+                "0000:01:00.0",
+                "gpu",
+                Some(ModuleType::Proprietary),
+            )
+            .expect_err(device);
+            let err = format!("{err:#}");
+            assert!(err.contains(&format!("[10de:{}]", &device[2..])), "{err}");
+            assert!(err.contains("module_type = \"open\""), "{err}");
+            check_driver_supports_device(
+                root.path(),
+                "0000:01:00.0",
+                "gpu",
+                Some(ModuleType::Open),
+            )
+            .unwrap();
+            check_driver_supports_device(root.path(), "0000:01:00.0", "gpu", None).unwrap();
+        }
+    }
+
+    /// `podman run --gpu` checks against the profile's module type, which is the
+    /// driver its clone gets: the snapshot key holds the driver image's path, and
+    /// the image's key holds the module type. `snapshot run --gpu` restores the
+    /// image recorded in the snapshot, which the current profile does not name, so
+    /// it must not refuse a GPU on the profile's say (the guest's attach fails
+    /// closed for a GPU the recorded driver cannot run).
+    #[test]
+    fn only_podman_run_checks_the_gpu_against_the_profiles_driver() {
+        let call = "crate::gpu::check_driver_supports_device(";
+        let code = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code(include_str!("../commands/podman/mod.rs")).contains(call),
+            "podman run does not check that the driver image supports the GPU"
+        );
+        assert!(
+            !code(include_str!("../commands/snapshot.rs")).contains(call),
+            "snapshot run checks the GPU against the current profile, not the driver image \
+             the snapshot recorded"
+        );
     }
 
     #[test]
