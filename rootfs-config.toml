@@ -279,6 +279,10 @@ firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-hotplug-v1.17.0"
 firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
 firecracker_args = "--enable-pci"
+# On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
+# to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
+# so the guest keeps the kernel's name.
+boot_args = "net.ifnames=0"
 
 # R580 is NVIDIA's long-term support branch and supports Turing (T4, T4G)
 # with the open kernel modules. The .run carries the open module sources, the
@@ -309,6 +313,10 @@ firecracker_repo = "ejc3/firecracker"
 firecracker_branch = "agent/vfio-hotplug-v1.17.0"
 firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
 firecracker_args = "--enable-pci"
+# On the PCI transport the guest's virtio-net NIC is a PCI device, which udev renames
+# to enp0s<slot>; fc-agent and fcvm configure "eth0" (IPv6, routes, the snapshot gate),
+# so the guest keeps the kernel's name.
+boot_args = "net.ifnames=0"
 
 # The proprietary modules with the GSP firmware off: a T4's initialisation on
 # every restore takes half as long as with the open modules (see
