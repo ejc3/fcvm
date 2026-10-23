@@ -193,6 +193,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 {
   "layout": {"generation": 14, "from_frame": 25845, "from_t": 861.5,
              "fcvm": {"x": 0, "y": 0, "w": 0.8928571428571429, "h": 1}, "ec2": {"x": 0.8928571428571429, "y": 0, "w": 0.10714285714285714, "h": 1}},
+  "budget": 707107, "budget_from_t": 863.2,
   "tiles": [
     {
       "id": "fcvm:1", "half": "fcvm", "rect": {"x": 0, "y": 0, "w": 0.0893, "h": 0.1},
@@ -296,6 +297,10 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   and `previous_rect`: it keeps the old tiles on screen until every tile of the new
   generation has delivered its first frame at or after `from_t`, then swaps them all at
   once.
+- `budget` is the grid's render budget in pixel-samples per frame per tile and
+  `budget_from_t` the scene time it took effect at (both null until every placed tile has
+  reported a fit); see "Grid budget" below. The page may show it; it needs nothing from
+  it.
 - `phase`: `waiting_capacity` (dark: no GPU behind the tile, or EC2 refused capacity),
   `borrowed` (lent to a visitor, drawn black), `pending` (assigned, nothing reported yet),
   `relaunching` (a newer generation is wanted than the agent has reported), or what the
@@ -537,11 +542,13 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 ```json
-{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }}
+{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9}
 ```
 
-Once a second per running slot: the renderer's `/health` `fps` and its GPU readings, passed
-through.
+Once a second per running slot: the renderer's `/health` `fps`, its GPU readings,
+`budget_fit` and `t` (the scene time of its newest frame), passed through. The coordinator
+reads the same fields from each EC2 tile's renderer (`GET https://ec2-<n>.<zone>/health`)
+once a second.
 
 ```json
 {"type": "draining", "reason": "spot interruption notice: terminate at 2026-10-22T10:00:00Z"}
@@ -614,6 +621,43 @@ agent posts `scene` plus the slot's `rect` to each running renderer as
 `previous_rect` (when present) for frames before `rect_from_frame` and `rect` from it. The
 coordinator posts the same body to each EC2 tile's renderer
 (`POST https://ec2-<n>.<zone>/scene`).
+
+```json
+{"type": "budget", "budget": 707107, "t": 863.2}
+```
+
+The grid budget, sent after the hello and whenever it changes. The agent posts
+`{"budget", "t"}` to every running renderer that draws a wall tile
+(`POST http://<publish ip>:<port>/budget`): when it arrives, and again after every scene
+post, because a new scene clears the renderer's budget schedule. A renderer drawing the
+whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
+body to each EC2 tile's renderer.
+
+### Grid budget
+
+One budget for every tile of the wall, so tiles draw the same samples per pixel at the same
+frame and moving frames match across tile edges. Tiles never adapt on their own. The
+coordinator runs the rule of the renderer's reference controller
+(`fleet/renderer/tools/budgetctl.py`) in the pure core (`fleet_core::budget`), on its
+1 s tick:
+
+- Every 2 s, a round over every placed tile of both sides that is not lent to a claim. No
+  decision until every one of them has reported a `budget_fit` (a tile that just joined
+  holds the round until its first report).
+- The smallest fit governs, rounded down to the ladder 250,000 x 2^(n/4), n from -8 to 40.
+- A lower rung is taken at once. A higher one only after two rounds in a row ask for at
+  least that much, and then the lower of the two asks.
+- A change takes effect at one scene time for every tile: `t` = the newest frame any tile
+  has drawn plus 1 s, rounded up to a frame (k/30). The agents and the EC2 poster post the
+  same `{budget, t}` everywhere.
+
+The budget does not ride on layout generations. Every tile covers the same share of the
+image (each side is as wide as its share of the tiles), so one budget gives every tile the
+same samples per pixel in any layout, and a re-tile, which every renderer applies at the
+layout's frame, changes them for all tiles together. A fit measures the GPU's
+pixel-samples per frame, which a tile's size changes little; when it does, the next round
+answers it. A tile that joins draws the budget in force (its `t` is in the past, so it
+applies from its first frame) until the round that counts it.
 
 ### Running it
 
