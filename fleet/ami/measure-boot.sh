@@ -15,7 +15,6 @@ REGION=${REGION:-us-east-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
 A() { aws --region "$REGION" "$@"; }
 now() { date +%s%3N; }
-subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${AZ_SUFFIX:-a}" --query 'Subnets[0].SubnetId' --output text)
 sg=$(A ec2 describe-security-groups --filters Name=group-name,Values=fcvm-fleet --query 'SecurityGroups[0].GroupId' --output text)
 case "$KIND" in
   tile) type=g4dn.xlarge; profile=fcvm-fleet-tile; net="Ipv6AddressCount=1"
@@ -23,13 +22,26 @@ case "$KIND" in
   host) type=g4dn.metal; profile=fcvm-fleet-host; net="Ipv6PrefixCount=1"; market=() ;;
   *) echo "measure-boot.sh tile|host <ami>" >&2; exit 2 ;;
 esac
-t0=$(now)
-id=$(A ec2 run-instances --image-id "$AMI" --instance-type $type "${market[@]}" \
-  --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,$net,DeleteOnTermination=true" \
-  --iam-instance-profile Name=$profile \
-  --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
-  --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build}]" \
-  --query 'Instances[0].InstanceId' --output text)
+# MARKET=on-demand measures a tile when spot has no capacity: the boot does not depend on it.
+[ "${MARKET:-}" = on-demand ] && market=()
+# Like the coordinator, an AZ that has no capacity is skipped; the time spent on refusals
+# is reported apart (capacity wait) and the clock starts at the request that was accepted.
+tw=$(now); id=""
+for az in ${AZS:-a b c d f}; do
+  subnet=$(A ec2 describe-subnets --filters Name=tag:Name,Values="fcvm-fleet-${REGION}${az}" --query 'Subnets[0].SubnetId' --output text)
+  t0=$(now)
+  id=$(A ec2 run-instances --image-id "$AMI" --instance-type $type "${market[@]}" \
+    --network-interfaces "DeviceIndex=0,SubnetId=$subnet,Groups=$sg,AssociatePublicIpAddress=true,$net,DeleteOnTermination=true" \
+    --iam-instance-profile Name=$profile \
+    --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
+    --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=fcvm-fleet-ami-measure-$KIND},{Key=Purpose,Value=fcvm-fleet-ami-build}]" \
+    --query 'Instances[0].InstanceId' --output text 2>/tmp/measure-boot.err.$$) && break
+  grep -q -E 'InsufficientInstanceCapacity|capacity' /tmp/measure-boot.err.$$ || { cat /tmp/measure-boot.err.$$ >&2; exit 1; }
+  echo "no $type capacity in ${REGION}${az}"
+done
+rm -f /tmp/measure-boot.err.$$
+[ -n "$id" ] || { echo "no capacity in any AZ"; exit 1; }
+echo "capacity wait $((t0 - tw)) ms (not counted below), AZ ${REGION}${az}"
 t_accepted=$(now)
 trap 'A ec2 terminate-instances --instance-ids "$id" >/dev/null; echo "terminated $id"' EXIT
 echo "launched $id: accepted after $((t_accepted - t0)) ms"
@@ -39,7 +51,7 @@ t_running=""
 if [ "$KIND" = tile ]; then
   while :; do
     [ -z "$t_running" ] && [ "$(A ec2 describe-instances --instance-ids "$id" --query 'Reservations[0].Instances[0].State.Name' --output text)" = running ] && t_running=$(now)
-    if curl -fsS -m 2 --resolve "tile.fcvm.dev:443:$ip" https://tile.fcvm.dev/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1; then break; fi
+    if curl -fsS -m 2 --connect-to "tile.fcvm.dev:443:$ip:443" https://tile.fcvm.dev/health 2>/dev/null | jq -e '.ready == true and .frame > 0' >/dev/null 2>&1; then break; fi
     [ $(( $(now) - t0 )) -lt 900000 ] || { echo "no frame in 15 minutes"; exit 1; }
     sleep 0.5
   done
