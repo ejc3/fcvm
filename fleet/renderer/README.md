@@ -263,6 +263,17 @@ Round 10, layout generations (`tools/retile.py`, four VMs):
   clearing the schedule, as through round 9, the same check reports 30 of 32
   frames at the default 250,000.
 
+- **A stream's first frames** (`tools/streamstart.py`, four VMs, a 2 x 2
+  grid with the camera moving at 353,553 pixel-samples, four streams at
+  270 px subscribing 70 ms apart): frames F to F+7, F the first frame every
+  stream delivered, stitched unencoded, equal the same frames drawn whole
+  (12 frames of history) in all 518,400 pixels, 8 of 8 frames in each of 4
+  runs, with no frame missing from any stream. Round 10's renderer (`41c46e09`)
+  skipped 9 to 12 slots after each stream started, so no tile drew F to F+7
+  all; with the encoder opened off the render thread but no priming, the
+  first frame all four drew differed in 162,911 pixels and the next four in
+  99,194 to 131,044, and the slowest cell skipped every other slot.
+
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
 cropped; `tools/seam_metric.py`):

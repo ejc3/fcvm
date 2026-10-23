@@ -62,6 +62,11 @@ class Renderer {
   // Makes the renderer's device current on the calling thread (for a thread
   // that allocates or frees its buffers).
   static void bind_thread();
+  // Whether the next frame at tile t continues the history drawn so far.
+  bool same_tile(const Tile& t) const {
+    return have_tile_ && t.w == tile_.w && t.h == tile_.h && t.full_w == tile_.full_w && t.full_h == tile_.full_h &&
+           t.x0 == tile_.x0 && t.y0 == tile_.y0;
+  }
   int width() const { return tile_.w; }
   int height() const { return tile_.h; }
   const RenderStats& stats() const { return stats_; }

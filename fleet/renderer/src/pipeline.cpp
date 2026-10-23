@@ -16,6 +16,9 @@
 #include "proto.h"
 
 static bool rect_eq(const Rect& a, const Rect& b) { return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h; }
+static bool geo_eq(const Tile& a, const Tile& b) {
+  return a.w == b.w && a.h == b.h && a.full_w == b.full_w && a.full_h == b.full_h && a.x0 == b.x0 && a.y0 == b.y0;
+}
 static int even_h(int h) { return std::clamp(h, 16, 2160) & ~1; }
 
 double now_unix_ms() {
@@ -86,6 +89,17 @@ void Pipeline::aux_post(std::function<void()> f) {
 
 void Pipeline::aux_loop() {
   Renderer::bind_thread();
+  {
+    // NVENC's smallest frame: opening a session to ask takes about 250 ms
+    int w = 16, h = 16;
+    std::string err;
+    if (!H264Encoder::min_size(r_.cu_context(), &w, &h, &err)) w = h = 16;
+    fprintf(stderr, "fleet-renderer: NVENC H.264 minimum frame %dx%d\n", w, h);
+    std::lock_guard<std::mutex> l(aux_mu_);
+    min_w_ = w;
+    min_h_ = h;
+  }
+  min_cv_.notify_all();
   for (;;) {
     std::function<void()> f;
     {
@@ -131,6 +145,15 @@ void Pipeline::prepare_layout(const std::shared_ptr<const Scene>& sc, const std:
     std::lock_guard<std::mutex> l(aux_mu_);
     prep_open_gen_ = gen;
   }
+  open_async(list, gen);
+}
+
+// Opens encoders on the aux thread and hands them over in prepared_, by key.
+// gen >= 0: for a pending layout, dropped once that layout is in effect.
+// gen == kOpenNow: for a stream that is waiting now; a failure is handed over
+// too (an entry with failed set), so the stream is closed rather than left
+// waiting.
+void Pipeline::open_async(std::shared_ptr<std::vector<std::pair<int, Enc>>> list, long long gen) {
   void* ctx = r_.cu_context();
   Renderer* r = &r_;
   int fps = opt_.fps;
@@ -142,22 +165,26 @@ void Pipeline::prepare_layout(const std::shared_ptr<const Scene>& sc, const std:
         e.enc = std::make_unique<H264Encoder>();
         std::string err;
         if (!e.enc->open(ctx, e.nv12, e.pitch, e.ew, e.eh, fps, key % 4, &err)) {
-          fprintf(stderr, "fleet-renderer: encoder %dx%d for layout %lld: %s\n", e.ew, e.eh, gen, err.c_str());
+          fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", e.ew, e.eh, err.c_str());
           e.enc.reset();
-        } else {
-          std::lock_guard<std::mutex> l(aux_mu_);
-          if (prep_open_gen_ == gen) {
-            auto it = prepared_.find(key);
-            if (it != prepared_.end()) old = std::move(it->second);
-            prepared_[key] = std::move(e);
-            e.nv12 = nullptr;  // handed over with the encoder
-          }
+          e.failed = true;
         }
       } catch (const std::exception& ex) {
-        fprintf(stderr, "fleet-renderer: encoder for layout %lld: %s\n", gen, ex.what());
+        fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", e.ew, e.eh, ex.what());
+        e.enc.reset();
+        e.failed = true;
       }
-      // whatever was not handed over (a failed open, a layout already in
-      // effect, an older encoder for the same key) is torn down here
+      {
+        std::lock_guard<std::mutex> l(aux_mu_);
+        if ((e.enc || (e.failed && gen == kOpenNow)) && (gen == kOpenNow || prep_open_gen_ == gen)) {
+          auto it = prepared_.find(key);
+          if (it != prepared_.end()) old = std::move(it->second);
+          prepared_[key] = std::move(e);
+          e.nv12 = nullptr;  // handed over with the encoder
+        }
+      }
+      // whatever was not handed over (a layout already in effect, an older
+      // encoder for the same key) is torn down here
       e.enc.reset();
       if (e.nv12) r->free_dev(e.nv12);
       old.enc.reset();
@@ -354,7 +381,7 @@ void Pipeline::run() {
       return;
     }
     frame_no++;
-    last_k = k;
+    last_k = std::max(k, primed_through_);  // slots drawn ahead are not drawn again
     window_frames++;
     double m = mono_s();
     if (m - window_start >= 1.0) {
@@ -370,10 +397,10 @@ void Pipeline::run() {
 // NVENC's minimum frame is larger, the smallest larger height it accepts (the
 // header says which; the client scales).
 Tile Pipeline::encode_geometry(const Scene& sc, int h) {
-  if (!min_w_) {
-    std::string err;
-    if (!H264Encoder::min_size(r_.cu_context(), &min_w_, &min_h_, &err)) { min_w_ = 16; min_h_ = 16; }
-    fprintf(stderr, "fleet-renderer: NVENC H.264 minimum frame %dx%d\n", min_w_, min_h_);
+  if (!min_known_) {  // asked on the aux thread at start; waits only in the first moments
+    std::unique_lock<std::mutex> l(aux_mu_);
+    min_cv_.wait(l, [&] { return min_w_ > 0; });
+    min_known_ = true;
   }
   Tile g = tile_geometry(sc.rect, sc.image_aspect, h);
   while ((g.w < min_w_ || g.h < min_h_) && h < 2160) {
@@ -390,6 +417,8 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   std::vector<std::pair<int, int>> prep;  // a pending layout's streams: (height, quality)
   std::shared_ptr<const Scene> prep_scene;
   long long prep_gen = -1;
+  long long pend_k = LLONG_MAX;  // the first frame of a pending layout
+  primed_through_ = LLONG_MIN;
   {
     std::lock_guard<std::mutex> l(mu_);
     subs = subs_;
@@ -412,6 +441,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
         s->need_key = true;
       }
     }
+    if (switch_pending_) pend_k = switch_k_;
     // open the pending layout's encoders ahead of its first frame
     if (switch_pending_ && prepared_gen_ != gen_next_ && !subs.empty()) {
       prepared_gen_ = gen_next_;
@@ -464,19 +494,54 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   // The budget for this slot: a posted schedule first (the same on every tile
   // of a grid), then the scene's, then a whole-image renderer's own, then the
   // default.
-  double budget = opt_.budget;
-  const char* source = "default";
   bool whole = sc->rect.x == 0 && sc->rect.y == 0 && sc->rect.w == 1 && sc->rect.h == 1;
-  {
+  auto budget_at = [&](long long kk, const char** src) {
+    double b = opt_.budget;
+    *src = "default";
     std::lock_guard<std::mutex> l(mu_);
-    double b;
-    if (sched_.at(std::llround(t * opt_.fps), &b)) { budget = b; source = "schedule"; }
-    else if (sc->budget > 0) { budget = sc->budget; source = "scene"; }
-    else if (opt_.adapt && whole) { budget = budget_; source = "local"; }
+    double v;
+    if (sched_.at(kk, &v)) { b = v; *src = "schedule"; }
+    else if (sc->budget > 0) { b = sc->budget; *src = "scene"; }
+    else if (opt_.adapt && whole) { b = budget_; *src = "local"; }
+    return b;
+  };
+  const char* source;
+  long long k0 = std::llround(t * opt_.fps);
+  // A stream's first frames. A moving frame averages the 7 frames before it,
+  // so a tile that starts drawing at a new size (a stream starts, or changes
+  // height) draws this slot and the next ones now, unsent, and its first frame
+  // sent has all 7 behind it: it no longer depends on when this tile's stream
+  // started, and matches a neighbour whose stream started at another slot. A
+  // layout switch needs none of this (every tile starts its history at the
+  // switch frame), nor does a whole-image renderer (it has no neighbours).
+  bool prime = opt_.accumulate && !whole && !encs_.empty() && !new_layout && !r_.same_tile(rt);
+  // Priming draws consecutive slots back to back from this one until at least
+  // 7 are drawn and the next begins a slot or more from now, so no slot after the
+  // priming is skipped either (a GPU clocking up from idle draws the first
+  // frames slower than a slot). It stops after PRIME_MAX slots regardless.
+  double budget;
+  if (prime) {
+    double p0 = mono_s();
+    long long jn = k0;
+    while (jn < pend_k) {  // never past a pending switch
+      budget = budget_at(jn, &source);
+      r_.set_budget(budget);
+      r_.render(*sc, rt, (double)jn / opt_.fps, true);
+      jn++;
+      long long now_k = (long long)std::floor((now_unix_ms() - (double)sc->epoch_unix_ms) / 1000.0 * opt_.fps);
+      // the next slot must not have begun by the time the loop picks it (one slot of margin)
+      if (jn - k0 >= TEMPORAL_WINDOW - 1 && jn > now_k + 1) break;
+      if (jn - k0 >= PRIME_MAX) break;
+    }
+    primed_through_ = jn - 1;
+    fprintf(stderr, "fleet-renderer: %dx%d tile primed with slots %lld..%lld in %.1f ms\n", rt.w, rt.h, k0, jn - 1,
+            (mono_s() - p0) * 1000.0);
+  } else {
+    budget = budget_at(k0, &source);
+    r_.set_budget(budget);
+    r_.render(*sc, rt, t, opt_.accumulate);
   }
-  r_.set_budget(budget);
-  r_.render(*sc, rt, t, opt_.accumulate);
-  {
+  if (!prime) {
     // this renderer's fit, from its cost model (the fixed part of a frame and
     // the cost per sample of each path, from the frames it drew)
     const RenderStats& rs = r_.stats();
@@ -490,7 +555,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     // a whole-image renderer alone follows its own fit, on the ladder
     if (opt_.adapt && whole && fit_ > 0) budget_ = local_budget(fit_, px);
   }
-  {
+  if (!prime) {
     // debug captures of this frame
     long long k = std::llround(t * opt_.fps);
     std::lock_guard<std::mutex> l(mu_);
@@ -534,8 +599,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     streams.push_back({h, q});
     Tile g = encode_geometry(*sc, h);
     if (new_layout) e.want_idr = true;  // the first frame of a layout generation is a keyframe
-    bool same = e.enc && g.w == e.geo.w && g.h == e.geo.h && g.full_w == e.geo.full_w && g.full_h == e.geo.full_h &&
-                g.x0 == e.geo.x0 && g.y0 == e.geo.y0;
+    bool same = e.enc && geo_eq(g, e.geo);
     bool continue_encode = false;
     if (!same) {
       retire(e);
@@ -543,14 +607,18 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       {
         std::lock_guard<std::mutex> l(aux_mu_);
         auto pit = prepared_.find(ekey);
-        if (pit != prepared_.end() && pit->second.enc && pit->second.geo.w == g.w && pit->second.geo.h == g.h &&
-            pit->second.geo.full_w == g.full_w && pit->second.geo.full_h == g.full_h && pit->second.geo.x0 == g.x0 &&
-            pit->second.geo.y0 == g.y0) {
+        if (pit != prepared_.end() && (pit->second.enc || pit->second.failed) && geo_eq(pit->second.geo, g)) {
           ready = std::move(pit->second);
           prepared_.erase(pit);
         }
       }
+      if (ready.failed) {
+        for (auto& s : e.subs) s->close();
+        e.opening = false;
+        continue;
+      }
       if (ready.enc) {
+        e.opening = false;
         e.enc = std::move(ready.enc);
         e.nv12 = ready.nv12;
         e.pitch = ready.pitch;
@@ -563,19 +631,20 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       }
     }
     if (!same && !continue_encode) {
-      enc_layout(e, g);
-      e.nv12 = r_.alloc_nv12(e.ew, e.eh, &e.pitch);
-      e.enc = std::make_unique<H264Encoder>();
-      std::string err;
-      if (!e.enc->open(r_.cu_context(), e.nv12, e.pitch, e.ew, e.eh, opt_.fps, q, &err)) {
-        fprintf(stderr, "fleet-renderer: encoder %dx%d: %s\n", e.ew, e.eh, err.c_str());
-        for (auto& s : e.subs) s->close();
-        e.enc.reset();
-        continue;
+      // open it on the aux thread (10 to 25 ms, more for the first one); the
+      // stream waits for it, and frames keep being drawn meanwhile
+      if (!e.opening || !geo_eq(e.open_geo, g)) {
+        auto list = std::make_shared<std::vector<std::pair<int, Enc>>>();
+        Enc ne;
+        enc_layout(ne, g);
+        list->emplace_back(ekey, std::move(ne));
+        open_async(list, kOpenNow);
+        e.opening = true;
+        e.open_geo = g;
       }
-      for (auto& s : e.subs) s->cur_h = 0;
-      e.want_idr = true;
+      continue;
     }
+    if (prime) continue;  // nothing is sent while a tile primes its history
     std::string hdr = header_json(e, q);
     auto hmsg = std::make_shared<const std::string>(ws_frame(1, hdr.data(), hdr.size()));
     for (auto& s : e.subs) {
@@ -626,15 +695,31 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   if (new_layout)
     fprintf(stderr, "fleet-renderer: layout generation %lld from frame %lld (that frame took %.1f ms)\n", gen_cur_,
             std::llround(t * opt_.fps), (mono_s() - sw0) * 1000.0);
-  if (new_layout) {
-    // the layout is in effect: encoders opened for it and not taken are torn down
-    std::map<int, Enc> left;
+  {
+    // encoders opened ahead and not taken: once no layout is pending, any that
+    // no waiting stream asked for are torn down
+    bool pending;
+    {
+      std::lock_guard<std::mutex> l(mu_);
+      pending = switch_pending_;
+    }
+    std::vector<Enc> left;
     {
       std::lock_guard<std::mutex> l(aux_mu_);
-      prep_open_gen_ = -1;
-      left.swap(prepared_);
+      if (new_layout) prep_open_gen_ = -1;
+      if (!pending) {
+        for (auto it = prepared_.begin(); it != prepared_.end();) {
+          auto w = encs_.find(it->first);
+          if (w != encs_.end() && w->second.opening && geo_eq(w->second.open_geo, it->second.geo)) {
+            ++it;
+          } else {
+            left.push_back(std::move(it->second));
+            it = prepared_.erase(it);
+          }
+        }
+      }
     }
-    for (auto& [k, e] : left) retire(e);
+    for (auto& e : left) retire(e);
   }
   std::lock_guard<std::mutex> l(hmu_);
   last_t_ = t;
