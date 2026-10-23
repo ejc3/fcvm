@@ -7,7 +7,9 @@ browsers read frames from `GET /frames`, a poster frame from `GET /still`
 and stats from `GET /health`.
 
 The renderer listens on `0.0.0.0:8080` (IPv4 and IPv6, plain HTTP and
-WebSocket; TLS comes later). Source: `fleet/renderer/`.
+WebSocket) for host-local clients, and, given a certificate, on `:443` with
+TLS for browsers (HTTPS and WSS, the same routes; see "TLS"). Source:
+`fleet/renderer/`.
 
 ## Coordinates and time
 
@@ -25,8 +27,13 @@ WebSocket; TLS comes later). Source: `fleet/renderer/`.
   (`tools/scene-high.json` holds at 80 km).
 - The world has one fixed landmark: an orbital ring, a band 120 km wide at
   420 km above the surface on an axis through the planet's centre, seen as an
-  arc over the southern sky. It is part of the world, like the terrain, and
-  needs nothing in the scene.
+  arc over the southern sky: lanes of plating and solar panels, lattice edges
+  and two open gaps crossed by trusses. It shades the ground where it crosses
+  the sun and is dark where the planet's shadow falls on it. It is part of the
+  world, like the terrain, and needs nothing in the scene.
+- Round 6: mountain basins hold lakes (water at a level of their own, a few
+  metres below the basin floor); the sea is at altitude 0. The eye is kept 60 m
+  above either.
 - **`t`** is seconds since `epoch_unix_ms` on the VM's clock (chrony keeps the
   VMs in step): `t = (now_unix_ms - epoch_unix_ms) / 1000`.
 - **Frames are drawn on a fixed grid of times:** `t = k / 30` for integer `k`
@@ -245,9 +252,13 @@ whose whole-image `X + Y + k` is even, `k` the frame slot), and under 0.3 on
 a quarter (stride 4: one pixel of each 2 x 2 block, top-left, bottom-right,
 top-right, bottom-left over four slots). At the default budget that is a 720p
 or 1080p view; wall tiles keep a sample on every pixel. Every pixel that drew
-nothing is filled from its 8 neighbours that did (those of the first one's hit
-kind, edge neighbours first), at half their weight, and the history below does
-the rest. In a hold, a pixel's next sample index is its own sample count, so a
+nothing is filled from its 8 neighbours that did, at half their weight, and the
+history below does the rest. Round 6: where one or more pairs of opposite
+neighbours (left-right, up-down, the two diagonals) both drew and share a hit
+kind, the fill averages the pair whose brightness (and, on land and water,
+distance) differs least, so an edge is continued along its own direction;
+otherwise it averages the neighbours of the first one's hit kind (left, right,
+up, down, then the diagonals). In a hold, a pixel's next sample index is its own sample count, so a
 hold's sum is still independent of how frames split it. The pattern, the fill
 and the rule for when to use it name only whole-image pixels, slots and the
 budget, so the matching rules below hold unchanged. `/health` reports the
@@ -284,9 +295,15 @@ rect is then the sample-weighted average of
 - for each of the frames `k-1 .. k-7` this renderer drew: that frame's color
   at the point where this pixel's first hit was in that frame's camera
   (bilinear over four pixels), counted only where the four pixels' hit kind
-  (sky, land, water) matches, their hit distance agrees within 4%, and the
-  point moved at most `g` pixels in x and in y. A frame weighs its sample
-  count, at most 64.
+  (sky, land, water) matches, their hit distance agrees within 4% (land and
+  water only), and the point moved at most `g` pixels in x and in y. A frame
+  weighs its sample count, at most 64.
+- Round 6: a pixel's "first hit" is the cloud in front of what it shows when
+  that cloud lets through under half the light (over the sky) or under a fifth
+  (over land and water), at the cloud's transmittance-weighted distance, taken
+  from the pixel's first sample. Its hit kind stays that of what lies behind.
+  Before, a near cloud was reprojected through the terrain behind it, or
+  through the sky at infinity, and smeared while the camera moved fast.
 
 This is computed for the rect plus the stream overlap (16 pixels) plus 2
 pixels on each side. Where a pixel's
@@ -339,6 +356,33 @@ read it with `fetch`.
   second request a few seconds later returns a more converged image.
 - `503` if no frame was drawn within 15 s (the GPU is not ready yet).
 
+## TLS (addition, round 6)
+
+Browsers reach renderers directly over IPv6, so the renderer terminates TLS
+itself.
+
+- With `TLS_CERT_FILE` set, every route is also served over TLS on `TLS_PORT`
+  (443): `https://` for `/health`, `/scene`, `/still`, `/raw`, and `wss://`
+  for `/frames`, with the same requests and responses as plain. Plain HTTP
+  stays on `PORT` (8080) for host-local clients (an aggregator, the agent).
+- **The file** is a JSON object in the format of the fleet's wildcard secret
+  (`fleet/tools/issue-cert.sh` on `fleet-deploy` documents it): `cert`, the
+  leaf certificate followed by its intermediates, PEM; `key`, the leaf's
+  private key, PEM. Other fields are ignored. The host hands it to the VM
+  (for fcvm: `--map <dir>:/run/fleet-tls:ro --env TLS_CERT_FILE=/run/fleet-tls/tls.json`).
+- **Reload:** the file is checked every 2 s. A new version of it (renamed into
+  place, or rewritten: a new inode, size or modification time) is loaded and
+  used for every connection accepted after that; connections already open,
+  streams included, keep the pair they started with and are not dropped. A
+  version that does not load (unparsable, no certificate, a key that does not
+  match) is logged and the pair in use stays. Until a pair has loaded, TLS
+  handshakes fail and plain HTTP works as before.
+- TLS 1.2 and 1.3 only. TLS 1.2 uses ECDHE with AES-GCM or ChaCha20-Poly1305;
+  no renegotiation, no compression. ALPN selects `http/1.1` when offered.
+- `/health` adds `"tls": {"loaded": bool, "loads": n, "not_after": "<RFC 3339>"}`
+  (`loads` counts pairs loaded since start) and, for every listener,
+  `"cpu_s"`, the process's CPU seconds (user + system).
+
 ## `GET /raw?t=<t>` (debug)
 
 Waits for the frame at `t` (a future slot, at most 15 s ahead) and returns this
@@ -358,4 +402,4 @@ compared pixel for pixel with the same frame drawn whole
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
 - Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (0), `MARGIN` (16), `ENC_BPP` (0.8),
-  `ACCUMULATE` (1).
+  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443).

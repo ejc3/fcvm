@@ -26,8 +26,13 @@ scene is at golden hour (sun about 7 degrees up):
   below cliffs, meadow, heath and dry grass, mottled forest canopy, beach, and
   snow on flatter high ground, with albedo detail down to tens of metres;
   Lambert plus GGX.
-- **Water** at sea level with animated wave normals, Fresnel reflection of
-  terrain, sky and clouds, sun glitter, depth-tinted seabed and shore foam.
+- **Water**: the sea at altitude 0 and lakes in mountain basins (the basin
+  floor carved a few tens of metres down, the lake's surface a few metres
+  below the floor's level). Animated wave normals with gusts (patches a few
+  hundred metres across of rough and of mirror-calm water), ripples below the
+  pixel turned into a blurred reflection, Fresnel reflection of terrain, sky
+  and clouds, sun glitter, depth-tinted bed, and a shore line that widens with
+  distance so it stays a pixel or so wide.
 - **Atmosphere**: Rayleigh, Mie and ozone single scattering over a precomputed
   transmittance table, a cheap multiple-scattering term, aerial perspective on
   everything (a denser haze than before, so distant ranges fade into it), the
@@ -35,8 +40,11 @@ scene is at golden hour (sun about 7 degrees up):
   starts where the view ray enters the atmosphere, so the planet's limb and
   its blue rim are drawn against black space.
 - **The orbital ring**: a band 120 km wide, 420 km up, around an axis through
-  the planet's centre: panels, lit seams on its night side, the planet's
-  shadow. It arcs over the southern sky and hides the sun and stars behind it.
+  the planet's centre. Across it: two rails, lattice lanes at the edges, two
+  open gaps crossed by trusses every half degree, dark solar lanes and plated
+  lanes; along it, plates with seams and lights. It is lit by the sun and by
+  the planet's day side, dark in the planet's shadow, hides the sun and stars
+  where it is opaque, and shades the ground where it crosses the sun.
 - **Clouds**: a cumulus layer (2.7 to 5.6 km) ray marched through a tileable
   Perlin-Worley volume (128^3, generated at start), its lookup warped by a
   ground-fixed noise and its second octave rotated, so the 14 km tile does not
@@ -49,8 +57,9 @@ scene is at golden hour (sun about 7 degrees up):
   lobe, a powder term and sky ambient that darkens toward the base. They drift
   with the wind and cast shadows on the ground.
 - **Light transport**: per sample a soft sun shadow (a random point of the
-  sun's disc), cloud shadow, and one bounce of sky or ground light; viewers'
-  lights add point lighting.
+  sun's disc), cloud shadow (from the first 8 km of the sun ray's crossing of
+  the cloud layer, letting 14% through as diffuse light), and one bounce of
+  sky or ground light; viewers' lights add point lighting.
 - **Words and the clock**: tubes along a stroke font, ray marched as 3D
   distance fields and laid out on the screen (the clock centred near the top,
   words in a grid below it, inside a safe area). Words are glowing glass; the
@@ -60,7 +69,8 @@ scene is at golden hour (sun about 7 degrees up):
 - The sun's glare: three exponential lobes around the sun's direction, scaled
   by how much of the sun the camera sees (a terrain and cloud shadow ray from
   the camera, one per frame).
-- ACES tone mapping (the fitted RRT and ODT), a warm-highlight, cool-shadow
+- A lift of the deepest shadows (up to 1.5x below about 4% of the exposed
+  range), then ACES tone mapping (the fitted RRT and ODT), a warm-highlight, cool-shadow
   split tone, a vignette over the whole image, sRGB, a dither seeded by the
   whole-image pixel.
 
@@ -70,7 +80,9 @@ the renderer draws around its rect, and pixels with few samples get an
 edge-aware 5 x 5 filter over pixels drawn under the same rules, so moving
 frames also match across tile edges. Views that would get under half a sample
 per pixel (720p and 1080p at the default budget) draw a checkerboard, half or
-a quarter of the pixels per frame, and fill the rest. Each stream encodes its tile plus 16
+a quarter of the pixels per frame, and fill the rest along the edge through
+each gap. A cloud covering most of a pixel is reprojected at its own distance,
+so near clouds keep their shape while the camera moves fast. Each stream encodes its tile plus 16
 pixels of overlap and the client crops them, so a tile edge is never the edge
 of an encoded picture. The rules are in PROTOCOL.md, "Sampling, accumulation
 and determinism", and "crop".
@@ -119,6 +131,8 @@ decoding):
 ```bash
 python3 tools/smoke.py HOST 8080                     # health, 60 frames, decode, GET /still
 curl -o poster.jpg 'http://HOST:8080/still?h=540'    # this rectangle's next frame as JPEG
+TLS=1 python3 tools/smoke.py HOST 443               # the same over HTTPS/WSS (TLS_CA=... to verify)
+python3 tools/tlscost.py HOST 8080 443 8 540 hi 10   # CPU and delay per stream, plain vs TLS
 Q=lo python3 tools/mosaic.py ...                     # any tool: Q=hi|std|lo picks the stream quality
 python3 tools/measure.py HOST 8080 8 136 240 1080    # fps per height, moving camera
 python3 tools/relaunch.py FCVM r1 <sbdf> TAG 5       # stop/start the VM, time to first frame

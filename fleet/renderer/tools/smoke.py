@@ -22,14 +22,14 @@ print("health", json.dumps(fc.health(host, port)))
 import urllib.error
 import urllib.request
 
-with urllib.request.urlopen(f"http://{host}:{port}/still?h=360&quality=85", timeout=20) as r:
+with fc.urlopen(fc.url(host, port, "/still?h=360&quality=85"), 20) as r:
     body, tile = r.read(), json.loads(r.headers["X-Fleet-Tile"])
     assert r.headers["Content-Type"] == "image/jpeg", r.headers["Content-Type"]
 assert body[:2] == b"\xff\xd8" and body[-2:] == b"\xff\xd9", "not a JPEG"
 assert tile["height"] == 360 and tile["width"] > 0, tile
 print("still", len(body), "bytes", tile)
 try:
-    urllib.request.urlopen(f"http://{host}:{port}/still?h=9", timeout=10)
+    fc.urlopen(fc.url(host, port, "/still?h=9"), 10)
     raise AssertionError("h=9 was accepted")
 except urllib.error.HTTPError as e:
     assert e.code == 400, e.code

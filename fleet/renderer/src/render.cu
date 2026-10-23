@@ -345,11 +345,19 @@ __device__ float cloud_shadow(V3 p, V3 l) {
   if (l.y <= 0.01f) return 1.0f;
   float t0 = sphere_near(p, l, CLOUD_BASE), t1 = sphere_near(p, l, CLOUD_TOP);
   if (t0 < 0.0f || t1 < 0.0f) return 1.0f;
+  // A low sun crosses 20 km or more of the layer, and five samples that far
+  // apart found a cloud on almost every path, shading whole plains at once.
+  // The shadow is taken from the first 8 km of the crossing, sampled every
+  // 1.6 km at most: the clouds nearest the ground cast it, with the gaps
+  // between them left lit.
+  t1 = fminf(t1, t0 + 8.0f);
   float od = 0.0f;
   const int N = 5;
   float ds = (t1 - t0) / N;
   for (int k = 0; k < N; k++) od += cloud_density(p + l * (t0 + (k + 0.5f) * ds), false) * ds;
-  return __expf(-od * 0.7f);
+  // a cumulus passes on 10 to 20% of the sunlight as diffuse light even where
+  // no direct ray gets through
+  return 0.14f + 0.86f * __expf(-od * 0.7f);
 }
 
 struct CloudOut {
@@ -485,7 +493,12 @@ __device__ Macro macro_smooth(V2 p) {
   return r;
 }
 __device__ __forceinline__ float terrain_s(V2 p, int oct) { return terrain_from(p, macro_smooth(p), oct, cG.noise); }
-__device__ __forceinline__ float ground_h(V2 p, int oct) { return fmaxf(terrain(p, oct), 0.0f); }
+// Terrain, or the water over it (the sea at 0, lakes in basins).
+__device__ __forceinline__ float ground_h(V2 p, int oct) {
+  float w;
+  float g = terrain_from(p, macro_at(p), oct, cG.noise, &w);
+  return fmaxf(g, w);
+}
 
 __global__ void k_macro(float4* out) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y;
@@ -529,6 +542,8 @@ __device__ float march_terrain(V3 o, V3 d, float tmin, float tmax, int max_steps
 }
 
 // 1 if the sun (direction l) is visible from p over the terrain.
+__device__ float ring_cover(V3 o, V3 d);  // the orbital ring's opacity along a ray (below)
+
 __device__ float terrain_shadow(V3 p, V3 l) {
   float t = 0.004f;
   for (int i = 0; i < 44; i++) {
@@ -579,7 +594,7 @@ __device__ Material terrain_material(V3 p, float h, V3 n) {
   float wf = smoothstepf(-0.05f, 0.35f, fo) * smoothstepf(0.84f, 0.92f, slope) *
              (1.0f - smoothstepf(0.6f, 1.0f, h + 0.3f * v)) * smoothstepf(0.02f, 0.06f, h);
   float canopy = 0.75f + 0.5f * noise(q * 160.0f, cG.noise);
-  veg = mix(veg, v3(0.068f, 0.105f, 0.042f) * canopy, wf * 0.85f);
+  veg = mix(veg, v3(0.085f, 0.125f, 0.05f) * canopy, wf * 0.85f);
   float wg = smoothstepf(0.76f, 0.86f, slope + 0.05f * v2_) * (1.0f - smoothstepf(1.45f, 1.85f, h + v * 0.3f));
   V3 a = mix(rock, veg, wg);
   V3 sand = v3(0.62f, 0.55f, 0.42f);
@@ -615,14 +630,19 @@ __device__ V3 sun_sample(float u1, float u2) {
 }
 
 __device__ float ggx_spec(V3 n, V3 v, V3 l, float rough, float f0) {
-  V3 h = normalize(v + l);
+  V3 hv = v + l;
+  float hl = dot(hv, hv);
+  if (hl < 1e-12f) return 0.0f;  // looking straight at the sun past the point: no half vector
+  V3 h = hv * rsqrtf(hl);
   float nh = fmaxf(dot(n, h), 0.0f), nl = fmaxf(dot(n, l), 0.0f), nv = fmaxf(dot(n, v), 1e-3f);
   float a = rough * rough, a2 = a * a;
   float dd = nh * nh * (a2 - 1.0f) + 1.0f;
   float D = a2 / (PI_F * dd * dd);
   float k = a * 0.5f;
   float G = (nl / (nl * (1 - k) + k)) * (nv / (nv * (1 - k) + k));
-  float F = f0 + (1.0f - f0) * powf(1.0f - fmaxf(dot(h, v), 0.0f), 5.0f);
+  // clamped: with the sun straight behind the eye dot(h, v) rounds to just over
+  // 1, and the fast-math powf of a negative base is NaN
+  float F = f0 + (1.0f - f0) * powf(sat(1.0f - dot(h, v)), 5.0f);
   return D * G * F / (4.0f * nv) ;  // already multiplied by nl via G/nl cancellation
 }
 
@@ -670,7 +690,7 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   V3 Es = sun_at(p);
   if (nl > 0.0f && Es.x + Es.y + Es.z > 1e-4f) {
     float vis = full ? terrain_shadow(p + n * 0.003f, l) : 1.0f;
-    if (vis > 0.0f) vis *= cloud_shadow(p, l);
+    if (vis > 0.0f) vis *= cloud_shadow(p, l) * (1.0f - ring_cover(p, l));
     float spec = ggx_spec(n, v, l, m.rough, 0.03f);
     L += Es * (vis * (nl / PI_F)) * m.albedo + Es * (vis * spec);
   }
@@ -682,7 +702,7 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   // at once: black patches); farther out march_oct lowers them
   float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 32, 9, 0.004f) : -1.0f;
   if (th < 0.0f) {
-    Lin = sky_lookup(bd) * (1.0f - 0.35f * sat(bd.y * 2.0f));  // clouds shade part of the sky
+    Lin = sky_lookup(bd);
   } else {
     V3 q = p + n * 0.004f + bd * th;
     float h2 = terrain(v2(q.x, q.z), 6);
@@ -745,31 +765,80 @@ __device__ float ring_hit(V3 o, V3 d) {
   return -1.0f;
 }
 
-__device__ V3 ring_shade(V3 o, V3 d, float t) {
+// Where a point of the band lies on it: u across the band (0 at one rail, 1
+// at the other) and phi around it (radians).
+__device__ __forceinline__ V2 ring_uv(V3 c, V3 a) {
+  float h = dot(c, a);
+  V3 radial = normalize(c - a * h);
+  V3 b = normalize(cross(a, radial));
+  V3 e = normalize(cross(b, a));
+  return v2(h / RING_W + 0.5f, atan2f(dot(c, b), dot(c, e)));
+}
+
+// The band's structure across its width: two rails, lattice lanes at the
+// edges, two open gaps crossed by trusses, solar lanes and plated lanes.
+// Returns the opacity; *kind is 0 plate, 1 solar, 2 rail, 3 lattice.
+__device__ float ring_alpha(V2 uv, int* kind) {
+  float u = uv.x;
+  float spoke = fractf(uv.y * (180.0f / PI_F) * 2.0f);  // trusses every half degree
+  bool truss = spoke < 0.06f;
+  *kind = 0;
+  if (u < 0.02f || u > 0.98f) { *kind = 2; return 1.0f; }
+  if (u < 0.12f || u > 0.88f) {  // lattice: a grid of beams with sky between them
+    *kind = 3;
+    float g = fractf(uv.y * (180.0f / PI_F) * 20.0f), k = fractf(u * 50.0f);
+    return (g < 0.18f || k < 0.18f || truss) ? 0.9f : 0.12f;
+  }
+  if ((u > 0.19f && u < 0.23f) || (u > 0.71f && u < 0.75f)) return truss ? 0.9f : 0.0f;  // open gaps
+  if ((u > 0.30f && u < 0.47f) || (u > 0.53f && u < 0.64f)) { *kind = 1; return 1.0f; }
+  return 1.0f;
+}
+
+// Opacity of the band along o + d*s (0 where nothing is hit).
+__device__ float ring_cover(V3 o, V3 d) {
+  float t = ring_hit(o, d);
+  if (t <= 0.0f) return 0.0f;
+  V3 p = o + d * t;
+  int k;
+  return ring_alpha(ring_uv(v3(p.x, p.y + PLANET_R, p.z), ring_axis()), &k);
+}
+
+__device__ V3 ring_shade(V3 o, V3 d, float t, float* alpha) {
   V3 a = ring_axis();
   V3 p = o + d * t;
   V3 c = v3(p.x, p.y + PLANET_R, p.z);
-  float h = dot(c, a);
-  V3 radial = normalize(c - a * h);
+  V2 uv = ring_uv(c, a);
+  int kind;
+  *alpha = ring_alpha(uv, &kind);
+  V3 radial = normalize(c - a * dot(c, a));
   V3 n = dot(radial, d) > 0.0f ? -radial : radial;  // the face toward the viewer
-  // panels: seams every 0.02 degrees around, and along the band
-  V3 b = normalize(cross(a, radial));
-  float phi = atan2f(dot(c, b), dot(c, normalize(cross(b, a))));
-  float panel = fractf(phi * 2865.0f), lane = fractf((h / RING_W + 0.5f) * 5.0f);
-  float seam = smoothstepf(0.0f, 0.04f, panel) * smoothstepf(1.0f, 0.96f, panel) * smoothstepf(0.0f, 0.08f, lane) *
-               smoothstepf(1.0f, 0.92f, lane);
-  V3 alb = v3(0.7f, 0.71f, 0.75f) * (0.55f + 0.45f * seam);
+  // plates: seams every 0.02 degrees around and five across each lane; each
+  // plate a slightly different shade
+  float pa = uv.y * 2865.0f;
+  float panel = fractf(pa), lane = fractf(uv.x * 25.0f);
+  float seam = smoothstepf(0.0f, 0.05f, panel) * smoothstepf(1.0f, 0.95f, panel) * smoothstepf(0.0f, 0.1f, lane) *
+               smoothstepf(1.0f, 0.9f, lane);
+  float shade = 0.85f + 0.3f * u01(hash_u32((uint32_t)(int)floorf(pa) * 31u + (uint32_t)(int)floorf(uv.x * 25.0f)));
+  V3 alb;
+  float rough, f0;
+  if (kind == 1) { alb = v3(0.05f, 0.07f, 0.13f); rough = 0.12f; f0 = 0.06f; }        // solar lanes
+  else if (kind == 2) { alb = v3(0.85f, 0.83f, 0.8f); rough = 0.25f; f0 = 0.5f; }   // rails
+  else if (kind == 3) { alb = v3(0.45f, 0.44f, 0.43f); rough = 0.5f; f0 = 0.04f; }  // lattice
+  else { alb = v3(0.72f, 0.71f, 0.7f) * shade; rough = 0.45f; f0 = 0.04f; }         // plates
+  alb = alb * (0.6f + 0.4f * seam);
   // in the planet's shadow?
   V3 l = cP.sun_dir;
   float bb = dot(c, l), cc = dot(c, c) - PLANET_R * PLANET_R;
   bool lit = !(bb < 0.0f && bb * bb - cc > 0.0f);
   float nl = fmaxf(dot(n, l), 0.0f);
-  V3 col = lit ? cP.sun_e * alb * (nl / PI_F + 0.25f * powf(fmaxf(dot(reflect(d, n), l), 0.0f), 24.0f)) : v3(0.0f);
+  V3 v = -d;
+  V3 col = lit ? cP.sun_e * (alb * (nl / PI_F) + v3(ggx_spec(n, v, l, rough, f0))) : v3(0.0f);
   // lights along the seams, brightest on its dark side
-  float lights = (1.0f - seam) * (lit ? 0.15f : 1.0f);
+  float lights = (1.0f - seam) * (kind == 0 ? 1.0f : 0.3f) * (lit ? 0.12f : 1.0f);
   col += v3(1.0f, 0.75f, 0.45f) * (0.8f * lights);
-  // light from the planet's day side below it
-  col += alb * cP.sun_e * (0.03f * sat(cP.sun_dir.y * 4.0f + 0.3f));
+  // light from the planet's day side below it: the inner face sees a
+  // hemisphere of sunlit ground and cloud (albedo about 0.3)
+  col += alb * cP.sun_e * (0.12f * sat(cP.sun_dir.y * 4.0f + 0.3f));
   return col;
 }
 
@@ -778,37 +847,53 @@ __device__ V3 sky_ray(V3 o, V3 d, bool with_sun) {
   V3 T;
   int n = sph_alt(o) > 15.0f ? 40 : 24;  // the limb seen from high up is a long path
   V3 L = scatter(o, d, fmaxf(tt, 1.0f), n, &T);
+  V3 behind = stars(d);
+  if (with_sun) behind += sun_disc(d);
   float tr = ring_hit(o, d);
-  if (tr > 0.0f) return L + ring_shade(o, d, tr) * T;  // the ring hides the sun and stars behind it
-  if (with_sun) L += sun_disc(d) * T;
-  L += stars(d) * T;
-  return L;
+  if (tr > 0.0f) {  // the ring, over the sun and stars where it is opaque
+    float al;
+    V3 rc = ring_shade(o, d, tr, &al);
+    behind = rc * al + behind * (1.0f - al);
+  }
+  return L + behind * T;
 }
 
-// Water at p (on the sea surface).
-__device__ V3 shade_water(V3 p, V3 rd, float t, Rng& rng, bool full) {
+// Water at p (on the sea, or on a lake at `level`).
+__device__ V3 shade_water(V3 p, V3 rd, float t, float level, Rng& rng, bool full) {
   V2 q = v2(p.x, p.z) * 70.0f;
   float wt = cP.wave_t;
   V3 n1 = noised(q + v2(wt, 0.35f * wt), cG.noise);
   V3 n2 = noised(oct_step(q) * 1.3f + v2(-0.6f * wt, wt), cG.noise);
   V3 n3 = noised(q * 0.21f + v2(0.2f * wt, -0.1f * wt), cG.noise);
   V2 g = v2(n1.y + n2.y * 0.7f + n3.y * 1.5f, n1.z + n2.z * 0.7f + n3.z * 1.5f);
-  float s = 0.05f / (1.0f + t * 0.35f);
+  // gusts: patches a few hundred metres across where the wind roughens the
+  // water and calm ones that mirror, which still read from kilometres away
+  float gust = smoothstepf(-0.2f, 0.5f, noise(v2(p.x, p.z) * 2.2f + v2(0.15f * wt, 0.05f * wt), cG.noise));
+  float s = (0.025f + 0.06f * gust) / (1.0f + t * 0.35f);
   V3 n = normalize(v3(-g.x * s, 1.0f, -g.y * s));
+  // ripples smaller than the pixel blur the reflection instead: tilt the
+  // normal by a random amount that grows with distance and gusts
+  {
+    float rough = (0.004f + 0.01f * gust) * fminf(t, 20.0f);
+    float u1 = rng.next(), u2 = rng.next();
+    float r = rough * sqrtf(u1), ang = 6.2831853f * u2;
+    n = normalize(n + v3(r * cosf(ang), 0.0f, r * sinf(ang)));
+  }
   V3 v = -rd;
   float cv = fmaxf(dot(n, v), 0.0f);
-  float F = 0.02f + 0.98f * powf(1.0f - cv, 5.0f);
+  float F = 0.02f + 0.98f * powf(sat(1.0f - cv), 5.0f);
   V3 r = reflect(rd, n);
   if (r.y < 0.004f) r = normalize(v3(r.x, 0.004f, r.z));
   // reflection
   V3 R;
   float tr = full ? march_terrain(p + v3(0, 0.0005f, 0), r, 0.0f, 80.0f, 56, 6, 0.002f) : -1.0f;
   if (tr >= 0.0f) {
+    // the reflected slope: its material in sun and sky light, without shadows
     V3 qh = p + r * tr;
     float h2 = terrain(v2(qh.x, qh.z), 6);
     V3 n2 = terrain_normal(qh, fmaxf(0.004f, tr * 0.002f), 6);
     Material m2 = terrain_material(qh, h2, n2);
-    V3 Ls = sun_at(qh) * (fmaxf(dot(n2, cP.sun_dir), 0.0f) / PI_F) + sky_lookup(v3(0, 1, 0)) * 0.7f;
+    V3 Ls = sun_at(qh) * (fmaxf(dot(n2, cP.sun_dir), 0.0f) / PI_F) + sky_lookup(n2.y > 0.0f ? n2 : v3(0, 1, 0));
     V3 Tair;
     V3 ins = scatter(p, r, tr, 6, &Tair);
     R = m2.albedo * Ls * Tair + ins;
@@ -821,18 +906,21 @@ __device__ V3 shade_water(V3 p, V3 rd, float t, Rng& rng, bool full) {
   }
   // glitter of the sun
   V3 l = sun_sample(rng.next(), rng.next());
-  float vis = (full && l.y > 0.0f) ? terrain_shadow(p + v3(0, 0.002f, 0), l) * cloud_shadow(p, l) : 1.0f;
+  float vis = (full && l.y > 0.0f) ? terrain_shadow(p + v3(0, 0.002f, 0), l) * cloud_shadow(p, l) * (1.0f - ring_cover(p, l)) : 1.0f;
   V3 spec = sun_at(p) * (ggx_spec(n, v, l, fminf(0.07f + 0.004f * t, 0.3f), 0.02f) * vis);
   // body of the water: seabed seen through absorbing water
-  float depth_m = fmaxf(-terrain(v2(p.x, p.z), 7), 0.0f) * 1000.0f;
+  float depth_m = fmaxf(level - terrain(v2(p.x, p.z), 7), 0.0f) * 1000.0f;
   V3 sigma = v3(0.32f, 0.055f, 0.028f);  // per metre
   V3 path = vexp(sigma * (-2.2f * fminf(depth_m, 300.0f)));
   V3 Ein = sun_at(p) * (fmaxf(cP.sun_dir.y, 0.0f) / PI_F) + sky_lookup(v3(0, 1, 0)) * 0.8f;
   V3 bed = v3(0.55f, 0.5f, 0.38f) * Ein;
   V3 deep = v3(0.004f, 0.020f, 0.032f) * Ein * 3.0f;
   V3 body = bed * path + deep * (v3(1.0f) - path);
-  // foam on the shore
-  float foam = smoothstepf(1.6f, 0.0f, depth_m) * sat(noise(v2(p.x, p.z) * 520.0f + v2(wt * 3.0f, 0.0f), cG.noise) * 1.5f + 0.4f);
+  // foam on the shore: surf on the sea, a thin bright line on lakes; the band
+  // widens with distance so the shore still shows as a line a pixel or so wide
+  float band = 1.6f + 2.2f * t;  // metres of depth
+  float foam = smoothstepf(band, 0.0f, depth_m) * sat(noise(v2(p.x, p.z) * 520.0f + v2(wt * 3.0f, 0.0f), cG.noise) * 1.5f + 0.4f);
+  if (level > 0.0f) foam *= 0.45f;
   body = mix(body, Ein * 0.75f, foam);
   return body * (1.0f - F) + R * F + spec;
 }
@@ -840,14 +928,14 @@ __device__ V3 shade_water(V3 p, V3 rd, float t, Rng& rng, bool full) {
 struct Hit {
   V3 L;
   float dist;  // primary distance, 1e9 for sky
-  float id;    // 0 sky, 1 land, 2 water
+  float id;    // 0 sky, 1 land, 2 water (what lies behind any cloud)
 };
 
 // One thread: how much of the sun the camera sees (terrain, then clouds).
 __global__ void k_sunvis() {
   V3 o = cP.cam.pos;
   float v = cP.sun_dir.y > -0.1f ? terrain_shadow(o, cP.sun_dir) : 0.0f;
-  if (v > 0.0f) v *= cloud_shadow(o, cP.sun_dir);
+  if (v > 0.0f) v *= cloud_shadow(o, cP.sun_dir) * (1.0f - ring_cover(o, cP.sun_dir));
   g_sunvis = v;
 }
 
@@ -862,10 +950,10 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
   V3 L;
   if (th >= 0.0f) {
     V3 p = o + d * th;
-    float h = terrain(v2(p.x, p.z), 8);
-    if (h <= 0.0f) {
-      p = o + d * th;
-      L = shade_water(p, d, th, rng, true);
+    float wl;
+    float h = terrain_from(v2(p.x, p.z), macro_at(v2(p.x, p.z)), 8, cG.noise, &wl);
+    if (h <= wl) {
+      L = shade_water(p, d, th, wl, rng, true);
       hres.id = 2.0f;
     } else {
       L = shade_terrain(p, d, th, pix, rng, true);
@@ -887,6 +975,13 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
     V3 ins = scatter(o, d, c.depth, 8, &Ta);
     L = L * c.T + c.L * Ta + ins * (1.0f - c.T);
   }
+  // Where the cloud is most of what the pixel shows, its distance is the one
+  // that moves with the camera: reprojecting a near cloud through the terrain
+  // behind it (or through the sky, at infinity) smeared it across the window.
+  // The hit kind stays that of what lies behind it. Over land and water, where
+  // the depth also decides which texels count, only a nearly opaque cloud
+  // takes over: a thin one would split the ground into islands.
+  if (c.T < (hres.id == 0.0f ? 0.5f : 0.2f)) hres.dist = c.depth;
   hres.L = L;
   return hres;
 }
@@ -1125,10 +1220,14 @@ __global__ void k_hold(float4* hold_sum, float2* hold_aux, float4* ring, float2*
 }
 
 // Checkerboard frames: fill each pixel that has no samples (hit kind -1)
-// from its 8 neighbours that do, those of the first one's hit kind (in the
-// order left, right, up, down, then the diagonals), at half their weight. Only pixels of the
-// drawn region whose neighbours all lie in it are ever read afterwards, and
-// the image's edges are the same for every renderer, so the fill matches
+// from its 8 neighbours that do, at half their weight. Where a pair of
+// opposite neighbours (left-right, up-down, or a diagonal) both drew and share
+// a hit kind, the fill interpolates along the pair that differs least, so an
+// edge (a silhouette against the sky) is continued along its own direction
+// instead of being stepped. Otherwise it averages the neighbours of the first
+// one's hit kind (left, right, up, down, then the diagonals). Only pixels of
+// the drawn region whose neighbours all lie in it are ever read afterwards,
+// and the image's edges are the same for every renderer, so the fill matches
 // across tiles.
 __global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao) {
   int i = blockIdx.x * blockDim.x + threadIdx.x, j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1141,22 +1240,43 @@ __global__ void k_fill(const float4* c, const float2* a, float4* co, float2* ao)
     return;
   }
   // the 4 edge neighbours first, then the 4 diagonal ones (a stride-4 frame
-  // can leave a pixel with only a diagonal neighbour that drew)
-  const int dx[8] = {-1, 1, 0, 0, -1, 1, -1, 1}, dy[8] = {0, 0, -1, 1, -1, -1, 1, 1};
+  // can leave a pixel with only a diagonal neighbour that drew); entries 2k
+  // and 2k+1 are opposite each other
+  const int dx[8] = {-1, 1, 0, 0, -1, 1, 1, -1}, dy[8] = {0, 0, -1, 1, -1, 1, -1, 1};
+  float4 nc[8];
+  float2 na[8];
+  bool ok[8];
+  for (int k = 0; k < 8; k++) {
+    int ii = i + dx[k], jj = j + dy[k];
+    ok[k] = false;
+    if (ii < 0 || jj < 0 || ii >= cP.ew || jj >= cP.eh) continue;
+    int nidx = jj * cP.ew + ii;
+    na[k] = a[nidx];
+    if (na[k].y < 0.0f) continue;
+    nc[k] = c[nidx];
+    ok[k] = true;
+  }
+  // the pair along the edge: both drew, same kind, least difference
+  int best = -1;
+  float bcost = 1e30f;
+  for (int pr = 0; pr < 4; pr++) {
+    int k0 = 2 * pr, k1 = k0 + 1;
+    if (!ok[k0] || !ok[k1] || na[k0].y != na[k1].y) continue;
+    float l0 = lum(v3(nc[k0].x, nc[k0].y, nc[k0].z)), l1 = lum(v3(nc[k1].x, nc[k1].y, nc[k1].z));
+    float cost = fabsf(l0 - l1) / (l0 + l1 + 1e-4f);
+    if (na[k0].x < 1e8f) cost += fabsf(na[k0].x - na[k1].x) / (na[k0].x + na[k1].x);
+    if (cost < bcost) { bcost = cost; best = pr; }
+  }
   float id = -1.0f, n = 0.0f, dsum = 0.0f, wsum = 0.0f;
   V3 col = v3(0.0f);
   for (int k = 0; k < 8; k++) {
-    int ii = i + dx[k], jj = j + dy[k];
-    if (ii < 0 || jj < 0 || ii >= cP.ew || jj >= cP.eh) continue;
-    int nidx = jj * cP.ew + ii;
-    float2 na = a[nidx];
-    if (na.y < 0.0f) continue;
-    if (id < 0.0f) id = na.y;
-    if (na.y != id) continue;
-    float4 nc = c[nidx];
-    col += v3(nc.x, nc.y, nc.z);
-    wsum += nc.w;
-    dsum += na.x;
+    if (!ok[k]) continue;
+    if (best >= 0 && k / 2 != best) continue;
+    if (id < 0.0f) id = na[k].y;
+    if (na[k].y != id) continue;
+    col += v3(nc[k].x, nc[k].y, nc[k].z);
+    wsum += nc[k].w;
+    dsum += na[k].x;
     n += 1.0f;
   }
   if (n == 0.0f) {
@@ -1176,8 +1296,9 @@ struct Ring {
 
 // Resolve the tile's pixels. Moving: this frame's samples plus the previous
 // frames' (up to TEMPORAL_WINDOW - 1 of them) reprojected through this pixel's
-// first hit. A previous frame's texel counts only where its hit kind matches,
-// its distance agrees within 4%, and the displacement is within `guard`
+// first hit (a cloud, where it covers more than half the pixel). A previous
+// frame's texel counts only where its hit kind matches, its distance agrees
+// within 4% (on land and water), and the displacement is within `guard`
 // pixels; the rule names whole-image pixels only, and every texel it can read
 // lies in the drawn region, so the result is the same on every renderer that
 // drew the same frames. Hold: the hold's average, with the motion output it
@@ -1234,7 +1355,10 @@ __global__ void k_resolve(float4* resolved, const float4* hold_blend, const floa
         int e = (yy - cP.ey0) * cP.ew + (xx - cP.ex0);
         float2 a = hist.a[h][e];
         if (a.y != id) continue;
-        if (depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
+        // in the sky (clear, or a cloud over it) any texel of the same kind
+        // counts: a cloud's edge blends with the sky beside it instead of
+        // dropping its history
+        if (id != 0.0f && depth < 1e8f && fabsf(a.x - expect) > 0.04f * expect + 0.002f) continue;
         float4 hv = hist.c[h][e];
         hc += v3(hv.x, hv.y, hv.z) * w;
         ws += w;
@@ -1287,7 +1411,7 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
       }
     if (ws > 0.0f) color = mix(color, sum / ws, strength);
   }
-  color = overlay(cam.pos, d0, color, pix, depth);
+  color = overlay(cam.pos, d0, color, pix, ca.y == 0.0f ? 1e9f : depth);  // clouds in the sky do not hide words
   // sun glare: the sun's disc spread by the eye and lens, scaled by how much
   // of the sun the camera sees (one value per frame), so it is the same on
   // every tile and tile edges match
@@ -1302,6 +1426,9 @@ __global__ void k_finish(uint8_t* rgba, float4* hdr, const float4* resolved, con
   // tone map: ACES (fitted RRT + ODT), a warm/cool split, a light vignette in
   // whole-image coordinates, sRGB, dither by whole-image pixel
   V3 t = color * cP.exposure;
+  // lift the deepest shadows before the curve's toe crushes them: up to 1.5x
+  // below about 0.03 of the exposed range, nothing above 0.2
+  t = t * (1.0f + 0.5f * __expf(-lum(t) * (1.0f / 0.04f)));
   t = aces_fitted(t);
   float l = lum(t);
   t = t * mix(v3(0.96f, 0.99f, 1.06f), v3(1.05f, 1.0f, 0.93f), smoothstepf(0.1f, 0.7f, l));

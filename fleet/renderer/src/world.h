@@ -75,12 +75,16 @@ HD Macro macro_direct(V2 pw, const V4* tab) {
 
 // Terrain height (km above sea level, negative under the sea) at world xz.
 // `oct` sets the detail octaves of the eroded layer: more for shading normals,
-// fewer for distant marching.
-HD float terrain_from(V2 pw, Macro m, int oct, const V4* tab) {
+// fewer for distant marching. With `water`, also the water level there: 0
+// (the sea) except in mountain basins, where the floor is carved into a lake
+// bed and the lake's surface lies 6 m below the floor's level. That level is
+// built from the first two octaves only, so it is the same for every `oct` and
+// nearly flat across a lake (a few metres over a kilometre).
+HD float terrain_from(V2 pw, Macro m, int oct, const V4* tab, float* water = nullptr) {
   V2 q = pw * (1.0f / 4.5f) + m.w * 1.2f;
   // Eroded fbm: octaves are damped where the accumulated slope is steep, so
   // detail gathers in valleys and ridges stay sharp.
-  float a = 0.0f, amp = 1.0f;
+  float a = 0.0f, amp = 1.0f, a2 = 0.0f;
   V2 d = {0.0f, 0.0f};
   V2 qe = q;
   for (int i = 0; i < oct; i++) {
@@ -89,6 +93,7 @@ HD float terrain_from(V2 pw, Macro m, int oct, const V4* tab) {
     a += amp * n.x / (1.0f + dot(d, d));
     amp *= 0.48f;
     qe = oct_step(qe);
+    if (i == 1) a2 = a;
   }
   // Ridged noise for long crests.
   V2 r = q * 0.62f + v2(4.4f, -2.2f);
@@ -102,7 +107,16 @@ HD float terrain_from(V2 pw, Macro m, int oct, const V4* tab) {
   }
   float lowland = 0.13f + 0.08f * a;
   float mount = 0.2f + 1.5f * rid + 1.1f * a;
-  return mixf(-0.55f + 0.25f * a, lowland, m.land) + m.massif * fmaxf(mount, 0.0f) * 1.15f;
+  // basins: inside a massif where the mountain field falls below zero
+  float basin = m.massif * fminf(fmaxf(-mount * 3.0f, 0.0f), 1.0f);
+  if (water) *water = basin > 0.0f ? fmaxf(mixf(-0.55f + 0.25f * a2, 0.13f + 0.08f * a2, m.land) - 0.006f, 0.0f) : 0.0f;
+  return mixf(-0.55f + 0.25f * a, lowland, m.land) + m.massif * fmaxf(mount, 0.0f) * 1.15f - 0.045f * basin;
 }
 
-HD float terrain_h(V2 pw, int oct, const V4* tab) { return terrain_from(pw, macro_direct(pw, tab), oct, tab); }
+// The surface a ray or the camera meets: terrain, or water above it.
+HD float surface_h(V2 pw, int oct, const V4* tab) {
+  float w;
+  float g = terrain_from(pw, macro_direct(pw, tab), oct, tab, &w);
+  return fmaxf(g, w);
+}
+

@@ -6,6 +6,7 @@ import base64
 import json
 import os
 import socket
+import ssl
 import struct
 import time
 import urllib.request
@@ -21,9 +22,36 @@ def _recv_exact(s, n):
     return bytes(b)
 
 
+def _tls(tls=None):
+    return tls if tls is not None else os.environ.get("TLS") == "1"
+
+
+def _ctx():
+    ca = os.environ.get("TLS_CA")
+    return ssl.create_default_context(cafile=ca) if ca else ssl._create_unverified_context()
+
+
+def url(host, port, path, tls=None):
+    """http:// or, with TLS, https:// (IPv6 literals bracketed)."""
+    h = f"[{host}]" if ":" in host else host
+    return f"{'https' if _tls(tls) else 'http'}://{h}:{port}{path}"
+
+
+def urlopen(req, timeout, tls=None):
+    return urllib.request.urlopen(req, timeout=timeout, context=_ctx() if _tls(tls) else None)
+
+
+def _wrap(sock, host, tls):
+    """TLS when tls (or TLS=1 in the environment): verified against TLS_CA if set,
+    else unverified (test certificates); SNI from TLS_NAME, else the host."""
+    if not _tls(tls):
+        return sock
+    return _ctx().wrap_socket(sock, server_hostname=os.environ.get("TLS_NAME", host))
+
+
 class Stream:
-    def __init__(self, host, port, h, timeout=30.0, q=None):
-        self.s = socket.create_connection((host, port), timeout=timeout)
+    def __init__(self, host, port, h, timeout=30.0, q=None, tls=None):
+        self.s = _wrap(socket.create_connection((host, port), timeout=timeout), host, tls)
         key = base64.b64encode(os.urandom(16)).decode()
         q = q or os.environ.get("Q")  # stream quality: hi, std or lo
         req = (f"GET /frames?h={h}{'&q=' + q if q else ''} HTTP/1.1\r\nHost: {host}:{port}\r\nUpgrade: websocket\r\n"
@@ -97,15 +125,15 @@ def frames(host, port, h, count=None, until_t=None, timeout=30.0, q=None):
     return header, out
 
 
-def post_scene(host, port, scene, timeout=10.0):
-    req = urllib.request.Request(f"http://{host}:{port}/scene", data=json.dumps(scene).encode(),
+def post_scene(host, port, scene, timeout=10.0, tls=None):
+    req = urllib.request.Request(url(host, port, "/scene", tls), data=json.dumps(scene).encode(),
                                  headers={"Content-Type": "application/json"}, method="POST")
-    with urllib.request.urlopen(req, timeout=timeout) as r:
+    with urlopen(req, timeout, tls) as r:
         return json.loads(r.read())
 
 
-def health(host, port, timeout=5.0):
-    with urllib.request.urlopen(f"http://{host}:{port}/health", timeout=timeout) as r:
+def health(host, port, timeout=5.0, tls=None):
+    with urlopen(url(host, port, "/health", tls), timeout, tls) as r:
         return json.loads(r.read())
 
 
