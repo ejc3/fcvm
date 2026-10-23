@@ -20,6 +20,20 @@ async fn test_localhost_overlay_mode() -> Result<()> {
     run_localhost_test(Some("overlay"), "localhost-overlay").await
 }
 
+/// Overlay mode with a container user. The guest runs rootless podman as that user,
+/// which cannot open a store built by root podman (as it is when fcvm runs as root)
+/// unless fc-agent shows the store through an id-mapped mount.
+#[tokio::test]
+async fn test_localhost_overlay_mode_with_user() -> Result<()> {
+    run_localhost_test_with_kernel(
+        Some("overlay"),
+        None,
+        Some("1000:1000"),
+        "localhost-overlay-user",
+    )
+    .await
+}
+
 /// Test with archive mode (podman load at boot)
 #[tokio::test]
 async fn test_localhost_archive_mode() -> Result<()> {
@@ -29,7 +43,7 @@ async fn test_localhost_archive_mode() -> Result<()> {
 /// Test with btrfs mode (pre-built btrfs image as graphroot, requires btrfs kernel)
 #[tokio::test]
 async fn test_localhost_btrfs_mode() -> Result<()> {
-    run_localhost_test_with_kernel(Some("btrfs"), Some("btrfs"), "localhost-btrfs").await
+    run_localhost_test_with_kernel(Some("btrfs"), Some("btrfs"), None, "localhost-btrfs").await
 }
 
 /// Test with default mode (auto-detect, should be overlay without btrfs kernel)
@@ -46,12 +60,13 @@ fn image_name_for_suffix(suffix: &str) -> String {
 }
 
 async fn run_localhost_test(image_mode: Option<&str>, suffix: &str) -> Result<()> {
-    run_localhost_test_with_kernel(image_mode, None, suffix).await
+    run_localhost_test_with_kernel(image_mode, None, None, suffix).await
 }
 
 async fn run_localhost_test_with_kernel(
     image_mode: Option<&str>,
     kernel_profile: Option<&str>,
+    user: Option<&str>,
     suffix: &str,
 ) -> Result<()> {
     let mode_label = image_mode.unwrap_or("default (auto-detect)");
@@ -84,6 +99,10 @@ async fn run_localhost_test_with_kernel(
     if let Some(profile) = kernel_profile {
         args.push("--kernel-profile");
         args.push(profile);
+    }
+    if let Some(user) = user {
+        args.push("--user");
+        args.push(user);
     }
     args.push(&image_name);
 

@@ -347,6 +347,22 @@ fn guest_path_of_spec(spec: &str) -> Option<&str> {
 /// fc-agent source and fails when the two differ.
 pub(crate) const IMAGE_STORE_MOUNT_POINT: &str = "/mnt/image-store";
 
+/// Where fc-agent mounts the image disk itself when the container runs as a non-root
+/// user, binding it at `IMAGE_STORE_MOUNT_POINT` through an id-mapped mount
+/// (`IMAGE_STORE_RAW_PATH` in fc-agent/src/container.rs). It too is created after
+/// the volumes are mounted.
+pub(crate) const IMAGE_STORE_RAW_MOUNT_POINT: &str = "/run/fcvm-image-store-raw";
+
+/// Whether the container of `args` runs as a non-root user, which fc-agent sets up
+/// for a `--user` whose uid is not 0.
+fn runs_as_non_root_user(args: &RunArgs) -> bool {
+    args.user
+        .as_deref()
+        .and_then(|spec| spec.split(':').next())
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .is_some_and(|uid| uid != 0)
+}
+
 /// The parsed `--map` arguments of a run, once no mount point of the run lies
 /// inside a read-only map that does not have it
 /// (`check_mount_points_inside_read_only_maps`).
@@ -410,7 +426,20 @@ fn guest_mount_points(
             IMAGE_STORE_MOUNT_POINT.to_string(),
         )
     });
-    maps.chain(others).chain(image_store).collect()
+    let image_store_raw = (mounts_image_store && runs_as_non_root_user(args)).then(|| {
+        (
+            format!(
+                "fcvm mounts the image disk of {} for user {} in the guest",
+                args.image,
+                args.user.as_deref().unwrap_or_default()
+            ),
+            IMAGE_STORE_RAW_MOUNT_POINT.to_string(),
+        )
+    });
+    maps.chain(others)
+        .chain(image_store)
+        .chain(image_store_raw)
+        .collect()
 }
 
 /// Refuse a mount point at or under a `--pmem` mount point, and an NFS share or the image
@@ -904,6 +933,45 @@ mod tests {
         assert_eq!(guest_path_of_spec("/images/a.raw"), None);
     }
 
+    /// A container that runs as a non-root user gets its image disk mounted at
+    /// `IMAGE_STORE_RAW_MOUNT_POINT` and bound at the image store, so the host lists
+    /// that mount point too; root, and a run with no user, mount the disk at the store.
+    #[test]
+    fn a_non_root_user_adds_the_raw_image_store_mount_point() {
+        for (user, listed) in [
+            (Some("1000:1000"), true),
+            (Some("0:0"), false),
+            (None, false),
+        ] {
+            let mut argv = Vec::new();
+            if let Some(user) = user {
+                argv.extend(["--user", user]);
+            }
+            argv.push("localhost/app:latest");
+            let args = parse_run(&argv);
+            let points = guest_mount_points(&args, &[], true);
+            assert_eq!(
+                points
+                    .iter()
+                    .any(|(_, guest)| guest == IMAGE_STORE_RAW_MOUNT_POINT),
+                listed,
+                "--user {user:?}: {points:?}"
+            );
+            assert!(
+                points
+                    .iter()
+                    .any(|(_, guest)| guest == IMAGE_STORE_MOUNT_POINT),
+                "--user {user:?}: {points:?}"
+            );
+            assert!(
+                !guest_mount_points(&args, &[], false)
+                    .iter()
+                    .any(|(_, guest)| guest == IMAGE_STORE_RAW_MOUNT_POINT),
+                "--user {user:?}: no image store, no raw mount point"
+            );
+        }
+    }
+
     /// The host's list of mount points is fc-agent's. Besides the mount points
     /// of the plan's volumes, disks and NFS shares (fc-agent/src/mounts.rs),
     /// the one directory fc-agent creates with an error that fails the boot is
@@ -927,21 +995,32 @@ mod tests {
                 .collect()
         };
 
-        let image_store = format!("let mount_path = \"{IMAGE_STORE_MOUNT_POINT}\";");
         let container = read("container.rs");
+        for constant in [
+            format!("pub const IMAGE_STORE_PATH: &str = \"{IMAGE_STORE_MOUNT_POINT}\";"),
+            format!("pub const IMAGE_STORE_RAW_PATH: &str = \"{IMAGE_STORE_RAW_MOUNT_POINT}\";"),
+        ] {
+            assert!(
+                container.contains(&constant),
+                "fc-agent's image store paths differ from the host's. Expected in \
+                 fc-agent/src/container.rs: {constant}"
+            );
+        }
         let mount_overlay_image = &container[container
             .find("pub fn mount_overlay_image(")
             .expect("mount_overlay_image is in container.rs")..];
         let mount_overlay_image =
             &mount_overlay_image[..mount_overlay_image.find("\n}\n").unwrap()];
         assert!(
-            mount_overlay_image.contains(&image_store),
-            "fc-agent does not mount the image store at {IMAGE_STORE_MOUNT_POINT}. Expected \
-             line in mount_overlay_image: {image_store}"
+            mount_overlay_image.contains("let mount_path = IMAGE_STORE_PATH;"),
+            "fc-agent does not mount the image store at IMAGE_STORE_PATH"
         );
         assert_eq!(
             fatal_creations("container.rs"),
-            ["std::fs::create_dir_all(mount_path).context(\"creating image store mount point\")?;"],
+            [
+                "std::fs::create_dir_all(mount_path).context(\"creating image store mount point\")?;",
+                "std::fs::create_dir_all(IMAGE_STORE_RAW_PATH)",
+            ],
             "fc-agent/src/container.rs creates another directory whose failure fails the boot. \
              If it does so after the volumes are mounted, add it to guest_mount_points"
         );
