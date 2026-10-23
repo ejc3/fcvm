@@ -159,9 +159,11 @@ the largest part of a create after the restore.
 ### With the startup snapshot taken at the container's start
 
 `fcvm serve` gives no `--health-check`, so until then it only restored the pre-start
-snapshot and every create started its container with `podman run` in the guest. Since then a
-run takes the startup snapshot at its first Healthy whatever decides it, and an identical
-later create restores the container already running. Same host type, same quiet-box gate
+snapshot and every create started its container with `podman run` in the guest. Since then
+serve passes `--startup-snapshot`: a run takes the startup snapshot at its first Healthy
+(here the container's start), and an identical later create restores the container already
+running. A plain `podman run` takes none unless it passes the flag (README, "Startup
+Snapshots"). Same host type, same quiet-box gate
 (1-minute load 0.17 to 0.95 at the eight starts), arms alternating, with all system snapshots
 removed before each measurement so neither arm reuses the other's: before at `e8ecb178`, after
 at `f0449371`. Every timed create of the after arm restored the startup snapshot. TTI in ms,
