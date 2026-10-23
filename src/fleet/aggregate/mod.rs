@@ -9,8 +9,14 @@
 //! shared state.
 //!
 //! The layout (region, tiles, scene epoch) arrives as `POST /layout` from whoever runs the
-//! aggregator: the agent for its host's band, the coordinator for the EC2 half. A new
-//! layout restarts the pipeline; viewers then get a new header and a keyframe.
+//! aggregator: the agent for its host's band, the coordinator for the EC2 half. A layout of
+//! a newer generation (a re-tile, taking effect at frame `from_frame`) is swapped in the way
+//! the page swaps tiles: the old pipeline keeps composing up to the frame before
+//! `from_frame`, while a new pipeline subscribes to the new tiles and waits until every one
+//! of them has delivered a frame at or after `from_frame` (or `swap_wait` has passed); then
+//! the new pipeline takes over at once, from a frame every tile has. Viewers get a new header
+//! and a keyframe at the swap, and never a frame mixing generations. A layout of the same
+//! generation (a renderer URL changed) replaces the pipeline at once.
 
 pub mod child;
 pub mod codec;
@@ -35,7 +41,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -53,6 +59,11 @@ pub struct Layout {
     pub image_aspect: f64,
     pub region: Rect,
     pub tiles: Vec<TileSpec>,
+    /// The layout generation, and the frame (k = 30 t) it takes effect at.
+    #[serde(default)]
+    pub generation: u64,
+    #[serde(default)]
+    pub from_frame: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -67,6 +78,9 @@ pub struct Options {
     /// A tile with no frame for the slot shows its newest older one up to this many slots
     /// back, else black.
     pub hold_slots: i64,
+    /// How long past a new generation's frame (or its arrival, if later) the old composite
+    /// is kept for a new tile that has delivered nothing; then the new one starts without it.
+    pub swap_wait: Duration,
     pub encode: EncodeParams,
 }
 
@@ -78,6 +92,7 @@ impl Default for Options {
             tile_query: "q=hi".into(),
             late: Duration::from_millis(150),
             hold_slots: 3,
+            swap_wait: Duration::from_secs(2),
             encode: EncodeParams::default(),
         }
     }
@@ -275,7 +290,50 @@ struct Held {
     decoded: Instant,
 }
 
-/// Run the aggregator until cancelled: one pipeline per layout.
+/// A running pipeline and the controls the swap uses.
+struct Live {
+    token: CancellationToken,
+    generation: u64,
+    /// Whether it publishes (a pipeline of a new generation starts warming, publishing
+    /// nothing).
+    publish: watch::Sender<bool>,
+    /// It composes slots before this one only.
+    until: watch::Sender<i64>,
+}
+
+fn start(
+    shared: &Arc<Shared>,
+    codec: &Arc<dyn Codec>,
+    opts: &Options,
+    layout: Layout,
+    publish: bool,
+) -> (Live, oneshot::Receiver<()>) {
+    let token = CancellationToken::new();
+    let (publish_tx, publish_rx) = watch::channel(publish);
+    let (until_tx, until_rx) = watch::channel(i64::MAX);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let gate = Gate {
+        publish: publish_rx,
+        until: until_rx,
+        ready: Some(ready_tx),
+    };
+    let live = Live {
+        token: token.clone(),
+        generation: layout.generation,
+        publish: publish_tx,
+        until: until_tx,
+    };
+    let (s, c, o) = (shared.clone(), codec.clone(), opts.clone());
+    tokio::spawn(async move {
+        if let Err(e) = pipeline(s, c, o, layout, gate, token).await {
+            tracing::warn!(error = %format!("{e:#}"), "aggregate pipeline stopped");
+        }
+    });
+    (live, ready_rx)
+}
+
+/// Run the aggregator until cancelled: one publishing pipeline per layout, and while a new
+/// generation warms up, its pipeline beside the old one.
 pub async fn run(
     shared: Arc<Shared>,
     codec: Arc<dyn Codec>,
@@ -283,35 +341,71 @@ pub async fn run(
     cancel: CancellationToken,
 ) {
     let mut layouts = shared.layout.subscribe();
+    let mut current: Option<Live> = None;
+    let mut warming: Option<(Live, oneshot::Receiver<()>)> = None;
+    let mut fresh = true;
     loop {
-        let layout = layouts.borrow_and_update().clone();
-        let generation = CancellationToken::new();
-        if let Some(l) = layout {
-            let (s, c, o, g) = (
-                shared.clone(),
-                codec.clone(),
-                opts.clone(),
-                generation.clone(),
-            );
-            tokio::spawn(async move {
-                if let Err(e) = pipeline(s, c, o, l, g).await {
-                    tracing::warn!(error = %format!("{e:#}"), "aggregate pipeline stopped");
+        if fresh {
+            fresh = false;
+            if let Some(l) = layouts.borrow_and_update().clone() {
+                // A newer layout supersedes one still warming.
+                if let Some((w, _)) = warming.take() {
+                    w.token.cancel();
                 }
-            });
+                match &current {
+                    Some(c) if l.generation > c.generation => {
+                        c.until.send_replace(l.from_frame);
+                        warming = Some(start(&shared, &codec, &opts, l, false));
+                    }
+                    _ => {
+                        if let Some(c) = current.take() {
+                            c.token.cancel();
+                        }
+                        current = Some(start(&shared, &codec, &opts, l, true).0);
+                    }
+                }
+            }
         }
+        let ready = async {
+            match warming.as_mut() {
+                Some((_, rx)) => rx.await.is_ok(),
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             r = layouts.changed() => {
-                generation.cancel();
                 if r.is_err() {
-                    return;
+                    break;
                 }
+                fresh = true;
             }
-            _ = cancel.cancelled() => {
-                generation.cancel();
-                return;
+            ok = ready => {
+                let (w, _) = warming.take().expect("a warming pipeline");
+                if !ok {
+                    // It stopped before it was ready; the old one stays.
+                    w.token.cancel();
+                    continue;
+                }
+                if let Some(c) = current.take() {
+                    c.token.cancel();
+                }
+                w.publish.send_replace(true);
+                current = Some(w);
             }
+            _ = cancel.cancelled() => break,
         }
     }
+    for l in current.into_iter().chain(warming.map(|(w, _)| w)) {
+        l.token.cancel();
+    }
+}
+
+/// What the swap tells a pipeline, and what it tells the swap.
+struct Gate {
+    publish: watch::Receiver<bool>,
+    until: watch::Receiver<i64>,
+    /// Sent once every tile has a frame at or after `from_frame`, or `swap_wait` passed.
+    ready: Option<oneshot::Sender<()>>,
 }
 
 fn wall_of(epoch_unix_ms: u64, k: i64, fps: u32) -> f64 {
@@ -323,6 +417,7 @@ async fn pipeline(
     codec: Arc<dyn Codec>,
     opts: Options,
     layout: Layout,
+    mut gate: Gate,
     cancel: CancellationToken,
 ) -> Result<()> {
     let g = geometry(layout.region, layout.image_aspect, opts.image_height);
@@ -360,6 +455,10 @@ async fn pipeline(
     let mut live = vec![false; n];
     let mut next: Option<i64> = None;
     let mut tick = tokio::time::interval(Duration::from_millis(5));
+    // A warming pipeline gives up waiting for a silent tile at this wall time.
+    let swap_by = (now_ms() as f64).max(wall_of(layout.epoch_unix_ms, layout.from_frame, opts.fps))
+        + opts.swap_wait.as_secs_f64() * 1000.0;
+    let streams: Vec<usize> = (0..n).filter(|i| layout.tiles[*i].url.is_some()).collect();
     loop {
         tokio::select! {
             _ = cancel.cancelled() => return Ok(()),
@@ -373,10 +472,13 @@ async fn pipeline(
                     frames[tile].clear();
                 }
                 Some(TileEvent::Frame { tile, k, pic, header, arrived, arrived_unix_ms }) => {
-                    if next.is_none() {
-                        next = Some(k);
+                    // Frames before the generation's frame belong to the old rectangles.
+                    if k >= layout.from_frame {
+                        if next.is_none() && *gate.publish.borrow() {
+                            next = Some(k);
+                        }
+                        frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms, decoded: Instant::now() });
                     }
-                    frames[tile].insert(k, Held { pic, header, arrived, arrived_unix_ms, decoded: Instant::now() });
                 }
                 None => {}
             },
@@ -432,6 +534,30 @@ async fn pipeline(
             }
             _ = tick.tick() => {}
         }
+        if !*gate.publish.borrow() {
+            // Warming: keep each tile's newest frames, and tell the swap once every tile has
+            // one at or after the generation's frame.
+            for f in frames.iter_mut() {
+                while f.len() as i64 > opts.hold_slots + 1 {
+                    f.pop_first();
+                }
+            }
+            let all = streams.iter().all(|i| !frames[*i].is_empty());
+            if all || now_ms() as f64 >= swap_by {
+                if let Some(r) = gate.ready.take() {
+                    let _ = r.send(());
+                }
+            }
+            continue;
+        }
+        if next.is_none() {
+            // Taking over: from the first slot every tile still holds.
+            next = frames
+                .iter()
+                .filter_map(|f| f.keys().next().copied())
+                .max()
+                .map(|k| k.max(layout.from_frame));
+        }
         // With no tile streaming, keep the region going in black on the slot clock.
         if next.is_none() && !live.iter().any(|l| *l) {
             let now_t = (now_ms() as f64 - layout.epoch_unix_ms as f64) / 1000.0;
@@ -439,6 +565,9 @@ async fn pipeline(
         }
         // Compose every slot that is complete or overdue.
         while let Some(k) = next {
+            if k >= *gate.until.borrow() {
+                break;
+            }
             let due = wall_of(layout.epoch_unix_ms, k, opts.fps) + opts.late.as_secs_f64() * 1000.0;
             let complete =
                 (0..n).all(|i| !live[i] || frames[i].keys().next_back().is_some_and(|m| *m >= k));

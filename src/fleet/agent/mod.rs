@@ -1,6 +1,7 @@
 //! `fcvm fleet agent`: runs one fcvm GPU VM per assigned slot on this host and reports
 //! to the coordinator over newline-delimited JSON on stdin and stdout.
 
+pub mod addr;
 pub mod dial;
 pub mod inventory;
 pub mod slot;
@@ -77,6 +78,11 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         fcvm_args.extend(tls::vm_args(&args.tls_dir));
         tokio::spawn(tls::run(secrets, secret.clone(), args.tls_dir.clone()));
     }
+    let ipv6_prefix = match (&args.ipv6_prefix, args.ipv6_prefix_from_imds) {
+        (Some(p), _) => Some(addr::Prefix::parse(p)?),
+        (None, true) => Some(addr::from_imds().await?),
+        (None, false) => None,
+    };
     let fcvm = match args.fcvm {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,
@@ -91,6 +97,8 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             image: args.image,
             extra_args: fcvm_args,
             frame_host: args.frame_host.unwrap_or_else(|| args.publish_ip.clone()),
+            ipv6_prefix,
+            frame_zone: args.frame_zone,
             publish_ip: args.publish_ip,
             sysfs_root: args.sysfs_root,
             start_timeout: Duration::from_secs(args.start_timeout_secs),
@@ -180,7 +188,11 @@ where
             .with_context(|| {
                 format!("--base-port {} leaves no port for GPU {i}", agent.base_port)
             })?;
-        ports.insert(g.sbdf.clone(), port);
+        let addr = match &agent.cfg.ipv6_prefix {
+            Some(p) => Some(p.slot_address(i)?),
+            None => None,
+        };
+        ports.insert(g.sbdf.clone(), (port, addr));
     }
     let (out, writer) = spawn_writer::<AgentMsg, _>(output, "coordinator");
     out.send(AgentMsg::Hello {
@@ -289,10 +301,19 @@ where
                             rect: a.rect?,
                             url: ports
                                 .get(&a.sbdf)
-                                .map(|p| format!("ws://{}:{p}/frames", cfg.health_host())),
+                                .map(|(p, _)| format!("ws://{}:{p}/frames", cfg.health_host())),
                         })
                     })
                     .collect(),
+                generation: placed
+                    .iter()
+                    .map(|a| a.layout_generation)
+                    .max()
+                    .unwrap_or(0),
+                from_frame: placed
+                    .iter()
+                    .max_by_key(|a| a.layout_generation)
+                    .map_or(0, |a| a.rect_from_frame),
             }),
             _ => None,
         };
@@ -330,7 +351,7 @@ fn assign(
     list: &[AssignSlot],
     slots: &mut BTreeMap<String, SlotHandle>,
     retired: &mut Vec<JoinHandle<()>>,
-    ports: &HashMap<String, u16>,
+    ports: &HashMap<String, (u16, Option<std::net::Ipv6Addr>)>,
     gpu_locks: &HashMap<String, Arc<Mutex<()>>>,
     cfg: &Arc<AgentCfg>,
     out: &mpsc::UnboundedSender<AgentMsg>,
@@ -382,7 +403,7 @@ fn assign(
             });
             continue;
         }
-        let (Some(&port), Some(lock)) = (ports.get(&a.sbdf), gpu_locks.get(&a.sbdf)) else {
+        let (Some(&(port, ipv6)), Some(lock)) = (ports.get(&a.sbdf), gpu_locks.get(&a.sbdf)) else {
             tracing::warn!(slot = %a.id, sbdf = %a.sbdf, "assigned a GPU this host does not have");
             let _ = out.send(AgentMsg::Slot(fleet_core::protocol::SlotReport {
                 id: a.id.clone(),
@@ -403,6 +424,7 @@ fn assign(
             id: a.id.clone(),
             sbdf: a.sbdf.clone(),
             port,
+            ipv6,
             cfg: cfg.clone(),
             out: out.clone(),
             gpu_lock: lock.clone(),

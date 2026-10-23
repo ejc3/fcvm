@@ -28,6 +28,11 @@ pub struct AgentCfg {
     pub extra_args: Vec<String>,
     pub publish_ip: String,
     pub frame_host: String,
+    /// The host's public IPv6 prefix: each slot runs routed at its own address in it.
+    pub ipv6_prefix: Option<super::addr::Prefix>,
+    /// With a zone, a slot's frame URL is `wss://<slot id>.<zone>/frames` (its DNS name,
+    /// TLS in the VM) instead of the publish address.
+    pub frame_zone: Option<String>,
     pub sysfs_root: PathBuf,
     pub start_timeout: Duration,
     pub stop_grace: Duration,
@@ -95,6 +100,8 @@ pub struct SlotCtx {
     pub id: String,
     pub sbdf: String,
     pub port: u16,
+    /// The slot's own IPv6 address, with `ipv6_prefix`.
+    pub ipv6: Option<std::net::Ipv6Addr>,
     pub cfg: Arc<AgentCfg>,
     pub out: mpsc::UnboundedSender<AgentMsg>,
     /// Held while the slot has a VM, so two slots can never run on one GPU.
@@ -137,13 +144,21 @@ impl SlotCtx {
             phase: phase.into(),
             generation,
             vm: Some(self.vm_name()),
-            frame_url: Some(frame_url(&self.cfg.frame_host, self.port)),
+            frame_url: Some(self.frame_url()),
             timings: timings.clone(),
             error,
             retry_in_ms: retry_in.map(ms),
-            ipv6: None,
+            ipv6: self.ipv6.map(|a| a.to_string()),
             ipv4: None,
         }));
+    }
+
+    /// The renderer's frame WebSocket as a browser opens it.
+    fn frame_url(&self) -> String {
+        match &self.cfg.frame_zone {
+            Some(zone) => format!("wss://{}.{zone}/frames", self.id),
+            None => frame_url(&self.cfg.frame_host, self.port),
+        }
     }
 
     /// Take the GPU out of rotation; the coordinator re-tiles around it.
@@ -560,7 +575,13 @@ async fn relaunch(
         name: ctx.vm_name(),
         sbdf: ctx.sbdf.clone(),
         publish: format!("{}:{}:8080", ctx.cfg.publish_ip, ctx.port),
-        extra_args: ctx.cfg.extra_args.clone(),
+        extra_args: match (&ctx.cfg.ipv6_prefix, ctx.ipv6) {
+            (Some(p), Some(a)) => super::addr::vm_args(p, a)
+                .into_iter()
+                .chain(ctx.cfg.extra_args.iter().cloned())
+                .collect(),
+            _ => ctx.cfg.extra_args.clone(),
+        },
         image: ctx.cfg.image.clone(),
     };
     let mut vm = Vm::spawn(&spec, &ctx.id).map_err(|e| Failure::Failed {

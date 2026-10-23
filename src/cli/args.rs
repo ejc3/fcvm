@@ -354,6 +354,20 @@ pub struct FleetAgentArgs {
     #[arg(long)]
     pub frame_host: Option<String>,
 
+    /// Run each slot's VM in fcvm's routed mode at `<prefix>::<GPU index + 2>` and report
+    /// that address (the coordinator writes it to `slot-<n>.<zone>`).
+    #[arg(long, conflicts_with = "ipv6_prefix_from_imds")]
+    pub ipv6_prefix: Option<String>,
+
+    /// Take the IPv6 prefix delegated to the instance's primary interface from IMDS.
+    #[arg(long)]
+    pub ipv6_prefix_from_imds: bool,
+
+    /// Report frame URLs as `wss://<slot id>.<zone>/frames` (the slot's DNS name and the
+    /// renderer's TLS port) instead of the publish address.
+    #[arg(long)]
+    pub frame_zone: Option<String>,
+
     /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
     #[arg(long)]
     pub gpus: Option<String>,

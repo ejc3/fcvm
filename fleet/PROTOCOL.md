@@ -618,10 +618,27 @@ The scene shared by every renderer, sent after the hello and whenever it changes
 agent posts `scene` plus the slot's `rect` to each running renderer as
 `POST http://<publish ip>:<port>/scene`, with the body
 `{"epoch_unix_ms", "rect", "layout_generation", "rect_from_frame", "previous_rect",
-"image_aspect", "camera", "time_of_day", "words", "lights"}`: the renderer draws
-`previous_rect` (when present) for frames before `rect_from_frame` and `rect` from it. The
+"image_aspect", "camera", "time_of_day", "words", "lights"}`. The
 coordinator posts the same body to each EC2 tile's renderer
 (`POST https://ec2-<n>.<zone>/scene`).
+
+The layout fields of that body, for the renderer (#1174 implements them):
+
+| field | meaning |
+|---|---|
+| `layout_generation` | the layout generation `rect` belongs to; it only grows (0 before the first) |
+| `rect_from_frame` | the frame index `k` (scene time `t = k / 30`, the same slots the renderer draws on) from which the renderer draws `rect` |
+| `previous_rect` | the rectangle the tile drew before this generation, or absent when the tile is new or did not move |
+| `rect` | the tile's rectangle from `rect_from_frame` on |
+
+For a frame `k < rect_from_frame` the renderer draws `previous_rect` when present (its
+streams keep the old tile size and crop until then); from `k >= rect_from_frame` it draws
+`rect`. With no `previous_rect`, it draws `rect` at once. A body that arrives after
+`rect_from_frame` (a late post, a relaunch) draws `rect` at once. Every renderer of the wall
+gets the same `rect_from_frame` for one generation, 45 frames (1.5 s) after the change, so
+every tile switches at one slot; the page and the aggregators swap their composites at that
+frame (see "Aggregator"). A new scene body with the same `layout_generation` and
+`rect_from_frame` does not restart the switch.
 
 ```json
 {"type": "budget", "budget": 707107, "t": 863.2}
@@ -682,25 +699,39 @@ fcvm fleet agent (--stdio | --dial <wss url> [--access-secret <secret>]) --image
                  [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
                  [--scrub] [--store-ready-file <path>] [--host-from-imds] [--secret-region <region>]
                  [--tls-secret <secret> [--tls-dir /run/fcvm-fleet/tls]]
+                 [--ipv6-prefix <prefix/len> | --ipv6-prefix-from-imds] [--frame-zone <zone>]
 ```
 
 `--host-from-imds` names the host by its EC2 instance id. `--tls-secret` hands the fleet's
-wildcard certificate to every renderer: the agent reads the secret (the format below,
-"Certificate") with the instance role, writes `fullchain.pem` and `key.pem` (mode 0600)
-into `--tls-dir`, maps that directory into each VM at `/run/fleet-tls` with
-`TLS_CERT_FILE` and `TLS_KEY_FILE` set, and reads the secret again every hour. The host
+wildcard certificate to every renderer in the renderer's TLS interface (its PROTOCOL.md,
+"TLS", round 6): the agent reads the secret (the format below, "Certificate") with the
+instance role, writes its `cert` and `key` as `tls.json` (a JSON object with those two
+fields, mode 0600, replaced by rename) into `--tls-dir`, maps that directory read-only into
+each VM at `/run/fleet-tls` with `TLS_CERT_FILE=/run/fleet-tls/tls.json` and
+`TLS_PORT=443`, and reads the secret again every hour. A renewal is a new file renamed into
+place; the renderer checks its file every 2 s and loads a new version for the connections
+that follow (the mapped directory's attribute cache is 1 s), so a renewal needs no
+restart.
+
+`--ipv6-prefix` (or `--ipv6-prefix-from-imds`: the prefix AWS delegates to the instance's
+primary interface, `Ipv6PrefixCount = 1`) runs each slot's VM in fcvm's routed mode at
+`<prefix>::<GPU index + 2>` (`--network routed --ipv6-prefix <prefix> --ipv6-address
+<addr>`; fcvm refuses the prefix's addresses 0 and 1). The slot keeps the address across
+relaunches and reports it as `ipv6` in every slot message; the coordinator writes it to
+`slot-<n>.<zone>` (AAAA, unproxied, TTL 60). The renderer's container shares the VM's
+network, so a browser reaches its TLS port at that address. `--frame-zone` reports the frame
+URL as `wss://<slot id>.<zone>/frames`. The host
 AMI's unit (`fcvm-fleet-agent.service`, `ExecStart=/usr/local/bin/fcvm fleet agent
 $FLEET_AGENT_ARGS`) takes, in `/etc/fcvm-fleet/agent.env`:
 
 ```
-FLEET_AGENT_ARGS=--dial wss://fleet-api-stage.fcvm.dev/agent --access-secret fcvm-fleet/agent-access-token --host-from-imds --image localhost/fcvm-renderer:fleet --base-port 20100 --publish-ip 0.0.0.0 --tls-secret fcvm-fleet/tls-wildcard --store-ready-file /var/lib/fcvm-fleet/store-ready
+FLEET_AGENT_ARGS=--dial wss://fleet-api-stage.fcvm.dev/agent --access-secret fcvm-fleet/agent-access-token --host-from-imds --image localhost/fcvm-renderer:fleet --base-port 20100 --publish-ip 0.0.0.0 --tls-secret fcvm-fleet/tls-wildcard --ipv6-prefix-from-imds --frame-zone fcvm.dev --store-ready-file /var/lib/fcvm-fleet/store-ready
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>
 --publish <publish ip>:<base port + gpu index>:8080 [--fcvm-arg ...] <image>`, run
 rootless; the pre-start snapshot cache makes every launch after the first a restore. The
-frame URL is `ws://<frame host>:<port>/frames` (one function, `frame_url`, to be replaced
-by the slot's routed IPv6 name and TLS once fcvm has `--ipv6-address`). `--gpus` replaces
+frame URL is `ws://<frame host>:<port>/frames`, or the slot's name with `--frame-zone`. `--gpus` replaces
 the sysfs inventory (tests and hosts without vfio-pci). `--spot-notice-url` polls an EC2
 metadata URL (IMDSv2) for `spot/instance-action` every 5 s.
 
@@ -733,10 +764,21 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   slot's `t`. A viewer that joins gets the header and every frame since the last
   keyframe, then live frames; one that falls behind resumes at the next keyframe. A
   layout change sends a new header and a keyframe.
+- A layout of a newer `generation` (a re-tile) swaps the way the page does: the
+  aggregator keeps composing the old layout up to the frame before `from_frame` and
+  subscribes to the new layout's tiles, dropping their frames before `from_frame`. Once
+  every tile of the new layout has delivered a frame at or after `from_frame` (or 2 s have
+  passed since `from_frame`'s time, or since the layout arrived if that is later; a tile
+  that has delivered nothing is then drawn black), the new layout takes over at once, from
+  the first frame every tile still holds, with a new header and a keyframe. Until then
+  viewers hold the old composite's last frame. No frame mixes the two generations. A layout
+  of the same generation (a tile's URL changed) replaces the old one at once.
 - The region's size is its share of a whole image `--image-height` tall (default 1080):
   the fcvm half of a 1920 x 1080 image is 960 x 1080. `?h=` is accepted and ignored.
 - `POST /layout`: `{"epoch_unix_ms","image_aspect","region":{x,y,w,h},
-  "tiles":[{"id","rect","url"}]}`; `GET /layout` returns it.
+  "tiles":[{"id","rect","url"}],"generation","from_frame"}` (`generation` and `from_frame`
+  default to 0: the layout generation of the tiles' rects and its frame; the agent sends
+  its placed slots' newest, the coordinator the EC2 side's); `GET /layout` returns it.
 - `GET /stats`: frames out, the output bitrate over the last 10 s, and percentiles of
   `after_last_tile_ms` (last tile frame used to the region frame out of the encoder),
   `after_first_tile_ms`, `encode_ms`, `tile_lateness_ms` and `out_lateness_ms` (wall

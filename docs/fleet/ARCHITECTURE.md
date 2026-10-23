@@ -220,7 +220,8 @@ to the same address. Two fcvm changes make that possible:
   in the prefix; a collision with a live VM is refused, as the hash path refuses one today.
 - VM names unique among live VMs, so `--name slot-3` identifies one VM.
 
-The slot's address is `<host prefix>::<gpu index + 1>`. The host prefix is a public IPv6
+The slot's address is `<host prefix>::<gpu index + 2>` (fcvm refuses the prefix's
+addresses 0 and 1). The host prefix is a public IPv6
 /80 that AWS delegates to the host's network interface at launch (`Ipv6PrefixCount = 1` in
 the launch template). The browser connects straight to the VM: `slot-<n>.<zone>` is an
 unproxied AAAA record pointing at the slot's address, which the coordinator writes through

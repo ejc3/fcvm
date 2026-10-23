@@ -30,6 +30,8 @@ struct FakeTile {
     id_u: u8,
     epoch: u64,
     queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
+    /// The first slot it sends (a renderer that comes up late).
+    from_k: i64,
 }
 
 fn now_ms() -> u64 {
@@ -73,7 +75,7 @@ async fn serve_tile(mut s: WebSocket, t: FakeTile) {
     {
         return;
     }
-    let mut k = ((now_ms() - t.epoch) as f64 * FPS as f64 / 1000.0).ceil() as i64;
+    let mut k = (((now_ms() - t.epoch) as f64 * FPS as f64 / 1000.0).ceil() as i64).max(t.from_k);
     loop {
         let due = t.epoch as f64 + k as f64 * 1000.0 / FPS as f64;
         let wait = due - now_ms() as f64;
@@ -142,6 +144,7 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
             id_u,
             epoch,
             queries: queries.clone(),
+            from_k: i64::MIN,
         }
     };
     let urls = [
@@ -194,6 +197,8 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
                 url: urls[i].clone(),
             })
             .collect(),
+        generation: 1,
+        from_frame: 0,
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -357,6 +362,8 @@ async fn a_region_with_no_tiles_streams_black() {
             },
             url: None,
         }],
+        generation: 1,
+        from_frame: 0,
     });
     let cancel = CancellationToken::new();
     let opts = Options {
@@ -389,5 +396,154 @@ async fn a_region_with_no_tiles_streams_black() {
             .enumerate()
             .all(|(p, plane)| plane.iter().all(|v| *v == [16, 128, 128][p])));
     }
+    cancel.cancel();
+}
+
+/// A new layout generation (the region re-tiled) keeps the old composite until every tile
+/// of the new generation has delivered a frame at or after the generation's frame, then
+/// swaps them all at once: no frame mixes the generations, and no new tile is drawn black
+/// for want of its first frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_generation_replaces_the_old_composite_all_at_once() {
+    let epoch = now_ms() - 10_000;
+    let queries = Arc::new(Mutex::new(Vec::new()));
+    let tile = |x0: u32, w: u32, id_u: u8, from_k: i64| FakeTile {
+        header: Header {
+            codec: "raw".into(),
+            width: w,
+            height: 72,
+            full_width: 128,
+            full_height: 72,
+            x0,
+            y0: 0,
+            fps: FPS,
+            crop: Crop {
+                left: 0,
+                top: 0,
+                right: 0,
+                bottom: 0,
+            },
+        },
+        id_u,
+        epoch,
+        queries: queries.clone(),
+        from_k,
+    };
+    let region = Rect {
+        x: 0.0,
+        y: 0.0,
+        w: 0.5,
+        h: 1.0,
+    };
+    let layout = |generation: u64, from_frame: i64, tiles: Vec<(&str, Rect, String)>| Layout {
+        epoch_unix_ms: epoch,
+        image_aspect: 16.0 / 9.0,
+        region,
+        tiles: tiles
+            .into_iter()
+            .map(|(id, rect, url)| TileSpec {
+                id: id.into(),
+                rect,
+                url: Some(url),
+            })
+            .collect(),
+        generation,
+        from_frame,
+    };
+    let shared = Shared::new();
+    let a = start_tile(tile(0, 64, 60, i64::MIN)).await;
+    shared.set_layout(layout(1, 0, vec![("slot-a", region, a)]));
+    let cancel = CancellationToken::new();
+    let opts = Options {
+        image_height: 72,
+        encode: EncodeParams {
+            keyint: 15,
+            ..Default::default()
+        },
+        ..Options::default()
+    };
+    tokio::spawn(run(shared.clone(), Arc::new(Raw), opts, cancel.clone()));
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    let s2 = shared.clone();
+    tokio::spawn(async move { axum::serve(l, router(s2)).await.unwrap() });
+    let (mut ws, _) = tokio_tungstenite::connect_async(format!("ws://{addr}/frames"))
+        .await
+        .unwrap();
+    let header = |m: Message| -> serde_json::Value {
+        match m {
+            Message::Text(t) => serde_json::from_str(&t).unwrap(),
+            other => panic!("a header, got {other:?}"),
+        }
+    };
+    assert_eq!(
+        header(next_msg(&mut ws).await)["tiles"],
+        serde_json::json!(["slot-a"])
+    );
+    // Generation 2 splits the region in two at frame F, 1.5 s ahead; the right tile's
+    // renderer only starts streaming half a second after F.
+    let now_k = ((now_ms() - epoch) as f64 * FPS as f64 / 1000.0) as i64;
+    let f = now_k + 45;
+    let half = |x: f64| Rect {
+        x,
+        y: 0.0,
+        w: 0.25,
+        h: 1.0,
+    };
+    let b = start_tile(tile(0, 32, 90, i64::MIN)).await;
+    let c = start_tile(tile(32, 32, 120, f + 15)).await;
+    shared.set_layout(layout(
+        2,
+        f,
+        vec![("slot-b", half(0.0), b), ("slot-c", half(0.25), c)],
+    ));
+    let mut old_ts = Vec::new();
+    loop {
+        match next_msg(&mut ws).await {
+            Message::Binary(bytes) => old_ts.push(Frame::parse(&bytes).unwrap().t),
+            m => {
+                assert_eq!(header(m)["tiles"], serde_json::json!(["slot-b", "slot-c"]));
+                break;
+            }
+        }
+    }
+    let k_of = |t: f64| (t * FPS as f64).round() as i64;
+    assert!(
+        old_ts.iter().all(|t| k_of(*t) < f),
+        "the old generation ran past its last frame {}: {:?}",
+        f - 1,
+        old_ts
+    );
+    assert_eq!(
+        old_ts.last().map(|t| k_of(*t)),
+        Some(f - 1),
+        "the old composite is kept up to the new generation's frame"
+    );
+    let Message::Binary(bytes) = next_msg(&mut ws).await else {
+        panic!("a frame after the new header")
+    };
+    let first = Frame::parse(&bytes).unwrap();
+    assert!(
+        k_of(first.t) >= f + 15,
+        "the new generation started at {} before its right tile's first frame {}",
+        k_of(first.t),
+        f + 15
+    );
+    assert!(first.key, "the new generation starts at a keyframe");
+    let pic = Picture {
+        width: 64,
+        height: 72,
+        data: first.au,
+    };
+    assert_eq!(
+        pic.get(10, 10)[1],
+        90,
+        "the left tile of the new generation"
+    );
+    assert_eq!(
+        pic.get(50, 10)[1],
+        120,
+        "the right tile of the new generation, not black"
+    );
     cancel.cancel();
 }

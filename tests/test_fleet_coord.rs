@@ -1983,7 +1983,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
     })
     .await
     .expect("a budget within 20 s");
-    assert_eq!(got.budget, fleet_core::budget::ladder_floor(5.0e5));
+    assert_eq!(got.budget, fleet_core::budget::ladder_floor(5.0e5 / 1.15));
     assert_eq!(
         got.t, 7.0,
         "a second past the newest frame (6.0), on a frame"

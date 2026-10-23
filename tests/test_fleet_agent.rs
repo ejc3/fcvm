@@ -68,6 +68,8 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         extra_args: vec![],
         publish_ip: "127.0.0.1".into(),
         frame_host: "gpu-host.example".into(),
+        ipv6_prefix: None,
+        frame_zone: None,
         sysfs_root: PathBuf::from("/nonexistent-sysfs"),
         start_timeout: Duration::from_secs(20),
         stop_grace: Duration::from_secs(10),
@@ -1352,8 +1354,10 @@ async fn a_dialing_agent_reconnects_and_replays_its_state_without_restarting_vms
     task.abort();
 }
 
-/// The renderers' certificate: written from the secret (mode 0600), left alone while the
-/// secret is unchanged, rewritten after a renewal; each VM gets the directory and the paths.
+/// The renderers' certificate in the renderer's TLS interface: `tls.json` with `cert` and
+/// `key` from the secret (mode 0600), left alone while the secret is unchanged, replaced by
+/// a new file after a renewal; each VM gets the directory read-only, `TLS_CERT_FILE` and
+/// `TLS_PORT`.
 #[tokio::test]
 async fn the_agent_writes_the_certificate_for_its_renderers() {
     use fcvm::fleet::agent::tls;
@@ -1382,16 +1386,20 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
         .await
         .unwrap());
-    let key = tls_dir.join("key.pem");
-    assert_eq!(std::fs::read_to_string(&key).unwrap(), "KEY-1");
+    let file = tls_dir.join("tls.json");
+    let read = |p: &std::path::Path| -> serde_json::Value {
+        serde_json::from_slice(&std::fs::read(p).unwrap()).unwrap()
+    };
     assert_eq!(
-        std::fs::read_to_string(tls_dir.join("fullchain.pem")).unwrap(),
-        "CHAIN-1"
+        read(&file),
+        serde_json::json!({"cert": "CHAIN-1", "key": "KEY-1"})
     );
     assert_eq!(
-        std::fs::metadata(&key).unwrap().permissions().mode() & 0o777,
+        std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
         0o600
     );
+    use std::os::unix::fs::MetadataExt;
+    let inode = std::fs::metadata(&file).unwrap().ino();
     assert!(!tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
         .await
         .unwrap());
@@ -1399,11 +1407,20 @@ async fn the_agent_writes_the_certificate_for_its_renderers() {
     assert!(tls::refresh(&secrets, "fcvm-fleet/tls-wildcard", &tls_dir)
         .await
         .unwrap());
-    assert_eq!(std::fs::read_to_string(&key).unwrap(), "KEY-2");
-    let args = tls::vm_args(&tls_dir);
-    assert_eq!(args[0], "--map");
-    assert_eq!(args[1], format!("{}:/run/fleet-tls", tls_dir.display()));
-    assert!(args.contains(&"TLS_KEY_FILE=/run/fleet-tls/key.pem".to_string()));
+    assert_eq!(read(&file)["key"], "KEY-2");
+    // A renewal is a new file renamed into place: the renderer notices the new inode.
+    assert_ne!(std::fs::metadata(&file).unwrap().ino(), inode);
+    assert_eq!(
+        tls::vm_args(&tls_dir),
+        vec![
+            "--map".to_string(),
+            format!("{}:/run/fleet-tls:ro", tls_dir.display()),
+            "--env".to_string(),
+            "TLS_CERT_FILE=/run/fleet-tls/tls.json".to_string(),
+            "--env".to_string(),
+            "TLS_PORT=443".to_string(),
+        ]
+    );
 }
 
 /// A moved tile's renderer is told the new rectangle, the layout generation, the frame it
@@ -1435,5 +1452,34 @@ async fn the_renderer_gets_the_layout_generation_with_its_rect() {
     assert_eq!(body["layout_generation"], 3);
     assert_eq!(body["rect_from_frame"], 1234);
     assert_eq!(body["previous_rect"]["x"], 0.0);
+    c.close().await;
+}
+
+/// With a host prefix each slot runs routed at its own address (`<prefix>::<GPU index + 2>`),
+/// reports it for its DNS name, and with a frame zone its frame URL is that name over TLS.
+#[tokio::test]
+async fn each_slot_runs_routed_at_its_own_address() {
+    let f = fake(2, &[]);
+    let mut cfg = cfg(&f.fcvm);
+    cfg.ipv6_prefix = Some(fcvm::fleet::agent::addr::Prefix::parse("2001:db8:1:2:3::/80").unwrap());
+    cfg.frame_zone = Some("fleet.example".into());
+    let mut c = Coord::start(&f, 2, cfg);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0)), ("slot-4", 1, 1, rect(0.25))]);
+    let got = c.until(&["slot-1", "slot-4"], "running", 1).await;
+    assert_eq!(got["slot-1"].ipv6.as_deref(), Some("2001:db8:1:2:3::2"));
+    assert_eq!(got["slot-4"].ipv6.as_deref(), Some("2001:db8:1:2:3::3"));
+    assert_eq!(
+        got["slot-1"].frame_url.as_deref(),
+        Some("wss://slot-1.fleet.example/frames")
+    );
+    let args = std::fs::read_to_string(f.dir.path().join("args-fleet-slot-4")).unwrap();
+    assert!(
+        args.contains(
+            "--network\nrouted\n--ipv6-prefix\n2001:db8:1:2:3::/80\n--ipv6-address\n2001:db8:1:2:3::3\n"
+        ),
+        "{args}"
+    );
     c.close().await;
 }

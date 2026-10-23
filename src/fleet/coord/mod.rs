@@ -237,6 +237,8 @@ impl Actor {
                     })
                 })
                 .collect(),
+            generation: f.layout.generation,
+            from_frame: f.layout.from_frame,
         });
         self.out.ec2_layout.send_if_modified(|cur| {
             let changed = *cur != ec2_layout;

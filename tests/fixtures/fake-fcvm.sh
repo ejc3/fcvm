@@ -3,7 +3,8 @@
 # prints on a restore (the one-line `restored` record on stdout), marks its "renderer" up
 # by writing $FAKE_FCVM_DIR/port-<published port>.up (a fake renderer on that port answers
 # while the file exists), and logs start and exit with nanosecond times to
-# $FAKE_FCVM_DIR/events.log so a test can check ordering.
+# $FAKE_FCVM_DIR/events.log so a test can check ordering. Each VM's arguments, one per
+# line, go to $FAKE_FCVM_DIR/args-<name>.
 #
 #   FAKE_RESTORE_SECS   time before the restored record (default 0.2)
 #   FAKE_STOP_SECS      time it takes to stop after SIGTERM (default 0.1)
@@ -21,6 +22,7 @@ if [ "${1:-}" = gpu ] && [ "${2:-}" = scrub ]; then
     fi
     exit "${FAKE_SCRUB_EXIT:-0}"
 fi
+argv=("$@")
 name=""
 port=""
 gpu=""
@@ -33,6 +35,7 @@ while [ $# -gt 0 ]; do
     shift
 done
 echo "start $name $$ $(date +%s%N)" >> "$log"
+printf '%s\n' "${argv[@]}" > "$dir/args-$name"
 if [ -n "${FAKE_FAIL_START:-}" ]; then
     if [ "$FAKE_FAIL_START" = gpu ]; then
         echo "[fake fcvm] GPU $gpu did not come back from its reset" >&2
