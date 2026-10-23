@@ -2563,16 +2563,17 @@ unless a second scan counts exactly one more. A `same-vm` case runs fill and
 scan as two processes in one VM. `HOST_CLEAR="sudo fcvm gpu scrub <sbdf>"`
 runs the host scrub between A and B.
 
-**Measured** on 2026-10-23, g4dn.metal (T4, 15,636,037,632 bytes, `reset_method`
-`bus`), driver 580.196.07, the default 1 GiB guest, with both module types:
+**Measured** on 2026-10-23, g4dn.metal (T4, `reset_method` `bus`), driver
+580.196.07, the default 1 GiB guest, with both module types:
 
-- open modules (`kernel-open/`, GSP firmware booted): B allocated 15,521,021,952
-  bytes (`cudaMalloc`, `cuMemAlloc`) and 15,456,010,240 (`cudaMallocManaged`);
+- open modules (`kernel-open/`, GSP firmware booted): `cudaMemGetInfo` total
+  15,636,037,632 bytes; B allocated 15,521,021,952 bytes (`cudaMalloc`,
+  `cuMemAlloc`) and 15,456,010,240 (`cudaMallocManaged`);
 - proprietary modules with `NVreg_EnableGpuFirmware=0`, the amd64 default since
   #1149 (in the guest, `/proc/driver/nvidia/version` reads "NVIDIA UNIX x86_64
-  Kernel Module" and `/proc/driver/nvidia/params` `EnableGpuFirmware: 0`): B
-  allocated 15,713,959,936 and 15,648,948,224 bytes, 184 MiB more, since no GSP
-  firmware is resident. No scrub and host only ran 2cb12514 (#1149 merged, before
+  Kernel Module" and `/proc/driver/nvidia/params` `EnableGpuFirmware: 0`):
+  `cudaMemGetInfo` total 15,828,320,256 bytes; B allocated 15,713,959,936 and
+  15,648,948,224 bytes, 184 MiB more, since no GSP firmware is resident. No scrub and host only ran 2cb12514 (#1149 merged, before
   the scrub); in-guest only, both, and the host scrub ran 65122f8c (#1158 merged).
   The box was a fresh one for this run alone, checked before and after each
   matrix: CPU 98.97 to 100 percent idle over 5 s, no process holding a VFIO
@@ -2581,7 +2582,8 @@ runs the host scrub between A and B.
   and 1.04 to 2.45 after it.
 
 Each layer ran the nine cases (same-vm, exit and kill, each with the three
-allocators):
+allocators). The host scrub runs between two VMs, so it acted on the six exit
+and kill cases; same-vm is one VM and has no host step:
 
 | modules | layers | marker words in B | non-zero words in B | scrub time |
 |---|---|---|---|---|
