@@ -695,6 +695,12 @@ pub fn admin_router(handle: Handle) -> axum::Router {
         .with_state(handle)
 }
 
+/// Whether the fleet sleeps with no active viewer: it scales its host groups, or it was told
+/// to sleep on fixed hosts.
+pub fn power_managed(args: &FleetCoordArgs) -> bool {
+    !args.scale_groups.is_empty() || args.sleep_when_idle
+}
+
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
     let config = Config {
         max_tiles: args.max_tiles,
@@ -707,7 +713,7 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
         restart_cooldown_secs: args.restart_cooldown,
         camera_seed: args.camera_seed,
         max_borrowed: args.max_borrowed,
-        power_managed: !args.scale_groups.is_empty(),
+        power_managed: power_managed(&args),
         idle_scale_down_secs: args.idle_scale_down,
         ..Config::default()
     };
@@ -912,4 +918,32 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     handle.shutdown().await;
     tracing::info!("coordinator stopped; state written");
     Ok(())
+}
+
+#[cfg(test)]
+mod power_tests {
+    use crate::cli::{Cli, Commands, FleetCommand};
+    use clap::Parser;
+
+    fn coord(extra: &[&str]) -> crate::cli::FleetCoordArgs {
+        let mut argv = vec!["fcvm", "fleet", "coord", "--listen", "127.0.0.1:0"];
+        argv.extend_from_slice(extra);
+        match Cli::try_parse_from(argv).expect("parses").cmd {
+            Commands::Fleet(f) => match f.cmd {
+                FleetCommand::Coord(a) => *a,
+                _ => panic!("coord"),
+            },
+            _ => panic!("fleet"),
+        }
+    }
+
+    #[test]
+    fn the_fleet_sleeps_with_scale_groups_or_when_told_to() {
+        assert!(!super::power_managed(&coord(&[])));
+        assert!(super::power_managed(&coord(&["--sleep-when-idle"])));
+        assert!(super::power_managed(&coord(&[
+            "--scale-group",
+            "us-east-1:fcvm-fleet-hosts"
+        ])));
+    }
 }

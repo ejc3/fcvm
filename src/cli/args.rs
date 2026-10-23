@@ -241,6 +241,12 @@ pub struct FleetCoordArgs {
     #[arg(long = "scale-group")]
     pub scale_groups: Vec<crate::fleet::coord::scale::Group>,
 
+    /// Sleep with no active viewer (no tiles, every VM stopped) and wake for the next one,
+    /// on hosts the coordinator does not scale (a fixed host, a test box). Implied by any
+    /// --scale-group.
+    #[arg(long)]
+    pub sleep_when_idle: bool,
+
     /// Desired capacity of each scale group while the fleet is awake
     #[arg(long, default_value_t = 1)]
     pub awake_capacity: u32,
