@@ -97,6 +97,12 @@ log("aggregate", agg["id"], "rect", agg["rect"], "tiles", agg["tiles"])
 agg_pid = pid_listening(ap)
 image_aspect = st["image_aspect"]
 layout = json.loads(urllib.request.urlopen(f"http://{ah}:{ap}/layout", timeout=5).read())
+# Reach each tile the way the aggregator does (its host-local plain URL): the snapshot's
+# frame URLs can be the slots' TLS names.
+local = {lt["id"]: lt["url"] for lt in layout["tiles"] if lt.get("url")}
+for t_ in tiles.values():
+    if t_.get("slot") in local:
+        t_["frame_url"] = local[t_["slot"]]
 
 # --- latency, bitrate, CPU over SECS ---------------------------------------------------
 first = tiles[agg["tiles"][0]]
