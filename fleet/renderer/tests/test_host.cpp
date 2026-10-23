@@ -265,14 +265,38 @@ int main() {
     double fslot = 1000.0 / 30;
     // the high-quality path at 80 ns per sample (the prior) needs 400 k = 8 spp
     // for 32 ms: unaffordable, so the fit stays just under 8 spp on the fast path
-    double f1 = m.fit(50000, 8, fslot);
+    double f1 = m.fit_now(50000, 8, fslot);
     CHECK(f1 < 8 * 50000 && f1 > 7.9 * 50000, "fast path capped under the high-quality threshold (%.0f)", f1);
     // measured: the high-quality path costs 30 ns per sample here, so 19.3 ms buys 644 k
     m.observe(true, 500000, 15.0, 19.0);
-    double f2 = m.fit(50000, 8, fslot);
+    double f2 = m.fit_now(50000, 8, fslot);
     CHECK(std::fabs(f2 - (0.7 * fslot - 4.0) / 3e-5) < 1000, "high-quality fit from its own cost (%.0f)", f2);
     // and the frame it predicts lands at 70% of the slot
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
+  }
+  {
+    // The windowed fit: a camera path whose cost per sample swings 2x every
+    // 20 s (40 ns on easy views, 80 ns on hard ones) at 30 fps. The latest
+    // frames' fit swings 2x with it; the window's holds at the hard views.
+    CostModel w;
+    const double fslot = 1000.0 / 30, px = 50000;
+    double lo_now = 1e18, hi_now = 0, lo_w = 1e18, hi_w = 0, first_w = -1, early = 0;
+    for (int f = 0; f < 30 * 300; f++) {
+      double t = f / 30.0;
+      double c = (int(t / 20) % 2) ? 8e-5 : 4e-5;
+      w.observe(false, 200000, 200000 * c, 200000 * c + 4.0, t);
+      double fn = w.fit_now(px, 8, fslot), fw = w.fit(px, 8, fslot, t);
+      if (t < 59.9) early = std::max(early, fw);
+      if (fw > 0 && first_w < 0) first_w = t;
+      if (t >= 120) {
+        lo_now = std::min(lo_now, fn); hi_now = std::max(hi_now, fn);
+        lo_w = std::min(lo_w, fw); hi_w = std::max(hi_w, fw);
+      }
+    }
+    CHECK(early == 0 && first_w >= 59.9 && first_w < 62, "the windowed fit is known from 60 s (%.1f)", first_w);
+    CHECK(hi_now / lo_now > 1.8, "the latest frames' fit swings with the path (%.0f to %.0f)", lo_now, hi_now);
+    CHECK(hi_w / lo_w < 1.01, "the window's fit holds (%.0f to %.0f)", lo_w, hi_w);
+    CHECK(std::fabs(lo_w - (0.7 * fslot - 4.0) / 8e-5) < 2000, "at the hard views' cost (%.0f)", lo_w);
   }
   {
     // Layout generations: the coordinator's scene body (fleet/PROTOCOL.md on

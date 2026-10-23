@@ -584,12 +584,16 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     std::lock_guard<std::mutex> l(hmu_);
     // a model belongs to one drawn size: a new size starts it again
     if (std::fabs(px - fit_px_) > 0.01 * px) { cost_ = CostModel(); cost_.hq_prior = HQ_COST_PRIOR; fit_px_ = px; budget_ = opt_.budget; }
-    if (rs.spp > 0) cost_.observe(rs.hq, px / rs.half * rs.spp, rs.trace_ms, rs.render_ms);
-    fit_ = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
+    double now = mono_s();
+    if (rs.spp > 0) cost_.observe(rs.hq, px / rs.half * rs.spp, rs.trace_ms, rs.render_ms, now);
+    fit_ = cost_.fit(px, HQ_SPP, 1000.0 / opt_.fps, now) * fit_scale_;
+    fit_now_ = cost_.fit_now(px, HQ_SPP, 1000.0 / opt_.fps) * fit_scale_;
     used_budget_ = budget;
     budget_source_ = source;
-    // a whole-image renderer alone follows its own fit, on the ladder
-    if (opt_.adapt && whole && fit_ > 0) budget_ = local_budget(fit_, px);
+    // a whole-image renderer alone follows its own fit, on the ladder (the
+    // latest frames' until the window is ready)
+    double own = fit_ > 0 ? fit_ : fit_now_;
+    if (opt_.adapt && whole && own > 0) budget_ = local_budget(own, px);
   }
   if (!prime) {
     // debug captures of this frame
@@ -856,7 +860,8 @@ std::string Pipeline::health_json() {
   if (gcur >= 0) o << gcur; else o << "null";
   if (gpend) o << ",\"layout_pending\":{\"generation\":" << gnext << ",\"from_frame\":" << gk << "}";
   o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
-    << "\",\"budget_fit\":" << std::round(fit_) << ",\"hq\":" << (rstats_.hq ? "true" : "false");
+    << "\",\"budget_fit\":" << std::round(fit_) << ",\"budget_fit_now\":" << std::round(fit_now_)
+    << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {
     // CPU seconds this process has used (user + system), for cost per stream
     rusage ru;
