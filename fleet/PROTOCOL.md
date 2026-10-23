@@ -222,7 +222,15 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
      "frame_url": "wss://...", "tiles": ["ec2:1", ...]}
   ],
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
-            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": ["slot-9"], "standby_ready": 1},
+            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": ["slot-9"], "standby_ready": 1,
+            "power": {"state": "waking", "idle_since": null, "asleep_since": null, "woke_at": 1761134400000,
+                      "hosts": [{"host": "i-0123456789abcdef0",
+                                 "phases": [{"phase": "instance_pending", "at": 1761134401000},
+                                            {"phase": "booted", "at": 1761134446000},
+                                            {"phase": "store_ready", "at": 1761134470000},
+                                            {"phase": "agent_connected", "at": 1761134492000}]}],
+                      "last_wake": {"started_at": ..., "awake_at": ..., "gpus": 16, "ms": 98000},
+                      "wakes": [...]}},
   "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 1.7777777777777777,
   "next_race_at": 1761134700000,
@@ -251,10 +259,6 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
     {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000},
     {"kind": "gpu_quarantined", "host": "<host>", "sbdf": "0000:05:00.0", "error": "...", "since": 1761134400000}
   ],
-  "power": {"state": "waking", "idle_since": null, "asleep_since": null, "woke_at": 1761134400000,
-            "hosts": [{"instance": "i-0123456789abcdef0", "phase": "agent_connected", "pending_at": 1761134401000,
-                       "booted_at": 1761134446000, "agent_at": 1761134492000, "rendering_at": null}],
-            "last_wake_ms": 98000, "wakes": [{"started_at": ..., "complete_at": ..., "ms": 98000}]},
   "counters": {"restores": 1834, "restores_last_hour": 96, "scrubs": 212, "scrub_failures": 1},
   "claims": [{"session": "claim-3", "viewer": "v-9", "slot": "slot-2", "gpu": {...}, "host": "<host>",
               "claimed_at": 1761134400000, "expires_at": 1761134460000, "first_frame_at": 1761134405400,
@@ -301,20 +305,23 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
-- `power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts' auto
-  scaling groups (`--scale-group`; without any it stays `awake`). After
+- `fleet.power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts'
+  auto scaling groups (`--scale-group`; without any it stays `awake`). After
   `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
-  never while a claim is active or a race is running, the fleet goes `asleep`: every group
-  is set to desired capacity 0, the EC2 half has no tiles (their instances are
-  terminated), no race is scheduled (`next_race_at` null) and `restart_now` is refused.
-  Hosts that leave then are not reclaimed. When an active viewer arrives it is `waking`
-  (`woke_at`): every group goes back to `--awake-capacity` (default 1), the EC2 half
-  launches as many tiles as the fcvm half had, and `hosts` gives each GPU host's progress
-  by EC2 instance id: `pending` and `booted` from the group (Pending, InService),
-  `agent_connected` when its agent says hello (the agent names itself by its instance id,
-  and starts once the host's store is mounted), `rendering` when all its placed slots run.
-  Once every placed tile of both halves runs it is `awake`, and the wake, first active
-  viewer to complete image, is recorded in `wakes` (`last_wake_ms`; the last 20).
+  never while a claim is active or a race is running, the fleet goes `asleep`
+  (`asleep_since`): every group is set to desired capacity 0, the EC2 half has no tiles
+  (their instances are terminated), no race is scheduled (`next_race_at` null) and
+  `restart_now` is refused. Hosts that leave then are not reclaimed. When an active viewer
+  arrives it is `waking` from `woke_at`, the moment the wake began: every group goes back
+  to `--awake-capacity` (default 1) and the EC2 half launches as many tiles as the fcvm
+  half had. `hosts` lists each GPU host by EC2 instance id with the phases it has reached,
+  in order: `instance_pending` and `booted` from the group (Pending, then InService),
+  `store_ready` when the host marked its store mounted (the agent's hello reports it; the
+  phase is absent when the host does not mark it), `agent_connected` when its agent says
+  hello (the agent names itself by its instance id), `tiles_rendering` when all its placed
+  slots run. Once every placed tile of both halves runs it is `awake`; `last_wake` gives
+  the wake's start, when it was complete (`awake_at`), the tiles placed then (`gpus`, both
+  halves) and the time between (`ms`); `wakes` keeps the last 20.
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
@@ -354,7 +361,7 @@ paint. Once per camera hold, 5.5 s into it, the coordinator subscribes to every 
 places each region in the whole image and encodes one JPEG (through the `ffmpeg` CLI).
 Served with `Cache-Control: public, max-age=10` and `Access-Control-Allow-Origin: *` (the
 page reads it from its own origin); `404` with `no-store` until the first poster exists. A hold whose capture does not finish before the flight keeps the previous
-poster. Borrowed tiles are black in it, as on the wall.
+poster, and so does a hold during a race (the relaunching tiles would be black). Borrowed tiles are black in it, as on the wall.
 
 ### Running it
 
@@ -415,10 +422,13 @@ is killed outright, each VM's fcvm gets SIGTERM from the kernel (the agent arms
 ### Agent to coordinator
 
 ```json
-{"type": "hello", "host": "<name>", "arch": "x86_64", "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 8}
+{"type": "hello", "host": "<name>", "arch": "x86_64", "gpus": [{"sbdf": "0000:01:00.0", "name": "Tesla T4"}], "capacity": 8,
+ "store_ready_at": 1761134470000}
 ```
 
-First line, once. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
+First line, once. `store_ready_at` (optional) is when the host's store was ready: the
+modification time of `--store-ready-file`, which the host's boot writes once the store is
+mounted. `gpus` are the NVIDIA display functions bound to `vfio-pci`, in address
 order; `capacity` is how many VMs the host runs at once (default: one per GPU). The
 coordinator makes one slot per GPU and ignores a repeated address. The first hello binds the
 connection to `host`; a hello naming a host another live connection holds is refused (the
@@ -537,7 +547,7 @@ fcvm fleet agent --stdio --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
                  [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
-                 [--scrub]
+                 [--scrub] [--store-ready-file <path>]
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>

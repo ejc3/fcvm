@@ -18,7 +18,7 @@ from PIL import Image  # noqa: E402
 URL, OUT = sys.argv[1], sys.argv[2]
 SECS = float(sys.argv[3]) if len(sys.argv) > 3 else 30.0
 # The camera is the coordinator's director: 7 s holds joined by flights, so a measurement
-# of SECONDS covers both; the director's viewpoints during it are recorded.
+# of SECONDS covers both; the director's state at its end is recorded.
 os.makedirs(OUT, exist_ok=True)
 fleetlive.connect_to(URL)
 
@@ -129,7 +129,7 @@ added = sorted((a.recv[t] - d.recv[t]) * 1000 for t in common)
 pct = lambda xs, q: xs[min(len(xs) - 1, round((len(xs) - 1) * q))] if xs else None
 res = {
     "region": agg["rect"], "tiles": len(agg["tiles"]), "header": a.header, "seconds": round(span, 1),
-    "director": v.snap["state"]["director"],
+    "nudges": v.snap["state"]["nudges"],
     "aggregate_kbps": round(a.bytes * 8 / span / 1000), "tile_kbps": round(d.bytes * 8 / span / 1000),
     "direct_total_kbps": round(sum(r_.bytes for r_ in directs) * 8 / span / 1000),
     "aggregate_frames": len(a.recv), "tile_frames": len(d.recv),

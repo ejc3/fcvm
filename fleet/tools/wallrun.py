@@ -80,7 +80,7 @@ def grab(frame_url, height, path):
 
 
 def poster(path, after=None, timeout=120):
-    """The poster once it exists (and differs from `after`); its headers and director."""
+    """The poster once it exists (and differs from `after`); its headers."""
     end = time.time() + timeout
     while time.time() < end:
         try:
@@ -115,10 +115,10 @@ v.until(lambda s: all_running(s, n), 600)
 body = None
 try:
     body, meta = poster(os.path.join(OUT, "poster.jpg"))
-    meta["director"] = v.snap["state"]["director"]
+    meta["nudges"] = v.snap["state"]["nudges"]
     append("poster.jsonl", meta)
     log(f"poster: {meta['bytes']} bytes, {meta['content_type']}, {meta['cache_control']}, "
-        f"viewpoint {meta['director']['viewpoint']}")
+        f"holding {meta['nudges']['holding']}")
 except Exception as e:
     log(f"poster failed: {e!r}")
     append("poster.jsonl", {"error": repr(e)})
@@ -157,7 +157,7 @@ if r["outcome"] == "committed":
         log(f"race during the claim failed: {e!r}")
     try:
         _, pm = poster(os.path.join(OUT, "poster-during-claim.jpg"), after=body, timeout=90)
-        pm["director"] = v.snap["state"]["director"]
+        pm["nudges"] = v.snap["state"]["nudges"]
         append("poster.jsonl", {"during_claim": True, **pm})
         log("poster during the claim taken")
     except Exception as e:

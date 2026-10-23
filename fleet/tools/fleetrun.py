@@ -103,8 +103,9 @@ v = Live()
 v.until(lambda s: all_running(s), 600)
 log("light", v.intent("light", {"pos": [-36.0, 1.75, -61.0], "color": [1.0, 0.45, 0.15]})["outcome"])
 def late_in_hold(s):
-    d, now_t = s["director"], (time.time() * 1000 - s["scene"]["epoch_unix_ms"]) / 1000
-    return d["arrived_t"] + 5.0 <= now_t < d["hold_until_t"] - 1.0
+    n = s["nudges"]
+    left = (n["next_hold_at"] or 0) - time.time() * 1000
+    return n["holding"] is not None and 1000 < left <= 2000
 v.until(late_in_hold, 120)
 st = v.snap["state"]
 json.dump(st, open(os.path.join(OUT, "snapshot-at-mosaic.json"), "w"), indent=1)
