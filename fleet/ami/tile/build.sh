@@ -15,7 +15,8 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 S=/var/lib/fleet-ami; L=/var/log/fleet-ami; mkdir -p "$S" "$L"
 [ -f "$S/env" ] && . "$S/env"
 exec > >(tee -a "$L/$PHASE.log") 2>&1
-trap 'echo "PHASE $PHASE FAILED at line $LINENO"; touch "$S/$PHASE.failed"' ERR
+# EXIT, not ERR: an ERR trap does not fire for a failure inside a function under set -e.
+trap 'rc=$?; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
 rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive

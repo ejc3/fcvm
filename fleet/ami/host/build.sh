@@ -18,13 +18,19 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 S=/var/lib/fleet-ami; L=/var/log/fleet-ami; mkdir -p "$S" "$L"
 [ -f "$S/env" ] && . "$S/env"
 exec > >(tee -a "$L/$PHASE.log") 2>&1
-trap 'echo "PHASE $PHASE FAILED at line $LINENO"; touch "$S/$PHASE.failed"' ERR
+# EXIT, not ERR: an ERR trap does not fire for a failure inside a function under set -e.
+trap 'rc=$?; [ $rc = 0 ] || { echo "PHASE $PHASE FAILED (exit $rc)"; touch "$S/$PHASE.failed"; }' EXIT
 rm -f "$S/$PHASE.done" "$S/$PHASE.failed"
 echo "== $PHASE start $(date -u +%FT%TZ)"
 export DEBIAN_FRONTEND=noninteractive
 APT="apt-get -o DPkg::Lock::Timeout=600"
 U=ubuntu; UH=/home/$U; SRC=$UH/fcvm
-as_user() { sudo -u "$U" -H env PATH="$UH/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" bash -c "$1"; }
+# Rootless podman needs the user's systemd instance and runtime directory (lingering, set in prep).
+as_user() {
+  local uid; uid=$(id -u "$U")
+  sudo -u "$U" -H env PATH="$UH/.cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin" \
+    XDG_RUNTIME_DIR=/run/user/$uid DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$uid/bus bash -c "$1"
+}
 
 case "$PHASE" in
 prep)
@@ -36,6 +42,7 @@ prep)
     curl zstd ffmpeg python3-pil
   # AGENTS.md "Fresh Bare-Metal Box Quickstart", steps 1, 1b, 1c and 4, made persistent.
   usermod -aG kvm "$U"
+  loginctl enable-linger "$U"
   cat > /etc/sysctl.d/99-fcvm.conf <<'X'
 kernel.unprivileged_userns_clone=1
 kernel.apparmor_restrict_unprivileged_userns=0
@@ -62,6 +69,8 @@ X
   systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service
   ;;
 build)
+  loginctl enable-linger "$U"
+  for _ in $(seq 1 30); do [ -S "/run/user/$(id -u "$U")/bus" ] && break; sleep 1; done
   /usr/local/lib/fcvm-fleet/bind-vfio.sh
   /usr/local/lib/fcvm-fleet/store.sh   # no archive yet: mounts the empty NVMe store
   # VFIO maps all guest memory for DMA, which counts against the caller's memlock limit;
