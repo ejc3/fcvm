@@ -51,7 +51,7 @@ scene is at golden hour (sun about 7 degrees up):
   repeat visibly from high up: two octaves for the body,
   two finer ones eroding the edges (billows on top, wisps below), flat bases,
   denser cores rising higher. The march takes coarse steps through empty air
-  and steps of 1.5% of the distance (120 to 600 m) inside clouds, so edges stay
+  and steps of 2% of the distance (120 to 800 m) inside clouds, so edges stay
   sharp at any distance; lit by a three-step light march toward the sun with
   three scattering orders, a strong forward lobe (silver lining) and a back
   lobe, a powder term and sky ambient that darkens toward the base. They drift
