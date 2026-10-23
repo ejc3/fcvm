@@ -87,6 +87,8 @@ default = ["integration-fast", "integration-slow"]
 # Test speed tiers (unit tests always run, no feature flag needed)
 integration-fast = []        # Quick VM tests, < 30s each (sanity, signal, exec, port forward)
 integration-slow = []        # Slow VM tests, > 30s each (clone, snapshot, fuse posix, egress)
+# Race gym (make race-gym, docs/race-gym.md): runs only when asked for, never in a suite
+race-gym = []
 
 # Privileged tests require sudo (bridged networking, pjdfstest, iptables)
 privileged-tests = []
