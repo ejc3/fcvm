@@ -6,6 +6,13 @@ use std::task::{ready, Poll};
 use tokio::io::unix::AsyncFd;
 use tokio::io::Interest;
 
+/// Register an owned fd with tokio's reactor.
+fn register(fd: OwnedFd) -> std::io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: the `AsyncFd` owns `fd`, which closes only when the `AsyncFd` drops or
+    // `into_inner` hands it back, and nothing in this module replaces it through `get_mut`.
+    Ok(unsafe { AsyncFd::register(fd) }?)
+}
+
 pub const HOST_CID: u32 = 2;
 pub const STATUS_PORT: u32 = 4999;
 pub const EXEC_PORT: u32 = 4998;
@@ -234,7 +241,7 @@ impl VsockStream {
         )
         .context("setting O_NONBLOCK on vsock")?;
 
-        let inner = Arc::new(AsyncFd::new(fd).context("wrapping vsock in AsyncFd")?);
+        let inner = Arc::new(register(fd).context("wrapping vsock in AsyncFd")?);
         Ok(Self { inner })
     }
 
@@ -330,7 +337,7 @@ impl AsyncFdStream {
         let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags))?;
         Ok(Self {
-            inner: Arc::new(AsyncFd::new(fd)?),
+            inner: Arc::new(register(fd)?),
         })
     }
 
@@ -379,7 +386,7 @@ impl VsockListener {
         )
         .context("listening on vsock")?;
 
-        let inner = AsyncFd::new(fd).context("wrapping listener in AsyncFd")?;
+        let inner = register(fd).context("wrapping listener in AsyncFd")?;
         Ok(Self { inner })
     }
 
@@ -394,7 +401,7 @@ impl VsockListener {
     /// snapshot keep the port bound, causing bind() to fail with EADDRINUSE.
     pub fn re_register(self) -> Result<Self> {
         let fd = self.inner.into_inner();
-        let inner = AsyncFd::new(fd).context("re-registering listener with AsyncFd")?;
+        let inner = register(fd).context("re-registering listener with AsyncFd")?;
         Ok(Self { inner })
     }
 
