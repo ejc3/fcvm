@@ -74,3 +74,30 @@ inline double local_budget(double fit, double px) {
   while (b > 62500 && samples_for(b, px) > fit) b = ladder_floor(b * 0.999);
   return b;
 }
+
+// A renderer's cost model for its fit: the fixed part of a frame (everything
+// but the samples) and the cost per sample of each path, from the frames it
+// drew. The fit is the largest budget whose predicted frame takes `frac` of a
+// slot: on the fast path below HQ_SPP samples per drawn pixel, on the
+// high-quality path from it, whichever allows more.
+struct CostModel {
+  double fixed_ms = -1, c_fast = -1, c_hq = -1;  // -1: not seen yet
+  double hq_prior = 1.0;                          // c_hq / c_fast before a high-quality frame is seen
+  void observe(bool hq, double samples, double trace_ms, double render_ms) {
+    if (samples <= 0 || trace_ms <= 0) return;
+    auto ew = [](double& v, double x) { v = v < 0 ? x : v + (x - v) * 0.2; };
+    ew(fixed_ms, std::max(0.0, render_ms - trace_ms));
+    ew(hq ? c_hq : c_fast, trace_ms / samples);
+  }
+  // px: drawn pixels; hq_spp: samples per drawn pixel where the high-quality path starts
+  double fit(double px, double hq_spp, double slot_ms, double frac = 0.70) const {
+    if (fixed_ms < 0 || (c_fast < 0 && c_hq < 0)) return 0;
+    double avail = frac * slot_ms - fixed_ms;
+    if (avail <= 0) return 1e4;
+    double cf = c_fast > 0 ? c_fast : c_hq / hq_prior;
+    double ch = c_hq > 0 ? c_hq : c_fast * hq_prior;
+    double b_fast = std::min(avail / cf, hq_spp * px * 0.999);
+    double b_hq = avail / ch;
+    return b_hq >= hq_spp * px ? std::max(b_hq, b_fast) : b_fast;
+  }
+};

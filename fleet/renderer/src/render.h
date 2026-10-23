@@ -10,6 +10,7 @@
 
 struct RenderStats {
   float render_ms = 0;  // last frame: trace + accumulate + tone map
+  float trace_ms = 0;   // of which the samples themselves (the part that scales with the budget)
   int spp = 0;          // samples drawn per pixel in the last frame
   int hold_samples = 0; // samples accumulated in the current hold (0 while moving)
   bool hold = false;
@@ -105,5 +106,7 @@ class Renderer {
   void* stream_ = nullptr;
   void* ev0_ = nullptr;
   void* ev1_ = nullptr;
+  void* evt0_ = nullptr;  // around the trace kernel
+  void* evt1_ = nullptr;
   RenderStats stats_;
 };

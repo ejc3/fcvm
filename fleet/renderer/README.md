@@ -201,10 +201,41 @@ GPUs with 21 checks, the new ones covering the high-quality path while the
 samples per frame change mid-sequence and a high-quality hold in different
 batches.
 
-The flat near cloud of the fast-move shot stays flat at 2,000,000
-pixel-samples (about 40 samples per pixel, high-quality march) on the
-100-GPU wall (`shots/scale100-nearcloud-before-after.png`): its cause is not
-the sample count or the march length, and is not fixed here.
+Round 9:
+
+- **The flat near cloud.** Two-arm renders of the fast-move frame at 1080
+  (12 frames of history; high quality at 16 spp and the fast path at 1 spp,
+  stride 4), measuring the cloud crop's detail energy (the standard deviation
+  of luminance minus a 3 px blur): base 5.76. Light march shortened near the
+  eye 5.94; a finer erosion octave near the eye 5.86; fine steps of 10 or 30 m
+  near the eye made the cloud disappear (the crop shows sky): with steps that
+  fine the march spent its 64 to 96 fine steps without becoming opaque. The
+  cloud is a deep region of thin density: where coverage is high the density
+  remap rises slowly, so it takes kilometres to become opaque and reads as a
+  uniform fog bank from inside or near the layer. Density now saturates at a
+  third of it (`sat(3 d)`): 6.66, with shaded undersides
+  (`shots/nearcloud-density-before-after.png`; the 8-VM fast shot's crop
+  5.48 -> 6.67, `shots/fast-8gpu-r7-r9.jpg`). Clouds are denser and darker
+  underneath everywhere, and a thin lens cloud at mid distance is grainier at
+  1 spp.
+- **Controller hysteresis.** Four of eight tiles slowed (`FIT_SCALE=0.5`), the
+  long moving path on the 100-GPU terrain block, 2 minutes each: the round 8
+  rule changed the budget 2 times (1.0 per minute, between 125,000 and
+  148,651), the new rule 0 times (125,000 throughout).
+- **Cost per path.** The fit now models a frame as a fixed part plus a cost per
+  sample per path. On the 100-GPU terrain block, no slowed tiles, 60 s: every
+  tile at 353,553 (7 samples per pixel, fast path; the slowest tile cannot
+  afford the high-quality path at 8), render 12.8 to 15.0 ms against the
+  23.3 ms target, 30.0 fps on every tile.
+- **The detail view's 26.1 fps run (round 8).** Not reproduced in 11 runs:
+  five with round 8's image in the order of `tools/measure.py`'s full table
+  (three with eight VMs up, two with one), its batch order once more, and five
+  with round 9's image, all 30.0. `measure.py` now records per row the slots
+  the renderer skipped, the slots missing from the stream and the frame-time
+  tail; round 9's detail rows: 1 skipped slot (the stream switch), no gaps,
+  frames at most 27.6 to 29.6 ms. The 26.1 row has none of these, so whether it
+  was the renderer skipping slots, the stream dropping frames for a slow
+  client, or the client is not known.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
