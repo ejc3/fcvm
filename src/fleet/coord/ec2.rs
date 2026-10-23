@@ -176,13 +176,7 @@ async fn post_scenes(
                 }
                 if read_health {
                     if let Ok(h) = driver.health(&a.id, &l).await {
-                        let report = HealthReport {
-                            id: a.id.clone(),
-                            fps: h.get("fps").and_then(|f| f.as_f64()).unwrap_or(0.0),
-                            gpu: h.get("gpu").cloned().unwrap_or(serde_json::Value::Null),
-                            budget_fit: h.get("budget_fit").and_then(|f| f.as_f64()),
-                            t: h.get("t").and_then(|f| f.as_f64()),
-                        };
+                        let report = HealthReport::from_renderer(&a.id, &h);
                         handle.send(Event::Ec2Health { at: 0, report }).await;
                     }
                 }

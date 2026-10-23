@@ -88,6 +88,7 @@ async fn health(State(r): State<Renderer>) -> Result<Json<serde_json::Value>, St
     let frame = r.frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     Ok(Json(serde_json::json!({
         "fps": 30.0, "t": 1.5, "frame": frame, "ready": true, "budget_fit": 1.0e6,
+        "frames_2s": {"render_ms_max": 12.5},
         "gpu": {"name": "fake", "temp_c": 40},
         "startup_ms": {"gpu_ready": 1500, "first_frame_drawn": 1600, "first_frame_sent": -1}
     })))

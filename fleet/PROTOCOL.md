@@ -542,11 +542,12 @@ A `/health` reply carrying `error` (the renderer failed) fails the relaunch at o
 | `total_ms` | the agent starts the relaunch | the first frame |
 
 ```json
-{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9}
+{"type": "health", "id": "slot-3", "fps": 29.8, "gpu": { ... }, "budget_fit": 1210000, "t": 861.9, "render_ms_max": 14.2}
 ```
 
 Once a second per running slot: the renderer's `/health` `fps`, its GPU readings,
-`budget_fit` and `t` (the scene time of its newest frame), passed through. The coordinator
+`budget_fit` (absent while the renderer is not `ready`), `t` (the scene time of its newest
+frame) and `render_ms_max` (its `frames_2s.render_ms_max`), passed through. The coordinator
 reads the same fields from each EC2 tile's renderer (`GET https://ec2-<n>.<zone>/health`)
 once a second.
 
@@ -635,29 +636,42 @@ body to each EC2 tile's renderer.
 
 ### Grid budget
 
-One budget for every tile of the wall, so tiles draw the same samples per pixel at the same
-frame and moving frames match across tile edges. Tiles never adapt on their own. The
+One budget for every tile of the wall, so tiles draw the same samples per pixel, and take
+the same path (fast, or high quality from `HQ_SPP` = 8 samples per drawn pixel), at the same
+frame, and moving frames match across tile edges. Tiles never adapt on their own. The
 coordinator runs the rule of the renderer's reference controller
-(`fleet/renderer/tools/budgetctl.py`) in the pure core (`fleet_core::budget`), on its
-1 s tick:
+(`fleet/renderer/tools/budgetctl.py` at 55e81ad5 on `fleet-renderer-adapt`) in the pure core
+(`fleet_core::budget`), on its 1 s tick:
 
 - Every 2 s, a round over every placed tile of both sides that is not lent to a claim. No
   decision until every one of them has reported a `budget_fit` (a tile that just joined
-  holds the round until its first report).
-- The smallest fit governs, rounded down to the ladder 250,000 x 2^(n/4), n from -8 to 40.
-- A lower rung is taken at once. A higher one only after two rounds in a row ask for at
-  least that much, and then the lower of the two asks.
+  holds the round until its first report; a held round changes nothing, so the count of
+  rounds below carries over it). A renderer that is not `ready` reports no fit.
+- The smallest fit governs, smoothed half the way each round.
+- The first budget is the ladder rung under smoothed fit / 1.15 (the ladder is
+  250,000 x 2^(n/4), n from -8 to 40).
+- Down, to the rung under the lower of the smoothed fit and this round's, when the budget
+  exceeds the smoothed fit by more than 5%. When any tile's `render_ms_max` (its slowest
+  render over the last 2 s) is over 90% of a slot (30 ms), at least one rung down at once.
+- Up, to the rung under smoothed fit / 1.15, after three rounds in a row allow it.
 - A change takes effect at one scene time for every tile: `t` = the newest frame any tile
   has drawn plus 1 s, rounded up to a frame (k/30). The agents and the EC2 poster post the
   same `{budget, t}` everywhere.
 
+The renderer's fit is a cost model of its frames: a fixed part per frame and a cost per
+sample on each path. The fast path's and the high-quality path's fits differ, and each
+renderer reports the larger budget that fits 70% of a slot on either. The path a frame takes
+follows from the budget and the tile's drawn size, and every tile of the wall has the same
+size, so the high-quality choice is grid-wide with the budget: the slowest tile decides it
+for all.
+
 The budget does not ride on layout generations. Every tile covers the same share of the
 image (each side is as wide as its share of the tiles), so one budget gives every tile the
-same samples per pixel in any layout, and a re-tile, which every renderer applies at the
-layout's frame, changes them for all tiles together. A fit measures the GPU's
-pixel-samples per frame, which a tile's size changes little; when it does, the next round
-answers it. A tile that joins draws the budget in force (its `t` is in the past, so it
-applies from its first frame) until the round that counts it.
+same samples per pixel, and the same path, in any layout, and a re-tile, which every
+renderer applies at the layout's frame, changes them for all tiles together. A tile's size
+moves its fit little; when it does, the next rounds answer it. A tile that joins draws the
+budget in force (its `t` is in the past, so it applies from its first frame) until the
+round that counts it.
 
 ### Running it
 

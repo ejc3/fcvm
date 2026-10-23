@@ -1970,6 +1970,7 @@ async fn the_slowest_tile_sets_one_budget_for_every_tile() {
                 gpu: Value::Null,
                 budget_fit: Some(fit),
                 t: Some(t),
+                render_ms_max: None,
             }))
             .unwrap();
     }

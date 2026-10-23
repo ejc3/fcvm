@@ -28,11 +28,13 @@ pub fn apply(mut state: State, event: &Event) -> State {
     if state.fleet.power.state != power {
         retile(&mut state.fleet, &state.config, event.at());
     }
-    // The budget's round bookkeeping (when the next round is due, a raise asked for once)
+    // The budget's round bookkeeping (when the next round is due, the smoothed fit, rounds
+    // that allowed a raise)
     // is not a change anyone sees; a tick that only moves it keeps the version.
     let mut before = before;
     before.budget.next_round_at = state.fleet.budget.next_round_at;
-    before.budget.want_up = state.fleet.budget.want_up;
+    before.budget.smoothed = state.fleet.budget.smoothed;
+    before.budget.up_rounds = state.fleet.budget.up_rounds;
     let changed = receipt.is_some() || state.fleet != before;
     if changed {
         state.version += 1;
@@ -1064,6 +1066,7 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
         slot.observed.fps = None;
         slot.observed.gpu_stats = None;
         slot.observed.budget_fit = None;
+        slot.observed.render_ms_max = None;
         slot.observed.frame_t = None;
         return;
     }
@@ -1139,6 +1142,7 @@ fn health(f: &mut Fleet, host: Option<&str>, h: &HealthReport) {
     slot.observed.fps = h.fps.is_finite().then_some(h.fps);
     slot.observed.gpu_stats = Some(h.gpu.clone());
     slot.observed.budget_fit = h.budget_fit.filter(|v| v.is_finite());
+    slot.observed.render_ms_max = h.render_ms_max.filter(|v| v.is_finite());
     slot.observed.frame_t = h.t.filter(|v| v.is_finite());
 }
 
@@ -1156,11 +1160,16 @@ fn budget_round(f: &mut Fleet, at: u64) {
         .filter(|s| s.position.is_some() && s.claim.is_none())
         .collect();
     let fits: Vec<Option<f64>> = tiles.iter().map(|s| s.observed.budget_fit).collect();
+    let overloaded = tiles.iter().any(|s| {
+        s.observed
+            .render_ms_max
+            .is_some_and(|ms| ms > crate::budget::OVERLOAD_MS)
+    });
     let newest = tiles
         .iter()
         .filter_map(|s| s.observed.frame_t)
         .fold(0.0, f64::max);
-    f.budget.round(&fits, newest);
+    f.budget.round(&fits, overloaded, newest);
 }
 
 /// Races stop waiting for tiles that leave (their host is reclaimed); a half that then has

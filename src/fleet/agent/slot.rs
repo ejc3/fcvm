@@ -460,13 +460,7 @@ pub async fn supervise(
             }
             _ = health_tick.tick() => {
                 if let Some(h) = ctx.health().await {
-                    let _ = ctx.out.send(AgentMsg::Health(HealthReport {
-                        id: ctx.id.clone(),
-                        fps: h.get("fps").and_then(|f| f.as_f64()).unwrap_or(0.0),
-                        gpu: h.get("gpu").cloned().unwrap_or(serde_json::Value::Null),
-                        budget_fit: h.get("budget_fit").and_then(|f| f.as_f64()),
-                        t: h.get("t").and_then(|f| f.as_f64()),
-                    }));
+                    let _ = ctx.out.send(AgentMsg::Health(HealthReport::from_renderer(&ctx.id, &h)));
                 }
             }
         }

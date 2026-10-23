@@ -180,6 +180,9 @@ pub struct Observed {
     pub budget_fit: Option<f64>,
     #[serde(default)]
     pub frame_t: Option<f64>,
+    /// The slowest render over the renderer's last 2 s (`frames_2s.render_ms_max`).
+    #[serde(default)]
+    pub render_ms_max: Option<f64>,
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,

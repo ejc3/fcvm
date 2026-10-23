@@ -418,6 +418,7 @@ async fn the_grid_budget_is_posted_to_wall_tiles_after_every_scene() {
         if let AgentMsg::Health(h) = c.next().await {
             assert_eq!(h.budget_fit, Some(1.0e6));
             assert_eq!(h.t, Some(1.5));
+            assert_eq!(h.render_ms_max, Some(12.5));
             break;
         }
     }

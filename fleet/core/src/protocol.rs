@@ -141,11 +141,32 @@ pub struct HealthReport {
     pub fps: f64,
     #[serde(default)]
     pub gpu: serde_json::Value,
-    /// The renderer's `budget_fit` and the scene time of its newest frame (`t`).
+    /// The renderer's `budget_fit`, the scene time of its newest frame (`t`), and its
+    /// slowest render over the last 2 s.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget_fit: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t: Option<f64>,
+    /// The slowest render over its last 2 s (`frames_2s.render_ms_max`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub render_ms_max: Option<f64>,
+}
+
+impl HealthReport {
+    /// The report for a renderer's `/health` reply. A renderer that is not `ready` reports
+    /// no fit, as budgetctl.py counts only ready tiles.
+    pub fn from_renderer(id: &str, h: &serde_json::Value) -> HealthReport {
+        let num = |v: Option<&serde_json::Value>| v.and_then(|f| f.as_f64());
+        let ready = h.get("ready").and_then(|r| r.as_bool()) != Some(false);
+        HealthReport {
+            id: id.to_string(),
+            fps: num(h.get("fps")).unwrap_or(0.0),
+            gpu: h.get("gpu").cloned().unwrap_or(serde_json::Value::Null),
+            budget_fit: num(h.get("budget_fit")).filter(|_| ready),
+            t: num(h.get("t")),
+            render_ms_max: num(h.get("frames_2s").and_then(|f| f.get("render_ms_max"))),
+        }
+    }
 }
 
 /// Agent -> coordinator.
@@ -298,6 +319,22 @@ pub struct RendererScene {
 
 #[cfg(test)]
 mod tests {
+    use super::HealthReport;
+
+    #[test]
+    fn a_health_reply_gives_the_fit_only_when_ready() {
+        let h = serde_json::json!({"fps": 30.0, "t": 12.5, "ready": true, "budget_fit": 4.0e5,
+            "frames_2s": {"n": 60, "render_ms_max": 31.5}});
+        let r = HealthReport::from_renderer("slot-1", &h);
+        assert_eq!(
+            (r.budget_fit, r.t, r.render_ms_max),
+            (Some(4.0e5), Some(12.5), Some(31.5))
+        );
+        let mut h = h;
+        h["ready"] = false.into();
+        assert_eq!(HealthReport::from_renderer("slot-1", &h).budget_fit, None);
+    }
+
     use super::*;
     use serde_json::json;
 

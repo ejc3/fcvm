@@ -2,7 +2,7 @@
   "config": {
     "ec2_max": 1
   },
-  "description": "One render budget for every tile of the wall, from budgetctl.py: every 2 s the smallest budget_fit of the placed tiles, rounded down to the ladder 250,000 x 2^(n/4); down at once, up only after two rounds (to the lower ask); no decision until every placed tile has reported; one start time t for every tile, a second past the newest frame drawn, rounded up to a frame. Covers mixed-speed tiles on both sides, a tile joining mid-adjustment (no decision until it reports, the pending raise kept) and the slowest tile leaving (the raise follows after two rounds).",
+  "description": "One render budget for every tile of the wall, from budgetctl.py at 55e81ad5 (the oracle here): every 2 s, once every placed tile has reported, the smallest budget_fit smoothed half the way each round; the first budget the ladder rung under fit / 1.15; down to the rung under the fit when the budget exceeds the smoothed fit by 5%, and a rung at once when a tile's render_ms_max is over 90% of a slot; up to the rung under fit / 1.15 after three rounds in a row allow it; one start time t for every tile, a second past the newest frame drawn. Covers mixed-speed tiles on both sides, noise within the margin, a tile joining mid-adjustment, an overloaded frame, and the slowest tile leaving.",
   "events": [
     {
       "at": 1000,
@@ -114,11 +114,11 @@
       "at": 4500,
       "host": "h1",
       "msg": {
-        "budget_fit": 2000000.0,
+        "budget_fit": 520000.0,
         "fps": 30.0,
         "gpu": null,
         "id": "slot-2",
-        "t": 12.0,
+        "t": 11.0,
         "type": "health"
       },
       "type": "agent"
@@ -129,6 +129,125 @@
     },
     {
       "at": 6500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 460000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 12.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 8000,
+      "type": "tick"
+    },
+    {
+      "at": 8500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 540000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 13.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 10000,
+      "type": "tick"
+    },
+    {
+      "at": 10500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 470000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 14.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 12000,
+      "type": "tick"
+    },
+    {
+      "at": 12500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 400000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 15.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 14000,
+      "type": "tick"
+    },
+    {
+      "at": 14500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 400000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 16.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 16000,
+      "type": "tick"
+    },
+    {
+      "at": 16500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 400000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 17.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 18000,
+      "type": "tick"
+    },
+    {
+      "at": 18500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 2000000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-2",
+        "t": 15.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 20000,
+      "type": "tick"
+    },
+    {
+      "at": 20500,
       "host": "h2",
       "msg": {
         "arch": "x86_64",
@@ -145,7 +264,7 @@
       "type": "agent"
     },
     {
-      "at": 6600,
+      "at": 20600,
       "host": "h2",
       "msg": {
         "frame_url": "ws://h2:20003/frames",
@@ -159,37 +278,97 @@
       "type": "agent"
     },
     {
-      "at": 8000,
+      "at": 22000,
       "type": "tick"
     },
     {
-      "at": 8500,
+      "at": 22500,
+      "host": "h2",
+      "msg": {
+        "budget_fit": 2000000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-3",
+        "t": 16.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 24000,
+      "type": "tick"
+    },
+    {
+      "at": 26000,
+      "type": "tick"
+    },
+    {
+      "at": 26500,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 2000000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-1",
+        "render_ms_max": 31.0,
+        "t": 17.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 28000,
+      "type": "tick"
+    },
+    {
+      "at": 28500,
       "host": "h2",
       "msg": {
         "budget_fit": 300000.0,
         "fps": 30.0,
         "gpu": null,
         "id": "slot-3",
-        "t": 13.0,
+        "t": 18.0,
         "type": "health"
       },
       "type": "agent"
     },
     {
-      "at": 10000,
+      "at": 30000,
       "type": "tick"
     },
     {
-      "at": 10500,
+      "at": 30500,
       "host": "h2",
       "type": "agent_gone"
     },
     {
-      "at": 12000,
+      "at": 30600,
+      "host": "h1",
+      "msg": {
+        "budget_fit": 2000000.0,
+        "fps": 30.0,
+        "gpu": null,
+        "id": "slot-1",
+        "t": 19.0,
+        "type": "health"
+      },
+      "type": "agent"
+    },
+    {
+      "at": 32000,
       "type": "tick"
     },
     {
-      "at": 14000,
+      "at": 34000,
+      "type": "tick"
+    },
+    {
+      "at": 36000,
+      "type": "tick"
+    },
+    {
+      "at": 38000,
       "type": "tick"
     }
   ],
@@ -205,48 +384,146 @@
     {
       "after": 8,
       "checks": {
-        "/view/budget": 500000,
+        "/view/budget": 420448,
         "/view/budget_from_t": 11.2
       },
-      "note": "mixed speeds: the slowest tile governs, one t for all"
+      "note": "mixed speeds: the slowest tile governs, with 15% margin, one t for all"
     },
     {
       "after": 10,
       "checks": {
-        "/view/budget": 500000,
+        "/view/budget": 420448,
         "/view/budget_from_t": 11.2
       },
-      "note": "every tile could take more: the first round only asks"
+      "note": "the slow tile within 8% of its load: no change"
     },
     {
-      "after": 13,
+      "after": 12,
       "checks": {
-        "/view/budget": 500000
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
       },
-      "note": "a tile joined and has not reported: no decision"
+      "note": "the slow tile within 8% of its load: no change"
     },
     {
-      "after": 15,
+      "after": 14,
       "checks": {
-        "/view/budget": 297302,
-        "/view/budget_from_t": 14.0
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
       },
-      "note": "the new tile is the slowest: down at once"
+      "note": "the slow tile within 8% of its load: no change"
     },
     {
-      "after": 17,
+      "after": 16,
       "checks": {
-        "/view/budget": 297302
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
       },
-      "note": "the slowest tile left: the first round asks"
+      "note": "the slow tile within 8% of its load: no change"
     },
     {
       "after": 18,
       "checks": {
-        "/view/budget": 1000000,
-        "/view/budget_from_t": 13.0
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
       },
-      "note": "the second round raises it"
+      "note": "the smoothed fit falls toward the budget: no change"
+    },
+    {
+      "after": 20,
+      "checks": {
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
+      },
+      "note": "the smoothed fit falls toward the budget: no change"
+    },
+    {
+      "after": 22,
+      "checks": {
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
+      },
+      "note": "the budget within 5% of the smoothed fit: no change"
+    },
+    {
+      "after": 24,
+      "checks": {
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
+      },
+      "note": "the slow tile sped up: the first round allowing a raise"
+    },
+    {
+      "after": 27,
+      "checks": {
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
+      },
+      "note": "the joining tile has not reported: no decision, the count kept"
+    },
+    {
+      "after": 29,
+      "checks": {
+        "/view/budget": 420448,
+        "/view/budget_from_t": 11.2
+      },
+      "note": "the second round allowing a raise"
+    },
+    {
+      "after": 30,
+      "checks": {
+        "/view/budget": 707107,
+        "/view/budget_from_t": 17.0
+      },
+      "note": "the third: up"
+    },
+    {
+      "after": 32,
+      "checks": {
+        "/view/budget": 594604,
+        "/view/budget_from_t": 18.0
+      },
+      "note": "a frame over 90% of its slot: one rung down at once"
+    },
+    {
+      "after": 34,
+      "checks": {
+        "/view/budget": 297302,
+        "/view/budget_from_t": 19.0
+      },
+      "note": "the joined tile is the slowest: down"
+    },
+    {
+      "after": 37,
+      "checks": {
+        "/view/budget": 297302,
+        "/view/budget_from_t": 19.0
+      },
+      "note": "the slowest tile left: up after three rounds"
+    },
+    {
+      "after": 38,
+      "checks": {
+        "/view/budget": 297302,
+        "/view/budget_from_t": 19.0
+      },
+      "note": "the slowest tile left: up after three rounds"
+    },
+    {
+      "after": 39,
+      "checks": {
+        "/view/budget": 707107,
+        "/view/budget_from_t": 20.0
+      },
+      "note": "the slowest tile left: up after three rounds"
+    },
+    {
+      "after": 40,
+      "checks": {
+        "/view/budget": 707107,
+        "/view/budget_from_t": 20.0
+      },
+      "note": "the slowest tile left: up after three rounds"
     }
   ],
   "final_view": {
@@ -274,8 +551,8 @@
       "lent": 0,
       "next_return_at": null
     },
-    "budget": 1000000,
-    "budget_from_t": 13.0,
+    "budget": 707107,
+    "budget_from_t": 20.0,
     "claims": [],
     "cooldown_until": null,
     "counters": {
@@ -289,7 +566,7 @@
         "host": "h2",
         "kind": "host_reclaimed",
         "retiling": true,
-        "since": 10500
+        "since": 30500
       }
     ],
     "fleet": {
@@ -343,22 +620,17 @@
         "x": 0.0,
         "y": 0.0
       },
-      "from_frame": 360,
-      "from_t": 12.0,
+      "from_frame": 960,
+      "from_t": 32.0,
       "generation": 4
     },
     "next_race_at": null,
     "nudges": {
-      "arrive_next_at": 30000,
+      "arrive_next_at": 55000,
       "holding": null,
-      "next": "horizon",
+      "next": "dawn-valley",
       "next_hold_at": null,
       "targets": [
-        {
-          "id": "horizon",
-          "label": "High above: the curve of the horizon",
-          "votes": 0
-        },
         {
           "id": "dawn-valley",
           "label": "Dawn in the valley",
@@ -368,6 +640,11 @@
           "id": "peak-seam-low-sun",
           "label": "The peak at a low sun",
           "votes": 0
+        },
+        {
+          "id": "peak-close",
+          "label": "Close to the peak",
+          "votes": 0
         }
       ]
     },
@@ -375,48 +652,6 @@
     "relaunch_all": null,
     "scene": {
       "camera": [
-        {
-          "fov_deg": 60.0,
-          "look": [
-            -63.5,
-            2.2,
-            -87.0
-          ],
-          "pos": [
-            -100.0,
-            0.35,
-            -90.0
-          ],
-          "t": 0.0
-        },
-        {
-          "fov_deg": 60.0,
-          "look": [
-            -63.5,
-            2.2,
-            -87.0
-          ],
-          "pos": [
-            -100.0,
-            0.35,
-            -90.0
-          ],
-          "t": 7.0
-        },
-        {
-          "fov_deg": 65.0,
-          "look": [
-            -75.0,
-            28.0,
-            -170.0
-          ],
-          "pos": [
-            -40.0,
-            20.0,
-            -80.0
-          ],
-          "t": 18.5
-        },
         {
           "fov_deg": 70.0,
           "look": [
@@ -444,11 +679,39 @@
             -60.0
           ],
           "t": 37.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.0,
+            1.8,
+            -92.0
+          ],
+          "t": 55.0
+        },
+        {
+          "fov_deg": 62.0,
+          "look": [
+            -10.75,
+            2.6,
+            -105.5
+          ],
+          "pos": [
+            -18.0,
+            1.8,
+            -92.0
+          ],
+          "t": 62.0
         }
       ],
       "epoch_unix_ms": 0,
       "lights": [],
-      "time_of_day": 0.45,
+      "time_of_day": 0.265,
       "words": []
     },
     "scoreboard": {
