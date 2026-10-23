@@ -7,3 +7,4 @@ playwright-report/
 .env.ports
 *.tsbuildinfo
 next-env.d.ts
+.wrangler/
