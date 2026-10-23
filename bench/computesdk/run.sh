@@ -81,7 +81,10 @@ PY
 
 # 2. fcvm serve on a port the kernel picks.
 SERVE_LOG=$OUT/serve.log
-"$FCVM" serve --port 0 "${SERVE_FLAGS[@]}" >"$SERVE_LOG" 2>&1 &
+# serve logs its bound port at info. The sandboxes inherit the filter, so they log warnings
+# and their restored records (stdout) only.
+RUST_LOG=${RUST_LOG:-warn,fcvm::commands::serve=info} \
+  "$FCVM" serve --port 0 "${SERVE_FLAGS[@]}" >"$SERVE_LOG" 2>&1 &
 SERVE_PID=$!
 trap 'kill -TERM $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true' EXIT
 PORT=""
