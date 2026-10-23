@@ -257,6 +257,22 @@ int main() {
     CHECK(samples_for(local_budget(406000, px720), px720) <= 406000 && stride_for(local_budget(406000, px720) / px720) == 4,
           "a stride's share is not chosen over the fit (budget %.0f)", local_budget(406000, px720));
     CHECK(local_budget(5e6, 50000) == ladder_floor(5e6), "at many samples per pixel the ladder rung stands");
+    // The cost model: 50,000 drawn pixels, a fixed 4 ms, the fast path 40 ns
+    // per sample. Slot 33.3 ms, target 23.3 ms: 19.3 ms of samples.
+    CostModel m;
+    m.hq_prior = 2.0;
+    m.observe(false, 250000, 10.0, 14.0);  // 250 k samples in 10 ms
+    double fslot = 1000.0 / 30;
+    // the high-quality path at 80 ns per sample (the prior) needs 400 k = 8 spp
+    // for 32 ms: unaffordable, so the fit stays just under 8 spp on the fast path
+    double f1 = m.fit(50000, 8, fslot);
+    CHECK(f1 < 8 * 50000 && f1 > 7.9 * 50000, "fast path capped under the high-quality threshold (%.0f)", f1);
+    // measured: the high-quality path costs 30 ns per sample here, so 19.3 ms buys 644 k
+    m.observe(true, 500000, 15.0, 19.0);
+    double f2 = m.fit(50000, 8, fslot);
+    CHECK(std::fabs(f2 - (0.7 * fslot - 4.0) / 3e-5) < 1000, "high-quality fit from its own cost (%.0f)", f2);
+    // and the frame it predicts lands at 70% of the slot
+    CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
   }
   tlscheck::run();
   DONE();

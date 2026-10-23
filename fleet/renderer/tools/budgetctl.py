@@ -4,11 +4,10 @@ reference for the fleet's coordinator.
     python3 tools/budgetctl.py [--period S] [--lead S] [--rounds N] HOST:PORT ...
 
 Every period it reads /health of every tile, takes the smallest budget_fit
-(the slowest tile governs), rounds it down to the ladder 250,000 x 2^(n/4),
-and posts that budget to every tile with one start time, `lead` seconds past
-the newest frame any tile has drawn, so every tile switches at the same slot.
-A lower rung is taken at once; a higher one only after two rounds in a row
-ask for at least that much. The budget in force is posted every round, since
+(the slowest tile governs), rounds it down to the ladder 250,000 x 2^(n/4)
+with the hysteresis in Controller, and posts that budget to every tile with
+one start time, `lead` seconds past the newest frame any tile has drawn, so
+every tile switches at the same slot. The budget in force is posted every round, since
 a new scene clears a tile's schedule. Prints one line per round.
 """
 import json
@@ -39,39 +38,65 @@ def post_budget(host, port, budget, t):
 
 
 class Controller:
-    def __init__(self):
-        self.current = None  # the budget last posted
-        self.want_up = None  # a higher rung asked for in the previous round
+    """Hysteresis on the slowest tile's fit F (smoothed over rounds):
+    - down when the budget in force exceeds F by more than 5%, to the rung
+      under F; at once when any tile's frame took over 90% of its slot;
+    - up when the rung under F / 1.15 is above the budget in force for three
+      rounds in a row, to that rung.
+    Once up, F must fall about 17% before the budget comes down again, and a
+    rung is 19%, so a steady load holds one budget."""
 
-    def decide(self, fits):
-        """The budget to post this round (or None), from every tile's fit."""
+    def __init__(self):
+        self.current = None  # the budget in force
+        self.f = None        # smoothed slowest fit
+        self.up_rounds = 0
+
+    def decide(self, fits, overloaded=False):
+        """The new budget this round, or None to keep the one in force."""
         fits = [f for f in fits if f and f > 0]
         if not fits:
             return None
-        b = ladder_floor(min(fits))
-        if self.current is None or b < self.current:
-            self.want_up = None
-            self.current = b
-            return b
-        if b > self.current:
-            if self.want_up is not None:
-                up = min(b, self.want_up)
-                self.want_up = None
+        m = min(fits)
+        self.f = m if self.f is None else self.f + (m - self.f) * 0.5
+        if self.current is None:
+            self.current = ladder_floor(self.f / 1.15)
+            return self.current
+        if overloaded or self.f < 0.95 * self.current:
+            self.up_rounds = 0
+            b = ladder_floor(min(self.f, m))
+            if overloaded:  # a frame near its slot: at least one rung down
+                b = min(b, ladder_floor(self.current * 0.999))
+            if b < self.current:
+                self.current = b
+                return b
+            return None
+        up = ladder_floor(self.f / 1.15)
+        if up > self.current:
+            self.up_rounds += 1
+            if self.up_rounds >= 3:
+                self.up_rounds = 0
                 self.current = up
                 return up
-            self.want_up = b
-            return None
-        self.want_up = None
+        else:
+            self.up_rounds = 0
         return None
 
 
 def self_test():
     assert ladder_floor(250000) == 250000 and ladder_floor(297302) == 297302 and ladder_floor(297300) == 250000
     c = Controller()
-    assert c.decide([1e6, 5e5]) == ladder_floor(5e5)          # the slowest tile governs
-    assert c.decide([2e6, 2e6]) is None                       # up only after two rounds
-    assert c.decide([2e6, 1.5e6]) == ladder_floor(1.5e6)      # then to the lower of the two asks
-    assert c.decide([3e5, 2e6]) == ladder_floor(3e5)          # down at once
+    assert c.decide([1e6, 5e5]) == ladder_floor(5e5 / 1.15)       # the slowest tile governs, with margin
+    cur = c.current
+    for f in (5.2e5, 4.6e5, 5.4e5, 4.7e5, 5.1e5):                  # +-8% around one load: no change
+        assert c.decide([2e6, f]) is None, f
+    assert c.current == cur
+    for _ in range(2):
+        assert c.decide([2e6, 2e6]) is None                       # up only after three rounds
+    assert c.decide([2e6, 2e6]) is not None and c.current > cur
+    hi = c.current
+    assert c.decide([3e5, 2e6]) is None or c.current < hi         # a drop below 95% brings it down
+    c2 = Controller(); c2.decide([1e6]); top = c2.current
+    assert c2.decide([1e6], overloaded=True) == ladder_floor(top * 0.999)  # overload: one rung down
     print("budgetctl self-test ok")
 
 
@@ -101,9 +126,10 @@ def main():
             except OSError:
                 hs.append(None)
         fits = [x.get("budget_fit") for x in hs if x and x.get("ready")]
+        over = any((x.get("frames_2s") or {}).get("render_ms_max", 0) > 0.9 * 1000 / 30 for x in hs if x)
         # every tile must report: a budget chosen without the slowest one
         # could be one it cannot draw
-        b = c.decide(fits) if len(fits) == len(tiles) else None
+        b = c.decide(fits, over) if len(fits) == len(tiles) else None
         tnow = max((x["t"] for x in hs if x), default=0)
         line = {"round": n, "fits": fits, "budget_in_use": [x.get("budget") for x in hs if x],
                 "render_ms": [x.get("render_ms") for x in hs if x]}

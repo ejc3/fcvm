@@ -326,7 +326,11 @@ __device__ float cloud_density(V3 p, bool detail) {
     d = (d - e) / (1.0f - e);
     if (d <= 0.0f) return 0.0f;
   }
-  return d * 60.0f;  // extinction per km
+  // The remap above rises slowly where coverage is high: a deep region of thin
+  // cloud, which seen from inside or near the layer read as a uniform fog
+  // bank (it took kilometres of 30 m steps to become opaque). Density
+  // saturates at a third of it, so cloud bodies get surfaces and shading.
+  return sat(d * 3.0f) * 60.0f;  // extinction per km
 }
 
 // Optical depth from p toward the sun through the cloud layer.
@@ -1585,11 +1589,15 @@ bool Renderer::init(std::string* err) {
     cudaStream_t st;
     CK(cudaStreamCreateWithFlags(&st, cudaStreamNonBlocking));
     stream_ = st;
-    cudaEvent_t e0, e1;
+    cudaEvent_t e0, e1, e2, e3;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
+    CK(cudaEventCreate(&e2));
+    CK(cudaEventCreate(&e3));
     ev0_ = e0;
     ev1_ = e1;
+    evt0_ = e2;
+    evt1_ = e3;
 
     // noise table, identical to the host's
     const HostNoise& hn = host_noise();
@@ -1809,6 +1817,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   unsigned int zero = 0;
   CK(cudaMemcpyToSymbolAsync(g_bad, &zero, sizeof zero, 0, cudaMemcpyHostToDevice, st));
   dim3 bs(8, 8);
+  CK(cudaEventRecord((cudaEvent_t)evt0_, st));
   if (held && p.sample_base < HOLD_MAX_SAMPLES) {
     k_hold<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)hold_sum_, (float2*)hold_aux_, (float4*)ring_[ri],
                                                                (float2*)ring_aux_[ri]);
@@ -1816,6 +1825,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     k_moving<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((float4*)ring_[ri], (float2*)ring_aux_[ri]);
   }
   CK(cudaGetLastError());
+  CK(cudaEventRecord((cudaEvent_t)evt1_, st));
   if (half && !(held && p.sample_base >= HOLD_MAX_SAMPLES)) {
     k_fill<<<dim3((ew_ + 7) / 8, (eh_ + 7) / 8), bs, 0, st>>>((const float4*)ring_[ri], (const float2*)ring_aux_[ri],
                                                                (float4*)fill_c_, (float2*)fill_a_);
@@ -1835,6 +1845,9 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   float ms = 0;
   cudaEventElapsedTime(&ms, (cudaEvent_t)ev0_, (cudaEvent_t)ev1_);
   stats_.render_ms = ms;
+  float tms = 0;
+  cudaEventElapsedTime(&tms, (cudaEvent_t)evt0_, (cudaEvent_t)evt1_);
+  stats_.trace_ms = tms;
   CK(cudaMemcpyFromSymbol(&stats_.bad_samples, g_bad, sizeof(unsigned int)));
   stats_.spp = (held && p.sample_base >= HOLD_MAX_SAMPLES) ? 0 : spp;
   stats_.half = stride;

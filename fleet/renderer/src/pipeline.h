@@ -136,6 +136,12 @@ class Pipeline {
   // health: the budget the last frame used, where it came from, and this
   // renderer's fit (budget at 70% of a slot, smoothed)
   double used_budget_ = 0, fit_ = 0, fit_px_ = 0, fit_scale_ = 1.0;
+  CostModel cost_;
+  struct FrameLog {
+    std::chrono::steady_clock::time_point at;
+    double frame_ms, render_ms, encode_ms;
+  };
+  std::deque<FrameLog> frame_log_;  // under hmu_
   const char* budget_source_ = "default";
   // health
   std::mutex hmu_;
