@@ -218,7 +218,17 @@ void Pipeline::stop() {
   cv_.notify_all();
 }
 
-std::string Pipeline::fatal() const { return fatal_; }
+std::string Pipeline::fatal() const {
+  std::lock_guard<std::mutex> l(hmu_);
+  return fatal_;
+}
+
+// health_json reads these from the server's threads
+void Pipeline::set_fatal(const std::string& m) {
+  fprintf(stderr, "fleet-renderer: %s\n", m.c_str());
+  std::lock_guard<std::mutex> l(hmu_);
+  fatal_ = m;
+}
 
 std::shared_ptr<Subscriber> Pipeline::subscribe(int h, int q) {
   auto s = std::make_shared<Subscriber>();
@@ -261,14 +271,7 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
     // a new layout generation takes effect at its rect_from_frame (at once
     // without one): every renderer starts its history there, so the tiles of
     // the new layout draw from the same frames whether or not they moved
-    if (sc->layout_generation >= 0 && sc->layout_generation != gen_cur_ &&
-        !(switch_pending_ && gen_next_ == sc->layout_generation)) {
-      switch_pending_ = true;
-      gen_next_ = sc->layout_generation;
-      switch_k_ = sc->rect_from_frame >= 0 ? sc->rect_from_frame : 0;
-      switch_from_ = sc->has_previous_rect ? sc->previous_rect : sc->rect;
-      switch_to_ = sc->rect;
-    }
+    lay_.on_scene(*sc);
     scene_version_++;
     sched_ = schedule_after_scene(sched_, same_clock, sc->budget > 0, k_last);
     // A scene means a stream is coming (a tile joining or rejoining the
@@ -306,28 +309,31 @@ bool Pipeline::post_budget(const std::string& body, std::string* err) {
 // encoders are keyed by height and quality; ordered by height first
 static int enc_key(const Subscriber& s) { return even_h(s.want_h) * 4 + std::clamp(s.want_q.load(), 0, 2); }
 
-std::string Pipeline::header_json(const Enc& e, int q) {
+std::string Pipeline::header_json(const Enc& e, int q, long long gen) {
   char b[448];
   snprintf(b, sizeof b,
            "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"x0\":%d,\"y0\":%d,\"fps\":%d,"
            "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},\"q\":\"%s\",\"bitrate\":%u,\"layout_generation\":%s}",
            e.enc->codec().c_str(), e.ew, e.eh, e.geo.full_w, e.geo.full_h, e.geo.x0, e.geo.y0, opt_.fps, e.left, e.top,
-           e.right, e.bottom, quality_name(q), e.enc->bitrate(), gen_cur_ >= 0 ? std::to_string(gen_cur_).c_str() : "null");
+           e.right, e.bottom, quality_name(q), e.enc->bitrate(), gen >= 0 ? std::to_string(gen).c_str() : "null");
   return b;
 }
 
 void Pipeline::run() {
   std::string err;
   if (!r_.init(&err)) {
-    fatal_ = "GPU init failed: " + err;
-    fprintf(stderr, "fleet-renderer: %s\n", fatal_.c_str());
+    set_fatal("GPU init failed: " + err);
     return;
   }
-  gpu_name_ = r_.gpu_name();
   gpu_.start(r_.pci_bus_id());
-  startup_ready_ms_ = (boottime_s() - proc_start_) * 1000.0;
-  fprintf(stderr, "fleet-renderer: GPU %s (%s) ready %.0f ms after process start\n", gpu_name_.c_str(),
-          r_.pci_bus_id().c_str(), startup_ready_ms_);
+  double ready_ms = (boottime_s() - proc_start_) * 1000.0;
+  {
+    std::lock_guard<std::mutex> l(hmu_);
+    gpu_name_ = r_.gpu_name();
+    startup_ready_ms_ = ready_ms;
+  }
+  fprintf(stderr, "fleet-renderer: GPU %s (%s) ready %.0f ms after process start\n", r_.gpu_name().c_str(),
+          r_.pci_bus_id().c_str(), ready_ms);
   ready_ = true;
   aux_ = std::thread([this] { aux_loop(); });
   long long last_k = LLONG_MIN;
@@ -385,8 +391,7 @@ void Pipeline::run() {
       frame_log_.push_back({std::chrono::steady_clock::now(), fms, rstats_.render_ms, encode_ms_});
       while (frame_log_.size() > 300) frame_log_.pop_front();
     } catch (const std::exception& e) {
-      fatal_ = std::string("frame failed: ") + e.what();
-      fprintf(stderr, "fleet-renderer: %s\n", fatal_.c_str());
+      set_fatal(std::string("frame failed: ") + e.what());
       return;
     }
     frame_no++;
@@ -427,6 +432,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   std::shared_ptr<const Scene> prep_scene;
   long long prep_gen = -1;
   long long pend_k = LLONG_MAX;  // the first frame of a pending layout
+  long long gen_cur = -1;  // the layout generation of this frame
   primed_through_ = LLONG_MIN;
   {
     std::lock_guard<std::mutex> l(mu_);
@@ -434,32 +440,31 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     sc = scene_;
     long long k = std::llround(t * opt_.fps);
     if (scene_prev_ && k < sc->rect_from_frame) sc = scene_prev_;  // the old layout until its last frame
-    if (switch_pending_ && k >= switch_k_) {
-      switch_pending_ = false;
-      gen_cur_ = gen_next_;
+    if (lay_.take(k)) {
       new_layout = true;
       // keep each stream's whole image as tall as it was: a stream's height
       // is its tile's, and the tile's share of the image may have changed
-      bool moved = !rect_eq(switch_from_, switch_to_);
+      bool moved = !rect_eq(lay_.from, lay_.to);
       for (auto& s : subs) {
         if (moved) {
-          int full = tile_geometry(switch_from_, sc->image_aspect, s->want_h).full_h;
-          s->want_h = tile_h_for(switch_to_, sc->image_aspect, full);
+          int full = tile_geometry(lay_.from, sc->image_aspect, s->want_h).full_h;
+          s->want_h = tile_h_for(lay_.to, sc->image_aspect, full);
         }
         s->cur_h = 0;  // a new header (layout_generation) at this frame
         s->need_key = true;
       }
     }
-    if (switch_pending_) pend_k = switch_k_;
+    gen_cur = lay_.cur;
+    if (lay_.pending) pend_k = lay_.k;
     // open the pending layout's encoders ahead of its first frame
-    if (switch_pending_ && prepared_gen_ != gen_next_ && !subs.empty()) {
-      prepared_gen_ = gen_next_;
-      if (!rect_eq(switch_from_, switch_to_)) {
+    if (lay_.pending && prepared_gen_ != lay_.next && !subs.empty()) {
+      prepared_gen_ = lay_.next;
+      if (!rect_eq(lay_.from, lay_.to)) {
         prep_scene = scene_;
-        prep_gen = gen_next_;
+        prep_gen = lay_.next;
         for (auto& s : subs)
-          prep.push_back({tile_h_for(switch_to_, scene_->image_aspect,
-                                     tile_geometry(switch_from_, scene_->image_aspect, s->want_h).full_h),
+          prep.push_back({tile_h_for(lay_.to, scene_->image_aspect,
+                                     tile_geometry(lay_.from, scene_->image_aspect, s->want_h).full_h),
                           std::clamp(s->want_q.load(), 0, 2)});
       }
     }
@@ -618,16 +623,19 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
                "\"layout_generation\":%s}",
                t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half, r_.stats().hq ? 1 : 0,
                budget, source, r_.stats().hold ? "true" : "false", r_.stats().hold_samples,
-               gen_cur_ >= 0 ? std::to_string(gen_cur_).c_str() : "null");
+               gen_cur >= 0 ? std::to_string(gen_cur).c_str() : "null");
       rq->tile = tj;
       rq->ok = true;
     }
     if (any) raw_cv_.notify_all();
   }
   double since_start = (boottime_s() - proc_start_) * 1000.0;
-  if (first_frame_ms_ < 0) {
-    first_frame_ms_ = since_start;
-    fprintf(stderr, "fleet-renderer: first frame drawn %.0f ms after process start (%dx%d, %.1f ms)\n", first_frame_ms_,
+  if (first_frame_ms_ < 0) {  // only this thread writes it
+    {
+      std::lock_guard<std::mutex> l(hmu_);
+      first_frame_ms_ = since_start;
+    }
+    fprintf(stderr, "fleet-renderer: first frame drawn %.0f ms after process start (%dx%d, %.1f ms)\n", since_start,
             rt.w, rt.h, r_.stats().render_ms);
   }
   double enc_ms = 0;
@@ -653,6 +661,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
         }
       }
       if (ready.failed) {
+        retire(ready);  // a failed open can still hold its input buffer
         for (auto& s : e.subs) s->close();
         e.opening = false;
         continue;
@@ -685,7 +694,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       continue;
     }
     if (prime) continue;  // nothing is sent while a tile primes its history
-    std::string hdr = header_json(e, q);
+    std::string hdr = header_json(e, q, gen_cur);
     auto hmsg = std::make_shared<const std::string>(ws_frame(1, hdr.data(), hdr.size()));
     for (auto& s : e.subs) {
       if (s->cur_h != ekey) {
@@ -726,14 +735,18 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       }
       s->need_key = false;
       s->push(msg);
-      if (first_sent_ms_ < 0) {
-        first_sent_ms_ = (boottime_s() - proc_start_) * 1000.0;
-        fprintf(stderr, "fleet-renderer: first frame sent %.0f ms after process start (%dx%d)\n", first_sent_ms_, g.w, g.h);
+      if (first_sent_ms_ < 0) {  // only this thread writes it
+        double sent_ms = (boottime_s() - proc_start_) * 1000.0;
+        {
+          std::lock_guard<std::mutex> l(hmu_);
+          first_sent_ms_ = sent_ms;
+        }
+        fprintf(stderr, "fleet-renderer: first frame sent %.0f ms after process start (%dx%d)\n", sent_ms, g.w, g.h);
       }
     }
   }
   if (new_layout)
-    fprintf(stderr, "fleet-renderer: layout generation %lld from frame %lld (that frame took %.1f ms)\n", gen_cur_,
+    fprintf(stderr, "fleet-renderer: layout generation %lld from frame %lld (that frame took %.1f ms)\n", gen_cur,
             std::llround(t * opt_.fps), (mono_s() - sw0) * 1000.0);
   {
     // encoders opened ahead and not taken: once no layout is pending, any that
@@ -741,7 +754,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     bool pending;
     {
       std::lock_guard<std::mutex> l(mu_);
-      pending = switch_pending_;
+      pending = lay_.pending;
     }
     std::vector<Enc> left;
     {
@@ -813,7 +826,7 @@ std::string Pipeline::health_json() {
   bool gpend;
   {
     std::lock_guard<std::mutex> l(mu_);  // never held together with hmu_
-    gcur = gen_cur_; gnext = gen_next_; gk = switch_k_; gpend = switch_pending_;
+    gcur = lay_.cur; gnext = lay_.next; gk = lay_.k; gpend = lay_.pending;
   }
   std::lock_guard<std::mutex> l(hmu_);
   std::ostringstream o;

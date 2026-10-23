@@ -168,28 +168,56 @@ Scene default_scene() {
 }
 
 Tile tile_geometry(const Rect& r, double image_aspect, int requested_h) {
-  int h = std::clamp(requested_h, 16, 2160);
-  h &= ~1;
-  Tile t;
-  t.h = h;
-  t.full_h = std::max(16, (int)std::lround(h / r.h));
-  t.full_w = std::max(16, (int)std::lround(t.full_h * image_aspect));
-  t.y0 = (int)std::lround(r.y * t.full_h);
-  t.x0 = (int)std::lround(r.x * t.full_w);
-  int w = (int)std::lround(r.w * t.full_w);
-  w = std::clamp(w, 16, 4096);
-  t.w = (w + 1) & ~1;
-  return t;
+  int h = std::clamp(requested_h, 16, 2160) & ~1;
+  for (;;) {
+    Tile t;
+    t.h = h;
+    t.full_h = std::max(16, (int)std::lround(h / r.h));
+    t.full_w = std::max(16, (int)std::lround(t.full_h * image_aspect));
+    t.y0 = (int)std::lround(r.y * t.full_h);
+    t.x0 = (int)std::lround(r.x * t.full_w);
+    int w = (int)std::lround(r.w * t.full_w);
+    if (w > 4096 && h > 16) {
+      // too wide to encode: a lower height, the same rect
+      h = std::max(16, (int)(h * 4096.0 / w)) & ~1;
+      continue;
+    }
+    w = std::clamp(w, 16, 4096);
+    t.w = (w + 1) & ~1;
+    return t;
+  }
 }
 
 int tile_h_for(const Rect& r, double image_aspect, int full_h) {
   int best = 16, bd = 1 << 30;
-  int c = (int)std::lround(full_h * r.h);
+  // a full_h beyond what a tile can be gets the nearest height there is
+  int c = std::clamp((int)std::lround(full_h * r.h), 16, 2160);
   for (int h = std::max(16, (c - 8) & ~1); h <= std::min(2160, c + 8); h += 2) {
     int d = std::abs(tile_geometry(r, image_aspect, h).full_h - full_h);
     if (d < bd) { bd = d; best = h; }
   }
   return best;
+}
+
+void LayoutSwitch::on_scene(const Scene& sc) {
+  if (sc.layout_generation < 0) {
+    pending = false;
+    cur = next = -1;
+    return;
+  }
+  if (sc.layout_generation == cur || (pending && next == sc.layout_generation)) return;
+  pending = true;
+  next = sc.layout_generation;
+  k = sc.rect_from_frame >= 0 ? sc.rect_from_frame : 0;
+  from = sc.has_previous_rect ? sc.previous_rect : sc.rect;
+  to = sc.rect;
+}
+
+bool LayoutSwitch::take(long long frame) {
+  if (!pending || frame < k) return false;
+  pending = false;
+  cur = next;
+  return true;
 }
 
 double scene_time(const Scene& s, double t) {
@@ -583,11 +611,31 @@ static void text_layout(const Scene& s, FrameParams& p, double st, double t, dou
   float alpha = (float)age_alpha(age);
   if (w->style == TEXT_STYLE_LOCKUP) {
     auto lines = wrap2(w->text, MSG_EM * 2.0f / asp, 1.15f);
+    // The last line keeps the one-line baseline, above the clock; the lines
+    // above it go up. Wrapped, the first line's cap top must stay inside the
+    // image (below MSG_TOP, projected), so a wrapped message gets a smaller em
+    // where the full one would cross it.
+    const float MSG_TOP = 0.96f;
+    auto base_of = [&](size_t li, float em) { return msg_base + (float)(lines.size() - 1 - li) * 1.2f * em * 2.0f; };
+    auto cap_top = [&](float em) {
+      GText g{};
+      place_type(g, cam, asp, U0, base_of(0, em), TYPE_KM, em);
+      V3 d = g.center + g.up * (SDF_CAP_HEIGHT * g.height) - cam.pos;
+      return dot(d, cam.up) / (dot(d, cam.fwd) * cam.tan_half);
+    };
+    float em = MSG_EM;
+    if (lines.size() > 1 && cap_top(em) > MSG_TOP) {
+      float lo = 0.5f * MSG_EM, hi = MSG_EM;
+      for (int i = 0; i < 24; i++) {
+        float mid = 0.5f * (lo + hi);
+        if (cap_top(mid) > MSG_TOP) hi = mid; else lo = mid;
+      }
+      em = lo;
+    }
     for (size_t li = 0; li < lines.size(); li++) {
       GText& g = p.text[p.n_text++];
       sdf_layout(g, lines[li], false);
-      float base = msg_base + (float)(lines.size() - 1 - li) * 1.2f * MSG_EM * 2.0f;
-      place_type(g, cam, asp, U0, base, TYPE_KM, MSG_EM);
+      place_type(g, cam, asp, U0, base_of(li, em), TYPE_KM, em);
       g.color = kWarmWhite * 2.4f;  // after exposure
       g.style = GTEXT_TYPE;
       g.occlude = 1;

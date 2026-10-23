@@ -98,7 +98,9 @@ arrives first. Each renderer then:
 
 A scene whose `layout_generation` is the one in force, or already pending,
 changes nothing about the switch (the coordinator re-posts the same body).
-Without `layout_generation` a scene takes effect at once, as before. With it
+Without `layout_generation` a scene takes effect at once, as before: it
+cancels a pending switch, and headers sent after it carry `layout_generation`
+null. With it
 and no `previous_rect`, the new rect applies from K and frames before K use it
 too. A re-tile keeps the clock, so it keeps the budget schedule (see "Budget"),
 and the budget the coordinator re-posts after the scene, with a `t` at or
@@ -294,7 +296,10 @@ y0     = round(rect.y * full_h)     x0     = round(rect.x * full_w)
 W      = round(rect.w * full_w), rounded up to even
 ```
 
-and the tile is whole-image pixels `[x0, x0+W) x [y0, y0+H)`. Tiles of a grid
+and the tile is whole-image pixels `[x0, x0+W) x [y0, y0+H)`. W is at most
+4096 (NVENC H.264): when it would be wider, `H` is lowered to
+`floor(H * 4096 / W)` rounded down to even and the geometry worked out again, so
+the tile still covers the whole rect at a lower height. Tiles of a grid
 asked at one height share `full_w x full_h`; neighbours meet with no gap and at
 most one pixel of overlap, and an overlapping pixel is the same whole-image
 pixel in both, drawn identically.
