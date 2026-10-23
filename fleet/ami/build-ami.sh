@@ -16,7 +16,8 @@
 #   build-ami.sh put-url <key>              presigned PUT URL for s3://<assets>/<key> (6 h)
 #   build-ami.sh get-url <key>              presigned GET URL for s3://<assets>/<key> (6 h)
 #
-# Environment: REGION (default us-east-1), SUBNET (default: the fleet subnet in us-east-1a).
+# Environment: REGION (default us-east-1), SUBNET (default: the fleet subnet in us-east-1a),
+# BASE_AMI (launch from an earlier fleet AMI instead of Ubuntu 24.04, to revise it).
 set -euo pipefail
 REGION=${REGION:-us-east-1}
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -63,7 +64,7 @@ launch)
     tile) type=${TYPE:-g4dn.xlarge}; profile=fcvm-fleet-tile; size=32 ;;
     *) echo "launch host|tile" >&2; exit 2 ;;
   esac
-  id=$(A ec2 run-instances --image-id "$(ubuntu_ami)" --instance-type "$type" --subnet-id "$(subnet)" \
+  id=$(A ec2 run-instances --image-id "${BASE_AMI:-$(ubuntu_ami)}" --instance-type "$type" --subnet-id "$(subnet)" \
     --security-group-ids "$(sg)" --iam-instance-profile Name=$profile \
     --metadata-options HttpTokens=required,HttpPutResponseHopLimit=1,HttpEndpoint=enabled \
     --block-device-mappings "[{\"DeviceName\":\"/dev/sda1\",\"Ebs\":{\"VolumeSize\":$size,\"VolumeType\":\"gp3\",\"DeleteOnTermination\":true}}]" \

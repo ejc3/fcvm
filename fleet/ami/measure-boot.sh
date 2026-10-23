@@ -79,7 +79,16 @@ ssm "echo kernel_start=\$(( \$(date +%s%3N) - \$(awk '{printf \"%d\", \$1*1000}'
   esac
 done
 if [ "$KIND" = host ]; then
-  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" 2>&1 | tail -3; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1"
+  # Ready for the agent: the GPUs on vfio-pci and the store restored from the AMI's archive.
+  while :; do
+    st=$(ssm "systemctl is-active fcvm-fleet-vfio.service fcvm-fleet-store.service | paste -sd' '" | tr -d '\t' | head -1)
+    case "$st" in "active active") break ;; *failed*) echo "host units: $st"; exit 1 ;; esac
+    sleep 5
+  done
+  ssm "for u in fcvm-fleet-vfio fcvm-fleet-store; do echo \$u \$(date -d \"\$(systemctl show -p ActiveEnterTimestamp --value \$u.service)\" +%s%3N); done; journalctl -u fcvm-fleet-store -o cat --no-pager | grep 'fcvm-fleet-store:'" | while read -r u t rest; do
+    case "$u" in fcvm-fleet-store:) echo "on-instance: $u $t $rest" ;; *) [ -z "$t" ] || echo "$u active $(( t - t0 )) ms after the request" ;; esac
+  done
+  ssm "G0=\$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1); prlimit --memlock=unlimited:unlimited sudo -u ubuntu -H XDG_RUNTIME_DIR=/run/user/1000 bash -c \"cd /tmp && bash /usr/local/lib/fcvm-fleet/warm.sh \$G0 /tmp/warm.log\" 2>&1 | tail -3; grep -o '\"status\":\"restored\"[^}]*' /tmp/warm.log | head -1"
   t_vm=$(now)
   echo "host: first GPU VM done $((t_vm - t0)) ms after the request (includes SSM round trips)"
 fi

@@ -39,7 +39,7 @@ prep)
   $APT update
   $APT install -y build-essential git jq qemu-utils busybox-static pkg-config libssl-dev clang make \
     podman skopeo uidmap slirp4netns fuse3 passt btrfs-progs bc bison flex libelf-dev libseccomp-dev \
-    curl zstd ffmpeg python3-pil
+    curl zstd ffmpeg python3-pil python3-boto3
   # AGENTS.md "Fresh Bare-Metal Box Quickstart", steps 1, 1b, 1c and 4, made persistent.
   usermod -aG kvm "$U"
   loginctl enable-linger "$U"
@@ -63,7 +63,7 @@ X
   update-initramfs -u
   update-grub
   install -d /usr/local/lib/fcvm-fleet /var/lib/fcvm-fleet /etc/fcvm-fleet
-  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0755 "$HERE/bind-vfio.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
   install -m 0644 "$HERE/fcvm-fleet-vfio.service" "$HERE/fcvm-fleet-store.service" "$HERE/fcvm-fleet-agent.service" /etc/systemd/system/
   systemctl daemon-reload
   systemctl enable fcvm-fleet-vfio.service fcvm-fleet-store.service
@@ -97,7 +97,11 @@ build)
   ;;
 bake)
   pkill -TERM -x fcvm || true; sleep 2
-  install -m 0755 "$HERE/warm.sh" /usr/local/lib/fcvm-fleet/
+  install -m 0755 "$HERE/warm.sh" "$HERE/store.sh" "$HERE/s3-cat.py" /usr/local/lib/fcvm-fleet/
+  # Where the store archive is fetched at boot; build-ami.sh uploads it there after bake.
+  if [ -n "${STORE_S3_KEY:-}" ]; then
+    printf 'STORE_S3_REGION=%s\nSTORE_S3_BUCKET=%s\nSTORE_S3_KEY=%s\n' "$STORE_S3_REGION" "$STORE_S3_BUCKET" "$STORE_S3_KEY" > /etc/fcvm-fleet/store.env
+  fi
   # What a host needs to run GPU VMs without building: everything in the store except
   # per-VM and per-run state, build caches and downloads that only setup reads.
   cd /mnt/fcvm-btrfs

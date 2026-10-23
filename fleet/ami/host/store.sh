@@ -17,9 +17,26 @@ if [ "${#devs[@]}" -gt 1 ]; then mkfs.btrfs -q -f -d raid0 -m raid0 "${devs[@]}"
 mkdir -p "$M"
 mount -o noatime "${devs[0]}" "$M"
 t1=$(date +%s%N)
-if [ -s "$ARCHIVE" ]; then
+# The archive is fetched from S3 when the AMI names one (/etc/fcvm-fleet/store.env:
+# STORE_S3_BUCKET, STORE_S3_KEY, STORE_S3_REGION): a volume restored from the AMI's
+# snapshot reads its blocks lazily from S3, which measured 4.6 MB/s (1.9 GB in 419 s),
+# while the instance role reads the object at network speed. The AMI's own copy is the
+# fallback.
+src=none
+if [ -r /etc/fcvm-fleet/store.env ]; then
+  . /etc/fcvm-fleet/store.env
+  if /usr/local/lib/fcvm-fleet/s3-cat.py "$STORE_S3_REGION" "$STORE_S3_BUCKET" "$STORE_S3_KEY" \
+      | zstd -q -d -T0 | tar -x --sparse --same-owner --numeric-owner -C "$M"; then
+    src=s3
+  else
+    echo "fetching s3://$STORE_S3_BUCKET/$STORE_S3_KEY failed; restoring from the AMI's copy"
+    find "$M" -mindepth 1 -delete
+  fi
+fi
+if [ "$src" = none ] && [ -s "$ARCHIVE" ]; then
   zstd -q -d -T0 -c "$ARCHIVE" | tar -x --sparse --same-owner --numeric-owner -C "$M"
+  src=ami
 fi
 chown ubuntu:ubuntu "$M"
 t2=$(date +%s%N)
-echo "fcvm-fleet-store: mkfs+mount $(( (t1 - t0) / 1000000 )) ms, restore $(( (t2 - t1) / 1000000 )) ms, $(du -sh --apparent-size "$M" | cut -f1) apparent"
+echo "fcvm-fleet-store: mkfs+mount $(( (t1 - t0) / 1000000 )) ms, restore from $src $(( (t2 - t1) / 1000000 )) ms, $(du -sh --apparent-size "$M" | cut -f1) apparent"

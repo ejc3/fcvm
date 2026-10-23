@@ -59,6 +59,9 @@ Conflicts=shutdown.target
 
 [Service]
 Type=forking
+# /dev/nvidia-uvm and /dev/nvidia-uvm-tools exist only once something asks for them, and
+# the CDI spec lists them: create them before anything starts a container.
+ExecStartPre=/usr/bin/nvidia-modprobe -u -c=0
 ExecStart=/usr/bin/nvidia-persistenced --user root
 ExecStopPost=/bin/rm -rf /var/run/nvidia-persistenced
 
@@ -72,8 +75,13 @@ X
   # during boot (24 s, measured); masked.
   systemctl mask nvidia-cdi-refresh.path nvidia-cdi-refresh.service
   rm -f /var/run/cdi/nvidia.yaml
+  # The spec lists the device nodes present now; /dev/nvidia-modeset can be left from a
+  # moment nvidia_modeset was loaded and is absent on every boot of the AMI.
+  rm -f /dev/nvidia-modeset
+  nvidia-modprobe -u -c=0
   nvidia-ctk cdi generate --device-name-strategy=index --disable-hook=apply-cuda-memory-limits --output=/etc/cdi/nvidia.yaml
-  ! grep -q -E 'additionalGids|GPU-[0-9a-f]{8}' /etc/cdi/nvidia.yaml
+  ! grep -q -E 'additionalGids|GPU-[0-9a-f]{8}|nvidia-modeset' /etc/cdi/nvidia.yaml
+  grep -q /dev/nvidia-uvm /etc/cdi/nvidia.yaml
   # Nothing on a tile uses podman's auto-update or restart-policy units (8.7 s each at boot).
   systemctl mask podman-auto-update.timer podman-auto-update.service podman-restart.service
   # The driver's modules load in sysinit, so nvidia-persistenced (DefaultDependencies=no)
