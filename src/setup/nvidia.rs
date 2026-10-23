@@ -11,7 +11,9 @@
 //! - `usr/lib/<triplet>/lib*.so.<version>` and `usr/bin/nvidia-smi` and
 //!   friends, from the same `.run`;
 //! - `usr/bin/nvidia-ctk` and `usr/bin/nvidia-cdi-hook` from the pinned
-//!   nvidia-container-toolkit release.
+//!   nvidia-container-toolkit release;
+//! - `usr/bin/fcvm-gpu-scrub`, built here from [`GPU_SCRUB_SOURCE`], which
+//!   fc-agent runs to zero the GPUs' memory before a container gets them.
 //!
 //! The modules and the user-space libraries come from one archive, so their
 //! versions match by construction, and the build checks it (`modinfo` version
@@ -220,11 +222,23 @@ fi
 dpkg-deb -x "${debs[0]}" "$NV_DIR/toolkit/base"
 install -m 0755 "$NV_DIR/toolkit/base/usr/bin/nvidia-ctk" "$NV_DIR/toolkit/base/usr/bin/nvidia-cdi-hook" "$NV_ROOT/usr/bin/"
 
+# The memory scrub fc-agent runs before a container gets the GPUs. It loads
+# libcuda.so.1 with dlopen, so it needs only a C compiler. It runs on the guest's
+# glibc: refuse a build that needs a version newer than 2.34, where dlopen and
+# pthread_create moved into libc, rather than ship one the guest cannot load.
+gcc -O2 -Wall -Wextra -Werror -pthread -o "$NV_ROOT/usr/bin/fcvm-gpu-scrub" "$NV_SCRUB_SOURCE"
+newest_glibc=$(objdump -T "$NV_ROOT/usr/bin/fcvm-gpu-scrub" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)
+if [[ "$(printf '%s\nGLIBC_2.34\n' "$newest_glibc" | sort -V | tail -1)" != "GLIBC_2.34" ]]; then
+    echo "ERROR: fcvm-gpu-scrub needs $newest_glibc, newer than GLIBC_2.34" >&2
+    exit 1
+fi
+
 for required in \
     "$MODDIR/nvidia.ko" "$MODDIR/nvidia-uvm.ko" \
     "$LIBDIR/libcuda.so.$NV_DRIVER_VERSION" "$LIBDIR/libcuda.so.1" \
     "$LIBDIR/libnvidia-ml.so.$NV_DRIVER_VERSION" "$LIBDIR/libnvidia-ml.so.1" \
-    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook"; do
+    "$NV_ROOT/usr/bin/nvidia-smi" "$NV_ROOT/usr/bin/nvidia-ctk" "$NV_ROOT/usr/bin/nvidia-cdi-hook" \
+    "$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do
     if [[ ! -e "$required" ]]; then
         echo "ERROR: driver image is missing $required" >&2
         exit 1
@@ -266,12 +280,21 @@ e2fsck -fn "$NV_IMAGE_TMP" >/dev/null
 echo "Driver image: $NV_IMAGE_TMP (${size_mib} MiB)"
 "##;
 
+/// The source of `usr/bin/fcvm-gpu-scrub`, compiled by the stage. Part of the
+/// image's key like the stage text.
+pub(crate) const GPU_SCRUB_SOURCE: &str = include_str!("nvidia_gpu_scrub.c");
+
 /// The header that hands the stage its inputs.
-fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) -> String {
+fn stage_header(
+    config: &NvidiaDriverConfig,
+    triplet: &str,
+    image_tmp: &Path,
+    scrub_source: &Path,
+) -> String {
     format!(
         "NV_DRIVER_VERSION=\"{}\"\nNV_DRIVER_URL=\"{}\"\nNV_DRIVER_SHA256=\"{}\"\n\
          NV_TOOLKIT_VERSION=\"{}\"\nNV_TOOLKIT_URL=\"{}\"\nNV_TOOLKIT_SHA256=\"{}\"\n\
-         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\n",
+         NV_LIB_TRIPLET=\"{}\"\nNV_IMAGE_TMP=\"{}\"\nNV_SCRUB_SOURCE=\"{}\"\n",
         config.driver_version,
         config.driver_url,
         config.driver_sha256,
@@ -280,11 +303,13 @@ fn stage_header(config: &NvidiaDriverConfig, triplet: &str, image_tmp: &Path) ->
         config.toolkit_sha256,
         triplet,
         image_tmp.display(),
+        scrub_source.display(),
     )
 }
 
 /// The image's content key: the kernel's identity, the pinned versions and
-/// hashes, and the stage text. Not the paths the build writes to.
+/// hashes, the stage text and the scrub tool's source. Not the paths the build
+/// writes to.
 pub fn driver_image_key(
     profile_name: &str,
     kernel_version: &str,
@@ -305,6 +330,7 @@ pub fn driver_image_key(
         &config.toolkit_url,
         &config.toolkit_sha256,
         DRIVER_IMAGE_STAGE,
+        GPU_SCRUB_SOURCE,
     ] {
         hasher.update((part.len() as u64).to_le_bytes());
         hasher.update(part.as_bytes());
@@ -517,9 +543,12 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
     let kernel_tmp = build_dir.join("kernel-image.discard");
     let _ = std::fs::remove_file(&kernel_tmp);
 
+    // Beside the script, unique to this invocation like it.
+    let scrub_source = script_path.with_extension("c");
+    std::fs::write(&scrub_source, GPU_SCRUB_SOURCE).context("writing the GPU scrub source")?;
     let stage = format!(
         "{}{}",
-        stage_header(config, lib_triplet(arch)?, &image_tmp),
+        stage_header(config, lib_triplet(arch)?, &image_tmp, &scrub_source),
         DRIVER_IMAGE_STAGE
     );
     let script = crate::setup::kernel::generate_vm_kernel_build_script(
@@ -543,6 +572,7 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
     super::run_build_as_sudo_invoker(&mut cmd);
     let status = run_streaming(cmd, "nvidia_build").await;
     let _ = std::fs::remove_file(&script_path);
+    let _ = std::fs::remove_file(&scrub_source);
     let status = match status {
         Ok(status) => status,
         Err(error) => {
@@ -690,7 +720,12 @@ mod tests {
 
     #[test]
     fn the_stage_reads_every_input_the_header_sets() {
-        let header = stage_header(&pinned(), "aarch64-linux-gnu", Path::new("/x/img.tmp"));
+        let header = stage_header(
+            &pinned(),
+            "aarch64-linux-gnu",
+            Path::new("/x/img.tmp"),
+            Path::new("/x/scrub.c"),
+        );
         for line in header.lines() {
             let name = line.split('=').next().unwrap();
             assert!(
@@ -709,6 +744,162 @@ mod tests {
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$version" != "$NV_DRIVER_VERSION" ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#"[[ "$vermagic" != "$KREL "* ]]"#));
         assert!(DRIVER_IMAGE_STAGE.contains(r#""$LIBDIR/libcuda.so.$NV_DRIVER_VERSION""#));
+    }
+
+    /// A stand-in for libcuda.so.1: each GPU has `free` bytes, an allocation
+    /// larger than what is left is refused as out of memory, and at exit it
+    /// reports per GPU what was allocated, zeroed, freed and left.
+    const FAKE_LIBCUDA: &str = r#"
+#include <stdio.h>
+#include <stdlib.h>
+static size_t avail[2] = {(1ul << 30) + (3ul << 20) + 4096, 5ul << 20};
+static size_t allocated[2], zeroed[2];
+static int allocs[2], frees[2];
+static __thread int cur = -1;
+int cuInit(unsigned f) { (void)f; return 0; }
+int cuDeviceGetCount(int *c) { *c = getenv("FAKE_GPUS") ? atoi(getenv("FAKE_GPUS")) : 2; return 0; }
+int cuDeviceGet(int *d, int o) { *d = o; return 0; }
+int cuCtxCreate_v2(void **c, unsigned f, int d) { (void)f; cur = d; *c = &avail[d]; return 0; }
+int cuCtxDestroy_v2(void *c) { (void)c; return 0; }
+int cuCtxSynchronize(void) { return 0; }
+int cuMemGetInfo_v2(size_t *f, size_t *t) { *f = avail[cur]; *t = 16ul << 30; return 0; }
+int cuMemAlloc_v2(unsigned long long *p, size_t n) {
+    if (n > avail[cur]) return 2;
+    avail[cur] -= n; allocated[cur] += n; allocs[cur]++;
+    *p = ((unsigned long long)cur << 40) | allocated[cur];
+    return 0;
+}
+int cuMemFree_v2(unsigned long long p) { frees[p >> 40]++; return 0; }
+int cuMemsetD32Async(unsigned long long p, unsigned v, size_t n, void *s) {
+    (void)s;
+    if (getenv("FAKE_MEMSET_FAILS")) return 700;
+    if (v == 0) zeroed[p >> 40] += 4 * n;
+    return 0;
+}
+int cuGetErrorString(int r, const char **s) { (void)r; *s = "fake error"; return 0; }
+__attribute__((destructor)) static void report(void) {
+    for (int d = 0; d < 2; d++)
+        fprintf(stderr, "fake device=%d allocated=%zu zeroed=%zu allocs=%d frees=%d left=%zu\n",
+                d, allocated[d], zeroed[d], allocs[d], frees[d], avail[d]);
+}
+"#;
+
+    fn gcc(args: &[&str]) {
+        let output = std::process::Command::new("gcc")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "gcc {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Build fcvm-gpu-scrub with the stage's flags and the fake libcuda, and
+    /// run it with `env`; returns (exit code, stdout, stderr).
+    fn run_scrub_against_fake(env: &[(&str, &str)]) -> (i32, String, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("scrub.c");
+        let tool = dir.path().join("fcvm-gpu-scrub");
+        std::fs::write(&source, GPU_SCRUB_SOURCE).unwrap();
+        assert!(
+            DRIVER_IMAGE_STAGE.contains(
+                r#"gcc -O2 -Wall -Wextra -Werror -pthread -o "$NV_ROOT/usr/bin/fcvm-gpu-scrub" "$NV_SCRUB_SOURCE""#
+            ),
+            "the stage builds the scrub with other flags than this test"
+        );
+        gcc(&[
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-pthread",
+            "-o",
+            tool.to_str().unwrap(),
+            source.to_str().unwrap(),
+        ]);
+        let lib = dir.path().join("lib");
+        std::fs::create_dir(&lib).unwrap();
+        if !env.iter().any(|(k, _)| *k == "NO_FAKE") {
+            let fake = dir.path().join("fake.c");
+            std::fs::write(&fake, FAKE_LIBCUDA).unwrap();
+            gcc(&[
+                "-shared",
+                "-fPIC",
+                "-o",
+                lib.join("libcuda.so.1").to_str().unwrap(),
+                fake.to_str().unwrap(),
+            ]);
+        }
+        let output = std::process::Command::new(&tool)
+            .env("LD_LIBRARY_PATH", &lib)
+            .envs(env.iter().copied())
+            .output()
+            .unwrap();
+        (
+            output.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    }
+
+    /// The scrub takes every allocation a GPU grants, down to 2 MiB, zeroes
+    /// all of it and frees all of it, on every GPU.
+    #[test]
+    fn the_gpu_scrub_zeroes_everything_it_can_allocate_on_every_gpu() {
+        let (code, stdout, stderr) = run_scrub_against_fake(&[]);
+        assert_eq!(code, 0, "{stdout}{stderr}");
+        assert!(stdout.contains("scrubbed devices=2 "), "{stdout}");
+        for (device, allocated) in [(0, (1u64 << 30) + (2 << 20)), (1, 4 << 20)] {
+            let line = stderr
+                .lines()
+                .find(|l| l.starts_with(&format!("fake device={device} ")))
+                .unwrap_or_else(|| panic!("no report for device {device}: {stderr}"));
+            assert!(
+                line.contains(&format!("allocated={allocated} zeroed={allocated} ")),
+                "device {device} was not zeroed in full: {line}"
+            );
+            let field = |name: &str| -> u64 {
+                line.split_whitespace()
+                    .find_map(|f| f.strip_prefix(&format!("{name}=")))
+                    .unwrap()
+                    .parse()
+                    .unwrap()
+            };
+            assert_eq!(field("allocs"), field("frees"), "{line}");
+            assert!(field("left") < 2 << 20, "{line}");
+        }
+    }
+
+    /// A GPU it cannot zero, or a missing driver, fails the scrub; what it
+    /// allocated is still freed.
+    #[test]
+    fn the_gpu_scrub_fails_when_it_cannot_zero_a_gpu() {
+        let (code, stdout, stderr) = run_scrub_against_fake(&[("FAKE_MEMSET_FAILS", "1")]);
+        assert_eq!(code, 1, "{stdout}{stderr}");
+        assert!(stderr.contains("cuMemsetD32Async: fake error"), "{stderr}");
+        assert!(!stdout.contains("scrubbed devices="), "{stdout}");
+        assert!(stderr.contains("allocs=2 frees=2"), "{stderr}");
+
+        let (code, stdout, stderr) = run_scrub_against_fake(&[("FAKE_GPUS", "0")]);
+        assert_eq!(code, 1, "{stdout}{stderr}");
+        assert!(stderr.contains("reports 0 GPU(s)"), "{stderr}");
+
+        let (code, _, stderr) = run_scrub_against_fake(&[("NO_FAKE", "1")]);
+        assert_eq!(code, 1, "{stderr}");
+        assert!(stderr.contains("libcuda.so.1"), "{stderr}");
+    }
+
+    /// fc-agent runs the scrub from the path the stage installs it at.
+    #[test]
+    fn fc_agent_runs_the_scrub_the_image_carries() {
+        let agent = include_str!("../../fc-agent/src/gpu.rs");
+        assert!(
+            agent.contains(r#"pub const SCRUB_TOOL: &str = "usr/bin/fcvm-gpu-scrub";"#),
+            "fc-agent's SCRUB_TOOL no longer names usr/bin/fcvm-gpu-scrub"
+        );
+        assert!(DRIVER_IMAGE_STAGE.contains(r#""$NV_ROOT/usr/bin/fcvm-gpu-scrub"; do"#));
     }
 
     #[test]

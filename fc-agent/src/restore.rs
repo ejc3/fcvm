@@ -193,6 +193,9 @@ pub struct RestorePhases {
     pub gpu_ms: f64,
     /// GPUs the driver initialised.
     pub gpus: usize,
+    /// The attach steps' milliseconds (the memory scrub); absent without GPUs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_steps: Option<crate::gpu::AttachSteps>,
 }
 
 impl RestorePhases {
@@ -274,8 +277,8 @@ pub async fn handle_clone_restore(
         let gpus = gpus.to_vec();
         tokio::spawn(async move {
             let started = std::time::Instant::now();
-            let ready = crate::gpu::attach(&gpus).await?;
-            Ok::<_, anyhow::Error>((elapsed_ms(started), ready))
+            let report = crate::gpu::attach(&gpus).await?;
+            Ok::<_, anyhow::Error>((elapsed_ms(started), report))
         })
     });
 
@@ -455,13 +458,17 @@ pub async fn handle_clone_restore(
     eprintln!("[fc-agent] exec re-registered after restore");
 
     if let Some(job) = gpu_attach {
-        let (gpu_ms, ready) = job
+        let (gpu_ms, report) = job
             .await
             .context("joining the GPU attach")?
             .context("restore phase gpu-attach")?;
         phases.gpu_ms = gpu_ms;
-        phases.gpus = ready;
-        eprintln!("[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={ready} elapsed_ms={gpu_ms:.3}");
+        phases.gpus = report.gpus;
+        phases.gpu_steps = Some(report.steps);
+        eprintln!(
+            "[fc-agent] restore phase=gpu-attach epoch={restore_epoch} gpus={} elapsed_ms={gpu_ms:.3}",
+            phases.gpus
+        );
     }
 
     // Publication, last: the plan's restore hook runs now, with egress open,
@@ -689,14 +696,32 @@ mod tests {
         phases.egress_wait_ms = 99_999.999;
         phases.total_ms = 99_999.999;
         phases.ack_connect_ms = 99_999.999;
+        phases.gpu_ms = 99_999.999;
+        phases.gpus = 8;
+        phases.gpu_steps = Some(crate::gpu::AttachSteps {
+            scrub_ms: 99_999.999,
+        });
         let frame = exec_proto::restore_complete_frame(
             "8f4b2c1e-6d3a-4f5b-9c7e-0a1b2c3d4e5f",
             &phases.to_frame_json(),
         );
         assert!(
-            frame.contains("\"ack_connect_ms\":99999.999"),
+            frame.contains("\"ack_connect_ms\":99999.999")
+                && frame.contains("\"gpu_steps\":{\"scrub_ms\":99999.999}"),
             "the ACK telemetry was dropped from the frame: {frame}"
         );
+    }
+
+    /// The ACK names the GPU memory scrub's duration, and says nothing about
+    /// GPU steps without GPUs.
+    #[test]
+    fn the_ack_carries_the_gpu_scrub_time() {
+        let mut phases = RestorePhases::default();
+        let bare: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert!(bare.get("gpu_steps").is_none(), "{bare}");
+        phases.gpu_steps = Some(crate::gpu::AttachSteps { scrub_ms: 61.5 });
+        let frame: serde_json::Value = serde_json::from_str(&phases.to_frame_json()).unwrap();
+        assert_eq!(frame["gpu_steps"]["scrub_ms"], 61.5, "{frame}");
     }
 
     #[tokio::test(flavor = "current_thread")]

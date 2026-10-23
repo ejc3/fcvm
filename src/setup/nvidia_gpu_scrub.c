@@ -1,0 +1,200 @@
+/*
+ * fcvm-gpu-scrub: zero every byte of GPU memory a process can allocate, on
+ * every GPU the driver sees, before a container is given the GPUs.
+ *
+ * A GPU moves between VMs. NVIDIA documents that newly allocated memory is
+ * not cleared, so a new VM's allocations can return the previous tenant's
+ * data (scripts/gpu-residue measures it). fc-agent runs this once per restore,
+ * after the driver initialised the GPUs and before the CDI spec is written
+ * (fc-agent/src/gpu.rs), and refuses to publish the clone if it fails.
+ *
+ * Per GPU, on its own thread: create a context, allocate until the device
+ * refuses even 2 MiB (halving the request on each refusal), then queue a
+ * memset of zero over every allocation, synchronise, free, destroy the
+ * context.
+ *
+ * It uses the CUDA driver API from the driver image's libcuda.so.1, loaded
+ * with dlopen, so it builds with a C compiler alone. Output, one line per GPU
+ * and a summary:
+ *   scrubbed device=<n> bytes=<b> free=<f> total=<t> ms=<ms>
+ *   scrubbed devices=<n> bytes=<b> ms=<ms>
+ * Exit status 0 only if every GPU was scrubbed; otherwise an error line names
+ * the GPU and the call that failed.
+ */
+#define _GNU_SOURCE
+#include <dlfcn.h>
+#include <inttypes.h>
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+typedef int CUresult;
+typedef int CUdevice;
+typedef void *CUcontext;
+typedef unsigned long long CUdeviceptr;
+typedef void *CUstream;
+
+#define CUDA_SUCCESS 0
+#define MIN_CHUNK ((size_t)2 << 20)
+#define MAX_CHUNK ((size_t)1 << 30)
+#define MAX_CHUNKS 8192
+#define MAX_DEVICES 64
+
+static CUresult (*cuInit)(unsigned int);
+static CUresult (*cuDeviceGetCount)(int *);
+static CUresult (*cuDeviceGet)(CUdevice *, int);
+static CUresult (*cuCtxCreate)(CUcontext *, unsigned int, CUdevice);
+static CUresult (*cuCtxDestroy)(CUcontext);
+static CUresult (*cuCtxSynchronize)(void);
+static CUresult (*cuMemGetInfo)(size_t *, size_t *);
+static CUresult (*cuMemAlloc)(CUdeviceptr *, size_t);
+static CUresult (*cuMemFree)(CUdeviceptr);
+static CUresult (*cuMemsetD32Async)(CUdeviceptr, unsigned int, size_t, CUstream);
+static CUresult (*cuGetErrorString)(CUresult, const char **);
+
+static int load(void *lib, void **fn, const char *name) {
+    *fn = dlsym(lib, name);
+    if (!*fn) {
+        fprintf(stderr, "fcvm-gpu-scrub: libcuda.so.1 has no %s\n", name);
+        return -1;
+    }
+    return 0;
+}
+
+static const char *error_name(CUresult r) {
+    const char *s = NULL;
+    if (cuGetErrorString && cuGetErrorString(r, &s) == CUDA_SUCCESS && s)
+        return s;
+    return "unknown error";
+}
+
+static double now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1e3 + ts.tv_nsec / 1e6;
+}
+
+struct job {
+    int ordinal;
+    size_t bytes, free, total;
+    double ms;
+    char error[256];
+};
+
+#define FAIL(j, call, r)                                                      \
+    do {                                                                      \
+        snprintf((j)->error, sizeof (j)->error, "%s: %s (%d)", call,          \
+                 error_name(r), (int)(r));                                    \
+        goto out;                                                             \
+    } while (0)
+
+static void *scrub(void *arg) {
+    struct job *j = arg;
+    double started = now_ms();
+    CUdevice dev;
+    CUcontext ctx = NULL;
+    CUdeviceptr chunks[MAX_CHUNKS];
+    size_t sizes[MAX_CHUNKS];
+    size_t n = 0, chunk = MAX_CHUNK;
+    CUresult r;
+
+    if ((r = cuDeviceGet(&dev, j->ordinal)) != CUDA_SUCCESS) FAIL(j, "cuDeviceGet", r);
+    if ((r = cuCtxCreate(&ctx, 0, dev)) != CUDA_SUCCESS) FAIL(j, "cuCtxCreate", r);
+    if ((r = cuMemGetInfo(&j->free, &j->total)) != CUDA_SUCCESS) FAIL(j, "cuMemGetInfo", r);
+    /* Take everything first, so no zeroed allocation is freed and handed out
+     * again while there is still memory to take. */
+    while (chunk >= MIN_CHUNK) {
+        CUdeviceptr p;
+        if (n == MAX_CHUNKS) {
+            snprintf(j->error, sizeof j->error, "more than %d allocations", MAX_CHUNKS);
+            goto out;
+        }
+        r = cuMemAlloc(&p, chunk);
+        if (r == CUDA_SUCCESS) {
+            chunks[n] = p;
+            sizes[n++] = chunk;
+            j->bytes += chunk;
+        } else if (r == 2 /* CUDA_ERROR_OUT_OF_MEMORY */) {
+            chunk /= 2;
+        } else {
+            FAIL(j, "cuMemAlloc", r);
+        }
+    }
+    /* Every size is a power of two from 2 MiB up, so a whole number of words. */
+    for (size_t i = 0; i < n; i++)
+        if ((r = cuMemsetD32Async(chunks[i], 0, sizes[i] / 4, NULL)) != CUDA_SUCCESS)
+            FAIL(j, "cuMemsetD32Async", r);
+    if ((r = cuCtxSynchronize()) != CUDA_SUCCESS) FAIL(j, "cuCtxSynchronize", r);
+    if (j->bytes == 0) snprintf(j->error, sizeof j->error, "allocated no memory");
+out:
+    while (n > 0) cuMemFree(chunks[--n]);
+    if (ctx && (r = cuCtxDestroy(ctx)) != CUDA_SUCCESS && !j->error[0])
+        snprintf(j->error, sizeof j->error, "cuCtxDestroy: %s (%d)", error_name(r), (int)r);
+    j->ms = now_ms() - started;
+    return NULL;
+}
+
+int main(void) {
+    double started = now_ms();
+    void *lib = dlopen("libcuda.so.1", RTLD_NOW);
+    if (!lib) {
+        fprintf(stderr, "fcvm-gpu-scrub: %s\n", dlerror());
+        return 1;
+    }
+    if (load(lib, (void **)&cuInit, "cuInit") ||
+        load(lib, (void **)&cuDeviceGetCount, "cuDeviceGetCount") ||
+        load(lib, (void **)&cuDeviceGet, "cuDeviceGet") ||
+        load(lib, (void **)&cuCtxCreate, "cuCtxCreate_v2") ||
+        load(lib, (void **)&cuCtxDestroy, "cuCtxDestroy_v2") ||
+        load(lib, (void **)&cuCtxSynchronize, "cuCtxSynchronize") ||
+        load(lib, (void **)&cuMemGetInfo, "cuMemGetInfo_v2") ||
+        load(lib, (void **)&cuMemAlloc, "cuMemAlloc_v2") ||
+        load(lib, (void **)&cuMemFree, "cuMemFree_v2") ||
+        load(lib, (void **)&cuMemsetD32Async, "cuMemsetD32Async") ||
+        load(lib, (void **)&cuGetErrorString, "cuGetErrorString"))
+        return 1;
+
+    CUresult r;
+    int count = 0;
+    if ((r = cuInit(0)) != CUDA_SUCCESS) {
+        fprintf(stderr, "fcvm-gpu-scrub: cuInit: %s (%d)\n", error_name(r), (int)r);
+        return 1;
+    }
+    if ((r = cuDeviceGetCount(&count)) != CUDA_SUCCESS) {
+        fprintf(stderr, "fcvm-gpu-scrub: cuDeviceGetCount: %s (%d)\n", error_name(r), (int)r);
+        return 1;
+    }
+    if (count <= 0 || count > MAX_DEVICES) {
+        fprintf(stderr, "fcvm-gpu-scrub: the driver reports %d GPU(s)\n", count);
+        return 1;
+    }
+
+    struct job jobs[MAX_DEVICES];
+    pthread_t threads[MAX_DEVICES];
+    memset(jobs, 0, sizeof jobs);
+    for (int i = 0; i < count; i++) {
+        jobs[i].ordinal = i;
+        if (pthread_create(&threads[i], NULL, scrub, &jobs[i]) != 0) {
+            fprintf(stderr, "fcvm-gpu-scrub: starting the thread for GPU %d failed\n", i);
+            return 1;
+        }
+    }
+    int failed = 0;
+    size_t bytes = 0;
+    for (int i = 0; i < count; i++) {
+        pthread_join(threads[i], NULL);
+        if (jobs[i].error[0]) {
+            fprintf(stderr, "fcvm-gpu-scrub: GPU %d: %s\n", i, jobs[i].error);
+            failed = 1;
+            continue;
+        }
+        bytes += jobs[i].bytes;
+        printf("scrubbed device=%d bytes=%zu free=%zu total=%zu ms=%.3f\n", i,
+               jobs[i].bytes, jobs[i].free, jobs[i].total, jobs[i].ms);
+    }
+    if (failed) return 1;
+    printf("scrubbed devices=%d bytes=%zu ms=%.3f\n", count, bytes, now_ms() - started);
+    return 0;
+}

@@ -266,7 +266,7 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
 	bench-container-import bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
@@ -314,6 +314,7 @@ help:
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
 	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
+	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
@@ -818,6 +819,13 @@ setup-fcvm: setup-default
 setup-gpu: private SHELL := $(TARGET_LEASE_SHELL)
 setup-gpu: build setup-btrfs
 	./target/release/fcvm setup --kernel-profile gpu --build-kernels --config "$(CURDIR)/rootfs-config.toml"
+
+# Cross-tenant GPU memory residue (scripts/gpu-residue/run.sh): one VM fills a
+# GPU's memory with a marker and ends, the next VM on that GPU counts the marker
+# in fresh allocations. Needs a host with the GPU on vfio-pci.
+gpu-residue-test: setup-gpu
+	@test -n "$(GPU)" || { echo "usage: make gpu-residue-test GPU=<pci address> [RESIDUE_OUT=<dir>]" >&2; exit 2; }
+	FCVM=./target/release/fcvm ./scripts/gpu-residue/run.sh "$(GPU)" $(RESIDUE_OUT)
 
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
