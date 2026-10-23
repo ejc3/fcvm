@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 
+pub mod scrub;
+
 /// The Firecracker argument a kernel profile must carry for passthrough: devices
 /// are attached to the PCI bus, which Firecracker builds only with it.
 pub const PCI_FIRECRACKER_ARG: &str = "--enable-pci";
@@ -65,9 +67,15 @@ pub fn canonical_sbdfs(addresses: &[String]) -> Result<Vec<String>> {
 
 /// What a passthrough device needs on the host, checked under `sysfs` and `dev`
 /// (normally `/sys` and `/dev`): the device exists, it is bound to vfio-pci (not
-/// to a host driver), and this process can open its IOMMU group and the VFIO
-/// container. Returns the group's device node.
-pub fn check_host_device(sysfs: &Path, dev: &Path, sbdf: &str) -> Result<PathBuf> {
+/// to a host driver), it is not quarantined by a failed host scrub (records in
+/// `gpu_state`, normally [`scrub::state_dir`]), and this process can open its
+/// IOMMU group and the VFIO container. Returns the group's device node.
+pub fn check_host_device(
+    sysfs: &Path,
+    dev: &Path,
+    gpu_state: &Path,
+    sbdf: &str,
+) -> Result<PathBuf> {
     let device = sysfs.join("bus/pci/devices").join(sbdf);
     if !device.exists() {
         bail!(
@@ -94,6 +102,7 @@ pub fn check_host_device(sysfs: &Path, dev: &Path, sbdf: &str) -> Result<PathBuf
             device.display()
         ),
     }
+    scrub::check_not_quarantined(gpu_state, sbdf)?;
     let group = std::fs::read_link(device.join("iommu_group"))
         .with_context(|| {
             format!(
@@ -230,8 +239,25 @@ mod tests {
         check_host_device(
             &root.path().join("sys"),
             &root.path().join("dev"),
+            &root.path().join("gpu-state"),
             "0000:01:00.0",
         )
+    }
+
+    /// A GPU whose last host scrub failed is not handed to a VM; one whose
+    /// scrub then succeeded is.
+    #[test]
+    fn a_quarantined_gpu_is_refused() {
+        let root = fixture(Some("vfio-pci"), Some("7"));
+        let state = root.path().join("gpu-state");
+        scrub::record_outcome(&state, "0000:01:00.0", &Err("reset failed".into())).unwrap();
+        let error = format!("{:#}", check(&root).unwrap_err());
+        assert!(
+            error.contains("quarantined") && error.contains("reset failed"),
+            "{error}"
+        );
+        scrub::record_outcome(&state, "0000:01:00.0", &Ok(Default::default())).unwrap();
+        assert!(check(&root).is_ok());
     }
 
     #[test]
@@ -261,6 +287,7 @@ mod tests {
         let err = check_host_device(
             &root.path().join("sys"),
             &root.path().join("dev"),
+            &root.path().join("gpu-state"),
             "0000:02:00.0",
         )
         .unwrap_err();
@@ -329,11 +356,11 @@ mod tests {
         let call = "crate::gpu::check_driver_supports_device(";
         let code = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
         assert!(
-            code(include_str!("commands/podman/mod.rs")).contains(call),
+            code(include_str!("../commands/podman/mod.rs")).contains(call),
             "podman run does not check that the driver image supports the GPU"
         );
         assert!(
-            !code(include_str!("commands/snapshot.rs")).contains(call),
+            !code(include_str!("../commands/snapshot.rs")).contains(call),
             "snapshot run checks the GPU against the current profile, not the driver image \
              the snapshot recorded"
         );

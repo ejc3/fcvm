@@ -53,6 +53,11 @@ const SMI_TIMEOUT: Duration = Duration::from_secs(120);
 const CDI_TIMEOUT: Duration = Duration::from_secs(60);
 /// nvidia-persistenced initialises the GPU and then detaches; its parent exits.
 const PERSISTENCED_TIMEOUT: Duration = Duration::from_secs(120);
+/// The memory scrub zeroes 16 GB on a T4 in a fraction of a second.
+const SCRUB_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The scrub tool in the driver image (src/setup/nvidia_gpu_scrub.c).
+pub const SCRUB_TOOL: &str = "usr/bin/fcvm-gpu-scrub";
 
 /// Orders GPU attachment against the container launch. An attach holds the gate
 /// from its check that no container is running until it has published the CDI
@@ -560,6 +565,8 @@ pub struct AttachSteps {
     pub nodes_ms: f64,
     /// `nvidia-persistenced`, which initialises the GPU and keeps it open.
     pub persistenced_ms: f64,
+    /// Zeroing the GPUs' memory ([`scrub_gpus`]).
+    pub scrub_ms: f64,
     /// `nvidia-smi -L`.
     pub smi_ms: f64,
     /// `nvidia-ctk cdi generate`.
@@ -627,6 +634,11 @@ async fn attach_devices(announced: &[String]) -> Result<AttachReport> {
     start_persistenced(driver_root).await?;
     steps.persistenced_ms = clock.lap("persistenced");
 
+    // Zero the memory the previous VM on these GPUs left, before anything can
+    // hand them to the container.
+    let parallel = scrub_parallelism(mem_available_kib()?, announced.len());
+    steps.scrub_ms = scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?;
+
     // Both only read the GPUs the daemon has initialised, so they run together.
     // The spec is generated after the daemon starts so it mounts its socket.
     let ((smi_ms, listed), (cdi_ms, spec)) = tokio::join!(
@@ -683,6 +695,95 @@ async fn generate_cdi_spec(driver_root: &Path) -> Result<()> {
         .env("LD_LIBRARY_PATH", library_dir(driver_root));
     run_checked("nvidia-ctk cdi generate", ctk, CDI_TIMEOUT).await?;
     Ok(())
+}
+
+/// The scrub tool command: the image's binary with the image's libraries,
+/// scrubbing at most `parallel` GPUs at a time.
+pub fn scrub_command(driver_root: &Path, parallel: usize) -> tokio::process::Command {
+    let mut command = tokio::process::Command::new(driver_root.join(SCRUB_TOOL));
+    command
+        .args(["--parallel", &parallel.to_string()])
+        .env("LD_LIBRARY_PATH", library_dir(driver_root));
+    command
+}
+
+/// How many GPUs the scrub may hold a CUDA context on at once, given the
+/// guest's `MemAvailable` in KiB. Measured on a T4 in a 1 GiB guest with eight
+/// GPUs (MemAvailable 345 to 364 MiB): the first context took about 185 MiB
+/// and each further one about 35 MiB; four at once left 54 MiB, eight were
+/// OOM-killed. So 256 MiB for the first and 64 MiB for each further one. At
+/// least 1: a guest too small for even that fails the scrub, and the attach.
+pub fn scrub_parallelism(mem_available_kib: u64, gpus: usize) -> usize {
+    let mib = mem_available_kib / 1024;
+    let extra = mib.saturating_sub(256) / 64;
+    (1 + extra as usize).clamp(1, gpus.max(1))
+}
+
+/// `MemAvailable` from `/proc/meminfo`, in KiB.
+fn mem_available_kib() -> Result<u64> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").context("reading /proc/meminfo")?;
+    meminfo
+        .lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+        .context("/proc/meminfo has no MemAvailable")
+}
+
+/// Zero the memory of every GPU before the container can use them, and
+/// return the scrub's milliseconds.
+///
+/// A GPU moves between VMs. NVIDIA documents that newly allocated memory is
+/// not cleared, so a new VM's first allocations can return what the previous
+/// VM left there; scripts/gpu-residue measures it. The tool allocates all free memory on each GPU, zeroes it and frees
+/// it. It must report at least `expected` GPUs; anything else fails the
+/// attach, so the clone is not published.
+pub async fn scrub_gpus(command: tokio::process::Command, expected: usize) -> Result<f64> {
+    let started = std::time::Instant::now();
+    // Named by path: an image built before the scrub existed does not have it.
+    let program = command
+        .as_std()
+        .get_program()
+        .to_string_lossy()
+        .into_owned();
+    let output = match run_checked(&program, command, SCRUB_TIMEOUT).await {
+        Ok(output) => output,
+        Err(error) => bail!(
+            "zeroing the GPUs' memory failed, so the previous tenant's data may still be \
+             on them: {error:#}\nkernel log:\n{}",
+            nvrm_log_tail().await
+        ),
+    };
+    let Some((devices, bytes)) = parse_scrub_summary(&output) else {
+        bail!(
+            "fcvm-gpu-scrub exited 0 with no summary line: {}",
+            output.trim()
+        );
+    };
+    if devices < expected {
+        bail!(
+            "fcvm-gpu-scrub zeroed {devices} of {expected} GPU(s): {}",
+            output.trim()
+        );
+    }
+    // Rounded to microseconds: the ACK frame has a byte budget.
+    let ms = (started.elapsed().as_secs_f64() * 1e6).round() / 1e3;
+    eprintln!("[fc-agent] gpu: zeroed {bytes} bytes on {devices} GPU(s) in {ms:.3} ms");
+    for line in output.lines().filter(|l| l.starts_with("scrubbed device=")) {
+        eprintln!("[fc-agent] gpu: {line}");
+    }
+    Ok(ms)
+}
+
+/// The GPU count and byte total of the scrub tool's summary line,
+/// `scrubbed devices=<n> bytes=<b> ms=<ms>`.
+pub fn parse_scrub_summary(output: &str) -> Option<(usize, u64)> {
+    output.lines().rev().find_map(|line| {
+        let rest = line.trim().strip_prefix("scrubbed devices=")?;
+        let mut fields = rest.split_whitespace();
+        let devices = fields.next()?.parse().ok()?;
+        let bytes = fields.next()?.strip_prefix("bytes=")?.parse().ok()?;
+        Some((devices, bytes))
+    })
 }
 
 /// Start nvidia-persistenced from the driver image. Without it nothing holds the
@@ -779,6 +880,130 @@ mod tests {
             nodes < daemon && daemon < smi && daemon < cdi,
             "nvidia-persistenced must start after the device nodes ({nodes}) and before \
              nvidia-smi -L ({smi}) and the CDI spec ({cdi}); it starts at {daemon}"
+        );
+    }
+
+    /// The scrub runs once the daemon has initialised the GPUs, and before the
+    /// GPU check and the CDI spec: the spec is what hands the GPUs to the
+    /// container, and the container starts only after the attach returns. Its
+    /// error must end the attach.
+    #[test]
+    fn the_scrub_runs_before_the_cdi_spec_and_the_container() {
+        let body = attach_devices_body();
+        let daemon = body
+            .find("start_persistenced(driver_root)")
+            .expect("no nvidia-persistenced");
+        let scrub = body
+            .find("scrub_gpus(scrub_command(driver_root, parallel), announced.len())")
+            .expect("attach_devices does not scrub the GPUs' memory");
+        let smi = body
+            .find("list_gpus(driver_root)")
+            .expect("no nvidia-smi -L");
+        let cdi = body
+            .find("generate_cdi_spec(driver_root)")
+            .expect("no CDI generation");
+        assert!(
+            daemon < scrub && scrub < smi && scrub < cdi,
+            "the scrub ({scrub}) must run after nvidia-persistenced ({daemon}) and before \
+             nvidia-smi -L ({smi}) and the CDI spec ({cdi})"
+        );
+        assert!(
+            body[scrub..].starts_with(
+                "scrub_gpus(scrub_command(driver_root, parallel), announced.len()).await?"
+            ),
+            "a failed scrub must fail the attach"
+        );
+    }
+
+    /// A tool standing in for fcvm-gpu-scrub: a shell script printing `output`
+    /// and exiting with `status`.
+    fn fake_scrub(dir: &Path, output: &str, status: i32) -> tokio::process::Command {
+        let tool = dir.join(format!("scrub-{status}-{}", output.len()));
+        std::fs::write(
+            &tool,
+            format!("#!/bin/sh\nprintf '%s' '{output}'\nexit {status}\n"),
+        )
+        .unwrap();
+        std::fs::set_permissions(&tool, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        tokio::process::Command::new(tool)
+    }
+
+    /// The scrub fails closed: a tool that fails, reports fewer GPUs than the
+    /// host attached, says nothing, or is not in the image ends the attach.
+    #[tokio::test]
+    async fn a_scrub_that_does_not_cover_every_gpu_fails_the_attach() {
+        let dir = tempfile::tempdir().unwrap();
+        let two = "scrubbed device=0 bytes=1 free=1 total=2 ms=1\n\
+                   scrubbed device=1 bytes=1 free=1 total=2 ms=1\n\
+                   scrubbed devices=2 bytes=2 ms=3.5\n";
+        assert!(scrub_gpus(fake_scrub(dir.path(), two, 0), 2).await.is_ok());
+
+        let failed = scrub_gpus(
+            fake_scrub(
+                dir.path(),
+                "fcvm-gpu-scrub: GPU 1: cuMemAlloc: out of memory",
+                1,
+            ),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{failed:#}").contains("cuMemAlloc"), "{failed:#}");
+
+        let short = scrub_gpus(
+            fake_scrub(dir.path(), "scrubbed devices=1 bytes=2 ms=3.5\n", 0),
+            2,
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{short:#}").contains("1 of 2"), "{short:#}");
+
+        let silent = scrub_gpus(fake_scrub(dir.path(), "", 0), 1)
+            .await
+            .unwrap_err();
+        assert!(format!("{silent:#}").contains("no summary"), "{silent:#}");
+
+        let missing = scrub_gpus(
+            tokio::process::Command::new(dir.path().join("no-such-tool")),
+            1,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{missing:#}").contains("no-such-tool"),
+            "{missing:#}"
+        );
+    }
+
+    /// Eight GPUs in a 1 GiB guest (about 350 MiB available) were OOM-killed
+    /// at four contexts at once; the scrub must take them two at a time there,
+    /// all at once only with room for every context, and never zero at a time.
+    #[test]
+    fn the_scrub_holds_only_as_many_contexts_as_the_guest_has_memory_for() {
+        assert_eq!(scrub_parallelism(353 * 1024, 8), 2);
+        assert_eq!(scrub_parallelism(100 * 1024, 8), 1);
+        assert_eq!(scrub_parallelism(0, 1), 1);
+        assert_eq!(scrub_parallelism(4096 * 1024, 8), 8);
+        assert_eq!(scrub_parallelism(4096 * 1024, 1), 1);
+        let command = scrub_command(Path::new(DRIVER_ROOT), 2);
+        let args: Vec<_> = command.as_std().get_args().collect();
+        assert_eq!(args, ["--parallel", "2"]);
+    }
+
+    #[test]
+    fn the_scrub_summary_is_its_last_line() {
+        assert_eq!(
+            parse_scrub_summary("scrubbed device=0 bytes=5 free=1 total=2 ms=1\nscrubbed devices=1 bytes=5 ms=2.0\n"),
+            Some((1, 5))
+        );
+        assert_eq!(
+            parse_scrub_summary("scrubbed device=0 bytes=5 free=1 total=2 ms=1\n"),
+            None
+        );
+        assert_eq!(
+            parse_scrub_summary("scrubbed devices=x bytes=5 ms=2.0"),
+            None
         );
     }
 

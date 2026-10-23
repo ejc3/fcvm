@@ -30,6 +30,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Print a VM's balloon target and size as one JSON line; with MIB, set the target first
     Balloon(BalloonArgs),
+    /// Host-side GPU pool operations: scrub a GPU's memory between VMs, show quarantines
+    Gpu(GpuArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
     /// Run HTTP/WebSocket API server for ComputeSDK integration
@@ -758,6 +760,45 @@ pub struct SnapshotRunArgs {
     /// this run did not, and a hook the caller never named must not run in its clone.
     #[arg(skip = true)]
     pub inherit_recorded_hook: bool,
+}
+
+// ============================================================================
+// GPU pool commands (host-side scrub and quarantine)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct GpuArgs {
+    #[command(subcommand)]
+    pub cmd: GpuCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuCommands {
+    /// Reset each GPU and wait until it reports its memory cleared, before the GPU
+    /// goes to another VM. Run as root after the previous VM's Firecracker has
+    /// exited. Prints one JSON line per GPU; a GPU whose scrub fails is quarantined
+    /// (`--gpu` refuses it) until a later scrub succeeds. Exits 0 only if every GPU
+    /// was scrubbed.
+    Scrub(GpuScrubArgs),
+    /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
+    Status(GpuStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuScrubArgs {
+    /// GPU PCI addresses (SSSS:BB:DD.F or BB:DD.F), scrubbed in parallel
+    #[arg(required = true, value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
+    /// Seconds to wait for each of the GPU's boot and its memory clear
+    #[arg(long, default_value_t = 5)]
+    pub timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuStatusArgs {
+    /// GPU PCI addresses; every recorded GPU when none are given
+    #[arg(value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
 }
 
 // ============================================================================
