@@ -4133,6 +4133,7 @@ pub fn build_snapshot_config(
             firecracker_bin: snapshot_firecracker_bin(vm_state, firecracker_pid),
             balloon_mib: vm_state.config.balloon_mib,
             balloon_free_page_reporting: vm_state.config.balloon_free_page_reporting,
+            parked_gpus: 0,
         },
     })
 }
@@ -4769,6 +4770,15 @@ pub(crate) fn recorded_vsock_socket_path(vm_state: &VmState) -> Result<&Path> {
 /// This is intentionally part of both snapshot APIs: deriving a conventional
 /// runtime path here would silently bypass `--vsock-dir`.
 async fn run_snapshot_network_command(vsock_socket: &Path, vm_id: &str, flag: &str) -> Result<()> {
+    run_fc_agent_one_shot(vsock_socket, vm_id, flag).await
+}
+
+/// Run `fc-agent <flag>` in the guest over the exec channel and fail unless it exits 0.
+pub(crate) async fn run_fc_agent_one_shot(
+    vsock_socket: &Path,
+    vm_id: &str,
+    flag: &str,
+) -> Result<()> {
     use crate::commands::exec::run_exec_in_vm_captured;
 
     let command = vec![FC_AGENT_PATH.to_string(), flag.to_string()];
