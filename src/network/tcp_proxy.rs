@@ -200,7 +200,7 @@ pub async fn stop_relays(relays: impl IntoIterator<Item = Relay>) {
 }
 
 /// Backlog for a port forward's listener: as long as the kernel allows, which caps it at
-/// net.core.somaxconn. `tokio::net::TcpListener::bind` asks for the same.
+/// net.core.somaxconn. `tokio::net::TcpListener::bind` asks for only 128.
 const PORT_FORWARD_BACKLOG: u32 = i32::MAX as u32;
 
 /// Where a published port's host-side listener binds: the address the mapping's HOSTIP

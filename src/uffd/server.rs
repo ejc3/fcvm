@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use std::fs::File;
-use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::unix::io::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -246,19 +246,6 @@ struct PeerVmm {
     /// the pidfd, so a PID that has since been recycled cannot misdirect anything.
     pid: u32,
     pidfd: OwnedFd,
-}
-
-/// A non-owning view that lets Tokio register [`PeerVmm::pidfd`] without duplicating it.
-///
-/// `AsyncFd` only needs `AsRawFd`, but this toolchain does not implement that trait for
-/// `&OwnedFd`. The `PeerVmm` borrowed by the handler outlives this wrapper, so the raw fd
-/// remains valid until `AsyncFd` is dropped.
-struct PidfdRef<'a>(&'a OwnedFd);
-
-impl AsRawFd for PidfdRef<'_> {
-    fn as_raw_fd(&self) -> RawFd {
-        self.0.as_raw_fd()
-    }
 }
 
 impl PeerVmm {
@@ -1810,7 +1797,7 @@ fn missing_fill_refused(
 }
 
 async fn wait_for_peer_vmm_exit(
-    async_peer_pidfd: &AsyncFd<PidfdRef<'_>>,
+    async_peer_pidfd: &AsyncFd<std::os::fd::BorrowedFd<'_>>,
     vm_id: &str,
     peer_pid: u32,
 ) -> Result<()> {
@@ -2526,11 +2513,14 @@ async fn handle_vm_page_faults(
         libc::fcntl(uffd_fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
     }
 
-    let async_uffd = AsyncFd::new(uffd).context("creating AsyncFd for UFFD")?;
+    let async_uffd = crate::utils::async_fd(uffd).context("creating AsyncFd for UFFD")?;
     // Firecracker keeps its own UFFD reference for the VMM's lifetime, and this handler
     // owns another one. Consequently, a normal VMM exit does not make OUR UFFD readable
     // or close it: the pidfd is the only authoritative lifetime signal.
-    let async_peer_pidfd = AsyncFd::new(PidfdRef(&peer.pidfd))
+    // SAFETY: the BorrowedFd borrows `peer.pidfd`, an `OwnedFd`, for the AsyncFd's whole life,
+    // so the pidfd stays open and unchanged while it is registered.
+    let async_peer_pidfd = unsafe { AsyncFd::register(peer.pidfd.as_fd()) }
+        .map_err(std::io::Error::from)
         .context("registering peer VMM pidfd with the reactor")?;
 
     let gate = Arc::new(ReplayGate::default());
@@ -2632,7 +2622,7 @@ fn persist_observed_working_set(
 async fn replay_then_serve(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    async_peer_pidfd: &AsyncFd<PidfdRef<'_>>,
+    async_peer_pidfd: &AsyncFd<std::os::fd::BorrowedFd<'_>>,
     peer_pid: u32,
     state: &mut VmState,
     working_set: Option<&WorkingSetStore>,
@@ -3888,7 +3878,7 @@ async fn replay_segments(
 async fn serve_faults(
     ctx: &VmContext<'_>,
     async_uffd: &AsyncFd<Uffd>,
-    async_peer_pidfd: &AsyncFd<PidfdRef<'_>>,
+    async_peer_pidfd: &AsyncFd<std::os::fd::BorrowedFd<'_>>,
     peer_pid: u32,
     state: &mut VmState,
 ) -> Result<()> {
@@ -4664,7 +4654,8 @@ async fn handshake(
 ) -> Result<(Uffd, Vec<GuestRegionUffdMapping>)> {
     let std_stream = stream.into_std().context("converting to std stream")?;
     // Keep non-blocking — AsyncFd handles readiness
-    let async_stream = AsyncFd::new(std_stream).context("creating AsyncFd for handshake socket")?;
+    let async_stream =
+        crate::utils::async_fd(std_stream).context("creating AsyncFd for handshake socket")?;
 
     if let PageSource::Minor { backing, .. } = source {
         send_backing_fd(&async_stream, backing).await?;
@@ -6154,7 +6145,7 @@ mod tests {
         // --- receive the fd exactly the way a clone's Firecracker does ---
         let (tx, rx) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.set_nonblocking(true).unwrap();
-        let tx = AsyncFd::new(tx).unwrap();
+        let tx = crate::utils::async_fd(tx).unwrap();
         send_backing_fd(&tx, &backing).await.unwrap();
         let mut hello = [0u8; 64];
         let (_, received) = rx.recv_with_fd(&mut hello).unwrap();
@@ -6484,7 +6475,7 @@ mod tests {
         const PAGE: usize = MinorClone::PAGE;
         // Page 1 is all zeros, so the backing memfd leaves it unwritten.
         let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0xA3, 0xA4]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         // An earlier clone recorded all four pages, the zero page among them.
@@ -6524,7 +6515,7 @@ mod tests {
         let (clone, uffd) = MinorClone::new(&[0xA1, 0, 0, 0xA4]);
         // An earlier clone touched page 1 and not page 2.
         clone.touch_as_another_clone(&[1]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         let mut recorded = PageSet::empty(clone.mem_size as u64);
@@ -6593,7 +6584,7 @@ mod tests {
         let (clone, uffd) = MinorClone::new(&[0xC0, 0, 0, 0xC3, 0, 0xC5, 0, 0]);
         // Earlier clones filled pages 2 and 6.
         clone.touch_as_another_clone(&[2, 6]);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         // Pages 1 to 3 are given back: a hole, a filled hole and a data page.
@@ -7811,7 +7802,7 @@ mod tests {
         let (clone, uffd) = BalloonedCopyClone::new(64);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         // Something for replay to populate once the parked fault is out of its way.
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range((48 * PAGE) as u64, (8 * PAGE) as u64);
@@ -7887,11 +7878,12 @@ mod tests {
         let (clone, uffd) = BalloonedCopyClone::new(256);
         let ctx = clone.ctx();
         let mut state = BalloonedCopyClone::state();
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         // serve_faults ends when its peer does. Pin this process, which outlives the test.
         let peer = PeerVmm::from_pid(std::process::id()).expect("pinning this process");
+        // SAFETY: the BorrowedFd borrows `peer.pidfd` for the AsyncFd's whole life.
         let async_peer_pidfd =
-            AsyncFd::new(PidfdRef(&peer.pidfd)).expect("registering the peer pidfd");
+            unsafe { AsyncFd::register(peer.pidfd.as_fd()) }.expect("registering the peer pidfd");
 
         let balloon = clone.inflate_until_stopped(16);
         wait_for_uffd_event(async_uffd.get_ref(), "the balloon's first REMOVE event");
@@ -8681,7 +8673,7 @@ mod tests {
         const PAGE: usize = FaultAroundClone::PAGE;
         // The region maps file pages 2..10 and granules are 4 pages.
         let (clone, uffd) = FaultAroundClone::new(4, 2, 8);
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         {
             let ctx = clone.ctx();
             assert!(
@@ -8726,7 +8718,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx();
         let mut state = clone.state();
         let mut workers =
@@ -8779,7 +8771,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -8889,7 +8881,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9001,7 +8993,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9093,7 +9085,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9192,7 +9184,7 @@ mod tests {
         let (clone, uffd) =
             FaultAroundClone::with_features(0, 0, 16, userfaultfd::FeatureFlags::EVENT_REMOVE);
         let gate = Arc::new(ReplayGate::default());
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         for gone in [true, false] {
@@ -9268,7 +9260,7 @@ mod tests {
             PageSource::Copy { mmap, .. } => &mmap[..],
             PageSource::Minor { .. } => unreachable!(),
         };
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let ctx = clone.ctx_with_gate(&gate);
         let mut state = clone.state();
         let mut workers =
@@ -9575,7 +9567,7 @@ mod tests {
         if let PageSource::Copy { replay_threads, .. } = &mut clone.source {
             *replay_threads = 4;
         }
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let gate = Arc::new(ReplayGate::default());
         {
             let ctx = clone.ctx_with_gate(&gate);
@@ -10026,7 +10018,7 @@ mod tests {
         // second recorded run, pages 10 and 11.
         remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(7));
         remember_removed(&ctx, &mut state.removed, clone.page(10), clone.page(12));
-        let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+        let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
         let mut recorded = PageSet::empty(clone.mem_size as u64);
         recorded.insert_range((4 * PAGE) as u64, (4 * PAGE) as u64);
         recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);
@@ -10707,7 +10699,7 @@ mod tests {
             let ctx = clone.ctx();
             let mut state = BalloonedCopyClone::state();
             remember_removed(&ctx, &mut state.removed, clone.page(5), clone.page(6));
-            let async_uffd = AsyncFd::new(uffd).expect("registering the userfaultfd");
+            let async_uffd = crate::utils::async_fd(uffd).expect("registering the userfaultfd");
             let mut recorded = PageSet::empty(clone.mem_size as u64);
             recorded.insert_range((4 * PAGE) as u64, (5 * PAGE) as u64);
             recorded.insert_range((10 * PAGE) as u64, (2 * PAGE) as u64);

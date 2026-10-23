@@ -9,6 +9,38 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tracing::{info, warn};
 
+/// A type that owns the file descriptor it reports through `AsRawFd`.
+///
+/// # Safety
+///
+/// An implementor closes that fd only when it is dropped, and every `as_raw_fd` call returns
+/// the same fd.
+pub unsafe trait OwnsFd: AsRawFd {}
+// SAFETY: each of these holds one fd, opened before construction and closed on drop.
+unsafe impl OwnsFd for std::os::fd::OwnedFd {}
+unsafe impl OwnsFd for std::os::unix::net::UnixStream {}
+unsafe impl OwnsFd for userfaultfd::Uffd {}
+unsafe impl OwnsFd for InotifyFd {}
+
+/// An inotify instance, owned, with the `AsRawFd` that `AsyncFd` needs.
+pub struct InotifyFd(pub nix::sys::inotify::Inotify);
+
+impl AsRawFd for InotifyFd {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        std::os::fd::AsFd::as_fd(&self.0).as_raw_fd()
+    }
+}
+
+/// Register `inner` with tokio's reactor, handing ownership of it to the `AsyncFd`.
+///
+/// tokio's safe `AsyncFd::new` is deprecated because it accepts any `AsRawFd`, including a
+/// bare `RawFd` that someone else can close while it is registered (RUSTSEC-2026-0386).
+pub fn async_fd<T: OwnsFd>(inner: T) -> std::io::Result<tokio::io::unix::AsyncFd<T>> {
+    // SAFETY: the AsyncFd owns `inner`, and `inner` owns its fd (`OwnsFd`), so the fd stays
+    // open and unchanged until the AsyncFd is dropped or hands `inner` back.
+    unsafe { tokio::io::unix::AsyncFd::register(inner) }.map_err(std::io::Error::from)
+}
+
 /// Event-driven watch on a directory for "a file appeared / changed" conditions.
 ///
 /// Wraps an inotify fd in tokio's `AsyncFd` so readiness waits are epoll-driven
@@ -24,10 +56,7 @@ use tracing::{info, warn};
 /// coalesced events, queue overflow, or unrelated files in the directory are
 /// all safe (just extra re-checks).
 pub struct DirWatch {
-    async_fd: tokio::io::unix::AsyncFd<std::os::fd::RawFd>,
-    // Keeps the inotify fd open; declared after async_fd so the AsyncFd is
-    // dropped (deregistered from the reactor) before the fd is closed.
-    inotify: nix::sys::inotify::Inotify,
+    async_fd: tokio::io::unix::AsyncFd<InotifyFd>,
 }
 
 impl DirWatch {
@@ -46,10 +75,9 @@ impl DirWatch {
                     | AddWatchFlags::IN_ATTRIB,
             )
             .map_err(|e| anyhow::anyhow!("inotify_add_watch {}: {e}", dir.display()))?;
-        let raw = std::os::fd::AsFd::as_fd(&inotify).as_raw_fd();
-        let async_fd = tokio::io::unix::AsyncFd::new(raw)
+        let async_fd = async_fd(InotifyFd(inotify))
             .map_err(|e| anyhow::anyhow!("registering inotify fd with tokio: {e}"))?;
-        Ok(Self { async_fd, inotify })
+        Ok(Self { async_fd })
     }
 
     /// Wait until at least one filesystem event has been consumed.
@@ -63,7 +91,7 @@ impl DirWatch {
                 .readable()
                 .await
                 .map_err(|e| anyhow::anyhow!("waiting for inotify readability: {e}"))?;
-            match self.inotify.read_events() {
+            match guard.get_inner().0.read_events() {
                 Ok(_events) => return Ok(()),
                 Err(nix::errno::Errno::EAGAIN) => {
                     guard.clear_ready();
@@ -184,9 +212,12 @@ impl ProcessWatch {
             return Ok(None);
         }
 
-        let async_fd = tokio::io::unix::AsyncFd::new(fd)
+        let registered = async_fd(fd)
             .with_context(|| format!("registering pidfd for PID {pid} with the reactor"))?;
-        Ok(Some(Self { async_fd, pid }))
+        Ok(Some(Self {
+            async_fd: registered,
+            pid,
+        }))
     }
 
     /// The PID being watched, for messages.

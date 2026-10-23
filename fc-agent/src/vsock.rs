@@ -205,6 +205,13 @@ fn connect_vsock(fd: &OwnedFd, cid: u32, port: u32) -> nix::Result<()> {
     connect(fd.as_raw_fd(), &VsockAddr::new(cid, port))
 }
 
+/// Register `fd` with tokio's reactor, handing ownership of it to the `AsyncFd`.
+fn register(fd: OwnedFd) -> std::io::Result<AsyncFd<OwnedFd>> {
+    // SAFETY: the AsyncFd owns `fd`, so nothing else can close or replace it while it is
+    // registered, and `OwnedFd::as_raw_fd` always returns the fd it holds.
+    unsafe { AsyncFd::register(fd) }.map_err(std::io::Error::from)
+}
+
 /// Async vsock stream — wraps an OwnedFd in Arc<AsyncFd> for non-blocking I/O.
 ///
 /// Uses Arc internally so the fd can be shared between read/write halves
@@ -234,7 +241,7 @@ impl VsockStream {
         )
         .context("setting O_NONBLOCK on vsock")?;
 
-        let inner = Arc::new(AsyncFd::new(fd).context("wrapping vsock in AsyncFd")?);
+        let inner = Arc::new(register(fd).context("wrapping vsock in AsyncFd")?);
         Ok(Self { inner })
     }
 
@@ -330,7 +337,7 @@ impl AsyncFdStream {
         let flags = nix::fcntl::OFlag::from_bits_retain(flags) | nix::fcntl::OFlag::O_NONBLOCK;
         nix::fcntl::fcntl(&fd, nix::fcntl::FcntlArg::F_SETFL(flags))?;
         Ok(Self {
-            inner: Arc::new(AsyncFd::new(fd)?),
+            inner: Arc::new(register(fd)?),
         })
     }
 
@@ -379,7 +386,7 @@ impl VsockListener {
         )
         .context("listening on vsock")?;
 
-        let inner = AsyncFd::new(fd).context("wrapping listener in AsyncFd")?;
+        let inner = register(fd).context("wrapping listener in AsyncFd")?;
         Ok(Self { inner })
     }
 
@@ -394,7 +401,7 @@ impl VsockListener {
     /// snapshot keep the port bound, causing bind() to fail with EADDRINUSE.
     pub fn re_register(self) -> Result<Self> {
         let fd = self.inner.into_inner();
-        let inner = AsyncFd::new(fd).context("re-registering listener with AsyncFd")?;
+        let inner = register(fd).context("re-registering listener with AsyncFd")?;
         Ok(Self { inner })
     }
 

@@ -6151,7 +6151,7 @@ async fn an_exited_clone_returns_its_server_slot() -> Result<()> {
                 .with_context(|| format!("watching test log {}", log_path.display()));
         }
 
-        let async_inotify = tokio::io::unix::AsyncFd::new(inotify)
+        let async_inotify = fcvm::utils::async_fd(inotify)
             .context("registering test-log inotify fd with the reactor")?;
         let wait = async {
             loop {
