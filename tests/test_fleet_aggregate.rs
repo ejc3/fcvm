@@ -674,11 +674,8 @@ async fn a_re_tile_of_streaming_tiles_skips_no_slot() {
     });
     let k_of = |t: f64| (t * FPS as f64).round() as i64;
     let mut last_old = None;
-    loop {
-        match next_msg(&mut ws).await {
-            Message::Binary(bytes) => last_old = Some(k_of(Frame::parse(&bytes).unwrap().t)),
-            _ => break,
-        }
+    while let Message::Binary(bytes) = next_msg(&mut ws).await {
+        last_old = Some(k_of(Frame::parse(&bytes).unwrap().t));
     }
     let Message::Binary(bytes) = next_msg(&mut ws).await else {
         panic!("a frame after the new header")
