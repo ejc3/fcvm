@@ -156,6 +156,35 @@ notification when it spawned `podman run`, podman took a median of 588 ms (p95 9
 that spawn to the container running. This change does not touch that time, and it is now
 the largest part of a create after the restore.
 
+### With the startup snapshot taken at the container's start
+
+`fcvm serve` gives no `--health-check`, so until then it only restored the pre-start
+snapshot and every create started its container with `podman run` in the guest. Since then a
+run takes the startup snapshot at its first Healthy whatever decides it, and an identical
+later create restores the container already running. Same host type, same quiet-box gate
+(1-minute load 0.17 to 0.95 at the eight starts), arms alternating, with all system snapshots
+removed before each measurement so neither arm reuses the other's: before at `e8ecb178`, after
+at `f0449371`. Every timed create of the after arm restored the startup snapshot. TTI in ms,
+harness statistics, then untrimmed p99 and max.
+
+| concurrency | sandboxes | before median | before p95 | before p99 | after median | after p95 | after p99 | before / after untrimmed p99 | before / after max |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 5 bursts x 100 | 2228 | 2467 | 2505 | 1678 | 2151 | 2256 | 2561 / 2392 | 2678 / 2417 |
+| 10 | 5 bursts x 10 | 586 | 635 | 661 | 437 | 596 | 602 | 667 / 607 | 667 / 607 |
+| 1 | 50 in sequence | 525 | 569 | 578 | 400 | 465 | 514 | 598 / 629 | 598 / 629 |
+
+One burst of 100 creates each way, without the command, p50 / p95 ms:
+
+| interval | before | after |
+|---|---|---|
+| create request to return | 1884 / 2095 | 1080 / 1649 |
+| restore start to guest ACK | 682 / 823 | 747 / 920 |
+| create request to the container-running notification at the host | 1871 / 2084 | 1063 / 1643 |
+| notification to the create's return | 11 / 28 | 13 / 27 |
+
+The restore of a running container takes a median 65 ms longer (more memory to page in), and
+podman's start of the container (about 600 ms under the burst) is gone.
+
 ### Published results, for reference
 
 As published, from different hardware, a different client location and different sandbox
