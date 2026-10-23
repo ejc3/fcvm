@@ -141,6 +141,14 @@ jobs:
               # is exactly the class that can break it.
               Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              # fleet/core is a workspace member that fcvm builds, so it is code.
+              # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
+              # is not built, read or run by anything the VM matrix executes, so
+              # the matrix can say nothing about it. Its own suites get their own
+              # jobs (fleet/web has one on the fleet-web branch); until a
+              # directory has one, it runs nothing here, as it did not before.
+              fleet/core/*) code=true; echo "code path: $f" ;;
+              fleet/*) echo "fleet path, no matrix: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
