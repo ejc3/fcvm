@@ -82,7 +82,8 @@ build)
   as_user "cd $SRC && make build"
   as_user "cd $SRC && make setup-gpu"
   as_user "cd $SRC && make -C fleet/renderer image TAG=fleet"
-  install -m 0755 "$(as_user "cd $SRC && readlink -f target/release/fcvm")" /usr/local/bin/fcvm
+  # fcvm finds fc-agent (the guest agent, musl) beside its own executable.
+  for b in fcvm fc-agent; do install -m 0755 "$(as_user "cd $SRC && readlink -f target/release/$b")" /usr/local/bin/$b; done
   # One GPU VM to first frame, as fleet/tools/gpurun.sh warms a host: exports the renderer
   # image into the store and leaves the pre-start snapshot that later starts restore from.
   G0=$(ls /sys/bus/pci/drivers/vfio-pci | grep -E '^[0-9a-f]{4}:' | head -1)
