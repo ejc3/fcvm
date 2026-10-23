@@ -14,6 +14,7 @@
 #include "../src/nvenc.h"
 #include "../src/proto.h"
 #include "../src/scene.h"
+#include "../src/subscriber.h"
 #include "../src/world.h"
 #include "check.h"
 #include "tls_check.h"
@@ -570,6 +571,24 @@ int main() {
     }
     CHECK(fatal_read_locked, "fatal() reads fatal_ under hmu_");
     CHECK(failed_retired, "a failed encoder open is retired (its NV12 buffer freed) before the stream is closed");
+  }
+  // --- a slow subscriber whose queue is cleared still gets the stream header
+  {
+    auto msg = [](const char* m) { return std::make_shared<const std::string>(m); };
+    Subscriber s;
+    s.offer_header(1080, msg("hdr-1080"));
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the first keyframe goes out");
+    for (int i = 0; i <= SUB_MAX_QUEUED_MSGS; i++) s.push(msg("frame"));  // the reader stalls
+    s.offer_header(720, msg("hdr-720"));  // its height changes: a new header is queued
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::DROPPED, "an overflowing queue is dropped");
+    // the next frame: the header for the current key, then the recovery keyframe
+    s.offer_header(720, msg("hdr-720"));
+    CHECK(s.offer_frame(msg("key"), false) == Subscriber::SKIPPED, "a delta frame waits for the keyframe");
+    CHECK(s.offer_frame(msg("key"), true) == Subscriber::SENT, "the recovery keyframe goes out");
+    std::string order;
+    for (auto& m : s.q) order += *m + " ";
+    CHECK(s.q.size() == 2 && *s.q[0] == "hdr-720" && *s.q[1] == "key",
+          "after a dropped queue the header is sent again before the keyframe (queue: %s)", order.c_str());
   }
   tlscheck::run();
   DONE();

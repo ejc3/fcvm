@@ -96,6 +96,7 @@ src/render.cu      kernels: tables, path tracer, accumulation, tone map, NV12
 src/world.h        terrain and noise, shared by GPU and host (host keeps the eye above ground)
 src/scene.cpp      scene JSON, camera splines and holds, tile geometry, per-frame parameters
 src/pipeline.cpp   frame clock, subscribers, per-height encoders, sample budget, /health
+src/subscriber.cpp a subscriber's queue: header and keyframe rules, a slow reader dropped to the next keyframe
 src/server.cpp     HTTP/1.1 and WebSocket
 src/nvenc.cpp      NVENC (libnvidia-encode loaded at run time; header from nv-codec-headers, MIT)
 src/gpustats.cpp   NVML (libnvidia-ml loaded at run time)

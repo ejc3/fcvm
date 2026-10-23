@@ -25,23 +25,7 @@
 #include "nvenc.h"
 #include "render.h"
 #include "scene.h"
-
-struct Subscriber {
-  int id = 0;
-  std::atomic<int> want_h{0};
-  std::atomic<int> want_q{1};  // 0 lo, 1 std, 2 hi
-  // filled by the render thread, drained by the connection's writer
-  std::mutex mu;
-  std::condition_variable cv;
-  std::deque<std::shared_ptr<const std::string>> q;  // complete WebSocket frames
-  size_t queued = 0;
-  bool closed = false;
-  // render-thread state
-  int cur_h = 0;  // encoder key the header was sent for (0: header pending)
-  bool need_key = true;
-  void push(std::shared_ptr<const std::string> m);
-  void close();
-};
+#include "subscriber.h"
 
 struct Options {
   int port = 8080;

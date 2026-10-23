@@ -15,8 +15,6 @@
 #include <chrono>
 #include <cstdio>
 #include <ctime>
-#include <fstream>
-#include <sstream>
 
 #include "json.h"
 
@@ -238,12 +236,26 @@ TlsFront::~TlsFront() {
 }
 
 bool TlsFront::load(const std::string& path, std::string* err) {
-  std::ifstream f(path, std::ios::binary);
-  if (!f) { *err = path + ": cannot read"; return false; }
-  std::stringstream ss;
-  ss << f.rdbuf();
+  // The version is taken from the descriptor that is read, so it names the
+  // file actually loaded even if another replaces it meanwhile.
+  int fd = open(path.c_str(), O_RDONLY | O_CLOEXEC);
+  if (fd < 0) { *err = path + ": cannot read"; return false; }
+  struct stat st {};
+  std::string text;
+  bool ok = fstat(fd, &st) == 0;
+  char buf[16384];
+  for (ssize_t n; ok && (n = read(fd, buf, sizeof buf)) != 0;) {
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      ok = false;
+    } else {
+      text.append(buf, (size_t)n);
+    }
+  }
+  close(fd);
+  if (!ok) { *err = path + ": cannot read"; return false; }
   std::string cert, key, na;
-  if (!parse_cert_json(ss.str(), &cert, &key, err)) { *err = path + ": " + *err; return false; }
+  if (!parse_cert_json(text, &cert, &key, err)) { *err = path + ": " + *err; return false; }
   SSL_CTX* c = build_ctx(cert, key, &na, err);
   if (!c) { *err = path + ": " + *err; return false; }
   std::shared_ptr<SSL_CTX> sp(c, SSL_CTX_free);
@@ -251,6 +263,8 @@ bool TlsFront::load(const std::string& path, std::string* err) {
     std::lock_guard<std::mutex> l(mu_);
     ctx_ = sp;  // connections already open hold their own reference to the old one
     not_after_ = na;
+    loaded_st_ = st;
+    have_loaded_st_ = true;
   }
   gen_++;
   return true;
@@ -260,11 +274,16 @@ void TlsFront::watch(const std::string& path, int period_ms) {
   // A file is loaded once per version (inode, size, modification time): a
   // rename into place or a rewrite is a new version. One read halfway
   // through a rewrite fails to parse, and the writer's last write makes a
-  // newer version that is read again. The version already loaded is taken
-  // here, before watch() returns: taken in the thread, a file replaced
-  // before the thread first ran was taken as the loaded one and never read.
+  // newer version that is read again. The watcher starts from the version
+  // load() read, so a file replaced after the load, before or after watch()
+  // is called, is read again.
   struct stat last0 {};
-  bool have0 = loaded() && stat(path.c_str(), &last0) == 0;
+  bool have0;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    last0 = loaded_st_;
+    have0 = have_loaded_st_;
+  }
   watcher_ = std::thread([this, path, period_ms, last0, have0] {
     struct stat last = last0;
     bool have = have0;

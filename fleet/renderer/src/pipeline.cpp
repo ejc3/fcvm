@@ -50,18 +50,6 @@ double process_start_boottime_s() {
   return std::stod(field) / (double)sysconf(_SC_CLK_TCK);
 }
 
-void Subscriber::push(std::shared_ptr<const std::string> m) {
-  std::lock_guard<std::mutex> l(mu);
-  q.push_back(m);
-  queued += m->size();
-  cv.notify_one();
-}
-void Subscriber::close() {
-  std::lock_guard<std::mutex> l(mu);
-  closed = true;
-  cv.notify_all();
-}
-
 Pipeline::Pipeline(const Options& o) : opt_(o) {
   scene_ = std::make_shared<const Scene>(default_scene());
   budget_ = o.budget;
@@ -696,13 +684,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     if (prime) continue;  // nothing is sent while a tile primes its history
     std::string hdr = header_json(e, q, gen_cur);
     auto hmsg = std::make_shared<const std::string>(ws_frame(1, hdr.data(), hdr.size()));
-    for (auto& s : e.subs) {
-      if (s->cur_h != ekey) {
-        s->push(hmsg);
-        s->cur_h = ekey;
-        s->need_key = true;
-      }
-    }
+    for (auto& s : e.subs) s->offer_header(ekey, hmsg);
     double t0 = mono_s();
     r_.to_nv12(e.nv12, e.pitch, e.ew, e.eh, g.x0 - e.left, g.y0 - e.top, g.full_h);
     bool force = e.want_idr || (t0 - e.last_idr) >= 2.0;
@@ -721,20 +703,9 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     payload.append((const char*)au.data(), au.size());
     auto msg = std::make_shared<const std::string>(ws_frame(2, payload.data(), payload.size()));
     for (auto& s : e.subs) {
-      if (s->need_key && !key) continue;
-      bool overflow;
-      {
-        std::lock_guard<std::mutex> l(s->mu);
-        overflow = s->q.size() > 90 || s->queued > (16u << 20);
-        if (overflow) { s->q.clear(); s->queued = 0; }
-      }
-      if (overflow) {  // a slow reader restarts at the next keyframe
-        s->need_key = true;
-        e.want_idr = true;
-        continue;
-      }
-      s->need_key = false;
-      s->push(msg);
+      Subscriber::Offer o = s->offer_frame(msg, key);
+      if (o == Subscriber::DROPPED) e.want_idr = true;  // a slow reader restarts at the next keyframe
+      if (o != Subscriber::SENT) continue;
       if (first_sent_ms_ < 0) {  // only this thread writes it
         double sent_ms = (boottime_s() - proc_start_) * 1000.0;
         {
