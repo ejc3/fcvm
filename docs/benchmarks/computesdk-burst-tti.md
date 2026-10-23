@@ -118,6 +118,44 @@ decides that a container is running by spawning `fcvm exec ... podman inspect`, 
 burst of 100 those execs are slow. At concurrency 1 the whole TTI is 666 ms. Tracked in
 #1161.
 
+### With the container start notification (#1161)
+
+Since #1161 fc-agent runs podman with `--sdnotify=conmon` and tells the host when podman
+reports the container running, and the health monitor takes that as the running signal
+instead of spawning `fcvm exec ... podman inspect`. Both arms below were measured on one
+c8gd.metal-24xl on 2026-10-23 with the commands above, alternating per configuration: before
+at `12e0f0ca`, after at `e8ecb178`. Nothing else ran on the host. Each measurement started
+only once the 1-minute load average was at most 1.0 (0.82 to 1.00 at the eight starts), and
+`pidstat` found no process using 1% of a CPU in the 5 s before any of them. During the runs
+it found only the benchmark's own processes (firecracker, fcvm, pasta, node). TTI in ms,
+harness statistics, then untrimmed p99 and max.
+
+| concurrency | sandboxes | before median | before p95 | before p99 | after median | after p95 | after p99 | before / after untrimmed p99 | before / after max |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 5 bursts x 100 | 3017 | 3520 | 3591 | 2125 | 2356 | 2381 | 3875 / 2444 | 3929 / 2501 |
+| 10 | 5 bursts x 10 | 716 | 770 | 779 | 579 | 636 | 637 | 795 / 638 | 795 / 638 |
+| 1 | 50 in sequence | 683 | 765 | 777 | 509 | 558 | 576 | 805 / 587 | 805 / 587 |
+
+One more burst of 100 creates each way, without the command, timed per sandbox on the host
+clock: the request, the status listener's container-ready file, podman's `State.StartedAt`
+in the guest (moved to the host clock by an offset measured afterwards over exec, round
+trip 10 ms at the median), the restore's `ack_ms` from the clone's restored record, and the
+create's return. p50 / p95 ms:
+
+| interval | before | after |
+|---|---|---|
+| create request to return | 2826 / 3445 | 1738 / 1970 |
+| restore start to guest ACK | 705 / 1088 | 609 / 762 |
+| podman started the container to the create's return | 1032 / 1666 | 29 / 196 |
+
+Before, a health check under that burst was one or two execs, each 569 ms at the median
+(10 sandboxes probed right after their start: `fcvm exec --vm -- true` 81 ms, `podman
+inspect` 415 ms of it inside the guest, starting the `fcvm` process 13 ms), and the next
+check waited as long as the last one took. In the before run, where fc-agent still sent its
+notification when it spawned `podman run`, podman took a median of 588 ms (p95 963) from
+that spawn to the container running. This change does not touch that time, and it is now
+the largest part of a create after the restore.
+
 ### Published results, for reference
 
 As published, from different hardware, a different client location and different sandbox

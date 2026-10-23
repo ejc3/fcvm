@@ -12,7 +12,7 @@ use crate::state::{truncate_id, HealthStatus, StateManager};
 
 /// Health check polling intervals.
 /// During startup, the interval adapts to match how long each check takes
-/// (minimum 100ms). Fast checks (podman inspect ~100ms) poll fast; slow
+/// (minimum 100ms). Fast checks (reading the container-ready file) poll fast; slow
 /// checks (nsenter+curl ~1-3s) poll slower to avoid hammering.
 const HEALTH_POLL_MIN_INTERVAL: Duration = Duration::from_millis(100);
 const HEALTH_POLL_MAX_INTERVAL: Duration = Duration::from_secs(5);
@@ -44,7 +44,7 @@ pub fn spawn_health_monitor_with_cancel(
     state_dir: PathBuf,
     cancel_token: Option<CancellationToken>,
 ) -> JoinHandle<()> {
-    spawn_health_monitor_full(vm_id, pid, state_dir, cancel_token, None)
+    spawn_health_monitor_full(vm_id, pid, state_dir, cancel_token, None, None)
 }
 
 /// Ack sent by the startup-snapshot path once its pause/resume cycle is over
@@ -59,6 +59,9 @@ pub type StartupSnapshotAck = oneshot::Sender<()>;
 /// - `pid`: Optional process ID for the VM
 /// - `state_dir`: Directory for state files
 /// - `cancel_token`: Optional token for graceful shutdown
+/// - `container_started`: Optional wake-up the status listener fires when fc-agent reports
+///   the container started. The state on disk is what the monitor checks; this only ends
+///   its sleep early.
 /// - `startup_healthy_tx`: Optional channel to signal when health first becomes Healthy.
 ///   This triggers startup snapshot creation, which PAUSES the VM (the memory dump can
 ///   take tens of seconds under I/O load). A paused VM cannot answer forwarded ports or
@@ -70,6 +73,7 @@ pub fn spawn_health_monitor_full(
     pid: Option<u32>,
     state_dir: PathBuf,
     cancel_token: Option<CancellationToken>,
+    container_started: Option<std::sync::Arc<tokio::sync::Notify>>,
     startup_healthy_tx: Option<oneshot::Sender<StartupSnapshotAck>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -119,17 +123,30 @@ pub fn spawn_health_monitor_full(
             if first_check {
                 first_check = false;
             } else {
-                // Sleep with cancellation support
-                if let Some(ref token) = cancel_token {
-                    tokio::select! {
-                        _ = tokio::time::sleep(poll_interval) => {}
-                        _ = token.cancelled() => {
-                            info!(target: "health-monitor", "cancellation requested during sleep, stopping");
-                            break;
-                        }
+                // Sleep with cancellation support. The container's start
+                // notification ends the sleep, so the check that sees it runs as
+                // soon as it arrives.
+                let cancelled = async {
+                    match &cancel_token {
+                        Some(token) => token.cancelled().await,
+                        None => std::future::pending().await,
                     }
-                } else {
-                    tokio::time::sleep(poll_interval).await;
+                };
+                let woken = async {
+                    match &container_started {
+                        Some(notify) => notify.notified().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    _ = tokio::time::sleep(poll_interval) => {}
+                    _ = woken => {
+                        debug!(target: "health-monitor", "container start notification, checking now");
+                    }
+                    _ = cancelled => {
+                        info!(target: "health-monitor", "cancellation requested during sleep, stopping");
+                        break;
+                    }
                 }
             }
 
@@ -140,6 +157,7 @@ pub fn spawn_health_monitor_full(
                 pid,
                 &mut last_failure_log,
                 &mut skip_podman_healthcheck,
+                startup_tx.is_some(),
             )
             .await;
             let check_duration = check_start.elapsed();
@@ -353,7 +371,9 @@ fn container_not_created_yet(code: i32, stderr: &str) -> bool {
     code == 125 && (stderr.contains("no such container") || stderr.contains("no such object"))
 }
 
-/// Check if the container is running via podman inspect.
+/// Check if the container is running now, via podman inspect over exec. Used only before
+/// a startup snapshot (see `check_health_once`): the start notification says the
+/// container started, not that it is still running.
 ///
 /// Returns:
 /// - `true` = container is running
@@ -592,6 +612,95 @@ async fn run_podman_healthcheck(pid: u32, username: Option<&str>, user_spec: Opt
     }
 }
 
+/// The file the status listener writes when fc-agent reports the container running.
+pub(crate) const CONTAINER_READY_FILE: &str = "container-ready";
+
+/// What the container-ready file says about the container.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ContainerStart {
+    /// No start notification yet.
+    NotYet,
+    /// podman started the container. `healthcheck`: its image defines a HEALTHCHECK.
+    Running { healthcheck: bool },
+}
+
+impl ContainerStart {
+    /// The start notification fc-agent sends on the status port, without its newline.
+    pub(crate) fn from_message(msg: &str) -> Option<Self> {
+        match msg {
+            exec_proto::CONTAINER_STARTED => Some(Self::Running { healthcheck: false }),
+            exec_proto::CONTAINER_STARTED_WITH_HEALTHCHECK => {
+                Some(Self::Running { healthcheck: true })
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Record a start notification in `runtime_dir`, in the words fc-agent sent it. Written to
+/// a temporary name and renamed, so the health monitor never reads a half-written file.
+pub(crate) fn write_container_start(
+    runtime_dir: &std::path::Path,
+    healthcheck: bool,
+) -> Result<()> {
+    let path = runtime_dir.join(CONTAINER_READY_FILE);
+    let tmp = runtime_dir.join(format!("{CONTAINER_READY_FILE}.tmp"));
+    let word = if healthcheck {
+        exec_proto::CONTAINER_STARTED_WITH_HEALTHCHECK
+    } else {
+        exec_proto::CONTAINER_STARTED
+    };
+    std::fs::write(&tmp, format!("{word}\n")).with_context(|| format!("writing {tmp:?}"))?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("renaming {tmp:?} to {path:?}"))
+}
+
+/// Read what the status listener recorded. A file that says something else than a start
+/// notification counts as a start of an image with a HEALTHCHECK: podman is then asked,
+/// as it was for every container before fc-agent sent whether there is one.
+pub(crate) fn read_container_start(runtime_dir: &std::path::Path) -> ContainerStart {
+    let path = runtime_dir.join(CONTAINER_READY_FILE);
+    match std::fs::read_to_string(&path) {
+        Ok(text) => ContainerStart::from_message(text.trim()).unwrap_or_else(|| {
+            warn!(target: "health-monitor", path = %path.display(), content = %text.trim(),
+                "unexpected container-ready content; asking podman for the healthcheck");
+            ContainerStart::Running { healthcheck: true }
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => ContainerStart::NotYet,
+        Err(e) => {
+            warn!(target: "health-monitor", path = %path.display(), error = %e,
+                "reading container-ready failed; treating the container as not started");
+            ContainerStart::NotYet
+        }
+    }
+}
+
+/// The health of a running container whose image defines a HEALTHCHECK, from podman.
+async fn podman_healthcheck_status(
+    pid: u32,
+    username: Option<&str>,
+    user_spec: Option<&str>,
+    skip_podman_healthcheck: &mut bool,
+) -> HealthStatus {
+    if *skip_podman_healthcheck {
+        return HealthStatus::Healthy;
+    }
+    match check_podman_healthcheck(pid, username, user_spec).await {
+        Some(true) => {
+            debug!(target: "health-monitor", "podman healthcheck healthy");
+            HealthStatus::Healthy
+        }
+        Some(false) => {
+            debug!(target: "health-monitor", "podman healthcheck not healthy");
+            HealthStatus::Unhealthy
+        }
+        None => {
+            debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
+            *skip_podman_healthcheck = true;
+            HealthStatus::Healthy
+        }
+    }
+}
+
 /// Perform a single health check iteration WITHOUT persisting the result.
 ///
 /// The monitor loop persists separately so the first Healthy can be gated on
@@ -602,6 +711,7 @@ async fn check_health_once(
     pid: Option<u32>,
     last_failure_log: &mut Option<Instant>,
     skip_podman_healthcheck: &mut bool,
+    confirm_running: bool,
 ) -> Result<(HealthStatus, Option<i32>)> {
     let (health_status, exit_code) = if let Some(pid) = pid {
         // First check if Firecracker process is still running
@@ -640,42 +750,52 @@ async fn check_health_once(
 
             // Two modes:
             // 1. health_check_url = Some(url) -> HTTP check (app responds to HTTP)
-            // 2. health_check_url = None -> Check if container is running via podman inspect
+            // 2. health_check_url = None -> the container start notification (and the
+            //    podman healthcheck, for an image that defines one)
             let status = match &state.config.health_check_url {
                 None => {
-                    // No HTTP check - check if container is actually running
-                    // Uses podman inspect to verify container state (not just process spawned)
-                    let container_running = check_container_running(
-                        pid,
-                        state.config.username.as_deref(),
-                        state.config.user.as_deref(),
-                    )
-                    .await;
-                    if container_running {
-                        debug!(target: "health-monitor", "container is running");
-                        *last_failure_log = None;
-                        // Continue to podman healthcheck below
-                        HealthStatus::Healthy
-                    } else {
-                        // Container not running yet - check if there's a podman healthcheck defined
-                        // so we can skip future checks if there isn't one
-                        // Note: We don't return Unhealthy here because check_podman_healthcheck
-                        // returns Some(false) when the container doesn't exist yet (inspect fails)
-                        if !*skip_podman_healthcheck
-                            && check_podman_healthcheck(
+                    // No HTTP check: the container is running once fc-agent says podman
+                    // started it (the status listener writes the container-ready file).
+                    // Nothing is spawned for that, so checks cost nothing under load
+                    // and the monitor learns of the start when it happens.
+                    match read_container_start(&paths::vm_runtime_dir(vm_id)) {
+                        ContainerStart::NotYet => {
+                            debug!(target: "health-monitor", "waiting for the container start notification");
+                            HealthStatus::Unknown
+                        }
+                        // A Healthy that triggers a startup snapshot (`podman prepare`)
+                        // also needs the container running now. A container that exits
+                        // right after it starts is reported started before its exit
+                        // reaches the host, and must not be snapshotted as healthy.
+                        ContainerStart::Running { .. }
+                            if confirm_running
+                                && !check_container_running(
+                                    pid,
+                                    state.config.username.as_deref(),
+                                    state.config.user.as_deref(),
+                                )
+                                .await =>
+                        {
+                            debug!(target: "health-monitor", "container started but is not running now");
+                            HealthStatus::Unknown
+                        }
+                        ContainerStart::Running { healthcheck: false } => {
+                            debug!(target: "health-monitor", "container is running (no HEALTHCHECK)");
+                            *last_failure_log = None;
+                            HealthStatus::Healthy
+                        }
+                        ContainerStart::Running { healthcheck: true } => {
+                            // The image defines a HEALTHCHECK: its result is podman's,
+                            // asked over exec.
+                            *last_failure_log = None;
+                            podman_healthcheck_status(
                                 pid,
                                 state.config.username.as_deref(),
                                 state.config.user.as_deref(),
+                                skip_podman_healthcheck,
                             )
                             .await
-                            .is_none()
-                        {
-                            // No healthcheck defined - skip future checks
-                            debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
-                            *skip_podman_healthcheck = true;
                         }
-                        debug!(target: "health-monitor", "waiting for container to be running");
-                        HealthStatus::Unknown
                     }
                 }
                 Some(url_str) => {
@@ -832,42 +952,7 @@ async fn check_health_once(
                 }
             };
 
-            // If base health check passed, also check podman healthcheck (AND logic)
-            // Skip if we already know the container has no healthcheck.
-            // Also skip when health_check_url is provided — the user explicitly specified
-            // their health check, and podman's internal HEALTHCHECK may not work (e.g.,
-            // rootless podman in VM without systemd can't schedule healthcheck timers).
-            let has_http_check = state.config.health_check_url.is_some();
-            let final_status = if status == HealthStatus::Healthy
-                && !*skip_podman_healthcheck
-                && !has_http_check
-            {
-                match check_podman_healthcheck(
-                    pid,
-                    state.config.username.as_deref(),
-                    state.config.user.as_deref(),
-                )
-                .await
-                {
-                    Some(true) => {
-                        debug!(target: "health-monitor", "all health checks passed");
-                        HealthStatus::Healthy
-                    }
-                    Some(false) => {
-                        debug!(target: "health-monitor", "podman healthcheck not healthy");
-                        HealthStatus::Unhealthy
-                    }
-                    None => {
-                        // No healthcheck defined - skip future checks
-                        debug!(target: "health-monitor", "no podman healthcheck defined, skipping future checks");
-                        *skip_podman_healthcheck = true;
-                        HealthStatus::Healthy
-                    }
-                }
-            } else {
-                status
-            };
-            (final_status, None)
+            (status, None)
         }
     } else {
         (HealthStatus::Unknown, None)
@@ -891,6 +976,7 @@ pub async fn run_health_check_once(
         pid,
         &mut last_failure_log,
         &mut skip_podman_healthcheck,
+        false,
     )
     .await?;
     // Update state file atomically (lock held across read-modify-write)
@@ -1250,6 +1336,29 @@ fn build_nsenter_curl_args(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The container-ready file round-trips both start notifications, a missing file
+    /// is no start yet, and anything else is treated as a start whose healthcheck
+    /// podman has to be asked about.
+    #[test]
+    fn container_start_is_read_back_as_written() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(read_container_start(dir.path()), ContainerStart::NotYet);
+        for healthcheck in [false, true] {
+            write_container_start(dir.path(), healthcheck).unwrap();
+            assert_eq!(
+                read_container_start(dir.path()),
+                ContainerStart::Running { healthcheck }
+            );
+        }
+        assert!(!dir.path().join("container-ready.tmp").exists());
+        std::fs::write(dir.path().join(CONTAINER_READY_FILE), "something else\n").unwrap();
+        assert_eq!(
+            read_container_start(dir.path()),
+            ContainerStart::Running { healthcheck: true }
+        );
+        assert_eq!(ContainerStart::from_message("exit:0"), None);
+    }
 
     /// podman exits 125 when the container is missing, and `fcvm exec` exits
     /// 125 when fcvm itself fails. Only the first is an expected startup state;

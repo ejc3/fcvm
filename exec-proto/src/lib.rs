@@ -428,6 +428,19 @@ pub fn parse_rejection(line: &[u8]) -> Option<String> {
     (rejection.kind == "error").then_some(rejection.data)
 }
 
+// ---- Container start notification ----
+//
+// fc-agent sends one of these on the status port once podman reports the container
+// running; fcvm's status listener records it for the health monitor. Shared so the two
+// binaries cannot disagree on the words.
+
+/// The container is running and its image defines no HEALTHCHECK.
+pub const CONTAINER_STARTED: &str = "ready";
+
+/// The container is running and its image defines a HEALTHCHECK, whose result the host
+/// asks podman for.
+pub const CONTAINER_STARTED_WITH_HEALTHCHECK: &str = "ready:healthcheck";
+
 // ---- Restore-completion ACK framing ----
 //
 // Shared by fc-agent (producer) and fcvm's restore listener (consumer) so the

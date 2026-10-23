@@ -3838,11 +3838,24 @@ pub fn build_snapshot_config(
         source_vsock_socket_path.display()
     );
 
+    // A VM started by an fcvm from before the container start notification has an
+    // fc-agent that never reports its container's start after a restore. Its snapshot
+    // would restore clones that are never healthy, and loading it would be refused.
+    let container_start_version = vm_state.config.container_start_version.ok_or_else(|| {
+        anyhow::anyhow!(
+            "VM {} was started by an fcvm whose fc-agent does not report its container's \
+             start, so clones restored from a snapshot of it would never be reported \
+             healthy; restart it with this fcvm and snapshot it then",
+            vm_state.vm_id
+        )
+    })?;
+
     Ok(crate::storage::SnapshotConfig {
         name: snapshot_key.to_string(),
         vm_id: vm_state.vm_id.clone(),
         generation_id: uuid::Uuid::new_v4(),
         network_boundary_version: crate::storage::snapshot::SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+        container_start_version,
         original_vsock_vm_id: Some(original_vsock_vm_id),
         source_vsock_socket_path,
         parent_snapshot: None, // Set by create_snapshot_core after determining diff base
@@ -6110,6 +6123,43 @@ mod tests {
         }
     }
 
+    /// A VM started by an fcvm from before the container start notification (#1161) is
+    /// not snapshotted: its fc-agent never reports its container's start after a
+    /// restore, so its clones would never be healthy. A VM this fcvm started is.
+    #[test]
+    fn a_vm_whose_fc_agent_does_not_report_its_container_start_is_not_snapshotted() {
+        let mut state = make_vm_state("vm-OLD", None);
+        state.config.container_start_version = None;
+        let error = build_snapshot_config(
+            &state,
+            "test-key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            None,
+        )
+        .expect_err("a VM without the container start notification was snapshotted");
+        let message = format!("{error:#}");
+        assert!(message.contains("vm-OLD"), "{message}");
+        assert!(message.contains("restart it with this fcvm"), "{message}");
+
+        let config = build_snapshot_config(
+            &make_vm_state("vm-NEW", None),
+            "test-key",
+            SnapshotType::User,
+            Path::new("/tmp/snap"),
+            vec![],
+            vec![],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            config.container_start_version,
+            crate::storage::snapshot::SNAPSHOT_CONTAINER_START_VERSION
+        );
+    }
+
     /// A snapshot of a clone carries the clone's pmem devices, so a clone of that
     /// snapshot attaches the same images and checks them against the same identity.
     #[test]
@@ -7991,6 +8041,7 @@ mod tests {
             "vm_id": "vm-OLD",
             "generation_id": "3f53da72-8c67-4ec7-8f3d-d25367129872",
             "network_boundary_version": 1,
+            "container_start_version": 1,
             "source_vsock_socket_path": "/runtime/vm-OLD/vsock.sock",
             "memory_path": "/tmp/memory.bin",
             "vmstate_path": "/tmp/vmstate.bin",

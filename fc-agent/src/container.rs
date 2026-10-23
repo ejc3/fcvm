@@ -787,8 +787,19 @@ pub async fn pull_image(plan: &Plan) -> Result<String> {
     )
 }
 
-/// Get the digest of a pulled image.
-pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<String> {
+/// What fc-agent reads from the image before the container starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImageFacts {
+    /// The image digest, the snapshot cache key the host is told about.
+    pub digest: String,
+    /// Whether the image defines a HEALTHCHECK. Sent with the start notification, so
+    /// the host runs `podman healthcheck` only for images that have one.
+    pub healthcheck: bool,
+}
+
+/// Get the digest of a pulled image and whether it defines a HEALTHCHECK, in one
+/// `podman image inspect`.
+pub async fn get_image_facts(image: &str, cmd_prefix: &[String]) -> Result<ImageFacts> {
     let (cmd, mut args) = if cmd_prefix.is_empty() {
         ("podman".to_string(), vec![])
     } else {
@@ -800,7 +811,7 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
         "image".to_string(),
         "inspect".to_string(),
         "--format".to_string(),
-        "{{.Digest}}".to_string(),
+        "{{.Digest}}\n{{json .HealthCheck}}".to_string(),
         image.to_string(),
     ]);
 
@@ -815,7 +826,33 @@ pub async fn get_image_digest(image: &str, cmd_prefix: &[String]) -> Result<Stri
         anyhow::bail!("podman image inspect failed: {}", stderr);
     }
 
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    parse_image_facts(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the output of `podman image inspect --format '{{.Digest}}\n{{json .HealthCheck}}'`.
+///
+/// `HEALTHCHECK NONE` is stored as a test of `["NONE"]`, and podman runs no check for it.
+fn parse_image_facts(stdout: &str) -> Result<ImageFacts> {
+    let mut lines = stdout.trim().splitn(2, '\n');
+    let digest = lines.next().unwrap_or_default().trim().to_string();
+    if digest.is_empty() {
+        anyhow::bail!("podman image inspect printed no digest: {stdout:?}");
+    }
+    let health: serde_json::Value = match lines.next().map(str::trim) {
+        Some(json) if !json.is_empty() => serde_json::from_str(json)
+            .with_context(|| format!("parsing the image's HealthCheck: {json:?}"))?,
+        _ => anyhow::bail!("podman image inspect printed no HealthCheck: {stdout:?}"),
+    };
+    let healthcheck = health
+        .get("Test")
+        .and_then(|test| test.as_array())
+        .and_then(|test| test.first())
+        .and_then(|first| first.as_str())
+        .is_some_and(|first| first != "NONE");
+    Ok(ImageFacts {
+        digest,
+        healthcheck,
+    })
 }
 
 /// Result of notify_cache_ready_and_wait: what this VM is, per the host.
@@ -1345,6 +1382,9 @@ pub fn build_podman_args(
         // with rootless podman (--user mode), causing the container to deadlock
         // on stdout/stderr pipe write.
         "--log-driver=none".to_string(),
+        // podman sends READY=1 to $NOTIFY_SOCKET (START_NOTIFY_SOCKET) once the
+        // container is running; that is the host's signal that it started.
+        "--sdnotify=conmon".to_string(),
     ]);
 
     if let Some((username, runtime_dir)) = user_info {
@@ -1640,11 +1680,144 @@ fn setup_user_mapping(args: &mut Vec<String>, username: &str, runtime_dir: &str)
     }
 }
 
-/// Run container in TTY mode. Never returns: powers the VM off when the container exits.
-pub async fn run_tty(podman_args: &[String], plan: &Plan, mounted_fuse_paths: &[String]) -> ! {
-    vsock::notify_container_started();
+/// The uid and gid podman runs the container as, or None when it runs as root. Matches
+/// how `agent::run` decides on a container user: a uid that is 0 or does not parse means
+/// root, and a spec without a gid takes group 100, as [`create_vm_user`] does.
+pub fn podman_user_ids(user_spec: Option<&str>) -> Option<(u32, u32)> {
+    let mut parts = user_spec?.split(':');
+    let uid: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+    if uid == 0 {
+        return None;
+    }
+    let gid = parts.next().and_then(|s| s.parse().ok()).unwrap_or(100);
+    Some((uid, gid))
+}
 
-    let exit_code = crate::tty::run_with_pty(podman_args, plan.tty, plan.interactive).await;
+/// Where podman reports that the container is running.
+///
+/// fc-agent runs podman with `--sdnotify=conmon` and this path in `NOTIFY_SOCKET`, and
+/// podman sends `READY=1` here once the OCI runtime has started the container. The
+/// container itself is not given the socket. podman records the path when it creates the
+/// container, so a `podman start` of a captured container reports here too.
+pub const START_NOTIFY_SOCKET: &str = "/run/fcvm-container-start.sock";
+
+/// Whether the container has started in this boot: [`NOT_STARTED`], or what the start
+/// notification said ([`STARTED`] or [`STARTED_WITH_HEALTHCHECK`]). A restore re-sends it
+/// to the clone's host process, whose status listener has never heard it.
+static CONTAINER_START: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+const NOT_STARTED: u8 = 0;
+const STARTED: u8 = 1;
+const STARTED_WITH_HEALTHCHECK: u8 = 2;
+
+/// Whether one sd_notify datagram says the service is ready.
+fn notify_says_ready(datagram: &[u8]) -> bool {
+    datagram
+        .split(|b| *b == b'\n')
+        .any(|line| line == b"READY=1")
+}
+
+/// The socket podman reports the container's start to, bound before podman runs.
+pub struct StartNotify {
+    socket: tokio::net::UnixDatagram,
+}
+
+impl StartNotify {
+    /// Bind [`START_NOTIFY_SOCKET`]. `owner` is the uid and gid rootless podman runs as;
+    /// podman sends from that user, and a datagram socket takes writes only from users
+    /// with write permission on it.
+    pub fn bind(owner: Option<(u32, u32)>) -> Result<Self> {
+        Self::bind_at(std::path::Path::new(START_NOTIFY_SOCKET), owner)
+    }
+
+    fn bind_at(path: &std::path::Path, owner: Option<(u32, u32)>) -> Result<Self> {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e).with_context(|| format!("removing a stale {path:?}")),
+        }
+        let socket = tokio::net::UnixDatagram::bind(path)
+            .with_context(|| format!("binding the container start socket {path:?}"))?;
+        if let Some((uid, gid)) = owner {
+            std::os::unix::fs::chown(path, Some(uid), Some(gid))
+                .with_context(|| format!("giving {path:?} to uid {uid}"))?;
+        }
+        Ok(Self { socket })
+    }
+
+    /// Wait for podman's `READY=1`, then tell the host the container is running. Other
+    /// datagrams (podman sends `MAINPID=` and, while it pulls, `EXTEND_TIMEOUT_USEC=`)
+    /// are read and ignored.
+    pub fn spawn(self, healthcheck: bool) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            if let Err(e) = self.wait_ready().await {
+                eprintln!(
+                    "[fc-agent] WARNING: reading the container start socket failed: {e}; \
+                     the host will not learn that the container started"
+                );
+                return;
+            }
+            let started = if healthcheck {
+                STARTED_WITH_HEALTHCHECK
+            } else {
+                STARTED
+            };
+            CONTAINER_START.store(started, std::sync::atomic::Ordering::Release);
+            eprintln!("[fc-agent] container running (podman READY=1)");
+            send_container_started(healthcheck).await;
+        })
+    }
+
+    /// Return once a datagram says `READY=1`.
+    async fn wait_ready(&self) -> std::io::Result<()> {
+        let mut buf = [0u8; 4096];
+        loop {
+            let n = self.socket.recv(&mut buf).await?;
+            if notify_says_ready(&buf[..n]) {
+                return Ok(());
+            }
+        }
+    }
+}
+
+/// Tell the host the container is running, off the runtime's worker threads: the send
+/// is a blocking vsock connect, retried.
+async fn send_container_started(healthcheck: bool) {
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || vsock::notify_container_started(healthcheck)).await
+    {
+        eprintln!("[fc-agent] WARNING: the container start notification task failed: {e}");
+    }
+}
+
+/// After a restore, tell the clone's host process that the container is running, if it
+/// was when the snapshot was taken. The host process that took the snapshot heard it;
+/// the clone's never did. Before the container starts this sends nothing: the start
+/// notification goes to the clone's host when it happens.
+pub async fn resend_container_started_after_restore() {
+    match CONTAINER_START.load(std::sync::atomic::Ordering::Acquire) {
+        NOT_STARTED => {}
+        started => send_container_started(started == STARTED_WITH_HEALTHCHECK).await,
+    }
+}
+
+/// Run container in TTY mode. Never returns: powers the VM off when the container exits.
+pub async fn run_tty(
+    podman_args: &[String],
+    plan: &Plan,
+    mounted_fuse_paths: &[String],
+    start_notify: StartNotify,
+    healthcheck: bool,
+) -> ! {
+    let start_watch = start_notify.spawn(healthcheck);
+
+    let exit_code = crate::tty::run_with_pty(
+        podman_args,
+        vec![("NOTIFY_SOCKET".to_string(), START_NOTIFY_SOCKET.to_string())],
+        plan.tty,
+        plan.interactive,
+    )
+    .await;
+    start_watch.abort();
 
     vsock::notify_container_exit(exit_code);
 
@@ -1661,15 +1834,19 @@ pub async fn run_async(
     podman_args: &[String],
     output: &OutputHandle,
     non_blocking_output: bool,
+    start_notify: StartNotify,
+    healthcheck: bool,
 ) -> Result<i32> {
     let mut cmd = Command::new(&podman_args[0]);
     cmd.args(&podman_args[1..]);
+    cmd.env("NOTIFY_SOCKET", START_NOTIFY_SOCKET);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn().context("spawning Podman container")?;
-
-    vsock::notify_container_started();
+    // The socket is already bound, so a READY=1 sent before this task first reads it
+    // waits in the socket's queue.
+    let start_watch = start_notify.spawn(healthcheck);
 
     // Stream stdout via OutputHandle.
     // In non-blocking mode, use try_send_line (drops on full) to prevent
@@ -1708,6 +1885,7 @@ pub async fn run_async(
     });
 
     let status = child.wait().await?;
+    start_watch.abort();
     let exit_code = status.code().unwrap_or(1);
 
     if let Some(task) = stdout_task {
@@ -1780,6 +1958,83 @@ mod tests {
 
         let args = super::build_podman_args(&plan, "alpine", None, &[]);
         assert!(!args.iter().any(|a| a == "--device"), "{args:?}");
+    }
+
+    /// podman is asked to report the container's start, the host's only signal that it
+    /// is running.
+    #[test]
+    fn podman_run_reports_the_start_over_sd_notify() {
+        let plan: crate::types::Plan = serde_json::from_str(r#"{"image": "alpine"}"#).unwrap();
+        for user in [None, Some(("fcvm-user", "/run/user/1000"))] {
+            let args = super::build_podman_args(&plan, "alpine", user, &[]);
+            let sdnotify = args.iter().position(|a| a == "--sdnotify=conmon");
+            let image = args.iter().position(|a| a == "alpine").unwrap();
+            assert!(sdnotify.is_some_and(|i| i < image), "{args:?}");
+        }
+    }
+
+    /// The image's HEALTHCHECK is read from the same inspect as its digest; a missing
+    /// one, and `HEALTHCHECK NONE`, are no healthcheck.
+    #[test]
+    fn image_facts_carry_the_digest_and_whether_there_is_a_healthcheck() {
+        let digest = "sha256:4b9a4e0196b9ec48c209f98d6e7cea3241bfc402262bf1b0500ea4dbb1002c45";
+        for (health, expected) in [
+            (
+                r#"{"Test":["CMD-SHELL","true"],"Interval":5000000000}"#,
+                true,
+            ),
+            (r#"{"Test":["CMD","/bin/check"]}"#, true),
+            ("null", false),
+            (r#"{"Test":["NONE"]}"#, false),
+            (r#"{"Test":[]}"#, false),
+        ] {
+            let facts = super::parse_image_facts(&format!("{digest}\n{health}\n")).unwrap();
+            assert_eq!(facts.digest, digest);
+            assert_eq!(facts.healthcheck, expected, "{health}");
+        }
+        assert!(super::parse_image_facts("\n").is_err());
+        assert!(super::parse_image_facts(&format!("{digest}\n")).is_err());
+        assert!(super::parse_image_facts(&format!("{digest}\nnot json")).is_err());
+    }
+
+    #[test]
+    fn container_user_ids_follow_the_plans_user() {
+        assert_eq!(super::podman_user_ids(None), None);
+        assert_eq!(super::podman_user_ids(Some("0")), None);
+        assert_eq!(super::podman_user_ids(Some("0:0")), None);
+        assert_eq!(
+            super::podman_user_ids(Some("1000:1000")),
+            Some((1000, 1000))
+        );
+        assert_eq!(super::podman_user_ids(Some("1000")), Some((1000, 100)));
+    }
+
+    /// The start watch returns on podman's READY=1 and not before: podman sends
+    /// MAINPID= and, while it pulls, EXTEND_TIMEOUT_USEC= on the same socket.
+    #[tokio::test]
+    async fn the_start_watch_waits_for_ready() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("start.sock");
+        let watch = super::StartNotify::bind_at(&path, None).unwrap();
+        let podman = std::os::unix::net::UnixDatagram::unbound().unwrap();
+
+        podman
+            .send_to(b"EXTEND_TIMEOUT_USEC=30000000", &path)
+            .unwrap();
+        podman.send_to(b"MAINPID=42", &path).unwrap();
+        let early =
+            tokio::time::timeout(std::time::Duration::from_millis(200), watch.wait_ready()).await;
+        assert!(early.is_err(), "returned before READY=1");
+
+        podman.send_to(b"MAINPID=42\nREADY=1", &path).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), watch.wait_ready())
+            .await
+            .expect("READY=1 was not seen")
+            .unwrap();
+
+        // A stale socket from an earlier boot is replaced, not an error.
+        drop(watch);
+        super::StartNotify::bind_at(&path, None).unwrap();
     }
 
     /// A pmem mount reaches the container read-only at the same path, as a

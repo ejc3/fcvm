@@ -1970,7 +1970,8 @@ async fn prepare_vm_for_lifecycle(
     };
 
     // Start status channel listener for fc-agent notifications
-    // - "ready" on port 4999 -> creates container-ready file for health check
+    // - "ready" / "ready:healthcheck" on port 4999 -> podman reports the container
+    //   running: creates the container-ready file the health monitor reads
     // - "exit:{code}" on port 4999 -> creates container-exit file with exit code
     // - "cache-ready:{digest}" on port 4999 -> trigger cache creation
     let status_socket_path = format!("{}_{}", vsock_socket_path.display(), VSOCK_STATUS_PORT);
@@ -1978,12 +1979,16 @@ async fn prepare_vm_for_lifecycle(
     // exit; consumed by run_vm_loop to decide relaunch-in-place vs terminate.
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Fired by the status listener when the container starts; wakes the health
+    // monitor so it checks at once instead of at its next poll.
+    let container_started = Arc::new(tokio::sync::Notify::new());
     let status_handle = {
         let runtime_dir = data_dir.clone();
         let socket_path = status_socket_path.clone();
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let container_started = container_started.clone();
         let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
@@ -1994,6 +1999,7 @@ async fn prepare_vm_for_lifecycle(
                 verdict,
                 reboot_flag,
                 exit_flag,
+                container_started,
             )
             .await
             {
@@ -2160,6 +2166,7 @@ async fn prepare_vm_for_lifecycle(
         vm_state.pid,
         paths::state_dir(),
         Some(health_cancel_token.clone()),
+        Some(container_started.clone()),
         startup_tx,
     );
 

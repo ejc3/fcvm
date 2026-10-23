@@ -441,6 +441,9 @@ async fn apply_restore_epoch(
         );
         crate::system::shutdown_vm(1).await;
     }
+    // 6. A container that was running when the snapshot was taken is running in the
+    //    clone, and the clone's host process has not been told.
+    crate::container::resend_container_started_after_restore().await;
 }
 
 #[derive(Debug, PartialEq, Eq)]

@@ -81,6 +81,7 @@ fn vm_state(vm_id: &str, pid: u32, network: NetworkConfig, health_check_url: &st
             balloon_mib: None,
             balloon_free_page_reporting: false,
             gpus: Vec::new(),
+            container_start_version: None,
         },
     }
 }
@@ -172,7 +173,54 @@ async fn test_health_monitor_behaviors() {
     // Test passes if no panic occurred
 }
 
-/// Answer every request on `listener` with `status`, counting them in `hits`.
+/// Without an HTTP health check, a VM is healthy once fc-agent has reported the container
+/// running, which the status listener records in the VM's container-ready file. The check
+/// reads that file; it does not run `fcvm exec ... podman inspect` in the guest (#1161).
+///
+/// The VM here is the test process itself, so no exec into it can answer: a check that
+/// still asked podman reads Unknown.
+#[tokio::test]
+async fn a_container_start_notification_makes_the_vm_healthy_without_asking_podman() {
+    let base_dir = create_unique_test_dir();
+    paths::init_with_paths(&base_dir, &base_dir);
+    let manager = StateManager::new(base_dir.join("state"));
+    manager.init().await.unwrap();
+
+    let vm_id = "start-notified-vm";
+    let mut state = vm_state(
+        vm_id,
+        std::process::id(),
+        NetworkConfig::default(),
+        "unused",
+    );
+    state.config.health_check_url = None;
+    manager.save_state(&state).await.unwrap();
+    let runtime_dir = paths::vm_runtime_dir(vm_id);
+    std::fs::create_dir_all(&runtime_dir).unwrap();
+
+    let check = || {
+        fcvm::health::run_health_check_once(vm_id, Some(std::process::id()), base_dir.join("state"))
+    };
+    assert_eq!(
+        check().await.unwrap(),
+        HealthStatus::Unknown,
+        "healthy before the container was reported running"
+    );
+
+    // What the status listener writes for fc-agent's "ready".
+    std::fs::write(runtime_dir.join("container-ready"), "ready\n").unwrap();
+    assert_eq!(check().await.unwrap(), HealthStatus::Healthy);
+    assert_eq!(
+        manager.load_state(vm_id).await.unwrap().health_status,
+        HealthStatus::Healthy
+    );
+
+    // A container that exited is stopped, whatever the start said.
+    std::fs::write(runtime_dir.join("container-exit"), "3\n").unwrap();
+    assert_eq!(check().await.unwrap(), HealthStatus::Stopped);
+}
+
+/// Answer every request on `listener` with `status`, counting them in `hits`./// Answer every request on `listener` with `status`, counting them in `hits`.
 fn answer_with(
     listener: tokio::net::TcpListener,
     status: &'static str,
