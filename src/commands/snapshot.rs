@@ -2001,20 +2001,11 @@ async fn cmd_snapshot_run_inner(
              on a Firecracker restore"
         );
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
-        let profile_name = snapshot_config
-            .metadata
-            .kernel_profile
-            .as_deref()
-            .unwrap_or("default");
-        let module_type = crate::setup::profile_module_type(profile_name)?;
+        // Whether the snapshot's driver image runs these GPUs is not checked here: the
+        // clone restores the image recorded in the snapshot, whose module type the
+        // current profile does not determine. The guest's attach fails closed instead.
         for sbdf in &gpus {
             crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
-            crate::gpu::check_driver_supports_device(
-                Path::new("/sys"),
-                sbdf,
-                profile_name,
-                module_type,
-            )?;
         }
     }
     vm_state.config.gpus = gpus.clone();

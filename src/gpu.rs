@@ -143,9 +143,9 @@ pub fn require_pci_transport(firecracker_args: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-/// Refuse, before launch, a passthrough device the profile's NVIDIA driver image
-/// cannot run: with `module_type = "proprietary"` only Turing and Ampere GPUs
-/// ([`ModuleType::supports_device`]). Without this the restore would load the
+/// Refuse, before `podman run` launches, a passthrough device the profile's NVIDIA
+/// driver image cannot run: with `module_type = "proprietary"` only Turing and
+/// Ampere GPUs ([`ModuleType::supports_device`]). Without this the restore would load the
 /// driver, fail to initialise the GPU and shut the clone down. A device that is
 /// not NVIDIA, or a profile without a driver image, is not checked here.
 pub fn check_driver_supports_device(
@@ -318,19 +318,25 @@ mod tests {
         }
     }
 
-    /// Both launch paths that take --gpu run the check.
+    /// `podman run --gpu` checks against the profile's module type, which is the
+    /// driver its clone gets: the snapshot key holds the driver image's path, and
+    /// the image's key holds the module type. `snapshot run --gpu` restores the
+    /// image recorded in the snapshot, which the current profile does not name, so
+    /// it must not refuse a GPU on the profile's say (the guest's attach fails
+    /// closed for a GPU the recorded driver cannot run).
     #[test]
-    fn both_gpu_launch_paths_check_the_driver_supports_the_device() {
-        for (name, source) in [
-            ("podman run", include_str!("commands/podman/mod.rs")),
-            ("snapshot run", include_str!("commands/snapshot.rs")),
-        ] {
-            let code = source.split("#[cfg(test)]").next().unwrap();
-            assert!(
-                code.contains("crate::gpu::check_driver_supports_device("),
-                "{name} does not check that the driver image supports the GPU"
-            );
-        }
+    fn only_podman_run_checks_the_gpu_against_the_profiles_driver() {
+        let call = "crate::gpu::check_driver_supports_device(";
+        let code = |source: &'static str| source.split("#[cfg(test)]").next().unwrap();
+        assert!(
+            code(include_str!("commands/podman/mod.rs")).contains(call),
+            "podman run does not check that the driver image supports the GPU"
+        );
+        assert!(
+            !code(include_str!("commands/snapshot.rs")).contains(call),
+            "snapshot run checks the GPU against the current profile, not the driver image \
+             the snapshot recorded"
+        );
     }
 
     #[test]

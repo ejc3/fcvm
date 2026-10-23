@@ -2410,9 +2410,11 @@ stage writes the parameters to `nvidia.params` beside the modules and fc-agent
 passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and
 `open` on arm64, which no g5g.metal run has measured yet. With the GSP firmware
 off the proprietary modules are allowed on Turing and Ampere GPUs only:
-`fcvm podman run --gpu` and `fcvm snapshot run --gpu` refuse any other NVIDIA
-GPU before launch when the profile builds them, and name `module_type = "open"`
-as the setting that runs it.
+`fcvm podman run --gpu` refuses any other NVIDIA GPU before launch when the
+profile builds them, and names `module_type = "open"` as the setting that runs
+it. `fcvm snapshot run --gpu` restores the driver image the snapshot recorded,
+which the current profile does not name, so it does not check; the guest's
+attach fails closed for a GPU that driver cannot run.
 
 The stage also lets nvidia.ko load with no GPU on the bus. `nvidia_init_module`
 refuses an empty bus unless an NVSwitch is present, and all three refusals
