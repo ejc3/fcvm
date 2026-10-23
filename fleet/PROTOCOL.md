@@ -237,19 +237,56 @@ Every pixel is a path-traced estimate. Its random numbers are seeded by
 value is reduced across pixels, so a pixel's samples are the same wherever it
 is drawn.
 
-**Budget.** Each frame spends a fixed number of pixel-samples (the scene's
-`budget`, else `BUDGET`, default 250,000) over the pixels it draws: its rect
-plus the stream overlap plus a guard band (below), counted before clipping to
-the image. The samples per pixel are
-`round(BUDGET / drawn pixels)`, clamped to 1..64, so every tile of a grid draws
-the same number: a 180 px wall tile of a 16 x 9 grid draws 3, a whole 1080p
-image 1. Moving frames match across tiles only if every renderer draws every
-slot, so the budget must leave the slowest tile inside its 33 ms; `/health`
-counts `slots_missed`, and the coordinator can lower `budget` for all tiles at
-once when any tile reports misses. `ADAPT=1`
-instead adjusts the budget so a frame's GPU time stays near 70% of its slot,
-which keeps the frame rate on a slow view but gives tiles different sample
-counts, so moving frames no longer match across tile edges.
+**Budget.** Each frame spends a fixed number of pixel-samples (its budget)
+over the pixels it draws: its rect plus the stream overlap plus a guard band
+(below), counted before clipping to the image. The samples per pixel are
+`round(budget / drawn pixels)`, clamped to 1..64, so every tile of a grid
+given the same budget draws the same number. Moving frames match across tile
+edges only if every tile uses the same budget at the same slot and draws
+every slot.
+
+The budget for a slot is, in this order (round 8):
+
+1. **A posted schedule.** `POST /budget` with `{"budget": B, "t": T}`
+   (`Content-Type: application/json`; B in 10,000..500,000,000) sets budget B
+   from the first slot at or after scene time T, until a later entry takes
+   effect. A later entry for the same slot replaces it. A new scene clears the
+   schedule (its times are on the old scene's clock). `200 {"ok":true}` or
+   `400` naming the field.
+2. The scene's `budget`.
+3. For a renderer drawing the whole image (`rect` is the unit square, so it
+   has no edges to match) with `ADAPT=1` (the default): its own fit, rounded
+   down to the ladder below.
+4. `BUDGET` (250,000).
+
+A hold keeps the budget it started with (its samples per frame and its
+quality stay fixed while it accumulates); a new budget reaches a hold at the
+next hold.
+
+**Adapting a grid.** Each renderer reports in `/health`: `budget` (the last
+frame's), `budget_source` (`schedule`, `scene`, `local` or `default`),
+`budget_fit` (the budget at which its frame's GPU time would be 70% of a slot:
+pixel-samples drawn x 0.7 x slot / render ms, smoothed over about five
+frames) and `hq` (below). One controller sets one budget for all tiles of a
+grid: every 2 s it reads every tile's `budget_fit`, takes the smallest (the
+slowest tile governs), rounds it down to the ladder `250,000 x 2^(n/4)` (n
+from -8 to 40), and posts it to every tile with one `t`, at least a second
+past the newest frame any tile has drawn, so every tile switches at the same
+slot. A lower rung is taken at once; a higher one only after two rounds in a
+row ask for at least that much. The budget in force is posted every round
+(so it survives a scene change), and only when every tile has reported.
+Tiles never adapt on their own. `tools/budgetctl.py` is the reference
+controller; the fleet coordinator is to run the same rule.
+
+**The high-quality path.** From `HQ_SPP` (8) samples per drawn pixel, with
+every pixel drawing, a frame takes the high-quality path: the full cloud march
+(fine steps of 1.5% of the distance, the light march every second step with
+four samples, until transmittance falls under 0.01), a second diffuse bounce
+with the first bounce's sunlight shadowed, a sun shadow march of up to 56
+steps over 60 km, and 12 aerial-perspective steps. Below it a frame takes the
+fast path of round 7. The choice follows from the budget and the tile size, so
+every tile of a grid makes the same one at the same slot. `/health` and the
+`/raw` tile header report `hq`.
 
 **Checkerboard (round 4).** Where the budget gives under 0.5 samples per
 drawn pixel, a frame draws one sample on half its pixels (stride 2: those
@@ -406,5 +443,6 @@ compared pixel for pixel with the same frame drawn whole
   stays current; a new subscriber wakes it at once.
 - Kernels are SASS for `sm_75` only (no PTX), so CUDA compiles nothing at
   start. Other GPU generations need a build with their `GENCODE`.
-- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (0), `MARGIN` (16), `ENC_BPP` (0.8),
-  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443).
+- Environment: `PORT` (8080), `FPS` (30), `BUDGET` (250000), `ADAPT` (1), `MARGIN` (16), `ENC_BPP` (0.8),
+  `ACCUMULATE` (1), `TLS_CERT_FILE` (unset: no TLS listener), `TLS_PORT` (443). `FIT_SCALE`
+  (1) scales the reported `budget_fit`, to test a grid of unequal GPUs; never set it in production.

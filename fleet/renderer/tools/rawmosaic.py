@@ -9,7 +9,12 @@ one piece (fleet-renderer still --seq). Streams at TILE_H stay subscribed the
 whole time so every renderer draws at that height. Writes OUT_PREFIX.ppm and
 OUT_PREFIX.json (scene with its epoch, t, per-tile geometry and spp).
 Q=hi|std|lo in the environment selects the stream quality (default std).
+GRID=C,R: the whole image is a C x R grid and the renderers take its top-left
+COLS x ROWS cells; the output covers that block. SETTLE=S: seconds of
+streaming before the frame time is chosen (default 4), e.g. for a budget
+controller to settle.
 """
+import os
 import json
 import sys
 import threading
@@ -22,9 +27,10 @@ out, cols, rows, tile_h, scene_path = sys.argv[1], int(sys.argv[2]), int(sys.arg
 ends = [(a.rsplit(":", 1)[0], int(a.rsplit(":", 1)[1])) for a in sys.argv[6:]]
 scene = json.load(open(scene_path))
 scene["epoch_unix_ms"] = int(time.time() * 1000)
+gc, gr = (int(v) for v in os.environ["GRID"].split(",")) if os.environ.get("GRID") else (cols, rows)
 for k, (h, p) in enumerate(ends):
     s = dict(scene)
-    s["rect"] = {"x": (k % cols) / cols, "y": (k // cols) / rows, "w": 1 / cols, "h": 1 / rows}
+    s["rect"] = {"x": (k % cols) / gc, "y": (k // cols) / gr, "w": 1 / gc, "h": 1 / gr}
     fc.post_scene(h, p, s)
 stop = False
 
@@ -57,7 +63,7 @@ T_box = [1e18]
 ths = [threading.Thread(target=drain, args=(k,), daemon=True) for k in range(len(ends))]
 for t in ths:
     t.start()
-time.sleep(4)
+time.sleep(float(os.environ.get("SETTLE", "4")))
 T = (int((time.time() * 1000 - scene["epoch_unix_ms"]) / 1000 * 30) + 60) / 30.0
 T_box[0] = T
 tiles = [None] * len(ends)
@@ -77,7 +83,8 @@ for t in ths:
     t.join(timeout=20)
 stop = True
 meta0 = tiles[0][0]
-W, H = meta0["full_width"], meta0["full_height"]
+W = min(meta0["full_width"], max(m["x0"] + m["width"] for m, _ in tiles))
+H = min(meta0["full_height"], max(m["y0"] + m["height"] for m, _ in tiles))
 canvas = bytearray(W * H * 3)
 for meta, ppm in tiles:
     hdr_end = ppm.index(b"255\n") + 4

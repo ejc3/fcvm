@@ -179,10 +179,10 @@ void Server::handle(Conn& c) {
     }
     return respond(c, 200, "OK", h, "application/json", true);
   }
-  if (path == "/scene") {
+  if (path == "/scene" || path == "/budget") {
     if (method != "POST") return respond(c, 405, "Method Not Allowed", "{\"error\":\"POST only\"}");
     // A JSON content type forces a CORS preflight, which this server never
-    // grants, so a page in a browser cannot change the scene.
+    // grants, so a page in a browser cannot change the scene or the budget.
     if (lower(hdr["content-type"]).find("application/json") != 0)
       return respond(c, 415, "Unsupported Media Type", "{\"error\":\"Content-Type must be application/json\"}");
     long len = hdr.count("content-length") ? atol(hdr["content-length"].c_str()) : -1;
@@ -194,7 +194,8 @@ void Server::handle(Conn& c) {
     }
     body.resize((size_t)len);
     std::string err;
-    if (!p_.post_scene(body, &err)) return respond(c, 400, "Bad Request", "{\"error\":\"" + json_escape(err) + "\"}");
+    bool ok = path == "/scene" ? p_.post_scene(body, &err) : p_.post_budget(body, &err);
+    if (!ok) return respond(c, 400, "Bad Request", "{\"error\":\"" + json_escape(err) + "\"}");
     return respond(c, 200, "OK", "{\"ok\":true}");
   }
   if (path == "/raw" && method == "GET") {  // debug: one unencoded frame, see PROTOCOL.md

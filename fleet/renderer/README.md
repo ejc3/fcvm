@@ -174,6 +174,38 @@ inside clouds, and shortens the sun shadow march (32 steps), the bounce ray
 measure scene's 720p frame the trace went from 29.6 to 27.2 ms, and on the
 1080 detail tile from 95.2 to 82.8 ms (`still --seq 12`, per-kernel events).
 
+### Grid-wide budget (round 8)
+
+Eight VMs, one T4 each; `tools/budgetctl.py` (period 1 s) driving all eight;
+the shots' JSON records `/health` read while streaming.
+
+| tiles | camera | budget before -> after | samples/pixel | high quality | render ms (slowest tile) | fps (slowest tile) |
+|---|---|---|---|---|---|---|
+| 192 x 108 (100-GPU wall), sky block | moving, 20 s | 250,000 -> 840,896 | 5 -> 17 | off -> on | 5.5 -> 13.9 | 30.0 -> 29.3 |
+| 192 x 108 (100-GPU wall), terrain block | moving, 40 s | 250,000 -> 500,000 | 5 -> 10 | off -> on | 13.9 -> 24.2 | 30.0 -> 30.0 |
+| 480 x 540 (8-GPU wall) | moving, 40 s | 250,000 -> 707,107 | 1 -> 2 | off | 13.5 -> 19.4 | 30.0 -> 30.0 |
+
+The slowest tile governs, and tiles differ a lot: on the 100-GPU wall a sky
+tile's fit was 2 to 4 M pixel-samples and a terrain tile's 0.4 to 0.5 M. At
+8-GPU size there is room for one more sample per pixel, not for the
+high-quality path.
+
+Unequal GPUs: four of eight VMs reported half their fit (`FIT_SCALE=0.5`);
+the controller followed those four (fits 0.48 to 0.78 M against 0.82 to
+1.15 M) and every tile drew the same budget at every slot. A moving frame of a
+4 x 2 block of the 100-GPU wall, at 420,448 pixel-samples (9 samples per
+pixel, high quality), stitched unencoded from the eight VMs equals the same
+block drawn as one rect in another VM in all 165,888 pixels
+(`shots/scale100-raw-tiles-vs-whole.png`). The seam test passes on three
+GPUs with 21 checks, the new ones covering the high-quality path while the
+samples per frame change mid-sequence and a high-quality hold in different
+batches.
+
+The flat near cloud of the fast-move shot stays flat at 2,000,000
+pixel-samples (about 40 samples per pixel, high-quality march) on the
+100-GPU wall (`shots/scale100-nearcloud-before-after.png`): its cause is not
+the sample count or the march length, and is not fixed here.
+
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,
 cropped; `tools/seam_metric.py`):

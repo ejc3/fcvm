@@ -20,12 +20,12 @@
 static void usage() {
   fprintf(stderr,
           "usage: fleet-renderer [serve]                      serve on $PORT (8080)\n"
-          "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N] [--checker 0|2|4]\n"
+          "       fleet-renderer still OUT.ppm [--t T] [--h H] [--scene FILE] [--spp N] [--frames N | --seq N] [--checker 0|2|4] [--hq 0|1]\n"
           "       fleet-renderer bench [--h H]... [--frames N]   time render + encode per height\n"
           "       fleet-renderer test [H]                       the seam test (whole image vs 2x2 tiles)\n"
           "       fleet-renderer startup [H]                    ms from process start to GPU ready, first frame, first encode\n"
           "       fleet-renderer sleep                          wait forever without using the GPU\n"
-          "env: PORT, FPS (30), BUDGET pixel-samples per frame (250000), ADAPT (0), MARGIN (16), ACCUMULATE (1),\n"
+          "env: PORT, FPS (30), BUDGET pixel-samples per frame (250000), ADAPT (1), MARGIN (16), ACCUMULATE (1),\n"
           "     TLS_CERT_FILE (JSON {cert, key}; enables HTTPS/WSS), TLS_PORT (443)\n");
 }
 
@@ -44,7 +44,7 @@ static int cmd_still(int argc, char** argv) {
   if (argc < 3) { usage(); return 2; }
   std::string out = argv[2];
   double t = 20;
-  int h = 720, spp = 0, frames = 1, seq = 0, checker = -1;
+  int h = 720, spp = 0, frames = 1, seq = 0, checker = -1, hq = -1;
   Scene sc = default_scene();
   for (int i = 3; i + 1 < argc; i += 2) {
     std::string k = argv[i];
@@ -54,12 +54,14 @@ static int cmd_still(int argc, char** argv) {
     else if (k == "--frames") frames = atoi(argv[i + 1]);
     else if (k == "--seq") seq = atoi(argv[i + 1]);
     else if (k == "--checker") checker = atoi(argv[i + 1]);
+    else if (k == "--hq") hq = atoi(argv[i + 1]);
     else if (k == "--scene") sc = parse_scene(read_file(argv[i + 1]));
     else { usage(); return 2; }
   }
   Renderer r;
   r.set_budget(envd("BUDGET", 2.5e5));
   r.set_checkerboard(checker);
+  r.set_quality(hq);
   std::string err;
   if (!r.init(&err)) { fprintf(stderr, "init: %s\n", err.c_str()); return 1; }
   Tile tile = tile_geometry(sc.rect, sc.image_aspect, h);
@@ -69,8 +71,9 @@ static int cmd_still(int argc, char** argv) {
   for (int f = 0; f < frames; f++) {
     double tf = seq > 0 ? (std::llround(t * 30) - (seq - 1 - f)) / 30.0 : t;
     r.render(sc, tile, tf, frames > 1, spp);
-    fprintf(stderr, "frame %d: %dx%d spp %d hold %d (%d samples) %.1f ms, %u bad samples\n", f, tile.w, tile.h,
-            r.stats().spp, (int)r.stats().hold, r.stats().hold_samples, r.stats().render_ms, r.stats().bad_samples);
+    fprintf(stderr, "frame %d: %dx%d spp %d hq %d hold %d (%d samples) %.1f ms, %u bad samples\n", f, tile.w, tile.h,
+            r.stats().spp, (int)r.stats().hq, (int)r.stats().hold, r.stats().hold_samples, r.stats().render_ms,
+            r.stats().bad_samples);
   }
   std::vector<uint8_t> px;
   r.download_rgba(&px);
@@ -139,7 +142,8 @@ int main(int argc, char** argv) {
   o.port = (int)envd("PORT", 8080);
   o.fps = (int)envd("FPS", 30);
   o.budget = envd("BUDGET", 2.5e5);
-  o.adapt = envd("ADAPT", 0) != 0;
+  o.adapt = envd("ADAPT", 1) != 0;
+  o.fit_scale = envd("FIT_SCALE", 1.0);
   o.margin = (int)envd("MARGIN", 16);
   o.accumulate = envd("ACCUMULATE", 1) != 0;
   Pipeline p(o);

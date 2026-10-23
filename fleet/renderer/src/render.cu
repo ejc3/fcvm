@@ -14,6 +14,7 @@
 #include <stdexcept>
 
 #include "font.h"
+#include "budget.h"
 #include "render.h"
 #include "world.h"
 
@@ -417,7 +418,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
       empty = 0;
       continue;
     }
-    float ds = cheap ? fmaxf(0.06f, 0.012f * s) : clampf(0.02f * s, 0.12f, 0.8f);
+    float ds = cheap ? fmaxf(0.06f, 0.012f * s) : cP.hq ? clampf(0.015f * s, 0.12f, 0.6f) : clampf(0.02f * s, 0.12f, 0.8f);
     nfine++;
     float sig = cloud_density(p, !cheap && out.T > 0.15f);
     if (s > fade_start) sig *= __expf(-(s - fade_start) * (1.0f / 40.0f));
@@ -429,7 +430,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     empty = 0;
     // the light march is the expensive part; inside a cloud it changes
     // slowly, so take it on every fourth fine step
-    if (lit_age++ % 4 == 0) od = cloud_light_od(p, 3);
+    if (lit_age++ % (cP.hq ? 2 : 4) == 0) od = cloud_light_od(p, cP.hq ? 4 : 3);
     // several orders of scattering, each softer and less directional
     float S = 0.0f, a = 1.0f, b = 1.0f, g = 1.0f;
     for (int o2 = 0; o2 < 3; o2++) {
@@ -449,7 +450,7 @@ __device__ CloudOut march_clouds(V3 o, V3 d, float tmax, int N, float jitter, bo
     out.T *= st;
     // nearly opaque: the rest of the cloud adds what this step's light would,
     // and the march ends (cheaper than walking on to T < 0.03)
-    if (out.T < 0.1f) {
+    if (out.T < (cP.hq ? 0.01f : 0.1f)) {
       out.L += Lin * out.T;
       wsum += out.T;
       dsum += out.T * s;
@@ -554,14 +555,15 @@ __device__ float ring_cover(V3 o, V3 d);  // the orbital ring's opacity along a 
 
 __device__ float terrain_shadow(V3 p, V3 l) {
   float t = 0.004f;
-  for (int i = 0; i < 32; i++) {
+  const int n = cP.hq ? 56 : 32;  // the high-quality path follows long low-sun shadows further
+  for (int i = 0; i < n; i++) {
     V3 q = p + l * t;
     float a = alt_flat(q);
     if (a > TERRAIN_MAX) break;
     float dh = a - ground_h(v2(q.x, q.z), t < 0.6f ? 7 : 5);
     if (dh < 0.0f) return 0.0f;
     t += fmaxf(dh * 0.55f, 0.004f + 0.006f * t);
-    if (t > 40.0f) break;
+    if (t > (cP.hq ? 60.0f : 40.0f)) break;
   }
   return 1.0f;
 }
@@ -708,7 +710,9 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
   // the bounce ray starts with the octaves the surface was found with (a
   // coarser surface lies above it in places, and every bounce from there hit
   // at once: black patches); farther out march_oct lowers them
-  float th = full ? march_terrain(p + n * 0.004f, bd, 0.0f, 6.0f, 14, 9, 0.004f) : -1.0f;
+  float th = !full ? -1.0f
+             : cP.hq ? march_terrain(p + n * 0.004f, bd, 0.0f, 8.0f, 24, 9, 0.004f)
+                     : march_terrain(p + n * 0.004f, bd, 0.0f, 6.0f, 14, 9, 0.004f);
   if (th < 0.0f) {
     Lin = sky_lookup(bd);
   } else {
@@ -716,7 +720,18 @@ __device__ V3 shade_terrain(V3 p, V3 rd, float t, float pix, Rng& rng, bool full
     float h2 = terrain(v2(q.x, q.z), 6);
     V3 n2 = terrain_normal(q, 0.01f, 6);
     Material m2 = terrain_material(q, h2, n2);
-    Lin = m2.albedo * (sun_at(q) * (fmaxf(dot(n2, cP.sun_dir), 0.0f) * 0.75f / PI_F) + sky_lookup(v3(0, 1, 0)) * 0.6f);
+    if (cP.hq) {
+      // the high-quality path: the bounce point's sunlight is shadowed, and
+      // its own light comes from a second bounce (sky, or the ground's
+      // albedo under the sky)
+      float vis2 = terrain_shadow(q + n2 * 0.003f, cP.sun_dir);
+      V3 bd2 = cosine_dir(n2, rng.next(), rng.next());
+      float th2 = march_terrain(q + n2 * 0.004f, bd2, 0.0f, 6.0f, 14, 7, 0.004f);
+      V3 L2 = th2 < 0.0f ? sky_lookup(bd2) : m2.albedo * sky_lookup(v3(0, 1, 0)) * 0.6f;
+      Lin = m2.albedo * (sun_at(q) * (vis2 * fmaxf(dot(n2, cP.sun_dir), 0.0f) / PI_F) + L2);
+    } else {
+      Lin = m2.albedo * (sun_at(q) * (fmaxf(dot(n2, cP.sun_dir), 0.0f) * 0.75f / PI_F) + sky_lookup(v3(0, 1, 0)) * 0.6f);
+    }
   }
   L += m.albedo * Lin;
   L += m.albedo * point_lights(p, n);
@@ -968,7 +983,7 @@ __device__ Hit trace(V3 o, V3 d, float pix, Rng& rng) {
       hres.id = 1.0f;
     }
     V3 T;
-    V3 ins = scatter(o, d, th, 8, &T);
+    V3 ins = scatter(o, d, th, cP.hq ? 12 : 8, &T);
     L = L * T + ins;
     hres.dist = th;
   } else {
@@ -1726,13 +1741,23 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
   // half the pixels per frame, or on a quarter under 0.3. (A checkerboard
   // frame is noisier, which costs bits and seams in the encoder, so wall tiles
   // stay at one or more samples on every pixel.)
+  // A hold keeps the budget it started with, so its samples per frame and
+  // its quality stay fixed while it accumulates (a budget change takes
+  // effect in holds at the next hold).
+  bool new_hold = accumulate && held && key != hold_key_;
+  if (new_hold) hold_budget_ = budget_;
+  double budget = (accumulate && held) ? hold_budget_ : budget_;
   int stride = checker_ > 0 ? checker_ : 1;
+  int hq = quality_ >= 0 ? quality_ : 0;
   if (spp <= 0) {
-    double per_px = budget_ / drawn_pixels(tile);
-    if (checker_ < 0) stride = per_px < 0.3 ? 4 : per_px < 0.5 ? 2 : 1;
+    double per_px = budget / drawn_pixels(tile);
+    if (checker_ < 0) stride = stride_for(per_px);
     spp = stride > 1 ? 1 : (int)std::lround(per_px);
+    if (quality_ < 0) hq = (stride == 1 && per_px >= HQ_SPP) ? 1 : 0;
   }
   spp = spp < 1 ? 1 : spp > 64 ? 64 : spp;
+  p.hq = hq;
+  stats_.hq = hq != 0;
   bool half = stride > 1;
   p.spp = spp;
   p.half = stride;
@@ -1748,7 +1773,7 @@ void Renderer::render(const Scene& s, const Tile& tile, double t, bool accumulat
     p.hold = 0;
     reset_history();
   } else if (held) {
-    if (key != hold_key_) {
+    if (new_hold) {
       CK(cudaMemsetAsync(hold_sum_, 0, ne * sizeof(float4), st));
       CK(cudaMemsetAsync(hold_aux_, 0, ne * sizeof(float2), st));
       CK(cudaMemcpyAsync(hold_blend_, display_, nr * sizeof(float4), cudaMemcpyDeviceToDevice, st));
