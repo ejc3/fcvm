@@ -397,7 +397,7 @@ the fix:
     second per restore path (5.6 in all). Of each 420-request burst at that
     rate, 37 and then 168 requests timed out, 9 and 17 failed navigation
     with a reset, and 3 and 1 were reported as teardown failures over a lock
-    file another fcvm had already removed (item 17; `left=[]`); at 1.4 both completed all 210. The harness refuses a run on any failed
+    file that was already gone (`left=[]`; item 17); at 1.4 both completed all 210. The harness refuses a run on any failed
     request, so the throughput run was repeated at lower rates. Their
     `requests.jsonl` (each failure's `error`), `status.json` and
     `bursts.jsonl` are kept under `results/reqbench-20261022-corpus-s7/` and
