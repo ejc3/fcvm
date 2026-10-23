@@ -619,12 +619,14 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # A reviewer with nothing to say posts no review object. Codex answers with a plain
 # comment: "Codex Review: Didn't find any major issues." plus one of a few short
 # sign-offs, then "**Reviewed commit:** `<sha>`", then a folded "About Codex in GitHub"
-# block. A CodeRabbit review that produces no comments replies "Full review finished."
-# (or "Review finished." for an incremental one) folded under "Action performed". Those
-# are verdicts, not findings: they need no disposition. Codex's also covers the commit it
-# names; CodeRabbit's names nothing, and its coverage comes from the walkthrough comment
-# instead (walkthrough_sha below, and the coverage check for how a result is bound to
-# the head).
+# block. Since 2026-10-15 the comment opens with "<!-- codex-review-receipt:v1 -->", an
+# HTML comment on its own line, which verdict_lines drops like any hidden comment
+# (strip_hidden_comments below). A CodeRabbit review that produces no comments replies
+# "Full review finished." (or "Review finished." for an incremental one) folded under
+# "Action performed". Those are verdicts, not findings: they need no disposition. Codex's
+# also covers the commit it names; CodeRabbit's names nothing, and its coverage comes
+# from the walkthrough comment instead (walkthrough_sha below, and the coverage check for
+# how a result is bound to the head).
 #
 # walkthrough_sha is the last commit of a review that RAN CLEAN, or "". CodeRabbit edits
 # one walkthrough comment in place, and its recent-review block names the range it
@@ -640,7 +642,7 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # beside a clean block at the head (#869) also declines: the comment is in a mixed state
 # from two runs, and which run wrote which block is not something this gate can read.
 #
-# Codex's SECOND no-findings shape, and since 2026-08-28 the only one it has posted here:
+# Codex's SECOND no-findings shape, posted here since 2026-08-28 alongside the first:
 # one comment per PR carrying "<!-- codex-pull-request-review-summary -->", opened when a
 # review STARTS and edited in place as reviews finish. Its table holds one row per review:
 #   | Code Review | Completed <relative-time datetime="..."> | `9ebed54` | Manual request |
@@ -666,8 +668,10 @@ TRIGGER_RE='\A[[:space:]]*@(codex[[:space:]]+(security[[:space:]]+)?review|coder
 # an open-ended tail would accept "Didn't find any major issues. P1: drops data" as a
 # verdict. An unlisted sign-off is not a verdict, so the gate blocks until someone reads
 # the comment, which is the right direction; extend the list when Codex says something
-# new. Only the About Codex block is stripped, and only under that exact summary text:
-# a details block with any other summary is where a bot folds its findings.
+# new. On 2026-10-23 the 129 Codex comments on ejc3/fcvm PRs carrying the phrase used 18
+# distinct sign-offs, all listed (#1190 was blocked on "Delightful!", one of seven then
+# missing). Only the About Codex block is stripped, and only under that exact summary
+# text: a details block with any other summary is where a bot folds its findings.
 # NOTICES: a listed reviewer saying that its review did NOT run. Neither a finding nor
 # coverage. Both bots post one, and because both are in VERDICT_BOTS none of it fell under
 # the notification-bot exemption below: every notice was a PR-level claim needing a
@@ -843,7 +847,7 @@ def verdict_lines:
   | if $s == null then null
     else ($s | split("\n") | map(gsub("^[[:space:]]+|[[:space:]]+$"; ""))
              | map(select(length > 0 and . != cr_note))) end;
-def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍)?$";
+def codex_line_re: "^Codex Review: Didn.t find any major issues\\.?( Bravo\\.| Keep it up!| Keep them coming!| Hooray!| Swish!| You.re on a roll\\.| :\\+1:| :rocket:| :tada:| Nice work[.!]| Great job[.!]| Breezy!| 👍| Delightful!| What shall we delve into next\\?| More of your lovely PRs please\\.| Can.t wait for the next one!| Chef.s kiss\\.| Already looking forward to the next diff\\.| Another round soon, please!)?$";
 def reviewed_re: "^\\*\\*Reviewed commit:\\*\\* `(?<sha>[0-9a-f]{7,40})`$";
 def is_verdict:
   verdict_lines as $l

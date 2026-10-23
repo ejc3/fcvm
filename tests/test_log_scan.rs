@@ -991,6 +991,106 @@ fn review_gate_accepts_the_codex_breezy_signoff() {
     assert!(!combined.contains("UNANSWERED"), "{combined}");
 }
 
+/// Runs the gate on one Codex comment `body` (a JSON string literal) posted after the head
+/// `deadbeef` arrived, and returns (exit code, combined output).
+fn run_gate_on_codex_comment(name: &str, body: &str) -> (Option<i32>, String) {
+    let comments = format!(
+        r#"[{{"author":{{"login":"chatgpt-codex-connector","__typename":"Bot"}},"createdAt":"2026-01-02T01:00:00Z","updatedAt":"2026-01-02T01:00:00Z","body":{body}}}]"#
+    );
+    let payload = format!(
+        r#"{{"data":{{"repository":{{"pullRequest":{{"author":{{"login":"me"}},"headRefOid":"deadbeef","commits":{{"nodes":[{{"commit":{{"committedDate":"2026-01-02T00:00:00Z","checkSuites":{{"nodes":[{{"createdAt":"2026-01-02T00:30:00Z"}}]}}}}}}]}},"reviewThreads":{{"nodes":[]}},"reviews":{{"nodes":[]}},"comments":{{"nodes":{comments}}},"recheck":{{"comments":{{"nodes":{comments}}}}}}}}}}}}}"#
+    );
+    let dir = std::env::temp_dir().join(format!("fcvm-gate-{name}-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let f = dir.join("payload.json");
+    std::fs::write(&f, payload).unwrap();
+    let out = Command::new("bash")
+        .arg(repo_root().join("scripts/check-review-threads.sh"))
+        .arg("--from-file")
+        .arg(&f)
+        .output()
+        .expect("check-review-threads.sh must be runnable");
+    let _ = std::fs::remove_dir_all(&dir);
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// Codex's receipt-marked no-findings comment, as posted on #1190, with `signoff` after the
+/// phrase (JSON-escaped). Every receipt-marked Codex comment on this repo is this body,
+/// byte for byte apart from the sign-off and the commit.
+fn codex_receipt_body(signoff: &str) -> String {
+    format!(
+        r#""<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues.{signoff}\n\n**Reviewed commit:** `deadbeef`\n\n<details> <summary>ℹ️ About Codex in GitHub</summary>\n<br/>\n\n[Your team has set up Codex to review pull requests in this repo](https://chatgpt.com/codex/cloud/settings/general). Reviews are triggered when you\n- Open a pull request for review\n- Mark a draft as ready\n- Comment \"@codex review\".\n\nIf Codex has suggestions, it will comment; otherwise it will react with 👍.\n\n\n\n\nCodex can also answer questions or update the PR. Try commenting \"@codex address that feedback\".\n            \n</details>""#
+    )
+}
+
+/// Codex's receipt-marked no-findings comment is a verdict with every sign-off it posts.
+///
+/// Since 2026-10-15 Codex opens its no-findings comment with
+/// "<!-- codex-review-receipt:v1 -->". On 2026-10-23 #1190's head was signed off with
+/// "Didn't find any major issues. Delightful!", and the gate reported the comment
+/// UNANSWERED and the head UNREVIEWED. The marker is a hidden HTML comment the gate already
+/// drops; the sign-off was missing from codex_line_re, as were six others Codex had posted
+/// on this repo since 2026-08-30. Each is checked here in the receipt-marked shape.
+#[test]
+fn review_gate_accepts_the_codex_receipt_verdict_and_its_signoffs() {
+    require_jq();
+    for signoff in [
+        " Delightful!",
+        " What shall we delve into next?",
+        " More of your lovely PRs please.",
+        " Can't wait for the next one!",
+        " Chef's kiss.",
+        " Already looking forward to the next diff.",
+        " Another round soon, please!",
+    ] {
+        let (code, out) = run_gate_on_codex_comment("receipt", &codex_receipt_body(signoff));
+        assert_eq!(
+            code,
+            Some(0),
+            "Codex's receipt-marked comment signed off with {signoff:?} is a verdict, not a claim.\n{out}"
+        );
+        assert!(out.contains("HEAD COVERED"), "{signoff:?}\n{out}");
+        assert!(!out.contains("UNANSWERED"), "{signoff:?}\n{out}");
+    }
+}
+
+/// The verdict words with a finding after them are a finding, not a verdict.
+///
+/// The sign-off list is enumerated so that the phrase cannot carry text after it. Green on
+/// the gate before and after the receipt fix; it goes red against a sign-off pattern with an
+/// open tail, which is the loosening this guards against.
+#[test]
+fn review_gate_treats_a_codex_receipt_verdict_with_a_finding_as_a_claim() {
+    require_jq();
+    for (case, signoff) in [
+        (
+            "the sign-off line",
+            r#" Delightful! P1: the lease is dropped before the rename"#,
+        ),
+        (
+            "a line below",
+            r#" Delightful!\n\nP1: the lease is dropped before the rename, which races the pruner."#,
+        ),
+    ] {
+        let (code, out) = run_gate_on_codex_comment("receipt-claim", &codex_receipt_body(signoff));
+        assert_eq!(
+            code,
+            Some(1),
+            "a finding on {case} after Codex's verdict words is a claim.\n{out}"
+        );
+        assert!(out.contains("carry no disposition"), "{case}\n{out}");
+        assert!(out.contains("UNREVIEWED HEAD"), "{case}\n{out}");
+        assert!(!out.contains("HEAD COVERED"), "{case}\n{out}");
+    }
+}
+
 /// A bot saying that its review did NOT run is not a finding, and covers no head.
 ///
 /// Codex out of quota posts "You have reached your Codex usage limits for code reviews" as

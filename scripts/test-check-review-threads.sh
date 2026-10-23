@@ -1946,6 +1946,41 @@ gsum_failed() { jq -n --arg t "$G_SUMMARY_TEMPLATE" --arg f "$G_FAILED_BLOCK" --
 run_case "a greptile summary naming the head with comments outside the diff is claimable" \
   "$(wrapc "$(gsuites "$G_RUN_CLEAN")" "$(cmt "$GREPTILE" Bot 2026-01-02T00:51:00Z "$(gsum_failed "$HEAD40")")")" 1 "carry no disposition"
 
+echo "== finding 49: Codex's receipt-marked verdict, with the sign-offs it actually posts =="
+# Since 2026-10-15 Codex opens its no-findings comment with "<!-- codex-review-receipt:v1 -->".
+# The marker is a hidden HTML comment and was already dropped; what blocked #1190 was its
+# sign-off, "Delightful!", one of seven Codex had posted here that codex_line_re did not
+# list. receipt_body is the #1190 body: every receipt-marked comment on this repo is
+# codex_body with that marker line in front, byte for byte apart from sign-off and sha.
+receipt_body() { jq -n --argjson b "$(codex_body "$1" "$2")" '"<!-- codex-review-receipt:v1 -->\n\n" + $b'; }
+run_case "the #1190 receipt-marked verdict covers the head it names" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")]")" \
+  0 "HEAD COVERED"
+run_case "the #1190 receipt-marked verdict needs no disposition" \
+  "$(wrap9 "$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")")" \
+  0 "CLEAR"
+for signoff in ' What shall we delve into next?' ' More of your lovely PRs please.' " Can't wait for the next one!" \
+               " Chef's kiss." ' Already looking forward to the next diff.' ' Another round soon, please!'; do
+  run_case "the codex sign-off '$signoff' is a verdict" \
+    "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body "$signoff" deadbeef)")]")" \
+    0 "HEAD COVERED"
+done
+# Guards, blocked before and after: the same words with a finding after the sign-off, on its
+# line or below it, are a finding; a receipt-marked verdict for an older commit covers nothing;
+# and the receipt words from anyone but the Codex bot are an ordinary comment.
+run_case "the receipt verdict with a finding on the sign-off line is claimable, not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful! P1: the lease is dropped before the rename' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "the receipt verdict with a finding appended below is claimable, not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body $' Delightful!\n\nP1: the lease is dropped before the rename, which races the pruner.' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+run_case "a receipt verdict naming an older commit is not coverage" \
+  "$(wrap6 "[$(cmt "$CODEX" Bot 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' abc123def4)")]")" \
+  1 "UNREVIEWED HEAD"
+run_case "a human posting the receipt verdict is claimable, not coverage" \
+  "$(wrap6 "[$(cmt helpful-human User 2026-01-02T01:00:00Z "$(receipt_body ' Delightful!' deadbeef)")]")" \
+  1 "carry no disposition" "UNREVIEWED HEAD"
+
 echo
 echo "passed=$pass failed=$fail"
 [ "$fail" -eq 0 ]
