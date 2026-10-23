@@ -273,6 +273,33 @@ pub const MAX_ACTIONS: usize = 50;
 /// of heavy use.
 pub const MAX_RECEIPTS: usize = 20_000;
 
+/// Totals since the fleet was first started (kept across coordinator restarts).
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct Counters {
+    /// fcvm GPU VMs that reached their first frame (a restore, the wall's or a claim's).
+    pub restores: u64,
+    /// GPU scrubs the agents reported, and the ones that failed.
+    pub scrubs: u64,
+    pub scrub_failures: u64,
+    /// Restores per minute (Unix minute, count) over the last hour.
+    pub restores_by_minute: VecDeque<(u64, u64)>,
+}
+
+/// A GPU taken out of rotation after a failed reset, scrub or attach. It returns only by
+/// an operator's `ReleaseQuarantine`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Quarantined {
+    pub host: String,
+    pub sbdf: String,
+    pub error: String,
+    pub since: u64,
+}
+
+/// The key of a GPU across hosts.
+pub fn gpu_key(host: &str, sbdf: &str) -> String {
+    format!("{host}/{sbdf}")
+}
+
 /// The part of the state compared after each event to decide whether the version moves.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Fleet {
@@ -310,6 +337,11 @@ pub struct Fleet {
     /// Hosts reclaimed (a spot notice, or gone): since when, and when they went away. Kept
     /// for a minute after they are gone so the page can say so.
     pub reclaimed: BTreeMap<String, (u64, Option<u64>)>,
+    #[serde(default)]
+    pub counters: Counters,
+    /// Quarantined GPUs by `gpu_key`.
+    #[serde(default)]
+    pub quarantined: BTreeMap<String, Quarantined>,
     /// Coordinator components that are degraded: reason and since when.
     pub degraded: BTreeMap<String, (String, u64)>,
 }
@@ -353,6 +385,8 @@ impl State {
                 claim_count: 0,
                 reclaimed: BTreeMap::new(),
                 degraded: BTreeMap::new(),
+                counters: Counters::default(),
+                quarantined: BTreeMap::new(),
             },
             config,
             receipts: BTreeMap::new(),

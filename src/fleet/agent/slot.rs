@@ -35,6 +35,11 @@ pub struct AgentCfg {
     pub backoff_max: Duration,
     /// A VM that ran this long before dying resets the backoff.
     pub stable_after: Duration,
+    /// Scrub a standby GPU (`<fcvm> gpu scrub <sbdf>`) before reporting it ready.
+    pub scrub: bool,
+    pub scrub_timeout: Duration,
+    /// Consecutive failed relaunches after which a GPU is quarantined.
+    pub quarantine_after: u32,
 }
 
 impl AgentCfg {
@@ -67,6 +72,8 @@ pub struct Desired {
     pub rect: Option<Rect>,
     /// A private session (`claim_gpu`): draw the whole image with this camera.
     pub private_camera: Option<Vec<Keyframe>>,
+    /// In the standby pool: no VM; the GPU reset, scrubbed and ready.
+    pub standby: bool,
 }
 
 /// The whole image, which a private session draws.
@@ -98,7 +105,9 @@ struct Running {
 enum Failure {
     /// The slot was unassigned; stop without reporting.
     Removed,
-    Failed(String),
+    /// `attach`: it failed before fcvm's restored record, where the GPU is reset and
+    /// attached, or while the GPU was still held.
+    Failed { error: String, attach: bool },
 }
 
 impl SlotCtx {
@@ -124,6 +133,47 @@ impl SlotCtx {
             error,
             retry_in_ms: retry_in.map(ms),
         }));
+    }
+
+    /// Take the GPU out of rotation; the coordinator re-tiles around it.
+    fn quarantine(&self, error: &str) {
+        tracing::warn!(slot = %self.id, sbdf = %self.sbdf, %error, "quarantining the GPU");
+        let _ = self.out.send(AgentMsg::Quarantine {
+            slot: self.id.clone(),
+            sbdf: self.sbdf.clone(),
+            error: error.to_string(),
+        });
+    }
+
+    /// `<fcvm> gpu scrub <sbdf>`: Ok when it exits 0, else its last output lines.
+    async fn scrub(&self) -> Result<(), String> {
+        let run = tokio::process::Command::new(&self.cfg.fcvm)
+            .args(["gpu", "scrub", &self.sbdf])
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .output();
+        let out = match tokio::time::timeout(self.cfg.scrub_timeout, run).await {
+            Err(_) => return Err(format!("scrub of {} timed out", self.sbdf)),
+            Ok(Err(e)) => return Err(format!("scrub of {} did not start: {e}", self.sbdf)),
+            Ok(Ok(o)) => o,
+        };
+        let ok = out.status.success();
+        let _ = self.out.send(AgentMsg::Scrub {
+            slot: self.id.clone(),
+            sbdf: self.sbdf.clone(),
+            ok,
+            error: (!ok).then(|| tail(&out.stderr)),
+        });
+        if ok {
+            Ok(())
+        } else {
+            Err(format!(
+                "scrub of {} failed ({}): {}",
+                self.sbdf,
+                out.status,
+                tail(&out.stderr)
+            ))
+        }
     }
 
     fn health_url(&self, path: &str) -> String {
@@ -195,6 +245,13 @@ fn renderer_body(
     }
 }
 
+/// The last lines of a process's output, for an error message.
+fn tail(b: &[u8]) -> String {
+    let s = String::from_utf8_lossy(b);
+    let lines: Vec<&str> = s.lines().rev().take(5).collect();
+    lines.into_iter().rev().collect::<Vec<_>>().join(" | ")
+}
+
 /// Resolves when the slot's desired-state sender is dropped (the slot was unassigned).
 async fn removed(desired: &mut watch::Receiver<Desired>) {
     while desired.changed().await.is_ok() {}
@@ -232,8 +289,49 @@ pub async fn supervise(
     let mut retry_after: Option<Duration> = None;
     let mut health_tick = tokio::time::interval(ctx.cfg.health_interval);
     health_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Relaunches that failed in a row, and whether the GPU is out of rotation.
+    let mut fails: u32 = 0;
+    let mut quarantined = false;
+    let mut ready: Option<u64> = None;
     loop {
         let want = desired.borrow_and_update().clone();
+        if quarantined {
+            // Nothing runs on it again; the coordinator drops the slot.
+            removed(&mut desired).await;
+            break;
+        }
+        if want.standby {
+            if let Some(mut r) = running.take() {
+                ctx.report("stopping", want.generation, &BTreeMap::new(), None, None);
+                r.vm.stop(ctx.cfg.stop_grace).await;
+            }
+            if ready != Some(want.generation) {
+                let readied = match wait_gpu_free(&ctx).await {
+                    Err(e) => Err(e),
+                    Ok(()) if ctx.cfg.scrub => ctx.scrub().await,
+                    Ok(()) => Ok(()),
+                };
+                if let Err(e) = readied {
+                    ctx.report(
+                        "failed",
+                        want.generation,
+                        &BTreeMap::new(),
+                        Some(e.clone()),
+                        None,
+                    );
+                    ctx.quarantine(&e);
+                    quarantined = true;
+                    continue;
+                }
+                ctx.report("standby", want.generation, &BTreeMap::new(), None, None);
+                ready = Some(want.generation);
+            }
+            if desired.changed().await.is_err() {
+                break;
+            }
+            continue;
+        }
+        ready = None;
         let behind = running
             .as_ref()
             .is_none_or(|r| r.generation < want.generation);
@@ -255,10 +353,30 @@ pub async fn supervise(
             {
                 // Holds a test between the `running` report and the next pass, the window
                 // where a rect change used to be read and dropped.
-                Ok(()) => failpoint::hit_async("fleet.agent.slot_running").await,
+                Ok(()) => {
+                    fails = 0;
+                    failpoint::hit_async("fleet.agent.slot_running").await
+                }
                 Err(Failure::Removed) => break,
-                Err(Failure::Failed(e)) => {
-                    tracing::warn!(slot = %ctx.id, generation = want.generation, error = %e, "relaunch failed");
+                Err(Failure::Failed { error: e, attach }) => {
+                    tracing::warn!(slot = %ctx.id, generation = want.generation, error = %e, attach, "relaunch failed");
+                    if attach {
+                        fails += 1;
+                    }
+                    // A failure that names the GPU, or attaches failing several times in a
+                    // row, takes it out.
+                    if e.contains(&ctx.sbdf) || fails >= ctx.cfg.quarantine_after {
+                        ctx.report(
+                            "failed",
+                            want.generation,
+                            &BTreeMap::new(),
+                            Some(e.clone()),
+                            None,
+                        );
+                        ctx.quarantine(&e);
+                        quarantined = true;
+                        continue;
+                    }
                     let delay = backoff.take();
                     ctx.report(
                         "failed",
@@ -378,7 +496,10 @@ async fn relaunch(
         ctx.report("stopping", generation, &timings, None, None);
         old.vm.stop(ctx.cfg.stop_grace).await;
     }
-    wait_gpu_free(ctx).await.map_err(Failure::Failed)?;
+    wait_gpu_free(ctx).await.map_err(|error| Failure::Failed {
+        error,
+        attach: true,
+    })?;
     timings.insert("teardown_ms".to_string(), ms(t0.elapsed()));
 
     ctx.report("restoring", generation, &timings, None, None);
@@ -390,7 +511,10 @@ async fn relaunch(
         extra_args: ctx.cfg.extra_args.clone(),
         image: ctx.cfg.image.clone(),
     };
-    let mut vm = Vm::spawn(&spec, &ctx.id).map_err(|e| Failure::Failed(format!("{e:#}")))?;
+    let mut vm = Vm::spawn(&spec, &ctx.id).map_err(|e| Failure::Failed {
+        error: format!("{e:#}"),
+        attach: false,
+    })?;
     let spawned = Instant::now();
     let mut restored = vm.restored_watch();
     let deadline = tokio::time::sleep(ctx.cfg.start_timeout);
@@ -400,7 +524,10 @@ async fn relaunch(
     let mut health_at: Option<Instant> = None;
     let mut baseline: Option<u64> = None;
     let mut posted: Option<RendererScene> = None;
-    let fail = |vm: &Vm, why: String| Failure::Failed(format!("{why}; fcvm said: {}", vm.tail()));
+    let fail = |vm: &Vm, why: String, attach: bool| Failure::Failed {
+        error: format!("{why}; fcvm said: {}", vm.tail()),
+        attach,
+    };
 
     let first_frame = loop {
         tokio::select! {
@@ -412,13 +539,13 @@ async fn relaunch(
                 ctx.report("starting", generation, &timings, None, None);
             }
             status = vm.exited() => {
-                let e = fail(&vm, format!("fcvm exited ({status}) before the renderer's first frame"));
+                let e = fail(&vm, format!("fcvm exited ({status}) before the renderer's first frame"), starting_at.is_none());
                 return Err(e);
             }
             _ = poll.tick() => {
                 let Some(h) = ctx.health().await else { continue };
                 if let Some(e) = h.get("error").and_then(|e| e.as_str()) {
-                    let e = fail(&vm, format!("the renderer failed: {e}"));
+                    let e = fail(&vm, format!("the renderer failed: {e}"), false);
                     vm.stop(ctx.cfg.stop_grace).await;
                     return Err(e);
                 }
@@ -463,7 +590,7 @@ async fn relaunch(
                 }
             }
             _ = &mut deadline => {
-                let e = fail(&vm, format!("no first frame {} s after fcvm started", ctx.cfg.start_timeout.as_secs()));
+                let e = fail(&vm, format!("no first frame {} s after fcvm started", ctx.cfg.start_timeout.as_secs()), starting_at.is_none());
                 vm.stop(ctx.cfg.stop_grace).await;
                 return Err(e);
             }

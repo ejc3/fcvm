@@ -79,7 +79,19 @@ pub struct FleetView {
     /// Rectangles per half.
     pub n: usize,
     pub max_tiles: usize,
+    /// The standby pool: GPUs beyond `max_tiles`, kept reset, scrubbed and bound with no
+    /// VM, and how many of them have reported ready.
     pub standby: Vec<String>,
+    pub standby_ready: usize,
+}
+
+/// Totals since the fleet was first started.
+#[derive(Debug, Clone, Serialize)]
+pub struct CountersView {
+    pub restores: u64,
+    pub restores_last_hour: u64,
+    pub scrubs: u64,
+    pub scrub_failures: u64,
 }
 
 /// Wall tiles lent to visitors: at most `cap` at once; the next comes back at
@@ -173,6 +185,27 @@ pub enum FailureView {
         reason: String,
         since: u64,
     },
+    /// A GPU out of rotation after a failed reset, scrub or attach, until an operator
+    /// releases it.
+    GpuQuarantined {
+        host: String,
+        sbdf: String,
+        error: String,
+        since: u64,
+    },
+}
+
+/// In the standby pool: an unplaced, unclaimed GPU on a host that is not draining, and not
+/// quarantined.
+fn in_standby(state: &State, s: &Slot) -> bool {
+    let f = &state.fleet;
+    s.position.is_none()
+        && s.claim.is_none()
+        && !crate::apply::is_quarantined(f, s)
+        && s.host
+            .as_ref()
+            .and_then(|h| f.hosts.get(h))
+            .is_some_and(|h| !h.draining)
 }
 
 /// A viewer's own GPU, as everyone sees it (no frame URL, no token).
@@ -230,6 +263,7 @@ pub struct View {
     /// Problems that are not one tile's: hosts reclaimed, coordinator components down.
     pub failures: Vec<FailureView>,
     pub claims: Vec<ClaimView>,
+    pub counters: CountersView,
     pub viewers: ViewersView,
     pub actions: Vec<Action>,
 }
@@ -338,12 +372,12 @@ pub fn view(state: &State) -> View {
             ));
         }
     }
-    let standby = f
-        .slots
-        .values()
-        .filter(|s| s.position.is_none() && s.claim.is_none())
-        .map(|s| s.id.clone())
-        .collect();
+    let pool: Vec<&Slot> = f.slots.values().filter(|s| in_standby(state, s)).collect();
+    let standby = pool.iter().map(|s| s.id.clone()).collect();
+    let standby_ready = pool
+        .iter()
+        .filter(|s| s.observed.phase == "standby")
+        .count();
     let fcvm_gpus = f
         .slots
         .values()
@@ -408,6 +442,7 @@ pub fn view(state: &State) -> View {
             n: f.n,
             max_tiles: c.max_tiles,
             standby,
+            standby_ready,
         },
         scene: f.scene.clone(),
         image_aspect: c.image_aspect,
@@ -422,6 +457,12 @@ pub fn view(state: &State) -> View {
         nudges: nudges(&f.director, f.scene.epoch_unix_ms),
         borrow: borrow(state),
         failures: failures(state),
+        counters: CountersView {
+            restores: f.counters.restores,
+            restores_last_hour: f.counters.restores_by_minute.iter().map(|(_, n)| n).sum(),
+            scrubs: f.counters.scrubs,
+            scrub_failures: f.counters.scrub_failures,
+        },
         claims: f
             .slots
             .values()
@@ -570,6 +611,12 @@ fn failures(state: &State) -> Vec<FailureView> {
                 since: *since,
             }),
     );
+    out.extend(f.quarantined.values().map(|q| FailureView::GpuQuarantined {
+        host: q.host.clone(),
+        sbdf: q.sbdf.clone(),
+        error: q.error.clone(),
+        since: q.since,
+    }));
     out
 }
 
@@ -585,6 +632,10 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
         let (Some(host), Some(gpu)) = (&s.host, &s.gpu) else {
             continue;
         };
+        // A quarantined GPU runs nothing: its slot leaves the assignment.
+        if crate::apply::is_quarantined(&state.fleet, s) {
+            continue;
+        }
         if let Some(list) = out.get_mut(host) {
             list.push(AssignSlot {
                 id: s.id.clone(),
@@ -594,6 +645,7 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 // its host's band (the aggregator draws the tile black).
                 rect: if s.claim.is_some() { None } else { s.rect },
                 private_camera: s.claim.as_ref().map(|c| c.camera.clone()),
+                standby: in_standby(state, s),
             });
         }
     }
@@ -622,6 +674,7 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             generation: s.generation,
             rect: s.rect,
             private_camera: None,
+            standby: false,
         })
         .collect()
 }

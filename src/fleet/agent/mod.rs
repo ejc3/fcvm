@@ -72,6 +72,9 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
             backoff_min: Duration::from_secs(1),
             backoff_max: Duration::from_secs(30),
             stable_after: Duration::from_secs(60),
+            scrub: args.scrub,
+            scrub_timeout: Duration::from_secs(120),
+            quarantine_after: 3,
         },
         spot_notice_url: args.spot_notice_url,
         spot_poll: Duration::from_secs(5),
@@ -282,6 +285,7 @@ fn assign(
             generation: a.generation,
             rect: a.rect,
             private_camera: a.private_camera.clone(),
+            standby: a.standby,
         };
         if let Some(h) = slots.get(&a.id) {
             h.desired.send_if_modified(|d| {
@@ -290,6 +294,7 @@ fn assign(
                     generation: d.generation.max(want.generation),
                     rect: want.rect,
                     private_camera: want.private_camera.clone(),
+                    standby: want.standby,
                 };
                 let changed = *d != next;
                 *d = next;

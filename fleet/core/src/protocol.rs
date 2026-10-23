@@ -154,6 +154,20 @@ pub enum AgentMsg {
     Aggregate {
         frame_url: String,
     },
+    /// A GPU scrub finished (`ok`), or failed with `error`.
+    Scrub {
+        slot: String,
+        sbdf: String,
+        ok: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error: Option<String>,
+    },
+    /// The agent took a GPU out of rotation: its reset, scrub or attach failed.
+    Quarantine {
+        slot: String,
+        sbdf: String,
+        error: String,
+    },
 }
 
 /// One slot an agent must run.
@@ -167,6 +181,10 @@ pub struct AssignSlot {
     /// A private session's camera: the renderer draws the whole image with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_camera: Option<Vec<Keyframe>>,
+    /// In the standby pool: run no VM, keep the GPU reset, scrubbed and bound, and report
+    /// `standby` when it is ready.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub standby: bool,
 }
 
 /// The scene shared by every renderer; the agent adds each slot's rect to make the
@@ -260,6 +278,7 @@ mod tests {
                 generation: 1,
                 rect: None,
                 private_camera: None,
+                standby: false,
             }],
             region: None,
         };

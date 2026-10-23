@@ -180,6 +180,12 @@
     },
     "claims": [],
     "cooldown_until": null,
+    "counters": {
+      "restores": 0,
+      "restores_last_hour": 0,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
     "failures": [],
     "fleet": {
       "ec2_instances": 0,
@@ -188,7 +194,8 @@
       "hosts": [],
       "max_tiles": 100,
       "n": 0,
-      "standby": []
+      "standby": [],
+      "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
     "next_race_at": null,

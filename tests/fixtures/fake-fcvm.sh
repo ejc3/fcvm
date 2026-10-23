@@ -8,19 +8,40 @@
 #   FAKE_RESTORE_SECS   time before the restored record (default 0.2)
 #   FAKE_STOP_SECS      time it takes to stop after SIGTERM (default 0.1)
 #   FAKE_DIE_AFTER_SECS exit with status 3 this long after coming up (default: never)
+#   FAKE_FAIL_START     exit with status 1 before the restored record; "gpu" names the GPU
+#                       in the error, anything else does not
+#   FAKE_SCRUB_EXIT     exit status of `gpu scrub <sbdf>` (default 0)
 set -u
+dir="${FAKE_FCVM_DIR:?}"
+log="$dir/events.log"
+if [ "${1:-}" = gpu ] && [ "${2:-}" = scrub ]; then
+    echo "scrub $3 $$ $(date +%s%N)" >> "$log"
+    if [ "${FAKE_SCRUB_EXIT:-0}" != 0 ]; then
+        echo "[fake fcvm] scrub of $3 left memory nonzero" >&2
+    fi
+    exit "${FAKE_SCRUB_EXIT:-0}"
+fi
 name=""
 port=""
+gpu=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) name="$2"; shift ;;
         --publish) port="${2#*:}"; port="${port%%:*}"; shift ;;
+        --gpu) gpu="$2"; shift ;;
     esac
     shift
 done
-dir="${FAKE_FCVM_DIR:?}"
-log="$dir/events.log"
 echo "start $name $$ $(date +%s%N)" >> "$log"
+if [ -n "${FAKE_FAIL_START:-}" ]; then
+    if [ "$FAKE_FAIL_START" = gpu ]; then
+        echo "[fake fcvm] GPU $gpu did not come back from its reset" >&2
+    else
+        echo "[fake fcvm] the restore failed" >&2
+    fi
+    echo "exit $name $$ $(date +%s%N)" >> "$log"
+    exit 1
+fi
 
 stop() {
     sleep "${FAKE_STOP_SECS:-0.1}"

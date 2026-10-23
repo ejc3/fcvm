@@ -216,6 +216,17 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
                         h.aggregate_url = Some(frame_url.clone());
                     }
                 }
+                AgentMsg::Scrub { ok, .. } => {
+                    let c = &mut state.fleet.counters;
+                    if *ok {
+                        c.scrubs += 1;
+                    } else {
+                        c.scrub_failures += 1;
+                    }
+                }
+                AgentMsg::Quarantine { sbdf, error, .. } => {
+                    quarantine(&mut state.fleet, host, sbdf, error, at);
+                }
             }
             None
         }
@@ -248,6 +259,59 @@ fn apply_inner(state: &mut State, event: &Event) -> Option<Receipt> {
             }
             None
         }
+        Event::ReleaseQuarantine { host, sbdf, .. } => {
+            state.fleet.quarantined.remove(&gpu_key(host, sbdf));
+            None
+        }
+    }
+}
+
+/// Whether the GPU behind a slot is quarantined.
+pub fn is_quarantined(f: &Fleet, s: &Slot) -> bool {
+    match (&s.host, &s.gpu) {
+        (Some(h), Some(g)) => f.quarantined.contains_key(&gpu_key(h, &g.sbdf)),
+        _ => false,
+    }
+}
+
+/// Take a GPU out of rotation: its slot leaves the tiling (and any race and claim), and
+/// stays out until an operator releases it.
+fn quarantine(f: &mut Fleet, host: &str, sbdf: &str, error: &str, at: u64) {
+    let key = gpu_key(host, sbdf);
+    if f.quarantined.contains_key(&key) {
+        return;
+    }
+    f.quarantined.insert(
+        key,
+        Quarantined {
+            host: host.to_string(),
+            sbdf: sbdf.to_string(),
+            error: error.to_string(),
+            since: at,
+        },
+    );
+    let on_gpu = |s: &Slot| {
+        s.host.as_deref() == Some(host) && s.gpu.as_ref().is_some_and(|g| g.sbdf == sbdf)
+    };
+    let claimed: Vec<u32> = f
+        .slots
+        .iter()
+        .filter(|(_, s)| on_gpu(s) && s.claim.is_some())
+        .map(|(n, _)| *n)
+        .collect();
+    for n in claimed {
+        release(f, n, at);
+    }
+    drop_from_races(f, on_gpu, at);
+}
+
+/// Count a restore in the totals and in this minute's bucket.
+fn count_restore(c: &mut Counters, at: u64) {
+    c.restores += 1;
+    let minute = at / 60_000;
+    match c.restores_by_minute.back_mut() {
+        Some((m, n)) if *m == minute => *n += 1,
+        _ => c.restores_by_minute.push_back((minute, 1)),
     }
 }
 
@@ -455,12 +519,14 @@ fn claim(state: &mut State, c: &Ctx) -> Result<String, String> {
         }
     }
     let hosts = f.hosts.clone();
+    let quarantined = f.quarantined.clone();
     let usable = |s: &Slot| {
         s.claim.is_none()
             && s.host
                 .as_ref()
                 .and_then(|h| hosts.get(h))
                 .is_some_and(|h| !h.draining)
+            && !matches!((&s.host, &s.gpu), (Some(h), Some(g)) if quarantined.contains_key(&gpu_key(h, &g.sbdf)))
     };
     // A standby GPU when there is one; otherwise a wall tile is lent. Only a tile that is
     // running its current generation (not relaunching, not still racing) can be lent; the
@@ -674,6 +740,16 @@ fn tick(state: &mut State, at: u64) {
         &mut f.last_claim_end,
         state.config.claim_cooldown_secs * 1000,
     );
+    // Restores per minute are kept for the last hour (this minute and the 59 before).
+    let minute = at / 60_000;
+    while f
+        .counters
+        .restores_by_minute
+        .front()
+        .is_some_and(|(m, _)| *m + 60 <= minute)
+    {
+        f.counters.restores_by_minute.pop_front();
+    }
 }
 
 fn hello(f: &mut Fleet, host: &str, arch: &str, gpus: &[Gpu], capacity: usize, at: u64) {
@@ -749,6 +825,15 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
 }
 
 fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotReport, at: u64) {
+    // A fcvm VM that reaches `running` from any other phase is one restore.
+    if half == Half::Fcvm && r.phase == "running" {
+        let restored = f.slots.get(&n).is_some_and(|s| {
+            (host.is_none() || s.host.as_deref() == host) && s.observed.phase != "running"
+        });
+        if restored {
+            count_restore(&mut f.counters, at);
+        }
+    }
     let slot = match half {
         Half::Fcvm => f.slots.get_mut(&n),
         Half::Ec2 => f.ec2.get_mut(&n),
@@ -925,6 +1010,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         .iter()
         .filter(|(_, s)| {
             s.claim.as_ref().is_none_or(|c| c.borrowed.is_some())
+                && !is_quarantined(f, s)
                 && s.host
                     .as_ref()
                     .and_then(|h| f.hosts.get(h))

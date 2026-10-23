@@ -84,11 +84,24 @@ mod tests {
         let mut s = State::new(Config::default(), 1000);
         s.version = 41;
         s.fleet.race_count = 7;
+        s.fleet.counters.restores = 1834;
+        s.fleet.quarantined.insert(
+            fleet_core::state::gpu_key("gpu-a", "0000:05:00.0"),
+            fleet_core::state::Quarantined {
+                host: "gpu-a".into(),
+                sbdf: "0000:05:00.0".into(),
+                error: "did not reset".into(),
+                since: 900,
+            },
+        );
         write_atomic(&path, &serde_json::to_vec(&s).unwrap()).unwrap();
         let back = load(&path).unwrap().unwrap();
         assert_eq!(back, s);
         let resumed = back.resumed(Config::default(), 2000);
         assert_eq!(resumed.version, 42);
         assert_eq!(resumed.fleet.race_count, 7);
+        // Totals and quarantines outlive a coordinator restart.
+        assert_eq!(resumed.fleet.counters.restores, 1834);
+        assert_eq!(resumed.fleet.quarantined.len(), 1);
     }
 }

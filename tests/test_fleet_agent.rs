@@ -74,6 +74,9 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         backoff_min: Duration::from_secs(1),
         backoff_max: Duration::from_secs(30),
         stable_after: Duration::from_secs(60),
+        scrub: false,
+        scrub_timeout: Duration::from_secs(10),
+        quarantine_after: 3,
     }
 }
 
@@ -129,6 +132,7 @@ impl Coord {
                     generation: *generation,
                     rect: *rect,
                     private_camera: None,
+                    standby: false,
                 })
                 .collect(),
             region: None,
@@ -398,6 +402,7 @@ async fn a_private_session_draws_the_whole_image_with_its_own_camera() {
                     generation,
                     rect,
                     private_camera: camera,
+                    standby: false,
                 }],
                 region: None,
             }
@@ -566,6 +571,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     generation: 1,
                     rect: rect(0.0),
                     private_camera: None,
+                    standby: false,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -573,6 +579,7 @@ async fn killing_the_agent_takes_its_vms_with_it() {
                     generation: 1,
                     rect: rect(0.25),
                     private_camera: None,
+                    standby: false,
                 },
             ],
             region: None,
@@ -684,6 +691,7 @@ async fn a_rect_change_right_after_running_is_posted() {
             generation: 1,
             rect: rect(x),
             private_camera: None,
+            standby: false,
         }],
         region: None,
     };
@@ -817,6 +825,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                         h: 0.5,
                     }),
                     private_camera: None,
+                    standby: false,
                 },
                 AssignSlot {
                     id: "slot-2".into(),
@@ -824,6 +833,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                     generation: 1,
                     rect: None,
                     private_camera: None,
+                    standby: false,
                 },
             ],
             region: Some(region),
@@ -883,6 +893,7 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
                 generation: 1,
                 rect: Some(wider),
                 private_camera: None,
+                standby: false,
             }],
             region: Some(wider),
         })
@@ -919,4 +930,134 @@ async fn the_agent_runs_and_feeds_its_aggregator() {
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn standby_slot(generation: u64, standby: bool, rect: Option<Rect>) -> CoordMsg {
+    CoordMsg::Assign {
+        slots: vec![AssignSlot {
+            id: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            generation,
+            rect,
+            private_camera: None,
+            standby,
+        }],
+        region: None,
+    }
+}
+
+/// A GPU in the standby pool runs no VM: the agent scrubs it, reports the scrub and then
+/// `standby`; placed on the wall later, it starts a VM at once.
+#[tokio::test]
+async fn a_standby_gpu_is_scrubbed_and_runs_no_vm() {
+    let f = fake(1, &[]);
+    let mut config = cfg(&f.fcvm);
+    config.scrub = true;
+    let mut c = Coord::start(&f, 1, config);
+    c.next().await;
+    c.send(scene());
+    c.send(standby_slot(1, true, None));
+    let mut scrubbed = false;
+    loop {
+        match c.next().await {
+            AgentMsg::Scrub { sbdf, ok, .. } => {
+                assert_eq!(sbdf, "0000:01:00.0");
+                assert!(ok);
+                scrubbed = true;
+            }
+            AgentMsg::Slot(r) if r.phase == "standby" => {
+                assert!(scrubbed, "standby is reported after the scrub");
+                break;
+            }
+            AgentMsg::Slot(r) => panic!("a standby GPU reported {r:?}"),
+            _ => {}
+        }
+    }
+    let ev = events(f.dir.path());
+    assert_eq!(ev.iter().filter(|e| e.kind == "start").count(), 0, "{ev:?}");
+    assert_eq!(ev.iter().filter(|e| e.kind == "scrub").count(), 1, "{ev:?}");
+    c.send(standby_slot(1, false, rect(0.0)));
+    c.until(&["slot-1"], "running", 1).await;
+    c.close().await;
+}
+
+/// A scrub that fails takes the GPU out of rotation: no VM, no standby report.
+#[tokio::test]
+async fn a_failed_scrub_quarantines_the_gpu() {
+    let f = fake(1, &[("FAKE_SCRUB_EXIT", "1")]);
+    let mut config = cfg(&f.fcvm);
+    config.scrub = true;
+    let mut c = Coord::start(&f, 1, config);
+    c.next().await;
+    c.send(scene());
+    c.send(standby_slot(1, true, None));
+    let q = loop {
+        match c.next().await {
+            AgentMsg::Quarantine { sbdf, error, .. } => break (sbdf, error),
+            AgentMsg::Slot(r) => assert_ne!(r.phase, "standby", "{r:?}"),
+            _ => {}
+        }
+    };
+    assert_eq!(q.0, "0000:01:00.0");
+    assert!(q.1.contains("left memory nonzero"), "{}", q.1);
+    c.close().await;
+}
+
+/// Three relaunches in a row that fail before the first frame quarantine the GPU, and the
+/// agent stops trying it.
+#[tokio::test]
+async fn three_failed_relaunches_quarantine_the_gpu() {
+    let f = fake(1, &[("FAKE_FAIL_START", "restore")]);
+    let mut config = cfg(&f.fcvm);
+    config.backoff_min = Duration::from_millis(50);
+    config.backoff_max = Duration::from_millis(50);
+    let mut c = Coord::start(&f, 1, config);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    let mut failed = Vec::new();
+    loop {
+        match c.next().await {
+            AgentMsg::Slot(r) if r.phase == "failed" => failed.push(r.retry_in_ms),
+            AgentMsg::Quarantine { error, .. } => {
+                assert!(error.contains("the restore failed"), "{error}");
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        failed,
+        vec![Some(50), Some(50), None],
+        "the third failure quarantines"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 3, "no relaunch after the quarantine");
+    c.close().await;
+}
+
+/// A failure whose error names the GPU quarantines it at once.
+#[tokio::test]
+async fn a_failure_naming_the_gpu_quarantines_it_at_once() {
+    let f = fake(1, &[("FAKE_FAIL_START", "gpu")]);
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    let error = loop {
+        if let AgentMsg::Quarantine { error, .. } = c.next().await {
+            break error;
+        }
+    };
+    assert!(error.contains("0000:01:00.0"), "{error}");
+    let starts = events(f.dir.path())
+        .iter()
+        .filter(|e| e.kind == "start")
+        .count();
+    assert_eq!(starts, 1);
+    c.close().await;
 }

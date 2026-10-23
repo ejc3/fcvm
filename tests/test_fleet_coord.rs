@@ -1110,3 +1110,68 @@ async fn an_ec2_capacity_wait_is_kept_out_of_the_race_time() {
     );
     assert_eq!(s["scoreboard"]["ec2"]["last_capacity_wait_ms"], wait_ms);
 }
+
+/// A GPU the agent quarantines leaves the wall (a standby GPU takes its place) and comes
+/// back only when an operator releases it through the admin endpoint. Restores count in
+/// the snapshot.
+#[tokio::test]
+async fn a_quarantined_gpu_returns_only_by_the_operator() {
+    let config = Config {
+        max_tiles: 1,
+        ..Config::default()
+    };
+    let (handle, _actor) = start(State::new(config, now_ms()), None, None, None);
+    let admin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let admin_url = format!("http://{}", admin.local_addr().unwrap());
+    let h = handle.clone();
+    tokio::spawn(async move {
+        axum::serve(admin, fcvm::fleet::coord::admin_router(h))
+            .await
+            .unwrap()
+    });
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    let slots = agent.assign().await;
+    assert!(slots[1].standby && slots[1].rect.is_none(), "{slots:?}");
+    assert!(!slots[0].standby && slots[0].rect.is_some());
+    agent.report("slot-1", "running", 1);
+    agent
+        .to_coord
+        .send(AgentMsg::Quarantine {
+            slot: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            error: "GPU 0000:01:00.0 did not reset".into(),
+        })
+        .unwrap();
+    let slots = loop {
+        let slots = agent.assign().await;
+        if slots.len() == 1 {
+            break slots;
+        }
+    };
+    assert_eq!(slots[0].id, "slot-2");
+    assert!(!slots[0].standby && slots[0].rect.is_some(), "{slots:?}");
+    let snap = |h: &Handle| -> Value {
+        serde_json::from_str::<Value>(&h.snapshot.borrow().text).unwrap()["state"].clone()
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while snap(&handle)["failures"][0]["kind"] != "gpu_quarantined" {
+        assert!(std::time::Instant::now() < deadline, "{}", snap(&handle));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(snap(&handle)["counters"]["restores"], 1);
+    let r = reqwest::Client::new()
+        .post(format!("{admin_url}/quarantine/release"))
+        .json(&json!({"host": "gpu-a", "sbdf": "0000:01:00.0"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), 200);
+    let slots = loop {
+        let slots = agent.assign().await;
+        if slots.len() == 2 {
+            break slots;
+        }
+    };
+    assert_eq!(slots[0].id, "slot-1");
+    assert!(slots[0].rect.is_some() && slots[1].standby, "{slots:?}");
+}

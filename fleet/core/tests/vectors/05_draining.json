@@ -201,6 +201,12 @@
     },
     "claims": [],
     "cooldown_until": 6000,
+    "counters": {
+      "restores": 1,
+      "restores_last_hour": 1,
+      "scrub_failures": 0,
+      "scrubs": 0
+    },
     "failures": [
       {
         "host": "h1",
@@ -243,10 +249,8 @@
       ],
       "max_tiles": 100,
       "n": 1,
-      "standby": [
-        "slot-1",
-        "slot-2"
-      ]
+      "standby": [],
+      "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
     "next_race_at": null,

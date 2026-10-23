@@ -65,6 +65,12 @@ pub enum Event {
         #[serde(default)]
         reason: Option<String>,
     },
+    /// An operator returns a quarantined GPU to rotation.
+    ReleaseQuarantine {
+        at: u64,
+        host: String,
+        sbdf: String,
+    },
 }
 
 impl Event {
@@ -77,7 +83,8 @@ impl Event {
             | Event::Agent { at, .. }
             | Event::AgentGone { at, .. }
             | Event::Ec2 { at, .. }
-            | Event::Degraded { at, .. } => *at,
+            | Event::Degraded { at, .. }
+            | Event::ReleaseQuarantine { at, .. } => *at,
         }
     }
 }

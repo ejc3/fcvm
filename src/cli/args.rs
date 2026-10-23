@@ -220,6 +220,11 @@ pub struct FleetCoordArgs {
     #[arg(long)]
     pub max_borrowed: Option<usize>,
 
+    /// Operator endpoint (POST /quarantine/release) on this address; keep it on loopback
+    /// or a private network. Off without it.
+    #[arg(long)]
+    pub admin_listen: Option<String>,
+
     /// ffmpeg binary for the poster frame (decode, then JPEG)
     #[arg(long, default_value = "ffmpeg")]
     pub ffmpeg: String,
@@ -284,6 +289,11 @@ pub struct FleetAgentArgs {
     /// Extra argument for the aggregator (`fcvm fleet aggregate`). Repeatable.
     #[arg(long = "aggregate-arg", allow_hyphen_values = true)]
     pub aggregate_args: Vec<String>,
+
+    /// Scrub each standby GPU with `<fcvm> gpu scrub <sbdf>` before reporting it ready; a
+    /// failed scrub quarantines the GPU
+    #[arg(long)]
+    pub scrub: bool,
 
     /// sysfs root for the GPU inventory and VFIO group lookup (tests)
     #[arg(long, default_value = "/sys", hide = true)]

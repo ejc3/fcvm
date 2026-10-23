@@ -435,7 +435,8 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::Agent { at, .. }
         | Event::AgentGone { at, .. }
         | Event::Ec2 { at, .. }
-        | Event::Degraded { at, .. } => *at = t,
+        | Event::Degraded { at, .. }
+        | Event::ReleaseQuarantine { at, .. } => *at = t,
     }
 }
 
@@ -583,6 +584,34 @@ pub fn start(
     (handle, task)
 }
 
+/// The operator's endpoint: `POST /quarantine/release {"host", "sbdf"}` returns a
+/// quarantined GPU to rotation.
+pub fn admin_router(handle: Handle) -> axum::Router {
+    #[derive(serde::Deserialize)]
+    struct Release {
+        host: String,
+        sbdf: String,
+    }
+    axum::Router::new()
+        .route(
+            "/quarantine/release",
+            axum::routing::post(
+                |axum::extract::State(h): axum::extract::State<Handle>,
+                 axum::Json(r): axum::Json<Release>| async move {
+                    tracing::info!(host = %r.host, sbdf = %r.sbdf, "operator released a quarantined GPU");
+                    h.send(Event::ReleaseQuarantine {
+                        at: 0,
+                        host: r.host,
+                        sbdf: r.sbdf,
+                    })
+                    .await;
+                    axum::Json(serde_json::json!({"ok": true}))
+                },
+            ),
+        )
+        .with_state(handle)
+}
+
 pub async fn run(args: FleetCoordArgs) -> Result<()> {
     let config = Config {
         max_tiles: args.max_tiles,
@@ -671,6 +700,18 @@ pub async fn run(args: FleetCoordArgs) -> Result<()> {
     eprintln!("fleet coordinator listening on {}", listener.local_addr()?);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut int = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+    if let Some(addr) = &args.admin_listen {
+        let admin = tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("listening on {addr}"))?;
+        eprintln!("fleet coordinator admin on {}", admin.local_addr()?);
+        let h = handle.clone();
+        tokio::spawn(async move {
+            if let Err(e) = axum::serve(admin, admin_router(h)).await {
+                tracing::error!(error = %e, "admin endpoint stopped");
+            }
+        });
+    }
     let verifier: Arc<dyn turnstile::Verifier> = match args.turnstile_secret {
         Some(secret) => Arc::new(turnstile::Siteverify::new(secret, None)?),
         None => Arc::new(turnstile::Off),
