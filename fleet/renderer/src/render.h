@@ -62,6 +62,8 @@ class Renderer {
   // Makes the renderer's device current on the calling thread (for a thread
   // that allocates or frees its buffers).
   static void bind_thread();
+  // Whether frame slot k is in the history (the 8 most recent slots drawn).
+  bool drew(long long k) const { return have_tile_ && ring_slot_[((k % TEMPORAL_WINDOW) + TEMPORAL_WINDOW) % TEMPORAL_WINDOW] == k; }
   // Whether the next frame at tile t continues the history drawn so far.
   bool same_tile(const Tile& t) const {
     return have_tile_ && t.w == tile_.w && t.h == tile_.h && t.full_w == tile_.full_w && t.full_h == tile_.full_h &&

@@ -271,6 +271,11 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
     }
     scene_version_++;
     sched_ = schedule_after_scene(sched_, same_clock, sc->budget > 0, k_last);
+    // A scene means a stream is coming (a tile joining or rejoining the
+    // wall): draw every slot until then, at the height last streamed, so the
+    // GPU has left its idle clocks (585 MHz on a T4, against 1590) and the
+    // tile has history when the stream starts.
+    warm_until_ = std::chrono::steady_clock::now() + std::chrono::seconds(WARM_S);
   } catch (const std::exception& e) {
     *err = e.what();
     return false;
@@ -337,8 +342,10 @@ void Pipeline::run() {
       std::unique_lock<std::mutex> l(mu_);
       sc = scene_;
       any = !subs_.empty();
-      // a recent GET /still keeps the renderer drawing every slot
-      paced = any || std::chrono::steady_clock::now() < still_until_;
+      // a recent GET /still, or a scene posted in the last WARM_S seconds,
+      // keeps the renderer drawing every slot
+      auto nowc = std::chrono::steady_clock::now();
+      paced = any || nowc < still_until_ || nowc < warm_until_;
       if (scene_version_ != seen_version) { seen_version = scene_version_; last_k = LLONG_MIN; }
     }
     double now = now_unix_ms();
@@ -357,10 +364,12 @@ void Pipeline::run() {
       // nobody is watching: draw twice a second so /health stays current
       std::unique_lock<std::mutex> l(mu_);
       cv_.wait_for(l, std::chrono::milliseconds(500), [&] {
-        return stop_.load() || !subs_.empty() || scene_version_ != seen_version ||
-               std::chrono::steady_clock::now() < still_until_;
+        auto nowc = std::chrono::steady_clock::now();
+        return stop_.load() || !subs_.empty() || scene_version_ != seen_version || nowc < still_until_ ||
+               nowc < warm_until_;
       });
-      if (!subs_.empty() || scene_version_ != seen_version || std::chrono::steady_clock::now() < still_until_) continue;
+      auto nowc = std::chrono::steady_clock::now();
+      if (!subs_.empty() || scene_version_ != seen_version || nowc < still_until_ || nowc < warm_until_) continue;
       k = std::max(k, last_k + 1);
     }
     double t = (double)k / opt_.fps;
@@ -486,9 +495,14 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   int render_h = opt_.idle_h;
   {
     std::lock_guard<std::mutex> l(mu_);
-    if (std::chrono::steady_clock::now() < still_until_) render_h = encode_geometry(*sc, still_h_).h;
+    auto nowc = std::chrono::steady_clock::now();
+    if (nowc < still_until_) render_h = encode_geometry(*sc, still_h_).h;
+    else if (nowc < warm_until_) render_h = encode_geometry(*sc, warm_h_).h;
   }
-  if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
+  if (!encs_.empty()) {
+    render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
+    warm_h_ = encs_.rbegin()->first / 4;  // a later scene warms at the height last streamed
+  }
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
   double px = r_.drawn_pixels(rt);
   // The budget for this slot: a posted schedule first (the same on every tile
@@ -514,7 +528,13 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   // started, and matches a neighbour whose stream started at another slot. A
   // layout switch needs none of this (every tile starts its history at the
   // switch frame), nor does a whole-image renderer (it has no neighbours).
-  bool prime = opt_.accumulate && !whole && !encs_.empty() && !new_layout && !r_.same_tile(rt);
+  // A stream that starts on a tile already drawing at its size (warmed by a
+  // scene post) needs no priming if the 7 slots before were all drawn.
+  bool full = true;
+  for (long long j = k0 - (TEMPORAL_WINDOW - 1); j < k0; j++) full = full && r_.drew(j);
+  bool prime = opt_.accumulate && !whole && !encs_.empty() && !new_layout &&
+               (!r_.same_tile(rt) || (!had_streams_ && !full));
+  had_streams_ = !encs_.empty();
   // Priming draws consecutive slots back to back from this one until at least
   // 7 are drawn and the next begins a slot or more from now, so no slot after the
   // priming is skipped either (a GPU clocking up from idle draws the first
@@ -523,21 +543,29 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   if (prime) {
     double p0 = mono_s();
     long long jn = k0;
+    double took_hist[3] = {0, 0, 0};  // the last three frames' times, newest first
     while (jn < pend_k) {  // never past a pending switch
       budget = budget_at(jn, &source);
       r_.set_budget(budget);
       double r0 = mono_s();
       r_.render(*sc, rt, (double)jn / opt_.fps, true);
       double took = mono_s() - r0;
+      took_hist[2] = took_hist[1];
+      took_hist[1] = took_hist[0];
+      took_hist[0] = took;
       jn++;
       long long now_k = (long long)std::floor((now_unix_ms() - (double)sc->epoch_unix_ms) / 1000.0 * opt_.fps);
       if (jn - k0 >= TEMPORAL_WINDOW - 1) {
         // the next slot must not have begun by the time the loop picks it (one slot of margin)
         if (jn > now_k + 1) break;
-        // a tile that draws a frame in most of a slot cannot get ahead: it
+        // A tile that draws a frame in most of a slot cannot get ahead and
         // skips slots on the clock anyway, so priming further only delays its
         // stream (a 1080 detail tile at 53 ms a frame primed 90 slots, 5.9 s)
-        if (took > 0.9 / opt_.fps) break;
+        // -- unless its frames are still getting faster: a GPU coming up from
+        // idle clocks takes about 1.5 s to reach full speed, and a tile that
+        // stopped priming then skipped every other slot for that long.
+        bool ramping = took_hist[2] > 0 && took < 0.95 * took_hist[2];
+        if (took > 0.9 / opt_.fps && !ramping) break;
       }
       if (jn - k0 >= PRIME_MAX) break;
     }
