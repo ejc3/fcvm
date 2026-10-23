@@ -1,0 +1,15 @@
+{
+ "recorded_at": 1792756499967,
+ "duration_s": 59,
+ "measured": {
+  "gpus": 8,
+  "fcvm_ms": 3489,
+  "ec2_ms": null
+ },
+ "wake": {
+  "gpus": 8,
+  "ms": 2829
+ },
+ "single_restart_ms": 2967,
+ "host": "g4dn.metal, 8 x Tesla T4"
+}

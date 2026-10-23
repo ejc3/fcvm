@@ -1,0 +1,25 @@
+WEBVTT
+
+00:00:00.000 --> 00:00:02.600
+The fleet is asleep: no GPU VM runs while nobody watches.
+
+00:00:02.600 --> 00:00:06.500
+A viewer arrives. Eight GPU VMs restore from a snapshot: every tile is back 2.8 s after the wake began.
+
+00:00:06.500 --> 00:00:24.000
+Eight NVIDIA T4s, one VM each, drawing one image.
+
+00:00:24.000 --> 00:00:26.000
+Restart all eight GPUs.
+
+00:00:26.000 --> 00:00:30.000
+Each VM is torn down and restored from its snapshot, its GPU reset and reattached.
+
+00:00:30.000 --> 00:00:44.000
+Every GPU back 3.5 s after the click, as the coordinator measured it.
+
+00:00:44.000 --> 00:00:47.000
+One VM opened: restart just this one.
+
+00:00:47.000 --> 00:00:59.000
+Back in 3.0 s: old VM stopped 0.4 s, snapshot restored 1.1 s, GPU reset and driver 0.7 s, renderer 0.3 s, first frame 0.5 s.
