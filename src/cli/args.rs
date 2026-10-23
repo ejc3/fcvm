@@ -372,6 +372,15 @@ pub struct RunArgs {
     #[arg(long)]
     pub health_check: Option<String>,
 
+    /// Take a startup snapshot of the running container at its first Healthy, and restore
+    /// one when it exists, so an identical later run starts with the container already
+    /// running instead of starting it with `podman run`. Without --health-check, Healthy is
+    /// the container's start (or its image's HEALTHCHECK). Off by default: every run
+    /// restored from the snapshot shares whatever the container made when it started
+    /// (keys, IDs, random seeds, a registration with a server). `fcvm serve` passes it.
+    #[arg(long)]
+    pub startup_snapshot: bool,
+
     /// Timeout in seconds for HTTP health check requests. Default: 5.
     #[arg(long, default_value = "5")]
     pub health_check_timeout: u64,

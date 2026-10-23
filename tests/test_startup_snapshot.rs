@@ -2,8 +2,9 @@
 //!
 //! Tests the two-tier snapshot system:
 //! 1. Pre-start snapshot: Created after image load, before container starts
-//! 2. Startup snapshot: Created at the first Healthy: the HTTP health check with
-//!    --health-check, otherwise the container's start (or its image's HEALTHCHECK)
+//! 2. Startup snapshot: Created at the first Healthy of a run that asks for one
+//!    (--startup-snapshot or --health-check): the HTTP check with --health-check,
+//!    otherwise the container's start (or its image's HEALTHCHECK)
 //!
 //! Selection priority: startup snapshot > pre-start snapshot > fresh boot
 
@@ -213,80 +214,162 @@ async fn snapshot_name(pid: u32) -> Result<String> {
         .with_context(|| format!("VM PID {pid} records no snapshot_name"))
 }
 
-/// Without --health-check, a run takes a startup snapshot when its container is first
-/// healthy (the container's start notification), and the next identical run restores the
-/// container already running: the guest runs no `podman run`, so the container's
-/// StartedAt is from before the second run began.
-#[tokio::test]
-async fn a_second_identical_run_restores_a_running_container_without_podman_run() -> Result<()> {
+/// The container's podman `State.StartedAt`, in seconds since the epoch.
+async fn container_started_at(pid: u32) -> Result<u64> {
+    let out = common::exec_in_vm(
+        pid,
+        &[
+            "podman",
+            "inspect",
+            "--format",
+            "{{.State.StartedAt.Unix}}",
+            "fcvm-container",
+        ],
+    )
+    .await?;
+    out.trim()
+        .parse()
+        .with_context(|| format!("podman StartedAt {out:?}"))
+}
+
+fn now_secs() -> Result<u64> {
+    Ok(std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs())
+}
+
+/// An --env value no other test or run shares, so each test starts from a cold cache.
+fn unique_env(tag: &str) -> Result<String> {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_nanos();
-    // A key no other test or run shares.
-    let test_id = format!("TEST_ID=startup-no-url-{}-{nanos}", std::process::id());
+    Ok(format!("TEST_ID={tag}-{}-{nanos}", std::process::id()))
+}
 
-    let (vm_name1, _, _, _) = common::unique_names("startup-no-url-1");
-    let (mut child1, pid1) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name1, "--env", &test_id, TEST_IMAGE,
-    ])
-    .await
-    .context("spawning the first run")?;
-    let first = async {
-        common::poll_health_by_pid(pid1, 300).await?;
-        // Healthy is published after the startup snapshot is taken.
-        snapshot_name(pid1).await
+/// Run `podman run` with `flags` until it is healthy, return the snapshot it records
+/// (what it restored from, or its startup snapshot once that is taken) and, with
+/// `started_at`, its container's StartedAt; then stop it.
+async fn run_once(
+    name: &str,
+    env: &str,
+    flags: &[&str],
+    started_at: bool,
+) -> Result<(String, Option<u64>)> {
+    let mut args = vec!["podman", "run", "--name", name, "--env", env];
+    args.extend_from_slice(flags);
+    args.push(TEST_IMAGE);
+    let (mut child, pid) = common::spawn_fcvm(&args)
+        .await
+        .with_context(|| format!("spawning {name}"))?;
+    let result = async {
+        common::poll_health_by_pid(pid, 300).await?;
+        // Healthy is published after a startup snapshot is taken.
+        let snapshot = snapshot_name(pid).await?;
+        let started = if started_at {
+            Some(container_started_at(pid).await?)
+        } else {
+            None
+        };
+        anyhow::Ok((snapshot, started))
     }
     .await;
-    common::kill_process(pid1).await;
-    let _ = child1.wait().await;
-    let startup_key = first?;
+    common::kill_process(pid).await;
+    let _ = child.wait().await;
+    result
+}
+
+/// With --startup-snapshot, a run takes a startup snapshot when its container is first
+/// healthy (without --health-check, the container's start notification), and the next
+/// identical run restores the container already running: the guest runs no `podman run`,
+/// so the container's StartedAt is from before the second run began.
+#[tokio::test]
+async fn a_second_identical_run_restores_a_running_container_without_podman_run() -> Result<()> {
+    let env = unique_env("startup-flag")?;
+    let flags = ["--startup-snapshot"];
+    let (startup_key, _) = run_once(
+        &common::unique_names("startup-flag-1").0,
+        &env,
+        &flags,
+        false,
+    )
+    .await?;
     anyhow::ensure!(
         startup_key.ends_with("-startup"),
-        "the first run took no startup snapshot without --health-check; it records {startup_key}"
+        "the first run took no startup snapshot with --startup-snapshot; it records {startup_key}"
     );
 
-    let second_began = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_secs();
-    let (vm_name2, _, _, _) = common::unique_names("startup-no-url-2");
-    let (mut child2, pid2) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name2, "--env", &test_id, TEST_IMAGE,
-    ])
-    .await
-    .context("spawning the second run")?;
-    let second = async {
-        common::poll_health_by_pid(pid2, 120).await?;
-        let restored_from = snapshot_name(pid2).await?;
-        let started_at = common::exec_in_vm(
-            pid2,
-            &[
-                "podman",
-                "inspect",
-                "--format",
-                "{{.State.StartedAt.Unix}}",
-                "fcvm-container",
-            ],
-        )
-        .await?;
-        anyhow::Ok((restored_from, started_at))
-    }
-    .await;
-    common::kill_process(pid2).await;
-    let _ = child2.wait().await;
-    let (restored_from, started_at) = second?;
-
+    let second_began = now_secs()?;
+    let (restored_from, started_at) = run_once(
+        &common::unique_names("startup-flag-2").0,
+        &env,
+        &flags,
+        true,
+    )
+    .await?;
     assert_eq!(
         restored_from, startup_key,
         "the second run did not restore the startup snapshot"
     );
-    let started_at: u64 = started_at
-        .trim()
-        .parse()
-        .with_context(|| format!("podman StartedAt {started_at:?}"))?;
+    let started_at = started_at.unwrap();
     assert!(
         started_at < second_began,
         "the second run's container started at {started_at}, after the run began at \
          {second_began}: the guest ran podman run instead of restoring a running container"
+    );
+    Ok(())
+}
+
+/// A plain `podman run` (no --startup-snapshot, no --health-check) takes no startup
+/// snapshot: an app that makes unique state when it starts would otherwise share it with
+/// every run restored from the snapshot.
+#[tokio::test]
+async fn a_plain_run_takes_no_startup_snapshot() -> Result<()> {
+    let env = unique_env("startup-plain")?;
+    let (recorded, _) =
+        run_once(&common::unique_names("startup-plain").0, &env, &[], false).await?;
+    assert!(
+        !recorded.ends_with("-startup"),
+        "a plain run took a startup snapshot: it records {recorded}"
+    );
+    // What it records is its pre-start snapshot; nothing was taken beside it.
+    assert!(
+        !common::snapshot_exists(&format!("{recorded}-startup")),
+        "a plain run left a startup snapshot {recorded}-startup"
+    );
+    Ok(())
+}
+
+/// A plain run does not restore a startup snapshot that a --startup-snapshot run left under
+/// the same key: it restores the pre-start snapshot and starts its own container.
+#[tokio::test]
+async fn a_plain_run_does_not_restore_a_startup_snapshot_another_run_took() -> Result<()> {
+    let env = unique_env("startup-shared")?;
+    let (startup_key, _) = run_once(
+        &common::unique_names("startup-shared-1").0,
+        &env,
+        &["--startup-snapshot"],
+        false,
+    )
+    .await?;
+    let pre_start = startup_key
+        .strip_suffix("-startup")
+        .with_context(|| {
+            format!("control: the flagged run took no startup snapshot ({startup_key})")
+        })?
+        .to_string();
+
+    let second_began = now_secs()?;
+    let (restored_from, started_at) =
+        run_once(&common::unique_names("startup-shared-2").0, &env, &[], true).await?;
+    assert_eq!(
+        restored_from, pre_start,
+        "a plain run restored {restored_from}, not the pre-start snapshot {pre_start}"
+    );
+    let started_at = started_at.unwrap();
+    assert!(
+        started_at >= second_began,
+        "the plain run's container started at {started_at}, before the run began at \
+         {second_began}: it resumed the flagged run's container"
     );
     Ok(())
 }

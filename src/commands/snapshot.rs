@@ -3955,6 +3955,8 @@ fn run_args_from_snapshot_metadata(
         // fail outright on a CH-only host). meta.hypervisor is recorded at snapshot create.
         hypervisor: meta.hypervisor.into(),
         health_check: meta.health_check_url.clone(),
+        // A cold boot of a captured disk takes no startup snapshot of its own.
+        startup_snapshot: false,
         on_restore: restore_hook,
         health_check_timeout: meta.health_check_timeout,
         privileged: false,

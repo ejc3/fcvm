@@ -345,8 +345,10 @@ fn validate_balloon_target(balloon: Option<u32>, mem: u32) -> Result<()> {
 /// holds what a restore cannot change about a running container (image, command,
 /// environment, volumes, ...); the name and labels stay restore-time.
 ///
-/// A `-i`/`-t` session without `--health-check` takes none: its container is driven by
-/// the caller's terminal, and a clone would resume someone else's session.
+/// A plain run takes none unless it asks (`--startup-snapshot`, which `fcvm serve` passes,
+/// or `--health-check`): an app that makes unique state when it starts (keys, IDs, random
+/// seeds, a registration with a server) would otherwise share it, silently, with every run
+/// restored from the snapshot.
 fn should_arm_startup_snapshot(
     skip_snapshot_creation: bool,
     has_snapshot_key: bool,
@@ -358,10 +360,12 @@ fn should_arm_startup_snapshot(
         && (lifecycle.is_prepare() || takes_startup_snapshot)
 }
 
-/// Whether a `podman run` with these arguments takes a startup snapshot once healthy, see
-/// [`should_arm_startup_snapshot`].
+/// Whether a `podman run` with these arguments takes a startup snapshot once healthy, and
+/// restores one that exists, see [`should_arm_startup_snapshot`]. A run that did not ask
+/// must not restore one either: a snapshot another run took under the same key holds that
+/// run's startup state.
 fn run_takes_startup_snapshot(args: &RunArgs) -> bool {
-    args.health_check.is_some() || !(args.tty || args.interactive)
+    args.health_check.is_some() || args.startup_snapshot
 }
 
 /// Whether this invocation must stay out of the snapshot cache entirely — no
@@ -1554,6 +1558,7 @@ async fn prepare_vm_for_lifecycle(
         // GPU. It restores the pre-start snapshot, which is taken before the container runs.
         if !lifecycle.is_prepare()
             && args.gpu.is_empty()
+            && run_takes_startup_snapshot(&args)
             && check_podman_snapshot(&startup_key).await.is_some()
         {
             info!(
@@ -3293,6 +3298,7 @@ mod tests {
             network: NetworkMode::Rootless,
             hypervisor: crate::cli::args::Hypervisor::Firecracker,
             health_check: None,
+            startup_snapshot: false,
             health_check_timeout: 5,
             on_restore: None,
             privileged: false,
@@ -4595,28 +4601,18 @@ mod tests {
         ));
     }
 
-    /// A plain run takes a startup snapshot without --health-check: the container's start
-    /// notification is its first Healthy. An interactive session does not, unless it asked
-    /// for one with --health-check.
+    /// A plain run takes (and restores) no startup snapshot; --startup-snapshot or
+    /// --health-check asks for one.
     #[test]
-    fn a_run_takes_a_startup_snapshot_unless_it_is_an_interactive_session() {
+    fn a_run_takes_a_startup_snapshot_only_when_it_asks() {
         let mut args = test_args();
-        assert!(args.health_check.is_none());
+        assert!(args.health_check.is_none() && !args.startup_snapshot);
+        assert!(!run_takes_startup_snapshot(&args));
+        args.startup_snapshot = true;
         assert!(run_takes_startup_snapshot(&args));
-        for (tty, interactive) in [(true, false), (false, true), (true, true)] {
-            args.tty = tty;
-            args.interactive = interactive;
-            args.health_check = None;
-            assert!(
-                !run_takes_startup_snapshot(&args),
-                "tty={tty} -i={interactive}"
-            );
-            args.health_check = Some("http://localhost/".to_string());
-            assert!(
-                run_takes_startup_snapshot(&args),
-                "tty={tty} -i={interactive}"
-            );
-        }
+        args.startup_snapshot = false;
+        args.health_check = Some("http://localhost/".to_string());
+        assert!(run_takes_startup_snapshot(&args));
     }
 
     #[test]
