@@ -863,6 +863,7 @@ fn snapshot_restore_args(
         vsock_dir: args.vsock_dir.clone(),
         publish: args.publish.clone(),
         ipv6_prefix: launch_ipv6_prefix(args),
+        ipv6_address: args.ipv6_address,
         // A VM with a passthrough device can not be snapshotted, so a --gpu run takes
         // no startup snapshot.
         startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
@@ -1207,6 +1208,7 @@ async fn prepare_vm_for_lifecycle(
 
     // Validate VM name before any setup work
     validate_vm_name(&args.name).context("invalid VM name")?;
+    crate::network::require_routed_for_address(args.network.into(), args.ipv6_address)?;
 
     // Validate hugepages memory alignment (2MB pages require even MiB)
     if args.hugepages && !args.mem.is_multiple_of(2) {
@@ -1460,8 +1462,21 @@ async fn prepare_vm_for_lifecycle(
         validate_gpu_run(&args, &lifecycle, no_snapshot)?;
         args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        let profile_name = args.kernel_profile.as_deref().unwrap_or("default");
+        let module_type = crate::setup::profile_module_type(profile_name)?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
+            crate::gpu::check_driver_supports_device(
+                Path::new("/sys"),
+                sbdf,
+                profile_name,
+                module_type,
+            )?;
         }
     }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
@@ -1705,72 +1720,95 @@ async fn prepare_vm_for_lifecycle(
         );
     }
 
+    // The VM's first state is written here, under its name, and refused when a live
+    // VM already has that name. Every error from here on removes the state again.
+    if let Err(e) = state_manager
+        .claim_name(&mut vm_state)
+        .await
+        .context("claiming the VM name")
+    {
+        cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+        return Err(e);
+    }
+
     // Bridged and routed re-derive this from the namespace they reserve (see
     // network::names); read the settled name back from network_config.
     let tap_device = format!("tap-{}", truncate_id(&vm_id, 8));
-    let mut network: Box<dyn NetworkManager> = match args.network {
-        NetworkMode::Bridged => {
-            // The guest's resolver is the first hashed host_dns entry,
-            // threaded from the same resolution the snapshot key saw instead
-            // of re-read inside setup() (#863). Fail closed like the old
-            // in-setup read did: a bridged guest NATs straight out and needs
-            // a real resolver, and --dns is the override.
-            if args.dns.is_none() && boot_inputs.host_dns().is_empty() {
-                bail!(
-                    "no usable host DNS server for bridged mode: neither {} named a \
+    let network: Result<Box<dyn NetworkManager>> = async {
+        let network: Box<dyn NetworkManager> = match args.network {
+            NetworkMode::Bridged => {
+                // The guest's resolver is the first hashed host_dns entry,
+                // threaded from the same resolution the snapshot key saw instead
+                // of re-read inside setup() (#863). Fail closed like the old
+                // in-setup read did: a bridged guest NATs straight out and needs
+                // a real resolver, and --dns is the override.
+                if args.dns.is_none() && boot_inputs.host_dns().is_empty() {
+                    bail!(
+                        "no usable host DNS server for bridged mode: neither {} named a \
                      nameserver this guest can reach (the warning above says what each \
                      source held). Pass --dns to name one.",
-                    crate::network::RESOLV_CONF_SOURCES.join(" nor ")
-                );
+                        crate::network::RESOLV_CONF_SOURCES.join(" nor ")
+                    );
+                }
+                Box::new(
+                    BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                        .with_dns_server(boot_inputs.host_dns().first().cloned()),
+                )
             }
-            Box::new(
-                BridgedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_dns_server(boot_inputs.host_dns().first().cloned()),
-            )
-        }
-        NetworkMode::Routed => {
-            let mut net =
-                RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone());
-            if let Some(ref prefix) = args.ipv6_prefix {
-                net = net.with_ipv6_prefix(prefix.clone());
+            NetworkMode::Routed => {
+                let mut net =
+                    RoutedNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                        .with_ipv6_address(args.ipv6_address);
+                if let Some(ref prefix) = args.ipv6_prefix {
+                    net = net.with_ipv6_prefix(prefix.clone());
+                }
+                // The IPv6 resolver comes from the launch's single resolv.conf
+                // snapshot, the same one the snapshot key and the guest's search
+                // domains are derived from. Letting routed read the host again
+                // would give the guest one resolver while its search list and its
+                // key describe another.
+                net = net.with_ipv6_dns(crate::network::first_ipv6_nameserver(&boot_inputs.dns));
+                if !args.forward_localhost.is_empty() {
+                    net = net.with_forward_localhost(args.forward_localhost.clone());
+                }
+                net.preflight_check()
+                    .context("routed mode preflight check failed")?;
+                if net.needs_loopback_ip() {
+                    let loopback_ip = state_manager
+                        .allocate_loopback_ip(&mut vm_state)
+                        .await
+                        .context("allocating loopback IP for routed mode")?;
+                    net = net.with_loopback_ip(loopback_ip);
+                }
+                Box::new(net)
             }
-            // The IPv6 resolver comes from the launch's single resolv.conf
-            // snapshot, the same one the snapshot key and the guest's search
-            // domains are derived from. Letting routed read the host again
-            // would give the guest one resolver while its search list and its
-            // key describe another.
-            net = net.with_ipv6_dns(crate::network::first_ipv6_nameserver(&boot_inputs.dns));
-            if !args.forward_localhost.is_empty() {
-                net = net.with_forward_localhost(args.forward_localhost.clone());
-            }
-            net.preflight_check()
-                .context("routed mode preflight check failed")?;
-            if net.needs_loopback_ip() {
+            NetworkMode::Rootless => {
+                // For rootless mode, allocate loopback IP atomically with state persistence
+                // This prevents race conditions when starting multiple VMs concurrently
                 let loopback_ip = state_manager
                     .allocate_loopback_ip(&mut vm_state)
                     .await
-                    .context("allocating loopback IP for routed mode")?;
-                net = net.with_loopback_ip(loopback_ip);
-            }
-            Box::new(net)
-        }
-        NetworkMode::Rootless => {
-            // For rootless mode, allocate loopback IP atomically with state persistence
-            // This prevents race conditions when starting multiple VMs concurrently
-            let loopback_ip = state_manager
-                .allocate_loopback_ip(&mut vm_state)
-                .await
-                .context("allocating loopback IP")?;
+                    .context("allocating loopback IP")?;
 
-            // --dns reaches pasta as well as the guest: naming the pasta
-            // gateway as the resolver means "the service on host
-            // 127.0.0.1:53", and pasta must be told not to claim port 53 for
-            // the host's own resolver instead (see resolver_is_pasta_gateway).
-            Box::new(
-                PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
-                    .with_loopback_ip(loopback_ip)
-                    .with_dns_server(args.dns.clone()),
-            )
+                // --dns reaches pasta as well as the guest: naming the pasta
+                // gateway as the resolver means "the service on host
+                // 127.0.0.1:53", and pasta must be told not to claim port 53 for
+                // the host's own resolver instead (see resolver_is_pasta_gateway).
+                Box::new(
+                    PastaNetwork::new(vm_id.clone(), tap_device.clone(), port_mappings.clone())
+                        .with_loopback_ip(loopback_ip)
+                        .with_dns_server(args.dns.clone()),
+                )
+            }
+        };
+        Ok(network)
+    }
+    .await;
+    let mut network = match network {
+        Ok(network) => network,
+        Err(e) => {
+            cleanup_failed_prepare(&state_manager, &vm_id, &data_dir).await;
+            return Err(e);
         }
     };
 
@@ -3262,6 +3300,7 @@ mod tests {
             non_blocking_output: false,
             label: vec![],
             ipv6_prefix: None,
+            ipv6_address: None,
             dns: None,
             image: "alpine:latest".to_string(),
             command_args: vec![],
@@ -3445,6 +3484,48 @@ mod tests {
         args.network = NetworkMode::Rootless;
         let restore = snapshot_restore_args(&args, "key", None, (None, None));
         assert_eq!(restore.ipv6_prefix, None);
+    }
+
+    /// A refused name claim must remove what the launch created before it, the runtime
+    /// directory among them, as every later setup error does.
+    #[test]
+    fn a_refused_name_claim_cleans_up_the_launch() {
+        let source = include_str!("mod.rs");
+        let claim = source
+            .find(".claim_name(&mut vm_state)")
+            .expect("podman run claims the VM's name");
+        let next_step = claim
+            + source[claim..]
+                .find("let tap_device")
+                .expect("the network is set up after the claim");
+        assert!(
+            source[claim..next_step].contains("cleanup_failed_prepare("),
+            "the claim's error path does not call cleanup_failed_prepare"
+        );
+    }
+
+    /// A cache hit gives the restored VM this run's --ipv6-address.
+    #[test]
+    fn a_cache_hit_restores_at_the_runs_own_address() {
+        let mut args = test_args();
+        args.network = NetworkMode::Routed;
+        args.ipv6_address = Some("2001:db8:bbbb:2::5".parse().unwrap());
+        let restore = snapshot_restore_args(&args, "key", None, (None, None));
+        assert_eq!(restore.ipv6_address, args.ipv6_address);
+    }
+
+    /// The restore swaps in the run's --ipv6-address, so the address is in no snapshot
+    /// key: every slot of a fleet restores one snapshot.
+    #[test]
+    fn ipv6_address_is_in_no_snapshot_key() {
+        let key = |address: Option<&str>| {
+            let mut args = test_args();
+            args.network = NetworkMode::Routed;
+            args.ipv6_address = address.map(|a| a.parse().unwrap());
+            key_for(&args, GuestBootInputs::default())
+        };
+        assert_eq!(key(None), key(Some("2001:db8::5")));
+        assert_eq!(key(Some("2001:db8::5")), key(Some("2001:db8::6")));
     }
 
     /// #1079: a restore takes the run's IPv6 prefix, so the prefix is in no snapshot key. A

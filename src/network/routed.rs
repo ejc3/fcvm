@@ -27,6 +27,223 @@ const HOST_LOOPBACK_ALIAS: &str = "10.0.2.2";
 /// Bridge device name
 const BRIDGE_DEVICE: &str = "br0";
 
+/// Where routed VMs hold their IPv6 addresses ([`AddressLease`]). Under /run, so the
+/// scope matches the host route table the addresses are routed in: one per kernel,
+/// shared by every fcvm data directory on it, and empty after a reboot.
+const ADDRESS_LEASE_DIR: &str = "/run/fcvm/routed-ipv6";
+
+/// One routed VM's hold on its IPv6 address, for as long as the VM lives.
+///
+/// A host /128 route says an address is in use only once a VM's setup has reached the
+/// step that adds it, so two VMs that start together could both find no route and
+/// both take the address. The lease closes that window: it is an exclusive `flock` on
+/// `<ADDRESS_LEASE_DIR>/<address>.lock`, taken before the address is used and held
+/// until the VM's network is torn down. The kernel releases it when the process
+/// exits, SIGKILL included, so a VM that died frees its address without cleanup.
+pub(crate) struct AddressLease {
+    path: std::path::PathBuf,
+    _lock: nix::fcntl::Flock<std::fs::File>,
+}
+
+impl Drop for AddressLease {
+    fn drop(&mut self) {
+        // Unlinked while still held (the lock is dropped after this body): a contender
+        // that opened the old file finds it unlinked once it gets the lock and opens
+        // the path again (`lease_address`), so the file never outlives the lease.
+        if let Err(error) = crate::state::manager::remove_if_exists(&self.path) {
+            warn!(path = %self.path.display(), %error, "removing an IPv6 address lease");
+        }
+    }
+}
+
+/// The process holding an address lease, as its holder wrote it into the lease file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LeaseHolder {
+    pub pid: u32,
+    pub vm_id: String,
+}
+
+/// What `lease_address` found.
+pub(crate) enum LeaseAttempt {
+    Leased(AddressLease),
+    /// Another live process holds the address. `holder` is None only in the moment
+    /// between its lock and its write of who it is.
+    Held {
+        holder: Option<LeaseHolder>,
+    },
+}
+
+/// Take the lease on `address` in `dir` for VM `vm_id` of this process, or report who
+/// holds it.
+///
+/// The holder writes `<pid> <vm_id>` into the lease file, so a refused VM can name it
+/// even before the holder has recorded its address anywhere else. The file is therefore
+/// opened without truncation: a contender opening it must not erase what the holder
+/// wrote.
+pub(crate) fn lease_address(
+    dir: &std::path::Path,
+    address: std::net::Ipv6Addr,
+    vm_id: &str,
+) -> Result<LeaseAttempt> {
+    use nix::fcntl::{Flock, FlockArg};
+    use std::io::{Read, Seek, Write};
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::create_dir_all(dir).with_context(|| {
+        format!(
+            "creating the IPv6 address lease directory {}",
+            dir.display()
+        )
+    })?;
+    // Ipv6Addr's Display is the canonical (RFC 5952) form, so every spelling of one
+    // address names one file.
+    let path = dir.join(format!("{address}.lock"));
+    // A retry needs a holder that unlinked the file between this open and this lock,
+    // which takes a release and a new lease each time.
+    for _ in 0..100 {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .open(&path)
+            .with_context(|| format!("opening the lease of IPv6 address {address}"))?;
+        match Flock::lock(file, FlockArg::LockExclusiveNonblock) {
+            Ok(lock) => {
+                let held = lock
+                    .metadata()
+                    .context("reading the lease file's identity")?;
+                let current = match std::fs::metadata(&path) {
+                    Ok(current) => Some(current),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                    Err(error) => return Err(error).context("reading the lease path"),
+                };
+                if !current.is_some_and(|c| c.dev() == held.dev() && c.ino() == held.ino()) {
+                    // The previous holder unlinked this file after we opened it.
+                    continue;
+                }
+                let mut file: &std::fs::File = &lock;
+                file.set_len(0)
+                    .and_then(|()| file.rewind())
+                    .and_then(|()| writeln!(file, "{} {}", std::process::id(), vm_id))
+                    .with_context(|| format!("recording the holder of IPv6 address {address}"))?;
+                return Ok(LeaseAttempt::Leased(AddressLease { path, _lock: lock }));
+            }
+            Err((mut file, nix::errno::Errno::EWOULDBLOCK)) => {
+                let mut written = String::new();
+                file.read_to_string(&mut written)
+                    .with_context(|| format!("reading the holder of IPv6 address {address}"))?;
+                let mut fields = written.split_whitespace();
+                let holder = match (fields.next().map(str::parse), fields.next()) {
+                    (Some(Ok(pid)), Some(vm_id)) => Some(LeaseHolder {
+                        pid,
+                        vm_id: vm_id.to_string(),
+                    }),
+                    _ => None,
+                };
+                return Ok(LeaseAttempt::Held { holder });
+            }
+            Err((_, error)) => {
+                return Err(error).with_context(|| format!("leasing IPv6 address {address}"))
+            }
+        }
+    }
+    anyhow::bail!("the lease of IPv6 address {address} kept being replaced while taking it")
+}
+
+/// Refuse `--ipv6-address` for a VM that does not use routed networking: only routed
+/// gives a VM an address of its own on the host's network. `network` is the VM's mode,
+/// the run's `--network` or, for a restore, the one its snapshot was created with.
+pub fn require_routed_for_address(
+    network: crate::firecracker::FcNetworkMode,
+    address: Option<std::net::Ipv6Addr>,
+) -> Result<()> {
+    use crate::firecracker::FcNetworkMode;
+    let mode = match network {
+        FcNetworkMode::Routed => return Ok(()),
+        FcNetworkMode::Bridged => "bridged",
+        FcNetworkMode::Rootless => "rootless",
+    };
+    match address {
+        None => Ok(()),
+        Some(address) => anyhow::bail!(
+            "--ipv6-address {address} is only valid with routed networking, and this VM \
+             uses {mode} networking (--network routed, or a snapshot created with it)"
+        ),
+    }
+}
+
+/// Check an address given with `--ipv6-address` against the prefix in use: it must lie
+/// inside the prefix and must not be its address 0 (the subnet-router anycast address)
+/// or 1 (the host's side of the prefix), the two a derived address never takes either.
+fn check_requested_address(
+    network: u128,
+    len: u8,
+    address: std::net::Ipv6Addr,
+    prefix_source: &str,
+) -> Result<()> {
+    let host_mask = u128::MAX >> len;
+    let bits = u128::from(address);
+    let prefix = format!("{}/{}", std::net::Ipv6Addr::from(network), len);
+    if bits & !host_mask != network {
+        anyhow::bail!(
+            "--ipv6-address {address} is outside {prefix}, the prefix in use ({prefix_source})"
+        );
+    }
+    if bits & host_mask <= 1 {
+        anyhow::bail!(
+            "--ipv6-address {address} is reserved in {prefix} ({prefix_source}): suffix 0 is \
+             the subnet-router anycast address and suffix 1 is the host's side of the prefix"
+        );
+    }
+    Ok(())
+}
+
+/// The host's /128 route for `address` in any routing table, or None when there is
+/// none. Every table, not only main: an address the host itself holds has its /128 only
+/// in table `local`.
+async fn host_route_for(address: &str) -> Result<Option<String>> {
+    let output = tokio::process::Command::new("ip")
+        .args(HOST_ROUTE_QUERY)
+        .arg(format!("{address}/128"))
+        .output()
+        .await
+        .context("running `ip -6 route show`")?;
+    anyhow::ensure!(
+        output.status.success(),
+        "`ip -6 route show table all {address}/128` failed: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    );
+    let route = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok((!route.is_empty()).then_some(route))
+}
+
+/// `ip` arguments that list the routes for one exact prefix, appended, in every table.
+const HOST_ROUTE_QUERY: [&str; 5] = ["-6", "route", "show", "table", "all"];
+
+/// The VM holding `address`, for the error that refuses it to another: by the state this
+/// data directory records for the lease holder (its first state, with its name, is
+/// written before its network is set up), else by the pid and VM id the holder wrote
+/// into the lease.
+async fn describe_address_holder(holder: Option<LeaseHolder>) -> String {
+    let Some(holder) = holder else {
+        return "another live fcvm process, which has not yet recorded who it is".to_string();
+    };
+    let manager = crate::state::StateManager::new(crate::paths::state_dir());
+    let state = manager.load_state(&holder.vm_id).await.ok();
+    match state {
+        Some(vm) if vm.pid == Some(holder.pid) && crate::state::owner_is_live(&vm) => format!(
+            "live VM '{}' (pid {})",
+            vm.name.as_deref().unwrap_or(&vm.vm_id),
+            holder.pid
+        ),
+        _ => format!(
+            "fcvm pid {} (VM {}, recorded in another data directory)",
+            holder.pid, holder.vm_id
+        ),
+    }
+}
+
 /// Routed networking using veth + IPv6 routing
 ///
 /// Unlike pasta mode (which proxies all outbound traffic through userspace L4),
@@ -55,6 +272,8 @@ pub struct RoutedNetwork {
     /// Explicit routable prefix (CIDR or bare 4-group /64 shorthand).
     /// Skips auto-detect and MASQUERADE.
     ipv6_prefix: Option<String>,
+    /// The VM's address (--ipv6-address), instead of one derived from `vm_id`.
+    ipv6_address: Option<std::net::Ipv6Addr>,
     /// Guest localhost ports forwarded to the host's loopback (--forward-localhost).
     forward_localhost: Vec<u16>,
     /// The IPv6 resolver the launch's resolv.conf snapshot selected, threaded
@@ -69,6 +288,9 @@ pub struct RoutedNetwork {
     namespace_id: Option<String>,
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
+    /// Held from the moment `vm_ipv6` is chosen until `cleanup` has removed everything
+    /// that names it.
+    address_lease: Option<AddressLease>,
     default_iface: Option<String>,
     proxy_handles: Vec<tcp_proxy::Relay>,
 }
@@ -84,12 +306,14 @@ impl RoutedNetwork {
             port_mappings,
             loopback_ip: None,
             ipv6_prefix: None,
+            ipv6_address: None,
             forward_localhost: Vec::new(),
             ipv6_dns: None,
             restore_mode: false,
             namespace_id: None,
             host_veth: None,
             vm_ipv6: None,
+            address_lease: None,
             default_iface: None,
             proxy_handles: Vec::new(),
         }
@@ -97,6 +321,14 @@ impl RoutedNetwork {
 
     pub fn with_ipv6_prefix(mut self, prefix: String) -> Self {
         self.ipv6_prefix = Some(prefix);
+        self
+    }
+
+    /// Give the VM this address (--ipv6-address) instead of deriving one from its id.
+    /// `setup` refuses it when it is outside the prefix in use, reserved, or held by
+    /// another live VM.
+    pub fn with_ipv6_address(mut self, address: Option<std::net::Ipv6Addr>) -> Self {
+        self.ipv6_address = address;
         self
     }
 
@@ -135,6 +367,11 @@ impl RoutedNetwork {
     #[cfg(test)]
     pub(crate) fn ipv6_prefix(&self) -> Option<&str> {
         self.ipv6_prefix.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ipv6_address(&self) -> Option<std::net::Ipv6Addr> {
+        self.ipv6_address
     }
 
     #[cfg(test)]
@@ -435,34 +672,65 @@ impl NetworkManager for RoutedNetwork {
             (host_addr, network, len)
         };
 
-        // Generate a unique IPv6 for this VM. Check for route collisions
-        // (astronomically unlikely with 64-bit hash, but defend against it).
-        let vm_ipv6 = {
-            let mut candidate = Self::generate_vm_ipv6(network, prefix_len, &self.vm_id);
-            for attempt in 0..10 {
-                let route_check = tokio::process::Command::new("ip")
-                    .args(["-6", "route", "show", &format!("{}/128", candidate)])
-                    .output()
-                    .await;
-                let route_exists = route_check
-                    .map(|o| !String::from_utf8_lossy(&o.stdout).trim().is_empty())
-                    .unwrap_or(false);
-                if !route_exists {
-                    break;
-                }
-                warn!(
-                    ipv6 = %candidate, attempt,
-                    "IPv6 route collision detected, trying alternative"
-                );
-                // Mix in the attempt counter for a different hash
-                candidate = Self::generate_vm_ipv6(
-                    network,
-                    prefix_len,
-                    &format!("{}:{}", self.vm_id, attempt),
+        // Choose the VM's address and lease it before anything names it. The lease
+        // decides between fcvm VMs that start together; a /128 route on an address
+        // nobody leases is something else's (a VM that exited without cleanup, or
+        // another program), and is never taken over.
+        let lease_dir = std::path::Path::new(ADDRESS_LEASE_DIR);
+        let (vm_ipv6, lease) = if let Some(address) = self.ipv6_address {
+            let source = if self.ipv6_prefix.is_some() {
+                "--ipv6-prefix or FCVM_IPV6_PREFIX"
+            } else {
+                "the host's detected /64"
+            };
+            check_requested_address(network, prefix_len, address, source)?;
+            let lease = match lease_address(lease_dir, address, &self.vm_id)? {
+                LeaseAttempt::Leased(lease) => lease,
+                LeaseAttempt::Held { holder } => anyhow::bail!(
+                    "--ipv6-address {address} is held by {}; a routed VM's address is \
+                     unique among live VMs",
+                    describe_address_holder(holder).await
+                ),
+            };
+            let candidate = address.to_string();
+            if let Some(route) = host_route_for(&candidate).await? {
+                anyhow::bail!(
+                    "--ipv6-address {address} already has a host route ({route}) that no \
+                     live fcvm VM holds: the host's own address, a route left by a VM that \
+                     exited without cleanup, or another program's. Choose another address, \
+                     or remove a stale route (ip -6 route del {address}/128)"
                 );
             }
-            candidate
+            (candidate, lease)
+        } else {
+            // A derived address: on a lease or route collision (astronomically
+            // unlikely with a 64-bit hash), derive another.
+            let mut chosen = None;
+            for attempt in 0..10 {
+                let seed = if attempt == 0 {
+                    self.vm_id.clone()
+                } else {
+                    format!("{}:{}", self.vm_id, attempt - 1)
+                };
+                let candidate = Self::generate_vm_ipv6(network, prefix_len, &seed);
+                let address: std::net::Ipv6Addr = candidate
+                    .parse()
+                    .context("parsing a derived VM IPv6 address")?;
+                let LeaseAttempt::Leased(lease) = lease_address(lease_dir, address, &self.vm_id)?
+                else {
+                    warn!(ipv6 = %candidate, attempt, "IPv6 address leased by another VM, trying another");
+                    continue;
+                };
+                if host_route_for(&candidate).await?.is_some() {
+                    warn!(ipv6 = %candidate, attempt, "IPv6 route collision detected, trying another");
+                    continue;
+                }
+                chosen = Some((candidate, lease));
+                break;
+            }
+            chosen.context("no free IPv6 address after 10 derived candidates")?
         };
+        self.address_lease = Some(lease);
         // Record state as soon as it's known so cleanup() can tear down a
         // partially-completed setup if a later step fails.
         self.vm_ipv6 = Some(vm_ipv6.clone());
@@ -1004,13 +1272,14 @@ impl NetworkManager for RoutedNetwork {
                 }
             }
         }
-
-        // Delete veth pair (auto-deletes peer)
+        // Delete veth pair (auto-deletes peer, and with it any route through it)
         if let Some(ref host_veth) = self.host_veth {
             if let Err(e) = veth::delete_veth_pair(host_veth).await {
                 warn!(error = %e, host_veth = %host_veth, "veth pair cleanup failed");
             }
         }
+        // Only now that nothing on the host names the address may another VM take it.
+        self.address_lease.take();
 
         // Delete namespace
         if let Some(ref ns_name) = self.namespace_id {
@@ -1309,6 +1578,183 @@ mod tests {
         assert!(!needs(&[Some("::")]));
         assert!(!needs(&[Some("127.0.0.1"), Some("::1")]));
         assert!(needs(&[Some("::"), None]));
+    }
+
+    // --- --ipv6-address tests ---
+
+    fn prefix(cidr: &str) -> (u128, u8) {
+        RoutedNetwork::parse_ipv6_prefix(cidr).unwrap()
+    }
+
+    #[test]
+    fn a_requested_address_must_lie_inside_the_prefix_in_use() {
+        let (network, len) = prefix("2001:db8:0:1::/64");
+        let check = |address: &str| {
+            check_requested_address(network, len, address.parse().unwrap(), "test")
+                .map_err(|error| error.to_string())
+        };
+        assert!(check("2001:db8:0:1::2").is_ok());
+        assert!(check("2001:db8:0:1:ffff:ffff:ffff:ffff").is_ok());
+        let outside = check("2001:db8:0:2::2").unwrap_err();
+        assert!(
+            outside.contains("outside 2001:db8:0:1::/64"),
+            "the refusal names the prefix: {outside}"
+        );
+
+        let (network, len) = prefix("2001:db8:0:1:0:0:5:0/112");
+        assert!(check_requested_address(
+            network,
+            len,
+            "2001:db8:0:1::5:3".parse().unwrap(),
+            "test"
+        )
+        .is_ok());
+        assert!(check_requested_address(
+            network,
+            len,
+            "2001:db8:0:1::6:3".parse().unwrap(),
+            "test"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_requested_address_may_not_be_the_prefix_suffix_zero_or_one() {
+        let (network, len) = prefix("2001:db8:0:1::/64");
+        for reserved in ["2001:db8:0:1::", "2001:db8:0:1::1"] {
+            let error = check_requested_address(network, len, reserved.parse().unwrap(), "test")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("reserved"), "{reserved}: {error}");
+        }
+    }
+
+    #[test]
+    fn only_routed_networking_takes_an_address() {
+        use crate::firecracker::FcNetworkMode;
+        let address = Some("2001:db8::5".parse().unwrap());
+        assert!(require_routed_for_address(FcNetworkMode::Routed, address).is_ok());
+        for (mode, name) in [
+            (FcNetworkMode::Bridged, "bridged"),
+            (FcNetworkMode::Rootless, "rootless"),
+        ] {
+            let error = require_routed_for_address(mode, address)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("only valid with routed networking") && error.contains(name),
+                "{error}"
+            );
+            assert!(require_routed_for_address(mode, None).is_ok());
+        }
+    }
+
+    fn leased(attempt: LeaseAttempt) -> Option<AddressLease> {
+        match attempt {
+            LeaseAttempt::Leased(lease) => Some(lease),
+            LeaseAttempt::Held { .. } => None,
+        }
+    }
+
+    /// Two VMs asking for one address: the second is refused while the first holds it,
+    /// in any spelling, and gets it once the first lets go.
+    #[test]
+    fn an_address_is_leased_to_one_vm_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::5".parse().unwrap();
+        let first = leased(lease_address(dir.path(), address, "vm-a").unwrap()).expect("free");
+        let same: std::net::Ipv6Addr = "2001:0db8:0:0::0005".parse().unwrap();
+        assert!(
+            leased(lease_address(dir.path(), same, "vm-b").unwrap()).is_none(),
+            "a held address must not be leased again"
+        );
+        assert!(
+            leased(lease_address(dir.path(), "2001:db8::6".parse().unwrap(), "vm-b").unwrap())
+                .is_some()
+        );
+        drop(first);
+        assert!(
+            !dir.path().join("2001:db8::5.lock").exists(),
+            "a released lease leaves no file"
+        );
+        assert!(leased(lease_address(dir.path(), same, "vm-b").unwrap()).is_some());
+    }
+
+    /// A VM refused an address learns who holds it from the lease itself, so the refusal
+    /// can name the holder before the holder has recorded its address anywhere else.
+    #[test]
+    fn a_refused_lease_names_its_holder() {
+        let dir = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::8".parse().unwrap();
+        let _held = leased(lease_address(dir.path(), address, "vm-holder").unwrap()).unwrap();
+        for _ in 0..2 {
+            match lease_address(dir.path(), address, "vm-other").unwrap() {
+                LeaseAttempt::Held { holder } => assert_eq!(
+                    holder,
+                    Some(LeaseHolder {
+                        pid: std::process::id(),
+                        vm_id: "vm-holder".to_string()
+                    }),
+                    "a contender must read the holder, and must not erase it for the next one"
+                ),
+                LeaseAttempt::Leased(_) => panic!("a held address was leased again"),
+            }
+        }
+    }
+
+    /// A lease is held by the process, so a process that dies releases it with no
+    /// cleanup. The lock is taken by a shell that then execs `sleep` (one process holding
+    /// the descriptor), which is then SIGKILLed.
+    #[test]
+    fn a_killed_holder_releases_its_lease() {
+        use std::io::BufRead;
+        let dir = tempfile::tempdir().unwrap();
+        let address: std::net::Ipv6Addr = "2001:db8::7".parse().unwrap();
+        let path = dir.path().join(format!("{address}.lock"));
+        let mut holder = std::process::Command::new("bash")
+            .args([
+                "-c",
+                "exec 9>\"$1\" && flock 9 && echo locked && exec sleep 600",
+                "holder",
+                path.to_str().unwrap(),
+            ])
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(holder.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        assert_eq!(line.trim(), "locked");
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_none());
+        holder.kill().unwrap();
+        holder.wait().unwrap();
+        assert!(leased(lease_address(dir.path(), address, "vm-b").unwrap()).is_some());
+    }
+
+    /// An address the host itself holds has its /128 only in table `local`, and the
+    /// collision check must see it, or `--ipv6-address` could give a VM the host's own
+    /// address. Gated on privileged-tests: the lanes that run it run routed VMs, so the
+    /// host has a global IPv6 address.
+    #[cfg(feature = "privileged-tests")]
+    #[tokio::test]
+    async fn the_hosts_own_address_counts_as_routed() {
+        let output = std::process::Command::new("ip")
+            .args(["-6", "addr", "show", "scope", "global"])
+            .output()
+            .unwrap();
+        let listing = String::from_utf8_lossy(&output.stdout);
+        let own = listing
+            .lines()
+            .find_map(|line| line.trim().strip_prefix("inet6 "))
+            .and_then(|rest| rest.split('/').next())
+            .expect("a host that runs routed VMs has a global IPv6 address")
+            .to_string();
+        assert!(
+            host_route_for(&own).await.unwrap().is_some(),
+            "the host's own address was not found as a route"
+        );
+        assert!(host_route_for("2001:db8:ffff::77").await.unwrap().is_none());
     }
 
     // --- parse_ipv6_prefix tests ---

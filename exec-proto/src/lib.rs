@@ -440,9 +440,10 @@ pub fn parse_rejection(line: &[u8]) -> Option<String> {
 pub const RESTORE_COMPLETE_PREFIX: &str = "restore-complete:";
 
 /// Whole-frame cap, prefix through newline. Sized for a UUID epoch plus the
-/// guest's phase-timing telemetry JSON with generous headroom (a dozen
-/// float-valued phases render near 450 bytes).
-pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 1024;
+/// guest's phase-timing telemetry JSON: about 30 restore phases (the firewall
+/// gate's among them) and nine GPU attach steps, each rounded to the microsecond,
+/// render near 1,000 bytes at five integer digits, so 1024 left none to spare.
+pub const RESTORE_COMPLETE_MAX_FRAME_BYTES: usize = 2048;
 
 /// How long fc-agent waits for the host to answer the connection it sends the ACK on. A
 /// blocking vsock connect otherwise waits only Linux's default of 2 s, which a guest busy

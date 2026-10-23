@@ -1732,9 +1732,11 @@ fn routed_network_for_restore(
     port_mappings: Vec<crate::network::PortMapping>,
     meta: &crate::storage::SnapshotMetadata,
     restore_prefix: Option<String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
 ) -> RoutedNetwork {
     let mut net = RoutedNetwork::new(vm_id, tap_device, port_mappings)
         .with_restore_mode()
+        .with_ipv6_address(ipv6_address)
         .with_ipv6_dns(meta.network_config.dns_server.clone())
         .with_forward_localhost(meta.forward_localhost.clone());
     if let Some(prefix) = restore_prefix {
@@ -1851,6 +1853,10 @@ async fn cmd_snapshot_run_inner(
     // --publish the snapshot cannot serve fails here with nothing to clean up.
     let port_mappings =
         clone_port_mappings(&snapshot_config.metadata.port_mappings, &args.publish)?;
+    crate::network::require_routed_for_address(
+        snapshot_config.metadata.network_mode,
+        args.ipv6_address,
+    )?;
 
     // Construct signal streams synchronously before either restore path can
     // allocate clone state.  Installing them inside a spawned task leaves the
@@ -1927,10 +1933,9 @@ async fn cmd_snapshot_run_inner(
             None
         }
     });
-    let vm_name = args.name.unwrap_or_else(|| {
-        // Auto-generate: snapshot-name + random suffix
-        format!("{}-{}", snapshot_name, &vm_id[..6])
-    });
+    let vm_name = args
+        .name
+        .unwrap_or_else(|| default_clone_name(&snapshot_name, &vm_id));
 
     // Validate VM name (whether user-provided or auto-generated)
     validate_vm_name(&vm_name).context("invalid VM name")?;
@@ -2001,8 +2006,16 @@ async fn cmd_snapshot_run_inner(
              on a Firecracker restore"
         );
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
+        // Whether the snapshot's driver image runs these GPUs is not checked here: the
+        // clone restores the image recorded in the snapshot, whose module type the
+        // current profile does not determine. The guest's attach fails closed instead.
         for sbdf in &gpus {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
         }
     }
     vm_state.config.gpus = gpus.clone();
@@ -2030,6 +2043,13 @@ async fn cmd_snapshot_run_inner(
             }
         };
     }
+
+    // The clone's first state is written here, under its name, and refused when a
+    // live VM already has that name.
+    setup_try!(state_manager
+        .claim_name(&mut vm_state)
+        .await
+        .context("claiming the VM name"));
 
     setup_try!(tokio::fs::create_dir_all(&data_dir)
         .await
@@ -2065,32 +2085,7 @@ async fn cmd_snapshot_run_inner(
     // `--vsock-dir` puts clone_vsock_base in a caller-owned directory so the clone's
     // listener lands at a predictable path; cache hits and clones honor the flag rather
     // than silently ignoring it.
-    let clone_vsock_base = match args.vsock_dir.as_deref() {
-        Some(dir) => {
-            let current_dir =
-                std::env::current_dir().context("resolving current directory for --vsock-dir")?;
-            let socket_path = super::podman::resolve_custom_vsock_socket_path(
-                std::path::Path::new(dir),
-                &current_dir,
-            );
-            let parent = socket_path
-                .parent()
-                .expect("a custom vsock socket path always has a parent");
-            tokio::fs::create_dir_all(parent)
-                .await
-                .with_context(|| format!("creating vsock dir: {:?}", parent))?;
-            // A caller-owned directory can hold a stale socket from a previous
-            // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
-            // reusing one --vsock-dir across runs leaves the old file behind.
-            // Firecracker's restore bind — unlike every host-side listener —
-            // does not unlink first, and the failed hit would fall back to a
-            // cold boot, silently throwing the cache away. Same semantics as
-            // the cold-boot set_vsock.
-            let _ = tokio::fs::remove_file(&socket_path).await;
-            socket_path
-        }
-        None => data_dir.join("vsock.sock"),
-    };
+    let clone_vsock_base = setup_try!(clone_vsock_base(args.vsock_dir.as_deref(), &data_dir).await);
     // Persist the clone's actual host-side socket before restore publishes its
     // state; snapshot control must address this socket. The recorded source
     // starts as the snapshot's embedded path, and the restore replaces it with
@@ -2279,6 +2274,7 @@ async fn cmd_snapshot_run_inner(
                 port_mappings.clone(),
                 &snapshot_config.metadata,
                 restore_prefix.clone(),
+                args.ipv6_address,
             );
             setup_try!(net
                 .preflight_check()
@@ -3377,6 +3373,7 @@ async fn cmd_snapshot_run_inner(
                                 vm_state.config.balloon_device(),
                                 args.non_blocking_output,
                                 vm_state.config.ipv6_prefix.as_ref(),
+                                args.ipv6_address,
                                 &network_config,
                                 &runtime_config,
                                 &data_dir.join("disks/rootfs.raw"),
@@ -3767,6 +3764,7 @@ async fn build_clone_reboot_plan(
     balloon: Option<crate::firecracker::BalloonDevice>,
     non_blocking_output: bool,
     ipv6_prefix: Option<&String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
     network_config: &crate::network::NetworkConfig,
     runtime_config: &RuntimeConfig,
     disk_path: &std::path::Path,
@@ -3796,6 +3794,7 @@ async fn build_clone_reboot_plan(
         non_blocking_output,
         None,
         ipv6_prefix,
+        ipv6_address,
         meta.restore_hook.clone(),
     );
 
@@ -3870,7 +3869,8 @@ async fn build_clone_reboot_plan(
 ///
 /// `ipv6_prefix` is the prefix the run gives the clone: the one `snapshot run --ipv6-prefix`
 /// was given, for a disk-only clone, and the clone's own, for the reboot plan. The prefix
-/// the snapshot recorded is never used (#1079).
+/// the snapshot recorded is never used (#1079). `ipv6_address` is the clone's
+/// `--ipv6-address` in the same two cases.
 ///
 /// `restore_hook` is the hook the run gives the clone, resolved by the caller: for a
 /// disk-only clone the caller's `--on-restore`, else the recorded one when the command
@@ -3886,6 +3886,7 @@ fn run_args_from_snapshot_metadata(
     non_blocking_output: bool,
     rootfs_override: Option<PathBuf>,
     ipv6_prefix: Option<&String>,
+    ipv6_address: Option<std::net::Ipv6Addr>,
     restore_hook: Option<String>,
 ) -> RunArgs {
     use crate::cli::args::NetworkMode as CliNetworkMode;
@@ -3986,11 +3987,72 @@ fn run_args_from_snapshot_metadata(
         non_blocking_output,
         label: vec![],
         ipv6_prefix: restore_ipv6_prefix(meta.network_mode, ipv6_prefix),
+        ipv6_address,
         image: meta.image.clone(),
         command_args: vec![],
         rootfs_override,
         image_disk_override: meta.image_disk_path.clone(),
         pmem_devices: meta.pmem_devices.clone(),
+    }
+}
+
+/// The clone's vsock socket: in its runtime directory, or at `--vsock-dir`.
+async fn clone_vsock_base(vsock_dir: Option<&str>, data_dir: &Path) -> Result<PathBuf> {
+    let Some(dir) = vsock_dir else {
+        return Ok(data_dir.join("vsock.sock"));
+    };
+    let current_dir =
+        std::env::current_dir().context("resolving current directory for --vsock-dir")?;
+    let socket_path =
+        super::podman::resolve_custom_vsock_socket_path(std::path::Path::new(dir), &current_dir);
+    let parent = socket_path
+        .parent()
+        .expect("a custom vsock socket path always has a parent");
+    tokio::fs::create_dir_all(parent)
+        .await
+        .with_context(|| format!("creating vsock dir: {:?}", parent))?;
+    // A caller-owned directory can hold a stale socket from a previous
+    // VM: teardown SIGKILLs the VMM, which never unlinks its socket, so
+    // reusing one --vsock-dir across runs leaves the old file behind.
+    // Firecracker's restore bind, unlike every host-side listener, does
+    // not unlink first, and the failed hit would fall back to a cold
+    // boot, silently throwing the cache away. Same semantics as the
+    // cold-boot set_vsock.
+    let _ = tokio::fs::remove_file(&socket_path).await;
+    Ok(socket_path)
+}
+
+/// Hex characters of the VM id in a generated clone name: 48 random bits, so 100 clones
+/// of one snapshot started together share a name with odds of about 2 in 10^11.
+const CLONE_NAME_SUFFIX_LEN: usize = 12;
+
+/// The name of a clone run without `--name`: the snapshot's name and part of the clone's
+/// VM id. Names are unique among live VMs and many clones of one snapshot may run at once,
+/// so the random part must be long; and it must be a valid VM name for every valid
+/// snapshot name, so the snapshot's part is cut to fit 63 characters and a character a VM
+/// name refuses ('.') becomes '-'.
+fn default_clone_name(snapshot_name: &str, vm_id: &str) -> String {
+    let random = vm_id.strip_prefix("vm-").unwrap_or(vm_id);
+    let random = truncate_id(random, CLONE_NAME_SUFFIX_LEN);
+    let keep = 63 - 1 - random.len();
+    let base: String = snapshot_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_start_matches('-')
+        .chars()
+        .take(keep)
+        .collect();
+    if base.is_empty() {
+        format!("clone-{random}")
+    } else {
+        format!("{base}-{random}")
     }
 }
 
@@ -4042,7 +4104,7 @@ async fn cmd_snapshot_run_disk_only(
     let vm_name = args
         .name
         .clone()
-        .unwrap_or_else(|| format!("{}-clone", snapshot_name));
+        .unwrap_or_else(|| default_clone_name(&snapshot_name, &generate_vm_id()));
     validate_vm_name(&vm_name).context("invalid VM name")?;
 
     let run_args = run_args_from_snapshot_metadata(
@@ -4055,6 +4117,7 @@ async fn cmd_snapshot_run_disk_only(
         args.non_blocking_output,
         Some(disk_path),
         args.ipv6_prefix.as_ref(),
+        args.ipv6_address,
         // The caller's hook, the recorded one only for a command line that inherits.
         restore_hook_for(
             args.on_restore.as_deref(),
@@ -4398,6 +4461,7 @@ mod tests {
             Vec::new(),
             &meta,
             Some("2001:db8:1::/64".to_string()),
+            Some("2001:db8:1::7".parse().unwrap()),
         );
         assert!(
             net.is_restore(),
@@ -4410,6 +4474,11 @@ mod tests {
         );
         assert_eq!(net.forward_localhost(), &[3300, 4026]);
         assert_eq!(net.ipv6_prefix(), Some("2001:db8:1::/64"));
+        assert_eq!(
+            net.ipv6_address(),
+            Some("2001:db8:1::7".parse().unwrap()),
+            "the restore's network must carry the clone's --ipv6-address"
+        );
     }
 
     /// #1079: a disk-only routed clone boots under the prefix `snapshot run` was given, and
@@ -4441,6 +4510,7 @@ mod tests {
                 false,
                 None,
                 given,
+                None,
                 None,
             )
             .ipv6_prefix
@@ -4517,6 +4587,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args.kernel_profile.as_deref(), Some("btrfs"));
         assert_eq!(args.image_mode, Some(crate::cli::ImageMode::Overlay));
@@ -4542,6 +4613,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert!(args2.env.is_empty());
 
@@ -4562,6 +4634,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(args_dns.dns.as_deref(), Some("192.0.2.53"));
 
@@ -4579,6 +4652,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4614,6 +4688,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4653,6 +4728,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         );
         assert_eq!(
             args.hypervisor,
@@ -4669,6 +4745,7 @@ mod tests {
             512,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -4711,6 +4788,7 @@ mod tests {
                 1024,
                 balloon,
                 false,
+                None,
                 None,
                 None,
                 None,
@@ -4916,6 +4994,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            ipv6_address: None,
             gpu: vec![],
         };
 
@@ -4990,6 +5069,7 @@ mod tests {
             vsock_dir: None,
             publish: vec![],
             ipv6_prefix: None,
+            ipv6_address: None,
             gpu: vec![],
         }
     }
@@ -5662,6 +5742,57 @@ mod watchdog_exit_classification_tests {
             body.contains("watchdog.rearm();\n                        watchdog_killed = false;"),
             "relaunch does not rearm"
         );
+    }
+
+    /// A clone run without `--name` gets a name that is valid for every valid snapshot name
+    /// and does not repeat across clones of one snapshot: names are unique among live VMs,
+    /// so a repeat refuses the second clone.
+    #[test]
+    fn generated_clone_names_are_valid_and_do_not_repeat() {
+        use crate::commands::snapshot::default_clone_name;
+        for len in 1..=128 {
+            let tag: String = "a.b-c_d".chars().cycle().take(len).collect();
+            crate::storage::snapshot::validate_snapshot_name(&tag).unwrap();
+            let name = default_clone_name(&tag, &crate::state::generate_vm_id());
+            crate::state::validate_vm_name(&name)
+                .unwrap_or_else(|e| panic!("tag of {len} characters gave {name:?}: {e}"));
+        }
+        for tag in ["-x", ".x", "..x", "_"] {
+            let name = default_clone_name(tag, &crate::state::generate_vm_id());
+            crate::state::validate_vm_name(&name)
+                .unwrap_or_else(|e| panic!("tag {tag:?} gave {name:?}: {e}"));
+        }
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..2000 {
+            let name = default_clone_name("golden", &crate::state::generate_vm_id());
+            assert!(
+                seen.insert(name.clone()),
+                "{name} repeated within 2000 clones"
+            );
+        }
+    }
+
+    /// Every error after the clone claims its name must go through `setup_try!`, which
+    /// deletes the claimed state; a bare `?` there would leave the name held by a VM that
+    /// never started.
+    #[test]
+    fn clone_setup_errors_after_the_name_claim_go_through_cleanup() {
+        let source = include_str!("snapshot.rs");
+        let start = source
+            .find(".claim_name(&mut vm_state)")
+            .expect("snapshot run claims the clone's name");
+        let end = start
+            + source[start..]
+                .find("failpoint::hit_async(\"restore.pre_resume\")")
+                .expect("the restore.pre_resume failpoint follows the claim");
+        let bare: Vec<&str> = source[start..end]
+            .lines()
+            .filter(|line| {
+                let code = line.split("//").next().unwrap_or("");
+                code.trim_end().ends_with("?;") && !code.contains("setup_try!")
+            })
+            .collect();
+        assert!(bare.is_empty(), "bare `?` after the name claim: {bare:#?}");
     }
 
     /// A failed watchdog kill must reach the common cleanup (task aborts, cleanup_vm), which a `?`

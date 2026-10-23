@@ -1672,7 +1672,7 @@ class CompleteAnalyzerFixture(unittest.TestCase):
                 "held_from_identity_read_through_terminal_verification": True,
             },
             "host": {
-                "hostname": "fixture", "kernel": "fixture", "machine": "aarch64",
+                "kernel": "fixture", "machine": "aarch64",
                 "python": "3.13", "cpu_count": 64,
                 "quiet_gate": {
                     "loadavg1": 0.1, "loadavg1_limit": 2.0,

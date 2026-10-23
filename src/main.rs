@@ -67,8 +67,8 @@ async fn run() -> Result<()> {
             // Setup handles its own path initialization after loading config
             // Don't pre-initialize here since setup may create storage first
         }
-        Commands::Completions(_) => {
-            // Shell completions don't need config
+        Commands::Completions(_) | Commands::Gpu(_) => {
+            // Shell completions and the GPU pool commands don't need config
             paths::init_with_defaults();
         }
         _ => {
@@ -121,6 +121,7 @@ async fn run() -> Result<()> {
         Commands::Snapshots(args) => commands::cmd_snapshots(args).await,
         Commands::Exec(args) => commands::cmd_exec(args).await,
         Commands::Balloon(args) => commands::cmd_balloon(args).await,
+        Commands::Gpu(args) => commands::cmd_gpu(args).await,
         Commands::Serve(args) => commands::cmd_serve(args).await,
         Commands::Setup(args) => commands::cmd_setup(args).await,
         Commands::Completions(args) => {
