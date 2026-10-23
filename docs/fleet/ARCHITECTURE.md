@@ -406,6 +406,16 @@ cleared between customers). DECIDED, all owner-approved:
   to first token.
 - **Tail latencies:** p50, p95 and p99 under a named external benchmark, and for GPU restores.
 
+## Scale to zero (DECIDED 2026-10-23)
+
+With no active viewers for 10 minutes (a hidden tab paused after 5 minutes does not count),
+the coordinator scales the GPU host groups to zero and terminates the EC2 tiles; only the
+coordinator stays up (about $18 a month). The first viewer to arrive wakes the fleet: the
+page shows the poster frame and "Waking up the GPUs" with a live clock and the real wake
+phases, and the measured wake time (first viewer to complete image) is recorded. The fleet
+never sleeps during a race or a "Your own GPU" session. Running cost is then about $5 an hour
+while anyone watches (one g4dn.metal at current spot prices, plus EC2 tiles while they run).
+
 ## Stack of PRs
 
 1. This document.
