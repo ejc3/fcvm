@@ -374,6 +374,12 @@ pub struct FleetAgentArgs {
     #[arg(long)]
     pub frame_zone: Option<String>,
 
+    /// Publish each slot's renderer TLS port (443 in the VM) on --publish-ip at this base
+    /// plus the GPU index (hosts whose VMs are not routed); with --frame-zone the frame URL
+    /// names the port.
+    #[arg(long)]
+    pub tls_publish_base: Option<u16>,
+
     /// GPUs to use instead of the vfio-pci inventory: <sbdf>=<name>,...
     #[arg(long)]
     pub gpus: Option<String>,

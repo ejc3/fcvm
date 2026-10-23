@@ -70,6 +70,7 @@ fn cfg(fcvm: &Path) -> AgentCfg {
         frame_host: "gpu-host.example".into(),
         ipv6_prefix: None,
         frame_zone: None,
+        tls_publish_base: None,
         sysfs_root: PathBuf::from("/nonexistent-sysfs"),
         start_timeout: Duration::from_secs(20),
         stop_grace: Duration::from_secs(10),
@@ -1481,5 +1482,27 @@ async fn each_slot_runs_routed_at_its_own_address() {
         ),
         "{args}"
     );
+    c.close().await;
+}
+
+/// Without routed VMs, the renderer's TLS port is published per slot (base + GPU index) and
+/// the zone frame URL names it.
+#[tokio::test]
+async fn a_slot_publishes_its_tls_port_when_not_routed() {
+    let f = fake(2, &[]);
+    let mut cfg = cfg(&f.fcvm);
+    cfg.frame_zone = Some("fleet.example".into());
+    cfg.tls_publish_base = Some(40100);
+    let mut c = Coord::start(&f, 2, cfg);
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-2", 1, 1, rect(0.0))]);
+    let got = c.until(&["slot-2"], "running", 1).await;
+    assert_eq!(
+        got["slot-2"].frame_url.as_deref(),
+        Some("wss://slot-2.fleet.example:40101/frames")
+    );
+    let args = std::fs::read_to_string(f.dir.path().join("args-fleet-slot-2")).unwrap();
+    assert!(args.contains("--publish\n127.0.0.1:40101:443\n"), "{args}");
     c.close().await;
 }

@@ -33,6 +33,10 @@ pub struct AgentCfg {
     /// With a zone, a slot's frame URL is `wss://<slot id>.<zone>/frames` (its DNS name,
     /// TLS in the VM) instead of the publish address.
     pub frame_zone: Option<String>,
+    /// Publish each slot's renderer TLS port (443 in the VM) on the publish address at this
+    /// base plus the GPU index, for hosts whose VMs are not routed (a test box, a local run);
+    /// the zone frame URL then names that port.
+    pub tls_publish_base: Option<u16>,
     pub sysfs_root: PathBuf,
     pub start_timeout: Duration,
     pub stop_grace: Duration,
@@ -102,6 +106,8 @@ pub struct SlotCtx {
     pub port: u16,
     /// The slot's own IPv6 address, with `ipv6_prefix`.
     pub ipv6: Option<std::net::Ipv6Addr>,
+    /// The host port its renderer's TLS port is published on, with `tls_publish_base`.
+    pub tls_port: Option<u16>,
     pub cfg: Arc<AgentCfg>,
     pub out: mpsc::UnboundedSender<AgentMsg>,
     /// Held while the slot has a VM, so two slots can never run on one GPU.
@@ -156,7 +162,10 @@ impl SlotCtx {
     /// The renderer's frame WebSocket as a browser opens it.
     fn frame_url(&self) -> String {
         match &self.cfg.frame_zone {
-            Some(zone) => format!("wss://{}.{zone}/frames", self.id),
+            Some(zone) => match self.tls_port {
+                Some(p) => format!("wss://{}.{zone}:{p}/frames", self.id),
+                None => format!("wss://{}.{zone}/frames", self.id),
+            },
             None => frame_url(&self.cfg.frame_host, self.port),
         }
     }
@@ -587,12 +596,17 @@ async fn relaunch(
         name: ctx.vm_name(),
         sbdf: ctx.sbdf.clone(),
         publish: format!("{}:{}:8080", ctx.cfg.publish_ip, ctx.port),
-        extra_args: match (&ctx.cfg.ipv6_prefix, ctx.ipv6) {
-            (Some(p), Some(a)) => super::addr::vm_args(p, a)
-                .into_iter()
-                .chain(ctx.cfg.extra_args.iter().cloned())
-                .collect(),
-            _ => ctx.cfg.extra_args.clone(),
+        extra_args: {
+            let mut a = match (&ctx.cfg.ipv6_prefix, ctx.ipv6) {
+                (Some(p), Some(a)) => super::addr::vm_args(p, a),
+                _ => Vec::new(),
+            };
+            if let Some(p) = ctx.tls_port {
+                a.push("--publish".into());
+                a.push(format!("{}:{p}:443", ctx.cfg.publish_ip));
+            }
+            a.extend(ctx.cfg.extra_args.iter().cloned());
+            a
         },
         image: ctx.cfg.image.clone(),
     };

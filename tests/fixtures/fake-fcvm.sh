@@ -29,7 +29,7 @@ gpu=""
 while [ $# -gt 0 ]; do
     case "$1" in
         --name) name="$2"; shift ;;
-        --publish) port="${2#*:}"; port="${port%%:*}"; shift ;;
+        --publish) [ -n "$port" ] || { port="${2#*:}"; port="${port%%:*}"; }; shift ;;
         --gpu) gpu="$2"; shift ;;
     esac
     shift
