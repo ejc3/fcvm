@@ -104,9 +104,14 @@ A message the coordinator could not read; nothing was applied.
 
 ```json
 {"type": "verify", "token": "<Turnstile token>"}
+{"type": "visibility", "visible": false}
 {"type": "intent", "id": "<client uuid>", "name": "nudge", "args": {"target": "coast"}}
 {"type": "ping", "client_unix_ms": 1761134400100.5}
 ```
+
+`visibility` says whether the page is visible. A connection counts as an active viewer
+until it reports `visible: false` (the page sends that when its tab has been hidden long
+enough to pause its streams) and again once it reports `true`.
 
 With Turnstile configured (`hello.turnstile` is the site key), every intent is refused
 (`"verify first"`, not recorded) until the connection has sent a token that Cloudflare's
@@ -246,11 +251,15 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
     {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000},
     {"kind": "gpu_quarantined", "host": "<host>", "sbdf": "0000:05:00.0", "error": "...", "since": 1761134400000}
   ],
+  "power": {"state": "waking", "idle_since": null, "asleep_since": null, "woke_at": 1761134400000,
+            "hosts": [{"instance": "i-0123456789abcdef0", "phase": "agent_connected", "pending_at": 1761134401000,
+                       "booted_at": 1761134446000, "agent_at": 1761134492000, "rendering_at": null}],
+            "last_wake_ms": 98000, "wakes": [{"started_at": ..., "complete_at": ..., "ms": 98000}]},
   "counters": {"restores": 1834, "restores_last_hour": 96, "scrubs": 212, "scrub_failures": 1},
   "claims": [{"session": "claim-3", "viewer": "v-9", "slot": "slot-2", "gpu": {...}, "host": "<host>",
               "claimed_at": 1761134400000, "expires_at": 1761134460000, "first_frame_at": 1761134405400,
               "click_to_first_frame_ms": 5400, "borrowed": "fcvm:2"}],
-  "viewers": {"count": 3},
+  "viewers": {"count": 3, "active": 2},
   "actions": [{"at", "viewer", "id", "name", "args", "summary", "outcome"}]
 }
 ```
@@ -292,6 +301,20 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
+- `power` is whether the GPU capacity is up, when the coordinator owns the GPU hosts' auto
+  scaling groups (`--scale-group`; without any it stays `awake`). After
+  `--idle-scale-down` seconds (default 600) with no active viewer (`viewers.active`), and
+  never while a claim is active or a race is running, the fleet goes `asleep`: every group
+  is set to desired capacity 0, the EC2 half has no tiles (their instances are
+  terminated), no race is scheduled (`next_race_at` null) and `restart_now` is refused.
+  Hosts that leave then are not reclaimed. When an active viewer arrives it is `waking`
+  (`woke_at`): every group goes back to `--awake-capacity` (default 1), the EC2 half
+  launches as many tiles as the fcvm half had, and `hosts` gives each GPU host's progress
+  by EC2 instance id: `pending` and `booted` from the group (Pending, InService),
+  `agent_connected` when its agent says hello (the agent names itself by its instance id,
+  and starts once the host's store is mounted), `rendering` when all its placed slots run.
+  Once every placed tile of both halves runs it is `awake`, and the wake, first active
+  viewer to complete image, is recorded in `wakes` (`last_wake_ms`; the last 20).
 - `counters` are totals since the fleet first started, kept in the state file across
   coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
   (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
@@ -343,8 +366,14 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
                  [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
+                 [--scale-group <region>:<group name>]... [--awake-capacity 1] [--idle-scale-down 600]
 ```
 
+- `--scale-group` hands the coordinator the GPU hosts' auto scaling groups (repeatable,
+  one per region); it sets their desired capacity (Auto Scaling `SetDesiredCapacity`) and,
+  while waking, reads their instances (`DescribeAutoScalingGroups`) every 5 s, with the
+  credentials of its task or instance role. A call that fails marks the coordinator
+  degraded (`scale`) and is retried.
 - `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
   `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
   rotation. It has no authentication: keep it on loopback or a private network.
