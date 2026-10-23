@@ -103,27 +103,68 @@ async fn state_of(id: &str) -> Result<VmState> {
         .await
 }
 
-/// Whether `pid` names a process that has not exited (a zombie has).
-fn alive(pid: u32) -> bool {
-    match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-        Ok(stat) => !matches!(
-            stat.rsplit_once(')')
-                .and_then(|(_, rest)| rest.split_whitespace().next()),
-            Some("Z") | Some("X") | None
-        ),
-        Err(_) => false,
+/// A process by PID and start time (field 22 of /proc/<pid>/stat), so a recycled PID is not
+/// taken for the process it once named.
+#[derive(Clone, Copy, Debug)]
+struct Proc {
+    pid: u32,
+    start: u64,
+}
+
+/// The state and start time of `pid`, if it exists.
+fn stat_of(pid: u32) -> Option<(String, u64)> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let (_, rest) = stat.rsplit_once(')')?;
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After the comm, fields start at 3 (state); starttime is field 22.
+    Some((fields.first()?.to_string(), fields.get(19)?.parse().ok()?))
+}
+
+impl Proc {
+    fn of(pid: u32) -> Option<Self> {
+        stat_of(pid).map(|(_, start)| Self { pid, start })
+    }
+
+    /// Still running: the PID exists, has this start time, and has not exited (a zombie has).
+    fn alive(&self) -> bool {
+        matches!(stat_of(self.pid), Some((state, start)) if start == self.start && state != "Z" && state != "X")
     }
 }
 
-async fn wait_gone(pid: u32, timeout: Duration) -> bool {
+/// Every live descendant of `pid`.
+fn descendants(pid: u32) -> Vec<Proc> {
+    let mut out = Vec::new();
+    let mut queue = vec![pid];
+    while let Some(p) = queue.pop() {
+        let Ok(tasks) = std::fs::read_dir(format!("/proc/{p}/task")) else {
+            continue;
+        };
+        for task in tasks.flatten() {
+            let children =
+                std::fs::read_to_string(task.path().join("children")).unwrap_or_default();
+            for child in children
+                .split_whitespace()
+                .filter_map(|c| c.parse::<u32>().ok())
+            {
+                if let Some(proc_) = Proc::of(child) {
+                    out.push(proc_);
+                    queue.push(child);
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn wait_gone(procs: &[Proc], timeout: Duration) -> Vec<Proc> {
     let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if !alive(pid) {
-            return true;
+    loop {
+        let left: Vec<Proc> = procs.iter().copied().filter(Proc::alive).collect();
+        if left.is_empty() || Instant::now() > deadline {
+            return left;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    !alive(pid)
 }
 
 /// The second sandbox of an image is restored from the snapshot the first one left in the
@@ -152,12 +193,12 @@ async fn serve_restores_sandboxes_from_the_snapshot_cache() -> Result<()> {
     let out = run_command(&client, &base, &second, "echo serve-ok").await?;
     assert_eq!(out.trim(), "serve-ok");
 
-    let child_pid = state.pid.context("sandbox state has no pid")?;
-    assert!(alive(child_pid));
+    let child = Proc::of(state.pid.context("sandbox state has no pid")?)
+        .context("the sandbox's fcvm process is not running")?;
     destroy(&client, &base, &second).await?;
     assert!(
-        !alive(child_pid),
-        "destroy returned while the sandbox's fcvm process {child_pid} was still running"
+        !child.alive(),
+        "destroy returned while the sandbox's fcvm process {child:?} was still running"
     );
 
     common::kill_process(serve.id().context("serve pid")?).await;
@@ -186,23 +227,58 @@ async fn serve_no_snapshot_boots_sandboxes_cold() -> Result<()> {
 }
 
 /// A SIGKILLed server cannot stop its sandboxes, so the kernel has to: every child is armed
-/// with a parent-death signal, and it tears its VM down on it.
+/// with a parent-death signal, and the VM processes under it carry their own. One sandbox is
+/// healthy and one is still being created when the server dies; nothing under either of them
+/// may survive.
 #[tokio::test(flavor = "multi_thread")]
 async fn sigkill_of_serve_ends_its_sandboxes() -> Result<()> {
     let (mut serve, base) = start_serve(&[], false).await?;
+    let serve_pid = serve.id().context("serve pid")?;
     let client = reqwest::Client::new();
 
-    let id = create(&client, &base).await?;
-    let state = state_of(&id).await?;
-    let child_pid = state.pid.context("sandbox state has no pid")?;
-    assert!(alive(child_pid));
+    create(&client, &base).await?;
+    let pending = {
+        let (client, base) = (client.clone(), base.clone());
+        tokio::spawn(async move { create(&client, &base).await })
+    };
+    // Kill the server as soon as the second sandbox's process exists, while its create is
+    // still pending.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut children = Vec::new();
+    while Instant::now() < deadline {
+        children = std::fs::read_dir(format!("/proc/{serve_pid}/task"))?
+            .flatten()
+            .flat_map(|t| {
+                std::fs::read_to_string(t.path().join("children"))
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|c| c.parse::<u32>().ok())
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        if children.len() >= 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    anyhow::ensure!(
+        children.len() >= 2,
+        "the second create never started a process"
+    );
+    let tree = descendants(serve_pid);
+    anyhow::ensure!(
+        tree.len() > children.len(),
+        "the healthy sandbox has no VM processes under it: {tree:?}"
+    );
 
     serve.start_kill()?;
     let _ = serve.wait().await;
+    let _ = pending.await;
 
+    let survivors = wait_gone(&tree, Duration::from_secs(60)).await;
     assert!(
-        wait_gone(child_pid, Duration::from_secs(60)).await,
-        "sandbox fcvm process {child_pid} outlived the SIGKILLed server"
+        survivors.is_empty(),
+        "processes under the SIGKILLed server outlived it: {survivors:?}"
     );
     Ok(())
 }

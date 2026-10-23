@@ -65,47 +65,86 @@ struct AppState {
 
 type SharedState = Arc<AppState>;
 
-/// An `fcvm podman run` child process. Dropping it while the child is unreaped sends
-/// SIGTERM, so a create abandoned by its client, or a sandbox the server never stopped,
-/// does not leave a VM behind. The child also gets SIGTERM from the kernel if this
-/// process dies (`die_with_parent`).
+/// An `fcvm podman run` child process. Dropping it while the child is unreaped stops it
+/// (SIGTERM, then SIGKILL after `STOP_GRACE`) on a task of its own, so a create abandoned by
+/// its client, or a sandbox the server never stopped, does not leave a VM behind. If this
+/// process dies, the kernel SIGKILLs the child (`die_with_parent`).
 struct ChildGuard {
-    child: tokio::process::Child,
+    child: Option<tokio::process::Child>,
 }
 
 impl ChildGuard {
+    fn new(child: tokio::process::Child) -> Self {
+        Self { child: Some(child) }
+    }
+
     fn pid(&self) -> Option<u32> {
         // `id` is None once tokio has reaped the child, so the PID cannot be recycled
         // while this returns Some.
-        self.child.id()
+        self.child.as_ref().and_then(|c| c.id())
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => child.wait().await,
+            None => Err(std::io::Error::other("sandbox child already stopped")),
+        }
+    }
+
+    /// Whether the child has exited; reaps it if so.
+    fn exited(&mut self) -> bool {
+        match self.child.as_mut() {
+            Some(child) => !matches!(child.try_wait(), Ok(None)),
+            None => true,
+        }
     }
 
     /// SIGTERM, then SIGKILL after `STOP_GRACE`, and reap.
     async fn stop(&mut self) -> Result<std::process::ExitStatus> {
-        if let Some(pid) = self.pid() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+        match self.child.as_mut() {
+            Some(child) => stop_child(child).await,
+            None => anyhow::bail!("sandbox child already stopped"),
         }
-        match tokio::time::timeout(STOP_GRACE, self.child.wait()).await {
-            Ok(status) => Ok(status?),
-            Err(_) => {
-                warn!(pid = ?self.pid(), "sandbox did not exit after SIGTERM; sending SIGKILL");
-                self.child.start_kill()?;
-                Ok(self.child.wait().await?)
-            }
+    }
+}
+
+/// SIGTERM, then SIGKILL after `STOP_GRACE`, and reap. The SIGKILL matters: a SIGTERM that
+/// reaches `fcvm podman run` before a cache hit's restore has installed its own handlers is
+/// not acted on.
+async fn stop_child(child: &mut tokio::process::Child) -> Result<std::process::ExitStatus> {
+    if let Some(pid) = child.id() {
+        let _ = nix::sys::signal::kill(
+            nix::unistd::Pid::from_raw(pid as i32),
+            nix::sys::signal::Signal::SIGTERM,
+        );
+    }
+    match tokio::time::timeout(STOP_GRACE, child.wait()).await {
+        Ok(status) => Ok(status?),
+        Err(_) => {
+            warn!(pid = ?child.id(), "sandbox did not exit after SIGTERM; sending SIGKILL");
+            child.start_kill()?;
+            Ok(child.wait().await?)
         }
     }
 }
 
 impl Drop for ChildGuard {
     fn drop(&mut self) {
-        if let Some(pid) = self.pid() {
-            let _ = nix::sys::signal::kill(
-                nix::unistd::Pid::from_raw(pid as i32),
-                nix::sys::signal::Signal::SIGTERM,
-            );
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        if child.id().is_none() {
+            return;
+        }
+        match tokio::runtime::Handle::try_current() {
+            Ok(runtime) => {
+                runtime.spawn(async move {
+                    let _ = stop_child(&mut child).await;
+                });
+            }
+            Err(_) => {
+                let _ = child.start_kill();
+            }
         }
     }
 }
@@ -130,17 +169,19 @@ impl SandboxProcess {
     }
 }
 
-/// Arm `command` so the kernel sends SIGTERM to the child when this process dies. SIGTERM,
-/// not SIGKILL, so the child's own teardown (VMM, namespace holder, pasta, disks, state
-/// file) runs. tokio spawns from a runtime worker thread, which lives as long as the
-/// runtime, so the signal is not sent early by a thread exiting.
+/// Arm `command` so the kernel SIGKILLs the child when this process dies. SIGKILL, because
+/// nothing is left to escalate after this process is gone, and a SIGTERM that lands before a
+/// cache hit's restore installs its own handlers is not acted on. The child's own children
+/// (VMM, namespace holder, pasta) carry their own parent-death signals, so the VM goes with
+/// it. tokio spawns from a runtime worker thread, which lives as long as the runtime, so the
+/// signal is not sent early by a thread exiting.
 fn die_with_parent(command: &mut tokio::process::Command) {
     let parent = std::process::id() as libc::pid_t;
     // SAFETY: the hook runs in the forked child before exec and makes two
     // async-signal-safe calls; `parent` was captured before the fork.
     unsafe {
         command.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             // The parent died between the fork and the prctl: no signal is coming.
@@ -545,7 +586,7 @@ async fn create_sandbox(
         .stderr(std::process::Stdio::inherit());
     die_with_parent(&mut command);
     let mut child = match command.spawn() {
-        Ok(child) => ChildGuard { child },
+        Ok(child) => ChildGuard::new(child),
         Err(e) => {
             error!(error = %e, "Failed to start fcvm podman run");
             return gateway_error(
@@ -566,7 +607,7 @@ async fn create_sandbox(
     let (_registration, ready_rx) = state.ready.register(pid);
     let vm = tokio::select! {
         vm = ready_rx => vm.ok(),
-        status = child.child.wait() => {
+        status = child.wait() => {
             let detail = match status {
                 Ok(status) => format!("fcvm podman run exited before the sandbox was ready: {}", status),
                 Err(e) => format!("waiting for fcvm podman run: {}", e),
@@ -1532,6 +1573,17 @@ async fn reaper_task(state: SharedState) {
             info!(sandbox_id = %id, "Sandbox expired, destroying");
             let _ = entry.sandbox.stop().await;
         }
+
+        // A sandbox whose `fcvm podman run` exited on its own (its container stopped, its
+        // VM died) is reaped here, so it does not stay a zombie, and dropped from the map.
+        let mut sandboxes = state.sandboxes.write().await;
+        sandboxes.retain(|id, entry| {
+            let exited = entry.sandbox.child.exited();
+            if exited {
+                info!(sandbox_id = %id, "Sandbox process exited, removing it");
+            }
+            !exited
+        });
     }
 }
 

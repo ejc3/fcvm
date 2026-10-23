@@ -29,6 +29,9 @@ def harness_stats(values):
 
 
 def row(label, values, failures, extra=""):
+    if not values:
+        print(f"| {label} | 0/{failures} | | | | | | | | | |{extra}")
+        return
     s = sorted(values)
     hm, h95, h99 = harness_stats(s)
     raw = [nearest_rank(s, p) for p in (50, 90, 95, 99)]
@@ -56,6 +59,8 @@ def main(paths):
     if len(paths) > 1:
         row("all", pooled, pooled_fail, " | |")
     s = sorted(pooled)
+    if not s:
+        return
     print()
     print("deciles of all bursts (ms): " + ", ".join(f"{nearest_rank(s, p):.0f}" for p in range(10, 101, 10)))
 
