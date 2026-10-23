@@ -16,7 +16,7 @@ const FPS = 20;
 
 beforeAll(async () => {
   const epochUnixMs = Math.floor(Date.now() / 1000) * 1000;
-  ensureReel(MEDIA, epochUnixMs);
+  ensureReel(MEDIA, epochUnixMs, "320x180");
   renderers = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 2, maxHeight: 360, epochUnixMs, scene: () => coord.patternScene() });
   await renderers.listen();
   coord = new MockCoordinator({
