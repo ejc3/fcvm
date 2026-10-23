@@ -20,7 +20,9 @@ grep -q "fn $fn(" "$tests" && { echo "race-gym-emit: $fn already exists" >&2; ex
 pin=${3:-}
 if [ -n "$pin" ]; then
   [[ "$pin" =~ ^[a-z,]+$ ]] || { echo "race-gym-emit: PIN=$pin must be oracle names (outcome,leak,...)" >&2; exit 2; }
-  jq -e --arg p "$pin" '[.failed[].oracle] as $o | ($p | split(",")) | all(. as $x | $o | index($x))' "$replay" >/dev/null \
+  # A pin must name a failure the replay recorded, unless the file already carries that pin:
+  # a schedule re-recorded after its fix no longer records the failure it pins.
+  jq -e --arg p "$pin" '([.failed[].oracle] + (.pin_oracles // [])) as $o | ($p | split(",")) | all(. as $x | $o | index($x))' "$replay" >/dev/null \
     || { echo "race-gym-emit: $replay recorded no failure for every oracle in PIN=$pin" >&2; exit 2; }
 fi
 mkdir -p "$(dirname "$case_file")"

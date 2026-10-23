@@ -18,31 +18,35 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// How often a parked hit looks for its go file.
 pub(crate) const POLL: Duration = Duration::from_millis(5);
 
-static SEQ: AtomicU64 = AtomicU64::new(0);
 static HITS: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
-static ACTOR_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-fn actor_dir(dir: &Path) -> &'static Path {
-    ACTOR_DIR.get_or_init(|| {
-        let actor = std::env::var("FCVM_RACE_ACTOR").unwrap_or_else(|_| "actor".to_string());
-        let path = dir.join(format!("{actor}-{}", std::process::id()));
-        if let Err(e) = std::fs::create_dir_all(&path) {
-            panic!("FAILPOINT park: creating {}: {e}", path.display());
-        }
-        path
-    })
-}
+/// Per park root (a spec can name several): this process's directory under it and the next
+/// sequence number there. One lock covers taking a number and publishing its file, so a
+/// file never appears after a later-numbered one (a controller that consumed the later one
+/// would otherwise see the earlier one out of order).
+static ACTOR_DIRS: Mutex<Option<HashMap<PathBuf, (PathBuf, u64)>>> = Mutex::new(None);
 
-fn publish(dir: &Path, suffix: &str, body: &str) -> PathBuf {
-    let dir = actor_dir(dir);
-    let seq = SEQ.fetch_add(1, Ordering::SeqCst);
+fn publish(root: &Path, suffix: &str, body: &str) -> PathBuf {
+    let mut dirs = ACTOR_DIRS.lock().unwrap_or_else(|e| e.into_inner());
+    let (dir, next) = dirs
+        .get_or_insert_with(HashMap::new)
+        .entry(root.to_path_buf())
+        .or_insert_with(|| {
+            let actor = std::env::var("FCVM_RACE_ACTOR").unwrap_or_else(|_| "actor".to_string());
+            let path = root.join(format!("{actor}-{}", std::process::id()));
+            if let Err(e) = std::fs::create_dir_all(&path) {
+                panic!("FAILPOINT park: creating {}: {e}", path.display());
+            }
+            (path, 0)
+        });
+    let seq = *next;
+    *next += 1;
     let name = format!("{seq:06}");
     let tmp = dir.join(format!(".{name}.{suffix}.tmp"));
     let path = dir.join(format!("{name}.{suffix}"));
@@ -67,6 +71,12 @@ pub(crate) fn announce(dir: &Path, point: &str) -> PathBuf {
     let hit = next_hit(point);
     let body = format!("point={point}\nhit={hit}\npid={}\n", std::process::id());
     publish(dir, "reached", &body)
+}
+
+/// Record that a park gave up waiting for its go file, so the controller fails the schedule
+/// instead of finding the actor further on than it released it.
+pub(crate) fn timed_out(dir: &Path, point: &str) {
+    note(dir, "park.timeout", point);
 }
 
 /// Record an event that does not wait.

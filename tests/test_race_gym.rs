@@ -116,6 +116,15 @@ async fn replay_file(path: &Path, out: &Path) -> Result<()> {
         )
         .await?;
         print_result(&format!("rerecord {}", path.display()), &result);
+        // A re-recording that did not reach the schedule's window would make a case that
+        // passes without exercising it.
+        if !result.feasible || result.failed.iter().any(|f| f.oracle == "control") {
+            bail!(
+                "RERECORD refused: the schedule was infeasible ({}) or did not run as planned ({:?})",
+                !result.feasible,
+                result.failed
+            );
+        }
         let file = out.join(path.file_name().context("replay path has no file name")?);
         let mut new = record(scenario.as_ref(), &replay.schedule, &result);
         new.pin_oracles = replay.pin_oracles.clone();
@@ -273,15 +282,19 @@ async fn race_gym() -> Result<()> {
     }
     let mut files: BTreeMap<String, PathBuf> = BTreeMap::new();
     let mut unconfirmed: Vec<String> = Vec::new();
-    for (signature, ns) in &groups {
+    for (k, (signature, ns)) in groups.iter().enumerate() {
+        // A control failure (unmodeled wait, divergence, a park that timed out) says the
+        // schedule did not run as recorded. It is reported as it is, never dropped as
+        // "not reproduced alone": a replay of a schedule that did not complete cannot agree.
+        let control = signature.starts_with("control:");
         for &n in ns.iter().take(3) {
             let (_, schedule, result) =
                 &results[results.iter().position(|(m, _, _)| *m == n).unwrap()];
             let mut replay = record(scenario.as_ref(), schedule, result);
-            if parallel > 1 {
+            if parallel > 1 && !control {
                 let confirm = race_gym::run(
                     scenario.as_ref(),
-                    &ctx(&out, format!("{run_id}-{n}-confirm"), 0),
+                    &ctx(&out, format!("{run_id}-{n}-confirm{k}"), 0),
                     &limits,
                     Plan::Replay(&result.steps),
                 )

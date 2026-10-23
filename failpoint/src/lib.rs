@@ -413,6 +413,7 @@ fn begin_sync(name: &str, action: &Action, cap: Duration) -> Hold {
             while !go.exists() {
                 if Instant::now() >= deadline {
                     release_by_timeout(name, &go, cap);
+                    park::timed_out(dir, name);
                     break;
                 }
                 std::thread::sleep(park::POLL);
@@ -461,6 +462,7 @@ async fn perform_async(name: &str, action: &Action, cap: Duration) {
             while !go.exists() {
                 if Instant::now() >= deadline {
                     release_by_timeout(name, &go, cap);
+                    park::timed_out(dir, name);
                     break;
                 }
                 tokio::time::sleep(park::POLL).await;
@@ -599,6 +601,35 @@ mod tests {
         // Arming anything but `*:park` turns no note on.
         let map = parse_spec("restore.pre_load:park:/tmp/gym").unwrap();
         assert!(!map.contains_key(EVERY_POINT));
+    }
+
+    /// Each park root gets its own directory (a spec may name several), and a park that
+    /// reaches its cap records that it ran on unreleased.
+    #[test]
+    fn test_park_roots_are_separate_and_a_timeout_is_recorded() {
+        let one = unique_path("root-one");
+        let two = unique_path("root-two");
+        perform_sync(
+            "unit.one",
+            &Action::Park(one.clone()),
+            Duration::from_millis(30),
+        );
+        perform_sync(
+            "unit.two",
+            &Action::Park(two.clone()),
+            Duration::from_millis(30),
+        );
+        for (root, point) in [(&one, "unit.one"), (&two, "unit.two")] {
+            let actor = root.join(format!("actor-{}", std::process::id()));
+            let reached = std::fs::read_to_string(actor.join("000000.reached")).unwrap();
+            assert!(reached.contains(&format!("point={point}\n")), "{reached}");
+            let note = std::fs::read_to_string(actor.join("000001.note")).unwrap();
+            assert!(
+                note.contains("note=park.timeout\n") && note.contains(point),
+                "{note}"
+            );
+            std::fs::remove_dir_all(root).unwrap();
+        }
     }
 
     /// A parked hit announces itself, waits for its go file, and numbers repeat hits of a

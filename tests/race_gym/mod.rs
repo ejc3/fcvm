@@ -265,6 +265,8 @@ struct Actor {
     /// Events not yet consumed by a step, oldest first.
     pending: Vec<Event>,
     status: Status,
+    /// The lock the actor last recorded a wait on, masked (`snapshots/#.lock`).
+    waiting_on: Option<String>,
     trace: Vec<String>,
 }
 
@@ -325,6 +327,7 @@ impl<'a> Run<'a> {
                 parked: Vec::new(),
                 pending: Vec::new(),
                 status: Status::Running,
+                waiting_on: None,
                 trace: Vec::new(),
             });
         }
@@ -345,6 +348,7 @@ impl<'a> Run<'a> {
             Err(_) => Vec::new(),
         };
         entries.sort();
+        let mut timeouts = Vec::new();
         for (idx, actor) in self.actors.iter_mut().enumerate() {
             let prefix = format!("a{idx}-");
             for dir in &entries {
@@ -387,6 +391,17 @@ impl<'a> Run<'a> {
                         });
                         actor.trace.push(label.clone());
                         actor.pending.push(Event::Parked(label));
+                    } else if body.get("note").map(String::as_str) == Some("park.timeout") {
+                        // The hit ran on unreleased: the schedule is no longer the one the
+                        // steps record.
+                        timeouts.push(Failure::new(
+                            "control",
+                            Some(idx),
+                            format!(
+                                "PARK TIMED OUT: actor {idx} at {} ran on without its release",
+                                body.get("detail").cloned().unwrap_or_default()
+                            ),
+                        ));
                     } else if body.get("note").map(String::as_str) == Some("lock.wait") {
                         // The lock's last two path components, ids masked: the path names
                         // this run's content key and VM ids, which a replay does not share.
@@ -404,6 +419,11 @@ impl<'a> Run<'a> {
                     actor.pending.push(Event::Exited(code));
                     actor.status = Status::Exited(code);
                 }
+            }
+        }
+        for failure in timeouts {
+            if !self.failed.contains(&failure) {
+                self.failed.push(failure);
             }
         }
         Ok(())
@@ -439,9 +459,10 @@ impl<'a> Run<'a> {
             let actor = &mut self.actors[idx];
             if !actor.pending.is_empty() {
                 let event = actor.pending.remove(0);
-                if let Event::Waiting(_) = event {
+                if let Event::Waiting(lock) = &event {
                     if !matches!(actor.status, Status::Exited(_)) {
                         actor.status = Status::Waiting;
+                        actor.waiting_on = Some(lock.clone());
                     }
                 }
                 return Ok(event);
@@ -458,16 +479,21 @@ impl<'a> Run<'a> {
         }
     }
 
-    /// Nobody can be released: wait until any actor that is not exited parks or exits.
-    async fn wait_any(&mut self) -> Result<()> {
+    /// Nobody can be released: wait until an actor outside `held` parks, or every actor
+    /// outside it has exited. A held actor's parked hit is not progress: it stays held.
+    async fn wait_any(&mut self, held: &[usize]) -> Result<()> {
         let deadline = Instant::now() + self.limits.step_deadline;
         loop {
             self.scan()?;
-            let progressed = self.actors.iter().any(|a| !a.parked.is_empty())
-                || self
-                    .actors
+            let free = || {
+                self.actors
                     .iter()
-                    .all(|a| matches!(a.status, Status::Exited(_)));
+                    .enumerate()
+                    .filter(|(idx, _)| !held.contains(idx))
+                    .map(|(_, a)| a)
+            };
+            let progressed = free().any(|a| !a.parked.is_empty())
+                || free().all(|a| matches!(a.status, Status::Exited(_)));
             if progressed {
                 return Ok(());
             }
@@ -544,8 +570,31 @@ impl<'a> Run<'a> {
                 return Ok(());
             }
             if !self.lockstep_once(cursor, &[]).await? {
-                self.wait_any().await?;
+                self.wait_any(&[]).await?;
             }
+        }
+    }
+
+    /// Before any release: every actor has parked at its first hit or exited, so the first
+    /// decisions do not depend on which process started faster.
+    async fn barrier(&mut self) -> Result<()> {
+        let deadline = Instant::now() + self.limits.step_deadline;
+        loop {
+            self.scan()?;
+            if self
+                .actors
+                .iter()
+                .all(|a| !a.parked.is_empty() || matches!(a.status, Status::Exited(_)))
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                bail!(
+                    "UNMODELED WAIT: not every actor reached its first point within {:?}",
+                    self.limits.step_deadline
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
@@ -586,10 +635,15 @@ impl<'a> Run<'a> {
                     .iter()
                     .enumerate()
                     .all(|(idx, act)| held.contains(&idx) || act.parked.is_empty());
+                // Only a lock this run owns can be held by a held actor; a shared lock
+                // (state, image cache, setup store) can be held by a concurrent run, which
+                // will let go.
                 let waiting_on_held = blocked
                     && self.actors.iter().enumerate().all(|(idx, act)| {
                         held.contains(&idx)
-                            || matches!(act.status, Status::Waiting | Status::Exited(_))
+                            || matches!(act.status, Status::Exited(_))
+                            || (act.status == Status::Waiting
+                                && act.waiting_on.as_deref().is_some_and(run_owned_lock))
                     });
                 if waiting_on_held {
                     // Everyone else waits on a lock a held actor owns: the targets cannot
@@ -597,7 +651,7 @@ impl<'a> Run<'a> {
                     self.finish_lockstep(&mut cursor).await?;
                     return Ok(false);
                 }
-                self.wait_any().await?;
+                self.wait_any(&held).await?;
             }
         }
         // Release `first` and run it alone until it exits or waits on the other.
@@ -616,7 +670,7 @@ impl<'a> Run<'a> {
                 None => {
                     // Running without a parked hit: another task of the actor is still
                     // going. Wait for it.
-                    self.wait_any().await?;
+                    self.wait_any(&[second]).await?;
                     if self.actors[first].parked.is_empty()
                         && !matches!(self.actors[first].status, Status::Exited(_))
                     {
@@ -654,7 +708,7 @@ impl<'a> Run<'a> {
                 .filter(|&idx| !self.actors[idx].parked.is_empty())
                 .max_by_key(|&idx| priority[idx]);
             let Some(idx) = pick else {
-                self.wait_any().await?;
+                self.wait_any(&[]).await?;
                 continue;
             };
             let label = self.oldest(idx).unwrap();
@@ -700,11 +754,18 @@ impl<'a> Run<'a> {
                 );
             }
         }
-        self.scan()?;
-        if !self.all_exited() {
-            bail!("REPLAY DIVERGED after the last recorded step: some actors have not exited");
+        // A recording waits for the last exits after its final release; so does a replay.
+        let deadline = Instant::now() + self.limits.step_deadline;
+        loop {
+            self.scan()?;
+            if self.all_exited() {
+                return Ok(());
+            }
+            if self.actors.iter().any(|a| !a.parked.is_empty()) || Instant::now() >= deadline {
+                bail!("REPLAY DIVERGED after the last recorded step: some actors have not exited");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        Ok(())
     }
 
     /// Kill what is left after an error, so an aborted schedule leaves nothing running.
@@ -720,6 +781,16 @@ impl<'a> Run<'a> {
             let _ = tokio::time::timeout(Duration::from_secs(60), actor.child.wait()).await;
         }
     }
+}
+
+/// Whether a lock (as a lock-wait event names it, masked) belongs to one run: its snapshot's
+/// generation lock or one of its VMs' directories or state files. Concurrent runs share the
+/// rest (state name and loopback locks, the image cache, the setup store).
+pub fn run_owned_lock(lock: &str) -> bool {
+    lock.starts_with("snapshots/")
+        || lock.starts_with("vm-disks/")
+        || lock.starts_with("vm-#/")
+        || (lock.starts_with("state/vm-") && lock.ends_with(".json.lock"))
 }
 
 fn set_pdeathsig(cmd: &mut tokio::process::Command) {
@@ -807,6 +878,7 @@ pub async fn run(
     let mut run = Run::start(scenario, ctx, limits).await?;
     let mut feasible = true;
     let driven: Result<()> = async {
+        run.barrier().await?;
         match plan {
             Plan::Schedule(Schedule::Lockstep) => run.finish_lockstep(&mut 0).await,
             Plan::Schedule(Schedule::Pair { a, i, b, j, first }) => {

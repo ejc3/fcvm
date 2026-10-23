@@ -340,3 +340,176 @@ kill $bg
     std::fs::remove_dir_all(&root)?;
     Ok(())
 }
+
+/// Shell actors, one per script, for the controller tests below. `park NAME SEQ` and
+/// `note KIND DETAIL SEQ` speak the failpoint protocol under `$PARK/$FCVM_RACE_ACTOR-$$`.
+struct Scripts(Vec<&'static str>);
+
+const PROTOCOL: &str = r#"
+set -u
+dir="$PARK/$FCVM_RACE_ACTOR-$$"; mkdir -p "$dir"
+park() { n=$(printf %06d $2); printf 'point=%s\nhit=1\npid=%s\n' "$1" $$ > "$dir/.$n.tmp"; mv "$dir/.$n.tmp" "$dir/$n.reached"; while [ ! -e "$dir/$n.go" ]; do sleep 0.005; done; }
+note() { n=$(printf %06d $3); printf 'note=%s\ndetail=%s\npid=%s\n' "$1" "$2" $$ > "$dir/.$n.tmp"; mv "$dir/.$n.tmp" "$dir/$n.note"; }
+"#;
+
+impl Scenario for Scripts {
+    fn name(&self) -> &str {
+        "scripts"
+    }
+    fn actors(&self) -> usize {
+        self.0.len()
+    }
+    fn params(&self) -> serde_json::Value {
+        serde_json::json!({})
+    }
+    fn command(&self, run: &RunCtx, idx: usize) -> Result<tokio::process::Command> {
+        let mut cmd = tokio::process::Command::new("bash");
+        cmd.arg("-c")
+            .arg(format!("{PROTOCOL}{}", self.0[idx]))
+            .env("PARK", &run.park_dir)
+            .env("SHARED", run.log_dir.join("shared"));
+        Ok(cmd)
+    }
+    fn end_oracles<'a>(
+        &'a self,
+        _run: &'a RunCtx,
+        exits: &'a [i32],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<Failure>> + Send + 'a>> {
+        Box::pin(async move {
+            exits
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| **c != 0)
+                .map(|(i, c)| Failure::new("outcome", Some(i), format!("exit {c}")))
+                .collect()
+        })
+    }
+}
+
+fn scripts_root(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(format!("race-gym-{name}-{}", std::process::id()))
+}
+
+/// Actor 0 waits on a lock actor 1 holds and exits a moment after actor 1's last release,
+/// with no step of its own. The replay waits for that exit as the recording did.
+#[tokio::test]
+async fn race_gym_a_replay_waits_for_exits_after_its_last_step() -> Result<()> {
+    let root = scripts_root("late-exit");
+    let actors = Scripts(vec![
+        r#"park a.first 0; note lock.wait shared/held.lock 1; while [ ! -e "$SHARED/free" ]; do sleep 0.01; done; sleep 0.3"#,
+        r#"park b.first 0; mkdir -p "$SHARED"; touch "$SHARED/free""#,
+    ]);
+    let limits = Limits {
+        step_deadline: Duration::from_secs(5),
+    };
+    let recorded = race_gym::run(
+        &actors,
+        &ctx(&root, "rec"),
+        &limits,
+        Plan::Schedule(&Schedule::Lockstep),
+    )
+    .await?;
+    assert!(recorded.failed.is_empty(), "{:?}", recorded.failed);
+    for rep in 0..3 {
+        let replayed = race_gym::run(
+            &actors,
+            &ctx(&root, &format!("rep{rep}")),
+            &limits,
+            Plan::Replay(&recorded.steps),
+        )
+        .await?;
+        assert!(
+            replayed.failed.is_empty(),
+            "replay {rep}: {:?}",
+            replayed.failed
+        );
+    }
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// The first release waits until every actor has parked at its first point, so a slow
+/// starter does not change the order of a lock-step run.
+#[tokio::test]
+async fn race_gym_lockstep_starts_when_every_actor_has_parked() -> Result<()> {
+    let root = scripts_root("barrier");
+    let actors = Scripts(vec![
+        r#"park a.one 0; park a.two 1"#,
+        r#"sleep 0.4; park b.one 0; park b.two 1"#,
+    ]);
+    let limits = Limits {
+        step_deadline: Duration::from_secs(5),
+    };
+    let result = race_gym::run(
+        &actors,
+        &ctx(&root, "b"),
+        &limits,
+        Plan::Schedule(&Schedule::Lockstep),
+    )
+    .await?;
+    assert!(result.failed.is_empty(), "{:?}", result.failed);
+    let order: Vec<(usize, &str)> = result
+        .steps
+        .iter()
+        .map(|s| (s.actor, s.release.as_str()))
+        .collect();
+    assert_eq!(
+        order,
+        [
+            (0, "a.one#1"),
+            (1, "b.one#1"),
+            (0, "a.two#1"),
+            (1, "b.two#1")
+        ]
+    );
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// A park that reached its cap and ran on unreleased fails the schedule.
+#[tokio::test]
+async fn race_gym_a_park_timeout_fails_the_schedule() -> Result<()> {
+    let root = scripts_root("park-timeout");
+    let actors = Scripts(vec![r#"park a.one 0; note park.timeout a.two 1"#]);
+    let limits = Limits {
+        step_deadline: Duration::from_secs(5),
+    };
+    let result = race_gym::run(
+        &actors,
+        &ctx(&root, "t"),
+        &limits,
+        Plan::Schedule(&Schedule::Lockstep),
+    )
+    .await?;
+    assert!(
+        result
+            .failed
+            .iter()
+            .any(|f| f.oracle == "control" && f.detail.contains("PARK TIMED OUT")),
+        "{:?}",
+        result.failed
+    );
+    std::fs::remove_dir_all(&root)?;
+    Ok(())
+}
+
+/// Only a lock one run owns can make a pair infeasible; a shared one is waited out.
+#[test]
+fn race_gym_only_run_owned_locks_make_a_pair_infeasible() {
+    for owned in [
+        "snapshots/#.lock",
+        "vm-disks/vm-#",
+        "vm-#/snapshot.lock",
+        "state/vm-#.json.lock",
+    ] {
+        assert!(race_gym::run_owned_lock(owned), "{owned}");
+    }
+    for shared in [
+        "state/names.lock",
+        "state/loopback-ip.lock",
+        "image-cache/#.lock",
+        "rootfs/.rootfs-creation.lock",
+    ] {
+        assert!(!race_gym::run_owned_lock(shared), "{shared}");
+    }
+}
