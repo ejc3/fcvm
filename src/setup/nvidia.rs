@@ -545,7 +545,7 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
 
     // Beside the script, unique to this invocation like it.
     let scrub_source = script_path.with_extension("c");
-    std::fs::write(&scrub_source, GPU_SCRUB_SOURCE).context("writing the GPU scrub source")?;
+    write_scrub_source(&scrub_source)?;
     let stage = format!(
         "{}{}",
         stage_header(config, lib_triplet(arch)?, &image_tmp, &scrub_source),
@@ -595,6 +595,14 @@ async fn build_driver_image(image: &DriverImage, profile_name: &str) -> Result<(
         }
     }
     published
+}
+
+/// Write the scrub source for the build, which may run as the sudo invoker
+/// rather than as this process.
+fn write_scrub_source(path: &Path) -> Result<()> {
+    std::fs::write(path, GPU_SCRUB_SOURCE).context("writing the GPU scrub source")?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))
+        .context("making the GPU scrub source readable")
 }
 
 /// The build tree and script of one driver image build, unique to the invocation
@@ -910,6 +918,21 @@ __attribute__((destructor)) static void report(void) {
         let (code, _, stderr) = run_scrub_against_fake(&[("NO_FAKE", "1")]);
         assert_eq!(code, 1, "{stderr}");
         assert!(stderr.contains("libcuda.so.1"), "{stderr}");
+    }
+
+    /// The build drops to the sudo invoker, so the source must be readable by
+    /// another user whatever this process's umask.
+    #[test]
+    fn the_scrub_source_is_readable_by_the_build_user_under_any_umask() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scrub.c");
+        // nextest runs each test in its own process, so the umask is ours.
+        let old = unsafe { libc::umask(0o077) };
+        let written = write_scrub_source(&path);
+        unsafe { libc::umask(old) };
+        written.unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "mode {mode:o}");
     }
 
     /// fc-agent runs the scrub from the path the stage installs it at.

@@ -255,10 +255,13 @@ pub fn scrub_device(
     sbdf: &str,
     timeout: Duration,
 ) -> Result<ScrubTimings> {
-    scrub_device_with(sysfs, dev, sbdf, timeout, &|device: &Path| {
-        let reset = device.join("reset");
-        std::fs::write(&reset, "1").with_context(|| format!("writing {}", reset.display()))
-    })
+    scrub_device_with(sysfs, dev, sbdf, timeout, &sysfs_reset)
+}
+
+/// The real reset: the kernel's function reset, a bus reset for these GPUs.
+fn sysfs_reset(device: &Path) -> Result<()> {
+    let reset = device.join("reset");
+    std::fs::write(&reset, "1").with_context(|| format!("writing {}", reset.display()))
 }
 
 /// [`scrub_device`] with the reset supplied, so a test can stand in for the
@@ -269,6 +272,20 @@ pub fn scrub_device_with(
     sbdf: &str,
     timeout: Duration,
     reset: &dyn Fn(&Path) -> Result<()>,
+) -> Result<ScrubTimings> {
+    scrub_device_marked(sysfs, dev, sbdf, timeout, reset, &|| Ok(()))
+}
+
+/// The scrub, calling `before_touching` once the checks have passed and the
+/// VFIO group is held, before the GPU is changed in any way. An error from it
+/// ends the scrub with the GPU untouched.
+fn scrub_device_marked(
+    sysfs: &Path,
+    dev: &Path,
+    sbdf: &str,
+    timeout: Duration,
+    reset: &dyn Fn(&Path) -> Result<()>,
+    before_touching: &dyn Fn() -> Result<()>,
 ) -> Result<ScrubTimings> {
     let started = Instant::now();
     let device = sysfs.join("bus/pci/devices").join(sbdf);
@@ -323,6 +340,7 @@ pub fn scrub_device_with(
         }
     };
 
+    before_touching()?;
     // Dropped in reverse order: memory decoding, then power control.
     let _power = hold_in_d0(&device)?;
     let _command = enable_memory_decoding(&device.join("config"))?;
@@ -423,24 +441,59 @@ pub fn read_records(state_dir: &Path) -> Result<Vec<GpuRecord>> {
     Ok(records)
 }
 
-/// Record a scrub's outcome under a lock and return the updated record. A
-/// failure quarantines the GPU; a success lifts a quarantine.
-pub fn record_outcome(
-    state_dir: &Path,
-    sbdf: &str,
-    outcome: &std::result::Result<ScrubTimings, String>,
-) -> Result<GpuRecord> {
+/// Take the GPU's record lock, `<state_dir>/<sbdf>.lock`. A scrub holds it
+/// from before it touches the GPU until its outcome is written.
+fn lock_gpu(state_dir: &Path, sbdf: &str) -> Result<std::fs::File> {
     use fs2::FileExt as _;
     std::fs::create_dir_all(state_dir)
         .with_context(|| format!("creating {}", state_dir.display()))?;
-    let lock = std::fs::File::create(state_dir.join(".lock"))
-        .with_context(|| format!("creating the lock in {}", state_dir.display()))?;
+    let path = state_dir.join(format!("{sbdf}.lock"));
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("opening {}", path.display()))?;
     lock.lock_exclusive()
-        .with_context(|| format!("locking {}", state_dir.display()))?;
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(lock)
+}
+
+/// Publish `record` atomically and durably: a synced temporary file renamed
+/// over the old one, then the directory synced so the rename itself survives
+/// a crash.
+fn write_record(state_dir: &Path, record: &GpuRecord) -> Result<()> {
+    let path = record_path(state_dir, &record.sbdf);
+    let tmp = state_dir.join(format!(".{}.json.{}", record.sbdf, uuid::Uuid::new_v4()));
+    let mut file =
+        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
+    file.write_all(serde_json::to_string_pretty(record)?.as_bytes())?;
+    file.sync_all()?;
+    std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
+    std::fs::File::open(state_dir)
+        .and_then(|dir| dir.sync_all())
+        .with_context(|| format!("syncing {}", state_dir.display()))
+}
+
+/// Read, change and write a GPU's record. The caller holds its lock.
+fn update_record(
+    state_dir: &Path,
+    sbdf: &str,
+    change: impl FnOnce(&mut GpuRecord),
+) -> Result<GpuRecord> {
     let mut record = read_record(state_dir, sbdf)?.unwrap_or_else(|| GpuRecord {
         sbdf: sbdf.to_string(),
         ..Default::default()
     });
+    change(&mut record);
+    record.updated = Some(chrono::Utc::now().to_rfc3339());
+    write_record(state_dir, &record)?;
+    Ok(record)
+}
+
+/// Apply a scrub's outcome to a record: a failure quarantines the GPU, a
+/// success lifts the quarantine.
+fn apply_outcome(record: &mut GpuRecord, outcome: &std::result::Result<ScrubTimings, String>) {
     match outcome {
         Ok(timings) => {
             record.scrubs += 1;
@@ -455,15 +508,112 @@ pub fn record_outcome(
             record.last_scrub = None;
         }
     }
-    record.updated = Some(chrono::Utc::now().to_rfc3339());
-    let path = record_path(state_dir, sbdf);
-    let tmp = state_dir.join(format!(".{sbdf}.json.{}", uuid::Uuid::new_v4()));
-    let mut file =
-        std::fs::File::create(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
-    file.write_all(serde_json::to_string_pretty(&record)?.as_bytes())?;
-    file.sync_all()?;
-    std::fs::rename(&tmp, &path).with_context(|| format!("publishing {}", path.display()))?;
-    Ok(record)
+}
+
+/// Record a scrub's outcome under the GPU's lock and return the record.
+pub fn record_outcome(
+    state_dir: &Path,
+    sbdf: &str,
+    outcome: &std::result::Result<ScrubTimings, String>,
+) -> Result<GpuRecord> {
+    let _lock = lock_gpu(state_dir, sbdf)?;
+    update_record(state_dir, sbdf, |record| apply_outcome(record, outcome))
+}
+
+/// What one `fcvm gpu scrub` did to one GPU.
+#[derive(Debug, Serialize)]
+pub struct ScrubReport {
+    pub sbdf: String,
+    /// `scrubbed`, `failed` (now quarantined) or `busy` (a VM holds the GPU;
+    /// nothing was done and nothing recorded).
+    pub outcome: &'static str,
+    pub error: Option<String>,
+    pub timings: Option<ScrubTimings>,
+    /// The GPU's record after this scrub; absent when busy.
+    pub record: Option<GpuRecord>,
+}
+
+/// Scrub one GPU and record the outcome under `state_dir`: the call the
+/// fleet agent makes, and what `fcvm gpu scrub` runs for each GPU.
+pub fn scrub_and_record(
+    sysfs: &Path,
+    dev: &Path,
+    state_dir: &Path,
+    sbdf: &str,
+    timeout: Duration,
+) -> ScrubReport {
+    scrub_and_record_with(sysfs, dev, state_dir, sbdf, timeout, &sysfs_reset)
+}
+
+/// [`scrub_and_record`] with the reset supplied, for tests.
+///
+/// The GPU's lock is held from before the GPU is touched until the outcome is
+/// written, and before the GPU is touched its record is marked quarantined
+/// ("a scrub started and has not recorded its outcome"). So the record always
+/// holds the latest scrub's outcome, and a scrub that dies, or cannot write its
+/// outcome, leaves the GPU refused. A scrub that cannot write the mark does not
+/// touch the GPU.
+pub fn scrub_and_record_with(
+    sysfs: &Path,
+    dev: &Path,
+    state_dir: &Path,
+    sbdf: &str,
+    timeout: Duration,
+    reset: &dyn Fn(&Path) -> Result<()>,
+) -> ScrubReport {
+    let failed = |error: String| ScrubReport {
+        sbdf: sbdf.to_string(),
+        outcome: "failed",
+        error: Some(error),
+        timings: None,
+        record: None,
+    };
+    let _lock = match lock_gpu(state_dir, sbdf) {
+        Ok(lock) => lock,
+        Err(error) => return failed(format!("{error:#}; the GPU was not touched")),
+    };
+    let mark = || {
+        update_record(state_dir, sbdf, |record| {
+            record.quarantined = true;
+            record.last_error = Some(format!(
+                "a scrub started at {} and has not recorded its outcome",
+                chrono::Utc::now().to_rfc3339()
+            ));
+        })
+        .map(|_| ())
+        .context("marking the GPU as being scrubbed; the GPU was not touched")
+    };
+    let result = scrub_device_marked(sysfs, dev, sbdf, timeout, reset, &mark);
+    if let Err(error) = &result {
+        if let Some(busy) = error.downcast_ref::<GpuBusy>() {
+            return ScrubReport {
+                sbdf: sbdf.to_string(),
+                outcome: "busy",
+                error: Some(busy.to_string()),
+                timings: None,
+                record: None,
+            };
+        }
+    }
+    let outcome = result.map_err(|error| format!("{error:#}"));
+    match update_record(state_dir, sbdf, |record| apply_outcome(record, &outcome)) {
+        Ok(record) => ScrubReport {
+            sbdf: sbdf.to_string(),
+            outcome: if outcome.is_ok() {
+                "scrubbed"
+            } else {
+                "failed"
+            },
+            error: outcome.as_ref().err().cloned(),
+            timings: outcome.ok(),
+            record: Some(record),
+        },
+        // The mark written before the GPU was touched still quarantines it.
+        Err(record_error) => failed(format!(
+            "{}recording the outcome failed: {record_error:#}",
+            outcome.err().map(|e| format!("{e}; ")).unwrap_or_default()
+        )),
+    }
 }
 
 /// Refuse a quarantined GPU. Called for every `--gpu` before the VM starts.
@@ -669,6 +819,93 @@ mod tests {
         std::fs::remove_file(fake.device().join("driver")).unwrap();
         let error = format!("{:#}", fake.scrub().unwrap_err());
         assert!(error.contains("not vfio-pci"), "{error}");
+    }
+
+    /// The scrub runs under the GPU's record lock from before the reset until
+    /// its outcome is written, so a later scrub's outcome cannot be overwritten
+    /// by an earlier one's; and from before the reset the record says the GPU
+    /// is not clean, so a scrub that dies or cannot record leaves it refused.
+    #[test]
+    fn the_scrub_marks_the_gpu_and_holds_its_lock_until_the_outcome_is_recorded() {
+        use fs2::FileExt as _;
+        let fake = Fake::new();
+        let state = fake.root.path().join("gpu-state");
+        let sbdf = "0000:18:00.0";
+        record_outcome(&state, sbdf, &Ok(ScrubTimings::default())).unwrap();
+        let during = std::cell::RefCell::new(None);
+        let report = scrub_and_record_with(
+            &fake.root.path().join("sys"),
+            &fake.root.path().join("dev"),
+            &state,
+            sbdf,
+            Duration::from_millis(50),
+            &|device: &Path| {
+                let lock = std::fs::OpenOptions::new()
+                    .create(true)
+                    .truncate(false)
+                    .write(true)
+                    .open(state.join(format!("{sbdf}.lock")))?;
+                let held = lock.try_lock_exclusive().is_err();
+                let marked = read_record(&state, sbdf)?.map(|r| r.quarantined);
+                *during.borrow_mut() = Some((held, marked));
+                std::fs::write(device.join("reset"), "1")?;
+                fake.set(RESET_SCRATCH, 0);
+                Ok(())
+            },
+        );
+        assert_eq!(report.outcome, "scrubbed", "{:?}", report.error);
+        assert_eq!(
+            *during.borrow(),
+            Some((true, Some(true))),
+            "during the reset the lock must be held and the GPU marked unclean"
+        );
+        let after = read_record(&state, sbdf).unwrap().unwrap();
+        assert!(!after.quarantined);
+        assert_eq!((after.scrubs, after.failures), (2, 0));
+    }
+
+    /// A scrub that cannot record that it started does not touch the GPU.
+    #[test]
+    fn a_scrub_that_cannot_mark_the_gpu_does_not_reset_it() {
+        let fake = Fake::new();
+        let state = fake.root.path().join("not-a-directory");
+        std::fs::write(&state, "").unwrap();
+        let reset = std::cell::Cell::new(false);
+        let report = scrub_and_record_with(
+            &fake.root.path().join("sys"),
+            &fake.root.path().join("dev"),
+            &state,
+            "0000:18:00.0",
+            Duration::from_millis(50),
+            &|_: &Path| {
+                reset.set(true);
+                Ok(())
+            },
+        );
+        assert_eq!(report.outcome, "failed");
+        assert!(
+            !reset.get(),
+            "the GPU was reset with no record saying a scrub had started"
+        );
+    }
+
+    /// A record is published by rename, and the directory is synced after
+    /// it, or a crash can bring back the record the rename replaced.
+    #[test]
+    fn a_published_record_is_synced_with_its_directory() {
+        let code = include_str!("scrub.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap();
+        let body = &code[code
+            .find("fn write_record(")
+            .expect("records are not written by write_record")..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let rename = body.find("std::fs::rename(").expect("no rename");
+        let dir_sync = body[rename..]
+            .find("File::open(state_dir)")
+            .expect("the directory is not synced after the rename");
+        assert!(body[rename + dir_sync..].contains(".sync_all()"));
     }
 
     #[test]

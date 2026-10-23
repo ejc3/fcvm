@@ -2489,9 +2489,12 @@ finished; the scrub follows NVIDIA's gpu-admin-tools `--reset-with-sbr
 
 1. Refuse unless the GPU is NVIDIA, on vfio-pci, and its `reset_method` is
    `bus`.
-2. Open the GPU's VFIO group and hold it for the whole scrub. A group has one
-   opener, so no VM can open the GPU mid-scrub, and a GPU a VM still holds is
-   reported `busy` and left alone.
+2. Take the GPU's record lock and open its VFIO group, and hold both until the
+   outcome is written. A group has one opener, so no VM can open the GPU
+   mid-scrub, and a GPU a VM still holds is reported `busy` and left alone.
+   Before touching the GPU, mark its record quarantined ("a scrub started and
+   has not recorded its outcome"); a scrub that cannot write that mark stops
+   there, and one that dies leaves the GPU refused.
 3. Set `power/control` to `on` (vfio-pci lets an idle GPU suspend to D3, where
    BAR0 reads all ones) and enable memory decoding; both are restored after.
 4. Check `PMC_BOOT_0` names Turing, Ampere or Ada; set VBIOS scratch 22
@@ -2508,7 +2511,11 @@ quarantined GPU, so `podman run --gpu` and `snapshot run --gpu` do not hand it
 out until a later scrub of it succeeds. An unreadable record also refuses.
 `fcvm gpu scrub` prints one JSON line per GPU with `outcome` `scrubbed`,
 `failed` or `busy` and exits 1 unless every GPU was scrubbed; `fcvm gpu
-status` prints every record. Only root runs the scrub.
+status` prints every record. Only root runs the scrub. Records are written to a
+synced temporary file, renamed, and the directory synced. One window is left
+(#1164): a launch whose quarantine check ran before a scrub started, and whose
+VMM opens the GPU after that scrub failed, gets the GPU; the in-guest scrub
+still zeroes it.
 
 **Measuring it.** `make gpu-residue-test GPU=<sbdf>` (`scripts/gpu-residue/`):
 VM A fills all the memory it can allocate with 16-byte records (a 64-bit

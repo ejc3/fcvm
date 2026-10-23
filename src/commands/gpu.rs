@@ -7,71 +7,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use anyhow::Result;
-use serde::Serialize;
 
 use crate::cli::{GpuArgs, GpuCommands};
-use crate::gpu::scrub::{self, GpuBusy, GpuRecord, ScrubTimings};
-
-/// What one `fcvm gpu scrub` did to one GPU.
-#[derive(Debug, Serialize)]
-pub struct ScrubReport {
-    pub sbdf: String,
-    /// `scrubbed`, `failed` (now quarantined) or `busy` (a VM holds the GPU;
-    /// nothing was done and nothing recorded).
-    pub outcome: &'static str,
-    pub error: Option<String>,
-    pub timings: Option<ScrubTimings>,
-    /// The GPU's record after this scrub; absent when busy.
-    pub record: Option<GpuRecord>,
-}
-
-/// Scrub one GPU and record the outcome under `state_dir`.
-pub fn scrub_and_record(
-    sysfs: &Path,
-    dev: &Path,
-    state_dir: &Path,
-    sbdf: &str,
-    timeout: Duration,
-) -> ScrubReport {
-    let result = scrub::scrub_device(sysfs, dev, sbdf, timeout);
-    if let Err(error) = &result {
-        if let Some(busy) = error.downcast_ref::<GpuBusy>() {
-            return ScrubReport {
-                sbdf: sbdf.to_string(),
-                outcome: "busy",
-                error: Some(busy.to_string()),
-                timings: None,
-                record: None,
-            };
-        }
-    }
-    let outcome = result.map_err(|error| format!("{error:#}"));
-    let (label, error, timings) = match &outcome {
-        Ok(timings) => ("scrubbed", None, Some(timings.clone())),
-        Err(error) => ("failed", Some(error.clone()), None),
-    };
-    // If the outcome cannot be recorded, a failure cannot quarantine the GPU,
-    // so report the scrub as failed either way.
-    match scrub::record_outcome(state_dir, sbdf, &outcome) {
-        Ok(record) => ScrubReport {
-            sbdf: sbdf.to_string(),
-            outcome: label,
-            error,
-            timings,
-            record: Some(record),
-        },
-        Err(record_error) => ScrubReport {
-            sbdf: sbdf.to_string(),
-            outcome: "failed",
-            error: Some(format!(
-                "{}recording the outcome failed: {record_error:#}",
-                error.map(|e| format!("{e}; ")).unwrap_or_default()
-            )),
-            timings,
-            record: None,
-        },
-    }
-}
+use crate::gpu::scrub::{self, GpuRecord};
 
 pub async fn cmd_gpu(args: GpuArgs) -> Result<()> {
     let state_dir = scrub::state_dir();
@@ -93,7 +31,7 @@ pub async fn cmd_gpu(args: GpuArgs) -> Result<()> {
                         .map(|sbdf| {
                             let state_dir = &state_dir;
                             scope.spawn(move || {
-                                scrub_and_record(
+                                scrub::scrub_and_record(
                                     Path::new("/sys"),
                                     Path::new("/dev"),
                                     state_dir,

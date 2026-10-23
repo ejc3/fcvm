@@ -184,19 +184,24 @@ int main(int argc, char **argv) {
     scan_all(host);
     size_t bytes = sum(chunks);
     // Positive control, after the count: write one marker into the last
-    // allocation and scan again. The scan must see exactly one more, or a 0
-    // above says nothing about this allocation path.
+    // allocation and scan again. The scan must see one more, or a 0 above says
+    // nothing about this allocation path; one more unless the overwritten word
+    // was already the marker (a previous tenant's).
     if (chunks.empty()) {
       fprintf(stderr, "allocated nothing\n");
       return 3;
     }
+    uint64_t before = 0;
+    CHECK(cudaMemcpy(&before, chunks.back().ptr, sizeof before,
+                     cudaMemcpyDeviceToHost));
     CHECK(cudaMemcpy(chunks.back().ptr, &MARKER, sizeof MARKER,
                      cudaMemcpyHostToDevice));
     unsigned long long again[2];
     scan_all(again);
-    if (again[0] != host[0] + 1) {
-      fprintf(stderr, "control: wrote 1 marker, scan went from %llu to %llu\n",
-              host[0], again[0]);
+    unsigned long long expected = host[0] + (before != MARKER ? 1 : 0);
+    if (again[0] != expected) {
+      fprintf(stderr, "control: wrote 1 marker, scan went from %llu to %llu, expected %llu\n",
+              host[0], again[0], expected);
       return 3;
     }
     printf("RESULT mode=%s gpu=\"%s\" bytes=%zu total=%zu free_before=%zu "

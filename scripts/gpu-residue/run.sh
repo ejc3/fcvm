@@ -38,7 +38,7 @@ CASES=${CASES:-same-vm exit kill}
 MODES=${MODES:-runtime driver managed}
 HERE=$(cd "$(dirname "$0")" && pwd)
 
-for tool in podman jq; do
+for tool in podman jq bc column; do
   command -v "$tool" >/dev/null || { echo "BLOCKED: $tool missing" >&2; exit 2; }
 done
 [ -x "$FCVM" ] || { echo "BLOCKED: no fcvm binary at $FCVM (make build)" >&2; exit 2; }
@@ -67,6 +67,18 @@ wait_gpu_released() {
 
 VM=(podman run --kernel-profile gpu --gpu "$GPU" --map "$OUT/tools:/tools")
 
+# A background VM A (the kill case) is stopped on any exit, so a run that
+# stops early does not leave it holding the GPU.
+apid=
+stop_a() {
+  if [ -n "$apid" ] && kill -0 "$apid" 2>/dev/null; then
+    kill -9 "$apid"
+    wait "$apid" 2>/dev/null || true
+  fi
+  apid=
+}
+trap stop_a EXIT
+
 printf 'case\tmode\tbytes\tmarker_words\tmarker_fraction\tnonzero_fraction\tscrub_ms\thost_clear_s\n' > "$OUT/summary.tsv"
 n=0
 for case in $CASES; do
@@ -94,10 +106,9 @@ for case in $CASES; do
         sleep 0.5
       done
       grep -q FILLED "$alog" || { echo "A never reported FILLED; see $alog" >&2; exit 1; }
-      kill -9 "$apid"
-      wait "$apid" || true
+      stop_a
     fi
-    grep -o 'FILLED.*' "$alog" | head -1
+    grep -o 'FILLED.*' "$alog" | head -1 || { echo "A printed no FILLED; see $alog" >&2; exit 1; }
     wait_gpu_released
     if [ "$case" != same-vm ] && [ -n "${HOST_CLEAR:-}" ]; then
       started=$(date +%s.%N)
@@ -109,12 +120,14 @@ for case in $CASES; do
       echo "== $case/$mode: B scans"
       "$FCVM" "${VM[@]}" --name "$tag-b" "$RUN_IMAGE" /tools/gpu-residue scan "$mode" > "$blog" 2>&1
     fi
-    result=$(grep -o 'RESULT .*' "$blog" | head -1)
+    result=$(grep -o 'RESULT .*' "$blog" | head -1 || true)
     [ -n "$result" ] || { echo "B printed no RESULT; see $blog" >&2; exit 1; }
     echo "   $result"
     field() { sed -n "s/.* $1=\([^ ]*\).*/\1/p" <<<"$result"; }
-    # The restore ACK's gpu_steps.scrub_ms, when fc-agent scrubbed the GPU.
-    scrub=$(grep -o '"scrub_ms":[0-9.]*' "$blog" | head -1 | cut -d: -f2 || true)
+    # The restore ACK's gpu_steps.scrub_ms, when fc-agent scrubbed the GPU: the
+    # restored record is a JSON line in B's log.
+    scrub=$(jq -rR 'fromjson? | select(type == "object" and has("ack_ms"))
+      | .guest_phases.gpu_steps.scrub_ms // empty' "$blog" | head -1 || true)
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$case" "$mode" "$(field bytes)" \
       "$(field marker_words)" "$(field marker_fraction)" "$(field nonzero_fraction)" \
       "${scrub:--}" "$clear_s" >> "$OUT/summary.tsv"
