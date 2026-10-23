@@ -13,8 +13,8 @@ import { Encoder, FFMPEG } from "./encoder.ts";
 import type { PatternScene } from "./pattern.ts";
 import { RenderPool } from "./render-pool.ts";
 
-function groupsAlive(subs: Set<{ tile: string; width: number; height: number }>, key: string): boolean {
-  for (const s of subs) if (`${s.tile}|${s.width}x${s.height}` === key) return true;
+function groupsAlive(subs: Set<{ tile: string; geomKey: string }>, key: string): boolean {
+  for (const s of subs) if (`${s.tile}|${s.geomKey}` === key) return true;
   return false;
 }
 
@@ -25,6 +25,8 @@ export interface RendererOptions {
   port: number;
   /** Host name the browser uses to reach this server, for frame_url. */
   publicHost: string;
+  /** The port the browser reaches it on, when that is not its own (a proxy in front). */
+  publicPort?: number;
   fps: number;
   threads: number;
   maxHeight: number;
@@ -43,6 +45,8 @@ interface TileEntry {
   skew: number;
   /** A scene of its own (a viewer's own GPU, with its own camera), or null for the shared one. */
   scene: (() => PatternScene) | null;
+  /** A re-tile: the rectangle this stream draws from scene t `atT` on. */
+  pending: { rect: Rect; atT: number } | null;
 }
 
 /** The renderer's q levels as libx264 quality: hi, std (the default), lo. */
@@ -55,6 +59,10 @@ interface Sub {
   width: number;
   height: number;
   geometry: TileGeometry | null;
+  /** The height the subscriber asked for. */
+  reqH: number;
+  /** Where the encoder's frames sit in the image; a frame drawn for another placement is not sent. */
+  geomKey: string;
   encoder: Encoder | null;
   /** Stamps of frames written to the encoder, oldest first. */
   stamps: { t: number; frame: number }[];
@@ -126,12 +134,21 @@ export class MockRenderers {
   }
 
   frameUrl(id: string): string {
-    return `ws://${this.opts.publicHost}:${this.port}/frames/${id}`;
+    return `ws://${this.opts.publicHost}:${this.opts.publicPort ?? this.port}/frames/${id}`;
   }
 
   setTile(id: string, rect: Rect, black: () => Rect[] = () => [], scene: (() => PatternScene) | null = null): void {
     const e = this.tiles.get(id);
-    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0, black, scene });
+    this.tiles.set(id, { rect, available: e?.available ?? true, skew: e?.skew ?? 0, black, scene, pending: null });
+    if (e && (e.rect.x !== rect.x || e.rect.y !== rect.y || e.rect.w !== rect.w || e.rect.h !== rect.h)) {
+      for (const s of this.subs) if (s.tile === id) this.resize(s, s.reqH);
+    }
+  }
+
+  /** A re-tile: from scene t `atT` on, the stream draws `rect` (a new header and keyframe then). */
+  retile(id: string, rect: Rect, atT: number): void {
+    const e = this.tiles.get(id);
+    if (e) e.pending = { rect, atT };
   }
 
   /** Forget a stream (a viewer's own GPU went back to the pool) and close its sockets. */
@@ -183,7 +200,7 @@ export class MockRenderers {
   }
 
   private subscribe(ws: WebSocket, tile: string, h: number, q: string): void {
-    const sub: Sub = { q, ws, tile, width: 0, height: 0, geometry: null, encoder: null, stamps: [], sentKey: false };
+    const sub: Sub = { q, ws, tile, width: 0, height: 0, geometry: null, reqH: h, geomKey: "", encoder: null, stamps: [], sentKey: false };
     this.subs.add(sub);
     this.stats.subscribers = this.subs.size;
     this.resize(sub, h);
@@ -191,7 +208,10 @@ export class MockRenderers {
       if (isBinary) return;
       try {
         const m = JSON.parse(data.toString()) as { h?: unknown };
-        if (typeof m.h === "number") this.resize(sub, m.h);
+        if (typeof m.h === "number") {
+          sub.reqH = m.h;
+          this.resize(sub, m.h);
+        }
       } catch {
         // Not a control message; ignored.
       }
@@ -220,7 +240,9 @@ export class MockRenderers {
       y0: tile.y0 - crop.top,
     };
     const { width, height } = geometry;
-    if (sub.encoder && width === sub.width && height === sub.height) return;
+    const key = JSON.stringify(geometry);
+    if (sub.encoder && key === sub.geomKey) return;
+    sub.geomKey = key;
     sub.encoder?.close();
     sub.width = width;
     sub.height = height;
@@ -275,23 +297,30 @@ export class MockRenderers {
     if (n <= this.lastFrame) return;
     this.lastFrame = n;
     const t = n / fps;
+    // Re-tiles due at this frame take effect before it is drawn.
+    for (const [id, e] of this.tiles) {
+      if (!e.pending || t < e.pending.atT - 1e-9) continue;
+      e.rect = e.pending.rect;
+      e.pending = null;
+      for (const s of this.subs) if (s.tile === id) this.resize(s, s.reqH);
+    }
     this.stats.renderBacklog = this.pool.backlog;
     const groups = new Map<string, Sub[]>();
     for (const s of this.subs) {
       if (!s.encoder) continue;
-      const key = `${s.tile}|${s.width}x${s.height}`;
-      const g = groups.get(key);
+      const gk = `${s.tile}|${s.geomKey}`;
+      const g = groups.get(gk);
       if (g) g.push(s);
-      else groups.set(key, [s]);
+      else groups.set(gk, [s]);
     }
     const scene = this.opts.scene();
-    for (const [key, subs] of groups) {
+    for (const [laneKey, subs] of groups) {
       // Several frames of one stream are drawn at once on the pool, and delivered
       // to the encoder in frame order.
       // Only a stream whose frame takes longer to draw than a frame period gets
       // more than one in flight; the rest keep the shortest latency.
-      const lane = this.lanes.get(key) ?? { inflight: 0, tail: Promise.resolve(), lastMs: 0 };
-      this.lanes.set(key, lane);
+      const lane = this.lanes.get(laneKey) ?? { inflight: 0, tail: Promise.resolve(), lastMs: 0 };
+      this.lanes.set(laneKey, lane);
       const allowed = Math.min(MAX_INFLIGHT, Math.max(1, Math.ceil(lane.lastMs / (1000 / fps))));
       if (lane.inflight >= allowed) {
         this.stats.framesSkipped += subs.length;
@@ -300,10 +329,9 @@ export class MockRenderers {
       const s0 = subs[0]!;
       const entry = this.tiles.get(s0.tile);
       if (!entry || !entry.available) continue;
-      // The size this frame is drawn at: a subscriber that changed height while
-      // it was drawn has a new encoder and must not get it.
-      const width = s0.width;
-      const height = s0.height;
+      // The placement this frame is drawn for: a subscriber whose height or
+      // rectangle changed while it was drawn has a new encoder and must not get it.
+      const key = s0.geomKey;
       const geometry = s0.geometry!;
       lane.inflight++;
       const started = Date.now();
@@ -315,7 +343,7 @@ export class MockRenderers {
         .then(async ([buf]) => {
           if (this.opts.holdMs) await new Promise((r) => setTimeout(r, this.opts.holdMs));
           for (const s of subs) {
-            if (!this.subs.has(s) || s.width !== width || s.height !== height || !s.encoder) continue;
+            if (!this.subs.has(s) || s.geomKey !== key || !s.encoder) continue;
             if (s.ws.bufferedAmount > 4 << 20) {
               this.stats.framesSkipped++;
               continue;
@@ -329,7 +357,7 @@ export class MockRenderers {
         })
         .finally(() => {
           lane.inflight--;
-          if (lane.inflight === 0 && !groupsAlive(this.subs, key)) this.lanes.delete(key);
+          if (lane.inflight === 0 && !groupsAlive(this.subs, laneKey)) this.lanes.delete(laneKey);
         });
     }
   }

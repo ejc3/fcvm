@@ -6,7 +6,7 @@
 // which holds it until the Turnstile check passes when the coordinator asks for one.
 
 import { useEffect, useRef, useState } from "react";
-import type { WallView } from "../../core/index.ts";
+import { wordArgs, type WallView } from "../../core/index.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import type { WallClient } from "./wall-client.ts";
 
@@ -32,7 +32,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
   const [word, setWord] = useState("");
   const panel = useRef<HTMLElement | null>(null);
   const iso = view.isolation;
-  const todTimer = useRef<{ last: number; pending: number | null; timer: ReturnType<typeof setTimeout> | null }>({ last: 0, pending: null, timer: null });
 
   useEffect(() => {
     const target = section ? panel.current?.querySelector<HTMLElement>(`#${section}-title`) : null;
@@ -48,20 +47,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, section]);
-
-  const sendTod = (v: number) => {
-    const s = todTimer.current;
-    s.pending = v;
-    const go = () => {
-      if (s.pending === null) return;
-      client.act("time_of_day", { v: s.pending });
-      s.pending = null;
-      s.last = performance.now();
-      s.timer = null;
-    };
-    if (performance.now() - s.last > 150) go();
-    else if (!s.timer) s.timer = setTimeout(go, 150);
-  };
 
   return (
     <aside ref={panel} className="drawer" role="dialog" aria-modal="false" aria-labelledby="play-title" data-testid="drawer">
@@ -102,7 +87,7 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
             e.preventDefault();
             const text = word.trim();
             if (text === "") return;
-            client.act("word", { text });
+            client.act("word", wordArgs(text, client.getState().ui.textStyle));
             setWord("");
           }}
         >
@@ -124,6 +109,22 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
             {p.word.submit}
           </button>
         </form>
+        <fieldset className="styles" data-testid="text-style">
+          <legend>{p.word.style.legend}</legend>
+          {p.word.style.options.map((o) => (
+            <label key={o.value} className={`style-option${o.selected ? " selected" : ""}`} data-testid={`text-style-${o.value}`}>
+              <input
+                type="radio"
+                name="text-style"
+                value={o.value}
+                checked={o.selected}
+                onChange={() => client.ui({ textStyle: o.value })}
+              />
+              <img src={o.thumb} alt={o.alt} width={96} height={54} />
+              <span>{o.label}</span>
+            </label>
+          ))}
+        </fieldset>
         <p className={`word-status ${p.word.statusKind}`} role="status" data-testid="word-status">
           {p.word.status}
         </p>
@@ -141,21 +142,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
         >
           {p.light.label}
         </button>
-      </section>
-      <section className="field">
-        <label htmlFor="tod">{p.timeOfDay.label}</label>
-        <input
-          id="tod"
-          type="range"
-          min={p.timeOfDay.min}
-          max={p.timeOfDay.max}
-          step={p.timeOfDay.step}
-          value={p.timeOfDay.value}
-          aria-valuetext={p.timeOfDay.valueText}
-          disabled={p.disabled}
-          onChange={(e) => sendTod(Number(e.target.value))}
-        />
-        <span className="value">{p.timeOfDay.valueText}</span>
       </section>
       <section>
         <button

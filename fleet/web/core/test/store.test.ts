@@ -45,7 +45,7 @@ describe("protocol parsing", () => {
 describe("snapshots", () => {
   it("drops a snapshot older than the last accepted, and a repeat of it", () => {
     let s = feed(initialState(), snapshotText(5, fleet()));
-    const older = fleet(2, 2, { viewers: { count: 99 } });
+    const older = fleet(2, 2, { viewers: { count: 99, active: 99 } });
     s = feed(s, snapshotText(4, older));
     expect(s.version).toBe(5);
     expect(s.accepted!.viewers.count).toBe(2);
@@ -59,7 +59,7 @@ describe("snapshots", () => {
 describe("intents and receipts", () => {
   it("keeps an intent pending until its receipt and its version both arrive", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "relaunch_all"), at: EPOCH });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "restart_now"), at: EPOCH });
     expect(s.pending).toHaveLength(1);
     s = feed(s, JSON.stringify({ type: "receipt", id: "a", outcome: "applied", version: 2 }));
     expect(s.pending).toHaveLength(1); // receipt seen, snapshot 2 not yet
@@ -69,7 +69,7 @@ describe("intents and receipts", () => {
 
   it("settles at once when the receipt's version is already accepted", () => {
     let s = feed(initialState(), snapshotText(3, fleet()));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "relaunch_all"), at: EPOCH });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "restart_now"), at: EPOCH });
     s = feed(s, JSON.stringify({ type: "receipt", id: "a", outcome: "applied", version: 3 }));
     expect(s.pending).toHaveLength(0);
   });
@@ -101,7 +101,7 @@ describe("intents and receipts", () => {
 
   it("resends only the intents with no receipt after a reconnect", () => {
     let s = feed(initialState(), snapshotText(1, fleet()));
-    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "relaunch_all"), at: EPOCH });
+    s = reduce(s, { type: "intent-sent", intent: makeIntent("a", "restart_now"), at: EPOCH });
     s = reduce(s, { type: "intent-sent", intent: makeIntent("b", "word", { text: "x" }), at: EPOCH });
     s = feed(s, JSON.stringify({ type: "receipt", id: "a", outcome: "applied", version: 2 }));
     expect(intentsToResend(s).map((i) => i.id)).toEqual(["b"]);
@@ -149,8 +149,8 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
       aggregates: [{ id: "agg:example-host", half: "fcvm", host: "example-host", rect: { x: 0, y: 0, w: 0.5, h: 1 }, frame_url: null, tiles: ["fcvm:1"] }],
       settings: { auto_relaunch_secs: null },
       relaunch_all: { started_at: 1761134400000, by: "viewer:v-4", fcvm_done_at: null, ec2_done_at: null, fcvm_last: null, ec2_last: null, fcvm_pending: 8, ec2_pending: 0 },
-      viewers: { count: 3 },
-      actions: [{ at: 1761134400000, viewer: "v-4", id: "i-1", name: "relaunch_all", args: {}, summary: "relaunch all (8 tiles)", outcome: "committed" }],
+      viewers: { count: 3, active: 2 },
+      actions: [{ at: 1761134400000, viewer: "v-4", id: "i-1", name: "restart_now", args: {}, summary: "race 1", outcome: "committed" }],
     },
   };
 
@@ -164,13 +164,14 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     expect(st.tiles[1]).toMatchObject({ phase: "waiting_capacity", slot: null, gpu: null });
     expect(st.scene.lights[0]!.color).toBe("#ffbc00");
     expect(st.scene.camera[0]).toEqual({ t: 0, pos: [0, 2, 0], look: [0, 1.5, -10], fov_deg: 60 });
-    expect(st.actions[0]).toMatchObject({ summary: "relaunch all (8 tiles)", outcome: "committed", args: {} });
+    expect(st.actions[0]).toMatchObject({ summary: "race 1", outcome: "committed", args: {} });
     // Fields the second design review adds are absent from this document: read as none.
     expect(st.scoreboard).toEqual({ fcvm: null, ec2: null });
     expect(st.next_race_at).toBeNull();
     expect(st.borrow).toBeNull();
     expect(st.counters).toBeNull();
-    expect(st.security).toEqual({ gpu_scrub: false });
+    expect(st.failures).toEqual([]);
+    expect(st.viewers).toEqual({ count: 3, active: 2 });
   });
 
   it("takes a committed receipt as applied and an error message as the coordinator's error", () => {
@@ -188,7 +189,7 @@ describe("the coordinator's documented snapshot (fleet/PROTOCOL.md)", () => {
     const s = feed(feed(initialState(), JSON.stringify({ type: "hello", viewer: "v-17" })), JSON.stringify(doc));
     expect(s.you).toBe("v-17");
     expect(s.turnstile.sitekey).toBeNull();
-    expect(s.accepted!.actions[0]).toMatchObject({ viewer: "v-4", id: "i-1", name: "relaunch_all" });
+    expect(s.accepted!.actions[0]).toMatchObject({ viewer: "v-4", id: "i-1", name: "restart_now" });
     expect(s.accepted!.aggregates[0]).toMatchObject({ id: "agg:example-host", half: "fcvm", host: "example-host", frame_url: null, tiles: ["fcvm:1"] });
   });
 });

@@ -1,11 +1,13 @@
 # fleet/web: the GPU wall page
 
 The page for `docs/fleet/ARCHITECTURE.md`: one image tiled across every GPU, fcvm on the
-left half and EC2 on the right, live from each tile's own renderer. It is a stage, not a
+left and EC2 on the right, each side as wide as the GPUs it has live, live from each tile's own renderer. It is a stage, not a
 dashboard: the image sits letterboxed between the race (a countdown to the next restart
 and two bars, fcvm against EC2) and one button, "Restart all N GPUs". Everything else
-(the camera's next stop, words, lights, the time of day, how the streams arrive, stream
-stats) is in the Play drawer. A viewer can also borrow one of the wall's GPUs for a
+(the camera's next stop, words, lights, how the streams arrive, stream stats) is in the Play drawer, where the sender of a word also picks how it is drawn:
+Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (big letters
+standing on a ridge). The three thumbnails are crops of the renderer's
+`shots/text-styles.jpg` (#1178, commit 46feb782), in `public/text-styles/`. A viewer can also borrow one of the wall's GPUs for a
 minute. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
 deployed.
 
@@ -41,7 +43,9 @@ app/       Next.js (App Router). Draws view models and sends actions:
            wall.css                 the surface's own stylesheet (no component library)
 mock/      a mock coordinator and mock renderers, Node only
 e2e/       Playwright tests against the mock (Chromium; a tagged subset in WebKit)
-scripts/   dev-mock.ts (run the page on the mock), measure.ts (decode and draw cost)
+scripts/   dev-mock.ts (run the page on the mock), measure.ts (decode and draw cost),
+           slow-link.ts (tiles after a race over a throttled link), coordinator-fixture.ts
+           (the coordinator's snapshot states for the contract tests)
 ```
 
 ## Running it
@@ -69,13 +73,13 @@ pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
 
 On a small machine, `FLEET_E2E_VIEW=1280x800 FLEET_MOCK_FPS=10 FLEET_MOCK_THREADS=3`
-makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_TILES`, `FLEET_MOCK_FCVM_MS`,
+makes the mock's work fit (CI uses these on a 4-vCPU runner). The mock needs `ffmpeg` with libx264 (`FLEET_FFMPEG` names another binary; CI uses the one in the `ffmpeg-static` package). Its knobs (`FLEET_MOCK_FCVM_GPUS`, `FLEET_MOCK_EC2_GPUS`, `FLEET_MOCK_FCVM_MS`,
 `FLEET_MOCK_EC2_MS`, `FLEET_MOCK_RACE_EVERY_S`, `FLEET_MOCK_TURNSTILE`, ...) are listed at the top of `mock/main.ts`.
 By default it restarts every GPU 20 s after start and every 5 minutes after that, holds
 "restart now" for 60 s after each restart, and a quarter of races wait 10 to 30 s for EC2
 spot capacity. fcvm restarts take 2.6 to 3.4 s (teardown, a restore holding a 0.6 s GPU
-reset, renderer start, first frame) and EC2 35 to 70 s (launch, boot, renderer start,
-first frame), shaped like the measured ones.
+reset, renderer start, first frame) and EC2 35 to 70 s (launch, then boot to first
+frame), shaped like the measured ones.
 In production the page reads the coordinator's URL from `FLEET_COORD_URL` per request.
 
 ## How the page works
@@ -124,6 +128,20 @@ so nothing blank is ever shown. The wake, as measured, appears once under the co
 "Last wake: 128 GPUs from zero in 2:07". The page reads the media from `FLEET_MEDIA_URL`
 (default `/media` on its own origin, Workers static assets: a 720p reel stays well under
 the 25 MiB per-file limit); the mock serves a generated 4 s test clip.
+
+**Each side as wide as its GPUs, and re-tiling without a hitch.** The coordinator gives
+every tile its rectangle, and the sides are as wide as the GPUs each has live (fcvm 100
+against EC2 12 puts the line at 100/112); there are no places waiting for capacity. When
+GPUs join or leave, the snapshot carries a new `layout.gen` and the frame (`at_frame`, on
+the renderers' t = k/30) from which the renderers draw the new rectangles. The page opens
+the new generation's streams at once and keeps drawing the old tiles, from frames before
+`at_frame`, until every tile of the new generation has a frame at or after it; then it
+swaps them all in one draw (after 4 s it swaps anyway, so a renderer that never answers
+cannot hold the image). The seams, hover labels, keyboard grid and dark tiles follow the
+tiling on screen, switching in the same moment; an opened VM and Aggregated mode take the
+new rectangles. A frame is placed by the stream header it was encoded under, and a place
+that moves to another GPU keeps its old stream until the swap. A side with no GPUs gives
+the other the full width and says "EC2: no GPUs live right now" (or fcvm).
 
 **Words on the stage.** One sentence under the title says what the page is, "fcvm" and
 "EC2" sit on backplates either side of the seam, and one line under each half says what a
@@ -285,6 +303,34 @@ the mosaic, seam and hover tests here (the `@engines` tests). If a worker has no
 `requestAnimationFrame`, the page ticks it from the main thread. Apple's Safari itself is
 not tested by this PR.
 
+**Tiles coming back after a race, over a slow link.** `node scripts/slow-link.ts <mode>
+<clean|slow>` puts a TCP proxy in front of the mock coordinator and renderers (connection
+setup time, one-way delay, one bandwidth cap shared by every connection, TCP backpressure
+kept), presses restart, samples each tile on the canvas every 100 ms, and reports when it
+showed a frame against the coordinator's `first_frame_at` for it. 15 tiles, fcvm restarts
+of about 5 s, EC2 about 12 s, 1440x900, Chromium on this development machine:
+
+| mode | link | shown after the coordinator says running |
+|---|---|---|
+| aggregated | none | p50 119 to 163 ms, max 227 ms |
+| aggregated | 100 ms RTT, 400 ms setup, 16 Mbit/s | p50 199 to 219 ms, max 318 ms |
+| aggregated | the same at 4 Mbit/s | p50 229 ms, max 292 ms |
+| direct | none | p50 215 to 221 ms, max 761 ms |
+| direct | 100 ms RTT, 400 ms setup, 16 Mbit/s | p50 928 to 974 ms, max 3.4 s |
+| direct | the same at 4 Mbit/s | p50 1.0 s, max 3.5 s |
+| direct | 100 ms RTT, 1200 ms setup, 16 Mbit/s | p50 8.1 s, max 9.8 s |
+
+The link queue peaked at 22 ms (16 Mbit/s) and 111 ms (4 Mbit/s): bandwidth is not what
+delays the direct tiles. In direct mode a restarted tile is a new renderer process, so
+the page opens a new socket for it once the coordinator says it runs, and opens them all
+at once. The browser connects to one IP and port one WebSocket at a time (RFC 6455,
+section 4.1), and the proxy, like a single forwarded port, is one address: the
+renderers' connections started exactly one setup time apart (510 to 513 ms at 400 ms
+setup, 1310 to 1320 ms at 1200 ms), so the eighth tile of a race waits for seven
+setups. Aggregated mode, the default, keeps one stream per host open through a race and
+showed every tile within 0.32 s. Over a tunnel with slow connection setup, give each
+renderer its own forwarded address or use aggregated mode.
+
 ## Interface notes
 
 The page and the mock follow `fleet/PROTOCOL.md` as the coordinator (#1146) and renderer
@@ -300,35 +346,39 @@ page draws only a stream's inner rectangle, placed at `x0, y0` of the full grid 
 VM fills its box), by drawing the whole frame scaled and clipped, because WebKit ignores a
 VideoFrame's source rectangle and `visibleRect`.
 
-**Assumed, not yet in PROTOCOL.md.** The second design review's state is not published
-yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` marks each):
+**The coordinator's names, held by a test.** `core/test/contract.test.ts` parses the
+coordinator's own snapshot states: the `final_view` of each of the 24 vectors in #1146's
+`fleet/core/tests/vectors`, copied into `core/test/fixtures/coordinator.json` by
+`node scripts/coordinator-fixture.ts <vectors dir> <commit>`. It fails when a field the
+page keeps is missing from them or holds another value, and when the page sends an
+intent the coordinator does not know. `mock/test/mock.test.ts` holds every snapshot the
+mock sent during its suite to the same shapes, apart from a short list PROTOCOL.md
+documents that no vector ends with (a borrowed tile's `borrowed`, `gpu_stats`, the
+agent's `ack_ms` and `total_ms`) and the mock pattern's flat camera (`x`, `y`, `zoom`).
 
-- state: `next_race_at` and `cooldown_until` (Unix ms or null); `scoreboard: {fcvm, ec2}`,
-  each null or `{median_ms, last_ms, races, measured_on, last_capacity_wait_ms}` with
-  capacity waits excluded from the times; `nudges: {targets: [{id, label, votes}],
-  holding, next_hold_at}`; `borrow: {cap, lent, next_return_at}`.
-- `relaunch_all` adds `fcvm_gpus`, `ec2_gpus`, `ec2_capacity_wait_ms` (so far) and
-  `ec2_waiting_since` (Unix ms while EC2 waits for capacity), and `by` is `schedule` for
-  the owner's cadence (also the `viewer` of that action).
-- a tile adds `failure: {kind, message, retry_at}` (`relaunch_failed`,
-  `host_reclaimed`), phase `borrowed` with `borrowed: {until}`, and phase `draining` for
-  a reclaimed host's tiles; `fleet.hosts[].draining` marks the host.
-- intents `nudge {target}`, `claim_gpu {}`, `claim_camera {drag}` and `release_gpu
-  {claim}`; the claim goes only to its connection as `{"type": "claim", "claim": {id,
-  tile, phase, frame_url, clicked_at, first_frame_at, expires_at, gpu, phases, camera,
-  ended}}`; a refusal is the receipt's reason.
-- `hello` adds `turnstile: "<site key>"` when actions need the check; the page sends
-  `{"type": "verify", "token"}` and the coordinator answers `{"type": "verified", "ok",
-  "reason"}`; until then intents are refused with "verify first".
-- `GET /poster.jpg` on the `/live` origin, readable from the page's origin (CORS).
-- state: `counters: {restores_total, scrubs_total, restores_last_hour}` and `security:
-  {gpu_scrub}`; without `security` the page says nothing about a scrub.
-- `fleet.power: {state, asleep_since, woke_at, hosts: [{host, phases: [{phase, at}]}],
-  last_wake: {started_at, awake_at, gpus}}`: `woke_at` is when the wake began, phases are
-  `instance_pending`, `booted`, `store_ready`, `agent_connected`, `tiles_rendering`;
-  `hosts` and `last_wake` are this page's reading. Without `power` the fleet is awake.
-- `{"type": "visibility", "visible": bool}` from the page; `viewers.count` counts visible tabs.
-- `/media/wall-reel.json: {recorded_at, duration_s, measured: {gpus, fcvm_ms, ec2_ms} | null}`.
+What the end-to-end run against #1146 changed:
+
+- `layout.generation` and `layout.from_frame` (were `gen`, `at_frame`).
+- `counters.restores` and `counters.scrubs` (were `restores_total`, `scrubs_total`).
+  There is no `security` field: the page speaks of the GPU memory scrub once
+  `counters.scrubs` is above zero.
+- The race button sends `restart_now` (was `relaunch_all`; the race is still the
+  snapshot's `relaunch_all`). A scheduled race is not an intent and so not in `actions`:
+  the feed's "the scheduled restart of every GPU began" comes from `relaunch_all.by`.
+- There is no `time_of_day` intent (each hold's viewpoint sets it), so the drawer has no
+  time-of-day slider.
+- A reclaimed host's tiles leave the tiling in the same event; there is no tile-level
+  `host_reclaimed` and no `draining` phase. The banner reads `failures` (`host_reclaimed`,
+  kept a minute) and `fleet.hosts[].draining`.
+- "N people watching" is `viewers.active` (visible tabs); `viewers.count` counts
+  connections.
+- Asleep, nothing is placed: `tiles` and `aggregates` are empty. EC2 tiles report
+  `starting` with `launch_ms` and `ready_ms`.
+- `word {text, text_style}`: `lockup` (the default), `skywriting` or `landmark`, per
+  message, as both #1146 and the renderer (#1178, "Words, the clock and lights") define it.
+
+Still this page's own: `/media/wall-reel.json: {recorded_at, duration_s, measured: {gpus,
+fcvm_ms, ec2_ms} | null}`.
 
 The wall no longer sends camera drags or `set_auto_relaunch`: the camera is directed,
 with nudges, and the owner's cadence replaces the viewer setting. A dropped light is
@@ -338,7 +388,9 @@ GPU, from a drag to the first draw at or past the claim's camera key tagged with
 intent. The renderer's `q=hi|std|lo` goes on the frame URL only when it is not `std`.
 
 The mock encodes H.264 baseline with libx264 (`q` as constant quality 14, 18 or 26)
-rather than High with NVENC, runs one aggregator per fcvm host and one for the EC2 half
+rather than High with NVENC, lays each side out in proportion to its GPUs (the fcvm side
+in one full-width band per host, `FLEET_MOCK_FCVM_GPUS`, `FLEET_MOCK_EC2_GPUS`, and
+`/mock/fault {fcvm_gpus, ec2_gpus}` to re-tile), runs one aggregator per fcvm host and one for the EC2 side
 (each draws its region whole and blacks out tiles that are not running), draws the UTC
 clock once in each half, renders a viewer's own GPU as the whole image from its own
 camera, and shows `relaunching` for 150 ms before a tile's first reported phase.

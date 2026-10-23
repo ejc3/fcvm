@@ -107,6 +107,7 @@ h1, h2, h3, p { margin: 0; }
 
 .half-line { position: absolute; width: 2px; margin-left: -1px; background: rgba(255, 255, 255, 0.4); }
 .seam-label { position: absolute; font: 600 15px var(--mono); }
+.empty-side { position: absolute; font-size: 14px; color: var(--muted); }
 .seam-label.fcvm { color: var(--fcvm); }
 .seam-label.ec2 { color: var(--ec2); }
 .caption { position: absolute; font-size: 14px; line-height: 18px; color: var(--muted); margin: 0; }
@@ -115,7 +116,7 @@ h1, h2, h3, p { margin: 0; }
 .caption.ec2 b { color: var(--ec2); }
 .dark-tile { position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; overflow: hidden; text-align: center; color: var(--accent); }
 .dark-tile.hatched { background: var(--hatch); }
-.dark-tile.failed, .dark-tile.reclaimed { color: var(--refused); }
+.dark-tile.failed { color: var(--refused); }
 .dark-tile.borrowed { color: var(--fcvm-soft); animation: fade-in 1200ms ease-out; }
 .wall.arrive { animation: fade-in 600ms ease-out; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
@@ -321,3 +322,14 @@ h1, h2, h3, p { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   .reel video, .reel.leaving video { transition: none; }
 }
+
+/* ---- message style ------------------------------------------------------------------ */
+
+.drawer .styles { border: 0; margin: 4px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.drawer .styles legend { font-size: 14px; color: var(--muted); margin-bottom: 6px; padding: 0; }
+.style-option { position: relative; display: flex; flex-direction: column; gap: 4px; min-height: 44px; padding: 4px; border: 1px solid var(--control); border-radius: 8px; cursor: pointer; font-size: 14px; }
+.style-option img { width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 4px; display: block; }
+.style-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.style-option.selected { border-color: var(--fcvm); background: #1d2a36; }
+.style-option:focus-within { outline: 2px solid var(--fcvm); outline-offset: 2px; }
+.phone .play-link { margin: 0 16px; }

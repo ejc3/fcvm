@@ -68,12 +68,29 @@ export interface PlacedTile {
 export interface MosaicLayout {
   image: Box;
   tiles: PlacedTile[];
-  /** x of the line between the halves, in CSS pixels. */
-  halfLineX: number;
+  /** x of the line between the halves, in CSS pixels, or null when one side has no tiles. */
+  halfLineX: number | null;
+  /** Where the fcvm side ends, as a fraction of the image width (0: no fcvm tiles, 1: no EC2 tiles). */
+  split: number;
+}
+
+/**
+ * Where the fcvm side ends: each side's width follows the GPUs it has, so the
+ * line sits at the right edge of the fcvm tiles (0 with none, 1 with no EC2 tiles).
+ */
+export function splitOf(tiles: readonly Tile[]): number {
+  const fcvm = tiles.filter((t) => t.half === "fcvm");
+  const ec2 = tiles.filter((t) => t.half === "ec2");
+  // No GPU on either side (asleep): nothing is placed, and the halves stay even.
+  if (fcvm.length === 0 && ec2.length === 0) return 0.5;
+  if (fcvm.length === 0) return 0;
+  if (ec2.length === 0) return 1;
+  return Math.max(...fcvm.map((t) => t.rect.x + t.rect.w));
 }
 
 export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, aspect: number = DEFAULT_IMAGE_ASPECT): MosaicLayout {
   const image = fitContain(area, aspect);
+  const split = splitOf(tiles);
   const snapped: Box = {
     x: snap(image.x, dpr),
     y: snap(image.y, dpr),
@@ -86,7 +103,8 @@ export function layoutMosaic(area: Box, tiles: readonly Tile[], dpr: number, asp
       const box = rectOnScreen(image, t.rect, dpr);
       return { id: t.id, box, streamHeight: streamHeightFor(box.h * dpr) };
     }),
-    halfLineX: snap(image.x + image.w / 2, dpr),
+    halfLineX: split > 0 && split < 1 ? snap(image.x + image.w * split, dpr) : null,
+    split,
   };
 }
 

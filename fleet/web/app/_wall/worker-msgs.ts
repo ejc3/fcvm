@@ -58,6 +58,8 @@ export interface TraceEntry {
   poster: boolean;
   /** The picture from before a suspension was shown (held, or under the live one fading in). */
   held: boolean;
+  /** The layout generation drawn. */
+  gen: number;
 }
 
 export type FromWorker =
@@ -71,4 +73,6 @@ export type FromWorker =
   | { type: "mode-shown"; mode: StreamMode }
   | { type: "trace"; req: number; entries: TraceEntry[] }
   /** The canvas shows something (the poster or a frame): the page's own poster can go. */
-  | { type: "painted" };
+  | { type: "painted" }
+  /** The drawer swapped to this layout generation. */
+  | { type: "gen-shown"; gen: number };

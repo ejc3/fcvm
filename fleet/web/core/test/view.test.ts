@@ -3,6 +3,8 @@ import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
 import {
   BORROW_FADE_MS,
+  TEXT_STYLES,
+  wordArgs,
   REPOSITORY_URL,
   isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
@@ -17,7 +19,7 @@ import {
 import { suggestMode } from "../mode.ts";
 import { parseReelMeta, reelView } from "../reel.ts";
 import type { Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
-import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
+import { EPOCH, fleet, fleetSplit, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
   let s = reduce(initialState(), { type: "socket", status: "open", at: EPOCH });
@@ -177,19 +179,24 @@ describe("the one button", () => {
 });
 
 describe("failure states", () => {
-  it("labels a failed tile with its error and retry time, and a reclaimed host's tiles", () => {
+  it("labels a failed tile with its error and retry time, and says when AWS reclaimed a host", () => {
     const st = fleet(2, 2);
     const f = st.tiles.find((t) => t.id === "fcvm:2")!;
     f.phase = "failed";
     f.failure = { kind: "relaunch_failed", message: "GPU did not come back", retry_at: EPOCH + 12_000 };
-    const r = st.tiles.find((t) => t.id === "fcvm:3")!;
-    r.phase = "draining";
-    r.failure = { kind: "host_reclaimed", message: "AWS reclaimed the spot host", retry_at: null };
-    st.fleet.hosts = [{ name: "example-host", draining: true }];
-    const v = view(stateWith(st), EPOCH);
+    let v = view(stateWith(st), EPOCH);
     expect(v.tiles.find((t) => t.id === "fcvm:2")).toMatchObject({ dark: true, phase: "failed: GPU did not come back", detail: "retrying in 0:12", glyph: { kind: "failed" } });
-    expect(v.tiles.find((t) => t.id === "fcvm:3")).toMatchObject({ dark: true, phase: "host reclaimed by AWS", detail: "re-tiling", glyph: { kind: "reclaimed" } });
-    expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe("AWS reclaimed an fcvm host. Its squares stay dark while the image is re-tiled onto the GPUs left.");
+    expect(v.banners.find((b) => b.kind === "reclaimed")).toBeUndefined();
+    // The coordinator takes a reclaimed host's tiles out in the same event and keeps the reason in `failures`.
+    const text = "AWS reclaimed an fcvm host. The image is re-tiled onto the GPUs left.";
+    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "example-host", since: EPOCH }] }), EPOCH);
+    expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe(text);
+    // Or only the host marked draining.
+    v = view(stateWith({ ...st, fleet: { ...st.fleet, hosts: [{ name: "example-host", draining: true }] } }), EPOCH);
+    expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe(text);
+    // Two reported hosts, one of them also draining: counted once each.
+    v = view(stateWith({ ...st, failures: [{ kind: "host_reclaimed", host: "a", since: EPOCH }, { kind: "host_reclaimed", host: "b", since: EPOCH }, { kind: "coordinator_degraded", host: null, since: EPOCH }], fleet: { ...st.fleet, hosts: [{ name: "a", draining: true }] } }), EPOCH);
+    expect(v.banners.find((b) => b.kind === "reclaimed")!.text).toBe("AWS reclaimed 2 fcvm hosts. The image is re-tiled onto the GPUs left.");
   });
 
   it("shows a place with no GPU behind it plainly, and leaves it out of the race", () => {
@@ -312,14 +319,14 @@ describe("Turnstile", () => {
     s = msg(s, { type: "hello", viewer: "v-3", turnstile: "example-sitekey" });
     expect(needsVerify(s)).toBe(true);
     expect(view(s, EPOCH).play!.verify).toMatchObject({ needed: true });
-    s = reduce(s, { type: "queue", action: { name: "relaunch_all", args: {} } });
+    s = reduce(s, { type: "queue", action: { name: "restart_now", args: {} } });
     s = reduce(s, { type: "verify-sent" });
     expect(view(s, EPOCH).play!.verify.text).toBe("Checking");
     s = msg(s, { type: "verified", ok: false, reason: "the check did not pass" });
     expect(view(s, EPOCH).play!.verify.error).toBe("the check did not pass");
     s = msg(s, { type: "verified", ok: true });
     expect(needsVerify(s)).toBe(false);
-    expect(s.turnstile.queued).toEqual([{ name: "relaunch_all", args: {} }]);
+    expect(s.turnstile.queued).toEqual([{ name: "restart_now", args: {} }]);
     s = msg(s, { type: "hello", viewer: "v-9", turnstile: "example-sitekey" });
     expect(needsVerify(s)).toBe(true);
   });
@@ -471,18 +478,21 @@ describe("restart timings", () => {
 });
 
 describe("the activity feed", () => {
-  it("names this viewer as you, others by number, and the owner's cadence as the schedule", () => {
+  it("names this viewer as you, others by number, and the owner's cadence (not an intent) from the race", () => {
     const actions = [
       { at: EPOCH + 1, viewer: "v-4", id: "a", name: "relaunch", args: { tile: "fcvm:3" }, summary: "relaunch slot-3", outcome: "committed" },
-      { at: EPOCH + 2, viewer: "v-7", id: "b", name: "relaunch_all", args: {}, summary: "relaunch all (8 tiles)", outcome: "committed" },
+      { at: EPOCH + 2, viewer: "v-7", id: "b", name: "restart_now", args: {}, summary: "race 1", outcome: "committed" },
       { at: EPOCH + 3, viewer: "v-4", id: "c", name: "word", args: {}, summary: "the text check refused it", outcome: "refused" },
-      { at: EPOCH + 4, viewer: "schedule", id: "d", name: "relaunch_all", args: {}, summary: "relaunch all (8 tiles)", outcome: "committed" },
-      { at: EPOCH + 5, viewer: "v-4", id: "e", name: "time_of_day", args: { v: 0.6 }, summary: "time of day", outcome: "committed" },
+      { at: EPOCH + 5, viewer: "v-4", id: "e", name: "light", args: { pos: [0, 1, 2], color: [1, 1, 1] }, summary: "light", outcome: "committed" },
     ];
-    let s = stateWith(fleet(2, 2, { actions }));
+    const race = { started_at: EPOCH + 4, by: "schedule", fcvm_done_at: null, ec2_done_at: null, fcvm_pending: 2, ec2_pending: 2, fcvm_gpus: 2, ec2_gpus: 2, ec2_capacity_wait_ms: 0, ec2_waiting_since: null };
+    let s = stateWith(fleet(2, 2, { actions, relaunch_all: race }));
     s = msg(s, { type: "hello", viewer: "v-4" });
     const v = view(s, EPOCH + 5000);
-    expect(v.feed.map((t) => t.text)).toEqual(["you set the time of day to 14:24", "the scheduled restart of every GPU began", "viewer 7 restarted every GPU"]);
+    expect(v.feed.map((t) => t.text)).toEqual(["you dropped a light", "the scheduled restart of every GPU began", "viewer 7 restarted every GPU"]);
+    // A race a viewer started is in `actions` already: no second line for it.
+    const byViewer = view(msg(stateWith(fleet(2, 2, { actions, relaunch_all: { ...race, by: "viewer:v-7" } })), { type: "hello", viewer: "v-4" }), EPOCH + 5000);
+    expect(byViewer.feed.map((t) => t.text)).toEqual(["you dropped a light", "viewer 7 restarted every GPU", "you restarted fcvm VM 3"]);
   });
 });
 
@@ -539,18 +549,18 @@ describe("streaming modes", () => {
 });
 
 describe("counters and isolation", () => {
-  it("counts GPU VMs restored, and scrubs only once the scrub has shipped", () => {
+  it("counts GPU VMs restored, and scrubs only once an agent has reported one", () => {
     expect(fmt.thousands(1284)).toBe("1,284");
     expect(fmt.thousands(1_234_567)).toBe("1,234,567");
     expect(fmt.thousands(12)).toBe("12");
     let v = view(stateWith(fleet()), EPOCH);
     expect(v.counter).toEqual({ label: "GPU VMs restored", value: "1,284", total: 1284, lastHour: "37 in the last hour", scrubs: "", wake: "" });
-    v = view(stateWith(fleet(2, 2, { security: { gpu_scrub: true } })), EPOCH);
+    v = view(stateWith(fleet(2, 2, { counters: { restores: 1284, restores_last_hour: 37, scrubs: 1201 } })), EPOCH);
     expect(v.counter!.scrubs).toBe("GPU memory scrubs: 1,201");
     expect(view(stateWith(fleet(2, 2, { counters: null })), EPOCH).counter).toBeNull();
   });
 
-  it("says how a square is isolated, the scrub only when it has shipped, with one link to the repository", () => {
+  it("says how a square is isolated, the scrub only once one was reported, with one link to the repository", () => {
     const off = isolationView(fleet());
     expect(off.sentences).toEqual([
       "Each square is its own virtual machine with its own Linux kernel.",
@@ -559,7 +569,7 @@ describe("counters and isolation", () => {
     ]);
     expect(off.link).toEqual({ label: "The fcvm repository", href: REPOSITORY_URL });
     expect(REPOSITORY_URL).toBe("https://github.com/ejc3/fcvm");
-    const on = isolationView(fleet(2, 2, { security: { gpu_scrub: true } }));
+    const on = isolationView(fleet(2, 2, { counters: { restores: 1284, restores_last_hour: 37, scrubs: 1 } }));
     expect(on.sentences.at(-1)).toBe("GPU memory is cleared before a GPU moves to the next virtual machine.");
     expect(isolationView(null).sentences).toHaveLength(3);
   });
@@ -567,12 +577,13 @@ describe("counters and isolation", () => {
 
 describe("asleep and waking", () => {
   const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, ...p });
+  // As the coordinator: asleep, nothing is placed; waking, tiles arrive as their GPUs join.
   const sleeping = (p: Partial<Power>, over: Partial<FleetState> = {}) => {
     const st = fleet(2, 2, over);
     st.fleet.power = power(p);
-    for (const t of st.tiles) {
-      t.phase = "asleep";
-      t.frame_url = null;
+    if (st.fleet.power.state === "asleep") {
+      st.tiles = [];
+      st.aggregates = [];
     }
     return st;
   };
@@ -597,7 +608,8 @@ describe("asleep and waking", () => {
     expect(v.plan.direct).toEqual([]);
     expect(v.score!.title).toBe("Restart time: click to the last GPU's first frame · last measured 22 Oct 2026, 23:14 UTC");
     expect(v.score!.fcvm.value).toBe("3.0 s");
-    expect(v.score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: true, note: "works once the GPUs are awake" });
+    // No tiles are placed, so no count: "Restart all 0 GPUs" would be wrong.
+    expect(v.score!.button).toEqual({ label: "Restart all GPUs", disabled: true, note: "works once the GPUs are awake" });
     expect(v.ownButton).toEqual({ label: "Get your own GPU", disabled: true, note: "works once the GPUs are awake" });
     expect(v.score!.countdown.label).toBe("Restarts resume once the GPUs are awake");
   });
@@ -665,5 +677,140 @@ describe("the recording", () => {
     expect(reelView({ ...base, power: "waking", allLive: true })).toMatchObject({ show: true, leaving: false });
     expect(reelView({ ...base, power: "awake", allLive: true })).toMatchObject({ show: true, leaving: true });
     expect(reelView({ ...base, power: "awake", reelOn: false }).show).toBe(false);
+  });
+});
+
+describe("re-tiling: each side as wide as the GPUs it has", () => {
+  const snap = (s: ClientState, version: number, st: FleetState) => msg(s, { type: "snapshot", version, state: st });
+  const shownIds = (v: ReturnType<typeof view>) => v.tiles.map((t) => t.id).sort();
+  const planIds = (v: ReturnType<typeof view>) => v.plan.direct.map((d) => d.id.slice(2)).sort();
+
+  // A join and a leave on each side: [fcvm before, ec2 before, fcvm after, ec2 after].
+  for (const [nf0, ne0, nf1, ne1, what] of [
+    [4, 4, 5, 4, "a GPU joins the fcvm side"],
+    [4, 4, 3, 4, "a GPU leaves the fcvm side"],
+    [4, 4, 4, 5, "a GPU joins the EC2 side"],
+    [4, 4, 4, 3, "a GPU leaves the EC2 side"],
+  ] as const) {
+    it(`${what}: the plan opens the new tiling at once, the overlays keep the drawn one until the drawer swaps`, () => {
+      let s = stateWith(fleetSplit(nf0, ne0, 1));
+      const before = view(s, EPOCH);
+      expect(before.layout!.split).toBeCloseTo(nf0 / (nf0 + ne0), 9);
+      s = snap(s, 2, fleetSplit(nf1, ne1, 2));
+      let v = view(s, EPOCH);
+      // The plan is generation 2 from the start, with its first frame.
+      expect(v.plan.gen).toBe(2);
+      expect(v.plan.atT).toBe(600 / 30);
+      expect(planIds(v)).toEqual(fleetSplit(nf1, ne1, 2).tiles.map((t) => t.id).sort());
+      // The overlays (seams, hover, keyboard grid, dark tiles) stay on generation 1 until it is drawn.
+      expect(shownIds(v)).toEqual(shownIds(before));
+      expect(v.layout!.split).toBeCloseTo(nf0 / (nf0 + ne0), 9);
+      expect(v.tiles.find((t) => t.id === "fcvm:1")!.box).toEqual(before.tiles.find((t) => t.id === "fcvm:1")!.box);
+      // A gen-shown for another generation changes nothing.
+      expect(reduce(s, { type: "gen-shown", gen: 1 }).shownLayout!.gen).toBe(1);
+      s = reduce(s, { type: "gen-shown", gen: 2 });
+      v = view(s, EPOCH);
+      expect(shownIds(v)).toEqual(planIds(v));
+      expect(v.layout!.split).toBeCloseTo(nf1 / (nf1 + ne1), 9);
+      expect(v.layout!.halfLineX).toBe(Math.round(v.layout!.image.x + v.layout!.image.w * (nf1 / (nf1 + ne1))));
+      expect(v.seams.segments.length).toBeGreaterThan(0);
+    });
+  }
+
+  it("keeps the latest state of a tile that stays, on its drawn rectangle", () => {
+    let s = stateWith(fleetSplit(4, 4, 1));
+    const next = fleetSplit(5, 4, 2);
+    next.tiles.find((t) => t.id === "fcvm:2")!.phase = "restoring";
+    s = snap(s, 2, next);
+    const v = view(s, EPOCH);
+    const tv = v.tiles.find((t) => t.id === "fcvm:2")!;
+    expect(tv.dark).toBe(true);
+    expect(tv.box!.w).toBeCloseTo(v.layout!.image.w / 8, 0);
+  });
+
+  it("gives one side the full width when the other has no GPUs, and says that side is empty", () => {
+    for (const [nf, ne, empty] of [[6, 0, "ec2"], [0, 6, "fcvm"]] as const) {
+      const v = view(stateWith(fleetSplit(nf, ne, 1)), EPOCH);
+      expect(v.layout!.halfLineX).toBeNull();
+      expect(v.layout!.split).toBe(nf === 0 ? 0 : 1);
+      const xs = v.tiles.map((t) => t.box!);
+      expect(Math.min(...xs.map((b) => b.x))).toBeCloseTo(v.layout!.image.x, 0);
+      expect(Math.max(...xs.map((b) => b.x + b.w))).toBeCloseTo(v.layout!.image.x + v.layout!.image.w, 0);
+      expect(v.labels.empty).toMatchObject({ half: empty, text: empty === "ec2" ? "EC2: no GPUs live right now" : "fcvm: no GPUs live right now" });
+      expect(v.labels.captions.map((c) => c.half)).toEqual([nf === 0 ? "ec2" : "fcvm"]);
+      expect(v.labels.captions[0]!.box.w).toBe(v.layout!.image.w);
+      expect(v.labels.seam).toHaveLength(1);
+    }
+    // Waking, a side not placed yet is still coming: no "empty" label (it would sit on the recording's badge).
+    const waking = fleetSplit(0, 6, 1);
+    waking.fleet.power = { state: "waking", asleep_since: null, woke_at: EPOCH - 5000, hosts: [{ host: "h1", phases: [{ phase: "instance_pending", at: EPOCH - 5000 }] }], last_wake: null };
+    expect(view(stateWith(waking), EPOCH).labels.empty).toBeNull();
+    // And with nothing placed (asleep), the halves stay even.
+    const asleep = fleetSplit(0, 0, 1);
+    asleep.fleet.power = { state: "asleep", asleep_since: EPOCH - 5000, woke_at: null, hosts: [], last_wake: null };
+    const av = view(stateWith(asleep), EPOCH);
+    expect(av.layout!.split).toBe(0.5);
+    expect(av.labels.empty).toBeNull();
+    const both = view(stateWith(fleetSplit(10, 2, 1)), EPOCH);
+    expect(both.labels.empty).toBeNull();
+    // EC2's side is a sixth of the image: too narrow for its caption, so they stack.
+    expect(both.labels.captions[1]!.box.y).toBeGreaterThan(both.labels.captions[0]!.box.y);
+  });
+
+  it("a generation change mid-magnify: the opened VM's stream follows its new rectangle, and a VM that left closes", () => {
+    const area = { focusArea: { x: 0, y: 0, w: 1400, h: 800 } };
+    let s = reduce(stateWith(fleetSplit(4, 4, 1)), { type: "ui", patch: { focusId: "fcvm:2" } });
+    let v = view(s, EPOCH, area);
+    const r1 = fleetSplit(4, 4, 1).tiles.find((t) => t.id === "fcvm:2")!.rect;
+    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r1.w * 16) / 9 / r1.h, 1);
+    s = snap(s, 2, fleetSplit(2, 4, 2));
+    v = view(s, EPOCH, area);
+    const r2 = fleetSplit(2, 4, 2).tiles.find((t) => t.id === "fcvm:2")!.rect;
+    expect(v.focus!.title).toBe("fcvm VM 2");
+    expect(v.plan.gen).toBe(2);
+    expect(v.plan.focus!.box!.w / v.plan.focus!.box!.h).toBeCloseTo((r2.w * 16) / 9 / r2.h, 1);
+    // The VM leaves in the next generation: nothing is opened any more.
+    s = snap(s, 3, fleetSplit(1, 4, 3));
+    v = view(s, EPOCH, area);
+    expect(v.focus).toBeNull();
+    expect(v.plan.focus).toBeNull();
+  });
+
+  it("Aggregated mode takes the new regions with the new generation", () => {
+    const agg = (st: FleetState) => [
+      { id: "agg:example-host", half: "fcvm" as const, host: "example-host", rect: { x: 0, y: 0, w: st.tiles.filter((t) => t.half === "fcvm").reduce((a, t) => Math.max(a, t.rect.x + t.rect.w), 0), h: 1 }, frame_url: "ws://example-host:2/frames/agg-a", tiles: st.tiles.filter((t) => t.half === "fcvm").map((t) => t.id) },
+    ];
+    const g1 = fleetSplit(4, 4, 1);
+    g1.aggregates = agg(g1);
+    const g2 = fleetSplit(6, 2, 2);
+    g2.aggregates = agg(g2);
+    let s = reduce(stateWith(g1), { type: "ui", patch: { mode: "aggregated" } });
+    s = snap(s, 2, g2);
+    const v = view(s, EPOCH);
+    expect(v.plan.aggregated[0]!.box!.w / v.layout!.image.w).toBeCloseTo(0.75, 2);
+  });
+});
+
+describe("the style of a message", () => {
+  it("offers Lockup, Skywriting and Landmark with thumbnails, Lockup picked until the viewer picks another", () => {
+    let s = stateWith(fleet());
+    let st = view(s, EPOCH).play!.word.style;
+    expect(st.options.map((o) => [o.value, o.label, o.selected])).toEqual([
+      ["lockup", "Lockup", true],
+      ["skywriting", "Skywriting", false],
+      ["landmark", "Landmark", false],
+    ]);
+    expect(st.options.every((o) => o.thumb.startsWith("/text-styles/") && o.alt.length > 0)).toBe(true);
+    s = reduce(s, { type: "ui", patch: { textStyle: "skywriting" } });
+    st = view(s, EPOCH).play!.word.style;
+    expect(st.options.filter((o) => o.selected).map((o) => o.value)).toEqual(["skywriting"]);
+  });
+
+  it("puts the choice in the word intent", () => {
+    for (const { value } of TEXT_STYLES) {
+      const intent = makeIntent("w", "word", wordArgs("hello", value));
+      expect(intent.args).toEqual({ text: "hello", text_style: value });
+    }
+    expect(JSON.parse(JSON.stringify(makeIntent("w", "word", wordArgs("hi", "landmark"))))).toEqual({ type: "intent", id: "w", name: "word", args: { text: "hi", text_style: "landmark" } });
   });
 });

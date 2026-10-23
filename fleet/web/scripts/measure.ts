@@ -79,8 +79,8 @@ for (const total of totals) {
     FLEET_WEB_PORT: String(base),
     FLEET_MOCK_COORD_PORT: String(base + 1),
     FLEET_MOCK_RENDER_PORT: String(base + 2),
-    FLEET_MOCK_TILES: String(perHalf),
-    FLEET_MOCK_EC2_SHORT: "0",
+    FLEET_MOCK_FCVM_GPUS: String(perHalf),
+    FLEET_MOCK_EC2_GPUS: String(perHalf),
     // Nothing restarts while it measures.
     FLEET_MOCK_RACE_EVERY_S: "0",
     FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "32",

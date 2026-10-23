@@ -9,6 +9,7 @@ import {
   layoutMosaic,
   rectOnScreen,
   snap,
+  splitOf,
   streamHeightFor,
   seamSegments,
   type Box,
@@ -19,7 +20,7 @@ import {
 import { frameSocketUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { FRAME_RATE, sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
 import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
 import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
@@ -54,12 +55,8 @@ const PHASE_TEXT: Record<string, string> = {
   restoring: "restoring the snapshot",
   starting: "starting the renderer",
   pending: "waiting for its host",
-  launching: "launching an instance",
-  terminating: "terminating the old instance",
   waiting_capacity: "AWS had no spot GPU",
-  draining: "host reclaimed by AWS",
   failed: "failed",
-  asleep: "asleep",
 };
 
 /**
@@ -74,7 +71,6 @@ const PART_ORDER: [string, string][] = [
   ["restore_ms", "snapshot restored"],
   ["gpu_ms", "GPU reset and driver loaded"],
   ["launch_ms", "instance launched"],
-  ["boot_ms", "instance booted"],
   ["ready_ms", "instance boot to first frame"],
   ["container_ms", "renderer started"],
   ["first_frame_ms", "first frame"],
@@ -164,7 +160,7 @@ export interface HoverLabel {
 
 /** What a dark tile shows instead of a clock: how far its restart is, or what is wrong. */
 export interface Glyph {
-  kind: "progress" | "failed" | "capacity" | "reclaimed" | "empty" | "borrowed";
+  kind: "progress" | "failed" | "capacity" | "empty" | "borrowed";
   /** Steps of a restart in this half, and how many are done. */
   steps: number;
   done: number;
@@ -197,7 +193,7 @@ export interface TileView {
 
 const STEPS: Record<Half, Record<string, number>> = {
   fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
-  ec2: { relaunching: 0, requested: 0, terminating: 0, waiting_capacity: 0, pending: 1, launching: 1, starting: 2 },
+  ec2: { relaunching: 0, requested: 0, stopping: 0, waiting_capacity: 0, pending: 1, starting: 2 },
 };
 const STEP_COUNT: Record<Half, number> = { fcvm: 4, ec2: 3 };
 
@@ -208,7 +204,7 @@ function relaunchMs(t: Tile): number | null {
 }
 
 function pendingRelaunch(pending: readonly IntentMsg[], t: Tile): boolean {
-  return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "relaunch_all");
+  return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "restart_now");
 }
 
 function isLive(t: Tile): boolean {
@@ -218,7 +214,6 @@ function isLive(t: Tile): boolean {
 function glyphFor(t: Tile, phase: string): Glyph {
   const steps = STEP_COUNT[t.half];
   if (phase === "borrowed" || (t.borrowed !== null && phase !== "running")) return { kind: "borrowed", steps, done: 0 };
-  if (t.failure?.kind === "host_reclaimed" || phase === "draining") return { kind: "reclaimed", steps, done: 0 };
   if (phase === "failed" || t.failure) return { kind: "failed", steps, done: 0 };
   if (phase === "waiting_capacity") return { kind: t.half === "ec2" ? "capacity" : "empty", steps, done: 0 };
   const step = STEPS[t.half][phase];
@@ -251,10 +246,7 @@ function tileView(
     const left = t.borrowed ? Math.max(0, t.borrowed.until - srvNow) : 0;
     detail = st.relaunch_all !== null && st.relaunch_all.fcvm_done_at === null && t.half === "fcvm" ? `sitting out this race · back in ${fmt.countdown(left)}` : `back in ${fmt.countdown(left)}`;
   }
-  if (glyph.kind === "reclaimed") {
-    phaseLine = "host reclaimed by AWS";
-    detail = "re-tiling";
-  } else if (glyph.kind === "failed") {
+  if (glyph.kind === "failed") {
     phaseLine = `failed: ${t.failure?.message || t.error || "no reason given"}`;
     const retry = t.failure?.retry_at ?? null;
     detail = retry === null ? "" : retry > srvNow ? `retrying in ${fmt.countdown(retry - srvNow)}` : "retrying now";
@@ -301,7 +293,7 @@ function tileView(
     glyph,
     phase: phaseLine,
     detail,
-    darkOutline: glyph.kind === "failed" || glyph.kind === "reclaimed" ? "#B04A3E" : COLORS[t.half].darkOutline,
+    darkOutline: glyph.kind === "failed" ? "#B04A3E" : COLORS[t.half].darkOutline,
     slowFade: glyph.kind === "borrowed",
     behind: fs?.behind ?? false,
     ariaLabel,
@@ -336,11 +328,16 @@ function counterView(st: FleetState): CounterView | null {
   return {
     wake: wakeStat(st),
     label: "GPU VMs restored",
-    value: fmt.thousands(c.restores_total),
-    total: c.restores_total,
+    value: fmt.thousands(c.restores),
+    total: c.restores,
     lastHour: `${fmt.thousands(c.restores_last_hour)} in the last hour`,
-    scrubs: st.security.gpu_scrub ? `GPU memory scrubs: ${fmt.thousands(c.scrubs_total)}` : "",
+    scrubs: scrubShipped(st) ? `GPU memory scrubs: ${fmt.thousands(c.scrubs)}` : "",
   };
+}
+
+/** The page speaks of the GPU memory scrub only once an agent has reported one. */
+function scrubShipped(st: FleetState | null): boolean {
+  return (st?.counters?.scrubs ?? 0) > 0;
 }
 
 export const REPOSITORY_URL = "https://github.com/ejc3/fcvm";
@@ -359,8 +356,8 @@ export interface IsolationView {
  * its own guest kernel, hosts with the IOMMU on and every GPU bound to
  * vfio-pci, a fresh VM restored from the gold snapshot with the slot's GPU
  * (`fcvm snapshot run --snapshot <gold> --gpu <sbdf>`, the GPU attached during
- * the restore). The scrub sentence appears only when the coordinator says the
- * scrub has shipped.
+ * the restore). The scrub sentence appears only once the coordinator has counted
+ * a scrub an agent reported (`counters.scrubs`).
  */
 export function isolationView(st: FleetState | null): IsolationView {
   const sentences = [
@@ -368,7 +365,7 @@ export function isolationView(st: FleetState | null): IsolationView {
     "Its GPU is handed to that virtual machine alone by the hardware's IOMMU (VFIO passthrough), not shared through a proxy in the host kernel.",
     "A restart throws the old virtual machine away, restores a fresh one from a snapshot, and attaches the GPU as it restores.",
   ];
-  if (st?.security.gpu_scrub) sentences.push("GPU memory is cleared before a GPU moves to the next virtual machine.");
+  if (scrubShipped(st)) sentences.push("GPU memory is cleared before a GPU moves to the next virtual machine.");
   return {
     title: "How it's isolated",
     open: "How it's isolated",
@@ -443,6 +440,20 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
 
 export const WORD_MAX = 28;
 
+/** How a viewer's message is drawn in the sky. The wire values are the coordinator's `text_style`. */
+export type TextStyle = "lockup" | "skywriting" | "landmark";
+
+export const TEXT_STYLES: readonly { value: TextStyle; label: string; thumb: string; alt: string }[] = [
+  { value: "lockup", label: "Lockup", thumb: "/text-styles/lockup.jpg", alt: "The message set as type above the clock, upper left" },
+  { value: "skywriting", label: "Skywriting", thumb: "/text-styles/skywriting.jpg", alt: "The message written in smoke in the sky" },
+  { value: "landmark", label: "Landmark", thumb: "/text-styles/landmark.jpg", alt: "The message in big letters standing on a ridge" },
+];
+
+/** The arguments of a word intent: the text and the style its sender picked. */
+export function wordArgs(text: string, style: TextStyle): { text: string; text_style: TextStyle } {
+  return { text, text_style: style };
+}
+
 export interface PlayView {
   title: string;
   close: string;
@@ -452,9 +463,17 @@ export interface PlayView {
     options: { id: string; label: string; votes: string; holding: boolean; chosen: boolean }[];
     disabled: boolean;
   } | null;
-  word: { label: string; placeholder: string; submit: string; maxLength: number; status: string; statusKind: "idle" | "pending" | "applied" | "refused" };
+  word: {
+    label: string;
+    placeholder: string;
+    submit: string;
+    maxLength: number;
+    status: string;
+    statusKind: "idle" | "pending" | "applied" | "refused";
+    /** The three ways to draw it, one picked (Lockup unless the viewer chose another). */
+    style: { legend: string; options: { value: TextStyle; label: string; thumb: string; alt: string; selected: boolean }[] };
+  };
   light: { label: string; on: boolean };
-  timeOfDay: { label: string; value: number; min: number; max: number; step: number; valueText: string };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
   stats: { label: string; on: boolean };
   verify: { needed: boolean; title: string; text: string; error: string };
@@ -479,8 +498,6 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
       statusKind = "refused";
     }
   }
-  const pendingTod = [...pend].reverse().find((i) => i.name === "time_of_day");
-  const tod = pendingTod && typeof pendingTod.args["v"] === "number" ? (pendingTod.args["v"] as number) : st.scene.time_of_day;
 
   let nudge: PlayView["nudge"] = null;
   const nd = st.nudges;
@@ -523,9 +540,16 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     title: "Play",
     close: "Close",
     nudge,
-    word: { label: "Write a word into the world", placeholder: "a word", submit: "Write", maxLength: WORD_MAX, status: wordStatus, statusKind },
+    word: {
+      label: "Write a word into the world",
+      placeholder: "a word",
+      submit: "Write",
+      maxLength: WORD_MAX,
+      status: wordStatus,
+      statusKind,
+      style: { legend: "How it is drawn", options: TEXT_STYLES.map((o) => ({ ...o, selected: o.value === s.ui.textStyle })) },
+    },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
-    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod) },
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
     stats: { label: "Show stream stats", on: s.ui.stats },
     verify: {
@@ -556,8 +580,8 @@ function actionText(a: Action, st: FleetState, you: string | null): string | nul
   const who = viewerName(a.viewer, you);
   const args = a.args ?? {};
   switch (a.name) {
-    case "relaunch_all":
-      return a.viewer === "schedule" ? "the scheduled restart of every GPU began" : `${who} restarted every GPU`;
+    case "restart_now":
+      return `${who} restarted every GPU`;
     case "relaunch": {
       const t = st.tiles.find((x) => x.id === args["tile"] || x.slot === args["tile"]);
       return `${who} restarted ${t ? tileName(t) : "a VM"}`;
@@ -566,8 +590,6 @@ function actionText(a: Action, st: FleetState, you: string | null): string | nul
       return typeof args["text"] === "string" ? `${who} wrote “${args["text"]}”` : `${who} wrote a word`;
     case "light":
       return `${who} dropped a light`;
-    case "time_of_day":
-      return typeof args["v"] === "number" ? `${who} set the time of day to ${fmt.timeOfDay(args["v"] as number)}` : null;
     case "nudge": {
       const target = st.nudges?.targets.find((x) => x.id === args["target"]);
       return `${who} chose ${target ? target.label : "a stop"} for the camera`;
@@ -586,15 +608,18 @@ export interface FeedItem {
 }
 
 function feedView(st: FleetState, srvNow: number, you: string | null, n: number): FeedItem[] {
-  const out: FeedItem[] = [];
-  const sorted = [...st.actions].sort((a, b) => b.at - a.at);
-  for (const a of sorted) {
+  const items: { at: number; key: string; text: string }[] = [];
+  for (const a of st.actions) {
     const text = actionText(a, st, you);
-    if (text === null) continue;
-    out.push({ key: a.id ?? `${a.at}-${out.length}`, text, when: fmt.ago(srvNow - a.at) });
-    if (out.length === n) break;
+    if (text !== null) items.push({ at: a.at, key: a.id ?? `${a.at}-${items.length}`, text });
   }
-  return out;
+  // The owner's cadence is not an intent, so it is not in `actions`: the race says who started it.
+  const ra = st.relaunch_all;
+  if (ra !== null && ra.by === "schedule") items.push({ at: ra.started_at, key: `race-${ra.started_at}`, text: "the scheduled restart of every GPU began" });
+  return items
+    .sort((a, b) => b.at - a.at)
+    .slice(0, n)
+    .map((x) => ({ key: x.key, text: x.text, when: fmt.ago(srvNow - x.at) }));
 }
 
 // ---- one VM opened -------------------------------------------------------------
@@ -885,6 +910,13 @@ export interface DrawPlan {
   suspended: boolean;
   /** The fleet is asleep or waking: the poster fills the image again, under tiles as they arrive. */
   posterFull: boolean;
+  /**
+   * The layout generation this plan is, and the scene t from which its tiles are
+   * drawn. A plan of a newer generation is drawn once every one of its regions has
+   * a frame at or after `atT`; until then the drawer keeps drawing the previous one.
+   */
+  gen: number;
+  atT: number;
 }
 
 /** The source a tile's pixels come from in a mode: its own stream, or the aggregate holding it. */
@@ -963,7 +995,7 @@ export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box,
 /** How long the returning label stays after the borrowed tile's first frame. */
 export const RETURNING_HOLD_MS = 4000;
 
-const RESTORING_PHASES = new Set(["borrowed", "relaunching", "requested", "stopping", "restoring", "starting", "pending"]);
+const RESTORING_PHASES = new Set(["borrowed", "relaunching", "stopping", "restoring", "starting", "pending"]);
 
 /** Whether this viewer's borrowed tile is still coming back (not yet streaming for RETURNING_HOLD_MS). */
 export function stillReturning(st: FleetState, id: string | null, srvNow: number): boolean {
@@ -1003,26 +1035,101 @@ function seamView(s: ClientState, layout: MosaicLayout | null, tiles: TileView[]
 export interface StageLabels {
   /** "fcvm" and "EC2" on backplates either side of the seam, top of the image. */
   seam: { half: Half; text: string; x: number; y: number; align: "right" | "left" }[];
-  /** One line under each half. */
-  captions: { half: Half; tag: string; text: string; box: Box }[];
+  /** One line under each side, side by side, or one under the other when a side is narrow. */
+  captions: { half: Half; tag: string; text: string; box: Box; align: "left" | "right" }[];
+  /** A side with no GPUs live: a small label where it would be, or null. */
+  empty: { half: Half; text: string; x: number; y: number; align: "right" | "left" } | null;
 }
 
-/** Height kept under the image for the captions. */
+/** Least height kept under the image for the captions. */
 export const CAPTION_BAND = 44;
+/** A side narrower than this puts the captions one under the other, full width. */
+export const CAPTION_MIN_W = 260;
 
-function stageLabels(layout: MosaicLayout | null): StageLabels {
-  if (!layout) return { seam: [], captions: [] };
+export const EMPTY_SIDE: Record<Half, string> = {
+  fcvm: "fcvm: no GPUs live right now",
+  ec2: "EC2: no GPUs live right now",
+};
+
+/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
+const CAPTION_CHAR_PX = 7.4;
+const CAPTION_LINE_PX = 18;
+
+function captionLines(half: Half, width: number): number {
+  return Math.max(1, Math.ceil(((CAPTIONS[half].length + 6) * CAPTION_CHAR_PX) / Math.max(1, width)));
+}
+
+/**
+ * The captions' boxes for an image and where its fcvm side ends: each under its
+ * side, or stacked full width when a side is too narrow; a side with no tiles has none.
+ */
+function captionBoxes(img: Box, split: number): { half: Half; box: Box }[] {
+  const y = img.y + img.h + 6;
+  const sides: Half[] = split <= 0 ? ["ec2"] : split >= 1 ? ["fcvm"] : ["fcvm", "ec2"];
+  if (sides.length === 1) return [{ half: sides[0]!, box: { x: img.x, y, w: img.w, h: 0 } }];
+  const mid = img.x + img.w * split;
+  const fw = mid - img.x - 8;
+  const ew = img.x + img.w - mid - 8;
+  if (Math.min(fw, ew) >= CAPTION_MIN_W) {
+    return [
+      { half: "fcvm", box: { x: img.x, y, w: fw, h: 0 } },
+      { half: "ec2", box: { x: mid + 8, y, w: ew, h: 0 } },
+    ];
+  }
+  const first = captionLines("fcvm", img.w) * CAPTION_LINE_PX;
+  return [
+    { half: "fcvm", box: { x: img.x, y, w: img.w, h: 0 } },
+    { half: "ec2", box: { x: img.x, y: y + first, w: img.w, h: 0 } },
+  ];
+}
+
+/** Height the captions take under an image of this width. */
+function captionBand(imgW: number, split: number): number {
+  const boxes = captionBoxes({ x: 0, y: 0, w: imgW, h: 0 }, split);
+  const stacked = boxes.length === 2 && boxes[1]!.box.y > boxes[0]!.box.y;
+  const lines = boxes.map((b) => captionLines(b.half, b.box.w));
+  const total = stacked ? lines.reduce((a, b) => a + b, 0) : Math.max(...lines);
+  return Math.max(CAPTION_BAND, total * CAPTION_LINE_PX + 8);
+}
+
+/** `awake`: a side with no GPUs is only "empty" once the fleet is up; asleep or waking it is still to come. */
+function stageLabels(layout: MosaicLayout | null, awake: boolean): StageLabels {
+  if (!layout) return { seam: [], captions: [], empty: null };
   const img = layout.image;
   const mid = layout.halfLineX;
+  const captions = captionBoxes(img, layout.split).map((c) => ({
+    half: c.half,
+    tag: KIND_TAG[c.half],
+    text: CAPTIONS[c.half],
+    box: c.box,
+    // Under its own side, the EC2 caption keeps to the right edge.
+    align: (c.half === "ec2" && c.box.x > img.x ? "right" : "left") as "left" | "right",
+  }));
+  if (mid === null) {
+    // One side has every GPU: it takes the whole width, and the other says it is empty.
+    const present: Half = layout.split >= 1 ? "fcvm" : "ec2";
+    const absent: Half = present === "fcvm" ? "ec2" : "fcvm";
+    return {
+      seam: [
+        present === "fcvm"
+          ? { half: "fcvm", text: "fcvm", x: img.x + 10, y: img.y + 10, align: "left" }
+          : { half: "ec2", text: "EC2", x: img.x + img.w - 10, y: img.y + 10, align: "right" },
+      ],
+      captions,
+      empty: !awake
+        ? null
+        : absent === "ec2"
+          ? { half: "ec2", text: EMPTY_SIDE.ec2, x: img.x + img.w - 10, y: img.y + 10, align: "right" }
+          : { half: "fcvm", text: EMPTY_SIDE.fcvm, x: img.x + 10, y: img.y + 10, align: "left" },
+    };
+  }
   return {
     seam: [
       { half: "fcvm", text: "fcvm", x: mid - 8, y: img.y + 10, align: "right" },
       { half: "ec2", text: "EC2", x: mid + 8, y: img.y + 10, align: "left" },
     ],
-    captions: [
-      { half: "fcvm", tag: "fcvm", text: CAPTIONS.fcvm, box: { x: img.x, y: img.y + img.h + 6, w: mid - img.x - 8, h: 0 } },
-      { half: "ec2", tag: "EC2", text: CAPTIONS.ec2, box: { x: mid + 8, y: img.y + img.h + 6, w: img.x + img.w - mid - 8, h: 0 } },
-    ],
+    captions,
+    empty: null,
   };
 }
 
@@ -1046,7 +1153,8 @@ export interface WallView {
   score: ScoreView | null;
   labels: StageLabels;
   play: PlayView | null;
-  playButton: { label: string; open: boolean };
+  /** The phone's way into the Play drawer: a text link under its one button. */
+  playButton: { label: string; open: boolean; phoneLabel: string };
   pause: { label: string; on: boolean };
   feed: FeedItem[];
   counter: CounterView | null;
@@ -1073,27 +1181,34 @@ export interface WallView {
   bandwidth: string;
 }
 
+/**
+ * The tiles the canvas draws now: the shown generation's places and rectangles,
+ * each with its latest state when the newest snapshot still has it.
+ */
+export function drawnTiles(s: ClientState): Tile[] {
+  const st = s.accepted;
+  if (!st) return [];
+  const shown = s.shownLayout;
+  if (!shown || shown.gen === st.layout.generation) return st.tiles;
+  const now = new Map(st.tiles.map((t) => [t.id, t]));
+  return shown.tiles.map((old) => {
+    const cur = now.get(old.id);
+    return cur ? { ...cur, rect: old.rect } : old;
+  });
+}
+
 export function pendingIntents(s: ClientState): IntentMsg[] {
   return s.pending.map((p) => p.intent);
 }
 
-/** Caption text: 14 px IBM Plex Sans averages about 7.4 px a character; lines are 18 px. */
-const CAPTION_CHAR_PX = 7.4;
-const CAPTION_LINE_PX = 18;
-
 /**
- * The image's area: the stage less the band its captions sit in, tall enough
- * for the longer caption at the width half the image will have.
+ * The image's area: the stage less the band its captions sit in, tall enough for
+ * the captions at the widths the two sides will have (`split`: where fcvm ends).
  */
-export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9): Box {
+export function imageArea(stage: Box, phone: boolean, aspect: number = 16 / 9, split = 0.5): Box {
   if (phone) return stage;
   let band = CAPTION_BAND;
-  for (let i = 0; i < 3; i++) {
-    const half = Math.min(stage.w, (stage.h - band) * aspect) / 2 - 8;
-    const chars = Math.max(...Object.values(CAPTIONS).map((c) => c.length + 6));
-    const lines = Math.max(1, Math.ceil((chars * CAPTION_CHAR_PX) / Math.max(1, half)));
-    band = Math.max(CAPTION_BAND, lines * CAPTION_LINE_PX + 8);
-  }
+  for (let i = 0; i < 3; i++) band = captionBand(Math.min(stage.w, (stage.h - band) * aspect), split);
   return { x: stage.x, y: stage.y, w: stage.w, h: Math.max(0, stage.h - band) };
 }
 
@@ -1112,11 +1227,15 @@ export function wallView(input: WallInput): WallView {
     banners.push({ kind: "offline", text: "The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back." });
   }
   if (st) {
-    const draining = st.fleet.hosts.filter((h) => h.draining);
-    if (draining.length > 0) {
+    // A reclaimed host's tiles leave the tiling at once; `failures` keeps it for a minute.
+    const reclaimed = new Set([
+      ...st.failures.filter((f) => f.kind === "host_reclaimed").map((f, i) => f.host ?? `#${i}`),
+      ...st.fleet.hosts.filter((h) => h.draining).map((h) => h.name),
+    ]);
+    if (reclaimed.size > 0) {
       banners.push({
         kind: "reclaimed",
-        text: `AWS reclaimed ${draining.length === 1 ? "an fcvm host" : `${draining.length} fcvm hosts`}. Its squares stay dark while the image is re-tiled onto the GPUs left.`,
+        text: `AWS reclaimed ${reclaimed.size === 1 ? "an fcvm host" : `${reclaimed.size} fcvm hosts`}. The image is re-tiled onto the GPUs left.`,
       });
     }
   }
@@ -1136,8 +1255,12 @@ export function wallView(input: WallInput): WallView {
     darkFadeMs: input.reducedMotion ? REDUCED_MOTION_DARK_FADE_MS : 0,
     suspended: s.ui.suspended,
     posterFull: false,
+    gen: s.accepted?.layout.generation ?? 0,
+    atT: 0,
   };
-  const area = input.mosaicArea ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect) : null;
+  const area = input.mosaicArea
+    ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect, s.accepted ? splitOf(input.canDecode ? drawnTiles(s) : s.accepted.tiles) : 0.5)
+    : null;
   const common = {
     title: TITLE,
     site: SITE,
@@ -1145,7 +1268,7 @@ export function wallView(input: WallInput): WallView {
     version: s.version,
     online,
     banners,
-    playButton: { label: "Play", open: s.ui.drawer },
+    playButton: { label: "Play", open: s.ui.drawer, phoneLabel: "Play: write a word in the sky, drop a light" },
     pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
     help: "Click a square to look at its VM.",
     rotateHint: "Turn your phone sideways for a bigger picture.",
@@ -1159,7 +1282,7 @@ export function wallView(input: WallInput): WallView {
       layout: null,
       tiles: [],
       score: null,
-      labels: { seam: [], captions: [] },
+      labels: { seam: [], captions: [], empty: null },
       play: null,
       feed: [],
       counter: null,
@@ -1180,13 +1303,18 @@ export function wallView(input: WallInput): WallView {
     };
   }
   const pend = pendingIntents(s);
-  const layout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
-  const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
   const sleep = sleepView(st, srvNow);
+  // Two tilings while a re-tile settles: the plan is the newest generation (its
+  // streams open now), and the overlays follow the one the canvas still draws.
+  const shownTiles = input.canDecode ? drawnTiles(s) : st.tiles;
+  const planLayout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
+  const layout = shownTiles === st.tiles ? planLayout : area ? layoutMosaic(area, shownTiles, input.dpr, st.image_aspect) : null;
+  const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
+  const placedPlan = new Map<string, PlacedTile>(planLayout?.tiles.map((p) => [p.id, p]) ?? []);
   // Asleep or waking, a tile that is not rendering yet shows the poster, not a dark square.
-  const tiles = st.tiles
-    .map((t) => tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend))
-    .map((tv) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv));
+  const asleepFix = (tv: TileView) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv);
+  const tiles = shownTiles.map((t) => asleepFix(tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend)));
+  const planViews = shownTiles === st.tiles ? tiles : st.tiles.map((t) => asleepFix(tileView(t, s, st, placedPlan.get(t.id)?.box ?? null, srvNow, pend)));
   const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
   const focus = focusTile ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online) : null;
   const own = ownView(s, st, srvNow, input);
@@ -1199,7 +1327,7 @@ export function wallView(input: WallInput): WallView {
   const opened = focus && focus.placed && !own ? focusTile : null;
   const asks: StreamAsk[] = st.tiles.filter(isLive).map((t) => {
     const focused = opened !== null && opened.id === t.id;
-    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedById.get(t.id)?.streamHeight ?? 144;
+    const height = focused ? focus!.placed!.streamHeight : covered ? STREAM_HEIGHTS[0] : placedPlan.get(t.id)?.streamHeight ?? 144;
     return { id: t.id, rect: t.rect, height, keep: focused };
   });
   const fitted = fitBandwidth(asks, st.image_aspect, input.budgetBps);
@@ -1211,14 +1339,14 @@ export function wallView(input: WallInput): WallView {
       url: frameSocketUrl(t.frame_url!, height, q),
       baseUrl: t.frame_url,
       height,
-      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedById.get(t.id)?.box ?? null,
+      box: covered ? (opened?.id === t.id ? focus!.placed!.box : null) : placedPlan.get(t.id)?.box ?? null,
     };
   });
   // Aggregated: each region is one big tile; it asks for the height it covers.
   const aggregated: DrawSource[] = st.aggregates
     .filter((g) => g.frame_url !== null)
     .map((g) => {
-      const box = layout ? rectOnScreen(layout.image, g.rect, input.dpr) : null;
+      const box = planLayout ? rectOnScreen(planLayout.image, g.rect, input.dpr) : null;
       const height = covered || !box ? STREAM_HEIGHTS[0] : streamHeightFor(box.h * input.dpr);
       return { id: `a:${g.id}`, url: frameSocketUrl(g.frame_url!, height), baseUrl: g.frame_url, height, box: covered ? null : box };
     });
@@ -1236,11 +1364,13 @@ export function wallView(input: WallInput): WallView {
     aggregated,
     focus: focusSource,
     estimatedBps: fitted.bps,
-    image: covered ? null : layout?.image ?? null,
+    image: covered ? null : planLayout?.image ?? null,
     posterFull: sleep !== null,
+    gen: st.layout.generation,
+    atT: st.layout.from_frame / FRAME_RATE,
     tiles: st.tiles.map((t, i) => {
-      const tv = tiles[i]!;
-      return { id: t.id, half: t.half, box: covered ? null : placedById.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
+      const tv = planViews[i]!;
+      return { id: t.id, half: t.half, box: covered ? null : placedPlan.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
     }),
   };
 
@@ -1252,7 +1382,7 @@ export function wallView(input: WallInput): WallView {
     layout,
     tiles,
     score: scoreView({ st, now: srvNow, pending: pend, online }),
-    labels: stageLabels(covered ? null : layout),
+    labels: stageLabels(covered ? null : layout, st.fleet.power.state === "awake"),
     play,
     feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
     counter: counterView(st),
@@ -1273,7 +1403,7 @@ export function wallView(input: WallInput): WallView {
     own,
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
-    viewers: fmt.count(st.viewers.count, "person watching", "people watching"),
+    viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
     plan,
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,
@@ -1290,10 +1420,9 @@ export function wallView(input: WallInput): WallView {
 export const NOTICE_MS = 8000;
 
 const INTENT_LABEL: Record<string, string> = {
-  relaunch_all: "The restart",
+  restart_now: "The restart",
   relaunch: "The restart",
   light: "The light",
-  time_of_day: "The time of day",
   nudge: "Your choice of stop",
 };
 

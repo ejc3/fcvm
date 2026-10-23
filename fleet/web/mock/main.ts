@@ -3,8 +3,9 @@
 //   FLEET_MOCK_COORD_PORT    coordinator port (required; 0 asks the kernel)
 //   FLEET_MOCK_RENDER_PORT   renderer port (required; 0 asks the kernel)
 //   FLEET_MOCK_HOST          host name the browser uses for frame_url (localhost)
-//   FLEET_MOCK_TILES         tiles per half (8, so 16 in all)
-//   FLEET_MOCK_EC2_SHORT     EC2 tiles waiting for capacity (1)
+//   FLEET_MOCK_PUBLIC_RENDER_PORT  the port frame_url names, when a proxy sits in front (the renderer port)
+//   FLEET_MOCK_FCVM_GPUS     fcvm GPUs live (8); each side is as wide as its share
+//   FLEET_MOCK_EC2_GPUS      EC2 GPUs live (7)
 //   FLEET_MOCK_GPUS_PER_HOST GPUs per fcvm host (8)
 //   FLEET_MOCK_FCVM_MS       typical fcvm restart (3000; each takes 0.87 to 1.13 of it)
 //   FLEET_MOCK_EC2_MS        typical EC2 restart (52000; each takes 0.67 to 1.33 of it)
@@ -67,6 +68,7 @@ export async function startMock() {
   const renderers = new MockRenderers({
     port: int("FLEET_MOCK_RENDER_PORT"),
     publicHost: env("FLEET_MOCK_HOST", "localhost"),
+    ...(process.env["FLEET_MOCK_PUBLIC_RENDER_PORT"] ? { publicPort: int("FLEET_MOCK_PUBLIC_RENDER_PORT") } : {}),
     fps: fps(),
     threads: int("FLEET_MOCK_THREADS", 12),
     maxHeight: int("FLEET_MOCK_MAX_HEIGHT", 1080),
@@ -76,8 +78,8 @@ export async function startMock() {
   await renderers.listen();
   coord = new MockCoordinator({
     port: int("FLEET_MOCK_COORD_PORT"),
-    perHalf: int("FLEET_MOCK_TILES", 8),
-    ec2Short: int("FLEET_MOCK_EC2_SHORT", 1),
+    fcvmGpus: int("FLEET_MOCK_FCVM_GPUS", 8),
+    ec2Gpus: int("FLEET_MOCK_EC2_GPUS", 7),
     gpusPerHost: Math.max(1, int("FLEET_MOCK_GPUS_PER_HOST", 8)),
     fcvmRelaunchMs: int("FLEET_MOCK_FCVM_MS", 3000),
     ec2RelaunchMs: int("FLEET_MOCK_EC2_MS", 52000),

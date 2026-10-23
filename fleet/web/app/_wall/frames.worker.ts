@@ -72,6 +72,8 @@ class TileStream {
   closed = false;
   decodedTimes: number[] = [];
   decodeStart = new Map<number, number>();
+  /** The header in force when each chunk went to the decoder: its frame is placed by it, not by a newer header. */
+  decodeMeta = new Map<number, { crop: Crop; grid: Grid | null }>();
   decodeMs: number[] = [];
   lastW = 0;
   lastH = 0;
@@ -179,6 +181,8 @@ class TileStream {
     const ts = Math.round(f.t * 1e6);
     this.decodeStart.set(ts, performance.now());
     if (this.decodeStart.size > 64) this.decodeStart.delete(this.decodeStart.keys().next().value!);
+    this.decodeMeta.set(ts, { crop: this.crop, grid: this.grid });
+    if (this.decodeMeta.size > 64) this.decodeMeta.delete(this.decodeMeta.keys().next().value!);
     try {
       this.decoder.decode(new EncodedVideoChunk({ type: f.keyframe ? "key" : "delta", timestamp: ts, data: f.data }));
     } catch {
@@ -198,8 +202,10 @@ class TileStream {
       frame.close();
       return;
     }
-    const crop = this.crop;
-    const grid = this.grid;
+    const meta = this.decodeMeta.get(frame.timestamp);
+    this.decodeMeta.delete(frame.timestamp);
+    const crop = meta?.crop ?? this.crop;
+    const grid = meta ? meta.grid : this.grid;
     this.lastW = frame.displayWidth - crop.left - crop.right;
     this.lastH = frame.displayHeight - crop.top - crop.bottom;
     this.decodedTimes.push(now());
@@ -213,7 +219,11 @@ class TileStream {
     } else {
       this.frames.push({ t, frame, crop, grid });
     }
-    while (this.frames.length > BUFFER_FRAMES) this.frames.shift()!.frame.close();
+    // While a re-tile waits, the frame on screen is kept: the old tiles are drawn from it.
+    while (this.frames.length > BUFFER_FRAMES) {
+      const i = pinT !== null && this.frames.length > 1 && Math.abs(this.frames[0]!.t - pinT) <= SAME_T_EPS ? 1 : 0;
+      this.frames.splice(i, 1)[0]!.frame.close();
+    }
   }
 
   resetDecoder(): void {
@@ -230,6 +240,7 @@ class TileStream {
     this.codedH = 0;
     this.waitingKey = true;
     this.decodeStart.clear();
+    this.decodeMeta.clear();
   }
 
   dropFrames(): void {
@@ -283,7 +294,14 @@ let plan: DrawPlan = {
   darkFadeMs: 0,
   suspended: false,
   posterFull: false,
+  gen: 0,
+  atT: 0,
 };
+/** A newer layout generation, waiting until every one of its regions has a frame at or after its atT. */
+let nextPlan: DrawPlan | null = null;
+let retileStarted = 0;
+/** The t on screen while a re-tile waits: buffers keep that frame. */
+let pinT: number | null = null;
 /** The mode being drawn. It becomes plan.mode only once that mode can be drawn whole. */
 let shownMode: StreamMode = "direct";
 /** When each tile last stopped being dark, for its fade back in. */
@@ -332,37 +350,51 @@ function post(m: FromWorker): void {
   self.postMessage(m);
 }
 
-function sourcesOf(mode: StreamMode): DrawSource[] {
-  return mode === "direct" ? plan.direct : plan.aggregated;
+function sourcesOf(mode: StreamMode, p: DrawPlan = plan): DrawSource[] {
+  return mode === "direct" ? p.direct : p.aggregated;
 }
 
 /** The streams to hold: the mode drawn, the mode wanted (while switching), and an opened tile. */
 function wantedSources(): Map<string, DrawSource> {
   const out = new Map<string, DrawSource>();
   if (plan.suspended) return out;
-  for (const src of sourcesOf(shownMode)) out.set(src.id, src);
-  if (plan.mode !== shownMode) for (const src of sourcesOf(plan.mode)) out.set(src.id, src);
-  if (plan.focus) out.set(plan.focus.id, plan.focus);
+  for (const src of sourcesOf(shownMode)) out.set(keyOf(src), src);
+  if (plan.mode !== shownMode) for (const src of sourcesOf(plan.mode)) out.set(keyOf(src), src);
+  if (plan.focus) out.set(keyOf(plan.focus), plan.focus);
+  // A waiting re-tile's streams open now, so its tiles have frames by its frame.
+  if (nextPlan) {
+    for (const src of sourcesOf(shownMode, nextPlan)) out.set(keyOf(src), src);
+    if (nextPlan.focus) out.set(keyOf(nextPlan.focus), nextPlan.focus);
+  }
   return out;
+}
+
+/**
+ * A stream is the renderer behind a source, so it is keyed by the source and its
+ * URL: when a re-tile gives a place another GPU, the old stream keeps drawing the
+ * old tiling while the new one starts.
+ */
+function keyOf(src: DrawSource): string {
+  return `${src.id} ${src.baseUrl ?? ""}`;
+}
+
+function streamOf(src: DrawSource): TileStream | undefined {
+  return streams.get(keyOf(src));
 }
 
 function syncStreams(): void {
   const wanted = wantedSources();
-  for (const src of wanted.values()) {
+  for (const [key, src] of wanted) {
     if (src.url === null || src.baseUrl === null) continue;
-    const st = streams.get(src.id);
-    if (!st || st.baseUrl !== src.baseUrl) {
-      st?.close();
-      streams.set(src.id, new TileStream(src.id, src.baseUrl, src.url, src.height));
-    } else {
-      st.setHeight(src.height, src.url);
-    }
+    const st = streams.get(key);
+    if (!st) streams.set(key, new TileStream(src.id, src.baseUrl, src.url, src.height));
+    else st.setHeight(src.height, src.url);
   }
-  for (const [id, st] of streams) {
-    const w = wanted.get(id);
+  for (const [key, st] of streams) {
+    const w = wanted.get(key);
     if (!w || w.url === null) {
       st.close();
-      streams.delete(id);
+      streams.delete(key);
     }
   }
 }
@@ -415,6 +447,26 @@ function fillEmpty(b: Box): void {
 }
 
 function applyPlan(p: DrawPlan): void {
+  // A re-tile: keep drawing the tiles on screen until every tile of the new
+  // generation has a frame at or after its first frame, then swap them all at once.
+  if (nextPlan !== null && p.gen === nextPlan.gen && !p.suspended) {
+    nextPlan = p;
+    plan = { ...plan, paused: p.paused, darkFadeMs: p.darkFadeMs };
+    dirty = true;
+    syncStreams();
+    return;
+  }
+  if (p.gen > plan.gen && prevT !== null && !p.suspended && !plan.suspended && !p.posterFull) {
+    nextPlan = p;
+    retileStarted = now();
+    pinT = prevT;
+    plan = { ...plan, paused: p.paused, darkFadeMs: p.darkFadeMs };
+    dirty = true;
+    syncStreams();
+    return;
+  }
+  nextPlan = null;
+  pinT = null;
   const was = plan.suspended;
   if (!was && p.suspended && canvas) {
     // Keep what is on screen: it stays up while hidden and when the tab comes back.
@@ -435,7 +487,10 @@ function applyPlan(p: DrawPlan): void {
     posterRetired = false;
     posterUrl = null;
   }
+  const genChanged = p.gen !== plan.gen;
   plan = p;
+  // Taken at once (nothing on screen yet, or suspended): the page's overlays follow now.
+  if (genChanged) post({ type: "gen-shown", gen: plan.gen });
   loadPoster(p.poster);
   dirty = true;
   needsClear = true;
@@ -461,9 +516,9 @@ function applyPlan(p: DrawPlan): void {
 function switchCap(): number {
   if (plan.mode === shownMode || plan.focus) return Infinity;
   const target = sourcesOf(plan.mode).filter((src) => src.box !== null && src.url !== null);
-  if (target.length === 0 || !target.every((src) => (streams.get(src.id)?.frames.length ?? 0) > 0)) return Infinity;
+  if (target.length === 0 || !target.every((src) => (streamOf(src)?.frames.length ?? 0) > 0)) return Infinity;
   if (switchStarted !== null && now() - switchStarted > SWITCH_HOLD_LIMIT_MS) return Infinity;
-  const newest = Math.min(...target.map((src) => { const f = streams.get(src.id)!.frames; return f[f.length - 1]!.t; }));
+  const newest = Math.min(...target.map((src) => { const f = streamOf(src)!.frames; return f[f.length - 1]!.t; }));
   // Never below what is on screen: the shown frames at prevT are still held.
   return prevT === null ? newest : Math.max(newest, prevT);
 }
@@ -476,9 +531,9 @@ function trySwitch(): void {
   switchStarted ??= now();
   const target = sourcesOf(plan.mode).filter((src) => src.box !== null && src.url !== null);
   if (target.length > 0) {
-    if (!target.every((src) => streams.has(src.id))) return;
+    if (!target.every((src) => streams.has(keyOf(src)))) return;
     const c = chooseCommonT(
-      target.map((src) => ({ id: src.id, ts: streams.get(src.id)!.frames.map((h) => h.t) })),
+      target.map((src) => ({ id: src.id, ts: streamOf(src)!.frames.map((h) => h.t) })),
       prevT,
     );
     if (c.T === null || (prevT !== null && c.T < prevT - SAME_T_EPS)) return;
@@ -489,6 +544,33 @@ function trySwitch(): void {
   dirty = true;
   needsClear = true;
   post({ type: "mode-shown", mode: shownMode });
+}
+
+/**
+ * Swap to the waiting generation once every one of its regions holds a frame at
+ * one t at or after its first frame (or after the switch's 4 s limit, so a region
+ * that never answers cannot hold the image forever).
+ */
+function tryRetile(): void {
+  const n = nextPlan;
+  if (!n) return;
+  const target = (n.focus ? [n.focus] : sourcesOf(shownMode, n)).filter((src) => src.box !== null && src.url !== null);
+  let ready = now() - retileStarted > SWITCH_HOLD_LIMIT_MS;
+  if (!ready && target.every((src) => streams.has(keyOf(src)))) {
+    const c = chooseCommonT(
+      target.map((src) => ({ id: src.id, ts: streamOf(src)!.frames.filter((h) => h.t >= n.atT - SAME_T_EPS && fitsPlan(h, src, n)).map((h) => h.t) })),
+      prevT,
+    );
+    ready = c.T !== null && c.T >= n.atT - SAME_T_EPS && target.every((src) => c.show.get(src.id)?.kind === "sync");
+  }
+  if (!ready) return;
+  plan = n;
+  nextPlan = null;
+  pinT = null;
+  dirty = true;
+  needsClear = true;
+  post({ type: "gen-shown", gen: plan.gen });
+  syncStreams();
 }
 
 function resize(w: number, h: number, d: number): void {
@@ -513,6 +595,21 @@ function devBox(b: Box): [number, number, number, number] {
 }
 
 /** Device-pixel box of a stream's inner rectangle placed in the image by its grid position. */
+/**
+ * Whether a frame was rendered for the place a plan draws its source in. After a
+ * re-tile's frame the renderers draw the new rectangles, so until the page has the
+ * new plan (a late snapshot), those frames do not fit the old boxes and are not drawn:
+ * the image holds on the last frame that fits instead of drawing pixels in the wrong place.
+ */
+function fitsPlan(h: Held, src: DrawSource, p: DrawPlan): boolean {
+  if (!p.image || !h.grid || !src.box || p.focus) return true;
+  const inner = innerRect({ width: h.frame.displayWidth, height: h.frame.displayHeight, crop: h.crop });
+  const [x, y, w, hh] = gridBox(p.image, h.grid, inner.sw, inner.sh);
+  const [bx, by, bw, bh] = devBox(src.box);
+  const tol = Math.max(2, Math.round(dpr * 2));
+  return Math.abs(x - bx) <= tol && Math.abs(y - by) <= tol && Math.abs(w - bw) <= tol && Math.abs(hh - bh) <= tol;
+}
+
 function gridBox(image: Box, g: Grid, w: number, h: number): [number, number, number, number] {
   const x0 = Math.round((image.x + (g.x0 / g.fullWidth) * image.w) * dpr);
   const y0 = Math.round((image.y + (g.y0 / g.fullHeight) * image.h) * dpr);
@@ -562,10 +659,15 @@ function draw(): void {
   // Paused: the picture holds what it shows; only a new plan or size redraws it.
   if (plan.paused && !dirty && captures.length === 0) return;
   if (!plan.paused) trySwitch();
+  if (nextPlan && !plan.paused) tryRetile();
   const shown = plan.focus ? [plan.focus] : sourcesOf(shownMode);
-  const drawable = shown.filter((src) => src.box !== null && streams.has(src.id));
-  const buffers = drawable.map((src) => ({ id: src.id, ts: streams.get(src.id)!.frames.map((h) => h.t) }));
-  const choice = plan.paused ? lastChoice : chooseCommonT(buffers, prevT, undefined, switchCap());
+  const drawable = shown.filter((src) => src.box !== null && streams.has(keyOf(src)));
+  const buffers = drawable.map((src) => ({ id: src.id, ts: streamOf(src)!.frames.filter((h) => fitsPlan(h, src, plan)).map((h) => h.t) }));
+  // Frames that do not fit (a re-tile the page has not heard of yet): keep the one on screen.
+  if (!nextPlan) pinT = drawable.some((src) => streamOf(src)!.frames.some((h) => !fitsPlan(h, src, plan))) ? prevT : null;
+  // While a re-tile waits, the old tiles show only frames from before its first frame.
+  const cap = nextPlan ? Math.min(switchCap(), nextPlan.atT - SAME_T_EPS) : switchCap();
+  const choice = plan.paused ? lastChoice : chooseCommonT(buffers, prevT, undefined, cap);
   if (resuming) {
     // Back from hidden: the picture holds until every region has a frame at one
     // t (the mode switch's rule), then the live image fades in over it.
@@ -579,14 +681,14 @@ function draw(): void {
         dirty = false;
         needsClear = false;
       }
-      if (trace) trace.push({ T: prevT, mode: shownMode, missing: 0, darkIn: 0, poster: false, held: true });
+      if (trace) trace.push({ T: prevT, mode: shownMode, missing: 0, darkIn: 0, poster: false, held: true, gen: plan.gen });
       answerCaptures(prevT);
       return;
     }
     resuming = false;
     heldFadeFrom = now();
     for (const src of live) {
-      const st = streams.get(src.id);
+      const st = streamOf(src);
       if (st) st.appearedAt = null;
     }
     dirty = true;
@@ -614,7 +716,7 @@ function draw(): void {
   let missing = 0;
   for (const src of shown) {
     if (!src.box) continue;
-    const st = streams.get(src.id);
+    const st = streamOf(src);
     const show = choice.show.get(src.id);
     const frame = st && show && (show.kind === "sync" || show.kind === "behind") ? st.frameAt(show.t) : null;
     if (!st || !show || !frame) {
@@ -695,13 +797,13 @@ function draw(): void {
     }
   }
   for (const src of shown) {
-    const st = streams.get(src.id);
+    const st = streamOf(src);
     if (!st) continue;
     const keep = releaseBefore(choice, src.id);
     if (keep !== null) st.releaseOlder(keep);
   }
   if (trace) {
-    trace.push({ T: choice.T, mode: shownMode, missing, darkIn, poster: posterOn(), held: heldFadeFrom !== null });
+    trace.push({ T: choice.T, mode: shownMode, missing, darkIn, poster: posterOn(), held: heldFadeFrom !== null, gen: plan.gen });
     if (trace.length > 20_000) trace.shift();
   }
   // The held picture goes once the live one has faded in over it.
@@ -711,11 +813,11 @@ function draw(): void {
     held = null;
   }
   // The poster goes once every stream drawn has shown a frame.
-  if (!posterRetired && !plan.posterFull && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streams.get(src.id)?.appearedAt != null)) {
+  if (!posterRetired && !plan.posterFull && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streamOf(src)?.appearedAt != null)) {
     posterRetired = true;
     dirty = true;
   }
-  if (!painted && (posterOn() || shown.some((src) => streams.get(src.id)?.appearedAt != null))) {
+  if (!painted && (posterOn() || shown.some((src) => streamOf(src)?.appearedAt != null))) {
     painted = true;
     post({ type: "painted" });
   }
@@ -761,7 +863,7 @@ function answerCaptures(T: number | null, shownBy: Record<string, string> = {}):
 function allLive(): boolean {
   if (plan.focus || resuming || plan.suspended) return false;
   const drawn = sourcesOf(shownMode).filter((src) => src.box !== null && src.url !== null);
-  return drawn.length > 0 && drawn.every((src) => streams.get(src.id)?.appearedAt != null);
+  return drawn.length > 0 && drawn.every((src) => streamOf(src)?.appearedAt != null);
 }
 
 function pct(xs: readonly number[], p: number): number {
@@ -777,7 +879,8 @@ function report(): void {
   let decoded = 0;
   let bytes = 0;
   const decodeAll: number[] = [];
-  for (const [id, s] of streams) {
+  for (const s of streams.values()) {
+    const id = s.id;
     const fps = s.fps(at);
     decoded += fps;
     bytes += s.bytes;

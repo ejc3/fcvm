@@ -96,6 +96,8 @@ export interface UiState {
   suspended: boolean;
   /** The recording is on screen (from asleep until the live image has replaced it). */
   reelOn: boolean;
+  /** How this viewer's next message is drawn. */
+  textStyle: "lockup" | "skywriting" | "landmark";
 }
 
 /** A tab hidden this long stops its frame streams; the coordinator socket stays. */
@@ -144,6 +146,17 @@ export interface OwnGpu {
   refused: string | null;
 }
 
+/**
+ * The tiling the canvas draws. A new layout generation is drawn only once every
+ * tile of it has a frame at or after its `from_frame`; until the frame drawer says
+ * so ("gen-shown"), the page lays its overlays out on the tiling still drawn.
+ */
+export interface ShownLayout {
+  gen: number;
+  tiles: FleetState["tiles"];
+  aggregates: FleetState["aggregates"];
+}
+
 export interface ClientState {
   connection: "connecting" | "open" | "closed";
   accepted: FleetState | null;
@@ -166,6 +179,7 @@ export interface ClientState {
   own: OwnGpu;
   /** Recent GPU readings per tile, oldest first. */
   gpuHistory: Record<string, GpuSample[]>;
+  shownLayout: ShownLayout | null;
   ui: UiState;
 }
 
@@ -185,7 +199,9 @@ export type ClientEvent =
   | { type: "queue-sent" }
   | { type: "turnstile-error"; error: string }
   /** The viewer closed its own-GPU view, or dismissed a refusal. */
-  | { type: "own-closed" };
+  | { type: "own-closed" }
+  /** The frame drawer now draws this layout generation. */
+  | { type: "gen-shown"; gen: number };
 
 const HANDLED_KEPT = 512;
 const NOTICES_KEPT = 6;
@@ -212,6 +228,7 @@ export function initialState(): ClientState {
     turnstile: { sitekey: null, verified: false, verifying: false, error: null, queued: [] },
     own: { requestId: null, requestedAt: null, claim: null, refused: null },
     gpuHistory: {},
+    shownLayout: null,
     ui: {
       mode: "aggregated",
       shownMode: "aggregated",
@@ -227,6 +244,7 @@ export function initialState(): ClientState {
       hiddenSince: null,
       suspended: false,
       reelOn: false,
+      textStyle: "lockup",
     },
   };
 }
@@ -320,6 +338,11 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, turnstile: { ...s.turnstile, queued: [] } };
     case "turnstile-error":
       return { ...s, turnstile: { ...s.turnstile, verifying: false, error: e.error } };
+    case "gen-shown": {
+      const st = s.accepted;
+      if (!st || st.layout.generation !== e.gen) return s;
+      return { ...s, shownLayout: { gen: st.layout.generation, tiles: st.tiles, aggregates: st.aggregates } };
+    }
     case "own-closed":
       return { ...s, own: { requestId: null, requestedAt: null, claim: null, refused: null } };
     case "message": {
@@ -362,9 +385,16 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           if (msg.version <= s.version) return s; // older or repeated: dropped
           const accepted = msg.state;
           const cameraWatches = s.cameraWatches.map((w) => resolveWatch(w, ownKeys(s), msg.version));
+          // The same generation (or the first): overlays follow it at once. A newer one
+          // waits until the frame drawer has swapped to it.
+          const shownLayout =
+            s.shownLayout === null || accepted.layout.generation <= s.shownLayout.gen
+              ? { gen: accepted.layout.generation, tiles: accepted.tiles, aggregates: accepted.aggregates }
+              : s.shownLayout;
           return {
             ...s,
             accepted,
+            shownLayout,
             version: msg.version,
             pending: settle(s.pending, msg.version),
             cameraWatches,

@@ -37,6 +37,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     }
   }
   return {
+    layout: { generation: 1, from_frame: 0 },
     tiles,
     image_aspect: 16 / 9,
     fleet: {
@@ -47,15 +48,15 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
       power: { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null },
     },
     borrow: { cap: 2, lent: 0, next_return_at: null },
-    counters: { restores_total: 1284, scrubs_total: 1201, restores_last_hour: 37 },
-    security: { gpu_scrub: false },
+    failures: [],
+    counters: { restores: 1284, scrubs: 0, restores_last_hour: 37 },
     scene: { epoch_unix_ms: EPOCH, camera: [{ t: 0, x: 0, y: 0, zoom: 1 }], time_of_day: 0.5, words: [], lights: [] },
     relaunch_all: null,
     next_race_at: null,
     cooldown_until: null,
     scoreboard: { fcvm: null, ec2: null },
     nudges: null,
-    viewers: { count: 2 },
+    viewers: { count: 2, active: 2 },
     actions: [],
     aggregates: [],
     ...over,
@@ -64,4 +65,28 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
 
 export function snapshotText(version: number, state: FleetState): string {
   return JSON.stringify({ type: "snapshot", version, state });
+}
+
+/**
+ * A fleet with `nf` fcvm and `ne` EC2 GPUs in layout generation `gen`: each
+ * side as wide as its share of the GPUs, one row per side, as a re-tile gives it.
+ */
+export function fleetSplit(nf: number, ne: number, gen: number, over: Partial<FleetState> = {}): FleetState {
+  const base = fleet(1, 1);
+  const proto = base.tiles[0]!;
+  const split = nf / Math.max(1, nf + ne);
+  const tiles: Tile[] = [];
+  for (const [half, n, x0, w] of [["fcvm", nf, 0, split], ["ec2", ne, split, 1 - split]] as const) {
+    for (let i = 0; i < n; i++) {
+      tiles.push({
+        ...structuredClone(proto),
+        id: `${half}:${i + 1}`,
+        half,
+        slot: half === "fcvm" ? `slot-${i + 1}` : `ec2-${i + 1}`,
+        rect: { x: x0 + (i * w) / n, y: 0, w: w / n, h: 1 },
+        frame_url: `ws://example-host:1/frames/${half}-${i + 1}`,
+      });
+    }
+  }
+  return { ...base, layout: { generation: gen, from_frame: gen * 300 }, tiles, ...over };
 }

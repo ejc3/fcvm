@@ -450,7 +450,7 @@ async fn ensure_custom_kernel(
 // ============================================================================
 
 /// Find the repo root by looking for Cargo.toml going up the directory tree.
-fn find_repo_root() -> Option<PathBuf> {
+pub(crate) fn find_repo_root() -> Option<PathBuf> {
     // Try CWD first
     let mut dir = std::env::current_dir().ok()?;
     loop {
@@ -776,12 +776,18 @@ pub fn vm_kernel_patches_dir(profile: &KernelProfile) -> Option<&str> {
 /// - Factor common logic between VM and host kernel builds
 /// - Drive all config (version, URLs, paths) from TOML
 /// - Not maintain separate shell scripts in source control
-fn generate_vm_kernel_build_script(
+///
+/// `post_build` is a shell stage run in the configured source tree after the
+/// image is built. When it is set the build also runs `make modules`, so the
+/// tree holds `Module.symvers` and out-of-tree modules link against this
+/// exact build (src/setup/nvidia.rs). Without it the script is unchanged.
+pub(crate) fn generate_vm_kernel_build_script(
     profile: &KernelProfile,
     profile_name: &str,
     sha: &str,
     dest: &Path,
     repo_root: &Path,
+    post_build: Option<&str>,
 ) -> Result<String> {
     let kernel_version = &profile.kernel_version;
     let kernel_major = kernel_version.split('.').next().unwrap_or(kernel_version);
@@ -910,7 +916,7 @@ echo ""
 
 # Build kernel
 echo "Building kernel with $NPROC parallel jobs..."
-make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"
+make ARCH="$KERNEL_ARCH" -j"$NPROC" "$KERNEL_IMAGE"{modules_target}
 
 # Copy output (Firecracker needs uncompressed ELF vmlinux, not bzImage)
 # Copy to a temp name then atomically rename so an interrupted copy never
@@ -926,12 +932,14 @@ echo ""
 echo "=== Build Complete ==="
 echo "Kernel: $KERNEL_PATH"
 echo "Size: $(du -h "$KERNEL_PATH" | cut -f1)"
-"##,
+{post_build}"##,
         kernel_version = kernel_version,
         kernel_major = kernel_major,
         profile_name = profile_name,
         sha = sha,
         kernel_path = dest.display(),
+        modules_target = if post_build.is_some() { " modules" } else { "" },
+        post_build = post_build.unwrap_or(""),
         patches_dir_line = patches_dir
             .as_ref()
             .map(|p| format!("PATCHES_DIR=\"{}\"", p.display()))
@@ -1026,7 +1034,7 @@ async fn build_kernel_locally(
 
     // Generate the build script
     let script_content =
-        generate_vm_kernel_build_script(profile, profile_name, &sha, dest, &repo_root)?;
+        generate_vm_kernel_build_script(profile, profile_name, &sha, dest, &repo_root, None)?;
 
     // Write to temp file
     let script_path = std::env::temp_dir().join(format!("fcvm-kernel-build-{}.sh", sha));
@@ -3124,6 +3132,7 @@ cp vmlinux arch/arm64/boot/Image
             "0123456789ab",
             &output,
             tmp.path(),
+            None,
         )
         .unwrap();
         let script_path = tmp.path().join("kernel-build.sh");

@@ -23,14 +23,6 @@ export function GlyphMark({ g, size }: { g: Glyph; size: number }) {
       </svg>
     );
   }
-  if (g.kind === "reclaimed") {
-    return (
-      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="glyph reclaimed">
-        <rect x="4" y="6" width="16" height="12" rx="2" fill="none" stroke="currentColor" strokeWidth="2" />
-        <path d="M4 18L20 6" stroke="currentColor" strokeWidth="2" />
-      </svg>
-    );
-  }
   if (g.kind === "borrowed") {
     return (
       <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="glyph borrowed">
@@ -103,7 +95,17 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
     <div className="layer" data-testid="overlays">
       {showMosaic && img ? (
         <>
-          <div className="half-line" style={{ left: L.halfLineX, top: img.y, height: img.h }} aria-hidden="true" />
+          {L.halfLineX !== null ? <div className="half-line" style={{ left: L.halfLineX, top: img.y, height: img.h }} aria-hidden="true" /> : null}
+          {view.labels.empty ? (
+            <span
+              className={`empty-side plate ${view.labels.empty.half}`}
+              data-testid={`empty-${view.labels.empty.half}`}
+              data-avoid=""
+              style={view.labels.empty.align === "right" ? { right: `calc(100vw - ${view.labels.empty.x}px)`, top: view.labels.empty.y } : { left: view.labels.empty.x, top: view.labels.empty.y }}
+            >
+              {view.labels.empty.text}
+            </span>
+          ) : null}
           {view.tiles.map((t) => (t.dark && t.box ? <DarkTile key={t.id} t={t} /> : null))}
           {statsOn
             ? view.tiles.map((t) =>
@@ -152,7 +154,7 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
                   key={c.half}
                   className={`caption ${c.half}`}
                   data-testid={`caption-${c.half}`}
-                  style={{ left: c.box.x, top: c.box.y, width: c.box.w, textAlign: c.half === "ec2" ? "right" : "left" }}
+                  style={{ left: c.box.x, top: c.box.y, width: c.box.w, textAlign: c.align }}
                 >
                   <b>{c.tag}</b> {c.text}
                 </p>

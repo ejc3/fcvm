@@ -12,17 +12,17 @@ import { createReadStream, statSync } from "node:fs";
 import http from "node:http";
 import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
-import { DEFAULT_IMAGE_ASPECT, type Half, type Rect } from "../core/protocol.ts";
+import { DEFAULT_IMAGE_ASPECT, FRAME_RATE, type Half, type Rect } from "../core/protocol.ts";
 import { cameraAt, poseAt, projectPoint, sceneT, type Vec3 } from "../core/scene.ts";
 import type { MockRenderers } from "./renderer.ts";
 import type { PatternScene } from "./pattern.ts";
+import { mockLayout } from "./layout.ts";
 
 export interface CoordinatorOptions {
   port: number;
-  /** Tiles per half; the grid is cols x rows per half. */
-  perHalf: number;
-  /** EC2 tiles with no instance (waiting for capacity). */
-  ec2Short: number;
+  /** GPUs live on each side: the image is split in proportion to them. */
+  fcvmGpus: number;
+  ec2Gpus: number;
   /** GPUs per fcvm host. */
   gpusPerHost: number;
   /** Typical restart times; each restart takes 0.87 to 1.13 (fcvm) or 0.67 to 1.33 (EC2) of these. */
@@ -74,16 +74,17 @@ const FCVM_PLAN: { phase: string; share: number; key: string }[] = [
 ];
 /** Of the restore, the GPU reset and driver load (about 0.58 s of a 3 s restart). */
 const GPU_SHARE_OF_RESTORE = 0.35;
+/** The EC2 driver's timings, as the coordinator's vectors give them: the launch, then boot to first frame. */
 const EC2_PLAN: { phase: string; share: number; key: string }[] = [
-  { phase: "launching", share: 0.25, key: "launch_ms" },
-  { phase: "starting", share: 0.55, key: "boot_ms" },
-  { phase: "starting", share: 0.12, key: "container_ms" },
-  { phase: "starting", share: 0.08, key: "first_frame_ms" },
+  { phase: "starting", share: 0.25, key: "launch_ms" },
+  { phase: "starting", share: 0.75, key: "ready_ms" },
 ];
 /** The coordinator shows `relaunching` until the agent or EC2 driver reports. */
 const RELAUNCHING_MS = 150;
-/** A reclaimed host drains this long before its tiles go dark. */
-const DRAIN_MS = 3000;
+/** A re-tile's rectangles start this many frames (on t = k/30) after it is decided. */
+const RETILE_LEAD_FRAMES = 15;
+/** A reclaimed host stays in `failures` (and `fleet.hosts`, draining) this long after its tiles leave. */
+const RECLAIM_KEPT_MS = 60_000;
 /** Races the scoreboard's medians are over. */
 const RACES_KEPT = 20;
 
@@ -173,29 +174,10 @@ interface Race {
   by: string;
   fcvm_done_at: number | null;
   ec2_done_at: number | null;
-  fcvm_last: string | null;
-  ec2_last: string | null;
   fcvm_gpus: number;
   ec2_gpus: number;
   ec2_capacity_wait_ms: number;
   ec2_waiting_since: number | null;
-}
-
-/** The grid for n tiles in a half: the factorisation whose tiles are closest to 16:9. */
-export function halfGrid(n: number): { cols: number; rows: number } {
-  let best = { cols: 1, rows: n };
-  let bestErr = Infinity;
-  for (let cols = 1; cols <= n; cols++) {
-    if (n % cols !== 0) continue;
-    const rows = n / cols;
-    const aspect = (0.5 * IMAGE_ASPECT) / cols / (1 / rows);
-    const err = Math.abs(Math.log(aspect / (16 / 9)));
-    if (err < bestErr) {
-      bestErr = err;
-      best = { cols, rows };
-    }
-  }
-  return best;
 }
 
 function within(outer: Rect, inner: Rect): boolean {
@@ -243,7 +225,7 @@ export class MockCoordinator {
   private wss: WebSocketServer;
   private camera: CameraKey[] = [{ t: 0, x: 0, y: 0, zoom: 1 }];
   private timeOfDay = 0.42;
-  private words: { text: string; t: number; pos: { x: number; y: number } }[] = [];
+  private words: { text: string; t: number; pos: { x: number; y: number }; text_style: string }[] = [];
   private lights: { pos: { x: number; y: number }; world: Vec3; color: [number, number, number]; t: number }[] = [];
   private race: Race | null = null;
   private races: { fcvm_ms: number; ec2_ms: number; wait_ms: number; fcvm_gpus: number; ec2_gpus: number }[] = [];
@@ -254,11 +236,16 @@ export class MockCoordinator {
   private nudge: { holding: string | null; nextHoldAt: number; votes: Map<string, string> };
   private nextClaim = 0;
   private aggregates: { id: string; half: Half; host: string | null; rect: Rect; tiles: string[] }[] = [];
+  /** The fcvm GPUs live, by slot number (a host has slots of one block of gpusPerHost). */
+  private fcvmSlots: number[] = [];
+  private ec2Count = 0;
+  /** Which tiling, and the frame (on t = k/30) its rectangles start at. */
+  private layout = { generation: 1, from_frame: 0 };
+  private failures: { kind: "host_reclaimed"; host: string; since: number; retiling: boolean }[] = [];
   private actions: { at: number; viewer: string; id: string; name: string; args: Record<string, unknown>; summary: string; outcome: string }[] = [];
   private offlineUntil = 0;
   private sitekey: string | null;
   private poster: { at: number; jpeg: Promise<Buffer> } | null = null;
-  private scheduleCount = 0;
   private restoresTotal = 0;
   private scrubsTotal = 0;
   /** Unix ms of each restore in the last hour. */
@@ -269,10 +256,12 @@ export class MockCoordinator {
     asleep_since: number | null;
     woke_at: number | null;
     hosts: { host: string; phases: { phase: string; at: number }[] }[];
-    last_wake: { started_at: number; awake_at: number; gpus: number } | null;
+    last_wake: { started_at: number; awake_at: number; gpus: number; ms: number } | null;
   } = { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null };
   /** Hosts whose tiles render again during a wake. */
   private rendering = new Set<string>();
+  /** The GPUs each side had when the fleet went to sleep; they join again as the fleet wakes. */
+  private slept: { fcvm: number[]; ec2: number } | null = null;
   /** Tests: stay asleep whoever watches. */
   private holdAsleep = false;
   private idleSince: number | null = null;
@@ -288,55 +277,10 @@ export class MockCoordinator {
     this.rand = rng(opts.seed ?? 1136);
     this.sitekey = opts.turnstileSitekey;
     this.gpuScrub = opts.gpuScrub ?? false;
-    const { cols, rows } = halfGrid(opts.perHalf);
-    const hostCount = Math.ceil(opts.perHalf / opts.gpusPerHost);
-    for (let h = 1; h <= hostCount; h++) this.hosts.push({ name: `mock-host-${h}`, draining: false });
-    for (const half of ["fcvm", "ec2"] as Half[]) {
-      for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          const i = r * cols + c + 1;
-          const short = half === "ec2" && i > opts.perHalf - opts.ec2Short;
-          const slot = short ? null : half === "fcvm" ? `slot-${i}` : `ec2-${i}`;
-          const rect = { x: (half === "fcvm" ? 0 : 0.5) + (c * 0.5) / cols, y: r / rows, w: 0.5 / cols, h: 1 / rows };
-          if (slot) {
-            opts.renderers.setTile(slot, rect);
-            opts.renderers.setAvailable(slot, true);
-          }
-          const host = short ? null : half === "fcvm" ? `g4dn.metal · mock-host-${1 + Math.floor((i - 1) / opts.gpusPerHost)}` : `g4dn.xlarge · mock-i-${String(i).padStart(4, "0")}`;
-          this.tiles.push({
-            id: `${half}:${i}`,
-            half,
-            rect,
-            slot,
-            index: i,
-            host,
-            phase: short ? "waiting_capacity" : "running",
-            generation: 1,
-            gpu: short ? null : { sbdf: half === "fcvm" ? `0000:${(0x18 + i).toString(16)}:00.0` : "0000:00:1e.0", name: "Tesla T4" },
-            gpuStats: short ? null : { temp_c: 55, power_w: 60, util_pct: 90 },
-            lastRelaunch: null,
-            failure: null,
-            borrowed: null,
-            timer: null,
-          });
-        }
-      }
-    }
-    // Aggregates: on the fcvm half one per host (its tiles are one band of rows,
-    // the protocol's layout), and one for the EC2 half. Each joins its tiles
-    // server-side: the mock draws the region whole (the picture is a pure
-    // function of position) and blacks out tiles that are not running.
-    for (const h of this.hosts) {
-      const mine = this.tiles.filter((t) => t.half === "fcvm" && t.host?.endsWith(h.name));
-      const y0 = Math.min(...mine.map((t) => t.rect.y));
-      const y1 = Math.max(...mine.map((t) => t.rect.y + t.rect.h));
-      this.aggregates.push({ id: `agg:${h.name}`, half: "fcvm", host: h.name, rect: { x: 0, y: y0, w: 0.5, h: y1 - y0 }, tiles: mine.map((t) => t.id) });
-    }
-    this.aggregates.push({ id: "agg:ec2", half: "ec2", host: null, rect: { x: 0.5, y: 0, w: 0.5, h: 1 }, tiles: this.tiles.filter((t) => t.half === "ec2").map((t) => t.id) });
-    for (const a of this.aggregates) {
-      opts.renderers.setTile(this.streamId(a.id), a.rect, () => this.tiles.filter((t) => t.phase !== "running" && within(a.rect, t.rect)).map((t) => t.rect));
-      opts.renderers.setAvailable(this.streamId(a.id), true);
-    }
+    for (let k = 1; k <= opts.fcvmGpus; k++) this.fcvmSlots.push(k);
+    for (const h of new Set(this.fcvmSlots.map((k) => this.hostOf(k)))) this.hosts.push({ name: h, draining: false });
+    this.ec2Count = opts.ec2Gpus;
+    this.applyLayout(null);
     const start = this.now();
     this.nextRaceAt = opts.raceEverySecs > 0 ? start + opts.firstRaceSecs * 1000 : null;
     this.nudge = { holding: "planet", nextHoldAt: start + (opts.holdSecs + opts.travelSecs) * 1000, votes: new Map() };
@@ -422,13 +366,14 @@ export class MockCoordinator {
     const ec2 = this.tiles.filter((t) => t.half === "ec2" && t.slot).length;
     const now = this.now();
     return {
+      layout: { ...this.layout, from_t: this.layout.from_frame / FRAME_RATE },
       tiles: this.tiles.map((t) => ({
         id: t.id,
         half: t.half,
         rect: t.rect,
         phase: t.phase,
         slot: t.slot,
-        frame_url: t.slot && t.phase !== "asleep" ? this.opts.renderers.frameUrl(t.slot) : null,
+        frame_url: t.slot ? this.opts.renderers.frameUrl(t.slot) : null,
         gpu: t.gpu,
         host: t.host,
         vm: t.slot ? `fleet-${t.slot}` : null,
@@ -445,7 +390,7 @@ export class MockCoordinator {
         gpus: fcvmGpus,
         fcvm_gpus: fcvmGpus,
         ec2_instances: ec2,
-        n: this.opts.perHalf,
+        n: this.tiles.length,
         max_tiles: 100,
         standby: [],
         power: this.power,
@@ -459,7 +404,7 @@ export class MockCoordinator {
         epoch_unix_ms: this.opts.epochUnixMs,
         camera: this.camera.map((k) => ({ t: k.t, pos: [k.x, k.y, 0], look: [k.x, k.y, -10], fov_deg: 60 / k.zoom, x: k.x, y: k.y, zoom: k.zoom, ...(k.intent ? { intent: k.intent } : {}) })),
         time_of_day: this.timeOfDay,
-        words: this.words.map((w) => ({ text: w.text, t: w.t })),
+        words: this.words.map((w) => ({ text: w.text, t: w.t, text_style: w.text_style })),
         lights: this.lights.map((l) => ({ pos: l.world, color: l.color, t: l.t })),
       },
       image_aspect: IMAGE_ASPECT,
@@ -469,11 +414,12 @@ export class MockCoordinator {
         ec2_pending: this.pending("ec2"),
       },
       counters: {
-        restores_total: this.restoresTotal,
-        scrubs_total: this.scrubsTotal,
+        restores: this.restoresTotal,
         restores_last_hour: this.restoreTimes.filter((t) => t > now - 3_600_000).length,
+        scrubs: this.scrubsTotal,
+        scrub_failures: 0,
       },
-      security: { gpu_scrub: this.gpuScrub },
+      failures: this.failures.filter((f) => f.since > now - RECLAIM_KEPT_MS),
       next_race_at: this.nextRaceAt,
       cooldown_until: this.cooldownUntil !== null && this.cooldownUntil > now ? this.cooldownUntil : null,
       scoreboard: this.scoreboard(),
@@ -482,7 +428,7 @@ export class MockCoordinator {
         holding: this.nudge.holding,
         next_hold_at: this.nudge.nextHoldAt,
       },
-      viewers: { count: [...this.clients].filter((c) => c.visible).length },
+      viewers: { count: this.clients.size, active: [...this.clients].filter((c) => c.visible).length },
       actions: this.actions,
       aggregates: this.aggregates.map((a) => ({ ...a, frame_url: this.aggregateUp(a) ? this.opts.renderers.frameUrl(this.streamId(a.id)) : null })),
     };
@@ -624,7 +570,7 @@ export class MockCoordinator {
         this.relaunch(r, c.viewer, 0);
         return this.committed(c, `relaunch ${r.slot}`);
       }
-      case "relaunch_all": {
+      case "restart_now": {
         if (this.raceRunning()) return this.refuse(c, "a restart of every GPU is already running");
         const now = this.now();
         if (this.cooldownUntil !== null && now < this.cooldownUntil) {
@@ -632,12 +578,6 @@ export class MockCoordinator {
         }
         const n = this.startRace(c.viewer);
         return this.committed(c, `relaunch all (${n} tiles)`);
-      }
-      case "time_of_day": {
-        const v = args["v"];
-        if (typeof v !== "number" || !(v >= 0 && v < 1)) return this.refuse(c, "time of day is a fraction of the day in [0, 1)");
-        this.timeOfDay = v;
-        return this.committed(c, `time of day ${v.toFixed(3)}`);
       }
       case "nudge": {
         const target = NUDGE_TARGETS.find((x) => x.id === args["target"]);
@@ -647,6 +587,9 @@ export class MockCoordinator {
       }
       case "word": {
         const text = typeof args["text"] === "string" ? args["text"].replace(/\s+/g, " ").trim() : "";
+        // The sender's style: lockup unless they picked another.
+        const style = args["text_style"] ?? "lockup";
+        if (style !== "lockup" && style !== "skywriting" && style !== "landmark") return this.refuse(c, "text_style is lockup, skywriting or landmark");
         await new Promise((r) => setTimeout(r, this.opts.checkMs));
         if (text.length === 0 || text.length > 28) return this.refuse(c, "a word is 1 to 28 characters");
         const bad = !/^[A-Za-z0-9 .,!?'-]+$/.test(text) || this.opts.refusedWords.some((w) => text.toLowerCase().includes(w.toLowerCase()));
@@ -657,7 +600,7 @@ export class MockCoordinator {
         const ang = k * 2.4;
         const rad = 0.25 + 0.12 * (k % 4);
         const pos = { x: (cam["x"] ?? 0) + Math.cos(ang) * rad * 1.6, y: (cam["y"] ?? 0) + Math.sin(ang) * rad - 0.1 };
-        this.words = [...this.words, { text, t, pos }].slice(-16);
+        this.words = [...this.words, { text, t, pos, text_style: style }].slice(-16);
         return this.committed(c, `word ${JSON.stringify(text)}`);
       }
       case "light": {
@@ -727,7 +670,7 @@ export class MockCoordinator {
         return this.committed(c, "claim camera");
       }
       default:
-        return this.refuse(c, `unknown intent ${name}`);
+        return this.refuse(c, `unknown intent "${name}"`);
     }
   }
 
@@ -747,7 +690,7 @@ export class MockCoordinator {
   private startRace(by: string): number {
     const now = this.now();
     // A tile lent to a visitor sits the race out.
-    const live = this.tiles.filter((t) => t.slot && t.phase !== "draining" && !t.borrowed);
+    const live = this.tiles.filter((t) => t.slot && !t.borrowed);
     const p = this.rand();
     const waitMs =
       this.forcedWaitMs ??
@@ -758,8 +701,6 @@ export class MockCoordinator {
       by,
       fcvm_done_at: null,
       ec2_done_at: null,
-      fcvm_last: null,
-      ec2_last: null,
       fcvm_gpus: live.filter((t) => t.half === "fcvm").length,
       ec2_gpus: live.filter((t) => t.half === "ec2").length,
       ec2_capacity_wait_ms: 0,
@@ -823,7 +764,8 @@ export class MockCoordinator {
       r.phase = "running";
       r.lastRelaunch = { clicked_at: clickedAt, by, first_frame_at: done, phases: { ...phases } };
       if (fc) this.countRestore(done);
-      this.checkRace(r);
+      this.checkRace();
+      this.wakeCheck();
       this.markDirty();
     };
     const begin = () => {
@@ -845,11 +787,9 @@ export class MockCoordinator {
     }, RELAUNCHING_MS);
   }
 
-  private checkRace(last: TileRuntime): void {
+  private checkRace(): void {
     const ra = this.race;
     if (!ra) return;
-    if (last.half === "fcvm" && ra.fcvm_done_at === null) ra.fcvm_last = last.slot;
-    if (last.half === "ec2" && ra.ec2_done_at === null) ra.ec2_last = last.slot;
     const now = this.now();
     if (ra.fcvm_done_at === null && this.pending("fcvm") === 0) ra.fcvm_done_at = now;
     if (ra.ec2_done_at === null && this.pending("ec2") === 0) ra.ec2_done_at = now;
@@ -884,9 +824,8 @@ export class MockCoordinator {
     if (this.nextRaceAt !== null && now >= this.nextRaceAt) {
       // Skip a beat that falls inside a running race.
       if (!this.raceRunning()) {
-        const id = `schedule-${++this.scheduleCount}`;
-        const n = this.startRace("schedule");
-        this.log({ viewer: "schedule", id, name: "relaunch_all", args: {} }, `relaunch all (${n} tiles)`, "committed");
+        // The cadence is not an intent: the race's `by` says so, and `actions` has nothing.
+        this.startRace("schedule");
       }
       const every = this.opts.raceEverySecs * 1000;
       // No cadence: a beat set by hand fires once.
@@ -931,6 +870,129 @@ export class MockCoordinator {
     this.markDirty();
   }
 
+  // ---- the tiling ---------------------------------------------------------------------
+
+  private hostOf(slot: number): string {
+    return `mock-host-${1 + Math.floor((slot - 1) / this.opts.gpusPerHost)}`;
+  }
+
+  private newTile(half: Half, k: number, rect: Rect, running: boolean): TileRuntime {
+    const slot = half === "fcvm" ? `slot-${k}` : `ec2-${k}`;
+    return {
+      id: `${half}:${k}`,
+      half,
+      rect,
+      slot,
+      index: k,
+      host: half === "fcvm" ? `g4dn.metal · ${this.hostOf(k)}` : `g4dn.xlarge · mock-i-${String(k).padStart(4, "0")}`,
+      phase: running ? "running" : "relaunching",
+      generation: 1,
+      gpu: { sbdf: half === "fcvm" ? `0000:${(0x18 + k).toString(16)}:00.0` : "0000:00:1e.0", name: "Tesla T4" },
+      gpuStats: { temp_c: 55, power_w: 60, util_pct: 90 },
+      lastRelaunch: null,
+      failure: null,
+      borrowed: null,
+      timer: null,
+    };
+  }
+
+  /**
+   * Lay the tiles out for the GPUs live: each side as wide as its share. With
+   * `atT` (a re-tile), the renderers switch to the new rectangles at that scene t,
+   * new GPUs start, and the streams of GPUs that left close after it.
+   */
+  private applyLayout(atT: number | null): void {
+    const r = this.opts.renderers;
+    const slots = [...this.fcvmSlots].sort((a, b) => a - b);
+    const byHost = new Map<string, number[]>();
+    for (const k of slots) byHost.set(this.hostOf(k), [...(byHost.get(this.hostOf(k)) ?? []), k]);
+    const lay = mockLayout([...byHost].map(([host, ks]) => ({ host, gpus: ks.length })), this.ec2Count, IMAGE_ASPECT);
+    const old = new Map(this.tiles.map((t) => [t.id, t]));
+    const next: TileRuntime[] = [];
+    const place = (half: Half, k: number, rect: Rect) => {
+      const id = `${half}:${k}`;
+      const t = old.get(id);
+      if (t) {
+        old.delete(id);
+        t.rect = rect;
+        if (atT === null) r.setTile(t.slot!, rect);
+        else r.retile(t.slot!, rect, atT);
+        next.push(t);
+      } else {
+        const t2 = this.newTile(half, k, rect, atT === null);
+        r.setTile(t2.slot!, rect);
+        r.setAvailable(t2.slot!, true);
+        next.push(t2);
+        // A GPU that joins starts its VM like any restart.
+        if (atT !== null) this.relaunch(t2, "join", 0);
+      }
+    };
+    for (const h of lay.hosts) byHost.get(h.host)!.forEach((k, i) => place("fcvm", k, h.rects[i]!));
+    lay.ec2.forEach((rect, i) => place("ec2", i + 1, rect));
+    // GPUs that left: their streams keep the old tiling's frames until the page swaps.
+    for (const t of old.values()) {
+      if (t.timer) clearTimeout(t.timer);
+      t.timer = null;
+      const slot = t.slot!;
+      if (atT === null) r.removeTile(slot);
+      // Unless the GPU came back meanwhile.
+      else this.later(this.msUntil(atT) + 5000, () => {
+        if (!this.tiles.some((x) => x.slot === slot)) r.removeTile(slot);
+      });
+    }
+    this.tiles = next;
+    const black = (rect: Rect) => () => this.tiles.filter((t) => t.phase !== "running" && within(rect, t.rect)).map((t) => t.rect);
+    const aggs = [
+      ...lay.hosts.map((h) => ({ id: `agg:${h.host}`, half: "fcvm" as Half, host: h.host as string | null, rect: h.band, tiles: byHost.get(h.host)!.map((k) => `fcvm:${k}`) })),
+      ...(lay.ec2Region ? [{ id: "agg:ec2", half: "ec2" as Half, host: null, rect: lay.ec2Region, tiles: lay.ec2.map((_, i) => `ec2:${i + 1}`) }] : []),
+    ];
+    const was = new Map(this.aggregates.map((a) => [a.id, a]));
+    for (const a of aggs) {
+      const sid = this.streamId(a.id);
+      if (was.has(a.id) && atT !== null) {
+        r.setTile(sid, was.get(a.id)!.rect, black(a.rect));
+        r.retile(sid, a.rect, atT);
+      } else {
+        r.setTile(sid, a.rect, black(a.rect));
+        r.setAvailable(sid, true);
+      }
+      was.delete(a.id);
+    }
+    for (const a of was.values()) {
+      const sid = this.streamId(a.id);
+      if (atT === null) r.removeTile(sid);
+      else this.later(this.msUntil(atT) + 5000, () => {
+        if (!this.aggregates.some((x) => this.streamId(x.id) === sid)) r.removeTile(sid);
+      });
+    }
+    this.aggregates = aggs;
+  }
+
+  /** Milliseconds from now until scene t `t`. */
+  private msUntil(t: number): number {
+    return Math.max(0, this.opts.epochUnixMs + t * 1000 - this.now());
+  }
+
+  /** Re-tile for the GPUs live now: a new layout generation starting half a second ahead. */
+  retile(): void {
+    const atFrame = Math.floor(this.sceneNow() * FRAME_RATE) + RETILE_LEAD_FRAMES;
+    this.layout = { generation: this.layout.generation + 1, from_frame: atFrame };
+    this.applyLayout(atFrame / FRAME_RATE);
+    this.markDirty();
+  }
+
+  /** Set how many GPUs each side has: fcvm slots are reused lowest first and leave highest first. */
+  setGpus(fcvm: number, ec2: number): void {
+    const slots = [...this.fcvmSlots].sort((a, b) => a - b);
+    while (slots.length > fcvm) slots.pop();
+    for (let k = 1; slots.length < fcvm; k++) if (!slots.includes(k)) slots.push(k);
+    this.fcvmSlots = slots;
+    this.ec2Count = Math.max(0, ec2);
+    for (const h of new Set(slots.map((k) => this.hostOf(k)))) if (!this.hosts.some((x) => x.name === h)) this.hosts.push({ name: h, draining: false });
+    this.hosts = this.hosts.filter((h) => slots.some((k) => this.hostOf(k) === h.name));
+    this.retile();
+  }
+
   // ---- scaling to zero ---------------------------------------------------------------
 
   /** An aggregate serves only while its host renders. */
@@ -953,7 +1015,10 @@ export class MockCoordinator {
     if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) this.wake();
   }
 
-  /** No viewers: every VM goes, the schedule waits, loans end. */
+  /**
+   * No viewers: as the coordinator, nothing is placed (`tiles` and `aggregates` empty,
+   * no layout rectangles), the schedule waits, loans end.
+   */
   sleep(): void {
     if (this.power.state !== "awake") return;
     const now = this.now();
@@ -962,13 +1027,13 @@ export class MockCoordinator {
       if (t.timer) clearTimeout(t.timer);
       t.timer = null;
       t.borrowed = null;
-      if (!t.slot) continue;
-      t.generation += 1;
-      t.phase = "asleep";
-      t.failure = null;
-      this.opts.renderers.setAvailable(t.slot, false);
+      if (t.slot) this.opts.renderers.setAvailable(t.slot, false);
     }
     for (const a of this.aggregates) this.opts.renderers.setAvailable(this.streamId(a.id), false);
+    this.slept = { fcvm: [...this.fcvmSlots], ec2: this.ec2Count };
+    this.fcvmSlots = [];
+    this.ec2Count = 0;
+    this.retile();
     this.rendering.clear();
     this.sleptRaceAt = this.nextRaceAt;
     this.nextRaceAt = null;
@@ -977,23 +1042,34 @@ export class MockCoordinator {
     this.markDirty();
   }
 
-  /** A viewer arrived: each host goes through its wake phases, then its tiles render. */
+  /**
+   * A viewer arrived. The EC2 half launches its instances at once; each GPU host goes
+   * through its phases and its GPUs join the wall when its agent connects (with no tile
+   * on the wall, every GPU joins at once, restoring like any restart). Awake once every
+   * placed tile runs.
+   */
   wake(): void {
-    if (this.power.state !== "asleep") return;
+    if (this.power.state !== "asleep" || this.slept === null) return;
     const start = this.now();
-    const names = [...this.hosts.map((h) => h.name), "ec2"];
+    const slept = this.slept;
+    const names = [...new Set(slept.fcvm.map((k) => this.hostOf(k)))];
     this.power = { ...this.power, state: "waking", woke_at: start, hosts: names.map((host) => ({ host, phases: [] })) };
+    this.ec2Count = slept.ec2;
+    this.retile();
     const total = this.opts.wakeMs ?? 120_000;
     const shares = [0, 0.4, 0.6, 0.72];
     names.forEach((host, i) => {
       const jitter = (i * 0.04) / Math.max(1, names.length - 1);
-      const at = [...shares.map((x) => x + jitter * x), 0.85 + 0.15 * (i / Math.max(1, names.length - 1))];
-      ["instance_pending", "booted", "store_ready", "agent_connected", "tiles_rendering"].forEach((phase, k) => {
-        this.later(total * at[k]!, () => {
+      ["instance_pending", "booted", "store_ready", "agent_connected"].forEach((phase, k) => {
+        this.later(total * (shares[k]! + jitter * shares[k]!), () => {
           if (this.power.state !== "waking" || this.power.woke_at !== start) return;
           const h = this.power.hosts.find((x) => x.host === host)!;
           h.phases = [...h.phases, { phase, at: this.now() }];
-          if (phase === "tiles_rendering") this.hostRenders(host);
+          if (phase === "agent_connected") {
+            this.fcvmSlots = [...this.fcvmSlots, ...slept.fcvm.filter((s) => this.hostOf(s) === host)];
+            this.retile();
+          }
+          this.wakeCheck();
           this.markDirty();
         });
       });
@@ -1001,24 +1077,30 @@ export class MockCoordinator {
     this.markDirty();
   }
 
-  private hostRenders(host: string): void {
+  /** During a wake: a host whose placed tiles all run reports `tiles_rendering`; all of them and the EC2 half, awake. */
+  private wakeCheck(): void {
+    if (this.power.state !== "waking") return;
     const now = this.now();
-    this.rendering.add(host);
-    for (const t of this.tiles) {
-      const mine = host === "ec2" ? t.half === "ec2" : t.half === "fcvm" && t.host?.endsWith(host);
-      if (!mine || !t.slot || t.phase !== "asleep") continue;
-      t.phase = "running";
-      this.opts.renderers.setAvailable(t.slot, true);
-      if (t.half === "fcvm") this.countRestore(now);
+    const runs = (host: string | null) =>
+      this.tiles.filter((t) => (host === null ? t.half === "ec2" : t.half === "fcvm" && t.host?.endsWith(host))).every((t) => t.phase === "running");
+    for (const h of this.power.hosts) {
+      const has = (p: string) => h.phases.some((x) => x.phase === p);
+      if (has("agent_connected") && !has("tiles_rendering") && runs(h.host)) {
+        h.phases = [...h.phases, { phase: "tiles_rendering", at: now }];
+        this.rendering.add(h.host);
+      }
     }
-    for (const a of this.aggregates) if ((a.host ?? "ec2") === host) this.opts.renderers.setAvailable(this.streamId(a.id), true);
-    if (this.power.hosts.every((h) => h.phases.some((p) => p.phase === "tiles_rendering"))) {
+    if (runs(null)) this.rendering.add("ec2");
+    if (this.power.hosts.every((h) => h.phases.some((p) => p.phase === "tiles_rendering")) && runs(null)) {
+      const started = this.power.woke_at!;
       const gpus = this.tiles.filter((t) => t.slot).length;
-      this.power = { ...this.power, state: "awake", last_wake: { started_at: this.power.woke_at!, awake_at: now, gpus } };
+      this.power = { ...this.power, state: "awake", last_wake: { started_at: started, awake_at: now, gpus, ms: now - started } };
       this.nextRaceAt = this.sleptRaceAt;
       this.sleptRaceAt = null;
+      this.slept = null;
       this.rendering.clear();
     }
+    this.markDirty();
   }
 
   private gpuTick(): void {
@@ -1147,48 +1229,34 @@ export class MockCoordinator {
   private reclaim(hostName: string): boolean {
     const host = this.hosts.find((h) => h.name === hostName);
     if (!host) return false;
+    // As the coordinator does: the host's tiles leave the tiling in the same event
+    // (the GPUs left are re-tiled at once); `failures` and the draining host say why.
     host.draining = true;
-    const mine = this.tiles.filter((t) => t.half === "fcvm" && t.host?.endsWith(hostName) && t.slot);
-    for (const t of mine) {
+    const since = this.now();
+    this.failures = [...this.failures.filter((f) => f.host !== hostName), { kind: "host_reclaimed", host: hostName, since, retiling: true }];
+    for (const t of this.tiles.filter((x) => x.half === "fcvm" && x.host?.endsWith(hostName) && x.slot)) {
       if (t.timer) clearTimeout(t.timer);
       t.timer = null;
-      t.generation += 1;
-      t.phase = "draining";
-      t.failure = { kind: "host_reclaimed", message: "AWS reclaimed the spot host", retry_at: null };
-      this.opts.renderers.setAvailable(t.slot!, false);
     }
-    this.markDirty();
-    this.later(DRAIN_MS, () => {
-      // Re-tiled: the host's places have no GPU behind them until it is replaced.
-      for (const t of mine) {
-        if (t.phase !== "draining") continue;
-        t.phase = "waiting_capacity";
-        t.failure = null;
-        t.slot = null;
-        t.gpu = null;
-        t.gpuStats = null;
-        t.host = null;
-      }
+    this.fcvmSlots = this.fcvmSlots.filter((k) => this.hostOf(k) !== hostName);
+    this.retile();
+    this.later(RECLAIM_KEPT_MS, () => {
       this.hosts = this.hosts.filter((h) => h !== host);
+      this.failures = this.failures.filter((f) => f.since !== since || f.host !== hostName);
       this.markDirty();
     });
     return true;
   }
 
   private replaceHost(hostName: string): void {
-    if (!this.hosts.some((h) => h.name === hostName)) this.hosts.push({ name: hostName, draining: false });
-    const per = this.opts.gpusPerHost;
+    const back = this.hosts.find((h) => h.name === hostName);
+    if (back) back.draining = false;
+    else this.hosts.push({ name: hostName, draining: false });
+    this.failures = this.failures.filter((f) => f.host !== hostName);
     const n = Number(/(\d+)$/.exec(hostName)?.[1] ?? "0");
-    for (const t of this.tiles) {
-      if (t.half !== "fcvm" || t.slot !== null || Math.floor((t.index - 1) / per) + 1 !== n) continue;
-      t.slot = `slot-${t.index}`;
-      t.host = `g4dn.metal · ${hostName}`;
-      t.gpu = { sbdf: `0000:${(0x18 + t.index).toString(16)}:00.0`, name: "Tesla T4" };
-      t.gpuStats = { temp_c: 38, power_w: 27, util_pct: 0 };
-      this.opts.renderers.setTile(t.slot, t.rect);
-      this.relaunch(t, "schedule", 0);
-    }
-    this.markDirty();
+    const per = this.opts.gpusPerHost;
+    for (let k = (n - 1) * per + 1; k <= n * per; k++) if (!this.fcvmSlots.includes(k)) this.fcvmSlots.push(k);
+    this.retile();
   }
 
   // ---- http: the poster and admin routes ------------------------------------------------
@@ -1259,6 +1327,9 @@ export class MockCoordinator {
           }
           if (typeof b["reclaim"] === "string" && !this.reclaim(b["reclaim"])) throw new Error(`no host ${b["reclaim"]}`);
           if (typeof b["replace_host"] === "string") this.replaceHost(b["replace_host"]);
+          if (typeof b["fcvm_gpus"] === "number" || typeof b["ec2_gpus"] === "number") {
+            this.setGpus(typeof b["fcvm_gpus"] === "number" ? b["fcvm_gpus"] : this.fcvmSlots.length, typeof b["ec2_gpus"] === "number" ? b["ec2_gpus"] : this.ec2Count);
+          }
           if (typeof b["renderers_silent"] === "boolean") this.opts.renderers.setSilent(b["renderers_silent"]);
           return { ok: true };
         });
@@ -1303,6 +1374,8 @@ export class MockCoordinator {
           if (typeof b["capacity_wait_ms"] === "number") this.forcedWaitMs = b["capacity_wait_ms"];
           if (typeof b["hold_in_ms"] === "number") this.nudge.nextHoldAt = this.now() + b["hold_in_ms"];
           if (typeof b["gpu_scrub"] === "boolean") this.gpuScrub = b["gpu_scrub"];
+          // The director sets the time of day per hold; tests set it here.
+          if (typeof b["time_of_day"] === "number") this.timeOfDay = b["time_of_day"];
           this.markDirty();
           return { ok: true };
         });

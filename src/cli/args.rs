@@ -30,6 +30,8 @@ pub enum Commands {
     Exec(ExecArgs),
     /// Print a VM's balloon target and size as one JSON line; with MIB, set the target first
     Balloon(BalloonArgs),
+    /// Host-side GPU pool operations: scrub a GPU's memory between VMs, show quarantines
+    Gpu(GpuArgs),
     /// Setup kernel and rootfs (kernel ~15MB download, rootfs ~10GB creation, takes 5-10 minutes)
     Setup(SetupArgs),
     /// Run HTTP/WebSocket API server for ComputeSDK integration
@@ -99,6 +101,12 @@ pub struct ServeArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8090)]
     pub port: u16,
+
+    /// Start every sandbox with `--no-snapshot`: a cold boot that neither restores from
+    /// nor creates the snapshot cache. By default each sandbox is an
+    /// `fcvm podman run` that restores from the cache when its snapshot exists.
+    #[arg(long)]
+    pub no_snapshot: bool,
 }
 
 // ============================================================================
@@ -262,6 +270,18 @@ pub struct RunArgs {
     #[arg(long, action = clap::ArgAction::Append)]
     pub pmem: Vec<String>,
 
+    /// Pass a host PCI device, such as a GPU, through to the VM: its address
+    /// (SSSS:BB:DD.F or BB:DD.F, as `lspci -D` prints it). Repeat for more than one.
+    /// The device must be bound to vfio-pci and its /dev/vfio group open to this
+    /// user. Needs --kernel-profile gpu (Firecracker with the PCI transport).
+    /// The VM boots and is snapshotted without the device, and the device is
+    /// attached when the VM is restored from that snapshot, so GPU and non-GPU runs
+    /// share one snapshot. A VM with a passthrough device cannot be snapshotted.
+    /// Not with --balloon or --pmem, whose memory handling pinned DMA memory forbids.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS",
+          conflicts_with_all = ["balloon", "pmem"])]
+    pub gpu: Vec<String>,
+
     /// Share directory via NFS: HOST_DIR:GUEST_MOUNT[:ro]
     /// Starts NFS server on host, VM mounts via network.
     /// Requires NFS kernel support (use --kernel-profile nested or --build-kernels).
@@ -334,6 +354,14 @@ pub struct RunArgs {
     /// The other network modes ignore it, and their snapshot keys do not include it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
+
+    /// The VM's IPv6 address in routed mode, instead of one derived from its random VM
+    /// id. It must lie inside the prefix in use (--ipv6-prefix, FCVM_IPV6_PREFIX or the
+    /// detected /64) and must not be the prefix's address 0 or 1. An address another
+    /// live VM holds is refused. Only valid with --network routed. Not part of any
+    /// snapshot key: a VM restored from a snapshot takes the address it is given.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
 
     /// HTTP health check URL. If not specified, health is based on container running status.
     /// The probe is plain HTTP for the URL's port, path and query, and the URL hostname is
@@ -489,7 +517,7 @@ pub enum SnapshotCommands {
     /// Serve snapshot memory for cloning
     Serve(SnapshotServeArgs),
     /// Run a clone from a snapshot
-    Run(SnapshotRunArgs),
+    Run(Box<SnapshotRunArgs>),
     /// List running snapshot servers
     Ls,
 }
@@ -655,6 +683,25 @@ pub struct SnapshotRunArgs {
     #[arg(long, action = clap::ArgAction::Append, value_delimiter = ',')]
     pub publish: Vec<String>,
 
+    /// Serve a directory the snapshot mapped read-only from this host directory instead of
+    /// the one it recorded. Grammar: HOST:GUEST:ro, as for `podman run --map`, repeated.
+    /// Each GUEST must be a path the snapshot mapped read-only with --portable-volumes:
+    /// the guest mounted it when it booted and the restore keeps that mount. A read-write
+    /// map cannot be moved, since the guest treats the sizes and pages it cached from one
+    /// as its own, and neither can one without portable volumes, whose open files the guest
+    /// names by host inode numbers. Files the guest
+    /// held open are found again by their path under the mount, so the new directory
+    /// should hold the same tree. What the guest cached from the recorded directory it
+    /// checks against the new one once the map's attribute timeout (1 s of guest time)
+    /// passes, by each file's size and modification time, as it does when a host file
+    /// changes under a running VM: a file whose size and mtime both match keeps the
+    /// guest's cached pages. Use it to give a
+    /// clone this host's copy of what the snapshot read from its own: certificates,
+    /// credentials, a checkout. Without this flag the clone serves the recorded host
+    /// directories.
+    #[arg(long = "map", action = clap::ArgAction::Append)]
+    pub map: Vec<String>,
+
     /// Routable IPv6 prefix to derive a routed clone's address from, in the forms
     /// `podman run --ipv6-prefix` takes. Without it the clone's address comes from the
     /// host's own /64, as for `podman run`. The prefix the snapshot was created under is
@@ -663,6 +710,13 @@ pub struct SnapshotRunArgs {
     /// ignore it.
     #[arg(long, env = "FCVM_IPV6_PREFIX")]
     pub ipv6_prefix: Option<String>,
+
+    /// The clone's IPv6 address, for a routed snapshot only: the guest's address is
+    /// swapped to it on restore, instead of one derived from the clone's random VM id.
+    /// The same rules as `podman run --ipv6-address` apply: inside the prefix in use,
+    /// not its address 0 or 1, and not held by another live VM.
+    #[arg(long, value_name = "ADDR")]
+    pub ipv6_address: Option<std::net::Ipv6Addr>,
 
     // ========================================================================
     // Internal fields - not exposed via CLI, used for startup snapshot support
@@ -677,6 +731,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]
     pub cpu: Option<u8>,
+
+    /// KEY=VALUE labels for the clone's state (internal use only).
+    /// Passed from podman run's --label when restoring from a snapshot; labels are not in
+    /// the snapshot key, so a cache hit takes the run's own.
+    #[arg(skip)]
+    pub label: Vec<String>,
 
     /// Memory in MiB (internal use only).
     /// Passed from podman run's --mem when restoring from a snapshot.
@@ -703,6 +763,12 @@ pub struct SnapshotRunArgs {
     #[arg(skip)]
     pub firecracker_args: Option<String>,
 
+    /// Pass a host PCI device, such as a GPU, through to the restored VM (repeatable).
+    /// The snapshot must have been made with --kernel-profile gpu (PCI transport) and
+    /// without a balloon or pmem device; the device is attached before the VM resumes.
+    #[arg(long, action = clap::ArgAction::Append, value_name = "PCI_ADDRESS")]
+    pub gpu: Vec<String>,
+
     /// Whether hugepages are enabled (internal use only).
     /// Passed from podman run's --hugepages when restoring from a snapshot cache hit.
     #[arg(skip)]
@@ -725,6 +791,45 @@ pub struct SnapshotRunArgs {
     /// this run did not, and a hook the caller never named must not run in its clone.
     #[arg(skip = true)]
     pub inherit_recorded_hook: bool,
+}
+
+// ============================================================================
+// GPU pool commands (host-side scrub and quarantine)
+// ============================================================================
+
+#[derive(Args, Debug)]
+pub struct GpuArgs {
+    #[command(subcommand)]
+    pub cmd: GpuCommands,
+}
+
+#[derive(Subcommand, Debug)]
+pub enum GpuCommands {
+    /// Reset each GPU and wait until it reports its memory cleared, before the GPU
+    /// goes to another VM. Run as root after the previous VM's Firecracker has
+    /// exited. Prints one JSON line per GPU; a GPU whose scrub fails is quarantined
+    /// (`--gpu` refuses it) until a later scrub succeeds. Exits 0 only if every GPU
+    /// was scrubbed.
+    Scrub(GpuScrubArgs),
+    /// Print each GPU's record as one JSON line: scrubs, failures, quarantine
+    Status(GpuStatusArgs),
+}
+
+#[derive(Args, Debug)]
+pub struct GpuScrubArgs {
+    /// GPU PCI addresses (SSSS:BB:DD.F or BB:DD.F), scrubbed in parallel
+    #[arg(required = true, value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
+    /// Seconds to wait for each of the GPU's boot and its memory clear
+    #[arg(long, default_value_t = 5)]
+    pub timeout_secs: u64,
+}
+
+#[derive(Args, Debug)]
+pub struct GpuStatusArgs {
+    /// GPU PCI addresses; every recorded GPU when none are given
+    #[arg(value_name = "PCI_ADDRESS")]
+    pub gpus: Vec<String>,
 }
 
 // ============================================================================
@@ -1225,7 +1330,7 @@ mod tests {
         let SnapshotCommands::Run(run) = snapshot.cmd else {
             panic!("expected `snapshot run` command");
         };
-        run
+        *run
     }
 
     #[test]

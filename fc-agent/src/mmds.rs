@@ -319,6 +319,7 @@ pub async fn watch_restore_epoch(
                         metadata.clone_ipv6.as_deref(),
                         &metadata.host_time,
                         metadata.restore_hook.as_deref(),
+                        &metadata.gpus,
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -342,6 +343,7 @@ pub async fn watch_restore_epoch(
                         metadata.clone_ipv6.as_deref(),
                         &metadata.host_time,
                         metadata.restore_hook.as_deref(),
+                        &metadata.gpus,
                     )
                     .await;
                     // Update the stable generation and stop fast-polling only
@@ -384,6 +386,7 @@ async fn apply_restore_epoch(
     clone_ipv6: Option<&str>,
     host_time: &str,
     restore_hook: Option<&str>,
+    gpus: &[String],
 ) {
     if let Err(error) = signals.restore_status.begin() {
         eprintln!(
@@ -404,6 +407,7 @@ async fn apply_restore_epoch(
         current,
         host_time,
         restore_hook,
+        gpus,
     )
     .await
     {
@@ -437,6 +441,9 @@ async fn apply_restore_epoch(
         );
         crate::system::shutdown_vm(1).await;
     }
+    // 6. A container that was running when the snapshot was taken is running in the
+    //    clone, and the clone's host process has not been told.
+    crate::container::resend_container_started_after_restore().await;
 }
 
 #[derive(Debug, PartialEq, Eq)]

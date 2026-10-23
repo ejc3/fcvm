@@ -1,8 +1,8 @@
 // Wire types for the coordinator's /live socket and the renderer's frame socket,
 // and parsers that refuse anything that does not match. The coordinator and the
 // renderer are the authority on these shapes (fleet/PROTOCOL.md); this file is the
-// browser's reading of them. Fields marked "assumed" are not in PROTOCOL.md yet:
-// they are this page's reading of the second design review, and the mock speaks them.
+// browser's reading of them. core/test/contract.test.ts parses the coordinator's own
+// snapshot states (#1146, fleet/core/tests/vectors) with it.
 
 export type Half = "fcvm" | "ec2";
 
@@ -29,11 +29,7 @@ export interface GpuInfo {
   util_pct: number | null;
 }
 
-/**
- * Why a tile is not running when that is a fault (assumed): `relaunch_failed`
- * (the VM did not come back; the coordinator retries at `retry_at`) or
- * `host_reclaimed` (AWS took the spot host back; the fleet re-tiles).
- */
+/** Why a tile is not running when that is a fault: `relaunch_failed` (the VM did not come back; the agent retries at `retry_at`). */
 export interface Failure {
   kind: string;
   message: string;
@@ -61,7 +57,7 @@ export interface Tile {
   gpu: GpuInfo | null;
   host: string | null;
   last_relaunch: LastRelaunch | null;
-  /** Lent to a visitor as their own GPU until this time (assumed); it sits out races meanwhile. */
+  /** Lent to a visitor as their own GPU until this time; it sits out races meanwhile. */
   borrowed: { until: number } | null;
 }
 
@@ -103,16 +99,16 @@ export interface RelaunchAll {
   /** Tiles still to reach their first frame. */
   fcvm_pending: number | null;
   ec2_pending: number | null;
-  /** GPUs restarted in each half (assumed). */
+  /** GPUs restarted in each half. */
   fcvm_gpus: number | null;
   ec2_gpus: number | null;
-  /** Time the EC2 half has waited for spot capacity so far, not counted in its time (assumed). */
+  /** Time the EC2 half has waited for spot capacity so far, not counted in its time. */
   ec2_capacity_wait_ms: number;
-  /** When the EC2 half's current wait for capacity began, or null (assumed). */
+  /** When the EC2 half's current wait for capacity began, or null. */
   ec2_waiting_since: number | null;
 }
 
-/** One half's measured restart times (assumed). Every number is the coordinator's. */
+/** One half's measured restart times. Every number is the coordinator's. */
 export interface HalfScore {
   /** Median click-to-last-first-frame over the races kept, capacity waits excluded. */
   median_ms: number;
@@ -131,7 +127,7 @@ export interface Scoreboard {
   ec2: HalfScore | null;
 }
 
-/** Where the directed camera can hold next, with this hold's votes (assumed). */
+/** Where the directed camera can hold next, with this hold's votes. */
 export interface NudgeTarget {
   id: string;
   label: string;
@@ -160,11 +156,7 @@ export interface HostWake {
   phases: { phase: string; at: number }[];
 }
 
-/**
- * The fleet scales to zero with no viewers and wakes when one arrives.
- * `asleep_since`, `woke_at` (when the wake began) and the per-host phases are the
- * coordinator's; `hosts` and `last_wake` are this page's reading (assumed).
- */
+/** The fleet scales to zero with no viewers and wakes when one arrives (`fleet.power`). */
 export interface Power {
   state: "asleep" | "waking" | "awake";
   asleep_since: number | null;
@@ -203,23 +195,29 @@ function parsePower(v: unknown): Power {
   };
 }
 
-/** Wall GPUs lent to visitors (assumed): at most `cap` at once; the next comes back at `next_return_at`. */
+/** Wall GPUs lent to visitors: at most `cap` at once; the next comes back at `next_return_at`. */
 export interface Borrow {
   cap: number;
   lent: number;
   next_return_at: number | null;
 }
 
-/** Running totals the coordinator keeps (assumed): VMs restored, GPU memory scrubs, restores in the last hour. */
+/** Running totals the coordinator keeps: GPU VMs restored, the last hour's, GPU memory scrubs agents reported. */
 export interface Counters {
-  restores_total: number;
-  scrubs_total: number;
+  restores: number;
   restores_last_hour: number;
+  scrubs: number;
 }
 
-/** What the fleet's isolation does today (assumed): the GPU memory scrub has shipped or not. */
-export interface Security {
-  gpu_scrub: boolean;
+/**
+ * What is wrong beyond one tile: `host_reclaimed` (a spot notice, or the host's agent
+ * went away; its tiles have already left the tiling), `coordinator_degraded`,
+ * `gpu_quarantined`. Each carries what its kind names; the page reads these.
+ */
+export interface FleetFailure {
+  kind: string;
+  host: string | null;
+  since: number | null;
 }
 
 export interface Action {
@@ -246,23 +244,39 @@ export interface Aggregate {
   tiles: string[];
 }
 
+/**
+ * Which tiling of the image this is: a new generation each time GPUs join or leave
+ * and the image is re-tiled, and the frame number (on the renderers' t = k/30 grid)
+ * from which the renderers draw the new rectangles. Frames before it are drawn with
+ * the old ones.
+ */
+export interface Layout {
+  generation: number;
+  from_frame: number;
+}
+
+/** Renderer frames per second: frame k is drawn at t = k / FRAME_RATE. */
+export const FRAME_RATE = 30;
+
 export interface FleetState {
+  layout: Layout;
   tiles: Tile[];
   /** Width over height of the whole image. */
   image_aspect: number;
   fleet: { hosts: Host[]; gpus: number; n: number; max_tiles: number | null; power: Power };
   borrow: Borrow | null;
   counters: Counters | null;
-  security: Security;
+  failures: FleetFailure[];
   scene: Scene;
   relaunch_all: RelaunchAll | null;
-  /** When the owner's cadence restarts everything next (assumed). */
+  /** When the owner's cadence restarts everything next. */
   next_race_at: number | null;
-  /** A viewer's "restart now" is refused until then (assumed). */
+  /** A viewer's `restart_now` is refused until then. */
   cooldown_until: number | null;
   scoreboard: Scoreboard;
   nudges: Nudges | null;
-  viewers: { count: number };
+  /** Connections, and those whose tab is visible (`active`): the page shows `active`. */
+  viewers: { count: number; active: number };
   actions: Action[];
   aggregates: Aggregate[];
 }
@@ -273,21 +287,21 @@ export interface SnapshotMsg {
   state: FleetState;
 }
 
-/** The first message on a connection: who it acts as, and the Turnstile site key when actions need one (assumed). */
+/** The first message on a connection: who it acts as, and the Turnstile site key when actions need one. */
 export interface HelloMsg {
   type: "hello";
   viewer: string;
   turnstile: string | null;
 }
 
-/** The answer to a `verify` (assumed). */
+/** The answer to a `verify`. */
 export interface VerifiedMsg {
   type: "verified";
   ok: boolean;
   reason: string | null;
 }
 
-/** A viewer's own GPU, borrowed from a wall tile, sent only to the connection that claimed it (assumed). */
+/** A viewer's own GPU, borrowed from a wall tile, sent only to the connection that claimed it. */
 export interface Claim {
   id: string;
   /** The wall tile whose GPU it borrowed. */
@@ -335,16 +349,9 @@ export type ServerMsg = SnapshotMsg | ReceiptMsg | ClockMsg | ErrorMsg | HelloMs
 
 export const DEFAULT_IMAGE_ASPECT = 16 / 9;
 
-export type IntentName =
-  | "relaunch"
-  | "relaunch_all"
-  | "nudge"
-  | "time_of_day"
-  | "word"
-  | "light"
-  | "claim_gpu"
-  | "claim_camera"
-  | "release_gpu";
+/** The intents the page sends, by the coordinator's names (PROTOCOL.md, "Intents"). */
+export const INTENT_NAMES = ["relaunch", "restart_now", "nudge", "word", "light", "claim_gpu", "claim_camera", "release_gpu"] as const;
+export type IntentName = (typeof INTENT_NAMES)[number];
 
 export interface IntentMsg {
   type: "intent";
@@ -358,7 +365,7 @@ export interface PingMsg {
   client_unix_ms: number;
 }
 
-/** A Turnstile token for this connection (assumed). */
+/** A Turnstile token for this connection. */
 export interface VerifyMsg {
   type: "verify";
   token: string;
@@ -612,7 +619,9 @@ function parseState(o: Obj): FleetState {
   const aspect = numOrNull(o, "image_aspect", "state") ?? DEFAULT_IMAGE_ASPECT;
   if (aspect <= 0) throw new ProtocolError("image_aspect is not positive");
   const sb = isObj(o["scoreboard"]) ? o["scoreboard"] : {};
+  const lay = isObj(o["layout"]) ? o["layout"] : null;
   return {
+    layout: lay ? { generation: num(lay, "generation", "layout"), from_frame: num(lay, "from_frame", "layout") } : { generation: 0, from_frame: 0 },
     tiles,
     image_aspect: aspect,
     fleet: {
@@ -635,20 +644,26 @@ function parseState(o: Obj): FleetState {
       : null,
     counters: isObj(o["counters"])
       ? {
-          restores_total: num(o["counters"], "restores_total", "counters"),
-          scrubs_total: numOrNull(o["counters"], "scrubs_total", "counters") ?? 0,
+          restores: num(o["counters"], "restores", "counters"),
           restores_last_hour: numOrNull(o["counters"], "restores_last_hour", "counters") ?? 0,
+          scrubs: numOrNull(o["counters"], "scrubs", "counters") ?? 0,
         }
       : null,
-    // Absent means not shipped: the page never claims a scrub it was not told about.
-    security: { gpu_scrub: isObj(o["security"]) && o["security"]["gpu_scrub"] === true },
+    failures: arr(o, "failures", "state").map((f, i) => {
+      const where = `failures[${i}]`;
+      if (!isObj(f)) throw new ProtocolError(`${where} is not an object`);
+      return { kind: str(f, "kind", where), host: strOrNull(f, "host", where), since: numOrNull(f, "since", where) };
+    }),
     scene: parseScene(obj(o, "scene", "state")),
     relaunch_all: parseRelaunchAll(o["relaunch_all"]),
     next_race_at: numOrNull(o, "next_race_at", "state"),
     cooldown_until: numOrNull(o, "cooldown_until", "state"),
     scoreboard: { fcvm: parseHalfScore(sb["fcvm"], "scoreboard.fcvm"), ec2: parseHalfScore(sb["ec2"], "scoreboard.ec2") },
     nudges: parseNudges(o["nudges"]),
-    viewers: { count: typeof viewers["count"] === "number" ? viewers["count"] : 0 },
+    viewers: {
+      count: typeof viewers["count"] === "number" ? viewers["count"] : 0,
+      active: typeof viewers["active"] === "number" ? viewers["active"] : 0,
+    },
     actions,
     aggregates: arr(o, "aggregates", "state").map((a, i) => {
       const where = `aggregates[${i}]`;
