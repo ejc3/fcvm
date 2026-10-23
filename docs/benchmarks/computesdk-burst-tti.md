@@ -118,6 +118,38 @@ decides that a container is running by spawning `fcvm exec ... podman inspect`, 
 burst of 100 those execs are slow. At concurrency 1 the whole TTI is 666 ms. Tracked in
 #1161.
 
+### With the container start notification (#1161)
+
+Since #1161 fc-agent runs podman with `--sdnotify=conmon` and tells the host when podman
+reports the container running, and the health monitor takes that as the running signal
+instead of spawning `fcvm exec ... podman inspect`. Both columns below were measured on one
+c8gd.metal-24xl on 2026-10-23 with the commands above: before at `12e0f0ca`, after at
+`03b58f0e`. TTI in ms, harness statistics, then untrimmed p99 and max.
+
+| concurrency | sandboxes | before median | before p95 | before p99 | after median | after p95 | after p99 | before / after untrimmed p99 | before / after max |
+|---|---|---|---|---|---|---|---|---|---|
+| 100 | 5 bursts x 100 | 2980 | 3440 | 3550 | 2125 | 2331 | 2354 | 3844 / 2411 | 3950 / 2513 |
+| 10 | 5 bursts x 10 | 717 | 761 | 790 | 546 | 606 | 613 | 815 / 632 | 815 / 632 |
+| 1 | 50 in sequence | 666 | 714 | 716 | 520 | 590 | 599 | 786 / 600 | 786 / 600 |
+
+One more burst of 100 creates each way, without the command, timed per sandbox on the host
+clock: the request, the status listener's container-ready file, podman's `State.StartedAt`
+in the guest (moved to the host clock by an offset measured afterwards over exec, round
+trip 10 ms at the median), and the create's return. p50 / p95 ms:
+
+| interval | before | after |
+|---|---|---|
+| create request to return | 2674 / 3245 | 1681 / 2016 |
+| podman started the container to the create's return | 907 / 1359 | 65 / 298 |
+
+Before, a health check under that burst was one or two execs, each about 425 ms at the
+median (10 sandboxes probed right after their start: `fcvm exec --vm -- true` 82 ms,
+`podman inspect` 302 ms of it inside the guest, starting the `fcvm` process 9 ms), and the
+next check waited as long as the last one took. In the before run, where fc-agent still
+sent its notification when it spawned `podman run`, podman took a median of 688 ms (p95
+1152) from that spawn to the container running. This change does not touch that time, and
+it is now the largest part of a create after the restore.
+
 ### Published results, for reference
 
 As published, from different hardware, a different client location and different sandbox
