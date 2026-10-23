@@ -847,6 +847,15 @@ async fn settle_balloon_check(ctx: &mut VmContext) -> Result<()> {
 /// `publish` is this run's own `--publish`, so the clone listens where this run asked,
 /// and a spec the cache key's lenient parse skipped is refused here as it is on a cache
 /// miss. The key hashes the mappings, so today they equal the snapshot's.
+/// `--label KEY=VALUE` flags as the state's label map. A flag without `=` is dropped.
+pub(crate) fn parse_labels(labels: &[String]) -> std::collections::HashMap<String, String> {
+    labels
+        .iter()
+        .filter_map(|l| l.split_once('='))
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect()
+}
+
 fn snapshot_restore_args(
     args: &RunArgs,
     snapshot_key: &str,
@@ -869,6 +878,7 @@ fn snapshot_restore_args(
         // no startup snapshot.
         startup_snapshot_base_key: startup_snapshot_base_key.filter(|_| args.gpu.is_empty()),
         cpu: Some(args.cpu),
+        label: args.label.clone(),
         mem: Some(args.mem),
         balloon: args.balloon,
         firecracker_bin,
@@ -1691,12 +1701,7 @@ async fn prepare_vm_for_lifecycle(
             .find_map(|s| s.strip_prefix("USER="))
             .map(|s| s.to_string());
     }
-    vm_state.config.labels = args
-        .label
-        .iter()
-        .filter_map(|l| l.split_once('='))
-        .map(|(k, v)| (k.to_string(), v.to_string()))
-        .collect();
+    vm_state.config.labels = parse_labels(&args.label);
 
     // Initialize state manager
     let state_manager = StateManager::new(paths::state_dir());

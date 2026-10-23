@@ -101,6 +101,12 @@ pub struct ServeArgs {
     /// Port to listen on
     #[arg(long, default_value_t = 8090)]
     pub port: u16,
+
+    /// Start every sandbox with `--no-snapshot`: a cold boot that neither restores from
+    /// nor creates the snapshot cache. By default each sandbox is an
+    /// `fcvm podman run` that restores from the cache when its snapshot exists.
+    #[arg(long)]
+    pub no_snapshot: bool,
 }
 
 // ============================================================================
@@ -725,6 +731,12 @@ pub struct SnapshotRunArgs {
     /// Passed from podman run's --cpu when restoring from a snapshot.
     #[arg(skip)]
     pub cpu: Option<u8>,
+
+    /// KEY=VALUE labels for the clone's state (internal use only).
+    /// Passed from podman run's --label when restoring from a snapshot; labels are not in
+    /// the snapshot key, so a cache hit takes the run's own.
+    #[arg(skip)]
+    pub label: Vec<String>,
 
     /// Memory in MiB (internal use only).
     /// Passed from podman run's --mem when restoring from a snapshot.
