@@ -32,6 +32,9 @@ struct FakeTile {
     queries: Arc<Mutex<Vec<HashMap<String, String>>>>,
     /// The first slot it sends (a renderer that comes up late).
     from_k: i64,
+    /// From this slot on it draws another rectangle: a new header (a new size) mid-stream,
+    /// as a renderer does at a re-tile's frame.
+    switch: Option<(i64, Header)>,
 }
 
 fn now_ms() -> u64 {
@@ -66,7 +69,7 @@ async fn tile_ws(
     ws.on_upgrade(move |s| serve_tile(s, t))
 }
 
-async fn serve_tile(mut s: WebSocket, t: FakeTile) {
+async fn serve_tile(mut s: WebSocket, mut t: FakeTile) {
     if s.send(AxMessage::Text(
         serde_json::to_string(&t.header).unwrap().into(),
     ))
@@ -81,6 +84,14 @@ async fn serve_tile(mut s: WebSocket, t: FakeTile) {
         let wait = due - now_ms() as f64;
         if wait > 0.0 {
             tokio::time::sleep(Duration::from_micros((wait * 1000.0) as u64)).await;
+        }
+        if let Some((_, h)) = t.switch.clone().filter(|(at, _)| k >= *at) {
+            t.header = h;
+            t.switch = None;
+            let text = serde_json::to_string(&t.header).unwrap();
+            if s.send(AxMessage::Text(text.into())).await.is_err() {
+                return;
+            }
         }
         let f = Frame {
             key: true,
@@ -145,6 +156,7 @@ async fn tiles_are_joined_at_one_t_without_their_margins() {
             epoch,
             queries: queries.clone(),
             from_k: i64::MIN,
+            switch: None,
         }
     };
     let urls = [
@@ -401,33 +413,35 @@ async fn a_region_with_no_tiles_streams_black() {
 
 /// A new layout generation (the region re-tiled) keeps the old composite until every tile
 /// of the new generation has delivered a frame at or after the generation's frame, then
-/// swaps them all at once: no frame mixes the generations, and no new tile is drawn black
-/// for want of its first frame.
+/// swaps them all at once: no frame mixes the generations, no new tile is drawn black for
+/// want of its first frame, and a stream that changes height at that frame is followed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_generation_replaces_the_old_composite_all_at_once() {
     let epoch = now_ms() - 10_000;
     let queries = Arc::new(Mutex::new(Vec::new()));
-    let tile = |x0: u32, w: u32, id_u: u8, from_k: i64| FakeTile {
-        header: Header {
-            codec: "raw".into(),
-            width: w,
-            height: 72,
-            full_width: 128,
-            full_height: 72,
-            x0,
-            y0: 0,
-            fps: FPS,
-            crop: Crop {
-                left: 0,
-                top: 0,
-                right: 0,
-                bottom: 0,
-            },
+    let head = |y0: u32, h: u32| Header {
+        codec: "raw".into(),
+        width: 64,
+        height: h,
+        full_width: 128,
+        full_height: 72,
+        x0: 0,
+        y0,
+        fps: FPS,
+        crop: Crop {
+            left: 0,
+            top: 0,
+            right: 0,
+            bottom: 0,
         },
+    };
+    let tile = |header: Header, id_u: u8, from_k: i64, switch: Option<(i64, Header)>| FakeTile {
+        header,
         id_u,
         epoch,
         queries: queries.clone(),
         from_k,
+        switch,
     };
     let region = Rect {
         x: 0.0,
@@ -451,8 +465,12 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
         from_frame,
     };
     let shared = Shared::new();
-    let a = start_tile(tile(0, 64, 60, i64::MIN)).await;
-    shared.set_layout(layout(1, 0, vec![("slot-a", region, a)]));
+    // Slot a draws the whole region until frame F, then the top half (its renderer sends a
+    // new header with the new height on the same stream); F is 2 s ahead.
+    let now_k = ((now_ms() - epoch) as f64 * FPS as f64 / 1000.0) as i64;
+    let f = now_k + 60;
+    let a = start_tile(tile(head(0, 72), 60, i64::MIN, Some((f, head(0, 36))))).await;
+    shared.set_layout(layout(1, 0, vec![("slot-a", region, a.clone())]));
     let cancel = CancellationToken::new();
     let opts = Options {
         image_height: 72,
@@ -480,29 +498,26 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
         header(next_msg(&mut ws).await)["tiles"],
         serde_json::json!(["slot-a"])
     );
-    // Generation 2 splits the region in two at frame F, 1.5 s ahead; the right tile's
+    // Generation 2 splits the region into top and bottom at frame F; the bottom tile's
     // renderer only starts streaming half a second after F.
-    let now_k = ((now_ms() - epoch) as f64 * FPS as f64 / 1000.0) as i64;
-    let f = now_k + 45;
-    let half = |x: f64| Rect {
-        x,
-        y: 0.0,
-        w: 0.25,
-        h: 1.0,
+    let half = |y: f64| Rect {
+        x: 0.0,
+        y,
+        w: 0.5,
+        h: 0.5,
     };
-    let b = start_tile(tile(0, 32, 90, i64::MIN)).await;
-    let c = start_tile(tile(32, 32, 120, f + 15)).await;
+    let c = start_tile(tile(head(36, 36), 120, f + 15, None)).await;
     shared.set_layout(layout(
         2,
         f,
-        vec![("slot-b", half(0.0), b), ("slot-c", half(0.25), c)],
+        vec![("slot-a", half(0.0), a), ("slot-c", half(0.5), c)],
     ));
     let mut old_ts = Vec::new();
     loop {
         match next_msg(&mut ws).await {
             Message::Binary(bytes) => old_ts.push(Frame::parse(&bytes).unwrap().t),
             m => {
-                assert_eq!(header(m)["tiles"], serde_json::json!(["slot-b", "slot-c"]));
+                assert_eq!(header(m)["tiles"], serde_json::json!(["slot-a", "slot-c"]));
                 break;
             }
         }
@@ -537,13 +552,24 @@ async fn a_new_generation_replaces_the_old_composite_all_at_once() {
     };
     assert_eq!(
         pic.get(10, 10)[1],
-        90,
-        "the left tile of the new generation"
+        60,
+        "the top tile: the same stream at its new height"
     );
     assert_eq!(
-        pic.get(50, 10)[1],
+        pic.get(10, 50)[1],
         120,
-        "the right tile of the new generation, not black"
+        "the bottom tile of the new generation, not black"
+    );
+    // The aggregator asked each stream for its tile's height in its own generation.
+    let hs: Vec<String> = queries
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|q| q.get("h").cloned())
+        .collect();
+    assert!(
+        hs.contains(&"72".to_string()) && hs.contains(&"36".to_string()),
+        "{hs:?}"
     );
     cancel.cancel();
 }

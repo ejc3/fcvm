@@ -635,10 +635,20 @@ For a frame `k < rect_from_frame` the renderer draws `previous_rect` when presen
 streams keep the old tile size and crop until then); from `k >= rect_from_frame` it draws
 `rect`. With no `previous_rect`, it draws `rect` at once. A body that arrives after
 `rect_from_frame` (a late post, a relaunch) draws `rect` at once. Every renderer of the wall
-gets the same `rect_from_frame` for one generation, 45 frames (1.5 s) after the change, so
-every tile switches at one slot; the page and the aggregators swap their composites at that
-frame (see "Aggregator"). A new scene body with the same `layout_generation` and
-`rect_from_frame` does not restart the switch.
+gets the same `rect_from_frame` for one generation, so every tile switches at one slot; the
+page and the aggregators swap their composites at that frame (see "Aggregator"). A new
+scene body with the same `layout_generation` and `rect_from_frame` does not restart the
+switch.
+
+A renderer needs `rect_from_frame` at least 0.5 s after the post that brings it arrives, to
+open the new rectangle's encoders off its render thread (renderer round 10). The coordinator
+sets it, for a layout made at scene time `t`, to `ceil(30 t) + 30 + 15`
+(`fleet_core::state::layout_from_frame`): 30 frames (1 s) for the post to reach every
+renderer (coordinator to agent to renderer, or coordinator to an EC2 tile) and 15 frames
+(0.5 s) for the encoders. A post that takes longer than the allowance leaves the renderer
+less than 0.5 s. A stream's height can change at
+`rect_from_frame` (the whole image keeps its height): the renderer sends a new stream header
+there, which a subscriber must take, as the aggregator does.
 
 ```json
 {"type": "budget", "budget": 707107, "t": 863.2}
@@ -647,8 +657,12 @@ frame (see "Aggregator"). A new scene body with the same `layout_generation` and
 The grid budget, sent after the hello and whenever it changes. The agent posts
 `{"budget", "t"}` to every running renderer that draws a wall tile
 (`POST http://<publish ip>:<port>/budget`): when it arrives, and again after every scene
-post, because a new scene clears the renderer's budget schedule. A renderer drawing the
-whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
+post. Since renderer round 10 a scene with the same `epoch_unix_ms` keeps the budget
+schedule, a new epoch keeps the budget in force, and only a scene carrying its own `budget`
+clears it (the coordinator's scene never carries one), so the re-post is no longer needed to
+avoid the renderer's default; it is kept because it costs one small request per scene
+change and keeps a renderer that missed the original post on the grid's budget. A renderer
+drawing the whole image for a claim gets no budget (it chooses its own). The coordinator posts the same
 body to each EC2 tile's renderer.
 
 ### Grid budget
@@ -763,7 +777,10 @@ processes; the host needs the `ffmpeg` CLI with libx264.
   `x0, y0` the region's top-left pixel in the whole image; then FCVF frames, each at the
   slot's `t`. A viewer that joins gets the header and every frame since the last
   keyframe, then live frames; one that falls behind resumes at the next keyframe. A
-  layout change sends a new header and a keyframe.
+  layout change sends a new header and a keyframe. A tile stream's own header can change
+  mid-stream (a re-tile changes its height at `rect_from_frame`); the aggregator takes the
+  new header and decodes the frames that follow at its size. Each generation subscribes
+  with `?h=` of its own tile height.
 - A layout of a newer `generation` (a re-tile) swaps the way the page does: the
   aggregator keeps composing the old layout up to the frame before `from_frame` and
   subscribes to the new layout's tiles, dropping their frames before `from_frame`. Once
