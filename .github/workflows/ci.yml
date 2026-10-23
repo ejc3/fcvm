@@ -145,12 +145,20 @@ jobs:
               # is exactly the class that can break it.
               Makefile) code=true; bench=true; echo "makefile: $f" ;;
               bench/*) bench=true; echo "bench path: $f" ;;
+              # fleet/core is a workspace member that fcvm builds, so it is code.
+              # The rest of fleet/ (renderer, media, shots, tools, PROTOCOL.md)
+              # is not built, read or run by anything the VM matrix executes, so
+              # the matrix can say nothing about it. Its own suites get their own
+              # jobs (fleet/web has fleet-web, below); until a
+              # directory has one, it runs nothing here, as it did not before.
+              fleet/core/*) code=true; echo "code path: $f" ;;
               # The fleet web page is TypeScript with its own suite (fleet-web);
               # the VM matrix does not build or run it. Like bench/, it precedes
               # the docs arm so its README still routes to its check.
               fleet/web/*) web=true; echo "fleet web path: $f" ;;
               # This file holds the fleet-web job, so a change here runs it too.
               .github/workflows/ci.yml) code=true; web=true; echo "ci workflow: $f" ;;
+              fleet/*) echo "fleet path, no matrix: $f" ;;
               docs/*|*.md) ;;
               *) code=true; echo "code path: $f" ;;
             esac
@@ -560,7 +568,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.
@@ -833,7 +841,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.
@@ -1115,7 +1123,7 @@ jobs:
       # full runner otherwise produces mystery ENOSPC failures downstream.
       # Runs as early as the repo's own script is available; it cannot rescue
       # a runner already too full for "Set up job" itself (2026-08-06:
-      # runner-i-0ea78b39da373fcca died there on _diag/ and killed every job
+      # runner-<id> died there on _diag/ and killed every job
       # it picked up, including two on the dependabot merge train). That case
       # is covered on the runner by scripts/runner-disk-guard.timer, which
       # runs this same script hourly with --quarantine. Needs no secrets.

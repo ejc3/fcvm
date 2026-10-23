@@ -1659,7 +1659,7 @@ def validate_host_compatibility(label, meta, host_rows, counts, vm_meta, vm_rows
         )
 
     compatibility = (
-        ("host_boot_id", "host_boot_id"),
+        ("host_boot_sha256", "host_boot_sha256"),
         ("host_machine", "host_machine"),
         ("host_kernel", "host_kernel_release"),
         ("source_revision", "source_revision"),
@@ -1669,7 +1669,9 @@ def validate_host_compatibility(label, meta, host_rows, counts, vm_meta, vm_rows
     for host_key, vm_key in compatibility:
         host_value = required_string(meta, host_key, f"host {label} run.json")
         vm_value = required_string(vm_meta, vm_key, "VM reqbench metadata")
-        if host_key in ("harness_sha256", "runtime_bundle_sha256"):
+        if host_key in (
+            "harness_sha256", "runtime_bundle_sha256", "host_boot_sha256",
+        ):
             sha256_field(meta, host_key, f"host {label} run.json")
             sha256_field(vm_meta, vm_key, "VM reqbench metadata")
         if host_value != vm_value:
@@ -2308,7 +2310,7 @@ def run_comparison(
             "dir": os.path.abspath(display_directory), "run_id": meta["run_id"],
             "comparison_label": meta["comparison_label"],
             "cpu_budget": meta["cpu_budget"], "cpus": meta.get("cpus"),
-            "host_boot_id": meta["host_boot_id"],
+            "host_boot_sha256": meta["host_boot_sha256"],
             "host_machine": meta["host_machine"],
             "host_kernel": meta["host_kernel"],
             "source_revision": meta["source_revision"],

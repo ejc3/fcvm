@@ -217,18 +217,43 @@ pub async fn run() -> Result<()> {
     // boot to read. Awaited (bounded) at shutdown below.
     let chronyd_task = tokio::spawn(start_chronyd(plan.ntp_servers.clone()));
 
-    let mounted_disk_paths = if !plan.extra_disks.is_empty() {
-        eprintln!(
-            "[fc-agent] mounting {} extra disk(s)",
-            plan.extra_disks.len()
-        );
-        let paths = mounts::mount_extra_disks(&plan.extra_disks, &mut mount_record)
+    // The NVIDIA driver image mounts with the extra disks, read-only, at a
+    // path of its own. It is not in plan.extra_disks, so the container does
+    // not get it as a volume; CDI gives the container the files it needs.
+    let mut boot_disks = plan.extra_disks.clone();
+    if let Some(driver) = &plan.gpu_driver {
+        boot_disks.push(crate::types::ExtraDiskMount {
+            device: driver.device.clone(),
+            mount_path: crate::gpu::DRIVER_ROOT.to_string(),
+            read_only: true,
+        });
+    }
+    let mounted_disk_paths = if !boot_disks.is_empty() {
+        eprintln!("[fc-agent] mounting {} extra disk(s)", boot_disks.len());
+        let paths = mounts::mount_extra_disks(&boot_disks, &mut mount_record)
             .context("mounting extra disks")?;
         eprintln!("[fc-agent] extra disks mounted successfully");
         paths
     } else {
         Vec::new()
     };
+
+    // Load the NVIDIA driver now, before the pre-start snapshot, so a restore
+    // that attaches a GPU only probes it. Not fatal: the attach loads what is
+    // not loaded and fails closed there.
+    if plan.gpu_driver.is_some() {
+        let started = std::time::Instant::now();
+        match crate::gpu::preload(std::path::Path::new(crate::gpu::DRIVER_ROOT)).await {
+            Ok(()) => eprintln!(
+                "[fc-agent] gpu: NVIDIA driver loaded at boot in {:.0} ms",
+                started.elapsed().as_secs_f64() * 1000.0
+            ),
+            Err(error) => eprintln!(
+                "[fc-agent] WARNING: gpu: the NVIDIA driver did not load at boot ({error:#}); \
+                 a restore that attaches a GPU loads it then"
+            ),
+        }
+    }
 
     // pmem mounts are guest kernel state carried in the snapshot, as extra disks
     // are, so a restore does not mount them again.
@@ -332,9 +357,10 @@ pub async fn run() -> Result<()> {
     container::set_podman_cmd_prefix(cmd_prefix.clone());
 
     // Open exec only now, with the rebind signal for vsock transport reset
-    // recovery. The host's health monitor runs `podman inspect` over exec as soon
-    // as the server accepts connections, so no podman command can start before
-    // storage setup, the container user and the command prefix are done. Overlay
+    // recovery. A host exec (a user's, or the health monitor's `podman inspect`
+    // for an image with a HEALTHCHECK) can arrive as soon as the server accepts
+    // connections, so no podman command can start before storage setup, the
+    // container user and the command prefix are done. Overlay
     // image mode rewrites storage.conf after this point, in mount_overlay_image(),
     // with the driver write_early_storage_conf() already named. The host's exec
     // client retries until the server listens.
@@ -426,9 +452,15 @@ pub async fn run() -> Result<()> {
     // host's pre-start snapshot pause can never capture the UART mid-transmit.
     // If the console cannot be proven quiet it returns Failed WITHOUT sending
     // cache-ready — the host never pauses us and the VM continues cold.
-    match container::get_image_digest(&image_ref, &cmd_prefix).await {
-        Ok(digest) => {
-            let cache_result = container::notify_cache_ready_and_wait(&digest, &restore_flag);
+    let mut restored = false;
+    // Whether the image defines a HEALTHCHECK, sent to the host with the container's
+    // start. Unknown counts as yes: the host then asks podman, which is what it did for
+    // every container before the start notification carried this.
+    let mut image_healthcheck = true;
+    match container::get_image_facts(&image_ref, &cmd_prefix).await {
+        Ok(facts) => {
+            image_healthcheck = facts.healthcheck;
+            let cache_result = container::notify_cache_ready_and_wait(&facts.digest, &restore_flag);
             match cache_result {
                 container::CacheResult::ColdStart => {
                     eprintln!("[fc-agent] cache ready: cold start (cache-ack received)");
@@ -445,6 +477,7 @@ pub async fn run() -> Result<()> {
                 }
                 container::CacheResult::WarmStart => {
                     eprintln!("[fc-agent] cache ready: warm start (snapshot restore detected)");
+                    restored = true;
                     // The watcher publishes Succeeded only after exec and egress are
                     // ready, and requests output reconnect before waking this wait.
                     // Failed is terminal and propagates to main(), which shuts the clone
@@ -489,9 +522,10 @@ pub async fn run() -> Result<()> {
             }
         }
         Err(e) => {
-            eprintln!("[fc-agent] WARNING: failed to get image digest: {:?}", e);
+            eprintln!("[fc-agent] WARNING: failed to inspect the image: {:?}", e);
         }
     }
+    crate::gpu::check_gpu_restore(plan.await_gpu_restore, restored)?;
 
     // VM-level setup: hostname and sysctl (runs as root before container starts).
     // When using --user, the container runs as non-root and can't do these.
@@ -576,21 +610,42 @@ pub async fn run() -> Result<()> {
     let user_ref = user_info
         .as_ref()
         .map(|(username, runtime_dir)| (username.as_str(), runtime_dir.as_str()));
+    // Taken before the args: an attach still loading the driver finishes first, and
+    // from here a GPU attached by a later restore cannot reach this container.
+    let gpu_devices = crate::gpu::launch_devices().await;
     let podman_args = if provisioned && container::container_exists(&cmd_prefix) {
         eprintln!("[fc-agent] starting captured fcvm-container (clone cold boot)");
         container::build_start_args(&plan, user_ref)
     } else {
-        container::build_podman_args(&plan, &image_ref, user_ref)
+        container::build_podman_args(&plan, &image_ref, user_ref, &gpu_devices)
     };
+
+    // Bound before podman starts, so its READY=1 always has somewhere to go.
+    let start_notify =
+        container::StartNotify::bind(container::podman_user_ids(plan.user.as_deref()))?;
 
     // TTY mode: never returns
     if plan.tty {
         eprintln!("[fc-agent] TTY mode enabled, using PTY");
-        container::run_tty(&podman_args, &plan, &mounted_fuse_paths).await;
+        container::run_tty(
+            &podman_args,
+            &plan,
+            &mounted_fuse_paths,
+            start_notify,
+            image_healthcheck,
+        )
+        .await;
     }
 
     // Non-TTY mode: async
-    let exit_code = container::run_async(&podman_args, &output, plan.non_blocking_output).await?;
+    let exit_code = container::run_async(
+        &podman_args,
+        &output,
+        plan.non_blocking_output,
+        start_notify,
+        image_healthcheck,
+    )
+    .await?;
 
     // Notify host of exit
     crate::vsock::notify_container_exit(exit_code);
@@ -875,8 +930,10 @@ impl PidFd {
     /// Returns true if it exited. A pidfd becomes readable on exit, so this is
     /// an epoll wakeup rather than a poll loop.
     async fn wait_for_exit(&self, timeout: Duration) -> bool {
-        use std::os::fd::AsRawFd;
-        let Ok(async_fd) = tokio::io::unix::AsyncFd::new(self.0.as_raw_fd()) else {
+        use std::os::fd::AsFd;
+        // SAFETY: the `BorrowedFd` borrows `self.0`, so the pidfd stays open and unchanged
+        // for as long as this local `AsyncFd` lives.
+        let Ok(async_fd) = (unsafe { tokio::io::unix::AsyncFd::register(self.0.as_fd()) }) else {
             return false;
         };
         tokio::time::timeout(timeout, async_fd.readable())
@@ -945,6 +1002,31 @@ async fn chronyc_sources() -> std::result::Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
+    /// The NVIDIA driver loads at boot, once its image is mounted and before the
+    /// pre-start snapshot is offered, so every clone of that snapshot already
+    /// holds it and a GPU restore only probes the device.
+    #[test]
+    fn the_gpu_driver_loads_after_its_image_mounts_and_before_the_snapshot() {
+        let source = include_str!("agent.rs");
+        let body = &source[..source
+            .find("\n#[cfg(test)]\nmod tests {")
+            .expect("agent.rs has no test module")];
+        let mount = body
+            .find("mounts::mount_extra_disks(&boot_disks")
+            .expect("the driver image is no longer mounted with the extra disks");
+        let preload = body
+            .find("crate::gpu::preload(")
+            .expect("fc-agent no longer loads the NVIDIA driver at boot");
+        let snapshot = body
+            .find("container::notify_cache_ready_and_wait(")
+            .expect("fc-agent no longer offers the pre-start snapshot");
+        assert!(
+            mount < preload && preload < snapshot,
+            "the driver must load after its image mounts ({mount}) and before the \
+             snapshot is offered ({snapshot}); it loads at {preload}"
+        );
+    }
+
     /// fc-agent opens its exec server only after storage.conf names the overlay
     /// driver, storage setup has run, and the container user and podman command
     /// prefix exist.

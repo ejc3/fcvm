@@ -38,7 +38,7 @@
     "ws_url_prewired": false,
     "allow_busy": false,
     "quiet_loadavg1_limit": 2.0,
-    "host_boot_id": "80bfe10d-dfda-4e4b-8dec-4149483747f9",
+    "host_boot_sha256": "acac488d92fdea053c91ada9bd3abbdc7dd1e50d75eff1634a8a151026d4f516",
     "host_kernel_release": "7.0.14-fcvm-cd6cd2b4b52e",
     "host_machine": "aarch64"
   },
@@ -41102,7 +41102,7 @@
         "ws_url_prewired": false,
         "allow_busy": false,
         "quiet_loadavg1_limit": 2.0,
-        "host_boot_id": "80bfe10d-dfda-4e4b-8dec-4149483747f9",
+        "host_boot_sha256": "acac488d92fdea053c91ada9bd3abbdc7dd1e50d75eff1634a8a151026d4f516",
         "host_kernel_release": "7.0.14-fcvm-cd6cd2b4b52e",
         "host_machine": "aarch64"
       },
@@ -43481,7 +43481,7 @@
         "ws_url_prewired": false,
         "allow_busy": false,
         "quiet_loadavg1_limit": 2.0,
-        "host_boot_id": "80bfe10d-dfda-4e4b-8dec-4149483747f9",
+        "host_boot_sha256": "acac488d92fdea053c91ada9bd3abbdc7dd1e50d75eff1634a8a151026d4f516",
         "host_kernel_release": "7.0.14-fcvm-cd6cd2b4b52e",
         "host_machine": "aarch64"
       },
@@ -84545,7 +84545,7 @@
             "ws_url_prewired": false,
             "allow_busy": false,
             "quiet_loadavg1_limit": 2.0,
-            "host_boot_id": "80bfe10d-dfda-4e4b-8dec-4149483747f9",
+            "host_boot_sha256": "acac488d92fdea053c91ada9bd3abbdc7dd1e50d75eff1634a8a151026d4f516",
             "host_kernel_release": "7.0.14-fcvm-cd6cd2b4b52e",
             "host_machine": "aarch64"
           },

@@ -250,6 +250,79 @@ kernel_config = "kernel/default-x86.conf"
 patches_dir = "kernel/patches-default-x86"
 base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
 
+# GPU passthrough guest. The default kernel plus loadable modules,
+# MMU_NOTIFIER and the PCI/MSI-X options a VFIO device behind Firecracker's PCI
+# transport needs; see kernel/gpu.conf. A separate profile rather than the
+# default because module support and the MMU_NOTIFIER patch would change the
+# default kernel's release identity and every default snapshot's cache key for
+# VMs that never see a GPU, and because GPU VMs need their own Firecracker
+# build (device passthrough) and --enable-pci, which a profile carries.
+# `fcvm setup --kernel-profile gpu` also builds the NVIDIA driver image
+# (src/setup/nvidia.rs) from the [.nvidia] table: kernel modules built against
+# this kernel, GSP firmware, the user-space driver and nvidia-container-toolkit,
+# all from one pinned driver version. No release is published for this
+# profile yet, so setup builds the kernel locally (--build-kernels).
+[kernel_profiles.gpu.arm64]
+description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA open kernel modules)"
+kernel_version = "6.18.50"
+kernel_repo = "ejc3/fcvm"
+build_inputs = [
+    "kernel/gpu.conf",
+    "kernel/patches-gpu/*.patch",
+]
+kernel_config = "kernel/gpu.conf"
+patches_dir = "kernel/patches-gpu"
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-aarch64-6.1.config"
+# Device passthrough (PUT /device-passthrough and LoadSnapshot
+# device_passthrough) on the PCI transport.
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "agent/vfio-hotplug-v1.17.0"
+firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
+firecracker_args = "--enable-pci"
+
+# R580 is NVIDIA's long-term support branch and supports Turing (T4, T4G)
+# with the open kernel modules. The .run carries the open module sources, the
+# user-space driver and the GSP firmware of one version, so the modules and
+# libraries match exactly. SHA-256 values match the .sha256sum files NVIDIA
+# publishes beside the same files under download.nvidia.com/XFree86/; the
+# toolkit's match its release's checksums.txt.
+[kernel_profiles.gpu.arm64.nvidia]
+driver_version = "580.196.07"
+driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-aarch64-580.196.07.run"
+driver_sha256 = "5b7d2319a1e5228cb47a67e07733a5abfb614cd8d4350a750211022343d27eed"
+toolkit_version = "1.20.1"
+toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_arm64.tar.gz"
+toolkit_sha256 = "2b58b68ec388cede52815a63fc87f3f019af96e21b7d29c3cb2890341db14b21"
+
+[kernel_profiles.gpu.amd64]
+description = "GPU passthrough guest kernel (PCI, MSI-X, NVIDIA proprietary kernel modules) (x86_64)"
+kernel_version = "6.18.50"
+kernel_repo = "ejc3/fcvm"
+build_inputs = [
+    "kernel/gpu-x86.conf",
+    "kernel/patches-gpu-x86/*.patch",
+]
+kernel_config = "kernel/gpu-x86.conf"
+patches_dir = "kernel/patches-gpu-x86"
+base_config_url = "https://raw.githubusercontent.com/firecracker-microvm/firecracker/03b096f3bde2c7f4a54bbdcc0ccdb9c6b2986781/resources/guest_configs/microvm-kernel-ci-x86_64-6.1.config"
+firecracker_repo = "ejc3/firecracker"
+firecracker_branch = "agent/vfio-hotplug-v1.17.0"
+firecracker_commit = "7277f695e0541c35d7da88cb5a64a4d177ea4338"
+firecracker_args = "--enable-pci"
+
+# The proprietary modules with the GSP firmware off: a T4's initialisation on
+# every restore takes half as long as with the open modules (see
+# module_type in src/setup/nvidia.rs). arm64 keeps the open modules until a
+# g5g.metal run measures the same there.
+[kernel_profiles.gpu.amd64.nvidia]
+module_type = "proprietary"
+driver_version = "580.196.07"
+driver_url = "https://us.download.nvidia.com/tesla/580.196.07/NVIDIA-Linux-x86_64-580.196.07.run"
+driver_sha256 = "0aab0518db53cf73c412dc7f32bbc850ca95e839d8923d0de4bff42c1c9169ce"
+toolkit_version = "1.20.1"
+toolkit_url = "https://github.com/NVIDIA/nvidia-container-toolkit/releases/download/v1.20.1/nvidia-container-toolkit_1.20.1_deb_amd64.tar.gz"
+toolkit_sha256 = "14dc22489851d4f1a6d1bbfdfb51524c8f110091738570cddaddc09778a63ad9"
+
 # arm64 nested profile (ARM64 NV2 with custom kernel and firecracker)
 [kernel_profiles.nested.arm64]
 description = "Nested virtualization support for running VMs inside VMs"

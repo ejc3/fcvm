@@ -2740,7 +2740,7 @@ class AnalyzerAvailability(unittest.TestCase):
             "allow_busy": False, "quiet_guard_passed": True,
             "quiet_guard_loadavg1": 0.1, "quiet_vm_processes": 0,
             "quiet_loadavg1_limit": 2.0,
-            "host_boot_id": "00000000-0000-0000-0000-000000000001",
+            "host_boot_sha256": "1" * 64,
             "host_kernel_release": "6.18.0-fixture", "host_machine": "aarch64",
             "loadavg": ["0.1", "0.1", "0.1"], "started": 1.0,
         }
@@ -3391,6 +3391,36 @@ class AnalyzerAvailability(unittest.TestCase):
                         any(expected in error for error in errors),
                         errors,
                     )
+
+    def test_boot_identity_must_be_a_hash_in_reqanalyze(self):
+        """reqanalyze reads only host_boot_sha256: a raw boot id in that field,
+        or the retired field name alone, is not a boot identity."""
+        raw = "12345678-9abc-4def-8123-456789abcdef"
+        cases = (
+            ("raw-in-hash-field", {"host_boot_sha256": raw}),
+            ("short-hash", {"host_boot_sha256": "1" * 63}),
+            ("empty", {"host_boot_sha256": ""}),
+        )
+        with tempfile.TemporaryDirectory() as d:
+            for name, overrides in cases:
+                with self.subTest(name=name):
+                    src = os.path.join(d, f"{name}.jsonl")
+                    self._write_clean_backend(src, "file", 6, 384.0, **overrides)
+                    errors = self._metadata_errors(src)
+                    self.assertTrue(
+                        any("host_boot_sha256" in error for error in errors),
+                        errors,
+                    )
+            retired = os.path.join(d, "retired.jsonl")
+            self._write_clean_backend(
+                retired, "file", 6, 384.0,
+                **{"host_boot_" + "id": raw, "host_boot_sha256": None},
+            )
+            errors = self._metadata_errors(retired)
+            self.assertTrue(
+                any("no valid host_boot_sha256" in error for error in errors),
+                errors,
+            )
 
     def test_port_host_ip_must_be_canonical(self):
         with tempfile.TemporaryDirectory() as d:
@@ -9144,6 +9174,161 @@ class FailureProbeWiring(unittest.TestCase):
             )
 
 
+class HostBootDigest(unittest.TestCase):
+    """Records name the host's boot only as a hash, never as the raw boot id.
+
+    Published records keep the instance type and never a host name, IP or boot
+    id (issue #1152). compare.py and reqanalyze.py need equality of the boot,
+    not its value. Watched FAIL before the change: `reqbench.host_boot_sha256`
+    did not exist and the meta line carried the raw boot id.
+    """
+
+    RAW = "12345678-9abc-4def-8123-456789abcdef"
+    # Spelled in two pieces so this file does not contain the forbidden key.
+    FORBIDDEN_KEY = "host_boot_" + "id"
+
+    def test_digest_is_sha256_of_domain_tag_and_boot_id(self):
+        expected = hashlib.sha256(b"fcvm-bench-boot\0" + self.RAW.encode()).hexdigest()
+        self.assertEqual(reqbench.host_boot_sha256(self.RAW), expected)
+        self.assertNotEqual(
+            reqbench.host_boot_sha256(self.RAW),
+            hashlib.sha256(self.RAW.encode()).hexdigest(),
+            "the digest must carry the domain tag",
+        )
+        self.assertNotEqual(
+            reqbench.host_boot_sha256(self.RAW),
+            reqbench.host_boot_sha256(self.RAW[:-1] + "0"),
+        )
+
+    def test_run_meta_host_fields_carry_the_hash_and_no_raw_boot_id(self):
+        real_read = reqbench.read_trimmed
+
+        def fake_read(path):
+            if path == "/proc/sys/kernel/random/boot_id":
+                return self.RAW
+            return real_read(path)
+
+        reqbench.read_trimmed = fake_read
+        try:
+            fields = reqbench.host_identity()
+        finally:
+            reqbench.read_trimmed = real_read
+        self.assertEqual(
+            set(fields),
+            {"host_boot_sha256", "host_kernel_release", "host_machine"},
+        )
+        self.assertEqual(
+            fields["host_boot_sha256"], reqbench.host_boot_sha256(self.RAW)
+        )
+        self.assertNotIn(self.RAW, json.dumps(fields))
+
+    def test_no_tracked_file_under_bench_names_the_raw_boot_id_field(self):
+        """Fails closed: if git cannot list the tree, the test errors."""
+        root = os.path.dirname(os.path.dirname(HERE))
+        listing = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--", "bench"],
+            check=True, capture_output=True,
+        ).stdout.decode().split("\0")
+        paths = [path for path in listing if path]
+        self.assertGreater(len(paths), 100, "git ls-files returned too little")
+        offenders = []
+        for path in paths:
+            full = os.path.join(root, path)
+            if not os.path.isfile(full):
+                continue
+            with open(full, "rb") as handle:
+                if self.FORBIDDEN_KEY.encode() in handle.read():
+                    offenders.append(path)
+        self.assertEqual(
+            offenders, [],
+            f"{len(offenders)} tracked files under bench/ still name "
+            f"{self.FORBIDDEN_KEY}; record host_boot_sha256 instead",
+        )
+
+
+class NoHostIdentifiersInTree(unittest.TestCase):
+    """Tracked files carry no EC2 instance id, volume id or AWS-internal host name.
+
+    Published records keep the instance type and never a box's host name, IP
+    address, boot id or instance id. #1153 removed the raw boot id; this pins the
+    rest of the class. Watched FAIL before the rewrite: 3 ladder hostinfo.json
+    files named an instance id and a host name, report/README.md quoted the
+    instance id, and runner ids sat in CI comments and a fixture.
+    """
+
+    INSTANCE = re.compile(r"(?<![0-9A-Za-z])i-(?:[0-9a-f]{17}|[0-9a-f]{8})(?![0-9A-Za-z])")
+    VOLUME = re.compile(r"(?<![0-9A-Za-z])vol-[0-9a-f]{8,17}(?![0-9A-Za-z])")
+    HOSTNAME = re.compile(
+        r"(?<![0-9A-Za-z])(?:ip|ec2)-[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}-[0-9]{1,3}(?![0-9A-Za-z])"
+    )
+    # RFC 5737 documentation addresses spelled as AWS host names are examples.
+    HOSTNAME_EXAMPLE = re.compile(r"(?:ip|ec2)-192-0-2-[0-9]{1,3}(?![0-9A-Za-z])")
+    # Placeholders the AWS CLI documentation uses; not any real resource.
+    PLACEHOLDERS = {
+        "i-" + "1234567890abcdef0",
+        "i-" + "0123456789abcdef0",
+        "vol-" + "1234567890abcdef0",
+    }
+    # Spelled in pieces so this file does not contain the forbidden keys.
+    FIELDS = ("instance" + "_id", "host_" + "ipv4", "host_" + "ipv6")
+    # Captured third-party pages and dependency locks are not our records.
+    SKIP_PREFIXES = ("bench/chromium/corpus-live/", "tests/package-lock.json")
+
+    def offenders(self, pathspec, with_fields):
+        root = os.path.dirname(os.path.dirname(HERE))
+        listing = subprocess.run(
+            ["git", "-C", root, "ls-files", "-z", "--", pathspec],
+            check=True, capture_output=True,
+        ).stdout.decode().split("\0")
+        paths = [p for p in listing if p and not p.startswith(self.SKIP_PREFIXES)]
+        self.assertGreater(len(paths), 100, "git ls-files returned too little")
+        found = []
+        for path in paths:
+            full = os.path.join(root, path)
+            if not os.path.isfile(full):
+                continue
+            with open(full, "rb") as handle:
+                text = handle.read().decode("utf-8", "replace")
+            hits = [m.group(0) for m in self.INSTANCE.finditer(text)]
+            hits += [m.group(0) for m in self.VOLUME.finditer(text)]
+            hits = [h for h in hits if h not in self.PLACEHOLDERS]
+            for match in self.HOSTNAME.finditer(text):
+                if not self.HOSTNAME_EXAMPLE.match(text, match.start()):
+                    hits.append("hostname")
+            if with_fields:
+                hits += [f for f in self.FIELDS if f'"{f}"' in text]
+            if hits:
+                found.append((path, len(hits)))
+        return found
+
+    def test_no_tracked_file_under_bench_names_a_box(self):
+        found = self.offenders("bench", with_fields=True)
+        self.assertEqual(
+            found, [],
+            f"{len(found)} tracked files under bench/ name an instance id, volume "
+            "id, AWS host name or a host address/instance field (path, hits); "
+            "record the instance type and, where equality is needed, a salted "
+            "SHA-256",
+        )
+
+    def test_no_tracked_file_anywhere_names_an_instance_volume_or_host(self):
+        found = self.offenders(".", with_fields=False)
+        self.assertEqual(
+            found, [],
+            f"{len(found)} tracked files name an instance id, volume id or AWS "
+            "host name (path, hits)",
+        )
+
+    def test_hostinfo_writer_records_no_name_or_address(self):
+        root = os.path.dirname(os.path.dirname(HERE))
+        with open(os.path.join(root, "bench/chromium/bench.sh")) as handle:
+            source = handle.read()
+        body = source.split("write_hostinfo() {", 1)[1].split("\n}\n", 1)[0]
+        for field in self.FIELDS:
+            self.assertNotIn(f'"{field}"', body)
+        self.assertNotIn("platform.uname()", body, "uname() carries the node name")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
 
@@ -9410,7 +9595,7 @@ class MakefileBenchGraph(unittest.TestCase):
         recipe whose script runs `make` reaches the link script through the
         sub-make and waits on its own ancestor forever.
 
-        Observed 2026-09-02 on parallel-box 2: `make bench-chromium-corpus`
+        Observed 2026-09-02 on a parallel box: `make bench-chromium-corpus`
         -> corpus_campaign.sh -> `make -C $REPO bench-chromium-request-golden`
         -> cargo-target-link.sh, `flock -x` parked in locks_lock_inode_wait
         with the box at load 0.00, until killed.
