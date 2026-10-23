@@ -24,6 +24,13 @@ half stamps the time its last tile came back. Viewers steer one shared camera (d
 turn, scroll to dive) and appear in the scene as small lights; clicking a square relaunches
 the GPU behind it, for everyone. The per-tile view below is the detail view, one click away.
 
+**Hover shows the seams. DECIDED (2026-10-22).** The image reads as one picture until the
+pointer is over it: then every tile boundary fades in as a faint line, and the tile under
+the pointer is outlined in its half's color with a label naming the tile, its kind, its GPU,
+its host and its last relaunch time. A long press does the same on touch screens, and a
+focusable tile grid does it for keyboard users. The page draws these over the frames; the
+renderers never draw them.
+
 **Proof that it is live, not recorded.** Several things on the page could not exist in a
 recording:
 
@@ -255,6 +262,13 @@ first frame needs no compile), encodes H.264 with NVENC, and serves:
 Scene inputs also include the viewers' words (placed in the world by the coordinator) and
 the dropped lights; both are part of the camera-and-scene state every renderer follows.
 
+**Convergence. DECIDED (2026-10-22).** A path-traced frame averages a few random light
+paths per pixel and is grainy; averaging the same pixel over many frames removes the grain,
+but only while nothing in the view changes. So the camera path holds at viewpoints for a
+few seconds, where each tile converges toward noise-free and a relaunched tile shows as a
+grainy patch healing in; and while the camera moves, each renderer reuses its previous
+frames' samples by reprojection (temporal accumulation), so motion is clean too.
+
 **No seams.** The browser shows every tile at one common `t`, holding each stream in a
 short buffer (a few frames) until all visible tiles have that frame; a tile that falls
 behind shows its last frame dimmed rather than tearing the image. A relaunched tile is
@@ -271,6 +285,23 @@ is too; the GPU spends the budget on more pixels and fewer steps per pixel, so t
 is drawn larger and sharper. A view that showed more of the scene through one GPU would
 spread the same budget over more area and lose detail, so the opened view never widens
 the rectangle.
+
+**Two ways to receive the image. DECIDED (2026-10-22).** Each viewer chooses (the page
+suggests one from its measured bandwidth); the choice is per viewer, not shared.
+
+- **Direct:** one stream per tile, straight from its VM, at a quality that keeps the total
+  within the viewer's bandwidth (about 100 lower-quality streams for a full wall).
+- **Aggregated:** an aggregator (`fcvm fleet aggregate`) pulls tiles at near-lossless quality
+  over the host's internal network, joins them at one common `t`, and encodes the joined
+  region once, so there are no tile edges inside it and the viewer receives a few
+  higher-quality streams. One aggregator runs on each GPU host for that host's tiles (the
+  coordinator places a host's tiles as one contiguous region), and one serves the EC2 half.
+
+Hover outlines and labels, dark tiles, phases and clocks are drawn by the page from the
+shared state in both modes, so they behave identically. Switching never hitches: the page
+opens the other mode's streams in the background, waits until it has a decoded frame for
+every region at a `t` it is already showing, swaps in one draw, and only then closes the
+old streams.
 
 **Resolution follows the viewer.** The page asks each tile for the height its rectangle
 occupies on that screen: a 4K screen showing 144 tiles asks for about 240 px each, the
@@ -328,6 +359,71 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
   Worker for the site.
 - **Testing before the fleet exists:** `pbox up N kvm-gpu-96 --open` gives one host with a
   delegated prefix, and the local transports drive it.
+
+## Decisions from the second design review (2026-10-22)
+
+- **The race is the permanent hero. DECIDED.** A global relaunch-all runs on a cadence only
+  the owner sets; every visitor sees a large countdown ("next restart in 0:41") and a
+  two-bar scoreboard, fcvm against EC2, that is always on screen. Viewers may press
+  "restart now" under a global cooldown shown to everyone. This replaces the
+  viewer-changeable auto-relaunch setting.
+- **Only measured numbers. DECIDED.** Every figure on the page comes from the coordinator's
+  measurements, timed for both halves by the same clock (click to first frame seen by the
+  coordinator), and says how many GPUs it was measured on.
+- **EC2 capacity waits are shown, not counted. DECIDED.** A wait for spot capacity is drawn
+  hatched and labelled "AWS had no spot GPU", and kept out of EC2's headline time.
+- **Directed camera with nudges. DECIDED.** The camera flies a choreographed path with
+  scenic holds, where the path-traced image converges; viewers vote or queue where the
+  next hold goes instead of steering continuously.
+- **Your own GPU. DECIDED.** Any viewer can claim a GPU: a private VM restores for them in
+  seconds, with their own camera, full screen, timed from click to first frame, for 60
+  seconds. The GPU is borrowed from the wall: the claimed tile visibly leaves the image,
+  labelled as a visitor's private GPU, and when the session ends its VM is destroyed and
+  the tile's VM restores back into the wall. One claim per address at a time, with a
+  cooldown; a cap on how many tiles may be borrowed at once keeps the wall mostly whole.
+- **The gpu profile uses NVIDIA's proprietary kernel modules with the GPU firmware off on
+  x86 (#1149). DECIDED.** GPU setup takes about 0.58 s instead of 1.07 s with the open
+  modules; the profile setting keeps `open` available for GPUs the proprietary modules do
+  not support.
+
+## Decisions from the sandbox landscape review (2026-10-23)
+
+From a survey of sandbox and GPU-cloud providers (no one else publishes restoring a whole GPU
+VM from a snapshot with the GPU attached at restore; almost no one publishes how GPU memory is
+cleared between customers). DECIDED, all owner-approved:
+
+- **GPU memory is scrubbed twice:** inside each new VM before its workload runs (fails
+  closed), and on the host before a GPU returns to the pool. A GPU whose reset or scrub fails
+  is quarantined and the wall re-tiles around it. The residue test and both scrub times are
+  published.
+- **A standby pool:** GPUs beyond `max_tiles` stay reset, scrubbed and bound, ready for a
+  failed or reclaimed tile or a claim.
+- **The wall counts:** a running count of GPU VMs restored and GPUs scrubbed, and a short,
+  sourced "How it's isolated" panel (own kernel per VM, GPU behind the IOMMU, scrubbed between
+  VMs).
+- **Warm models:** a GPU snapshot that brings a model back already resident in GPU memory
+  (CUDA state moved to RAM with NVIDIA's cuda-checkpoint before the snapshot), measured as time
+  to first token.
+- **Tail latencies:** p50, p95 and p99 under a named external benchmark, and for GPU restores.
+
+## Scale to zero (DECIDED 2026-10-23)
+
+With no active viewers for 10 minutes (a hidden tab paused after 5 minutes does not count),
+the coordinator scales the GPU host groups to zero and terminates the EC2 tiles; only the
+coordinator stays up (about $18 a month). The first viewer to arrive wakes the fleet: the
+page shows the poster frame and "Waking up the GPUs" with a live clock and the real wake
+phases, and the measured wake time (first viewer to complete image) is recorded. The fleet
+never sleeps during a race or a "Your own GPU" session. Running cost is then about $5 an hour
+while anyone watches (one g4dn.metal at current spot prices, plus EC2 tiles while they run).
+
+**The wake reel. DECIDED (2026-10-23).** While the fleet is asleep or waking, the stage plays a
+60 to 90 second screen recording of the real wall in use (real GPUs, real coordinator, real
+EC2 instances): the planet with hover showing the seams, a restart-all race with the fcvm
+half healing while EC2 stays dark, the 80 km hold, and a "Your own GPU" borrow. A badge says
+when it was recorded and that the live wall is waking; the race plays in real time, and any
+compressed stretch is marked as skipped while the real clock keeps running. When the live
+image is complete the page crossfades to it. The reel is recorded during the end-to-end run
+and re-recorded whenever the measured numbers change.
 
 ## Stack of PRs
 
