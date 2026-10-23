@@ -9,18 +9,17 @@
 #   bench/computesdk/run.sh            # via `make bench-computesdk`
 #
 # Knobs (environment):
-#   MODE=snapshot|cold   snapshot (default): sandboxes restore from the snapshot cache.
-#                        cold: `fcvm serve --no-snapshot`, every sandbox boots cold.
-#   CONCURRENCY=100      sandboxes per burst, all launched at once (the published setting)
-#   BURSTS=5             bursts to run, one after another
+#   CONCURRENCY=100      sandboxes launched at once (the published setting)
+#   ITERATIONS=CONCURRENCY  sandboxes per run; the published runs set it equal to CONCURRENCY,
+#                        which makes one run one burst
+#   BURSTS=5             runs, one after another
 #   WORK=<dir>           scratch for the harness checkout and results
 #                        (default /mnt/fcvm-btrfs/computesdk-bench)
-#   OUT=<dir>            where results go (default $WORK/results/<UTC time>-<mode>)
+#   OUT=<dir>            where results go (default $WORK/results/<UTC time>)
 #
-# Before the first burst one sandbox is created and destroyed, untimed. In snapshot mode that
-# creates the image's snapshot, and in both modes it puts the image in fcvm's image cache. The
-# published runs measure providers whose images or templates already exist, so a burst here
-# starts from the same place.
+# Each sandbox restores the pre-start snapshot of its image. Before the first run one sandbox
+# is created and destroyed, untimed, which creates that snapshot. The published runs measure
+# providers whose images or templates already exist, so a run here starts from the same place.
 set -euo pipefail
 
 HARNESS_REPO=https://github.com/computesdk/benchmarks.git
@@ -28,20 +27,15 @@ HARNESS_COMMIT=9135206e8153ae3c6e0d556e73a47696c7deeabb # 2026-10-22
 PROVIDER_PKG=@computesdk/provider@2.1.14                # the version the harness lockfile pins
 PNPM=(npx --yes pnpm@10.33.0)
 
-MODE=${MODE:-snapshot}
 CONCURRENCY=${CONCURRENCY:-100}
+ITERATIONS=${ITERATIONS:-$CONCURRENCY}
 BURSTS=${BURSTS:-5}
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 FCVM=$REPO/target/release/fcvm
 WORK=${WORK:-/mnt/fcvm-btrfs/computesdk-bench}
-OUT=${OUT:-$WORK/results/$(date -u +%Y%m%dT%H%M%SZ)-$MODE}
+OUT=${OUT:-$WORK/results/$(date -u +%Y%m%dT%H%M%SZ)}
 
-case "$MODE" in
-  snapshot) SERVE_FLAGS=() ;;
-  cold) SERVE_FLAGS=(--no-snapshot) ;;
-  *) echo "MODE must be snapshot or cold (got $MODE)" >&2; exit 2 ;;
-esac
 [ -x "$FCVM" ] || { echo "missing $FCVM: run make build" >&2; exit 2; }
 for tool in node git curl jq python3; do
   command -v "$tool" >/dev/null || { echo "BLOCKED: $tool missing" >&2; exit 2; }
@@ -84,7 +78,7 @@ SERVE_LOG=$OUT/serve.log
 # serve logs its bound port at info. The sandboxes inherit the filter, so they log warnings
 # and their restored records (stdout) only.
 RUST_LOG=${RUST_LOG:-warn,fcvm::commands::serve=info} \
-  "$FCVM" serve --port 0 "${SERVE_FLAGS[@]}" >"$SERVE_LOG" 2>&1 &
+  "$FCVM" serve --port 0 >"$SERVE_LOG" 2>&1 &
 SERVE_PID=$!
 trap 'kill -TERM $SERVE_PID 2>/dev/null; wait $SERVE_PID 2>/dev/null || true' EXIT
 PORT=""
@@ -97,16 +91,16 @@ done
 [ -n "$PORT" ] || { echo "fcvm serve did not report its port" >&2; exit 1; }
 URL=http://127.0.0.1:$PORT
 
-# 3. Untimed warm-up: one sandbox, created and destroyed.
+# 3. Untimed warm-up: one sandbox, created and destroyed. It creates the snapshot.
 ID=$(curl -sf -X POST "$URL/v1/sandboxes" -H 'Content-Type: application/json' \
   -d '{"runtime":"node"}' --max-time 900 | jq -er '.data.sandboxId')
 curl -sf -X POST "$URL/s/$ID/run/command" -H 'Content-Type: application/json' \
   -d '{"command":"node -v"}' | jq -e '.data.exit_code == 0' >/dev/null
 curl -sf -X DELETE "$URL/v1/sandboxes/$ID" >/dev/null
 
-# 4. The bursts. The harness writes results/burst_tti/<date>.json for each.
+# 4. The runs. The harness writes results/burst_tti/<date>.json for each.
 {
-  echo "mode=$MODE concurrency=$CONCURRENCY bursts=$BURSTS"
+  echo "concurrency=$CONCURRENCY iterations=$ITERATIONS bursts=$BURSTS"
   echo "harness=$HARNESS_REPO@$HARNESS_COMMIT provider_pkg=$PROVIDER_PKG"
   echo "fcvm_commit=$(git -C "$REPO" rev-parse HEAD) fcvm_dirty=$(git -C "$REPO" status --porcelain | grep -vc '^??' || true)"
   echo "node=$(node -v) kernel=$(uname -r) arch=$(uname -m) cpus=$(nproc)"
@@ -118,7 +112,7 @@ for b in $(seq 1 "$BURSTS"); do
     cd "$H"
     FCVM_SERVE_URL=$URL npx tsx packages/benchsdk-runner/dist/bin.js run \
       benchmarks/sandbox/tti.bench.ts --provider fcvm \
-      --iterations "$CONCURRENCY" --concurrency "$CONCURRENCY" --no-ingest
+      --iterations "$ITERATIONS" --concurrency "$CONCURRENCY" --no-ingest
   ) >"$OUT/burst-$b.log" 2>&1
   cp "$H/results/burst_tti/latest.json" "$OUT/burst-$b.json"
   echo "burst $b: $(jq -r '.results[] | select(.provider=="fcvm") | "median=\(.summary.ttiMs.median|floor) p95=\(.summary.ttiMs.p95|floor) p99=\(.summary.ttiMs.p99|floor) success=\(.successRate)"' "$OUT/burst-$b.json")"

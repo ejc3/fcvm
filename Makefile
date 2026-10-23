@@ -333,7 +333,7 @@ help:
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
-	@echo "  bench-computesdk   ComputeSDK Burst TTI against fcvm serve (MODE=snapshot|cold, CONCURRENCY=, BURSTS=)"
+	@echo "  bench-computesdk   ComputeSDK Burst TTI against fcvm serve (CONCURRENCY=, ITERATIONS=, BURSTS=)"
 	@echo "  bench-gpu-restore  Cache-hit GPU VM restore latency, N runs (needs vfio-pci bound GPUs)"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
@@ -860,7 +860,7 @@ test-serve-sdk: build
 
 # ComputeSDK Burst TTI (computesdk/benchmarks' sandbox TTI task at a pinned commit) against
 # `fcvm serve` on this host. Method and results: docs/benchmarks/computesdk-burst-tti.md.
-# Knobs: MODE=snapshot|cold, CONCURRENCY, BURSTS, WORK, OUT (see bench/computesdk/run.sh).
+# Knobs: CONCURRENCY, ITERATIONS, BURSTS, WORK, OUT (see bench/computesdk/run.sh).
 bench-computesdk: setup-default
 	@bash bench/computesdk/run.sh
 
