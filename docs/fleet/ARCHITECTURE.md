@@ -416,6 +416,15 @@ phases, and the measured wake time (first viewer to complete image) is recorded.
 never sleeps during a race or a "Your own GPU" session. Running cost is then about $5 an hour
 while anyone watches (one g4dn.metal at current spot prices, plus EC2 tiles while they run).
 
+**The wake reel. DECIDED (2026-10-23).** While the fleet is asleep or waking, the stage plays a
+60 to 90 second screen recording of the real wall in use (real GPUs, real coordinator, real
+EC2 instances): the planet with hover showing the seams, a restart-all race with the fcvm
+half healing while EC2 stays dark, the 80 km hold, and a "Your own GPU" borrow. A badge says
+when it was recorded and that the live wall is waking; the race plays in real time, and any
+compressed stretch is marked as skipped while the real clock keeps running. When the live
+image is complete the page crossfades to it. The reel is recorded during the end-to-end run
+and re-recorded whenever the measured numbers change.
+
 ## Stack of PRs
 
 1. This document.
