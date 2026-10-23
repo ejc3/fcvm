@@ -16,7 +16,14 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/../.." && pwd)
 FCVM=$REPO/target/release/fcvm
 OUT=${OUT:-/mnt/fcvm-btrfs/gpu-restore/$(date -u +%Y%m%dT%H%M%SZ)}
+# One run per OUT, and OUT new or empty, so runs.csv and the summary hold this run's rows only.
+if [ -e "$OUT" ] && [ -n "$(ls -A "$OUT")" ]; then
+  echo "OUT=$OUT already holds results; pick a new OUT" >&2
+  exit 2
+fi
 mkdir -p "$OUT/runs"
+exec 9>"$OUT/.lock"
+flock -n 9 || { echo "another bench-gpu-restore run holds $OUT/.lock" >&2; exit 2; }
 for tool in jq python3 lspci; do
   command -v "$tool" >/dev/null || { echo "BLOCKED: $tool missing" >&2; exit 2; }
 done
