@@ -81,6 +81,14 @@ class WorkflowSecurityTest(unittest.TestCase):
     def builder(self, context):
         return evaluate(job_field('build-runner-ami.yml', 'build-ami', 'if'), context)
 
+    def test_no_workflow_hard_codes_an_aws_account_id(self):
+        # The account id comes from the AWS_ACCOUNT_ID repository variable; a public
+        # workflow must not carry it (an ARN account field or a 12-digit literal).
+        for workflow in sorted((ROOT / '.github/workflows').glob('*.y*ml')):
+            text = workflow.read_text()
+            self.assertNotRegex(text, r'arn:aws:[a-z0-9-]*:[a-z0-9-]*:\d{12}:', workflow.name)
+            self.assertNotRegex(text, r"['\"]\d{12}['\"]", workflow.name)
+
     def test_trusted_pr_and_comment_events_keep_ci(self):
         for association in ['OWNER', 'MEMBER', 'COLLABORATOR']:
             for event_name in ['pull_request', 'issue_comment', 'pull_request_review_comment']:

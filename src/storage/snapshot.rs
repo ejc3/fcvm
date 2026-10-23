@@ -34,6 +34,15 @@ fn default_health_check_timeout() -> u64 {
 /// is captured in every current memory snapshot.
 pub const SNAPSHOT_NETWORK_BOUNDARY_VERSION: u32 = 1;
 
+/// Version of the container start notification (#1161): fc-agent tells the host when
+/// podman reports the container running, after a restore too, and a container it
+/// creates reports its start through `--sdnotify=conmon`. The health monitor of a VM
+/// without an HTTP health check waits for that notification. A snapshot made before it
+/// existed restores an fc-agent that never re-sends it, or a captured container that
+/// `podman start` never reports, so its clones would never be healthy. Such a snapshot
+/// is refused when it is loaded.
+pub const SNAPSHOT_CONTAINER_START_VERSION: u32 = 1;
+
 /// Type of snapshot - distinguishes user-created from system-generated
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SnapshotType {
@@ -99,6 +108,10 @@ pub struct SnapshotConfig {
     /// version may resume with external ingress live before socket cleanup, so
     /// it must be rejected by the host before the VMM is started.
     pub network_boundary_version: u32,
+    /// The container start notification version of the VM this snapshot was taken
+    /// from ([`SNAPSHOT_CONTAINER_START_VERSION`]). Required: a snapshot without it is
+    /// refused, see that constant.
+    pub container_start_version: u32,
     /// Original VM lineage retained for disk redirects and diagnostics.
     /// When a VM is restored from cache/snapshot, its vmstate still references
     /// the original VM's paths. When snapshotting such a VM, we preserve this
@@ -333,7 +346,7 @@ pub struct SnapshotExtraDisk {
 
 /// Volume configuration saved in snapshot metadata.
 /// Used to start VolumeServers when serving snapshot for clones.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapshotVolumeConfig {
     /// Path on host filesystem
     pub host_path: PathBuf,
@@ -535,6 +548,21 @@ fn parse_snapshot_config(name: &str, metadata_json: &[u8]) -> Result<SnapshotCon
             missing_or_null.join(", ")
         );
     }
+    match object
+        .get("container_start_version")
+        .filter(|version| !version.is_null())
+    {
+        Some(version) if version.as_u64() == Some(u64::from(SNAPSHOT_CONTAINER_START_VERSION)) => {}
+        Some(version) => anyhow::bail!(
+            "snapshot '{name}' uses container start notification version {version} \
+             (expected {SNAPSHOT_CONTAINER_START_VERSION}); delete and recreate the snapshot"
+        ),
+        None => anyhow::bail!(
+            "snapshot '{name}' was created before fc-agent reported its container's start \
+             (container_start_version missing), so a VM restored from it would never be \
+             reported healthy; delete and recreate the snapshot with this fcvm"
+        ),
+    }
     let config: SnapshotConfig = serde_json::from_value(value).with_context(|| {
         format!(
             "snapshot '{name}' metadata is incompatible with this fcvm build; delete and recreate the snapshot"
@@ -691,6 +719,81 @@ mod tests {
         }
     }
 
+    /// A snapshot made before the container start notification (#1161) is refused when
+    /// it is loaded, naming the snapshot and saying to recreate it: a VM restored from it
+    /// would never report its container's start, so its health would stay Unknown.
+    #[tokio::test]
+    async fn a_snapshot_from_before_the_container_start_notification_is_refused() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let snapshots = temp_dir.path().join("snapshots");
+        let manager = SnapshotManager::new(snapshots.clone());
+        let config = |name: &str, version: Option<serde_json::Value>| {
+            let mut config = serde_json::json!({
+                "name": name,
+                "vm_id": "vm-1",
+                "generation_id": uuid::Uuid::new_v4(),
+                "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                "source_vsock_socket_path": "/source/vsock.sock",
+                "memory_path": "/memory.bin",
+                "vmstate_path": "/vmstate.bin",
+                "disk_path": "/disk.raw",
+                "created_at": "2026-10-01T00:00:00Z",
+                "snapshot_type": "User",
+                "kind": "Full",
+                "metadata": {
+                    "image": "alpine",
+                    "vcpu": 1,
+                    "memory_mib": 256,
+                    "network_config": {"tap_device": "tap", "guest_mac": "02:00:00:00:00:01"}
+                }
+            });
+            if let Some(version) = version {
+                config["container_start_version"] = version;
+            }
+            config
+        };
+        for (name, version, expected) in [
+            ("before-1161", None, "container_start_version missing"),
+            (
+                "null-version",
+                Some(serde_json::Value::Null),
+                "container_start_version missing",
+            ),
+            ("future-version", Some(serde_json::json!(2)), "version 2"),
+        ] {
+            let snapshot_dir = snapshots.join(name);
+            tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+            tokio::fs::write(
+                snapshot_dir.join("config.json"),
+                serde_json::to_vec(&config(name, version)).unwrap(),
+            )
+            .await
+            .unwrap();
+            let error = manager
+                .load_snapshot(name)
+                .await
+                .expect_err("a snapshot without the container start notification was loaded");
+            let message = format!("{error:#}");
+            assert!(message.contains(&format!("snapshot '{name}'")), "{message}");
+            assert!(message.contains(expected), "{message}");
+            assert!(message.contains("delete and recreate"), "{message}");
+        }
+
+        let snapshot_dir = snapshots.join("current");
+        tokio::fs::create_dir_all(&snapshot_dir).await.unwrap();
+        tokio::fs::write(
+            snapshot_dir.join("config.json"),
+            serde_json::to_vec(&config(
+                "current",
+                Some(serde_json::json!(SNAPSHOT_CONTAINER_START_VERSION)),
+            ))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+        manager.load_snapshot("current").await.unwrap();
+    }
+
     #[test]
     fn test_snapshot_config_json_roundtrip() {
         let config = SnapshotConfig {
@@ -698,6 +801,7 @@ mod tests {
             vm_id: "abc123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
             network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+            container_start_version: SNAPSHOT_CONTAINER_START_VERSION,
             original_vsock_vm_id: None,
             source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
@@ -791,6 +895,7 @@ mod tests {
             "vm_id": "def456",
             "generation_id": "fc9642dc-babd-4876-8c7f-48bccd9554e8",
             "network_boundary_version": 1,
+            "container_start_version": 1,
             "source_vsock_socket_path": "/source/vsock.sock",
             "memory_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/memory.bin",
             "vmstate_path": "/mnt/fcvm-btrfs/snapshots/nginx-snap/vmstate.bin",
@@ -835,6 +940,7 @@ mod tests {
             "vm_id": "def456",
             "generation_id": "fc9642dc-babd-4876-8c7f-48bccd9554e8",
             "network_boundary_version": 1,
+            "container_start_version": 1,
             "source_vsock_socket_path": "/run/test-vsock/vsock.sock",
             "content_key": "0123456789ab-startup",
             "memory_path": "/mnt/fcvm-btrfs/snapshots/cb-req-golden/memory.bin",
@@ -899,6 +1005,7 @@ mod tests {
             vm_id: "test123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
             network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+            container_start_version: SNAPSHOT_CONTAINER_START_VERSION,
             original_vsock_vm_id: None,
             source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
@@ -985,6 +1092,7 @@ mod tests {
                 vm_id: format!("vm-{}", name),
                 generation_id: uuid::Uuid::new_v4(),
                 network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                container_start_version: SNAPSHOT_CONTAINER_START_VERSION,
                 original_vsock_vm_id: None,
                 source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
                 parent_snapshot: None,
@@ -1058,6 +1166,7 @@ mod tests {
             vm_id: "vm123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
             network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+            container_start_version: SNAPSHOT_CONTAINER_START_VERSION,
             original_vsock_vm_id: None,
             source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
@@ -1168,6 +1277,7 @@ mod tests {
                 "vm_id": vm_id,
                 "generation_id": generation_id,
                 "network_boundary_version": SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+                "container_start_version": SNAPSHOT_CONTAINER_START_VERSION,
                 "source_vsock_socket_path": "/source/vsock.sock",
                 "memory_path": "/memory.bin",
                 "vmstate_path": "/vmstate.bin",
@@ -1255,6 +1365,7 @@ mod tests {
             vm_id: "user123".to_string(),
             generation_id: uuid::Uuid::new_v4(),
             network_boundary_version: SNAPSHOT_NETWORK_BOUNDARY_VERSION,
+            container_start_version: SNAPSHOT_CONTAINER_START_VERSION,
             original_vsock_vm_id: None,
             source_vsock_socket_path: PathBuf::from("/source/vsock.sock"),
             parent_snapshot: None,
@@ -1350,6 +1461,7 @@ mod tests {
             "vm_id": "x",
             "generation_id": "5d2cb020-b470-498d-a252-f6b6ca75b712",
             "network_boundary_version": 1,
+            "container_start_version": 1,
             "source_vsock_socket_path": "/source/vsock.sock",
             "memory_path": "/m",
             "vmstate_path": "/v",

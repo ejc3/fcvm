@@ -33,6 +33,7 @@ jobs:
       - name: Verify ephemeral host, smoke test, and hold for independent observation
         env:
           ACCEPTANCE_RUNNER_NAME: ${{ runner.name }}
+          EXPECTED_AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
         shell: bash
         run: |
           set -euo pipefail
@@ -51,7 +52,7 @@ jobs:
           def validate(data):
               identity = data['identity']
               instance = identity['instanceId']
-              if (identity['accountId'] != '928413605543' or identity['region'] != 'us-west-1'
+              if (identity['accountId'] != data['expected_account'] or identity['region'] != 'us-west-1'
                       or identity['architecture'] != 'arm64' or data['machine'] != 'aarch64'
                       or not re.fullmatch(r'i-[0-9a-f]{17}', instance)):
                   raise ValueError('Unexpected instance identity or architecture')
@@ -106,7 +107,8 @@ jobs:
               properties[key] = subprocess.check_output(
                   ['systemctl', 'show', service, '--property=' + key, '--value'],
                   text=True, timeout=5).strip()
-          validate({'identity': identity, 'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
+          validate({'identity': identity, 'expected_account': os.environ['EXPECTED_AWS_ACCOUNT_ID'],
+                    'runner_name': os.environ['ACCEPTANCE_RUNNER_NAME'],
               'machine': os.uname().machine, 'settings': json.loads((directory / '.runner').read_bytes()),
               'service': service, 'cgroup': Path('/proc/self/cgroup').read_text(),
               'dropin': dropin.read_text(), 'dropin_uid': info.st_uid,

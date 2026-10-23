@@ -266,8 +266,8 @@ CONTAINER_RUN := $(CONTAINER_RUN_BASE) --ulimit nproc=65536:65536 --pids-limit=6
 	_test-unit _test-agent-unit _test-fast _test-all _test-root _setup-fcvm _bench \
 	container-build container-test container-test-unit container-test-fast container-test-all container-test-fc-mock \
 	container-setup-fcvm container-shell container-clean container-bench \
-	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
-	bench-container-import bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
+	cargo-target-link build-host-tools setup-btrfs setup-default release-default-kernel setup-fcvm setup-gpu gpu-residue-test setup-cloud-hypervisor setup-passt setup-pjdfstest setup-hugepages bench bench-vm bench-hugepages bench-hugepages-test \
+	bench-container-import bench-computesdk bench-gpu-restore bench-chromium analyze-chromium-request analyze-chromium-campaign bench-clone-latency test-chromium-request \
 	bench-chromium-request-build bench-webkit-request-build bench-webkit-request-golden bench-webkit-request-verify bench-webkit-request-run test-chromium bench-chromium-request-golden bench-chromium-request-verify \
 	bench-chromium-corpus bench-chromium-corpus-extra bench-stop \
 	bench-chromium-request-run bench-chromium-request-all bench-chromium-hostcdp bench-chromium-fault \
@@ -313,6 +313,8 @@ help:
 	@echo "Setup:"
 	@echo "  setup-btrfs        Create btrfs loopback at /mnt/fcvm-btrfs"
 	@echo "  setup-fcvm         Download kernel and create rootfs"
+	@echo "  setup-gpu          Build the gpu profile kernel and NVIDIA driver image"
+	@echo "  gpu-residue-test   GPU memory residue between VMs (GPU=<pci address>)"
 	@echo "  setup-passt        Build and install the pinned upstream pasta/passt"
 	@echo "  setup-pjdfstest    Build pjdfstest"
 	@echo "  setup-lint-tools   Install cargo-audit and cargo-deny"
@@ -332,6 +334,8 @@ help:
 	@echo "  bench-hugepages    Run hugepages benchmark (32GB VM, 16GB dirty)"
 	@echo "  bench-hugepages-test  Run hugepages benchmark (2GB VM, 256MB dirty)"
 	@echo "  bench-container-import  Compare podman load vs direct image mount"
+	@echo "  bench-computesdk   ComputeSDK Burst TTI against fcvm serve (CONCURRENCY=, ITERATIONS=, BURSTS=)"
+	@echo "  bench-gpu-restore  Cache-hit GPU VM restore latency, N runs (needs vfio-pci bound GPUs)"
 	@echo "  bench-chromium     Chromium shared-nothing clone bench (egress x memory matrix)"
 	@echo "  bench-chromium-request-build   Build the request-bench container image"
 	@echo "  bench-webkit-request-build     Build the WebKit request-bench container image"
@@ -810,6 +814,22 @@ setup-fcvm: setup-default
 	@echo "==> Running fcvm setup --kernel-profile btrfs..."
 	./target/release/fcvm setup --kernel-profile btrfs --build-kernels
 
+# GPU passthrough guest: the gpu profile's kernel, its Firecracker build, and
+# the NVIDIA driver image built against that kernel (src/setup/nvidia.rs). Not
+# part of setup-fcvm: it downloads the NVIDIA driver (~300-400 MB). Reads this
+# checkout's rootfs-config.toml rather than syncing it over ~/.config/fcvm.
+setup-gpu: private SHELL := $(TARGET_LEASE_SHELL)
+setup-gpu: build setup-btrfs
+	./target/release/fcvm setup --kernel-profile gpu --build-kernels --config "$(CURDIR)/rootfs-config.toml"
+
+# Cross-tenant GPU memory residue (scripts/gpu-residue/run.sh): one VM fills a
+# GPU's memory with a marker and ends, the next VM on that GPU counts the marker
+# in fresh allocations. Needs a host with the GPU on vfio-pci.
+gpu-residue-test: private SHELL := $(TARGET_LEASE_SHELL)
+gpu-residue-test: setup-gpu
+	@test -n "$(GPU)" || { echo "usage: make gpu-residue-test GPU=<pci address> [RESIDUE_OUT=<dir>]" >&2; exit 2; }
+	FCVM=./target/release/fcvm ./scripts/gpu-residue/run.sh "$(GPU)" $(RESIDUE_OUT)
+
 # Build and install host kernel with all patches from kernel/patches/
 # Requires reboot to activate the new kernel
 install-host-kernel: private SHELL := $(TARGET_LEASE_SHELL)
@@ -846,6 +866,17 @@ test-serve-sdk: build
 	fi
 	cd tests && npm install --silent
 	npx tsx tests/test_serve_sdk.ts
+
+# ComputeSDK Burst TTI (computesdk/benchmarks' sandbox TTI task at a pinned commit) against
+# `fcvm serve` on this host. Method and results: docs/benchmarks/computesdk-burst-tti.md.
+# Knobs: CONCURRENCY, ITERATIONS, BURSTS, WORK, OUT (see bench/computesdk/run.sh).
+bench-computesdk: setup-default
+	@bash bench/computesdk/run.sh
+
+# Cache-hit GPU VM restore latency: N `fcvm podman run --gpu` runs, rotating over the host's
+# vfio-pci bound NVIDIA GPUs. Knobs: N (default 104), IMAGE, OUT.
+bench-gpu-restore: setup-gpu
+	@bash bench/gpu-restore/run.sh
 
 # Chromium shared-nothing benchmark: per-request clone latency + memory density
 # across every egress path, vs host-native baselines. Results land in
@@ -1477,8 +1508,9 @@ fmt: cargo-target-link
 	$(CARGO) fmt
 
 # SSH to jumpbox (IP from terraform: cd ~/src/aws && terraform output jumpbox_ssh_command)
-JUMPBOX_IP := 54.193.62.221
+JUMPBOX_IP ?=
 ssh:
+	@test -n "$(JUMPBOX_IP)" || { echo "set JUMPBOX_IP (terraform output jumpbox_ssh_command)" >&2; exit 2; }
 	ssh -i ~/.ssh/fcvm-ec2 ubuntu@$(JUMPBOX_IP)
 
 # Kernel patch helpers - generates properly formatted patches

@@ -138,8 +138,8 @@ came from:
   resolve 155.8 vs 154.3, connect_total 173.0 vs 163.8, screenshot 82.8 vs
   80.3, navigate 598.4 vs 409.1. The two runs were measured on different
   hosts: the withdrawn series on this box (`cell.host_kernel_release`
-  7.0.14-fcvm-cd6cd2b4b52e, boot 80bfe10d), the verified run on a
-  6.17.0-1019-aws host (boot 291f8bad), each on its own golden and fcvm
+  7.0.14-fcvm-cd6cd2b4b52e, boot hash acac488d), the verified run on a
+  6.17.0-1019-aws host (boot hash 34dd09df), each on its own golden and fcvm
   binary. So neither the navigate change nor the 3.8 ms noop shift is
   attributed to the DNS fix. The withdrawn 982.9 is 37.9% above the
   verified 712.6 across that host change; how much of the gap is DNS is
@@ -226,10 +226,10 @@ measures that.
 The two verified 2 vCPU cells are 57.7 ms apart: this ladder's 770.3 and the
 2026-08-30 run's 712.6, measured on different goldens, fcvm binaries, container
 images (`cell.image_id` 5b870d814e5d and 334fc21f7c8c) and host boots
-(`cell.host_boot_id` 21ffa582 and 291f8bad). Both ran on kernel
-6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` names its machine
-(box parallel-box-2, instance i-0b8def825d4e9bcc2) and the 2026-08-30 run has
-no `hostinfo.json`, so whether that is one box rebooted or two is not
+(`cell.host_boot_sha256` prefixes cba28e78 and 34dd09df). Both ran on kernel
+6.17.0-1019-aws on aarch64. The ladder's `hostinfo.json` records the instance type and
+`instance_sha256` (prefix bb28b8ba), and the 2026-08-30 run has no
+`hostinfo.json`, so whether that is one box rebooted or two is not
 established. Their within-run intervals overlap, which says nothing about
 run-to-run variation: no configuration here was measured twice under the same
 conditions, so nothing in this report prices that term. The pair gives one

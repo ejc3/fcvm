@@ -47,7 +47,21 @@ sudo ./fcvm podman run --name web --network bridged nginx:alpine
 
 # Routed — IPv6 native at kernel line rate, requires sudo + IPv6 host
 sudo ./fcvm podman run --name web --network routed nginx:alpine
+
+# Routed at a chosen address in the prefix in use, instead of one derived from the VM id
+sudo ./fcvm podman run --name slot-3 --network routed --ipv6-address 2001:db8:0:1::3 nginx:alpine
 ```
+
+A routed VM's address is derived from its random VM id unless `--ipv6-address` names one.
+That address must lie inside the prefix in use (`--ipv6-prefix`, `FCVM_IPV6_PREFIX`, or the
+detected /64) and must not be its address 0 or 1. An address another live VM holds is
+refused, naming that VM, and so is one the host already routes when no live VM holds it
+(a VM that exited without cleanup leaves its route). The flag is refused with any other
+network mode.
+
+VM names are unique among running VMs: `podman run --name X` and `snapshot run --name X`
+are refused, naming the VM's pid, while a live VM is named X. A VM whose process exited
+frees its name, SIGKILL included, so `exec --name X` always finds at most one VM.
 
 | Mode | Flag | Root | How It Works |
 |------|------|------|-------------|
@@ -138,6 +152,9 @@ from `snapshot run --ipv6-prefix` (also read from `FCVM_IPV6_PREFIX`), in the fo
 snapshot was created under is never used, so a clone on another host, or on a host whose
 routed prefix changed, gets an address the network routes to it. On a host with no
 routable /64 of its own, set the variable. Other network modes ignore it.
+`snapshot run --ipv6-address` gives a routed clone that address instead of a derived one,
+under the rules `podman run --ipv6-address` follows; fc-agent swaps it in for the
+snapshot's address on restore. The address is in no snapshot key.
 
 ### Building a Snapshot Without Leaving a VM Behind
 
@@ -437,7 +454,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 
 **Key `podman run` flags:**
 ```
---name <NAME>         VM name (required)
+--name <NAME>         VM name (required; unique among running VMs)
 --network <MODE>      rootless (default), bridged, or routed
 --publish <[IP:]H:G>  Port forward (e.g., 8080:80, '[::]:80:80')
 --map <H:G[:ro]>      Volume mount (e.g., /data:/data:ro); :ro is read-only in the guest and follows the host
@@ -456,6 +473,7 @@ See [`Containerfile`](Containerfile) for the complete dependency list used in CI
 --no-snapshot         Disable automatic snapshot creation
 --hypervisor <VMM>    firecracker (default) or cloud-hypervisor (#632)
 --ipv6-prefix <PREFIX>  Use explicit /64 prefix for routed mode (skips auto-detect and MASQUERADE; also read from FCVM_IPV6_PREFIX)
+--ipv6-address <ADDR>   Routed mode only: the VM's address, inside the prefix in use, instead of a derived one
 ```
 
 Run `fcvm --help` or `fcvm <command> --help` for full options.

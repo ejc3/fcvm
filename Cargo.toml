@@ -44,7 +44,7 @@ serde_json = "1"
 sha2 = "0.10"
 hex = "0.4"
 toml = { version = "0.9", default-features = false, features = ["std", "serde", "parse"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
+tokio = { version = "1.51.6", features = ["rt-multi-thread", "macros", "process", "fs", "signal", "io-util", "io-std", "sync", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 which = "6"
 uuid = { version = "1", features = ["v4", "serde"] }
@@ -106,7 +106,7 @@ ffmpeg-tests = []
 [dev-dependencies]
 serial_test = "3"
 criterion = "0.5"
-tokio = { version = "1", features = ["test-util"] }
+tokio = { version = "1.51.6", features = ["test-util"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # small_rng: SmallRng for the seeded chaos harness (tests/test_fuzz_chaos.rs)

@@ -148,6 +148,15 @@ pub async fn cmd_setup(args: SetupArgs) -> Result<()> {
         crate::setup::ensure_profile_firecracker(&profile, profile_name)
             .await
             .context("setting up profile firecracker")?;
+
+        // A profile that pins an NVIDIA driver gets its driver image, built
+        // against this profile's kernel.
+        if profile.nvidia.is_some() {
+            let image = crate::setup::ensure_nvidia_driver_image(profile_name, true)
+                .await
+                .context("setting up NVIDIA driver image")?;
+            println!("  ✓ NVIDIA driver image ready: {}", image.display());
+        }
     }
 
     // Resolve rootfs type: CLI override > kernel profile config > default (ext4)
