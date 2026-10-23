@@ -2605,15 +2605,16 @@ another way, which is why both layers stay.
 Costs:
 
 - In the guest, one T4, open modules: `scrub_ms` 410 to 447 over six restores,
-  and `gpu_ms` 1,693 to 1,846 against 1,277 to 1,647 without the scrub.
-  Proprietary modules: `scrub_ms` 283 to 291 over six restores, and `gpu_ms` 970
-  to 1,012 against 681 to 804 without the scrub (18 restores of 2cb12514). Inside the tool (347 to 401
-  ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99, zeroing 15.5 GB 64
-  to 73, free 31 to 37, context destroy about 90.
-- Two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
+  and `gpu_ms` 1,693 to 1,846 against 1,277 to 1,647 without the scrub. Inside
+  the tool (347 to 401 ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99,
+  zeroing 15.5 GB 64 to 73, free 31 to 37, context destroy about 90.
+- In the guest, one T4, proprietary modules: `scrub_ms` 283 to 291 over six
+  restores, and `gpu_ms` 970 to 1,012 against 681 to 804 without the scrub (15
+  restores of 2cb12514).
+- Open modules, two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
   2,609 to 2,674 ms, `gpu_ms` 11,798 to 11,834 against 9,249 on main. Before
   the contexts were bounded, eight at once OOM-killed the scrub and the guest.
-- On the host: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
+- On the host, open modules: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
   95 to 103, clear 872 to 904); all eight GPUs at once, 1.23 s wall.
   gpu-admin-tools took 1.46 s for the same on one T4.
 
