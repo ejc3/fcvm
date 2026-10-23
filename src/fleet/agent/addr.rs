@@ -68,7 +68,7 @@ pub async fn from_imds() -> Result<Prefix> {
 pub fn check_routed_user(routed: bool, root: bool) -> Result<()> {
     if routed && !root {
         bail!(
-            "--ipv6-prefix runs every VM in fcvm's routed mode, which needs root: run the agent as root"
+            "--ipv6-prefix runs every VM in fcvm's routed mode, which needs root: run the agent as root (on a fleet host, fcvm-fleet-agent.service runs it, fleet/ami/host/fcvm-fleet-agent.service in the AMI recipe: it must not set User=ubuntu)"
         );
     }
     Ok(())
@@ -92,7 +92,8 @@ mod tests {
 
     #[test]
     fn a_routed_agent_must_be_root() {
-        assert!(check_routed_user(true, false).is_err());
+        let e = check_routed_user(true, false).unwrap_err().to_string();
+        assert!(e.contains("fcvm-fleet-agent.service"), "{e}");
         assert!(check_routed_user(true, true).is_ok());
         assert!(check_routed_user(false, false).is_ok());
     }
