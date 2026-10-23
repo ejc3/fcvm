@@ -13,7 +13,9 @@
 use super::Handle;
 use anyhow::Result;
 use async_trait::async_trait;
-use fleet_core::protocol::{AssignSlot, RendererScene, SharedScene, SlotReport};
+use fleet_core::protocol::{
+    AssignSlot, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+};
 use fleet_core::Event;
 use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,6 +54,10 @@ pub trait Ec2Driver: Send + Sync {
     /// Post the renderer's scene body (its rectangle and the shared scene) to the tile.
     async fn post_scene(&self, tile: &str, launched: &Launched, body: &RendererScene)
         -> Result<()>;
+    /// Post the grid budget to the tile's renderer (`POST /budget`).
+    async fn post_budget(&self, tile: &str, launched: &Launched, body: &BudgetBody) -> Result<()>;
+    /// The renderer's `/health` reply.
+    async fn health(&self, tile: &str, launched: &Launched) -> Result<serde_json::Value>;
     /// How long a tile waits before asking again after a capacity refusal.
     fn capacity_retry(&self) -> Duration {
         CAPACITY_RETRY
@@ -97,24 +103,37 @@ impl Ec2Driver for FakeEc2 {
     async fn post_scene(&self, _tile: &str, _l: &Launched, _body: &RendererScene) -> Result<()> {
         Ok(())
     }
+    async fn post_budget(&self, _tile: &str, _l: &Launched, _body: &BudgetBody) -> Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &Launched) -> Result<serde_json::Value> {
+        anyhow::bail!("a fake instance has no renderer")
+    }
 }
 
 /// The running instance of each tile, for the scene poster.
 type Running = Arc<std::sync::Mutex<HashMap<String, Launched>>>;
 
 /// Post every running tile its renderer body whenever its rectangle, the layout or the
-/// scene changes (and retry a failed post once a second).
+/// scene changes, and the grid budget after every scene and whenever it changes (retrying
+/// a failed post once a second). Once a second it also reads each tile's health for the
+/// budget (`Event::Ec2Health`).
 async fn post_scenes(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
     mut scene: watch::Receiver<Option<SharedScene>>,
+    mut budget: watch::Receiver<Option<BudgetBody>>,
     running: Running,
+    handle: Handle,
 ) {
     let mut posted: HashMap<String, (String, RendererScene)> = HashMap::new();
+    let mut budget_posted: HashMap<String, (String, BudgetBody)> = HashMap::new();
     let mut tick = tokio::time::interval(Duration::from_secs(1));
+    let mut read_health = false;
     loop {
         let list = assign.borrow_and_update().clone();
         let shared = scene.borrow_and_update().clone();
+        let grid = *budget.borrow_and_update();
         let now: Vec<(AssignSlot, Launched)> = {
             let r = running.lock().unwrap();
             list.into_iter()
@@ -130,23 +149,51 @@ async fn post_scenes(
                     previous_rect: a.previous_rect,
                     ..shared.for_renderer(rect)
                 };
-                if posted.get(&a.id) == Some(&(l.instance.clone(), body.clone())) {
-                    continue;
-                }
-                match driver.post_scene(&a.id, &l, &body).await {
-                    Ok(()) => {
-                        posted.insert(a.id.clone(), (l.instance.clone(), body));
+                if posted.get(&a.id) != Some(&(l.instance.clone(), body.clone())) {
+                    match driver.post_scene(&a.id, &l, &body).await {
+                        Ok(()) => {
+                            posted.insert(a.id.clone(), (l.instance.clone(), body));
+                            // A new scene clears the renderer's budget schedule.
+                            budget_posted.remove(&a.id);
+                        }
+                        Err(e) => {
+                            tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "scene not posted yet");
+                            continue;
+                        }
                     }
-                    Err(e) => {
-                        tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "scene not posted yet")
+                }
+                if let Some(b) = grid {
+                    if budget_posted.get(&a.id) != Some(&(l.instance.clone(), b)) {
+                        match driver.post_budget(&a.id, &l, &b).await {
+                            Ok(()) => {
+                                budget_posted.insert(a.id.clone(), (l.instance.clone(), b));
+                            }
+                            Err(e) => {
+                                tracing::debug!(tile = %a.id, error = %format!("{e:#}"), "budget not posted yet")
+                            }
+                        }
+                    }
+                }
+                if read_health {
+                    if let Ok(h) = driver.health(&a.id, &l).await {
+                        let report = HealthReport {
+                            id: a.id.clone(),
+                            fps: h.get("fps").and_then(|f| f.as_f64()).unwrap_or(0.0),
+                            gpu: h.get("gpu").cloned().unwrap_or(serde_json::Value::Null),
+                            budget_fit: h.get("budget_fit").and_then(|f| f.as_f64()),
+                            t: h.get("t").and_then(|f| f.as_f64()),
+                        };
+                        handle.send(Event::Ec2Health { at: 0, report }).await;
                     }
                 }
             }
         }
+        read_health = false;
         tokio::select! {
             r = assign.changed() => if r.is_err() { return },
             r = scene.changed() => if r.is_err() { return },
-            _ = tick.tick() => {}
+            r = budget.changed() => if r.is_err() { return },
+            _ = tick.tick() => read_health = true,
         }
     }
 }
@@ -157,6 +204,7 @@ pub async fn run(
     driver: Arc<dyn Ec2Driver>,
     mut assign: watch::Receiver<Vec<AssignSlot>>,
     scene: watch::Receiver<Option<SharedScene>>,
+    budget: watch::Receiver<Option<BudgetBody>>,
     handle: Handle,
 ) {
     let running: Running = Arc::default();
@@ -164,7 +212,9 @@ pub async fn run(
         driver.clone(),
         assign.clone(),
         scene,
+        budget,
         running.clone(),
+        handle.clone(),
     ));
     let mut tiles: HashMap<String, watch::Sender<u64>> = HashMap::new();
     loop {

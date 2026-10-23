@@ -9,7 +9,9 @@
 
 use super::inventory::{holders, vfio_node};
 use super::vm::{wait_restored, Vm, VmSpec};
-use fleet_core::protocol::{AgentMsg, HealthReport, RendererScene, SharedScene, SlotReport};
+use fleet_core::protocol::{
+    AgentMsg, BudgetBody, HealthReport, RendererScene, SharedScene, SlotReport,
+};
 use fleet_core::scene::Keyframe;
 use fleet_core::tiling::Rect;
 use std::collections::BTreeMap;
@@ -105,6 +107,8 @@ struct Running {
     generation: u64,
     started: Instant,
     posted: Option<RendererScene>,
+    /// The budget posted since the last scene post (a scene post clears the renderer's).
+    budget_posted: Option<BudgetBody>,
 }
 
 enum Failure {
@@ -215,6 +219,21 @@ impl SlotCtx {
         }
         Ok(())
     }
+
+    async fn post_budget(&self, body: &BudgetBody) -> Result<(), String> {
+        let r = self
+            .http
+            .post(self.health_url("/budget"))
+            .timeout(Duration::from_secs(5))
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| format!("POST /budget: {e}"))?;
+        if !r.status().is_success() {
+            return Err(format!("POST /budget answered {}", r.status()));
+        }
+        Ok(())
+    }
 }
 
 /// Has the renderer drawn a frame since `baseline`, the frame counter in the `/health` reply
@@ -290,6 +309,7 @@ pub async fn supervise(
     ctx: SlotCtx,
     mut desired: watch::Receiver<Desired>,
     mut scene: watch::Receiver<Option<SharedScene>>,
+    mut budget: watch::Receiver<Option<BudgetBody>>,
 ) {
     let _gpu = ctx.gpu_lock.clone().lock_owned().await;
     let mut running: Option<Running> = None;
@@ -405,19 +425,25 @@ pub async fn supervise(
         let r = running.as_mut().expect("not behind, so a VM runs");
         // A rect or scene that changed while the relaunch ran (its notification already
         // consumed above), or a post that failed, is posted here.
-        post_if_changed(&ctx, r, &desired, &mut scene).await;
+        post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
         tokio::select! {
             changed = desired.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                post_if_changed(&ctx, r, &desired, &mut scene).await;
+                post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
             }
             changed = scene.changed() => {
                 if changed.is_err() {
                     break;
                 }
-                post_if_changed(&ctx, r, &desired, &mut scene).await;
+                post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
+            }
+            changed = budget.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                post_if_changed(&ctx, r, &desired, &mut scene, &mut budget).await;
             }
             status = r.vm.exited() => {
                 let ran = r.started.elapsed();
@@ -438,6 +464,8 @@ pub async fn supervise(
                         id: ctx.id.clone(),
                         fps: h.get("fps").and_then(|f| f.as_f64()).unwrap_or(0.0),
                         gpu: h.get("gpu").cloned().unwrap_or(serde_json::Value::Null),
+                        budget_fit: h.get("budget_fit").and_then(|f| f.as_f64()),
+                        t: h.get("t").and_then(|f| f.as_f64()),
                     }));
                 }
             }
@@ -453,15 +481,33 @@ async fn post_if_changed(
     r: &mut Running,
     desired: &watch::Receiver<Desired>,
     scene: &mut watch::Receiver<Option<SharedScene>>,
+    budget: &mut watch::Receiver<Option<BudgetBody>>,
 ) {
     let want = desired.borrow().clone();
     let body = renderer_body(scene, &want);
-    let Some(body) = body.filter(|b| Some(b) != r.posted.as_ref()) else {
+    if let Some(body) = body.filter(|b| Some(b) != r.posted.as_ref()) {
+        match ctx.post_scene(&body).await {
+            Ok(()) => {
+                r.posted = Some(body);
+                r.budget_posted = None;
+            }
+            Err(e) => tracing::warn!(slot = %ctx.id, error = %e, "scene not posted"),
+        }
+    }
+    // The grid budget is for wall tiles; a renderer drawing the whole image (a claimed
+    // GPU) chooses its own.
+    if r.posted.is_none() || want.rect.is_none() || want.private_camera.is_some() {
+        return;
+    }
+    let Some(b) = *budget.borrow_and_update() else {
         return;
     };
-    match ctx.post_scene(&body).await {
-        Ok(()) => r.posted = Some(body),
-        Err(e) => tracing::warn!(slot = %ctx.id, error = %e, "scene not posted"),
+    if r.budget_posted == Some(b) {
+        return;
+    }
+    match ctx.post_budget(&b).await {
+        Ok(()) => r.budget_posted = Some(b),
+        Err(e) => tracing::warn!(slot = %ctx.id, error = %e, "budget not posted"),
     }
 }
 
@@ -621,6 +667,7 @@ async fn relaunch(
         generation,
         started: spawned,
         posted,
+        budget_posted: None,
     });
     Ok(())
 }

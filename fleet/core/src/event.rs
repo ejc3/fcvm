@@ -77,6 +77,11 @@ pub enum Event {
         viewer: String,
         visible: bool,
     },
+    /// An EC2 tile's renderer health, read by the coordinator.
+    Ec2Health {
+        at: u64,
+        report: crate::protocol::HealthReport,
+    },
     /// The GPU hosts' auto scaling groups, polled while the fleet wakes.
     ScaleInstances {
         at: u64,
@@ -105,6 +110,7 @@ impl Event {
             | Event::Degraded { at, .. }
             | Event::ReleaseQuarantine { at, .. }
             | Event::Visibility { at, .. }
+            | Event::Ec2Health { at, .. }
             | Event::ScaleInstances { at, .. } => *at,
         }
     }

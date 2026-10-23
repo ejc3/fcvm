@@ -23,6 +23,7 @@ struct Fake {
     fcvm: PathBuf,
     base: u16,
     scenes: Scenes,
+    budgets: Scenes,
 }
 
 /// A temp dir, a wrapper that runs the fake fcvm with `env`, and `gpus` fake renderers.
@@ -41,12 +42,13 @@ fn fake(gpus: usize, env: &[(&str, &str)]) -> Fake {
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(&fcvm, std::fs::Permissions::from_mode(0o755)).unwrap();
     let (base, listeners) = consecutive_listeners(gpus);
-    let scenes = start_renderers(dir.path(), base, listeners);
+    let (scenes, budgets) = start_renderers_with_budgets(dir.path(), base, listeners);
     Fake {
         dir,
         fcvm,
         base,
         scenes,
+        budgets,
     }
 }
 
@@ -376,6 +378,96 @@ async fn a_new_rect_is_posted_without_a_relaunch() {
         .filter(|e| e.kind == "start")
         .count();
     assert_eq!(starts, 1, "a rect or scene change must not relaunch");
+    c.close().await;
+}
+
+async fn wait_len(
+    list: &std::sync::Arc<std::sync::Mutex<Vec<serde_json::Value>>>,
+    n: usize,
+    what: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while list.lock().unwrap().len() < n {
+        assert!(Instant::now() < deadline, "{what}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// The grid budget reaches a wall tile's renderer, again after every scene post (a new
+/// scene clears the renderer's schedule), never a renderer drawing the whole image for a
+/// claim; the agent forwards the renderer's `budget_fit` and `t`.
+#[tokio::test]
+async fn the_grid_budget_is_posted_to_wall_tiles_after_every_scene() {
+    let f = fake(1, &[]);
+    let mut c = Coord::start(&f, 1, cfg(&f.fcvm));
+    c.next().await;
+    c.send(scene());
+    c.assign(&[("slot-1", 0, 1, rect(0.0))]);
+    c.until(&["slot-1"], "running", 1).await;
+    let grid = fleet_core::protocol::BudgetBody {
+        budget: 500_000,
+        t: 11.2,
+    };
+    c.send(CoordMsg::Budget(grid));
+    wait_len(&f.budgets[0], 1, "the budget was not posted").await;
+    assert_eq!(
+        f.budgets[0].lock().unwrap()[0],
+        serde_json::json!({"budget": 500_000, "t": 11.2})
+    );
+    loop {
+        if let AgentMsg::Health(h) = c.next().await {
+            assert_eq!(h.budget_fit, Some(1.0e6));
+            assert_eq!(h.t, Some(1.5));
+            break;
+        }
+    }
+    let mut s = Scene::new(1_000);
+    s.time_of_day = 20.0;
+    c.send(CoordMsg::Scene(SharedScene::new(&s, 32.0 / 9.0)));
+    wait_len(
+        &f.budgets[0],
+        2,
+        "the budget was not posted again after the scene",
+    )
+    .await;
+    let posted = f.budgets[0].lock().unwrap().clone();
+    assert_eq!(posted[1], posted[0]);
+
+    // A claim: the renderer draws the whole image and chooses its own budget.
+    c.send(CoordMsg::Assign {
+        slots: vec![AssignSlot {
+            id: "slot-1".into(),
+            sbdf: "0000:01:00.0".into(),
+            generation: 2,
+            rect: None,
+            private_camera: Some(vec![]),
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
+            standby: false,
+        }],
+        region: None,
+    });
+    c.until(&["slot-1"], "running", 2).await;
+    let mut healths = 0;
+    while healths < 3 {
+        if let AgentMsg::Health(_) = c.next().await {
+            healths += 1;
+        }
+    }
+    assert_eq!(
+        f.budgets[0].lock().unwrap().len(),
+        2,
+        "a claimed GPU got the grid budget"
+    );
+    c.assign(&[("slot-1", 0, 3, rect(0.0))]);
+    c.until(&["slot-1"], "running", 3).await;
+    wait_len(
+        &f.budgets[0],
+        3,
+        "the budget was not posted when the claim ended",
+    )
+    .await;
     c.close().await;
 }
 

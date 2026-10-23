@@ -27,7 +27,9 @@ use crate::fleet::aggregate::codec::{Codec, Ffmpeg, Raw};
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::now_ms;
 use anyhow::{bail, Context, Result};
-use fleet_core::protocol::{AgentMsg, AssignSlot, ClaimMsg, CoordMsg, ServerMsg, SharedScene};
+use fleet_core::protocol::{
+    AgentMsg, AssignSlot, BudgetBody, ClaimMsg, CoordMsg, ServerMsg, SharedScene,
+};
 use fleet_core::tiling::Rect;
 use fleet_core::view::{ec2_assignment, host_assignments, host_regions, shared_scene};
 use fleet_core::{apply, view, Config, Event, Receipt, State};
@@ -99,6 +101,7 @@ struct AgentConn {
     tx: mpsc::UnboundedSender<CoordMsg>,
     last_assign: Option<(Vec<AssignSlot>, Option<Rect>)>,
     last_scene: Option<SharedScene>,
+    last_budget: Option<BudgetBody>,
 }
 
 /// The channels the actor publishes on.
@@ -111,6 +114,8 @@ pub struct Outputs {
     pub power: watch::Sender<String>,
     /// The shared scene, for the EC2 tiles' renderers.
     pub scene: watch::Sender<Option<SharedScene>>,
+    /// The grid budget, for the EC2 tiles' renderers.
+    pub budget: watch::Sender<Option<BudgetBody>>,
     /// The slots' DNS records, when the coordinator writes them (zone, wanted records).
     pub dns: Option<(String, watch::Sender<dns::Wanted>)>,
     pub store: Option<store::StoreTx>,
@@ -188,6 +193,12 @@ impl Actor {
             *cur = Some(scene.clone());
             changed
         });
+        let budget = self.state.fleet.budget.body();
+        self.out.budget.send_if_modified(|cur| {
+            let changed = *cur != budget;
+            *cur = budget;
+            changed
+        });
         for conn in self.agents.values_mut() {
             let mine = (
                 assignments.get(&conn.host).cloned().unwrap_or_default(),
@@ -204,6 +215,10 @@ impl Actor {
                     region: mine.1,
                 });
                 conn.last_assign = Some(mine);
+            }
+            if let Some(b) = budget.filter(|b| conn.last_budget != Some(*b)) {
+                let _ = conn.tx.send(CoordMsg::Budget(b));
+                conn.last_budget = Some(b);
             }
         }
         let f = &self.state.fleet;
@@ -404,6 +419,7 @@ impl Actor {
                         tx,
                         last_assign: None,
                         last_scene: None,
+                        last_budget: None,
                     },
                 );
                 let _ = reply.send(true);
@@ -473,7 +489,8 @@ fn set_at(event: &mut Event, t: u64) {
         | Event::Degraded { at, .. }
         | Event::ReleaseQuarantine { at, .. }
         | Event::Visibility { at, .. }
-        | Event::ScaleInstances { at, .. } => *at = t,
+        | Event::ScaleInstances { at, .. }
+        | Event::Ec2Health { at, .. } => *at = t,
     }
 }
 
@@ -581,6 +598,7 @@ pub fn start(
     let (ec2_layout_tx, ec2_layout_rx) = watch::channel(None);
     let (power_tx, power_rx) = watch::channel(state.fleet.power.state.clone());
     let (scene_tx, scene_rx) = watch::channel(None);
+    let (budget_tx, budget_rx) = watch::channel(state.fleet.budget.body());
     let dns_out = dns_writer.map(|cf| {
         let (tx, rx) = watch::channel(dns::wanted(&state, &cf.zone));
         (cf, tx, rx)
@@ -593,6 +611,7 @@ pub fn start(
             ec2_layout: ec2_layout_tx,
             power: power_tx,
             scene: scene_tx,
+            budget: budget_tx,
             dns: dns_out
                 .as_ref()
                 .map(|(cf, tx, _)| (cf.zone.clone(), tx.clone())),
@@ -629,7 +648,13 @@ pub fn start(
         }
     });
     if let Some(driver) = ec2 {
-        tokio::spawn(ec2::run(driver, ec2_rx, scene_rx, handle.clone()));
+        tokio::spawn(ec2::run(
+            driver,
+            ec2_rx,
+            scene_rx,
+            budget_rx,
+            handle.clone(),
+        ));
     }
     if let Some(cfg) = power {
         tokio::spawn(scale::run(cfg, power_rx, handle.clone()));

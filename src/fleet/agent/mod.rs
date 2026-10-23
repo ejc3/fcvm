@@ -12,7 +12,7 @@ use crate::cli::FleetAgentArgs;
 use crate::fleet::aggregate::{Layout, TileSpec};
 use crate::fleet::lines::{spawn_writer, LineReader};
 use anyhow::{Context, Result};
-use fleet_core::protocol::{AgentMsg, AssignSlot, CoordMsg, SharedScene};
+use fleet_core::protocol::{AgentMsg, AssignSlot, BudgetBody, CoordMsg, SharedScene};
 use fleet_core::state::Gpu;
 use slot::{supervise, AgentCfg, Desired, SlotCtx};
 use std::collections::{BTreeMap, HashMap};
@@ -210,6 +210,7 @@ where
 
     let cfg = Arc::new(agent.cfg);
     let (scene_tx, scene_rx) = watch::channel::<Option<SharedScene>>(None);
+    let (budget_tx, budget_rx) = watch::channel::<Option<BudgetBody>>(None);
     // The aggregator's layout follows the assignment and the scene.
     let (layout_tx, layout_rx) = watch::channel::<Option<Layout>>(None);
     let aggregator = agent.aggregate.clone().map(|(port, argv)| {
@@ -251,6 +252,9 @@ where
             CoordMsg::Scene(s) => {
                 scene_tx.send_replace(Some(s));
             }
+            CoordMsg::Budget(b) => {
+                budget_tx.send_replace(Some(b));
+            }
             CoordMsg::Assign {
                 slots: list,
                 region: r,
@@ -267,6 +271,7 @@ where
                     &out,
                     &http,
                     &scene_rx,
+                    &budget_rx,
                 );
                 tracing::debug!(slots = list.len(), "assignment applied");
             }
@@ -331,6 +336,7 @@ fn assign(
     out: &mpsc::UnboundedSender<AgentMsg>,
     http: &reqwest::Client,
     scene_rx: &watch::Receiver<Option<SharedScene>>,
+    budget_rx: &watch::Receiver<Option<BudgetBody>>,
 ) {
     // Slots no longer listed, or moved to another GPU, are torn down by their tasks.
     let keep: HashMap<&str, &str> = list
@@ -402,7 +408,7 @@ fn assign(
             gpu_lock: lock.clone(),
             http: http.clone(),
         };
-        let task = tokio::spawn(supervise(ctx, rx, scene_rx.clone()));
+        let task = tokio::spawn(supervise(ctx, rx, scene_rx.clone(), budget_rx.clone()));
         slots.insert(
             a.id.clone(),
             SlotHandle {

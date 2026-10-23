@@ -141,6 +141,11 @@ pub struct HealthReport {
     pub fps: f64,
     #[serde(default)]
     pub gpu: serde_json::Value,
+    /// The renderer's `budget_fit` and the scene time of its newest frame (`t`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_fit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t: Option<f64>,
 }
 
 /// Agent -> coordinator.
@@ -259,6 +264,16 @@ pub enum CoordMsg {
         region: Option<Rect>,
     },
     Scene(SharedScene),
+    /// The grid's budget: every renderer draws `budget` pixel-samples per frame from the
+    /// first frame at or after scene time `t` (`POST /budget`, again after every scene).
+    Budget(BudgetBody),
+}
+
+/// The body of a renderer's `POST /budget`.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct BudgetBody {
+    pub budget: u64,
+    pub t: f64,
 }
 
 /// The body of a renderer's `POST /scene`.

@@ -306,6 +306,10 @@ pub struct PowerView {
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
     pub layout: LayoutView,
+    /// The grid's render budget (pixel-samples per frame per tile) and the scene time it
+    /// took effect at; null until every tile has reported a fit.
+    pub budget: Option<u64>,
+    pub budget_from_t: Option<f64>,
     pub tiles: Vec<TileView>,
     pub aggregates: Vec<AggregateView>,
     pub fleet: FleetView,
@@ -480,6 +484,8 @@ pub fn view(state: &State) -> View {
         });
     }
     View {
+        budget: f.budget.current,
+        budget_from_t: f.budget.from_t,
         layout: LayoutView {
             generation: f.layout.generation,
             from_frame: f.layout.from_frame,

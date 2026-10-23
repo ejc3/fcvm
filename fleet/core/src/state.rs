@@ -175,6 +175,11 @@ pub struct Observed {
     pub error: Option<String>,
     pub fps: Option<f64>,
     pub gpu_stats: Option<serde_json::Value>,
+    /// From the renderer's health: its budget fit and newest frame's scene time.
+    #[serde(default)]
+    pub budget_fit: Option<f64>,
+    #[serde(default)]
+    pub frame_t: Option<f64>,
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,
@@ -440,6 +445,9 @@ pub struct Fleet {
     pub hidden: std::collections::BTreeSet<String>,
     #[serde(default)]
     pub power: Power,
+    /// The grid's render budget.
+    #[serde(default)]
+    pub budget: crate::budget::Budget,
     /// Coordinator components that are degraded: reason and since when.
     pub degraded: BTreeMap<String, (String, u64)>,
 }
@@ -488,6 +496,7 @@ impl State {
                 quarantined: BTreeMap::new(),
                 hidden: Default::default(),
                 power: Power::default(),
+                budget: Default::default(),
             },
             config,
             receipts: BTreeMap::new(),

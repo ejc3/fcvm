@@ -17,7 +17,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::Message;
 
@@ -1063,6 +1063,17 @@ impl ec2::Ec2Driver for ScarceEc2 {
     ) -> anyhow::Result<()> {
         Ok(())
     }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        anyhow::bail!("no renderer")
+    }
     fn capacity_retry(&self) -> Duration {
         Duration::from_millis(300)
     }
@@ -1881,4 +1892,105 @@ async fn slot_dns_records_follow_the_reported_addresses() {
     agent.to_coord.send(report("2001:db8::2")).unwrap();
     let w = wait_writes(4).await;
     assert_eq!(w[3], "update \"slot-1.fcvm.example\" \"2001:db8::2\"");
+}
+
+/// An EC2 tile whose renderer reports a fit; it records the budgets posted to it.
+struct BudgetEc2 {
+    posted: std::sync::Mutex<Vec<fleet_core::protocol::BudgetBody>>,
+}
+
+#[async_trait::async_trait]
+impl ec2::Ec2Driver for BudgetEc2 {
+    async fn launch(&self, _tile: &str) -> Result<ec2::Launched, ec2::LaunchError> {
+        Ok(ec2::Launched {
+            instance: "i-test".into(),
+            frame_url: None,
+            ipv6: None,
+            ipv4: None,
+        })
+    }
+    async fn ready(&self, _tile: &str, l: &ec2::Launched) -> anyhow::Result<ec2::Launched> {
+        Ok(l.clone())
+    }
+    async fn terminate(&self, _instance: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_scene(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        _body: &fleet_core::protocol::RendererScene,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn post_budget(
+        &self,
+        _tile: &str,
+        _l: &ec2::Launched,
+        body: &fleet_core::protocol::BudgetBody,
+    ) -> anyhow::Result<()> {
+        self.posted.lock().unwrap().push(*body);
+        Ok(())
+    }
+    async fn health(&self, _tile: &str, _l: &ec2::Launched) -> anyhow::Result<serde_json::Value> {
+        Ok(json!({"fps": 30.0, "budget_fit": 1.0e6, "t": 5.0}))
+    }
+}
+
+/// The coordinator reads every tile's fit (the agents' health reports, the EC2 tile's
+/// `/health`), and the slowest tile's budget reaches the agents and the EC2 tile with one
+/// start time.
+#[tokio::test]
+async fn the_slowest_tile_sets_one_budget_for_every_tile() {
+    let config = Config {
+        ec2_max: 1,
+        ..Config::default()
+    };
+    let driver = Arc::new(BudgetEc2 {
+        posted: Default::default(),
+    });
+    let (handle, _actor) = start(
+        State::new(config, now_ms()),
+        None,
+        Some(driver.clone() as Arc<dyn ec2::Ec2Driver>),
+        None,
+        None,
+        None,
+    );
+    let mut agent = FakeAgent::connect(&handle, "gpu-a", 2);
+    agent.assign().await;
+    agent.report("slot-1", "running", 1);
+    agent.report("slot-2", "running", 1);
+    for (id, fit, t) in [("slot-1", 2.0e6, 4.0), ("slot-2", 5.0e5, 6.0)] {
+        agent
+            .to_coord
+            .send(AgentMsg::Health(fleet_core::protocol::HealthReport {
+                id: id.into(),
+                fps: 30.0,
+                gpu: Value::Null,
+                budget_fit: Some(fit),
+                t: Some(t),
+            }))
+            .unwrap();
+    }
+    let got = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let CoordMsg::Budget(b) = agent.next().await {
+                return b;
+            }
+        }
+    })
+    .await
+    .expect("a budget within 20 s");
+    assert_eq!(got.budget, fleet_core::budget::ladder_floor(5.0e5));
+    assert_eq!(
+        got.t, 7.0,
+        "a second past the newest frame (6.0), on a frame"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while driver.posted.lock().unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the EC2 tile got no budget");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(driver.posted.lock().unwrap()[0], got);
 }

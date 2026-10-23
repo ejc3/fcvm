@@ -404,6 +404,8 @@
       "lent": 0,
       "next_return_at": null
     },
+    "budget": null,
+    "budget_from_t": null,
     "claims": [],
     "cooldown_until": null,
     "counters": {

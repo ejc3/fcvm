@@ -13,7 +13,7 @@ use super::aws::{signed, xml_tag, CredentialChain};
 use super::ec2::{Ec2Driver, LaunchError, Launched};
 use anyhow::{bail, Context, Result};
 use async_trait::async_trait;
-use fleet_core::protocol::RendererScene;
+use fleet_core::protocol::{BudgetBody, RendererScene};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -51,6 +51,28 @@ enum CallError {
 }
 
 impl AwsEc2 {
+    /// A client that reaches the tile's renderer by its address under its DNS name (the
+    /// name its certificate is for), and the URL of `path` on it.
+    fn renderer(
+        &self,
+        tile: &str,
+        launched: &Launched,
+        path: &str,
+    ) -> Result<(reqwest::Client, String)> {
+        let ip = launched
+            .ipv4
+            .as_deref()
+            .context("the tile has no address yet")?;
+        let addr: std::net::IpAddr = ip.parse().context("the tile's address")?;
+        let name = format!("{tile}.{}", self.zone);
+        let client = reqwest::Client::builder()
+            .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
+            .timeout(Duration::from_secs(5))
+            .build()?;
+        let url = format!("{}://{name}:{}{path}", self.health_scheme, self.health_port);
+        Ok((client, url))
+    }
+
     pub fn new(
         regions: Vec<String>,
         spot_template: String,
@@ -244,22 +266,30 @@ impl Ec2Driver for AwsEc2 {
         launched: &Launched,
         body: &RendererScene,
     ) -> Result<()> {
-        let ip = launched
-            .ipv4
-            .as_deref()
-            .context("the tile has no address yet")?;
-        let addr: std::net::IpAddr = ip.parse().context("the tile's address")?;
-        let name = format!("{tile}.{}", self.zone);
-        let client = reqwest::Client::builder()
-            .resolve(&name, std::net::SocketAddr::new(addr, self.health_port))
-            .timeout(Duration::from_secs(5))
-            .build()?;
-        let url = format!("{}://{name}:{}/scene", self.health_scheme, self.health_port);
+        let (client, url) = self.renderer(tile, launched, "/scene")?;
         let r = client.post(&url).json(body).send().await?;
         if !r.status().is_success() {
-            bail!("POST /scene to {name} answered {}", r.status());
+            bail!("POST {url} answered {}", r.status());
         }
         Ok(())
+    }
+
+    async fn post_budget(&self, tile: &str, launched: &Launched, body: &BudgetBody) -> Result<()> {
+        let (client, url) = self.renderer(tile, launched, "/budget")?;
+        let r = client.post(&url).json(body).send().await?;
+        if !r.status().is_success() {
+            bail!("POST {url} answered {}", r.status());
+        }
+        Ok(())
+    }
+
+    async fn health(&self, tile: &str, launched: &Launched) -> Result<serde_json::Value> {
+        let (client, url) = self.renderer(tile, launched, "/health")?;
+        let r = client.get(&url).send().await?;
+        if !r.status().is_success() {
+            bail!("GET {url} answered {}", r.status());
+        }
+        Ok(r.json().await?)
     }
 
     async fn terminate(&self, instance: &str) -> Result<()> {
