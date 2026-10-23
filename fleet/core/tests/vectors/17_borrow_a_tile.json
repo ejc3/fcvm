@@ -508,7 +508,7 @@
     "relaunch_all": {
       "by": "viewer:v2",
       "ec2_capacity_wait_ms": 0,
-      "ec2_done_at": null,
+      "ec2_done_at": 6000,
       "ec2_gpus": 0,
       "ec2_ms": null,
       "ec2_pending": 0,

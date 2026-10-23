@@ -640,8 +640,15 @@ fn relaunch_all(r: &Race) -> RelaunchAllView {
         race: r.id,
         started_at: r.started_at,
         by: r.by.clone(),
-        fcvm_done_at: r.fcvm.done_at,
-        ec2_done_at: r.ec2.done_at,
+        // A half with no GPUs has nothing to restart: it is done when the race starts.
+        fcvm_done_at: r
+            .fcvm
+            .done_at
+            .or(r.fcvm.tiles.is_empty().then_some(r.started_at)),
+        ec2_done_at: r
+            .ec2
+            .done_at
+            .or(r.ec2.tiles.is_empty().then_some(r.started_at)),
         fcvm_pending: pending(&r.fcvm),
         ec2_pending: pending(&r.ec2),
         fcvm_gpus: r.fcvm.tiles.len(),

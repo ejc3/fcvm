@@ -404,7 +404,7 @@
       "ec2_ms": 7000,
       "ec2_pending": 0,
       "ec2_waiting_since": null,
-      "fcvm_done_at": null,
+      "fcvm_done_at": 3000,
       "fcvm_gpus": 0,
       "fcvm_ms": null,
       "fcvm_pending": 0,

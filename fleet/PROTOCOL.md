@@ -315,7 +315,9 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
 - `relaunch_all` is the latest race (null before the first): who started it (`schedule`
   or `viewer:<id>`), each half's tiles timed (`*_gpus`), still to reach their first frame
   (`*_pending`), when the half finished and its time (`*_ms`, click to the last tile's
-  first frame as the coordinator saw it, less EC2 capacity waits). `ec2_capacity_wait_ms`
+  first frame as the coordinator saw it, less EC2 capacity waits). A half with no GPUs
+  (`*_gpus` 0) has nothing to restart: its `*_done_at` is `started_at` and its `*_ms` null,
+  so the race is over once the other half is. `ec2_capacity_wait_ms`
   is the capacity waits finished so far; `ec2_waiting_since` is when the half's current
   wait began (null when none runs), so a page can draw the wait as it grows.
 - `scoreboard` holds only measured numbers; a half is null until one of its races has
