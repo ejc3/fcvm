@@ -386,6 +386,27 @@ All of it is Terraform in ejc3/aws, applied by the jumpbox:
   modules; the profile setting keeps `open` available for GPUs the proprietary modules do
   not support.
 
+## Decisions from the sandbox landscape review (2026-10-23)
+
+From a survey of sandbox and GPU-cloud providers (no one else publishes restoring a whole GPU
+VM from a snapshot with the GPU attached at restore; almost no one publishes how GPU memory is
+cleared between customers). DECIDED, all owner-approved:
+
+- **GPU memory is scrubbed twice:** inside each new VM before its workload runs (fails
+  closed), and on the host before a GPU returns to the pool. A GPU whose reset or scrub fails
+  is quarantined and the wall re-tiles around it. The residue test and both scrub times are
+  published.
+- **A standby pool:** GPUs beyond `max_tiles` stay reset, scrubbed and bound, ready for a
+  failed or reclaimed tile or a claim.
+- **The wall counts:** a running count of GPU VMs restored and GPUs scrubbed, and a short,
+  sourced "How it's isolated" panel (own kernel per VM, GPU behind the IOMMU, scrubbed between
+  VMs).
+- **Warm models:** a GPU snapshot that brings a model back already resident in GPU memory
+  (CUDA state moved to RAM with NVIDIA's cuda-checkpoint before the snapshot), measured as time
+  to first token.
+- **Tail latencies:** p50, p95 and p99 under a named external benchmark, and for GPU restores.
+- **Egress rules with credential injection** per sandbox, enforced on the host.
+
 ## Stack of PRs
 
 1. This document.
