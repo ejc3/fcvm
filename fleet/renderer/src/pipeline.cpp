@@ -526,11 +526,19 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     while (jn < pend_k) {  // never past a pending switch
       budget = budget_at(jn, &source);
       r_.set_budget(budget);
+      double r0 = mono_s();
       r_.render(*sc, rt, (double)jn / opt_.fps, true);
+      double took = mono_s() - r0;
       jn++;
       long long now_k = (long long)std::floor((now_unix_ms() - (double)sc->epoch_unix_ms) / 1000.0 * opt_.fps);
-      // the next slot must not have begun by the time the loop picks it (one slot of margin)
-      if (jn - k0 >= TEMPORAL_WINDOW - 1 && jn > now_k + 1) break;
+      if (jn - k0 >= TEMPORAL_WINDOW - 1) {
+        // the next slot must not have begun by the time the loop picks it (one slot of margin)
+        if (jn > now_k + 1) break;
+        // a tile that draws a frame in most of a slot cannot get ahead: it
+        // skips slots on the clock anyway, so priming further only delays its
+        // stream (a 1080 detail tile at 53 ms a frame primed 90 slots, 5.9 s)
+        if (took > 0.9 / opt_.fps) break;
+      }
       if (jn - k0 >= PRIME_MAX) break;
     }
     primed_through_ = jn - 1;
