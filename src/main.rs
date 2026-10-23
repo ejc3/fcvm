@@ -81,6 +81,9 @@ async fn run() -> Result<()> {
     // Use RUST_LOG if set, otherwise default to WARN (quiet by default, use RUST_LOG=info for verbose)
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
 
+    // `log_internal_errors(false)` on both: when stderr's reader is gone, tracing-subscriber
+    // would report the failed write with eprintln!, which panics on the same broken stderr
+    // and kills fcvm mid-command (a VM's teardown included). Logs are lost; nothing else is.
     // If --sub-process flag is set, disable timestamps AND level (subprocess mode)
     // Parent process already shows timestamp and level, so subprocess just shows the message
     // But KEEP target tags to show the nesting hierarchy!
@@ -94,6 +97,7 @@ async fn run() -> Result<()> {
             .without_time()
             .with_level(false) // Disable level prefix too (INFO, DEBUG, etc.)
             .with_ansi(false) // NEVER use ANSI in subprocesses
+            .log_internal_errors(false)
             .try_init()
             .ok();
     } else {
@@ -105,6 +109,7 @@ async fn run() -> Result<()> {
             .with_writer(std::io::stderr) // Logs to stderr, keep stdout clean for command output
             .with_target(true) // Show targets for all processes
             .with_ansi(use_color) // Only use ANSI when outputting to TTY
+            .log_internal_errors(false)
             .try_init()
             .ok();
     }
