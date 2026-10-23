@@ -405,7 +405,6 @@ cleared between customers). DECIDED, all owner-approved:
   (CUDA state moved to RAM with NVIDIA's cuda-checkpoint before the snapshot), measured as time
   to first token.
 - **Tail latencies:** p50, p95 and p99 under a named external benchmark, and for GPU restores.
-- **Egress rules with credential injection** per sandbox, enforced on the host.
 
 ## Stack of PRs
 
