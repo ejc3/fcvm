@@ -2682,8 +2682,9 @@ firmware off). Every step passed with both.
 - MSI-X goes through the GIC ITS: the driver holds six vectors
   (`ITS-PCI-MSIX-0000:00:06.0`, `msi_irqs` 28 to 33) while `nvidia-persistenced` keeps
   the GPU open, and they deliver. With the proprietary modules one vector counted 76
-  after the attach and went from 10 to 39 while `fcvm-gpu-scrub` ran its CUDA work;
-  with the open modules it counted 3 to 5.
+  after the attach. Stopping the daemon released the vectors, so the counts started
+  again when it was restarted: that vector read 10 after the restart and 39 after
+  `fcvm-gpu-scrub` ran its CUDA work. With the open modules it counted 3 to 5.
 - `dmesg` shows the aarch64 module loading ("NVIDIA UNIX Open Kernel Module for
   aarch64 580.196.07", or "NVIDIA UNIX aarch64 Kernel Module" with
   `EnableGpuFirmware: 0`) and three warnings, none of them a failure:
