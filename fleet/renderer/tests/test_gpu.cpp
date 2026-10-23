@@ -163,6 +163,35 @@ int main(int argc, char** argv) {
   dc = compare(wm, q2, &hd);
   CHECK(dc > 1000, "control: another frame t must differ (%ld pixels differ)", dc);
 
+  // 7. The high-quality path (taken from HQ_SPP samples per drawn pixel; set
+  // here directly): moving with history while the samples per frame change
+  // mid-sequence, as when the controller raises every tile's budget at one
+  // slot, and a hold in different batches. And it really changes the image.
+  {
+    r.set_quality(1);
+    std::vector<std::pair<double, int>> seq;
+    const long k0 = 37 * 30;
+    for (int k = 0; k < 12; k++) seq.push_back({(k0 + k) / 30.0, k < 6 ? 2 : 8});
+    Img wq = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, seq, true);
+    CHECK(r.stats().hq, "the high-quality path was taken");
+    Img qq[4];
+    quads(r, s, h, seq, true, qq);
+    d = compare(wq, qq, &hd);
+    CHECK(d == 0 && hd == 0, "high quality, moving, spp 2 then 8: %ld pixels differ (8-bit), %ld (float)", d, hd);
+    Img whq = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, {{th - 3, 4}, {th - 2, 4}, {th - 1, 4}, {th, 4}}, true);
+    quads(r, s, h, {{th - 0.5, 8}, {th, 8}}, true, qq);
+    d = compare(whq, qq, &hd);
+    CHECK(d == 0 && hd == 0, "high quality, hold, 16 samples in different batches: %ld pixels differ (8-bit), %ld (float)",
+          d, hd);
+    r.set_quality(0);
+    Img wlo = draw(r, s, Rect{0, 0, 1, 1}, 2 * h, {{th - 3, 4}, {th - 2, 4}, {th - 1, 4}, {th, 4}}, true);
+    long dq = 0;
+    for (size_t p = 0; p < wlo.rgba.size(); p += 4) dq += memcmp(&wlo.rgba[p], &whq.rgba[p], 3) != 0;
+    CHECK(dq > (long)(wlo.rgba.size() / 4 / 10), "the high-quality path changes the image (%ld pixels)", dq);
+    r.set_quality(-1);
+    fprintf(stderr, "high quality moving whole: fnv64 %016llx\n", (unsigned long long)fnv(wq.rgba));
+  }
+
   // 6. No sample is NaN. The golden-hour view looks toward pixels where the
   // sun is straight behind the eye: GGX's Fresnel term then took the
   // fast-math powf of a value just below zero, about one sample in a frame.

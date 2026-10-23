@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "budget.h"
 #include "gpustats.h"
 
 // how long one GET /still keeps the renderer drawing every slot at its height
@@ -42,16 +43,19 @@ struct Subscriber {
 struct Options {
   int port = 8080;
   int fps = 30;
-  double budget = 2.5e5;  // pixel-samples per frame (drawn pixels x samples)
-  // Adjust the budget so a frame's GPU time fits its slot. Off by default:
-  // with it, tiles of one image draw different sample counts, and moving
-  // frames stop matching across tile edges.
-  bool adapt = false;
+  double budget = 2.5e5;  // pixel-samples per frame (drawn pixels x samples) until something sets one
+  // A renderer drawing the whole image (no neighbours to match) adapts its own
+  // budget to its fit. Tiles of a grid never do: they take the budget the
+  // controller posts to all of them (POST /budget), so they agree at every slot.
+  bool adapt = true;
   int idle_h = 144;
   bool accumulate = true;
   // Pixels encoded past each side of the tile (inside the image); the client
   // crops them, so no tile edge is an edge of an encoded picture.
   int margin = 16;
+  // Test hook: scales the reported budget_fit, as a slower (< 1) or faster GPU
+  // would. Never set in production.
+  double fit_scale = 1.0;
 };
 
 class Pipeline {
@@ -66,6 +70,9 @@ class Pipeline {
   void unsubscribe(const std::shared_ptr<Subscriber>& s);
   void wake();
   bool post_scene(const std::string& body, std::string* err);
+  // POST /budget: {"budget": B, "t": T}, B pixel-samples per frame from the
+  // first slot at or after scene time T.
+  bool post_budget(const std::string& body, std::string* err);
   // Debug: the unencoded tile of the frame at time t (a future frame slot), as
   // a binary PPM. Waits for that frame; false if this renderer skipped it.
   bool raw_frame(double t, std::string* ppm, std::string* tile_json);
@@ -124,7 +131,12 @@ class Pipeline {
   std::atomic<bool> ready_{false};
   std::string fatal_;
   double proc_start_ = 0;
-  double budget_ = 1.0e6;  // current pixel-samples per frame
+  double budget_ = 1.0e6;  // a whole-image renderer's own adapted budget
+  BudgetSchedule sched_;   // under mu_
+  // health: the budget the last frame used, where it came from, and this
+  // renderer's fit (budget at 70% of a slot, smoothed)
+  double used_budget_ = 0, fit_ = 0, fit_px_ = 0, fit_scale_ = 1.0;
+  const char* budget_source_ = "default";
   // health
   std::mutex hmu_;
   double last_t_ = 0;

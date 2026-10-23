@@ -15,6 +15,7 @@ struct RenderStats {
   bool hold = false;
   unsigned int bad_samples = 0;  // non-finite samples dropped in the last frame (should be 0)
   int half = 1;          // checkerboard stride: 1 every pixel drew, 2 half, 4 a quarter
+  bool hq = false;       // the frame took the high-quality path
 };
 
 class Renderer {
@@ -36,6 +37,9 @@ class Renderer {
   // Checkerboard frames: -1 by the budget (the default: stride 2 under 0.5
   // samples per drawn pixel, 4 under 0.3), 0 never, 2 or 4 always.
   void set_checkerboard(int mode) { checker_ = mode; }
+  // The high-quality path: -1 by the budget (on from HQ_SPP samples per drawn
+  // pixel, every pixel drawing; the default), 0 never, 1 always.
+  void set_quality(int mode) { quality_ = mode; }
   // Draw frame t into the tile's RGBA8 buffer on the device. accumulate=false draws
   // every frame independently (seeded by t only), which is what the seam test uses.
   // spp > 0 overrides the budget.
@@ -94,6 +98,8 @@ class Renderer {
   int hold_n_ = 0;
   long long hold_frames_ = 0;
   int checker_ = -1;  // -1 by budget, 0 never, 2 or 4 always
+  int quality_ = -1;  // -1 by budget, 0 never, 1 always
+  double hold_budget_ = 0;  // the budget the current hold started with
   void* fill_c_ = nullptr;  // checkerboard fill output, swapped into the ring
   void* fill_a_ = nullptr;
   void* stream_ = nullptr;

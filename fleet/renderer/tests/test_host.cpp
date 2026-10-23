@@ -5,6 +5,7 @@
 #include <string>
 #include <vector>
 
+#include "../src/budget.h"
 #include "../src/jpeg.h"
 #include "../src/json.h"
 #include "../src/nvenc.h"
@@ -221,6 +222,41 @@ int main() {
       std::string got = pacific_clock(k.t);
       CHECK(got == k.want, "pacific_clock(%lld) = %s, want %s", (long long)k.t, got.c_str(), k.want);
     }
+  }
+  {
+    // The grid-wide budget: a schedule gives every slot one budget, the same
+    // for every tile that was given the same entries; the fit and the ladder.
+    BudgetSchedule a, b;
+    double x, y;
+    CHECK(!a.at(10, &x), "an empty schedule names no budget");
+    a.add(100, 4e5);
+    a.add(160, 8e5);
+    b.add(160, 8e5);  // posted in another order
+    b.add(100, 4e5);
+    bool same = true;
+    for (long long k = 90; k < 200; k++) {
+      bool ha = a.at(k, &x), hb = b.at(k, &y);
+      same = same && ha == hb && (!ha || x == y);
+    }
+    CHECK(same, "two tiles with the same entries use the same budget at every slot");
+    BudgetSchedule c;
+    c.add(100, 4e5);
+    c.add(160, 8e5);
+    CHECK(c.at(159, &x) && x == 4e5 && c.at(160, &x) && x == 8e5, "a budget takes effect exactly at its slot");
+    c.add(200, 9e5);
+    c.add(200, 5e5);
+    CHECK(c.at(210, &x) && x == 5e5, "a later entry for the same slot replaces it");
+    CHECK(std::fabs(budget_fit(1e6, 20.0, 1000.0 / 30) - 1e6 * 0.7 * (1000.0 / 30) / 20.0) < 1, "fit at 70%% of a slot");
+    CHECK(ladder_floor(250000) == 250000 && ladder_floor(297302) == 297302 && ladder_floor(297300) == 250000 &&
+              ladder_floor(1e6) == 1000000 && ladder_floor(10) == 62500,
+          "ladder: %.0f %.0f %.0f %.0f", ladder_floor(250000), ladder_floor(297300), ladder_floor(1e6), ladder_floor(10));
+    // A renderer alone at 1280x720 (about 1.08 M drawn pixels) whose fit is
+    // 406 k samples: a stride-2 budget would draw 540 k, so it stays on
+    // stride 4 (the 720p row of round 8's first run sat on stride 2 at 31 ms).
+    double px720 = 1.08e6;
+    CHECK(samples_for(local_budget(406000, px720), px720) <= 406000 && stride_for(local_budget(406000, px720) / px720) == 4,
+          "a stride's share is not chosen over the fit (budget %.0f)", local_budget(406000, px720));
+    CHECK(local_budget(5e6, 50000) == ladder_floor(5e6), "at many samples per pixel the ladder rung stands");
   }
   tlscheck::run();
   DONE();

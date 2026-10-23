@@ -59,6 +59,7 @@ void Subscriber::close() {
 Pipeline::Pipeline(const Options& o) : opt_(o) {
   scene_ = std::make_shared<const Scene>(default_scene());
   budget_ = o.budget;
+  fit_scale_ = o.fit_scale;
   r_.set_fps(o.fps);
   r_.set_margin(o.margin);
 }
@@ -96,11 +97,31 @@ bool Pipeline::post_scene(const std::string& body, std::string* err) {
     std::lock_guard<std::mutex> l(mu_);
     scene_ = sc;
     scene_version_++;
+    sched_ = BudgetSchedule();  // its times are on the old scene's clock
   } catch (const std::exception& e) {
     *err = e.what();
     return false;
   }
   cv_.notify_all();
+  return true;
+}
+
+bool Pipeline::post_budget(const std::string& body, std::string* err) {
+  double b, t;
+  try {
+    Json j = Json::parse(body);
+    b = j.at("budget").number("budget");
+    t = j.at("t").number("t");
+  } catch (const std::exception& e) {
+    *err = e.what();
+    return false;
+  }
+  if (!(b >= 1e4 && b <= 5e8)) { *err = "'budget' must be in 10000..500000000"; return false; }
+  if (!std::isfinite(t)) { *err = "'t' must be a number"; return false; }
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    sched_.add((long long)std::ceil(t * opt_.fps - 1e-6), b);
+  }
   return true;
 }
 
@@ -253,17 +274,34 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   if (!encs_.empty()) render_h = encode_geometry(*sc, encs_.rbegin()->first / 4).h;
   Tile rt = tile_geometry(sc->rect, sc->image_aspect, render_h);
   double px = r_.drawn_pixels(rt);
-  double budget = (sc->budget > 0 && !opt_.adapt) ? sc->budget : budget_;
-  int spp = 0;  // the renderer derives it (or a checkerboard) from the budget
+  // The budget for this slot: a posted schedule first (the same on every tile
+  // of a grid), then the scene's, then a whole-image renderer's own, then the
+  // default.
+  double budget = opt_.budget;
+  const char* source = "default";
+  bool whole = sc->rect.x == 0 && sc->rect.y == 0 && sc->rect.w == 1 && sc->rect.h == 1;
+  {
+    std::lock_guard<std::mutex> l(mu_);
+    double b;
+    if (sched_.at(std::llround(t * opt_.fps), &b)) { budget = b; source = "schedule"; }
+    else if (sc->budget > 0) { budget = sc->budget; source = "scene"; }
+    else if (opt_.adapt && whole) { budget = budget_; source = "local"; }
+  }
   r_.set_budget(budget);
-  if (opt_.adapt) spp = std::clamp((int)std::lround(budget / px), 1, 64);
-  r_.render(*sc, rt, t, opt_.accumulate, spp);
-  if (opt_.adapt && r_.stats().spp > 0 && r_.stats().render_ms > 0) {
-    // Keep the GPU time of a frame near 70% of its slot (encoding and the
-    // scaling kernels take the rest); move a third of the way each frame.
-    double per_sample = r_.stats().render_ms / (px * r_.stats().spp);
-    double target = 0.70 * 1000.0 / opt_.fps / per_sample;
-    budget_ = std::clamp(budget_ + (target - budget_) / 3.0, 1.0e5, 3.2e7);
+  r_.render(*sc, rt, t, opt_.accumulate);
+  {
+    // this renderer's fit, from the samples it drew and their GPU time
+    const RenderStats& rs = r_.stats();
+    double drawn = px / rs.half * rs.spp;
+    double f = budget_fit(drawn, rs.render_ms, 1000.0 / opt_.fps) * fit_scale_;
+    std::lock_guard<std::mutex> l(hmu_);
+    // a fit belongs to one drawn size: a new size starts it again
+    if (std::fabs(px - fit_px_) > 0.01 * px) { fit_ = 0; fit_px_ = px; budget_ = opt_.budget; }
+    if (rs.spp > 0 && f > 0) fit_ = fit_ > 0 ? fit_ + (f - fit_) * 0.2 : f;
+    used_budget_ = budget;
+    budget_source_ = source;
+    // a whole-image renderer alone follows its own fit, on the ladder
+    if (opt_.adapt && whole && fit_ > 0) budget_ = local_budget(fit_, px);
   }
   {
     // debug captures of this frame
@@ -281,12 +319,12 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       r_.download_rgba(&rq->rgba);
       rq->w = rt.w;
       rq->h = rt.h;
-      char tj[256];
+      char tj[320];
       snprintf(tj, sizeof tj,
                "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,"
-               "\"spp\":%d,\"checkerboard\":%d,\"hold\":%s,\"hold_samples\":%d}",
-               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half,
-               r_.stats().hold ? "true" : "false", r_.stats().hold_samples);
+               "\"spp\":%d,\"checkerboard\":%d,\"hq\":%d,\"budget\":%.0f,\"hold\":%s,\"hold_samples\":%d}",
+               t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half, r_.stats().hq ? 1 : 0,
+               budget, r_.stats().hold ? "true" : "false", r_.stats().hold_samples);
       rq->tile = tj;
       rq->ok = true;
     }
@@ -462,6 +500,8 @@ std::string Pipeline::health_json() {
   o << ",\"render_ms\":" << std::round(rstats_.render_ms * 10) / 10 << ",\"encode_ms\":" << std::round(encode_ms_ * 10) / 10
     << ",\"spp\":" << rstats_.spp << ",\"checkerboard\":" << rstats_.half << ",\"hold\":" << (rstats_.hold ? "true" : "false")
     << ",\"hold_samples\":" << rstats_.hold_samples << ",\"slots_missed\":" << slots_missed_;
+  o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
+    << "\",\"budget_fit\":" << std::round(fit_) << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {
     // CPU seconds this process has used (user + system), for cost per stream
     rusage ru;
