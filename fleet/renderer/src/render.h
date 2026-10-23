@@ -59,6 +59,9 @@ class Renderer {
   void* alloc_nv12(int w, int h, size_t* pitch);
   void free_dev(void* p);
   void* cu_context() const { return ctx_; }
+  // Makes the renderer's device current on the calling thread (for a thread
+  // that allocates or frees its buffers).
+  static void bind_thread();
   int width() const { return tile_.w; }
   int height() const { return tile_.h; }
   const RenderStats& stats() const { return stats_; }

@@ -1906,3 +1906,4 @@ void* Renderer::alloc_nv12(int w, int h, size_t* pitch) {
   return p;
 }
 void Renderer::free_dev(void* p) { cudaFree(p); }
+void Renderer::bind_thread() { cudaSetDevice(0); }
