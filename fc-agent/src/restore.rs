@@ -337,15 +337,6 @@ pub async fn handle_clone_restore(
     // path can settle it rather than race it.
     spawn_restore_side_job(restart_journald());
 
-    // Reconfigure IPv6 — before any network traffic can use the old address.
-    // The link is UP throughout (the boundary no longer takes it down), so the
-    // gate is what holds inbound traffic off until the cleanup below finishes.
-    let ipv6_started = std::time::Instant::now();
-    if let Some(new_ipv6) = clone_ipv6 {
-        network::reconfigure_ipv6(new_ipv6).await;
-    }
-    phases.ipv6_ms = elapsed_ms(ipv6_started);
-
     // Pin the neighbour entry BEFORE the boundary reopens the gate. The clone
     // inherits the source's neighbour table, and restore_snapshot_network ends
     // by publishing; anything answered between publication and a later pin
@@ -354,8 +345,25 @@ pub async fn handle_clone_restore(
     // purges the neighbour table any more.
     // Order matters: drop the inherited entries first, then pin the one the
     // host's health checks depend on. Flushing after the pin would delete it.
+    //
+    // The flush also runs before the IPv6 swap below. The swap announces the
+    // new address, which lets in the traffic that was waiting for it, and the
+    // guest resolves its senders' addresses to answer; a flush running then
+    // deletes those entries mid-resolution and left one INCOMPLETE for a
+    // second (2 of 1700 routed restores with an early client). Pinned by
+    // `inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced`.
     network::flush_stale_neighbours().await;
     network::pin_namespace_neighbour().await;
+
+    // Reconfigure IPv6, then announce it: before any network traffic can use
+    // the old address. The link is UP throughout (the boundary no longer takes
+    // it down), so the gate is what holds inbound traffic off until the
+    // cleanup below finishes.
+    let ipv6_started = std::time::Instant::now();
+    if let Some(new_ipv6) = clone_ipv6 {
+        network::reconfigure_ipv6(new_ipv6).await;
+    }
+    phases.ipv6_ms = elapsed_ms(ipv6_started);
     // ANNOUNCE, as early as possible. The host cannot forward a packet to this
     // clone until its namespace has learned the guest's MAC, and it only learns
     // that when the guest transmits. The old boundary got this for free: taking

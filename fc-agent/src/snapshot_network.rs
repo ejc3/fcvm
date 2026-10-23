@@ -3685,6 +3685,35 @@ mod tests {
         );
     }
 
+    /// The inherited neighbours are flushed before the clone takes its new IPv6
+    /// and announces it. The announcement brings in the traffic that was
+    /// waiting for the address (a client that dialled during the restore),
+    /// and the guest resolves the client's address to answer it; a flush
+    /// running then (up to ten dump-and-delete rounds) deletes those entries
+    /// mid-resolution and left one INCOMPLETE until its retransmit a second
+    /// later. Caught under packet capture: 2 of 1700 routed restores with an
+    /// early client took 946 and 977 ms for the first connection after the
+    /// ACK, each with a storm of guest solicitations during the flush and the
+    /// next one at +976 ms. Source-pinned like the test above: the window is a
+    /// kernel interleaving no runtime test can hold open.
+    #[test]
+    fn inherited_neighbours_are_flushed_before_the_new_ipv6_is_announced() {
+        let source = include_str!("restore.rs");
+        let start = source
+            .find("pub async fn handle_clone_restore(")
+            .expect("handle_clone_restore is in restore.rs");
+        let body = &source[start..];
+        let at = |needle: &str| {
+            body.find(needle)
+                .unwrap_or_else(|| panic!("{needle} is not in handle_clone_restore"))
+        };
+        assert!(
+            at("network::flush_stale_neighbours().await") < at("network::reconfigure_ipv6("),
+            "the neighbour flush runs after the new IPv6 is announced, while the traffic \
+             the announcement admits is resolving neighbours"
+        );
+    }
+
     /// A failed NFS remount fails the restore. The remount runs before the hook
     /// so that a hook can use the share; a remount that failed and was only
     /// logged left the mount point an ordinary directory, so a hook writing
