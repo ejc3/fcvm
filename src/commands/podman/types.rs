@@ -291,13 +291,14 @@ impl VolumeMapping {
     /// Parse a volume spec string: HOST:GUEST[:ro]
     pub fn parse(spec: &str) -> Result<Self> {
         let parts: Vec<&str> = spec.split(':').collect();
-        if parts.len() < 2 {
-            bail!("Invalid volume spec '{}': expected HOST:GUEST[:ro]", spec);
-        }
+        let read_only = match parts.as_slice() {
+            [_, _] => false,
+            [_, _, "ro"] => true,
+            _ => bail!("Invalid volume spec '{}': expected HOST:GUEST[:ro]", spec),
+        };
 
         let host_path = PathBuf::from(parts[0]);
         let guest_path = parts[1].to_string();
-        let read_only = parts.len() > 2 && parts[2] == "ro";
 
         // Validate host path exists
         if !host_path.exists() {
@@ -567,6 +568,37 @@ mod tests {
 
     fn mount_point(argument: &str, guest: &str) -> (String, String) {
         (argument.to_string(), guest.to_string())
+    }
+
+    /// A spec is HOST:GUEST or HOST:GUEST:ro. Anything else after GUEST is refused,
+    /// where it used to make a read-write map.
+    #[test]
+    fn a_map_spec_takes_only_ro_after_the_guest_path() {
+        let host = tempfile::tempdir().unwrap();
+        let h = host.path().display();
+        assert!(
+            !VolumeMapping::parse(&format!("{h}:/data"))
+                .unwrap()
+                .read_only
+        );
+        assert!(
+            VolumeMapping::parse(&format!("{h}:/data:ro"))
+                .unwrap()
+                .read_only
+        );
+        for bad in [
+            format!("{h}:/data:rox"),
+            format!("{h}:/data:rw"),
+            format!("{h}:/data:ro:x"),
+        ] {
+            let Err(err) = VolumeMapping::parse(&bad) else {
+                panic!("{bad} parsed");
+            };
+            assert!(
+                format!("{err:#}").contains("expected HOST:GUEST[:ro]"),
+                "{bad}: {err:#}"
+            );
+        }
     }
 
     /// A map inside a read-only map whose mount point the host directory does

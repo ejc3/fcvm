@@ -2563,18 +2563,38 @@ unless a second scan counts exactly one more. A `same-vm` case runs fill and
 scan as two processes in one VM. `HOST_CLEAR="sudo fcvm gpu scrub <sbdf>"`
 runs the host scrub between A and B.
 
-**Measured** on 2026-10-23, g4dn.metal (T4, 15,636,037,632 bytes, `reset_method`
-`bus`), driver 580.196.07 with the open modules, the default 1 GiB guest. B
-allocated 15,521,021,952 bytes (`cudaMalloc`, `cuMemAlloc`) and 15,456,010,240
-(`cudaMallocManaged`). Each layer ran the nine cases (same-vm, exit and kill,
-each with the three allocators):
+**Measured** on 2026-10-23, g4dn.metal (T4, `reset_method` `bus`), driver
+580.196.07, the default 1 GiB guest, with both module types:
 
-| layers | marker words in B | non-zero words in B | scrub time |
-|---|---|---|---|
-| none (main) | 0 in all 9 | 0 in all 9 | none |
-| host only | 0 in all 9 | 0 in all 9 | host 1.21 to 1.24 s per scrub, wall |
-| in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 413 to 459 |
-| both | 0 in all 9 | 0 in all 9 | `scrub_ms` 401 to 450, host as above |
+- open modules (`kernel-open/`, GSP firmware booted): `cudaMemGetInfo` total
+  15,636,037,632 bytes; B allocated 15,521,021,952 bytes (`cudaMalloc`,
+  `cuMemAlloc`) and 15,456,010,240 (`cudaMallocManaged`);
+- proprietary modules with `NVreg_EnableGpuFirmware=0`, the amd64 default since
+  #1149 (in the guest, `/proc/driver/nvidia/version` reads "NVIDIA UNIX x86_64
+  Kernel Module" and `/proc/driver/nvidia/params` `EnableGpuFirmware: 0`):
+  `cudaMemGetInfo` total 15,828,320,256 bytes; B allocated 15,713,959,936 and
+  15,648,948,224 bytes, 184 MiB more, since no GSP firmware is resident. No scrub and host only ran 2cb12514 (#1149 merged, before
+  the scrub); in-guest only, both, and the host scrub ran 65122f8c (#1158 merged).
+  The box was a fresh one for this run alone, checked before and after each
+  matrix: CPU 98.97 to 100 percent idle over 5 s, no process holding a VFIO
+  group, no fcvm or Firecracker left between runs; the 1-minute load average
+  read 6.33 before the first matrix (a build had finished 2 minutes earlier)
+  and 1.04 to 2.45 after it.
+
+Each layer ran the nine cases (same-vm, exit and kill, each with the three
+allocators). The host scrub runs between two VMs, so it acted on the six exit
+and kill cases; same-vm is one VM and has no host step:
+
+| modules | layers | marker words in B | non-zero words in B | scrub time |
+|---|---|---|---|---|
+| open | none | 0 in all 9 | 0 in all 9 | none |
+| open | host only | 0 in all 9 | 0 in all 9 | host 1.21 to 1.24 s per scrub, wall |
+| open | in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 413 to 459 |
+| open | both | 0 in all 9 | 0 in all 9 | `scrub_ms` 401 to 450, host as above |
+| proprietary | none | 0 in all 9 | 0 in all 9 | none |
+| proprietary | host only | 0 in all 9 | 0 in all 9 | host 1.22 to 1.24 s per scrub, wall |
+| proprietary | in-guest only | 0 in all 9 | 0 in all 9 | `scrub_ms` 280 to 328 |
+| proprietary | both | 0 in all 9 | 0 in all 9 | `scrub_ms` 282 to 322, host 1.21 to 1.24 s |
 
 Nothing was found even without either layer: on this driver a later process
 of the same VM also gets zeroed memory, and the GPU runs its own clear after
@@ -2584,18 +2604,21 @@ another way, which is why both layers stay.
 
 Costs:
 
-- In the guest, one T4: `scrub_ms` 410 to 447 over six restores, and `gpu_ms`
-  1,693 to 1,846 against 1,277 to 1,647 on main. Inside the tool (347 to 401
-  ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99, zeroing 15.5 GB 64
-  to 73, free 31 to 37, context destroy about 90.
-- Two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
+- In the guest, one T4, open modules: `scrub_ms` 410 to 447 over six restores,
+  and `gpu_ms` 1,693 to 1,846 against 1,277 to 1,647 without the scrub. Inside
+  the tool (347 to 401 ms): `cuInit` 47 to 68, context 75 to 87, alloc 3 to 99,
+  zeroing 15.5 GB 64 to 73, free 31 to 37, context destroy about 90.
+- In the guest, one T4, proprietary modules: `scrub_ms` 283 to 291 over six
+  restores, and `gpu_ms` 970 to 1,012 against 681 to 804 without the scrub (15
+  restores of 2cb12514).
+- Open modules, two T4s in one VM: 632 to 646 ms. Eight in the 1 GiB guest (two at a time):
   2,609 to 2,674 ms, `gpu_ms` 11,798 to 11,834 against 9,249 on main. Before
   the contexts were bounded, eight at once OOM-killed the scrub and the guest.
-- On the host: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
+- On the host, open modules: 1,178 to 1,212 ms per T4 over 17 scrubs (reset 179 to 188, boot
   95 to 103, clear 872 to 904); all eight GPUs at once, 1.23 s wall.
   gpu-admin-tools took 1.46 s for the same on one T4.
 
-Which layer: the in-guest scrub is on every restore's critical path (about
+Which layer: the in-guest scrub is on every restore's critical path (0.3 to
 0.4 s per GPU, and guest memory for a context) and holds whatever happened
 before the VM started. The host scrub is off the critical path (between
 tenants), confirms through the GPU's own registers that its memory was

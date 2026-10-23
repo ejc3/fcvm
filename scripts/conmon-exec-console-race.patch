@@ -1,0 +1,71 @@
+conmon: accept the console when the runtime exits before the loop sees it
+
+For `exec -t`, the runtime connects to the console socket and sends the
+terminal before it exits. conmon accepts that connection from a main-loop
+callback, and quits the loop from runtime_exit_cb when it reaps the runtime.
+The two can be dispatched from different polls: a callback that reaps
+children (the initial child check, or a SIGCHLD from the exec'd process,
+which is reparented to conmon and can exit first) runs waitpid() after the
+poll that scheduled it. When the runtime connects and exits in between,
+runtime_exit_cb quits the loop with the connection still queued, and conmon
+exits with "Runtime did not set up terminal" without writing to the sync
+pipe. podman then reports `container create failed (no logs from conmon):
+conmon bytes ""` for an exec whose process already ran.
+
+After the loop, if the runtime succeeded and no terminal was received, take
+a connection that is already queued on the console socket.
+
+Carried by fcvm (issue #841). The race is still present in upstream conmon
+main, which since 05eff515 reports the same failure on the sync pipe.
+
+--- a/src/conmon.c
++++ b/src/conmon.c
+@@ -23,6 +23,7 @@
+ 
+ #include <sys/stat.h>
+ #include <locale.h>
++#include <poll.h>
+ 
+ static void disconnect_std_streams(int dev_null_r, int dev_null_w)
+ {
+@@ -340,8 +341,9 @@
+ 	if (seccomp_listener != NULL)
+ 		g_unix_fd_add(seccomp_socket_fd, G_IO_IN, seccomp_accept_cb, csname);
+ 
++	guint console_watch = 0;
+ 	if (csname != NULL) {
+-		g_unix_fd_add(console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
++		console_watch = g_unix_fd_add(console_socket_fd, G_IO_IN, terminal_accept_cb, csname);
+ 		/* Process any SIGCHLD we may have missed before the signal handler was in place.  */
+ 		if (!opt_exec || !opt_terminal || container_status < 0) {
+ 			GHashTable *exit_status_cache = g_hash_table_new_full(g_int_hash, g_int_equal, g_free, g_free);
+@@ -385,6 +387,29 @@
+ 		nexitf("Failed to create container: exit status %d", get_exit_status(runtime_status));
+ 	}
+ 
++	/*
++	 * The runtime connects to the console socket and sends the terminal
++	 * before it exits, but the main loop can still quit without accepting
++	 * it. Any callback that reaps children (the initial child check, or a
++	 * SIGCHLD from an exec'd process that exited and was reparented to us)
++	 * calls waitpid() after the poll that scheduled it. If the runtime
++	 * connected and exited in between, runtime_exit_cb quits the loop while
++	 * the connection sits in the listen queue, unseen by that poll. Accept
++	 * it now rather than failing an exec whose process already ran.
++	 */
++	if (opt_terminal && mainfd_stdout == -1 && console_watch != 0) {
++		struct pollfd pending = {.fd = console_socket_fd, .events = POLLIN};
++		int ready;
++		do
++			ready = poll(&pending, 1, 0);
++		while (ready < 0 && errno == EINTR);
++		if (ready > 0) {
++			ndebug("accepting the console after the runtime exited");
++			g_source_remove(console_watch);
++			terminal_accept_cb(console_socket_fd, G_IO_IN, csname);
++		}
++	}
++
+ 	if (opt_terminal && mainfd_stdout == -1)
+ 		nexit("Runtime did not set up terminal");
+ 
