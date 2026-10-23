@@ -6,7 +6,7 @@
 // which holds it until the Turnstile check passes when the coordinator asks for one.
 
 import { useEffect, useRef, useState } from "react";
-import type { WallView } from "../../core/index.ts";
+import { wordArgs, type WallView } from "../../core/index.ts";
 import { TurnstileWidget } from "./Turnstile.tsx";
 import type { WallClient } from "./wall-client.ts";
 
@@ -102,7 +102,7 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
             e.preventDefault();
             const text = word.trim();
             if (text === "") return;
-            client.act("word", { text });
+            client.act("word", wordArgs(text, client.getState().ui.textStyle));
             setWord("");
           }}
         >
@@ -124,6 +124,22 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
             {p.word.submit}
           </button>
         </form>
+        <fieldset className="styles" data-testid="text-style">
+          <legend>{p.word.style.legend}</legend>
+          {p.word.style.options.map((o) => (
+            <label key={o.value} className={`style-option${o.selected ? " selected" : ""}`} data-testid={`text-style-${o.value}`}>
+              <input
+                type="radio"
+                name="text-style"
+                value={o.value}
+                checked={o.selected}
+                onChange={() => client.ui({ textStyle: o.value })}
+              />
+              <img src={o.thumb} alt={o.alt} width={96} height={54} />
+              <span>{o.label}</span>
+            </label>
+          ))}
+        </fieldset>
         <p className={`word-status ${p.word.statusKind}`} role="status" data-testid="word-status">
           {p.word.status}
         </p>

@@ -357,6 +357,26 @@ test("the text check refuses a word, and the page says so", async ({ page }) => 
   expect(st.state.scene.words.some((w) => w.text === "forbidden")).toBe(false);
 });
 
+test("the sender picks how the message is drawn: Skywriting, with the keyboard", async ({ page }) => {
+  await openWall(page, 15);
+  await page.getByTestId("play").click();
+  const lockup = page.getByRole("radio", { name: "Lockup" });
+  await expect(lockup).toBeChecked();
+  await expect(page.getByTestId("text-style-lockup").locator("img")).toHaveJSProperty("complete", true);
+  expect(await page.getByTestId("text-style").locator("img").evaluateAll((imgs) => imgs.map((i) => (i as HTMLImageElement).naturalWidth))).toEqual([320, 320, 320]);
+  // Arrow keys move between the three, as in any radio group.
+  await lockup.focus();
+  await page.keyboard.press("ArrowRight");
+  await expect(page.getByRole("radio", { name: "Skywriting" })).toBeChecked();
+  await page.getByLabel("Write a word into the world").fill("smoke");
+  await page.keyboard.press("Enter");
+  await expect(page.getByTestId("word-status")).toHaveText("“smoke” is in the world");
+  const sent = await page.evaluate(() => window.__fleet!.client.getState().accepted!.actions.filter((a) => a.name === "word" && a.args?.["text"] === "smoke").at(-1)!.args);
+  expect(sent).toEqual({ text: "smoke", text_style: "skywriting" });
+  const st = (await mockState()).state as unknown as { scene: { words: { text: string; text_style: string }[] } };
+  expect(st.scene.words.find((w) => w.text === "smoke")!.text_style).toBe("skywriting");
+});
+
 test("viewers choose the directed camera's next stop", async ({ page }) => {
   await openWall(page, 15);
   await page.getByTestId("play").click();
@@ -961,7 +981,14 @@ test("phone: the image full width, the two bars, one button, and a hint to turn 
   await expect(page.getByTestId("scoreboard")).toBeVisible();
   await expect(page.getByTestId("bar-fcvm")).toBeVisible();
   await expect(page.getByTestId("bar-ec2")).toBeVisible();
-  await expect(page.locator(".phone button:visible")).toHaveCount(1);
+  // One button; Play is a text link under it.
+  await expect(page.locator(".phone .btn:visible")).toHaveCount(1);
+  await page.getByTestId("phone-play").click();
+  await expect(page.getByTestId("drawer")).toBeVisible();
+  await page.getByTestId("text-style-landmark").click();
+  await expect(page.getByRole("radio", { name: "Landmark" })).toBeChecked();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth)).toBeLessThanOrEqual(0);
+  await page.getByRole("button", { name: "Close" }).click();
   await expect(page.getByTestId("restart-all")).toBeVisible();
   await expect(page.getByTestId("rotate-hint")).toHaveText("Turn your phone sideways for a bigger picture.");
   const overflow = await page.evaluate(() => document.documentElement.scrollWidth - window.innerWidth);

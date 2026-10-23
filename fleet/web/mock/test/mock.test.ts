@@ -113,6 +113,19 @@ describe("mock coordinator", () => {
     c.ws.close();
   });
 
+  it("keeps each word's style, Lockup when none is sent, and refuses a style it does not know", async () => {
+    const c = await live();
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-1", name: "word", args: { text: "smoke", text_style: "skywriting" } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-2", name: "word", args: { text: "plain" } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ws-3", name: "word", args: { text: "odd", text_style: "neon" } }));
+    await c.next(() => c.msgs.filter((m) => m["type"] === "receipt").length === 3);
+    const words = coord.fleetState().scene.words;
+    expect(words.find((w) => w.text === "smoke")).toMatchObject({ text_style: "skywriting" });
+    expect(words.find((w) => w.text === "plain")).toMatchObject({ text_style: "lockup" });
+    expect(c.msgs.find((m) => m["id"] === "ws-3")).toMatchObject({ outcome: "refused", reason: "text_style is lockup, skywriting or landmark" });
+    c.ws.close();
+  });
+
   it("refuses the test word", async () => {
     const c = await live();
     c.ws.send(JSON.stringify({ type: "intent", id: "w-bad", name: "word", args: { text: "forbidden" } }));

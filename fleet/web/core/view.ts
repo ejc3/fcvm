@@ -444,6 +444,20 @@ function sleepView(st: FleetState, srvNow: number): SleepView | null {
 
 export const WORD_MAX = 28;
 
+/** How a viewer's message is drawn in the sky. The wire values are the coordinator's `text_style`. */
+export type TextStyle = "lockup" | "skywriting" | "landmark";
+
+export const TEXT_STYLES: readonly { value: TextStyle; label: string; thumb: string; alt: string }[] = [
+  { value: "lockup", label: "Lockup", thumb: "/text-styles/lockup.jpg", alt: "The message set as type above the clock, upper left" },
+  { value: "skywriting", label: "Skywriting", thumb: "/text-styles/skywriting.jpg", alt: "The message written in smoke in the sky" },
+  { value: "landmark", label: "Landmark", thumb: "/text-styles/landmark.jpg", alt: "The message on a sign standing on the ground" },
+];
+
+/** The arguments of a word intent: the text and the style its sender picked. */
+export function wordArgs(text: string, style: TextStyle): { text: string; text_style: TextStyle } {
+  return { text, text_style: style };
+}
+
 export interface PlayView {
   title: string;
   close: string;
@@ -453,7 +467,16 @@ export interface PlayView {
     options: { id: string; label: string; votes: string; holding: boolean; chosen: boolean }[];
     disabled: boolean;
   } | null;
-  word: { label: string; placeholder: string; submit: string; maxLength: number; status: string; statusKind: "idle" | "pending" | "applied" | "refused" };
+  word: {
+    label: string;
+    placeholder: string;
+    submit: string;
+    maxLength: number;
+    status: string;
+    statusKind: "idle" | "pending" | "applied" | "refused";
+    /** The three ways to draw it, one picked (Lockup unless the viewer chose another). */
+    style: { legend: string; options: { value: TextStyle; label: string; thumb: string; alt: string; selected: boolean }[] };
+  };
   light: { label: string; on: boolean };
   timeOfDay: { label: string; value: number; min: number; max: number; step: number; valueText: string };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
@@ -524,7 +547,15 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
     title: "Play",
     close: "Close",
     nudge,
-    word: { label: "Write a word into the world", placeholder: "a word", submit: "Write", maxLength: WORD_MAX, status: wordStatus, statusKind },
+    word: {
+      label: "Write a word into the world",
+      placeholder: "a word",
+      submit: "Write",
+      maxLength: WORD_MAX,
+      status: wordStatus,
+      statusKind,
+      style: { legend: "How it is drawn", options: TEXT_STYLES.map((o) => ({ ...o, selected: o.value === s.ui.textStyle })) },
+    },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
     timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod) },
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
@@ -1127,7 +1158,8 @@ export interface WallView {
   score: ScoreView | null;
   labels: StageLabels;
   play: PlayView | null;
-  playButton: { label: string; open: boolean };
+  /** The phone's way into the Play drawer: a text link under its one button. */
+  playButton: { label: string; open: boolean; phoneLabel: string };
   pause: { label: string; on: boolean };
   feed: FeedItem[];
   counter: CounterView | null;
@@ -1237,7 +1269,7 @@ export function wallView(input: WallInput): WallView {
     version: s.version,
     online,
     banners,
-    playButton: { label: "Play", open: s.ui.drawer },
+    playButton: { label: "Play", open: s.ui.drawer, phoneLabel: "Play: write a word in the sky, drop a light" },
     pause: { label: s.ui.paused ? "Resume" : "Pause", on: s.ui.paused },
     help: "Click a square to look at its VM.",
     rotateHint: "Turn your phone sideways for a bigger picture.",

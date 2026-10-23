@@ -322,3 +322,14 @@ h1, h2, h3, p { margin: 0; }
 @media (prefers-reduced-motion: reduce) {
   .reel video, .reel.leaving video { transition: none; }
 }
+
+/* ---- message style ------------------------------------------------------------------ */
+
+.drawer .styles { border: 0; margin: 4px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.drawer .styles legend { font-size: 14px; color: var(--muted); margin-bottom: 6px; padding: 0; }
+.style-option { position: relative; display: flex; flex-direction: column; gap: 4px; min-height: 44px; padding: 4px; border: 1px solid var(--control); border-radius: 8px; cursor: pointer; font-size: 14px; }
+.style-option img { width: 100%; height: auto; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 4px; display: block; }
+.style-option input { position: absolute; opacity: 0; width: 1px; height: 1px; }
+.style-option.selected { border-color: var(--fcvm); background: #1d2a36; }
+.style-option:focus-within { outline: 2px solid var(--fcvm); outline-offset: 2px; }
+.phone .play-link { margin: 0 16px; }

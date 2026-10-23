@@ -96,6 +96,8 @@ export interface UiState {
   suspended: boolean;
   /** The recording is on screen (from asleep until the live image has replaced it). */
   reelOn: boolean;
+  /** How this viewer's next message is drawn. */
+  textStyle: "lockup" | "skywriting" | "landmark";
 }
 
 /** A tab hidden this long stops its frame streams; the coordinator socket stays. */
@@ -242,6 +244,7 @@ export function initialState(): ClientState {
       hiddenSince: null,
       suspended: false,
       reelOn: false,
+      textStyle: "lockup",
     },
   };
 }

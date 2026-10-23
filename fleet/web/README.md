@@ -5,7 +5,10 @@ left and EC2 on the right, each side as wide as the GPUs it has live, live from 
 dashboard: the image sits letterboxed between the race (a countdown to the next restart
 and two bars, fcvm against EC2) and one button, "Restart all N GPUs". Everything else
 (the camera's next stop, words, lights, the time of day, how the streams arrive, stream
-stats) is in the Play drawer. A viewer can also borrow one of the wall's GPUs for a
+stats) is in the Play drawer, where the sender of a word also picks how it is drawn:
+Lockup (type above the clock), Skywriting (smoke in the sky) or Landmark (a sign on the
+ground). The three thumbnails are crops of the renderer's `shots/text-styles.jpg` (#1178,
+commit cb3eb357), in `public/text-styles/`. A viewer can also borrow one of the wall's GPUs for a
 minute. It runs against a mock fleet (`mock/`) until the coordinator and renderers are
 deployed.
 
@@ -345,6 +348,14 @@ yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` ma
   `hosts` and `last_wake` are this page's reading. Without `power` the fleet is awake.
 - `{"type": "visibility", "visible": bool}` from the page; `viewers.count` counts visible tabs.
 - `/media/wall-reel.json: {recorded_at, duration_s, measured: {gpus, fcvm_ms, ec2_ms} | null}`.
+- `word {text, text_style}`: the sender picks how their message is drawn, `lockup` (the
+  default when absent), `skywriting` or `landmark`; the mock refuses any other value and
+  keeps the style with the word in `scene.words[]`. The renderer (#1178, PROTOCOL.md "Text
+  styles") reads a different shape today: one `text_style` for the whole scene, with the
+  values `classic` (its default), `lockup`, `skywriting` and `inworld`. So the coordinator
+  has to map `landmark` to `inworld` and carry the newest word's style into the scene's
+  `text_style` (the renderer draws the newest word only), or the renderer has to take a
+  per-word style. Neither PR defines it yet.
 
 The wall no longer sends camera drags or `set_auto_relaunch`: the camera is directed,
 with nudges, and the owner's cadence replaces the viewer setting. A dropped light is

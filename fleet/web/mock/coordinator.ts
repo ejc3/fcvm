@@ -228,7 +228,7 @@ export class MockCoordinator {
   private wss: WebSocketServer;
   private camera: CameraKey[] = [{ t: 0, x: 0, y: 0, zoom: 1 }];
   private timeOfDay = 0.42;
-  private words: { text: string; t: number; pos: { x: number; y: number } }[] = [];
+  private words: { text: string; t: number; pos: { x: number; y: number }; text_style: string }[] = [];
   private lights: { pos: { x: number; y: number }; world: Vec3; color: [number, number, number]; t: number }[] = [];
   private race: Race | null = null;
   private races: { fcvm_ms: number; ec2_ms: number; wait_ms: number; fcvm_gpus: number; ec2_gpus: number }[] = [];
@@ -405,7 +405,7 @@ export class MockCoordinator {
         epoch_unix_ms: this.opts.epochUnixMs,
         camera: this.camera.map((k) => ({ t: k.t, pos: [k.x, k.y, 0], look: [k.x, k.y, -10], fov_deg: 60 / k.zoom, x: k.x, y: k.y, zoom: k.zoom, ...(k.intent ? { intent: k.intent } : {}) })),
         time_of_day: this.timeOfDay,
-        words: this.words.map((w) => ({ text: w.text, t: w.t })),
+        words: this.words.map((w) => ({ text: w.text, t: w.t, text_style: w.text_style })),
         lights: this.lights.map((l) => ({ pos: l.world, color: l.color, t: l.t })),
       },
       image_aspect: IMAGE_ASPECT,
@@ -593,6 +593,9 @@ export class MockCoordinator {
       }
       case "word": {
         const text = typeof args["text"] === "string" ? args["text"].replace(/\s+/g, " ").trim() : "";
+        // The sender's style: lockup unless they picked another.
+        const style = args["text_style"] ?? "lockup";
+        if (style !== "lockup" && style !== "skywriting" && style !== "landmark") return this.refuse(c, "text_style is lockup, skywriting or landmark");
         await new Promise((r) => setTimeout(r, this.opts.checkMs));
         if (text.length === 0 || text.length > 28) return this.refuse(c, "a word is 1 to 28 characters");
         const bad = !/^[A-Za-z0-9 .,!?'-]+$/.test(text) || this.opts.refusedWords.some((w) => text.toLowerCase().includes(w.toLowerCase()));
@@ -603,7 +606,7 @@ export class MockCoordinator {
         const ang = k * 2.4;
         const rad = 0.25 + 0.12 * (k % 4);
         const pos = { x: (cam["x"] ?? 0) + Math.cos(ang) * rad * 1.6, y: (cam["y"] ?? 0) + Math.sin(ang) * rad - 0.1 };
-        this.words = [...this.words, { text, t, pos }].slice(-16);
+        this.words = [...this.words, { text, t, pos, text_style: style }].slice(-16);
         return this.committed(c, `word ${JSON.stringify(text)}`);
       }
       case "light": {

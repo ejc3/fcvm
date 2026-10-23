@@ -564,6 +564,11 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
           <p className="rotate-hint" data-testid="rotate-hint">
             {view.rotateHint}
           </p>
+          {view.play ? (
+            <button type="button" className="link play-link" data-testid="phone-play" aria-expanded={view.playButton.open} onClick={() => client.ui({ drawer: true, lightMode: false })}>
+              {view.playButton.phoneLabel}
+            </button>
+          ) : null}
           <div className="dock">{restart}</div>
         </div>
       ) : (

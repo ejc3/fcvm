@@ -3,6 +3,8 @@ import * as fmt from "../format.ts";
 import { initialState, makeIntent, reduce, type ClientState, type FrameStats } from "../store.ts";
 import {
   BORROW_FADE_MS,
+  TEXT_STYLES,
+  wordArgs,
   REPOSITORY_URL,
   isolationView,
   REDUCED_MOTION_DARK_FADE_MS,
@@ -766,5 +768,29 @@ describe("re-tiling: each side as wide as the GPUs it has", () => {
     s = snap(s, 2, g2);
     const v = view(s, EPOCH);
     expect(v.plan.aggregated[0]!.box!.w / v.layout!.image.w).toBeCloseTo(0.75, 2);
+  });
+});
+
+describe("the style of a message", () => {
+  it("offers Lockup, Skywriting and Landmark with thumbnails, Lockup picked until the viewer picks another", () => {
+    let s = stateWith(fleet());
+    let st = view(s, EPOCH).play!.word.style;
+    expect(st.options.map((o) => [o.value, o.label, o.selected])).toEqual([
+      ["lockup", "Lockup", true],
+      ["skywriting", "Skywriting", false],
+      ["landmark", "Landmark", false],
+    ]);
+    expect(st.options.every((o) => o.thumb.startsWith("/text-styles/") && o.alt.length > 0)).toBe(true);
+    s = reduce(s, { type: "ui", patch: { textStyle: "skywriting" } });
+    st = view(s, EPOCH).play!.word.style;
+    expect(st.options.filter((o) => o.selected).map((o) => o.value)).toEqual(["skywriting"]);
+  });
+
+  it("puts the choice in the word intent", () => {
+    for (const { value } of TEXT_STYLES) {
+      const intent = makeIntent("w", "word", wordArgs("hello", value));
+      expect(intent.args).toEqual({ text: "hello", text_style: value });
+    }
+    expect(JSON.parse(JSON.stringify(makeIntent("w", "word", wordArgs("hi", "landmark"))))).toEqual({ type: "intent", id: "w", name: "word", args: { text: "hi", text_style: "landmark" } });
   });
 });
