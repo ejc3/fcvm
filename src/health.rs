@@ -157,6 +157,7 @@ pub fn spawn_health_monitor_full(
                 pid,
                 &mut last_failure_log,
                 &mut skip_podman_healthcheck,
+                startup_tx.is_some(),
             )
             .await;
             let check_duration = check_start.elapsed();
@@ -368,6 +369,93 @@ fn user_cmd_prefix(name: &str, user_spec: Option<&str>) -> Vec<String> {
 /// warning, so the exit code alone does not decide it: podman's message does.
 fn container_not_created_yet(code: i32, stderr: &str) -> bool {
     code == 125 && (stderr.contains("no such container") || stderr.contains("no such object"))
+}
+
+/// Check if the container is running now, via podman inspect over exec. Used only before
+/// a startup snapshot (see `check_health_once`): the start notification says the
+/// container started, not that it is still running.
+///
+/// Returns:
+/// - `true` = container is running
+/// - `false` = container not running yet (or inspect failed)
+async fn check_container_running(
+    pid: u32,
+    username: Option<&str>,
+    user_spec: Option<&str>,
+) -> bool {
+    let exe = match find_fcvm_binary() {
+        Some(e) => e,
+        None => return false, // Can't find fcvm binary
+    };
+
+    // Build the command to run inside the VM.
+    // With --user, podman runs as the target user (rootless), so we need runuser.
+    let mut cmd_args: Vec<String> = vec![
+        "exec".into(),
+        // Quiet: health-monitor subprocess. A benign "stream closed before exit" race
+        // during teardown is downgraded to debug for quiet callers (#607); user-invoked
+        // execs still surface a visible error.
+        "--quiet".into(),
+        "--pid".into(),
+        pid.to_string(),
+        "--vm".into(),
+        "--".into(),
+    ];
+    if let Some(name) = username {
+        cmd_args.extend(user_cmd_prefix(name, user_spec));
+    }
+    cmd_args.extend([
+        "podman".into(),
+        "inspect".into(),
+        "--format".into(),
+        "{{.State.Running}}".into(),
+        "fcvm-container".into(),
+    ]);
+
+    let child = match tokio::process::Command::new(&exe)
+        .args(&cmd_args)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            debug!(target: "health-monitor", error = %e, "podman inspect spawn failed");
+            return false;
+        }
+    };
+
+    let output =
+        match tokio::time::timeout(HEALTH_CHECK_EXEC_TIMEOUT, child.wait_with_output()).await {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                debug!(target: "health-monitor", error = %e, "podman inspect exec failed");
+                return false;
+            }
+            Err(_) => {
+                debug!(target: "health-monitor", "podman inspect exec timed out");
+                return false;
+            }
+        };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
+        // Exit code 125 = container not found (expected during startup).
+        // Any other failure is unexpected and worth warning about.
+        let code = output.status.code().unwrap_or(-1);
+        if container_not_created_yet(code, &stderr) {
+            debug!(target: "health-monitor", "waiting for container to be created");
+        } else {
+            warn!(target: "health-monitor", stderr = %stderr, code, "podman inspect failed");
+        }
+        return false;
+    }
+
+    let running = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    debug!(target: "health-monitor", running = %running, "container running status");
+
+    running == "true"
 }
 
 /// Check podman healthcheck status by exec'ing into VM.
@@ -618,6 +706,7 @@ async fn check_health_once(
     pid: Option<u32>,
     last_failure_log: &mut Option<Instant>,
     skip_podman_healthcheck: &mut bool,
+    confirm_running: bool,
 ) -> Result<(HealthStatus, Option<i32>)> {
     let (health_status, exit_code) = if let Some(pid) = pid {
         // First check if Firecracker process is still running
@@ -666,6 +755,22 @@ async fn check_health_once(
                     match read_container_start(&paths::vm_runtime_dir(vm_id)) {
                         ContainerStart::NotYet => {
                             debug!(target: "health-monitor", "waiting for the container start notification");
+                            HealthStatus::Unknown
+                        }
+                        // A Healthy that triggers a startup snapshot (`podman prepare`)
+                        // also needs the container running now. A container that exits
+                        // right after it starts is reported started before its exit
+                        // reaches the host, and must not be snapshotted as healthy.
+                        ContainerStart::Running { .. }
+                            if confirm_running
+                                && !check_container_running(
+                                    pid,
+                                    state.config.username.as_deref(),
+                                    state.config.user.as_deref(),
+                                )
+                                .await =>
+                        {
+                            debug!(target: "health-monitor", "container started but is not running now");
                             HealthStatus::Unknown
                         }
                         ContainerStart::Running { healthcheck: false } => {
@@ -865,6 +970,7 @@ pub async fn run_health_check_once(
         pid,
         &mut last_failure_log,
         &mut skip_podman_healthcheck,
+        false,
     )
     .await?;
     // Update state file atomically (lock held across read-modify-write)
