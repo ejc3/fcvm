@@ -35,10 +35,12 @@ while [ $# -gt 0 ]; do
     shift
 done
 echo "start $name $$ $(date +%s%N)" >> "$log"
+# fcvm names the GPU it attaches on every run, failed or not.
+echo "2026-10-23T00:00:00.000000Z  INFO fcvm::commands::podman: attaching GPU $gpu" >&2
 printf '%s\n' "${argv[@]}" > "$dir/args-$name"
 if [ -n "${FAKE_FAIL_START:-}" ]; then
     if [ "$FAKE_FAIL_START" = gpu ]; then
-        echo "[fake fcvm] GPU $gpu did not come back from its reset" >&2
+        echo "2026-10-23T00:00:00.000000Z ERROR fcvm: Error: GPU $gpu did not come back from its reset" >&2
     else
         echo "[fake fcvm] the restore failed" >&2
     fi

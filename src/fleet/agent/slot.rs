@@ -292,6 +292,18 @@ fn renderer_body(
 }
 
 /// The last lines of a process's output, for an error message.
+/// Does a relaunch failure blame the GPU? Its reason names the GPU's address (it is still
+/// held, it did not come back), or one of fcvm's error lines does. fcvm's other lines name
+/// the GPU on every run (the device it attaches), so they say nothing about the failure.
+pub fn names_gpu(error: &str, sbdf: &str) -> bool {
+    let (why, said) = error.split_once("; fcvm said: ").unwrap_or((error, ""));
+    why.contains(sbdf)
+        || said
+            .lines()
+            .filter(|l| l.contains(" ERROR ") || l.contains("Error:"))
+            .any(|l| l.contains(sbdf))
+}
+
 fn tail(b: &[u8]) -> String {
     let s = String::from_utf8_lossy(b);
     let lines: Vec<&str> = s.lines().rev().take(5).collect();
@@ -412,7 +424,7 @@ pub async fn supervise(
                     }
                     // A failure that names the GPU, or attaches failing several times in a
                     // row, takes it out.
-                    if e.contains(&ctx.sbdf) || fails >= ctx.cfg.quarantine_after {
+                    if names_gpu(&e, &ctx.sbdf) || fails >= ctx.cfg.quarantine_after {
                         ctx.report(
                             "failed",
                             want.generation,
@@ -690,6 +702,23 @@ async fn relaunch(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_an_error_line_or_the_reason_blames_the_gpu() {
+        let info = "fcvm exited (exit status: 1) before the renderer's first frame; fcvm said: \
+            2026-10-23T09:49:15Z  INFO fcvm::commands::podman: attaching GPU 0000:e8:00.0\n\
+            2026-10-23T09:49:15Z ERROR fcvm: Error: Bridged/routed networking requires root";
+        assert!(
+            !names_gpu(info, "0000:e8:00.0"),
+            "a config error is not the GPU's"
+        );
+        let gpu = "fcvm exited; fcvm said: 2026-10-23T09:49:15Z ERROR fcvm: Error: GPU 0000:e8:00.0 did not come back from its reset";
+        assert!(names_gpu(gpu, "0000:e8:00.0"));
+        assert!(names_gpu(
+            "GPU 0000:e8:00.0 (/dev/vfio/88) is still held by pid [7]",
+            "0000:e8:00.0"
+        ));
+    }
 
     #[test]
     fn frame_url_brackets_ipv6_literals() {

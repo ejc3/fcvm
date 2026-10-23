@@ -83,6 +83,7 @@ pub async fn run(args: FleetAgentArgs) -> Result<()> {
         (None, true) => Some(addr::from_imds().await?),
         (None, false) => None,
     };
+    addr::check_routed_user(ipv6_prefix.is_some(), nix::unistd::geteuid().is_root())?;
     let fcvm = match args.fcvm {
         Some(p) => p,
         None => std::env::current_exe().context("locating this fcvm binary")?,

@@ -63,6 +63,17 @@ pub async fn from_imds() -> Result<Prefix> {
     Prefix::parse(first)
 }
 
+/// fcvm's routed mode needs root, so an agent given a prefix must run as root; refusing at
+/// start beats every VM failing (and being retried) with the same configuration error.
+pub fn check_routed_user(routed: bool, root: bool) -> Result<()> {
+    if routed && !root {
+        bail!(
+            "--ipv6-prefix runs every VM in fcvm's routed mode, which needs root: run the agent as root"
+        );
+    }
+    Ok(())
+}
+
 /// The `fcvm podman run` arguments that put a VM at `addr` in routed mode.
 pub fn vm_args(prefix: &Prefix, addr: Ipv6Addr) -> Vec<String> {
     vec![
@@ -78,6 +89,13 @@ pub fn vm_args(prefix: &Prefix, addr: Ipv6Addr) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_routed_agent_must_be_root() {
+        assert!(check_routed_user(true, false).is_err());
+        assert!(check_routed_user(true, true).is_ok());
+        assert!(check_routed_user(false, false).is_ok());
+    }
 
     #[test]
     fn a_slot_address_is_the_gpu_index_plus_two_in_the_prefix() {
