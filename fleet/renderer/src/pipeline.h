@@ -111,6 +111,10 @@ class Pipeline {
   bool min_known_ = false;     // render thread
   long long primed_through_ = LLONG_MIN;  // render thread: the last slot drawn ahead by this frame
   static constexpr long long PRIME_MAX = 90;  // slots a tile draws ahead at most when it primes
+  static constexpr int WARM_S = 10;  // seconds a posted scene keeps the renderer drawing every slot
+  std::chrono::steady_clock::time_point warm_until_{};  // under mu_
+  bool had_streams_ = false;  // render thread: the last frame drawn had a stream
+  int warm_h_ = 540;  // render thread: the stream height to warm at (the last one streamed)
   void frame_once(double t, uint32_t frame_no);
   // overlap and encoded size of an encoder for tile g
   void enc_layout(Enc& e, const Tile& g) const;

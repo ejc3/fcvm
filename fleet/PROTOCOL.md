@@ -222,7 +222,17 @@ Then binary messages, each one access unit:
   and the following ones back to back, unsent, until it has drawn 7 and is at least a
   slot ahead of the clock (at most 90 slots), then continues on the
   clock. A tile that took more than 90% of a slot for its last frame stops
-  after 7: it cannot get ahead, and skips slots on the clock as before. Its first frame sent has all 7 behind it. The encoder opens on a
+  after 7 unless its frames are still getting faster (a GPU leaving its idle
+  clocks: 585 MHz on a T4 against 1590, about 1.5 s to full speed): it cannot
+  get ahead, and skips slots on the clock as before. Its first frame sent has
+  all 7 behind it.
+- **Warming (round 10).** A posted scene keeps the renderer drawing every
+  slot for 10 s at the height it last streamed (540 before any stream), as
+  it would for a subscriber. A tile that joins or rejoins the wall gets its
+  scene before its stream, so its GPU has left the idle clocks and, when the
+  stream asks for the height being drawn, the 7 slots before its first frame
+  are already drawn and it starts at once. A stream at another height primes
+  as above. The encoder opens on a
   second thread meanwhile, and NVENC's minimum frame size is asked once at
   start on that thread (opening a session to ask took about 250 ms on the
   render thread). Measured on a 2 x 2 grid at 270 px: priming took 111 to
