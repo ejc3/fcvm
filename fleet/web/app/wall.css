@@ -294,3 +294,30 @@ h1, h2, h3, p { margin: 0; }
   .seams, .poster, .bar-row .solid, .switch::after { transition: none; }
   .wall.arrive, .tick { animation: none; }
 }
+
+/* ---- asleep and waking ------------------------------------------------------------ */
+
+.reel { position: absolute; pointer-events: none; }
+.reel video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: 0; transition: opacity 400ms ease-out; }
+.reel video.on { opacity: 1; }
+.reel.leaving video { opacity: 0; transition: opacity 700ms ease-in-out; }
+.reel video::cue { font: 15px var(--sans); }
+.reel-play { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); display: flex; flex-direction: column; align-items: center; gap: 8px; pointer-events: auto; }
+.reel-play .note { font-size: 14px; color: var(--muted); }
+.reel-badge { position: absolute; left: 12px; top: 12px; max-width: calc(50% - 100px); display: flex; flex-direction: column; gap: 2px; font-size: 14px; color: var(--text); }
+.reel-badge .caption-line { color: var(--muted); }
+.sleep-card { position: absolute; width: min(330px, 46vw); display: flex; flex-direction: column; gap: 6px; padding: 12px 14px; border-radius: 10px; background: var(--plate); border: 1px solid var(--line); font-size: 14px; }
+.sleep-card .title { font-size: 16px; font-weight: 600; }
+.sleep-card .clock { font: 600 30px/1.1 var(--mono); font-variant-numeric: tabular-nums; color: var(--fcvm); }
+.sleep-card .line { color: var(--muted); }
+.sleep-card .steps { list-style: none; margin: 4px 0 0; padding: 0; display: grid; grid-template-columns: 14px minmax(0, 1fr) auto; gap: 4px 8px; align-items: center; }
+.sleep-card .steps li { display: contents; }
+.sleep-card .mark { width: 10px; height: 10px; border-radius: 5px; border: 2px solid var(--control); }
+.sleep-card .done .mark { background: var(--fcvm); border-color: var(--fcvm); }
+.sleep-card .partial .mark { border-color: var(--fcvm); }
+.sleep-card .waiting .label { color: var(--muted); }
+.sleep-card .v { font: 500 14px var(--mono); }
+.countdown .counter .wake { flex-basis: 100%; color: var(--dim); }
+@media (prefers-reduced-motion: reduce) {
+  .reel video, .reel.leaving video { transition: none; }
+}

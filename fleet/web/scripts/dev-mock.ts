@@ -51,7 +51,12 @@ const ready = await new Promise<{ coord: number; render: number }>((resolve) => 
 });
 
 const host = process.env.FLEET_MOCK_HOST ?? "localhost";
-const env = { ...process.env, FLEET_COORD_URL: `ws://${host}:${ready.coord}/live` };
+const env = {
+  ...process.env,
+  FLEET_COORD_URL: `ws://${host}:${ready.coord}/live`,
+  // The mock serves its generated recording; a deployment serves the real one beside the page.
+  FLEET_MEDIA_URL: process.env.FLEET_MEDIA_URL ?? `http://${host}:${ready.coord}/media`,
+};
 console.log(`mock coordinator ws://${host}:${ready.coord}/live, renderers on ${ready.render}`);
 const next = spawn(process.execPath, ["node_modules/next/dist/bin/next", prod ? "start" : "dev", "-p", process.env.FLEET_WEB_PORT!], {
   stdio: "inherit",

@@ -8,7 +8,9 @@
 // Rust); it speaks the shapes fleet/PROTOCOL.md documents for the browser, plus
 // the second design review's fields the page assumes (see core/protocol.ts).
 
+import { createReadStream, statSync } from "node:fs";
 import http from "node:http";
+import path from "node:path";
 import { WebSocketServer, type WebSocket } from "ws";
 import { DEFAULT_IMAGE_ASPECT, type Half, type Rect } from "../core/protocol.ts";
 import { cameraAt, poseAt, projectPoint, sceneT, type Vec3 } from "../core/scene.ts";
@@ -44,6 +46,12 @@ export interface CoordinatorOptions {
   turnstileSitekey: string | null;
   /** The GPU memory scrub has shipped: every GPU moving to the next VM is scrubbed and counted. */
   gpuScrub?: boolean;
+  /** With no visible viewer for this long the fleet sleeps (0: never by itself). */
+  sleepAfterSecs?: number;
+  /** How long a wake takes, from the first instance requested to every tile rendering. */
+  wakeMs?: number;
+  /** Where the recording's files are served from at /media (none: /media answers 404). */
+  mediaDir?: string;
   /** Words the fake text check refuses. */
   refusedWords: string[];
   /** Delay of the fake text check. */
@@ -88,6 +96,8 @@ const NUDGE_TARGETS: { id: string; label: string; x: number; y: number; zoom: nu
 
 interface Client {
   ws: WebSocket;
+  /** The tab is visible; hidden tabs do not count as viewers. */
+  visible: boolean;
   /** The connection's viewer id, as the coordinator gives it. */
   viewer: string;
   verified: boolean;
@@ -254,6 +264,21 @@ export class MockCoordinator {
   /** Unix ms of each restore in the last hour. */
   private restoreTimes: number[] = [];
   private gpuScrub: boolean;
+  private power: {
+    state: "asleep" | "waking" | "awake";
+    asleep_since: number | null;
+    woke_at: number | null;
+    hosts: { host: string; phases: { phase: string; at: number }[] }[];
+    last_wake: { started_at: number; awake_at: number; gpus: number } | null;
+  } = { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null };
+  /** Hosts whose tiles render again during a wake. */
+  private rendering = new Set<string>();
+  /** Tests: stay asleep whoever watches. */
+  private holdAsleep = false;
+  private idleSince: number | null = null;
+  /** The schedule's next beat, kept while the fleet sleeps. */
+  private sleptRaceAt: number | null = null;
+  private mediaMissing = false;
   /** Races already added to the scoreboard. */
   private recorded = new WeakSet<Race>();
 
@@ -403,7 +428,7 @@ export class MockCoordinator {
         rect: t.rect,
         phase: t.phase,
         slot: t.slot,
-        frame_url: t.slot ? this.opts.renderers.frameUrl(t.slot) : null,
+        frame_url: t.slot && t.phase !== "asleep" ? this.opts.renderers.frameUrl(t.slot) : null,
         gpu: t.gpu,
         host: t.host,
         vm: t.slot ? `fleet-${t.slot}` : null,
@@ -423,6 +448,7 @@ export class MockCoordinator {
         n: this.opts.perHalf,
         max_tiles: 100,
         standby: [],
+        power: this.power,
       },
       borrow: {
         cap: this.opts.borrowCap,
@@ -456,9 +482,9 @@ export class MockCoordinator {
         holding: this.nudge.holding,
         next_hold_at: this.nudge.nextHoldAt,
       },
-      viewers: { count: this.clients.size },
+      viewers: { count: [...this.clients].filter((c) => c.visible).length },
       actions: this.actions,
-      aggregates: this.aggregates.map((a) => ({ ...a, frame_url: this.opts.renderers.frameUrl(this.streamId(a.id)) })),
+      aggregates: this.aggregates.map((a) => ({ ...a, frame_url: this.aggregateUp(a) ? this.opts.renderers.frameUrl(this.streamId(a.id)) : null })),
     };
   }
 
@@ -475,7 +501,7 @@ export class MockCoordinator {
 
   private connect(ws: WebSocket): void {
     const k = this.nextViewer++;
-    const client: Client = { ws, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null };
+    const client: Client = { ws, visible: true, viewer: `v-${k + 1}`, verified: this.sitekey === null, claim: null };
     this.clients.add(client);
     this.sendTo(client, { type: "hello", viewer: client.viewer, ...(this.sitekey ? { turnstile: this.sitekey } : {}) });
     // Publish now, to everyone: a change made since the last snapshot belongs to
@@ -499,6 +525,9 @@ export class MockCoordinator {
       const m = parsed as Record<string, unknown>;
       if (m["type"] === "ping") {
         this.sendTo(client, { type: "clock", server_unix_ms: this.now(), client_unix_ms: m["client_unix_ms"] });
+      } else if (m["type"] === "visibility") {
+        client.visible = m["visible"] === true;
+        this.markDirty();
       } else if (m["type"] === "verify") {
         const ok = this.sitekey === null || m["token"] === "mock-pass";
         if (ok) client.verified = true;
@@ -851,6 +880,7 @@ export class MockCoordinator {
 
   private tick(): void {
     const now = this.now();
+    this.powerTick(now);
     if (this.nextRaceAt !== null && now >= this.nextRaceAt) {
       // Skip a beat that falls inside a running race.
       if (!this.raceRunning()) {
@@ -899,6 +929,96 @@ export class MockCoordinator {
     ];
     this.nudge = { holding: best, nextHoldAt: now + (this.opts.holdSecs + this.opts.travelSecs) * 1000, votes: new Map() };
     this.markDirty();
+  }
+
+  // ---- scaling to zero ---------------------------------------------------------------
+
+  /** An aggregate serves only while its host renders. */
+  private aggregateUp(a: { host: string | null; half: Half }): boolean {
+    if (this.power.state === "awake") return true;
+    return this.rendering.has(a.host ?? "ec2");
+  }
+
+  private powerTick(now: number): void {
+    const visible = [...this.clients].filter((c) => c.visible).length;
+    const after = (this.opts.sleepAfterSecs ?? 0) * 1000;
+    if (this.power.state === "awake" && after > 0) {
+      if (visible > 0) {
+        this.idleSince = null;
+      } else {
+        this.idleSince ??= now;
+        if (now - this.idleSince >= after) this.sleep();
+      }
+    }
+    if (this.power.state === "asleep" && visible > 0 && !this.holdAsleep) this.wake();
+  }
+
+  /** No viewers: every VM goes, the schedule waits, loans end. */
+  sleep(): void {
+    if (this.power.state !== "awake") return;
+    const now = this.now();
+    for (const c of this.clients) if (c.claim && c.claim.phase !== "ended") this.endClaim(c.claim, "The fleet went to sleep.");
+    for (const t of this.tiles) {
+      if (t.timer) clearTimeout(t.timer);
+      t.timer = null;
+      t.borrowed = null;
+      if (!t.slot) continue;
+      t.generation += 1;
+      t.phase = "asleep";
+      t.failure = null;
+      this.opts.renderers.setAvailable(t.slot, false);
+    }
+    for (const a of this.aggregates) this.opts.renderers.setAvailable(this.streamId(a.id), false);
+    this.rendering.clear();
+    this.sleptRaceAt = this.nextRaceAt;
+    this.nextRaceAt = null;
+    this.power = { ...this.power, state: "asleep", asleep_since: now, woke_at: null, hosts: [] };
+    this.idleSince = null;
+    this.markDirty();
+  }
+
+  /** A viewer arrived: each host goes through its wake phases, then its tiles render. */
+  wake(): void {
+    if (this.power.state !== "asleep") return;
+    const start = this.now();
+    const names = [...this.hosts.map((h) => h.name), "ec2"];
+    this.power = { ...this.power, state: "waking", woke_at: start, hosts: names.map((host) => ({ host, phases: [] })) };
+    const total = this.opts.wakeMs ?? 120_000;
+    const shares = [0, 0.4, 0.6, 0.72];
+    names.forEach((host, i) => {
+      const jitter = (i * 0.04) / Math.max(1, names.length - 1);
+      const at = [...shares.map((x) => x + jitter * x), 0.85 + 0.15 * (i / Math.max(1, names.length - 1))];
+      ["instance_pending", "booted", "store_ready", "agent_connected", "tiles_rendering"].forEach((phase, k) => {
+        this.later(total * at[k]!, () => {
+          if (this.power.state !== "waking" || this.power.woke_at !== start) return;
+          const h = this.power.hosts.find((x) => x.host === host)!;
+          h.phases = [...h.phases, { phase, at: this.now() }];
+          if (phase === "tiles_rendering") this.hostRenders(host);
+          this.markDirty();
+        });
+      });
+    });
+    this.markDirty();
+  }
+
+  private hostRenders(host: string): void {
+    const now = this.now();
+    this.rendering.add(host);
+    for (const t of this.tiles) {
+      const mine = host === "ec2" ? t.half === "ec2" : t.half === "fcvm" && t.host?.endsWith(host);
+      if (!mine || !t.slot || t.phase !== "asleep") continue;
+      t.phase = "running";
+      this.opts.renderers.setAvailable(t.slot, true);
+      if (t.half === "fcvm") this.countRestore(now);
+    }
+    for (const a of this.aggregates) if ((a.host ?? "ec2") === host) this.opts.renderers.setAvailable(this.streamId(a.id), true);
+    if (this.power.hosts.every((h) => h.phases.some((p) => p.phase === "tiles_rendering"))) {
+      const gpus = this.tiles.filter((t) => t.slot).length;
+      this.power = { ...this.power, state: "awake", last_wake: { started_at: this.power.woke_at!, awake_at: now, gpus } };
+      this.nextRaceAt = this.sleptRaceAt;
+      this.sleptRaceAt = null;
+      this.rendering.clear();
+    }
   }
 
   private gpuTick(): void {
@@ -1101,6 +1221,10 @@ export class MockCoordinator {
         }
       });
     };
+    if (req.method === "GET" && url.pathname.startsWith("/media/")) {
+      this.media(req, res, url.pathname.slice("/media/".length));
+      return;
+    }
     if (req.method === "GET" && url.pathname === "/poster.jpg") {
       this.posterJpeg().then(
         (jpeg) => res.writeHead(200, { "content-type": "image/jpeg", "access-control-allow-origin": "*", "cache-control": "no-store" }).end(jpeg),
@@ -1146,6 +1270,24 @@ export class MockCoordinator {
           return { ok: true };
         });
         return;
+      case "/mock/power":
+        body((b) => {
+          if (typeof b["wake_ms"] === "number") this.opts.wakeMs = b["wake_ms"];
+          if (typeof b["hold"] === "boolean") this.holdAsleep = b["hold"];
+          if (b["sleep"] === true) this.sleep();
+          if (b["wake"] === true) {
+            this.holdAsleep = false;
+            this.wake();
+          }
+          return { ok: true, state: this.power.state };
+        });
+        return;
+      case "/mock/media":
+        body((b) => {
+          this.mediaMissing = b["missing"] === true;
+          return { ok: true };
+        });
+        return;
       case "/mock/turnstile":
         body((b) => {
           this.sitekey = typeof b["sitekey"] === "string" ? b["sitekey"] : null;
@@ -1168,6 +1310,39 @@ export class MockCoordinator {
       default:
         res.writeHead(404).end();
     }
+  }
+
+  /** The recording's files, with byte ranges (a browser seeks a looping video by range). */
+  private media(req: http.IncomingMessage, res: http.ServerResponse, name: string): void {
+    const types: Record<string, string> = { ".mp4": "video/mp4", ".webm": "video/webm", ".vtt": "text/vtt", ".json": "application/json" };
+    const type = types[path.extname(name)];
+    const dir = this.opts.mediaDir;
+    const file = dir && type && /^[A-Za-z0-9._-]+$/.test(name) ? path.join(dir, name) : null;
+    let size = -1;
+    try {
+      if (file && !this.mediaMissing) size = statSync(file).size;
+    } catch {
+      size = -1;
+    }
+    const head = { "access-control-allow-origin": "*", "accept-ranges": "bytes", "cache-control": "no-store" };
+    if (!file || size < 0) {
+      res.writeHead(404, head).end();
+      return;
+    }
+    const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range ?? "");
+    if (m) {
+      const first = m[1] === "" ? Math.max(0, size - Number(m[2])) : Number(m[1]);
+      const last = m[1] !== "" && m[2] !== "" ? Math.min(size - 1, Number(m[2])) : size - 1;
+      if (first > last || first >= size) {
+        res.writeHead(416, { ...head, "content-range": `bytes */${size}` }).end();
+        return;
+      }
+      res.writeHead(206, { ...head, "content-type": type!, "content-length": last - first + 1, "content-range": `bytes ${first}-${last}/${size}` });
+      createReadStream(file, { start: first, end: last }).pipe(res);
+      return;
+    }
+    res.writeHead(200, { ...head, "content-type": type!, "content-length": size });
+    createReadStream(file).pipe(res);
   }
 
   async close(): Promise<void> {

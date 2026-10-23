@@ -65,6 +65,8 @@ export interface FrameStats {
   drawMsP95: number;
   rafMsP50: number;
   rafMsP95: number;
+  /** Every region the image draws has shown a frame (the live image is whole). */
+  allLive: boolean;
 }
 
 export type StreamMode = "direct" | "aggregated";
@@ -92,6 +94,8 @@ export interface UiState {
   hiddenSince: number | null;
   /** The frame streams are closed: the tab has been hidden for HIDDEN_PAUSE_MS. */
   suspended: boolean;
+  /** The recording is on screen (from asleep until the live image has replaced it). */
+  reelOn: boolean;
 }
 
 /** A tab hidden this long stops its frame streams; the coordinator socket stays. */
@@ -222,6 +226,7 @@ export function initialState(): ClientState {
       returning: null,
       hiddenSince: null,
       suspended: false,
+      reelOn: false,
     },
   };
 }

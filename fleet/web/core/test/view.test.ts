@@ -15,7 +15,8 @@ import {
   type WallInput,
 } from "../view.ts";
 import { suggestMode } from "../mode.ts";
-import type { Claim, FleetState, RelaunchAll } from "../protocol.ts";
+import { parseReelMeta, reelView } from "../reel.ts";
+import type { Claim, FleetState, Power, RelaunchAll } from "../protocol.ts";
 import { EPOCH, fleet, snapshotText } from "./fixtures.ts";
 
 function stateWith(st: FleetState, version = 1): ClientState {
@@ -23,7 +24,7 @@ function stateWith(st: FleetState, version = 1): ClientState {
   s = reduce(s, { type: "message", text: snapshotText(version, st), at: EPOCH });
   const tiles: FrameStats["tiles"] = {};
   for (const t of st.tiles) tiles[`d:${t.id}`] = { connected: true, fps: 24, newestT: 100, width: 320, height: 180, behind: false, decodeMs: 2 };
-  return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17 } });
+  return reduce(s, { type: "frame-stats", stats: { T: 100, tiles, drawMsP50: 1, drawMsP95: 2, rafMsP50: 16.7, rafMsP95: 17, allLive: true } });
 }
 
 function msg(s: ClientState, m: unknown, at = EPOCH): ClientState {
@@ -543,7 +544,7 @@ describe("counters and isolation", () => {
     expect(fmt.thousands(1_234_567)).toBe("1,234,567");
     expect(fmt.thousands(12)).toBe("12");
     let v = view(stateWith(fleet()), EPOCH);
-    expect(v.counter).toEqual({ label: "GPU VMs restored", value: "1,284", total: 1284, lastHour: "37 in the last hour", scrubs: "" });
+    expect(v.counter).toEqual({ label: "GPU VMs restored", value: "1,284", total: 1284, lastHour: "37 in the last hour", scrubs: "", wake: "" });
     v = view(stateWith(fleet(2, 2, { security: { gpu_scrub: true } })), EPOCH);
     expect(v.counter!.scrubs).toBe("GPU memory scrubs: 1,201");
     expect(view(stateWith(fleet(2, 2, { counters: null })), EPOCH).counter).toBeNull();
@@ -561,5 +562,108 @@ describe("counters and isolation", () => {
     const on = isolationView(fleet(2, 2, { security: { gpu_scrub: true } }));
     expect(on.sentences.at(-1)).toBe("GPU memory is cleared before a GPU moves to the next virtual machine.");
     expect(isolationView(null).sentences).toHaveLength(3);
+  });
+});
+
+describe("asleep and waking", () => {
+  const power = (p: Partial<Power>): Power => ({ state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null, ...p });
+  const sleeping = (p: Partial<Power>, over: Partial<FleetState> = {}) => {
+    const st = fleet(2, 2, over);
+    st.fleet.power = power(p);
+    for (const t of st.tiles) {
+      t.phase = "asleep";
+      t.frame_url = null;
+    }
+    return st;
+  };
+
+  it("formats dates and minutes the way the page shows them", () => {
+    expect(fmt.utcDate(Date.UTC(2026, 9, 22, 23, 14, 59))).toBe("22 Oct 2026, 23:14 UTC");
+    expect(fmt.utcDate(Date.UTC(2024, 1, 29, 0, 5))).toBe("29 Feb 2024, 00:05 UTC");
+    expect(fmt.utcDate(Date.UTC(1999, 11, 31, 9, 0))).toBe("31 Dec 1999, 09:00 UTC");
+    expect(fmt.minSec(127_900)).toBe("2:07");
+  });
+
+  it("asleep: no dark squares over the poster, the poster full size, the scores dated, the buttons waiting", () => {
+    const st = sleeping(
+      { state: "asleep", asleep_since: EPOCH - 600_000 },
+      { scoreboard: SCORES, relaunch_all: race(Date.UTC(2026, 9, 22, 23, 14), { fcvm_done_at: 1, ec2_done_at: 2 }) },
+    );
+    const v = view(stateWith(st), EPOCH);
+    expect(v.sleep).toEqual({ state: "asleep", title: "The GPUs are asleep", line: "Nobody was watching, so the fleet scaled to zero 10 min ago. It wakes when someone watches.", clock: "", steps: [] });
+    expect(v.tiles.every((t) => !t.dark)).toBe(true);
+    expect(v.plan.tiles.every((t) => !t.dark)).toBe(true);
+    expect(v.plan.posterFull).toBe(true);
+    expect(v.plan.direct).toEqual([]);
+    expect(v.score!.title).toBe("Restart time: click to the last GPU's first frame · last measured 22 Oct 2026, 23:14 UTC");
+    expect(v.score!.fcvm.value).toBe("3.0 s");
+    expect(v.score!.button).toEqual({ label: "Restart all 8 GPUs", disabled: true, note: "works once the GPUs are awake" });
+    expect(v.ownButton).toEqual({ label: "Get your own GPU", disabled: true, note: "works once the GPUs are awake" });
+    expect(v.score!.countdown.label).toBe("Restarts resume once the GPUs are awake");
+  });
+
+  it("waking: a clock since the wake began and each real phase as every host reaches it", () => {
+    const start = EPOCH;
+    const st = sleeping({
+      state: "waking",
+      woke_at: start,
+      hosts: [
+        { host: "h1", phases: [{ phase: "instance_pending", at: start + 300 }, { phase: "booted", at: start + 41_200 }] },
+        { host: "h2", phases: [{ phase: "instance_pending", at: start + 500 }] },
+      ],
+    });
+    const v = view(stateWith(st), start + 63_400);
+    expect(v.sleep!.title).toBe("Waking up the GPUs");
+    expect(v.sleep!.clock).toBe("1:03.4");
+    expect(v.sleep!.steps.map((x) => [x.label, x.state, x.value])).toEqual([
+      ["instances requested", "done", "0:00.5"],
+      ["hosts booted", "partial", "1 of 2 hosts"],
+      ["snapshot store ready", "waiting", ""],
+      ["agents connected", "waiting", ""],
+      ["tiles rendering", "waiting", ""],
+    ]);
+    // No progress bar: nothing on the card that is not a reported phase.
+    expect(Object.keys(v.sleep!)).toEqual(["state", "title", "line", "clock", "steps"]);
+  });
+
+  it("reads a fleet that does not scale to zero as awake, and shows the last wake once, as measured", () => {
+    let s = stateWith(fleet());
+    expect(s.accepted!.fleet.power.state).toBe("awake");
+    expect(view(s, EPOCH).sleep).toBeNull();
+    const st = fleet();
+    st.fleet.power = power({ last_wake: { started_at: Date.UTC(2026, 9, 22, 23, 0), awake_at: Date.UTC(2026, 9, 22, 23, 2, 7, 600), gpus: 128 } });
+    s = stateWith(st);
+    expect(view(s, EPOCH).counter!.wake).toBe("Last wake: 128 GPUs from zero in 2:07 (22 Oct 2026, 23:00 UTC)");
+  });
+});
+
+describe("the recording", () => {
+  const meta = parseReelMeta({ recorded_at: Date.UTC(2026, 9, 21, 18, 30), duration_s: 42, measured: { gpus: 16, fcvm_ms: 3100, ec2_ms: 52_000 } });
+  const base = { base: "/media", meta, power: "waking", reelOn: true, allLive: false, reducedMotion: false, saveData: false };
+
+  it("plays the MP4 with the WebM as the alternative and captions, with a badge and caption from its metadata", () => {
+    const r = reelView(base);
+    expect(r.sources).toEqual([{ src: "/media/wall-reel.mp4", type: "video/mp4" }, { src: "/media/wall-reel.webm", type: "video/webm" }]);
+    expect(r.track.src).toBe("/media/wall-reel.vtt");
+    expect(r).toMatchObject({ show: true, leaving: false, autoplay: true });
+    expect(r.badge).toBe("Recorded 21 Oct 2026, 18:30 UTC. The live wall is waking up.");
+    expect(r.caption).toBe("In this recording 16 GPUs restart: fcvm is back in 3.1 s, EC2 in 52 s.");
+    expect(reelView({ ...base, power: "asleep" }).badge).toBe("Recorded 21 Oct 2026, 18:30 UTC. The live wall is asleep; it wakes when someone watches.");
+    expect(reelView({ ...base, base: "https://example-host/media/" }).sources[0]!.src).toBe("https://example-host/media/wall-reel.mp4");
+  });
+
+  it("does not start by itself with less motion or data saving, and says nothing it was not told", () => {
+    expect(reelView({ ...base, reducedMotion: true })).toMatchObject({ autoplay: false, manualNote: "Not started by itself, as your device asks for less motion." });
+    expect(reelView({ ...base, saveData: true })).toMatchObject({ autoplay: false, manualNote: "Not started by itself, as your browser asks to save data." });
+    expect(reelView({ ...base, meta: null })).toMatchObject({ badge: "", caption: "" });
+    expect(parseReelMeta({ duration_s: 4 })).toBeNull();
+    expect(parseReelMeta("x")).toBeNull();
+  });
+
+  it("leaves only once the fleet is awake and every region of the live image has a frame", () => {
+    expect(reelView({ ...base, power: "awake", allLive: false })).toMatchObject({ show: true, leaving: false });
+    expect(reelView({ ...base, power: "waking", allLive: true })).toMatchObject({ show: true, leaving: false });
+    expect(reelView({ ...base, power: "awake", allLive: true })).toMatchObject({ show: true, leaving: true });
+    expect(reelView({ ...base, power: "awake", reelOn: false }).show).toBe(false);
   });
 });

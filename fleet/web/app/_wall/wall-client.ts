@@ -102,6 +102,15 @@ export class WallClient {
     this.worker = null;
   }
 
+  /** Whether the tab is visible: hidden tabs do not count as viewers. */
+  private visible = true;
+
+  /** Tell the coordinator whether this tab is visible (also sent on every connect). */
+  setVisible(visible: boolean): void {
+    this.visible = visible;
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send(JSON.stringify({ type: "visibility", visible }));
+  }
+
   private connect(): void {
     if (this.stopped) return;
     this.dispatch({ type: "socket", status: "connecting", at: now() });
@@ -110,6 +119,7 @@ export class WallClient {
     ws.onopen = () => {
       this.attempt = 0;
       this.dispatch({ type: "socket", status: "open", at: now() });
+      ws.send(JSON.stringify({ type: "visibility", visible: this.visible }));
       for (const intent of intentsToResend(this.state)) ws.send(JSON.stringify(intent));
       this.ping();
     };

@@ -8,6 +8,8 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
 import {
   CLICK_SLOP_PX,
+  parseReelMeta,
+  type ReelMeta,
   HIDDEN_PAUSE_MS,
   streamsSuspended,
   LONG_PRESS_MS,
@@ -30,6 +32,7 @@ import { FocusPanel } from "./FocusPanel.tsx";
 import { OwnGpu } from "./OwnGpu.tsx";
 import { Overlays } from "./Overlays.tsx";
 import { PlayDrawer, VerifyBox } from "./PlayDrawer.tsx";
+import { Reel } from "./Reel.tsx";
 import { Countdown, Scoreboard } from "./Score.tsx";
 import type { DrawSettings } from "./worker-msgs.ts";
 
@@ -49,6 +52,13 @@ function hiddenLimitMs(): number {
   const q = new URLSearchParams(window.location.search);
   const v = Number(q.get("hidden_ms"));
   return q.get("debug") === "1" && Number.isFinite(v) && v > 0 ? v : HIDDEN_PAUSE_MS;
+}
+
+/** The browser asks to save data (Chrome's Data Saver, a low-data mode). */
+function saveData(): boolean {
+  if (typeof navigator === "undefined") return false;
+  const c = (navigator as unknown as { connection?: { saveData?: unknown } }).connection;
+  return c?.saveData === true;
 }
 
 /** The browser's downlink estimate in Mbit/s, where it gives one (Chrome). */
@@ -104,13 +114,15 @@ function RestartIcon() {
   );
 }
 
-export function Wall({ coordUrl }: { coordUrl: string }) {
+export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: string }) {
   const client = useMemo(() => new WallClient(coordUrl), [coordUrl]);
   const poster = useMemo(() => posterUrl(coordUrl), [coordUrl]);
   const state = useSyncExternalStore(client.subscribe, client.getState, client.getState);
   const [now, setNow] = useState(0);
   const [canDecode, setCanDecode] = useState(true);
   const [painted, setPainted] = useState(false);
+  // The recording's metadata: null until read, or when it is missing.
+  const [reelMeta, setReelMeta] = useState<ReelMeta | null>(null);
   const [dpr, setDpr] = useState(1);
   const [viewport, setViewport] = useState({ w: 0, h: 0 });
   const [areas, setAreas] = useState<Areas>({ mosaic: null, focus: null, own: null });
@@ -141,6 +153,30 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
       off();
       client.stop();
     };
+  }, [client]);
+
+  // The recording's metadata, read once: its date and numbers are data, not text in the page.
+  useEffect(() => {
+    let gone = false;
+    fetch(`${mediaUrl.replace(/\/$/, "")}/wall-reel.json`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((j: unknown) => {
+        if (!gone) setReelMeta(parseReelMeta(j));
+      })
+      .catch(() => {
+        // No metadata: the recording plays without its badge.
+      });
+    return () => {
+      gone = true;
+    };
+  }, [mediaUrl]);
+
+  // Tell the coordinator whether this tab is visible: hidden tabs do not count as viewers.
+  useEffect(() => {
+    const send = () => client.setVisible(document.visibilityState === "visible");
+    send();
+    document.addEventListener("visibilitychange", send);
+    return () => document.removeEventListener("visibilitychange", send);
   }, [client]);
 
   // A tab hidden for HIDDEN_PAUSE_MS closes its frame streams; the coordinator
@@ -215,10 +251,19 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
         labelSize,
         budgetBps: budgetParam(),
         poster,
+        media: { base: mediaUrl, meta: reelMeta },
+        saveData: saveData(),
       }),
-    [state, now, dpr, areas, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen],
+    [state, now, dpr, areas, canDecode, phone, reducedMotion, client, avoid, labelSize, poster, ownOpen, mediaUrl, reelMeta],
   );
   viewRef.current = view;
+
+  // The recording stays on screen from the moment the fleet sleeps until the live image has replaced it.
+  const sleeping = view.sleep !== null;
+  useEffect(() => {
+    if (sleeping && !client.getState().ui.reelOn) client.ui({ reelOn: true });
+  }, [client, sleeping]);
+  const reelDone = useCallback(() => client.ui({ reelOn: false }), [client]);
 
   // After each draw of the page, measure what the next view model places around.
   useLayoutEffect(() => {
@@ -444,6 +489,13 @@ export function Wall({ coordUrl }: { coordUrl: string }) {
               ? { left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h, bottom: "auto", right: "auto" }
               : undefined
           }
+        />
+      ) : null}
+      {view.reel?.show && view.plan.image && areas.mosaic ? (
+        <Reel
+          reel={view.reel}
+          onDone={reelDone}
+          box={{ left: view.plan.image.x - areas.mosaic.x, top: view.plan.image.y - areas.mosaic.y, width: view.plan.image.w, height: view.plan.image.h }}
         />
       ) : null}
     </div>

@@ -17,6 +17,9 @@
 //   FLEET_MOCK_HOLD_S        how long the directed camera holds on a stop (20)
 //   FLEET_MOCK_TURNSTILE     a Turnstile site key: actions need the check (unset: none)
 //   FLEET_MOCK_GPU_SCRUB     1: the GPU memory scrub has shipped (counted, and said on the page)
+//   FLEET_MOCK_SLEEP_AFTER_S with no visible viewer this long the fleet scales to zero (60; 0: never)
+//   FLEET_MOCK_WAKE_MS       how long a wake takes, first instance to every tile rendering (120000)
+//   FLEET_MOCK_MEDIA_DIR     where the generated recording is kept (node_modules/.cache/fleet-mock-media)
 //   FLEET_MOCK_FPS           frames per second, a divisor of 30 (30): frames land on t = k/30 as the renderer's do
 //   FLEET_MOCK_THREADS       render threads (12)
 //   FLEET_MOCK_MAX_HEIGHT    tallest stream it will encode (1080)
@@ -27,6 +30,7 @@
 
 import { MockCoordinator } from "./coordinator.ts";
 import { MockRenderers } from "./renderer.ts";
+import { ensureReel } from "./media.ts";
 
 function env(name: string, fallback?: string): string {
   const v = process.env[name] ?? fallback;
@@ -57,6 +61,8 @@ function fps(): number {
 
 export async function startMock() {
   const epochUnixMs = Math.floor(Date.now() / 1000) * 1000;
+  const mediaDir = env("FLEET_MOCK_MEDIA_DIR", "node_modules/.cache/fleet-mock-media");
+  ensureReel(mediaDir, epochUnixMs);
   let coord: MockCoordinator | null = null;
   const renderers = new MockRenderers({
     port: int("FLEET_MOCK_RENDER_PORT"),
@@ -86,6 +92,9 @@ export async function startMock() {
     travelSecs: 4,
     turnstileSitekey: process.env.FLEET_MOCK_TURNSTILE || null,
     gpuScrub: process.env.FLEET_MOCK_GPU_SCRUB === "1",
+    sleepAfterSecs: int("FLEET_MOCK_SLEEP_AFTER_S", 60),
+    wakeMs: int("FLEET_MOCK_WAKE_MS", 120_000),
+    mediaDir,
     refusedWords: env("FLEET_MOCK_REFUSED", "forbidden").split(",").filter(Boolean),
     checkMs: 250,
     epochUnixMs,

@@ -180,6 +180,28 @@ export function Overlays({ view, phone }: { view: WallView; phone: boolean }) {
           ) : null}
         </>
       ) : null}
+      {view.sleep && img ? (
+        <div className={`sleep-card ${view.sleep.state}`} data-testid="sleep-card" style={{ right: `calc(100vw - ${img.x + img.w - 12}px)`, top: img.y + 12 }} role="status">
+          <span className="title">{view.sleep.title}</span>
+          {view.sleep.clock ? (
+            <span className="clock" data-testid="wake-clock">
+              {view.sleep.clock}
+            </span>
+          ) : null}
+          <span className="line">{view.sleep.line}</span>
+          {view.sleep.steps.length > 0 ? (
+            <ol className="steps" data-testid="wake-steps">
+              {view.sleep.steps.map((st) => (
+                <li key={st.phase} className={st.state} data-testid={`wake-${st.phase}`} data-state={st.state}>
+                  <span className="mark" aria-hidden="true" />
+                  <span className="label">{st.label}</span>
+                  <span className="v">{st.value}</span>
+                </li>
+              ))}
+            </ol>
+          ) : null}
+        </div>
+      ) : null}
       {view.banners.length > 0 ? (
         <div className="banners" role="status">
           {view.banners.map((b) => (

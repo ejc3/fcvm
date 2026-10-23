@@ -72,6 +72,9 @@ export default defineConfig({
       FLEET_MOCK_BORROW_CAP: "1",
       FLEET_MOCK_CLAIM_S: "8",
       FLEET_MOCK_HOLD_S: "600",
+      // The fleet sleeps only when a test puts it to sleep; a wake takes 6 s.
+      FLEET_MOCK_SLEEP_AFTER_S: "0",
+      FLEET_MOCK_WAKE_MS: "6000",
       FLEET_MOCK_FPS: process.env.FLEET_MOCK_FPS ?? "15",
       FLEET_MOCK_THREADS: process.env.FLEET_MOCK_THREADS ?? "12",
     },

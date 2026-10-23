@@ -151,6 +151,58 @@ export interface Host {
   draining: boolean;
 }
 
+/** The steps a host goes through when the fleet wakes, in order. */
+export const WAKE_PHASES = ["instance_pending", "booted", "store_ready", "agent_connected", "tiles_rendering"] as const;
+
+/** One host's progress through a wake: each phase it has reached, with when. */
+export interface HostWake {
+  host: string;
+  phases: { phase: string; at: number }[];
+}
+
+/**
+ * The fleet scales to zero with no viewers and wakes when one arrives.
+ * `asleep_since`, `woke_at` (when the wake began) and the per-host phases are the
+ * coordinator's; `hosts` and `last_wake` are this page's reading (assumed).
+ */
+export interface Power {
+  state: "asleep" | "waking" | "awake";
+  asleep_since: number | null;
+  woke_at: number | null;
+  hosts: HostWake[];
+  /** The last completed wake: when it began, when every GPU was rendering, how many GPUs. */
+  last_wake: { started_at: number; awake_at: number; gpus: number } | null;
+}
+
+function parsePower(v: unknown): Power {
+  // A coordinator that does not scale to zero sends nothing: always awake.
+  if (!isObj(v)) return { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null };
+  const w = "fleet.power";
+  const state = str(v, "state", w);
+  if (state !== "asleep" && state !== "waking" && state !== "awake") throw new ProtocolError(`${w}.state is ${state}`);
+  const lw = v["last_wake"];
+  return {
+    state,
+    asleep_since: numOrNull(v, "asleep_since", w),
+    woke_at: numOrNull(v, "woke_at", w),
+    hosts: arr(v, "hosts", w).flatMap((h) =>
+      isObj(h) && typeof h["host"] === "string"
+        ? [
+            {
+              host: h["host"],
+              phases: arr(h, "phases", `${w}.hosts`).flatMap((p) =>
+                isObj(p) && typeof p["phase"] === "string" && typeof p["at"] === "number" ? [{ phase: p["phase"], at: p["at"] }] : [],
+              ),
+            },
+          ]
+        : [],
+    ),
+    last_wake: isObj(lw)
+      ? { started_at: num(lw, "started_at", `${w}.last_wake`), awake_at: num(lw, "awake_at", `${w}.last_wake`), gpus: num(lw, "gpus", `${w}.last_wake`) }
+      : null,
+  };
+}
+
 /** Wall GPUs lent to visitors (assumed): at most `cap` at once; the next comes back at `next_return_at`. */
 export interface Borrow {
   cap: number;
@@ -198,7 +250,7 @@ export interface FleetState {
   tiles: Tile[];
   /** Width over height of the whole image. */
   image_aspect: number;
-  fleet: { hosts: Host[]; gpus: number; n: number; max_tiles: number | null };
+  fleet: { hosts: Host[]; gpus: number; n: number; max_tiles: number | null; power: Power };
   borrow: Borrow | null;
   counters: Counters | null;
   security: Security;
@@ -312,7 +364,13 @@ export interface VerifyMsg {
   token: string;
 }
 
-export type ClientMsg = IntentMsg | PingMsg | VerifyMsg;
+/** Whether this tab is visible, sent on connect and on every change: hidden tabs do not count as viewers. */
+export interface VisibilityMsg {
+  type: "visibility";
+  visible: boolean;
+}
+
+export type ClientMsg = IntentMsg | PingMsg | VerifyMsg | VisibilityMsg;
 
 /** Outcomes a receipt can carry that mean the intent took effect. */
 export function receiptApplied(r: ReceiptMsg): boolean {
@@ -566,6 +624,7 @@ function parseState(o: Obj): FleetState {
       gpus: num(fleet, "gpus", "fleet"),
       n: num(fleet, "n", "fleet"),
       max_tiles: numOrNull(fleet, "max_tiles", "fleet"),
+      power: parsePower(fleet["power"]),
     },
     borrow: isObj(o["borrow"])
       ? {

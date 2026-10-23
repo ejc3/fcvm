@@ -19,9 +19,10 @@ import {
 import { frameSocketUrl } from "./net.ts";
 import { fitBandwidth, type StreamAsk } from "./bandwidth.ts";
 import { suggestMode } from "./mode.ts";
-import { sameViewer, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
-import { KIND_TAG, scoreView, type ScoreView } from "./race.ts";
+import { sameViewer, WAKE_PHASES, type Action, type FleetState, type Half, type IntentMsg, type Rect, type Tile } from "./protocol.ts";
+import { KIND_TAG, NOT_AWAKE_NOTE, scoreView, type ScoreView } from "./race.ts";
 import { sceneUnixMs } from "./scene.ts";
+import { reelView, type ReelMeta, type ReelView } from "./reel.ts";
 import type { ClientState, GpuSample, Notice, StreamMode } from "./store.ts";
 
 export const SITE = "fcvm.dev";
@@ -58,6 +59,7 @@ const PHASE_TEXT: Record<string, string> = {
   waiting_capacity: "AWS had no spot GPU",
   draining: "host reclaimed by AWS",
   failed: "failed",
+  asleep: "asleep",
 };
 
 /**
@@ -144,6 +146,10 @@ export interface WallInput {
   budgetBps?: number;
   /** The coordinator's poster URL. */
   poster?: string | null;
+  /** Where the recording's files are served from, and what its metadata says. */
+  media?: { base: string; meta: ReelMeta | null };
+  /** The browser asks to save data. */
+  saveData?: boolean;
 }
 
 // ---- tiles -------------------------------------------------------------------
@@ -314,12 +320,21 @@ export interface CounterView {
   lastHour: string;
   /** "GPU memory scrubs: 1,284", or "" until the scrub has shipped. */
   scrubs: string;
+  /** The last wake from zero, as measured: "Last wake: 16 GPUs from zero in 2:07", or "". */
+  wake: string;
+}
+
+function wakeStat(st: FleetState): string {
+  const w = st.fleet.power.last_wake;
+  if (w === null) return "";
+  return `Last wake: ${fmt.count(w.gpus, "GPU", "GPUs")} from zero in ${fmt.minSec(w.awake_at - w.started_at)} (${fmt.utcDate(w.started_at)})`;
 }
 
 function counterView(st: FleetState): CounterView | null {
   const c = st.counters;
   if (c === null) return null;
   return {
+    wake: wakeStat(st),
     label: "GPU VMs restored",
     value: fmt.thousands(c.restores_total),
     total: c.restores_total,
@@ -359,6 +374,68 @@ export function isolationView(st: FleetState | null): IsolationView {
     open: "How it's isolated",
     sentences,
     link: { label: "The fcvm repository", href: REPOSITORY_URL },
+  };
+}
+
+// ---- asleep and waking -------------------------------------------------------------
+
+const WAKE_LABEL: Record<string, string> = {
+  instance_pending: "instances requested",
+  booted: "hosts booted",
+  store_ready: "snapshot store ready",
+  agent_connected: "agents connected",
+  tiles_rendering: "tiles rendering",
+};
+
+export interface WakeStep {
+  phase: string;
+  label: string;
+  state: "done" | "partial" | "waiting";
+  /** When every host had reached it, since the wake began ("0:41.2"), or "1 of 2 hosts". */
+  value: string;
+}
+
+export interface SleepView {
+  state: "asleep" | "waking";
+  title: string;
+  line: string;
+  /** Since the wake began, counting; "" while asleep. */
+  clock: string;
+  steps: WakeStep[];
+}
+
+function sleepView(st: FleetState, srvNow: number): SleepView | null {
+  const p = st.fleet.power;
+  if (p.state === "awake") return null;
+  if (p.state === "asleep") {
+    const since = p.asleep_since === null ? "" : ` ${fmt.ago(srvNow - p.asleep_since)}`;
+    return {
+      state: "asleep",
+      title: "The GPUs are asleep",
+      line: `Nobody was watching, so the fleet scaled to zero${since}. It wakes when someone watches.`,
+      clock: "",
+      steps: [],
+    };
+  }
+  const start = p.woke_at ?? srvNow;
+  const hosts = p.hosts.length;
+  const steps: WakeStep[] = WAKE_PHASES.map((phase) => {
+    const reached = p.hosts.map((h) => h.phases.find((x) => x.phase === phase)?.at ?? null);
+    const done = reached.filter((x): x is number => x !== null);
+    const all = hosts > 0 && done.length === hosts;
+    return {
+      phase,
+      label: WAKE_LABEL[phase] ?? phase.replace(/_/g, " "),
+      state: all ? "done" : done.length > 0 ? "partial" : "waiting",
+      value: all ? fmt.raceClock(Math.max(...done) - start) : done.length > 0 ? `${done.length} of ${fmt.count(hosts, "host", "hosts")}` : "",
+    };
+  });
+  return {
+    state: "waking",
+    title: "Waking up the GPUs",
+    line: "The fleet scaled to zero while nobody was watching. Each step below is reported by the hosts as it completes.",
+    clock: fmt.raceClock(srvNow - start),
+    steps,
   };
 }
 
@@ -710,6 +787,7 @@ export const OWN_GPU_SECONDS = 60;
 function ownButton(st: FleetState, srvNow: number, online: boolean, busy: boolean): OwnButton {
   const b = st.borrow;
   const label = "Get your own GPU";
+  if (st.fleet.power.state !== "awake") return { label, note: NOT_AWAKE_NOTE, disabled: true };
   if (b === null || b.cap === 0) return { label, note: "this fleet lends no GPUs", disabled: true };
   if (b.lent >= b.cap) {
     const when = b.next_return_at === null ? "soon" : `in ${fmt.countdown(b.next_return_at - srvNow)}`;
@@ -805,6 +883,8 @@ export interface DrawPlan {
   darkFadeMs: number;
   /** The tab has been hidden long enough: close every frame stream, keep the last picture. */
   suspended: boolean;
+  /** The fleet is asleep or waking: the poster fills the image again, under tiles as they arrive. */
+  posterFull: boolean;
 }
 
 /** The source a tile's pixels come from in a mode: its own stream, or the aggregate holding it. */
@@ -971,6 +1051,10 @@ export interface WallView {
   feed: FeedItem[];
   counter: CounterView | null;
   isolation: IsolationView;
+  /** Asleep or waking: the poster full size and a card instead of tiles. */
+  sleep: SleepView | null;
+  /** The recording of the wall, while asleep or waking and until the live image replaces it. */
+  reel: ReelView | null;
   focus: FocusView | null;
   own: OwnView | null;
   ownButton: OwnButton | null;
@@ -1051,6 +1135,7 @@ export function wallView(input: WallInput): WallView {
     paused: s.ui.paused,
     darkFadeMs: input.reducedMotion ? REDUCED_MOTION_DARK_FADE_MS : 0,
     suspended: s.ui.suspended,
+    posterFull: false,
   };
   const area = input.mosaicArea ? imageArea(input.mosaicArea, input.phone, s.accepted?.image_aspect) : null;
   const common = {
@@ -1079,6 +1164,8 @@ export function wallView(input: WallInput): WallView {
       feed: [],
       counter: null,
       isolation: isolationView(null),
+      sleep: null,
+      reel: null,
       focus: null,
       own: null,
       ownButton: null,
@@ -1095,7 +1182,11 @@ export function wallView(input: WallInput): WallView {
   const pend = pendingIntents(s);
   const layout = area ? layoutMosaic(area, st.tiles, input.dpr, st.image_aspect) : null;
   const placedById = new Map<string, PlacedTile>(layout?.tiles.map((p) => [p.id, p]) ?? []);
-  const tiles = st.tiles.map((t) => tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend));
+  const sleep = sleepView(st, srvNow);
+  // Asleep or waking, a tile that is not rendering yet shows the poster, not a dark square.
+  const tiles = st.tiles
+    .map((t) => tileView(t, s, st, placedById.get(t.id)?.box ?? null, srvNow, pend))
+    .map((tv) => (sleep && tv.dark ? { ...tv, dark: false, hatch: false } : tv));
   const focusTile = s.ui.focusId === null ? null : st.tiles.find((t) => t.id === s.ui.focusId) ?? null;
   const focus = focusTile ? focusView(s, st, tiles.find((x) => x.id === focusTile.id)!, focusTile, input, srvNow, online) : null;
   const own = ownView(s, st, srvNow, input);
@@ -1146,6 +1237,7 @@ export function wallView(input: WallInput): WallView {
     focus: focusSource,
     estimatedBps: fitted.bps,
     image: covered ? null : layout?.image ?? null,
+    posterFull: sleep !== null,
     tiles: st.tiles.map((t, i) => {
       const tv = tiles[i]!;
       return { id: t.id, half: t.half, box: covered ? null : placedById.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
@@ -1165,6 +1257,18 @@ export function wallView(input: WallInput): WallView {
     feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
     counter: counterView(st),
     isolation: isolationView(st),
+    sleep,
+    reel: input.media
+      ? reelView({
+          base: input.media.base,
+          meta: input.media.meta,
+          power: st.fleet.power.state,
+          reelOn: s.ui.reelOn,
+          allLive: s.frames?.allLive ?? false,
+          reducedMotion: input.reducedMotion ?? false,
+          saveData: input.saveData ?? false,
+        })
+      : null,
     focus,
     own,
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),

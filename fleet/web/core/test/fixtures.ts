@@ -39,7 +39,13 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
   return {
     tiles,
     image_aspect: 16 / 9,
-    fleet: { hosts: [{ name: "example-host", draining: false }], gpus: tiles.length, n: cols * rows, max_tiles: 100 },
+    fleet: {
+      hosts: [{ name: "example-host", draining: false }],
+      gpus: tiles.length,
+      n: cols * rows,
+      max_tiles: 100,
+      power: { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null },
+    },
     borrow: { cap: 2, lent: 0, next_return_at: null },
     counters: { restores_total: 1284, scrubs_total: 1201, restores_last_hour: 37 },
     security: { gpu_scrub: false },

@@ -1,5 +1,5 @@
 import { expect, test, devices, type Page } from "@playwright/test";
-import { seconds, thousands } from "../core/format.ts";
+import { seconds, thousands, utcDate } from "../core/format.ts";
 import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew } from "./helpers.ts";
 
 const view = (page: Page) =>
@@ -730,6 +730,111 @@ test("coming back to the tab holds the last picture, then fades the live image i
   expect(trace.some((e) => e.held && e.T !== trace[0]!.T)).toBe(true);
   for (let i = 1; i < trace.length; i++) expect(trace[i]!.T!, `draw ${i}`).toBeGreaterThanOrEqual(trace[i - 1]!.T!);
   expect(trace.at(-1)!.held).toBe(false);
+});
+
+const reelDate = async () => utcDate(((await (await fetch(`${COORD}/media/wall-reel.json`)).json()) as { recorded_at: number }).recorded_at);
+const power = async () => ((await mockState()).state as unknown as { fleet: { power: { state: string } } }).fleet.power.state;
+const sleepNow = () => admin("/mock/power", { sleep: true, hold: true });
+
+/** Wake the fleet and wait until the live image has replaced the recording. */
+async function wakeUp(page: Page): Promise<void> {
+  await admin("/mock/power", { wake: true });
+  await expect.poll(power, { timeout: 20_000 }).toBe("awake");
+  await expect(page.getByTestId("reel")).toHaveCount(0, { timeout: 20_000 });
+}
+
+test("asleep: the recording plays over the poster with its badge, the scores are dated, the buttons wait; waking shows the real phases, then the live image takes over with no blank frame", async ({ page }) => {
+  await openWall(page, 15);
+  await sleepNow();
+  await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+  await expect(page.locator(".dark-tile")).toHaveCount(0);
+  await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "playing", { timeout: 15_000 });
+  const t0 = await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime);
+  await page.waitForTimeout(600);
+  expect(await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).currentTime)).not.toBe(t0);
+  expect(await page.getByTestId("reel-video").evaluate((v) => { const x = v as HTMLVideoElement; return [x.muted, x.loop, x.playsInline, x.textTracks[0]?.mode]; })).toEqual([true, true, true, "showing"]);
+  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is asleep; it wakes when someone watches.`);
+  await expect(page.getByTestId("scoreboard")).toHaveAttribute("aria-label", /· last measured \d+ \w+ \d{4}, \d\d:\d\d UTC$/);
+  await expect(page.getByTestId("restart-note")).toHaveText("works once the GPUs are awake");
+  await expect(page.getByTestId("own-note")).toHaveText("works once the GPUs are awake");
+  await expect(page.getByTestId("restart-all")).toBeDisabled();
+
+  // Waking: a live clock since the wake began and each phase as the hosts report it.
+  await page.evaluate(() => window.__fleet!.client.traceStart());
+  await admin("/mock/power", { wake: true });
+  await expect(page.getByTestId("sleep-card")).toContainText("Waking up the GPUs");
+  await expect(page.getByTestId("reel-badge")).toHaveText(`Recorded ${await reelDate()}. The live wall is waking up.`);
+  await expect(page.getByTestId("wake-clock")).toHaveText(/^0:0\d\.\d$/);
+  await expect(page.getByTestId("wake-instance_pending")).toHaveAttribute("data-state", "done");
+  await expect(page.getByTestId("wake-booted")).toHaveAttribute("data-state", "done", { timeout: 10_000 });
+  // The live image takes over only once it is whole: at the moment the recording starts to fade, every region has a frame.
+  await page.waitForSelector(".reel.leaving", { timeout: 25_000 });
+  expect(await page.evaluate(() => window.__fleet!.client.getState().frames!.allLive)).toBe(true);
+  const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
+  const pts = [0.1, 0.3, 0.45, 0.6, 0.8].flatMap((u) => [0.2, 0.7].map((v) => ({ x: img.x + u * img.w, y: img.y + v * img.h })));
+  const shot = await page.evaluate((p) => window.__fleet!.client.capture(p), pts);
+  for (const px of shot.pixels) expect(px.slice(0, 3)).not.toEqual([6, 8, 11]);
+  await expect(page.getByTestId("reel")).toHaveCount(0, { timeout: 5000 });
+  const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
+  expect(trace.filter((e) => e.T !== null && e.missing > 0 && !e.poster)).toEqual([]);
+  // The wake, measured once.
+  await expect(page.getByTestId("wake-stat")).toHaveText(/^Last wake: 15 GPUs from zero in 0:0\d \(\d+ \w+ \d{4}, \d\d:\d\d UTC\)$/);
+  await expect(page.getByTestId("restart-all")).toBeEnabled();
+});
+
+test("with less motion asked for, the poster stays and a button plays the recording", async ({ page }) => {
+  await page.emulateMedia({ reducedMotion: "reduce" });
+  await openWall(page, 15);
+  await sleepNow();
+  try {
+    await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "manual");
+    await expect(page.getByTestId("reel-play")).toHaveText("Play the recording");
+    await expect(page.getByTestId("reel")).toContainText("Not started by itself, as your device asks for less motion.");
+    await page.waitForTimeout(800);
+    expect(await page.getByTestId("reel-video").evaluate((v) => (v as HTMLVideoElement).paused)).toBe(true);
+    await page.getByTestId("reel-play").click();
+    await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "playing", { timeout: 15_000 });
+  } finally {
+    await wakeUp(page);
+  }
+});
+
+test("a missing recording leaves the poster, with nothing broken on top", async ({ page }) => {
+  await admin("/mock/media", { missing: true });
+  try {
+    await openWall(page, 15);
+    await page.evaluate(() => window.__fleet!.client.traceStart());
+    await sleepNow();
+    await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "failed", { timeout: 15_000 });
+    await expect(page.getByTestId("reel-video")).toHaveCount(0);
+    await expect(page.getByTestId("reel-play")).toHaveCount(0);
+    await expect(page.getByTestId("reel-badge")).toHaveCount(0);
+    await page.waitForTimeout(500);
+    const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
+    expect(trace.at(-1)!.poster).toBe(true);
+    await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
+  } finally {
+    await admin("/mock/media", { missing: false });
+    await wakeUp(page);
+  }
+});
+
+test("hidden tabs do not count as viewers", async ({ browser }) => {
+  const a = await browser.newContext();
+  const b = await browser.newContext();
+  const pa = await a.newPage();
+  const pb = await b.newPage();
+  await visibility.install(pb);
+  await openWall(pa, 15);
+  await openWall(pb, 15);
+  const watching = () => pa.getByTestId("viewers").textContent();
+  const n = Number((await watching())!.match(/^(\d+)/)![1]);
+  await visibility.set(pb, "hidden");
+  await expect(pa.getByTestId("viewers")).toHaveText(new RegExp(`^${n - 1} (person|people) watching$`));
+  await visibility.set(pb, "visible");
+  await expect(pa.getByTestId("viewers")).toHaveText(new RegExp(`^${n} (person|people) watching$`));
+  await a.close();
+  await b.close();
 });
 
 test("touch: a long press shows the pressed tile's seams and label", async ({ browser }) => {

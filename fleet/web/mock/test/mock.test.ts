@@ -7,19 +7,23 @@ import { FFMPEG } from "../encoder.ts";
 import { tileGeometry } from "../../core/layout.ts";
 import { spawnSync } from "node:child_process";
 import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
+import { ensureReel } from "../media.ts";
 
+const MEDIA = "node_modules/.cache/fleet-mock-media-test";
 let coord: MockCoordinator;
 let renderers: MockRenderers;
 const FPS = 20;
 
 beforeAll(async () => {
   const epochUnixMs = Math.floor(Date.now() / 1000) * 1000;
+  ensureReel(MEDIA, epochUnixMs);
   renderers = new MockRenderers({ port: 0, publicHost: "localhost", fps: FPS, threads: 2, maxHeight: 360, epochUnixMs, scene: () => coord.patternScene() });
   await renderers.listen();
   coord = new MockCoordinator({
     port: 0, perHalf: 2, ec2Short: 1, gpusPerHost: 1, fcvmRelaunchMs: 400, ec2RelaunchMs: 900,
     raceEverySecs: 0, firstRaceSecs: 0, cooldownSecs: 1, capacityWaitProb: 0, capacityWaitMs: [0, 0],
     borrowCap: 1, claimSecs: 1, holdSecs: 600, travelSecs: 0.5, turnstileSitekey: null,
+    sleepAfterSecs: 0, wakeMs: 800, mediaDir: MEDIA,
     refusedWords: ["forbidden"], checkMs: 20, epochUnixMs, renderers,
   });
   await coord.listen();
@@ -505,6 +509,65 @@ describe("mock race, second design review", () => {
     const back = await live();
     expect(await back.next((m) => m["type"] === "hello")).toBeTruthy();
     back.ws.close();
+  });
+
+  it("counts only visible tabs as viewers", async () => {
+    const c = await live();
+    await c.next((m) => m["type"] === "snapshot");
+    const count = () => coord.fleetState().viewers.count;
+    const before = count();
+    c.ws.send(JSON.stringify({ type: "visibility", visible: false }));
+    await until(() => count() === before - 1);
+    c.ws.send(JSON.stringify({ type: "visibility", visible: true }));
+    await until(() => count() === before);
+    c.ws.close();
+  });
+
+  it("sleeps with nobody watching and wakes host by host when a viewer comes, measuring the wake", async () => {
+    await admin("/mock/power", { sleep: true, hold: true });
+    let st = coord.fleetState();
+    expect(st.fleet.power).toMatchObject({ state: "asleep", woke_at: null });
+    expect(st.tiles.filter((t) => t.slot).every((t) => t.phase === "asleep" && t.frame_url === null)).toBe(true);
+    expect(st.aggregates.every((a) => a.frame_url === null)).toBe(true);
+    const restored = st.counters.restores_total;
+    await admin("/mock/power", { wake: true });
+    st = coord.fleetState();
+    expect(st.fleet.power.state).toBe("waking");
+    expect(st.fleet.power.hosts.map((h) => h.host)).toEqual(["mock-host-1", "mock-host-2", "ec2"]);
+    await until(() => coord.fleetState().fleet.power.state === "awake", 5000);
+    st = coord.fleetState();
+    for (const h of st.fleet.power.hosts) {
+      expect(h.phases.map((p) => p.phase)).toEqual(["instance_pending", "booted", "store_ready", "agent_connected", "tiles_rendering"]);
+      for (let i = 1; i < h.phases.length; i++) expect(h.phases[i]!.at).toBeGreaterThanOrEqual(h.phases[i - 1]!.at);
+    }
+    const lw = st.fleet.power.last_wake!;
+    expect(lw.started_at).toBe(st.fleet.power.woke_at);
+    expect(lw.awake_at).toBe(Math.max(...st.fleet.power.hosts.map((h) => h.phases.at(-1)!.at)));
+    expect(lw.gpus).toBe(st.tiles.filter((t) => t.slot).length);
+    expect(st.tiles.filter((t) => t.slot).every((t) => t.phase === "running" && t.frame_url !== null)).toBe(true);
+    expect(st.counters.restores_total).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
+  });
+
+  it("serves the recording with byte ranges, and answers 404 when it is missing", async () => {
+    const base = `http://localhost:${coord.port}/media`;
+    const meta = (await (await fetch(`${base}/wall-reel.json`)).json()) as Record<string, unknown>;
+    expect(meta).toMatchObject({ duration_s: 4, measured: null });
+    const full = await fetch(`${base}/wall-reel.mp4`);
+    expect(full.headers.get("content-type")).toBe("video/mp4");
+    const size = Number(full.headers.get("content-length"));
+    await full.arrayBuffer();
+    expect(size).toBeGreaterThan(1000);
+    // A 4 s 720p clip, far under Workers' 25 MiB static asset limit.
+    expect(size).toBeLessThan(25 * 2 ** 20);
+    const part = await fetch(`${base}/wall-reel.mp4`, { headers: { range: "bytes=100-199" } });
+    expect(part.status).toBe(206);
+    expect(part.headers.get("content-range")).toBe(`bytes 100-199/${size}`);
+    expect((await part.arrayBuffer()).byteLength).toBe(100);
+    expect((await fetch(`${base}/wall-reel.vtt`)).headers.get("content-type")).toBe("text/vtt");
+    expect((await fetch(`${base}/../package.json`)).status).toBe(404);
+    await admin("/mock/media", { missing: true });
+    expect((await fetch(`${base}/wall-reel.mp4`)).status).toBe(404);
+    await admin("/mock/media", { missing: false });
   });
 
   it("fails a tile with a retry time, and reclaims a host: draining, then no GPU behind its places", async () => {

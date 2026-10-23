@@ -96,6 +96,20 @@ test("screenshots", async ({ page, browser }) => {
   await expect(page.getByTestId("banner-offline")).toHaveCount(0, { timeout: 20_000 });
   await admin("/mock/fault", { replace_host: "mock-host-2" });
 
+  // Asleep: the recording over the poster, the dated scores, the buttons waiting.
+  await expect(page.getByTestId("dark-fcvm:2")).toHaveCount(0, { timeout: 30_000 });
+  await admin("/mock/power", { sleep: true, hold: true, wake_ms: 20_000 });
+  await expect(page.getByTestId("reel")).toHaveAttribute("data-state", "playing", { timeout: 15_000 });
+  await page.mouse.move(away.x, away.y);
+  await page.waitForTimeout(800);
+  await shot(page, "asleep");
+  // Waking, mid-way: some phases reported, the live clock running.
+  await admin("/mock/power", { wake: true });
+  await expect(page.getByTestId("wake-store_ready")).toHaveAttribute("data-state", /partial|done/, { timeout: 20_000 });
+  await shot(page, "waking");
+  await expect(page.getByTestId("reel")).toHaveCount(0, { timeout: 30_000 });
+  await admin("/mock/power", { wake_ms: 6000 });
+
   const ctx = await browser.newContext({ ...devices["iPhone 13"], deviceScaleFactor: 1 });
   const phone = await ctx.newPage();
   await openWall(phone, 3, "aggregated");
@@ -104,6 +118,5 @@ test("screenshots", async ({ page, browser }) => {
   await ctx.close();
 
   // Leave the fleet at rest.
-  await expect(page.getByTestId("dark-fcvm:2")).toHaveCount(0, { timeout: 30_000 });
   await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
 });

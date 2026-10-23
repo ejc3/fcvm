@@ -9,5 +9,7 @@ export default function Page() {
   if (coordUrl === "") {
     return <p style={{ padding: 24 }}>{NO_FLEET}</p>;
   }
-  return <Wall coordUrl={coordUrl} />;
+  // The recording shown while the fleet sleeps: static files beside the page, or elsewhere.
+  const mediaUrl = process.env.FLEET_MEDIA_URL ?? "/media";
+  return <Wall coordUrl={coordUrl} mediaUrl={mediaUrl} />;
 }

@@ -63,6 +63,11 @@ export function Countdown({
             {counter.value}
           </b>
           <span className="sub">{counter.lastHour}</span>
+          {counter.wake ? (
+            <span className="sub wake" data-testid="wake-stat">
+              {counter.wake}
+            </span>
+          ) : null}
           {counter.scrubs ? (
             <span className="sub" data-testid="counter-scrubs">
               {counter.scrubs}

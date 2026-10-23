@@ -282,6 +282,7 @@ let plan: DrawPlan = {
   paused: false,
   darkFadeMs: 0,
   suspended: false,
+  posterFull: false,
 };
 /** The mode being drawn. It becomes plan.mode only once that mode can be drawn whole. */
 let shownMode: StreamMode = "direct";
@@ -428,6 +429,11 @@ function applyPlan(p: DrawPlan): void {
     resuming = true;
     resumeStarted = now();
     heldFadeFrom = null;
+  }
+  if (p.posterFull && !plan.posterFull) {
+    // Asleep or waking: the poster comes back, fetched again for the latest picture.
+    posterRetired = false;
+    posterUrl = null;
   }
   plan = p;
   loadPoster(p.poster);
@@ -705,7 +711,7 @@ function draw(): void {
     held = null;
   }
   // The poster goes once every stream drawn has shown a frame.
-  if (!posterRetired && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streams.get(src.id)?.appearedAt != null)) {
+  if (!posterRetired && !plan.posterFull && poster && shown.length > 0 && shown.every((src) => src.box === null || src.url === null || streams.get(src.id)?.appearedAt != null)) {
     posterRetired = true;
     dirty = true;
   }
@@ -751,6 +757,13 @@ function answerCaptures(T: number | null, shownBy: Record<string, string> = {}):
   captures = [];
 }
 
+/** Every region the image draws has a stream that has shown a frame, and no resume is holding the picture. */
+function allLive(): boolean {
+  if (plan.focus || resuming || plan.suspended) return false;
+  const drawn = sourcesOf(shownMode).filter((src) => src.box !== null && src.url !== null);
+  return drawn.length > 0 && drawn.every((src) => streams.get(src.id)?.appearedAt != null);
+}
+
 function pct(xs: readonly number[], p: number): number {
   if (xs.length === 0) return 0;
   const s = [...xs].sort((a, b) => a - b);
@@ -787,6 +800,7 @@ function report(): void {
     drawMsP95: pct(drawMs, 0.95),
     rafMsP50: pct(rafMs, 0.5),
     rafMsP95: pct(rafMs, 0.95),
+    allLive: allLive(),
   };
   const kinds = [...lastChoice.show.values()];
   const bench: BenchStats = {

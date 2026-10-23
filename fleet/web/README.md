@@ -18,6 +18,7 @@ deployed.
 | ![An opened VM](docs/screenshots/tile-opened.jpg) | ![A viewer's own GPU](docs/screenshots/own-gpu.jpg) |
 | ![The borrowed tile, as another viewer sees it](docs/screenshots/own-gpu-borrowed-tile.jpg) | ![A failed VM and a reclaimed host](docs/screenshots/failure-failed-and-reclaimed.jpg) |
 | ![The coordinator offline, the picture still live](docs/screenshots/failure-offline.jpg) | ![How it's isolated](docs/screenshots/isolation.jpg) |
+| ![Asleep: the recording over the poster](docs/screenshots/asleep.jpg) | ![Waking, mid-way](docs/screenshots/waking.jpg) |
 
 <img src="docs/screenshots/phone.jpg" alt="The wall on a phone" width="260">
 
@@ -61,8 +62,8 @@ FLEET_MEASURE_BASE_PORT=<block+15>   # measure.ts uses it and the next two
 pnpm install
 pnpm dev:mock         # the page on the mock fleet, next dev
 pnpm build && pnpm start:mock    # the same with a production build
-pnpm lint && pnpm typecheck && pnpm test     # 131 unit tests (vitest)
-pnpm build && pnpm test:e2e                  # 35 browser tests (Playwright)
+pnpm lint && pnpm typecheck && pnpm test     # 141 unit tests (vitest)
+pnpm build && pnpm test:e2e                  # 39 browser tests (Playwright)
 FLEET_SCREENSHOT_DIR=$PWD/docs/screenshots pnpm test:e2e   # also rewrites the pictures
 pnpm build && pnpm measure [16 50 100]       # decode and draw cost
 ```
@@ -104,6 +105,25 @@ cleared before a GPU moves to the next VM. Each sentence is what
 `docs/fleet/ARCHITECTURE.md` describes (hosts with the IOMMU on and every GPU bound to
 vfio-pci; `fcvm snapshot run --snapshot <gold> --gpu <sbdf>`; GPU attach as a restore
 phase). One link goes to the fcvm repository; no other product is named.
+
+**Scaled to zero.** With no visible viewer the fleet sleeps, and it wakes when one
+arrives (`fleet.power`: asleep, waking, awake). The page tells the coordinator on every
+visibilitychange, and on connect, whether its tab is visible (`{"type": "visibility",
+"visible": bool}`), so hidden tabs do not count. Asleep or waking, the stage plays a
+recording of the real wall (`/media/wall-reel.mp4`, `/media/wall-reel.webm` as the
+alternative, captions from `/media/wall-reel.vtt`; muted, inline, looping) over the poster,
+which shows until the video plays and stays if it cannot. With less motion asked for or
+data saving on, the poster stays with a "Play the recording" button. A badge says when it
+was recorded, from `/media/wall-reel.json`. Beside it, a card shows a live clock since the
+wake began and each phase as every host reports it (instances requested, hosts booted,
+snapshot store ready, agents connected, tiles rendering); there is no progress bar.
+Restart and the own-GPU button say they work once the GPUs are awake, and the scores
+keep their last numbers, labelled with the date they were measured. Once the fleet is
+awake and every region of the live image has a frame, the recording fades out over it,
+so nothing blank is ever shown. The wake, as measured, appears once under the counter:
+"Last wake: 128 GPUs from zero in 2:07". The page reads the media from `FLEET_MEDIA_URL`
+(default `/media` on its own origin, Workers static assets: a 720p reel stays well under
+the 25 MiB per-file limit); the mock serves a generated 4 s test clip.
 
 **Words on the stage.** One sentence under the title says what the page is, "fcvm" and
 "EC2" sit on backplates either side of the seam, and one line under each half says what a
@@ -303,6 +323,12 @@ yet; the page reads these shapes and the mock speaks them (`core/protocol.ts` ma
 - `GET /poster.jpg` on the `/live` origin, readable from the page's origin (CORS).
 - state: `counters: {restores_total, scrubs_total, restores_last_hour}` and `security:
   {gpu_scrub}`; without `security` the page says nothing about a scrub.
+- `fleet.power: {state, asleep_since, woke_at, hosts: [{host, phases: [{phase, at}]}],
+  last_wake: {started_at, awake_at, gpus}}`: `woke_at` is when the wake began, phases are
+  `instance_pending`, `booted`, `store_ready`, `agent_connected`, `tiles_rendering`;
+  `hosts` and `last_wake` are this page's reading. Without `power` the fleet is awake.
+- `{"type": "visibility", "visible": bool}` from the page; `viewers.count` counts visible tabs.
+- `/media/wall-reel.json: {recorded_at, duration_s, measured: {gpus, fcvm_ms, ec2_ms} | null}`.
 
 The wall no longer sends camera drags or `set_auto_relaunch`: the camera is directed,
 with nudges, and the owner's cadence replaces the viewer setting. A dropped light is

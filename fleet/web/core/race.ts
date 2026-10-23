@@ -182,6 +182,9 @@ export interface ScoreInput {
   online: boolean;
 }
 
+/** The fleet is not awake: restarts and loans wait for it. */
+export const NOT_AWAKE_NOTE = "works once the GPUs are awake";
+
 /** GPUs a restart-all would restart: every tile with a GPU behind it. */
 export function restartableGpus(st: FleetState): number {
   return st.tiles.filter((t) => t.gpu !== null && t.slot !== null && t.borrowed === null).length;
@@ -197,6 +200,7 @@ export function restartButton(i: ScoreInput): RestartButton {
   const n = restartableGpus(st);
   const label = `Restart all ${fmt.count(n, "GPU", "GPUs")}`;
   if (!i.online) return { label, disabled: true, note: "paused while the coordinator is offline" };
+  if (st.fleet.power.state !== "awake") return { label, disabled: true, note: NOT_AWAKE_NOTE };
   const ra = runningRace(st);
   if (ra) return { label: "Restarting now", disabled: true, note: "" };
   if (i.pending.some((p) => p.name === "relaunch_all")) return { label: "Restart requested", disabled: true, note: "" };
@@ -233,13 +237,18 @@ export function scoreView(i: ScoreInput): ScoreView {
     fcvm = restBar("fcvm", sb.fcvm, axis);
     ec2 = restBar("ec2", sb.ec2, axis);
     countdown =
-      st.next_race_at === null
+      st.fleet.power.state !== "awake"
+        ? { label: "Restarts resume once the GPUs are awake", value: "--", note: "", racing: false }
+        : st.next_race_at === null
         ? { label: "Next restart", value: "--", note: "none scheduled", racing: false }
         : { label: "Next restart in", value: fmt.countdown(st.next_race_at - now), note: "every GPU, both sides at once", racing: false };
   }
+  // Asleep or waking, the bars are the last measured ones: say when.
+  const last = st.relaunch_all?.started_at ?? null;
+  const dated = st.fleet.power.state !== "awake" && last !== null ? ` · last measured ${fmt.utcDate(last)}` : "";
   return {
     racing: ra !== null,
-    title: "Restart time: click to the last GPU's first frame",
+    title: `Restart time: click to the last GPU's first frame${dated}`,
     fcvm,
     ec2,
     countdown,
