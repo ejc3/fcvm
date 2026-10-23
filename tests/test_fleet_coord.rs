@@ -357,6 +357,10 @@ async fn two_viewers_see_the_same_state_at_every_version_both_saw() {
             (&mut b, format!("b-{i}"))
         };
         who.intent(&id, "light", light(i as f64)).await;
+        // The two viewers' sockets are read by separate tasks, so without this wait the
+        // next viewer's light can be committed first and the scene's order below is the
+        // order of arrival, not of sending.
+        who.receipt(&id).await;
         who.intent(&format!("{id}-n"), "nudge", json!({"target": "coast"}))
             .await;
     }
