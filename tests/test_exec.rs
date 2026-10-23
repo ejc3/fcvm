@@ -1173,6 +1173,104 @@ async fn run_exec_with_pty_interrupt(
     }
 }
 
+/// Issue #841: `podman exec -t` must survive conmon reaping the runtime before it
+/// has accepted the console.
+///
+/// For a TTY exec the runtime (crun) connects to conmon's console socket and sends
+/// the terminal, then exits. conmon accepts the console from one main-loop callback
+/// and quits the loop when it reaps the runtime in another. A callback that reaps
+/// children calls `waitpid()` after the poll that scheduled it, so when crun connects
+/// and exits in that gap, the loop quits with the connection still queued. Stock
+/// conmon 2.1.10 then logs "Runtime did not set up terminal" and exits without
+/// writing its sync pipe, and podman prints `container create failed (no logs from
+/// conmon): conmon bytes ""` for an exec whose process already ran. In CI the gap
+/// opened only when a starved vCPU preempted conmon there.
+///
+/// This test holds the gap open: a wrapper runs conmon under strace with every
+/// `wait4()` delayed by two seconds, and detaches from crun at its `execve` so crun
+/// itself runs at full speed and finishes inside the delay. The
+/// rootfs carries a rebuilt conmon (`scripts/conmon-exec-console-race.patch`) that
+/// accepts a console still queued when the loop exits; with the archive's conmon
+/// this test fails with no token and the journal line below.
+#[tokio::test]
+async fn test_exec_tty_when_conmon_reaps_the_runtime_before_the_console() -> Result<()> {
+    let (vm_name, _, _, _) = common::unique_names("exec-conmon-race");
+    let (_child, fcvm_pid) = common::spawn_fcvm(&[
+        "podman",
+        "run",
+        "--name",
+        &vm_name,
+        "--network",
+        "rootless",
+        common::TEST_IMAGE,
+    ])
+    .await
+    .context("spawning fcvm podman run")?;
+    if let Err(e) = common::poll_health_by_pid(fcvm_pid, 180).await {
+        common::kill_process(fcvm_pid).await;
+        return Err(e.context("VM failed to become healthy"));
+    }
+
+    let result: Result<()> = async {
+        // podman starts this in place of conmon. -DDD keeps the tracer out of
+        // podman's process tree, so podman still sees conmon's first process exit
+        // once it has daemonized.
+        let install = "cat > /tmp/slow-conmon <<'EOF'\n\
+            #!/bin/sh\n\
+            exec strace -DDD -f --detach-on=execve -qq --seccomp-bpf -o /dev/null \
+            -e trace=wait4 -e inject=wait4:delay_enter=2000000 /usr/bin/conmon \"$@\"\n\
+            EOF\n\
+            chmod +x /tmp/slow-conmon";
+        common::exec_in_vm(fcvm_pid, &[install])
+            .await
+            .context("installing the delayed conmon wrapper")?;
+
+        // podman's -t needs a terminal; script gives it one. `tty` prints the
+        // terminal the container process got, a line podman's own debug output
+        // never starts with. --log-level=debug is passed on to conmon, which then
+        // logs that it took the late console. The timeout bounds the archive's
+        // conmon, where the strace tracer holds podman's sync pipe open and podman
+        // waits for it.
+        let run = "timeout 60 script -qec \
+            'podman --log-level=debug --conmon /tmp/slow-conmon exec -t --latest tty' \
+            /dev/null </dev/null >/tmp/conmon-race.out 2>&1; echo \"rc=$?\"; \
+            tr -d '\\r' </tmp/conmon-race.out | grep -c '^/dev/pts/[0-9]'; \
+            journalctl -q -t conmon --no-pager -o cat | grep -E 'did not set up terminal|accepting the console' || true";
+        let out = common::exec_in_vm(fcvm_pid, &[run])
+            .await
+            .context("running the TTY exec under the delayed conmon")?;
+        println!("conmon race exec:\n{}", out);
+
+        anyhow::ensure!(
+            !out.contains("Runtime did not set up terminal"),
+            "#841 regression: conmon quit before accepting the console:\n{}",
+            out
+        );
+        anyhow::ensure!(
+            out.lines().next() == Some("rc=0"),
+            "TTY exec under the delayed conmon did not exit 0:\n{}",
+            out
+        );
+        anyhow::ensure!(
+            out.lines().nth(1).and_then(|n| n.trim().parse::<u32>().ok()) >= Some(1),
+            "the TTY exec printed no terminal name:\n{}",
+            out
+        );
+        // Without this line the delay did not open the gap, and the pass above
+        // says nothing about the race.
+        anyhow::ensure!(
+            out.contains("accepting the console after the runtime exited"),
+            "conmon never took the late-console path, so the race was not exercised:\n{}",
+            out
+        );
+        Ok(())
+    }
+    .await;
+
+    common::kill_process(fcvm_pid).await;
+    result
+}
+
 /// Stress test: Run 100 parallel TTY execs to verify no race conditions
 ///
 /// This test verifies that the TTY stdin fix works under heavy parallel load.
