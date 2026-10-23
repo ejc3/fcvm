@@ -358,10 +358,6 @@ struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     runner: R,
     /// Opens the nfnetlink socket the gate's removal is committed on.
     netfilter: N,
-    /// That socket, opened by the first removal and kept for the gate's
-    /// lifetime, then released off the caller's thread when the gate is
-    /// dropped (see `Drop`). Guards the slot only, never held across an await.
-    channel: std::sync::Mutex<Option<N::Channel>>,
     /// Per family and direction, what this gate knows of that half from
     /// iptables: installed (a verification that found the gate closed, or a
     /// close that succeeded), removed by this gate, or not known. A removal
@@ -377,19 +373,49 @@ struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     timings: std::sync::Mutex<GateTimings>,
 }
 
-/// Opens the netlink socket nf_tables batches are sent on.
+/// Lends out the netlink socket nf_tables batches are sent on.
+///
+/// The socket is kept, not released, between uses. Releasing an nfnetlink
+/// socket runs nf_tables' NETLINK_URELEASE notifier (`nft_rcv_nl_event`),
+/// which takes the namespace's commit mutex and, holding it, flushes the
+/// pending transaction destruction, and the destruction a rule-deleting commit
+/// schedules begins with `synchronize_rcu()`. So a release after a removal
+/// waits one RCU grace period, and every nf_tables commit in the namespace
+/// waits behind it. That was the whole cost of opening the gate (#1151): each
+/// `iptables-restore` did its work in about 3 ms and then waited 26, 46 or
+/// 79 ms (2, 4, 8 vCPUs) in close() at exit, twice per half. A release
+/// between the halves put the ingress commit behind that mutex (20 ms median
+/// at 2 vCPUs); a release on another thread raced with process spawns, whose
+/// exec then made the final release and waited (see `network::packet_sender`).
+/// A socket that is never released costs none of it.
 trait NetfilterOpener {
     type Channel: NetlinkChannel + Send + 'static;
-    fn open(&self) -> Result<Self::Channel>;
+    /// The kept socket, or a new one.
+    fn take(&self) -> Result<Self::Channel>;
+    /// Keep `channel` for the next `take`. A socket that failed a request is
+    /// dropped instead of given back: its queue may hold replies nobody read.
+    fn give_back(&self, channel: Self::Channel);
 }
 
 struct SystemNetfilter;
 
+/// fc-agent's one nfnetlink socket, between uses. The guest-wide boundary
+/// lock serializes the gate transactions that use it.
+static NETFILTER_SOCKET: std::sync::Mutex<Option<KernelChannel>> = std::sync::Mutex::new(None);
+
 impl NetfilterOpener for SystemNetfilter {
     type Channel = KernelChannel;
 
-    fn open(&self) -> Result<KernelChannel> {
-        KernelChannel::open(crate::nftables::NETLINK_NETFILTER, "nf_tables netlink")
+    fn take(&self) -> Result<KernelChannel> {
+        let kept = NETFILTER_SOCKET.lock().unwrap().take();
+        match kept {
+            Some(channel) => Ok(channel),
+            None => KernelChannel::open(crate::nftables::NETLINK_NETFILTER, "nf_tables netlink"),
+        }
+    }
+
+    fn give_back(&self, channel: KernelChannel) {
+        *NETFILTER_SOCKET.lock().unwrap() = Some(channel);
     }
 }
 
@@ -410,29 +436,6 @@ pub struct GateTimings {
     pub ingress_commit_ms: f64,
 }
 
-/// Releasing an nfnetlink socket runs nf_tables' NETLINK_URELEASE notifier
-/// (`nft_rcv_nl_event`), which takes the namespace's commit mutex and, holding
-/// it, flushes the pending transaction destruction, and the destruction a
-/// rule-deleting commit schedules begins with `synchronize_rcu()`. So the
-/// release after a removal waits one RCU grace period, and every nf_tables
-/// commit in the namespace waits behind it. That was the whole cost of opening
-/// the gate (#1151): each `iptables-restore` did its work in about 3 ms and
-/// then waited 26, 46 or 79 ms (2, 4, 8 vCPUs) in close() at exit, twice per
-/// half. Releasing the egress half's socket while the restore went on put the
-/// ingress commit behind that mutex instead (20 ms median at 2 vCPUs).
-///
-/// So the gate keeps one socket for both halves and releases it when it is
-/// dropped, after publication, on a thread of its own. The commits have
-/// already moved the packet path to the new ruleset generation; the grace
-/// period only delays freeing the deleted rules.
-impl<R, N: NetfilterOpener> Drop for IptablesGate<R, N> {
-    fn drop(&mut self) {
-        if let Some(channel) = self.channel.get_mut().ok().and_then(Option::take) {
-            crate::network::release_off_path(channel);
-        }
-    }
-}
-
 impl<R> IptablesGate<R, SystemNetfilter> {
     fn new(runner: R) -> Self {
         Self::with_netfilter(runner, SystemNetfilter)
@@ -444,7 +447,6 @@ impl<R, N: NetfilterOpener> IptablesGate<R, N> {
         Self {
             runner,
             netfilter,
-            channel: std::sync::Mutex::new(None),
             halves: std::sync::Mutex::new([[HalfKnown::Unknown; 2]; 2]),
             timings: std::sync::Mutex::new(GateTimings::default()),
         }
@@ -853,7 +855,7 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
     /// This used to be one `iptables-restore --noflush` per family: two
     /// commits per half, with one family open and the other not between them,
     /// and each process waited one RCU grace period on exit. The socket here
-    /// is kept for both halves and released off the restore's path (`Drop`).
+    /// is kept and never released (`NetfilterOpener`).
     ///
     /// `directions` names which halves to remove. The egress half alone
     /// (`[Direction::Output]`) is what a restored clone removes before its
@@ -865,11 +867,7 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         // ruleset that never holds still fails closed instead of spinning.
         const ATTEMPTS: usize = 8;
         let read_started = std::time::Instant::now();
-        let taken = self.channel.lock().unwrap().take();
-        let mut channel = match taken {
-            Some(channel) => channel,
-            None => self.netfilter.open()?,
-        };
+        let mut channel = self.netfilter.take()?;
         let half_name = if directions.contains(&Direction::Input) {
             "ingress"
         } else {
@@ -946,8 +944,9 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
             }
         };
         let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
-        // Kept for the next half; released when the gate is dropped (`Drop`).
-        *self.channel.lock().unwrap() = Some(channel);
+        // Kept for the next removal, never released (see `NetfilterOpener`).
+        // Every error above returned with the socket dropped.
+        self.netfilter.give_back(channel);
         for family in Family::BOTH {
             self.mark(family, directions, HalfKnown::Removed);
         }
@@ -2860,14 +2859,31 @@ mod tests {
     }
 
     /// Opens the model nf_tables kernel for an `IptablesGate` under test.
-    struct ModelNetfilter(Arc<Mutex<crate::nftables::model::Kernel>>);
+    #[derive(Clone)]
+    struct ModelNetfilter(
+        Arc<Mutex<crate::nftables::model::Kernel>>,
+        Arc<Mutex<Option<crate::nftables::model::Channel>>>,
+    );
+
+    impl ModelNetfilter {
+        fn new(kernel: Arc<Mutex<crate::nftables::model::Kernel>>) -> Self {
+            Self(kernel, Arc::new(Mutex::new(None)))
+        }
+    }
 
     impl NetfilterOpener for ModelNetfilter {
         type Channel = crate::nftables::model::Channel;
 
-        fn open(&self) -> Result<Self::Channel> {
+        fn take(&self) -> Result<Self::Channel> {
+            if let Some(channel) = self.1.lock().unwrap().take() {
+                return Ok(channel);
+            }
             self.0.lock().unwrap().opens += 1;
             Ok(crate::nftables::model::Channel::new(self.0.clone()))
+        }
+
+        fn give_back(&self, channel: Self::Channel) {
+            *self.1.lock().unwrap() = Some(channel);
         }
     }
 
@@ -2895,7 +2911,7 @@ mod tests {
         let kernel = armed_model();
         let runner = RecordingRunner::default();
         let calls = runner.0.clone();
-        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter::new(kernel.clone()));
 
         gate.open_egress().await.unwrap();
         {
@@ -2961,43 +2977,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn both_halves_share_one_socket_released_off_the_callers_thread() {
+    async fn the_gate_socket_is_kept_and_never_released() {
         // Releasing an nfnetlink socket after a deletion waits an RCU grace
-        // period while holding nf_tables' commit mutex, so a release between
-        // the halves delays the ingress commit, and a release on the
-        // caller's thread delays the caller. The model's release blocks until
-        // let go (or two seconds pass).
+        // period while holding nf_tables' commit mutex: inline it delays the
+        // caller, between the halves it delays the ingress commit, and on
+        // another thread it lands in the exec of a process forked meanwhile.
+        // The model's release blocks until let go (or two seconds pass).
         let kernel = armed_model();
         let (release, blocker) = std::sync::mpsc::channel::<()>();
         kernel.lock().unwrap().close_blocker = Some(Arc::new(Mutex::new(blocker)));
-        let gate = IptablesGate::with_netfilter(
-            RecordingRunner::default(),
-            ModelNetfilter(kernel.clone()),
-        );
+        let netfilter = ModelNetfilter::new(kernel.clone());
         let started = std::time::Instant::now();
-        gate.open_egress().await.unwrap();
-        gate.open().await.unwrap();
-        drop(gate);
+        for _ in 0..2 {
+            let gate = IptablesGate::with_netfilter(RecordingRunner::default(), netfilter.clone());
+            gate.open_egress().await.unwrap();
+            gate.open().await.unwrap();
+            drop(gate);
+            kernel.lock().unwrap().arm(Family::Ipv4);
+            kernel.lock().unwrap().arm(Family::Ipv6);
+        }
         let elapsed = started.elapsed();
         assert!(
             elapsed < std::time::Duration::from_millis(500),
-            "opening the gate and dropping it waited {elapsed:?} for a socket release"
+            "opening the gate twice waited {elapsed:?} for a socket release"
         );
-        {
-            let k = kernel.lock().unwrap();
-            assert_eq!(k.commits.len(), 2);
-            assert_eq!(k.opens, 1, "both halves must share one socket");
-            assert_eq!(k.closes, 0, "released before the caller let it go");
-        }
-        release.send(()).unwrap();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while kernel.lock().unwrap().closes == 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "the socket was never released"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
+        let k = kernel.lock().unwrap();
+        assert_eq!(k.commits.len(), 4);
+        assert_eq!(k.opens, 1, "every removal must use the one kept socket");
+        assert_eq!(k.closes, 0, "the gate's socket was released");
+        drop(k);
+        drop(release);
     }
 
     #[tokio::test]
@@ -3013,7 +3022,7 @@ mod tests {
         }
         let gate = IptablesGate::with_netfilter(
             RecordingRunner::default(),
-            ModelNetfilter(kernel.clone()),
+            ModelNetfilter::new(kernel.clone()),
         );
         gate.open().await.unwrap();
         let k = kernel.lock().unwrap();
@@ -3090,7 +3099,7 @@ mod tests {
         }));
         let gate = IptablesGate::with_netfilter(
             RecordingRunner::default(),
-            ModelNetfilter(kernel.clone()),
+            ModelNetfilter::new(kernel.clone()),
         );
         gate.open().await.unwrap();
         let k = kernel.lock().unwrap();
@@ -3116,7 +3125,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
         let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
-        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter::new(kernel.clone()));
         let error = gate.open().await.unwrap_err();
         assert!(
             format!("{error:#}").contains("nf_tables backend"),
@@ -3129,7 +3138,7 @@ mod tests {
         let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
         let gate = IptablesGate::with_netfilter(
             RecordingRunner::default(),
-            ModelNetfilter(kernel.clone()),
+            ModelNetfilter::new(kernel.clone()),
         );
         gate.open().await.unwrap();
         assert!(kernel.lock().unwrap().commits.is_empty());
@@ -3146,7 +3155,7 @@ mod tests {
             calls: Arc::new(Mutex::new(Vec::new())),
         };
         let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
-        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter::new(kernel.clone()));
         assert!(gate
             .family_is_closed("iptables", IPV4_LOOPBACK)
             .await

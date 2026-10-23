@@ -29,21 +29,28 @@ pub(crate) fn open_raw_socket(
     Ok(unsafe { std::os::fd::FromRawFd::from_raw_fd(raw) })
 }
 
-/// Release a socket on a thread of its own, for sockets whose release waits
-/// out an RCU grace period: AF_PACKET (`packet_release()` calls
-/// `synchronize_net()`) and NETLINK_NETFILTER after a commit that deleted
-/// rules (see the `Drop` of `snapshot_network::IptablesGate`). Measured in
-/// restored clones, one grace period is 26, 46 and 79 ms at 2, 4 and 8 vCPUs.
-/// A restore that only sent on the socket has nothing to wait for. The packet
-/// receive barrier is the one release that must stay synchronous, and it does
-/// not use this.
+/// The one AF_PACKET socket fc-agent sends frames through (the gateway ARP
+/// probe, the IPv6 announcement), opened on first use and never closed.
 ///
-/// A thread that cannot be spawned releases the socket here instead, which is
-/// slower and still correct.
-pub(crate) fn release_off_path<T: Send + 'static>(socket: T) {
-    let _ = std::thread::Builder::new()
-        .name("fc-sock-release".to_string())
-        .spawn(move || drop(socket));
+/// Releasing an AF_PACKET socket waits one RCU grace period
+/// (`packet_release()` calls `synchronize_net()`): 26, 46 and 79 ms at 2, 4
+/// and 8 vCPUs in restored clones. Released inline it sat on the restore's
+/// path; released on another thread it raced with process spawns, because a
+/// child forked before the release holds a reference until its exec closes
+/// the CLOEXEC descriptor, and the child then made the final release and
+/// waited inside its own exec (the `iptables -S` verification after the ARP
+/// probe went from 2-3 ms to 27-75 ms). A socket that is never released costs
+/// neither. Protocol 0 registers no receive hook, so it sees no traffic; each
+/// send names its protocol in the address. The receive barrier opens and
+/// closes its own socket: its grace period is the barrier.
+fn packet_sender() -> std::io::Result<std::os::fd::BorrowedFd<'static>> {
+    use std::os::fd::AsFd;
+    static SENDER: std::sync::OnceLock<OwnedFd> = std::sync::OnceLock::new();
+    if let Some(socket) = SENDER.get() {
+        return Ok(socket.as_fd());
+    }
+    let socket = open_raw_socket(libc::AF_PACKET, libc::SOCK_RAW, 0)?;
+    Ok(SENDER.get_or_init(|| socket).as_fd())
 }
 
 /// One row of the kernel's IPv4 route table that names a default gateway.
@@ -135,21 +142,19 @@ fn interface_ipv4(interface: &str) -> Option<Ipv4Addr> {
     None
 }
 
-/// Send `frame` on `interface` through an AF_PACKET socket bound to
-/// `protocol`, addressed to `destination`, and hand back the socket: its
-/// release waits a grace period, so the caller passes it to
-/// `release_off_path`.
+/// Send `frame` on `interface` through `packet_sender`, as `protocol`,
+/// addressed to `destination`.
 fn send_ethernet_frame(
     interface: &str,
     frame: &[u8],
     protocol: u16,
     destination: [u8; 6],
-) -> std::io::Result<OwnedFd> {
+) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let index = nix::net::if_::if_nametoindex(interface)
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))?;
-    let fd = open_raw_socket(libc::AF_PACKET, libc::SOCK_RAW, protocol.to_be() as i32)?;
+    let fd = packet_sender()?;
     // SAFETY: sockaddr_ll is fully zero-initialized before the fields we set.
     let mut address: libc::sockaddr_ll = unsafe { std::mem::zeroed() };
     address.sll_family = libc::AF_PACKET as u16;
@@ -169,18 +174,15 @@ fn send_ethernet_frame(
         )
     };
     if sent < 0 {
-        let error = std::io::Error::last_os_error();
-        release_off_path(fd);
-        return Err(error);
+        return Err(std::io::Error::last_os_error());
     }
     if sent as usize != frame.len() {
-        release_off_path(fd);
         return Err(std::io::Error::other(format!(
             "short send: {sent} of {} bytes",
             frame.len()
         )));
     }
-    Ok(fd)
+    Ok(())
 }
 
 /// Broadcast one ARP request for the gateway, natively and without waiting.
@@ -551,13 +553,10 @@ pub fn refresh_gateway_arp() {
     let frame = build_arp_request(mac, source_ip, route.gateway);
     const ETH_P_ARP: u16 = 0x0806;
     match send_ethernet_frame(&route.interface, &frame, ETH_P_ARP, [0xff; 6]) {
-        Ok(socket) => {
-            release_off_path(socket);
-            eprintln!(
-                "[fc-agent] gateway {} ARP probe sent from {} ({})",
-                route.gateway, source_ip, route.interface
-            )
-        }
+        Ok(()) => eprintln!(
+            "[fc-agent] gateway {} ARP probe sent from {} ({})",
+            route.gateway, source_ip, route.interface
+        ),
         Err(error) => eprintln!(
             "[fc-agent] WARNING: gateway {} ARP probe failed: {error}",
             route.gateway
@@ -902,10 +901,7 @@ pub fn announce_ipv6(interface: &str, address: &str) {
     const ETH_P_IPV6: u16 = 0x86dd;
     let frame = build_unsolicited_na(mac, address);
     match send_ethernet_frame(interface, &frame, ETH_P_IPV6, ALL_NODES_MAC) {
-        Ok(socket) => {
-            release_off_path(socket);
-            eprintln!("[fc-agent] announced IPv6 {address} on {interface}");
-        }
+        Ok(()) => eprintln!("[fc-agent] announced IPv6 {address} on {interface}"),
         Err(error) => {
             eprintln!(
                 "[fc-agent] WARNING: announcing IPv6 {address} on {interface} failed: {error}"
@@ -1630,6 +1626,27 @@ mod gateway_arp_tests {
 #[cfg(test)]
 mod ipv6_announce_tests {
     use super::*;
+
+    /// Frames go out through the one socket `packet_sender` keeps open. A
+    /// socket opened per send has to be released, and the release waits a
+    /// grace period: on the restore's path when inline, and inside the exec
+    /// of whatever process was forked meanwhile when on another thread.
+    /// Source-pinned: which process pays depends on a fork interleaving no
+    /// runtime test can hold.
+    #[test]
+    fn frames_are_sent_through_the_socket_that_is_never_released() {
+        let source = include_str!("network.rs");
+        let start = source
+            .find("fn send_ethernet_frame(")
+            .expect("send_ethernet_frame is in network.rs");
+        let end = start + source[start..].find("\n}\n").expect("its body ends");
+        let body = &source[start..end];
+        assert!(body.contains("packet_sender()"), "{body}");
+        assert!(
+            !body.contains("open_raw_socket"),
+            "send_ethernet_frame opens a socket per send:\n{body}"
+        );
+    }
 
     #[test]
     fn the_unsolicited_na_overrides_with_our_link_layer_address() {

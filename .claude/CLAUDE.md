@@ -153,12 +153,17 @@ flushes the pending destruction, which starts with `synchronize_rcu()`) while
 holding the namespace's commit mutex; so does releasing any AF_PACKET socket
 (`packet_release()` calls `synchronize_net()`). Measured in restored clones,
 that wait was 26, 46 and 79 ms at 2, 4 and 8 vCPUs, and it was the whole
-110-260 ms the gate used to cost (#1151). So the gate keeps one socket for
-both halves and releases it off-thread after publication, and the ARP and
-neighbour announcements release theirs off-thread too
-(`network::release_off_path`). The receive barrier is the one release that
-must stay synchronous: its grace period is the barrier.
-`both_halves_share_one_socket_released_off_the_callers_thread` and
+110-260 ms the gate used to cost (#1151).
+
+So fc-agent never releases those sockets: it keeps one nfnetlink socket and one
+send-only AF_PACKET socket for its whole life. Releasing them on another thread
+is not a fix: a process forked before the release holds a reference until its
+exec closes the CLOEXEC descriptor, so that process makes the final release and
+waits the grace period inside its own exec (the `iptables -S` after the ARP
+probe went from 2-3 ms to 27-75 ms). The receive barrier is the one release
+that must stay: its grace period is the barrier.
+`the_gate_socket_is_kept_and_never_released`,
+`frames_are_sent_through_the_socket_that_is_never_released` and
 `opening_each_half_is_one_transaction_for_both_families` pin it.
 
 ## MAXIMUM REUSE / CACHEABILITY
