@@ -318,6 +318,7 @@ async fn create_sandbox(
         network: crate::cli::NetworkMode::Rootless,
         hypervisor: crate::cli::args::Hypervisor::Firecracker,
         ipv6_prefix: None,
+        ipv6_address: None,
         health_check: None,
         on_restore: None,
         health_check_timeout: 5,

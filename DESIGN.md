@@ -397,7 +397,8 @@ Uses veth pairs + IPv6 routing for kernel line-rate networking without userspace
 **Features**:
 - Requires root and a host with a global IPv6 /64 subnet (or `--ipv6-prefix` to specify one explicitly)
 - Native IPv6 routing through the kernel stack (no userspace L4 translation)
-- Each VM gets a unique IPv6 derived from the host's /64 prefix
+- Each VM gets a unique IPv6 derived from the host's /64 prefix, or the address `--ipv6-address` names inside the prefix in use (not its address 0 or 1)
+- A VM leases its address before using it: an exclusive `flock` on `/run/fcvm/routed-ipv6/<address>.lock`, held until its network is torn down and released by the kernel if the process dies. Of two VMs that ask for one address together, exactly one gets it. If the lease is free but the host already has a /128 route for the address, in any routing table, the route belongs to something other than a live fcvm VM (the host itself, a VM that died without cleanup, another program), so a given address is refused and a derived one is re-derived
 - Port forwarding via built-in TCP proxy (`setns` + tokio relay): a mapping listens on its HOSTIP, or on the VM's loopback IP (same allocation as rootless) when it names none
 - Parallel-safe: per-VM routes, proxy NDP, ip6tables rules
 
@@ -412,15 +413,18 @@ struct RoutedNetwork {
     namespace_id: Option<String>,
     host_veth: Option<String>,
     vm_ipv6: Option<String>,
+    address_lease: Option<AddressLease>, // held until cleanup has removed everything naming vm_ipv6
     default_iface: Option<String>,
     proxy_handles: Vec<Relay>,
     ipv6_prefix: Option<String>,       // explicit /64 prefix (skips auto-detect + MASQUERADE)
+    ipv6_address: Option<Ipv6Addr>,    // --ipv6-address, instead of a derived address
 }
 
 async fn setup() -> Result<NetworkConfig> {
     self.preflight_check()             // root, IPv6, ip6tables (skipped if --ipv6-prefix); rejects /udp publishes
     detect_host_ipv6()                 // find /64 subnet (or /128 with on-link /64); skipped if --ipv6-prefix
-    generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash
+    generate_vm_ipv6(prefix, vm_id)    // deterministic IPv6 from hash, or the --ipv6-address given
+    lease_address(vm_ipv6)             // flock held for the VM's life; refused if held or routed
     create_namespace(ns_name)
     // Disable DAD inside namespace (accept_dad=0 on all + default)
     create_veth_pair(host_veth, guest_veth)
@@ -855,7 +859,7 @@ curl http://172.30.x.1:8080
 **Setup Sequence** (16 steps):
 1. Preflight: verify root, global IPv6, ip6tables
 2. Detect host IPv6 /64 subnet (supports direct /64 or AWS-style /128 with on-link /64 route)
-3. Generate deterministic VM IPv6 from host prefix + hash of vm_id (with collision detection)
+3. Generate deterministic VM IPv6 from host prefix + hash of vm_id, or take `--ipv6-address`; lease it (collision detection: the lease, then the host's /128 routes)
 4. Create network namespace (`ip netns add fcvm-XXXX`)
 5. Disable IPv6 DAD inside namespace (`accept_dad=0` on all + default, before any interface exists)
 6. Create veth pair, move guest side to namespace
@@ -1453,6 +1457,11 @@ One async session per connection:
    fcvm exec --name my-vm -- hostname    # By name
    fcvm exec --pid 12345 -- hostname     # By PID
    ```
+   Names are unique among live VMs. A launch writes its first state through
+   `StateManager::claim_name`, which holds `names.lock` in the state directory while it
+   checks every state with that name and writes its own, so of two launches with one name
+   exactly one proceeds. A state is live while its process runs (PID, start time, not a
+   zombie); a state with the name whose process is gone is deleted by the claim.
 
 3. **Interactive flags** (`-i`, `-t`): Match docker/podman semantics:
    - `-i`: Keep stdin open
@@ -1591,7 +1600,8 @@ fcvm snapshot run --snapshot <NAME> [OPTIONS]
 --pid <SERVE_PID>         Memory server PID (UFFD lazy-restore mode)
 --snapshot <NAME>         Snapshot name (no serve process needed)
                           (Either --pid or --snapshot is required; mutually exclusive)
---name <NAME>             Clone VM name (auto-generated if not provided)
+--name <NAME>             Clone VM name (auto-generated if not provided; unique among running VMs)
+--ipv6-address <ADDR>     Routed snapshots only: the clone's address, swapped in on restore
 --exec <CMD>              Execute command in container after clone is healthy
 --publish <SPEC>          [HOSTIP:]HOSTPORT:GUESTPORT[/PROTO], comma-separated or repeated.
                           The clone publishes these mappings instead of the snapshot's
