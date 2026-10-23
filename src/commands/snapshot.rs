@@ -2007,7 +2007,12 @@ async fn cmd_snapshot_run_inner(
         );
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
         for sbdf in &gpus {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
         }
     }
     vm_state.config.gpus = gpus.clone();

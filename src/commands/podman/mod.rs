@@ -1463,7 +1463,12 @@ async fn prepare_vm_for_lifecycle(
         args.gpu = crate::gpu::canonical_sbdfs(&args.gpu)?;
         crate::gpu::require_pci_transport(runtime_config.effective_firecracker_args().as_deref())?;
         for sbdf in &args.gpu {
-            crate::gpu::check_host_device(Path::new("/sys"), Path::new("/dev"), sbdf)?;
+            crate::gpu::check_host_device(
+                Path::new("/sys"),
+                Path::new("/dev"),
+                &crate::gpu::scrub::state_dir(),
+                sbdf,
+            )?;
         }
     }
     // Resolved ONCE for the whole launch. The same values feed the snapshot
