@@ -292,7 +292,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (frames fall on scene time k/30; `from_t` is that time), 45 frames (1.5 s) after the
   change, so it reaches every renderer first. Each renderer draws its old rectangle up to
   that frame and its new one from it. A tile the change moved carries `previous_rect`
-  (null for a new tile, or one that did not move). The page reads `layout.generation`,
+  (null for a tile that did not move; the whole image for a GPU that warmed before joining). The page reads `layout.generation`,
   `layout.from_t` (or `from_frame`), `layout.fcvm`, `layout.ec2`, and each tile's `rect`
   and `previous_rect`: it keeps the old tiles on screen until every tile of the new
   generation has delivered its first frame at or after `from_t`, then swaps them all at
@@ -614,7 +614,9 @@ none is placed). For each slot the agent reconciles:
 - `warm: true` (with `rect: null`): the GPU is joining. Run its VM as for a placed slot and
   post the whole image (`rect` `{"x": 0, "y": 0, "w": 1, "h": 1}`) with the shared camera,
   outside the host's aggregator layout. When it is placed (same generation, `warm` gone,
-  `rect` set) post its rectangle; no relaunch.
+  `rect` set, `previous_rect` the whole image) post its rectangle; the renderer keeps drawing
+  the whole image until `rect_from_frame`, so it opens the new encoders ahead of the switch.
+  No relaunch.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
   backoff resets once a VM has run for 60 s.

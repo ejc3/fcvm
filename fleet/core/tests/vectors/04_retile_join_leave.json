@@ -169,6 +169,13 @@
     {
       "after": 2,
       "checks": {
+        "/assign/hB/0/layout_generation": 2,
+        "/assign/hB/0/previous_rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
         "/view/fleet/n": 3,
         "/view/fleet/warming": [
           "slot-4",
@@ -176,7 +183,7 @@
         ],
         "/view/layout/generation": 2
       },
-      "note": "one is running: it joins"
+      "note": "one is running: it joins, drawing the whole image until the generation's frame"
     },
     {
       "after": 4,
@@ -484,7 +491,12 @@
         "id": "fcvm:1",
         "last_relaunch": null,
         "phase": "running",
-        "previous_rect": null,
+        "previous_rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
         "rect": {
           "h": 0.25,
           "w": 1.0,

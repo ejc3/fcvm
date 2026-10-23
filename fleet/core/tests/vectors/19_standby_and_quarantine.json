@@ -411,7 +411,12 @@
         "id": "fcvm:1",
         "last_relaunch": null,
         "phase": "running",
-        "previous_rect": null,
+        "previous_rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
         "rect": {
           "h": 1.0,
           "w": 0.5,

@@ -1282,7 +1282,7 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
         }
     }
     active.sort_unstable();
-    f.warming = warming.into_iter().collect();
+    let was_warming = std::mem::replace(&mut f.warming, warming.into_iter().collect());
     // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
     // the GPUs it has live); asleep it has none.
     let want_ec2 = if asleep {
@@ -1369,7 +1369,16 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
             let new = placed.get(&(half, *n)).copied();
             let (pos, rect) = (new.map(|p| p.0), new.map(|p| p.1));
             if rect != s.rect {
-                s.previous_rect = s.rect;
+                // A GPU that warmed drew the whole image until it joins.
+                s.previous_rect = match (half, s.rect) {
+                    (Half::Fcvm, None) if was_warming.contains(n) => Some(Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        w: 1.0,
+                        h: 1.0,
+                    }),
+                    _ => s.rect,
+                };
                 s.rect_generation = generation;
             }
             s.position = pos;

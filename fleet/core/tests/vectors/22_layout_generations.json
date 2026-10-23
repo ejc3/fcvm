@@ -219,7 +219,12 @@
           "x": 0.0,
           "y": 0.0
         },
-        "/view/tiles/2/previous_rect": null,
+        "/view/tiles/2/previous_rect": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
         "/view/tiles/2/rect": {
           "h": 0.33333333333333337,
           "w": 0.75,
