@@ -27,29 +27,33 @@ pub struct StoreUser {
     pub gid: u32,
     pub sub_start: u64,
     pub sub_count: u64,
+    pub sub_gid_start: u64,
+    pub sub_gid_count: u64,
 }
 
 /// Who a store's files belong to on disk: the ids container uid and gid 0 were written
-/// as, and where container ids 1 and up begin. Root podman on the host writes the
-/// container ids themselves (0, 0, 1). Rootless podman on the host writes its builder's
-/// uid and gid, and its subordinate ids from the subuid start the host passes in the
-/// plan, which is also the container user's `sub_start`.
+/// as, and where container uids and gids 1 and up begin. Root podman on the host writes
+/// the container ids themselves (0, 0, 1, 1). Rootless podman on the host writes its
+/// builder's uid and gid, and its subordinate ids from the subuid and subgid starts the
+/// host passes in the plan, which are also the container user's ranges.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StoreOwner {
     uid: u32,
     gid: u32,
     sub_start: u64,
+    sub_gid_start: u64,
 }
 
 impl StoreOwner {
     /// The owner a store has, from who owns its `overlay-images` directory.
     fn of(meta: &std::fs::Metadata, user: &StoreUser) -> Self {
         use std::os::unix::fs::MetadataExt;
-        let sub_start = if meta.uid() == 0 { 1 } else { user.sub_start };
+        let root_built = meta.uid() == 0;
         Self {
             uid: meta.uid(),
             gid: meta.gid(),
-            sub_start,
+            sub_start: if root_built { 1 } else { user.sub_start },
+            sub_gid_start: if root_built { 1 } else { user.sub_gid_start },
         }
     }
 }
@@ -58,18 +62,25 @@ impl StoreUser {
     /// The `X-mount.idmap` option (util-linux 2.39) that shows a store `owner` wrote as
     /// this user's, or None when the store already holds this user's ids.
     fn idmap_option(&self, owner: StoreOwner) -> Option<String> {
-        if owner.uid == self.uid && owner.gid == self.gid && owner.sub_start == self.sub_start {
+        if owner.uid == self.uid
+            && owner.gid == self.gid
+            && owner.sub_start == self.sub_start
+            && owner.sub_gid_start == self.sub_gid_start
+        {
             return None;
         }
         Some(format!(
-            "X-mount.idmap=u:{ou}:{uid}:1 u:{os}:{sub}:{n} g:{og}:{gid}:1 g:{os}:{sub}:{n}",
+            "X-mount.idmap=u:{ou}:{uid}:1 u:{os}:{sub}:{n} g:{og}:{gid}:1 g:{ogs}:{subg}:{ng}",
             ou = owner.uid,
             og = owner.gid,
             os = owner.sub_start,
+            ogs = owner.sub_gid_start,
             uid = self.uid,
             gid = self.gid,
             sub = self.sub_start,
-            n = self.sub_count
+            n = self.sub_count,
+            subg = self.sub_gid_start,
+            ng = self.sub_gid_count
         ))
     }
 }
@@ -1591,6 +1602,15 @@ pub fn resolve_subuid_range(subuid_range: Option<(u64, u64)>) -> (u64, u64) {
     subuid_range.unwrap_or((100000, 65536))
 }
 
+/// The VM user's subordinate gid range: the host's from /etc/subgid when the plan
+/// carries it, which can differ from its uid range, otherwise the uid range.
+pub fn resolve_subgid_range(
+    subgid_range: Option<(u64, u64)>,
+    subuid_range: Option<(u64, u64)>,
+) -> (u64, u64) {
+    subgid_range.unwrap_or_else(|| resolve_subuid_range(subuid_range))
+}
+
 /// Create the VM user and set up rootless podman prerequisites.
 /// Call this BEFORE importing images so podman load runs as the target user.
 /// Returns (username, uid, runtime_dir) for use by run_as_user_prefix().
@@ -1604,6 +1624,7 @@ pub fn create_vm_user(
     user_spec: &str,
     desired_name: &str,
     subuid_range: Option<(u64, u64)>,
+    subgid_range: Option<(u64, u64)>,
     provisioned: bool,
 ) -> (String, String, String) {
     let parts: Vec<&str> = user_spec.split(':').collect();
@@ -1624,13 +1645,19 @@ pub fn create_vm_user(
         .output();
 
     let (subuid_start, subuid_count) = resolve_subuid_range(subuid_range);
-    let subuid_entry = format!("{}:{}:{}\n", username, subuid_start, subuid_count);
+    let (subgid_start, subgid_count) = resolve_subgid_range(subgid_range, subuid_range);
     eprintln!(
-        "[fc-agent] subuid/subgid: {}:{}",
-        subuid_start, subuid_count
+        "[fc-agent] subuid {}:{}, subgid {}:{}",
+        subuid_start, subuid_count, subgid_start, subgid_count
     );
-    let _ = std::fs::write("/etc/subuid", &subuid_entry);
-    let _ = std::fs::write("/etc/subgid", &subuid_entry);
+    let _ = std::fs::write(
+        "/etc/subuid",
+        format!("{username}:{subuid_start}:{subuid_count}\n"),
+    );
+    let _ = std::fs::write(
+        "/etc/subgid",
+        format!("{username}:{subgid_start}:{subgid_count}\n"),
+    );
 
     let runtime_dir = format!("/run/user/{}", uid);
     let _ = std::fs::create_dir_all(&runtime_dir);
@@ -2060,31 +2087,54 @@ mod tests {
             gid: 100,
             sub_start: 100000,
             sub_count: 65536,
+            sub_gid_start: 200000,
+            sub_gid_count: 65536,
         };
         let root_built = StoreOwner {
             uid: 0,
             gid: 0,
             sub_start: 1,
+            sub_gid_start: 1,
         };
         assert_eq!(
             user.idmap_option(root_built).as_deref(),
-            Some("X-mount.idmap=u:0:1001:1 u:1:100000:65536 g:0:100:1 g:1:100000:65536")
+            Some("X-mount.idmap=u:0:1001:1 u:1:100000:65536 g:0:100:1 g:1:200000:65536")
         );
+        // Rootless podman as another uid wrote the host's ranges, which are also the
+        // user's, so only the owner moves; the gid range stays the gid range.
         let built_by_another_uid = StoreOwner {
             uid: 2000,
             gid: 100,
             sub_start: 100000,
+            sub_gid_start: 200000,
         };
         assert_eq!(
             user.idmap_option(built_by_another_uid).as_deref(),
-            Some("X-mount.idmap=u:2000:1001:1 u:100000:100000:65536 g:100:100:1 g:100000:100000:65536")
+            Some("X-mount.idmap=u:2000:1001:1 u:100000:100000:65536 g:100:100:1 g:200000:200000:65536")
         );
         let built_by_the_user = StoreOwner {
             uid: 1001,
             gid: 100,
             sub_start: 100000,
+            sub_gid_start: 200000,
         };
         assert_eq!(user.idmap_option(built_by_the_user), None);
+    }
+
+    /// The guest's /etc/subgid takes the host's gid range when the plan carries one,
+    /// so a rootless-built store's group ids are the user's; without one it is the uid
+    /// range, as before.
+    #[test]
+    fn the_subgid_range_is_the_hosts_and_falls_back_to_the_subuid_range() {
+        assert_eq!(
+            resolve_subgid_range(Some((200000, 65536)), Some((100000, 65536))),
+            (200000, 65536)
+        );
+        assert_eq!(
+            resolve_subgid_range(None, Some((100000, 65536))),
+            (100000, 65536)
+        );
+        assert_eq!(resolve_subgid_range(None, None), (100000, 65536));
     }
 
     use super::{consume_cache_wait_lines, run_cache_handshake, CacheResult, StatusConnector};

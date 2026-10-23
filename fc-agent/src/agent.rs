@@ -339,19 +339,32 @@ pub async fn run() -> Result<()> {
                 .subuid_start
                 .zip(plan.subuid_count)
                 .or_else(|| plan.subuid_start.map(|s| (s, 65536)));
-            let (username, _uid, runtime_dir) =
-                container::create_vm_user(user_spec, desired_name, subuid_range, provisioned);
+            let subgid_range = plan
+                .subgid_start
+                .zip(plan.subgid_count)
+                .or_else(|| plan.subgid_start.map(|s| (s, 65536)));
+            let (username, _uid, runtime_dir) = container::create_vm_user(
+                user_spec,
+                desired_name,
+                subuid_range,
+                subgid_range,
+                provisioned,
+            );
             let gid: u32 = user_spec
                 .split(':')
                 .nth(1)
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(100);
             let (sub_start, sub_count) = container::resolve_subuid_range(subuid_range);
+            let (sub_gid_start, sub_gid_count) =
+                container::resolve_subgid_range(subgid_range, subuid_range);
             let store_user = container::StoreUser {
                 uid,
                 gid,
                 sub_start,
                 sub_count,
+                sub_gid_start,
+                sub_gid_count,
             };
             Some((username, runtime_dir, store_user))
         }

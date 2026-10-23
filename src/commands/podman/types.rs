@@ -429,7 +429,7 @@ fn guest_mount_points(
     let image_store_raw = (mounts_image_store && runs_as_non_root_user(args)).then(|| {
         (
             format!(
-                "fcvm mounts the image disk of {} for user {} in the guest",
+                "fcvm mounts the image store disk of {} for user {} in the guest",
                 args.image,
                 args.user.as_deref().unwrap_or_default()
             ),
@@ -970,6 +970,25 @@ mod tests {
                 "--user {user:?}: no image store, no raw mount point"
             );
         }
+    }
+
+    /// fc-agent mounts the raw image store disk after the pmem devices, so a `--pmem`
+    /// mount point under it would be hidden; the host refuses it before boot.
+    #[test]
+    fn a_pmem_mount_point_under_the_raw_image_store_is_refused() {
+        let args = parse_run(&[
+            "--user",
+            "1000:1000",
+            "--pmem",
+            "/images/a.ext4:/run/fcvm-image-store-raw/cache:ro",
+            "localhost/app:latest",
+        ]);
+        let points = guest_mount_points(&args, &[], true);
+        let err = check_pmem_mount_points(&points).expect_err("the pmem mount point is hidden");
+        assert!(
+            format!("{err:#}").contains("/run/fcvm-image-store-raw"),
+            "{err:#}"
+        );
     }
 
     /// The host's list of mount points is fc-agent's. Besides the mount points

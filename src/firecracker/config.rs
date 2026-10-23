@@ -546,6 +546,8 @@ impl FirecrackerConfig {
                     "user": self.user.as_deref(),
                     "subuid_start": runtime.subuid_start,
                     "subuid_count": runtime.subuid_count,
+                    "subgid_start": runtime.subgid_start,
+                    "subgid_count": runtime.subgid_count,
                     "non_blocking_output": self.non_blocking_output,
                     "forward_localhost": self.forward_localhost.iter().map(|p| p.to_string()).collect::<Vec<_>>(),
                     // Guest ports reachable from the host. fc-agent DNATs each to
@@ -598,6 +600,10 @@ pub struct MmdsRuntime {
     pub subuid_start: Option<u64>,
     /// Host user's subordinate UID range count
     pub subuid_count: Option<u64>,
+    /// Host user's subordinate GID range start (from /etc/subgid)
+    pub subgid_start: Option<u64>,
+    /// Host user's subordinate GID range count
+    pub subgid_count: Option<u64>,
     /// Host timestamp (UTC epoch seconds)
     pub host_time: String,
     /// The host's NTP servers, already resolved to addresses, for the guest's chronyd.
@@ -1069,6 +1075,8 @@ mod tests {
             no_proxy: None,
             subuid_start: None,
             subuid_count: None,
+            subgid_start: None,
+            subgid_count: None,
             host_time: "0".to_string(),
             ntp_servers: vec![],
         });
@@ -1095,6 +1103,8 @@ mod tests {
             no_proxy: None,
             subuid_start: None,
             subuid_count: None,
+            subgid_start: None,
+            subgid_count: None,
             host_time: "0".to_string(),
             ntp_servers: vec![],
         };
