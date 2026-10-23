@@ -59,15 +59,32 @@ Scene parse_scene(const std::string& body) {
   if (ep != std::floor(ep) || std::fabs(ep) > 9.0e15) throw std::runtime_error("'epoch_unix_ms' must be an integer");
   s.epoch_unix_ms = (int64_t)ep;
 
-  const Json& r = j.at("rect");
-  s.rect.x = r.at("x").number("rect.x");
-  s.rect.y = r.at("y").number("rect.y");
-  s.rect.w = r.at("w").number("rect.w");
-  s.rect.h = r.at("h").number("rect.h");
-  if (!(s.rect.w > 0 && s.rect.h > 0 && s.rect.x >= 0 && s.rect.y >= 0 && s.rect.x + s.rect.w <= 1.0 + 1e-9 &&
-        s.rect.y + s.rect.h <= 1.0 + 1e-9))
-    throw std::runtime_error("'rect' must lie inside the unit square with positive w and h");
-  if (s.rect.w < 1.0 / 256 || s.rect.h < 1.0 / 256) throw std::runtime_error("'rect' is smaller than 1/256 of the image");
+  auto read_rect = [&](const Json& r, const std::string& name) {
+    Rect x;
+    x.x = r.at("x").number(name + ".x");
+    x.y = r.at("y").number(name + ".y");
+    x.w = r.at("w").number(name + ".w");
+    x.h = r.at("h").number(name + ".h");
+    if (!(x.w > 0 && x.h > 0 && x.x >= 0 && x.y >= 0 && x.x + x.w <= 1.0 + 1e-9 && x.y + x.h <= 1.0 + 1e-9))
+      throw std::runtime_error("'" + name + "' must lie inside the unit square with positive w and h");
+    if (x.w < 1.0 / 256 || x.h < 1.0 / 256) throw std::runtime_error("'" + name + "' is smaller than 1/256 of the image");
+    return x;
+  };
+  s.rect = read_rect(j.at("rect"), "rect");
+  // layout generations (the coordinator's re-tiling): `previous_rect` for
+  // frames before `rect_from_frame`, `rect` from it
+  auto frame_no = [&](const char* k) {
+    double v = j.at(k).number(k);
+    if (!(v >= 0 && v == std::floor(v) && v < 9.0e15)) throw std::runtime_error(std::string("'") + k + "' must be a non-negative integer");
+    return (long long)v;
+  };
+  if (j.has("layout_generation") && j.at("layout_generation").type != Json::Null) s.layout_generation = frame_no("layout_generation");
+  if (j.has("rect_from_frame") && j.at("rect_from_frame").type != Json::Null) s.rect_from_frame = frame_no("rect_from_frame");
+  if (j.has("previous_rect") && j.at("previous_rect").type != Json::Null) {
+    s.previous_rect = read_rect(j.at("previous_rect"), "previous_rect");
+    s.has_previous_rect = true;
+    if (s.rect_from_frame < 0) throw std::runtime_error("'previous_rect' needs 'rect_from_frame'");
+  }
 
   s.image_aspect = j.at("image_aspect").number("image_aspect");
   if (!(s.image_aspect >= 0.1 && s.image_aspect <= 10)) throw std::runtime_error("'image_aspect' must be in 0.1..10");
@@ -154,6 +171,16 @@ Tile tile_geometry(const Rect& r, double image_aspect, int requested_h) {
   w = std::clamp(w, 16, 4096);
   t.w = (w + 1) & ~1;
   return t;
+}
+
+int tile_h_for(const Rect& r, double image_aspect, int full_h) {
+  int best = 16, bd = 1 << 30;
+  int c = (int)std::lround(full_h * r.h);
+  for (int h = std::max(16, (c - 8) & ~1); h <= std::min(2160, c + 8); h += 2) {
+    int d = std::abs(tile_geometry(r, image_aspect, h).full_h - full_h);
+    if (d < bd) { bd = d; best = h; }
+  }
+  return best;
 }
 
 double scene_time(const Scene& s, double t) {
