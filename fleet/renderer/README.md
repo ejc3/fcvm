@@ -298,6 +298,27 @@ Round 10, from the end-to-end run on eight T4s:
   stayed within 448 k to 489 k and the budget changed once (353,553 to
   420,448 at 225 s), 0 times in the last 3 minutes; the latest frames' fit on
   the same run still swung 447 k to 711 k. No frame took over 27.0 ms.
+Round 11, text styles (`text_style`, PROTOCOL.md "Text styles"):
+
+- `shots/text-styles.jpg`: classic and the three new styles, a hold (128
+  samples) and a moving frame at 1080, the message "Hello from 8 GPUs".
+  `shots/text-styles-wall.jpg`: the 8-GPU wall's whole image at 360 (180 px
+  tiles) and the upper-left tile of a 4 x 2 wall opened at 1080.
+- Seam test on three GPUs: 30/30 each, the round 9 hashes unchanged (classic
+  is the default and draws as before); each new style stitches with 0 pixels
+  different moving and as a hold accumulated in different batches, and
+  draws its word.
+- fps with the camera moving, each style against classic on the same wall
+  tile (the one its word falls in), two runs each, render ms:
+
+  | style | 180 px tile | 720p whole | 1080 detail of that tile | 1080 whole |
+  |---|---|---|---|---|
+  | lockup | 4.5 (classic 4.4 to 4.5) | 25.8 to 25.9 (25.9 to 26.0), 29.9 to 30.0 fps | 13.7 to 13.8 (13.6), 30.0 fps | 57.3 to 57.8 (57.8 to 58.1), 15.0 fps |
+  | skywriting | 5.8 (5.6) | 27.3 to 27.4 (26.0), 29.9 to 30.0 fps | 17.0 (14.8), 30.0 fps | 60.2 to 60.5 (58.1 to 58.2), 13.3 to 13.4 fps (14.9) |
+  | inworld | 13.7 to 13.8 (13.7 to 13.8) | 26.0 to 26.1 (26.1 to 26.2), 30.0 fps | 59.1 to 59.3 (59.3 to 59.9), 14.3 to 14.4 fps (14.8) | 58.0 to 58.4 (58.2), 15.0 fps |
+
+  The inworld tile is terrain the default budget cannot draw at 30 fps in
+  the detail view with any text style.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,

@@ -210,5 +210,39 @@ int main(int argc, char** argv) {
     }
     CHECK(bad == 0 && r.stats().hold_samples == 64, "golden-hour hold at 1080, 64 samples: %u non-finite samples", bad);
   }
+
+  // 7. The text styles (lockup, skywriting, inworld): every one stitches, moving
+  // (accumulation off) and as a hold in different batches, and draws the
+  // newest word.
+  for (int style = TEXT_STYLE_LOCKUP; style <= TEXT_STYLE_INWORLD; style++) {
+    const char* name[] = {"classic", "lockup", "skywriting", "inworld"};
+    // skywriting and the sign stay where the camera saw them when the word
+    // came, so these use views that keep them in frame: the shots' moving
+    // path (word at 0, frame at 10) and its golden-hour hold (word at 5, frames
+    // at 22..25)
+    Scene ts = s;
+    ts.text_style = style;
+    ts.camera = {Keyframe{0, {-22, 0.7, -30}, {-45, 1.2, -85}, 60}, Keyframe{60, {-40, 2.4, -70}, {-20, 0.8, -40}, 64}};
+    ts.words = {{"Hello FLEET", 0.0}};
+    Scene th2 = ts;
+    th2.camera = {Keyframe{0, {-15, 2.2, -100}, {-70, 1.4, -70}, 62}};
+    th2.words = {{"Seams hold", 5.0}};
+    const double tmv = 10.0, thd = 25.0;
+    Img w1 = draw(r, ts, Rect{0, 0, 1, 1}, 2 * h, {{tmv, 2}}, false);
+    quads(r, ts, h, {{tmv, 2}}, false, q);
+    d = compare(w1, q, &hd);
+    CHECK(d == 0 && hd == 0, "%s, moving: %ld pixels differ (8-bit), %ld (float)", name[style], d, hd);
+    Img w2 = draw(r, th2, Rect{0, 0, 1, 1}, 2 * h, {{thd - 3, 4}, {thd - 2, 4}, {thd - 1, 4}, {thd, 4}}, true);
+    quads(r, th2, h, {{thd - 0.5, 8}, {thd, 8}}, true, q);
+    d = compare(w2, q, &hd);
+    CHECK(d == 0 && hd == 0, "%s, hold: %ld pixels differ (8-bit), %ld (float)", name[style], d, hd);
+    Scene nw = ts;
+    nw.words.clear();
+    Img w3 = draw(r, nw, Rect{0, 0, 1, 1}, 2 * h, {{tmv, 2}}, false);
+    long dw = 0;
+    for (size_t p = 0; p < w1.rgba.size(); p += 4) dw += memcmp(&w1.rgba[p], &w3.rgba[p], 3) != 0;
+    CHECK(dw > 300, "%s draws the word (%ld pixels)", name[style], dw);
+    fprintf(stderr, "%s moving whole: fnv64 %016llx\n", name[style], (unsigned long long)fnv(w1.rgba));
+  }
   DONE();
 }

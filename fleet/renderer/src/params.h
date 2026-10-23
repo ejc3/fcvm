@@ -23,15 +23,34 @@ struct GCam {
   float aspect;    // whole-image width / height
 };
 
+// Text styles (the scene's text_style): classic draws the stroke font as
+// tubes; the others draw Inter from a signed distance atlas.
+#define TEXT_STYLE_CLASSIC 0
+#define TEXT_STYLE_LOCKUP 1      // emissive type at depth, upper left
+#define TEXT_STYLE_SKYWRITING 2  // the message as smoke in the sky
+#define TEXT_STYLE_INWORLD 3     // the message as a lit sign standing on the ground
+
+// GText.style
+#define GTEXT_TUBE 0    // classic words
+#define GTEXT_RIM 1     // classic clock
+#define GTEXT_TYPE 2    // emissive SDF type in a plane facing the camera
+#define GTEXT_SMOKE 3   // SDF letters as a smoke volume
+#define GTEXT_SIGN 4    // SDF letters lit on a board standing in the world
+
 struct GText {
-  V3 center, right, up;  // billboard frame; right and up are unit vectors
-  float height;          // glyph cell height in km
+  // Classic: the centre of the text. SDF styles: the left end of the
+  // baseline. right and up are unit vectors spanning the text's plane.
+  V3 center, right, up;
+  float height;          // classic: glyph cell height; SDF styles: the em, in km
   float alpha;           // fade in/out
   V3 color;              // emitted radiance
-  int style;             // 0: glowing glass tube (words), 1: dark core with a light rim (clock)
+  int style;             // GTEXT_*
   int occlude;           // 1: hidden behind nearer terrain
   int len;
   unsigned char ch[MAX_CHARS];
+  float gx[MAX_CHARS];   // SDF styles: each glyph's origin along the baseline, em (kerned)
+  float width;           // SDF styles: the advance of the whole line, em
+  float age;             // smoke: seconds since the message appeared
 };
 
 struct GLight {

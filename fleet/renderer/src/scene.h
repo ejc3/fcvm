@@ -16,7 +16,7 @@ struct Keyframe {
   double fov_deg;
 };
 struct SceneWord {
-  std::string text;  // uppercased, filtered to the font, at most MAX_CHARS
+  std::string text;  // printable ASCII, at most MAX_CHARS (the classic style draws it uppercased)
   double t;
 };
 struct SceneLight {
@@ -38,6 +38,7 @@ struct Scene {
   std::vector<SceneLight> lights;  // sorted by t
   double loop_s = 0;  // > 0 only for the built-in demo scene: t wraps
   double budget = 0;  // pixel-samples per frame for every tile; 0: the renderer's BUDGET
+  int text_style = 0;  // TEXT_STYLE_*: how the clock and the words are drawn
   // Layout generations: draw previous_rect for frames before rect_from_frame
   // (when has_previous_rect), rect from it; -1: absent.
   long long layout_generation = -1, rect_from_frame = -1;

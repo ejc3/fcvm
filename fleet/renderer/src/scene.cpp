@@ -9,6 +9,7 @@
 #include "font.h"
 #include "json.h"
 #include "world.h"
+#include "font_sdf.h"
 
 namespace {
 void vec3(const Json& j, double out[3], const std::string& what) {
@@ -20,9 +21,8 @@ void vec3(const Json& j, double out[3], const std::string& what) {
 std::string clean_text(const std::string& in) {
   std::string out;
   for (unsigned char c : in) {
-    if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 'a' + 'A');
-    if (c >= 0x80) continue;  // the font is ASCII
-    if (!font_has(c)) c = '?';
+    if (c >= 0x80) continue;  // the fonts are ASCII
+    if (c < 0x20 || c > 0x7E) c = '?';
     if (out.size() < MAX_CHARS) out += (char)c;
   }
   // trim spaces
@@ -124,6 +124,14 @@ Scene parse_scene(const std::string& body) {
         if (!(c >= 0 && c <= 64)) throw std::runtime_error("'lights[].color' components must be in 0..64");
       s.lights.push_back(sl);
     }
+  }
+  if (j.has("text_style") && j.at("text_style").type != Json::Null) {
+    std::string ts = j.at("text_style").string("text_style");
+    if (ts == "classic") s.text_style = TEXT_STYLE_CLASSIC;
+    else if (ts == "lockup") s.text_style = TEXT_STYLE_LOCKUP;
+    else if (ts == "skywriting") s.text_style = TEXT_STYLE_SKYWRITING;
+    else if (ts == "inworld") s.text_style = TEXT_STYLE_INWORLD;
+    else throw std::runtime_error("'text_style' must be classic, lockup, skywriting or inworld");
   }
   if (j.has("budget")) {
     s.budget = j.at("budget").number("budget");
@@ -323,10 +331,16 @@ V3 sun_direction(double tod) {
 }
 
 
+// The classic stroke font has capitals only.
 void set_text(GText& g, const std::string& s) {
   g.len = (int)std::min<size_t>(s.size(), MAX_CHARS);
   memset(g.ch, 0, sizeof g.ch);
-  for (int i = 0; i < g.len; i++) g.ch[i] = (unsigned char)s[i];
+  for (int i = 0; i < g.len; i++) {
+    unsigned char c = (unsigned char)s[i];
+    if (c >= 'a' && c <= 'z') c = (unsigned char)(c - 'a' + 'A');
+    if (!font_has(c)) c = '?';
+    g.ch[i] = c;
+  }
 }
 }  // namespace
 
@@ -367,6 +381,171 @@ std::string pacific_clock(int64_t unix_s) {
   char buf[32];
   snprintf(buf, sizeof buf, "%02d:%02d:%02d %s", l.tm_hour, l.tm_min, l.tm_sec, dst ? "PDT" : "PST");
   return buf;
+}
+
+namespace {
+// ------------------------------------------------------------ SDF text layout
+
+int sdf_index(unsigned char c) { return c >= 32 && c <= 126 ? c - 32 : '?' - 32; }
+
+float sdf_kern(unsigned char a, unsigned char b) {
+  int lo = 0, hi = kSdfKernN - 1;
+  while (lo <= hi) {
+    int m = (lo + hi) / 2;
+    int c = kSdfKern[m].a != a ? (int)kSdfKern[m].a - a : (int)kSdfKern[m].b - b;
+    if (c == 0) return kSdfKern[m].d;
+    if (c < 0) lo = m + 1; else hi = m - 1;
+  }
+  return 0.0f;
+}
+
+// Glyph origins of s along the baseline, in em, kerned; with `tabular`, digits
+// sit centred on one fixed advance so a clock does not shift as it counts.
+void sdf_layout(GText& g, const std::string& str, bool tabular) {
+  float dig = 0;
+  for (char c = '0'; c <= '9'; c++) dig = std::max(dig, kSdfGlyphs[c - 32].advance);
+  g.len = (int)std::min<size_t>(str.size(), MAX_CHARS);
+  memset(g.ch, 0, sizeof g.ch);
+  float x = 0;
+  for (int i = 0; i < g.len; i++) {
+    unsigned char c = (unsigned char)str[i];
+    if (c < 32 || c > 126) c = '?';
+    g.ch[i] = c;
+    bool fixed = tabular && c >= '0' && c <= '9';
+    if (i > 0) {
+      unsigned char a = g.ch[i - 1];
+      bool afixed = tabular && a >= '0' && a <= '9';
+      if (!fixed && !afixed) x += sdf_kern(a, c);
+    }
+    float adv = kSdfGlyphs[sdf_index(c)].advance;
+    g.gx[i] = fixed ? x + 0.5f * (dig - adv) : x;
+    x += fixed ? dig : adv;
+  }
+  g.width = x;
+}
+
+// A message too wide for the safe area splits at the space nearest its middle.
+std::vector<std::string> wrap2(const std::string& m, float em_u, float max_u) {
+  GText g;
+  sdf_layout(g, m, false);
+  if (g.width * em_u <= max_u) return {m};
+  size_t best = std::string::npos;
+  for (size_t i = 0; i < m.size(); i++)
+    if (m[i] == ' ' && (best == std::string::npos ||
+                        std::abs((double)i - m.size() / 2.0) < std::abs((double)best - m.size() / 2.0)))
+      best = i;
+  if (best == std::string::npos) return {m};
+  return {m.substr(0, best), m.substr(best + 1)};
+}
+
+double age_alpha(double age) { return std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0); }
+
+// The newest word on screen (age 0..90 s), or null.
+const SceneWord* newest_word(const Scene& s, double st) {
+  for (int i = (int)s.words.size() - 1; i >= 0; i--) {
+    double age = st - s.words[i].t;
+    if (age >= 0 && age <= 90) return &s.words[i];
+  }
+  return nullptr;
+}
+
+const V3 kWarmWhite = v3(1.0f, 0.92f, 0.80f);
+
+// Type facing the camera with the left end of its baseline at screen position
+// (u, v) (-1..1 across the image), em_frac of the image's height to the em, at
+// dist km.
+void place_type(GText& g, const GCam& cam, float asp, float u, float v, float dist, float em_frac) {
+  V3 dir = normalize(cam.fwd + cam.right * (u * cam.tan_half * asp) + cam.up * (v * cam.tan_half));
+  g.center = cam.pos + dir * dist;
+  g.right = cam.right;
+  g.up = cam.up;
+  g.height = em_frac * 2.0f * cam.tan_half * dist;
+}
+}  // namespace
+
+// The clock and the newest word in Inter (text_style lockup, skywriting,
+// inworld). The clock is always type in the upper left. The word is type above
+// it (lockup), smoke in the sky (skywriting), or a sign on the ground
+// (inworld); the last two stay where the camera saw them when the word arrived.
+static void sdf_text(const Scene& s, FrameParams& p, double st, double t, double aspect) {
+  const float asp = (float)aspect;
+  const GCam& cam = p.cam;
+  const float U0 = -0.90f;        // left edge of the safe area
+  const float MSG_EM = 0.068f;    // the message's em, of the image height (cap height 4.9%)
+  const float CLOCK_EM = 0.040f;  // the clock's (cap height 2.9%)
+  const float TYPE_KM = 6.0f;     // far enough that the haze touches it
+  const float msg_cap_v = SDF_CAP_HEIGHT * MSG_EM * 2.0f, clock_cap_v = SDF_CAP_HEIGHT * CLOCK_EM * 2.0f;
+  const float msg_base = 0.84f - msg_cap_v;                // the message's (last) baseline
+  const float clock_top = s.text_style == TEXT_STYLE_LOCKUP ? msg_base - 0.9f * msg_cap_v : 0.84f;
+  {
+    GText& g = p.text[p.n_text++];
+    sdf_layout(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)), true);
+    place_type(g, cam, asp, U0, clock_top - clock_cap_v, TYPE_KM, CLOCK_EM);
+    g.color = kWarmWhite * 2.2f;
+    g.style = GTEXT_TYPE;
+    g.occlude = 1;
+    g.alpha = 1.0f;
+  }
+  const SceneWord* w = newest_word(s, st);
+  if (!w) return;
+  double age = st - w->t;
+  float alpha = (float)age_alpha(age);
+  if (s.text_style == TEXT_STYLE_LOCKUP) {
+    auto lines = wrap2(w->text, MSG_EM * 2.0f / asp, 1.15f);
+    for (size_t li = 0; li < lines.size(); li++) {
+      GText& g = p.text[p.n_text++];
+      sdf_layout(g, lines[li], false);
+      float base = msg_base + (float)(lines.size() - 1 - li) * 1.2f * MSG_EM * 2.0f;
+      place_type(g, cam, asp, U0, base, TYPE_KM, MSG_EM);
+      g.color = kWarmWhite * 2.8f;
+      g.style = GTEXT_TYPE;
+      g.occlude = 1;
+      g.alpha = alpha;
+    }
+    return;
+  }
+  // skywriting and the sign stay where the camera was looking when the word came
+  CamPose wp = camera_at(s.camera, w->t);
+  clamp_above_ground(wp.pos);
+  to_world(wp.look);
+  GCam wc = make_cam(wp.pos, wp.look, wp.fov_deg, aspect);
+  GText& g = p.text[p.n_text++];
+  sdf_layout(g, w->text, false);
+  g.alpha = alpha;
+  g.age = (float)age;
+  g.occlude = 1;
+  if (s.text_style == TEXT_STYLE_SKYWRITING) {
+    const float dist = 9.0f, em_frac = 0.085f;
+    float em_u = em_frac * 2.0f / asp;
+    place_type(g, wc, asp, -0.5f * g.width * em_u, 0.36f, dist, em_frac);
+    g.color = v3(1.0f);
+    g.style = GTEXT_SMOKE;
+    return;
+  }
+  // inworld: a board standing where the view left of centre and a little
+  // below the horizon meets the ground (at most 12 km out; 9 km when it meets
+  // none), facing the camera
+  V3 dir = normalize(wc.fwd + wc.right * (-0.32f * wc.tan_half * asp) + wc.up * (-0.06f * wc.tan_half));
+  const V4* tab = host_noise().tab.data();
+  float dist = 9.0f;
+  for (float d = 0.3f; d < 12.0f; d += 0.02f) {
+    V3 q = wc.pos + dir * d;
+    double qp[3] = {q.x, q.y, q.z};
+    double alt = q.y + curvature(qp);
+    if (alt <= std::max(0.0, (double)surface_h(v2(q.x, q.z), 9, tab))) { dist = d; break; }
+  }
+  V3 gp = wc.pos + dir * dist;
+  double gq[3] = {gp.x, gp.y, gp.z};
+  float ground = (float)(std::max(0.0, (double)surface_h(v2(gp.x, gp.z), 9, tab)) - curvature(gq));
+  V3 n = v3(wc.pos.x - gp.x, 0.0f, wc.pos.z - gp.z);
+  n = normalize(n);
+  g.right = normalize(cross(v3(0, 1, 0), n));
+  g.up = v3(0, 1, 0);
+  g.height = 0.055f * 2.0f * wc.tan_half * dist;  // cap height 4% of the image from where it was placed
+  // the board's bottom edge 0.9 em above the ground; the letters' baseline 0.45 em above that
+  g.center = v3(gp.x, ground, gp.z) - g.right * (0.5f * g.width * g.height) + g.up * (1.35f * g.height);
+  g.color = v3(1.0f, 0.78f, 0.52f) * 3.0f;
+  g.style = GTEXT_SIGN;
 }
 
 FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* hold_key, bool* held) {
@@ -423,41 +602,45 @@ FrameParams build_frame(const Scene& s, const Tile& tile, double t, uint64_t* ho
     float wh = (len * GLYPH_ADVANCE - (GLYPH_ADVANCE - GLYPH_W)) / GLYPH_H;  // width / height
     return hfrac * wh / asp;
   };
-  {
-    GText& g = p.text[p.n_text++];
-    set_text(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)));
-    place(g, 0.0f, 0.66f, 2.0f, 0.075f);
-    g.color = v3(1.0f, 0.86f, 0.62f) * 3.2f;  // the rim's light
-    g.style = 1;
-    g.occlude = 0;  // always readable
-    g.alpha = 1.0f;
-  }
-  int first = std::max(0, (int)s.words.size() - (MAX_TEXTS - 1));
-  int slot = 0;
-  for (int i = (int)s.words.size() - 1; i >= first; i--) {  // newest first gets the top row
-    const SceneWord& w = s.words[i];
-    double age = st - w.t;
-    if (age < 0 || age > 90) continue;
-    GText& g = p.text[p.n_text++];
-    set_text(g, w.text);
-    uint32_t h = hash_u32((uint32_t)i * 2654435761u ^ (uint32_t)std::lround(w.t * 1000));
-    const float hf = 0.05f;
-    // six rows below the clock, three columns; the safe area is 85% of the
-    // width and from 0.45 down to -0.75 of the height
-    int row = slot % 6, col = (slot / 6) % 3;
-    slot++;
-    float v = 0.38f - row * 0.2f;
-    float half = text_halfwidth_u(g.len, hf);
-    float lim = std::max(0.0f, 0.85f - half);
-    float u = std::clamp((col - 1) * 0.55f + (u01(h) - 0.5f) * 0.3f, -lim, lim);
-    place(g, u, v, 2.5f, hf);
-    float hue = u01(hash_u32(h ^ 0xABCDu));
-    V3 col3 = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
-                 0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
-    g.color = (col3 * 0.85f + v3(0.15f)) * 2.6f;
-    g.style = 0;
-    g.occlude = 1;
-    g.alpha = (float)(std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0));
+  if (s.text_style == TEXT_STYLE_CLASSIC) {
+    {
+      GText& g = p.text[p.n_text++];
+      set_text(g, pacific_clock((int64_t)std::floor(s.epoch_unix_ms / 1000.0 + t)));
+      place(g, 0.0f, 0.66f, 2.0f, 0.075f);
+      g.color = v3(1.0f, 0.86f, 0.62f) * 3.2f;  // the rim's light
+      g.style = 1;
+      g.occlude = 0;  // always readable
+      g.alpha = 1.0f;
+    }
+    int first = std::max(0, (int)s.words.size() - (MAX_TEXTS - 1));
+    int slot = 0;
+    for (int i = (int)s.words.size() - 1; i >= first; i--) {  // newest first gets the top row
+      const SceneWord& w = s.words[i];
+      double age = st - w.t;
+      if (age < 0 || age > 90) continue;
+      GText& g = p.text[p.n_text++];
+      set_text(g, w.text);
+      uint32_t h = hash_u32((uint32_t)i * 2654435761u ^ (uint32_t)std::lround(w.t * 1000));
+      const float hf = 0.05f;
+      // six rows below the clock, three columns; the safe area is 85% of the
+      // width and from 0.45 down to -0.75 of the height
+      int row = slot % 6, col = (slot / 6) % 3;
+      slot++;
+      float v = 0.38f - row * 0.2f;
+      float half = text_halfwidth_u(g.len, hf);
+      float lim = std::max(0.0f, 0.85f - half);
+      float u = std::clamp((col - 1) * 0.55f + (u01(h) - 0.5f) * 0.3f, -lim, lim);
+      place(g, u, v, 2.5f, hf);
+      float hue = u01(hash_u32(h ^ 0xABCDu));
+      V3 col3 = v3(0.5f + 0.5f * cosf(6.2832f * hue), 0.5f + 0.5f * cosf(6.2832f * (hue + 0.33f)),
+                   0.5f + 0.5f * cosf(6.2832f * (hue + 0.67f)));
+      g.color = (col3 * 0.85f + v3(0.15f)) * 2.6f;
+      g.style = 0;
+      g.occlude = 1;
+      g.alpha = (float)(std::min(1.0, age / 1.5) * std::min(1.0, (90 - age) / 3.0));
+    }
+  } else {
+    sdf_text(s, p, st, t, aspect);
   }
 
   *held = pose.held;

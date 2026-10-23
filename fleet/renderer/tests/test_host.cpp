@@ -87,7 +87,7 @@ int main() {
     CHECK(e.words.empty() && e.lights.empty(), "empty words and lights parse");
     Scene lc = parse_scene(R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
         "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"words":[{"text":"hi é!","t":1}]})");
-    CHECK(lc.words.size() == 1 && lc.words[0].text == "HI !", "text uppercased and filtered: '%s'", lc.words[0].text.c_str());
+    CHECK(lc.words.size() == 1 && lc.words[0].text == "hi !", "text filtered to ASCII: '%s'", lc.words[0].text.c_str());
     auto bad = [](const char* j) {
       try { parse_scene(j); } catch (const std::exception&) { return true; }
       return false;
@@ -342,6 +342,47 @@ int main() {
     BudgetSchedule none = schedule_after_scene(s2, false, false, 50);
     CHECK(none.size() == 0, "nothing in force, nothing carried");
     CHECK(schedule_after_scene(s2, true, true, 200).size() == 0, "a scene budget clears the schedule");
+  }
+  // --- text styles
+  {
+    const char* base = R"({"epoch_unix_ms":0,"rect":{"x":0,"y":0,"w":1,"h":1},"image_aspect":1.7778,
+        "camera":[{"t":0,"pos":[0,1,0],"look":[0,1,1],"fov_deg":60}],"time_of_day":0.5,"words":[{"text":"AVA hi","t":1}])";
+    auto with = [&](const std::string& extra) { return parse_scene(std::string(base) + extra + "}"); };
+    CHECK(with("").text_style == TEXT_STYLE_CLASSIC, "text_style absent: classic");
+    CHECK(with(R"(,"text_style":"lockup")").text_style == TEXT_STYLE_LOCKUP &&
+              with(R"(,"text_style":"skywriting")").text_style == TEXT_STYLE_SKYWRITING &&
+              with(R"(,"text_style":"inworld")").text_style == TEXT_STYLE_INWORLD &&
+              with(R"(,"text_style":null)").text_style == TEXT_STYLE_CLASSIC,
+          "text_style names");
+    bool threw = false;
+    try { with(R"(,"text_style":"wordart")"); } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "an unknown text_style is refused");
+    Tile tl = tile_geometry(Rect{0, 0, 1, 1}, 16.0 / 9, 540);
+    uint64_t key;
+    bool held;
+    FrameParams pc = build_frame(with(""), tl, 2.0, &key, &held);
+    CHECK(pc.n_text == 2 && pc.text[1].style == GTEXT_TUBE && memcmp(pc.text[1].ch, "AVA HI", 6) == 0,
+          "classic draws the word in capitals");
+    FrameParams pl = build_frame(with(R"(,"text_style":"lockup")"), tl, 2.0, &key, &held);
+    CHECK(pl.n_text == 2 && pl.text[0].style == GTEXT_TYPE && pl.text[1].style == GTEXT_TYPE &&
+              memcmp(pl.text[1].ch, "AVA hi", 6) == 0,
+          "lockup: the clock and the word as type, case kept");
+    // kerning: V tucks under A, so V starts before A's advance ends
+    CHECK(pl.text[1].gx[1] < pl.text[1].gx[0] + 0.69f - 0.02f, "A V kerned (V at %.3f em)", pl.text[1].gx[1]);
+    // the clock's digits sit on one advance: 11:11 and 08:08 are as wide
+    GText a1, a2;
+    FrameParams p1 = build_frame(with(R"(,"text_style":"lockup")"), tl, 2.0, &key, &held);
+    a1 = p1.text[0];
+    FrameParams p2 = build_frame(with(R"(,"text_style":"lockup")"), tl, 3.0, &key, &held);
+    a2 = p2.text[0];
+    CHECK(fabsf(a1.width - a2.width) < 1e-6f && a1.width > 3.0f, "the clock's width does not change as it counts (%.4f, %.4f)",
+          a1.width, a2.width);
+    // the message sits above the clock, both from one left edge
+    V3 dm = pl.text[1].center - pl.cam.pos, dc = pl.text[0].center - pl.cam.pos;
+    float um = dot(dm, pl.cam.right) / dot(dm, pl.cam.fwd), uc = dot(dc, pl.cam.right) / dot(dc, pl.cam.fwd);
+    float vm = dot(dm, pl.cam.up) / dot(dm, pl.cam.fwd), vc = dot(dc, pl.cam.up) / dot(dc, pl.cam.fwd);
+    CHECK(fabsf(um - uc) < 1e-4f && vm > vc && um < 0, "left-aligned lockup, message above the clock (u %.4f %.4f, v %.4f %.4f)",
+          um, uc, vm, vc);
   }
   tlscheck::run();
   DONE();
