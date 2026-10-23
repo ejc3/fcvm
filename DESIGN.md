@@ -2408,8 +2408,11 @@ unloaded and the GPU removed and rescanned, two rounds per variant, twice; the
 proprietary modules with the GSP firmware left on took 1,111 to 1,223 ms. The
 stage writes the parameters to `nvidia.params` beside the modules and fc-agent
 passes them to `insmod`. The gpu profile uses `proprietary` on amd64 and
-`open` on arm64, which no g5g.metal run has measured yet. The proprietary
-modules support Turing and Ampere only.
+`open` on arm64, which no g5g.metal run has measured yet. With the GSP firmware
+off the proprietary modules are allowed on Turing and Ampere GPUs only:
+`fcvm podman run --gpu` and `fcvm snapshot run --gpu` refuse any other NVIDIA
+GPU before launch when the profile builds them, and name `module_type = "open"`
+as the setting that runs it.
 
 The stage also lets nvidia.ko load with no GPU on the bus. `nvidia_init_module`
 refuses an empty bus unless an NVSwitch is present, and all three refusals

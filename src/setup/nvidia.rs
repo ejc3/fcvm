@@ -101,6 +101,35 @@ impl ModuleType {
             ModuleType::Proprietary => "proprietary",
         }
     }
+
+    /// Whether these modules can run the NVIDIA device `device` (PCI device ID).
+    ///
+    /// The open modules run every GPU this driver supports (Turing and later). The
+    /// proprietary modules are loaded with the GSP firmware off, which this
+    /// configuration was measured with on Turing only; they are allowed on Turing
+    /// and Ampere, and refused on anything later (Blackwell has no proprietary
+    /// module support at all). The ranges cover exactly the Turing and Ampere
+    /// entries of the driver's `supported-gpus.json` (580.196.07): Turing
+    /// 0x1E00-0x1FFF and 0x2180-0x21FF, Ampere 0x2080-0x20FF, 0x2200-0x22FF and
+    /// 0x2400-0x25FF. Volta (0x1Dxx), Hopper (0x23xx), Ada (0x26xx-0x28xx) and
+    /// Blackwell (0x29xx and up) fall outside them.
+    pub fn supports_device(self, device: u16) -> bool {
+        match self {
+            ModuleType::Open => true,
+            ModuleType::Proprietary => matches!(
+                device,
+                0x1E00..=0x1FFF | 0x2180..=0x21FF | 0x2080..=0x20FF | 0x2200..=0x22FF | 0x2400..=0x25FF
+            ),
+        }
+    }
+}
+
+/// The module type of `profile_name`'s NVIDIA driver image on this architecture,
+/// or `None` when the profile builds no driver image.
+pub fn profile_module_type(profile_name: &str) -> Result<Option<ModuleType>> {
+    Ok(get_kernel_profile(profile_name)?
+        .and_then(|profile| profile.nvidia)
+        .map(|nvidia| nvidia.module_type))
 }
 
 fn is_sha256(value: &str) -> bool {
