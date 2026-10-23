@@ -148,7 +148,7 @@ export interface OwnGpu {
 
 /**
  * The tiling the canvas draws. A new layout generation is drawn only once every
- * tile of it has a frame at or after its `at_frame`; until the frame drawer says
+ * tile of it has a frame at or after its `from_frame`; until the frame drawer says
  * so ("gen-shown"), the page lays its overlays out on the tiling still drawn.
  */
 export interface ShownLayout {
@@ -340,8 +340,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
       return { ...s, turnstile: { ...s.turnstile, verifying: false, error: e.error } };
     case "gen-shown": {
       const st = s.accepted;
-      if (!st || st.layout.gen !== e.gen) return s;
-      return { ...s, shownLayout: { gen: st.layout.gen, tiles: st.tiles, aggregates: st.aggregates } };
+      if (!st || st.layout.generation !== e.gen) return s;
+      return { ...s, shownLayout: { gen: st.layout.generation, tiles: st.tiles, aggregates: st.aggregates } };
     }
     case "own-closed":
       return { ...s, own: { requestId: null, requestedAt: null, claim: null, refused: null } };
@@ -388,8 +388,8 @@ export function reduce(s: ClientState, e: ClientEvent): ClientState {
           // The same generation (or the first): overlays follow it at once. A newer one
           // waits until the frame drawer has swapped to it.
           const shownLayout =
-            s.shownLayout === null || accepted.layout.gen <= s.shownLayout.gen
-              ? { gen: accepted.layout.gen, tiles: accepted.tiles, aggregates: accepted.aggregates }
+            s.shownLayout === null || accepted.layout.generation <= s.shownLayout.gen
+              ? { gen: accepted.layout.generation, tiles: accepted.tiles, aggregates: accepted.aggregates }
               : s.shownLayout;
           return {
             ...s,

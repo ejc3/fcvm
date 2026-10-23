@@ -55,12 +55,8 @@ const PHASE_TEXT: Record<string, string> = {
   restoring: "restoring the snapshot",
   starting: "starting the renderer",
   pending: "waiting for its host",
-  launching: "launching an instance",
-  terminating: "terminating the old instance",
   waiting_capacity: "AWS had no spot GPU",
-  draining: "host reclaimed by AWS",
   failed: "failed",
-  asleep: "asleep",
 };
 
 /**
@@ -75,7 +71,6 @@ const PART_ORDER: [string, string][] = [
   ["restore_ms", "snapshot restored"],
   ["gpu_ms", "GPU reset and driver loaded"],
   ["launch_ms", "instance launched"],
-  ["boot_ms", "instance booted"],
   ["ready_ms", "instance boot to first frame"],
   ["container_ms", "renderer started"],
   ["first_frame_ms", "first frame"],
@@ -165,7 +160,7 @@ export interface HoverLabel {
 
 /** What a dark tile shows instead of a clock: how far its restart is, or what is wrong. */
 export interface Glyph {
-  kind: "progress" | "failed" | "capacity" | "reclaimed" | "empty" | "borrowed";
+  kind: "progress" | "failed" | "capacity" | "empty" | "borrowed";
   /** Steps of a restart in this half, and how many are done. */
   steps: number;
   done: number;
@@ -198,7 +193,7 @@ export interface TileView {
 
 const STEPS: Record<Half, Record<string, number>> = {
   fcvm: { relaunching: 0, requested: 0, stopping: 1, restoring: 2, starting: 3 },
-  ec2: { relaunching: 0, requested: 0, terminating: 0, waiting_capacity: 0, pending: 1, launching: 1, starting: 2 },
+  ec2: { relaunching: 0, requested: 0, stopping: 0, waiting_capacity: 0, pending: 1, starting: 2 },
 };
 const STEP_COUNT: Record<Half, number> = { fcvm: 4, ec2: 3 };
 
@@ -209,7 +204,7 @@ function relaunchMs(t: Tile): number | null {
 }
 
 function pendingRelaunch(pending: readonly IntentMsg[], t: Tile): boolean {
-  return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "relaunch_all");
+  return pending.some((i) => (i.name === "relaunch" && i.args["tile"] === t.id) || i.name === "restart_now");
 }
 
 function isLive(t: Tile): boolean {
@@ -219,7 +214,6 @@ function isLive(t: Tile): boolean {
 function glyphFor(t: Tile, phase: string): Glyph {
   const steps = STEP_COUNT[t.half];
   if (phase === "borrowed" || (t.borrowed !== null && phase !== "running")) return { kind: "borrowed", steps, done: 0 };
-  if (t.failure?.kind === "host_reclaimed" || phase === "draining") return { kind: "reclaimed", steps, done: 0 };
   if (phase === "failed" || t.failure) return { kind: "failed", steps, done: 0 };
   if (phase === "waiting_capacity") return { kind: t.half === "ec2" ? "capacity" : "empty", steps, done: 0 };
   const step = STEPS[t.half][phase];
@@ -252,10 +246,7 @@ function tileView(
     const left = t.borrowed ? Math.max(0, t.borrowed.until - srvNow) : 0;
     detail = st.relaunch_all !== null && st.relaunch_all.fcvm_done_at === null && t.half === "fcvm" ? `sitting out this race · back in ${fmt.countdown(left)}` : `back in ${fmt.countdown(left)}`;
   }
-  if (glyph.kind === "reclaimed") {
-    phaseLine = "host reclaimed by AWS";
-    detail = "re-tiling";
-  } else if (glyph.kind === "failed") {
+  if (glyph.kind === "failed") {
     phaseLine = `failed: ${t.failure?.message || t.error || "no reason given"}`;
     const retry = t.failure?.retry_at ?? null;
     detail = retry === null ? "" : retry > srvNow ? `retrying in ${fmt.countdown(retry - srvNow)}` : "retrying now";
@@ -302,7 +293,7 @@ function tileView(
     glyph,
     phase: phaseLine,
     detail,
-    darkOutline: glyph.kind === "failed" || glyph.kind === "reclaimed" ? "#B04A3E" : COLORS[t.half].darkOutline,
+    darkOutline: glyph.kind === "failed" ? "#B04A3E" : COLORS[t.half].darkOutline,
     slowFade: glyph.kind === "borrowed",
     behind: fs?.behind ?? false,
     ariaLabel,
@@ -337,11 +328,16 @@ function counterView(st: FleetState): CounterView | null {
   return {
     wake: wakeStat(st),
     label: "GPU VMs restored",
-    value: fmt.thousands(c.restores_total),
-    total: c.restores_total,
+    value: fmt.thousands(c.restores),
+    total: c.restores,
     lastHour: `${fmt.thousands(c.restores_last_hour)} in the last hour`,
-    scrubs: st.security.gpu_scrub ? `GPU memory scrubs: ${fmt.thousands(c.scrubs_total)}` : "",
+    scrubs: scrubShipped(st) ? `GPU memory scrubs: ${fmt.thousands(c.scrubs)}` : "",
   };
+}
+
+/** The page speaks of the GPU memory scrub only once an agent has reported one. */
+function scrubShipped(st: FleetState | null): boolean {
+  return (st?.counters?.scrubs ?? 0) > 0;
 }
 
 export const REPOSITORY_URL = "https://github.com/ejc3/fcvm";
@@ -360,8 +356,8 @@ export interface IsolationView {
  * its own guest kernel, hosts with the IOMMU on and every GPU bound to
  * vfio-pci, a fresh VM restored from the gold snapshot with the slot's GPU
  * (`fcvm snapshot run --snapshot <gold> --gpu <sbdf>`, the GPU attached during
- * the restore). The scrub sentence appears only when the coordinator says the
- * scrub has shipped.
+ * the restore). The scrub sentence appears only once the coordinator has counted
+ * a scrub an agent reported (`counters.scrubs`).
  */
 export function isolationView(st: FleetState | null): IsolationView {
   const sentences = [
@@ -369,7 +365,7 @@ export function isolationView(st: FleetState | null): IsolationView {
     "Its GPU is handed to that virtual machine alone by the hardware's IOMMU (VFIO passthrough), not shared through a proxy in the host kernel.",
     "A restart throws the old virtual machine away, restores a fresh one from a snapshot, and attaches the GPU as it restores.",
   ];
-  if (st?.security.gpu_scrub) sentences.push("GPU memory is cleared before a GPU moves to the next virtual machine.");
+  if (scrubShipped(st)) sentences.push("GPU memory is cleared before a GPU moves to the next virtual machine.");
   return {
     title: "How it's isolated",
     open: "How it's isolated",
@@ -450,7 +446,7 @@ export type TextStyle = "lockup" | "skywriting" | "landmark";
 export const TEXT_STYLES: readonly { value: TextStyle; label: string; thumb: string; alt: string }[] = [
   { value: "lockup", label: "Lockup", thumb: "/text-styles/lockup.jpg", alt: "The message set as type above the clock, upper left" },
   { value: "skywriting", label: "Skywriting", thumb: "/text-styles/skywriting.jpg", alt: "The message written in smoke in the sky" },
-  { value: "landmark", label: "Landmark", thumb: "/text-styles/landmark.jpg", alt: "The message on a sign standing on the ground" },
+  { value: "landmark", label: "Landmark", thumb: "/text-styles/landmark.jpg", alt: "The message in big letters standing on a ridge" },
 ];
 
 /** The arguments of a word intent: the text and the style its sender picked. */
@@ -478,7 +474,6 @@ export interface PlayView {
     style: { legend: string; options: { value: TextStyle; label: string; thumb: string; alt: string; selected: boolean }[] };
   };
   light: { label: string; on: boolean };
-  timeOfDay: { label: string; value: number; min: number; max: number; step: number; valueText: string };
   streams: { label: string; on: boolean; note: string; disabled: boolean };
   stats: { label: string; on: boolean };
   verify: { needed: boolean; title: string; text: string; error: string };
@@ -503,8 +498,6 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
       statusKind = "refused";
     }
   }
-  const pendingTod = [...pend].reverse().find((i) => i.name === "time_of_day");
-  const tod = pendingTod && typeof pendingTod.args["v"] === "number" ? (pendingTod.args["v"] as number) : st.scene.time_of_day;
 
   let nudge: PlayView["nudge"] = null;
   const nd = st.nudges;
@@ -557,7 +550,6 @@ function playView(s: ClientState, st: FleetState, srvNow: number, pend: IntentMs
       style: { legend: "How it is drawn", options: TEXT_STYLES.map((o) => ({ ...o, selected: o.value === s.ui.textStyle })) },
     },
     light: { label: s.ui.lightMode ? "Click the picture to drop it" : "Drop a light", on: s.ui.lightMode },
-    timeOfDay: { label: "Time of day", value: tod, min: 0, max: 1 - 1 / 96, step: 1 / 96, valueText: fmt.timeOfDay(tod) },
     streams: { label: "See every VM's own stream", on: direct, note: streamsNote, disabled: !hasAgg },
     stats: { label: "Show stream stats", on: s.ui.stats },
     verify: {
@@ -588,8 +580,8 @@ function actionText(a: Action, st: FleetState, you: string | null): string | nul
   const who = viewerName(a.viewer, you);
   const args = a.args ?? {};
   switch (a.name) {
-    case "relaunch_all":
-      return a.viewer === "schedule" ? "the scheduled restart of every GPU began" : `${who} restarted every GPU`;
+    case "restart_now":
+      return `${who} restarted every GPU`;
     case "relaunch": {
       const t = st.tiles.find((x) => x.id === args["tile"] || x.slot === args["tile"]);
       return `${who} restarted ${t ? tileName(t) : "a VM"}`;
@@ -598,8 +590,6 @@ function actionText(a: Action, st: FleetState, you: string | null): string | nul
       return typeof args["text"] === "string" ? `${who} wrote “${args["text"]}”` : `${who} wrote a word`;
     case "light":
       return `${who} dropped a light`;
-    case "time_of_day":
-      return typeof args["v"] === "number" ? `${who} set the time of day to ${fmt.timeOfDay(args["v"] as number)}` : null;
     case "nudge": {
       const target = st.nudges?.targets.find((x) => x.id === args["target"]);
       return `${who} chose ${target ? target.label : "a stop"} for the camera`;
@@ -618,15 +608,18 @@ export interface FeedItem {
 }
 
 function feedView(st: FleetState, srvNow: number, you: string | null, n: number): FeedItem[] {
-  const out: FeedItem[] = [];
-  const sorted = [...st.actions].sort((a, b) => b.at - a.at);
-  for (const a of sorted) {
+  const items: { at: number; key: string; text: string }[] = [];
+  for (const a of st.actions) {
     const text = actionText(a, st, you);
-    if (text === null) continue;
-    out.push({ key: a.id ?? `${a.at}-${out.length}`, text, when: fmt.ago(srvNow - a.at) });
-    if (out.length === n) break;
+    if (text !== null) items.push({ at: a.at, key: a.id ?? `${a.at}-${items.length}`, text });
   }
-  return out;
+  // The owner's cadence is not an intent, so it is not in `actions`: the race says who started it.
+  const ra = st.relaunch_all;
+  if (ra !== null && ra.by === "schedule") items.push({ at: ra.started_at, key: `race-${ra.started_at}`, text: "the scheduled restart of every GPU began" });
+  return items
+    .sort((a, b) => b.at - a.at)
+    .slice(0, n)
+    .map((x) => ({ key: x.key, text: x.text, when: fmt.ago(srvNow - x.at) }));
 }
 
 // ---- one VM opened -------------------------------------------------------------
@@ -1002,7 +995,7 @@ export function placeLabel(tile: Box, size: { w: number; h: number }, area: Box,
 /** How long the returning label stays after the borrowed tile's first frame. */
 export const RETURNING_HOLD_MS = 4000;
 
-const RESTORING_PHASES = new Set(["borrowed", "relaunching", "requested", "stopping", "restoring", "starting", "pending"]);
+const RESTORING_PHASES = new Set(["borrowed", "relaunching", "stopping", "restoring", "starting", "pending"]);
 
 /** Whether this viewer's borrowed tile is still coming back (not yet streaming for RETURNING_HOLD_MS). */
 export function stillReturning(st: FleetState, id: string | null, srvNow: number): boolean {
@@ -1099,7 +1092,8 @@ function captionBand(imgW: number, split: number): number {
   return Math.max(CAPTION_BAND, total * CAPTION_LINE_PX + 8);
 }
 
-function stageLabels(layout: MosaicLayout | null): StageLabels {
+/** `awake`: a side with no GPUs is only "empty" once the fleet is up; asleep or waking it is still to come. */
+function stageLabels(layout: MosaicLayout | null, awake: boolean): StageLabels {
   if (!layout) return { seam: [], captions: [], empty: null };
   const img = layout.image;
   const mid = layout.halfLineX;
@@ -1122,8 +1116,9 @@ function stageLabels(layout: MosaicLayout | null): StageLabels {
           : { half: "ec2", text: "EC2", x: img.x + img.w - 10, y: img.y + 10, align: "right" },
       ],
       captions,
-      empty:
-        absent === "ec2"
+      empty: !awake
+        ? null
+        : absent === "ec2"
           ? { half: "ec2", text: EMPTY_SIDE.ec2, x: img.x + img.w - 10, y: img.y + 10, align: "right" }
           : { half: "fcvm", text: EMPTY_SIDE.fcvm, x: img.x + 10, y: img.y + 10, align: "left" },
     };
@@ -1194,7 +1189,7 @@ export function drawnTiles(s: ClientState): Tile[] {
   const st = s.accepted;
   if (!st) return [];
   const shown = s.shownLayout;
-  if (!shown || shown.gen === st.layout.gen) return st.tiles;
+  if (!shown || shown.gen === st.layout.generation) return st.tiles;
   const now = new Map(st.tiles.map((t) => [t.id, t]));
   return shown.tiles.map((old) => {
     const cur = now.get(old.id);
@@ -1232,11 +1227,15 @@ export function wallView(input: WallInput): WallView {
     banners.push({ kind: "offline", text: "The coordinator is offline. The picture still streams straight from the VMs; the controls are paused until it is back." });
   }
   if (st) {
-    const draining = st.fleet.hosts.filter((h) => h.draining);
-    if (draining.length > 0) {
+    // A reclaimed host's tiles leave the tiling at once; `failures` keeps it for a minute.
+    const reclaimed = new Set([
+      ...st.failures.filter((f) => f.kind === "host_reclaimed").map((f, i) => f.host ?? `#${i}`),
+      ...st.fleet.hosts.filter((h) => h.draining).map((h) => h.name),
+    ]);
+    if (reclaimed.size > 0) {
       banners.push({
         kind: "reclaimed",
-        text: `AWS reclaimed ${draining.length === 1 ? "an fcvm host" : `${draining.length} fcvm hosts`}. Its squares stay dark while the image is re-tiled onto the GPUs left.`,
+        text: `AWS reclaimed ${reclaimed.size === 1 ? "an fcvm host" : `${reclaimed.size} fcvm hosts`}. The image is re-tiled onto the GPUs left.`,
       });
     }
   }
@@ -1256,7 +1255,7 @@ export function wallView(input: WallInput): WallView {
     darkFadeMs: input.reducedMotion ? REDUCED_MOTION_DARK_FADE_MS : 0,
     suspended: s.ui.suspended,
     posterFull: false,
-    gen: s.accepted?.layout.gen ?? 0,
+    gen: s.accepted?.layout.generation ?? 0,
     atT: 0,
   };
   const area = input.mosaicArea
@@ -1367,8 +1366,8 @@ export function wallView(input: WallInput): WallView {
     estimatedBps: fitted.bps,
     image: covered ? null : planLayout?.image ?? null,
     posterFull: sleep !== null,
-    gen: st.layout.gen,
-    atT: st.layout.at_frame / FRAME_RATE,
+    gen: st.layout.generation,
+    atT: st.layout.from_frame / FRAME_RATE,
     tiles: st.tiles.map((t, i) => {
       const tv = planViews[i]!;
       return { id: t.id, half: t.half, box: covered ? null : placedPlan.get(t.id)?.box ?? null, dark: tv.dark, outline: tv.darkOutline, slowFade: tv.slowFade };
@@ -1383,7 +1382,7 @@ export function wallView(input: WallInput): WallView {
     layout,
     tiles,
     score: scoreView({ st, now: srvNow, pending: pend, online }),
-    labels: stageLabels(covered ? null : layout),
+    labels: stageLabels(covered ? null : layout, st.fleet.power.state === "awake"),
     play,
     feed: feedView(st, srvNow, s.you, input.phone ? 1 : 3),
     counter: counterView(st),
@@ -1404,7 +1403,7 @@ export function wallView(input: WallInput): WallView {
     own,
     ownButton: ownButton(st, srvNow, online, s.own.requestId !== null || (s.own.claim !== null && s.own.claim.phase !== "ended")),
     ownRefusal: s.own.refused === null ? null : { text: `No GPU is free right now: ${s.own.refused}. Try again in a minute.`, dismiss: "OK" },
-    viewers: fmt.count(st.viewers.count, "person watching", "people watching"),
+    viewers: fmt.count(st.viewers.active, "person watching", "people watching"),
     plan,
     seams: seamView(s, covered ? null : layout, tiles, input, returning),
     returning,
@@ -1421,10 +1420,9 @@ export function wallView(input: WallInput): WallView {
 export const NOTICE_MS = 8000;
 
 const INTENT_LABEL: Record<string, string> = {
-  relaunch_all: "The restart",
+  restart_now: "The restart",
   relaunch: "The restart",
   light: "The light",
-  time_of_day: "The time of day",
   nudge: "Your choice of stop",
 };
 

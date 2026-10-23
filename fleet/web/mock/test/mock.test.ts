@@ -7,6 +7,7 @@ import { MockRenderers } from "../renderer.ts";
 import { FFMPEG } from "../encoder.ts";
 import { tileGeometry } from "../../core/layout.ts";
 import { spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { expectedRgb, frameCtx, renderI420 } from "../pattern.ts";
 import { ensureReel } from "../media.ts";
 
@@ -41,6 +42,9 @@ async function admin(path: string, body: unknown): Promise<unknown> {
   return r.json();
 }
 
+/** Every snapshot state any socket of this suite received: the last test holds them to the coordinator's shapes. */
+const seenStates: unknown[] = [];
+
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Wait for a condition on the mock's state, polling. */
@@ -60,6 +64,7 @@ function live(): Promise<{ ws: WebSocket; msgs: Record<string, unknown>[]; next:
     ws.on("message", (d) => {
       const m = JSON.parse(d.toString()) as Record<string, unknown>;
       msgs.push(m);
+      if (m["type"] === "snapshot") seenStates.push(m["state"]);
       for (const w of [...waiters]) if (w.pred(m)) { waiters.splice(waiters.indexOf(w), 1); w.res(m); }
     });
     const next = (pred: (m: Record<string, unknown>) => boolean) =>
@@ -165,9 +170,9 @@ describe("mock coordinator", () => {
 
   it("races relaunch all and stamps each half", async () => {
     const c = await live();
-    c.ws.send(JSON.stringify({ type: "intent", id: "ra-1", name: "relaunch_all", args: {} }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ra-1", name: "restart_now", args: {} }));
     await c.next((m) => m["type"] === "receipt" && m["id"] === "ra-1");
-    c.ws.send(JSON.stringify({ type: "intent", id: "ra-2", name: "relaunch_all", args: {} }));
+    c.ws.send(JSON.stringify({ type: "intent", id: "ra-2", name: "restart_now", args: {} }));
     expect(await c.next((m) => m["type"] === "receipt" && m["id"] === "ra-2")).toMatchObject({ outcome: "refused" });
     await new Promise((r) => setTimeout(r, 1300));
     const ra = coord.fleetState().relaunch_all!;
@@ -309,7 +314,7 @@ describe("mock coordinator, review findings", () => {
     const a = await live();
     await a.next((m) => m["type"] === "snapshot");
     const id = `tod-${Date.now()}`;
-    a.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 18.25 } }));
+    a.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
     // B connects while that change waits for its flush.
     await new Promise((r) => setTimeout(r, 2));
     const b = await live();
@@ -352,7 +357,7 @@ describe("mock aggregates", () => {
   it("lists one aggregate per fcvm host and one for EC2, covering the image, each serving the frame protocol", async () => {
     const st = coord.fleetState();
     expect(st.aggregates.map((a) => a.id)).toEqual(["agg:mock-host-1", "agg:mock-host-2", "agg:ec2"]);
-    expect(st.layout).toEqual({ gen: 1, at_frame: 0 });
+    expect(st.layout).toEqual({ generation: 1, from_frame: 0, from_t: 0 });
     // Two fcvm GPUs and one EC2: the fcvm side is two thirds of the image.
     expect(st.aggregates[2]!.rect.x).toBeCloseTo(2 / 3, 9);
     expect(st.aggregates[0]!.tiles).toEqual(["fcvm:1"]);
@@ -382,25 +387,28 @@ describe("mock aggregates", () => {
     const hello = await c.next((m) => m["type"] === "hello");
     expect(hello["viewer"]).toMatch(/^v-\d+$/);
     expect(hello["turnstile"]).toBeUndefined();
-    const id = `tod-${Date.now()}`;
-    c.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 0.75 } }));
+    const id = `lit-${Date.now()}`;
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
     await c.next((m) => m["type"] === "receipt");
     const a = coord.fleetState().actions.at(-1)!;
-    expect(a).toMatchObject({ name: "time_of_day", args: { v: 0.75 }, viewer: hello["viewer"], id, outcome: "committed" });
+    expect(a).toMatchObject({ name: "light", viewer: hello["viewer"], id, outcome: "committed" });
+    // As the coordinator: no time_of_day intent (the director sets it per hold).
+    c.ws.send(JSON.stringify({ type: "intent", id: `tod-${Date.now()}`, name: "time_of_day", args: { v: 0.75 } }));
+    expect(await c.next((m) => m["type"] === "receipt" && String(m["id"]).startsWith("tod-"))).toMatchObject({ outcome: "refused", reason: 'unknown intent "time_of_day"' });
     c.ws.close();
   });
 });
 
 describe("mock race, second design review", () => {
-  it("runs the owner's cadence, logs it as the schedule, and holds viewers to the cooldown", async () => {
+  it("runs the owner's cadence as the race's `by` (not an action), and holds viewers to the cooldown", async () => {
     const c = await live();
     await admin("/mock/schedule", { next_in_ms: 0, cooldown_s: 30 });
     await until(() => coord.fleetState().relaunch_all?.by === "schedule" && coord.fleetState().relaunch_all!.ec2_done_at === null);
     const st = coord.fleetState();
-    expect(st.actions.at(-1)).toMatchObject({ viewer: "schedule", name: "relaunch_all", outcome: "committed" });
+    expect(st.actions.some((x) => x.viewer === "schedule")).toBe(false);
     expect(st.cooldown_until! - st.relaunch_all!.started_at).toBe(30_000);
     await until(() => coord.fleetState().relaunch_all!.ec2_done_at !== null);
-    c.ws.send(JSON.stringify({ type: "intent", id: `cool-${Date.now()}`, name: "relaunch_all", args: {} }));
+    c.ws.send(JSON.stringify({ type: "intent", id: `cool-${Date.now()}`, name: "restart_now", args: {} }));
     const r = await c.next((m) => m["type"] === "receipt");
     expect(r).toMatchObject({ outcome: "refused" });
     expect(String(r["reason"])).toMatch(/^the next restart is allowed in \d+ s$/);
@@ -411,7 +419,7 @@ describe("mock race, second design review", () => {
   it("keeps a capacity wait out of EC2's time and says how long it was", async () => {
     const c = await live();
     await admin("/mock/schedule", { capacity_wait_ms: 600 });
-    c.ws.send(JSON.stringify({ type: "intent", id: `cap-${Date.now()}`, name: "relaunch_all", args: {} }));
+    c.ws.send(JSON.stringify({ type: "intent", id: `cap-${Date.now()}`, name: "restart_now", args: {} }));
     await c.next((m) => m["type"] === "receipt");
     await until(() => coord.fleetState().relaunch_all!.ec2_waiting_since !== null);
     await until(() => coord.fleetState().tiles.find((t) => t.id === "ec2:1")!.phase === "waiting_capacity");
@@ -432,21 +440,19 @@ describe("mock race, second design review", () => {
     await sleep(1000);
   });
 
-  it("counts every GPU VM restored, and scrubs only once the scrub has shipped", async () => {
+  it("counts every GPU VM restored, and the scrubs agents report", async () => {
     const before = coord.fleetState().counters;
-    expect(coord.fleetState().security).toEqual({ gpu_scrub: false });
     const c = await live();
     c.ws.send(JSON.stringify({ type: "intent", id: `cnt-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
     await c.next((m) => m["type"] === "receipt");
-    await until(() => coord.fleetState().counters.restores_total === before.restores_total + 1);
-    expect(coord.fleetState().counters.scrubs_total).toBe(before.scrubs_total);
+    await until(() => coord.fleetState().counters.restores === before.restores + 1);
+    expect(coord.fleetState().counters.scrubs).toBe(before.scrubs);
     expect(coord.fleetState().counters.restores_last_hour).toBe(before.restores_last_hour + 1);
     await admin("/mock/schedule", { gpu_scrub: true });
-    expect(coord.fleetState().security).toEqual({ gpu_scrub: true });
     c.ws.send(JSON.stringify({ type: "intent", id: `cnt2-${Date.now()}`, name: "relaunch", args: { tile: "fcvm:1" } }));
     await c.next((m) => m["type"] === "receipt" && String(m["id"]).startsWith("cnt2"));
-    await until(() => coord.fleetState().counters.restores_total === before.restores_total + 2);
-    expect(coord.fleetState().counters.scrubs_total).toBe(before.scrubs_total + 1);
+    await until(() => coord.fleetState().counters.restores === before.restores + 2);
+    expect(coord.fleetState().counters.scrubs).toBe(before.scrubs + 1);
     await admin("/mock/schedule", { gpu_scrub: false });
     c.ws.close();
   });
@@ -511,14 +517,14 @@ describe("mock race, second design review", () => {
     await admin("/mock/turnstile", { sitekey: "example-sitekey" });
     const c = await live();
     expect(await c.next((m) => m["type"] === "hello")).toMatchObject({ turnstile: "example-sitekey" });
-    c.ws.send(JSON.stringify({ type: "intent", id: `ts-1-${Date.now()}`, name: "time_of_day", args: { v: 0.3 } }));
+    c.ws.send(JSON.stringify({ type: "intent", id: `ts-1-${Date.now()}`, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
     expect(await c.next((m) => m["type"] === "receipt")).toMatchObject({ outcome: "refused", reason: "verify first" });
     c.ws.send(JSON.stringify({ type: "verify", token: "wrong" }));
     expect(await c.next((m) => m["type"] === "verified")).toMatchObject({ ok: false });
     c.ws.send(JSON.stringify({ type: "verify", token: "mock-pass" }));
     expect(await c.next((m) => m["type"] === "verified" && m["ok"] === true)).toMatchObject({ ok: true });
     const id = `ts-2-${Date.now()}`;
-    c.ws.send(JSON.stringify({ type: "intent", id, name: "time_of_day", args: { v: 0.3 } }));
+    c.ws.send(JSON.stringify({ type: "intent", id, name: "light", args: { pos: [0, 1, -2], color: [1, 1, 1] } }));
     expect(await c.next((m) => m["type"] === "receipt" && m["id"] === id)).toMatchObject({ outcome: "committed" });
     await admin("/mock/turnstile", { sitekey: null });
     c.ws.close();
@@ -553,29 +559,34 @@ describe("mock race, second design review", () => {
     back.ws.close();
   });
 
-  it("counts only visible tabs as viewers", async () => {
+  it("counts every connection, and only visible tabs as active viewers", async () => {
     const c = await live();
     await c.next((m) => m["type"] === "snapshot");
-    const count = () => coord.fleetState().viewers.count;
-    const before = count();
+    const v = () => coord.fleetState().viewers;
+    const before = v();
     c.ws.send(JSON.stringify({ type: "visibility", visible: false }));
-    await until(() => count() === before - 1);
+    await until(() => v().active === before.active - 1);
+    expect(v().count).toBe(before.count);
     c.ws.send(JSON.stringify({ type: "visibility", visible: true }));
-    await until(() => count() === before);
+    await until(() => v().active === before.active);
     c.ws.close();
   });
 
-  it("sleeps with nobody watching and wakes host by host when a viewer comes, measuring the wake", async () => {
+  it("sleeps with nobody watching (nothing placed) and wakes host by host when a viewer comes, measuring the wake", async () => {
+    const awake = coord.fleetState().tiles.length;
     await admin("/mock/power", { sleep: true, hold: true });
     let st = coord.fleetState();
     expect(st.fleet.power).toMatchObject({ state: "asleep", woke_at: null });
-    expect(st.tiles.filter((t) => t.slot).every((t) => t.phase === "asleep" && t.frame_url === null)).toBe(true);
-    expect(st.aggregates.every((a) => a.frame_url === null)).toBe(true);
-    const restored = st.counters.restores_total;
+    // As the coordinator: asleep, nothing is placed.
+    expect(st.tiles).toEqual([]);
+    expect(st.aggregates).toEqual([]);
+    const restored = st.counters.restores;
     await admin("/mock/power", { wake: true });
     st = coord.fleetState();
     expect(st.fleet.power.state).toBe("waking");
-    expect(st.fleet.power.hosts.map((h) => h.host)).toEqual(["mock-host-1", "mock-host-2", "ec2"]);
+    // The GPU hosts; the EC2 half launches at once and is not a host here.
+    expect(st.fleet.power.hosts.map((h) => h.host)).toEqual(["mock-host-1", "mock-host-2"]);
+    expect(st.tiles.every((t) => t.half === "ec2")).toBe(true);
     await until(() => coord.fleetState().fleet.power.state === "awake", 5000);
     st = coord.fleetState();
     for (const h of st.fleet.power.hosts) {
@@ -584,10 +595,12 @@ describe("mock race, second design review", () => {
     }
     const lw = st.fleet.power.last_wake!;
     expect(lw.started_at).toBe(st.fleet.power.woke_at);
-    expect(lw.awake_at).toBe(Math.max(...st.fleet.power.hosts.map((h) => h.phases.at(-1)!.at)));
+    expect(lw.awake_at).toBeGreaterThanOrEqual(Math.max(...st.fleet.power.hosts.map((h) => h.phases.at(-1)!.at)));
+    expect(lw.ms).toBe(lw.awake_at - lw.started_at);
+    expect(st.tiles).toHaveLength(awake);
     expect(lw.gpus).toBe(st.tiles.filter((t) => t.slot).length);
     expect(st.tiles.filter((t) => t.slot).every((t) => t.phase === "running" && t.frame_url !== null)).toBe(true);
-    expect(st.counters.restores_total).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
+    expect(st.counters.restores).toBe(restored + st.tiles.filter((t) => t.slot && t.half === "fcvm").length);
   });
 
   it("serves the recording with byte ranges, and answers 404 when it is missing", async () => {
@@ -628,8 +641,8 @@ describe("mock race, second design review", () => {
     await until(() => frames.length > 3);
     await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 3 });
     const st = coord.fleetState();
-    expect(st.layout.gen).toBe(st0.layout.gen + 1);
-    const atT = st.layout.at_frame / 30;
+    expect(st.layout.generation).toBe(st0.layout.generation + 1);
+    const atT = st.layout.from_frame / 30;
     // Ahead of now, on the renderers' t = k/30 grid.
     expect(atT * 1000).toBeGreaterThan(Date.now() - coord.patternScene().epoch_unix_ms);
     // Two fcvm against three EC2: the fcvm side is two fifths of the image.
@@ -664,27 +677,70 @@ describe("mock race, second design review", () => {
     await admin("/mock/fault", { fcvm_gpus: 2, ec2_gpus: 1 });
   }, 60_000);
 
-  it("fails a tile with a retry time, and reclaims a host: draining, then no GPU behind its places", async () => {
+  it("fails a tile with a retry time, and reclaims a host as the coordinator does: its tiles leave at once, `failures` says why", async () => {
     await admin("/mock/fault", { fail: "fcvm:1", message: "GPU did not come back", retry_ms: 300 });
-    let t = coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!;
+    const t = coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!;
     expect(t.phase).toBe("failed");
     expect(t.failure).toMatchObject({ kind: "relaunch_failed", message: "GPU did not come back" });
     expect(t.error).toBe("GPU did not come back");
     await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.phase === "running");
     expect(coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.failure).toBeNull();
+    const gen = coord.fleetState().layout.generation;
     await admin("/mock/fault", { reclaim: "mock-host-2" });
-    t = coord.fleetState().tiles.find((x) => x.id === "fcvm:2")!;
-    expect(t.phase).toBe("draining");
-    expect(t.failure?.kind).toBe("host_reclaimed");
-    expect(coord.fleetState().fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(true);
-    const gen = coord.fleetState().layout.gen;
-    // Its GPU leaves and the image is re-tiled onto the GPUs left: no dark place stays behind.
-    await until(() => coord.fleetState().tiles.every((x) => x.id !== "fcvm:2"));
-    expect(coord.fleetState().layout.gen).toBe(gen + 1);
-    expect(coord.fleetState().fleet.hosts.map((h) => h.name)).toEqual(["mock-host-1"]);
-    expect(coord.fleetState().tiles.find((x) => x.id === "fcvm:1")!.rect).toMatchObject({ x: 0, w: 0.5, h: 1 });
+    // The same event: the host's tile is gone and the GPUs left are re-tiled; no tile carries the reclaim.
+    let st = coord.fleetState();
+    expect(st.tiles.map((x) => x.id)).not.toContain("fcvm:2");
+    expect(st.tiles.every((x) => x.failure === null || x.failure.kind === "relaunch_failed")).toBe(true);
+    expect(st.layout.generation).toBe(gen + 1);
+    expect(st.tiles.find((x) => x.id === "fcvm:1")!.rect).toMatchObject({ x: 0, w: 0.5, h: 1 });
+    expect(st.failures).toEqual([{ kind: "host_reclaimed", host: "mock-host-2", since: expect.any(Number), retiling: true }]);
+    expect(st.fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(true);
     await admin("/mock/fault", { replace_host: "mock-host-2" });
-    expect(coord.fleetState().layout.gen).toBe(gen + 2);
+    st = coord.fleetState();
+    expect(st.layout.generation).toBe(gen + 2);
+    expect(st.failures).toEqual([]);
+    expect(st.fleet.hosts.find((h) => h.name === "mock-host-2")!.draining).toBe(false);
     await until(() => coord.fleetState().tiles.find((x) => x.id === "fcvm:2")?.phase === "running");
+  });
+});
+
+describe("the mock speaks the coordinator's snapshot shapes", () => {
+  // The coordinator's own states (#1146, core/test/fixtures/coordinator.json): every
+  // field the mock sends must be one the coordinator sends, at the same path.
+  const fixture = JSON.parse(readFileSync(new URL("../../core/test/fixtures/coordinator.json", import.meta.url), "utf8")) as { views: Record<string, unknown> };
+  /**
+   * In PROTOCOL.md's "Snapshot state" but in no vector's final view (none ends mid-loan
+   * or with GPU readings), so listed by hand with the line that documents it.
+   */
+  const DOCUMENTED: Record<string, string> = {
+    "tiles[].borrowed.until": '"borrowed": {"session", "viewer", "since", "until"}',
+    "tiles[].gpu_stats": '"gpu_stats": { ... }, the agent\'s readings',
+    "fleet.power.hosts[]": '"hosts": [{"host": "i-...", "phases": [{"phase", "at"}]}]',
+    "tiles[].last_relaunch.phases.ack_ms": "Agent, `timings`: fcvm's own restore clock",
+    "tiles[].last_relaunch.phases.total_ms": "Agent, `timings`: the relaunch start to the first frame",
+  };
+  /** The mock's own, read by nothing the real coordinator feeds. */
+  const MOCK_ONLY: Record<string, string> = {
+    "scene.camera[].x": "the mock renderer's flat test pattern pans by x, y and zoom, not pos and look",
+    "scene.camera[].y": "the same",
+    "scene.camera[].zoom": "the same",
+  };
+  const shapes = (v: unknown, at = "", out = new Set<string>()): Set<string> => {
+    if (v !== null && typeof v === "object") {
+      const arr = Array.isArray(v);
+      for (const [k, x] of arr ? v.map((y, i) => [i, y] as const) : Object.entries(v)) shapes(x, arr ? `${at}[]` : at ? `${at}.${k}` : String(k), out);
+      if (!arr) out.add(at);
+    } else out.add(at);
+    return out;
+  };
+  it("sends nothing the coordinator does not", () => {
+    expect(seenStates.length).toBeGreaterThan(20);
+    const coordinator = new Set<string>();
+    for (const v of Object.values(fixture.views)) shapes(v, "", coordinator);
+    const allowed = (p: string) =>
+      coordinator.has(p) || [...Object.keys(DOCUMENTED), ...Object.keys(MOCK_ONLY)].some((d) => p === d || p.startsWith(`${d}.`) || p.startsWith(`${d}[]`));
+    const mock = new Set<string>();
+    for (const st of seenStates) shapes(st, "", mock);
+    expect([...mock].filter((p) => p !== "" && !allowed(p)).sort()).toEqual([]);
   });
 });

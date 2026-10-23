@@ -533,7 +533,7 @@ export function Wall({ coordUrl, mediaUrl }: { coordUrl: string; mediaUrl: strin
         type="button"
         className="btn primary big"
         disabled={score.button.disabled}
-        onClick={() => client.act("relaunch_all")}
+        onClick={() => client.act("restart_now")}
         data-testid="restart-all"
         aria-describedby="restart-note"
       >

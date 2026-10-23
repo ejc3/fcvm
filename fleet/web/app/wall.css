@@ -116,7 +116,7 @@ h1, h2, h3, p { margin: 0; }
 .caption.ec2 b { color: var(--ec2); }
 .dark-tile { position: absolute; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; overflow: hidden; text-align: center; color: var(--accent); }
 .dark-tile.hatched { background: var(--hatch); }
-.dark-tile.failed, .dark-tile.reclaimed { color: var(--refused); }
+.dark-tile.failed { color: var(--refused); }
 .dark-tile.borrowed { color: var(--fcvm-soft); animation: fade-in 1200ms ease-out; }
 .wall.arrive { animation: fade-in 600ms ease-out; }
 @keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }

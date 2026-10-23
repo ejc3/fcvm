@@ -37,7 +37,7 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
     }
   }
   return {
-    layout: { gen: 1, at_frame: 0 },
+    layout: { generation: 1, from_frame: 0 },
     tiles,
     image_aspect: 16 / 9,
     fleet: {
@@ -48,15 +48,15 @@ export function fleet(cols = 2, rows = 2, over: Partial<FleetState> = {}): Fleet
       power: { state: "awake", asleep_since: null, woke_at: null, hosts: [], last_wake: null },
     },
     borrow: { cap: 2, lent: 0, next_return_at: null },
-    counters: { restores_total: 1284, scrubs_total: 1201, restores_last_hour: 37 },
-    security: { gpu_scrub: false },
+    failures: [],
+    counters: { restores: 1284, scrubs: 0, restores_last_hour: 37 },
     scene: { epoch_unix_ms: EPOCH, camera: [{ t: 0, x: 0, y: 0, zoom: 1 }], time_of_day: 0.5, words: [], lights: [] },
     relaunch_all: null,
     next_race_at: null,
     cooldown_until: null,
     scoreboard: { fcvm: null, ec2: null },
     nudges: null,
-    viewers: { count: 2 },
+    viewers: { count: 2, active: 2 },
     actions: [],
     aggregates: [],
     ...over,
@@ -88,5 +88,5 @@ export function fleetSplit(nf: number, ne: number, gen: number, over: Partial<Fl
       });
     }
   }
-  return { ...base, layout: { gen, at_frame: gen * 300 }, tiles, ...over };
+  return { ...base, layout: { generation: gen, from_frame: gen * 300 }, tiles, ...over };
 }

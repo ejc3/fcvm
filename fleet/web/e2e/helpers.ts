@@ -38,6 +38,11 @@ export async function setSkew(tile: string, skew: number): Promise<void> {
   await admin("/mock/fault", { tile, skew });
 }
 
+/** The time of day, as the coordinator's director sets it per hold (there is no viewer intent for it). */
+export async function setTimeOfDay(v: number): Promise<void> {
+  await admin("/mock/schedule", { time_of_day: v });
+}
+
 /** A mock admin route: faults, the schedule, Turnstile, going offline. */
 export async function admin(path: string, body: unknown): Promise<void> {
   const r = await fetch(`${COORD}${path}`, { method: "POST", body: JSON.stringify(body) });

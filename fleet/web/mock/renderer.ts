@@ -25,6 +25,8 @@ export interface RendererOptions {
   port: number;
   /** Host name the browser uses to reach this server, for frame_url. */
   publicHost: string;
+  /** The port the browser reaches it on, when that is not its own (a proxy in front). */
+  publicPort?: number;
   fps: number;
   threads: number;
   maxHeight: number;
@@ -132,7 +134,7 @@ export class MockRenderers {
   }
 
   frameUrl(id: string): string {
-    return `ws://${this.opts.publicHost}:${this.port}/frames/${id}`;
+    return `ws://${this.opts.publicHost}:${this.opts.publicPort ?? this.port}/frames/${id}`;
   }
 
   setTile(id: string, rect: Rect, black: () => Rect[] = () => [], scene: (() => PatternScene) | null = null): void {

@@ -81,6 +81,8 @@ export interface MosaicLayout {
 export function splitOf(tiles: readonly Tile[]): number {
   const fcvm = tiles.filter((t) => t.half === "fcvm");
   const ec2 = tiles.filter((t) => t.half === "ec2");
+  // No GPU on either side (asleep): nothing is placed, and the halves stay even.
+  if (fcvm.length === 0 && ec2.length === 0) return 0.5;
   if (fcvm.length === 0) return 0;
   if (ec2.length === 0) return 1;
   return Math.max(...fcvm.map((t) => t.rect.x + t.rect.w));

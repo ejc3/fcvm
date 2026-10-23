@@ -32,7 +32,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
   const [word, setWord] = useState("");
   const panel = useRef<HTMLElement | null>(null);
   const iso = view.isolation;
-  const todTimer = useRef<{ last: number; pending: number | null; timer: ReturnType<typeof setTimeout> | null }>({ last: 0, pending: null, timer: null });
 
   useEffect(() => {
     const target = section ? panel.current?.querySelector<HTMLElement>(`#${section}-title`) : null;
@@ -48,20 +47,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose, section]);
-
-  const sendTod = (v: number) => {
-    const s = todTimer.current;
-    s.pending = v;
-    const go = () => {
-      if (s.pending === null) return;
-      client.act("time_of_day", { v: s.pending });
-      s.pending = null;
-      s.last = performance.now();
-      s.timer = null;
-    };
-    if (performance.now() - s.last > 150) go();
-    else if (!s.timer) s.timer = setTimeout(go, 150);
-  };
 
   return (
     <aside ref={panel} className="drawer" role="dialog" aria-modal="false" aria-labelledby="play-title" data-testid="drawer">
@@ -157,21 +142,6 @@ export function PlayDrawer({ client, view, onClose, section }: { client: WallCli
         >
           {p.light.label}
         </button>
-      </section>
-      <section className="field">
-        <label htmlFor="tod">{p.timeOfDay.label}</label>
-        <input
-          id="tod"
-          type="range"
-          min={p.timeOfDay.min}
-          max={p.timeOfDay.max}
-          step={p.timeOfDay.step}
-          value={p.timeOfDay.value}
-          aria-valuetext={p.timeOfDay.valueText}
-          disabled={p.disabled}
-          onChange={(e) => sendTod(Number(e.target.value))}
-        />
-        <span className="value">{p.timeOfDay.valueText}</span>
       </section>
       <section>
         <button

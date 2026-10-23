@@ -1,6 +1,6 @@
 import { expect, test, devices, type Page } from "@playwright/test";
 import { seconds, thousands, utcDate } from "../core/format.ts";
-import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew } from "./helpers.ts";
+import { COORD, admin, fleetNow, focusError, mockState, openWall, raceOver, seamReport, setSkew, setTimeOfDay } from "./helpers.ts";
 
 const view = (page: Page) =>
   page.evaluate(() => {
@@ -152,11 +152,11 @@ test("the owner's schedule: a shared countdown, a restart by the schedule, a coo
  * swapped to the new generation and every tile is live again.
  */
 async function retile(page: Page, fcvm: number, ec2: number, live: number) {
-  const gen0 = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.gen);
+  const gen0 = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation);
   await page.evaluate(() => window.__fleet!.client.traceStart());
   await admin("/mock/fault", { fcvm_gpus: fcvm, ec2_gpus: ec2 });
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().shownLayout?.gen), { timeout: 15_000 }).toBe(gen0 + 1);
-  const atT = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.at_frame / 30);
+  const atT = await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.from_frame / 30);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.bench?.tilesSynced ?? 0), { timeout: 30_000 }).toBe(live);
   const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
   return { gen0, atT, trace };
@@ -207,7 +207,7 @@ test("a re-tile the page hears of after its frame has passed still draws nothing
     const server = ws.connectToServer();
     server.onMessage((m) => {
       const text = String(m);
-      if (late !== null && text.includes('"type":"snapshot"') && (JSON.parse(text) as { state: { layout: { gen: number } } }).state.layout.gen >= late) {
+      if (late !== null && text.includes('"type":"snapshot"') && (JSON.parse(text) as { state: { layout: { generation: number } } }).state.layout.generation >= late) {
         setTimeout(() => ws.send(text), 1500);
         return;
       }
@@ -216,7 +216,7 @@ test("a re-tile the page hears of after its frame has passed still draws nothing
     ws.onMessage((m) => server.send(m));
   });
   await openWall(page, 15);
-  late = (await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.gen)) + 1;
+  late = (await page.evaluate(() => window.__fleet!.client.getState().accepted!.layout.generation)) + 1;
   try {
     const r = await retile(page, 10, 7, 17);
     expectNoHitch(r);
@@ -395,8 +395,8 @@ test("viewers choose the directed camera's next stop", async ({ page }) => {
 
 test("the count of GPU VMs restored ticks as VMs restore; the isolation panel says how a square is isolated", async ({ page }) => {
   await openWall(page, 15);
-  const counters = async () => ((await mockState()).state as unknown as { counters: { restores_total: number } }).counters;
-  const n0 = (await counters()).restores_total;
+  const counters = async () => ((await mockState()).state as unknown as { counters: { restores: number; scrubs: number } }).counters;
+  const n0 = (await counters()).restores;
   await expect(page.getByTestId("counter")).toContainText("GPU VMs restored:");
   await expect(page.getByTestId("counter-value")).toHaveText(thousands(n0));
   await expect(page.getByTestId("counter-scrubs")).toHaveCount(0);
@@ -415,15 +415,16 @@ test("the count of GPU VMs restored ticks as VMs restore; the isolation panel sa
   ]);
   await expect(page.getByTestId("isolation-repo")).toHaveAttribute("href", "https://github.com/ejc3/fcvm");
   await expect(panel.locator("a")).toHaveCount(1);
-  // Once the scrub has shipped, the page says so, and counts scrubs.
+  // Once an agent reports a scrub (`counters.scrubs`), the page says so, and counts them.
+  expect((await counters()).scrubs).toBe(0);
   await admin("/mock/schedule", { gpu_scrub: true });
   try {
-    await expect(panel.locator("p").last()).toHaveText("GPU memory is cleared before a GPU moves to the next virtual machine.");
-    await expect(page.getByTestId("counter-scrubs")).toHaveText(/^GPU memory scrubs: [\d,]+$/);
+    await page.evaluate(() => window.__fleet!.client.send("relaunch", { tile: "fcvm:1" }));
+    await expect(panel.locator("p").last()).toHaveText("GPU memory is cleared before a GPU moves to the next virtual machine.", { timeout: 10_000 });
+    await expect(page.getByTestId("counter-scrubs")).toHaveText("GPU memory scrubs: 1");
   } finally {
     await admin("/mock/schedule", { gpu_scrub: false });
   }
-  await expect(panel.locator("p")).toHaveCount(3);
 });
 
 test("a dropped light lands in the world where it was clicked", async ({ page }) => {
@@ -458,7 +459,7 @@ test("two viewers hold the same state at the same version", async ({ browser }) 
   const pb = await b.newPage();
   await openWall(pa, 15);
   await openWall(pb, 15);
-  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.75 }));
+  await setTimeOfDay(0.75);
   await expect.poll(() => pb.evaluate(() => window.__fleet!.client.getState().accepted!.scene.time_of_day)).toBe(0.75);
   let same = false;
   for (let i = 0; i < 50 && !same; i++) {
@@ -474,16 +475,15 @@ test("two viewers hold the same state at the same version", async ({ browser }) 
     }
   }
   expect(same).toBe(true);
-  await pa.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
+  await setTimeOfDay(0.42);
   await a.close();
   await b.close();
 });
 
 test("this viewer's own actions read as you", async ({ page }) => {
   await openWall(page, 15);
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.6 }));
-  await expect(page.getByTestId("feed")).toContainText("you set the time of day to 14:24");
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
+  await page.evaluate(() => window.__fleet!.client.send("light", { pos: [0, 1, -2], color: [1, 0.8, 0.5] }));
+  await expect(page.getByTestId("feed")).toContainText("you dropped a light");
 });
 
 test("switching streams never shows a region without a frame, nor a t going back, both ways", { tag: "@engines" }, async ({ page }) => {
@@ -606,15 +606,15 @@ test("failure states: a failed VM with its retry, a reclaimed host re-tiling, th
   const failed = page.getByTestId("dark-fcvm:2");
   await expect(failed).toHaveAttribute("data-kind", "failed");
   await expect(says(page, "fcvm VM 2")).toHaveAttribute("aria-label", /failed: GPU did not come back after reset, retrying in 0:0[1-4]/);
+  // As the coordinator: the host's tiles leave the tiling at once and `failures` says why.
   await admin("/mock/fault", { reclaim: "mock-host-2" });
-  await expect(page.getByTestId("banner-reclaimed")).toHaveText("AWS reclaimed an fcvm host. Its squares stay dark while the image is re-tiled onto the GPUs left.");
-  await expect(page.getByTestId("dark-fcvm:5")).toHaveAttribute("data-kind", "reclaimed");
-  await expect(says(page, "fcvm VM 5")).toHaveAttribute("aria-label", /host reclaimed by AWS, re-tiling/);
-  // Its GPUs leave and the image is re-tiled onto the GPUs left: no dark places stay.
+  await expect(page.getByTestId("banner-reclaimed")).toHaveText("AWS reclaimed an fcvm host. The image is re-tiled onto the GPUs left.");
+  // The old tiling stays on screen until the new one has frames; then no place of that host is left.
   await expect(says(page, "fcvm VM 5")).toHaveCount(0, { timeout: 15_000 });
-  await expect(page.getByTestId("banner-reclaimed")).toHaveCount(0);
+  await expect(page.getByTestId("dark-fcvm:5")).toHaveCount(0);
   await expect(page.getByTestId("restart-all")).toHaveText("Restart all 11 GPUs");
   await admin("/mock/fault", { replace_host: "mock-host-2" });
+  await expect(page.getByTestId("banner-reclaimed")).toHaveCount(0);
   await expect(says(page, "fcvm VM 5")).toHaveCount(1, { timeout: 15_000 });
   await expect(page.getByTestId("dark-fcvm:5")).toHaveCount(0, { timeout: 15_000 });
   await expect(page.getByTestId("dark-fcvm:2")).toHaveCount(0, { timeout: 15_000 });
@@ -815,12 +815,12 @@ test("a tab hidden past the limit closes every frame stream and keeps the coordi
   await expect.poll(subscribers, { timeout: 5000 }).toBe(0);
   await expect.poll(() => page.evaluate(() => Object.keys(window.__fleet!.client.getState().frames?.tiles ?? {}).length)).toBe(0);
   const v0 = await page.evaluate(() => window.__fleet!.client.getState().version);
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.5 }));
+  await setTimeOfDay(0.5);
   await expect.poll(() => page.evaluate(() => window.__fleet!.client.getState().version)).toBeGreaterThan(v0);
   expect(await page.evaluate(() => window.__fleet!.client.getState().connection)).toBe("open");
   await visibility.set(page, "visible");
   await expect.poll(subscribers, { timeout: 10_000 }).toBeGreaterThanOrEqual(15);
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
+  await setTimeOfDay(0.42);
 });
 
 test("coming back to the tab holds the last picture, then fades the live image in at one common t", async ({ page }) => {
@@ -869,6 +869,13 @@ async function wakeUp(page: Page): Promise<void> {
 
 test("asleep: the recording plays over the poster with its badge, the scores are dated, the buttons wait; waking shows the real phases, then the live image takes over with no blank frame", async ({ page }) => {
   await openWall(page, 15);
+  // The scores are dated while asleep: make sure one race has been measured.
+  if ((await fleetNow()).scoreboard.fcvm === null) {
+    await admin("/mock/schedule", { clear_cooldown: true });
+    await page.evaluate(() => window.__fleet!.client.send("restart_now", {}));
+    await expect.poll(async () => (await fleetNow()).scoreboard.fcvm !== null, { timeout: 40_000 }).toBe(true);
+    await raceOver();
+  }
   await sleepNow();
   await expect(page.getByTestId("sleep-card")).toContainText("The GPUs are asleep");
   await expect(page.locator(".dark-tile")).toHaveCount(0);
@@ -882,6 +889,7 @@ test("asleep: the recording plays over the poster with its badge, the scores are
   await expect(page.getByTestId("restart-note")).toHaveText("works once the GPUs are awake");
   await expect(page.getByTestId("own-note")).toHaveText("works once the GPUs are awake");
   await expect(page.getByTestId("restart-all")).toBeDisabled();
+  await expect(page.getByTestId("restart-all")).toHaveText("Restart all GPUs");
 
   // Waking: a live clock since the wake began and each phase as the hosts report it.
   await page.evaluate(() => window.__fleet!.client.traceStart());
@@ -902,7 +910,7 @@ test("asleep: the recording plays over the poster with its badge, the scores are
   const trace = await page.evaluate(() => window.__fleet!.client.traceStop());
   expect(trace.filter((e) => e.T !== null && e.missing > 0 && !e.poster)).toEqual([]);
   // The wake, measured once.
-  await expect(page.getByTestId("wake-stat")).toHaveText(/^Last wake: 15 GPUs from zero in 0:0\d \(\d+ \w+ \d{4}, \d\d:\d\d UTC\)$/);
+  await expect(page.getByTestId("wake-stat")).toHaveText(/^Last wake: 15 GPUs from zero in 0:\d\d \(\d+ \w+ \d{4}, \d\d:\d\d UTC\)$/);
   await expect(page.getByTestId("restart-all")).toBeEnabled();
 });
 

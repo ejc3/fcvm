@@ -198,12 +198,13 @@ export function sittingOut(st: FleetState, h: Half): number {
 export function restartButton(i: ScoreInput): RestartButton {
   const { st, now } = i;
   const n = restartableGpus(st);
-  const label = `Restart all ${fmt.count(n, "GPU", "GPUs")}`;
+  // Asleep or waking, the GPUs placed are none or some: the count would say less than a restart will.
+  const label = st.fleet.power.state === "awake" ? `Restart all ${fmt.count(n, "GPU", "GPUs")}` : "Restart all GPUs";
   if (!i.online) return { label, disabled: true, note: "paused while the coordinator is offline" };
   if (st.fleet.power.state !== "awake") return { label, disabled: true, note: NOT_AWAKE_NOTE };
   const ra = runningRace(st);
   if (ra) return { label: "Restarting now", disabled: true, note: "" };
-  if (i.pending.some((p) => p.name === "relaunch_all")) return { label: "Restart requested", disabled: true, note: "" };
+  if (i.pending.some((p) => p.name === "restart_now")) return { label: "Restart requested", disabled: true, note: "" };
   if (st.cooldown_until !== null && st.cooldown_until > now) {
     return { label, disabled: true, note: `available again in ${fmt.countdown(st.cooldown_until - now)}` };
   }

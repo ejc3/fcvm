@@ -23,14 +23,6 @@ export function GlyphMark({ g, size }: { g: Glyph; size: number }) {
       </svg>
     );
   }
-  if (g.kind === "reclaimed") {
-    return (
-      <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="glyph reclaimed">
-        <rect x="4" y="6" width="16" height="12" rx="2" fill="none" stroke="currentColor" strokeWidth="2" />
-        <path d="M4 18L20 6" stroke="currentColor" strokeWidth="2" />
-      </svg>
-    );
-  }
   if (g.kind === "borrowed") {
     return (
       <svg width={size} height={size} viewBox="0 0 24 24" aria-hidden="true" className="glyph borrowed">

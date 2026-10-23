@@ -3,6 +3,7 @@
 //   FLEET_MOCK_COORD_PORT    coordinator port (required; 0 asks the kernel)
 //   FLEET_MOCK_RENDER_PORT   renderer port (required; 0 asks the kernel)
 //   FLEET_MOCK_HOST          host name the browser uses for frame_url (localhost)
+//   FLEET_MOCK_PUBLIC_RENDER_PORT  the port frame_url names, when a proxy sits in front (the renderer port)
 //   FLEET_MOCK_FCVM_GPUS     fcvm GPUs live (8); each side is as wide as its share
 //   FLEET_MOCK_EC2_GPUS      EC2 GPUs live (7)
 //   FLEET_MOCK_GPUS_PER_HOST GPUs per fcvm host (8)
@@ -67,6 +68,7 @@ export async function startMock() {
   const renderers = new MockRenderers({
     port: int("FLEET_MOCK_RENDER_PORT"),
     publicHost: env("FLEET_MOCK_HOST", "localhost"),
+    ...(process.env["FLEET_MOCK_PUBLIC_RENDER_PORT"] ? { publicPort: int("FLEET_MOCK_PUBLIC_RENDER_PORT") } : {}),
     fps: fps(),
     threads: int("FLEET_MOCK_THREADS", 12),
     maxHeight: int("FLEET_MOCK_MAX_HEIGHT", 1080),

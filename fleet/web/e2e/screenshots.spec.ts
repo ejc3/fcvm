@@ -4,7 +4,7 @@
 // a phone. Written to FLEET_SCREENSHOT_DIR when set, else to the test's output folder.
 
 import { expect, test, devices, type Page } from "@playwright/test";
-import { admin, openWall, raceOver } from "./helpers.ts";
+import { admin, openWall, raceOver, setTimeOfDay } from "./helpers.ts";
 
 async function shot(page: Page, name: string): Promise<void> {
   const dir = process.env.FLEET_SCREENSHOT_DIR ?? test.info().outputPath();
@@ -35,7 +35,7 @@ test("screenshots", async ({ page, browser }) => {
     const img = await page.evaluate(() => window.__fleet!.view().layout!.image);
     await page.mouse.click(img.x + u * img.w, img.y + v * img.h);
   }
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.65 }));
+  await setTimeOfDay(0.65);
 
   // A race with a wait for spot capacity, mid-way: fcvm back, EC2 waiting and hatched.
   await admin("/mock/schedule", { capacity_wait_ms: 5000, clear_cooldown: true, cooldown_s: 45 });
@@ -118,5 +118,5 @@ test("screenshots", async ({ page, browser }) => {
   await ctx.close();
 
   // Leave the fleet at rest.
-  await page.evaluate(() => window.__fleet!.client.send("time_of_day", { v: 0.42 }));
+  await setTimeOfDay(0.42);
 });
