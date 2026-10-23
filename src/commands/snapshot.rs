@@ -2627,6 +2627,9 @@ async fn cmd_snapshot_run_inner(
     // guest starts running (same ordering as the podman path).
     let reboot_requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let container_exit_seen = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // Fired by the status listener when the container starts or exits; wakes the
+    // health monitor so it checks at once instead of at its next poll.
+    let status_changed = Arc::new(tokio::sync::Notify::new());
     let status_socket_path = format!("{}_{}", clone_vsock_base.display(), VSOCK_STATUS_PORT);
     // Restored, and bound BEFORE the VMM resumes: the clone wakes mid-handshake
     // (the snapshot captured fc-agent waiting for its cache verdict), observes
@@ -2644,6 +2647,7 @@ async fn cmd_snapshot_run_inner(
         let vm_id_clone = vm_id.clone();
         let reboot_flag = reboot_requested.clone();
         let exit_flag = container_exit_seen.clone();
+        let status_changed = status_changed.clone();
         let verdict = cache_verdict.clone();
         tokio::spawn(async move {
             if let Err(e) = run_status_listener(
@@ -2654,6 +2658,7 @@ async fn cmd_snapshot_run_inner(
                 verdict,
                 reboot_flag,
                 exit_flag,
+                status_changed,
             )
             .await
             {
@@ -3190,6 +3195,7 @@ async fn cmd_snapshot_run_inner(
             vm_state.pid,
             paths::state_dir(),
             Some(health_cancel_token.clone()),
+            Some(status_changed.clone()),
             startup_tx,
         ));
 
