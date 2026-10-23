@@ -11,6 +11,8 @@ def pct(s, p):
 
 rows = list(csv.DictReader(open(sys.argv[1])))
 ok = [r for r in rows if r["exit"] == "0"]
+if not ok:
+    sys.exit(f"no successful run among {len(rows)}")
 no_record = sum(1 for r in ok if not r["ack_ms"])
 print(f"runs {len(rows)}, exit 0: {len(ok)}, exit 0 without a restored record: {no_record}, "
       f"backends: {sorted({r['backend'] for r in ok})}")

@@ -60,7 +60,7 @@ def main(paths):
         row("all", pooled, pooled_fail, " | |")
     s = sorted(pooled)
     if not s:
-        return
+        sys.exit("no successful sandbox in any burst")
     print()
     print("deciles of all bursts (ms): " + ", ".join(f"{nearest_rank(s, p):.0f}" for p in range(10, 101, 10)))
 

@@ -1543,6 +1543,19 @@ mod terminal_input_tests {
 // Cleanup
 // ============================================================================
 
+/// Stop every sandbox at once and wait for all of them: each stop can take up to
+/// `STOP_GRACE`, so one after another would take that long per sandbox.
+async fn stop_all(entries: Vec<(String, SandboxEntry)>, message: &'static str) {
+    let mut stops = tokio::task::JoinSet::new();
+    for (id, mut entry) in entries {
+        stops.spawn(async move {
+            info!(sandbox_id = %id, "{}", message);
+            let _ = entry.sandbox.stop().await;
+        });
+    }
+    while stops.join_next().await.is_some() {}
+}
+
 async fn reaper_task(state: SharedState) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
@@ -1573,10 +1586,7 @@ async fn reaper_task(state: SharedState) {
         } else {
             Vec::new()
         };
-        for (id, mut entry) in expired_entries {
-            info!(sandbox_id = %id, "Sandbox expired, destroying");
-            let _ = entry.sandbox.stop().await;
-        }
+        stop_all(expired_entries, "Sandbox expired, destroying").await;
 
         // A sandbox whose `fcvm podman run` exited on its own (its container stopped, its
         // VM died) is reaped here, so it does not stay a zombie, and dropped from the map.
@@ -1666,11 +1676,7 @@ pub async fn cmd_serve(args: ServeArgs) -> Result<()> {
             // Drain the map first to release the write lock, then stop handles
             // outside the lock so in-flight API requests aren't blocked.
             let entries: Vec<_> = shutdown_state.sandboxes.write().await.drain().collect();
-            for (id, entry) in entries {
-                info!(sandbox_id = %id, "Stopping sandbox");
-                let mut sandbox = entry.sandbox;
-                let _ = sandbox.stop().await;
-            }
+            stop_all(entries, "Stopping sandbox").await;
         })
         .await
         .context("Server error")?;
