@@ -15,6 +15,9 @@
 #include "json.h"
 #include "proto.h"
 
+static bool rect_eq(const Rect& a, const Rect& b) { return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h; }
+static int even_h(int h) { return std::clamp(h, 16, 2160) & ~1; }
+
 double now_unix_ms() {
   timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
@@ -64,6 +67,125 @@ Pipeline::Pipeline(const Options& o) : opt_(o) {
   r_.set_margin(o.margin);
 }
 
+Pipeline::~Pipeline() {
+  {
+    std::lock_guard<std::mutex> l(aux_mu_);
+    aux_stop_ = true;
+  }
+  aux_cv_.notify_all();
+  if (aux_.joinable()) aux_.join();
+}
+
+void Pipeline::aux_post(std::function<void()> f) {
+  {
+    std::lock_guard<std::mutex> l(aux_mu_);
+    aux_q_.push_back(std::move(f));
+  }
+  aux_cv_.notify_all();
+}
+
+void Pipeline::aux_loop() {
+  Renderer::bind_thread();
+  for (;;) {
+    std::function<void()> f;
+    {
+      std::unique_lock<std::mutex> l(aux_mu_);
+      aux_cv_.wait(l, [&] { return aux_stop_ || !aux_q_.empty(); });
+      if (aux_q_.empty()) return;
+      f = std::move(aux_q_.front());
+      aux_q_.pop_front();
+    }
+    f();
+  }
+}
+
+// hand an encoder to the aux thread to tear down (the encoder first, then its
+// input buffer, which it has registered)
+void Pipeline::retire(Enc& e) {
+  std::shared_ptr<H264Encoder> enc(std::move(e.enc));
+  void* nv12 = e.nv12;
+  e.nv12 = nullptr;
+  if (!enc && !nv12) return;
+  Renderer* r = &r_;
+  aux_post([enc, nv12, r]() mutable {
+    enc.reset();
+    if (nv12) r->free_dev(nv12);
+  });
+}
+
+// Opens, on the aux thread, the encoders the streams will need from a pending
+// layout's first frame: (height, quality) per stream at the new layout.
+void Pipeline::prepare_layout(const std::shared_ptr<const Scene>& sc, const std::vector<std::pair<int, int>>& hq,
+                              long long gen) {
+  auto list = std::make_shared<std::vector<std::pair<int, Enc>>>();
+  for (auto [h, q] : hq) {
+    int key = even_h(h) * 4 + q;
+    bool dup = false;
+    for (auto& p : *list) dup = dup || p.first == key;
+    if (dup) continue;
+    Enc e;
+    enc_layout(e, encode_geometry(*sc, even_h(h)));
+    list->emplace_back(key, std::move(e));
+  }
+  {
+    std::lock_guard<std::mutex> l(aux_mu_);
+    prep_open_gen_ = gen;
+  }
+  void* ctx = r_.cu_context();
+  Renderer* r = &r_;
+  int fps = opt_.fps;
+  aux_post([this, list, ctx, r, fps, gen]() {
+    for (auto& [key, e] : *list) {
+      Enc old;
+      try {
+        e.nv12 = r->alloc_nv12(e.ew, e.eh, &e.pitch);
+        e.enc = std::make_unique<H264Encoder>();
+        std::string err;
+        if (!e.enc->open(ctx, e.nv12, e.pitch, e.ew, e.eh, fps, key % 4, &err)) {
+          fprintf(stderr, "fleet-renderer: encoder %dx%d for layout %lld: %s\n", e.ew, e.eh, gen, err.c_str());
+          e.enc.reset();
+        } else {
+          std::lock_guard<std::mutex> l(aux_mu_);
+          if (prep_open_gen_ == gen) {
+            auto it = prepared_.find(key);
+            if (it != prepared_.end()) old = std::move(it->second);
+            prepared_[key] = std::move(e);
+            e.nv12 = nullptr;  // handed over with the encoder
+          }
+        }
+      } catch (const std::exception& ex) {
+        fprintf(stderr, "fleet-renderer: encoder for layout %lld: %s\n", gen, ex.what());
+      }
+      // whatever was not handed over (a failed open, a layout already in
+      // effect, an older encoder for the same key) is torn down here
+      e.enc.reset();
+      if (e.nv12) r->free_dev(e.nv12);
+      old.enc.reset();
+      if (old.nv12) r->free_dev(old.nv12);
+    }
+  });
+}
+
+void Pipeline::enc_layout(Enc& e, const Tile& g) const {
+  // overlap: up to `margin` pixels on each side that lie inside the image,
+  // trimmed by one where needed to keep the encoded size even (4:2:0)
+  int M = opt_.margin;
+  int l = std::min(M, g.x0), r = std::max(0, std::min(M, g.full_w - (g.x0 + g.w)));
+  int tp = std::min(M, g.y0), b = std::max(0, std::min(M, g.full_h - (g.y0 + g.h)));
+  auto even = [M](int* a, int* c) {
+    if ((*a + *c) & 1) {
+      if (*c > 0 && *c < M) (*c)--;
+      else if (*a > 0) (*a)--;
+      else (*c)--;
+    }
+  };
+  even(&l, &r);
+  even(&tp, &b);
+  e.geo = g;
+  e.left = l; e.right = r; e.top = tp; e.bottom = b;
+  e.ew = g.w + l + r; e.eh = g.h + tp + b;
+}
+
 void Pipeline::stop() {
   stop_ = true;
   cv_.notify_all();
@@ -94,10 +216,34 @@ void Pipeline::wake() { cv_.notify_all(); }
 bool Pipeline::post_scene(const std::string& body, std::string* err) {
   try {
     auto sc = std::make_shared<const Scene>(parse_scene(body));
+    std::shared_ptr<const Scene> prev;
+    if (sc->has_previous_rect) {
+      auto p = std::make_shared<Scene>(*sc);
+      p->rect = sc->previous_rect;
+      prev = p;
+    }
+    long long k_last;
+    {
+      std::lock_guard<std::mutex> h(hmu_);
+      k_last = std::llround(last_t_ * opt_.fps);
+    }
     std::lock_guard<std::mutex> l(mu_);
+    bool same_clock = scene_->epoch_unix_ms == sc->epoch_unix_ms;
     scene_ = sc;
+    scene_prev_ = prev;
+    // a new layout generation takes effect at its rect_from_frame (at once
+    // without one): every renderer starts its history there, so the tiles of
+    // the new layout draw from the same frames whether or not they moved
+    if (sc->layout_generation >= 0 && sc->layout_generation != gen_cur_ &&
+        !(switch_pending_ && gen_next_ == sc->layout_generation)) {
+      switch_pending_ = true;
+      gen_next_ = sc->layout_generation;
+      switch_k_ = sc->rect_from_frame >= 0 ? sc->rect_from_frame : 0;
+      switch_from_ = sc->has_previous_rect ? sc->previous_rect : sc->rect;
+      switch_to_ = sc->rect;
+    }
     scene_version_++;
-    sched_ = BudgetSchedule();  // its times are on the old scene's clock
+    sched_ = schedule_after_scene(sched_, same_clock, sc->budget > 0, k_last);
   } catch (const std::exception& e) {
     *err = e.what();
     return false;
@@ -125,17 +271,16 @@ bool Pipeline::post_budget(const std::string& body, std::string* err) {
   return true;
 }
 
-static int even_h(int h) { return std::clamp(h, 16, 2160) & ~1; }
 // encoders are keyed by height and quality; ordered by height first
 static int enc_key(const Subscriber& s) { return even_h(s.want_h) * 4 + std::clamp(s.want_q.load(), 0, 2); }
 
 std::string Pipeline::header_json(const Enc& e, int q) {
-  char b[384];
+  char b[448];
   snprintf(b, sizeof b,
            "{\"codec\":\"%s\",\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,\"x0\":%d,\"y0\":%d,\"fps\":%d,"
-           "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},\"q\":\"%s\",\"bitrate\":%u}",
+           "\"crop\":{\"left\":%d,\"top\":%d,\"right\":%d,\"bottom\":%d},\"q\":\"%s\",\"bitrate\":%u,\"layout_generation\":%s}",
            e.enc->codec().c_str(), e.ew, e.eh, e.geo.full_w, e.geo.full_h, e.geo.x0, e.geo.y0, opt_.fps, e.left, e.top,
-           e.right, e.bottom, quality_name(q), e.enc->bitrate());
+           e.right, e.bottom, quality_name(q), e.enc->bitrate(), gen_cur_ >= 0 ? std::to_string(gen_cur_).c_str() : "null");
   return b;
 }
 
@@ -152,6 +297,7 @@ void Pipeline::run() {
   fprintf(stderr, "fleet-renderer: GPU %s (%s) ready %.0f ms after process start\n", gpu_name_.c_str(),
           r_.pci_bus_id().c_str(), startup_ready_ms_);
   ready_ = true;
+  aux_ = std::thread([this] { aux_loop(); });
   long long last_k = LLONG_MIN;
   uint64_t seen_version = 0;
   uint32_t frame_no = 0;
@@ -240,11 +386,48 @@ Tile Pipeline::encode_geometry(const Scene& sc, int h) {
 void Pipeline::frame_once(double t, uint32_t frame_no) {
   std::vector<std::shared_ptr<Subscriber>> subs;
   std::shared_ptr<const Scene> sc;
+  bool new_layout = false;
+  std::vector<std::pair<int, int>> prep;  // a pending layout's streams: (height, quality)
+  std::shared_ptr<const Scene> prep_scene;
+  long long prep_gen = -1;
   {
     std::lock_guard<std::mutex> l(mu_);
     subs = subs_;
     sc = scene_;
+    long long k = std::llround(t * opt_.fps);
+    if (scene_prev_ && k < sc->rect_from_frame) sc = scene_prev_;  // the old layout until its last frame
+    if (switch_pending_ && k >= switch_k_) {
+      switch_pending_ = false;
+      gen_cur_ = gen_next_;
+      new_layout = true;
+      // keep each stream's whole image as tall as it was: a stream's height
+      // is its tile's, and the tile's share of the image may have changed
+      bool moved = !rect_eq(switch_from_, switch_to_);
+      for (auto& s : subs) {
+        if (moved) {
+          int full = tile_geometry(switch_from_, sc->image_aspect, s->want_h).full_h;
+          s->want_h = tile_h_for(switch_to_, sc->image_aspect, full);
+        }
+        s->cur_h = 0;  // a new header (layout_generation) at this frame
+        s->need_key = true;
+      }
+    }
+    // open the pending layout's encoders ahead of its first frame
+    if (switch_pending_ && prepared_gen_ != gen_next_ && !subs.empty()) {
+      prepared_gen_ = gen_next_;
+      if (!rect_eq(switch_from_, switch_to_)) {
+        prep_scene = scene_;
+        prep_gen = gen_next_;
+        for (auto& s : subs)
+          prep.push_back({tile_h_for(switch_to_, scene_->image_aspect,
+                                     tile_geometry(switch_from_, scene_->image_aspect, s->want_h).full_h),
+                          std::clamp(s->want_q.load(), 0, 2)});
+      }
+    }
   }
+  if (!prep.empty()) prepare_layout(prep_scene, prep, prep_gen);
+  double sw0 = mono_s();
+  if (new_layout) r_.reset_history();
   // (re)assign subscribers to encoders by height; drop closed ones
   for (auto& [h, e] : encs_) {
     e.subs.erase(std::remove_if(e.subs.begin(), e.subs.end(),
@@ -264,8 +447,7 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
   }
   for (auto it = encs_.begin(); it != encs_.end();) {
     if (it->second.subs.empty()) {
-      it->second.enc.reset();
-      if (it->second.nv12) r_.free_dev(it->second.nv12);
+      retire(it->second);
       it = encs_.erase(it);
     } else {
       ++it;
@@ -324,12 +506,14 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       r_.download_rgba(&rq->rgba);
       rq->w = rt.w;
       rq->h = rt.h;
-      char tj[320];
+      char tj[384];
       snprintf(tj, sizeof tj,
                "{\"t\":%.17g,\"x0\":%d,\"y0\":%d,\"width\":%d,\"height\":%d,\"full_width\":%d,\"full_height\":%d,"
-               "\"spp\":%d,\"checkerboard\":%d,\"hq\":%d,\"budget\":%.0f,\"hold\":%s,\"hold_samples\":%d}",
+               "\"spp\":%d,\"checkerboard\":%d,\"hq\":%d,\"budget\":%.0f,\"budget_source\":\"%s\",\"hold\":%s,\"hold_samples\":%d,"
+               "\"layout_generation\":%s}",
                t, rt.x0, rt.y0, rt.w, rt.h, rt.full_w, rt.full_h, r_.stats().spp, r_.stats().half, r_.stats().hq ? 1 : 0,
-               budget, r_.stats().hold ? "true" : "false", r_.stats().hold_samples);
+               budget, source, r_.stats().hold ? "true" : "false", r_.stats().hold_samples,
+               gen_cur_ >= 0 ? std::to_string(gen_cur_).c_str() : "null");
       rq->tile = tj;
       rq->ok = true;
     }
@@ -349,28 +533,37 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
     if (heights.empty() || heights.back() != h) heights.push_back(h);
     streams.push_back({h, q});
     Tile g = encode_geometry(*sc, h);
+    if (new_layout) e.want_idr = true;  // the first frame of a layout generation is a keyframe
     bool same = e.enc && g.w == e.geo.w && g.h == e.geo.h && g.full_w == e.geo.full_w && g.full_h == e.geo.full_h &&
                 g.x0 == e.geo.x0 && g.y0 == e.geo.y0;
+    bool continue_encode = false;
     if (!same) {
-      // overlap: up to `margin` pixels on each side that lie inside the image,
-      // trimmed by one where needed to keep the encoded size even (4:2:0)
-      int M = opt_.margin;
-      int l = std::min(M, g.x0), r = std::max(0, std::min(M, g.full_w - (g.x0 + g.w)));
-      int tp = std::min(M, g.y0), b = std::max(0, std::min(M, g.full_h - (g.y0 + g.h)));
-      auto even = [M](int* a, int* c) {
-        if ((*a + *c) & 1) {
-          if (*c > 0 && *c < M) (*c)--;
-          else if (*a > 0) (*a)--;
-          else (*c)--;
+      retire(e);
+      Enc ready;
+      {
+        std::lock_guard<std::mutex> l(aux_mu_);
+        auto pit = prepared_.find(ekey);
+        if (pit != prepared_.end() && pit->second.enc && pit->second.geo.w == g.w && pit->second.geo.h == g.h &&
+            pit->second.geo.full_w == g.full_w && pit->second.geo.full_h == g.full_h && pit->second.geo.x0 == g.x0 &&
+            pit->second.geo.y0 == g.y0) {
+          ready = std::move(pit->second);
+          prepared_.erase(pit);
         }
-      };
-      even(&l, &r);
-      even(&tp, &b);
-      e.enc.reset();
-      if (e.nv12) r_.free_dev(e.nv12);
-      e.geo = g;
-      e.left = l; e.right = r; e.top = tp; e.bottom = b;
-      e.ew = g.w + l + r; e.eh = g.h + tp + b;
+      }
+      if (ready.enc) {
+        e.enc = std::move(ready.enc);
+        e.nv12 = ready.nv12;
+        e.pitch = ready.pitch;
+        e.geo = ready.geo;
+        e.left = ready.left; e.right = ready.right; e.top = ready.top; e.bottom = ready.bottom;
+        e.ew = ready.ew; e.eh = ready.eh;
+        for (auto& s : e.subs) s->cur_h = 0;
+        e.want_idr = true;
+        continue_encode = true;
+      }
+    }
+    if (!same && !continue_encode) {
+      enc_layout(e, g);
       e.nv12 = r_.alloc_nv12(e.ew, e.eh, &e.pitch);
       e.enc = std::make_unique<H264Encoder>();
       std::string err;
@@ -430,6 +623,19 @@ void Pipeline::frame_once(double t, uint32_t frame_no) {
       }
     }
   }
+  if (new_layout)
+    fprintf(stderr, "fleet-renderer: layout generation %lld from frame %lld (that frame took %.1f ms)\n", gen_cur_,
+            std::llround(t * opt_.fps), (mono_s() - sw0) * 1000.0);
+  if (new_layout) {
+    // the layout is in effect: encoders opened for it and not taken are torn down
+    std::map<int, Enc> left;
+    {
+      std::lock_guard<std::mutex> l(aux_mu_);
+      prep_open_gen_ = -1;
+      left.swap(prepared_);
+    }
+    for (auto& [k, e] : left) retire(e);
+  }
   std::lock_guard<std::mutex> l(hmu_);
   last_t_ = t;
   frame_ = frame_no;
@@ -478,6 +684,12 @@ bool Pipeline::next_frame(int still_h, std::vector<uint8_t>* rgba, int* w, int* 
 
 std::string Pipeline::health_json() {
   GpuSample g = gpu_.latest();
+  long long gcur, gnext, gk;
+  bool gpend;
+  {
+    std::lock_guard<std::mutex> l(mu_);  // never held together with hmu_
+    gcur = gen_cur_; gnext = gen_next_; gk = switch_k_; gpend = switch_pending_;
+  }
   std::lock_guard<std::mutex> l(hmu_);
   std::ostringstream o;
   o.precision(6);
@@ -519,6 +731,9 @@ std::string Pipeline::health_json() {
       << ",\"render_ms_max\":" << std::round(rmax * 10) / 10 << ",\"encode_ms_max\":" << std::round(emax * 10) / 10 << "}";
   }
   o << ",\"trace_ms\":" << std::round(rstats_.trace_ms * 10) / 10;
+  o << ",\"layout_generation\":";
+  if (gcur >= 0) o << gcur; else o << "null";
+  if (gpend) o << ",\"layout_pending\":{\"generation\":" << gnext << ",\"from_frame\":" << gk << "}";
   o << ",\"budget\":" << std::round(used_budget_) << ",\"budget_source\":\"" << budget_source_
     << "\",\"budget_fit\":" << std::round(fit_) << ",\"hq\":" << (rstats_.hq ? "true" : "false");
   {

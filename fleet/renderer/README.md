@@ -144,8 +144,9 @@ python3 tools/seam_metric.py out.png 4 2              # seam ratio at every tile
 
 ## Measured (2026-10-23, g4dn.metal from the fleet host AMI, one T4 per fcvm VM)
 
-The fps table, seams and shots are from round 7; the TLS numbers from round
-6; the stream-quality and subscriber numbers from round 4.
+The fps table, seams and shots are from round 7 (round 10's fps runs and
+seam hashes match round 9's); the TLS numbers from round 6; the
+stream-quality and subscriber numbers from round 4.
 
 Moving camera, `tools/measure.py`, 8 s per row after 2 s to settle, default
 budget (250,000 pixel-samples per frame over the drawn region), `q=std`; wall
@@ -236,6 +237,31 @@ Round 9:
   frames at most 27.6 to 29.6 ms. The 26.1 row has none of these, so whether it
   was the renderer skipping slots, the stream dropping frames for a slow
   client, or the client is not known.
+
+Round 10, layout generations (`tools/retile.py`, four VMs):
+
+- **A re-tile mid-stream.** Four tiles stream a moving camera as a 2 x 2 grid
+  (layout 1, 270 px streams), then get layout 2, four columns, with
+  `previous_rect` and `rect_from_frame` K 2.5 s ahead. Every tile's unencoded
+  frame at K-1, stitched under the 2 x 2 layout, and at K+6, stitched under the
+  four columns, equals the same frame drawn whole in another VM (12 frames of
+  history for K-1, 7 for K+6) in all 518,400 pixels, in three runs
+  (`shots/retile-old-new.jpg`, old layout left, new right). Each stream's last
+  layout-1 frame is K-1 and its new header (`layout_generation` 2, 540 px
+  tall, whole image still 540) comes with frame K, a keyframe, and no frame
+  from K on is missing. The frame at K took 21.5 to 26.8 ms.
+- **What the switch cost before.** Opening each new encoder on the render
+  thread took 10 to 25 ms and tearing each old one down 29 to 245 ms, so the
+  frame at K took 61 to 281 ms and tiles skipped 1 to 8 slots; frame K+6
+  stitched under the new layout then differed from the whole frame in 222,469
+  of 518,400 pixels. Encoders for a pending layout are now opened, and old
+  ones torn down, on a second thread.
+- **Scene then budget.** On a tile streaming at 500,000 pixel-samples per
+  frame, a scene post followed 1 s later by the budget, `/health` read every
+  30 ms: every frame it reported in between drew 500,000 from the schedule (31
+  or 32 frames per check, same clock and new clock, two runs). With every scene
+  clearing the schedule, as through round 9, the same check reports 30 of 32
+  frames at the default 250,000.
 
 Stream quality at 180 px tiles (4 x 2 grid, 160 x 180 inner, 192 x 212
 delivered; one moving frame unencoded and as the eight streams decode it,

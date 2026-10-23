@@ -35,6 +35,22 @@ class BudgetSchedule {
   std::vector<std::pair<long long, double>> v_;
 };
 
+// The schedule a new scene leaves. On the same clock (the same epoch_unix_ms,
+// as for a re-tile) the entries still name the same slots and stay. On a new
+// clock they name nothing, so only the budget in force at the last frame drawn
+// carries over, from slot 0, until the controller posts again: every tile of a
+// grid had that budget, so the frames drawn between the scene post and the
+// controller's next budget post still agree. A scene with its own budget
+// clears the schedule.
+inline BudgetSchedule schedule_after_scene(BudgetSchedule s, bool same_clock, bool scene_budget, long long k_last) {
+  if (scene_budget) return BudgetSchedule();
+  if (same_clock) return s;
+  BudgetSchedule n;
+  double b;
+  if (s.at(k_last, &b)) n.add(0, b);
+  return n;
+}
+
 // The budget at which this tile's frame would take `frac` of its slot, from the
 // samples it drew and the GPU time they took (fixed costs count as per-sample
 // cost, so the fit errs low).

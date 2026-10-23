@@ -8,10 +8,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "budget.h"
@@ -61,6 +63,7 @@ struct Options {
 class Pipeline {
  public:
   explicit Pipeline(const Options& o);
+  ~Pipeline();
   // Process start, as CLOCK_BOOTTIME seconds (for start-to-first-frame timing).
   void set_process_start(double boottime_s) { proc_start_ = boottime_s; }
   void run();  // the render thread; returns only on a fatal error
@@ -99,6 +102,26 @@ class Pipeline {
     std::vector<std::shared_ptr<Subscriber>> subs;
   };
   void frame_once(double t, uint32_t frame_no);
+  // overlap and encoded size of an encoder for tile g
+  void enc_layout(Enc& e, const Tile& g) const;
+  // Work kept off the render thread: tearing an encoder down (40 to 250 ms
+  // measured on a T4) and opening the encoders of a pending layout ahead of its
+  // first frame, so a re-tile skips no slot (a skipped slot leaves a tile
+  // without that frame in its history, and its moving frames stop matching
+  // its neighbours' for 8 frames).
+  void aux_loop();
+  void aux_post(std::function<void()> f);
+  void retire(Enc& e);
+  std::thread aux_;
+  std::mutex aux_mu_;
+  std::condition_variable aux_cv_;
+  std::deque<std::function<void()>> aux_q_;
+  bool aux_stop_ = false;
+  // encoders opened ahead for the pending layout, by encoder key (under aux_mu_)
+  std::map<int, Enc> prepared_;
+  long long prepared_gen_ = -1;  // render thread: the generation prepared for
+  long long prep_open_gen_ = -1;  // under aux_mu_: the generation whose encoders may still be added
+  void prepare_layout(const std::shared_ptr<const Scene>& sc, const std::vector<std::pair<int, int>>& hq, long long gen);
   Tile encode_geometry(const Scene& sc, int h);
   int min_w_ = 0, min_h_ = 0;
   std::string header_json(const Enc& e, int q);
@@ -123,6 +146,12 @@ class Pipeline {
   std::mutex mu_;
   std::condition_variable cv_;
   std::shared_ptr<const Scene> scene_;
+  // layout generations: the scene with previous_rect, drawn before
+  // rect_from_frame; the generation in effect and a pending switch (under mu_)
+  std::shared_ptr<const Scene> scene_prev_;
+  long long gen_cur_ = -1, gen_next_ = -1, switch_k_ = 0;
+  bool switch_pending_ = false;
+  Rect switch_from_, switch_to_;
   uint64_t scene_version_ = 0;
   std::vector<std::shared_ptr<Subscriber>> subs_;
   int next_id_ = 1;

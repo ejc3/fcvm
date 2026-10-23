@@ -68,9 +68,50 @@ grants. The body is at most 1 MiB.
 | `words` | viewer text | optional; may be empty |
 | `lights` | viewer lights | optional; may be empty; `color` components 0 to 64 |
 | `budget` | pixel-samples per frame for every tile (see "Budget") | optional; 10,000 to 50,000,000; absent means the renderer's `BUDGET` |
+| `layout_generation` | the coordinator's layout this rect belongs to (see "Layout generations") | optional; a non-negative integer or null |
+| `rect_from_frame` | the first frame (scene time x 30) drawn with `rect` | optional; a non-negative integer or null |
+| `previous_rect` | the rect drawn for frames before `rect_from_frame` | optional; null, or a rect as above; needs `rect_from_frame` |
 
 Answers `200 {"ok":true}`, or `400 {"error":"<what is wrong>"}` naming the
 field. A scene replaces the previous one whole.
+
+### Layout generations (addition, round 10)
+
+The coordinator re-tiles a running wall by posting every renderer a scene with
+a new `layout_generation`, its new `rect`, its old one as `previous_rect` and
+one `rect_from_frame` K shared by all of them, far enough ahead that every post
+arrives first. Each renderer then:
+
+- draws frames before K with `previous_rect` and frames from K with `rect`, so
+  the frames before K stitch under the old layout and the frames from K under
+  the new one;
+- starts its history again at K (every renderer, whether its rect moved or not:
+  a moving frame reads the 8 frames before it, and those were drawn under
+  another layout on some neighbours), so frame K and the 7 after it draw like
+  the first frames of a stream;
+- sends every subscriber a new text header at frame K, with the new tile's
+  size and position and `layout_generation`, followed by a keyframe. A
+  subscriber keeps the whole image's height: its height is converted so that
+  `full_height` stays what it was under `previous_rect` (asked at `h=270` for a
+  1/2-high cell of a 540-high image, it gets `height` 540 after a move to a
+  full-height column).
+
+A scene whose `layout_generation` is the one in force, or already pending,
+changes nothing about the switch (the coordinator re-posts the same body).
+Without `layout_generation` a scene takes effect at once, as before. With it
+and no `previous_rect`, the new rect applies from K and frames before K use it
+too. A re-tile keeps the clock, so it keeps the budget schedule (see "Budget"),
+and the budget the coordinator re-posts after the scene, with a `t` at or
+before the current frame, changes nothing: every frame drawn between the two
+posts already has the grid's budget.
+
+A switch must skip no slot: a tile that skips one lacks that frame in its
+history, and its moving frames stop matching its neighbours' for 8 frames. So
+the renderer opens the new layout's encoders ahead of K, on a separate thread,
+as soon as the scene arrives, and tears the old ones down on that thread after
+K (opening took 10 to 25 ms per encoder and tearing down 29 to 245 ms on a T4;
+done on the render thread they skipped 1 to 8 slots at K). K must leave time
+for that: at least 0.5 s after the last post arrives.
 
 ### Camera interpolation and holds
 
@@ -127,13 +168,16 @@ field. A scene replaces the previous one whole.
 ```json
 {"codec":"avc1.64001f","width":512,"height":556,
  "full_width":1920,"full_height":1080,"x0":480,"y0":0,"fps":30,
- "crop":{"left":16,"top":0,"right":16,"bottom":16},"q":"std","bitrate":6830899}
+ "crop":{"left":16,"top":0,"right":16,"bottom":16},"q":"std","bitrate":6830899,
+ "layout_generation":2}
 ```
 
 `codec`, `width`, `height` are the contract: the size of the delivered
 (decoded) pictures. The renderer adds `full_width`, `full_height` (the whole
 image's pixel grid at this height), `x0`, `y0` (the tile's top-left pixel in
-that grid) and `fps`.
+that grid), `fps` and `layout_generation` (the layout the tile belongs to,
+null without one; a new header arrives at the frame a new layout takes
+effect).
 
 **`crop` (addition, round 3).** Each picture is the tile plus an overlap of up
 to 16 pixels (`MARGIN`) on every side that lies inside the image (none past the image's
@@ -228,6 +272,9 @@ encoded), `spp` (samples per pixel drawn in it), `checkerboard` (see below),
 subscriber was connected, since start), and `startup_ms`, milliseconds from the
 process start (read from `/proc/self/stat`) to CUDA being ready, the first
 frame drawn and the first frame sent to a subscriber (`-1` until it happens).
+`layout_generation` is the layout in force (null without one), and
+`layout_pending` (`{"generation", "from_frame"}`, present only while one is
+waiting) the next.
 `Access-Control-Allow-Origin: *` is set on this route only.
 
 ## Sampling, accumulation and determinism
@@ -250,9 +297,15 @@ The budget for a slot is, in this order (round 8):
 1. **A posted schedule.** `POST /budget` with `{"budget": B, "t": T}`
    (`Content-Type: application/json`; B in 10,000..500,000,000) sets budget B
    from the first slot at or after scene time T, until a later entry takes
-   effect. A later entry for the same slot replaces it. A new scene clears the
-   schedule (its times are on the old scene's clock). `200 {"ok":true}` or
-   `400` naming the field.
+   effect. A later entry for the same slot replaces it. A T at or before the
+   current frame applies from the next frame drawn. A new scene with the same
+   `epoch_unix_ms` (a re-tile) keeps the schedule; one with a new
+   `epoch_unix_ms` keeps only the budget in force at the last frame drawn, from
+   slot 0, since the old entries' times are on the old clock; one with its own
+   `budget` clears it (round 10; until then every scene cleared it, so a frame
+   drawn between a scene post and the controller's next budget post fell back
+   to `BUDGET` on some tiles and not others). `200 {"ok":true}` or `400`
+   naming the field.
 2. The scene's `budget`.
 3. For a renderer drawing the whole image (`rect` is the unit square, so it
    has no edges to match) with `ADAPT=1` (the default): its own fit, rounded
@@ -444,7 +497,9 @@ itself.
 Waits for the frame at `t` (a future slot, at most 15 s ahead) and returns this
 renderer's tile of it unencoded, as a binary PPM at the height being drawn,
 with a header `X-Fleet-Tile: {"t":..,"x0":..,"y0":..,"width":..,"height":..,
-"full_width":..,"full_height":..,"spp":..}`; `404` if the renderer skipped that
+"full_width":..,"full_height":..,"spp":..,"layout_generation":..}` (and
+`hq`, `budget`, `budget_source`); the tile is the one drawn for that frame,
+under `previous_rect` before `rect_from_frame`; `404` if the renderer skipped that
 slot. `tools/rawmosaic.py` uses it to stitch an unencoded mosaic that can be
 compared pixel for pixel with the same frame drawn whole
 (`fleet-renderer still --seq 12`). Not for browsers.

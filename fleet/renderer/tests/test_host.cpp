@@ -274,6 +274,51 @@ int main() {
     // and the frame it predicts lands at 70% of the slot
     CHECK(std::fabs(4.0 + f2 * 3e-5 - 0.7 * fslot) < 0.05, "predicted frame at the target");
   }
+  {
+    // Layout generations: the coordinator's scene body (fleet/PROTOCOL.md on
+    // fleet-control: "layout_generation", "rect_from_frame", "previous_rect").
+    std::string b = R"({"epoch_unix_ms": 1, "rect": {"x": 0.25, "y": 0, "w": 0.25, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "layout_generation": 2, "rect_from_frame": 900, "previous_rect": {"x": 0.5, "y": 0, "w": 0.5, "h": 0.5}})";
+    Scene sc = parse_scene(b);
+    CHECK(sc.layout_generation == 2 && sc.rect_from_frame == 900 && sc.has_previous_rect && sc.previous_rect.x == 0.5 &&
+              sc.previous_rect.h == 0.5 && sc.rect.x == 0.25,
+          "layout fields parsed");
+    std::string n = R"({"epoch_unix_ms": 1, "rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "layout_generation": 3, "rect_from_frame": null, "previous_rect": null})";
+    Scene sn = parse_scene(n);
+    CHECK(sn.layout_generation == 3 && sn.rect_from_frame == -1 && !sn.has_previous_rect, "null layout fields");
+    bool threw = false;
+    try {
+      parse_scene(R"({"epoch_unix_ms": 1, "rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "image_aspect": 1.7778,
+        "camera": [{"t": 0, "pos": [0,1,0], "look": [0,1,10], "fov_deg": 60}], "time_of_day": 0.3,
+        "previous_rect": {"x": 0, "y": 0, "w": 1, "h": 1}})");
+    } catch (const std::exception&) { threw = true; }
+    CHECK(threw, "previous_rect without rect_from_frame is refused");
+    // a stream keeps its whole image's height across a re-tile: 2x2 -> 4x1
+    Rect a{0, 0, 0.5, 0.5}, c{0, 0, 0.25, 1};
+    int full = tile_geometry(a, 16.0 / 9, 270).full_h;
+    int h2 = tile_h_for(c, 16.0 / 9, full);
+    CHECK(full == 540 && h2 == 540 && tile_geometry(c, 16.0 / 9, h2).full_h == 540, "540 -> tile height %d", h2);
+    // a budget posted with a t in the past applies from the next slot
+    BudgetSchedule bs;
+    double bb;
+    bs.add((long long)std::ceil(0.0 * 30), 707107);
+    CHECK(bs.at(26000, &bb) && bb == 707107, "a past t applies at once");
+    // a scene on the same clock keeps the schedule; on a new clock the budget
+    // in force carries over from slot 0; a scene with its own budget clears it
+    BudgetSchedule s2;
+    s2.add(100, 500000);
+    s2.add(400, 353553);
+    BudgetSchedule same = schedule_after_scene(s2, true, false, 200);
+    CHECK(same.at(200, &bb) && bb == 500000 && same.at(400, &bb) && bb == 353553, "same clock keeps the entries");
+    BudgetSchedule fresh = schedule_after_scene(s2, false, false, 200);
+    CHECK(fresh.at(0, &bb) && bb == 500000 && fresh.at(400, &bb) && bb == 500000, "new clock carries the budget in force");
+    BudgetSchedule none = schedule_after_scene(s2, false, false, 50);
+    CHECK(none.size() == 0, "nothing in force, nothing carried");
+    CHECK(schedule_after_scene(s2, true, true, 200).size() == 0, "a scene budget clears the schedule");
+  }
   tlscheck::run();
   DONE();
 }
