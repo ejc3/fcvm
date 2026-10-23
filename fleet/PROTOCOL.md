@@ -217,7 +217,7 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
      "frame_url": "wss://...", "tiles": ["ec2:1", ...]}
   ],
   "fleet": {"hosts": [{"name", "arch", "gpus": [{"sbdf", "name"}], "draining"}], "gpus": 8, "fcvm_gpus": 8,
-            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": []},
+            "ec2_instances": 0, "n": 8, "max_tiles": 100, "standby": ["slot-9"], "standby_ready": 1},
   "scene": {"epoch_unix_ms": ..., "camera": [...], "time_of_day": 0.3, "words": [{"text", "t"}], "lights": [{"pos", "color", "t"}]},
   "image_aspect": 1.7777777777777777,
   "next_race_at": 1761134700000,
@@ -243,8 +243,10 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   "borrow": {"cap": 1, "lent": 1, "next_return_at": 1761134460000},
   "failures": [
     {"kind": "host_reclaimed", "host": "<host>", "since": 1761134400000, "retiling": true},
-    {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000}
+    {"kind": "coordinator_degraded", "component": "text_check", "reason": "...", "since": 1761134400000},
+    {"kind": "gpu_quarantined", "host": "<host>", "sbdf": "0000:05:00.0", "error": "...", "since": 1761134400000}
   ],
+  "counters": {"restores": 1834, "restores_last_hour": 96, "scrubs": 212, "scrub_failures": 1},
   "claims": [{"session": "claim-3", "viewer": "v-9", "slot": "slot-2", "gpu": {...}, "host": "<host>",
               "claimed_at": 1761134400000, "expires_at": 1761134460000, "first_frame_at": 1761134405400,
               "click_to_first_frame_ms": 5400, "borrowed": "fcvm:2"}],
@@ -290,6 +292,20 @@ tiles rounded up, whichever is smaller), and a claim when no tile can be lent.
   (`id`), with a label and this hold's votes; `holding` is the viewpoint held now (null
   while flying) and `next_hold_at` when the camera leaves it; `next` is the next hold once
   the vote has closed, `arrive_next_at` when the camera gets there.
+- `counters` are totals since the fleet first started, kept in the state file across
+  coordinator restarts: `restores` counts fcvm GPU VMs that reached their first frame
+  (the wall's, races', claims' and returns'), `restores_last_hour` those in the current
+  minute and the 59 before it, `scrubs` and `scrub_failures` the GPU scrubs agents
+  reported.
+- `fleet.standby` is the standby pool: GPUs beyond `max_tiles` (every other GPU draws the
+  wall), on hosts that are not draining and not quarantined. They run no VM; their agent
+  keeps them reset, scrubbed and bound, and `standby_ready` counts those that reported
+  ready. A claim takes a standby GPU before it borrows a wall tile, and a standby GPU takes
+  the place of a quarantined or reclaimed one when the fleet re-tiles.
+- A GPU whose reset, scrub or attach fails is quarantined by its agent (Agent: `quarantine`):
+  it leaves the tiling and the agent's assignment, `failures` lists it as `gpu_quarantined`,
+  and it stays out (also when its agent reconnects or the coordinator restarts with its state
+  file) until an operator releases it with `POST /quarantine/release`.
 - `borrow`: at most `cap` wall tiles are lent at once, `lent` are now, and the next comes
   back at `next_return_at`.
 - A tile whose VM did not come back carries `failure` (`kind: "relaunch_failed"`, the
@@ -326,8 +342,12 @@ fcvm fleet coord --listen <addr:port> [--agent-cmd '<command>']... [--state-file
                  [--ec2-aggregate-listen <addr:port> --ec2-aggregate-url <ws url>] [--aggregate-arg <arg>]...
                  [--race-every <secs>] [--restart-cooldown 60] [--camera-seed 1] [--max-borrowed <n>]
                  [--trust-cf-connecting-ip] [--turnstile-secret <secret> --turnstile-site-key <key>]
-                 [--ffmpeg ffmpeg]
+                 [--admin-listen <addr:port>] [--ffmpeg ffmpeg]
 ```
+
+- `--admin-listen` serves the operator's endpoint, `POST /quarantine/release` with
+  `{"host": "<host>", "sbdf": "0000:05:00.0"}`, which returns a quarantined GPU to
+  rotation. It has no authentication: keep it on loopback or a private network.
 
 - `--agent-cmd` starts an agent as a child process and talks to it over its stdin and
   stdout: `fcvm fleet agent --stdio ...` locally, `ssh <host> fcvm fleet agent --stdio ...`
@@ -388,7 +408,8 @@ running. Phases, in order: `stopping` (tearing the old VM down), `restoring` (fc
 the snapshot restore and GPU attach run inside it), `starting` (fcvm acknowledged the
 restore; the container and renderer are coming up), `running` (the renderer reported its
 first frame), and `failed` (`error` says why; `retry_in_ms` is when the agent tries again,
-its backoff).
+its backoff; absent when the failure quarantined the GPU). A slot assigned `standby`
+reports `standby` once its GPU is free (and scrubbed, with `--scrub`) and no VM runs.
 
 `timings`, all milliseconds, present once known:
 
@@ -421,10 +442,27 @@ The host is going away (EC2 `spot/instance-action` appeared). The coordinator ta
 host's slots out of the tiling at once and stops relaunching them; the agent keeps its VMs
 until the host stops.
 
+```json
+{"type": "scrub", "slot": "slot-9", "sbdf": "0000:09:00.0", "ok": true}
+{"type": "scrub", "slot": "slot-9", "sbdf": "0000:09:00.0", "ok": false, "error": "..."}
+```
+
+A GPU scrub finished (with `--scrub`: `<fcvm> gpu scrub <sbdf>`, exit status 0 is ok).
+
+```json
+{"type": "quarantine", "slot": "slot-5", "sbdf": "0000:05:00.0", "error": "..."}
+```
+
+The agent took a GPU out of rotation and runs nothing on it again: its scrub failed, a
+relaunch failed with an error naming the GPU's address, or three relaunches in a row
+failed before fcvm's `restored` record (the GPU reset and attach) or while the GPU was
+still held. Failures after the restore (the container or the renderer) do not count.
+
 ### Coordinator to agent
 
 ```json
 {"type": "assign", "slots": [{"id": "slot-3", "sbdf": "0000:01:00.0", "generation": 4, "rect": {"x": 0, "y": 0, "w": 0.25, "h": 0.5}},
+                             {"id": "slot-9", "sbdf": "0000:09:00.0", "generation": 1, "rect": null, "standby": true},
                              {"id": "slot-4", "sbdf": "0000:02:00.0", "generation": 7, "rect": null,
                               "private_camera": [{"t": 812.0, "pos": [-100, 0.35, -90], "look": [-63.5, 2.2, -87], "fov_deg": 60, "intent": "<claim id>"}]}],
  "region": {"x": 0, "y": 0, "w": 0.5, "h": 0.5}}
@@ -441,7 +479,9 @@ none is placed). For each slot the agent reconciles:
 - a newer `generation` arriving mid-relaunch waits for the current relaunch and then runs
   once.
 - `rect` changed, generation not: post the new scene to the running renderer, no
-  relaunch. `rect: null` (standby, or the host drains): keep the VM, post nothing.
+  relaunch. `rect: null` (the host drains): keep the VM, post nothing.
+- `standby: true` (the standby pool): stop any VM, wait until the GPU is free, scrub it
+  with `--scrub`, report `standby`, and run nothing until the slot is placed again.
 - a slot no longer listed: tear its VM down.
 - a VM that exits on its own: report `failed`, relaunch after 1 s, doubling to 30 s; the
   backoff resets once a VM has run for 60 s.
@@ -468,6 +508,7 @@ fcvm fleet agent --stdio --image <renderer image> --base-port <port>
                  [--host <name>] [--publish-ip <ip>] [--frame-host <name or ip>]
                  [--gpus <sbdf>=<name>,...] [--fcvm <path>] [--fcvm-arg <arg>]...
                  [--spot-notice-url <url>] [--aggregate-port <port> [--aggregate-arg <arg>]...]
+                 [--scrub]
 ```
 
 Each slot's VM is `fcvm podman run --name fleet-<slot> --kernel-profile gpu --gpu <sbdf>
