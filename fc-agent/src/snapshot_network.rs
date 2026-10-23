@@ -362,16 +362,17 @@ struct IptablesGate<R, N: NetfilterOpener = SystemNetfilter> {
     /// lifetime, then released off the caller's thread when the gate is
     /// dropped (see `Drop`). Guards the slot only, never held across an await.
     channel: std::sync::Mutex<Option<N::Channel>>,
-    /// Per family and direction: whether this transaction has seen iptables
-    /// report that half of the gate installed (a verification that found the
-    /// gate closed, or a close that succeeded), and has not removed it since.
-    /// A removal that finds such a half missing from nf_tables refuses instead
-    /// of reporting the gate open: iptables and nf_tables disagreeing means
-    /// the gate lives somewhere this removal does not reach (an
-    /// iptables-legacy binary, for one), and an unpublished clone is the
-    /// failure the restore can report. Indexed `[family][direction]`.
-    /// Guards the array only, never held across an await.
-    installed: std::sync::Mutex<[[bool; 2]; 2]>,
+    /// Per family and direction, what this gate knows of that half from
+    /// iptables: installed (a verification that found the gate closed, or a
+    /// close that succeeded), removed by this gate, or not known. A removal
+    /// that finds a half missing from nf_tables refuses when iptables reports
+    /// it installed, and asks iptables when it is not known: iptables and
+    /// nf_tables disagreeing means the gate lives somewhere this removal does
+    /// not reach (an iptables-legacy binary, for one), and an unpublished
+    /// clone is the failure a restore can report. Indexed
+    /// `[family][direction]`. Guards the array only, never held across an
+    /// await.
+    halves: std::sync::Mutex<[[HalfKnown; 2]; 2]>,
     /// What each gate operation of this transaction cost.
     timings: std::sync::Mutex<GateTimings>,
 }
@@ -444,17 +445,30 @@ impl<R, N: NetfilterOpener> IptablesGate<R, N> {
             runner,
             netfilter,
             channel: std::sync::Mutex::new(None),
-            installed: std::sync::Mutex::new([[false; 2]; 2]),
+            halves: std::sync::Mutex::new([[HalfKnown::Unknown; 2]; 2]),
             timings: std::sync::Mutex::new(GateTimings::default()),
         }
     }
 
-    fn mark_installed(&self, family: Family, directions: &[Direction], installed: bool) {
-        let mut marks = self.installed.lock().unwrap();
+    fn mark(&self, family: Family, directions: &[Direction], known: HalfKnown) {
+        let mut halves = self.halves.lock().unwrap();
         for direction in directions {
-            marks[family_index(family)][direction_index(*direction)] = installed;
+            halves[family_index(family)][direction_index(*direction)] = known;
         }
     }
+
+    fn known(&self, family: Family, direction: Direction) -> HalfKnown {
+        self.halves.lock().unwrap()[family_index(family)][direction_index(direction)]
+    }
+}
+
+/// What a gate knows of one half of itself in one family (see
+/// `IptablesGate::halves`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HalfKnown {
+    Unknown,
+    Installed,
+    Removed,
 }
 
 fn family_index(family: Family) -> usize {
@@ -468,6 +482,17 @@ fn direction_index(direction: Direction) -> usize {
     match direction {
         Direction::Input => 0,
         Direction::Output => 1,
+    }
+}
+
+/// Why a gate iptables sees and nf_tables does not hold fails the removal.
+const ELSEWHERE: &str = "the gate is not where this removal can reach it (is the guest's \
+     iptables the nf_tables backend?), so the clone stays unpublished";
+
+fn program_of(family: Family) -> &'static str {
+    match family {
+        Family::Ipv4 => "iptables",
+        Family::Ipv6 => "ip6tables",
     }
 }
 
@@ -749,7 +774,12 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
         let state = self.read_family_state(program).await?;
         let closed = family_gate_is_closed(&state, loopback_network);
         let family = family_of(program);
-        self.mark_installed(family, &[Direction::Input, Direction::Output], closed);
+        let known = if closed {
+            HalfKnown::Installed
+        } else {
+            HalfKnown::Unknown
+        };
+        self.mark(family, &[Direction::Input, Direction::Output], known);
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
         let mut timings = self.timings.lock().unwrap();
         match family {
@@ -805,10 +835,10 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
             .await?;
         self.install_hook(program, "OUTPUT", GATE_OUTPUT_CHAIN)
             .await?;
-        self.mark_installed(
+        self.mark(
             family_of(program),
             &[Direction::Input, Direction::Output],
-            true,
+            HalfKnown::Installed,
         );
         Ok(())
     }
@@ -829,61 +859,97 @@ impl<R: CommandRunner, N: NetfilterOpener> IptablesGate<R, N> {
     /// (`[Direction::Output]`) is what a restored clone removes before its
     /// hook runs; the ingress half follows at publication.
     async fn remove_halves(&self, directions: &[Direction]) -> Result<()> {
+        // A batch is pinned to the generation its reads saw. A commit anywhere
+        // in the namespace in between (a workload's own firewall change)
+        // refuses it whole, and it is read and built again. Bounded so a
+        // ruleset that never holds still fails closed instead of spinning.
+        const ATTEMPTS: usize = 8;
         let read_started = std::time::Instant::now();
         let taken = self.channel.lock().unwrap().take();
         let mut channel = match taken {
             Some(channel) => channel,
             None => self.netfilter.open()?,
         };
-        let mut removals = Vec::new();
-        for family in Family::BOTH {
-            for direction in directions {
-                let half = direction.half();
-                let layout = crate::nftables::read_half(&mut channel, family, half)?;
-                let installed = self.installed.lock().unwrap()[family_index(family)]
-                    [direction_index(*direction)];
-                if installed && (!layout.chain || layout.hooks.is_empty()) {
-                    bail!(
-                        "{}tables reported the gate's {} chain installed, but the \
-                         {} filter table in nf_tables holds {}; the gate is not where \
-                         this removal can reach it (is the guest's iptables the \
-                         nf_tables backend?), so the clone stays unpublished",
-                        if family == Family::Ipv6 { "ip6" } else { "ip" },
-                        half.chain,
-                        family.name(),
-                        if layout.chain {
-                            "no jump to it"
-                        } else {
-                            "no such chain"
+        let half_name = if directions.contains(&Direction::Input) {
+            "ingress"
+        } else {
+            "egress"
+        };
+        let mut attempt = 0;
+        let (read_ms, commit_started) = loop {
+            attempt += 1;
+            let generation = crate::nftables::generation(&mut channel)?;
+            let mut removals = Vec::new();
+            for family in Family::BOTH {
+                for direction in directions {
+                    let half = direction.half();
+                    let layout = crate::nftables::read_half(&mut channel, family, half)?;
+                    let held = layout.chain || !layout.hooks.is_empty();
+                    match self.known(family, *direction) {
+                        HalfKnown::Installed if !layout.chain || layout.hooks.is_empty() => {
+                            bail!(
+                                "{} reported the gate's {} chain installed, but the {} \
+                                 filter table in nf_tables holds {}; {}",
+                                program_of(family),
+                                half.chain,
+                                family.name(),
+                                if layout.chain {
+                                    "no jump to it"
+                                } else {
+                                    "no such chain"
+                                },
+                                ELSEWHERE
+                            );
                         }
-                    );
-                }
-                removals.push(Removal {
-                    family,
-                    half,
-                    layout,
-                });
-            }
-        }
-        let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
-        let commit_started = std::time::Instant::now();
-        if let Some((batch, _begin, end)) = crate::nftables::removal_batch(&removals) {
-            crate::nftables::commit(&mut channel, &batch, end).with_context(|| {
-                format!(
-                    "removing the {} half of the snapshot network gate in both families",
-                    if directions.contains(&Direction::Input) {
-                        "ingress"
-                    } else {
-                        "egress"
+                        HalfKnown::Unknown if !held => {
+                            let state = self.read_family_state(program_of(family)).await?;
+                            let (rules, hooks) = match direction {
+                                Direction::Input => (&state.input_rules, state.input_hooks),
+                                Direction::Output => (&state.output_rules, state.output_hooks),
+                            };
+                            if rules.is_some() || hooks > 0 {
+                                bail!(
+                                    "{} shows the gate's {} chain, but the {} filter table \
+                                     in nf_tables does not hold it; {}",
+                                    program_of(family),
+                                    half.chain,
+                                    family.name(),
+                                    ELSEWHERE
+                                );
+                            }
+                        }
+                        _ => {}
                     }
-                )
+                    removals.push(Removal {
+                        family,
+                        half,
+                        layout,
+                    });
+                }
+            }
+            let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+            let commit_started = std::time::Instant::now();
+            let Some((batch, _begin, end)) = crate::nftables::removal_batch(&removals, generation)
+            else {
+                break (read_ms, commit_started);
+            };
+            let outcome = crate::nftables::commit(&mut channel, &batch, end).with_context(|| {
+                format!("removing the {half_name} half of the snapshot network gate in both families")
             })?;
-        }
+            match outcome {
+                crate::nftables::Commit::Committed => break (read_ms, commit_started),
+                crate::nftables::Commit::GenerationMoved if attempt < ATTEMPTS => continue,
+                crate::nftables::Commit::GenerationMoved => bail!(
+                    "removing the {half_name} half of the snapshot network gate: the ruleset \
+                     changed under each of {ATTEMPTS} attempts"
+                ),
+            }
+        };
         let commit_ms = commit_started.elapsed().as_secs_f64() * 1000.0;
         // Kept for the next half; released when the gate is dropped (`Drop`).
         *self.channel.lock().unwrap() = Some(channel);
         for family in Family::BOTH {
-            self.mark_installed(family, directions, false);
+            self.mark(family, directions, HalfKnown::Removed);
         }
         let mut timings = self.timings.lock().unwrap();
         if directions.contains(&Direction::Input) {
@@ -2990,7 +3056,8 @@ mod tests {
             .rules
             .retain(|(chain, _, _)| *chain != "INPUT");
         let before = kernel.lock().unwrap().ipv4.clone();
-        let (batch, _, end) = crate::nftables::removal_batch(&removals).unwrap();
+        let generation = crate::nftables::generation(&mut channel).unwrap();
+        let (batch, _, end) = crate::nftables::removal_batch(&removals, generation).unwrap();
         let error = crate::nftables::commit(&mut channel, &batch, end).unwrap_err();
         assert!(format!("{error:#}").contains("No such file"), "{error:#}");
         let k = kernel.lock().unwrap();
@@ -2999,6 +3066,62 @@ mod tests {
             "a failed batch must leave the other family untouched"
         );
         assert!(k.commits.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rule_replaced_since_the_read_is_left_alone() {
+        // A rule replaced in place keeps its handle. A batch built from a
+        // read taken before the replacement would delete the replacement,
+        // someone else's rule, and succeed. The batch is pinned to the
+        // generation it read; a moved generation re-reads.
+        use crate::nftables::model::Rule;
+        let kernel = armed_model();
+        let hook = {
+            let k = kernel.lock().unwrap();
+            k.ipv4
+                .rules
+                .iter()
+                .find(|(chain, _, _)| *chain == "INPUT")
+                .unwrap()
+                .1
+        };
+        kernel.lock().unwrap().before_batch = Some(Box::new(move |k| {
+            k.replace_rule(Family::Ipv4, hook, Rule::Other);
+        }));
+        let gate = IptablesGate::with_netfilter(
+            RecordingRunner::default(),
+            ModelNetfilter(kernel.clone()),
+        );
+        gate.open().await.unwrap();
+        let k = kernel.lock().unwrap();
+        assert!(
+            k.ipv4
+                .rules
+                .iter()
+                .any(|(c, h, r)| *c == "INPUT" && *h == hook && *r == Rule::Other),
+            "the replacement rule was deleted: {:?}",
+            k.ipv4.rules
+        );
+        assert!(!holds_gate(&k.ipv6, GATE_INPUT_CHAIN), "{:?}", k.ipv6);
+    }
+
+    #[tokio::test]
+    async fn an_unverified_gate_that_nftables_does_not_hold_is_confirmed_absent() {
+        // A removal with no verification before it (the source's resume)
+        // cannot tell a gate nf_tables does not hold from a gate that is not
+        // there. iptables is asked: if it shows the gate, the removal fails
+        // instead of reporting it open.
+        let runner = ScriptedRunner {
+            dump: ARMED_V4_DUMP.to_string(),
+            calls: Arc::new(Mutex::new(Vec::new())),
+        };
+        let kernel = Arc::new(Mutex::new(crate::nftables::model::Kernel::default()));
+        let gate = IptablesGate::with_netfilter(runner, ModelNetfilter(kernel.clone()));
+        let error = gate.open().await.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("nf_tables backend"),
+            "{error:#}"
+        );
     }
 
     #[tokio::test]

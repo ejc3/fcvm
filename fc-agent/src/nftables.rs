@@ -41,6 +41,12 @@ const NFT_MSG_DELCHAIN: u16 = 5;
 const NFT_MSG_NEWRULE: u16 = 6;
 const NFT_MSG_GETRULE: u16 = 7;
 const NFT_MSG_DELRULE: u16 = 8;
+const NFT_MSG_NEWGEN: u16 = 15;
+const NFT_MSG_GETGEN: u16 = 16;
+
+const NFTA_GEN_ID: u16 = 1;
+/// `NFNL_BATCH_GENID`: the ruleset generation a batch was built against.
+const NFNL_BATCH_GENID: u16 = 1;
 
 const NFTA_CHAIN_TABLE: u16 = 1;
 const NFTA_CHAIN_NAME: u16 = 3;
@@ -269,6 +275,48 @@ fn dump<C: NetlinkChannel>(
     Ok(())
 }
 
+/// The namespace's current ruleset generation (`NFT_MSG_GETGEN`). Every
+/// commit moves it. A batch that carries it (`removal_batch`) is refused with
+/// `ERESTART` when any commit has landed since, so a removal built from reads
+/// taken after this call cannot act on a ruleset that changed under it.
+pub(crate) fn generation<C: NetlinkChannel>(channel: &mut C) -> Result<u32> {
+    let sequence = next_sequence();
+    let request_type = nft_type(NFT_MSG_GETGEN);
+    channel.send(&message(request_type, NLM_F_REQUEST, sequence, 0, 0, &[]))?;
+    loop {
+        let datagram = channel
+            .receive()
+            .context("waiting for the nf_tables generation")?;
+        let mut found: Option<Result<u32>> = None;
+        for_each_netlink_message(datagram, |header, payload| {
+            if header.sequence != sequence {
+                return Ok(false);
+            }
+            if header.message_type == NLMSG_ERROR {
+                let (error, _) = decode_netlink_error(payload)?;
+                let errno = error.checked_neg().filter(|e| *e > 0).unwrap_or(libc::EIO);
+                found = Some(Err(anyhow::anyhow!(
+                    "reading the nf_tables generation: {}",
+                    io::Error::from_raw_os_error(errno)
+                )));
+                return Ok(true);
+            }
+            if header.message_type == nft_type(NFT_MSG_NEWGEN) {
+                let body = payload.get(4..).context("short nf_tables generation")?;
+                let id = attribute(&attributes(body)?, NFTA_GEN_ID)
+                    .and_then(be_u32)
+                    .context("an nf_tables generation without an id")?;
+                found = Some(Ok(id));
+                return Ok(true);
+            }
+            Ok(false)
+        })?;
+        if let Some(found) = found {
+            return found;
+        }
+    }
+}
+
 /// Read what `family`'s filter table holds of `half`: the hook rules' handles
 /// and whether the chain exists. A family with no filter table holds nothing.
 pub(crate) fn read_half<C: NetlinkChannel>(
@@ -347,11 +395,12 @@ pub(crate) struct Removal {
     pub(crate) layout: HalfLayout,
 }
 
-/// The batch that removes every `removals` entry, and the sequence numbers of
-/// its BEGIN and END messages. Per entry: the hook rules by handle, then the
+/// The batch that removes every `removals` entry, pinned to the ruleset
+/// `generation` the removals were read under, and the sequence numbers of its
+/// BEGIN and END messages. Per entry: the hook rules by handle, then the
 /// chain's flush and deletion, the order iptables-restore uses. Returns `None`
 /// when there is nothing to remove.
-pub(crate) fn removal_batch(removals: &[Removal]) -> Option<(Vec<u8>, u32, u32)> {
+pub(crate) fn removal_batch(removals: &[Removal], generation: u32) -> Option<(Vec<u8>, u32, u32)> {
     let mut body = Vec::new();
     let mut messages = 0usize;
     for removal in removals {
@@ -401,13 +450,15 @@ pub(crate) fn removal_batch(removals: &[Removal]) -> Option<(Vec<u8>, u32, u32)>
         return None;
     }
     let begin = next_sequence();
+    let mut pinned = Vec::new();
+    append_attribute(&mut pinned, NFNL_BATCH_GENID, &generation.to_be_bytes());
     let mut batch = message(
         NFNL_MSG_BATCH_BEGIN,
         NLM_F_REQUEST,
         begin,
         0,
         NFNL_SUBSYS_NFTABLES,
-        &[],
+        &pinned,
     );
     batch.extend(body);
     let end = next_sequence();
@@ -422,17 +473,26 @@ pub(crate) fn removal_batch(removals: &[Removal]) -> Option<(Vec<u8>, u32, u32)>
     Some((batch, begin, end))
 }
 
+/// What became of a batch that nf_tables did not refuse outright.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Commit {
+    Committed,
+    /// The ruleset generation moved since the batch's reads; nothing changed.
+    GenerationMoved,
+}
+
 /// Send a batch and wait for its verdict. nf_tables answers a committed batch
 /// with an acknowledgement of its END message (the only message that asks for
 /// one), and a failed one with an error naming the message that failed or,
-/// for a failed commit, the BEGIN message; a failed batch changes nothing.
-pub(crate) fn commit<C: NetlinkChannel>(channel: &mut C, batch: &[u8], end: u32) -> Result<()> {
+/// for a failed commit or a moved generation, the BEGIN message; a failed
+/// batch changes nothing.
+pub(crate) fn commit<C: NetlinkChannel>(channel: &mut C, batch: &[u8], end: u32) -> Result<Commit> {
     channel.send(batch).context("sending the nf_tables batch")?;
     loop {
         let datagram = channel
             .receive()
             .context("waiting for the nf_tables batch verdict")?;
-        let mut verdict: Option<Result<()>> = None;
+        let mut verdict: Option<Result<Commit>> = None;
         for_each_netlink_message(datagram, |header, payload| {
             if header.message_type != NLMSG_ERROR {
                 return Ok(false);
@@ -443,6 +503,10 @@ pub(crate) fn commit<C: NetlinkChannel>(channel: &mut C, batch: &[u8], end: u32)
                     .checked_neg()
                     .filter(|errno| *errno > 0)
                     .unwrap_or(libc::EIO);
+                if errno == libc::ERESTART && request.message_type == NFNL_MSG_BATCH_BEGIN {
+                    verdict = Some(Ok(Commit::GenerationMoved));
+                    return Ok(true);
+                }
                 verdict = Some(Err(anyhow::anyhow!(
                     "nf_tables refused the batch at message type {:#x} sequence {}: {}",
                     request.message_type,
@@ -452,7 +516,7 @@ pub(crate) fn commit<C: NetlinkChannel>(channel: &mut C, batch: &[u8], end: u32)
                 return Ok(true);
             }
             if request.sequence == end && request.message_type == NFNL_MSG_BATCH_END {
-                verdict = Some(Ok(()));
+                verdict = Some(Ok(Commit::Committed));
                 return Ok(true);
             }
             Ok(false)
@@ -488,7 +552,10 @@ pub(crate) mod model {
         pub(crate) rules: Vec<(&'static str, u64, Rule)>,
     }
 
-    #[derive(Debug, Default)]
+    /// A change to the model kernel, run while it holds itself.
+    pub(crate) type KernelChange = Box<dyn FnOnce(&mut Kernel) + Send>;
+
+    #[derive(Default)]
     pub(crate) struct Kernel {
         pub(crate) ipv4: Table,
         pub(crate) ipv6: Table,
@@ -499,6 +566,11 @@ pub(crate) mod model {
         /// seconds), as a real close waits out an RCU grace period.
         pub(crate) close_blocker:
             Option<std::sync::Arc<std::sync::Mutex<std::sync::mpsc::Receiver<()>>>>,
+        /// The ruleset generation, moved by every commit.
+        pub(crate) genid: u32,
+        /// Runs once when the next batch arrives, before it is applied: a
+        /// concurrent ruleset change between a removal's read and its commit.
+        pub(crate) before_batch: Option<KernelChange>,
         /// Channels opened and closed so far.
         pub(crate) opens: usize,
         pub(crate) closes: usize,
@@ -517,6 +589,9 @@ pub(crate) mod model {
 
         /// The armed gate in one family, as iptables-nft lays it out.
         pub(crate) fn arm(&mut self, family: Family) {
+            // nf_tables never reports generation 0, and a batch pinned to 0
+            // skips the check.
+            self.genid = self.genid.max(1);
             let handles = [
                 self.next_handle + 1,
                 self.next_handle + 2,
@@ -536,6 +611,19 @@ pub(crate) mod model {
                 ("OUTPUT", handles[1], Rule::Jump("FCVM_SNAPSHOT_OUT")),
                 ("FCVM_SNAPSHOT_IN", handles[2], Rule::Other),
             ];
+        }
+
+        /// Replace the rule with `handle` in place, keeping its handle, as
+        /// `NFT_MSG_NEWRULE` with `NLM_F_REPLACE` does, and move the generation.
+        pub(crate) fn replace_rule(&mut self, family: Family, handle: u64, rule: Rule) {
+            let table = self.table(family.nfproto());
+            let slot = table
+                .rules
+                .iter_mut()
+                .find(|(_, h, _)| *h == handle)
+                .expect("the rule to replace exists");
+            slot.2 = rule;
+            self.genid += 1;
         }
 
         pub(crate) fn add_rule(&mut self, family: Family, chain: &'static str, rule: Rule) -> u64 {
@@ -657,6 +745,18 @@ pub(crate) mod model {
             })?;
             let (first, _) = messages[0];
             if first.message_type == NFNL_MSG_BATCH_BEGIN {
+                if let Some(change) = kernel.before_batch.take() {
+                    change(&mut kernel);
+                }
+                let pinned = attributes(&messages[0].1[4..])?
+                    .iter()
+                    .find(|(kind, _)| *kind == NFNL_BATCH_GENID)
+                    .and_then(|(_, value)| be_u32(value));
+                if pinned.is_some_and(|genid| genid != 0 && genid != kernel.genid) {
+                    kernel.refused += 1;
+                    kernel.pending.push_back(error(first, libc::ERESTART));
+                    return Ok(());
+                }
                 let mut working = (kernel.ipv4.clone(), kernel.ipv6.clone());
                 let mut applied = Vec::new();
                 let mut failure = None;
@@ -737,6 +837,7 @@ pub(crate) mod model {
                         kernel.ipv4 = working.0;
                         kernel.ipv6 = working.1;
                         kernel.commits.push(applied);
+                        kernel.genid += 1;
                         let (end, _) = messages.last().unwrap();
                         kernel.pending.push_back(error(*end, 0));
                     }
@@ -746,6 +847,19 @@ pub(crate) mod model {
             let family = messages[0].1[0];
             let list = attributes(&messages[0].1[4..])?;
             let mut reply = Vec::new();
+            if first.message_type & 0xff == NFT_MSG_GETGEN {
+                let mut attrs = Vec::new();
+                append_attribute(&mut attrs, NFTA_GEN_ID, &kernel.genid.to_be_bytes());
+                kernel.pending.push_back(message(
+                    nft_type(NFT_MSG_NEWGEN),
+                    0,
+                    first.sequence,
+                    0,
+                    0,
+                    &attrs,
+                ));
+                return Ok(());
+            }
             match first.message_type & 0xff {
                 NFT_MSG_GETCHAIN => {
                     let chains = kernel.table(family).chains.clone();
