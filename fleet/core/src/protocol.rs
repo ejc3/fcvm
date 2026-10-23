@@ -112,7 +112,7 @@ impl ServerMsg {
 // ---------------------------------------------------------------------------
 
 /// What an agent reports about one slot.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct SlotReport {
     pub id: String,
     pub phase: String,
@@ -128,6 +128,11 @@ pub struct SlotReport {
     /// With `failed`: when the agent tries again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retry_in_ms: Option<u64>,
+    /// The slot's public addresses, for its DNS names (`slot-<n>`, `ec2-<n>`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ipv4: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -188,6 +193,14 @@ pub struct AssignSlot {
     /// A private session's camera: the renderer draws the whole image with it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub private_camera: Option<Vec<Keyframe>>,
+    /// The layout generation of `rect`, the frame it takes effect at, and the slot's
+    /// rectangle before (when this generation moved it).
+    #[serde(default)]
+    pub layout_generation: u64,
+    #[serde(default)]
+    pub rect_from_frame: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_rect: Option<Rect>,
     /// In the standby pool: run no VM, keep the GPU reset, scrubbed and bound, and report
     /// `standby` when it is ready.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -222,6 +235,9 @@ impl SharedScene {
         RendererScene {
             epoch_unix_ms: self.epoch_unix_ms,
             rect,
+            layout_generation: 0,
+            rect_from_frame: 0,
+            previous_rect: None,
             image_aspect: self.image_aspect,
             camera: self.camera.clone(),
             time_of_day: self.time_of_day,
@@ -250,6 +266,14 @@ pub enum CoordMsg {
 pub struct RendererScene {
     pub epoch_unix_ms: u64,
     pub rect: Rect,
+    /// The layout generation `rect` belongs to, and the frame it takes effect at; before
+    /// that frame the renderer keeps drawing `previous_rect` (when the tile moved).
+    #[serde(default)]
+    pub layout_generation: u64,
+    #[serde(default)]
+    pub rect_from_frame: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_rect: Option<Rect>,
     pub image_aspect: f64,
     pub camera: Vec<Keyframe>,
     pub time_of_day: f64,
@@ -285,13 +309,17 @@ mod tests {
                 generation: 1,
                 rect: None,
                 private_camera: None,
+                layout_generation: 0,
+                rect_from_frame: 0,
+                previous_rect: None,
                 standby: false,
             }],
             region: None,
         };
         assert_eq!(
             serde_json::to_value(&a).unwrap(),
-            json!({"type":"assign","slots":[{"id":"slot-1","sbdf":"0000:01:00.0","generation":1,"rect":null}],"region":null})
+            json!({"type":"assign","slots":[{"id":"slot-1","sbdf":"0000:01:00.0","generation":1,"rect":null,
+                "layout_generation":0,"rect_from_frame":0}],"region":null})
         );
         let s = CoordMsg::Scene(SharedScene::new(&Scene::new(5), 2.0));
         let v = serde_json::to_value(&s).unwrap();

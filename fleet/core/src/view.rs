@@ -13,7 +13,11 @@ pub struct TileView {
     /// The tile's place: `fcvm:<k>` or `ec2:<k>`, 1-based, row-major.
     pub id: String,
     pub half: Half,
+    /// Its rectangle from `layout.from_frame` on.
     pub rect: Rect,
+    /// Its rectangle before, when the current layout generation moved it (null for a tile
+    /// that is new or did not move).
+    pub previous_rect: Option<Rect>,
     /// `waiting_capacity` (dark), `borrowed` (lent to a visitor, drawn black),
     /// `relaunching` (desired generation not yet reported), or the slot's reported phase.
     pub phase: String,
@@ -32,6 +36,18 @@ pub struct TileView {
     pub last_relaunch: Option<RelaunchView>,
     /// While the tile's GPU is lent to a visitor's private session.
     pub borrowed: Option<BorrowedView>,
+}
+
+/// The current layout generation: from frame `from_frame` (scene time `from_t`) every
+/// tile draws its `rect`; before it, a tile with a `previous_rect` drew that.
+#[derive(Debug, Clone, Serialize)]
+pub struct LayoutView {
+    pub generation: u64,
+    pub from_frame: i64,
+    pub from_t: f64,
+    /// Each side's rectangle; null for a side with no GPU.
+    pub fcvm: Option<Rect>,
+    pub ec2: Option<Rect>,
 }
 
 /// A tile's fault: `relaunch_failed` (its VM did not come back; the agent tries again at
@@ -76,8 +92,11 @@ pub struct FleetView {
     pub fcvm_gpus: usize,
     /// EC2 tiles holding an instance.
     pub ec2_instances: usize,
-    /// Rectangles per half.
+    /// Tiles on the fcvm side and on the EC2 side (one per live GPU).
     pub n: usize,
+    pub ec2_n: usize,
+    /// EC2 tiles still waiting for an instance (capacity): not on the wall.
+    pub ec2_waiting: usize,
     pub max_tiles: usize,
     /// The standby pool: GPUs beyond `max_tiles`, kept reset, scrubbed and bound with no
     /// VM, and how many of them have reported ready.
@@ -196,6 +215,13 @@ pub enum FailureView {
     },
 }
 
+/// The slot's rectangle before the current layout generation moved it.
+fn moved_from(state: &State, s: &Slot) -> Option<Rect> {
+    (s.rect_generation == state.fleet.layout.generation)
+        .then_some(s.previous_rect)
+        .flatten()
+}
+
 /// In the standby pool: an unplaced, unclaimed GPU on a host that is not draining, and not
 /// quarantined.
 fn in_standby(state: &State, s: &Slot) -> bool {
@@ -279,6 +305,7 @@ pub struct PowerView {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct View {
+    pub layout: LayoutView,
     pub tiles: Vec<TileView>,
     pub aggregates: Vec<AggregateView>,
     pub fleet: FleetView,
@@ -324,6 +351,7 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
             id,
             half,
             rect,
+            previous_rect: None,
             phase: "waiting_capacity".into(),
             slot: None,
             frame_url: None,
@@ -342,6 +370,7 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
             id,
             half,
             rect,
+            previous_rect: None,
             phase: if lent.is_some() {
                 "borrowed".into()
             } else {
@@ -383,26 +412,21 @@ fn tile(id: String, half: Half, rect: Rect, slot: Option<&Slot>) -> TileView {
 pub fn view(state: &State) -> View {
     let f = &state.fleet;
     let c = &state.config;
-    let mut tiles = Vec::with_capacity(f.n * 2);
-    for half in [Half::Fcvm, Half::Ec2] {
-        let dx = if half == Half::Ec2 { 0.5 } else { 0.0 };
-        let rects: Vec<Rect> = f
-            .layout
-            .iter()
-            .map(|r| Rect { x: r.x + dx, ..*r })
-            .collect();
-        let units = match half {
-            Half::Fcvm => &f.slots,
-            Half::Ec2 => &f.ec2,
-        };
-        for (k, rect) in rects.into_iter().enumerate() {
-            let slot = units.values().find(|s| s.position == Some(k));
-            tiles.push(tile(
-                format!("{}:{}", half.as_str(), k + 1),
+    let mut tiles = Vec::with_capacity(f.n + f.ec2_n);
+    for (half, units) in [(Half::Fcvm, &f.slots), (Half::Ec2, &f.ec2)] {
+        let mut placed: Vec<&Slot> = units.values().filter(|s| s.position.is_some()).collect();
+        placed.sort_by_key(|s| s.position);
+        for s in placed {
+            let mut t = tile(
+                format!("{}:{}", half.as_str(), s.position.unwrap() + 1),
                 half,
-                rect,
-                slot,
-            ));
+                s.rect.expect("a placed slot has a rectangle"),
+                Some(s),
+            );
+            t.previous_rect = (s.rect_generation == f.layout.generation)
+                .then_some(s.previous_rect)
+                .flatten();
+            tiles.push(t);
         }
     }
     let pool: Vec<&Slot> = f.slots.values().filter(|s| in_standby(state, s)).collect();
@@ -445,17 +469,24 @@ pub fn view(state: &State) -> View {
         })
         .collect();
     aggregates.sort_by(|a, b| a.rect.y.total_cmp(&b.rect.y));
-    if let Some(url) = &c.ec2_aggregate_url {
+    if let (Some(url), Some(rect)) = (&c.ec2_aggregate_url, f.layout.ec2) {
         aggregates.push(AggregateView {
             id: "agg:ec2".into(),
             half: Half::Ec2,
             host: None,
-            rect: crate::tiling::half_rect(Half::Ec2),
+            rect,
             frame_url: Some(url.clone()),
-            tiles: (1..=f.n).map(|k| format!("ec2:{k}")).collect(),
+            tiles: (1..=f.ec2_n).map(|k| format!("ec2:{k}")).collect(),
         });
     }
     View {
+        layout: LayoutView {
+            generation: f.layout.generation,
+            from_frame: f.layout.from_frame,
+            from_t: f.layout.from_frame as f64 / 30.0,
+            fcvm: f.layout.fcvm,
+            ec2: f.layout.ec2,
+        },
         tiles,
         aggregates,
         fleet: FleetView {
@@ -473,6 +504,8 @@ pub fn view(state: &State) -> View {
             fcvm_gpus,
             ec2_instances: f.ec2.values().filter(|s| s.observed.vm.is_some()).count(),
             n: f.n,
+            ec2_n: f.ec2_n,
+            ec2_waiting: f.ec2.values().filter(|s| s.observed.vm.is_none()).count(),
             max_tiles: c.max_tiles,
             standby,
             standby_ready,
@@ -714,6 +747,9 @@ pub fn host_assignments(state: &State) -> BTreeMap<String, Vec<AssignSlot>> {
                 // its host's band (the aggregator draws the tile black).
                 rect: if s.claim.is_some() { None } else { s.rect },
                 private_camera: s.claim.as_ref().map(|c| c.camera.clone()),
+                layout_generation: state.fleet.layout.generation,
+                rect_from_frame: state.fleet.layout.from_frame,
+                previous_rect: moved_from(state, s),
                 standby: in_standby(state, s),
             });
         }
@@ -743,6 +779,9 @@ pub fn ec2_assignment(state: &State) -> Vec<AssignSlot> {
             generation: s.generation,
             rect: s.rect,
             private_camera: None,
+            layout_generation: state.fleet.layout.generation,
+            rect_from_frame: state.fleet.layout.from_frame,
+            previous_rect: moved_from(state, s),
             standby: false,
         })
         .collect()

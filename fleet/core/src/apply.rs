@@ -7,7 +7,7 @@ use crate::event::{Event, Intent};
 use crate::protocol::{AgentMsg, HealthReport, SlotReport};
 use crate::scene::{drag, Keyframe, Light, Word, MAX_LIGHTS, MAX_WORDS};
 use crate::state::*;
-use crate::tiling::{bands, Half, Rect};
+use crate::tiling::{bands, grid_in, sides, Half, Rect};
 use std::collections::BTreeMap;
 
 /// How long a reclaimed host stays in the failure list after it is gone.
@@ -20,8 +20,14 @@ pub const SCOREBOARD_RACES: usize = 20;
 pub fn apply(mut state: State, event: &Event) -> State {
     let before = state.fleet.clone();
     let receipt = apply_inner(&mut state, event);
-    power_step(&mut state, event.at());
+    // Retile, step the power state on what is placed, and retile again when that changed
+    // the power (asleep, the EC2 side has no tiles).
     retile(&mut state.fleet, &state.config, event.at());
+    let power = state.fleet.power.state.clone();
+    power_step(&mut state, event.at());
+    if state.fleet.power.state != power {
+        retile(&mut state.fleet, &state.config, event.at());
+    }
     let changed = receipt.is_some() || state.fleet != before;
     if changed {
         state.version += 1;
@@ -333,13 +339,15 @@ pub fn image_settled(f: &Fleet) -> bool {
     !race_running(f) && !f.slots.values().chain(f.ec2.values()).any(starting)
 }
 
-/// Every placed tile of both halves runs its current generation.
+/// Every placed fcvm tile runs its current generation, and every EC2 tile does too or is
+/// waiting for capacity (a wait the EC2 side shows on its own).
 fn image_complete(f: &Fleet) -> bool {
-    let done = |s: &Slot| {
-        s.position.is_none()
-            || (s.observed.phase == "running" && s.observed.generation >= s.generation)
-    };
-    f.n > 0 && f.slots.values().all(done) && f.ec2.values().all(done)
+    let running = |s: &Slot| s.observed.phase == "running" && s.observed.generation >= s.generation;
+    f.n + f.ec2_n > 0
+        && f.slots.values().all(|s| s.position.is_none() || running(s))
+        && f.ec2
+            .values()
+            .all(|s| running(s) || s.observed.phase == "waiting_capacity")
 }
 
 /// Sleep after `idle_scale_down_secs` with no active viewer (never during a claim or a
@@ -370,7 +378,6 @@ fn power_step(state: &mut State, at: u64) {
     }
     let idle = f.power.idle_since.is_some_and(|t| at >= t + idle_ms);
     if active == 0 && idle && !claims && !racing {
-        f.power.gpus_before_sleep = f.slots.values().filter(|s| s.position.is_some()).count();
         f.power.state = "asleep".into();
         f.power.asleep_since = Some(at);
         f.power.woke_at = None;
@@ -832,13 +839,18 @@ fn start_race(state: &mut State, by: &str, at: u64) -> u64 {
             );
         }
     }
+    // Every EC2 tile races, also one still waiting for capacity (that wait is kept out of
+    // the half's time); a tile without an instance has no place yet and names its slot.
     for slot in f.ec2.values_mut() {
         bump(slot, by, at);
-        if let Some(k) = slot.position {
+        {
             race.ec2.tiles.insert(
                 slot.id.clone(),
                 RaceTile {
-                    tile: format!("ec2:{}", k + 1),
+                    tile: slot
+                        .position
+                        .map(|k| format!("ec2:{}", k + 1))
+                        .unwrap_or_else(|| slot.id.clone()),
                     generation: slot.generation,
                     first_frame_at: None,
                     phases: BTreeMap::new(),
@@ -973,6 +985,8 @@ fn new_slot(id: String, half: Half, host: Option<String>, gpu: Option<Gpu>, at: 
         created_at: at,
         position: None,
         rect: None,
+        previous_rect: None,
+        rect_generation: 0,
         observed: Observed {
             phase: "pending".into(),
             ..Default::default()
@@ -1000,6 +1014,11 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     if host.is_some() && slot.host.as_deref() != host {
         return;
     }
+    // An agent that reconnected with its VMs running reports generations this slot (made
+    // again at its hello) has not reached; adopt them, so a relaunch goes past them.
+    if half == Half::Fcvm && r.generation > slot.generation {
+        slot.generation = r.generation;
+    }
     slot.observed.phase = r.phase.clone();
     slot.observed.generation = r.generation;
     slot.observed.vm = r.vm.clone();
@@ -1007,6 +1026,8 @@ fn observe_slot(f: &mut Fleet, half: Half, n: u32, host: Option<&str>, r: &SlotR
     slot.observed.timings = r.timings.clone();
     slot.observed.error = r.error.clone();
     slot.observed.retry_at = r.retry_in_ms.map(|ms| at + ms);
+    slot.observed.ipv6 = r.ipv6.clone();
+    slot.observed.ipv4 = r.ipv4.clone();
     if r.phase == "waiting_capacity" {
         let id = slot.id.clone();
         let since = at.saturating_sub(r.timings.get("capacity_wait_ms").copied().unwrap_or(0));
@@ -1175,71 +1196,100 @@ fn retile(f: &mut Fleet, c: &Config, at: u64) {
                     .is_some_and(|h| !h.draining)
         })
         .map(|(n, _)| *n)
+        .take(c.max_tiles)
         .collect();
-    // Asleep, the EC2 half has no tiles; waking, it launches as many as the fcvm half had.
-    let fcvm_gpus = match f.power.state.as_str() {
-        "asleep" => 0,
-        "waking" => active.len().max(f.power.gpus_before_sleep),
-        _ => active.len(),
+    // The EC2 side wants its configured tiles whatever the fcvm side has (each side shows
+    // the GPUs it has live); asleep it has none.
+    let want_ec2 = if f.power.state == "asleep" {
+        0
+    } else {
+        c.ec2_max.min(c.max_tiles) as u32
     };
-    let want_ec2 = c.ec2_max.min(c.max_tiles).min(fcvm_gpus) as u32;
     f.ec2.retain(|n, _| *n <= want_ec2);
     for n in 1..=want_ec2 {
         f.ec2
             .entry(n)
             .or_insert_with(|| new_slot(ec2_name(n), Half::Ec2, None, None, at));
     }
-    let instances = f.ec2.values().filter(|s| s.observed.vm.is_some()).count();
-    let n = c.max_tiles.min(active.len().max(instances));
-    f.n = n;
-    // The placed slots (the first n by number) grouped by host, hosts ordered by their
-    // lowest placed slot; one band per host, then one band of dark tiles if EC2 has more
-    // instances than the fcvm half has GPUs.
+    // Each side is as wide as its share of the live GPUs. An EC2 tile is live once it has
+    // an instance; one still waiting for capacity is not on the wall.
+    let live_ec2: Vec<u32> = f
+        .ec2
+        .iter()
+        .filter(|(_, s)| s.observed.vm.is_some())
+        .map(|(n, _)| *n)
+        .take(c.max_tiles)
+        .collect();
+    f.n = active.len();
+    f.ec2_n = live_ec2.len();
+    let (fcvm_side, ec2_side) = sides(f.n, f.ec2_n);
+    // fcvm: one band per host, hosts ordered by their lowest placed slot.
     let mut groups: Vec<(String, Vec<u32>)> = Vec::new();
-    for num in active.iter().take(n) {
+    for num in &active {
         let host = f.slots[num].host.clone().expect("active slots have a host");
         match groups.iter_mut().find(|(h, _)| *h == host) {
             Some((_, v)) => v.push(*num),
             None => groups.push((host, vec![*num])),
         }
     }
-    let placed: usize = groups.iter().map(|(_, v)| v.len()).sum();
-    let mut counts: Vec<usize> = groups.iter().map(|(_, v)| v.len()).collect();
-    if n > placed {
-        counts.push(n - placed);
-    }
-    let bands = if n == 0 {
+    let counts: Vec<usize> = groups.iter().map(|(_, v)| v.len()).collect();
+    let host_bands = if f.n == 0 {
         Vec::new()
     } else {
-        bands(Half::Fcvm, &counts, c.image_aspect, c.tile_aspect)
+        bands(fcvm_side, &counts, c.image_aspect, c.tile_aspect)
     };
-    f.layout = bands
-        .iter()
-        .flat_map(|(_, tiles)| tiles.iter().copied())
-        .collect();
-    for s in f.slots.values_mut() {
-        s.position = None;
-        s.rect = None;
-    }
+    let ec2_rects = grid_in(ec2_side, f.ec2_n, c.image_aspect, c.tile_aspect);
+    // The new place of every slot, then compare with the old.
+    let mut placed: BTreeMap<(Half, u32), (usize, Rect)> = BTreeMap::new();
     for h in f.hosts.values_mut() {
         h.region = None;
     }
     let mut k = 0;
     for (gi, (host, nums)) in groups.iter().enumerate() {
         if let Some(h) = f.hosts.get_mut(host) {
-            h.region = Some(bands[gi].0);
+            h.region = Some(host_bands[gi].0);
         }
-        for num in nums {
-            let s = f.slots.get_mut(num).unwrap();
-            s.position = Some(k);
-            s.rect = Some(f.layout[k]);
+        for (i, num) in nums.iter().enumerate() {
+            placed.insert((Half::Fcvm, *num), (k, host_bands[gi].1[i]));
             k += 1;
         }
     }
-    for (num, s) in f.ec2.iter_mut() {
-        let k = (*num - 1) as usize;
-        s.position = (k < n).then_some(k);
-        s.rect = f.layout.get(k).map(|r| Rect { x: r.x + 0.5, ..*r });
+    for (i, num) in live_ec2.iter().enumerate() {
+        placed.insert((Half::Ec2, *num), (i, ec2_rects[i]));
+    }
+    let changed = f
+        .slots
+        .iter()
+        .map(|(n, s)| ((Half::Fcvm, *n), s))
+        .chain(f.ec2.iter().map(|(n, s)| ((Half::Ec2, *n), s)))
+        .any(|(key, s)| placed.get(&key).map(|p| (p.0, p.1)) != s.position.zip(s.rect))
+        // A slot that left moved nothing still here, but the sides changed.
+        || f.layout.fcvm != (f.n > 0).then_some(fcvm_side)
+        || f.layout.ec2 != (f.ec2_n > 0).then_some(ec2_side);
+    let generation = if changed {
+        f.layout.generation + 1
+    } else {
+        f.layout.generation
+    };
+    if changed {
+        f.layout = LayoutGen {
+            generation,
+            from_frame: (f.scene.t_at(at) * 30.0).round() as i64 + LAYOUT_LEAD_FRAMES,
+            fcvm: (f.n > 0).then_some(fcvm_side),
+            ec2: (f.ec2_n > 0).then_some(ec2_side),
+        };
+    }
+    for (half, slots) in [(Half::Fcvm, &mut f.slots), (Half::Ec2, &mut f.ec2)] {
+        for (n, s) in slots.iter_mut() {
+            let new = placed.get(&(half, *n)).copied();
+            let (pos, rect) = (new.map(|p| p.0), new.map(|p| p.1));
+            if rect != s.rect {
+                s.previous_rect = s.rect;
+                s.rect_generation = generation;
+            }
+            s.position = pos;
+            s.rect = rect;
+        }
     }
     drop_missing_from_races(f, at);
 }

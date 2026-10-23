@@ -94,10 +94,6 @@ pub struct Power {
     pub woke_at: Option<u64>,
     pub hosts: BTreeMap<String, HostWake>,
     pub wakes: VecDeque<Wake>,
-    /// fcvm GPUs the fleet had when it fell asleep: the EC2 half launches that many tiles
-    /// at once when it wakes, instead of waiting for the hosts.
-    #[serde(default)]
-    pub gpus_before_sleep: usize,
 }
 
 impl Default for Power {
@@ -109,7 +105,6 @@ impl Default for Power {
             woke_at: None,
             hosts: BTreeMap::new(),
             wakes: VecDeque::new(),
-            gpus_before_sleep: 0,
         }
     }
 }
@@ -183,6 +178,11 @@ pub struct Observed {
     /// When the agent will try a failed slot again.
     #[serde(default)]
     pub retry_at: Option<u64>,
+    /// The slot's public addresses, as last reported.
+    #[serde(default)]
+    pub ipv6: Option<String>,
+    #[serde(default)]
+    pub ipv4: Option<String>,
 }
 
 /// One relaunch of one slot, from the click to its first frame.
@@ -206,10 +206,16 @@ pub struct Slot {
     /// Desired generation; a relaunch increments it.
     pub generation: u64,
     pub created_at: u64,
-    /// Place in its half's grid (0-based) and the rectangle there; `None` on standby or
-    /// while its host drains.
+    /// Place in its side's grid (0-based) and the rectangle there; `None` on standby, while
+    /// its host drains, or (EC2) before it has an instance.
     pub position: Option<usize>,
     pub rect: Option<Rect>,
+    /// When the last layout change moved it: its rectangle before, and the layout
+    /// generation that moved it.
+    #[serde(default)]
+    pub previous_rect: Option<Rect>,
+    #[serde(default)]
+    pub rect_generation: u64,
     pub observed: Observed,
     pub last_relaunch: Option<Relaunch>,
     /// A viewer's private session on this (standby) GPU.
@@ -344,6 +350,20 @@ pub const MAX_ACTIONS: usize = 50;
 /// of heavy use.
 pub const MAX_RECEIPTS: usize = 20_000;
 
+/// A layout generation. Each change of the tiling (a GPU joins or leaves either side) makes
+/// a new one that takes effect at `from_frame` (frame k is scene time k/30): renderers
+/// switch to their new rectangle at that frame, so every tile of a frame has one layout.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+pub struct LayoutGen {
+    pub generation: u64,
+    pub from_frame: i64,
+    pub fcvm: Option<Rect>,
+    pub ec2: Option<Rect>,
+}
+
+/// Frames a new layout waits before it takes effect, so it reaches every renderer first.
+pub const LAYOUT_LEAD_FRAMES: i64 = 45;
+
 /// Totals since the fleet was first started (kept across coordinator restarts).
 #[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 pub struct Counters {
@@ -379,12 +399,14 @@ pub struct Fleet {
     pub slots: BTreeMap<u32, Slot>,
     /// EC2 tiles by number (`ec2-<n>`).
     pub ec2: BTreeMap<u32, Slot>,
-    /// Rectangles per half.
+    /// Tiles on the fcvm side (one per live fcvm GPU, at most `max_tiles`).
     pub n: usize,
-    /// The fcvm half's rectangles by position (the EC2 half's are the same, 0.5 to the
-    /// right).
+    /// Tiles on the EC2 side (one per EC2 tile with an instance, at most `max_tiles`).
     #[serde(default)]
-    pub layout: Vec<Rect>,
+    pub ec2_n: usize,
+    /// The current layout: its generation, the frame it takes effect at, the two sides.
+    #[serde(default)]
+    pub layout: LayoutGen,
     pub scene: Scene,
     pub director: Director,
     /// Owners (client addresses) of `scene.lights`, index for index.
@@ -444,7 +466,8 @@ impl State {
                 slots: BTreeMap::new(),
                 ec2: BTreeMap::new(),
                 n: 0,
-                layout: Vec::new(),
+                ec2_n: 0,
+                layout: LayoutGen::default(),
                 scene,
                 director,
                 light_owners: Vec::new(),
@@ -482,7 +505,8 @@ impl State {
         f.slots.clear();
         f.ec2.clear();
         f.n = 0;
-        f.layout.clear();
+        f.layout = LayoutGen::default();
+        f.ec2_n = 0;
         f.viewers.clear();
         f.degraded.clear();
         // A race interrupted by the restart cannot finish.

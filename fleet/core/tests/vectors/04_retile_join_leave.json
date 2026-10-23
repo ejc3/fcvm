@@ -77,7 +77,7 @@
         "/assign/hA/1/id": "slot-2",
         "/view/fleet/n": 2,
         "/view/tiles/0/rect": {
-          "h": 0.5,
+          "h": 1.0,
           "w": 0.5,
           "x": 0.0,
           "y": 0.0
@@ -89,7 +89,7 @@
       "checks": {
         "/assign/hA/0/rect": {
           "h": 0.4,
-          "w": 0.25,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
@@ -98,14 +98,14 @@
         "/view/aggregates/0/id": "agg:hA",
         "/view/aggregates/0/rect": {
           "h": 0.4,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
         "/view/aggregates/1/id": "agg:hB",
         "/view/aggregates/1/rect": {
           "h": 0.6,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.4
         },
@@ -117,13 +117,13 @@
         "/view/fleet/n": 5,
         "/view/tiles/0/rect": {
           "h": 0.4,
-          "w": 0.25,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.0
         },
         "/view/tiles/2/rect": {
-          "h": 0.3,
-          "w": 0.5,
+          "h": 0.6,
+          "w": 0.3333333333333333,
           "x": 0.0,
           "y": 0.4
         }
@@ -138,7 +138,7 @@
         "/view/fleet/n": 3,
         "/view/tiles/0/rect": {
           "h": 0.5,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
@@ -152,7 +152,7 @@
         "/view/aggregates/0/id": "agg:hC",
         "/view/aggregates/1/rect": {
           "h": 0.75,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.25
         },
@@ -160,7 +160,7 @@
         "/view/tiles/0/host": "hC",
         "/view/tiles/0/rect": {
           "h": 0.25,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
@@ -179,7 +179,7 @@
         "id": "agg:hC",
         "rect": {
           "h": 0.25,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
@@ -194,7 +194,7 @@
         "id": "agg:hB",
         "rect": {
           "h": 0.75,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.25
         },
@@ -228,6 +228,8 @@
     ],
     "fleet": {
       "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
       "fcvm_gpus": 4,
       "gpus": 4,
       "hosts": [
@@ -277,6 +279,18 @@
       "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "from_frame": 165,
+      "from_t": 5.5,
+      "generation": 4
+    },
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
@@ -361,9 +375,10 @@
         "id": "fcvm:1",
         "last_relaunch": null,
         "phase": "pending",
+        "previous_rect": null,
         "rect": {
           "h": 0.25,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
@@ -387,9 +402,15 @@
         "id": "fcvm:2",
         "last_relaunch": null,
         "phase": "pending",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
         "rect": {
           "h": 0.375,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.25
         },
@@ -413,9 +434,15 @@
         "id": "fcvm:3",
         "last_relaunch": null,
         "phase": "pending",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.5
+        },
         "rect": {
           "h": 0.375,
-          "w": 0.25,
+          "w": 0.5,
           "x": 0.0,
           "y": 0.625
         },
@@ -439,105 +466,19 @@
         "id": "fcvm:4",
         "last_relaunch": null,
         "phase": "pending",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.5
+        },
         "rect": {
           "h": 0.375,
-          "w": 0.25,
-          "x": 0.25,
+          "w": 0.5,
+          "x": 0.5,
           "y": 0.625
         },
         "slot": "slot-5",
-        "vm": null
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": null,
-        "generation": null,
-        "gpu": null,
-        "gpu_stats": null,
-        "half": "ec2",
-        "host": null,
-        "id": "ec2:1",
-        "last_relaunch": null,
-        "phase": "waiting_capacity",
-        "rect": {
-          "h": 0.25,
-          "w": 0.5,
-          "x": 0.5,
-          "y": 0.0
-        },
-        "slot": null,
-        "vm": null
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": null,
-        "generation": null,
-        "gpu": null,
-        "gpu_stats": null,
-        "half": "ec2",
-        "host": null,
-        "id": "ec2:2",
-        "last_relaunch": null,
-        "phase": "waiting_capacity",
-        "rect": {
-          "h": 0.375,
-          "w": 0.5,
-          "x": 0.5,
-          "y": 0.25
-        },
-        "slot": null,
-        "vm": null
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": null,
-        "generation": null,
-        "gpu": null,
-        "gpu_stats": null,
-        "half": "ec2",
-        "host": null,
-        "id": "ec2:3",
-        "last_relaunch": null,
-        "phase": "waiting_capacity",
-        "rect": {
-          "h": 0.375,
-          "w": 0.25,
-          "x": 0.5,
-          "y": 0.625
-        },
-        "slot": null,
-        "vm": null
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": null,
-        "generation": null,
-        "gpu": null,
-        "gpu_stats": null,
-        "half": "ec2",
-        "host": null,
-        "id": "ec2:4",
-        "last_relaunch": null,
-        "phase": "waiting_capacity",
-        "rect": {
-          "h": 0.375,
-          "w": 0.25,
-          "x": 0.75,
-          "y": 0.625
-        },
-        "slot": null,
         "vm": null
       }
     ],

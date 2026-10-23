@@ -185,7 +185,7 @@
         "id": "agg:h2",
         "rect": {
           "h": 1.0,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
@@ -217,6 +217,8 @@
     ],
     "fleet": {
       "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
       "fcvm_gpus": 1,
       "gpus": 3,
       "hosts": [
@@ -262,6 +264,18 @@
       "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "from_frame": 135,
+      "from_t": 4.5,
+      "generation": 3
+    },
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
@@ -437,37 +451,20 @@
           "phases": {}
         },
         "phase": "relaunching",
+        "previous_rect": {
+          "h": 0.33333333333333337,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.6666666666666666
+        },
         "rect": {
           "h": 1.0,
-          "w": 0.5,
+          "w": 1.0,
           "x": 0.0,
           "y": 0.0
         },
         "slot": "slot-3",
         "vm": "fleet-slot-3"
-      },
-      {
-        "borrowed": null,
-        "error": null,
-        "failure": null,
-        "fps": null,
-        "frame_url": null,
-        "generation": null,
-        "gpu": null,
-        "gpu_stats": null,
-        "half": "ec2",
-        "host": null,
-        "id": "ec2:1",
-        "last_relaunch": null,
-        "phase": "waiting_capacity",
-        "rect": {
-          "h": 1.0,
-          "w": 0.5,
-          "x": 0.5,
-          "y": 0.0
-        },
-        "slot": null,
-        "vm": null
       }
     ],
     "viewers": {

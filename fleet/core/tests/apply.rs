@@ -2,7 +2,7 @@
 
 use fleet_core::protocol::{AgentMsg, SlotReport};
 use fleet_core::state::Gpu;
-use fleet_core::tiling::{half_rect, Half, Rect};
+use fleet_core::tiling::{Half, Rect};
 use fleet_core::view::host_assignments;
 use fleet_core::{apply, view, Config, Event, State};
 use std::collections::BTreeSet;
@@ -26,13 +26,13 @@ fn hello(at: u64, host: &str, gpus: usize) -> Event {
     }
 }
 
-/// Each half's tiles exactly cover it, the EC2 half mirrors the fcvm half, every host's
-/// tiles lie inside its region and the regions do not overlap, every positioned slot holds
-/// a distinct tile, and no GPU backs two slots.
+/// The tiles exactly cover the image (each side as wide as its share of the live GPUs, one
+/// tile per GPU), every host's tiles lie inside its region and the regions do not overlap,
+/// every positioned slot holds a distinct tile, and no GPU backs two slots.
 fn check_layout(state: &State) {
     let v = view(state);
-    let n = v.fleet.n;
-    assert_eq!(v.tiles.len(), 2 * n);
+    let (n, e) = (v.fleet.n, v.fleet.ec2_n);
+    assert_eq!(v.tiles.len(), n + e);
     let eps = 1e-9;
     let overlap = |a: &Rect, b: &Rect| {
         let w = (a.x + a.w).min(b.x + b.w) - a.x.max(b.x);
@@ -45,22 +45,31 @@ fn check_layout(state: &State) {
             && r.x + r.w <= a.x + a.w + eps
             && r.y + r.h <= a.y + a.h + eps
     };
-    for (half, offset) in [(Half::Fcvm, 0), (Half::Ec2, n)] {
-        let tiles: Vec<Rect> = v.tiles[offset..offset + n].iter().map(|t| t.rect).collect();
-        let area: f64 = tiles.iter().map(|r| r.w * r.h).sum();
-        if n > 0 {
-            assert!((area - 0.5).abs() < 1e-9, "{half:?} area {area}");
-        }
-        for (i, a) in tiles.iter().enumerate() {
-            assert!(inside(a, &half_rect(half)));
-            for b in &tiles[i + 1..] {
-                assert!(!overlap(a, b), "{a:?} overlaps {b:?}");
-            }
+    let rects: Vec<Rect> = v.tiles.iter().map(|t| t.rect).collect();
+    let area: f64 = rects.iter().map(|r| r.w * r.h).sum();
+    if n + e > 0 {
+        assert!((area - 1.0).abs() < 1e-9, "area {area}");
+    }
+    for (i, a) in rects.iter().enumerate() {
+        for b in &rects[i + 1..] {
+            assert!(!overlap(a, b), "{a:?} overlaps {b:?}");
         }
     }
-    for k in 0..n {
-        let (l, r) = (v.tiles[k].rect, v.tiles[n + k].rect);
-        assert_eq!((l.x + 0.5, l.y, l.w, l.h), (r.x, r.y, r.w, r.h));
+    for t in &v.tiles {
+        let side = match t.half {
+            Half::Fcvm => v.layout.fcvm,
+            Half::Ec2 => v.layout.ec2,
+        }
+        .expect("a side with tiles has a rectangle");
+        assert!(inside(&t.rect, &side));
+    }
+    if n + e > 0 {
+        let fw = v.layout.fcvm.map_or(0.0, |r| r.w);
+        assert!(
+            (fw * (n + e) as f64 - n as f64).abs() < 1e-9,
+            "fcvm width {fw} for {n} of {}",
+            n + e
+        );
     }
     let regions: Vec<_> = v
         .aggregates
@@ -149,6 +158,8 @@ fn version_moves_exactly_when_the_view_or_a_receipt_changes() {
                 timings: Default::default(),
                 error: None,
                 retry_in_ms: None,
+                ipv6: None,
+                ipv4: None,
             }),
         });
     }

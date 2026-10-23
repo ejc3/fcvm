@@ -189,6 +189,8 @@
     "failures": [],
     "fleet": {
       "ec2_instances": 0,
+      "ec2_n": 0,
+      "ec2_waiting": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
       "hosts": [],
@@ -207,6 +209,13 @@
       "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": null,
+      "fcvm": null,
+      "from_frame": 0,
+      "from_t": 0.0,
+      "generation": 0
+    },
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": 25000,

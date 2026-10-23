@@ -1,8 +1,8 @@
 {
   "config": {
-    "ec2_max": 10
+    "ec2_max": 3
   },
-  "description": "EC2 tiles follow the fcvm GPU count; a tile EC2 has no capacity for stays dark; a race times the EC2 half from the same click, with a tile's wait for spot capacity recorded and kept out of the half's time; fewer fcvm GPUs drop the extra EC2 tiles.",
+  "description": "The EC2 side runs its configured tiles; one is on the wall once it has an instance, as wide as its share of the live GPUs, and one EC2 has no capacity for is not shown. A race times every EC2 tile from the same click, a tile's wait for spot capacity recorded and kept out of the half's time. The EC2 side does not depend on the fcvm side.",
   "events": [
     {
       "at": 1000,
@@ -134,22 +134,50 @@
       "after": 0,
       "checks": {
         "/ec2_assign/2/id": "ec2-3",
-        "/view/tiles/3/phase": "pending",
-        "/view/tiles/3/slot": "ec2-1"
+        "/view/fleet/ec2_waiting": 3,
+        "/view/tiles/3": null
       }
     },
     {
       "after": 1,
       "checks": {
         "/view/fleet/ec2_instances": 1,
+        "/view/fleet/ec2_n": 1,
+        "/view/layout/ec2": {
+          "h": 1.0,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.0
+        },
+        "/view/layout/fcvm": {
+          "h": 1.0,
+          "w": 0.75,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/tiles/0/rect": {
+          "h": 0.5,
+          "w": 0.75,
+          "x": 0.0,
+          "y": 0.0
+        },
         "/view/tiles/3/frame_url": "ws://ec2-1.example:443/frames",
-        "/view/tiles/3/phase": "running"
+        "/view/tiles/3/id": "ec2:1",
+        "/view/tiles/3/phase": "running",
+        "/view/tiles/3/rect": {
+          "h": 1.0,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.0
+        },
+        "/view/tiles/3/slot": "ec2-1"
       }
     },
     {
       "after": 2,
       "checks": {
-        "/view/tiles/4/phase": "waiting_capacity"
+        "/view/fleet/ec2_waiting": 2,
+        "/view/tiles/4": null
       }
     },
     {
@@ -157,6 +185,8 @@
       "checks": {
         "/ec2_assign/0/generation": 2,
         "/view/races/0/ec2/tiles/ec2-1/tile": "ec2:1",
+        "/view/races/0/ec2/tiles/ec2-2/tile": "ec2-2",
+        "/view/relaunch_all/ec2_gpus": 3,
         "/view/relaunch_all/ec2_waiting_since": null
       }
     },
@@ -181,6 +211,7 @@
     {
       "after": 7,
       "checks": {
+        "/view/fleet/ec2_n": 3,
         "/view/races/0/ec2/capacity_wait_ms": 6000,
         "/view/races/0/ec2/done_at": 10000,
         "/view/races/0/ec2/time_ms": 7000,
@@ -194,10 +225,19 @@
     {
       "after": 8,
       "checks": {
-        "/ec2_assign": [],
+        "/ec2_assign/2/id": "ec2-3",
+        "/view/fleet/ec2_n": 3,
         "/view/fleet/n": 0,
-        "/view/tiles": []
-      }
+        "/view/layout/ec2": {
+          "h": 1.0,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "/view/layout/fcvm": null,
+        "/view/tiles/0/id": "ec2:1"
+      },
+      "note": "the fcvm side is gone: the EC2 side takes the whole width"
     }
   ],
   "final_view": {
@@ -235,7 +275,9 @@
       }
     ],
     "fleet": {
-      "ec2_instances": 0,
+      "ec2_instances": 3,
+      "ec2_n": 3,
+      "ec2_waiting": 0,
       "fcvm_gpus": 0,
       "gpus": 0,
       "hosts": [],
@@ -254,6 +296,18 @@
       "standby_ready": 0
     },
     "image_aspect": 1.7777777777777777,
+    "layout": {
+      "ec2": {
+        "h": 1.0,
+        "w": 1.0,
+        "x": 0.0,
+        "y": 0.0
+      },
+      "fcvm": null,
+      "from_frame": 645,
+      "from_t": 21.5,
+      "generation": 5
+    },
     "next_race_at": null,
     "nudges": {
       "arrive_next_at": null,
@@ -309,7 +363,7 @@
                 "launch_ms": 1200,
                 "ready_ms": 4800
               },
-              "tile": "ec2:2",
+              "tile": "ec2-2",
               "waiting_since": 4000
             },
             "ec2-3": {
@@ -321,7 +375,7 @@
                 "launch_ms": 1600,
                 "ready_ms": 5000
               },
-              "tile": "ec2:3",
+              "tile": "ec2-3",
               "waiting_since": null
             }
           },
@@ -402,7 +456,122 @@
       },
       "fcvm": null
     },
-    "tiles": [],
+    "tiles": [
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": "ws://ec2-1.example:443/frames",
+        "generation": 2,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:1",
+        "last_relaunch": {
+          "by": "viewer:v1",
+          "clicked_at": 3000,
+          "first_frame_at": 9000,
+          "phases": {
+            "capacity_wait_ms": 0,
+            "launch_ms": 1500,
+            "ready_ms": 4500
+          }
+        },
+        "phase": "running",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.0
+        },
+        "rect": {
+          "h": 0.5,
+          "w": 1.0,
+          "x": 0.0,
+          "y": 0.0
+        },
+        "slot": "ec2-1",
+        "vm": "instance-2"
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": "ws://ec2-2.example:443/frames",
+        "generation": 2,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:2",
+        "last_relaunch": {
+          "by": "viewer:v1",
+          "clicked_at": 3000,
+          "first_frame_at": 15000,
+          "phases": {
+            "capacity_wait_ms": 6000,
+            "launch_ms": 1200,
+            "ready_ms": 4800
+          }
+        },
+        "phase": "running",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.5,
+          "y": 0.5
+        },
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.0,
+          "y": 0.5
+        },
+        "slot": "ec2-2",
+        "vm": "instance-3"
+      },
+      {
+        "borrowed": null,
+        "error": null,
+        "failure": null,
+        "fps": null,
+        "frame_url": "ws://ec2-3.example:443/frames",
+        "generation": 2,
+        "gpu": null,
+        "gpu_stats": null,
+        "half": "ec2",
+        "host": null,
+        "id": "ec2:3",
+        "last_relaunch": {
+          "by": "viewer:v1",
+          "clicked_at": 3000,
+          "first_frame_at": 10000,
+          "phases": {
+            "capacity_wait_ms": 0,
+            "launch_ms": 1600,
+            "ready_ms": 5000
+          }
+        },
+        "phase": "running",
+        "previous_rect": {
+          "h": 0.5,
+          "w": 0.25,
+          "x": 0.75,
+          "y": 0.5
+        },
+        "rect": {
+          "h": 0.5,
+          "w": 0.5,
+          "x": 0.5,
+          "y": 0.5
+        },
+        "slot": "ec2-3",
+        "vm": "instance-4"
+      }
+    ],
     "viewers": {
       "active": 0,
       "count": 0
