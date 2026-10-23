@@ -896,6 +896,7 @@ async fn cmd_snapshot_create(args: SnapshotCreateArgs) -> Result<()> {
             expected_parent_dir.as_deref(),
         )
         .await?;
+        failpoint::hit_async("snapshot.create.locked").await;
 
         // Serialize dirty-bitmap resets, then re-read both the selected VM identity and its
         // lineage. The selector may now resolve to a replacement VM, or a snapshot that won
@@ -1840,6 +1841,7 @@ async fn cmd_snapshot_run_inner(
         false,
     )
     .await?;
+    failpoint::hit_async("restore.locked").await;
 
     // Load snapshot configuration
     let snapshot_manager = SnapshotManager::new(paths::snapshot_dir());
@@ -2791,6 +2793,7 @@ async fn cmd_snapshot_run_inner(
     // release the shared per-snapshot lock so creators are not blocked for the lifetime
     // of this clone.
     drop(snapshot_shared_lock);
+    failpoint::hit_async("restore.unlocked").await;
 
     let (mut vm_manager, mut holder_child) = setup_try!(setup_result);
 

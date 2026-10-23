@@ -33,9 +33,16 @@ fn lock_opened_state_file(
     use std::os::unix::fs::MetadataExt;
 
     loop {
-        let guard = Flock::lock(file, arg)
-            .map_err(|(_, error)| error)
-            .context("acquiring state lock")?;
+        let guard = match Flock::lock(file, nonblocking(arg)) {
+            Ok(guard) => guard,
+            Err((file, nix::errno::Errno::EWOULDBLOCK)) if nonblocking(arg) != arg => {
+                failpoint::note("lock.wait", path.display());
+                Flock::lock(file, arg)
+                    .map_err(|(_, error)| error)
+                    .context("acquiring state lock")?
+            }
+            Err((_, error)) => return Err(error).context("acquiring state lock"),
+        };
         let held = guard
             .metadata()
             .context("reading held state lock identity")?;
@@ -52,6 +59,15 @@ fn lock_opened_state_file(
         // may be touched until we hold the inode now published at the path.
         drop(guard);
         file = open_lock_file(path)?;
+    }
+}
+
+/// The non-blocking form of a blocking lock request, so a wait can be recorded first.
+fn nonblocking(arg: FlockArg) -> FlockArg {
+    match arg {
+        FlockArg::LockShared => FlockArg::LockSharedNonblock,
+        FlockArg::LockExclusive => FlockArg::LockExclusiveNonblock,
+        other => other,
     }
 }
 

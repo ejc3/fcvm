@@ -1876,6 +1876,7 @@ async fn cleanup_vm_inner(
             .and_then(|pid| crate::utils::process_start_time(pid).map(|start| (pid, start)))
     });
 
+    failpoint::hit_async("teardown.pre_kill").await;
     let kill_start = std::time::Instant::now();
     failures.record("signalling VM process", vm_manager.start_kill());
     if let Some(ref mut holder) = holder_child {
@@ -1994,6 +1995,7 @@ async fn cleanup_vm_inner(
         // The logs are copied out BEFORE removing the directory they live in.
         let saved = save_vm_logs(&data_dir, &vm_id, std::path::Path::new("/tmp")).await;
 
+        failpoint::hit_async("teardown.pre_remove_data_dir").await;
         // Includes disks, sockets, everything under the VM's runtime directory.
         let removed = match tokio::fs::remove_dir_all(&data_dir).await {
             Ok(()) => {
@@ -3090,6 +3092,7 @@ pub async fn restore_from_snapshot(
         vsock_override.is_some(),
     )
     .await?;
+    failpoint::hit_async("restore.post_clone_disk").await;
     let rootfs_path = substrate.rootfs_path;
     let holder_pid_for_post_start = substrate.holder_pid_for_post_start;
 
@@ -3116,6 +3119,9 @@ pub async fn restore_from_snapshot(
         vm_manager.set_mount_redirects(redirects.clone());
     }
 
+    // failpoint: before the VMM is spawned, which is when the host creates any missing
+    // mountpoint of the mount redirect and the child binds over it.
+    failpoint::hit_async("restore.pre_spawn_vmm").await;
     if let Err(error) = vm_manager
         .start(&firecracker_bin, None, firecracker_args.as_deref())
         .await
@@ -3187,6 +3193,9 @@ pub async fn restore_from_snapshot(
             }
         };
 
+        // failpoint: the VMM runs in its mount namespace and has not yet opened the
+        // paths vmstate.bin names.
+        failpoint::hit_async("restore.pre_load").await;
         // Timing instrumentation: measure snapshot load operation
         let load_start = std::time::Instant::now();
         client
@@ -3743,6 +3752,15 @@ async fn reflink_disks_to_snapshot(
 /// temp dir into place, then remove the old. Shared by the snapshot-create paths so a
 /// finalized snapshot directory always appears atomically.
 async fn atomic_replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
+    failpoint::hit_async("snapshot.install.pre_rename").await;
+    let result = replace_dir(temp_dir, final_dir).await;
+    if result.is_ok() {
+        failpoint::hit_async("snapshot.install.post_rename").await;
+    }
+    result
+}
+
+async fn replace_dir(temp_dir: &Path, final_dir: &Path) -> Result<()> {
     if final_dir.exists() {
         let old = snapshot_sibling(final_dir, "old");
         let _ = tokio::fs::remove_dir_all(&old).await;
@@ -4027,12 +4045,17 @@ async fn lock_vm_snapshots(
     let lock_file = std::fs::File::create(&lock_path)
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     use fs2::FileExt;
+    let mut noted_wait = false;
     loop {
         match lock_file.try_lock_exclusive() {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if give_up_at.is_some_and(|at| std::time::Instant::now() >= at) {
                     return Ok(None);
+                }
+                if !noted_wait {
+                    failpoint::note("lock.wait", lock_path.display());
+                    noted_wait = true;
                 }
                 debug!("waiting for per-VM snapshot lock");
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -4074,6 +4097,7 @@ pub async fn acquire_snapshot_dir_lock(
         .with_context(|| format!("creating snapshot lock: {}", lock_path.display()))?;
     let wait_started = std::time::Instant::now();
     let mut next_info_log = std::time::Duration::from_secs(5);
+    let mut noted_wait = false;
     loop {
         // Fully-qualified fs2 calls: std::fs::File now has inherent try_lock_*
         // methods with a different error type, and inherent methods win over
@@ -4086,6 +4110,10 @@ pub async fn acquire_snapshot_dir_lock(
         match result {
             Ok(()) => break,
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if !noted_wait {
+                    failpoint::note("lock.wait", lock_path.display());
+                    noted_wait = true;
+                }
                 debug!(lock = %lock_path.display(), "waiting for per-snapshot lock");
                 let elapsed = wait_started.elapsed();
                 if elapsed >= next_info_log {
