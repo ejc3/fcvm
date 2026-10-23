@@ -39,7 +39,7 @@ const RESTORE_COMPLETION_READ_TIMEOUT: std::time::Duration =
 /// Messages:
 /// - "ready\n" / "ready:healthcheck\n" - podman reports the container running (the
 ///   second: its image defines a HEALTHCHECK). Recorded in the container-ready file the
-///   health monitor reads, and `status_changed` wakes the monitor.
+///   health monitor reads, and `container_started` wakes the monitor.
 /// - "exit:{code}\n" - Container exited, write exit code to file
 /// - "cache-ready:{digest}\n" - The guest's (re-sendable) ask: "what am I?".
 ///   Answered from `cache_verdict` with "cache-ack" / "cache-restored" /
@@ -59,7 +59,7 @@ pub(crate) async fn run_status_listener(
     cache_verdict: SharedCacheVerdict,
     reboot_requested: Arc<std::sync::atomic::AtomicBool>,
     container_exited: Arc<std::sync::atomic::AtomicBool>,
-    status_changed: Arc<tokio::sync::Notify>,
+    container_started: Arc<tokio::sync::Notify>,
 ) -> Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixListener;
@@ -138,13 +138,16 @@ pub(crate) async fn run_status_listener(
                 crate::health::ContainerStart::from_message(msg)
             {
                 crate::health::write_container_start(runtime_dir, healthcheck)?;
-                status_changed.notify_one();
+                container_started.notify_one();
                 info!(vm_id = %vm_id, healthcheck, "Container ready notification received");
             } else if let Some(code_str) = msg.strip_prefix("exit:") {
                 // Write exit code to file
+                // Not a wake-up for the health monitor: an exit can come just before a
+                // guest reboot, and a monitor that saw it at once would persist Stopped
+                // and end, leaving the relaunched VM with no health monitor. It is read
+                // at the monitor's next poll, as before.
                 std::fs::write(&exit_file, format!("{}\n", code_str))
                     .with_context(|| format!("writing exit file: {:?}", exit_file))?;
-                status_changed.notify_one();
                 info!(
                     vm_id = %vm_id,
                     exit_code = %code_str,
@@ -1898,6 +1901,71 @@ mod tests {
         );
     }
 
+    /// An exit notification does not wake the health monitor. A container can exit just
+    /// before a guest reboot; a monitor woken by that exit would persist Stopped and end
+    /// before the reboot relaunch removes the exit file, and the relaunched VM would have
+    /// no health monitor.
+    #[tokio::test]
+    async fn an_exit_notification_does_not_wake_the_health_monitor() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let runtime_dir = temp_dir.path().to_path_buf();
+        let socket_path = runtime_dir.join("status.sock");
+        let socket_path_string = socket_path.to_string_lossy().to_string();
+        let runtime_dir_for_task = runtime_dir.clone();
+        let container_started = Arc::new(tokio::sync::Notify::new());
+        let container_started_for_task = container_started.clone();
+        let exit_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exit_flag_for_task = exit_flag.clone();
+
+        let listener_task = tokio::spawn(async move {
+            run_status_listener(
+                &socket_path_string,
+                &runtime_dir_for_task,
+                "vm-test",
+                None,
+                shared_cache_verdict(CacheVerdict::Pending),
+                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                exit_flag_for_task,
+                container_started_for_task,
+            )
+            .await
+        });
+        for _ in 0..50 {
+            if socket_path.exists() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
+        stream.write_all(b"exit:3\n").await.unwrap();
+        drop(stream);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !exit_flag.load(std::sync::atomic::Ordering::Acquire) {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "exit was not processed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // notify_one stores a permit when nobody waits, so a wake-up sent for the exit
+        // would resolve this at once.
+        let woken = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            container_started.notified(),
+        )
+        .await;
+        listener_task.abort();
+        assert!(
+            woken.is_err(),
+            "the exit notification woke the health monitor"
+        );
+        assert_eq!(
+            std::fs::read_to_string(runtime_dir.join("container-exit")).unwrap(),
+            "3\n"
+        );
+    }
+
     /// A start notification is recorded for the health monitor, with whether the image
     /// has a HEALTHCHECK, and wakes it.
     #[tokio::test]
@@ -1907,8 +1975,8 @@ mod tests {
         let socket_path = runtime_dir.join("status.sock");
         let socket_path_string = socket_path.to_string_lossy().to_string();
         let runtime_dir_for_task = runtime_dir.clone();
-        let status_changed = Arc::new(tokio::sync::Notify::new());
-        let status_changed_for_task = status_changed.clone();
+        let container_started = Arc::new(tokio::sync::Notify::new());
+        let container_started_for_task = container_started.clone();
 
         let listener_task = tokio::spawn(async move {
             run_status_listener(
@@ -1919,7 +1987,7 @@ mod tests {
                 shared_cache_verdict(CacheVerdict::Pending),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                status_changed_for_task,
+                container_started_for_task,
             )
             .await
         });
@@ -1933,9 +2001,12 @@ mod tests {
         let mut stream = tokio::net::UnixStream::connect(&socket_path).await.unwrap();
         stream.write_all(b"ready:healthcheck\n").await.unwrap();
         drop(stream);
-        tokio::time::timeout(std::time::Duration::from_secs(5), status_changed.notified())
-            .await
-            .expect("the health monitor was not woken");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            container_started.notified(),
+        )
+        .await
+        .expect("the health monitor was not woken");
         listener_task.abort();
 
         assert_eq!(

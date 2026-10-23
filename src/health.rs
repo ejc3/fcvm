@@ -59,9 +59,9 @@ pub type StartupSnapshotAck = oneshot::Sender<()>;
 /// - `pid`: Optional process ID for the VM
 /// - `state_dir`: Directory for state files
 /// - `cancel_token`: Optional token for graceful shutdown
-/// - `status_changed`: Optional wake-up the status listener fires when fc-agent reports
-///   the container started or exited. The state on disk is what the monitor checks; this
-///   only ends its sleep early.
+/// - `container_started`: Optional wake-up the status listener fires when fc-agent reports
+///   the container started. The state on disk is what the monitor checks; this only ends
+///   its sleep early.
 /// - `startup_healthy_tx`: Optional channel to signal when health first becomes Healthy.
 ///   This triggers startup snapshot creation, which PAUSES the VM (the memory dump can
 ///   take tens of seconds under I/O load). A paused VM cannot answer forwarded ports or
@@ -73,7 +73,7 @@ pub fn spawn_health_monitor_full(
     pid: Option<u32>,
     state_dir: PathBuf,
     cancel_token: Option<CancellationToken>,
-    status_changed: Option<std::sync::Arc<tokio::sync::Notify>>,
+    container_started: Option<std::sync::Arc<tokio::sync::Notify>>,
     startup_healthy_tx: Option<oneshot::Sender<StartupSnapshotAck>>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
@@ -123,9 +123,9 @@ pub fn spawn_health_monitor_full(
             if first_check {
                 first_check = false;
             } else {
-                // Sleep with cancellation support. A status notification (the
-                // container started or exited) ends the sleep, so the check that
-                // sees it runs as soon as it arrives.
+                // Sleep with cancellation support. The container's start
+                // notification ends the sleep, so the check that sees it runs as
+                // soon as it arrives.
                 let cancelled = async {
                     match &cancel_token {
                         Some(token) => token.cancelled().await,
@@ -133,7 +133,7 @@ pub fn spawn_health_monitor_full(
                     }
                 };
                 let woken = async {
-                    match &status_changed {
+                    match &container_started {
                         Some(notify) => notify.notified().await,
                         None => std::future::pending().await,
                     }
@@ -141,7 +141,7 @@ pub fn spawn_health_monitor_full(
                 tokio::select! {
                     _ = tokio::time::sleep(poll_interval) => {}
                     _ = woken => {
-                        debug!(target: "health-monitor", "status notification, checking now");
+                        debug!(target: "health-monitor", "container start notification, checking now");
                     }
                     _ = cancelled => {
                         info!(target: "health-monitor", "cancellation requested during sleep, stopping");
