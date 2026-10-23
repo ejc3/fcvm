@@ -1550,7 +1550,11 @@ mod tests {
             )),
             "fc-agent pins a different IPv6 gateway than routed mode gives its guests"
         );
-        let routed = include_str!("routed.rs");
+        // Search the production half only: the test module quotes every needle.
+        let routed = include_str!("routed.rs")
+            .split("\nmod tests {")
+            .next()
+            .expect("routed.rs has a production section");
         assert!(routed.contains("host_ipv6: Some(ROUTED_GATEWAY_IPV6.to_string())"));
         assert!(routed.contains("&format!(\"{ROUTED_GATEWAY_IPV6}/64\")"));
         assert!(routed.contains("crate::network::pasta::NAMESPACE_MAC"));
