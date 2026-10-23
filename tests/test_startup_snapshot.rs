@@ -1,8 +1,9 @@
-//! Startup snapshot tests - verifies snapshot creation after HTTP health check passes
+//! Startup snapshot tests - verifies snapshot creation at the first Healthy
 //!
 //! Tests the two-tier snapshot system:
 //! 1. Pre-start snapshot: Created after image load, before container starts
-//! 2. Startup snapshot: Created after HTTP health check passes (requires --health-check-url)
+//! 2. Startup snapshot: Created at the first Healthy: the HTTP health check with
+//!    --health-check, otherwise the container's start (or its image's HEALTHCHECK)
 //!
 //! Selection priority: startup snapshot > pre-start snapshot > fresh boot
 
@@ -196,68 +197,98 @@ async fn test_startup_snapshot_priority() -> Result<()> {
     }
 }
 
-/// Test that no startup snapshot is created without --health-check-url
-///
-/// Startup snapshot requires HTTP health check because:
-/// - Container-ready file alone doesn't indicate application readiness
-/// - HTTP health check confirms the application is fully initialized
+/// The snapshot a VM was started from or last snapshotted to, from `fcvm ls --json`.
+async fn snapshot_name(pid: u32) -> Result<String> {
+    let fcvm_path = common::find_fcvm_binary()?;
+    let output = tokio::process::Command::new(&fcvm_path)
+        .args(["ls", "--json", "--pid", &pid.to_string()])
+        .output()
+        .await
+        .context("running fcvm ls")?;
+    let vms: Vec<serde_json::Value> =
+        serde_json::from_slice(&output.stdout).context("parsing fcvm ls --json")?;
+    vms.first()
+        .and_then(|vm| vm.get("config")?.get("snapshot_name")?.as_str())
+        .map(str::to_string)
+        .with_context(|| format!("VM PID {pid} records no snapshot_name"))
+}
+
+/// Without --health-check, a run takes a startup snapshot when its container is first
+/// healthy (the container's start notification), and the next identical run restores the
+/// container already running: the guest runs no `podman run`, so the container's
+/// StartedAt is from before the second run began.
 #[tokio::test]
-async fn test_no_startup_snapshot_without_health_check_url() -> Result<()> {
-    println!("\nNo startup snapshot without health check URL test");
-    println!("=================================================");
-    println!("Verifies startup snapshot requires --health-check-url");
+async fn a_second_identical_run_restores_a_running_container_without_podman_run() -> Result<()> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    // A key no other test or run shares.
+    let test_id = format!("TEST_ID=startup-no-url-{}-{nanos}", std::process::id());
 
-    let (vm_name, _, _, _) = common::unique_names("startup-no-url");
-
-    // Use unique env var to get unique snapshot key (prevents parallel test interference)
-    let test_id = format!("TEST_ID=no-url-{}", std::process::id());
-
-    // Start VM WITHOUT --health-check-url (uses container-ready file only)
-    println!("Starting VM without --health-check-url...");
-    let (mut child, fcvm_pid) = common::spawn_fcvm(&[
-        "podman", "run", "--name", &vm_name, "--env",
-        &test_id, // Note: no --health-check flag
-        TEST_IMAGE,
+    let (vm_name1, _, _, _) = common::unique_names("startup-no-url-1");
+    let (mut child1, pid1) = common::spawn_fcvm(&[
+        "podman", "run", "--name", &vm_name1, "--env", &test_id, TEST_IMAGE,
     ])
     .await
-    .context("spawning fcvm")?;
-
-    println!("  fcvm PID: {}", fcvm_pid);
-    println!("  Waiting for VM to become healthy (via container-ready file)...");
-
-    // Wait for healthy status
-    let health_result = tokio::time::timeout(
-        Duration::from_secs(300),
-        common::poll_health_by_pid(fcvm_pid, 300),
-    )
-    .await;
-
-    // Wait a bit to ensure startup snapshot would have been created if it were going to be
-    tokio::time::sleep(Duration::from_secs(3)).await;
-
-    // Cleanup
-    println!("  Stopping VM...");
-    common::kill_process(fcvm_pid).await;
-    let _ = child.wait().await;
-
-    match health_result {
-        Ok(Ok(_)) => {
-            println!("  VM became healthy via container-ready file");
-            // Note: We can't easily check that startup snapshot was NOT created
-            // because we don't know the exact snapshot key. The test validates
-            // that the health check path works without the HTTP URL.
-            println!("✅ NO STARTUP SNAPSHOT WITHOUT URL TEST PASSED!");
-            println!("  Container-ready health check worked (startup snapshot not triggered)");
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            println!("❌ Health check failed: {}", e);
-            Err(e)
-        }
-        Err(_) => {
-            anyhow::bail!("Timeout waiting for VM to become healthy")
-        }
+    .context("spawning the first run")?;
+    let first = async {
+        common::poll_health_by_pid(pid1, 300).await?;
+        // Healthy is published after the startup snapshot is taken.
+        snapshot_name(pid1).await
     }
+    .await;
+    common::kill_process(pid1).await;
+    let _ = child1.wait().await;
+    let startup_key = first?;
+    anyhow::ensure!(
+        startup_key.ends_with("-startup"),
+        "the first run took no startup snapshot without --health-check; it records {startup_key}"
+    );
+
+    let second_began = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs();
+    let (vm_name2, _, _, _) = common::unique_names("startup-no-url-2");
+    let (mut child2, pid2) = common::spawn_fcvm(&[
+        "podman", "run", "--name", &vm_name2, "--env", &test_id, TEST_IMAGE,
+    ])
+    .await
+    .context("spawning the second run")?;
+    let second = async {
+        common::poll_health_by_pid(pid2, 120).await?;
+        let restored_from = snapshot_name(pid2).await?;
+        let started_at = common::exec_in_vm(
+            pid2,
+            &[
+                "podman",
+                "inspect",
+                "--format",
+                "{{.State.StartedAt.Unix}}",
+                "fcvm-container",
+            ],
+        )
+        .await?;
+        anyhow::Ok((restored_from, started_at))
+    }
+    .await;
+    common::kill_process(pid2).await;
+    let _ = child2.wait().await;
+    let (restored_from, started_at) = second?;
+
+    assert_eq!(
+        restored_from, startup_key,
+        "the second run did not restore the startup snapshot"
+    );
+    let started_at: u64 = started_at
+        .trim()
+        .parse()
+        .with_context(|| format!("podman StartedAt {started_at:?}"))?;
+    assert!(
+        started_at < second_began,
+        "the second run's container started at {started_at}, after the run began at \
+         {second_began}: the guest ran podman run instead of restoring a running container"
+    );
+    Ok(())
 }
 
 /// Test startup snapshot creation for restored VMs (from pre-start snapshot)

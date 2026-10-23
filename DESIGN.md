@@ -2650,7 +2650,7 @@ still load):
   and restores the device as it was saved.
   `test_balloon_target_honored_on_snapshot_cache_hit` covers it with one hit
   above the snapshot's target and one below.
-  The startup snapshot (`--health-check`) is not shared between targets. It
+  The startup snapshot is not shared between targets. It
   holds a workload that initialised under the target of the run that made it
   (the memory the guest had, which a workload sizes itself by), and a restore
   can set a target but cannot replay that. So its name carries the target:

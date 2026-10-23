@@ -335,15 +335,33 @@ fn validate_balloon_target(balloon: Option<u32>, mem: u32) -> Result<()> {
     Ok(())
 }
 
+/// Whether a run takes a startup snapshot (memory and disk of the running container) at
+/// its first Healthy, so the next identical run restores the container already running
+/// instead of starting it with `podman run`.
+///
+/// Healthy is the HTTP check with `--health-check`, podman's healthcheck for an image that
+/// defines one, and otherwise the container's start notification (#1161) confirmed over
+/// exec (see `health::check_health_once`). The key is the pre-start key, which already
+/// holds what a restore cannot change about a running container (image, command,
+/// environment, volumes, ...); the name and labels stay restore-time.
+///
+/// A `-i`/`-t` session without `--health-check` takes none: its container is driven by
+/// the caller's terminal, and a clone would resume someone else's session.
 fn should_arm_startup_snapshot(
     skip_snapshot_creation: bool,
     has_snapshot_key: bool,
-    has_explicit_http_health_check: bool,
+    takes_startup_snapshot: bool,
     lifecycle: &PodmanLifecycle,
 ) -> bool {
     !skip_snapshot_creation
         && has_snapshot_key
-        && (lifecycle.is_prepare() || has_explicit_http_health_check)
+        && (lifecycle.is_prepare() || takes_startup_snapshot)
+}
+
+/// Whether a `podman run` with these arguments takes a startup snapshot once healthy, see
+/// [`should_arm_startup_snapshot`].
+fn run_takes_startup_snapshot(args: &RunArgs) -> bool {
+    args.health_check.is_some() || !(args.tty || args.interactive)
 }
 
 /// Whether this invocation must stay out of the snapshot cache entirely — no
@@ -1571,12 +1589,11 @@ async fn prepare_vm_for_lifecycle(
                 "Pre-start snapshot hit! Restoring from cached snapshot"
             );
             // Call snapshot run with startup snapshot creation enabled
-            // (if health_check_url is set)
+            // (see should_arm_startup_snapshot)
             let snapshot_args = snapshot_restore_args(
                 &args,
                 &key,
-                // Create startup snapshot if this config has a health check URL
-                args.health_check.as_ref().map(|_| key.clone()),
+                run_takes_startup_snapshot(&args).then(|| key.clone()),
                 snapshot_run_firecracker_overrides(&runtime_config),
             );
             let attempt = super::snapshot::cmd_snapshot_run_attempt(snapshot_args).await;
@@ -1936,17 +1953,14 @@ async fn prepare_vm_for_lifecycle(
     });
 
     // Create startup snapshot channel for health-triggered snapshot creation
-    // Only create startup snapshots if:
-    // - Not skipping snapshots (no --no-snapshot)
-    // - Have a snapshot key
-    // - Have a health_check URL configured (HTTP health check, not just container-ready)
+    // (see should_arm_startup_snapshot).
     let (startup_tx, startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
     ) = if should_arm_startup_snapshot(
         skip_snapshot_creation,
         snapshot_key.is_some(),
-        args.health_check.is_some(),
+        run_takes_startup_snapshot(&args),
         &lifecycle,
     ) {
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -3151,7 +3165,7 @@ pub async fn cmd_podman_run(args: RunArgs) -> Result<()> {
         snapshot_restore_args(
             &ctx.args,
             key,
-            ctx.args.health_check.as_ref().map(|_| key.clone()),
+            run_takes_startup_snapshot(&ctx.args).then(|| key.clone()),
             (None, None),
         )
     });
@@ -4573,6 +4587,36 @@ mod tests {
             true,
             &PodmanLifecycle::Run
         ));
+        assert!(!should_arm_startup_snapshot(
+            true,
+            true,
+            true,
+            &PodmanLifecycle::Run
+        ));
+    }
+
+    /// A plain run takes a startup snapshot without --health-check: the container's start
+    /// notification is its first Healthy. An interactive session does not, unless it asked
+    /// for one with --health-check.
+    #[test]
+    fn a_run_takes_a_startup_snapshot_unless_it_is_an_interactive_session() {
+        let mut args = test_args();
+        assert!(args.health_check.is_none());
+        assert!(run_takes_startup_snapshot(&args));
+        for (tty, interactive) in [(true, false), (false, true), (true, true)] {
+            args.tty = tty;
+            args.interactive = interactive;
+            args.health_check = None;
+            assert!(
+                !run_takes_startup_snapshot(&args),
+                "tty={tty} -i={interactive}"
+            );
+            args.health_check = Some("http://localhost/".to_string());
+            assert!(
+                run_takes_startup_snapshot(&args),
+                "tty={tty} -i={interactive}"
+            );
+        }
     }
 
     #[test]

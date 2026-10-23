@@ -3043,15 +3043,14 @@ async fn cmd_snapshot_run_inner(
     // Create cancellation token for graceful health monitor shutdown
     let health_cancel_token = tokio_util::sync::CancellationToken::new();
 
-    // Create startup snapshot channel if:
-    // - startup_snapshot_base_key is set (passed from podman run on cache hit)
-    // - snapshot has a health check URL (needed to know when VM is fully initialized)
+    // Create the startup snapshot channel when podman run passed startup_snapshot_base_key:
+    // it decides whether a run takes one (`run_takes_startup_snapshot`). The trigger is
+    // the clone's first Healthy, whatever decides it (HTTP check, podman healthcheck, or
+    // the container start notification).
     let (startup_tx, mut startup_rx): (
         Option<tokio::sync::oneshot::Sender<crate::health::StartupSnapshotAck>>,
         Option<tokio::sync::oneshot::Receiver<crate::health::StartupSnapshotAck>>,
-    ) = if args.startup_snapshot_base_key.is_some()
-        && snapshot_config.metadata.health_check_url.is_some()
-    {
+    ) = if args.startup_snapshot_base_key.is_some() {
         let (tx, rx) = tokio::sync::oneshot::channel();
         (Some(tx), Some(rx))
     } else {
